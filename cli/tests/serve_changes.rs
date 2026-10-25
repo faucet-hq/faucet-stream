@@ -398,6 +398,21 @@ async fn plan_approve_run_with_policy_budget_rejection_and_audit() {
     assert_eq!(change["plan"]["summary"]["template_kind"], "pipeline");
     assert!(change["plan"]["summary"]["previous_version"].is_null());
     assert_eq!(change["plan"]["rows"].as_array().unwrap().len(), 1);
+    // The proposed body follows the template-body rule: only an unscoped
+    // admin reads it; the plan stays visible to every reviewer.
+    let (code, as_op) = api.get("dave-tok", &format!("/v1/changes/{tid}")).await;
+    assert_eq!(code, 200, "{as_op}");
+    assert_ne!(as_op["payload"]["config"], tpl, "{as_op}");
+    assert_eq!(as_op["plan"]["summary"]["template"], "tpl-a");
+    let (code, as_admin) = api.get("admin-tok", &format!("/v1/changes/{tid}")).await;
+    assert_eq!(code, 200, "{as_admin}");
+    assert_eq!(as_admin["payload"]["config"], tpl);
+    let (_, listed) = api.get("bob-tok", "/v1/changes").await;
+    let listed = listed
+        .as_array()
+        .and_then(|l| l.iter().find(|c| c["id"] == tid.as_str()).cloned())
+        .expect("listed");
+    assert_ne!(listed["payload"]["config"], tpl, "{listed}");
     let (code, err) = api
         .post("dave-tok", &format!("/v1/changes/{tid}/approve"), json!({}))
         .await;
@@ -676,6 +691,31 @@ async fn require_approval_turns_submissions_into_change_requests() {
         client: reqwest::Client::new(),
     };
     let config = csv_config(&input, &output, "gated");
+
+    // A malformed field is refused at submit, not after approval.
+    let (code, err) = api
+        .post(
+            "bob-tok",
+            "/v1/runs",
+            json!({ "config": config, "clock": "2026-10-01" }),
+        )
+        .await;
+    assert_eq!(code, 400, "{err}");
+    assert!(err.to_string().contains("RFC3339"), "{err}");
+    let (code, err) = api
+        .post(
+            "bob-tok",
+            "/v1/runs",
+            json!({ "config": config, "concurrency": 0 }),
+        )
+        .await;
+    assert_eq!(code, 422, "{err}");
+    let (_, pending) = api.get("admin-tok", "/v1/changes?status=pending").await;
+    assert_eq!(
+        pending.as_array().map(Vec::len),
+        Some(0),
+        "no change request was created: {pending}"
+    );
 
     // POST /v1/runs answers with a pending change request, not a run.
     let (code, resp) = api
@@ -980,4 +1020,24 @@ async fn gated_deletes_and_retirements_run_through_change_requests() {
     assert!(done["template"].is_null(), "{done}");
     let (code, _) = api.get("viewer-tok", "/v1/templates/tpl-d?version=1").await;
     assert_eq!(code, 404);
+}
+
+/// A configured principal may not take a server actor's name, so a removed
+/// principal can never pass as one when its approved change executes.
+#[test]
+fn an_auth_config_principal_may_not_take_a_server_actor_name() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["trigger:nightly", "system:expiry", "sync:origin", "runtime"] {
+        let auth_path = dir.path().join("auth.yaml");
+        std::fs::write(
+            &auth_path,
+            format!("principals:\n  - {{ name: \"{name}\", token: t1, role: operator }}\n"),
+        )
+        .unwrap();
+        let err = faucet_cli::serve::ServeConfig::from_args(serve_args(0, auth_path, Vec::new()))
+            .err()
+            .unwrap_or_else(|| panic!("{name} accepted"))
+            .to_string();
+        assert!(err.contains("reserved"), "{name}: {err}");
+    }
 }

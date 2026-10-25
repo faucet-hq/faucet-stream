@@ -121,7 +121,7 @@ schema. A config submitted to `faucet serve` may set `pricing:` inline but not
 | `faucet_source_bytes_total{pipeline,row,connector}` / `faucet_sink_bytes_total{…}` | Estimated bytes read / written, per page, live. |
 | `faucet_cost_signals_total{pipeline,row,connector,kind,unit}` | Connector-reported cost signals as they arrive. |
 | `faucet_source_throttled_total{pipeline,row,connector}` / `faucet_source_throttle_wait_seconds{…}` / `faucet_source_retries_total{…,class}` | Source-side rate limiting, live ([details](./resilience.md#source-side-throttling)). |
-| `faucet_usage_estimated_cost_total{pipeline,row,currency}` | Estimated cost of finished invocations, in thousandths of a currency unit. |
+| `faucet_usage_estimated_cost_total{pipeline,row,currency}` | Estimated cost of finished invocations, in thousandths of a currency unit (amounts below a thousandth carry over to the next run of the same series). |
 | `faucet_usage_hosted_equivalent_total{pipeline,row,currency}` | The hosted per-row equivalent, same unit. |
 | `faucet_usage_bytes_total{pipeline,row,direction}` | Estimated bytes of finished invocations (`read` / `written`). |
 

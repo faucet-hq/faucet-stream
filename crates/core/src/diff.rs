@@ -136,7 +136,7 @@ pub fn plan_ranges(min: i64, max: i64, target: usize) -> Vec<KeyRange> {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Normalizer {
-    /// Round floats to this absolute tolerance before comparing (`0` = exact).
+    /// Floats no further apart than this absolute tolerance compare equal (`0` = exact).
     #[serde(default)]
     pub float_tolerance: f64,
     /// Parse strings that look like timestamps (RFC 3339, or
@@ -242,14 +242,40 @@ impl Normalizer {
             return "n?".into();
         };
         // An integral float is the same number as the integer (`1.0` == `1`).
-        if f.fract() == 0.0 && f.abs() < 9.0e15 {
+        if f.fract() == 0.0 && f >= i64::MIN as f64 && f < i64::MAX as f64 {
             return format!("n{}", f as i64);
+        }
+        if f.fract() == 0.0 && f >= 0.0 && f < u64::MAX as f64 {
+            return format!("n{}", f as u64);
         }
         if self.float_tolerance > 0.0 {
             let rounded = (f / self.float_tolerance).round() * self.float_tolerance;
             return format!("f{rounded:e}");
         }
         format!("f{f:e}")
+    }
+
+    /// Whether two values are numbers no further apart than `float_tolerance`.
+    /// Leaf comparisons use it, so a pair straddling a rounding boundary of the
+    /// digest grid is not reported as changed.
+    fn within_tolerance(&self, a: Option<&Value>, b: Option<&Value>) -> bool {
+        if self.float_tolerance <= 0.0 {
+            return false;
+        }
+        match (self.number_of(a), self.number_of(b)) {
+            (Some(x), Some(y)) => (x - y).abs() <= self.float_tolerance,
+            _ => false,
+        }
+    }
+
+    fn number_of(&self, v: Option<&Value>) -> Option<f64> {
+        match v? {
+            Value::Number(n) => n.as_f64(),
+            Value::String(s) if self.numeric_strings => {
+                s.trim().parse::<f64>().ok().filter(|f| f.is_finite())
+            }
+            _ => None,
+        }
     }
 
     fn canonical_string(&self, s: &str) -> String {
@@ -572,8 +598,9 @@ fn changed_columns(
         .into_iter()
         .filter(|n| !is_excluded(n, exclude))
         .filter(|n| {
-            norm.canonical_column(n, key, a.get(n.as_str()))
-                != norm.canonical_column(n, key, b.get(n.as_str()))
+            let (x, y) = (a.get(n.as_str()), b.get(n.as_str()));
+            norm.canonical_column(n, key, x) != norm.canonical_column(n, key, y)
+                && !norm.within_tolerance(x, y)
         })
         .collect();
     out.sort();
@@ -897,6 +924,38 @@ mod tests {
             n.canonical(Some(&json!("7"))),
             n.canonical(Some(&json!(7))),
             "non-key columns keep numeric_strings off"
+        );
+    }
+
+    #[test]
+    fn float_tolerance_compares_pairs_across_a_rounding_boundary() {
+        let loose = Normalizer {
+            float_tolerance: 0.01,
+            ..norm()
+        };
+        let key = vec!["id".to_string()];
+        let src = vec![json!({"id": 1, "amount": 1.004999})];
+        let dst = vec![json!({"id": 1, "amount": 1.005001})];
+        assert!(diff_rows(&src, &dst, &key, None, &[], &loose).is_empty());
+        let far = vec![json!({"id": 1, "amount": 1.02})];
+        assert_eq!(diff_rows(&src, &far, &key, None, &[], &loose).len(), 1);
+        assert_eq!(
+            diff_rows(&src, &dst, &key, None, &[], &norm()).len(),
+            1,
+            "exact by default"
+        );
+    }
+
+    #[test]
+    fn large_integral_floats_equal_the_integer() {
+        let n = norm();
+        assert_eq!(
+            n.canonical(Some(&json!(1e16))),
+            n.canonical(Some(&json!(10_000_000_000_000_000_i64)))
+        );
+        assert_eq!(
+            n.canonical(Some(&json!(1e19))),
+            n.canonical(Some(&json!(10_000_000_000_000_000_000_u64)))
         );
     }
 

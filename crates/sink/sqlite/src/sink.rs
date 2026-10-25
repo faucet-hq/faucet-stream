@@ -604,6 +604,12 @@ impl SqliteDriver {
     }
 }
 
+impl SqliteDriver {
+    fn auto_map(&self) -> bool {
+        matches!(self.config.column_mapping, SqliteColumnMapping::AutoMap)
+    }
+}
+
 #[async_trait]
 impl SqlDriver for SqliteDriver {
     type Dialect = Sqlite;
@@ -636,6 +642,8 @@ impl SqlDriver for SqliteDriver {
             .database_url
             .trim_start_matches("sqlite://")
             .trim_start_matches("sqlite:");
+        // Connection options (`?mode=rwc`) are not part of the dataset.
+        let path = path.split('?').next().unwrap_or(path);
         format!("sqlite://{}?table={}", path, self.config.table_name)
     }
 
@@ -878,7 +886,37 @@ impl SqlDriver for SqliteDriver {
     }
 
     fn evolution(&self) -> Option<&dyn SqlEvolution> {
-        Some(self)
+        self.auto_map().then_some(self as &dyn SqlEvolution)
+    }
+
+    /// Upsert and delete need real key columns, which the JSON-column mode
+    /// lacks.
+    fn write_modes(&self) -> &'static [faucet_core::WriteMode] {
+        if self.auto_map() {
+            &[
+                faucet_core::WriteMode::Append,
+                faucet_core::WriteMode::Upsert,
+                faucet_core::WriteMode::Delete,
+                faucet_core::WriteMode::Overwrite,
+            ]
+        } else {
+            &[
+                faucet_core::WriteMode::Append,
+                faucet_core::WriteMode::Overwrite,
+            ]
+        }
+    }
+
+    /// The JSON-column mode writes whole records, so it reports no schema.
+    fn capabilities(&self, derived: faucet_core::Capabilities) -> faucet_core::Capabilities {
+        if self.auto_map() {
+            derived
+        } else {
+            derived
+                .to_builder()
+                .schema_report(faucet_core::SchemaReport::Schemaless)
+                .build()
+        }
     }
 
     /// Column-mapping mode only: the run-id column, the journaled keys and the
@@ -1062,6 +1100,36 @@ mod tests {
         let config = SqliteSinkConfig::new("sqlite:///tmp/test.db", "events");
         let sink = SqliteSink::new(config).await.unwrap();
         assert_eq!(sink.dataset_uri(), "sqlite:///tmp/test.db?table=events");
+    }
+
+    #[tokio::test]
+    async fn dataset_uri_drops_connection_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}/opts.db?mode=rwc", dir.path().display());
+        let sink = SqliteSink::new(SqliteSinkConfig::new(&url, "events"))
+            .await
+            .unwrap();
+        assert_eq!(
+            sink.dataset_uri(),
+            format!("sqlite://{}/opts.db?table=events", dir.path().display())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_memory_database_round_trips_rows_on_the_sink_pool() {
+        let config = SqliteSinkConfig::new("sqlite::memory:", "mem").column_mapping(
+            SqliteColumnMapping::Json {
+                column: "data".into(),
+            },
+        );
+        let sink = SqliteSink::new(config).await.unwrap();
+        let rows = vec![serde_json::json!({"a": 1}), serde_json::json!({"a": 2})];
+        assert_eq!(sink.write_batch(&rows).await.unwrap(), 2);
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mem")
+            .fetch_one(&sink.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
     }
 
     #[tokio::test]

@@ -162,11 +162,20 @@ impl MessageDriver for NatsDriver {
                 }
             }
         } else {
-            for m in group {
-                client
-                    .publish(m.destination, Bytes::from(m.payload))
-                    .await
-                    .map_err(|e| FaucetError::Sink(format!("nats publish: {e}")))?;
+            // A message the server would refuse fails alone; the rest still go out.
+            let max_payload = client.server_info().max_payload;
+            for (i, m) in group.into_iter().enumerate() {
+                if m.payload.len() > max_payload {
+                    outcomes[i] = Err(FaucetError::Sink(format!(
+                        "nats publish: message of {} bytes exceeds the server's max_payload of \
+                         {max_payload} bytes",
+                        m.payload.len()
+                    )));
+                    continue;
+                }
+                if let Err(e) = client.publish(m.destination, Bytes::from(m.payload)).await {
+                    outcomes[i] = Err(FaucetError::Sink(format!("nats publish: {e}")));
+                }
             }
             client
                 .flush()

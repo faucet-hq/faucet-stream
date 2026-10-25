@@ -9,6 +9,7 @@ description = "Snowflake query source connector for the faucet-stream ecosystem"
 readme = "README.md"
 keywords = ["snowflake", "sql", "etl", "pipeline", "connector"]
 categories.workspace = true
+exclude = ["tests/fixtures/**"]
 
 [dependencies]
 faucet-core.workspace = true

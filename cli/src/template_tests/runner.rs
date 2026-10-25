@@ -293,26 +293,22 @@ pub async fn resolve_target_version(
 /// exact match, so `--filter auto:defaults` runs one case.
 pub(crate) fn name_matches(name: &str, filter: Option<&str>) -> bool {
     let Some(pat) = filter else { return true };
-    let mut rest = name;
-    let mut parts = pat.split('*').peekable();
-    let first = parts.next().unwrap_or("");
-    if !rest.starts_with(first) {
+    let parts: Vec<&str> = pat.split('*').collect();
+    if parts.len() == 1 {
+        return name == pat;
+    }
+    let (first, last) = (parts[0], parts[parts.len() - 1]);
+    if name.len() < first.len() + last.len() || !name.starts_with(first) || !name.ends_with(last) {
         return false;
     }
-    rest = &rest[first.len()..];
-    let mut last_empty = pat.ends_with('*');
-    while let Some(part) = parts.next() {
-        if part.is_empty() {
-            last_empty = true;
-            continue;
-        }
-        last_empty = parts.peek().is_some() || pat.ends_with('*');
+    let mut rest = &name[first.len()..name.len() - last.len()];
+    for part in &parts[1..parts.len() - 1] {
         match rest.find(part) {
             Some(i) => rest = &rest[i + part.len()..],
             None => return false,
         }
     }
-    last_empty || rest.is_empty()
+    true
 }
 
 /// The template's `params:` declaration, needed by the `auto:` generator.
@@ -809,6 +805,13 @@ mod tests {
         assert!(name_matches("auto:missing-tenant", Some("auto:*")));
         assert!(name_matches("sink=jsonl,object=A", Some("*object=A")));
         assert!(name_matches("sink=jsonl,object=A", Some("sink=*,object=A")));
+        assert!(name_matches("abxb", Some("a*b")));
+        assert!(name_matches("auto:region=eu-west=eu", Some("auto:*=eu")));
+        assert!(!name_matches("auto:region=eu-west", Some("auto:*=eu")));
+        assert!(!name_matches("ab", Some("ab*b")));
+        assert!(name_matches("abb", Some("ab*b")));
+        assert!(name_matches("a-x-y-b", Some("a*x*b")));
+        assert!(!name_matches("a-y-b", Some("a*x*b")));
         assert!(!name_matches("sink=bigquery", Some("sink=jsonl*")));
     }
 

@@ -56,8 +56,8 @@ With the `host` form, faucet renders a connect descriptor, rejecting values cont
 | `VARCHAR2`, `CHAR`, `NVARCHAR2`, `CLOB`, `NCLOB`, `LONG`, `ROWID` | string |
 | `RAW`, `LONG RAW`, `BLOB` | base64 string |
 | `DATE` | `2024-01-02T03:04:05` |
-| `TIMESTAMP` | `2024-01-02T03:04:05.500` (fraction in 3, 6 or 9 digits) |
-| `TIMESTAMP WITH [LOCAL] TIME ZONE` | `2024-01-02T03:04:05+05:30` |
+| `TIMESTAMP(p)` | `2024-01-02T03:04:05.500000` (the column's declared digits, rounded up to 0/3/6/9) |
+| `TIMESTAMP(p) WITH [LOCAL] TIME ZONE` | `2024-01-02T03:04:05.000000+05:30` (`Z` for UTC) |
 | `INTERVAL DAY TO SECOND` / `YEAR TO MONTH` | ISO-8601 duration (`P1DT2H3M4.5S`, `P1Y2M`) |
 | `BOOLEAN` (23ai) | boolean |
 | `JSON` (21c+) | select `JSON_SERIALIZE(col RETURNING CLOB) AS col` and list it under `json_columns` |

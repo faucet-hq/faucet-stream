@@ -346,3 +346,27 @@ async fn null_topic_path_is_unresolved() {
         .unwrap_err();
     assert!(format!("{err}").contains("did not resolve"), "{err}");
 }
+
+/// `flush` runs as a cancellable backend call: a run already cancelled gets
+/// `Cancelled` without blocking on the producer queue.
+#[tokio::test]
+async fn flush_observes_the_run_cancel_token() {
+    use faucet_core::CancellationToken;
+    use faucet_core::io::CallContext;
+    let sink = KafkaSink::new(sink_config(
+        "127.0.0.1:1",
+        KafkaSinkTopic::Fixed { name: "t".into() },
+    ))
+    .await
+    .unwrap();
+    sink.flush().await.expect("an empty queue flushes at once");
+
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    sink.set_call_context(CallContext::new().with_cancel(cancel));
+    let err = sink.flush().await.unwrap_err();
+    assert!(
+        matches!(err, faucet_core::FaucetError::Cancelled { .. }),
+        "{err:?}"
+    );
+}

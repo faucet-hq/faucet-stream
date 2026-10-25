@@ -24,7 +24,8 @@ pub fn describe() {
     metrics::describe_counter!(
         "faucet_local_outputs_skipped_total",
         "Local sink outputs a sweep declined to delete, by scope and reason \
-         (pre_existing / already_deleted / not_on_disk / in_flight / delete_failed)."
+         (pre_existing / already_deleted / not_on_disk / in_flight / delete_failed / \
+         relative_path / other_host / changed)."
     );
     metrics::describe_counter!(
         "faucet_local_outputs_sweeps_total",
@@ -51,23 +52,22 @@ pub fn sweep(scope: &'static str, report: &SweepReport) {
         .increment(report.deleted as u64);
     metrics::counter!("faucet_local_outputs_bytes_deleted_total", "scope" => scope)
         .increment(report.bytes);
-    for reason in [
-        SkipReason::PreExisting,
-        SkipReason::AlreadyDeleted,
-        SkipReason::NotOnDisk,
-        SkipReason::InFlight,
-        SkipReason::DeleteFailed,
-    ] {
-        let n = report.skipped_for(reason);
-        if n > 0 {
-            metrics::counter!(
-                "faucet_local_outputs_skipped_total",
-                "scope" => scope,
-                "reason" => reason.as_str(),
-            )
-            .increment(n as u64);
-        }
+    for (reason, n) in skip_counts(report) {
+        metrics::counter!(
+            "faucet_local_outputs_skipped_total",
+            "scope" => scope,
+            "reason" => reason.as_str(),
+        )
+        .increment(n as u64);
     }
+}
+
+fn skip_counts(report: &SweepReport) -> Vec<(SkipReason, usize)> {
+    SkipReason::ALL
+        .into_iter()
+        .map(|r| (r, report.skipped_for(r)))
+        .filter(|(_, n)| *n > 0)
+        .collect()
 }
 
 /// Count a file recorded into the ledger.
@@ -112,6 +112,22 @@ mod tests {
         sweep("expired", &report);
         recorded("jsonl", 3);
         recorded("jsonl", 0);
+    }
+
+    #[test]
+    fn every_skip_reason_is_counted() {
+        let mut report = SweepReport::default();
+        for r in SkipReason::ALL {
+            report.push(outcome(false, Some(r)));
+        }
+        report.push(outcome(false, Some(SkipReason::OtherHost)));
+        let counts = skip_counts(&report);
+        assert_eq!(counts.len(), SkipReason::ALL.len());
+        assert!(counts.contains(&(SkipReason::OtherHost, 2)));
+        assert!(counts.contains(&(SkipReason::RelativePath, 1)));
+        let names: std::collections::BTreeSet<_> =
+            SkipReason::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(names.len(), SkipReason::ALL.len(), "ALL has no duplicates");
     }
 
     #[test]

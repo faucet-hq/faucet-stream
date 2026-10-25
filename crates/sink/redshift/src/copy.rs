@@ -105,6 +105,16 @@ pub(crate) fn copy_statement(
     sql
 }
 
+/// A `COPY` manifest listing `keys` in `bucket`, every entry mandatory, so
+/// one `COPY` loads them all or nothing.
+pub(crate) fn manifest_body(bucket: &str, keys: &[String]) -> Vec<u8> {
+    let entries: Vec<serde_json::Value> = keys
+        .iter()
+        .map(|k| serde_json::json!({"url": s3_uri(bucket, k), "mandatory": true}))
+        .collect();
+    serde_json::to_vec(&serde_json::json!({ "entries": entries })).unwrap_or_default()
+}
+
 /// Build a multi-row `INSERT INTO table (cols) VALUES ($1,$2),($3,$4)…`.
 /// Placeholders are numbered `$1..=$(num_rows*columns.len())`.
 pub(crate) fn insert_statement(
@@ -302,6 +312,19 @@ mod tests {
         assert_eq!(
             qualified_table_ref(Some("we\"ird"), "ta\"ble"),
             "\"we\"\"ird\".\"ta\"\"ble\""
+        );
+    }
+
+    #[test]
+    fn a_manifest_lists_every_part_as_mandatory() {
+        let body = manifest_body("b", &["p/1.jsonl".into(), "p/2.jsonl".into()]);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"entries": [
+                {"url": "s3://b/p/1.jsonl", "mandatory": true},
+                {"url": "s3://b/p/2.jsonl", "mandatory": true},
+            ]})
         );
     }
 

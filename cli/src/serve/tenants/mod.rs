@@ -253,7 +253,7 @@ fn catalog_builder(state: ServerState, tenant: String, names: BTreeSet<String>) 
             let provider = if names.contains(name) {
                 connection_provider(&state, &tenant, name, spec)
             } else {
-                faucet_auth::build_provider(spec)
+                crate::auth_catalog::build_provider(spec)
             }
             .map_err(|e| crate::error::CliError::AuthProviderBuild {
                 name: name.clone(),
@@ -437,7 +437,7 @@ pub async fn over_limit(state: &ServerState, tenant: &str) -> Result<Option<Stri
     if active > max as usize {
         metrics::record_limit_rejection(tenant, "max_concurrent_runs");
         return Ok(Some(format!(
-            "tenant '{tenant}' already has {max} run(s) queued or running across the cluster \
+            "tenant '{tenant}' already has {active} run(s) queued or running across the cluster \
              (limit max_concurrent_runs = {max})"
         )));
     }
@@ -749,14 +749,28 @@ pub async fn mark_needs_reauth(state: &ServerState, tenant: &str, name: &str, re
     if rec.status == ConnectionStatus::NeedsReauth {
         return;
     }
+    let read_at = rec.updated_at;
     let mut rec = rec;
     rec.status = ConnectionStatus::NeedsReauth;
     rec.reauth_reason = Some(reason.to_string());
     rec.updated_at = Utc::now();
     rec.updated_by = "system:tenants".into();
-    if let Err(e) = history.connection_upsert(&rec).await {
-        tracing::warn!(tenant, connection = name, error = %e, "could not mark the connection needs_reauth");
-        return;
+    // Compare-and-set: a reconnect that stored fresh credentials since the
+    // read wins, rather than being overwritten with the revoked ones.
+    match history.connection_replace(&rec, read_at).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::info!(
+                tenant,
+                connection = name,
+                "connection changed since the failed refresh; not marking it needs_reauth"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(tenant, connection = name, error = %e, "could not mark the connection needs_reauth");
+            return;
+        }
     }
     tracing::warn!(
         tenant,
@@ -1164,6 +1178,24 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_tenant_run_unescapes_config_authored_auth_like_faucet_run() {
+        let build = catalog_builder(
+            crate::serve::test_support::test_state(),
+            "acme".into(),
+            BTreeSet::new(),
+        );
+        let specs = std::collections::HashMap::from([(
+            "idp".to_string(),
+            serde_json::json!({"type": "static", "config": {"token": "abc$${x}"}}),
+        )]);
+        let catalog = build(Some(&specs)).unwrap();
+        let cred = catalog["idp"].credential().await.unwrap();
+        assert_eq!(cred, faucet_core::Credential::Bearer("abc${x}".into()));
+        let cli = crate::auth_catalog::build_auth_catalog(Some(&specs)).unwrap();
+        assert_eq!(cli["idp"].credential().await.unwrap(), cred);
+    }
+
     fn state_with_vault() -> (ServerState, Arc<Vault>) {
         let state = crate::serve::test_support::test_state();
         state.set_tenants(TenantsRuntime::new(
@@ -1172,6 +1204,113 @@ mod tests {
         ));
         let v = state.tenants().vault.clone().unwrap();
         (state, v)
+    }
+
+    /// Reads a connection as it was before a concurrent reconnect.
+    struct StaleConnectionReads(crate::serve::history::memory::MemoryHistory);
+
+    #[async_trait::async_trait]
+    impl crate::serve::history::RunHistory for StaleConnectionReads {
+        async fn claim_idempotency(
+            &self,
+            k: &str,
+            f: &str,
+            r: &str,
+            w: std::time::Duration,
+        ) -> Result<crate::serve::history::Claim, crate::serve::history::HistoryError> {
+            self.0.claim_idempotency(k, f, r, w).await
+        }
+        async fn upsert(&self, rec: &RunRecord) -> Result<(), crate::serve::history::HistoryError> {
+            self.0.upsert(rec).await
+        }
+        async fn get(
+            &self,
+            id: &str,
+        ) -> Result<Option<RunRecord>, crate::serve::history::HistoryError> {
+            self.0.get(id).await
+        }
+        async fn list(
+            &self,
+            f: &crate::serve::history::ListFilter,
+        ) -> Result<crate::serve::history::ListPage, crate::serve::history::HistoryError> {
+            self.0.list(f).await
+        }
+        async fn delete(
+            &self,
+            id: &str,
+        ) -> Result<crate::serve::history::DeleteOutcome, crate::serve::history::HistoryError>
+        {
+            self.0.delete(id).await
+        }
+        async fn purge_expired(
+            &self,
+            d: std::time::Duration,
+        ) -> Result<usize, crate::serve::history::HistoryError> {
+            self.0.purge_expired(d).await
+        }
+        async fn recover_orphans(&self) -> Result<usize, crate::serve::history::HistoryError> {
+            Ok(0)
+        }
+        fn degraded(&self) -> bool {
+            false
+        }
+        async fn connection_get(
+            &self,
+            tenant: &str,
+            name: &str,
+        ) -> Result<Option<ConnectionRecord>, crate::serve::history::HistoryError> {
+            Ok(self.0.connection_get(tenant, name).await?.map(|mut c| {
+                c.updated_at -= chrono::Duration::seconds(1);
+                c.status = ConnectionStatus::Active;
+                c
+            }))
+        }
+        async fn connection_replace(
+            &self,
+            c: &ConnectionRecord,
+            expected: chrono::DateTime<Utc>,
+        ) -> Result<bool, crate::serve::history::HistoryError> {
+            self.0.connection_replace(c, expected).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_since_the_failed_refresh_is_not_overwritten() {
+        let mem =
+            crate::serve::history::memory::MemoryHistory::new(std::time::Duration::from_secs(60));
+        let v = Vault::new(TEST_VAULT_KEY, &[]).unwrap();
+        let fresh = conn(
+            &v,
+            "acme",
+            "crm",
+            serde_json::json!({"type": "static", "config": {"token": "new"}}),
+        );
+        crate::serve::history::RunHistory::connection_upsert(&mem, &fresh)
+            .await
+            .unwrap();
+        let history =
+            Arc::new(StaleConnectionReads(mem)) as Arc<dyn crate::serve::history::RunHistory>;
+        let state = ServerState::new(
+            &crate::serve::test_support::test_config(),
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            history.clone(),
+            crate::serve::logs::LogHub::new(),
+            None,
+            #[cfg(feature = "triggers")]
+            crate::serve::triggers::health::TriggersHandle::empty(),
+        );
+        mark_needs_reauth(&state, "acme", "crm", "invalid_grant").await;
+        let stored = history
+            .connection_get("acme", "crm")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.sealed, fresh.sealed,
+            "the reconnect's credentials stay"
+        );
+        assert!(stored.reauth_reason.is_none());
     }
 
     #[tokio::test]
@@ -1196,6 +1335,7 @@ mod tests {
             .unwrap()
             .expect("two runs, limit one");
         assert!(msg.contains("across the cluster"), "{msg}");
+        assert!(msg.contains("already has 2 run(s)"), "{msg}");
         t.limits.max_concurrent_runs = Some(5);
         state.history().tenant_upsert(&t).await.unwrap();
         assert!(over_limit(&state, "acme").await.unwrap().is_none());

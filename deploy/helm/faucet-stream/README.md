@@ -192,6 +192,13 @@ pipelineConfig:
 `job`/`cronjob` require a `pipelineConfig` (inline `content` or
 `existingConfigMap`); the chart fails the render otherwise.
 
+Job and CronJob pods are ephemeral: their working directory
+(`serve.persistence.mountPath`) is an `emptyDir` wiped after every run, so a
+`state: { type: file }` bookmark or a local output kept there is lost and the
+next run starts from scratch. Use a redis / postgres state store, or set
+`job.persistence.existingClaim` / `cronjob.persistence.existingClaim` to mount
+an existing PVC there.
+
 ---
 
 ## Serve features
@@ -435,6 +442,7 @@ See [`values.yaml`](./values.yaml) — every key is commented. Common ones:
 | `job.enabled` | `false` | one-shot `faucet run` |
 | `cronjob.enabled` | `false` | scheduled `faucet run` |
 | `cronjob.schedule` | `0 * * * *` | cron expression |
+| `job.persistence.existingClaim` / `cronjob.persistence.existingClaim` | `""` | PVC for the run pod's working directory (`emptyDir` otherwise) |
 | `pipelineConfig.create` | `false` | render pipeline config into a ConfigMap |
 | `serviceMonitor.enabled` | `false` | Prometheus Operator scrape |
 | `otel.logs.enabled` | `false` | ship run logs over OTLP (needs an `otel` image) |

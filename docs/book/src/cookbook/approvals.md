@@ -83,6 +83,10 @@ default config now points somewhere else), the request becomes `invalidated`
 with the difference spelled out and **nothing runs**: the approver reviewed
 something else. A rotated secret or a live probe result is not material.
 
+Under `--auth-config` the requester is also checked again: if it is no longer
+a principal in the file, now holds a lower role than when it asked, or is
+scoped to a different tenant, the request becomes `failed` and nothing runs.
+
 Otherwise the request executes and becomes `executed` (with `run_id` or the
 template id and version) or, if execution itself errors, `failed` with the
 reason. A run carries the label `change: <id>` and, unless the requester set
@@ -182,7 +186,10 @@ A template trigger that waits for approval stores the template body with its
 when the approved run executes — so a trigger carrying a `secret: true` param
 or `env` overrides is refused with `422`. Change-request responses hide
 callback `headers` from everyone but admins and the proposed `config` from
-principals that cannot approve.
+principals that cannot approve. The body a `template_register` change proposes
+is shown only to unscoped admins, the same rule `GET /v1/templates/{id}`
+applies to a registered body (it can hold inline credentials); its plan stays
+visible to every reviewer.
 
 `--approval-expiry-secs` sets the default window when the auth config does not.
 

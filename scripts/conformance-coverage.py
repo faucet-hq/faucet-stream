@@ -47,9 +47,71 @@ INTEROP = "crates/interop-tests/tests"
 ROLE_DIRS = {"sources": ("source", "crates/source"), "sinks": ("sink", "crates/sink")}
 
 
+RAW_STRING = re.compile(r'b?r(#*)"')
+
+
 def strip_comments(text):
-    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
-    return re.sub(r"//[^\n]*", "", text)
+    """Rust source without comments and with every string/char literal emptied,
+    so a `/*`, `//` or brace inside a literal changes nothing."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+        elif text.startswith("/*", i):
+            depth, i = 1, i + 2
+            while i < n and depth:
+                if text.startswith("/*", i):
+                    depth, i = depth + 1, i + 2
+                elif text.startswith("*/", i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+        elif (c in "rb") and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")) and RAW_STRING.match(text, i):
+            m = RAW_STRING.match(text, i)
+            close = '"' + m.group(1)
+            j = text.find(close, m.end())
+            out.append('""')
+            i = n if j < 0 else j + len(close)
+        elif c == '"':
+            i += 1
+            while i < n and text[i] != '"':
+                i += 2 if text[i] == "\\" else 1
+            out.append('""')
+            i += 1
+        elif c == "'":
+            m = re.match(r"'(\\(x[0-9a-fA-F]{2}|u\{[0-9a-fA-F]+\}|.)|[^\\'\n])'", text[i:])
+            if m:
+                out.append("' '")
+                i += m.end()
+            else:
+                out.append(c)
+                i += 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+IGNORED_TEST = re.compile(r"#\[ignore\b[^\]]*\]")
+
+
+def drop_ignored_tests(text):
+    """Test source without the functions marked `#[ignore]`, which a plain
+    `cargo test` never runs. Expects comment-stripped input."""
+    while True:
+        m = IGNORED_TEST.search(text)
+        if not m:
+            return text
+        f = re.compile(r"\bfn\s+\w+[^{;]*\{").search(text, m.end())
+        if not f:
+            return text[: m.start()]
+        depth, i = 1, f.end()
+        while i < len(text) and depth:
+            depth += {"{": 1, "}": -1}.get(text[i], 0)
+            i += 1
+        text = text[: m.start()] + text[i:]
 
 
 def non_test_source(text):
@@ -182,7 +244,7 @@ def check(root="."):
             ):
                 if os.path.exists(test_path):
                     with open(test_path, encoding="utf-8") as fh:
-                        test_src += strip_comments(fh.read())
+                        test_src += drop_ignored_tests(strip_comments(fh.read()))
             for req in reqs:
                 if not any(applies(t, caps, src) for t in req["triggers"]):
                     continue

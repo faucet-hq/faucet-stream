@@ -16,13 +16,32 @@ pub async fn decode(
     let json: Value = faucet_core::fidelity::from_slice(body)
         .map_err(|e| FaucetError::Source(format!("json-schema decode: {e}")))?;
     if validate {
-        let registered = client.get_schema(schema_id).await?;
-        let validator = client.parsed("json-schema", &registered.schema, |text| {
-            let schema_value: Value = serde_json::from_str(text)
-                .map_err(|e| FaucetError::Source(format!("json-schema parse: {e}")))?;
-            jsonschema::validator_for(&schema_value)
-                .map_err(|e| FaucetError::Source(format!("json-schema compile: {e}")))
-        })?;
+        let validator = match client.compiled_for::<jsonschema::Validator>("json-schema", schema_id)
+        {
+            Some(validator) => validator,
+            None => {
+                let registered = client.get_schema(schema_id).await?;
+                registered.expect_type("JSON")?;
+                let references: Vec<(String, String)> = client
+                    .references(&registered)
+                    .await?
+                    .into_iter()
+                    .map(|(name, s)| (name, s.schema))
+                    .collect();
+                let mut key = registered.schema.clone();
+                for (name, text) in &references {
+                    key.push('\u{0}');
+                    key.push_str(name);
+                    key.push('\u{0}');
+                    key.push_str(text);
+                }
+                let validator = client.parsed("json-schema", &key, |_| {
+                    compile(&registered.schema, &references)
+                })?;
+                client.remember_compiled("json-schema", schema_id, validator.clone());
+                validator
+            }
+        };
         // Validate the payload as the producer wrote it: the fidelity parse
         // turns numbers JSON cannot hold exactly into strings, which a schema
         // declaring `integer` / `number` would refuse. A number beyond the
@@ -40,6 +59,48 @@ pub async fn decode(
         }
     }
     Ok(json)
+}
+
+/// The base every relative reference name resolves against.
+const REFERENCE_BASE: &str = "https://schema-registry.faucet.invalid/";
+
+fn reference_uri(name: &str) -> String {
+    if name.contains(':') {
+        name.to_string()
+    } else {
+        format!("{REFERENCE_BASE}{name}")
+    }
+}
+
+/// A validator for `schema` whose `$ref`s may name `references` by their
+/// reference names.
+fn compile(
+    schema: &str,
+    references: &[(String, String)],
+) -> Result<jsonschema::Validator, FaucetError> {
+    let parse = |text: &str| -> Result<Value, FaucetError> {
+        serde_json::from_str(text)
+            .map_err(|e| FaucetError::Source(format!("json-schema parse: {e}")))
+    };
+    let schema_value = parse(schema)?;
+    if references.is_empty() {
+        return jsonschema::validator_for(&schema_value)
+            .map_err(|e| FaucetError::Source(format!("json-schema compile: {e}")));
+    }
+    let mut registry = jsonschema::Registry::new();
+    for (name, text) in references {
+        registry = registry
+            .add(reference_uri(name), parse(text)?)
+            .map_err(|e| FaucetError::Source(format!("json-schema reference '{name}': {e}")))?;
+    }
+    let registry = registry
+        .prepare()
+        .map_err(|e| FaucetError::Source(format!("json-schema references: {e}")))?;
+    jsonschema::options()
+        .with_base_uri(format!("{REFERENCE_BASE}schema"))
+        .with_registry(&registry)
+        .build(&schema_value)
+        .map_err(|e| FaucetError::Source(format!("json-schema compile: {e}")))
 }
 
 /// Encode `value` as JSON under `subject`, registering the schema first.
@@ -61,6 +122,46 @@ mod tests {
     use crate::SchemaRegistryConfig;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn validation_follows_schema_references() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/schemas/ids/31"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema": r#"{"type":"object","properties":{"qty":{"$ref":"qty.json"}}}"#,
+                "schemaType": "JSON",
+                "references": [{"name": "qty.json", "subject": "qty", "version": 1}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/subjects/qty/versions/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema": r#"{"type":"integer","minimum":1}"#, "schemaType": "JSON"
+            })))
+            .mount(&server)
+            .await;
+        let client = SchemaRegistryClient::new(&SchemaRegistryConfig::new(server.uri())).unwrap();
+        let good = envelope::encode(31, br#"{"qty": 3}"#);
+        assert_eq!(
+            decode(&client, &good, true).await.unwrap(),
+            serde_json::json!({"qty": 3})
+        );
+        let cached = client
+            .compiled_for::<jsonschema::Validator>("json-schema", 31)
+            .expect("the validator is cached by schema id");
+        let bad = envelope::encode(31, br#"{"qty": 0}"#);
+        let err = decode(&client, &bad, true).await.unwrap_err();
+        assert!(err.to_string().contains("validation failed"), "{err}");
+        let reused = client
+            .compiled_for::<jsonschema::Validator>("json-schema", 31)
+            .unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&cached, &reused),
+            "reused, not rebuilt"
+        );
+    }
 
     #[tokio::test]
     async fn json_schema_round_trip_without_validation() {

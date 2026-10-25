@@ -281,15 +281,19 @@ pub async fn replay(
     )
     .await?;
 
+    let records_written = summary.invocations.iter().map(written_by).sum();
     if summary.had_failures() {
-        let detail = summary
+        let error = summary
             .invocations
             .iter()
             .find_map(|i| i.error.clone())
             .unwrap_or_else(|| "unknown error".to_string());
-        return Err(CliError::Internal(format!("dlq replay failed: {detail}")));
+        return Err(CliError::ReplayFailed {
+            records_written,
+            candidates,
+            error,
+        });
     }
-    let records_written = summary.invocations.iter().map(|i| i.records_written).sum();
 
     Ok(ReplayOutcome {
         candidates,
@@ -297,6 +301,18 @@ pub async fn replay(
         records_written,
         dry_run: inputs.dry_run,
         failed_dlq: failed.to_string_lossy().into_owned(),
+    })
+}
+
+/// Rows an invocation wrote. A failed invocation's outcome carries
+/// `records_written: 0`, so its count comes from the usage meter, which tallies
+/// every batch the sink accepted before the failure.
+fn written_by(outcome: &crate::executor::InvocationOutcome) -> usize {
+    if outcome.error.is_none() {
+        return outcome.records_written;
+    }
+    outcome.usage.as_ref().map_or(outcome.records_written, |u| {
+        usize::try_from(u.usage.records_written).unwrap_or(usize::MAX)
     })
 }
 
@@ -324,13 +340,19 @@ pub fn discard(
     let mut archived_to = Vec::new();
 
     for file in &files {
+        let limit = dec.verify_file(file)?;
         let mut already = reader::discarded_lines(file)?;
         let mut ids = String::new();
         let archive = archive_path(file);
+        let in_archive = if delete {
+            std::collections::HashSet::new()
+        } else {
+            archived_lines(&archive)?
+        };
         let mut removed = String::new();
         let mut archived = false;
         let mut file_discarded = 0usize;
-        reader::for_each_line(file, |line| {
+        reader::for_each_verified_line(file, limit, |line| {
             let id = reader::line_id(line);
             if already.contains(&id)
                 || plan::discard_keep_line(line, dec, reason.as_deref(), before_ms)
@@ -340,8 +362,9 @@ pub fn discard(
             file_discarded += 1;
             ids.push_str(&id);
             ids.push('\n');
+            let archived_before = in_archive.contains(&id);
             already.insert(id);
-            if !delete {
+            if !delete && !archived_before {
                 removed.push_str(line);
                 removed.push('\n');
                 // Archive in bounded chunks, never the whole file at once.
@@ -438,12 +461,22 @@ pub fn purge_with(location: &str, dec: &DlqDecryptor) -> CliResult<PurgeOutcome>
         if ids.is_empty() {
             continue;
         }
+        if reader::is_compressed(file) {
+            return Err(CliError::Config(format!(
+                "DLQ file '{}' is compressed and cannot be rewritten in place; its discarded \
+                 envelopes stay hidden from replay, inspect and status",
+                file.display()
+            )));
+        }
         let stamp = |f: &std::path::Path| -> CliResult<(u64, Option<std::time::SystemTime>)> {
             let m = std::fs::metadata(f).map_err(|e| {
                 CliError::Internal(format!("reading DLQ file '{}': {e}", f.display()))
             })?;
             Ok((m.len(), m.modified().ok()))
         };
+        let original = std::fs::File::open(file).map_err(|e| {
+            CliError::Internal(format!("reading DLQ file '{}': {e}", file.display()))
+        })?;
         let before = stamp(file)?;
         let tmp = file.with_file_name(format!(
             "{}.faucet-purge",
@@ -453,7 +486,8 @@ pub fn purge_with(location: &str, dec: &DlqDecryptor) -> CliResult<PurgeOutcome>
         ));
         let write_err =
             |e: std::io::Error| CliError::Internal(format!("writing '{}': {e}", tmp.display()));
-        let purged = if reader::starts_sealed(file)? {
+        let sealed = reader::starts_sealed(file)?;
+        let purged = if sealed {
             // A file sealed with whole-file integrity is verified and
             // re-sealed as a whole.
             let text = std::fs::read_to_string(file).map_err(|e| {
@@ -479,6 +513,7 @@ pub fn purge_with(location: &str, dec: &DlqDecryptor) -> CliResult<PurgeOutcome>
         }
         std::fs::rename(&tmp, file)
             .map_err(|e| CliError::Internal(format!("replacing '{}': {e}", file.display())))?;
+        copy_late_appends(&original, before.0, file, sealed.then_some(dec))?;
         let sidecar = reader::discard_sidecar(file);
         if let Err(e) = std::fs::remove_file(&sidecar)
             && e.kind() != std::io::ErrorKind::NotFound
@@ -516,8 +551,92 @@ fn append_to(path: &std::path::Path, body: &str) -> CliResult<()> {
         .open(path)
         .map_err(|e| CliError::Internal(format!("opening archive '{}': {e}", path.display())))?;
     f.write_all(body.as_bytes())
+        .and_then(|()| f.sync_all())
         .map_err(|e| CliError::Internal(format!("writing archive '{}': {e}", path.display())))?;
     Ok(())
+}
+
+/// Carry over lines a writer appended to the replaced file after it was
+/// checked: they land at the end of the purged file instead of being lost
+/// with the old one. Only complete lines are carried (a line still being
+/// written stays behind, with a warning). With `sealed`, the file is sealed
+/// with whole-file integrity: the late lines belong to the old file's chain,
+/// so they are opened and re-sealed into the rewritten file under a new
+/// trailer rather than copied as bytes. Best effort: a writer that keeps the
+/// old file open past this point still writes to the replaced copy.
+fn copy_late_appends(
+    original: &std::fs::File,
+    mut copied: u64,
+    dest: &std::path::Path,
+    sealed: Option<&DlqDecryptor>,
+) -> CliResult<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let err = |e: std::io::Error| {
+        CliError::Internal(format!(
+            "carrying late lines into '{}': {e}",
+            dest.display()
+        ))
+    };
+    let mut src = original;
+    let mut partial = 0u64;
+    loop {
+        let len = original.metadata().map_err(err)?.len();
+        if len <= copied {
+            break;
+        }
+        src.seek(SeekFrom::Start(copied)).map_err(err)?;
+        let mut tail = Vec::with_capacity((len - copied) as usize);
+        src.take(len - copied).read_to_end(&mut tail).map_err(err)?;
+        let complete = tail.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+        partial = (tail.len() - complete) as u64;
+        if complete == 0 {
+            break;
+        }
+        tail.truncate(complete);
+        let carried = match sealed {
+            Some(dec) => dec
+                .reseal_appended(dest, &String::from_utf8_lossy(&tail))
+                .map_err(CliError::from)?,
+            None => {
+                let mut out = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(dest)
+                    .map_err(err)?;
+                out.write_all(&tail)
+                    .and_then(|()| out.sync_all())
+                    .map_err(err)?;
+                tail.iter().filter(|b| **b == b'\n').count()
+            }
+        };
+        copied += complete as u64;
+        tracing::warn!(
+            file = %dest.display(),
+            lines = carried,
+            "dlq purge: lines appended during the purge were carried into the rewritten file"
+        );
+    }
+    if partial > 0 {
+        tracing::warn!(
+            file = %dest.display(),
+            bytes = partial,
+            "dlq purge: a line was still being written to the replaced file and was not \
+             carried over; purge only while nothing writes the DLQ"
+        );
+    }
+    Ok(())
+}
+
+/// The ids of the lines an earlier, interrupted discard already archived.
+fn archived_lines(archive: &std::path::Path) -> CliResult<std::collections::HashSet<String>> {
+    let mut ids = std::collections::HashSet::new();
+    if !archive.exists() {
+        return Ok(ids);
+    }
+    reader::for_each_line(archive, |line| {
+        ids.insert(reader::line_id(line));
+        Ok(())
+    })?;
+    Ok(ids)
 }
 
 #[cfg(test)]
@@ -612,6 +731,94 @@ mod tests {
             std::fs::read_to_string(&file).unwrap(),
             format!("{}\n", unbound[1])
         );
+    }
+
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn a_sealed_dlq_with_a_removed_line_is_not_read() {
+        use faucet_common_file::sealed_lines::LineSeal;
+        let enc = faucet_core::CompiledEncryption::compile(&faucet_core::EncryptionSpec {
+            key: "k".into(),
+            previous_keys: vec![],
+            algorithm: Default::default(),
+        })
+        .unwrap();
+        let mut seal = LineSeal::new();
+        let mut body = String::from_utf8(seal.header(&enc)).unwrap();
+        for id in 1..=3 {
+            let line = env_line("quality", "QualityFailure", id, json!({ "id": id }));
+            body.push_str(&String::from_utf8(seal.seal(&enc, line.as_bytes())).unwrap());
+        }
+        body.push_str(&String::from_utf8(seal.trailer(&enc)).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("dlq.jsonl");
+        std::fs::write(&file, &body).unwrap();
+        let dec = DlqDecryptor::from_keys(&["k".to_string()]).unwrap();
+        let scan = reader::scan_files(std::slice::from_ref(&file), &dec).unwrap();
+        assert_eq!(scan.envelopes.len(), 3);
+
+        let mut lines: Vec<&str> = body.lines().collect();
+        lines.remove(2);
+        std::fs::write(&file, format!("{}\n", lines.join("\n"))).unwrap();
+        let err = reader::scan_files(std::slice::from_ref(&file), &dec).unwrap_err();
+        assert!(
+            err.to_string().contains("failed its integrity check"),
+            "{err}"
+        );
+        let loc = file.to_str().unwrap();
+        let err = discard(loc, None, None, false, &dec).unwrap_err();
+        assert!(
+            err.to_string().contains("failed its integrity check"),
+            "{err}"
+        );
+        assert!(!reader::discard_sidecar(&file).exists());
+    }
+
+    /// A sealed DLQ of two flushes whose final trailer and one line of the
+    /// last flush were removed: the last flush is no longer covered by any
+    /// trailer, so its remaining lines are not read (they would hide the
+    /// removal), while the verified first flush still is.
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn lines_after_the_last_verifying_trailer_are_not_read() {
+        use faucet_common_file::sealed_lines::LineSeal;
+        let enc = faucet_core::CompiledEncryption::compile(&faucet_core::EncryptionSpec {
+            key: "k".into(),
+            previous_keys: vec![],
+            algorithm: Default::default(),
+        })
+        .unwrap();
+        let mut seal = LineSeal::new();
+        let mut lines = vec![String::from_utf8(seal.header(&enc)).unwrap()];
+        let push = |seal: &mut LineSeal, id: i64| {
+            let line = env_line("quality", "QualityFailure", id, json!({ "id": id }));
+            String::from_utf8(seal.seal(&enc, line.as_bytes())).unwrap()
+        };
+        lines.push(push(&mut seal, 1));
+        lines.push(String::from_utf8(seal.trailer(&enc)).unwrap());
+        for id in 2..=4 {
+            lines.push(push(&mut seal, id));
+        }
+        lines.push(String::from_utf8(seal.trailer(&enc)).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("dlq.jsonl");
+        let dec = DlqDecryptor::from_keys(&["k".to_string()]).unwrap();
+        std::fs::write(&file, lines.concat()).unwrap();
+        let scan = reader::scan_files(std::slice::from_ref(&file), &dec).unwrap();
+        assert_eq!(scan.envelopes.len(), 4);
+
+        // Drop line 3 (id 3) and the final trailer.
+        let tampered = [&lines[..4], &lines[5..6]].concat().concat();
+        std::fs::write(&file, tampered).unwrap();
+        let scan = reader::scan_files(std::slice::from_ref(&file), &dec).unwrap();
+        let ids: Vec<i64> = scan
+            .envelopes
+            .iter()
+            .map(|e| e.payload["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![1], "only the verified flush is read");
+        let out = discard(file.to_str().unwrap(), None, None, true, &dec).unwrap();
+        assert_eq!(out.discarded, 1, "only verified lines are discarded");
     }
 
     #[test]
@@ -831,6 +1038,113 @@ mod tests {
         // The archive holds the discarded envelope.
         let archived = std::fs::read_to_string(dir.path().join("dlq.jsonl.archived")).unwrap();
         assert!(archived.contains("QualityFailure"));
+    }
+
+    #[test]
+    fn lines_appended_during_a_purge_are_carried_over() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "dlq.jsonl", "old-1\nold-2\n");
+        let original = std::fs::File::open(&path).unwrap();
+        let mut live = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let tmp = write(dir.path(), "dlq.jsonl.faucet-purge", "old-2\n");
+        std::fs::rename(&tmp, &path).unwrap();
+        writeln!(live, "late").unwrap();
+        copy_late_appends(&original, 12, &path, None).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old-2\nlate\n");
+        copy_late_appends(&original, 17, &path, None).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old-2\nlate\n");
+        // A line still being written is not carried as a torn fragment.
+        write!(live, "torn").unwrap();
+        copy_late_appends(&original, 17, &path, None).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old-2\nlate\n");
+    }
+
+    /// Lines a sealed writer appends to the replaced file during a purge are
+    /// re-sealed into the rewritten file's chain, so it still verifies whole,
+    /// reads them, and a writer can keep appending to it.
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn late_lines_of_a_sealed_dlq_are_resealed_not_copied() {
+        use faucet_common_file::sealed_lines::{LineSeal, Opened, open, open_for_append};
+        use std::io::Write;
+        let enc = faucet_core::CompiledEncryption::compile(&faucet_core::EncryptionSpec {
+            key: "k".into(),
+            previous_keys: vec![],
+            algorithm: Default::default(),
+        })
+        .unwrap();
+        let line = |id: i64| env_line("quality", "QualityFailure", id, json!({ "id": id }));
+        // The old file: header, two envelopes, trailer.
+        let mut old = LineSeal::new();
+        let mut body = old.header(&enc);
+        body.extend(old.seal(&enc, line(1).as_bytes()));
+        body.extend(old.seal(&enc, line(2).as_bytes()));
+        body.extend(old.trailer(&enc));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dlq.jsonl");
+        std::fs::write(&path, &body).unwrap();
+        let original = std::fs::File::open(&path).unwrap();
+        let mut live = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        // The purged file (envelope 1 removed), sealed under a fresh id.
+        let mut new = LineSeal::new();
+        let mut purged = new.header(&enc);
+        purged.extend(new.seal(&enc, line(2).as_bytes()));
+        purged.extend(new.trailer(&enc));
+        let tmp = dir.path().join("dlq.jsonl.faucet-purge");
+        std::fs::write(&tmp, &purged).unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+        // A flush lands in the old file after the swap: a line + its trailer.
+        let mut late = old.seal(&enc, line(3).as_bytes());
+        late.extend(old.trailer(&enc));
+        live.write_all(&late).unwrap();
+
+        let dec = DlqDecryptor::from_keys(&["k".to_string()]).unwrap();
+        copy_late_appends(&original, body.len() as u64, &path, Some(&dec)).unwrap();
+        let raw = std::fs::read(&path).unwrap();
+        let Opened::Sealed { plain, .. } = open(&raw, &enc).unwrap() else {
+            panic!("a verified sealed file");
+        };
+        assert_eq!(
+            String::from_utf8(plain).unwrap(),
+            format!("{}\n{}\n", line(2), line(3))
+        );
+        assert!(matches!(
+            open_for_append(&raw, &enc).unwrap(),
+            Opened::Sealed { .. }
+        ));
+        let scan = reader::scan_files(std::slice::from_ref(&path), &dec).unwrap();
+        assert_eq!(scan.envelopes.len(), 2);
+    }
+
+    #[test]
+    fn a_retried_discard_does_not_archive_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "{}\n{}\n",
+            env_line("quality", "QualityFailure", 1, json!({"id": 1})),
+            env_line("quality", "QualityFailure", 2, json!({"id": 2})),
+        );
+        let path = write(dir.path(), "dlq.jsonl", &body);
+        let dec = DlqDecryptor::default();
+        discard(path.to_str().unwrap(), None, None, false, &dec).unwrap();
+        std::fs::remove_file(reader::discard_sidecar(&path)).unwrap();
+        let again = discard(path.to_str().unwrap(), None, None, false, &dec).unwrap();
+        assert_eq!(again.discarded, 2);
+        let archived = std::fs::read_to_string(dir.path().join("dlq.jsonl.archived")).unwrap();
+        assert_eq!(archived, body);
+        assert!(
+            reader::scan_files(&[path], &dec)
+                .unwrap()
+                .envelopes
+                .is_empty()
+        );
     }
 
     /// An envelope a running pipeline appends while (or after) a discard runs

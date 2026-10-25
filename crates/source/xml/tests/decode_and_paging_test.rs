@@ -461,3 +461,144 @@ async fn a_zipped_json_member_decodes_with_exact_numbers() {
     assert_eq!(records[0]["ratio"], serde_json::json!(0.25));
     assert_eq!(records[0]["n"], serde_json::json!(7));
 }
+
+fn csv_parse() -> DecodeStep {
+    DecodeStep::Parse {
+        parse: ParseSpec {
+            format: ParseFormat::Csv,
+            records_path: None,
+            delimiter: None,
+            has_headers: true,
+            sheet: None,
+            header_row: 0,
+        },
+    }
+}
+
+/// `xsd:base64Binary` is commonly wrapped at 76 columns; the line breaks are
+/// not part of the encoding.
+#[tokio::test]
+async fn decode_pipeline_accepts_line_wrapped_base64() {
+    let server = MockServer::start().await;
+    let csv: String = std::iter::once("id,name\n".to_string())
+        .chain((0..20).map(|i| format!("{i},name-{i}\n")))
+        .collect();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(csv.as_bytes());
+    let wrapped: Vec<String> = b64
+        .as_bytes()
+        .chunks(76)
+        .map(|c| String::from_utf8(c.to_vec()).unwrap())
+        .collect();
+    let body = format!(
+        "<Envelope><Body><reportBytes>\r\n{}\r\n</reportBytes></Body></Envelope>",
+        wrapped.join("\r\n")
+    );
+    Mock::given(method("POST"))
+        .and(path("/report"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+    let mut config = XmlStreamConfig::new(server.uri(), "/report")
+        .method(reqwest::Method::POST)
+        .body("<runReport/>")
+        .decode(vec![
+            DecodeStep::Extract {
+                extract: "reportBytes".into(),
+            },
+            DecodeStep::Simple(SimpleStep::Base64),
+            csv_parse(),
+        ]);
+    config.batch_size = 0;
+    let records = XmlStream::new(config).fetch_all().await.unwrap();
+    assert_eq!(records.len(), 20);
+    assert_eq!(records[19]["name"], "name-19");
+}
+
+#[test]
+fn a_step_after_parse_is_refused() {
+    let config = XmlStreamConfig::new("http://localhost", "/report").decode(vec![
+        DecodeStep::Extract {
+            extract: "reportBytes".into(),
+        },
+        csv_parse(),
+        DecodeStep::Simple(SimpleStep::Base64),
+    ]);
+    let err = config.validate().unwrap_err().to_string();
+    assert!(
+        err.contains("`parse` (step 2) must be the last step"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn a_repeated_csv_header_fails_instead_of_dropping_a_column() {
+    let server = MockServer::start().await;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(b"id,amount,amount\n1,10,20\n");
+    Mock::given(method("POST"))
+        .and(path("/report"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "<Envelope><reportBytes>{b64}</reportBytes></Envelope>"
+        )))
+        .mount(&server)
+        .await;
+    let config = XmlStreamConfig::new(server.uri(), "/report")
+        .method(reqwest::Method::POST)
+        .body("<runReport/>")
+        .decode(vec![
+            DecodeStep::Extract {
+                extract: "reportBytes".into(),
+            },
+            DecodeStep::Simple(SimpleStep::Base64),
+            csv_parse(),
+        ]);
+    let err = XmlStream::new(config)
+        .fetch_all()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("\"amount\" repeats at columns 1 and 2"),
+        "{err}"
+    );
+}
+
+/// Several empty CSV header cells are named `column_<i>` (as Excel's are)
+/// instead of colliding on `""`; a header that still repeats is refused.
+#[tokio::test]
+async fn decode_pipeline_names_empty_csv_headers() {
+    let server = MockServer::start().await;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(b"id,amount,,\n1,2,3,4\n");
+    Mock::given(method("POST"))
+        .and(path("/report"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(format!("<r><reportBytes>{b64}</reportBytes></r>")),
+        )
+        .mount(&server)
+        .await;
+    let mut config = XmlStreamConfig::new(server.uri(), "/report")
+        .method(reqwest::Method::POST)
+        .body("<runReport/>")
+        .decode(vec![
+            DecodeStep::Extract {
+                extract: "reportBytes".into(),
+            },
+            DecodeStep::Simple(SimpleStep::Base64),
+            DecodeStep::Parse {
+                parse: ParseSpec {
+                    format: ParseFormat::Csv,
+                    records_path: None,
+                    delimiter: None,
+                    has_headers: true,
+                    sheet: None,
+                    header_row: 0,
+                },
+            },
+        ]);
+    config.batch_size = 0;
+    let records = XmlStream::new(config).fetch_all().await.unwrap();
+    assert_eq!(
+        records,
+        vec![serde_json::json!({"id": "1", "amount": "2", "column_2": "3", "column_3": "4"})]
+    );
+}

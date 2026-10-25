@@ -85,7 +85,7 @@ Flags:
 | `--status <tier>` | Additively widen the eligible readiness set beyond `{mandatory, active}`: `available` / `draft` / `archived`. Env: `FAUCET_STATUS`. |
 | `--tag <t>` | Narrow the eligible set to rows carrying any listed tag (union). Env: `FAUCET_TAGS`. |
 | `--include-parents <off\|eligible\|all>` | Parent/`depends_on` inclusion policy for a narrowed run set (default `off`). Overrides `selection.include_parents:`. Env: `FAUCET_INCLUDE_PARENTS`. |
-| `--param <NAME=VALUE>` | Supply a value for a declared [`params:`](config.md#params) entry. Repeatable; coerced to the declared type. A `required` param with no value is an error naming it. |
+| `--param <NAME=VALUE>` | Supply a value for a declared [`params:`](config.md#params) entry. Repeatable; coerced to the declared type. A bare `--param NAME` reads the value from the environment variable `NAME` upper-cased (`api_token` → `$API_TOKEN`), so a secret stays out of the process arguments. A `required` param with no value is an error naming it. |
 | `--param-env <NAME[=VALUE]>` | Override an environment variable for this run's `${env:VAR}` resolution only. Bare `NAME` takes the value from the caller's environment (so a secret stays out of the process arguments). The process environment is not modified. Repeatable. |
 | `--source <id\|path> --sink <id\|path>` | Template Hub: compose a `source-template` with a `sink-template` and run the result instead of loading a config file. Ids resolve under `--hub` / `$FAUCET_HUB` / `./hub`. See [`hub`](#hub). |
 | `--source-hub` / `--sink-hub` / `--overlay-hub <hub>` | Look that side up in its own hub (e.g. a private source catalog next to the public sinks). See [`hub`](#hub). |
@@ -1096,7 +1096,7 @@ as a pipeline but prints a deprecation notice — add `kind: pipeline`. See the
 | `--reason <text>` | *(deprecate)* Why the template is being retired; surfaced to anyone who triggers it. |
 | `--undo` | *(deprecate)* Revive instead of retire. |
 | `--version <n\|channel>` | *(deprecate)* Retire (or revive) only this version. It still runs when pinned, with a warning; `newest` skips it and `launch` refuses it. |
-| `--param <NAME=VALUE>` | *(run)* Supply a declared param. Repeatable. |
+| `--param <NAME=VALUE>` | *(run)* Supply a declared param (bare `NAME` reads `$NAME` upper-cased). Repeatable. |
 | `--param-env <NAME[=VALUE]>` | *(run)* Override an environment variable for this materialization only. Repeatable. |
 | `--limit <n>` | *(run)* Stop after writing this many records. On a `write_mode: overwrite` row the sample is staged and then discarded — the destination is left unchanged. |
 | `--select` / `--only` / `--skip` / `--tag` / `--status` / `--include-parents` | *(run / rows)* Run — or, with `rows`, preview — only some of the template's rows: a source template's streams, a pipeline's matrix rows. The same selection model as `faucet run`; for a source template only the selected streams are composed, so a stream the sink cannot run does not block the others. A topology template refuses any selection. See [Running a subset of streams](../cookbook/templates.md#running-a-subset-of-streams). |

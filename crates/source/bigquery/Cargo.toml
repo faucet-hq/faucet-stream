@@ -9,6 +9,7 @@ description = "BigQuery query source connector for the faucet-stream ecosystem"
 readme = "README.md"
 keywords = ["bigquery", "gcp", "etl", "pipeline", "connector"]
 categories.workspace = true
+exclude = ["tests/fixtures/**"]
 
 [dependencies]
 chrono.workspace = true

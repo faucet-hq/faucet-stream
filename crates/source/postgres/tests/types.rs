@@ -68,8 +68,8 @@ async fn types_without_a_native_decode_are_read_as_text() {
     };
     assert_eq!(streamed, rows, "the streaming path decodes the same way");
 
-    // Duplicate column names cannot be addressed from a wrapper query, so an
-    // undecodable value there is an error, never a silent null.
+    // Duplicate column names are refused with an alias hint: a record keeps one
+    // value per field, so the other column would vanish.
     let dup = PostgresSource::new(PostgresSourceConfig::new(
         &url,
         "SELECT t.span, t.span FROM t WHERE id = 1",
@@ -77,11 +77,24 @@ async fn types_without_a_native_decode_are_read_as_text() {
     .await
     .expect("source");
     let err = dup.fetch_all().await.unwrap_err().to_string();
+    assert!(err.contains("two columns named \"span\""), "{err}");
+    assert!(err.contains("alias them"), "{err}");
+
+    // A data-modifying WITH cannot be wrapped, so an undecodable value there is
+    // an error, never a silent null.
+    const NO_WRAP: &str = "WITH d AS (UPDATE t SET id = id WHERE false RETURNING id) ";
+    let unwrapped = PostgresSource::new(PostgresSourceConfig::new(
+        &url,
+        format!("{NO_WRAP}SELECT t.span FROM t WHERE id = 1"),
+    ))
+    .await
+    .expect("source");
+    let err = unwrapped.fetch_all().await.unwrap_err().to_string();
     assert!(err.contains("cannot decode"), "{err}");
 
     let exact = PostgresSource::new(PostgresSourceConfig::new(
         &url,
-        "SELECT 1.50::numeric AS n, 1.50::numeric AS n, '12:30:00'::time AS t, '12:30:00'::time AS t",
+        format!("{NO_WRAP}SELECT 1.50::numeric AS n, '12:30:00'::time AS t"),
     ))
     .await
     .expect("source");
@@ -90,12 +103,12 @@ async fn types_without_a_native_decode_are_read_as_text() {
     let n = row["n"].as_str().expect("numeric is a string");
     assert_eq!(n.parse::<f64>().unwrap(), 1.5, "{n}");
 
-    // #862 L-073: the fallback decoder (duplicate names skip the text cast)
-    // never renders a NUMERIC in exponent notation, and keeps the declared
+    // #862 L-073: the fallback decoder (an unwrappable query skips the text
+    // cast) never renders a NUMERIC in exponent notation, and keeps the declared
     // scale (#885) as the server's own text output does.
     let tiny = PostgresSource::new(PostgresSourceConfig::new(
         &url,
-        "SELECT 0.0000001::numeric(20,10) AS n, 0.0000001::numeric(20,10) AS n",
+        format!("{NO_WRAP}SELECT 0.0000001::numeric(20,10) AS n"),
     ))
     .await
     .expect("source");

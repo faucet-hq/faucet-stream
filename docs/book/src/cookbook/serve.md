@@ -236,6 +236,13 @@ sets the `faucet_serve_history_degraded` gauge, and `/readyz` returns `503`.
 Any other database error (a constraint, a decode failure, lock contention) is
 returned to the request that hit it and never degrades the server.
 
+A pool timeout while every pooled connection is in use is treated as load, not
+an outage, as long as the backend answered some call in the last 30 seconds:
+the request gets the error and the server stays out of degraded mode. Once the
+backend has answered nothing for 30 seconds — every connection hung on a
+database that stopped responding — the next pool timeout degrades the server
+too.
+
 In cluster mode (`--cluster`) the server never falls back to memory: peers
 must share one store, so requests that need the database fail instead. The
 lease heartbeat (every third of `--lease-ttl-secs`) is the health check there:

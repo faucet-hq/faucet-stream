@@ -167,7 +167,7 @@ impl TapProcess {
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stdout);
                 loop {
-                    match faucet_common_singer::read_capped_line(&mut reader, max_line).await {
+                    match faucet_common_singer::read_capped_utf8_line(&mut reader, max_line).await {
                         Ok(faucet_common_singer::CappedLine::TooLong) => {
                             let _ = tx.send(Line::Overlong(max_line)).await;
                             break;
@@ -184,6 +184,11 @@ impl TapProcess {
                             }
                         }
                         Ok(faucet_common_singer::CappedLine::Eof) => break,
+                        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                            if tx.send(Line::Malformed(e.to_string())).await.is_err() {
+                                break;
+                            }
+                        }
                         Err(e) => {
                             let _ = tx
                                 .send(Line::Malformed(format!("stdout read error: {e}")))

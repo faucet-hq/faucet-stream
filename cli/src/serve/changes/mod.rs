@@ -278,9 +278,17 @@ impl ChangeRequest {
     }
 
     /// The record as `actor` may read it: a callback's headers are masked for
-    /// everyone but an admin, and the proposed config for anyone who cannot
-    /// approve a change.
+    /// everyone but an admin, the proposed config for anyone who cannot
+    /// approve a change, and a proposed template body for anyone but an
+    /// unscoped admin (the rule `GET /v1/templates/{id}` applies to the
+    /// registered body).
     pub fn redacted_for(mut self, actor: &AuthContext) -> Self {
+        if self.kind == ChangeKind::TemplateRegister
+            && !actor.reads_template_bodies()
+            && let Some(config) = self.payload.get_mut("config")
+        {
+            *config = Value::String(REDACTED.to_string());
+        }
         if actor.role == Role::Admin {
             return self;
         }
@@ -1179,6 +1187,9 @@ async fn execute(
     actor: &AuthContext,
     mut change: ChangeRequest,
 ) -> Result<ChangeRequest, ServeError> {
+    if let Err(why) = requester_still_authorized(state.auth_mode(), &change) {
+        return finish_failed(state, actor, change, why).await;
+    }
     let requester = AuthContext {
         principal: change.requester.clone(),
         role: change.requester_role,
@@ -1432,6 +1443,55 @@ async fn execute_template_deprecate(
             version,
         }),
     ))
+}
+
+/// Under `--auth-config`, the requester must still be a configured principal
+/// with at least the role and the same tenant scope it held when it asked.
+/// Server-originated requesters (`system:`, `trigger:`, `sync:`, `runtime`)
+/// are not in the file and are not checked.
+fn requester_still_authorized(
+    mode: &crate::serve::config::AuthMode,
+    change: &ChangeRequest,
+) -> Result<(), String> {
+    let crate::serve::config::AuthMode::Rbac(rbac) = mode else {
+        return Ok(());
+    };
+    let name = change.requester.as_str();
+    let Some((role, tenant)) = rbac.principal(name) else {
+        if crate::serve::rbac::is_server_identity(name) {
+            return Ok(());
+        }
+        return Err(format!(
+            "requester '{name}' is no longer a principal in --auth-config, so the approved \
+             change cannot run on its behalf"
+        ));
+    };
+    let downgraded = change
+        .requester_role
+        .permissions()
+        .into_iter()
+        .any(|p| !role.grants(p));
+    if downgraded {
+        return Err(format!(
+            "requester '{name}' now holds role {role:?}, below the {:?} it held when it \
+             requested this change, so the approved change cannot run on its behalf",
+            change.requester_role
+        ));
+    }
+    // `change.tenant` is the tenant the change runs under: the requester's own
+    // scope or the tenant route an unscoped principal proposed it through. An
+    // unscoped principal may act for any tenant, so only a principal that is
+    // now scoped to a different tenant (or scoped at all, for an untenanted
+    // change) has lost the right to run it.
+    if let Some(scope) = tenant
+        && Some(scope) != change.tenant.as_deref()
+    {
+        return Err(format!(
+            "requester '{name}' is no longer scoped to the tenant this change was \
+             requested for, so the approved change cannot run on its behalf"
+        ));
+    }
+    Ok(())
 }
 
 async fn finish_failed(
@@ -1781,6 +1841,72 @@ mod tests {
     }
 
     #[test]
+    fn execution_requires_the_requester_to_still_be_authorized() {
+        use crate::serve::config::AuthMode;
+        use crate::serve::rbac::{PrincipalSpec, RbacConfig};
+        let spec = |name: &str, role, tenant: Option<&str>| PrincipalSpec {
+            name: name.into(),
+            token: format!("tok-{name}"),
+            role,
+            tenant: tenant.map(Into::into),
+        };
+        let mode = |ps| AuthMode::Rbac(std::sync::Arc::new(RbacConfig::new(ps).unwrap()));
+        let c = stored(ChangeKind::Run, json!({}), "m", 1);
+
+        assert!(requester_still_authorized(&AuthMode::None, &c).is_ok());
+        assert!(
+            requester_still_authorized(&mode(vec![spec("bob", Role::Operator, None)]), &c).is_ok()
+        );
+        assert!(
+            requester_still_authorized(&mode(vec![spec("bob", Role::Admin, None)]), &c).is_ok()
+        );
+        let gone = requester_still_authorized(&mode(vec![spec("amy", Role::Admin, None)]), &c)
+            .unwrap_err();
+        assert!(gone.contains("no longer a principal"), "{gone}");
+        let down = requester_still_authorized(&mode(vec![spec("bob", Role::Viewer, None)]), &c)
+            .unwrap_err();
+        assert!(down.contains("Viewer"), "{down}");
+        let scoped =
+            requester_still_authorized(&mode(vec![spec("bob", Role::Operator, Some("acme"))]), &c)
+                .unwrap_err();
+        assert!(scoped.contains("tenant"), "{scoped}");
+
+        // An unscoped principal that proposed through a tenant route.
+        let mut routed = c.clone();
+        routed.tenant = Some("acme".into());
+        assert!(
+            requester_still_authorized(&mode(vec![spec("bob", Role::Operator, None)]), &routed)
+                .is_ok()
+        );
+        assert!(
+            requester_still_authorized(
+                &mode(vec![spec("bob", Role::Operator, Some("acme"))]),
+                &routed
+            )
+            .is_ok()
+        );
+        let moved = requester_still_authorized(
+            &mode(vec![spec("bob", Role::Operator, Some("globex"))]),
+            &routed,
+        )
+        .unwrap_err();
+        assert!(moved.contains("tenant"), "{moved}");
+
+        let mut sys = c.clone();
+        sys.requester = "sync:origin".into();
+        assert!(
+            requester_still_authorized(&mode(vec![spec("amy", Role::Admin, None)]), &sys).is_ok()
+        );
+        // A removed principal whose name merely contains a colon is not a
+        // server actor.
+        let mut colon = c.clone();
+        colon.requester = "ci:deploy".into();
+        let gone = requester_still_authorized(&mode(vec![spec("amy", Role::Admin, None)]), &colon)
+            .unwrap_err();
+        assert!(gone.contains("no longer a principal"), "{gone}");
+    }
+
+    #[test]
     fn responses_mask_what_the_reader_may_not_see() {
         let mut c = stored(
             ChangeKind::Run,
@@ -1806,6 +1932,30 @@ mod tests {
             c.clone().redacted_for(&who(Role::Viewer)).payload,
             c.payload
         );
+
+        let register = stored(
+            ChangeKind::TemplateRegister,
+            json!({"config": "auth: {token: inline}", "tags": ["dev"]}),
+            "m",
+            1,
+        );
+        assert_eq!(
+            register.clone().redacted_for(&who(Role::Admin)).payload,
+            register.payload,
+            "an unscoped admin reads the proposed body"
+        );
+        let op = register.clone().redacted_for(&who(Role::Operator));
+        assert_eq!(
+            op.payload["config"], REDACTED,
+            "approvers below admin do not"
+        );
+        assert_eq!(op.payload["tags"], json!(["dev"]));
+        assert!(op.plan.is_some(), "the plan stays visible for review");
+        let scoped = register.clone().redacted_for(&AuthContext {
+            tenant: Some("acme".into()),
+            ..who(Role::Admin)
+        });
+        assert_eq!(scoped.payload["config"], REDACTED);
     }
 
     #[tokio::test]

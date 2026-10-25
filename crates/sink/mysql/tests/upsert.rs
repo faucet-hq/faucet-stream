@@ -212,7 +212,7 @@ async fn supported_write_modes_includes_upsert_and_delete() {
     let (_container, url) = start_mysql().await;
     create_upsert_table(&url).await;
 
-    let config = MysqlSinkConfig::new(&url, "t");
+    let config = MysqlSinkConfig::new(&url, "t").column_mapping(MysqlColumnMapping::AutoMap);
     let sink = MysqlSink::new(config).await.expect("sink new");
 
     let modes = sink.supported_write_modes();

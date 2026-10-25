@@ -310,6 +310,14 @@ async fn rollback_node_leased(
             crate::registry::sink_kinds_where(|c| c.rollback()).join(", ")
         )));
     }
+    let addressed = sink.dataset_uri();
+    if addressed != marker.sink_uri {
+        return Err(CliError::Config(format!(
+            "rollback: run {} wrote to {}, but the sink config now addresses {addressed}; load \
+             the config with the parameters and profile the run used",
+            marker.run_id, marker.sink_uri
+        )));
+    }
     let ik = state::index_key(&marker.state_key);
     let later_runs = RunIndex::decode(store.get(&ik).await?.as_ref()).later(&marker.run_id);
     let base = |outcome: RollbackOutcome, blocked: bool| RollbackReport {
@@ -715,7 +723,7 @@ mod tests {
         let sink = S(Default::default());
         let node = crate::expand::expand(
             &crate::config::PipelineConfig::from_text(
-                "version: 1\nname: p\npipeline:\n  source: {type: csv, config: {path: x.csv}}\n  sink: {type: sqlite, config: {database_url: 'sqlite::memory:', table_name: t, write_mode: upsert, key: [id]}}\n  state: {type: memory}\n",
+                "version: 1\nname: p\npipeline:\n  source: {type: csv, config: {path: x.csv}}\n  sink: {type: sqlite, config: {database_url: 'sqlite::memory:', table_name: t, column_mapping: auto_map, write_mode: upsert, key: [id]}}\n  state: {type: memory}\n",
                 std::path::Path::new("p.yaml"),
             )
             .unwrap(),

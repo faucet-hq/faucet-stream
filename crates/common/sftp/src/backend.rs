@@ -8,8 +8,9 @@
 //! first. A new name (the default naming never reuses one) is published
 //! atomically either way.
 //!
-//! The SSH session is opened lazily on first use and reused for the life of
-//! the sink. Only the server's typed "no such file" status means "missing";
+//! The SSH session is opened lazily on first use and reused; after a failed
+//! operation a session that no longer answers is dropped, so the next one
+//! reconnects. Only the server's typed "no such file" status means "missing";
 //! every other stat or remove failure is an error (#783).
 
 use crate::{
@@ -43,6 +44,19 @@ struct SftpObjects {
     posix_rename: bool,
     /// The run's call context (#880): every operation runs through it, once.
     calls: Arc<faucet_core::CallSlot>,
+}
+
+/// How long the liveness probe after a failed operation may take.
+const LIVENESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A probe that timed out or failed below the protocol (I/O, a closed
+/// channel) means the session is gone; a server status reply means it lives.
+fn session_is_dead<T>(probe: &Result<Result<T, SftpError>, tokio::time::error::Elapsed>) -> bool {
+    match probe {
+        Err(_) => true,
+        Ok(Ok(_)) | Ok(Err(SftpError::Status(_))) => false,
+        Ok(Err(_)) => true,
+    }
 }
 
 fn err(what: &str, path: &str, e: impl std::fmt::Display) -> FaucetError {
@@ -118,6 +132,37 @@ impl SftpObjects {
         Ok(s)
     }
 
+    /// Run `op`; when it fails, drop the cached session if it no longer
+    /// answers, so the next operation reconnects instead of reusing a dead
+    /// transport.
+    async fn guarded<T>(
+        &self,
+        op: impl std::future::Future<Output = Result<T, FaucetError>>,
+    ) -> Result<T, FaucetError> {
+        let result = op.await;
+        if result.is_err() {
+            self.drop_if_dead().await;
+        }
+        result
+    }
+
+    async fn drop_if_dead(&self) {
+        let Some(conn) = self.session.lock().await.clone() else {
+            return;
+        };
+        let probe = tokio::time::timeout(LIVENESS_TIMEOUT, conn.session().canonicalize(".")).await;
+        if session_is_dead(&probe) {
+            let mut guard = self.session.lock().await;
+            if guard.as_ref().is_some_and(|s| Arc::ptr_eq(s, &conn)) {
+                tracing::warn!(
+                    host = %self.connection.host,
+                    "SFTP: the session stopped answering; the next operation reconnects"
+                );
+                *guard = None;
+            }
+        }
+    }
+
     /// Whether `path` is an existing directory; `false` when it is missing.
     async fn is_dir(conn: &SftpConnection, path: &str) -> Result<bool, FaucetError> {
         match conn.session().metadata(path).await {
@@ -189,46 +234,52 @@ impl ObjectClient for SftpObjects {
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>, FaucetError> {
-        self.calls.call_once("list", self.list_now(prefix)).await
+        self.calls
+            .call_once("list", self.guarded(self.list_now(prefix)))
+            .await
     }
 
     async fn exists(&self, key: &str) -> Result<bool, FaucetError> {
-        self.calls.call_once("head", self.exists_now(key)).await
+        self.calls
+            .call_once("head", self.guarded(self.exists_now(key)))
+            .await
     }
 
     /// The directories in `prefix`'s directory whose names start with the
     /// rest of it (a listing returns files only).
     async fn list_dirs(&self, prefix: &str) -> Result<Vec<String>, FaucetError> {
         self.calls
-            .call_once("list", self.list_dirs_now(prefix))
+            .call_once("list", self.guarded(self.list_dirs_now(prefix)))
             .await
     }
 
     async fn remove_empty_dir(&self, dir: &str) -> Result<(), FaucetError> {
         self.calls
-            .call_once("delete", self.remove_dir_now(dir))
+            .call_once("delete", self.guarded(self.remove_dir_now(dir)))
             .await
     }
 
     async fn download(&self, key: &str, to: &Path) -> Result<(), FaucetError> {
         self.calls
-            .call_once("get", self.download_now(key, to))
+            .call_once("get", self.guarded(self.download_now(key, to)))
             .await
     }
 
     async fn upload(&self, from: &Path, key: &str) -> Result<(), FaucetError> {
         self.calls
-            .call_once("put", self.upload_now(from, key))
+            .call_once("put", self.guarded(self.upload_now(from, key)))
             .await
     }
 
     async fn delete(&self, key: &str) -> Result<(), FaucetError> {
-        self.calls.call_once("delete", self.delete_now(key)).await
+        self.calls
+            .call_once("delete", self.guarded(self.delete_now(key)))
+            .await
     }
 
     async fn rename(&self, from: &str, to: &str) -> Result<(), FaucetError> {
         self.calls
-            .call_once("copy", self.rename_now(from, to))
+            .call_once("copy", self.guarded(self.rename_now(from, to)))
             .await
     }
 
@@ -397,7 +448,7 @@ impl SftpObjects {
 /// temporary name beside its destination, then renamed into place
 /// (`posix-rename` when the server has it), so a reader never sees a partial
 /// file. Missing directories are created. The SSH session is opened on first
-/// use and reused for the backend's life.
+/// use and reused; one that stops answering is replaced on the next call.
 ///
 /// Every operation runs through the run's call context (#880) and reports
 /// to its round-trip recorder; the preflight probe opens the session.
@@ -550,6 +601,33 @@ mod tests {
             error_message: "m".into(),
             language_tag: "en".into(),
         })
+    }
+
+    #[test]
+    fn only_a_failure_below_the_protocol_marks_the_session_dead() {
+        type Probe = Result<Result<String, SftpError>, tokio::time::error::Elapsed>;
+        let alive: Probe = Ok(Ok("/".into()));
+        assert!(!session_is_dead(&alive));
+        let refused: Probe = Ok(Err(status(crate::StatusCode::PermissionDenied)));
+        assert!(!session_is_dead(&refused));
+        for e in [
+            SftpError::IO("channel closed".into()),
+            SftpError::Timeout,
+            SftpError::UnexpectedBehavior("RecvError".into()),
+        ] {
+            let p: Probe = Ok(Err(e));
+            assert!(session_is_dead(&p));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_operation_without_a_session_stays_an_error() {
+        let objects = SftpObjects::new(SftpConnectionConfig::with_password("127.0.0.1", "u", "p"));
+        let r: Result<(), FaucetError> = objects
+            .guarded(async { Err(FaucetError::Sink("boom".into())) })
+            .await;
+        assert!(r.unwrap_err().to_string().contains("boom"));
+        assert!(objects.session.lock().await.is_none());
     }
 
     #[test]

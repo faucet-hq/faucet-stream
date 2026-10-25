@@ -208,7 +208,8 @@ impl RabbitMqConnectionConfig {
         }
     }
 
-    /// Resolve this config into a parsed AMQP URI (pure — no I/O).
+    /// Resolve this config into a parsed AMQP URI (pure — no I/O). With
+    /// `tls.enabled`, an `amqp://` url without a port connects to 5671.
     pub fn to_uri(&self) -> Result<AMQPUri, FaucetError> {
         if self.connect_timeout_secs == 0 {
             return Err(FaucetError::Config(
@@ -264,6 +265,11 @@ impl RabbitMqConnectionConfig {
         };
 
         if self.tls.enabled {
+            if uri.scheme == AMQPScheme::AMQP
+                && self.url.as_deref().is_some_and(|u| !has_explicit_port(u))
+            {
+                uri.authority.port = DEFAULT_TLS_PORT;
+            }
             uri.scheme = AMQPScheme::AMQPS;
         }
         if uri.scheme == AMQPScheme::AMQPS && !cfg!(feature = "tls") {
@@ -412,6 +418,20 @@ pub fn amqp_error(context: &str, e: lapin::Error) -> FaucetError {
     } else {
         FaucetError::Source(format!("rabbitmq: {context}: {msg}"))
     }
+}
+
+/// Whether `url`'s authority names a port.
+fn has_explicit_port(url: &str) -> bool {
+    let rest = url.trim().split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let after_host = match host_port.strip_prefix('[') {
+        Some(v6) => v6.split_once(']').map_or("", |(_, r)| r),
+        None => host_port,
+    };
+    after_host
+        .rsplit_once(':')
+        .is_some_and(|(_, port)| !port.is_empty())
 }
 
 #[cfg(test)]
@@ -587,6 +607,45 @@ mod tests {
         let c = RabbitMqConnectionConfig::from_url("amqps://broker");
         assert!(c.uses_tls());
         assert!(c.validate().is_err());
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_on_an_amqp_url_without_a_port_uses_the_tls_port() {
+        let tls = || RabbitMqTls {
+            enabled: true,
+            ..Default::default()
+        };
+        for (url, port) in [
+            ("amqp://user:pw@rabbit/%2f", 5671),
+            ("amqp://rabbit", 5671),
+            ("amqp://rabbit:5672/%2f", 5672),
+            ("amqp://rabbit:15671", 15671),
+            ("amqps://rabbit", 5671),
+        ] {
+            let c = RabbitMqConnectionConfig {
+                tls: tls(),
+                ..RabbitMqConnectionConfig::from_url(url)
+            };
+            let uri = c.to_uri().unwrap();
+            assert_eq!(uri.scheme, AMQPScheme::AMQPS, "{url}");
+            assert_eq!(uri.authority.port, port, "{url}");
+        }
+        let plain = RabbitMqConnectionConfig::from_url("amqp://rabbit")
+            .to_uri()
+            .unwrap();
+        assert_eq!(plain.authority.port, 5672);
+    }
+
+    #[test]
+    fn explicit_ports_are_detected() {
+        assert!(has_explicit_port("amqp://h:1/v"));
+        assert!(has_explicit_port("amqp://u:p@h:1"));
+        assert!(has_explicit_port("amqp://[::1]:5672/"));
+        assert!(!has_explicit_port("amqp://u:p@h/v"));
+        assert!(!has_explicit_port("amqp://[::1]/v"));
+        assert!(!has_explicit_port("amqp://h:/v"));
+        assert!(!has_explicit_port("amqp://h?x=1:2"));
     }
 
     #[cfg(feature = "tls")]

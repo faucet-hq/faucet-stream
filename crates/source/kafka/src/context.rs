@@ -256,6 +256,29 @@ impl ConsumerContext for BookmarkContext {
         err: RDKafkaRespErr,
         tpl: &mut TopicPartitionList,
     ) {
+        off_runtime_worker(|| self.rebalance_now(base_consumer, err, tpl));
+    }
+}
+
+/// Run `f`, which makes blocking broker round trips, without stalling the
+/// tokio worker that polls the consumer: on a multi-thread runtime the
+/// worker's other tasks move elsewhere while it blocks.
+fn off_runtime_worker<R>(f: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
+impl BookmarkContext {
+    fn rebalance_now(
+        &self,
+        base_consumer: &BaseConsumer<Self>,
+        err: RDKafkaRespErr,
+        tpl: &mut TopicPartitionList,
+    ) {
         match err {
             RDKafkaRespErr::RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS => {
                 let rebalance = Rebalance::Assign(tpl);
@@ -722,6 +745,20 @@ fn filter_seeks_by_committed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocking_rebalance_work_runs_on_every_runtime_flavor() {
+        assert_eq!(off_runtime_worker(|| 1), 1);
+        let current = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        assert_eq!(current.block_on(async { off_runtime_worker(|| 2) }), 2);
+        let multi = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        assert_eq!(multi.block_on(async { off_runtime_worker(|| 3) }), 3);
+    }
 
     #[test]
     fn start_floors_are_the_assigned_start_offsets() {

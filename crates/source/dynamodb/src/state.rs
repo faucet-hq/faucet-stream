@@ -102,6 +102,38 @@ impl StreamBookmark {
         serde_json::from_value(v.clone()).unwrap_or_default()
     }
 
+    /// Parse a stored bookmark; `null` is absent, anything unparseable is an
+    /// error so a stream never silently restarts at `start_position`. A field
+    /// a streams bookmark never carries (a scan bookmark's `segments`, say) is
+    /// refused too: every known field is optional, so such an object would
+    /// otherwise read as an empty bookmark.
+    pub fn parse(v: &Value) -> Result<Self, faucet_core::FaucetError> {
+        if v.is_null() {
+            return Ok(Self::default());
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)] // only its field set is used
+        struct Fields {
+            #[serde(default)]
+            stream_arn: Option<Value>,
+            #[serde(default)]
+            shards: Option<Value>,
+            #[serde(default)]
+            finished: Option<Value>,
+            #[serde(default)]
+            verified_at: Option<Value>,
+        }
+        serde_json::from_value::<Fields>(v.clone())
+            .and_then(|_| serde_json::from_value(v.clone()))
+            .map_err(|e| {
+                faucet_core::FaucetError::State(format!(
+                    "dynamodb: the stored streams bookmark cannot be read ({e}); fix or delete \
+                 the state entry so the read does not restart at start_position"
+                ))
+            })
+    }
+
     /// Serialize.
     pub fn to_value(&self) -> Value {
         serde_json::to_value(self).unwrap_or(Value::Null)
@@ -214,6 +246,19 @@ mod tests {
         assert_eq!(StreamBookmark::from_value(&v), b);
         assert_eq!(
             StreamBookmark::from_value(&json!(3)),
+            StreamBookmark::default()
+        );
+        assert_eq!(
+            StreamBookmark::parse(&Value::Null).unwrap(),
+            StreamBookmark::default()
+        );
+        assert_eq!(StreamBookmark::parse(&v).unwrap(), b);
+        assert!(StreamBookmark::parse(&json!(3)).is_err());
+        let scan = json!({"total_segments": 4, "segments": {"0": {"id": {"S": "a"}}}});
+        let err = StreamBookmark::parse(&scan).unwrap_err().to_string();
+        assert!(err.contains("unknown field"), "{err}");
+        assert_eq!(
+            StreamBookmark::parse(&json!({})).unwrap(),
             StreamBookmark::default()
         );
     }

@@ -145,7 +145,12 @@ fn index_of(schema: &Schema, name: &str) -> Option<usize> {
 #[cfg(feature = "transform-select")]
 fn select(batch: RecordBatch, fields: &[String]) -> Result<RecordBatch, FaucetError> {
     let schema = batch.schema();
-    let indices: Vec<usize> = fields.iter().filter_map(|f| index_of(&schema, f)).collect();
+    let mut indices: Vec<usize> = Vec::with_capacity(fields.len());
+    for i in fields.iter().filter_map(|f| index_of(&schema, f)) {
+        if !indices.contains(&i) {
+            indices.push(i);
+        }
+    }
     batch
         .project(&indices)
         .map_err(|e| FaucetError::Transform(format!("columnar select: {e}")))
@@ -302,7 +307,7 @@ fn constant_column(
         // rather than silently corrupt if that gate is ever weakened.
         other => {
             return Err(FaucetError::Transform(format!(
-                "columnar set/redact: value {other} is not a columnar-safe scalar                  (should have fallen back to the Value path)"
+                "columnar set/redact: value {other} is not a columnar-safe scalar (should have fallen back to the Value path)"
             )));
         }
     };
@@ -382,6 +387,28 @@ mod tests {
             json!({ "id": 1, "name": "ada", "email": "a@x.io", "score": 1.5, "ok": true }),
             json!({ "id": 2, "name": "grace", "email": null, "score": 2.5, "ok": false }),
         ]
+    }
+
+    #[cfg(feature = "transform-select")]
+    #[test]
+    fn select_with_a_repeated_field_keeps_one_column() {
+        let fields: Vec<String> = vec!["id".into(), "name".into(), "id".into()];
+        assert_parity(
+            corpus(),
+            RecordTransform::Select {
+                fields: fields.clone(),
+            },
+        );
+        let batch = values_to_record_batch_inferred(&corpus()).unwrap();
+        let kernel = batch_form(&RecordTransform::Select { fields }).unwrap();
+        let out = kernel(batch).unwrap();
+        let names: Vec<&str> = out
+            .schema_ref()
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(names, ["id", "name"]);
     }
 
     #[cfg(feature = "transform-select")]

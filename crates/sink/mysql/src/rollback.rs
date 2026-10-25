@@ -566,6 +566,15 @@ impl MysqlDriver {
             .fetch_one(&mut **conn)
             .await
             .map_err(|e| sink_err("count previous rows", e))?;
+        // Replacing the rows of a table other tables reference would cascade
+        // into, break or be blocked by them, as the overwrite commit refuses.
+        let deps = crate::sink::table_dependents(conn, &self.config.table_name).await?;
+        if !deps.referenced_by.is_empty() {
+            return Err(crate::sink::referenced_overwrite_error(
+                &self.config.table_name,
+                &deps.referenced_by,
+            ));
+        }
         if opts.dry_run {
             return Ok(RollbackOutcome {
                 restored: restored as u64,
@@ -577,8 +586,7 @@ impl MysqlDriver {
         }
         // A target with foreign keys or triggers gets its rows back in place,
         // keeping its definition (#789 SQL-108).
-        let deps = crate::sink::table_dependents(conn, &self.config.table_name).await?;
-        if !deps.pinned.is_empty() || !deps.referenced_by.is_empty() {
+        if !deps.pinned.is_empty() {
             crate::sink::replace_rows_in_place(
                 conn,
                 &self.config.table_name,

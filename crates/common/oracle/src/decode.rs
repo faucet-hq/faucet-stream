@@ -9,7 +9,7 @@ use oracle::sql_type::{IntervalDS, IntervalYM, OracleType};
 use serde_json::{Map, Value};
 
 use crate::pool::Side;
-use crate::types::{Cell, cell_to_json};
+use crate::types::{Cell, cell_to_json_at};
 
 /// How a column's value is read from the driver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +69,16 @@ pub fn extract_kind(ty: &OracleType) -> Result<ExtractKind, String> {
     })
 }
 
+/// The fractional-second digits a timestamp column declares.
+fn fraction_digits(ty: &OracleType) -> Option<u8> {
+    match ty {
+        OracleType::Timestamp(p) | OracleType::TimestampTZ(p) | OracleType::TimestampLTZ(p) => {
+            Some(*p)
+        }
+        _ => None,
+    }
+}
+
 fn read_cell(v: &oracle::SqlValue, kind: ExtractKind) -> oracle::Result<Cell> {
     if v.is_null()? {
         return Ok(Cell::Null);
@@ -121,7 +131,10 @@ pub fn row_to_json(
         {
             crate::types::float32_to_json(v.get::<f32>().map_err(decode_err)?)
         } else {
-            cell_to_json(read_cell(v, kind).map_err(decode_err)?)
+            cell_to_json_at(
+                read_cell(v, kind).map_err(decode_err)?,
+                fraction_digits(info.oracle_type()),
+            )
         };
         let value = parse_json_column(info.name(), shaped, json_columns);
         out.insert(info.name().to_string(), value);

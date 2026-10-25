@@ -29,7 +29,7 @@ source:
 | `wait_time_seconds` | `10` | Long-poll wait per `ReceiveMessage` (0–20). |
 | `batch_size` | `1000` | Records per emitted page. `0` = one page for the whole drain. |
 | `include_metadata` | `false` | Wrap each record as `{message_id, attributes, payload}` — the SQS `MessageId` for downstream deduplication of redeliveries, and the message attributes (requested only when this is on). |
-| `visibility_extension_secs` | `60` | Visibility timeout renewed (every third of the window) on every message received but not yet deleted, so a slow page is not redelivered into the same run. `0` disables renewal (3–43200 otherwise). |
+| `visibility_extension_secs` | `60` | Visibility timeout requested on every receive and renewed (every third of the window) on every message received but not yet deleted, even when the queue's own timeout is shorter, so a slow page is not redelivered into the same run. `0` disables renewal (3–43200 otherwise). |
 
 Each `ReceiveMessage` call requests up to 10 messages (the SQS API cap),
 capped further so it never over-reads past `max_messages`. With

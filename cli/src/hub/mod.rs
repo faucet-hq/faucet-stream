@@ -138,6 +138,12 @@ impl HubLocation {
                 "hub 'github:{rest}': expected `github:owner/repo[@ref][/path]`"
             )));
         }
+        let dot_segment = |s: &str| s.split('/').any(|seg| seg == "." || seg == "..");
+        if dot_segment(repo) || dot_segment(r#ref) || dot_segment(path) {
+            return Err(CliError::Config(format!(
+                "hub 'github:{rest}': `.` and `..` segments are not allowed in the repo, ref or path"
+            )));
+        }
         Ok(Self::Github {
             repo: repo.to_string(),
             r#ref: r#ref.to_string(),
@@ -158,6 +164,22 @@ impl HubLocation {
         }
     }
 
+    /// Whether two locations name the same hub: the same repository, ref and
+    /// path, or the same directory (compared canonically when it exists).
+    /// Not [`Self::cache_key`], which folds distinct paths together.
+    pub fn same_hub(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Dir(a), Self::Dir(b)) => {
+                a == b
+                    || matches!(
+                        (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+                        (Ok(a), Ok(b)) if a == b
+                    )
+            }
+            (a, b) => a == b,
+        }
+    }
+
     /// Stable filesystem-safe key for the cache directory.
     pub fn cache_key(&self) -> String {
         let raw = match self {
@@ -165,15 +187,22 @@ impl HubLocation {
             Self::Github { repo, r#ref, path } => format!("github/{repo}/{ref}/{path}"),
         };
         raw.trim_end_matches('/')
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '/' || c == '.' || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
+            .split('/')
+            .map(|seg| match seg {
+                "" | "." | ".." => "_".to_string(),
+                seg => seg
+                    .chars()
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                            c
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect(),
             })
-            .collect()
+            .collect::<Vec<_>>()
+            .join("/")
     }
 }
 
@@ -224,7 +253,7 @@ pub fn hub_locations(flags: &[String]) -> CliResult<Vec<HubLocation>> {
     let mut out: Vec<HubLocation> = Vec::new();
     for g in given {
         let loc = HubLocation::parse(g)?;
-        if !out.iter().any(|o| o.cache_key() == loc.cache_key()) {
+        if !out.iter().any(|o| o.same_hub(&loc)) {
             out.push(loc);
         }
     }
@@ -1323,6 +1352,9 @@ mod tests {
             "github:acme/hub@",
             "https://github.com/acme",
             "https://github.com/acme/hub/blob/main/x",
+            "github:o/r@main/../../repos/o/r/contents",
+            "github:o/r@../x",
+            "github:o/./r",
         ] {
             assert!(HubLocation::parse(bad).is_err(), "{bad} must be rejected");
         }
@@ -1339,6 +1371,10 @@ mod tests {
             "github/a/b/feature/x"
         );
         assert!(!HubLocation::Dir(PathBuf::from("/x")).is_remote());
+        assert_eq!(
+            gh("a/b", "main", "x/../..").cache_key(),
+            "github/a/b/main/x/_/_"
+        );
     }
 
     #[test]

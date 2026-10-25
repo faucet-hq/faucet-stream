@@ -53,7 +53,7 @@ impl ClickHouseDriver {
             &[StagingScheme::S3, StagingScheme::Gcs],
             &[StagingFormat::Jsonl, StagingFormat::Csv],
         )?;
-        let uploader = StageUploader::from_location(loc)?;
+        let uploader = StageUploader::from_location(loc)?.with_call_context(calls.get());
         let (staged, sql) = self
             .stage_and_build_sql(&uploader, records, staging)
             .await?;

@@ -530,8 +530,35 @@ impl MongoCdcSource {
         }
     }
 
-    /// Open the change stream and drain it with an idle-timeout terminator.
+    /// Drain the change stream. The last emitted bookmark is remembered for a
+    /// later read on the same instance only once the stream has ended without
+    /// error: the consumer polls on only after writing the previous page, so
+    /// reaching the end means every page was handed on. A read abandoned after
+    /// a failed write therefore resumes where the previous complete read
+    /// ended, and redelivers the unwritten page.
     fn stream_pages_impl<'a>(
+        &'a self,
+        ctx: &'a HashMap<String, Value>,
+        batch_size: usize,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamPage, FaucetError>> + Send + 'a>> {
+        use futures::TryStreamExt as _;
+        Box::pin(async_stream::try_stream! {
+            let mut inner = self.stream_pages_raw(ctx, batch_size);
+            let mut last = None;
+            while let Some(page) = inner.try_next().await? {
+                if let Some(b) = &page.bookmark {
+                    last = Some(Bookmark::from_value(b.clone())?);
+                }
+                yield page;
+            }
+            if let Some(b) = last {
+                *self.pending_bookmark.lock().await = Some(b);
+            }
+        })
+    }
+
+    /// Open the change stream and drain it with an idle-timeout terminator.
+    fn stream_pages_raw<'a>(
         &'a self,
         _ctx: &'a HashMap<String, Value>,
         batch_size: usize,
@@ -543,7 +570,7 @@ impl MongoCdcSource {
 
         Box::pin(async_stream::try_stream! {
 
-            let pending = self.pending_bookmark.lock().await.take();
+            let pending = self.pending_bookmark.lock().await.clone();
             let mut start = resolve_start(&self.config.start_from, pending.as_ref())?;
             // A fresh `now` start opens the real stream at the present and
             // anchors at its initial post-batch token; a separate capture

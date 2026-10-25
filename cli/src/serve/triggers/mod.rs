@@ -160,6 +160,7 @@ pub fn spawn_watchers(
                 mode,
                 start_at,
                 lookback_secs,
+                poll_timeout_secs,
             } => match object_arrival::ObjectArrivalWatcher::build_store(store) {
                 Ok((s, bucket, prefix)) => {
                     let w = object_arrival::ObjectArrivalWatcher::new(
@@ -172,7 +173,8 @@ pub fn spawn_watchers(
                         *start_at,
                         chrono::Utc::now(),
                     )
-                    .with_lookback(Duration::from_secs(*lookback_secs));
+                    .with_lookback(Duration::from_secs(*lookback_secs))
+                    .with_poll_timeout(poll_timeout_secs.map(Duration::from_secs));
                     handles.push(tokio::spawn(watcher::run_supervised(
                         w,
                         state.clone(),
@@ -191,6 +193,7 @@ pub fn spawn_watchers(
                 queue,
                 threshold,
                 poll_interval_secs,
+                poll_timeout_secs,
             } => match queue_depth::build_probe(queue) {
                 Ok(probe) => {
                     let w = queue_depth::QueueDepthWatcher::new(
@@ -198,7 +201,8 @@ pub fn spawn_watchers(
                         probe,
                         *threshold,
                         Duration::from_secs(*poll_interval_secs),
-                    );
+                    )
+                    .with_poll_timeout(poll_timeout_secs.map(Duration::from_secs));
                     handles.push(tokio::spawn(watcher::run_supervised(
                         w,
                         state.clone(),

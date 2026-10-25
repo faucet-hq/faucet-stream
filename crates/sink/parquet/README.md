@@ -361,7 +361,7 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 | A field is missing from the output | It wasn't in the current file's first batch (so not in that file's inferred schema) and was dropped — check the one-shot-per-file warn log naming the field. The schema is re-inferred per file, so a widened field is captured in the next file once a rollover boundary is crossed; in single-file mode (no rollover) ensure the widest record shape appears in the opening batch, or widen `sample_size`. Set `max_rows_per_file` / `max_bytes_per_file` if you need files to roll more often so a mid-run column addition is picked up sooner. |
 | Single-file `.parquet` path ignored; UUID files appear | You set a rollover threshold on a fixed `.parquet` path. Drop the threshold for single-file mode, or use a directory destination. |
 | S3 `403`/credential errors | Credentials missing from the AWS chain, or wrong region. Set `region` and the AWS env vars/profile. |
-| Connecting to MinIO/LocalStack fails | Set `endpoint_url` and `allow_http: true` (required for `http://` endpoints). |
+| Connecting to MinIO/LocalStack fails | Set `endpoint_url` to the service's URL (an `http://` endpoint works as is; `allow_http` is accepted but not needed) and `region`. |
 
 ## See also
 

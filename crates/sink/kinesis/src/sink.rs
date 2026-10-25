@@ -265,6 +265,24 @@ impl KinesisDriver {
             match response {
                 Ok(out) => {
                     let results = out.records();
+                    let rejected = results.iter().filter(|r| r.error_code().is_some()).count();
+                    let counted = out
+                        .failed_record_count()
+                        .and_then(|n| usize::try_from(n).ok());
+                    if results.len() != pending.len() || counted.is_some_and(|n| n != rejected) {
+                        let detail = format!(
+                            "kinesis: PutRecords answered {} result(s) ({} failed, FailedRecordCount {}) \
+                             for {} entries; the outcome of each record is unknown",
+                            results.len(),
+                            rejected,
+                            counted.map_or_else(|| "absent".to_string(), |n| n.to_string()),
+                            pending.len()
+                        );
+                        for entry in &pending {
+                            outcomes.insert(entry.index, Err(FaucetError::Sink(detail.clone())));
+                        }
+                        return Ok(outcomes);
+                    }
                     let failed: HashSet<usize> = pending
                         .iter()
                         .zip(results)
@@ -481,7 +499,13 @@ impl MessageDriver for KinesisDriver {
             .collect();
         let mut shipped = self.ship(calls, encoded).await?;
         let outcomes: Vec<RowOutcome> = (0..n)
-            .map(|i| shipped.remove(&i).unwrap_or(Ok(())))
+            .map(|i| {
+                shipped.remove(&i).unwrap_or_else(|| {
+                    Err(FaucetError::Sink(format!(
+                        "kinesis: no delivery outcome was recorded for record {i}"
+                    )))
+                })
+            })
             .collect();
         let delivered = outcomes.iter().filter(|o| o.is_ok()).count();
         tracing::info!(

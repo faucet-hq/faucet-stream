@@ -32,6 +32,8 @@ pub struct QueueDepthWatcher {
     confirmed: Option<u64>,
     poll: Duration,
     compiled: std::sync::Arc<super::compiled::CompiledTrigger>,
+    /// `poll_timeout_secs`; `None` = the default for the poll interval.
+    poll_timeout: Option<Duration>,
 }
 
 impl QueueDepthWatcher {
@@ -49,7 +51,15 @@ impl QueueDepthWatcher {
             confirmed: None,
             poll,
             compiled,
+            poll_timeout: None,
         }
+    }
+
+    /// Bound each poll by `poll_timeout_secs` instead of the default.
+    #[must_use]
+    pub fn with_poll_timeout(mut self, limit: Option<Duration>) -> Self {
+        self.poll_timeout = limit;
+        self
     }
 }
 
@@ -65,7 +75,14 @@ impl Watcher for QueueDepthWatcher {
         self.poll
     }
 
-    async fn poll(&mut self, state: &ServerState) -> Result<bool, String> {
+    fn poll_timeout(&self) -> Option<Duration> {
+        Some(
+            self.poll_timeout
+                .unwrap_or_else(|| super::watcher::default_poll_timeout(self.poll)),
+        )
+    }
+
+    async fn poll(&mut self, state: &ServerState) -> Result<bool, super::watcher::PollError> {
         let depth = self.probe.depth().await?;
         let history = state.history();
         if depth < self.threshold {
@@ -126,10 +143,13 @@ impl Watcher for QueueDepthWatcher {
 /// fire (backpressure) is retried quietly, a failed or erroring one is an
 /// error, so the watcher backs off and turns unhealthy instead of refiring a
 /// run that cannot start on every poll while reporting healthy.
-fn uncommitted_result(outcome: FireOutcome) -> Result<bool, String> {
+fn uncommitted_result(outcome: FireOutcome) -> Result<bool, super::watcher::PollError> {
+    use super::watcher::PollError;
     match outcome {
-        FireOutcome::Failed(e) => Err(format!("queue_depth run cannot start: {e}")),
-        FireOutcome::Error(e) => Err(format!("queue_depth fire failed: {e}")),
+        FireOutcome::Failed(e) => Err(PollError::fired(format!(
+            "queue_depth run cannot start: {e}"
+        ))),
+        FireOutcome::Error(e) => Err(PollError::fired(format!("queue_depth fire failed: {e}"))),
         _ => Ok(false),
     }
 }
@@ -218,6 +238,28 @@ mod kafka_probe {
     use rdkafka::{ClientConfig, Offset, TopicPartitionList};
     use std::time::Duration;
 
+    /// One partition's lag. A group with no commit on it starts at the low
+    /// watermark (what is still retained), not at offset 0.
+    pub(super) fn partition_lag(low: i64, high: i64, committed: Offset) -> i64 {
+        let from = match committed {
+            Offset::Offset(n) => n.max(low),
+            Offset::End => high,
+            _ => low,
+        };
+        (high - from).max(0)
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn lag_starts_at_the_low_watermark_without_a_commit() {
+        assert_eq!(partition_lag(9_000_000, 9_000_010, Offset::Invalid), 10);
+        assert_eq!(partition_lag(9_000_000, 9_000_010, Offset::Beginning), 10);
+        assert_eq!(partition_lag(0, 50, Offset::Offset(20)), 30);
+        assert_eq!(partition_lag(40, 50, Offset::Offset(20)), 10);
+        assert_eq!(partition_lag(0, 50, Offset::End), 0);
+        assert_eq!(partition_lag(0, 50, Offset::Offset(60)), 0);
+    }
+
     pub struct KafkaProbe {
         brokers: String,
         topic: String,
@@ -270,18 +312,14 @@ mod kafka_probe {
                     .map_err(|e| format!("kafka committed: {e}"))?;
                 let mut lag: i64 = 0;
                 for p in &parts {
-                    let (_low, high) = consumer
+                    let (low, high) = consumer
                         .fetch_watermarks(&topic, *p, Duration::from_secs(10))
                         .map_err(|e| format!("kafka watermarks: {e}"))?;
                     let committed_off = committed
                         .find_partition(&topic, *p)
                         .map(|e| e.offset())
                         .unwrap_or(Offset::Invalid);
-                    let c = match committed_off {
-                        Offset::Offset(n) => n,
-                        _ => 0,
-                    };
-                    lag += (high - c).max(0);
+                    lag += partition_lag(low, high, committed_off);
                 }
                 Ok(lag.max(0) as u64)
             })
@@ -358,7 +396,14 @@ mod tests {
         assert!(
             uncommitted_result(FireOutcome::Failed("no such source".into()))
                 .unwrap_err()
+                .message
                 .contains("no such source")
+        );
+        assert!(
+            uncommitted_result(FireOutcome::Error("db".into()))
+                .unwrap_err()
+                .counted,
+            "the fire path already counted it"
         );
         assert!(uncommitted_result(FireOutcome::Error("db".into())).is_err());
         assert_eq!(

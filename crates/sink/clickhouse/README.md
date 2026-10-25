@@ -73,7 +73,7 @@ sink:
       compression: none
       cleanup: always
       region: us-east-1        # for the derived s3() URL (omit for gs://)
-      # endpoint: minio:9000   # S3-compatible override (path-style)
+      # endpoint: http://minio:9000   # S3-compatible override (path-style; scheme kept, https:// when omitted)
       access_key: "${env:CH_STAGE_KEY}"   # creds the server uses to READ the stage
       secret_key: "${env:CH_STAGE_SECRET}"
 ```

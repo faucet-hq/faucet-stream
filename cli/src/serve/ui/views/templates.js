@@ -668,6 +668,10 @@ export async function renderTemplateDetail(container, { id, query }) {
     let seed = "";
     try {
       const rec = await api(`/v1/templates/${encodeURIComponent(id)}?version=${st.newest}`);
+      if (rec.body_withheld) {
+        toast(`v${st.newest} config is withheld: only an unscoped admin can read stored template configs`, "error");
+        return;
+      }
       seed = rec.body || "";
     } catch (e) { toast(`could not load v${st.newest} config: ${e.message}`, "error"); }
     newverHost.innerHTML = "";
@@ -880,8 +884,8 @@ function renderVersions(host, id, st, d, reload) {
       <button class="btn-ghost tpl-launch" data-perm="template_admin" ${st.stable === v || retired || blocked ? "disabled" : ""}
         title="${escapeHtml(launchTitle)}">Launch</button>
       ${t && t.has_tests ? `<button class="btn-ghost tpl-runtests" data-perm="template_admin" title="run v${v}'s tests: bundle and record the result">Run tests</button>` : ""}
-      <button class="btn-ghost tpl-view">Config</button>
-      <button class="btn-ghost tpl-view-clean" title="comments stripped, canonical YAML">Clean</button>
+      <button class="btn-ghost tpl-view" data-perm="template_admin">Config</button>
+      <button class="btn-ghost tpl-view-clean" data-perm="template_admin" title="comments stripped, canonical YAML">Clean</button>
       <button class="${retired ? "btn-ghost" : "btn-warn"} tpl-vdeprecate" data-perm="template_admin"
         title="${retired ? `make v${v} usable again` : `retire v${v}: pinned runs still work but warn, newest skips it, launch refuses it`}">${retired ? "Revive" : "Deprecate"}</button>
       <button class="btn-danger tpl-del" data-perm="template_admin">Delete</button>
@@ -954,7 +958,10 @@ function renderVersions(host, id, st, d, reload) {
       try {
         const q = clean ? `?version=${v}&clean=true` : `?version=${v}`;
         const rec = await api(`/v1/templates/${encodeURIComponent(id)}${q}`);
-        body.textContent = rec.body;
+        body.textContent = rec.body_withheld
+          ? "Config withheld: only an unscoped admin can read a template's stored config."
+          : rec.body;
+        body.classList.toggle("tpl-body-withheld", !!rec.body_withheld);
         body.dataset.mode = mode;
         body.hidden = false;
       } catch (e) {
@@ -1377,7 +1384,13 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
     for (const el of allInputs()) {
       const raw = el.value;
       if (raw === "") continue; // omitted → the template's default (or a typed error)
-      supplied[el.dataset.name] = coerce(raw, (params[el.dataset.name] || {}).type);
+      const type = (params[el.dataset.name] || {}).type;
+      const bad = invalidParam(raw, type);
+      if (bad) {
+        toast(`${el.dataset.name}: ${bad}`, "error");
+        return;
+      }
+      supplied[el.dataset.name] = coerce(raw, type);
     }
     const body = { version: host.querySelector("#tg-version").value };
     if (sinkSel) {
@@ -1519,9 +1532,15 @@ function channelTarget(channel, st) {
 
 /** Send the wire type the server expects; it accepts strings too, but a typed
  *  value keeps the error messages about the value rather than its spelling. */
+function invalidParam(raw, type) {
+  if (type === "int" && !/^\s*-?\d+\s*$/.test(raw)) return "expected a whole number";
+  if (type === "float" && !Number.isFinite(Number(raw.trim() || "x"))) return "expected a finite number";
+  return null;
+}
+
+// Numbers go as their exact text so the server parses them without float rounding.
 function coerce(raw, type) {
-  if (type === "int") return Number.parseInt(raw, 10);
-  if (type === "float") return Number.parseFloat(raw);
+  if (type === "int" || type === "float") return raw.trim();
   if (type === "bool") return raw === "true";
   return raw;
 }

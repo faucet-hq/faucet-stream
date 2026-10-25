@@ -550,8 +550,11 @@ pub trait Source: Send + Sync {
     /// The default pulls a **single page** via
     /// [`stream_pages`](Self::stream_pages) and reports success/failure — it
     /// exercises the real read path (DNS, TLS, auth, the first request, the
-    /// first-record decode) but never paginates the full dataset and never
-    /// repeats. The page stream is dropped immediately after the first page.
+    /// first-record decode) and never repeats. The page stream is dropped
+    /// immediately after the first page, so a source that streams stops after
+    /// one page; a source that keeps the default `stream_pages` buffers its
+    /// whole fetch before that page exists, so it should override `check` when
+    /// its dataset is large.
     ///
     /// Sources whose first page *blocks* waiting for inbound data (webhook,
     /// websocket) or has *side effects* (CDC consuming WAL) override this with a

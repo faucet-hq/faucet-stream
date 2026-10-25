@@ -88,10 +88,11 @@ impl S3BackendBuilder {
     }
 
     /// The multipart part size, and the largest object sent as one
-    /// `PutObject`. Default [`PART_BYTES`]; S3 needs at least 5 MiB for every
-    /// part but the last.
+    /// `PutObject`. Default [`PART_BYTES`]; raised to
+    /// [`MIN_PART_BYTES`](crate::MIN_PART_BYTES), the least S3 accepts for
+    /// every part but the last.
     pub fn part_size(mut self, bytes: usize) -> Self {
-        self.part_bytes = bytes.max(1);
+        self.part_bytes = bytes.max(crate::objects::MIN_PART_BYTES);
         self
     }
 
@@ -174,7 +175,7 @@ mod tests {
             b.describe(Area::Destination, "x.jsonl"),
             "s3://bkt/pre/x.jsonl"
         );
-        assert_eq!(b.part_size(), Some(1));
+        assert_eq!(b.part_size(), Some(crate::objects::MIN_PART_BYTES));
         assert_eq!(b.remote().upload_concurrency(), 3);
         assert!(b.client().config().region().is_some());
         assert!(format!("{b:?}").contains("bkt"));

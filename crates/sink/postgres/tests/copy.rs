@@ -135,7 +135,9 @@ async fn copy_and_insert_land_identical_rows_jsonb_mapping() {
         .expect("create");
     }
 
-    let records = hazard_records();
+    // A JSON `null` record is stored as the JSON value on both paths.
+    let mut records = hazard_records();
+    records.push(json!(null));
     for (table, method) in [
         ("j_insert", PostgresWriteMethod::Insert),
         ("j_copy", PostgresWriteMethod::Copy),
@@ -158,15 +160,19 @@ async fn copy_and_insert_land_identical_rows_jsonb_mapping() {
                 .await
                 .expect("dump")
                 .iter()
-                .map(|r| r.get::<Value, _>("data"))
+                .map(|r| r.get::<Option<Value>, _>("data"))
                 .collect::<Vec<_>>()
         }
     };
     let via_insert = get("j_insert").await;
     let via_copy = get("j_copy").await;
     assert_eq!(via_insert, via_copy);
-    assert_eq!(via_copy.len(), 3);
-    assert_eq!(via_copy[0]["meta"]["arr"], json!([1, "a\tb"]));
+    assert_eq!(via_copy.len(), 4);
+    assert_eq!(
+        via_copy[0].as_ref().unwrap()["meta"]["arr"],
+        json!([1, "a\tb"])
+    );
+    assert_eq!(via_copy[3], Some(Value::Null));
 }
 
 #[tokio::test(flavor = "multi_thread")]

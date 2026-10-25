@@ -56,7 +56,12 @@ spec:
     - name: tmp
       emptyDir: {}
     - name: scratch
+      {{- if .Values.job.persistence.existingClaim }}
+      persistentVolumeClaim:
+        claimName: {{ .Values.job.persistence.existingClaim }}
+      {{- else }}
       emptyDir: {}
+      {{- end }}
     {{- with include "faucet-stream.logSpoolVolume" . | trim }}{{ . | nindent 4 }}{{- end }}
     - name: pipeline-config
       configMap:

@@ -25,6 +25,8 @@ use tokio_util::sync::CancellationToken;
 const HEALTHY: u8 = 0;
 const UNREACHABLE: u8 = 1;
 const PERMANENT: u8 = 2;
+/// Every pooled connection checked out; new calls time out acquiring one.
+const SATURATED: u8 = 3;
 
 /// A primary that is healthy, unreachable, or answering with a permanent error.
 struct Flaky {
@@ -36,6 +38,9 @@ impl Flaky {
     fn check(&self) -> Result<(), HistoryError> {
         match self.mode.load(Ordering::SeqCst) {
             UNREACHABLE => Err(HistoryError::Unreachable("connection refused".into())),
+            SATURATED => Err(HistoryError::PoolTimedOut(
+                "pool timed out while waiting for an open connection".into(),
+            )),
             PERMANENT => Err(HistoryError::BackendClassified {
                 message: "UNIQUE constraint failed".into(),
                 transience: Transience::Permanent,
@@ -109,6 +114,9 @@ impl RunHistory for Flaky {
     fn degraded(&self) -> bool {
         false
     }
+    fn pool_saturated(&self) -> bool {
+        self.mode.load(Ordering::SeqCst) == SATURATED
+    }
 }
 
 fn flaky() -> (FallbackHistory, Arc<AtomicU8>) {
@@ -176,6 +184,30 @@ fn run(id: &str) -> RunRecord {
         None,
         chrono::Utc::now(),
     )
+}
+
+#[tokio::test]
+async fn a_saturated_pool_degrades_only_once_the_backend_stops_answering() {
+    let (fb, mode) = flaky();
+    let fb = fb.with_saturation_grace(Duration::from_secs(2));
+    fb.upsert(&run("r0")).await.unwrap();
+    mode.store(SATURATED, Ordering::SeqCst);
+    let err = fb.upsert(&run("r1")).await.unwrap_err();
+    assert!(err.is_pool_timeout(), "{err}");
+    assert!(
+        !fb.degraded(),
+        "a busy pool on a backend that just answered is load, not an outage"
+    );
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    fb.upsert(&run("r2")).await.unwrap();
+    assert!(
+        fb.degraded(),
+        "a pool that stays saturated with no answer for the grace is a hung backend"
+    );
+    assert!(
+        fb.get("r2").await.unwrap().is_some(),
+        "runs keep going in memory"
+    );
 }
 
 #[tokio::test]
@@ -411,4 +443,58 @@ async fn a_fenced_instance_shortens_the_flush_grace() {
     mode.store(HEALTHY, Ordering::SeqCst);
     maintain_leases(&state, &mut health, Duration::from_secs(20)).await;
     assert_eq!(state.cluster().flush_grace(normal), normal);
+}
+
+/// A claim stored by the previous release holds the fingerprint of the
+/// resolved config; a retry of the same request after the upgrade replays it
+/// instead of answering 409, while a different request still conflicts.
+#[cfg(all(feature = "source-csv", feature = "sink-jsonl"))]
+#[tokio::test]
+async fn a_claim_from_the_previous_release_still_replays() {
+    use faucet_cli::serve::runner::{SubmitRequest, legacy_request_fingerprint, submit};
+    let history: Arc<dyn RunHistory> = Arc::new(MemoryHistory::new(Duration::from_secs(60)));
+    let state = ServerState::new(
+        &config(),
+        None,
+        CancellationToken::new(),
+        history.clone(),
+        LogHub::new(),
+        None,
+        TriggersHandle::from_compiled(&[]),
+    );
+    let yaml = "version: 1\nname: legacy\npipeline:\n  source: { type: csv, config: { path: x.csv } }\n  sink: { type: jsonl, config: { path: out.jsonl } }\n";
+    let req: SubmitRequest =
+        serde_json::from_value(serde_json::json!({"config": yaml, "idempotency_key": "k"}))
+            .unwrap();
+    let cfg =
+        faucet_cli::config::PipelineConfig::from_text(yaml, std::path::Path::new("submitted.yaml"))
+            .unwrap();
+    history.upsert(&run("prior")).await.unwrap();
+    history
+        .claim_idempotency(
+            "k",
+            &legacy_request_fingerprint(&req, &cfg),
+            "prior",
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    let actor = faucet_cli::serve::rbac::AuthContext {
+        principal: "t".into(),
+        role: faucet_cli::serve::rbac::Role::Admin,
+        source_ip: None,
+        tenant: None,
+    };
+    let replayed = submit(state.clone(), req.clone(), actor.clone())
+        .await
+        .expect("replay");
+    assert_eq!(replayed.run_id, "prior");
+
+    let mut other = req;
+    other.labels.insert("team".into(), "x".into());
+    let err = submit(state, other, actor).await.unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("idempotency"),
+        "{err}"
+    );
 }

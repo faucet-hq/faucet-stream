@@ -106,7 +106,7 @@ iceberg-rust applies Parquet **position** and **equality** delete files during t
 
 ## Sharding and discovery
 
-`enumerate_shards(n)` plans `n` hash shards; each worker keeps the data files whose path hashes to its shard, so the shards partition the table's files exactly (incremental reads shard the same way). `discover()` walks every namespace (recursively where the catalog supports nested namespaces) and returns one descriptor per table: `name` `namespace.table`, a JSON Schema derived from the Iceberg schema, the current snapshot's `total-records` as the row estimate, and `config_patch: { table: <namespace.table> }`.
+`enumerate_shards(n)` plans `n` hash shards; each worker keeps the data files whose path hashes to its shard, so the shards partition the table's files exactly (incremental reads shard the same way). `discover()` walks every namespace (recursively where the catalog supports nested namespaces; a REST catalog that rejects the `parent` filter with 400, 405 or 501 is treated as having none, and a namespace dropped while it is listed is skipped) and returns one descriptor per table: `name` `namespace.table`, a JSON Schema derived from the Iceberg schema, the current snapshot's `total-records` as the row estimate, and `config_patch: { table: <namespace.table> }`.
 
 ## Preflight (`faucet doctor`)
 

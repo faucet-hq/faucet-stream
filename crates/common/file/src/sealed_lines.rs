@@ -313,6 +313,147 @@ pub fn plaintext(raw: &[u8], enc: &CompiledEncryption) -> Result<Vec<u8>, Faucet
     })
 }
 
+/// What a [`Verifier`] concluded about a whole file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Verdict {
+    /// A sealed file that ends on a verifying trailer: every line is covered.
+    Whole,
+    /// A sealed file whose last flush is unfinished: only the first
+    /// `verified_lines` non-blank lines (through the last verifying trailer)
+    /// are covered; the lines after them are not.
+    UnfinishedTail {
+        /// Non-blank lines covered by the last verifying trailer.
+        verified_lines: usize,
+    },
+    /// A file written before whole-file integrity; each line opened on its own.
+    Legacy,
+    /// No lines at all.
+    Empty,
+}
+
+/// [`open`] / [`open_for_append`] one line at a time, holding only the running
+/// digest: memory stays bounded by the longest line whatever the file size.
+/// Feed every line in order with [`Self::push`], then call [`Self::finish`].
+pub struct Verifier<'a> {
+    enc: &'a CompiledEncryption,
+    state: VerifyState,
+    lines: usize,
+    settled_lines: Option<usize>,
+    ended_on_trailer: bool,
+    damage: Option<FaucetError>,
+    trailer_after_damage: bool,
+}
+
+enum VerifyState {
+    Start,
+    Sealed(LineSeal),
+    Legacy,
+}
+
+impl<'a> Verifier<'a> {
+    /// A verifier for a file sealed with `enc`.
+    pub fn new(enc: &'a CompiledEncryption) -> Self {
+        Self {
+            enc,
+            state: VerifyState::Start,
+            lines: 0,
+            settled_lines: None,
+            ended_on_trailer: false,
+            damage: None,
+            trailer_after_damage: false,
+        }
+    }
+
+    /// Feed the next line (with or without its newline). Blank lines are skipped.
+    pub fn push(&mut self, line: &str) {
+        let line = line.trim();
+        if line.is_empty() {
+            return;
+        }
+        self.lines += 1;
+        let number = self.lines;
+        let opened = sealed_bytes(line, number).and_then(|b| self.enc.open_line(&b));
+        if self.damage.is_some() {
+            if matches!(opened, Ok(SealedLine::Trailer(_))) {
+                self.trailer_after_damage = true;
+            }
+            return;
+        }
+        let step = match (&mut self.state, opened) {
+            (VerifyState::Start, Ok(SealedLine::Header(body))) => {
+                match serde_json::from_slice::<Header>(&body)
+                    .ok()
+                    .filter(|h| h.faucet_sealed_lines == VERSION)
+                {
+                    Some(h) => {
+                        self.state = VerifyState::Sealed(LineSeal {
+                            file: h.file,
+                            count: 0,
+                            digest: Sha256::new(),
+                        });
+                        Ok(())
+                    }
+                    None => Err(damaged("its header is unreadable")),
+                }
+            }
+            (VerifyState::Start, Ok(SealedLine::Trailer(_))) => {
+                Err(damaged("it starts with its trailer"))
+            }
+            (VerifyState::Start, _) => {
+                self.state = VerifyState::Legacy;
+                sealed_bytes(line, number).and_then(|b| self.enc.decrypt(&b).map(|_| ()))
+            }
+            (VerifyState::Legacy, _) => {
+                sealed_bytes(line, number).and_then(|b| self.enc.decrypt(&b).map(|_| ()))
+            }
+            (VerifyState::Sealed(seal), Ok(SealedLine::Data(_))) => {
+                seal.digest.update(line.as_bytes());
+                seal.digest.update(b"\n");
+                seal.count += 1;
+                self.ended_on_trailer = false;
+                Ok(())
+            }
+            (VerifyState::Sealed(_), Ok(SealedLine::Header(_))) => {
+                Err(damaged(&format!("line {number} is a second header")))
+            }
+            (VerifyState::Sealed(seal), Ok(SealedLine::Trailer(body))) => {
+                verify_trailer(&body, seal).map(|()| {
+                    self.settled_lines = Some(number);
+                    self.ended_on_trailer = true;
+                })
+            }
+            (VerifyState::Sealed(_), Err(e)) => Err(e),
+        };
+        if let Err(e) = step {
+            self.damage = Some(e);
+        }
+    }
+
+    /// The verdict, as [`open_for_append`] would reach it: damage or a missing
+    /// trailer after the last verifying one is an unfinished tail, unless a
+    /// later trailer shows a flush finished after it.
+    pub fn finish(self) -> Result<Verdict, FaucetError> {
+        if let Some(e) = self.damage {
+            return match (&self.state, self.settled_lines) {
+                (VerifyState::Sealed(_), Some(n)) if !self.trailer_after_damage => {
+                    Ok(Verdict::UnfinishedTail { verified_lines: n })
+                }
+                _ => Err(e),
+            };
+        }
+        match (self.state, self.settled_lines) {
+            (VerifyState::Start, _) => Ok(Verdict::Empty),
+            (VerifyState::Legacy, _) => Ok(Verdict::Legacy),
+            (VerifyState::Sealed(_), Some(_)) if self.ended_on_trailer => Ok(Verdict::Whole),
+            (VerifyState::Sealed(_), Some(n)) => Ok(Verdict::UnfinishedTail { verified_lines: n }),
+            (VerifyState::Sealed(_), None) => Err(damaged(
+                "it ends without its trailer — the file was cut short",
+            )),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,6 +623,57 @@ mod tests {
         tail.push(lines[5].clone());
         tail.push(b"torn".to_vec());
         assert!(open_for_append(&tail.concat(), &enc).is_ok());
+    }
+
+    fn verify(enc: &CompiledEncryption, raw: &[u8]) -> Result<Verdict, FaucetError> {
+        let mut v = Verifier::new(enc);
+        for line in String::from_utf8_lossy(raw).lines() {
+            v.push(line);
+        }
+        v.finish()
+    }
+
+    #[test]
+    fn the_streaming_verifier_agrees_with_open_for_append() {
+        let enc = enc();
+        let (lines, _) = file(&enc, &["1", "2", "3"]);
+        assert_eq!(verify(&enc, &lines.concat()).unwrap(), Verdict::Whole);
+        assert_eq!(verify(&enc, b"\n \n").unwrap(), Verdict::Empty);
+        // Damage, a missing trailer or a foreign file id all fail like `open`.
+        let dropped = [&lines[..2], &lines[3..]].concat();
+        assert!(verify(&enc, &dropped.concat()).is_err());
+        assert!(verify(&enc, &lines[..4].concat()).is_err());
+        let (other, _) = file(&enc, &["1", "2", "3"]);
+        assert!(verify(&enc, &[&lines[..4], &other[4..]].concat().concat()).is_err());
+        // Two flushes: an unfinished third one is a tail covering 4 lines.
+        let mut seal = LineSeal::new();
+        let mut raw = seal.header(&enc);
+        raw.extend(seal.seal(&enc, b"1"));
+        raw.extend(seal.trailer(&enc));
+        raw.extend(seal.seal(&enc, b"2"));
+        raw.extend(seal.trailer(&enc));
+        let mut tail = raw.clone();
+        tail.extend(seal.seal(&enc, b"3"));
+        assert_eq!(
+            verify(&enc, &tail).unwrap(),
+            Verdict::UnfinishedTail { verified_lines: 5 }
+        );
+        tail.extend_from_slice(b"RkNUAQ\n");
+        assert_eq!(
+            verify(&enc, &tail).unwrap(),
+            Verdict::UnfinishedTail { verified_lines: 5 }
+        );
+        // Damage followed by a later trailer is refused, not cut.
+        let mut forged = raw.clone();
+        forged.extend(seal.seal(&enc, b"x"));
+        forged.extend_from_slice(b"RkNUAQ\n");
+        forged.extend(seal.trailer(&enc));
+        assert!(verify(&enc, &forged).is_err());
+        // A header-less file opens line by line.
+        let legacy = [b64(&enc.encrypt(b"1")), b64(&enc.encrypt(b"2"))].concat();
+        assert_eq!(verify(&enc, &legacy).unwrap(), Verdict::Legacy);
+        assert!(verify(&enc, b"RkNUAQ-not-base64\n").is_err());
+        assert!(verify(&enc, &lines[4]).is_err(), "trailer first");
     }
 
     #[test]

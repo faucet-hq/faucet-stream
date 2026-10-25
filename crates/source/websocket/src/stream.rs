@@ -303,6 +303,7 @@ impl SourceDriver for WebsocketDriver {
         let max_messages = self.config.max_messages.unwrap_or(usize::MAX);
         let idle_timeout = self.config.idle_timeout;
         let reconnect = self.config.reconnect;
+        let control_timeout = self.config.connect_timeout;
         let reconnect_backoff = self.config.reconnect_backoff;
         let max_attempts = self.config.max_reconnect_attempts;
         let ping_interval = self.config.ping_interval;
@@ -428,9 +429,16 @@ impl SourceDriver for WebsocketDriver {
                             stop = true;
                         }
                         _ = async { ping_timer.as_mut().unwrap().tick().await }, if ping_timer.is_some() => {
-                            if let Err(e) = write.send(Message::Ping(Vec::new().into())).await {
-                                tracing::warn!(error = %e, "websocket source: ping failed, treating as disconnect");
-                                reconnect_now = true;
+                            match tokio::time::timeout(control_timeout, write.send(Message::Ping(Vec::new().into()))).await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => {
+                                    tracing::warn!(error = %e, "websocket source: ping failed, treating as disconnect");
+                                    reconnect_now = true;
+                                }
+                                Err(_) => {
+                                    tracing::warn!("websocket source: ping not sent within connect_timeout, treating as disconnect");
+                                    reconnect_now = true;
+                                }
                             }
                         }
                         recv = tokio::time::timeout(poll_budget, read.next()) => {
@@ -440,9 +448,16 @@ impl SourceDriver for WebsocketDriver {
                                         Message::Text(t) => handle_payload(t.as_bytes()),
                                         Message::Binary(b) => handle_payload(&b),
                                         Message::Ping(payload) => {
-                                            if let Err(e) = write.send(Message::Pong(payload)).await {
-                                                tracing::warn!(error = %e, "websocket source: pong failed");
-                                                reconnect_now = true;
+                                            match tokio::time::timeout(control_timeout, write.send(Message::Pong(payload))).await {
+                                                Ok(Ok(())) => {}
+                                                Ok(Err(e)) => {
+                                                    tracing::warn!(error = %e, "websocket source: pong failed");
+                                                    reconnect_now = true;
+                                                }
+                                                Err(_) => {
+                                                    tracing::warn!("websocket source: pong not sent within connect_timeout, treating as disconnect");
+                                                    reconnect_now = true;
+                                                }
                                             }
                                         }
                                         Message::Pong(_) | Message::Frame(_) => {}
@@ -485,6 +500,9 @@ impl SourceDriver for WebsocketDriver {
                     }
 
                     if let Some(e) = fatal {
+                        if !buffer.is_empty() {
+                            yield StreamPage { records: std::mem::take(&mut buffer), bookmark: None };
+                        }
                         Err(e)?;
                     }
 
@@ -510,7 +528,11 @@ impl SourceDriver for WebsocketDriver {
                             tracing::warn!(attempt = reconnect_attempts, delay_ms = delay.as_millis() as u64, "websocket source: reconnecting");
                             sleep_or_cancel(delay, &cancel).await;
                             continue 'outer;
-                        } else if reconnect {
+                        }
+                        if !buffer.is_empty() {
+                            yield StreamPage { records: std::mem::take(&mut buffer), bookmark: None };
+                        }
+                        if reconnect {
                             Err(FaucetError::Source(format!(
                                 "websocket source: exceeded max_reconnect_attempts ({})",
                                 max_attempts.unwrap_or(0)

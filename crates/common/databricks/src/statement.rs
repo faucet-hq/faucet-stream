@@ -319,16 +319,34 @@ pub fn backoff_delay(base: Duration, attempt: u32) -> Duration {
     base.saturating_mul(factor).min(MAX_BACKOFF)
 }
 
-/// A `Retry-After` header in seconds (HTTP-date form is ignored).
+/// The longest server-stated `Retry-After` wait honoured before failing.
+pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(600);
+
+/// A `Retry-After` header (delta-seconds or HTTP date).
 fn retry_after(resp: &reqwest::Response) -> Option<Duration> {
-    resp.headers()
-        .get(reqwest::header::RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .map(|s| Duration::from_secs(s).min(MAX_BACKOFF))
+    faucet_core::util::retry_after(resp.headers())
+}
+
+/// An error response body, at most
+/// [`DEFAULT_ERROR_BODY_MAX_LEN`](faucet_core::util::DEFAULT_ERROR_BODY_MAX_LEN) bytes.
+async fn bounded_error_body(mut resp: reqwest::Response) -> String {
+    let max = faucet_core::util::DEFAULT_ERROR_BODY_MAX_LEN;
+    let mut raw: Vec<u8> = Vec::new();
+    let mut more = false;
+    while let Ok(Some(chunk)) = resp.chunk().await {
+        raw.extend_from_slice(&chunk);
+        if raw.len() > max {
+            more = true;
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&raw);
+    if more || text.len() > max {
+        let end = text.floor_char_boundary(max.min(text.len()));
+        format!("{}...(truncated)", &text[..end])
+    } else {
+        text.into_owned()
+    }
 }
 
 /// Stringify a JSON value for a named parameter (`value` is a string or null).
@@ -636,14 +654,24 @@ impl StatementClient {
             let code = status.as_u16();
             let retryable = code == 429 || code == 503 || (verb == Verb::Get && code >= 500);
             if retryable && attempt < self.options.max_retries {
-                let wait = retry_after(&resp)
-                    .unwrap_or_else(|| backoff_delay(self.options.retry_backoff, attempt));
+                let stated = retry_after(&resp);
+                if let Some(wait) = stated
+                    && wait > MAX_RETRY_AFTER
+                {
+                    return Err(self.side.error(format!(
+                        "databricks: HTTP {status}: the server asks to wait {}s, more than the {}s ceiling",
+                        wait.as_secs(),
+                        MAX_RETRY_AFTER.as_secs()
+                    )));
+                }
+                let wait =
+                    stated.unwrap_or_else(|| backoff_delay(self.options.retry_backoff, attempt));
                 tracing::debug!(status = code, attempt, "databricks: retrying request");
                 self.calls.wait(wait).await?;
                 attempt += 1;
                 continue;
             }
-            let text = resp.text().await.unwrap_or_default();
+            let text = bounded_error_body(resp).await;
             return Err(self
                 .side
                 .error(format!("databricks: HTTP {status}: {text}")));

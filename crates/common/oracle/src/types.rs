@@ -53,17 +53,27 @@ pub enum Cell {
     Bool(bool),
 }
 
-/// Shape a [`Cell`] as JSON.
+/// Shape a [`Cell`] as JSON. Timestamps render with nine fractional digits;
+/// [`cell_to_json_at`] uses the column's declared precision.
 pub fn cell_to_json(cell: Cell) -> Value {
+    cell_to_json_at(cell, None)
+}
+
+/// [`cell_to_json`] with timestamps rendered through
+/// [`faucet_core::fidelity`] at `fraction_digits` (a `TIMESTAMP(p)` column's
+/// `p`; `None` renders nine digits), `Z` for UTC.
+pub fn cell_to_json_at(cell: Cell, fraction_digits: Option<u8>) -> Value {
+    use faucet_core::fidelity::{TimePrecision, timestamp, timestamp_naive};
+    let precision = TimePrecision::from_digits(u32::from(fraction_digits.unwrap_or(9)));
     match cell {
         Cell::Null => Value::Null,
         Cell::Text(s) => Value::String(s),
         Cell::Number(s) => number_text_to_json(&s),
         Cell::Float(f) => float_to_json(f),
         Cell::Bytes(b) => Value::String(base64::engine::general_purpose::STANDARD.encode(b)),
-        Cell::Date(d) => Value::String(d.format("%Y-%m-%dT%H:%M:%S").to_string()),
-        Cell::Timestamp(t) => Value::String(t.format("%Y-%m-%dT%H:%M:%S%.f").to_string()),
-        Cell::TimestampTz(t) => Value::String(t.format("%Y-%m-%dT%H:%M:%S%.f%:z").to_string()),
+        Cell::Date(d) => timestamp_naive(&d, TimePrecision::Seconds),
+        Cell::Timestamp(t) => timestamp_naive(&t, precision),
+        Cell::TimestampTz(t) => timestamp(&t, precision),
         Cell::IntervalDs {
             days,
             hours,
@@ -243,12 +253,20 @@ impl TypeFamily {
 /// result) to JSON using the column's type family. The session renders dates
 /// as `YYYY-MM-DD HH24:MI:SS[.FF] [TZH:TZM]` (see [`crate::NLS_SESSION_SQL`]).
 pub fn typed_text_to_json(text: &str, family: TypeFamily) -> Value {
+    typed_text_to_json_at(text, family, None)
+}
+
+/// [`typed_text_to_json`] with a timestamp column's declared fractional
+/// digits (`TIMESTAMP(p)`'s `p`, `ALL_TAB_COLUMNS.DATA_SCALE`); `None` keeps
+/// the digits the text has.
+pub fn typed_text_to_json_at(text: &str, family: TypeFamily, digits: Option<u8>) -> Value {
     match family {
         TypeFamily::Integer | TypeFamily::Decimal | TypeFamily::BinaryFloat => {
             number_text_to_json(text)
         }
-        TypeFamily::Date | TypeFamily::Timestamp | TypeFamily::TimestampTz => {
-            Value::String(normalize_datetime_text(text))
+        TypeFamily::Date => Value::String(normalize_datetime_text_at(text, Some(0))),
+        TypeFamily::Timestamp | TypeFamily::TimestampTz => {
+            Value::String(normalize_datetime_text_at(text, digits))
         }
         TypeFamily::IntervalDs => {
             Value::String(oracle_interval_ds_to_iso(text).unwrap_or_else(|| text.to_string()))
@@ -271,17 +289,35 @@ pub fn typed_text_to_json(text: &str, family: TypeFamily) -> Value {
     }
 }
 
-/// `2024-01-02 03:04:05.500000 +01:00` → `2024-01-02T03:04:05.5+01:00`.
-/// Text in another shape is returned unchanged.
+/// `2024-01-02 03:04:05.500000 +01:00` → `2024-01-02T03:04:05.500000+01:00`:
+/// RFC 3339 through [`faucet_core::fidelity`], keeping the text's fractional
+/// digits (`Z` for UTC). Text in another shape is returned unchanged.
 pub fn normalize_datetime_text(text: &str) -> String {
+    normalize_datetime_text_at(text, None)
+}
+
+/// [`normalize_datetime_text`] at `digits` fractional digits; `None` keeps
+/// the text's.
+pub fn normalize_datetime_text_at(text: &str, digits: Option<u8>) -> String {
+    use faucet_core::fidelity::{TimePrecision, timestamp, timestamp_naive};
     let t = text.trim();
+    let digits = digits.map(u32::from).unwrap_or_else(|| {
+        t.split_once('.')
+            .map(|(_, rest)| rest.chars().take_while(char::is_ascii_digit).count() as u32)
+            .unwrap_or(0)
+    });
+    let precision = TimePrecision::from_digits(digits);
+    let as_text = |v: Value| match v {
+        Value::String(s) => s,
+        other => other.to_string(),
+    };
     for fmt in ["%Y-%m-%d %H:%M:%S%.f %:z", "%Y-%m-%d %H:%M:%S%.f%:z"] {
         if let Ok(dt) = DateTime::parse_from_str(t, fmt) {
-            return dt.format("%Y-%m-%dT%H:%M:%S%.f%:z").to_string();
+            return as_text(timestamp(&dt, precision));
         }
     }
     if let Ok(dt) = NaiveDateTime::parse_from_str(t, "%Y-%m-%d %H:%M:%S%.f") {
-        return dt.format("%Y-%m-%dT%H:%M:%S%.f").to_string();
+        return as_text(timestamp_naive(&dt, precision));
     }
     t.to_string()
 }
@@ -356,8 +392,11 @@ pub fn iso_to_oracle_interval(iso: &str, day_to_second: bool) -> Option<String> 
             '0'..='9' => num.push(c),
             'Y' => years = std::mem::take(&mut num).parse().ok()?,
             'M' => months = std::mem::take(&mut num).parse().ok()?,
-            'W' => days += 7 * std::mem::take(&mut num).parse::<i64>().ok()?,
-            'D' => days += std::mem::take(&mut num).parse::<i64>().ok()?,
+            'W' => {
+                let weeks = std::mem::take(&mut num).parse::<i64>().ok()?;
+                days = days.checked_add(weeks.checked_mul(7)?)?;
+            }
+            'D' => days = days.checked_add(std::mem::take(&mut num).parse::<i64>().ok()?)?,
             _ => return None,
         }
     }
@@ -392,7 +431,13 @@ pub fn iso_to_oracle_interval(iso: &str, day_to_second: bool) -> Option<String> 
         if years != 0 || months != 0 {
             return None;
         }
-        let total_secs = ((days * 24 + hours) * 60 + minutes) * 60 + seconds;
+        let total_secs = days
+            .checked_mul(24)?
+            .checked_add(hours)?
+            .checked_mul(60)?
+            .checked_add(minutes)?
+            .checked_mul(60)?
+            .checked_add(seconds)?;
         let (d, rem) = (total_secs / 86_400, total_secs % 86_400);
         Some(format!(
             "{sign}{d} {:02}:{:02}:{:02}.{nanos:09}",
@@ -404,7 +449,7 @@ pub fn iso_to_oracle_interval(iso: &str, day_to_second: bool) -> Option<String> 
         if days != 0 || hours != 0 || minutes != 0 || seconds != 0 || nanos != 0 {
             return None;
         }
-        let total = years * 12 + months;
+        let total = years.checked_mul(12)?.checked_add(months)?;
         Some(format!("{sign}{}-{}", total / 12, total % 12))
     }
 }
@@ -481,14 +526,30 @@ mod tests {
         let t = d + chrono::Duration::milliseconds(500);
         assert_eq!(
             cell_to_json(Cell::Timestamp(t)),
-            json!("2024-01-02T03:04:05.500")
+            json!("2024-01-02T03:04:05.500000000")
+        );
+        assert_eq!(
+            cell_to_json_at(Cell::Timestamp(t), Some(6)),
+            json!("2024-01-02T03:04:05.500000")
+        );
+        assert_eq!(
+            cell_to_json_at(Cell::Timestamp(d), Some(3)),
+            json!("2024-01-02T03:04:05.000")
+        );
+        let utc = FixedOffset::east_opt(0)
+            .unwrap()
+            .from_local_datetime(&t)
+            .unwrap();
+        assert_eq!(
+            cell_to_json_at(Cell::TimestampTz(utc), Some(6)),
+            json!("2024-01-02T03:04:05.500000Z")
         );
         let tz = FixedOffset::east_opt(3600)
             .unwrap()
             .from_local_datetime(&d)
             .unwrap();
         assert_eq!(
-            cell_to_json(Cell::TimestampTz(tz)),
+            cell_to_json_at(Cell::TimestampTz(tz), Some(0)),
             json!("2024-01-02T03:04:05+01:00")
         );
         assert_eq!(
@@ -586,11 +647,23 @@ mod tests {
         );
         assert_eq!(
             typed_text_to_json("2024-01-02 03:04:05.250000000", Timestamp),
-            json!("2024-01-02T03:04:05.250")
+            json!("2024-01-02T03:04:05.250000000")
         );
         assert_eq!(
-            typed_text_to_json("2024-01-02 03:04:05.250000000 +05:30", TimestampTz),
+            typed_text_to_json_at("2024-01-02 03:04:05.250000000", Timestamp, Some(6)),
+            json!("2024-01-02T03:04:05.250000")
+        );
+        assert_eq!(
+            typed_text_to_json_at("2024-01-02 03:04:05.250000000 +05:30", TimestampTz, Some(3)),
             json!("2024-01-02T03:04:05.250+05:30")
+        );
+        assert_eq!(
+            typed_text_to_json_at("2024-01-02 03:04:05.250000000 +00:00", TimestampTz, Some(6)),
+            json!("2024-01-02T03:04:05.250000Z")
+        );
+        assert_eq!(
+            typed_text_to_json("2024-01-02 03:04:05.000000000", Date),
+            json!("2024-01-02T03:04:05")
         );
         assert_eq!(typed_text_to_json("not a date", Date), json!("not a date"));
         assert_eq!(
@@ -621,6 +694,21 @@ mod tests {
             Some("P1DT2H3M4S".into())
         );
         assert_eq!(oracle_interval_ym_to_iso("12"), None);
+    }
+
+    #[test]
+    fn iso_intervals_too_large_for_i64_are_refused() {
+        assert_eq!(
+            iso_to_oracle_interval("P1DT9223372036854775807S", true),
+            None
+        );
+        assert_eq!(iso_to_oracle_interval("P1067519911673565W", true), None);
+        assert_eq!(iso_to_oracle_interval("P999999999999999D", true), None);
+        assert_eq!(iso_to_oracle_interval("P9223372036854775807Y", false), None);
+        assert_eq!(
+            iso_to_oracle_interval("P1W1D", true).as_deref(),
+            Some("+8 00:00:00.000000000")
+        );
     }
 
     #[test]

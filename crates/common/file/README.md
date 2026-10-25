@@ -119,6 +119,9 @@ Features mirror the formats: `file-format-csv`, `-xml`, `-excel`, `-avro`,
 `LineSeal` writes the header, bound record lines and the trailer (record count
 plus a SHA-256 digest of the lines), and `open` / `plaintext` verify a file whole
 — a file written before the header existed is read line by line with a warning.
+`Verifier` reaches the same verdict one line at a time (memory bounded by the
+longest line) and reports how many lines an unfinished last flush leaves
+uncovered.
 `ObjectFilter` is the object-store listing filter the s3 / gcs / azure-blob
 sources share: folder markers and `_`/`.`-prefixed keys are skipped unless an
 `include` glob names exactly what to read.

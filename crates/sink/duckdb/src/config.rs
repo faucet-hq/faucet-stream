@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 pub enum DuckdbColumnMapping {
     /// Insert each record as a single JSON text column.
     Json { column: String },
-    /// Map top-level JSON keys directly to table columns. Only keys that match
-    /// existing columns are inserted; extra keys are ignored.
+    /// Map top-level JSON keys directly to table columns. A key with no
+    /// matching column is added to the table (`ALTER TABLE … ADD COLUMN`)
+    /// when `create_table` is true, and fails the write when it is false.
     AutoMap,
 }
 

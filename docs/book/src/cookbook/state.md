@@ -320,7 +320,10 @@ prefix plus a stable hash, so an email or a value containing `::` cannot split
 the key. A non-string value is tagged by its type — the number `42` keys as
 `_n.42`, `true` as `_b.true` — so the number `42` and the string `"42"` never
 share a bookmark (key scheme 3; a string that itself starts like a tag, such as
-`_n.42`, keys as `_s._n.42`). A child that keeps state refuses a parent record
+`_n.42`, keys as `_s._n.42`). A string equal to a marker segment such as
+`__lease__` or `__status__` keys as `_s.__lease__` (key scheme 4), so a child's
+bookmark never lands on its row's marker; such a value's earlier key is not
+migrated, since it was the marker itself. A child that keeps state refuses a parent record
 whose key is missing, null or empty. Source
 connectors keep their own natural keys (the CDC source uses
 `postgres-cdc:<slot>`).

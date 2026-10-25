@@ -100,6 +100,46 @@ async fn signed_requests_are_verified() {
     assert_eq!(records, vec![json!({"id": 1})]);
 }
 
+/// A signed request repeated inside the tolerance window is acknowledged but
+/// stored once.
+#[tokio::test]
+async fn a_repeated_signed_request_is_stored_once() {
+    let addr = free_addr();
+    let cfg = WebhookSourceConfig::new()
+        .listen_addr(addr.clone())
+        .max_payloads(2)
+        .timeout_secs(3)
+        .signature(
+            serde_json::from_value(json!({
+                "header": "X-Signature",
+                "secret": "s3cret",
+                "timestamp_header": "X-Timestamp"
+            }))
+            .unwrap(),
+        );
+    let source = WebhookSource::new(cfg);
+    let run = tokio::spawn(async move { source.fetch_all().await });
+    let url = format!("http://{addr}/webhook");
+    let client = reqwest::Client::new();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let body = r#"{"id":7}"#;
+    let signature = sign("s3cret", format!("{now}.{body}").as_bytes());
+    let send = || {
+        client
+            .post(&url)
+            .header("X-Timestamp", now.to_string())
+            .header("X-Signature", signature.clone())
+            .body(body)
+    };
+    assert_eq!(post_until_up(&client, &url, send).await.status(), 200);
+    assert_eq!(send().send().await.unwrap().status(), 200);
+    let records = run.await.unwrap().unwrap();
+    assert_eq!(records, vec![json!({"id": 7})]);
+}
+
 /// API-14: a payload arriving after the window closed is refused with a
 /// retryable status, never acknowledged and dropped.
 #[tokio::test]
@@ -123,6 +163,64 @@ async fn payloads_over_the_cap_are_refused_not_acknowledged() {
     }
     let records = run.await.unwrap().unwrap();
     assert_eq!(records, vec![json!({"n": 1})]);
+}
+
+/// The window's buffered bytes are bounded: a POST that would cross
+/// `max_buffered_bytes` closes the window and is refused with a retryable
+/// status, and the payloads already stored are emitted.
+#[tokio::test]
+async fn buffered_bytes_are_bounded_per_window() {
+    let addr = free_addr();
+    let source = WebhookSource::new(
+        WebhookSourceConfig::new()
+            .listen_addr(addr.clone())
+            .max_buffered_bytes(30)
+            .timeout_secs(30),
+    );
+    let started = std::time::Instant::now();
+    let run = tokio::spawn(async move { source.fetch_all().await });
+    let url = format!("http://{addr}/webhook");
+    let client = reqwest::Client::new();
+    let body = r#"{"n":1,"pad":"xxxxxxxx"}"#;
+    let first = post_until_up(&client, &url, || client.post(&url).body(body)).await;
+    assert_eq!(first.status(), 200);
+    if let Ok(resp) = client.post(&url).body(body).send().await {
+        assert_eq!(resp.status(), 503);
+        assert!(resp.headers().contains_key("retry-after"));
+    }
+    let records = run.await.unwrap().unwrap();
+    assert_eq!(records, vec![json!({"n": 1, "pad": "xxxxxxxx"})]);
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "the bound ends the window"
+    );
+}
+
+/// A body larger than `max_buffered_bytes` (but within `max_body_bytes`) is
+/// still taken into an empty window, which it fills and closes, rather than
+/// being refused in every window.
+#[tokio::test]
+async fn a_body_over_the_byte_cap_is_taken_into_an_empty_window() {
+    let addr = free_addr();
+    let source = WebhookSource::new(
+        WebhookSourceConfig::new()
+            .listen_addr(addr.clone())
+            .max_buffered_bytes(8)
+            .timeout_secs(30),
+    );
+    let started = std::time::Instant::now();
+    let run = tokio::spawn(async move { source.fetch_all().await });
+    let url = format!("http://{addr}/webhook");
+    let client = reqwest::Client::new();
+    let body = r#"{"n":1,"pad":"xxxxxxxx"}"#;
+    let first = post_until_up(&client, &url, || client.post(&url).body(body)).await;
+    assert_eq!(first.status(), 200);
+    let records = run.await.unwrap().unwrap();
+    assert_eq!(records, vec![json!({"n": 1, "pad": "xxxxxxxx"})]);
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "a full window closes without waiting for the timeout"
+    );
 }
 
 /// API-49: an invalid path is a config error, not a router panic, and a

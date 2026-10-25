@@ -59,9 +59,39 @@ class FidelityCoverageTest(unittest.TestCase):
         r.crate("sink", "b")
         r.write(
             "crates/interop-tests/tests/pair.rs",
-            "use faucet_source_a::A; use faucet_sink_b::B;\n" + RUNS,
+            "use faucet_source_a::A; use faucet_sink_b::{B as Bee};\n"
+            "fn t() { let (a, b) = (A::new(), Bee::new()); fidelity::assert_round_trip(&a, &b, Tolerance::exact()); }\n",
         )
         self.assertEqual(r.check(), [])
+
+    def test_a_crate_named_only_outside_the_corpus_test_is_not_credited(self):
+        r = Repo()
+        r.crate("source", "a")
+        r.crate("sink", "b")
+        r.write(
+            "crates/interop-tests/tests/pair.rs",
+            "use faucet_source_a::A; use faucet_sink_b::B;\n"
+            "fn other() { let _ = B::new(); }\n"
+            "fn t() { let a = A::new(); fidelity::assert_round_trip(&a, &a, Tolerance::exact()); }\n",
+        )
+        self.assertEqual(r.check(), ["faucet-sink-b: does not run the fidelity corpus"])
+
+    def test_helpers_and_trait_impls_reach_the_crate(self):
+        r = Repo()
+        r.crate("sink", "b")
+        r.crate("source", "c")
+        r.write(
+            "crates/interop-tests/tests/remote.rs",
+            "struct R;\nimpl Remote for R { fn sink(&self) -> X { faucet_sink_b::BSink::new() } }\n"
+            "fn seed() -> Y { faucet_source_c::C::new() }\n"
+            "fn t() { let r = R; let _ = seed(); remote_matrix::assert_corpus_written(&r).await; }\n",
+        )
+        self.assertEqual(r.check(), [])
+
+    def test_an_ignored_corpus_test_does_not_count(self):
+        r = Repo()
+        r.crate("sink", "x", test="#[test]\n#[ignore]\n" + RUNS)
+        self.assertEqual(r.check(), ["faucet-sink-x: does not run the fidelity corpus"])
 
     def test_a_helper_assertion_counts_and_comments_do_not(self):
         r = Repo()

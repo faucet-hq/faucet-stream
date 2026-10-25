@@ -90,7 +90,7 @@ async fn parse_csv_inner(
     while let Some(rec) = records.next().await {
         let rec = rec.map_err(|e| FaucetError::Source(format!("rest: CSV parse error: {e}")))?;
         if has_headers && headers.is_none() {
-            headers = Some(rec.iter().map(str::to_string).collect());
+            headers = Some(header_names(&rec)?);
             continue;
         }
         out.push(Value::Object(csv_record_to_object(
@@ -124,6 +124,42 @@ fn csv_record_to_object(
         obj.insert(key, value);
     }
     obj
+}
+
+/// The header row's names; a repeated name is refused, since rows are keyed by
+/// header and the later column would silently replace the earlier one.
+fn header_names(rec: &csv_async::StringRecord) -> Result<Vec<String>, FaucetError> {
+    let names = name_empty_headers(rec.iter().map(str::to_string).collect());
+    check_unique_headers(&names, "CSV")?;
+    Ok(names)
+}
+
+/// Name empty CSV header cells `column_<i>` (as the Excel path does) when
+/// more than one is empty, so a header row like `id,amount,,` keeps every
+/// column instead of colliding on `""`. A single empty name is kept as is.
+fn name_empty_headers(mut names: Vec<String>) -> Vec<String> {
+    if names.iter().filter(|n| n.is_empty()).count() > 1 {
+        for (i, name) in names.iter_mut().enumerate() {
+            if name.is_empty() {
+                *name = format!("column_{i}");
+            }
+        }
+    }
+    names
+}
+
+fn check_unique_headers(names: &[String], what: &str) -> Result<(), FaucetError> {
+    let mut seen = std::collections::HashMap::with_capacity(names.len());
+    for (i, name) in names.iter().enumerate() {
+        if let Some(first) = seen.insert(name.as_str(), i) {
+            let shown = if name.is_empty() { "(empty)" } else { name };
+            return Err(FaucetError::Source(format!(
+                "rest: {what} header {shown:?} repeats at columns {first} and {i}; rows are \
+                 keyed by header name, so one column would be lost — rename one of them"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn is_null_field(field: &str, nulls: &[String]) -> bool {
@@ -191,7 +227,7 @@ pub async fn csv_to_ndjson_with_options(
     while let Some(rec) = records.next().await {
         let rec = rec.map_err(|e| FaucetError::Source(format!("rest: CSV parse error: {e}")))?;
         if has_headers && headers.is_none() {
-            headers = Some(rec.iter().map(str::to_string).collect());
+            headers = Some(header_names(&rec)?);
             continue;
         }
         let line = csv_record_to_ndjson_line(&rec, headers.as_deref(), null_values)?;
@@ -263,7 +299,7 @@ where
             let rec =
                 rec.map_err(|e| FaucetError::Source(format!("rest: CSV parse error: {e}")))?;
             if has_headers && headers.is_none() {
-                headers = Some(rec.iter().map(str::to_string).collect());
+                headers = Some(header_names(&rec)?);
                 continue;
             }
             let line = csv_record_to_ndjson_line(&rec, headers.as_deref(), &null_values)?;
@@ -352,7 +388,7 @@ where
             let rec =
                 rec.map_err(|e| FaucetError::Source(format!("rest: CSV parse error: {e}")))?;
             if has_headers && headers.is_none() {
-                headers = Some(rec.iter().map(str::to_string).collect());
+                headers = Some(header_names(&rec)?);
                 continue;
             }
             page.push(Value::Object(csv_record_to_object(
@@ -479,8 +515,14 @@ pub fn parse_excel(
             ))
         })?
         .iter()
-        .map(cell_to_string)
+        .enumerate()
+        .map(|(i, cell)| {
+            Some(cell_to_string(cell))
+                .filter(|k| !k.is_empty())
+                .unwrap_or_else(|| format!("column_{i}"))
+        })
         .collect();
+    check_unique_headers(&headers, "Excel")?;
     let timestamps = timestamp_columns(range.rows().skip(header_row + 1));
     let mut out = Vec::new();
     for row in range.rows().skip(header_row + 1) {
@@ -489,7 +531,6 @@ pub fn parse_excel(
             let key = headers
                 .get(i)
                 .cloned()
-                .filter(|k| !k.is_empty())
                 .unwrap_or_else(|| format!("column_{i}"));
             obj.insert(
                 key,
@@ -607,9 +648,9 @@ fn cell_to_value_in(cell: &calamine::Data, timestamp: bool) -> Value {
 ///
 /// Column names come from the header row, or `column_<i>` without one, so a
 /// batch's schema is field-for-field what `csv_record_to_object` produces.
-/// A short row is padded with nulls and a long one widens no schema — the
-/// header fixes the column set for the whole stream, exactly as it fixes the
-/// key set on the `Value` path.
+/// A short row is padded with nulls. A row longer than the first fails the
+/// read: the `Value` path keeps its extra fields as `column_<i>`, which a
+/// fixed batch schema cannot, so dropping them would lose data silently.
 #[cfg(feature = "arrow")]
 pub fn csv_reader_to_record_batches<R>(
     reader: R,
@@ -684,7 +725,7 @@ where
             let rec = rec
                 .map_err(|e| FaucetError::Source(format!("rest: CSV parse error: {e}")))?;
             if has_headers && headers.is_none() {
-                headers = Some(rec.iter().map(str::to_string).collect());
+                headers = Some(header_names(&rec)?);
                 continue;
             }
             // The first data row fixes the column set when there is no header.
@@ -700,6 +741,15 @@ where
                         .map(|n| Field::new(n, DataType::Utf8, true))
                         .collect::<Vec<_>>(),
                 )));
+            }
+            if rec.len() > cols.len() {
+                let line = rec.position().map_or(0, |p| p.line());
+                Err(FaucetError::Source(format!(
+                    "rest: CSV line {line} has {} fields but the header has {}; the columnar \
+                     path cannot keep the extra fields — fix the export or read it row by row",
+                    rec.len(),
+                    cols.len()
+                )))?;
             }
             for (i, col) in cols.iter_mut().enumerate() {
                 // A field the row does not have is null, never a silent shift.
@@ -739,6 +789,20 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn empty_csv_headers_are_named_only_when_they_would_collide() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            super::name_empty_headers(names(&["id", "", "x", ""])),
+            names(&["id", "column_1", "x", "column_3"])
+        );
+        assert_eq!(
+            super::name_empty_headers(names(&["id", "", "x"])),
+            names(&["id", "", "x"])
+        );
+        let collided = super::name_empty_headers(names(&["column_1", "", ""]));
+        assert!(super::check_unique_headers(&collided, "CSV").is_err());
+    }
 
     mod jsonl {
         use super::super::*;
@@ -1132,6 +1196,24 @@ mod tests {
     mod record_batches {
         use super::super::*;
         use futures::StreamExt as _;
+
+        #[tokio::test]
+        async fn a_row_longer_than_the_header_fails_instead_of_dropping_fields() {
+            let r = std::io::Cursor::new(b"a,b\n1,2\n3,4,5\n".to_vec());
+            let s = csv_reader_to_record_batches(r, b',', true, 10);
+            futures::pin_mut!(s);
+            let err = s.next().await.unwrap().unwrap_err().to_string();
+            assert!(err.contains("line 3 has 3 fields"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn a_repeated_header_fails_the_columnar_read() {
+            let r = std::io::Cursor::new(b"Id,Name,Name\n1,Alice,Smith\n".to_vec());
+            let s = csv_reader_to_record_batches(r, b',', true, 10);
+            futures::pin_mut!(s);
+            let err = s.next().await.unwrap().unwrap_err().to_string();
+            assert!(err.contains("\"Name\" repeats at columns 1 and 2"), "{err}");
+        }
 
         async fn batches(
             csv: &str,

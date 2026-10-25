@@ -285,3 +285,30 @@ async fn accessor_methods_on_constructed_source() {
         "config_schema must describe the topics field"
     );
 }
+
+/// A `sasl_ssl` block whose layers are the wrong kind is refused while the
+/// client is configured, before any broker is contacted.
+#[tokio::test(flavor = "multi_thread")]
+async fn sasl_ssl_with_mismatched_layers_is_refused_at_construction() {
+    let mut cfg = source_config("127.0.0.1:1", "t", "g", 1);
+    cfg.auth = KafkaAuth::SaslSsl {
+        sasl: Box::new(KafkaAuth::Tls { ca_path: None }),
+        ssl: Box::new(KafkaAuth::None),
+    };
+    let err = KafkaSource::new(cfg).await.err().expect("refused");
+    assert!(err.to_string().contains("`sasl_ssl.sasl` must be"), "{err}");
+
+    let mut cfg = source_config("127.0.0.1:1", "t", "g", 1);
+    cfg.auth = KafkaAuth::SaslSsl {
+        sasl: Box::new(KafkaAuth::SaslPlain {
+            username: "u".into(),
+            password: "p".into(),
+        }),
+        ssl: Box::new(KafkaAuth::SaslPlain {
+            username: "u".into(),
+            password: "p".into(),
+        }),
+    };
+    let err = KafkaSource::new(cfg).await.err().expect("refused");
+    assert!(err.to_string().contains("`sasl_ssl.ssl` must be"), "{err}");
+}

@@ -111,6 +111,60 @@ async fn submit_gives_up_after_max_retries() {
 }
 
 #[tokio::test]
+async fn a_stated_wait_above_the_ceiling_fails_without_retrying() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "3600"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let err = client(&server.uri(), opts())
+        .execute(&StatementRequest::new("SELECT 1"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("asks to wait 3600s"), "{err}");
+}
+
+#[tokio::test]
+async fn an_http_date_retry_after_is_honoured() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(seq(vec![
+            ResponseTemplate::new(503)
+                .insert_header("Retry-After", "Wed, 21 Oct 2015 07:28:00 GMT"),
+            ResponseTemplate::new(200).set_body_json(ok("d")),
+        ]))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let r = client(&server.uri(), opts())
+        .execute(&StatementRequest::new("SELECT 1"))
+        .await
+        .unwrap();
+    assert_eq!(r.statement_id.as_deref(), Some("d"));
+}
+
+#[tokio::test]
+async fn a_large_error_body_is_truncated() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("x".repeat(100_000)))
+        .mount(&server)
+        .await;
+    let err = client(&server.uri(), opts())
+        .execute(&StatementRequest::new("SELECT 1"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.ends_with("...(truncated)"),
+        "{}",
+        &err[err.len() - 40..]
+    );
+    assert!(err.len() < 3000, "{}", err.len());
+}
+
+#[tokio::test]
 async fn submit_500_is_not_retried() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

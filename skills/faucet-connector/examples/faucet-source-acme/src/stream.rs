@@ -1,14 +1,14 @@
 //! The acme source: the one module that performs I/O.
 
 use crate::config::AcmeSourceConfig;
+use faucet_core::io::{CallContext, CallSlot};
+use faucet_core::observability::RoundtripRecorder;
 use faucet_core::{
-    FaucetError, Source, Stream, StreamPage, Value, async_stream, async_trait, execute_with_retry,
-    json,
+    FaucetError, RetryPolicy, Source, Stream, StreamPage, Value, async_stream, async_trait, json,
 };
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const MAX_API_LIMIT: usize = 1000;
@@ -16,33 +16,41 @@ const RETRY_BASE: Duration = Duration::from_millis(500);
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(60);
 const MAX_ERROR_BODY: usize = 512;
 
-#[derive(Deserialize)]
-struct AcmePage {
-    data: Vec<Value>,
-}
-
 /// acme source connector.
 pub struct AcmeSource {
     config: AcmeSourceConfig,
-    client: reqwest::Client,
+    client: faucet_core::http::Client,
+    calls: CallSlot,
     records_url: reqwest::Url,
     start_after: Mutex<Option<Value>>,
 }
 
 impl AcmeSource {
     /// Validates the config and builds the HTTP client once. The client pools
-    /// connections, so every request in every run reuses it.
+    /// connections, so every request in every run reuses it. Every request
+    /// runs through `calls`, which carries the request timeout and retry
+    /// policy and, once the pipeline installs it, the run's deadline, cancel
+    /// token and round-trip recorder.
     pub fn new(config: AcmeSourceConfig) -> Result<Self, FaucetError> {
         config.validate()?;
         faucet_core::state::validate_state_key(&config.state_key())
             .map_err(|e| FaucetError::Config(format!("acme: {e}")))?;
         let records_url = records_url(&config.base_url, &config.collection)?;
+        let timeout = Duration::from_secs(config.timeout_secs);
         let client = faucet_core::http::Client::builder()
-            .timeout(Duration::from_secs(config.timeout_secs))
-            .build_reqwest()?;
+            .timeout(timeout)
+            .build()?;
+        let calls = CallSlot::new(CallContext::new().with_timeout(timeout).with_retry(
+            RetryPolicy {
+                max_attempts: config.max_retries.saturating_add(1),
+                base: RETRY_BASE,
+                ..RetryPolicy::default()
+            },
+        ));
         Ok(Self {
             config,
             client,
+            calls,
             records_url,
             start_after: Mutex::new(None),
         })
@@ -68,34 +76,43 @@ impl AcmeSource {
         after: Option<&Value>,
         limit: usize,
     ) -> Result<Vec<Value>, FaucetError> {
-        execute_with_retry(self.config.max_retries, RETRY_BASE, || async move {
-            let mut req = self
-                .client
-                .get(self.records_url.clone())
-                .bearer_auth(&self.config.token)
-                .query(&[("limit", limit.to_string())]);
-            if let Some(after) = after {
-                req = req.query(&[("after", cursor_param(after))]);
-            }
-            let resp = req.send().await?;
-            let status = resp.status();
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                return Err(FaucetError::RateLimited(retry_after(&resp)));
-            }
-            if !status.is_success() {
-                let url = resp.url().to_string();
-                let body = resp.text().await.unwrap_or_default();
-                return Err(FaucetError::HttpStatus {
-                    status: status.as_u16(),
-                    url,
-                    body: truncate(body),
-                });
-            }
-            let bytes = resp.bytes().await?;
-            let page: AcmePage = faucet_core::serde_json::from_slice(&bytes)?;
-            Ok(page.data)
-        })
-        .await
+        self.calls
+            .call("page", || async move {
+                let mut req = self
+                    .client
+                    .get(self.records_url.clone())
+                    .bearer_auth(&self.config.token)
+                    .query(&[("limit", limit.to_string())]);
+                if let Some(after) = after {
+                    req = req.query(&[("after", cursor_param(after))]);
+                }
+                let resp = self.client.send(req).await?;
+                let status = resp.status();
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    return Err(FaucetError::RateLimited(retry_after(&resp)));
+                }
+                if !status.is_success() {
+                    let url = resp.url().to_string();
+                    let body = self.client.text(resp).await.unwrap_or_default();
+                    return Err(FaucetError::HttpStatus {
+                        status: status.as_u16(),
+                        url,
+                        body: truncate(body),
+                    });
+                }
+                match self.client.json_value(resp).await? {
+                    Value::Object(mut page) => match page.remove("data") {
+                        Some(Value::Array(data)) => Ok(data),
+                        _ => Err(FaucetError::Source(
+                            "acme: response has no `data` array".into(),
+                        )),
+                    },
+                    _ => Err(FaucetError::Source(
+                        "acme: response is not a JSON object".into(),
+                    )),
+                }
+            })
+            .await
     }
 }
 
@@ -137,28 +154,35 @@ impl Source for AcmeSource {
         } else {
             page_size.min(MAX_API_LIMIT)
         };
+        // Only an empty page ends the read: a backend may return fewer records
+        // than `limit` (it clamps the page size) while more remain.
         Box::pin(async_stream::try_stream! {
             let mut cursor = self.start_cursor()?;
             let mut all = Vec::new();
             loop {
                 let records = self.fetch_page(cursor.as_ref(), limit).await?;
-                let exhausted = records.len() < limit;
-                if let Some(last) = records.last() {
-                    cursor = Some(cursor_of(last, &self.config.cursor_field)?);
-                }
+                let Some(last) = records.last() else { break };
+                let next = cursor_of(last, &self.config.cursor_field)?;
+                advanced(cursor.as_ref(), &next)?;
+                cursor = Some(next);
                 if single_page {
                     all.extend(records);
-                } else if !records.is_empty() {
+                } else {
                     yield StreamPage { records, bookmark: cursor.as_ref().map(bookmark) };
-                }
-                if exhausted {
-                    break;
                 }
             }
             if single_page && !all.is_empty() {
                 yield StreamPage { records: all, bookmark: cursor.as_ref().map(bookmark) };
             }
         })
+    }
+
+    fn set_call_context(&self, ctx: CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(&self, recorder: Arc<RoundtripRecorder>) {
+        self.calls.install_recorder(recorder);
     }
 
     fn state_key(&self) -> Option<String> {
@@ -219,6 +243,18 @@ fn cursor_of(record: &Value, field: &str) -> Result<Value, FaucetError> {
         })
 }
 
+/// A page whose last cursor equals the one it was requested after would be
+/// fetched again forever (the backend ignored `after`, or the cursor field is
+/// not unique), so it fails the read.
+fn advanced(previous: Option<&Value>, next: &Value) -> Result<(), FaucetError> {
+    if previous == Some(next) {
+        return Err(FaucetError::Source(format!(
+            "acme: the cursor did not advance past {next}; the backend returned the same page again"
+        )));
+    }
+    Ok(())
+}
+
 fn cursor_param(cursor: &Value) -> String {
     match cursor {
         Value::String(s) => s.clone(),
@@ -273,6 +309,14 @@ mod tests {
         let err = cursor_of(&json!({"name": "x"}), "id").unwrap_err();
         assert!(matches!(err, FaucetError::Source(_)), "{err:?}");
         assert!(cursor_of(&json!({"id": null}), "id").is_err());
+    }
+
+    #[test]
+    fn a_cursor_that_does_not_advance_is_an_error() {
+        assert!(advanced(None, &json!(1)).is_ok());
+        assert!(advanced(Some(&json!(1)), &json!(2)).is_ok());
+        let err = advanced(Some(&json!(2)), &json!(2)).unwrap_err();
+        assert!(matches!(err, FaucetError::Source(_)), "{err:?}");
     }
 
     #[test]

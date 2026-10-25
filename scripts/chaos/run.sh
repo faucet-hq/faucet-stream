@@ -265,7 +265,7 @@ serve:
                 type: postgres
                 config:
                   connection_url: "${PG}"
-                  query: "SELECT to_char(date_trunc('minute', now()), 'HH24:MI') AS ts, 'x' AS fired"
+                  query: "SELECT to_char(date_trunc('minute', '\${trigger.tick}'::timestamptz), 'HH24:MI') AS ts, to_char(now(), 'HH24:MI:SS') AS fired"
               sink:
                 type: postgres
                 config: { connection_url: "${PG}", table_name: tick_log, column_mapping: auto_map }
@@ -298,6 +298,7 @@ install() { # cluster|single
     -f "${WORK}/values-$1.yaml" --wait --timeout 10m >/dev/null || return 1
   TOKEN="$(k get secret faucet-faucet-stream-serve-auth -o jsonpath='{.data.FAUCET_SERVE_AUTH_TOKEN}' | base64 -d)"
   INSTALLED_AT=$(date +%s)
+  OUTAGES=()
 }
 
 # ------------------------------------------------------------------- API ---
@@ -460,8 +461,10 @@ s_all_pods() {
   local port id q1 q2 st
   port="$(any_port)"; id="$(submit "$port" slow | run_id)"; q1="$(submit "$port" fast | run_id)"; q2="$(submit "$port" fast | run_id)"
   wait_owner "$id" >/dev/null || return 1
+  local t0; t0=$(date +%s)
   k delete pod -l app.kubernetes.io/component=serve --grace-period=0 --force >/dev/null 2>&1
   k rollout status deploy/faucet-faucet-stream --timeout=600s >/dev/null
+  OUTAGES+=("${t0} $(date +%s)")
   sleep 5; port="$(any_port)"
   for r in "$id" "$q1" "$q2"; do
     st="$(wait_terminal "$port" "$r" 360)"; [ "$st" = completed ] || fail "${r}: ${st}" || return 1
@@ -475,6 +478,7 @@ s_history_outage() { # #905: readiness must see it; no run executes twice
   port="$(any_port)"; id="$(submit "$port" slow | run_id)"
   owner="$(wait_owner "$id")" || return 1
   local ports=(); for p in $(pods); do ports+=("$(port_for "$p")"); done
+  local t0; t0=$(date +%s)
   psql postgres "ALTER DATABASE faucet_history ALLOW_CONNECTIONS false; SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'faucet_history'" >/dev/null
   for _ in $(seq 1 $((LEASE_TTL + 15))); do
     down=0
@@ -488,6 +492,7 @@ s_history_outage() { # #905: readiness must see it; no run executes twice
   [ "$down" -eq "${#ports[@]}" ] || { psql postgres "ALTER DATABASE faucet_history ALLOW_CONNECTIONS true" >/dev/null; fail "/readyz still history_ok on $(( ${#ports[@]} - down )) pod(s) (#905)"; return 1; }
   sleep 20
   psql postgres "ALTER DATABASE faucet_history ALLOW_CONNECTIONS true" >/dev/null
+  OUTAGES+=("${t0} $(date +%s)")
   for p in "${ports[@]}"; do
     for _ in $(seq 1 60); do [ "$(curl -s -m 3 "localhost:${p}/readyz" | jq -r .history_ok 2>/dev/null)" = true ] && break; sleep 1; done
   done
@@ -535,17 +540,21 @@ s_poison() {
 }
 
 s_schedule() { # once per tick across every replica, through everything above
-  # A tick missed while the history was unreachable fires once as catch-up,
-  # in a later minute, so a minute may hold two rows and the total matches.
-  local window expected actual dupes
+  # Each row carries the tick it ran for. A tick may be missing only inside an
+  # outage (no replica or no history), where catch-up runs just the latest one.
+  local window minutes expected actual dupes missing excused="false" o
   window="ts > to_char(date_trunc('minute', to_timestamp(${INSTALLED_AT})), 'HH24:MI') AND ts < to_char(date_trunc('minute', now()), 'HH24:MI')"
-  expected="$(sql "SELECT count(*) FROM generate_series(date_trunc('minute', to_timestamp(${INSTALLED_AT})) + interval '1 minute', date_trunc('minute', now()) - interval '1 minute', interval '1 minute')")"
+  minutes="generate_series(date_trunc('minute', to_timestamp(${INSTALLED_AT})) + interval '1 minute', date_trunc('minute', now()) - interval '1 minute', interval '1 minute') m"
+  for o in ${OUTAGES[@]+"${OUTAGES[@]}"}; do
+    excused="${excused} OR m BETWEEN to_timestamp(${o% *}) - interval '1 minute' AND to_timestamp(${o#* }) + interval '1 minute'"
+  done
+  expected="$(sql "SELECT count(*) FROM ${minutes}")"
   actual="$(sql "SELECT count(*) FROM tick_log WHERE ${window}")"
-  dupes="$(sql "SELECT coalesce(string_agg(ts || ' x' || n, ', '), '') FROM (SELECT ts, count(*) n FROM tick_log WHERE ${window} GROUP BY ts HAVING count(*) > 2) d")"
-  [ -z "$dupes" ] || fail "a minute fired more than a tick plus one catch-up: ${dupes}" || return 1
-  [ "$actual" -ge "$expected" ] || fail "${actual} runs for ${expected} minutes" || return 1
-  [ "$actual" -le $((expected + 2)) ] || fail "${actual} runs for ${expected} minutes: duplicates" || return 1
-  echo "${actual} scheduled runs over ${expected} minutes across ${REPLICAS} replicas"
+  dupes="$(sql "SELECT coalesce(string_agg(ts || ' x' || n, ', '), '') FROM (SELECT ts, count(*) n FROM tick_log WHERE ${window} GROUP BY ts HAVING count(*) > 1) d")"
+  [ -z "$dupes" ] || fail "a tick ran more than once: ${dupes}" || return 1
+  missing="$(sql "SELECT coalesce(string_agg(to_char(m, 'HH24:MI'), ', '), '') FROM ${minutes} WHERE to_char(m, 'HH24:MI') NOT IN (SELECT ts FROM tick_log) AND NOT (${excused})")"
+  [ -z "$missing" ] || fail "ticks never ran outside an outage: ${missing}" || return 1
+  echo "${actual} scheduled runs over ${expected} minutes across ${REPLICAS} replicas, none twice"
 }
 
 s_single_kill() {

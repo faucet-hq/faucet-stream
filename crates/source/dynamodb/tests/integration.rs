@@ -329,6 +329,25 @@ async fn streams_cdc_captures_changes_and_resumes() {
     let err = failing.fetch_all().await.unwrap_err().to_string();
     assert!(err.contains("expired") && err.contains("on_gap"), "{err}");
 
+    // An unreadable stored bookmark fails the read instead of restarting.
+    let corrupt = DynamoDbSource::new(cfg.clone()).await.unwrap();
+    corrupt
+        .apply_start_bookmark(json!({"shards": {"s1": 4960}}))
+        .await
+        .unwrap();
+    let err = corrupt.fetch_all().await.unwrap_err();
+    assert!(matches!(err, faucet_core::FaucetError::State(_)), "{err}");
+
+    // A scan-mode bookmark left under the key after a mode switch is refused
+    // too, rather than reading as an empty streams bookmark.
+    let scan_shaped = DynamoDbSource::new(cfg.clone()).await.unwrap();
+    scan_shaped
+        .apply_start_bookmark(json!({"total_segments": 1, "segments": {}}))
+        .await
+        .unwrap();
+    let err = scan_shaped.fetch_all().await.unwrap_err();
+    assert!(matches!(err, faucet_core::FaucetError::State(_)), "{err}");
+
     // on_gap: resnapshot re-reads the table, then streams the retained window.
     cfg.on_gap = OnGap::Resnapshot;
     let resnap = DynamoDbSource::new(cfg).await.unwrap();

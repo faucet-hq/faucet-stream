@@ -18,7 +18,7 @@ Reach for it when you need to export logs, metrics, orders, or any indexed docum
 - **Unconditional scroll cleanup** — the open `_scroll_id` is always sent to `DELETE _search/scroll` on every exit path (clean drain, `max_pages` truncation, mid-stream error, or the consumer dropping the stream) via an RAII guard, so the cluster never leaks server-side scroll state.
 - **Matrix-context interpolation** — `${field.path}` placeholders in `index` and `query` resolve against the parent-record context at runtime, so one config can fan out across indices or query values.
 - **`max_pages` cap** — bound the number of scroll responses for previews or partial exports.
-- **No-batching sentinel** — `batch_size: 0` issues a single non-scroll `_search?size=10000` for small lookup indices or sinks that prefer one large request.
+- **No-batching sentinel** — `batch_size: 0` drains the whole result through the scroll API (10 000 documents per request) into one page, for small lookup indices or sinks that prefer one large request.
 - **Client built once** — the `reqwest` client is constructed in `new()` and reused for every request.
 
 ## Installation
@@ -199,7 +199,7 @@ source:
   config:
     base_url: http://localhost:9200
     index: country_codes
-    batch_size: 0      # single _search?size=10000, no scroll context
+    batch_size: 0      # whole result in one page, read through scroll
 ```
 
 ### Daily metrics window driven by a matrix context
@@ -221,8 +221,8 @@ source:
 The source overrides [`Source::stream_pages`](https://docs.rs/faucet-core/latest/faucet_core/trait.Source.html#tymethod.stream_pages): the pipeline writes documents to the sink as each scroll page lands, so client-side memory stays `O(batch_size)` regardless of the index's total document count.
 
 - `batch_size` (default `1000`) is passed straight to the scroll API as the `size` parameter on the initial `POST /{index}/_search?scroll={timeout}&size={batch_size}`. Each scroll response — initial and follow-up — becomes exactly one `StreamPage`. The trailing empty scroll page is the end-of-scroll sentinel and is consumed but not emitted.
-- **`batch_size: 0` is the "no batching" sentinel**: the source skips scroll entirely and issues a single `POST /{index}/_search?size=10000`, emitting one page. The `10000` cap mirrors Elasticsearch's default `index.max_result_window`; indices with a larger window still receive only `10000` hits — switch back to scroll if you need more.
-- `batch_size: 0` is also honoured on the buffered `fetch_all` / `fetch_with_context` path — it maps to the same `size=10000` initial search (not the literal `size=0`, which would return zero hits).
+- **`batch_size: 0` is the "no batching" sentinel**: the source scrolls through the whole result with `size=10000` per request (Elasticsearch's default `index.max_result_window`) and emits it as one page, so no hit is dropped; memory holds the whole result.
+- `batch_size: 0` is also honoured on the buffered `fetch_all` / `fetch_with_context` path — it maps to the same `size=10000` scroll (not the literal `size=0`, which would return zero hits).
 - `max_pages`, when set, caps the total number of scroll responses emitted; the cap applies *after* the page is yielded.
 - The trait-level `batch_size` argument to `stream_pages` is **ignored** in favour of the config field, so a pipeline-supplied hint never silently overrides an explicit config value.
 - This source has no incremental-replication / resume mode today, so every emitted page carries `bookmark: None` (see [Resume & state](#resume--state)). For incremental loads, encode the watermark in the query (e.g. a `range` on `@timestamp`) and drive it from a matrix context or `${now.*}` token.

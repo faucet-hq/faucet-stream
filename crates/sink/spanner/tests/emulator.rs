@@ -232,6 +232,33 @@ async fn write_batch_partial_reports_failed_rows() {
     assert_eq!(support::count_rows(&conn, "t").await, 2);
 }
 
+/// A row whose values cannot be encoded fails on its own on the per-row
+/// path, in upsert and append mode; the rest are committed.
+#[tokio::test(flavor = "multi_thread")]
+async fn write_batch_partial_fails_only_an_unencodable_row() {
+    for (db, write) in [
+        ("em-enc-up", upsert_spec()),
+        ("em-enc-ap", WriteSpec::default()),
+    ] {
+        let (sink, conn) = sink_for(db, write).await;
+        let outcomes = sink
+            .write_batch_partial(&[
+                json!({"id": 1, "v": "ok"}),
+                json!({"id": "not-an-int-at-all", "v": "bad"}),
+                json!({"id": 3, "v": "ok"}),
+            ])
+            .await
+            .expect("partial write");
+        assert!(
+            outcomes[0].is_ok() && outcomes[2].is_ok(),
+            "{db}: {outcomes:?}"
+        );
+        let err = outcomes[1].as_ref().unwrap_err().to_string();
+        assert!(err.contains("column `id`"), "{db}: {err}");
+        assert_eq!(support::count_rows(&conn, "t").await, 2, "{db}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn exactly_once_persists_data_and_token_atomically() {
     let (sink, conn) = sink_for("em-eo", upsert_spec()).await;

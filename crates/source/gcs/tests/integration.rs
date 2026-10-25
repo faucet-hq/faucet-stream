@@ -103,6 +103,84 @@ async fn source_reads_json_lines() {
     assert_eq!(sorted, vec![1, 2]);
 }
 
+/// Under `verify_checksum` a JSON Lines object is verified before it is paged.
+#[tokio::test]
+async fn checksummed_json_lines_page_after_verification() {
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
+        return;
+    };
+    let body: String = (0..5).map(|i| format!("{{\"id\":{i}}}\n")).collect();
+    seed_object(
+        &host,
+        &bucket,
+        "v/rows.jsonl",
+        &body,
+        "application/x-ndjson",
+    )
+    .await;
+    let source = GcsSource::new(
+        GcsSourceConfig::new(&bucket)
+            .prefix("v/")
+            .with_batch_size(2)
+            .verify_checksum(true)
+            .auth(GcsCredentials::Anonymous)
+            .storage_host(&host),
+    )
+    .await
+    .unwrap();
+    let ids: Vec<i64> = stream_all(&source)
+        .await
+        .iter()
+        .map(|r| r["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, (0..5).collect::<Vec<i64>>());
+}
+
+/// Each listing page is metered as one `list` round trip.
+#[tokio::test]
+async fn listing_pages_are_metered() {
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
+        return;
+    };
+    for n in 0..3 {
+        seed_object(
+            &host,
+            &bucket,
+            &format!("m/{n}.jsonl"),
+            "{\"id\":1}\n",
+            "application/x-ndjson",
+        )
+        .await;
+    }
+    let source = GcsSource::new(
+        GcsSourceConfig::new(&bucket)
+            .prefix("m/")
+            .auth(GcsCredentials::Anonymous)
+            .storage_host(&host),
+    )
+    .await
+    .unwrap();
+    let meter = std::sync::Arc::new(faucet_core::UsageMeter::new());
+    source.set_roundtrip_recorder(std::sync::Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Source,
+            "p",
+            "r",
+            "gcs",
+        )
+        .with_meter(meter.clone()),
+    ));
+    assert_eq!(
+        source
+            .fetch_with_context(&HashMap::new())
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(meter.snapshot().source_roundtrips.get("list"), Some(&1));
+}
+
 #[tokio::test]
 async fn source_reads_json_array() {
     let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
@@ -730,6 +808,61 @@ async fn parquet_schema_mismatch_across_objects_is_an_error() {
     assert!(!jsonl.supports_columnar());
     let mut non_parquet = jsonl.stream_batches(&ctx, 0);
     assert!(non_parquet.next().await.unwrap().is_err());
+}
+
+/// Writer key-value metadata (`pandas`, `ARROW:schema`) is not a schema
+/// difference: two objects with the same columns read as one schema.
+#[cfg(feature = "arrow")]
+#[tokio::test]
+async fn parquet_objects_differing_only_in_writer_metadata_read_as_one_schema() {
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use futures::StreamExt;
+    use std::sync::Arc;
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
+        return;
+    };
+    let write = |metadata: HashMap<String, String>, id: i64| {
+        let schema = Arc::new(
+            Schema::new(vec![Field::new("id", DataType::Int64, false)]).with_metadata(metadata),
+        );
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![id]))])
+                .unwrap();
+        let mut buf = Vec::new();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(&mut buf, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        buf
+    };
+    let plain = write(HashMap::new(), 1);
+    let tagged = write(
+        HashMap::from([("pandas".to_string(), "{\"index_columns\":[]}".to_string())]),
+        2,
+    );
+    for (name, body) in [("meta/a.parquet", plain), ("meta/b.parquet", tagged)] {
+        seed_bytes(&host, &bucket, name, body, "application/vnd.apache.parquet").await;
+    }
+    let source = GcsSource::new(
+        GcsSourceConfig::new(&bucket)
+            .prefix("meta/")
+            .file_format(GcsFileFormat::Parquet)
+            .auth(GcsCredentials::Anonymous)
+            .storage_host(&host),
+    )
+    .await
+    .unwrap();
+    let ctx = HashMap::new();
+    let mut batches = source.stream_batches(&ctx, 0);
+    let mut rows = 0;
+    while let Some(page) = batches.next().await {
+        rows += page
+            .expect("writer metadata is not a schema difference")
+            .batch
+            .num_rows();
+    }
+    assert_eq!(rows, 2);
 }
 
 /// Avro and ORC objects (#719): resolved against the first object's schema on

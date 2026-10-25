@@ -27,7 +27,7 @@ pub(crate) struct Encoded {
 
 impl Encoded {
     /// Bytes this entry contributes to a request (the message body — the
-    /// quantity SQS counts against its 256 KiB request ceiling).
+    /// quantity SQS counts against its per-request payload ceiling).
     pub fn request_bytes(&self) -> usize {
         self.body.len()
     }

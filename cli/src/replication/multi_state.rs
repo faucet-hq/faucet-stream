@@ -421,7 +421,9 @@ pub fn record_failure(
         return FailureAction::Retry;
     };
     t.consecutive_failures += 1;
-    t.last_error = Some(error.to_string());
+    t.last_error = Some(crate::pipeline_state::outcome::scrub_error(
+        &crate::secrets::registry::redact_message(error),
+    ));
     state.updated_at = now;
     if t.consecutive_failures >= max_failures.max(1) {
         t.set_phase(TablePhase::Paused, now);
@@ -701,6 +703,19 @@ mod tests {
         );
         assert_eq!(s.tables["a"].phase, TablePhase::Paused);
         assert_eq!(s.tables["a"].last_error.as_deref(), Some("boom"));
+        crate::secrets::registry::register("mirror-s3cr3t-value");
+        let long = format!(
+            "connect postgres://u:pw@h/d failed: mirror-s3cr3t-value {}",
+            "x".repeat(2000)
+        );
+        record_failure(&mut s, "a", &long, 9, t0());
+        let stored = s.tables["a"].last_error.clone().unwrap();
+        assert!(
+            !stored.contains("mirror-s3cr3t-value") && !stored.contains(":pw@"),
+            "{stored}"
+        );
+        assert!(stored.chars().count() <= crate::pipeline_state::outcome::MAX_ERROR_CHARS + 1);
+        s.tables.get_mut("a").unwrap().last_error = Some("boom".into());
         assert!(due_for_snapshot(&s, 300, t0()).is_empty());
         let later = t0() + chrono::Duration::seconds(300);
         assert_eq!(due_for_snapshot(&s, 300, later), vec!["a"]);

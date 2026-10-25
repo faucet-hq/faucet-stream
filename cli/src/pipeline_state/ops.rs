@@ -802,7 +802,7 @@ pub async fn reset(
 
     let mut changes = Vec::new();
     let mut exactly_once = None;
-    let mut token_rewound = false;
+    let mut rewind: Vec<String> = Vec::new();
     for e in targets {
         let eo_bookmark =
             e.key.kind == KeyKind::Bookmark && (row.atomic_watermark || is_envelope(&e.value));
@@ -830,17 +830,8 @@ pub async fn reset(
             });
             exactly_once = Some(adj);
         } else {
-            if eo_bookmark && !req.dry_run {
-                let sink = build_row_sink(row, auth).await?;
-                sink.rewind_commit_token(&e.key.key, None)
-                    .await
-                    .map_err(|err| {
-                        CliError::Config(format!(
-                            "--rewind-token: {err} — reset without --rewind-token to keep the \
-                         sequence in the state store instead"
-                        ))
-                    })?;
-                token_rewound = true;
+            if eo_bookmark {
+                rewind.push(e.key.key.clone());
             }
             changes.push(KeyChange {
                 key: e.key.key.clone(),
@@ -849,7 +840,14 @@ pub async fn reset(
             });
         }
     }
+    let mut token_rewound = false;
     if !req.dry_run {
+        // Tokens go first: the state keys still name them if a rewind fails,
+        // so running the reset again finishes it.
+        if !rewind.is_empty() {
+            let sink = build_row_sink(row, auth).await?;
+            token_rewound = rewind_tokens(sink.as_ref(), &rewind).await?;
+        }
         for c in &changes {
             match &c.after {
                 Some(v) => store.put(&c.key, v).await?,
@@ -865,6 +863,26 @@ pub async fn reset(
         applied: !req.dry_run,
         warnings,
     })
+}
+
+/// Rewind each key's commit token in order; a failure names the keys already
+/// rewound.
+async fn rewind_tokens(sink: &dyn faucet_core::Sink, keys: &[String]) -> CliResult<bool> {
+    for (i, key) in keys.iter().enumerate() {
+        sink.rewind_commit_token(key, None).await.map_err(|err| {
+            let done = if i == 0 {
+                "no commit token was rewound".to_string()
+            } else {
+                format!("already rewound: {}", keys[..i].join(", "))
+            };
+            CliError::Config(format!(
+                "--rewind-token: rewinding '{key}' failed: {err} ({done}; the state store is \
+                 unchanged, so running the reset again completes it) — reset without \
+                 --rewind-token to keep the sequence in the state store instead"
+            ))
+        })?;
+    }
+    Ok(!keys.is_empty())
 }
 
 // ── export / import ─────────────────────────────────────────────────────────
@@ -1614,6 +1632,38 @@ matrix:
         .unwrap_err();
         assert!(err.to_string().contains("--rewind-token"), "{err}");
         assert!(store.get("orders::a").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_failed_rewind_names_the_tokens_already_rewound() {
+        struct Flaky(std::sync::Mutex<Vec<String>>);
+        #[faucet_core::async_trait]
+        impl faucet_core::Sink for Flaky {
+            async fn write_batch(&self, r: &[Value]) -> Result<usize, faucet_core::FaucetError> {
+                Ok(r.len())
+            }
+            async fn rewind_commit_token(
+                &self,
+                scope: &str,
+                _: Option<&str>,
+            ) -> Result<(), faucet_core::FaucetError> {
+                if scope == "k2" {
+                    return Err(faucet_core::FaucetError::Sink("down".into()));
+                }
+                self.0.lock().unwrap().push(scope.to_string());
+                Ok(())
+            }
+        }
+        let sink = Flaky(Default::default());
+        let keys = vec!["k1".to_string(), "k2".to_string()];
+        let err = rewind_tokens(&sink, &keys).await.unwrap_err().to_string();
+        assert!(
+            err.contains("'k2'") && err.contains("already rewound: k1"),
+            "{err}"
+        );
+        assert!(rewind_tokens(&sink, &keys[..1]).await.unwrap());
+        assert!(!rewind_tokens(&sink, &[]).await.unwrap());
+        assert_eq!(*sink.0.lock().unwrap(), vec!["k1", "k1"]);
     }
 
     #[tokio::test]

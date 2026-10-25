@@ -181,7 +181,14 @@ curl -X POST localhost:8080/v1/tenants/acme/templates/crm-contacts/runs \
   connection shadows a config `auth:` entry of the same name); a reference
   to a connection the tenant does not have is a `409`;
 - binds `${tenant.id}`, `${tenant.name}` (the id when unnamed) and
-  `${tenant.labels.<key>}` anywhere in the document;
+  `${tenant.labels.<key>}` anywhere in the document, as literal text (a value
+  is never read as another `${…}` directive); in a SQL source's query and in a
+  `table` / `table_name` / `collection` / `index` / `schema` / `dataset` field
+  the value must be a plain identifier (letters, digits, `_`, `.`, `-`, `$`),
+  otherwise the run is refused (so a name with a space cannot sit inside a
+  quoted SQL literal either). A matrix row or node that picks its source by
+  `ref` is classified by that template's connector; only a spec whose kind
+  cannot be told treats every `query` / `sql` field as SQL;
 - keeps its bookmarks at `acme::crm-contacts::<row>` (and its SLA, profiling
   and rollback markers beside them), so tenants never share a bookmark;
 - carries `tenant` on its run record, usage records, audit entries and change
@@ -197,10 +204,12 @@ Run a template once per tenant:
 ```bash
 curl -X POST localhost:8080/v1/templates/crm-contacts/fanout \
   -H "Authorization: Bearer $OPERATOR" -H 'content-type: application/json' \
-  -d '{"tenants": "all", "concurrency": 8}'
+  -d '{"tenants": "all", "fanout_concurrency": 8}'
 ```
 
-`tenants` is `"all"` (every tenant that is not suspended) or a list. Each
+`tenants` is `"all"` (every tenant that is not suspended) or a list.
+`fanout_concurrency` caps the submissions in flight (default 4); `concurrency`
+is the trigger body's own field and caps each run's connectors. Each
 tenant runs as itself; the response has one entry per tenant —
 `submitted` (with `run_id`), `pending_approval`, `skipped` (a missing or
 revoked connection, a suspended tenant, a tenant at its limit — with the

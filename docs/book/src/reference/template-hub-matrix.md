@@ -67,7 +67,7 @@
 ```bash
 faucet run --source faucet-hq/example-csv --sink faucet-hq/bigquery \
   --param bq_project=<bq_project> \
-  --param bq_sa_key="$BQ_SA_KEY"
+  --param bq_sa_key
 ```
 
 **→ faucet-hq/jsonl**
@@ -80,7 +80,7 @@ faucet run --source faucet-hq/example-csv --sink faucet-hq/jsonl
 
 ```bash
 faucet run --source faucet-hq/example-csv --sink faucet-hq/postgres \
-  --param pg_url="$PG_URL"
+  --param pg_url
 ```
 
 **→ faucet-hq/sqlite**
@@ -108,17 +108,17 @@ faucet run --source faucet-hq/example-csv --sink faucet-hq/sqlite
 
 ```bash
 faucet run --source faucet-hq/example-rest-api --sink faucet-hq/bigquery \
-  --param api_token="$API_TOKEN" \
+  --param api_token \
   --param base_url=<base_url> \
   --param bq_project=<bq_project> \
-  --param bq_sa_key="$BQ_SA_KEY"
+  --param bq_sa_key
 ```
 
 **→ faucet-hq/jsonl**
 
 ```bash
 faucet run --source faucet-hq/example-rest-api --sink faucet-hq/jsonl \
-  --param api_token="$API_TOKEN" \
+  --param api_token \
   --param base_url=<base_url>
 ```
 
@@ -126,16 +126,16 @@ faucet run --source faucet-hq/example-rest-api --sink faucet-hq/jsonl \
 
 ```bash
 faucet run --source faucet-hq/example-rest-api --sink faucet-hq/postgres \
-  --param api_token="$API_TOKEN" \
+  --param api_token \
   --param base_url=<base_url> \
-  --param pg_url="$PG_URL"
+  --param pg_url
 ```
 
 **→ faucet-hq/sqlite**
 
 ```bash
 faucet run --source faucet-hq/example-rest-api --sink faucet-hq/sqlite \
-  --param api_token="$API_TOKEN" \
+  --param api_token \
   --param base_url=<base_url>
 ```
 

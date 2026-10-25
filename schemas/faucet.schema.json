@@ -2354,7 +2354,7 @@
       "type": "object",
       "properties": {
         "max_staleness_secs": {
-          "description": "Maximum seconds since the last *successful* run before the pipeline\ncounts as stale. Evaluated when a run fails (against the previous\nsuccess) and by `faucet doctor`. Requires a `state:` block to persist\nthe last-success timestamp.",
+          "description": "Maximum seconds since the last *successful* run before the pipeline\ncounts as stale. Evaluated when a run ends (a failure, or a success\narriving later than this after the previous one) and by `faucet\ndoctor`. A pipeline that stops running emits nothing: alert on the\n`faucet_pipeline_sla_last_success_unix_seconds` gauge for that. Requires\na `state:` block to persist the last-success timestamp.",
           "type": [
             "integer",
             "null"
@@ -3315,6 +3315,13 @@
           "type": "number",
           "format": "double",
           "default": 0.0
+        },
+        "timeout_secs": {
+          "description": "Seconds the count probe may take to return its first record before the\nrun fails. Default 300. Raise it for an authoritative count that is\nslow to compute (a `count(*)` on a busy warehouse).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 300
         }
       },
       "additionalProperties": false,
@@ -3458,7 +3465,7 @@
       "type": "object",
       "properties": {
         "float_tolerance": {
-          "description": "Round floats to this absolute tolerance before comparing (`0` = exact).",
+          "description": "Floats no further apart than this absolute tolerance compare equal (`0` = exact).",
           "type": "number",
           "format": "double",
           "default": 0.0
@@ -5966,7 +5973,7 @@
           }
         },
         "next": {
-          "description": "JSONPath to the next listing page's URL (absolute, or a path relative to\n`base_url`) in each response, e.g. `$.next`. Pages are followed until it\nis absent, null, empty or repeats. Without it only the first page is\nread, so set it for a paginated listing.",
+          "description": "JSONPath to the next listing page's URL (absolute, a path relative to\n`base_url` — a root-relative path that already starts with `base_url`'s\npath is not prefixed twice — or a query-only `?…` for the same listing)\nin each response, e.g. `$.next`. Pages are followed until it\nis absent, null, empty or repeats. Without it only the first page is\nread, so set it for a paginated listing.",
           "type": [
             "string",
             "null"
@@ -6769,7 +6776,7 @@
           "type": "string"
         },
         "value": {
-          "description": "Metadata value, sent verbatim. Use `${env:…}` / `${secret:…}` for\ncredentials rather than inlining them.",
+          "description": "Metadata value, sent verbatim; for a `-bin` key, the base64 of the\nbytes to send. Use `${env:…}` / `${secret:…}` for credentials rather\nthan inlining them.",
           "type": "string"
         }
       },
@@ -11544,7 +11551,7 @@
           "additionalProperties": true
         },
         {
-          "description": "Map top-level JSON keys directly to table columns. Only keys that match\nexisting columns are inserted; extra keys are ignored.",
+          "description": "Map top-level JSON keys directly to table columns. A key with no\nmatching column is added to the table (`ALTER TABLE … ADD COLUMN`)\nwhen `create_table` is true, and fails the write when it is false.",
           "type": "string",
           "const": "auto_map"
         }
@@ -12985,7 +12992,7 @@
       ]
     },
     "sink_kafka__KafkaExactlyOnceSpec": {
-      "description": "Exactly-once delivery knobs for the Kafka sink (#654 M20).\n\nThese four apply **only** under `delivery: exactly_once` — the transactional\nproducer and its compacted commit-token side-topic. They used to sit flat\nbeside `brokers` / `linger_ms`, where nothing said they were inert in the\ndefault at-least-once mode; grouping them is what makes that legible.",
+      "description": "Exactly-once delivery knobs for the Kafka sink (#654 M20).\n\nThese apply **only** under `delivery: exactly_once` — the transactional\nproducer and its compacted commit-token side-topic. They used to sit flat\nbeside `brokers` / `linger_ms`, where nothing said they were inert in the\ndefault at-least-once mode; grouping them is what makes that legible.",
       "type": "object",
       "properties": {
         "transactional_id_prefix": {
@@ -13017,6 +13024,13 @@
           ],
           "format": "int32",
           "default": -1
+        },
+        "migrate_unprefixed_token": {
+          "description": "With a `transactional_id_prefix`, resume from the bare-scope token an\nunprefixed sink wrote until this sink commits its own (default `false`).\nTurn it on only for the one deployment that is adding a prefix to an\nexisting pipeline; another environment's token would skip its pages.",
+          "type": [
+            "boolean",
+            "string"
+          ]
         }
       },
       "additionalProperties": true
@@ -14429,7 +14443,7 @@
           ]
         },
         "endpoint": {
-          "description": "Explicit S3-compatible endpoint (`host[:port]`, path-style) — for MinIO /\nnon-AWS stores. Overrides `region`.",
+          "description": "Explicit S3-compatible endpoint (`host[:port]`, path-style) — for MinIO /\nnon-AWS stores. Overrides `region`. An `http://` or `https://` prefix\nis kept; without one the server fetches over `https://`.",
           "type": [
             "string",
             "null"
@@ -17019,7 +17033,7 @@
                       "default": 1000
                     },
                     "visibility_extension_secs": {
-                      "description": "Visibility timeout, in seconds, the source keeps renewing on every\nmessage it has received but not yet deleted (while a page is assembled\nand while the sink writes it), so a slow page is not redelivered into\nthe same run. Renewed every third of this window. `0` disables renewal\nand leaves the queue's own visibility timeout in charge. Default 60.",
+                      "description": "Visibility timeout, in seconds, the source keeps renewing on every\nmessage it has received but not yet deleted (while a page is assembled\nand while the sink writes it), so a slow page is not redelivered into\nthe same run. Each receive requests this window and it is renewed every\nthird of it, so a queue whose own visibility timeout is shorter still\nholds the messages. `0` disables renewal and leaves the queue's own\nvisibility timeout in charge. Default 60.",
                       "type": [
                         "integer",
                         "string"
@@ -17892,7 +17906,7 @@
                       "default": 1000
                     },
                     "verify_length": {
-                      "description": "Verify each object's byte length against the length the store\nadvertises, failing the read with\n[`FaucetError::Source`](faucet_core::FaucetError::Source) on a short\n(truncated) or over-long transfer (#161). Cheap — a byte counter over\na body that is read anyway — so it defaults to `true`.\n\nSkipped (with a debug log, not a failure) when the store advertises no\nlength, or when it reports a non-empty `Content-Encoding`: the body on\nthe wire is then transcoded and its length legitimately differs from\nthe stored object's.",
+                      "description": "Verify each object's byte length against the length the store\nadvertises, failing the read with\n[`FaucetError::Source`](faucet_core::FaucetError::Source) on a short\n(truncated) or over-long transfer (#161). Cheap — a byte counter over\na body that is read anyway — so it defaults to `true`.\n\nSkipped (with a debug log, not a failure) when the store advertises no\nlength. Applied whatever the object's `Content-Encoding`: S3 serves an\nobject's bytes as stored and never transcodes them, so the advertised\nlength always matches the body on the wire.",
                       "type": [
                         "boolean",
                         "string"
@@ -17900,7 +17914,7 @@
                       "default": true
                     },
                     "verify_checksum": {
-                      "description": "Verify each object's body against the checksum the store advertises\n(#161). Stronger than the length check but costs a hash over the full\nbody, so it defaults to `false`. When the store advertises no usable\nchecksum for an object, verification is skipped for that object (a\ndebug log notes it); the length check still applies.",
+                      "description": "Verify each object's body against the checksum the store advertises\n(#161). Stronger than the length check but costs a hash over the full\nbody, so it defaults to `false`. When the store advertises no usable\nchecksum for an object, verification is skipped for that object (a\ndebug log notes it); the length check still applies. A JSON Lines\nobject is then read whole (up to `max_object_bytes`) and verified\nbefore any of its records is emitted.",
                       "type": [
                         "boolean",
                         "string"
@@ -17964,7 +17978,7 @@
                     },
                     "max_object_bytes": {
                       "default": 2147483648,
-                      "description": "Largest object, once decompressed, that a format read whole (JSON\narray, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet) may\nreach; a larger one fails with an error instead of exhausting memory.\nDefault 2 GiB.",
+                      "description": "Largest object, once decompressed, that a format read whole (JSON\narray, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet, and\nJSON Lines under `verify_checksum`) may reach; a larger one fails with\nan error instead of exhausting memory. Default 2 GiB.",
                       "format": "uint64",
                       "minimum": 0,
                       "type": [
@@ -18912,7 +18926,7 @@
                       "default": "json"
                     },
                     "attributes_key": {
-                      "description": "JSON key the message attribute map is surfaced under. Default\n`__attributes`.",
+                      "description": "JSON key the message attribute map is surfaced under. Default\n`__attributes`. Must differ from the record's own fields (`data`,\n`message_id`, `ordering_key`, `publish_time_millis`, `decode_error`).",
                       "type": "string",
                       "default": "__attributes"
                     },
@@ -19671,6 +19685,16 @@
                       "minimum": 0,
                       "default": 1048576
                     },
+                    "max_buffered_bytes": {
+                      "description": "Most request-body bytes held in memory for one window (default:\n256 MiB). Once a POST would cross it the window closes, the payloads\nalready stored are emitted, and that POST and later ones are refused\nwith `503 Service Unavailable` + `Retry-After`. An empty window always\ntakes one POST, however large (`max_body_bytes` bounds it), and closes\nonce it reaches the bound. `0` removes the bound.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 268435456
+                    },
                     "auth_token": {
                       "description": "Optional shared secret. When set, every request must carry it in the\n`Authorization` header (either the raw token or `Bearer <token>`);\nrequests without it are rejected with `401 Unauthorized`. When `None`\n(default) the endpoint is unauthenticated.",
                       "type": [
@@ -20327,7 +20351,10 @@
                       "type": "string"
                     },
                     "query": {
-                      "description": "Elasticsearch query DSL. Defaults to `{\"match_all\": {}}`."
+                      "description": "Elasticsearch query DSL. Defaults to `{\"match_all\": {}}`.",
+                      "default": {
+                        "match_all": {}
+                      }
                     },
                     "scroll_timeout": {
                       "description": "Scroll context keep-alive (e.g. `\"5m\"`), renewed by every scroll\nrequest — so it must outlast the slowest page *write* between two\nrequests, or the context expires mid-run. Defaults to `\"5m\"`.",
@@ -21481,7 +21508,7 @@
                       "default": true
                     },
                     "verify_checksum": {
-                      "description": "Verify each object's body against the checksum the store advertises\n(#161). Stronger than the length check but costs a hash over the full\nbody, so it defaults to `false`. When the store advertises no usable\nchecksum for an object, verification is skipped for that object (a\ndebug log notes it); the length check still applies.",
+                      "description": "Verify each object's body against the checksum the store advertises\n(#161). Stronger than the length check but costs a hash over the full\nbody, so it defaults to `false`. When the store advertises no usable\nchecksum for an object, verification is skipped for that object (a\ndebug log notes it); the length check still applies. A JSON Lines\nobject is then read whole (up to `max_object_bytes`) and verified\nbefore any of its records is emitted.",
                       "type": [
                         "boolean",
                         "string"
@@ -21553,7 +21580,7 @@
                     },
                     "max_object_bytes": {
                       "default": 2147483648,
-                      "description": "Largest object, once decompressed, that a format read whole (JSON\narray, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet) may\nreach; a larger one fails with an error instead of exhausting memory.\nDefault 2 GiB.",
+                      "description": "Largest object, once decompressed, that a format read whole (JSON\narray, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet, and\nJSON Lines under `verify_checksum`) may reach; a larger one fails with\nan error instead of exhausting memory. Default 2 GiB.",
                       "format": "uint64",
                       "minimum": 0,
                       "type": [
@@ -23219,7 +23246,7 @@
                       "default": 1000
                     },
                     "verify_length": {
-                      "description": "Verify each object's byte length against the length the store\nadvertises, failing the read with\n[`FaucetError::Source`](faucet_core::FaucetError::Source) on a short\n(truncated) or over-long transfer (#161). Cheap — a byte counter over\na body that is read anyway — so it defaults to `true`.\n\nSkipped (with a debug log, not a failure) when the store advertises no\nlength, or when it reports a non-empty `Content-Encoding`: the body on\nthe wire is then transcoded and its length legitimately differs from\nthe stored object's.",
+                      "description": "Verify each object's byte length against the length the store\nadvertises, failing the read with\n[`FaucetError::Source`](faucet_core::FaucetError::Source) on a short\n(truncated) or over-long transfer (#161). Cheap — a byte counter over\na body that is read anyway — so it defaults to `true`.\n\nSkipped (with a debug log, not a failure) when the store advertises no\nlength. Applied whatever the object's `Content-Encoding`: S3 serves an\nobject's bytes as stored and never transcodes them, so the advertised\nlength always matches the body on the wire.",
                       "type": [
                         "boolean",
                         "string"
@@ -23227,7 +23254,7 @@
                       "default": true
                     },
                     "verify_checksum": {
-                      "description": "Verify each object's body against the checksum the store advertises\n(#161). Stronger than the length check but costs a hash over the full\nbody, so it defaults to `false`. When the store advertises no usable\nchecksum for an object, verification is skipped for that object (a\ndebug log notes it); the length check still applies.",
+                      "description": "Verify each object's body against the checksum the store advertises\n(#161). Stronger than the length check but costs a hash over the full\nbody, so it defaults to `false`. When the store advertises no usable\nchecksum for an object, verification is skipped for that object (a\ndebug log notes it); the length check still applies. A JSON Lines\nobject is then read whole (up to `max_object_bytes`) and verified\nbefore any of its records is emitted.",
                       "type": [
                         "boolean",
                         "string"
@@ -23291,7 +23318,7 @@
                     },
                     "max_object_bytes": {
                       "default": 2147483648,
-                      "description": "Largest object, once decompressed, that a format read whole (JSON\narray, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet) may\nreach; a larger one fails with an error instead of exhausting memory.\nDefault 2 GiB.",
+                      "description": "Largest object, once decompressed, that a format read whole (JSON\narray, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet, and\nJSON Lines under `verify_checksum`) may reach; a larger one fails with\nan error instead of exhausting memory. Default 2 GiB.",
                       "format": "uint64",
                       "minimum": 0,
                       "type": [
@@ -23740,7 +23767,7 @@
                       "default": true
                     },
                     "verify_checksum": {
-                      "description": "Verify each object's body against the checksum the store advertises\n(#161). Stronger than the length check but costs a hash over the full\nbody, so it defaults to `false`. When the store advertises no usable\nchecksum for an object, verification is skipped for that object (a\ndebug log notes it); the length check still applies.",
+                      "description": "Verify each object's body against the checksum the store advertises\n(#161). Stronger than the length check but costs a hash over the full\nbody, so it defaults to `false`. When the store advertises no usable\nchecksum for an object, verification is skipped for that object (a\ndebug log notes it); the length check still applies. A JSON Lines\nobject is then read whole (up to `max_object_bytes`) and verified\nbefore any of its records is emitted.",
                       "type": [
                         "boolean",
                         "string"
@@ -23812,7 +23839,7 @@
                     },
                     "max_object_bytes": {
                       "default": 2147483648,
-                      "description": "Largest object, once decompressed, that a format read whole (JSON\narray, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet) may\nreach; a larger one fails with an error instead of exhausting memory.\nDefault 2 GiB.",
+                      "description": "Largest object, once decompressed, that a format read whole (JSON\narray, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet, and\nJSON Lines under `verify_checksum`) may reach; a larger one fails with\nan error instead of exhausting memory. Default 2 GiB.",
                       "format": "uint64",
                       "minimum": 0,
                       "type": [
@@ -25012,7 +25039,7 @@
                       ]
                     },
                     "staging": {
-                      "description": "Staged bulk load (#528): stage each page to Azure Blob / ADLS and have\nSQL Server / Synapse pull it with `COPY INTO` instead of parameterized\n`INSERT`s. Absent ⇒ the ordinary insert path. Requires the crate's\n`staging` feature at build time to execute.",
+                      "description": "Staged bulk load (#528): stage each page to Azure Blob / ADLS and have\nSQL Server / Synapse pull it with `COPY INTO` instead of parameterized\n`INSERT`s. Absent ⇒ the ordinary insert path. Requires the crate's\n`staging` feature at build time to execute. A staged page loads whole,\nalso under a DLQ, and the sink then declares no exactly-once writes.",
                       "anyOf": [
                         {
                           "$ref": "#/$defs/sink_mssql__MssqlStagingConfig"
@@ -25383,7 +25410,7 @@
                       ]
                     },
                     "batch_size": {
-                      "description": "Max entries per `SendMessageBatch` request (1–10). Default 10.\n\n**The house `batch_size = 0` \"no batching\" sentinel does not apply\nhere** — `SendMessageBatch` caps a request at\n[`MAX_ENTRIES_PER_REQUEST`](crate::MAX_ENTRIES_PER_REQUEST)\n(10) entries, so an unbatched whole-page request is not expressible.\n`0` (and anything above 10) is rejected at config load; pages larger\nthan `batch_size` are re-chunked into several requests (also\nre-chunked to stay under the 256 KiB per-request payload limit).",
+                      "description": "Max entries per `SendMessageBatch` request (1–10). Default 10.\n\n**The house `batch_size = 0` \"no batching\" sentinel does not apply\nhere** — `SendMessageBatch` caps a request at\n[`MAX_ENTRIES_PER_REQUEST`](crate::MAX_ENTRIES_PER_REQUEST)\n(10) entries, so an unbatched whole-page request is not expressible.\n`0` (and anything above 10) is rejected at config load; pages larger\nthan `batch_size` are re-chunked into several requests (also\nre-chunked to stay under the 1 MiB per-request payload limit, and\nre-split into 256 KiB requests where a queue still enforces that).",
                       "type": [
                         "integer",
                         "string"
@@ -27706,7 +27733,7 @@
                       }
                     },
                     "max_retries": {
-                      "description": "Number of retries on transient failures (default: 0).",
+                      "description": "Number of retries on transient failures (default: 0).\nA `POST` / `PATCH` is not retried after a timeout or a\nconnection dropped mid-response, since the endpoint may already hold it.",
                       "type": [
                         "integer",
                         "string"
@@ -28727,7 +28754,7 @@
                       "x-faucet-resource": "url"
                     },
                     "batch_size": {
-                      "description": "Rows per load unit. For `insert`, the per-statement multi-row chunk size;\nfor `copy`, the number of rows per staged S3 object. Defaults to\n[`DEFAULT_BATCH_SIZE`]. `0` = one unit for the whole page.",
+                      "description": "Rows per load unit. For `insert`, the per-statement multi-row chunk size;\nfor `copy`, the number of rows per staged S3 object (a commit group's\nobjects load in one `COPY` through a manifest). Defaults to\n[`DEFAULT_BATCH_SIZE`]. `0` = one unit for the whole page.",
                       "type": [
                         "integer",
                         "string"
@@ -35516,7 +35543,7 @@
           "type": "string"
         },
         "timestamp_header": {
-          "description": "Header carrying the Unix-seconds timestamp the sender signed. When set,\nthe signed content is `<timestamp>.<body>` and a timestamp more than\n`tolerance_secs` from now is rejected (replay protection).",
+          "description": "Header carrying the Unix-seconds timestamp the sender signed. When set,\nthe signed content is `<timestamp>.<body>`, a timestamp more than\n`tolerance_secs` from now is rejected, and a request repeating one\nalready stored in this window is acknowledged without being stored\nagain. Without it, identical signed requests are each stored.",
           "type": [
             "string",
             "null"

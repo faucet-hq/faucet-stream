@@ -198,3 +198,106 @@ fn token_endpoint_expiry_ratio_valid_accepted() {
     ));
     assert!(result.is_ok());
 }
+
+#[tokio::test]
+async fn failed_token_responses_are_bounded_and_masked_in_the_error() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let padding = "x".repeat(10_000);
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(format!(
+            r#"{{"error":"invalid_request","access_token":"LIVE-TOKEN","pad":"{padding}"}}"#
+        )))
+        .mount(&server)
+        .await;
+    let url = format!("{}/token", server.uri());
+
+    let err = faucet_source_rest::fetch_token_from_endpoint(
+        &url,
+        &reqwest::Method::POST,
+        &HeaderMap::new(),
+        None,
+        "$.token",
+        None,
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(!err.contains("LIVE-TOKEN"), "{err}");
+    assert!(
+        err.contains("invalid_request") && err.contains("(truncated)"),
+        "{err}"
+    );
+    assert!(err.len() < 3_000, "{} bytes", err.len());
+
+    let err = faucet_source_rest::fetch_oauth2_token(&url, "id", "secret", &[])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(!err.contains("LIVE-TOKEN"), "{err}");
+    assert!(err.len() < 3_000, "{} bytes", err.len());
+}
+
+#[tokio::test]
+async fn token_lifetimes_sent_as_strings_are_accepted() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "oauth-token",
+            "expires_in": "3600"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/auth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "endpoint-token",
+            "expires_in": "3600"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/data"))
+        .and(wiremock::matchers::header(
+            "authorization",
+            "Bearer endpoint-token",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([{"id": 1}])))
+        .mount(&server)
+        .await;
+
+    let token = faucet_source_rest::fetch_oauth2_token(
+        &format!("{}/oauth", server.uri()),
+        "id",
+        "secret",
+        &[],
+    )
+    .await
+    .expect("a string expires_in no longer fails the fetch");
+    assert_eq!(token, "oauth-token");
+
+    let stream = RestStream::new(RestStreamConfig::new(&server.uri(), "/api/data").auth(
+        Auth::TokenEndpoint {
+            encoding: Default::default(),
+            url: format!("{}/auth/token", server.uri()),
+            method: reqwest::Method::POST,
+            headers: HeaderMap::new(),
+            body: None,
+            token_path: "$.access_token".into(),
+            expiry_path: Some("$.expires_in".into()),
+            expiry_ratio: DEFAULT_TOKEN_ENDPOINT_EXPIRY_RATIO,
+            response_validator: None,
+        },
+    ))
+    .unwrap();
+    let records = faucet_core::Source::fetch_all(&stream).await.unwrap();
+    assert_eq!(records.len(), 1);
+}

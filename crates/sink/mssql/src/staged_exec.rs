@@ -29,7 +29,10 @@ impl MssqlDriver {
         let loc = staging
             .spec
             .validate(&[StagingScheme::Azure], &[StagingFormat::Csv])?;
-        let uploader = StageUploader::from_location(loc)?;
+        // Uploads are bounded by the run's deadline and cancel, not the
+        // per-statement timeout: a large page takes as long as it takes.
+        let ctx = self.calls.get().without_timeout();
+        let uploader = StageUploader::from_location(loc)?.with_call_context(ctx.clone());
         let seq = self.stage_seq.fetch_add(1, Ordering::Relaxed);
         let (staged, sql) = crate::staged::build_staged_copy_sql(
             &uploader,
@@ -42,6 +45,8 @@ impl MssqlDriver {
         )
         .await?;
 
+        let cleanup =
+            crate::staged::StagedCleanup::new(uploader, vec![staged], staging.spec.cleanup);
         let run = async {
             let mut conn = self.checkout().await?;
             self.on_conn(&mut conn, "copy", false, async |c| {
@@ -56,9 +61,9 @@ impl MssqlDriver {
             .await
         }
         .await;
-        uploader
-            .cleanup(&[staged], staging.spec.cleanup, run.is_ok())
-            .await;
+        // On its own bounded context, so a cancelled or deadlined load still
+        // removes what it staged.
+        cleanup.finish(run.is_ok()).await;
         run?;
         tracing::debug!(records = records.len(), "MSSQL staged load written");
         Ok(records.len())

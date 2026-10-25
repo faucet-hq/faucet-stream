@@ -249,6 +249,9 @@ impl Source for TransformingSource {
                     .increment(n_in as u64);
                 counter!("faucet_transform_records_out_total", metric_labels.clone())
                     .increment(batch.num_rows() as u64);
+                if let Some(a) = &self.row_accounts {
+                    a.add_transform(n_in, batch.num_rows());
+                }
                 yield crate::columnar::ColumnarPage { batch, bookmark };
             }
         })
@@ -1215,6 +1218,34 @@ mod columnar_tests {
         let rows = record_batch_to_values(&page.batch).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(page.bookmark, Some(json!("bm")));
+    }
+
+    #[tokio::test]
+    async fn columnar_path_feeds_row_accounts() {
+        let inner: Box<dyn Source> = Box::new(ColumnarMock(vec![
+            json!({"id": 1}),
+            json!({"id": 2}),
+            json!({"id": 3}),
+        ]));
+        let rows: crate::stage::PageFnBox = Arc::new(Ok);
+        let keep_first: crate::stage::PageFnBatchBox = Arc::new(|b| Ok(b.slice(0, 1)));
+        let accounts = Arc::new(crate::accounting::RowAccounts::default());
+        let wrapped = TransformingSource::new_with_batches(
+            inner,
+            vec![TransformStage::PageFn(rows)],
+            vec![Some(keep_first)],
+            Labels::for_named("t"),
+        )
+        .unwrap()
+        .with_row_accounts(Arc::clone(&accounts));
+        let ctx = HashMap::new();
+        let mut s = wrapped.stream_batches(&ctx, 0);
+        while let Some(p) = s.next().await {
+            p.unwrap();
+        }
+        let snap = accounts.snapshot();
+        assert_eq!((snap.transform_in, snap.transform_out), (3, 1));
+        assert_eq!(snap.filtered(), 2);
     }
 
     #[tokio::test]

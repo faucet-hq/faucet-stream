@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Run a test command; retry it ONLY when it failed because a container image
-# could not be pulled (#789 SUPPLY-13). A test that fails for any other reason
+# could not be pulled (#789 SUPPLY-13): every failing test must have logged a
+# pull error (scripts/pull_flake.py). A test that fails for any other reason
 # fails the job on its first run, so a flaky test cannot pass by being re-run.
 #   scripts/retry-on-image-pull.sh cargo test --workspace --all-features
 set -uo pipefail
 
-PULL_FLAKE='bytes remaining on stream|toomanyrequests|pull access denied|failed to pull|error pulling image|PullImage|manifest unknown|TLS handshake timeout|Client\.Timeout exceeded while awaiting headers'
+FLAKE_CHECK="$(dirname "$0")/pull_flake.py"
 attempts="${RETRY_ATTEMPTS:-3}"
 log="$(mktemp)"
 trap 'rm -f "$log"' EXIT
@@ -18,8 +19,8 @@ for attempt in $(seq 1 "$attempts"); do
   if [ "$status" -eq 0 ]; then
     exit 0
   fi
-  if ! grep -qE "$PULL_FLAKE" "$log"; then
-    echo "::error::'$*' failed (not an image-pull failure, so it is not retried)"
+  if ! python3 "$FLAKE_CHECK" "$log"; then
+    echo "::error::'$*' failed (not only an image-pull failure, so it is not retried)"
     exit "$status"
   fi
   if [ "$attempt" -lt "$attempts" ]; then

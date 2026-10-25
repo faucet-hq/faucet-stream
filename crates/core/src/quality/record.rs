@@ -37,16 +37,20 @@ pub fn evaluate_record_check(c: &CompiledRecordCheck, rec: &Value) -> Result<(),
             Some(_) => Err("value was not a string".into()),
             None => Err("field was missing".into()),
         },
-        CompiledRecordKind::ValueInSet { path, values } => match path.resolve(rec).ok().flatten() {
-            Some(v) if set_contains(values, v) => Ok(()),
-            Some(_) => Err("value not in allowed set".into()),
-            None => Err("field was missing".into()),
-        },
-        CompiledRecordKind::NotInSet { path, values } => match path.resolve(rec).ok().flatten() {
-            Some(v) if set_contains(values, v) => Err("value is in the forbidden set".into()),
-            // present-and-not-in-set OR missing -> pass
-            _ => Ok(()),
-        },
+        CompiledRecordKind::ValueInSet { path, index, .. } => {
+            match path.resolve(rec).ok().flatten() {
+                Some(v) if index.contains(v) => Ok(()),
+                Some(_) => Err("value not in allowed set".into()),
+                None => Err("field was missing".into()),
+            }
+        }
+        CompiledRecordKind::NotInSet { path, index, .. } => {
+            match path.resolve(rec).ok().flatten() {
+                Some(v) if index.contains(v) => Err("value is in the forbidden set".into()),
+                // present-and-not-in-set OR missing -> pass
+                _ => Ok(()),
+            }
+        }
         CompiledRecordKind::Compare { path, op, value } => {
             let resolved = path.resolve(rec).ok().flatten();
             let Some(actual) = resolved else {
@@ -150,13 +154,81 @@ fn values_equal(a: &Value, b: &Value) -> bool {
 /// equality ([`values_equal`]) rather than structural `Vec::contains`, so an
 /// int/float spelling difference (`0` vs `0.0`) does not bypass the check or
 /// cause a false quarantine (audit #321 M1).
+#[cfg(test)]
 fn set_contains(values: &[Value], v: &Value) -> bool {
     values.iter().any(|candidate| values_equal(candidate, v))
 }
 
+/// Membership index for `value_in_set` / `not_in_set`, with the same
+/// numeric-aware equality as a linear scan: strings hash exactly, numbers are
+/// bucketed by their `f64` value and confirmed exactly, and the remaining
+/// values (booleans, null, objects, arrays) are scanned.
+#[derive(Debug, Clone, Default)]
+pub struct ValueSetIndex {
+    strings: std::collections::HashSet<String>,
+    numbers: std::collections::HashMap<u64, Vec<serde_json::Number>>,
+    rest: Vec<Value>,
+}
+
+fn number_bucket(n: &serde_json::Number) -> Option<u64> {
+    let f = n.as_f64()?;
+    Some(if f == 0.0 {
+        0.0f64.to_bits()
+    } else {
+        f.to_bits()
+    })
+}
+
+impl ValueSetIndex {
+    /// Index `values`.
+    pub fn new(values: &[Value]) -> Self {
+        let mut idx = Self::default();
+        for v in values {
+            match v {
+                Value::String(s) => {
+                    idx.strings.insert(s.clone());
+                }
+                Value::Number(n) => match number_bucket(n) {
+                    Some(b) => idx.numbers.entry(b).or_default().push(n.clone()),
+                    None => idx.rest.push(v.clone()),
+                },
+                other => idx.rest.push(other.clone()),
+            }
+        }
+        idx
+    }
+
+    /// Whether `v` equals a member of the set.
+    pub fn contains(&self, v: &Value) -> bool {
+        match v {
+            Value::String(s) => self.strings.contains(s.as_str()),
+            Value::Number(n) => {
+                let in_bucket = number_bucket(n)
+                    .and_then(|b| self.numbers.get(&b))
+                    .is_some_and(|ns| {
+                        ns.iter()
+                            .any(|c| cmp_numbers(c, n) == Some(std::cmp::Ordering::Equal))
+                    });
+                in_bucket || self.rest.iter().any(|c| values_equal(c, v))
+            }
+            other => self.rest.iter().any(|c| values_equal(c, other)),
+        }
+    }
+}
+
+/// A `compare` ordering operand as an exact decimal: a JSON number, or a
+/// string holding one (how exact decimals and big integers are rendered).
+fn decimal_operand(v: &Value) -> Option<crate::replication::Decimal> {
+    match v {
+        Value::Number(n) => crate::replication::Decimal::parse(&n.to_string()),
+        Value::String(s) => crate::replication::Decimal::parse(s),
+        _ => None,
+    }
+}
+
 /// Evaluate a `compare` check. Ordering ops (`gt`/`gte`/`lt`/`lte`) compare
 /// integer operands exactly via [`cmp_numbers`] (no precision loss above
-/// 2^53); `eq`/`ne` compare numbers numerically (`1` == `1.0`) and all other
+/// 2^53), and a string holding an exact decimal compares by its exact value; `eq`/`ne` compare numbers numerically (`1` == `1.0`) and all other
 /// types by exact structural JSON equality via [`values_equal`].
 fn evaluate_compare(op: CompareOp, actual: &Value, expected: &Value) -> Result<(), String> {
     use std::cmp::Ordering;
@@ -176,10 +248,14 @@ fn evaluate_compare(op: CompareOp, actual: &Value, expected: &Value) -> Result<(
             }
         }
         CompareOp::Gt | CompareOp::Gte | CompareOp::Lt | CompareOp::Lte => {
-            let (Value::Number(a), Value::Number(b)) = (actual, expected) else {
-                return Err("value was not numeric".into());
+            let ord = match (actual, expected) {
+                (Value::Number(a), Value::Number(b)) => cmp_numbers(a, b),
+                _ => match (decimal_operand(actual), decimal_operand(expected)) {
+                    (Some(a), Some(b)) => Some(a.cmp(&b)),
+                    _ => None,
+                },
             };
-            let Some(ord) = cmp_numbers(a, b) else {
+            let Some(ord) = ord else {
                 return Err("value was not numeric".into());
             };
             let ok = match op {
@@ -216,6 +292,81 @@ mod tests {
     use crate::quality::compile::CompiledQuality;
     use crate::quality::config::{CompareOp, JsonType, OnFailure, QualitySpec, RecordCheck};
     use serde_json::json;
+
+    #[test]
+    fn ordering_compares_decimal_strings_exactly() {
+        let ok = |op, a: Value, b: Value| evaluate_compare(op, &a, &b).is_ok();
+        assert!(ok(CompareOp::Gte, json!("12.50"), json!(0)));
+        assert!(ok(CompareOp::Lt, json!("-0.01"), json!(0)));
+        assert!(!ok(CompareOp::Gt, json!("0.00"), json!(0)));
+        assert!(ok(CompareOp::Gte, json!("-0"), json!(0)));
+        assert!(ok(
+            CompareOp::Gt,
+            json!("100000000000000000000.000000001"),
+            json!("1e20")
+        ));
+        assert!(ok(
+            CompareOp::Lt,
+            json!("12345678901234567890123"),
+            json!("12345678901234567890124")
+        ));
+        assert!(ok(CompareOp::Lte, json!(2.5), json!("2.50")));
+        assert!(ok(CompareOp::Gt, json!("-1.5"), json!("-1.51")));
+        assert!(ok(CompareOp::Lt, json!(".5"), json!("1")));
+        for bad in [
+            json!("abc"),
+            json!("1.2.3"),
+            json!(""),
+            json!("-"),
+            json!("1e"),
+            json!(true),
+        ] {
+            assert_eq!(
+                evaluate_compare(CompareOp::Gt, &bad, &json!(0)),
+                Err("value was not numeric".to_string()),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_index_agrees_with_a_linear_scan() {
+        let members = vec![
+            json!("a"),
+            json!(1),
+            json!(2.5),
+            json!(0.0),
+            json!(9007199254740993u64),
+            json!(-3),
+            json!(true),
+            json!(null),
+            json!({"k": [1, 2]}),
+            json!([1, "x"]),
+        ];
+        let idx = ValueSetIndex::new(&members);
+        let probes = [
+            json!("a"),
+            json!("b"),
+            json!(1.0),
+            json!(1),
+            json!(2.5),
+            json!(-0.0),
+            json!(0),
+            json!(9007199254740993u64),
+            json!(9007199254740992u64),
+            json!(-3.0),
+            json!(true),
+            json!(false),
+            json!(null),
+            json!({"k": [1, 2]}),
+            json!({"k": [2, 1]}),
+            json!([1, "x"]),
+            json!("1"),
+        ];
+        for p in &probes {
+            assert_eq!(idx.contains(p), set_contains(&members, p), "{p}");
+        }
+    }
 
     fn one(check: RecordCheck) -> crate::quality::compile::CompiledRecordCheck {
         let spec = QualitySpec {

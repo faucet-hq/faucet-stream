@@ -1842,12 +1842,13 @@ impl Mapper<'_> {
                 );
             }
         }
-        let write: Vec<WriteMode> = if append_only {
-            vec![WriteMode::Append]
-        } else if incremental.is_some() {
-            vec![WriteMode::Upsert, WriteMode::Append]
-        } else {
-            vec![WriteMode::Overwrite, WriteMode::Upsert]
+        // Keyed modes need `primary_keys`; listing one without keys makes the
+        // stream, and so the whole template, uncomposable.
+        let write: Vec<WriteMode> = match (append_only, incremental.is_some(), keys.is_empty()) {
+            (true, _, _) | (false, true, true) => vec![WriteMode::Append],
+            (false, true, false) => vec![WriteMode::Upsert, WriteMode::Append],
+            (false, false, true) => vec![WriteMode::Overwrite],
+            (false, false, false) => vec![WriteMode::Overwrite, WriteMode::Upsert],
         };
         let summary = StreamSummary {
             name: name.clone(),
@@ -3202,6 +3203,10 @@ mod tests {
             "/req": list(json!([{"name": "account", "in": "query", "required": true}, {"name": "limit", "in": "query", "required": true}]), items(json!({"id": {}}))),
         })));
         assert!(stream(&i, "a").primary_keys.is_empty());
+        assert_eq!(
+            stream(&i, "a").write,
+            WriteChoice::One(WriteMode::Overwrite)
+        );
         assert_eq!(
             stream(&i, "b").primary_keys,
             vec!["org".to_string(), "n".to_string()]

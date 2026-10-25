@@ -11,6 +11,12 @@ use axum::response::{IntoResponse, Response};
 #[folder = "src/serve/ui/"]
 struct UiAssets;
 
+/// The console's content policy: its own scripts only, no framing, and
+/// inline `style` attributes (the views set them) but no inline scripts.
+pub(crate) const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; \
+     style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; \
+     object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+
 /// Send embedded asset bytes with the right content-type and `no-cache`
 /// (assets are tiny + embedded; correctness over caching — see spec §11).
 fn serve_asset(path: &str) -> Response {
@@ -22,6 +28,13 @@ fn serve_asset(path: &str) -> Response {
                 [
                     (header::CONTENT_TYPE, mime.to_string()),
                     (header::CACHE_CONTROL, "no-cache".to_string()),
+                    (
+                        header::CONTENT_SECURITY_POLICY,
+                        CONTENT_SECURITY_POLICY.to_string(),
+                    ),
+                    (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+                    (header::X_FRAME_OPTIONS, "DENY".to_string()),
+                    (header::REFERRER_POLICY, "no-referrer".to_string()),
                 ],
                 file.data.into_owned(),
             )
@@ -66,6 +79,20 @@ pub async fn spa_fallback(method: Method, headers: HeaderMap) -> Response {
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+
+    #[tokio::test]
+    async fn the_shell_and_assets_carry_the_content_policy_headers() {
+        for resp in [index().await, asset(Path("app.js".into())).await] {
+            assert_eq!(resp.status(), StatusCode::OK);
+            let h = resp.headers();
+            let csp = h[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+            assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+            assert!(csp.contains("script-src 'self'"), "{csp}");
+            assert_eq!(h[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+            assert_eq!(h[header::X_FRAME_OPTIONS], "DENY");
+            assert_eq!(h[header::REFERRER_POLICY], "no-referrer");
+        }
+    }
 
     #[test]
     fn wants_html_true_for_browser_accept() {

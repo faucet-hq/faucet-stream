@@ -32,6 +32,11 @@ use std::time::Duration;
 const PRIMARY_ATTEMPTS: u32 = 3;
 /// First retry delay; later ones grow ×4.
 const RETRY_BASE: Duration = Duration::from_millis(50);
+/// How long a saturated pool's acquire timeouts are taken for load rather
+/// than an outage, counted from the primary's last successful call. A
+/// database that stops answering keeps every connection checked out, so
+/// saturation alone cannot tell the two apart; silence this long can.
+pub const SATURATION_GRACE: Duration = Duration::from_secs(30);
 /// A run id no run can have — the recovery probe's read.
 const RECOVERY_PROBE_ID: &str = "__faucet_history_recovery_probe__";
 
@@ -53,6 +58,12 @@ pub struct FallbackHistory {
     degraded: AtomicBool,
     /// `"postgres"` / `"sqlite"` — for log + metric context.
     label: &'static str,
+    /// Base of [`last_ok_ms`](Self::last_ok_ms).
+    epoch: std::time::Instant,
+    /// Milliseconds after `epoch` of the primary's last successful call.
+    last_ok_ms: std::sync::atomic::AtomicU64,
+    /// See [`SATURATION_GRACE`].
+    saturation_grace: Duration,
 }
 
 impl FallbackHistory {
@@ -70,7 +81,30 @@ impl FallbackHistory {
             fallback: MemoryHistory::new(idem_retention),
             degraded: AtomicBool::new(false),
             label,
+            epoch: std::time::Instant::now(),
+            last_ok_ms: std::sync::atomic::AtomicU64::new(0),
+            saturation_grace: SATURATION_GRACE,
         }
+    }
+
+    /// Override [`SATURATION_GRACE`] (tests, and operators who know their
+    /// database's slowest legitimate call).
+    #[must_use]
+    pub fn with_saturation_grace(mut self, grace: Duration) -> Self {
+        self.saturation_grace = grace;
+        self
+    }
+
+    /// Record that the primary just answered.
+    fn note_ok(&self) {
+        let ms = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_ok_ms.fetch_max(ms, Ordering::AcqRel);
+    }
+
+    /// Whether the primary answered a call within the saturation grace.
+    fn answered_recently(&self) -> bool {
+        let last = Duration::from_millis(self.last_ok_ms.load(Ordering::Acquire));
+        self.epoch.elapsed().saturating_sub(last) <= self.saturation_grace
     }
 
     /// Start already degraded with no way back: the in-memory store is the
@@ -83,6 +117,9 @@ impl FallbackHistory {
             fallback: MemoryHistory::new(idem_retention),
             degraded: AtomicBool::new(true),
             label,
+            epoch: std::time::Instant::now(),
+            last_ok_ms: std::sync::atomic::AtomicU64::new(0),
+            saturation_grace: SATURATION_GRACE,
         }
     }
 
@@ -102,6 +139,9 @@ impl FallbackHistory {
             fallback: MemoryHistory::new(idem_retention),
             degraded: AtomicBool::new(true),
             label,
+            epoch: std::time::Instant::now(),
+            last_ok_ms: std::sync::atomic::AtomicU64::new(0),
+            saturation_grace: SATURATION_GRACE,
         }
     }
 
@@ -141,6 +181,7 @@ impl FallbackHistory {
         if p.get(RECOVERY_PROBE_ID).await.is_err() {
             return false;
         }
+        self.note_ok();
         if self.degraded.swap(false, Ordering::AcqRel) {
             tracing::warn!(
                 backend = self.label,
@@ -150,6 +191,23 @@ impl FallbackHistory {
             crate::serve::metrics::set_history_degraded(false);
         }
         true
+    }
+
+    /// Whether `err` means the primary is down. An acquire timeout while every
+    /// pooled connection is checked out, with the primary still answering
+    /// other calls within [`SATURATION_GRACE`], is saturation: the caller sees
+    /// an ordinary error and the server stays out of degraded mode. Any other
+    /// connectivity failure — and an acquire timeout once the primary has gone
+    /// quiet for longer than the grace, as it does when every connection hangs
+    /// on a database that stopped answering — trips.
+    fn should_trip(&self, err: &HistoryError) -> bool {
+        if !err.is_unreachable() {
+            return false;
+        }
+        let saturated = err.is_pool_timeout()
+            && self.primary.get().is_some_and(|p| p.pool_saturated())
+            && self.answered_recently();
+        !saturated
     }
 
     /// Record a primary-backend failure and flip to degraded (log + metric once).
@@ -179,7 +237,12 @@ macro_rules! primary {
                     tokio::time::sleep(RETRY_BASE * 4u32.pow(attempt - 1)).await;
                     attempt += 1;
                 }
-                other => break other,
+                other => {
+                    if !matches!(&other, Err(e) if e.is_unreachable()) {
+                        $self.note_ok();
+                    }
+                    break other;
+                }
             }
         }
     }};
@@ -195,7 +258,7 @@ macro_rules! via {
         if !$self.is_degraded() && $self.primary.get().is_some() {
             match primary!($self, $primary => $pcall) {
                 Ok(v) => return Ok(v),
-                Err(e) if e.is_unreachable() => $self.trip(&e),
+                Err(e) if $self.should_trip(&e) => $self.trip(&e),
                 Err(e) => return Err(e),
             }
         }
@@ -222,7 +285,7 @@ macro_rules! strict {
         }
         match primary!($self, $primary => $pcall) {
             Ok(v) => Ok(v),
-            Err(e) if e.is_unreachable() => {
+            Err(e) if $self.should_trip(&e) => {
                 $self.trip(&e);
                 Err($self.unavailable())
             }
@@ -246,7 +309,7 @@ impl RunHistory for FallbackHistory {
         if !self.is_degraded() && self.primary.get().is_some() {
             match primary!(self, p => p.claim_idempotency(key, fingerprint, run_id, window)) {
                 Ok(v) => return Ok(v),
-                Err(e) if e.is_unreachable() => self.trip(&e),
+                Err(e) if self.should_trip(&e) => self.trip(&e),
                 Err(e) => return Err(e),
             }
         }
@@ -747,10 +810,10 @@ impl RunHistory for FallbackHistory {
 
     // ── Pipeline-template registry (#444) ────────────────────────────────────
     //
-    // Forwarded like every other method: while the SQL backend is reachable
-    // templates persist; once degraded they land in the in-memory fallback, so
-    // the control plane keeps serving (a registration made while degraded is
-    // process-lifetime only — the same trade-off as a degraded run record).
+    // Strict (`strict!`): while the SQL backend is reachable templates persist;
+    // once degraded every template call fails with `Degraded` (a 503) rather
+    // than reading or writing the in-memory fallback, so a registration is
+    // never silently process-lifetime only.
     async fn template_register(
         &self,
         draft: &crate::serve::history::templates::TemplateDraft,
@@ -959,6 +1022,121 @@ mod tests {
         fn degraded(&self) -> bool {
             false
         }
+    }
+
+    /// A primary whose pool is saturated and whose calls fail with `err`.
+    struct Saturated(fn() -> HistoryError);
+
+    impl Saturated {
+        fn fail<T>(&self) -> Result<T, HistoryError> {
+            Err((self.0)())
+        }
+    }
+
+    fn pool_timeout() -> HistoryError {
+        HistoryError::PoolTimedOut("pool timed out while waiting for an open connection".into())
+    }
+
+    fn io_error() -> HistoryError {
+        HistoryError::Unreachable("connection reset by peer".into())
+    }
+
+    #[async_trait]
+    impl RunHistory for Saturated {
+        async fn claim_idempotency(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: Duration,
+        ) -> Result<Claim, HistoryError> {
+            self.fail()
+        }
+        async fn upsert(&self, _: &RunRecord) -> Result<(), HistoryError> {
+            self.fail()
+        }
+        async fn get(&self, _: &str) -> Result<Option<RunRecord>, HistoryError> {
+            self.fail()
+        }
+        async fn list(&self, _: &ListFilter) -> Result<ListPage, HistoryError> {
+            self.fail()
+        }
+        async fn delete(&self, _: &str) -> Result<DeleteOutcome, HistoryError> {
+            self.fail()
+        }
+        async fn purge_expired(&self, _: Duration) -> Result<usize, HistoryError> {
+            self.fail()
+        }
+        async fn recover_orphans(&self) -> Result<usize, HistoryError> {
+            self.fail()
+        }
+        fn degraded(&self) -> bool {
+            false
+        }
+        fn pool_saturated(&self) -> bool {
+            true
+        }
+    }
+
+    fn queued() -> RunRecord {
+        RunRecord::queued(
+            "r".into(),
+            None,
+            Default::default(),
+            None,
+            chrono::Utc::now(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_saturated_pool_is_an_error_not_a_degraded_server() {
+        let h = FallbackHistory::healthy(
+            Box::new(Saturated(pool_timeout)),
+            Duration::from_secs(60),
+            "test",
+        );
+        assert!(h.upsert(&queued()).await.is_err());
+        assert!(
+            h.claim_idempotency("k", "f", "r", Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+        assert!(
+            !h.degraded(),
+            "saturation must not move the server to degraded mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_saturated_pool_that_stopped_answering_trips() {
+        let h = FallbackHistory::healthy(
+            Box::new(Saturated(pool_timeout)),
+            Duration::from_secs(60),
+            "test",
+        )
+        .with_saturation_grace(Duration::ZERO);
+        #[allow(clippy::disallowed_methods)] // let the grace elapse
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        h.upsert(&queued())
+            .await
+            .expect("the fallback takes the record");
+        assert!(
+            h.degraded(),
+            "no answer within the grace means the database is gone, not busy"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connection_error_trips_even_when_the_pool_reads_saturated() {
+        let h = FallbackHistory::healthy(
+            Box::new(Saturated(io_error)),
+            Duration::from_secs(60),
+            "test",
+        );
+        h.upsert(&queued())
+            .await
+            .expect("the fallback takes the record");
+        assert!(h.degraded());
     }
 
     fn change(id: &str) -> crate::serve::changes::ChangeRequest {

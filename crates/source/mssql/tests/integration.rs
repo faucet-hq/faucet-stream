@@ -181,6 +181,8 @@ async fn incremental_resumes_without_duplicates() {
         initial_value: Value::from("2024-01-15"),
     };
     let source = MssqlSource::new(scfg).await.expect("source");
+    let key = faucet_core::Source::state_key(&source).expect("derived state key");
+    assert!(key.starts_with("mssql:127.0.0.1:"), "{key}");
 
     // Run 1: initial_value=2024-01-15 -> rows 2024-02-01 and 2024-03-01.
     let (rows, bookmark) = source.fetch_all_incremental().await.expect("run 1");

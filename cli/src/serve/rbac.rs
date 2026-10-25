@@ -287,6 +287,17 @@ pub struct AuthContext {
     pub tenant: Option<String>,
 }
 
+/// Whether `name` is one the server gives its own actors (`system:<task>`,
+/// `trigger:<name>`, `sync:<origin>`, `runtime`). No `--auth-config`
+/// principal may take such a name, so a requester that holds one was never a
+/// configured principal.
+pub fn is_server_identity(name: &str) -> bool {
+    name == "runtime"
+        || ["system:", "trigger:", "sync:"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+}
+
 impl AuthContext {
     /// The tenant a listing is filtered to (#709): a tenant-scoped principal
     /// always sees its own tenant — naming another is a 404, so existence
@@ -306,6 +317,12 @@ impl AuthContext {
     /// unscoped principal sees everything, a scoped one only its own.
     pub fn sees_tenant(&self, tenant: Option<&str>) -> bool {
         self.tenant.as_deref().is_none_or(|own| tenant == Some(own))
+    }
+
+    /// Whether this principal may read a stored template body, which can
+    /// hold inline credentials: unscoped admins only.
+    pub fn reads_template_bodies(&self) -> bool {
+        self.role == Role::Admin && self.tenant.is_none()
     }
 
     /// Actor for a server-internal task (the change-request expiry sweep,
@@ -384,6 +401,14 @@ impl RbacConfig {
         Ok(cfg)
     }
 
+    /// The current role and tenant of the principal named `name`, if any.
+    pub fn principal(&self, name: &str) -> Option<(Role, Option<&str>)> {
+        self.principals
+            .iter()
+            .find(|p| p.name == name)
+            .map(|p| (p.role, p.tenant.as_deref()))
+    }
+
     /// The approval policy (#703) this config carries.
     pub fn approvals(&self) -> &crate::serve::changes::ApprovalPolicy {
         &self.approvals
@@ -455,6 +480,13 @@ impl RbacConfig {
             if p.token.is_empty() {
                 return Err(CliError::Serve(format!(
                     "--auth-config: principal '{}' has an empty token",
+                    p.name
+                )));
+            }
+            if is_server_identity(&p.name) {
+                return Err(CliError::Serve(format!(
+                    "--auth-config: principal name '{}' is reserved for the server's own actors \
+                     (`runtime` and names starting with `system:`, `trigger:` or `sync:`)",
                     p.name
                 )));
             }
@@ -1006,6 +1038,17 @@ mod tests {
         assert!(RbacConfig::new(vec![]).is_err());
         assert!(RbacConfig::new(vec![spec("", "t", Role::Admin)]).is_err());
         assert!(RbacConfig::new(vec![spec("a", "", Role::Admin)]).is_err());
+        for reserved in ["runtime", "system:x", "trigger:t", "sync:origin"] {
+            let err = RbacConfig::new(vec![spec(reserved, "t", Role::Operator)])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("reserved"), "{reserved}: {err}");
+        }
+        RbacConfig::new(vec![spec("ci:deploy", "t", Role::Operator)])
+            .expect("other names with a colon stay valid");
+        assert!(is_server_identity("system:tenants"));
+        assert!(!is_server_identity("ci:deploy"));
+        assert!(!is_server_identity("runtime-ops"));
         // Duplicate name.
         assert!(
             RbacConfig::new(vec![

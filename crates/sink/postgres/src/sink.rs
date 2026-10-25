@@ -1110,6 +1110,12 @@ impl PostgresDriver {
     }
 }
 
+impl PostgresDriver {
+    fn auto_map(&self) -> bool {
+        matches!(self.config.column_mapping, PostgresColumnMapping::AutoMap)
+    }
+}
+
 #[async_trait]
 impl SqlDriver for PostgresDriver {
     type Dialect = Postgres;
@@ -1194,9 +1200,33 @@ impl SqlDriver for PostgresDriver {
         }
     }
 
-    /// A configured `scope` replaces only its window (#518).
+    /// A configured `scope` replaces only its window (#518). JSONB mode
+    /// writes whole records, so it reports no schema.
     fn capabilities(&self, derived: faucet_core::Capabilities) -> faucet_core::Capabilities {
-        derived.to_builder().scoped_overwrite(true).build()
+        let b = derived.to_builder().scoped_overwrite(true);
+        if self.auto_map() {
+            b.build()
+        } else {
+            b.schema_report(faucet_core::SchemaReport::Schemaless)
+                .build()
+        }
+    }
+
+    /// Upsert and delete need real key columns, which JSONB mode lacks.
+    fn write_modes(&self) -> &'static [faucet_core::WriteMode] {
+        if self.auto_map() {
+            &[
+                faucet_core::WriteMode::Append,
+                faucet_core::WriteMode::Upsert,
+                faucet_core::WriteMode::Delete,
+                faucet_core::WriteMode::Overwrite,
+            ]
+        } else {
+            &[
+                faucet_core::WriteMode::Append,
+                faucet_core::WriteMode::Overwrite,
+            ]
+        }
     }
 
     fn target(&self, table: &str) -> TableTarget {
@@ -1451,7 +1481,7 @@ impl SqlDriver for PostgresDriver {
     }
 
     fn evolution(&self) -> Option<&dyn SqlEvolution> {
-        Some(self)
+        self.auto_map().then_some(self as &dyn SqlEvolution)
     }
 
     /// `COPY` serves plain pages under `write_method: copy`; the exactly-once

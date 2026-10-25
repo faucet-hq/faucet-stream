@@ -239,7 +239,7 @@ async fn oracle_logminer_cdc_end_to_end() {
     assert_eq!(first["schema"], "FAUCET");
     assert_eq!(
         first["after"],
-        json!({"ID": 1, "NAME": "it's", "AMT": 12.5, "NOTE": "short note", "TS": "2024-01-02T03:04:05.500"})
+        json!({"ID": 1, "NAME": "it's", "AMT": 12.5, "NOTE": "short note", "TS": "2024-01-02T03:04:05.500000"})
     );
     let upd = records.iter().find(|r| r["op"] == "u").unwrap();
     assert_eq!(upd["before"]["NAME"], "it's");

@@ -17,7 +17,13 @@ use crate::error::{CliError, CliResult};
 
 /// Directories a hub catalog is made of. `examples` is fetched so the shipped
 /// `example-csv` template runs offline from a remote hub too.
-const HUB_DIRS: &[&str] = &["source-templates", "sink-templates", "examples"];
+const HUB_DIRS: &[&str] = &[
+    "source-templates",
+    "sink-templates",
+    "examples",
+    super::DEPLOYMENT_DIR,
+    super::catalog::TEST_SUITE_DIR,
+];
 const FETCH_CONCURRENCY: usize = 8;
 const COMPLETE_MARKER: &str = ".complete";
 /// Written into every snapshot so a later `@version` lookup knows which remote
@@ -323,7 +329,7 @@ impl GithubHub {
             let Some(entries) = self.list_dir(dir).await? else {
                 continue;
             };
-            found_any = true;
+            found_any |= matches!(*dir, "source-templates" | "sink-templates");
             let mut pending: Vec<(String, Entry)> = entries
                 .into_iter()
                 .map(|e| ((*dir).to_string(), e))
@@ -557,8 +563,24 @@ pub async fn fetch_cached(
     if !is_complete(&snapshot) {
         let tmp = key_dir.join(format!(".tmp-{sha}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        hub.download(&tmp).await?;
-        install_snapshot(&tmp, &snapshot)?;
+        let fetched = match hub.download(&tmp).await {
+            Ok(()) => install_snapshot(&tmp, &snapshot),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = fetched {
+            let _ = std::fs::remove_dir_all(&tmp);
+            let Some(dir) = cached else {
+                return Err(e);
+            };
+            tracing::warn!(hub = %loc.describe(), error = %e, "hub download failed — using the cached snapshot");
+            eprintln!(
+                "warning: fetching {} @ {} failed ({e}); using the cached snapshot at {}",
+                loc.describe(),
+                short_commit(&sha),
+                dir.display()
+            );
+            return Ok(dir);
+        }
         eprintln!(
             "fetched {} @ {} → {}",
             loc.describe(),
@@ -941,6 +963,64 @@ mod tests {
             .to_string();
         assert!(err.contains("no cached copy"), "{err}");
         assert!(err.contains("--hub <local directory>"), "{err}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(hub_env)]
+    async fn overlays_and_suites_are_fetched_and_a_failed_download_keeps_the_cache() {
+        let server = MockServer::start().await;
+        let base = server.uri();
+        for dir in [
+            crate::hub::DEPLOYMENT_DIR,
+            crate::hub::catalog::TEST_SUITE_DIR,
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/repos/acme/hub/contents/{dir}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!([entry("x.yaml", "file", dir, &base)])),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/raw/{dir}/x.yaml")))
+                .respond_with(ResponseTemplate::new(200).set_body_string("kind: deployment\n"))
+                .mount(&server)
+                .await;
+        }
+        mock_hub(&server, "0123456789abcdef").await;
+        let cache = tempfile::tempdir().unwrap();
+        // SAFETY: serialised with every test that touches the variable.
+        unsafe { std::env::remove_var(OFFLINE_ENV) };
+        let dir = fetch_cached(&loc(), cache.path(), &server.uri())
+            .await
+            .unwrap();
+        assert!(dir.join("deployments/x.yaml").is_file());
+        assert!(dir.join("test-suites/x.yaml").is_file());
+
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/hub/commits/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("fedcba9876543210"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/hub/contents/source-templates"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("rate limit exceeded"))
+            .mount(&server)
+            .await;
+        let again = fetch_cached(&loc(), cache.path(), &server.uri())
+            .await
+            .unwrap();
+        assert_eq!(again, dir, "the last good snapshot is used");
+        let key_dir = cache.path().join(loc().cache_key());
+        assert!(
+            std::fs::read_dir(&key_dir)
+                .unwrap()
+                .flatten()
+                .all(|e| !e.file_name().to_string_lossy().starts_with(".tmp-")),
+            "the partial download is removed"
+        );
     }
 
     #[tokio::test]

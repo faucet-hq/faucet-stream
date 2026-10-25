@@ -1,5 +1,6 @@
 //! Best-effort bookmark-lag gauge. When a pipeline's bookmark is a
-//! `Value::String` that parses as RFC3339, we update two gauges:
+//! `Value::String` that parses as RFC3339 — bare, or as the `value` of a
+//! cursor bookmark `{"value": …, "boundary": …}` — we update two gauges:
 //! `faucet_pipeline_last_bookmark_unix_seconds` (epoch seconds of the
 //! bookmark) and `faucet_pipeline_seconds_since_last_bookmark` (now - that).
 //! Non-string / non-RFC3339 bookmarks leave the gauges untouched.
@@ -26,6 +27,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub fn update_bookmark_lag(bookmark: &Value, labels: &Labels) -> bool {
     let s = match bookmark {
         Value::String(s) => s,
+        Value::Object(o) => match o.get("value") {
+            Some(Value::String(s)) => s,
+            _ => return false,
+        },
         _ => return false,
     };
     let ts = match parse_rfc3339_to_unix_seconds(s) {
@@ -196,5 +201,19 @@ mod tests {
             &Value::String("2026-05-23T10:00:00Z".to_string()),
             &l,
         ));
+    }
+
+    #[test]
+    fn update_reads_a_cursor_bookmark_value() {
+        let l = Labels::new("p", "r", "rid");
+        assert!(update_bookmark_lag(
+            &serde_json::json!({"value": "2026-10-01T00:00:00Z", "boundary": ["abc"]}),
+            &l,
+        ));
+        assert!(!update_bookmark_lag(
+            &serde_json::json!({"value": 17, "boundary": null}),
+            &l,
+        ));
+        assert!(!update_bookmark_lag(&serde_json::json!({"lsn": "0/1"}), &l));
     }
 }

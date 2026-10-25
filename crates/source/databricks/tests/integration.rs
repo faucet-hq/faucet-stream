@@ -545,3 +545,92 @@ async fn duplicate_result_column_names_are_refused() {
         .expect_err("duplicate names");
     assert!(err.to_string().contains("two columns named"), "{err}");
 }
+
+/// A response listing several external links continues from the last
+/// link's `next_chunk_internal_link`, so no chunk is read twice.
+#[tokio::test]
+async fn several_external_links_continue_from_the_last_one() {
+    let server = MockServer::start().await;
+    let link = |n: u32| format!("{}/presigned/chunk{n}", server.uri());
+    let next = |n: u32| format!("/api/2.0/sql/statements/s10/result/chunks/{n}");
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "statement_id": "s10",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": manifest(&[("id", "INT")]),
+            "result": { "external_links": [
+                { "chunk_index": 0, "external_link": link(0), "next_chunk_internal_link": next(1) },
+                { "chunk_index": 1, "external_link": link(1), "next_chunk_internal_link": next(2) }
+            ] }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(next(2)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "external_links": [{ "chunk_index": 2, "external_link": link(2) }]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(next(1)))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    for n in 0..3u32 {
+        Mock::given(method("GET"))
+            .and(path(format!("/presigned/chunk{n}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([[n.to_string()]])))
+            .mount(&server)
+            .await;
+    }
+    let rows = source(&server.uri(), "SELECT id FROM t")
+        .await
+        .fetch_with_context(&HashMap::new())
+        .await
+        .unwrap();
+    let ids: Vec<i64> = rows.iter().map(|r| r["id"].as_i64().unwrap()).collect();
+    assert_eq!(ids, vec![0, 1, 2]);
+}
+
+/// A presigned chunk whose body stalls is ended by the run's call deadline.
+#[tokio::test]
+async fn a_stalled_external_link_body_honours_the_call_deadline() {
+    use faucet_conformance::hung::{Reply, StallingBodyServer};
+    let addr = std::sync::Arc::new(std::sync::OnceLock::<String>::new());
+    let base = addr.clone();
+    let server = StallingBodyServer::start(move |m, target| {
+        let uri = base.get().cloned().unwrap_or_default();
+        if m == "POST" {
+            Reply::full(
+                "application/json",
+                json!({
+                    "statement_id": "s11",
+                    "status": { "state": "SUCCEEDED" },
+                    "manifest": manifest(&[("id", "INT")]),
+                    "result": { "external_links": [{ "external_link": format!("{uri}/presigned/slow") }] }
+                })
+                .to_string(),
+            )
+        } else {
+            assert!(target.starts_with("/presigned/"));
+            Reply::stall_body("application/json", "[[\"1\"],", 1 << 20)
+        }
+    })
+    .await
+    .unwrap();
+    addr.set(server.http_url()).unwrap();
+    let src = source(&server.http_url(), "SELECT id FROM t").await;
+    src.set_call_context(
+        faucet_core::CallContext::new()
+            .with_deadline(tokio::time::Instant::now() + std::time::Duration::from_millis(500)),
+    );
+    let started = std::time::Instant::now();
+    let err = src.fetch_with_context(&HashMap::new()).await.unwrap_err();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "{err}"
+    );
+}

@@ -5,6 +5,7 @@
 // back to a raw-JSON textarea so no config is ever unreachable.
 
 import { escapeHtml, mdInline } from "./utils.js";
+import { isSecretField } from "./secret-field.js";
 
 function resolveRef(schema, root) {
   if (schema && schema.$ref) {
@@ -17,7 +18,7 @@ function resolveRef(schema, root) {
 }
 
 // Build a control for `schema`; returns { el, read() }.
-function build(schema, root, value, required) {
+function build(schema, root, value, required, name) {
   schema = resolveRef(schema, root) || {};
   const desc = schema.description ? `<small class="help">${mdInline(firstSentence(schema.description))}</small>` : "";
 
@@ -31,7 +32,7 @@ function build(schema, root, value, required) {
       const inner = { ...resolveRef(real[0], root), description: schema.description };
       const innerType = jsonType(inner, value);
       if (innerType === "object" && inner.properties) return buildOptional(inner, root, value);
-      return build(inner, root, value, required);
+      return build(inner, root, value, required, name);
     }
   }
   // A unit enum with documented variants (schemars emits one `const` per branch).
@@ -52,7 +53,7 @@ function build(schema, root, value, required) {
   if (type === "array") return buildArray(schema, root, value || []);
   if (type === "boolean") return buildBool(schema, value, desc);
   if (type === "integer" || type === "number") return buildNumber(schema, value, type, desc);
-  if (type === "string") return buildString(schema, value, desc);
+  if (type === "string") return buildString(schema, value, desc, name);
   return buildRaw(value); // fallback
 }
 
@@ -66,7 +67,7 @@ function buildObject(schema, root, value) {
     row.className = "sf-field";
     const label = document.createElement("label");
     label.innerHTML = escapeHtml(key).replace(/_/g, "_<wbr>") + (reqset.has(key) ? " *" : "");
-    const ctrl = build(sub, root, value[key], reqset.has(key));
+    const ctrl = build(sub, root, value[key], reqset.has(key), key);
     row.appendChild(label);
     row.appendChild(ctrl.el);
     wrap.appendChild(row);
@@ -216,9 +217,15 @@ function buildNumber(schema, value, type, desc) {
   return withHelp(inp, desc, () => (inp.value === "" ? undefined : Number(inp.value)));
 }
 
-function buildString(schema, value, desc) {
+function buildString(schema, value, desc, name) {
   const inp = document.createElement("input");
-  inp.type = /password|secret|token|key/i.test(schema.title || "") ? "password" : "text";
+  if (isSecretField(name, schema.title)) {
+    inp.type = "password";
+    // Keeps browsers from saving or autofilling a login password here.
+    inp.autocomplete = "new-password";
+  } else {
+    inp.type = "text";
+  }
   if (value !== undefined) inp.value = value;
   else if (schema.default !== undefined) inp.value = schema.default;
   if (schema.description) inp.placeholder = plain(firstSentence(schema.description));

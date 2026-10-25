@@ -454,13 +454,18 @@ async fn consumers_endpoint_and_plan_impact_over_chained_pipelines() {
     let annotated = audit(&base, &client, "catalog.annotate").await;
     assert!(annotated.len() >= 3, "{annotated:?}");
 
-    // Plan A with a sample that drops `email`: B's sink (contact reads email)
-    // is breaking, its contract v3 is named, its owner + the dashboard listed.
+    // Plan A dropping `email`: B's sink (contact reads email) is breaking,
+    // its contract v3 is named, its owner + the dashboard listed.
+    let a_dropping = format!(
+        "version: 1\nname: a\npipeline:\n  source: {{ type: csv, config: {{ path: {} }} }}\n  transforms:\n    - type: drop\n      config: {{ fields: [email] }}\n  sink: {{ type: csv, config: {{ path: {} }} }}\n",
+        in_csv.display(),
+        a_csv.display()
+    );
     let resp = client
         .post(format!("{base}/v1/plan"))
         .bearer_auth("op-tok")
         .json(&json!({
-            "config": a,
+            "config": a_dropping,
             "sample": [{ "id": "1", "amount": "10" }],
             "impact": true
         }))

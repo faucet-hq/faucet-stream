@@ -14,6 +14,9 @@ pub struct TriggerHealth {
     pub healthy: bool,
     pub consecutive_failures: u64,
     pub last_fire: Option<String>, // RFC3339
+    /// The last poll error, redacted. Kept off the unauthenticated `/readyz`
+    /// body; the supervisor logs it (`trigger poll failed`).
+    #[serde(skip_serializing)]
     pub last_error: Option<String>,
 }
 
@@ -131,7 +134,7 @@ impl TriggersHandle {
     pub fn record_err(&self, name: &str, err: String, unhealthy_threshold: u64) {
         if let Some(mut h) = self.inner.health.get_mut(name) {
             h.consecutive_failures += 1;
-            h.last_error = Some(err);
+            h.last_error = Some(crate::secrets::registry::redact_message(&err));
             if h.consecutive_failures >= unhealthy_threshold {
                 h.healthy = false;
             }
@@ -158,6 +161,21 @@ impl TriggersHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_public_snapshot_carries_no_error_text() {
+        let h = TriggerHealth {
+            name: "t".into(),
+            kind: "webhook".into(),
+            healthy: false,
+            consecutive_failures: 3,
+            last_fire: None,
+            last_error: Some("listing s3://k:secret@bucket failed".into()),
+        };
+        let v = serde_json::to_value(&h).unwrap();
+        assert!(v.get("last_error").is_none(), "{v}");
+        assert_eq!(v["consecutive_failures"], 3);
+    }
     use crate::serve::triggers::spec::PipelineRef;
     use crate::serve::triggers::spec::{RunTemplate, TriggerKind, TriggerSpec};
 

@@ -128,6 +128,19 @@ fn schema_has(schema: Option<&Value>, prop: &str) -> bool {
         .is_some_and(|p| p.contains_key(prop))
 }
 
+/// Whether some config of this source reads only what changed since its last
+/// run — the kind-level view of [`registry::source_resumes_from_bookmark`].
+fn source_supports_incremental(kind: &str, schema: Option<&Value>) -> bool {
+    schema_has(schema, "replication_method")
+        || schema_has(schema, "replication")
+        || (kind == "file" && schema_has(schema, "incremental"))
+        || matches!(
+            kind,
+            "iceberg" | "dynamodb" | "kafka" | "kinesis" | "singer"
+        )
+        || kind.ends_with("-cdc")
+}
+
 fn wire<T: Serialize>(v: T) -> String {
     serde_json::to_value(v)
         .ok()
@@ -146,7 +159,7 @@ pub fn capabilities(kind: &str, is_source: bool, schema: Option<&Value>) -> Capa
             exactly_once: caps.exactly_once(),
             compression,
             discover: caps.discover(),
-            incremental: schema_has(schema, "replication_method"),
+            incremental: source_supports_incremental(kind, schema),
             reports_lag: caps.reports_lag(),
             ..Capabilities::default()
         };
@@ -431,6 +444,36 @@ mod tests {
         assert!(plain.discover && !plain.exactly_once && !plain.compression);
         assert_eq!(plain.delivery, "non_deterministic");
         assert!(plain.write_modes.is_empty());
+    }
+
+    #[test]
+    fn incremental_follows_every_bookmark_mechanism() {
+        let schema = |prop: &str| json!({"properties": {prop: {}}});
+        for (kind, prop) in [
+            ("postgres", "replication"),
+            ("mysql", "replication"),
+            ("rest", "replication_method"),
+            ("file", "incremental"),
+        ] {
+            assert!(
+                capabilities(kind, true, Some(&schema(prop))).incremental,
+                "{kind}"
+            );
+        }
+        for kind in ["postgres-cdc", "kafka", "iceberg", "dynamodb"] {
+            assert!(capabilities(kind, true, None).incremental, "{kind}");
+        }
+        assert!(!capabilities("csv", true, Some(&schema("path"))).incremental);
+        assert!(!capabilities("s3", true, Some(&schema("incremental"))).incremental);
+        let export = build_export(&RegistryIndex::embedded());
+        let pg = export
+            .connectors
+            .iter()
+            .find(|c| c.id == "source-postgres")
+            .expect("postgres source");
+        if pg.compiled {
+            assert!(pg.capabilities.incremental);
+        }
     }
 
     #[test]

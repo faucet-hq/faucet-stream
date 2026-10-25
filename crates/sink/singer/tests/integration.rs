@@ -444,6 +444,40 @@ async fn interrupted_write_is_reported_and_the_target_restarted() {
 }
 
 #[tokio::test]
+async fn a_flush_after_an_interrupted_write_does_not_confirm_the_half_page() {
+    let fx = Fixture::new();
+    let sink = SingerSink::new(fx.config(json!({"mode": "echo", "delay_start": 5}))).unwrap();
+    let pad = "z".repeat(1024);
+    let records: Vec<Value> = (0..2000).map(|i| json!({"id": i, "pad": pad})).collect();
+    let cut = tokio::time::timeout(Duration::from_millis(300), sink.write_batch(&records)).await;
+    assert!(cut.is_err(), "the write is blocked on the pipe");
+    let err = sink.flush().await.unwrap_err().to_string();
+    assert!(err.contains("interrupted"), "{err}");
+    assert!(
+        fx.events("state").is_empty(),
+        "no flush marker was confirmed"
+    );
+}
+
+#[tokio::test]
+async fn env_values_handed_to_the_target_are_redacted() {
+    let fx = Fixture::new();
+    let secret = "env-only-secret-value";
+    let mut cfg = fx.config(json!({"mode": "crash", "crash_after": 1, "secret": "abcd"}));
+    cfg.env.insert("FAKE_TARGET_SECRET".into(), secret.into());
+    let sink = SingerSink::new(cfg).unwrap();
+    let pad = "p".repeat(4096);
+    let big: Vec<Value> = (0..500).map(|i| json!({"id": i, "pad": pad})).collect();
+    let err = match sink.write_batch(&big).await {
+        Err(e) => e,
+        Ok(_) => sink.flush().await.unwrap_err(),
+    }
+    .to_string();
+    assert!(!err.contains(secret), "env values must be redacted: {err}");
+    assert!(err.contains("env ***"), "{err}");
+}
+
+#[tokio::test]
 async fn failed_flush_poisons_the_sink() {
     let fx = Fixture::new();
     let mut cfg = fx.config(json!({"mode": "silent"}));

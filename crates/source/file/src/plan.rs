@@ -282,21 +282,58 @@ pub fn list_local(path: &str, recursive: bool) -> Result<Vec<Candidate>, FaucetE
             ctime_ns: ctime_ns(&meta),
         }]);
     }
-    walk(root, recursive, &mut out)?;
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(std::fs::canonicalize(root).map_err(|e| io_err(root, e))?);
+    // Real directories are walked first and symlinked ones only afterwards,
+    // in sorted order, so a directory reachable both directly and through a
+    // link is always listed under its real path: the bookmark and state key
+    // on the path, and a listing that switched alias between runs would
+    // re-read or skip files.
+    let mut links = std::collections::VecDeque::new();
+    walk(root, recursive, &mut seen, &mut links, &mut out)?;
+    while let Some(link) = links.pop_front() {
+        let canonical = std::fs::canonicalize(&link).map_err(|e| io_err(&link, e))?;
+        if seen.insert(canonical) {
+            walk(&link, recursive, &mut seen, &mut links, &mut out)?;
+        }
+    }
     Ok(out)
 }
 
-fn walk(dir: &Path, recursive: bool, out: &mut Vec<Candidate>) -> Result<(), FaucetError> {
+/// List `dir` in name order, descending into each real subdirectory and
+/// queueing symlinked subdirectories in `links` for the caller to walk once
+/// every real directory has been seen. A directory already listed (an
+/// ancestor, or a sibling under its real name) is not listed again.
+fn walk(
+    dir: &Path,
+    recursive: bool,
+    seen: &mut std::collections::HashSet<std::path::PathBuf>,
+    links: &mut std::collections::VecDeque<std::path::PathBuf>,
+    out: &mut Vec<Candidate>,
+) -> Result<(), FaucetError> {
+    let mut entries = Vec::new();
     for entry in std::fs::read_dir(dir).map_err(|e| io_err(dir, e))? {
         let entry = entry.map_err(|e| io_err(dir, e))?;
-        let p = entry.path();
+        let is_link = entry
+            .file_type()
+            .map_err(|e| io_err(&entry.path(), e))?
+            .is_symlink();
+        entries.push((entry.path(), is_link));
+    }
+    entries.sort();
+    for (p, is_link) in entries {
         if unfinished_output(&p) {
             continue;
         }
         let meta = std::fs::metadata(&p).map_err(|e| io_err(&p, e))?;
         if meta.is_dir() {
-            if recursive {
-                walk(&p, recursive, out)?;
+            if !recursive {
+                continue;
+            }
+            if is_link {
+                links.push_back(p);
+            } else if seen.insert(std::fs::canonicalize(&p).map_err(|e| io_err(&p, e))?) {
+                walk(&p, recursive, seen, links, out)?;
             }
         } else if meta.is_file() {
             out.push(Candidate {
@@ -312,6 +349,26 @@ fn walk(dir: &Path, recursive: bool, out: &mut Vec<Candidate>) -> Result<(), Fau
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_reachable_through_a_link_is_listed_under_its_real_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::create_dir_all(d.join("b/real")).unwrap();
+        std::fs::write(d.join("b/real/x.jsonl"), b"{}\n").unwrap();
+        // `a/alias` sorts, and is walked, before `b/real`.
+        std::fs::create_dir_all(d.join("a")).unwrap();
+        std::os::unix::fs::symlink(d.join("b/real"), d.join("a/alias")).unwrap();
+        std::os::unix::fs::symlink(d.join("b"), d.join("0link")).unwrap();
+        let listed: Vec<String> = list_local(d.to_str().unwrap(), true)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.path)
+            .collect();
+        let real = d.join("b/real/x.jsonl").to_string_lossy().into_owned();
+        assert_eq!(listed, vec![real]);
+    }
 
     fn c(path: &str, m: i64) -> Candidate {
         Candidate {

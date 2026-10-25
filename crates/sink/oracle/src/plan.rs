@@ -222,7 +222,13 @@ pub(crate) fn value_to_text(v: &Value, kind: BindKind) -> Result<Option<String>,
             iso_to_oracle_interval(s, false).unwrap_or_else(|| s.clone())
         }
         (BindKind::Boolean, Value::Bool(b)) => b.to_string(),
-        (BindKind::Json, Value::String(s)) if serde_json::from_str::<Value>(s).is_ok() => s.clone(),
+        // Only a JSON document carried as text passes through; any other
+        // string stays a JSON string, whatever it looks like.
+        (BindKind::Json, Value::String(s))
+            if serde_json::from_str::<Value>(s).is_ok_and(|v| v.is_object() || v.is_array()) =>
+        {
+            s.clone()
+        }
         (BindKind::Json, other) => other.to_string(),
         (_, Value::String(s)) => s.clone(),
         (_, other) => other.to_string(),
@@ -1075,6 +1081,10 @@ mod tests {
         assert_eq!(t(json!(true), Boolean), Ok(Some("true".into())));
         assert_eq!(t(json!("{\"a\":1}"), Json), Ok(Some("{\"a\":1}".into())));
         assert_eq!(t(json!("plain"), Json), Ok(Some("\"plain\"".into())));
+        assert_eq!(t(json!("42"), Json), Ok(Some("\"42\"".into())));
+        assert_eq!(t(json!("true"), Json), Ok(Some("\"true\"".into())));
+        assert_eq!(t(json!("null"), Json), Ok(Some("\"null\"".into())));
+        assert_eq!(t(json!("[1]"), Json), Ok(Some("[1]".into())));
         assert_eq!(t(json!({"a": [1]}), Json), Ok(Some("{\"a\":[1]}".into())));
         assert_eq!(t(json!("s"), Text), Ok(Some("s".into())));
         assert_eq!(t(json!(3), Clob), Ok(Some("3".into())));

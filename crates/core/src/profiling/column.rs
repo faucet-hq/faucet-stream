@@ -214,13 +214,19 @@ impl ColumnAcc {
             Value::Object(_) => self.types.object += 1,
             Value::Array(_) => self.types.array += 1,
         }
-        let text = value_text(v);
         // Distinctness is typed — `1` and `"1"` are two values — while the
         // frequency sketch keys on the display text.
-        self.distinct
-            .insert_hash(hash64(&(type_tag(v), text.as_ref())));
+        let distinct_hash = match v {
+            Value::Object(_) | Value::Array(_) => {
+                let mut h = std::hash::DefaultHasher::new();
+                hash_canonical(v, &mut h);
+                std::hash::Hasher::finish(&h)
+            }
+            _ => hash64(&(type_tag(v), value_text(v).as_ref())),
+        };
+        self.distinct.insert_hash(distinct_hash);
         if let Some(top) = &mut self.top {
-            top.insert(&truncate_text(&text));
+            top.insert(&truncate_text(&value_text(v)));
             // The estimate only grows, so a column clearly past the cap (a
             // margin over the sketch's error) ends the run past it too and
             // will report no top values.
@@ -295,6 +301,36 @@ fn value_text(v: &Value) -> std::borrow::Cow<'_, str> {
     }
 }
 
+#[cfg(feature = "policy")]
+fn classify(
+    classifier: Option<&crate::policy::CompiledPolicy>,
+    name: &str,
+    v: &Value,
+    acc: &mut ColumnAcc,
+) {
+    if let Some(policy) = classifier
+        && acc.top.is_some()
+        && is_classified(policy, name, v)
+    {
+        acc.top = None;
+    }
+}
+
+#[cfg(feature = "policy")]
+fn is_classified(policy: &crate::policy::CompiledPolicy, path: &str, v: &Value) -> bool {
+    if !policy.labels_for_name(path).is_empty() {
+        return true;
+    }
+    match v {
+        Value::Null => false,
+        Value::Object(map) => map
+            .iter()
+            .any(|(k, child)| is_classified(policy, &format!("{path}.{k}"), child)),
+        Value::Array(items) => items.iter().any(|item| is_classified(policy, path, item)),
+        scalar => !policy.labels_for_scalar(scalar).is_empty(),
+    }
+}
+
 fn type_tag(v: &Value) -> u8 {
     match v {
         Value::Null => 0,
@@ -306,13 +342,44 @@ fn type_tag(v: &Value) -> u8 {
     }
 }
 
-fn truncate_text(s: &str) -> String {
-    if s.chars().count() <= MAX_VALUE_TEXT {
-        return s.to_string();
+/// Hash a value so that equal values hash equally whatever their objects' key
+/// order, without rendering it.
+fn hash_canonical<H: std::hash::Hasher>(v: &Value, h: &mut H) {
+    use std::hash::Hash;
+    type_tag(v).hash(h);
+    match v {
+        Value::Null => {}
+        Value::Bool(b) => b.hash(h),
+        Value::Number(n) => n.to_string().hash(h),
+        Value::String(s) => s.hash(h),
+        Value::Array(items) => {
+            items.len().hash(h);
+            for item in items {
+                hash_canonical(item, h);
+            }
+        }
+        Value::Object(map) => {
+            map.len().hash(h);
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            for (k, val) in entries {
+                k.hash(h);
+                hash_canonical(val, h);
+            }
+        }
     }
-    let mut out: String = s.chars().take(MAX_VALUE_TEXT).collect();
-    out.push('…');
-    out
+}
+
+fn truncate_text(s: &str) -> std::borrow::Cow<'_, str> {
+    match s.char_indices().nth(MAX_VALUE_TEXT) {
+        None => std::borrow::Cow::Borrowed(s),
+        Some((cut, _)) => {
+            let mut out = String::with_capacity(cut + '…'.len_utf8());
+            out.push_str(&s[..cut]);
+            out.push('…');
+            std::borrow::Cow::Owned(out)
+        }
+    }
 }
 
 /// The run-level accumulator: hand it every page the sink wrote, then
@@ -328,6 +395,8 @@ pub struct Profiler {
     /// Every rejected name, as a bounded sketch: records keyed by data (an id
     /// or a date per key) would otherwise grow the exact set without limit.
     skipped_sketch: HyperLogLog,
+    #[cfg(feature = "policy")]
+    classifier: Option<std::sync::Arc<crate::policy::CompiledPolicy>>,
 }
 
 /// How many rejected column names are remembered exactly before the count
@@ -342,7 +411,21 @@ impl Profiler {
             columns: HashMap::new(),
             skipped: std::collections::HashSet::new(),
             skipped_sketch: HyperLogLog::new(),
+            #[cfg(feature = "policy")]
+            classifier: None,
         }
+    }
+
+    /// Publish no top values for a column a data-flow policy classifies, by
+    /// its name, a nested field's name, or a value detector; its counts,
+    /// nulls and numeric summary are still profiled.
+    #[cfg(feature = "policy")]
+    pub fn withhold_classified_values(
+        mut self,
+        policy: std::sync::Arc<crate::policy::CompiledPolicy>,
+    ) -> Self {
+        self.classifier = Some(policy);
+        self
     }
 
     pub fn spec(&self) -> &ProfilingSpec {
@@ -367,6 +450,8 @@ impl Profiler {
                     continue;
                 }
                 if let Some(acc) = self.columns.get_mut(name) {
+                    #[cfg(feature = "policy")]
+                    classify(self.classifier.as_deref(), name, v, acc);
                     acc.observe(v);
                     continue;
                 }
@@ -379,6 +464,8 @@ impl Profiler {
                 }
                 let mut acc =
                     ColumnAcc::new(self.spec.top_values, self.spec.categorical_max_distinct);
+                #[cfg(feature = "policy")]
+                classify(self.classifier.as_deref(), name, v, &mut acc);
                 acc.observe(v);
                 self.columns.insert(name.clone(), acc);
             }
@@ -419,6 +506,62 @@ mod tests {
         b.insert("b".into(), json!(1));
         assert_eq!(value_text(&Value::Object(a)), r#"{"a":2,"b":1}"#);
         assert_eq!(value_text(&Value::Object(b)), r#"{"a":2,"b":1}"#);
+    }
+
+    #[test]
+    fn truncate_text_borrows_short_text_and_cuts_long_text() {
+        assert!(matches!(
+            truncate_text("short"),
+            std::borrow::Cow::Borrowed("short")
+        ));
+        let exact = "é".repeat(MAX_VALUE_TEXT);
+        assert!(matches!(
+            truncate_text(&exact),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let long = "é".repeat(MAX_VALUE_TEXT + 5);
+        let cut = truncate_text(&long);
+        assert_eq!(cut.chars().count(), MAX_VALUE_TEXT + 1);
+        assert!(cut.ends_with('…'));
+    }
+
+    #[test]
+    fn nested_values_are_distinct_by_content_not_key_order() {
+        let mut first = serde_json::Map::new();
+        first.insert("b".into(), json!([1, {"y": 2, "x": 1}]));
+        first.insert("a".into(), json!("s"));
+        let rp = profile(&[
+            json!({"n": Value::Object(first)}),
+            json!({"n": {"a": "s", "b": [1, {"x": 1, "y": 2}]}}),
+            json!({"n": {"a": "s", "b": [{"x": 1, "y": 2}, 1]}}),
+            json!({"n": [1, "1"]}),
+            json!({"n": ["1", 1]}),
+        ]);
+        assert_eq!(rp.columns["n"].distinct, 4);
+    }
+
+    #[cfg(feature = "policy")]
+    #[test]
+    fn classified_columns_publish_no_top_values() {
+        let policy: crate::policy::PolicySpec = serde_json::from_value(json!({
+            "classifications": [
+                {"label": "pii", "fields": ["ssn"]},
+                {"label": "contact", "value_detector": "email"}
+            ]
+        }))
+        .unwrap();
+        let policy = std::sync::Arc::new(crate::policy::CompiledPolicy::compile(&policy).unwrap());
+        let mut p = Profiler::new(ProfilingSpec::default()).withhold_classified_values(policy);
+        p.observe_page(&[
+            json!({"ssn": "1", "who": "x", "user": {"ssn": "2"}, "plan": "a"}),
+            json!({"ssn": "1", "who": "a@b.co", "user": {"ssn": "2"}, "plan": "a"}),
+        ]);
+        let rp = p.finish();
+        for col in ["ssn", "who", "user"] {
+            assert!(rp.columns[col].top_values.is_none(), "{col}");
+            assert_eq!(rp.columns[col].present, 2, "{col}");
+        }
+        assert!(rp.columns["plan"].top_values.is_some());
     }
 
     fn profile(records: &[Value]) -> RunProfile {

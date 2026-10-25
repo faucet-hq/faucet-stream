@@ -216,6 +216,8 @@ async fn messages_survive_a_downstream_failure_after_the_page_is_yielded() {
     cfg.wait_time_seconds = 1;
     cfg.idle_timeout_secs = Some(5);
     cfg.batch_size = 2;
+    // A held lease would hide the messages from the count; this checks deletion only.
+    cfg.visibility_extension_secs = 0;
 
     let source = SqsSource::new(cfg).await.expect("source");
     {
@@ -313,6 +315,31 @@ async fn held_messages_are_not_redelivered_while_a_page_is_assembled() {
     assert!(
         drain(&source).await.len() > 2,
         "without renewal the held messages come back (proves the test can fail)"
+    );
+}
+
+/// A queue whose visibility timeout (2 s) is shorter than the first renewal
+/// (10 s for a 30 s window) still holds received messages: each receive asks
+/// for the renewed window.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_short_queue_timeout_does_not_redeliver_before_the_first_renewal() {
+    let (_container, endpoint) = start_localstack().await;
+    let client = raw_client(&endpoint).await;
+    let queue = create_queue_with_visibility(&client, "lease-short", "2").await;
+    seed(&client, &queue, 2).await;
+    let mut cfg = SqsSourceConfig::new(&queue);
+    cfg.region = Some("us-east-1".into());
+    cfg.endpoint_url = Some(endpoint.clone());
+    cfg.credentials = test_credentials();
+    cfg.wait_time_seconds = 1;
+    cfg.idle_timeout_secs = Some(6);
+    cfg.batch_size = 4;
+    cfg.visibility_extension_secs = 30;
+    let source = SqsSource::new(cfg).await.expect("source");
+    assert_eq!(
+        drain(&source).await.len(),
+        2,
+        "no redelivery before renewal"
     );
 }
 

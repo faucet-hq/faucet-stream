@@ -5,3 +5,5 @@ crates/core/src/profiling/drift.rs: c.distinct as f64 -- a distinct-value count 
 crates/source/duckdb/src/convert.rs: f32::from(v) -- an Arrow Float16 widened to f32, a binary float; the decimal arms are the next match arms
 cli/src/sql_bind.rs: s.parse::<f64>() -- binds a decimal literal of at most 15 significant digits (is_plain_decimal), every one of which a double holds exactly; longer literals stay text
 crates/conformance/src/tds.rs: (*f as f32).to_le_bytes() -- the test TDS server encodes a REAL cell (a binary float) on the wire; the DECIMAL arm next to it sends exact digits
+crates/core/src/file_format/json.rs: match parsed.as_f64() { -- checks whether a parsed literal survives as a double; an unfaithful one stays text
+crates/core/src/profiling/column.rs: if let Some(f) = n.as_f64() -- feeds numeric profile statistics (mean, min, max), not a written value

@@ -160,7 +160,15 @@ impl RabbitMqDriver {
                 })
                 .await;
             match done {
-                Ok(Ok(published)) => published?,
+                Ok(Ok(Ok(()))) => {}
+                // A channel error: earlier groups keep their confirmed
+                // outcomes, the rest fail, and the next write reconnects.
+                Ok(Ok(Err(e))) => {
+                    *self.state.lock().await = None;
+                    let undecided = prepared[n * chunk..].iter().map(|(i, _)| *i);
+                    fail_cut(&mut outcomes, undecided, &e);
+                    return Ok(outcomes);
+                }
                 Ok(Err(_)) => {
                     let unconfirmed = prepared[n * chunk..].iter().map(|(i, _)| *i);
                     fail_unconfirmed(&mut outcomes, unconfirmed, limit);

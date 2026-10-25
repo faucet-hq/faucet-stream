@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use arrow::error::ArrowError;
 use faucet_core::FaucetError;
 use serde_json::Value;
 
@@ -39,14 +38,16 @@ pub fn infer_arrow_schema(records: &[Value], sample_size: usize) -> Result<Schem
     }
 
     let take = sample_size.min(records.len());
-    let iter = records
+    let sample: Vec<Value> = records
         .iter()
         .take(take)
         .filter(|v| v.is_object())
-        .map(Ok::<&Value, ArrowError>);
+        .cloned()
+        .collect();
 
-    let raw = arrow_json::reader::infer_json_schema_from_iterator(iter)
+    let raw = faucet_core::columnar::infer_arrow_schema(&sample)
         .map_err(|e| FaucetError::Sink(format!("delta: schema inference failed: {e}")))?;
+    let raw = Arc::unwrap_or_clone(raw);
 
     if raw.fields().is_empty() {
         return Err(FaucetError::Sink(
@@ -89,6 +90,8 @@ fn make_nullable(field: &Field) -> Field {
         // Null in every sampled record: a nullable string column (no format
         // can store a Null-typed one).
         DataType::Null => DataType::Utf8,
+        // Delta has no unsigned types; integers above i64::MAX keep every digit.
+        DataType::UInt64 => DataType::Decimal128(20, 0),
         other => other.clone(),
     };
     Field::new(field.name(), data_type, true).with_metadata(field.metadata().clone())
@@ -193,6 +196,37 @@ mod tests {
         );
         assert!(delta.fields().iter().all(|f| f.is_nullable()));
         assert!(infer_delta_schema(&[], 10).is_err());
+    }
+
+    #[test]
+    fn integers_above_i64_infer_an_exact_decimal() {
+        let records = vec![json!({"id": 18446744073709551615u64}), json!({"id": 7})];
+        let schema = infer_arrow_schema(&records, 10).unwrap();
+        assert_eq!(
+            schema.field_with_name("id").unwrap().data_type(),
+            &DataType::Decimal128(20, 0)
+        );
+        let delta = infer_delta_schema(&records, 10).unwrap();
+        let mut decoder = deltalake::arrow::json::ReaderBuilder::new(delta)
+            .build_decoder()
+            .unwrap();
+        decoder.serialize(&records).unwrap();
+        let batch = decoder.flush().unwrap().unwrap();
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<deltalake::arrow::array::Decimal128Array>()
+            .unwrap();
+        assert_eq!(ids.value(0), 18_446_744_073_709_551_615_i128);
+        assert_eq!(ids.value(1), 7);
+    }
+
+    #[test]
+    fn integers_above_i64_mixed_with_negatives_are_refused() {
+        let records = vec![json!({"id": 18446744073709551615u64}), json!({"id": -1})];
+        let err = infer_arrow_schema(&records, 10).unwrap_err();
+        assert!(matches!(err, FaucetError::Sink(_)));
+        assert!(err.to_string().contains("i64::MAX"), "{err}");
     }
 
     #[test]

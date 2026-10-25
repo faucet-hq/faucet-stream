@@ -49,7 +49,8 @@ pub struct SqsSinkConfig {
     /// (10) entries, so an unbatched whole-page request is not expressible.
     /// `0` (and anything above 10) is rejected at config load; pages larger
     /// than `batch_size` are re-chunked into several requests (also
-    /// re-chunked to stay under the 256 KiB per-request payload limit).
+    /// re-chunked to stay under the 1 MiB per-request payload limit, and
+    /// re-split into 256 KiB requests where a queue still enforces that).
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
 

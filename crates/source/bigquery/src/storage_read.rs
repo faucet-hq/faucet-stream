@@ -49,13 +49,18 @@ pub fn resolve_table(project_id: &str, read_table: Option<&str>) -> Result<Strin
                 .into(),
         )
     })?;
-    match t.split('.').collect::<Vec<_>>().as_slice() {
-        [dataset, table] => Ok(format!(
+    let mut parts = t.rsplitn(3, '.');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(table), Some(dataset), None) => Ok(format!(
             "projects/{project_id}/datasets/{dataset}/tables/{table}"
         )),
-        [project, dataset, table] => Ok(format!(
-            "projects/{project}/datasets/{dataset}/tables/{table}"
-        )),
+        (Some(table), Some(dataset), Some(project))
+            if !project.contains('.') || project.contains(':') =>
+        {
+            Ok(format!(
+                "projects/{project}/datasets/{dataset}/tables/{table}"
+            ))
+        }
         _ => Err(FaucetError::Config(format!(
             "BigQuery read_table '{t}' must be 'dataset.table' or 'project.dataset.table'"
         ))),
@@ -568,5 +573,14 @@ mod tests {
         assert!(resolve_table("p", None).is_err());
         assert!(resolve_table("p", Some("just_a_name")).is_err());
         assert!(resolve_table("p", Some("a.b.c.d")).is_err());
+        assert!(resolve_table("p", Some("example.com.ds.t")).is_err());
+    }
+
+    #[test]
+    fn resolve_table_accepts_a_domain_scoped_project() {
+        assert_eq!(
+            resolve_table("p", Some("example.com:proj.ds.events")).unwrap(),
+            "projects/example.com:proj/datasets/ds/tables/events"
+        );
     }
 }

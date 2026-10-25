@@ -12,7 +12,11 @@ use tokio::sync::Mutex;
 #[derive(Debug, Clone, Deserialize)]
 pub struct RegistrySchema {
     pub schema: String,
-    #[serde(default = "default_schema_type")]
+    #[serde(
+        default = "default_schema_type",
+        rename = "schemaType",
+        alias = "schema_type"
+    )]
     pub schema_type: String,
     #[serde(default)]
     pub references: Vec<SchemaReference>,
@@ -27,6 +31,25 @@ pub struct SchemaReference {
 
 fn default_schema_type() -> String {
     "AVRO".into()
+}
+
+/// The most references followed from one schema, transitively.
+const MAX_REFERENCES: usize = 256;
+
+impl RegistrySchema {
+    /// Refuse a schema registered as another type than the codec reads
+    /// (`AVRO`, `PROTOBUF`, `JSON`).
+    pub fn expect_type(&self, want: &str) -> Result<(), FaucetError> {
+        if self.schema_type.eq_ignore_ascii_case(want) {
+            Ok(())
+        } else {
+            Err(FaucetError::Source(format!(
+                "schema registry: the writer schema is registered as {}, but the configured \
+                 format reads {want}",
+                self.schema_type
+            )))
+        }
+    }
 }
 
 /// HTTP client that fetches and caches Schema Registry entries.
@@ -50,7 +73,15 @@ pub struct SchemaRegistryClient {
     /// the run's context here, so a registry request ends at the run's
     /// deadline and is metered (`schema`, `register`).
     calls: Arc<faucet_core::CallSlot>,
+    /// Schemas fetched by subject and version, for references.
+    versions: Arc<Mutex<LruCache<(String, i32), RegistrySchema>>>,
+    /// The built codec / descriptor pool / validator per codec and schema
+    /// id. A registered schema id never changes, so a hit skips fetching the
+    /// schema and resolving its references again.
+    compiled: Arc<std::sync::Mutex<CompiledCache>>,
 }
+
+type CompiledCache = LruCache<(&'static str, u32), Arc<dyn std::any::Any + Send + Sync>>;
 
 impl SchemaRegistryClient {
     pub fn new(config: &SchemaRegistryConfig) -> Result<Self, FaucetError> {
@@ -67,6 +98,8 @@ impl SchemaRegistryClient {
             cache: Arc::new(Mutex::new(LruCache::new(capacity))),
             register_cache: Arc::new(Mutex::new(LruCache::new(capacity))),
             parsed: Arc::new(std::sync::Mutex::new(LruCache::new(capacity))),
+            versions: Arc::new(Mutex::new(LruCache::new(capacity))),
+            compiled: Arc::new(std::sync::Mutex::new(LruCache::new(capacity))),
             calls: Arc::new(faucet_core::CallSlot::new(
                 faucet_core::CallContext::new().without_timeout(),
             )),
@@ -110,6 +143,34 @@ impl SchemaRegistryClient {
         Ok(built)
     }
 
+    /// The value a codec of `kind` built for `schema_id` and stored with
+    /// [`remember_compiled`](Self::remember_compiled), if still cached.
+    pub fn compiled_for<T>(&self, kind: &'static str, schema_id: u32) -> Option<Arc<T>>
+    where
+        T: Send + Sync + 'static,
+    {
+        let hit = self
+            .compiled
+            .lock()
+            .ok()
+            .and_then(|mut c| c.get(&(kind, schema_id)).cloned())?;
+        hit.downcast::<T>().ok()
+    }
+
+    /// Store what a codec of `kind` built for `schema_id` (with every
+    /// reference resolved), so later messages with that id reuse it.
+    pub fn remember_compiled<T>(&self, kind: &'static str, schema_id: u32, value: Arc<T>)
+    where
+        T: Send + Sync + 'static,
+    {
+        if let Ok(mut c) = self.compiled.lock() {
+            c.put(
+                (kind, schema_id),
+                value as Arc<dyn std::any::Any + Send + Sync>,
+            );
+        }
+    }
+
     fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.auth {
             Some(a) => req.basic_auth(&a.username, Some(&a.password)),
@@ -149,6 +210,93 @@ impl SchemaRegistryClient {
 
         let mut cache = self.cache.lock().await;
         cache.put(schema_id, schema.clone());
+        Ok(schema)
+    }
+
+    /// Every schema `schema` references, transitively, each named by the
+    /// reference name the referring schema uses; a schema comes after those it
+    /// references. A cycle or more than 256 references is an error.
+    pub async fn references(
+        &self,
+        schema: &RegistrySchema,
+    ) -> Result<Vec<(String, RegistrySchema)>, FaucetError> {
+        let mut out: Vec<(String, RegistrySchema)> = Vec::new();
+        let mut done: std::collections::HashSet<(String, i32)> = Default::default();
+        let mut path: Vec<(String, i32)> = Vec::new();
+        for r in &schema.references {
+            Box::pin(self.collect_reference(r, &mut out, &mut done, &mut path)).await?;
+        }
+        Ok(out)
+    }
+
+    async fn collect_reference(
+        &self,
+        r: &SchemaReference,
+        out: &mut Vec<(String, RegistrySchema)>,
+        done: &mut std::collections::HashSet<(String, i32)>,
+        path: &mut Vec<(String, i32)>,
+    ) -> Result<(), FaucetError> {
+        let key = (r.subject.clone(), r.version);
+        if done.contains(&key) {
+            return Ok(());
+        }
+        if path.contains(&key) {
+            return Err(FaucetError::Source(format!(
+                "schema registry: schema references form a cycle through {} version {}",
+                r.subject, r.version
+            )));
+        }
+        if done.len() >= MAX_REFERENCES {
+            return Err(FaucetError::Source(format!(
+                "schema registry: a schema references more than {MAX_REFERENCES} schemas"
+            )));
+        }
+        let referenced = self.get_subject_version(&r.subject, r.version).await?;
+        path.push(key.clone());
+        for inner in &referenced.references {
+            Box::pin(self.collect_reference(inner, out, done, path)).await?;
+        }
+        path.pop();
+        done.insert(key);
+        out.push((r.name.clone(), referenced));
+        Ok(())
+    }
+
+    /// Fetch the schema registered under `subject` at `version`.
+    pub async fn get_subject_version(
+        &self,
+        subject: &str,
+        version: i32,
+    ) -> Result<RegistrySchema, FaucetError> {
+        let key = (subject.to_string(), version);
+        if let Some(hit) = self.versions.lock().await.get(&key) {
+            return Ok(hit.clone());
+        }
+        let url = format!(
+            "{}/subjects/{}/versions/{version}",
+            self.base_url,
+            urlencoding::encode(subject)
+        );
+        let schema: RegistrySchema = self
+            .calls
+            .call_once("schema", async {
+                let resp = self
+                    .apply_auth(self.http.get(&url))
+                    .send()
+                    .await
+                    .map_err(FaucetError::Http)?;
+                if !resp.status().is_success() {
+                    return Err(FaucetError::Source(format!(
+                        "schema registry GET {url} returned {}",
+                        resp.status()
+                    )));
+                }
+                resp.json()
+                    .await
+                    .map_err(|e| FaucetError::Source(format!("schema registry JSON decode: {e}")))
+            })
+            .await?;
+        self.versions.lock().await.put(key, schema.clone());
         Ok(schema)
     }
 

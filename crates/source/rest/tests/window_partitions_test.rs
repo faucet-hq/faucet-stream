@@ -164,3 +164,34 @@ async fn a_partition_cut_short_by_max_pages_fails_without_a_bookmark() {
          be silent"
     );
 }
+
+struct NumericIds;
+
+impl Respond for NumericIds {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let id = if req.url.path() == "/p/0" { "10" } else { "9" };
+        ResponseTemplate::new(200).set_body_json(json!({ "data": [{ "id": id }] }))
+    }
+}
+
+#[tokio::test]
+async fn the_consolidated_bookmark_orders_numeric_strings_numerically() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/p/\d+$"))
+        .respond_with(NumericIds)
+        .mount(&server)
+        .await;
+    let mut cfg = RestStreamConfig::new(&server.uri(), "/p/{n}")
+        .records_path("$.data[*]")
+        .replication_method(ReplicationMethod::Incremental)
+        .replication_key("id")
+        .start_replication_value(json!("0"));
+    cfg.pagination = PaginationStyle::None;
+    cfg.partitions = (0..2)
+        .map(|n| HashMap::from([("n".to_string(), json!(n))]))
+        .collect();
+    let (records, bookmark) = drain(&RestStream::new(cfg).unwrap()).await;
+    assert_eq!(records.len(), 2);
+    assert_eq!(bookmark, Some(json!("10")));
+}

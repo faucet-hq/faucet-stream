@@ -605,9 +605,79 @@ fn coerce_partition_value(raw: &str, dt: &DataType) -> Value {
             .parse::<f64>()
             .map(faucet_core::fidelity::float64)
             .unwrap_or_else(|_| Value::String(raw.to_string())),
-        // Dates/timestamps/strings/decimals: keep the logical string form.
+        DataType::Timestamp(unit, tz) => partition_timestamp(raw, unit, tz.as_deref())
+            .unwrap_or_else(|| Value::String(raw.to_string())),
+        DataType::Decimal128(_, scale) | DataType::Decimal256(_, scale) => {
+            partition_decimal(raw, *scale).unwrap_or_else(|| Value::String(raw.to_string()))
+        }
+        DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => {
+            partition_binary(raw).unwrap_or_else(|| Value::String(raw.to_string()))
+        }
         _ => Value::String(raw.to_string()),
     }
+}
+
+/// A Delta timestamp partition value (`YYYY-MM-DD HH:MM:SS[.ffffff]` in UTC,
+/// or RFC 3339) rendered like a data column of the same type.
+fn partition_timestamp(
+    raw: &str,
+    unit: &arrow::datatypes::TimeUnit,
+    tz: Option<&str>,
+) -> Option<Value> {
+    use arrow::datatypes::TimeUnit;
+    use faucet_core::fidelity::TimePrecision;
+    let utc = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f")
+        .map(|n| n.and_utc())
+        .or_else(|_| chrono::DateTime::parse_from_rfc3339(raw).map(|d| d.to_utc()))
+        .ok()?;
+    let precision = match unit {
+        TimeUnit::Second => TimePrecision::Seconds,
+        TimeUnit::Millisecond => TimePrecision::Millis,
+        TimeUnit::Microsecond => TimePrecision::Micros,
+        TimeUnit::Nanosecond => TimePrecision::Nanos,
+    };
+    Some(match tz {
+        Some(name) if name.eq_ignore_ascii_case("utc") || name == "Etc/UTC" => {
+            faucet_core::fidelity::timestamp(&utc, precision)
+        }
+        Some(name) => {
+            let zone = name.parse::<arrow::array::timezone::Tz>().ok()?;
+            faucet_core::fidelity::timestamp(&utc.with_timezone(&zone), precision)
+        }
+        None => faucet_core::fidelity::timestamp_naive(&utc.naive_utc(), precision),
+    })
+}
+
+/// A Delta decimal partition value as an exact decimal at the column's scale.
+fn partition_decimal(raw: &str, scale: i8) -> Option<Value> {
+    let text = raw.trim();
+    let (neg, body) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let (int, frac) = body.split_once('.').unwrap_or((body, ""));
+    let scale_len = usize::try_from(scale).ok()?;
+    if frac.len() > scale_len
+        || int.is_empty() && frac.is_empty()
+        || !int.bytes().chain(frac.bytes()).all(|b| b.is_ascii_digit())
+    {
+        return faucet_core::fidelity::decimal_text(raw).ok();
+    }
+    let digits = format!("{int}{frac:0<scale_len$}");
+    let unscaled: i128 = digits.parse().ok()?;
+    Some(faucet_core::fidelity::decimal_from_i128(
+        if neg { -unscaled } else { unscaled },
+        i32::from(scale),
+    ))
+}
+
+/// A Delta binary partition value (each char one byte) as base64.
+fn partition_binary(raw: &str) -> Option<Value> {
+    let bytes = raw
+        .chars()
+        .map(|c| u8::try_from(u32::from(c)).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    Some(faucet_core::fidelity::binary(&bytes))
 }
 
 /// Merge partition values into a data row, then narrow to `requested` columns
@@ -764,6 +834,65 @@ mod tests {
         );
         // Empty and the Hive sentinel both become JSON null.
         assert_eq!(coerce_partition_value("", &DataType::Utf8), Value::Null);
+        assert_eq!(
+            coerce_partition_value(HIVE_NULL, &DataType::Int64),
+            Value::Null
+        );
+        assert_eq!(
+            coerce_partition_value(
+                "2026-01-01 00:00:00",
+                &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))
+            ),
+            json!("2026-01-01T00:00:00.000000Z")
+        );
+        assert_eq!(
+            coerce_partition_value(
+                "2026-01-01 10:30:00.5",
+                &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
+            ),
+            json!("2026-01-01T10:30:00.500000")
+        );
+        assert_eq!(
+            coerce_partition_value(
+                "2026-01-01T00:00:00.123456Z",
+                &DataType::Timestamp(
+                    arrow::datatypes::TimeUnit::Microsecond,
+                    Some("+02:00".into())
+                )
+            ),
+            json!("2026-01-01T02:00:00.123456+02:00")
+        );
+        assert_eq!(
+            coerce_partition_value(
+                "yesterday",
+                &DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None)
+            ),
+            json!("yesterday")
+        );
+        assert_eq!(
+            coerce_partition_value("1.5", &DataType::Decimal128(10, 2)),
+            json!("1.50")
+        );
+        assert_eq!(
+            coerce_partition_value("-7", &DataType::Decimal128(10, 2)),
+            json!("-7.00")
+        );
+        assert_eq!(
+            coerce_partition_value("1.234", &DataType::Decimal128(10, 2)),
+            json!("1.234")
+        );
+        assert_eq!(
+            coerce_partition_value("abc", &DataType::Decimal128(10, 2)),
+            json!("abc")
+        );
+        assert_eq!(
+            coerce_partition_value("\u{1}\u{2}\u{3}", &DataType::Binary),
+            json!("AQID")
+        );
+        assert_eq!(
+            coerce_partition_value("\u{263a}", &DataType::Binary),
+            json!("\u{263a}")
+        );
         assert_eq!(
             coerce_partition_value(HIVE_NULL, &DataType::Int64),
             Value::Null

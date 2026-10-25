@@ -98,14 +98,15 @@ impl Cursor {
     /// — call [`Cursor::commit`] after a successful fire so a dropped fire is
     /// retried.
     pub fn new_objects(&self, listing: &[ListedObject]) -> Vec<ListedObject> {
-        let horizon = self.horizon();
-        listing
-            .iter()
-            .filter(|o| self.floor.is_none_or(|f| o.last_modified > f))
-            .filter(|o| horizon.is_none_or(|h| o.last_modified >= h))
-            .filter(|o| !self.seen.contains_key(&identity(o)))
-            .cloned()
-            .collect()
+        listing.iter().filter(|o| self.is_new(o)).cloned().collect()
+    }
+
+    /// Whether `o` is newer than the floor, within the look-back window, and
+    /// not remembered — the per-object test behind [`Cursor::new_objects`].
+    pub fn is_new(&self, o: &ListedObject) -> bool {
+        self.floor.is_none_or(|f| o.last_modified > f)
+            && self.horizon().is_none_or(|h| o.last_modified >= h)
+            && !self.seen.contains_key(&identity(o))
     }
 
     /// Whether `o` is newer than every object fired so far.
@@ -201,6 +202,10 @@ pub struct ObjectArrivalWatcher {
     /// Whether the stored cursor has been read (once, on the first poll).
     resumed: bool,
     compiled: Arc<super::compiled::CompiledTrigger>,
+    /// Limit on the whole poll (`poll_timeout_secs`); `None` = unbounded.
+    poll_timeout: Option<Duration>,
+    /// Longest wait for the next listing page before the poll fails.
+    page_timeout: Duration,
 }
 
 impl ObjectArrivalWatcher {
@@ -258,7 +263,24 @@ impl ObjectArrivalWatcher {
             cursor,
             resumed: false,
             compiled,
+            poll_timeout: None,
+            page_timeout: super::watcher::default_poll_timeout(poll),
         }
+    }
+
+    /// Bound the whole poll (`poll_timeout_secs`); without it only each
+    /// listing page is bounded.
+    #[must_use]
+    pub fn with_poll_timeout(mut self, limit: Option<Duration>) -> Self {
+        self.poll_timeout = limit;
+        self
+    }
+
+    /// Override how long the watcher waits for the next listing page.
+    #[must_use]
+    pub fn with_page_timeout(mut self, limit: Duration) -> Self {
+        self.page_timeout = limit;
+        self
     }
 
     /// Resume from the cursor a previous process stored, so objects that
@@ -305,18 +327,34 @@ impl ObjectArrivalWatcher {
         self
     }
 
-    async fn list(&self) -> Result<Vec<ListedObject>, String> {
+    /// List the prefix, keeping only the objects the cursor has not fired:
+    /// memory follows the new objects, not the size of the prefix.
+    async fn list_new(&self) -> Result<Vec<ListedObject>, String> {
         let prefix_path = self.prefix.as_deref().map(object_store::path::Path::from);
         let mut stream = self.store.list(prefix_path.as_ref());
         let mut out = Vec::new();
-        while let Some(meta) = stream.next().await {
+        // Bound each wait for the store, not the whole listing: a large
+        // prefix takes as long as it takes while pages keep arriving.
+        loop {
+            let next = tokio::time::timeout(self.page_timeout, stream.next())
+                .await
+                .map_err(|_| {
+                    format!(
+                        "listing objects: no response from the store within {}s",
+                        self.page_timeout.as_secs()
+                    )
+                })?;
+            let Some(meta) = next else { break };
             let meta = meta.map_err(|e| format!("listing objects: {e}"))?;
-            out.push(ListedObject {
+            let o = ListedObject {
                 key: meta.location.to_string(),
                 last_modified: meta.last_modified,
                 size: meta.size,
                 etag: meta.e_tag,
-            });
+            };
+            if self.cursor.is_new(&o) {
+                out.push(o);
+            }
         }
         Ok(out)
     }
@@ -336,10 +374,13 @@ impl Watcher for ObjectArrivalWatcher {
         self.poll
     }
 
-    async fn poll(&mut self, state: &ServerState) -> Result<bool, String> {
+    fn poll_timeout(&self) -> Option<Duration> {
+        self.poll_timeout
+    }
+
+    async fn poll(&mut self, state: &ServerState) -> Result<bool, super::watcher::PollError> {
         self.resume(state).await?;
-        let listing = self.list().await?;
-        let mut new = self.cursor.new_objects(&listing);
+        let mut new = self.list_new().await?;
         if new.is_empty() {
             return Ok(false);
         }
@@ -434,7 +475,7 @@ impl Watcher for ObjectArrivalWatcher {
             self.save(state).await;
         }
         match problem {
-            Some(e) => Err(e),
+            Some(e) => Err(super::watcher::PollError::fired(e)),
             None => Ok(fired),
         }
     }
@@ -475,6 +516,16 @@ mod cursor_tests {
         }
         // After commit, none are new.
         assert!(c.new_objects(&listing).is_empty());
+    }
+
+    #[test]
+    fn is_new_is_the_per_object_form_of_new_objects() {
+        let mut c = Cursor::starting_beginning();
+        let (a, b) = (obj("a", 100), obj("b", 200));
+        c.commit(&a);
+        assert!(!c.is_new(&a));
+        assert!(c.is_new(&b));
+        assert_eq!(c.new_objects(&[a, b.clone()]), vec![b]);
     }
 
     #[test]

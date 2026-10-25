@@ -215,8 +215,11 @@ DLQ inspect: ./dlq/contract_breaches.jsonl
       {"order_id":"A-17","status":"backordered"}
 ```
 
-The location may be a single `.jsonl` file, a directory of `*.jsonl` files, or a
-glob. Blank, malformed, and non-envelope lines are counted (`malformed` /
+The location may be a single `.jsonl` file, a directory of JSON Lines files
+(`.jsonl` / `.ndjson`, plain or `.gz` / `.zst`-compressed, which are decoded),
+or a glob. A directory or glob skips discard archives, the `replay-failed`
+files a replay writes, and files a writer has not finished (`*.faucet-tmp*`,
+`*.faucet-purge`); name such a file directly to read it. Blank, malformed, and non-envelope lines are counted (`malformed` /
 `non-envelope`) but never abort the read. Add `--reason contract` to restrict the
 breakdown, `--limit N` to size the sample, or `--json` for a machine-readable
 summary.
@@ -321,8 +324,12 @@ else, including non-envelope lines, is left untouched.
 A discarded envelope's payload stays in the file. When it must not be kept — PII
 that reached the DLQ after a masking mistake, say — add `--purge`: every discarded
 envelope is removed from the file itself (an atomic rewrite), with no archive.
-Run it while nothing writes the DLQ; a file that changes during the rewrite is
-refused rather than losing the new lines. An encrypted DLQ (below) is re-sealed
+Run it while nothing writes the DLQ; a file that changes while it is being
+read is refused. Complete lines appended between that check and the swap are
+carried over to the end of the rewritten file (re-sealed into its integrity
+chain for an encrypted DLQ) as a best effort, but a line still being written
+at that moment, or anything a writer that keeps the file open writes after the
+swap, goes to the replaced copy and is lost — so stop the pipeline first. An encrypted DLQ (below) is re-sealed
 as it is rewritten — a fresh header and an integrity trailer over the records
 kept, under the current key — so it still opens and the sink can keep
 appending to it; that needs the key (`--encryption-key`), and a file that fails
@@ -367,6 +374,13 @@ The `faucet dlq` verbs handle sealed files transparently:
 - `replay` — picks the key up **automatically** from the config's own
   `dlq:` block's `encryption` (a JSON Lines `file` sink or a `jsonl` sink);
   `--encryption-key` overrides.
+- With the key, `inspect`, `replay` and `discard` first check the file's
+  whole-file integrity (header, trailers, line order): a file with lines
+  removed, reordered or added is refused rather than read as a subset. Lines
+  after the last trailer — a flush a writer has not finished — are not covered
+  by any trailer, so they are skipped with a warning (and read once the flush
+  completes). The check streams the file, so it needs no more memory than the
+  longest line.
 - `discard` keeps and archives lines **verbatim** (still sealed) — filtering
   decrypts only in memory; nothing is ever re-written in plaintext.
 - Rows that fail again during a `replay` land in the fresh failure DLQ sealed

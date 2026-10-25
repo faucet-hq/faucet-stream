@@ -65,15 +65,60 @@ pub(crate) async fn native<Si: Sink + ?Sized>(
 }
 
 /// Write governed envelopes to a DLQ sink (its own governed stack, #870).
+/// Every envelope must land: a row the DLQ skipped is a lost row, so a short
+/// write fails with `RowsUnaccounted` instead of counting it as dead-lettered.
 pub(crate) async fn dlq(
     sink: &dyn Sink,
     envelopes: &GovernedEnvelopes,
 ) -> Result<usize, FaucetError> {
-    sink.write_batch(envelopes.envelopes()).await
+    let offered = envelopes.envelopes().len();
+    let report = sink.write_batch_reported(envelopes.envelopes()).await?;
+    if report.accepted.saturating_add(report.coalesced) < offered {
+        return Err(FaucetError::RowsUnaccounted {
+            offered: offered as u64,
+            accepted: report.accepted as u64,
+        });
+    }
+    Ok(report.accepted)
 }
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{Value, json};
+
+    struct Short(usize, usize);
+    #[async_trait::async_trait]
+    impl crate::Sink for Short {
+        async fn write_batch(&self, r: &[Value]) -> Result<usize, crate::FaucetError> {
+            Ok(r.len().min(self.0))
+        }
+        async fn write_batch_reported(
+            &self,
+            r: &[Value],
+        ) -> Result<crate::accounting::WriteReport, crate::FaucetError> {
+            let n = r.len().min(self.0);
+            Ok(crate::accounting::WriteReport::accepted(n).with_skipped(self.1.min(r.len() - n)))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dlq_that_writes_fewer_envelopes_than_offered_fails() {
+        let env = super::GovernedEnvelopes::sealed((0..5).map(|i| json!({"i": i})).collect());
+        let full = Short(10, 0);
+        assert_eq!(super::dlq(&full, &env).await.unwrap(), 5);
+        let skipping = Short(2, 3);
+        let err = super::dlq(&skipping, &env).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::FaucetError::RowsUnaccounted {
+                    offered: 5,
+                    accepted: 2
+                }
+            ),
+            "{err}"
+        );
+    }
     /// The structural half of the typestate: outside this gateway, the code
     /// that drives a run never calls a sink's write methods directly, so
     /// every write goes through a function that takes a governed value.

@@ -113,12 +113,23 @@ the compiler and the tests, not this skill.
 3. **Implement the trait** in `src/stream.rs` or `src/sink.rs`, the only
    module that does I/O. Open the trait on docs.rs for the locked version and
    implement the required method, then override `config_schema`,
-   `connector_name` and `dataset_uri`. Then, in order of importance:
+   `connector_name` and `dataset_uri`. Run every backend request through a
+   `CallSlot` built in the constructor (its own timeout and retry policy) and
+   forward `set_call_context` / `set_roundtrip_recorder` to it, so the run's
+   deadline, cancel token and round-trip metering reach each call
+   ([Backend calls](https://faucet-hq.github.io/faucet-stream/extending/authoring-connectors.html#backend-calls-callcontext-httpclient-batching)).
+   Export a `DESCRIPTOR` that answers the connector's capabilities from config
+   alone
+   ([Declaring capabilities](https://faucet-hq.github.io/faucet-stream/extending/authoring-connectors.html#declaring-capabilities)).
+   Then, in order of importance:
    - **Source:** override `stream_pages` to read page by page from the
      backend's paging primitive (the default buffers everything), and make the
      whole-result method drain that stream. For incremental sync, add the state
      key, start-bookmark and per-page bookmark pieces
      ([Streaming pages and bookmarks](https://faucet-hq.github.io/faucet-stream/extending/authoring-connectors.html#streaming-pages-and-bookmarks)).
+     Stop paging on an empty page or an explicit end marker, never on a short
+     page (backends clamp the page size), and fail when the next cursor does
+     not advance.
      Override `check` only if a one-page probe would block or have side
      effects.
    - **Sink:** `write_batch` through the backend's bulk API, split to its
@@ -126,7 +137,10 @@ the compiler and the tests, not this skill.
      backend reports them; keyed upsert/delete through the shared write spec
      and planner; an atomic watermark only when rows and token commit in one
      transaction
-     ([Write, flush, checkpoint](https://faucet-hq.github.io/faucet-stream/extending/authoring-connectors.html#write-flush-checkpoint));
+     ([Write, flush, checkpoint](https://faucet-hq.github.io/faucet-stream/extending/authoring-connectors.html#write-flush-checkpoint)).
+     When a page goes out in several requests, report the rows of requests
+     that succeeded as written so a dead-letter replay does not append them
+     twice;
      a read-only `check` probe.
 
 4. **Unit and integration tests.** Unit tests at the bottom of each file,
@@ -152,6 +166,9 @@ the compiler and the tests, not this skill.
 
 7. **Publish and register.** Publish to crates.io, then make it usable and
    discoverable: users run it from a custom `faucet` binary that registers it
+   with `register_source_described` / `register_sink_described` and the
+   crate's `DESCRIPTOR` (registered without one, it is treated as a plain
+   source or an append-only sink, so `write_mode: upsert` is refused)
    ([Custom binaries with third-party connectors](https://github.com/faucet-hq/faucet-stream/blob/main/cli/README.md#custom-binaries-with-third-party-connectors)),
    and a PR to the registry index makes `faucet search` find it
    ([Connector marketplace](https://faucet-hq.github.io/faucet-stream/extending/marketplace.html#publishing-your-connector)).

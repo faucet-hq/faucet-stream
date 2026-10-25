@@ -114,6 +114,35 @@ mod docker {
         faucet_conformance::assert_driver_row_paths_agree(&sink).await;
     }
 
+    /// Core NATS: a message over the server's `max_payload` fails alone and
+    /// the rest of its group is still published.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_oversized_message_fails_alone() {
+        let (_container, server) = start_nats().await;
+        let sub_client = async_nats::connect(&server).await.expect("sub connect");
+        let mut subscriber = sub_client.subscribe("big.out").await.expect("subscribe");
+        sub_client.flush().await.unwrap();
+        let max = sub_client.server_info().max_payload;
+        let mut cfg = NatsSinkConfig::new("big.out");
+        cfg.connection.servers = vec![server];
+        let sink = NatsSink::new(cfg).await.unwrap();
+        let rows = vec![
+            serde_json::json!({"a": 1}),
+            serde_json::json!({"blob": "x".repeat(max + 1)}),
+            serde_json::json!({"a": 3}),
+        ];
+        let outcomes = sink.write_batch_partial(&rows).await.unwrap();
+        assert!(outcomes[0].is_ok() && outcomes[2].is_ok(), "{outcomes:?}");
+        let err = outcomes[1].as_ref().unwrap_err().to_string();
+        assert!(err.contains("max_payload"), "{err}");
+        for _ in 0..2 {
+            tokio::time::timeout(std::time::Duration::from_secs(5), subscriber.next())
+                .await
+                .expect("a published message")
+                .expect("subscription open");
+        }
+    }
+
     /// JetStream mode awaits every publish acknowledgement: a row whose
     /// subject no stream stores fails alone instead of vanishing behind a
     /// green run (#789 MSG-31), and the batch is bounded by

@@ -304,24 +304,35 @@ pub fn replay_sink_config(sink: &ConnectorSpec) -> CliResult<Value> {
 /// sealed the DLQ file a replay reads back.
 pub fn dlq_encryption_value(dlq: Option<&DlqSpec>) -> Option<&serde_json::Value> {
     let dlq = dlq?;
-    if !writes_json_lines(&dlq.sink) {
+    if !writes_json_lines(&dlq.sink)
+        || (dlq.sink.kind == "file" && file_sink_compresses(&dlq.sink.config))
+    {
         return None;
     }
     dlq.sink.config.get("encryption")
 }
 
 /// Whether a DLQ sink writes local JSON Lines files the DLQ tooling reads
-/// back line by line: any `jsonl` sink, or an uncompressed `file` sink whose
-/// `format` (or, under `auto`, whose path's extension) is JSON Lines.
+/// back line by line: a `jsonl` sink, or a `file` sink whose `format` (or,
+/// under `auto`, whose path's extension) is JSON Lines — compressed only when
+/// the path names the codec (`.gz` / `.zst`), since the reader decodes by name.
 pub fn writes_json_lines(sink: &ConnectorSpec) -> bool {
-    match sink.kind.as_str() {
+    let readable = match sink.kind.as_str() {
         "jsonl" => true,
-        "file" => {
-            file_sink_format(&sink.config) == Some(faucet_core::FileFormat::JsonLines)
-                && !file_sink_compresses(&sink.config)
-        }
+        "file" => file_sink_format(&sink.config) == Some(faucet_core::FileFormat::JsonLines),
         _ => false,
-    }
+    };
+    readable && file_sink_compresses(&sink.config) == path_names_codec(&sink.config)
+}
+
+fn path_names_codec(config: &serde_json::Value) -> bool {
+    config
+        .get("path")
+        .and_then(|p| p.as_str())
+        .is_some_and(|p| {
+            let p = p.to_ascii_lowercase();
+            p.ends_with(".gz") || p.ends_with(".zst")
+        })
 }
 
 fn file_sink_format(config: &serde_json::Value) -> Option<faucet_core::FileFormat> {
@@ -335,7 +346,7 @@ fn file_sink_format(config: &serde_json::Value) -> Option<faucet_core::FileForma
     }
 }
 
-/// Whether a `file` sink config compresses its output: an explicit
+/// Whether a `file` / `jsonl` sink config compresses its output: an explicit
 /// `gzip`/`zstd`, or `auto` (the default) with a `.gz`/`.zst` path.
 fn file_sink_compresses(config: &serde_json::Value) -> bool {
     match config.get("compression").and_then(|c| c.as_str()) {
@@ -618,6 +629,31 @@ mod tests {
             assert_eq!(dlq_encryption_value(Some(&dlq_sink(kind, config))), None);
         }
         assert_eq!(dlq_encryption_value(None), None);
+    }
+
+    #[test]
+    fn compressed_dlqs_are_read_back_only_when_the_name_says_so() {
+        for (kind, config, readable) in [
+            ("jsonl", json!({"path": "dlq.jsonl.gz"}), true),
+            ("file", json!({"path": "dlq.jsonl.zst"}), true),
+            (
+                "jsonl",
+                json!({"path": "dlq.jsonl", "compression": "gzip"}),
+                false,
+            ),
+            (
+                "file",
+                json!({"path": "dlq.jsonl.gz", "compression": "none"}),
+                false,
+            ),
+            ("jsonl", json!({"path": "dlq.jsonl"}), true),
+        ] {
+            assert_eq!(
+                writes_json_lines(&dlq_sink(kind, config.clone()).sink),
+                readable,
+                "{kind} {config}"
+            );
+        }
     }
 
     #[test]

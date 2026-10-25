@@ -1126,33 +1126,39 @@ impl Topology {
                     Arc::new(std::sync::Mutex::new(None));
                 let failures: Arc<std::sync::Mutex<Vec<(String, String, NodeErrorKind)>>> =
                     Arc::new(std::sync::Mutex::new(Vec::new()));
-                let wrapped = joined.zip(order.clone()).map(|(f, (node_id, _))| {
-                    let coop = coop.clone();
-                    let slot = Arc::clone(&first_err);
-                    let failed = Arc::clone(&failures);
-                    async move {
-                        match f.await {
-                            Ok(o) => Some(o),
-                            Err(e) => {
-                                failed.lock().unwrap_or_else(|p| p.into_inner()).push((
-                                    node_id,
-                                    e.to_string(),
-                                    NodeErrorKind::classify(&e),
-                                ));
-                                tracing::error!(
-                                    error = %e,
-                                    "topology node failed; cancelling siblings so they flush"
-                                );
-                                let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
-                                if guard.is_none() {
-                                    *guard = Some(e);
+                let finished: Arc<std::sync::Mutex<Vec<(usize, NodeOutcome)>>> =
+                    Arc::new(std::sync::Mutex::new(Vec::new()));
+                let wrapped = joined.zip(order.clone()).enumerate().map(
+                    |(i, (f, (node_id, _)))| {
+                        let coop = coop.clone();
+                        let slot = Arc::clone(&first_err);
+                        let failed = Arc::clone(&failures);
+                        let done = Arc::clone(&finished);
+                        async move {
+                            match f.await {
+                                Ok(o) => {
+                                    done.lock().unwrap_or_else(|p| p.into_inner()).push((i, o));
                                 }
-                                coop.cancel();
-                                None
+                                Err(e) => {
+                                    failed.lock().unwrap_or_else(|p| p.into_inner()).push((
+                                        node_id,
+                                        e.to_string(),
+                                        NodeErrorKind::classify(&e),
+                                    ));
+                                    tracing::error!(
+                                        error = %e,
+                                        "topology node failed; cancelling siblings so they flush"
+                                    );
+                                    let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+                                    if guard.is_none() {
+                                        *guard = Some(e);
+                                    }
+                                    coop.cancel();
+                                }
                             }
                         }
-                    }
-                });
+                    },
+                );
                 // The grace window opens only once something has cancelled the
                 // token — a healthy run is never bounded by it.
                 let all = futures::future::join_all(wrapped);
@@ -1164,9 +1170,9 @@ impl Topology {
                         tokio::time::sleep(grace).await;
                     }
                 };
-                let outcomes = tokio::select! {
+                tokio::select! {
                     biased;
-                    v = all => v,
+                    _ = all => {}
                     () = deadline => {
                         tracing::warn!(
                             grace_secs = grace.as_secs(),
@@ -1174,10 +1180,12 @@ impl Topology {
                              aborting them"
                         );
                         abort_all();
-                        Vec::new()
                     }
                 };
-                let outcomes: Vec<NodeOutcome> = outcomes.into_iter().flatten().collect();
+                let mut done =
+                    std::mem::take(&mut *finished.lock().unwrap_or_else(|p| p.into_inner()));
+                done.sort_by_key(|(i, _)| *i);
+                let outcomes: Vec<NodeOutcome> = done.into_iter().map(|(_, o)| o).collect();
                 let err = first_err.lock().unwrap_or_else(|p| p.into_inner()).take();
                 let complete = err.is_none() && !externally_cancelled();
                 let finish = finish_sinks(&outcomes, complete).await;
@@ -1529,9 +1537,10 @@ fn reports(
 ///
 /// - **Complete:** every `write_mode: overwrite` sink swaps its staging in
 ///   (`commit_overwrite`) and only then persists its bookmark, which `run_stream`
-///   held back; then every sink's [`Sink::complete_run`] runs (#753). A commit
-///   that fails discards the remaining sinks' staging rather than swapping a
-///   subset in.
+///   held back; then every sink's [`Sink::complete_run`] runs (#753). When a
+///   commit or a bookmark write fails, the sinks not yet committed discard
+///   their staging; sinks already committed stay committed, so a failed run
+///   can leave some destinations replaced.
 /// - **Otherwise:** every overwrite sink discards its staging, leaving its
 ///   destination as it was (#789 CORE-14).
 #[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
@@ -1569,16 +1578,20 @@ async fn finish_sinks(outcomes: &[NodeOutcome], complete: bool) -> Result<(), Fa
         if !f.sink.is_overwrite() {
             continue;
         }
-        if let Err(e) = f.sink.commit_overwrite().await {
+        let committed = match f.sink.commit_overwrite().await {
+            Ok(()) => match (f.deferred, f.bookmark) {
+                (Some(d), Some(bm)) => d.store.put(&d.key, bm).await,
+                _ => Ok(()),
+            },
+            Err(e) => Err(e),
+        };
+        if let Err(e) = committed {
             for rest in &sinks[i + 1..] {
                 if rest.sink.is_overwrite() {
                     abort_quietly(rest.sink).await;
                 }
             }
             return Err(e);
-        }
-        if let (Some(d), Some(bm)) = (f.deferred, f.bookmark) {
-            d.store.put(&d.key, bm).await?;
         }
     }
     for f in &sinks {
@@ -2671,6 +2684,58 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
     use std::sync::Mutex;
+
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn a_failed_bookmark_write_discards_the_remaining_overwrite_staging() {
+        struct Ovw(&'static str, Arc<Mutex<Vec<String>>>);
+        #[async_trait]
+        impl Sink for Ovw {
+            async fn write_batch(&self, r: &[Value]) -> Result<usize, FaucetError> {
+                Ok(r.len())
+            }
+            fn is_overwrite(&self) -> bool {
+                true
+            }
+            async fn commit_overwrite(&self) -> Result<(), FaucetError> {
+                self.1.lock().unwrap().push(format!("commit:{}", self.0));
+                Ok(())
+            }
+            async fn abort_overwrite(&self) -> Result<(), FaucetError> {
+                self.1.lock().unwrap().push(format!("abort:{}", self.0));
+                Ok(())
+            }
+        }
+        struct FailingStore;
+        #[async_trait]
+        impl StateStore for FailingStore {
+            async fn get(&self, _: &str) -> Result<Option<Value>, FaucetError> {
+                Ok(None)
+            }
+            async fn put(&self, _: &str, _: &Value) -> Result<(), FaucetError> {
+                Err(FaucetError::State("store down".into()))
+            }
+            async fn delete(&self, _: &str) -> Result<(), FaucetError> {
+                Ok(())
+            }
+        }
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let outcome = |name: &'static str| NodeOutcome::Sink {
+            node_id: name.into(),
+            records: 1,
+            bookmark: Some(json!(1)),
+            sink: Box::new(Ovw(name, log.clone())),
+            deferred: Some(DeferredState {
+                store: Arc::new(FailingStore),
+                key: format!("p::{name}"),
+            }),
+        };
+        let err = finish_sinks(&[outcome("a"), outcome("b")], true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FaucetError::State(_)), "{err}");
+        assert_eq!(*log.lock().unwrap(), vec!["commit:a", "abort:b"]);
+    }
 
     // ── Mock connectors ───────────────────────────────────────────────────────
 

@@ -8,20 +8,31 @@ pub const DESCRIPTOR: ConnectorDescriptor = ConnectorDescriptor::new("postgres",
 
 fn capabilities(config: &Value) -> Capabilities {
     let column_mapped = config.is_null() || tag(config, "column_mapping") == Some("auto_map");
-    Capabilities::builder()
-        .write_modes([
+    // JSONB mode stores whole records: no key columns, nothing to evolve.
+    let jsonb = !config.is_null() && matches!(tag(config, "column_mapping"), None | Some("jsonb"));
+    let modes: &[WriteMode] = if jsonb {
+        &[WriteMode::Append, WriteMode::Overwrite]
+    } else {
+        &[
             WriteMode::Append,
             WriteMode::Upsert,
             WriteMode::Delete,
             WriteMode::Overwrite,
-        ])
+        ]
+    };
+    Capabilities::builder()
+        .write_modes(modes.iter().copied())
         .idempotent_writes(true)
-        .keyed_upsert(true)
+        .keyed_upsert(!jsonb)
         .keyed_dedup(!config.is_null() && dedups_by_key(config))
         .cleanup(column_mapped)
         .rollback(column_mapped)
-        .schema_evolution(true)
-        .schema_report(SchemaReport::Reported)
+        .schema_evolution(!jsonb)
+        .schema_report(if jsonb {
+            SchemaReport::Schemaless
+        } else {
+            SchemaReport::Reported
+        })
         .scoped_overwrite(true)
         .build()
 }
@@ -35,11 +46,14 @@ mod tests {
     fn column_mapping_gates_cleanup_and_rollback() {
         let jsonb = DESCRIPTOR.capabilities(&json!({"table_name": "t"}));
         assert!(!jsonb.cleanup() && !jsonb.rollback() && !jsonb.keyed_dedup());
-        assert!(jsonb.idempotent_writes() && jsonb.keyed_upsert() && jsonb.overwrite());
-        assert!(jsonb.schema_evolution() && jsonb.scoped_overwrite());
+        assert!(jsonb.idempotent_writes() && !jsonb.keyed_upsert() && jsonb.overwrite());
+        assert!(!jsonb.schema_evolution() && jsonb.scoped_overwrite());
         assert!(!jsonb.staged_load() && !jsonb.direct_overwrite());
-        assert_eq!(jsonb.schema_report(), SchemaReport::Reported);
-        assert_eq!(jsonb.write_modes().len(), 4);
+        assert_eq!(jsonb.schema_report(), SchemaReport::Schemaless);
+        assert_eq!(
+            jsonb.write_modes(),
+            [WriteMode::Append, WriteMode::Overwrite]
+        );
         let explicit =
             DESCRIPTOR.capabilities(&json!({"column_mapping": {"jsonb": {"column": "d"}}}));
         assert!(!explicit.cleanup() && !explicit.rollback());
@@ -48,6 +62,8 @@ mod tests {
             "column_mapping": "auto_map", "write_mode": "upsert", "key": ["id"]
         }));
         assert!(mapped.cleanup() && mapped.rollback() && mapped.keyed_dedup());
+        assert!(mapped.schema_evolution() && mapped.keyed_upsert());
+        assert_eq!(mapped.write_modes().len(), 4);
         assert!(
             !DESCRIPTOR
                 .capabilities(&json!({"column_mapping": "${m}", "write_mode": "upsert"}))

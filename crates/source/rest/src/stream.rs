@@ -259,6 +259,53 @@ fn jsonpath_first_string(v: &Value, path: &str) -> Option<String> {
     }
 }
 
+/// Read an async job's status from a poll response: `Some(text)` for a
+/// string, number or boolean, `None` for an explicit `null` (not set yet).
+/// A path that matches nothing or a non-scalar is an error naming the path
+/// and the response's shape (its top-level member names), never its values:
+/// a poll body can carry tokens and signed URLs.
+fn poll_status(body: &Value, path: &str) -> Result<Option<String>, FaucetError> {
+    match jsonpath_first_value(body, path) {
+        Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s)),
+        Some(Value::Number(n)) => Ok(Some(n.to_string())),
+        Some(Value::Bool(b)) => Ok(Some(b.to_string())),
+        found => {
+            let matched = match found {
+                None => "matched nothing",
+                Some(Value::Array(_)) => "matched an array",
+                _ => "matched an object",
+            };
+            Err(FaucetError::Source(format!(
+                "async_job: `status.path` {path:?} {matched} in the poll response ({}); it \
+                 must select a string, number or boolean",
+                json_shape(body)
+            )))
+        }
+    }
+}
+
+/// A response's shape for an error message: its top-level member names (at
+/// most 20), or its JSON type. No values.
+fn json_shape(body: &Value) -> String {
+    const MAX: usize = 20;
+    match body {
+        Value::Object(map) if map.is_empty() => "an empty object".to_string(),
+        Value::Object(map) => {
+            let mut keys: Vec<&str> = map.keys().take(MAX).map(String::as_str).collect();
+            if map.len() > MAX {
+                keys.push("…");
+            }
+            format!("top-level keys: {}", keys.join(", "))
+        }
+        Value::Array(a) => format!("an array of {} element(s)", a.len()),
+        Value::String(_) => "a string".to_string(),
+        Value::Number(_) => "a number".to_string(),
+        Value::Bool(_) => "a boolean".to_string(),
+        Value::Null => "null".to_string(),
+    }
+}
+
 /// First JSONPath match as an owned [`Value`] (type-preserving). Used by the
 /// resumable-cursor bookmark (#547) so a numeric cursor stays a number.
 fn jsonpath_first_value(v: &Value, path: &str) -> Option<Value> {
@@ -408,11 +455,14 @@ fn inject_sql_predicate(query: &str, predicate: &str) -> String {
     let kw = |t: &str, k: &str| t.eq_ignore_ascii_case(k);
     let mut where_at: Option<usize> = None;
     let mut boundary: Option<usize> = None;
+    let mut seen_from = false;
     let mut i = 0;
     while i < toks.len() {
         let (pos, t) = toks[i];
         let two = |a: &str, b: &str| kw(t, a) && i + 1 < toks.len() && kw(toks[i + 1].1, b);
-        if where_at.is_none() && kw(t, "where") {
+        if !seen_from {
+            seen_from = kw(t, "from");
+        } else if where_at.is_none() && kw(t, "where") {
             where_at = Some(pos);
         } else if two("order", "by")
             || two("group", "by")
@@ -455,11 +505,17 @@ fn sql_literal(v: &Value) -> String {
     match v {
         Value::String(s) if is_sql_datetime(s) => s.clone(),
         Value::String(s) if let Some(t) = offset_datetime_as_rfc3339(s) => t,
-        Value::String(s) => format!("'{}'", s.replace('\'', "\\'")),
+        Value::String(s) => quoted_literal(s),
         Value::Number(n) => n.to_string(),
         Value::Bool(b) => b.to_string(),
-        other => format!("'{}'", other.to_string().replace('\'', "\\'")),
+        other => quoted_literal(&other.to_string()),
     }
+}
+
+/// `s` single-quoted with `\` and `'` backslash-escaped, so a value can never
+/// end the literal early.
+fn quoted_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
 /// Fill `{key}` placeholders in a URL path with percent-encoded values, so a
@@ -2315,8 +2371,15 @@ impl RestDriver {
                     poll_json.as_ref(),
                 )
                 .await?;
-            let status = jsonpath_first_string(&body, &job.status.path).unwrap_or_default();
-            match job.status.classify(&status) {
+            // An explicit `null` is a status not set yet (a queued job), so it
+            // keeps polling; a path matching nothing, or a non-scalar, fails.
+            let status = poll_status(&body, &job.status.path)?;
+            let outcome = match &status {
+                Some(s) => job.status.classify(s),
+                None => JobOutcome::Pending,
+            };
+            let status = status.unwrap_or_else(|| "null".to_string());
+            match outcome {
                 JobOutcome::Success => break body,
                 JobOutcome::Failure => {
                     let detail = job
@@ -3244,19 +3307,10 @@ fn partitioned_truncation(config: &RestStreamConfig) -> Result<(), FaucetError> 
 }
 
 fn value_max(current: Option<Value>, candidate: Value) -> Option<Value> {
-    match current {
-        None => Some(candidate),
-        Some(cur) => {
-            let take_candidate = match (&cur, &candidate) {
-                (Value::Number(a), Value::Number(b)) => {
-                    b.as_f64().unwrap_or(f64::MIN) > a.as_f64().unwrap_or(f64::MIN)
-                }
-                (Value::String(a), Value::String(b)) => b > a,
-                _ => true,
-            };
-            Some(if take_candidate { candidate } else { cur })
-        }
-    }
+    Some(match current {
+        None => candidate,
+        Some(cur) => faucet_core::replication::max_value(cur, candidate),
+    })
 }
 
 #[async_trait]
@@ -3947,31 +4001,23 @@ impl RestDriver {
         let base = self.config.base_url.trim_end_matches('/');
         let url = format!("{base}/{entity}");
         let mut bounds = [0i64; 2];
-        for (i, dir) in ["asc", "desc"].into_iter().enumerate() {
-            let mut headers = self.static_headers.clone();
-            for (k, v) in self.metadata_headers(&url).await?.iter() {
-                headers.insert(k.clone(), v.clone());
-            }
-            let request = self.client.get(&url).headers(headers).query(&[
-                ("cross-company", "true"),
-                ("$orderby", &format!("{key} {dir}")),
-                ("$top", "1"),
-                ("$select", key),
-                ("$format", "json"),
-            ]);
-            let resp = self.client.send(request).await.map_err(|e| {
-                FaucetError::Source(format!("rest: OData key-bounds request failed: {e}"))
+        let order: Vec<String> = ["asc", "desc"]
+            .iter()
+            .map(|dir| format!("{key} {dir}"))
+            .collect();
+        for (i, orderby) in order.iter().enumerate() {
+            let body = with_matcher_scope(
+                self.call_ctx(self.retry_policy.max_attempts.saturating_sub(1))
+                    .call("discover", || self.key_bounds_probe(&url, key, orderby)),
+            )
+            .await
+            .map_err(|e| match e {
+                FaucetError::Http(e) => {
+                    FaucetError::Source(format!("rest: OData key-bounds request failed: {e}"))
+                }
+                FaucetError::HttpStatus { body, .. } => FaucetError::Source(body),
+                other => other,
             })?;
-            if !resp.status().is_success() {
-                return Err(FaucetError::Source(format!(
-                    "rest: OData key-bounds returned HTTP {}",
-                    resp.status().as_u16()
-                )));
-            }
-            let body: serde_json::Value =
-                self.client.json(resp).await.map_err(|e| {
-                    FaucetError::Source(format!("rest: OData key-bounds body: {e}"))
-                })?;
             let Some(row) = body
                 .get("value")
                 .and_then(|v| v.as_array())
@@ -3984,6 +4030,54 @@ impl RestDriver {
             })?;
         }
         Ok(Some((bounds[0], bounds[1])))
+    }
+
+    /// One key-bounds request (`$top=1` ordered by the key). A `429` or `5xx`
+    /// is returned retriable, so the caller's retry policy covers it like any
+    /// data page.
+    async fn key_bounds_probe(
+        &self,
+        url: &str,
+        key: &str,
+        orderby: &str,
+    ) -> Result<serde_json::Value, FaucetError> {
+        let mut headers = self.static_headers.clone();
+        for (k, v) in self.metadata_headers(url).await?.iter() {
+            headers.insert(k.clone(), v.clone());
+        }
+        let mut query: Vec<(&str, &str)> = Vec::with_capacity(5);
+        if let Some(scope) = self.config.query_params.get("cross-company") {
+            query.push(("cross-company", scope));
+        }
+        query.extend([
+            ("$orderby", orderby),
+            ("$top", "1"),
+            ("$select", key),
+            ("$format", "json"),
+        ]);
+        let request = self.client.get(url).headers(headers).query(&query);
+        self.roundtrip("discover");
+        let resp = self.client.send(request).await?;
+        let status = resp.status().as_u16();
+        if status == 429 {
+            return Err(plain_rate_limit(resp.headers()));
+        }
+        if !(200..300).contains(&status) {
+            let message = format!("rest: OData key-bounds returned HTTP {status}");
+            return Err(if status >= 500 {
+                FaucetError::HttpStatus {
+                    status,
+                    url: faucet_core::redact_uri_credentials(url),
+                    body: message,
+                }
+            } else {
+                FaucetError::Source(message)
+            });
+        }
+        self.client
+            .json(resp)
+            .await
+            .map_err(|e| FaucetError::Source(format!("rest: OData key-bounds body: {e}")))
     }
 
     /// Stream an OData entity as concurrent key-range tiles: discover the key's
@@ -4065,7 +4159,7 @@ impl RestDriver {
                 seen.insert(url.clone());
                 let resp = self.discover_get_json(&url, "discovery list").await?;
                 names.extend(crate::discovery::dataset_names_unsorted(&resp, list));
-                match crate::discovery::next_list_url(&resp, list, base) {
+                match crate::discovery::next_list_url_from(&resp, list, base, Some(&url)) {
                     Some(next) if !seen.contains(&next) => url = next,
                     _ => break,
                 }
@@ -4098,6 +4192,44 @@ impl RestDriver {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn poll_status_reads_scalars_treats_null_as_unset_and_names_only_the_shape() {
+        let body = serde_json::json!({"s": "done", "n": 3, "b": true, "z": null, "o": {}, "a": []});
+        assert_eq!(poll_status(&body, "$.s").unwrap().as_deref(), Some("done"));
+        assert_eq!(poll_status(&body, "$.n").unwrap().as_deref(), Some("3"));
+        assert_eq!(poll_status(&body, "$.b").unwrap().as_deref(), Some("true"));
+        assert_eq!(poll_status(&body, "$.z").unwrap(), None);
+        let e = poll_status(&body, "$.o").unwrap_err().to_string();
+        assert!(
+            e.contains("matched an object") && e.contains("top-level keys: "),
+            "{e}"
+        );
+        let e = poll_status(&body, "$.a").unwrap_err().to_string();
+        assert!(e.contains("matched an array"), "{e}");
+        let e = poll_status(&body, "$.missing").unwrap_err().to_string();
+        assert!(e.contains("matched nothing") && !e.contains("done"), "{e}");
+    }
+
+    #[test]
+    fn json_shape_lists_at_most_twenty_keys_and_no_values() {
+        let wide: serde_json::Map<String, Value> = (0..25)
+            .map(|i| (format!("k{i:02}"), Value::from("v")))
+            .collect();
+        let shape = json_shape(&Value::Object(wide));
+        assert!(
+            shape.ends_with("k19, …") && !shape.contains("k20"),
+            "{shape}"
+        );
+        assert_eq!(json_shape(&serde_json::json!({})), "an empty object");
+        assert_eq!(
+            json_shape(&serde_json::json!([1, 2])),
+            "an array of 2 element(s)"
+        );
+        assert_eq!(json_shape(&serde_json::json!("x")), "a string");
+        assert_eq!(json_shape(&serde_json::json!(1)), "a number");
+        assert_eq!(json_shape(&serde_json::json!(false)), "a boolean");
+        assert_eq!(json_shape(&Value::Null), "null");
+    }
 
     #[tokio::test]
     async fn matcher_hits_count_per_call_scope() {
@@ -4300,8 +4432,21 @@ mod tests {
         // Numbers compare numerically.
         assert_eq!(value_max(Some(json!(5)), json!(10)), Some(json!(10)));
         assert_eq!(value_max(Some(json!(10)), json!(5)), Some(json!(10)));
-        // Heterogeneous / other → prefer the latest candidate.
-        assert_eq!(value_max(Some(json!("a")), json!(3)), Some(json!(3)));
+        // The same exact ordering the in-pass fold uses.
+        assert_eq!(value_max(Some(json!("9")), json!("10")), Some(json!("10")));
+        assert_eq!(value_max(Some(json!("10")), json!("9")), Some(json!("10")));
+        assert_eq!(
+            value_max(
+                Some(json!(9_007_199_254_740_993_u64)),
+                json!(9_007_199_254_740_992_u64)
+            ),
+            Some(json!(9_007_199_254_740_993_u64))
+        );
+        assert_eq!(
+            value_max(Some(json!("10.5")), json!(3)),
+            Some(json!("10.5"))
+        );
+        assert_eq!(value_max(Some(json!(3)), json!("2.5")), Some(json!(3)));
     }
 
     #[test]
@@ -4982,6 +5127,19 @@ mod patch_edge_tests {
         assert_eq!(sql_literal(&json!(false)), "false");
         // Non-scalars stringify quoted (defensive; bookmarks are scalars).
         assert_eq!(sql_literal(&json!([1, 2])), "'[1,2]'");
+        assert_eq!(
+            sql_literal(&json!(r"a\' OR Name != '")),
+            r"'a\\\' OR Name != \''"
+        );
+        assert_eq!(sql_literal(&json!(r"ends\")), r"'ends\\'");
+    }
+
+    #[test]
+    fn inject_sql_predicate_ignores_clause_words_in_the_select_list() {
+        assert_eq!(
+            inject_sql_predicate("SELECT Id, Offset, Limit FROM T ORDER BY Id", "X > 1"),
+            "SELECT Id, Offset, Limit FROM T WHERE X > 1 ORDER BY Id"
+        );
     }
 
     #[test]

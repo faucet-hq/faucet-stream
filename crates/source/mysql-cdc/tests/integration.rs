@@ -596,7 +596,7 @@ async fn anchor_types_and_compressed_transactions() {
         conn.query_drop(
             "INSERT INTO test.t VALUES (1, '2026-06-06 12:30:00', 'shipped', 'a,c', \
              '2026-06-06', '2026-06-06 12:30:00.500', '10:00:00', 2026, 0.1), \
-             (2, NULL, 'new', '', '2026-01-02', '2026-01-02 00:00:00', '23:59:59', 0, 1.5)",
+             (2, NULL, 'new', '', '2026-01-02', '2026-01-02 00:00:00', '-30:00:00', 0, 1.5)",
         )
         .await
         .expect("insert between runs");
@@ -621,6 +621,11 @@ async fn anchor_types_and_compressed_transactions() {
     assert_eq!(rows[1]["flags"], json!(""));
     assert_eq!(rows[1]["y"], json!(0), "YEAR 0000 is 0, not 1900");
     assert_eq!(rows[1]["dt"], json!("2026-01-02T00:00:00+00:00"));
+    assert_eq!(
+        rows[1]["tm"],
+        json!("-30:00:00"),
+        "a TIME duration keeps sign and hours"
+    );
 
     // SQL-28: a compressed transaction's bookmark is the payload's end.
     source

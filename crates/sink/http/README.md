@@ -86,7 +86,7 @@ faucet run pipeline.yaml
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `max_retries` | int | `0` | Number of retries on retriable failures (network errors, 5xx, 429). Retries back off exponentially with jitter from 250 ms; a `429` (or `503`) carrying `Retry-After` waits the stated time instead (a stated wait over 3600 s fails at once). 4xx client errors fail fast. After exhausting retries the last error is returned. |
+| `max_retries` | int | `0` | Number of retries on retriable failures (network errors, 5xx, 429). Retries back off exponentially with jitter from 250 ms; a `429` (or `503`) carrying `Retry-After` waits the stated time instead (a stated wait over 3600 s fails at once). 4xx client errors fail fast. After exhausting retries the last error is returned. A non-idempotent method (`POST`, `PATCH`) is **not** retried after a timeout or a connection dropped mid-response, because the endpoint may already have accepted the body; connection failures before sending, 5xx and 429 are still retried. |
 
 ## Authentication
 

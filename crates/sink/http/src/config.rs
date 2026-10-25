@@ -81,6 +81,8 @@ pub struct HttpSinkConfig {
     #[serde(default)]
     pub batch_mode: HttpBatchMode,
     /// Number of retries on transient failures (default: 0).
+    /// A `POST` / `PATCH` is not retried after a timeout or a
+    /// connection dropped mid-response, since the endpoint may already hold it.
     #[serde(default)]
     pub max_retries: usize,
     /// Maximum number of concurrent requests in Individual mode (default: 10).

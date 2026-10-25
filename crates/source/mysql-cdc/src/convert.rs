@@ -330,9 +330,14 @@ fn hinted_value(hint: &ColumnHint, v: &Value) -> Option<Json> {
                     |at| at.and_utc().to_rfc3339(),
                 ),
         )),
-        (ColumnHint::Time, Value::Time(false, 0, h, mi, s, micro)) if *h < 24 => Some(
-            Json::String(format!("{h:02}:{mi:02}:{s:02}{}", fraction(*micro))),
-        ),
+        (ColumnHint::Time, Value::Time(neg, days, h, mi, s, micro)) => {
+            let sign = if *neg { "-" } else { "" };
+            let hours = u64::from(*days) * 24 + u64::from(*h);
+            Some(Json::String(format!(
+                "{sign}{hours:02}:{mi:02}:{s:02}{}",
+                fraction(*micro)
+            )))
+        }
         (ColumnHint::Year, Value::Bytes(b)) => {
             let year: u16 = std::str::from_utf8(b).ok()?.parse().ok()?;
             Some(Json::from(if year == 1900 { 0 } else { year }))
@@ -509,7 +514,14 @@ mod tests {
             v(ColumnHint::Time, Value::Time(false, 0, 10, 0, 0, 0)),
             Some(Json::String("10:00:00".into()))
         );
-        assert_eq!(v(ColumnHint::Time, Value::Time(true, 0, 1, 0, 0, 0)), None);
+        assert_eq!(
+            v(ColumnHint::Time, Value::Time(true, 0, 1, 30, 0, 0)),
+            Some(Json::String("-01:30:00".into()))
+        );
+        assert_eq!(
+            v(ColumnHint::Time, Value::Time(false, 1, 6, 0, 0, 500_000)),
+            Some(Json::String("30:00:00.500".into()))
+        );
         assert_eq!(
             v(ColumnHint::Year, Value::Bytes(b"1900".to_vec())),
             Some(Json::from(0))

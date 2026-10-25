@@ -153,22 +153,24 @@ pub struct S3SourceConfig {
     /// a body that is read anyway — so it defaults to `true`.
     ///
     /// Skipped (with a debug log, not a failure) when the store advertises no
-    /// length, or when it reports a non-empty `Content-Encoding`: the body on
-    /// the wire is then transcoded and its length legitimately differs from
-    /// the stored object's.
+    /// length. Applied whatever the object's `Content-Encoding`: S3 serves an
+    /// object's bytes as stored and never transcodes them, so the advertised
+    /// length always matches the body on the wire.
     #[serde(default = "default_true")]
     pub verify_length: bool,
     /// Verify each object's body against the checksum the store advertises
     /// (#161). Stronger than the length check but costs a hash over the full
     /// body, so it defaults to `false`. When the store advertises no usable
     /// checksum for an object, verification is skipped for that object (a
-    /// debug log notes it); the length check still applies.
+    /// debug log notes it); the length check still applies. A JSON Lines
+    /// object is then read whole (up to `max_object_bytes`) and verified
+    /// before any of its records is emitted.
     #[serde(default)]
     pub verify_checksum: bool,
     /// Largest object, once decompressed, that a format read whole (JSON
-    /// array, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet) may
-    /// reach; a larger one fails with an error instead of exhausting memory.
-    /// Default 2 GiB.
+    /// array, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet, and
+    /// JSON Lines under `verify_checksum`) may reach; a larger one fails with
+    /// an error instead of exhausting memory. Default 2 GiB.
     #[serde(default = "default_max_object_bytes")]
     pub max_object_bytes: u64,
     /// Compression codec applied to each downloaded object. Defaults to

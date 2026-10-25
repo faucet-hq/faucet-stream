@@ -209,6 +209,25 @@ async fn conformance_driver_declarations_and_row_paths() {
     .await
     .expect("json sink");
     assert!(!json.supports_cleanup() && !json.supports_rollback());
+    // No key columns and nothing to evolve: append and overwrite only.
+    assert_eq!(
+        json.supported_write_modes(),
+        &[WriteMode::Append, WriteMode::Overwrite]
+    );
+    assert!(!json.supports_schema_evolution());
+    assert_eq!(
+        json.capabilities().schema_report(),
+        faucet_core::SchemaReport::Schemaless
+    );
+    faucet_conformance::assert_descriptor_matches_sink(
+        &faucet_sink_mysql::DESCRIPTOR,
+        "mysql",
+        &serde_json::json!({
+            "connection_url": url, "table_name": "jd",
+            "column_mapping": {"json": {"column": "data"}}
+        }),
+        &json,
+    );
     faucet_conformance::assert_driver_declarations_truthful(&json).await;
     faucet_conformance::assert_driver_row_paths_agree(&json).await;
 }

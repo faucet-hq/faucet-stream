@@ -346,7 +346,10 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
     /// writes into its staging target (it routes there off its own config), so
     /// the orchestrator must call `begin_overwrite` before, and
     /// `commit_overwrite`/`abort_overwrite` after, all the suppressed
-    /// invocations that share the destination.
+    /// invocations that share the destination. A suppressed run does not
+    /// persist its bookmark either (it would claim delivery before the swap):
+    /// the orchestrator persists each invocation's [`PipelineResult::bookmark`]
+    /// after `commit_overwrite` succeeds.
     pub fn with_suppress_overwrite(mut self, suppress: bool) -> Self {
         self.suppress_overwrite_lifecycle = suppress;
         self
@@ -1065,23 +1068,23 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                 source_drains_on_cancel,
                 row_accounts: self.row_accounts.clone(),
             };
+            let cleanup = self.cleanup.clone().filter(|p| {
+                p.trigger != crate::cleanup::CleanupTrigger::CompleteRead || complete_read.is_some()
+            });
+            if cleanup.is_some() && !wrapped_sink.supports_cleanup() {
+                return Err(FaucetError::Config(format!(
+                    "cleanup is configured but sink '{}' does not support scoped cleanup",
+                    wrapped_sink.connector_name()
+                )));
+            }
             let overwriting = wrapped_sink.is_overwrite() && !self.suppress_overwrite_lifecycle;
             if overwriting {
                 wrapped_sink.begin_overwrite().await?;
             }
 
-            let cleanup = self.cleanup.clone().filter(|p| {
-                p.trigger != crate::cleanup::CleanupTrigger::CompleteRead || complete_read.is_some()
-            });
             let run_result = match cleanup {
                 None => Box::pin(run_stream_with(pages, &wrapped_sink, opts, extras)).await,
                 Some(policy) => {
-                    if !wrapped_sink.supports_cleanup() {
-                        return Err(FaucetError::Config(format!(
-                            "cleanup is configured but sink '{}' does not support scoped cleanup",
-                            wrapped_sink.connector_name()
-                        )));
-                    }
                     let mut tracker = crate::cleanup::CleanupTracker::new(&wrapped_sink, &policy);
                     if let Some(signal) = complete_read.clone() {
                         tracker = tracker.gated_by(signal);
@@ -1176,6 +1179,11 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                         {
                             store.put(key, bm).await?;
                         }
+                        if let Ok(res) = &run_result
+                            && let Some(bm) = res.bookmark.as_ref()
+                        {
+                            crate::observability::update_bookmark_lag(bm, &obs_labels);
+                        }
                     }
                     _ => {
                         if let Err(e) = wrapped_sink.abort_overwrite().await {
@@ -1229,6 +1237,28 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
 
         result
     }
+}
+
+/// The governance pass that quarantined most of a page's envelopes, read from
+/// each envelope's `reason`; ties go to the earlier pass in `ALL` order.
+fn dominant_governance_reason(envelopes: &[Value]) -> crate::dlq::DlqReason {
+    let candidates = [
+        crate::dlq::DlqReason::Quality,
+        crate::dlq::DlqReason::Contract,
+        crate::dlq::DlqReason::SchemaDrift,
+    ];
+    let mut counts = [0usize; 3];
+    for env in envelopes {
+        let reason = env.get("reason").and_then(Value::as_str);
+        if let Some(i) = candidates.iter().position(|c| Some(c.as_str()) == reason) {
+            counts[i] += 1;
+        }
+    }
+    let best = (0..candidates.len())
+        .rev()
+        .max_by_key(|&i| counts[i])
+        .unwrap_or(0);
+    candidates[best]
 }
 
 /// Fold the run's non-finite count (values with no JSON rendering written as
@@ -1637,6 +1667,13 @@ where
 /// their bookmark after seeing every record emit `Some` on the final page;
 /// CDC-style sources emit `Some` per committed transaction and get
 /// per-transaction durability automatically.
+///
+/// Exception: when the sink [`is_overwrite`](Sink::is_overwrite), no bookmark
+/// is persisted here, because the destination only becomes visible at the
+/// staging swap. `run_stream` neither begins nor commits that swap: the caller
+/// calls [`Sink::begin_overwrite`] before, [`Sink::commit_overwrite`] after a
+/// successful return, and only then persists [`PipelineResult::bookmark`]
+/// itself. [`Pipeline::run`] does all of this.
 ///
 /// Returns the cumulative [`PipelineResult`] — `records_written` is the sum
 /// across all pages and `bookmark` is the last per-page bookmark observed.
@@ -2290,10 +2327,8 @@ where
                         // Capture the quality count BEFORE the splice — the splice
                         // moves `quality_envelopes`, so its length is unavailable
                         // afterward. Used below to pick the page `reason` label.
-                        #[cfg(feature = "quality")]
                         let quality_count = quality_envelopes.len();
-                        #[cfg(not(feature = "quality"))]
-                        let quality_count = 0usize;
+                        let governance_reason = dominant_governance_reason(quality_envelopes.envelopes());
                         envelopes.prepend(quality_envelopes);
                         let page_failures = envelopes.len();
 
@@ -2406,8 +2441,9 @@ where
                             //    was synthesized from an outer `write_batch_partial`
                             //    error (OnBatchError::DlqAll); no genuine per-row
                             //    failures occurred.
-                            //  - `quality`  — every envelope is quality-sourced
-                            //    (no sink-side failures on this page).
+                            //  - `quality` / `contract` / `schema_drift` — every
+                            //    envelope came from a governance pass (no sink-side
+                            //    failures); the most frequent pass names the page.
                             // The per-row quality volume is separately exposed via
                             // `faucet_quality_records_quarantined_total`.
                             let reason_label = if had_per_row_sink_failure {
@@ -2417,7 +2453,7 @@ where
                             } else if page_failures > quality_count {
                                 DlqReason::Partial.as_str()
                             } else {
-                                DlqReason::Quality.as_str()
+                                governance_reason.as_str()
                             };
                             counter!("faucet_sink_dlq_records_total", metric_labels.clone())
                                 .increment(page_failures as u64);
@@ -2458,14 +2494,18 @@ where
                                 counter!("faucet_sink_dlq_errors_total", lbl).increment(1);
                                 FaucetError::Sink(format!("DLQ sink flush failed: {e}"))
                             })?;
-                            let bm_labels =
-                                crate::observability::Labels::new(&*pipeline_name, &*row, &*run_id);
-                            crate::observability::update_bookmark_lag(&bookmark, &bm_labels);
-                            if !defer_bookmarks
-                                && let (Some(store), Some(key)) =
+                            if !defer_bookmarks {
+                                if let (Some(store), Some(key)) =
                                     (state_store.as_ref(), state_key.as_ref())
-                            {
-                                with_retry!("state_put", store.put(key, &bookmark))?;
+                                {
+                                    with_retry!("state_put", store.put(key, &bookmark))?;
+                                }
+                                let bm_labels = crate::observability::Labels::new(
+                                    &*pipeline_name,
+                                    &*row,
+                                    &*run_id,
+                                );
+                                crate::observability::update_bookmark_lag(&bookmark, &bm_labels);
                             }
                             last_bookmark = Some(bookmark);
                         }
@@ -2536,9 +2576,6 @@ where
                                 (&pipeline_name, &row, sink_name),
                             )?;
                             with_retry!("flush", sink.flush())?;
-                            let bm_labels =
-                                crate::observability::Labels::new(&*pipeline_name, &*row, &*run_id);
-                            crate::observability::update_bookmark_lag(&bookmark, &bm_labels);
                             if let (Some(store), Some(key)) =
                                 (state_store.as_ref(), state_key.as_ref())
                             {
@@ -2546,6 +2583,9 @@ where
                                     crate::idempotency::wrap_state(Some(&bookmark), next_seq);
                                 with_retry!("state_put", store.put(key, &wrapped))?;
                             }
+                            let bm_labels =
+                                crate::observability::Labels::new(&*pipeline_name, &*row, &*run_id);
+                            crate::observability::update_bookmark_lag(&bookmark, &bm_labels);
                             last_bookmark = Some(bookmark);
                         } else if !governed.is_empty() {
                             // No bookmark → not individually checkpointed; write
@@ -2613,14 +2653,18 @@ where
                             if !defer_bookmarks {
                                 with_retry!("flush", sink.flush())?;
                             }
-                            let bm_labels =
-                                crate::observability::Labels::new(&*pipeline_name, &*row, &*run_id);
-                            crate::observability::update_bookmark_lag(&bookmark, &bm_labels);
-                            if !defer_bookmarks
-                                && let (Some(store), Some(key)) =
+                            if !defer_bookmarks {
+                                if let (Some(store), Some(key)) =
                                     (state_store.as_ref(), state_key.as_ref())
-                            {
-                                with_retry!("state_put", store.put(key, &bookmark))?;
+                                {
+                                    with_retry!("state_put", store.put(key, &bookmark))?;
+                                }
+                                let bm_labels = crate::observability::Labels::new(
+                                    &*pipeline_name,
+                                    &*row,
+                                    &*run_id,
+                                );
+                                crate::observability::update_bookmark_lag(&bookmark, &bm_labels);
                             }
                             last_bookmark = Some(bookmark);
                         }
@@ -5212,6 +5256,25 @@ mod tests {
         assert_eq!(dlq.len(), 1);
         assert_eq!(dlq[0]["error"]["kind"], "QualityFailure");
         assert_eq!(result.dlq.unwrap().records_dlq, 1);
+    }
+
+    #[test]
+    fn governance_page_reason_follows_the_envelopes() {
+        use crate::dlq::DlqReason;
+        let env = |r: &str| json!({"reason": r});
+        assert_eq!(
+            dominant_governance_reason(&[env("contract"), env("contract"), env("quality")]),
+            DlqReason::Contract
+        );
+        assert_eq!(
+            dominant_governance_reason(&[env("schema_drift")]),
+            DlqReason::SchemaDrift
+        );
+        assert_eq!(
+            dominant_governance_reason(&[env("quality"), env("contract")]),
+            DlqReason::Quality
+        );
+        assert_eq!(dominant_governance_reason(&[]), DlqReason::Quality);
     }
 
     #[cfg(feature = "quality")]
@@ -8028,6 +8091,44 @@ mod cleanup_tests {
         assert!(
             sink.written.lock().unwrap().is_empty(),
             "must fail before writing anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_cleanup_is_refused_before_overwrite_staging_begins() {
+        struct OverwriteNoCleanup(Arc<Mutex<Vec<String>>>);
+        #[async_trait]
+        impl Sink for OverwriteNoCleanup {
+            async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+                Ok(records.len())
+            }
+            fn is_overwrite(&self) -> bool {
+                true
+            }
+            async fn begin_overwrite(&self) -> Result<(), FaucetError> {
+                self.0.lock().unwrap().push("begin".into());
+                Ok(())
+            }
+            async fn abort_overwrite(&self) -> Result<(), FaucetError> {
+                self.0.lock().unwrap().push("abort".into());
+                Ok(())
+            }
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = OverwriteNoCleanup(events.clone());
+        let source = src(vec![json!({"id": 1})]);
+        let err = Pipeline::new(&source, &sink)
+            .with_cleanup(policy(100))
+            .run()
+            .await
+            .expect_err("unsupported sink must be rejected");
+        assert!(
+            matches!(&err, FaucetError::Config(m) if m.contains("scoped cleanup")),
+            "{err}"
+        );
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "no staging may be created"
         );
     }
 

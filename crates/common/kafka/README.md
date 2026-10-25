@@ -107,7 +107,9 @@ value_format:
 
 The Confluent wire envelope is `[0x00][schema_id: 4-byte big-endian][payload bytes…]`. The
 client caches schema fetches (keyed by id) and registrations (keyed by subject/type/text) in
-two LRUs of `cache_capacity`, so a stream sharing one schema issues a single registry call.
+LRUs of `cache_capacity`, so a stream sharing one schema issues a single registry call. The
+decoder built for a writer schema (Avro codec, compiled `.proto`, JSON Schema validator), with
+its references resolved, is cached by schema id too, so references are followed once per id.
 On the sink side the subject is `{topic}-value` (Confluent TopicNameStrategy).
 
 ---

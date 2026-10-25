@@ -414,8 +414,8 @@ pub fn contains_unescaped(s: &str, prefix: &str) -> bool {
 }
 
 /// Unescape a raw config document everywhere except the connector, transform,
-/// state and DLQ configs — those are interpolated again at run time and are
-/// unescaped when built instead — and the blocks later load passes still
+/// state and DLQ configs and the `auth:` catalog — those are interpolated
+/// again later and are unescaped when built instead — and the blocks later load passes still
 /// interpolate: `vars:` (substituted into those configs) and the typed blocks
 /// the secrets pass walks, which [`crate::secrets::unescape_typed_blocks`]
 /// unescapes once that pass is done (#862 M-023).
@@ -424,6 +424,7 @@ pub(crate) fn unescape_document(doc: &mut Value) {
         matches!(
             path,
             ["vars"]
+                | ["auth"]
                 | ["observability" | "verify" | "reconcile" | "lineage" | "catalog"]
                 | ["notifications" | "notify"]
                 | ["pipeline", "masking"]
@@ -440,7 +441,16 @@ pub(crate) fn unescape_document(doc: &mut Value) {
                 | ["matrix", _, "source", "transforms", _, "config"]
                 | ["matrix", _, "transforms", _, "config"]
                 | ["matrix", _, "state", "config"]
+                | ["matrix", _, "dlq", "sink", "config"]
                 | ["mirror" | "replication", "snapshot", "source", "config"]
+                | [
+                    "mirror" | "replication",
+                    "snapshot",
+                    "source",
+                    "transforms",
+                    _,
+                    "config"
+                ]
         )
     }
     fn walk(v: &mut Value, path: &mut Vec<String>) {
@@ -1310,8 +1320,13 @@ mod tests {
             "matrix": [{ "id": "r", "source": { "config": { "q": "$${e}" } } }],
             "notifications": [{ "text": "$${f}" }],
             "vars": { "v": "$${g}" },
-            "execution": { "note": "$${h}" }
+            "execution": { "note": "$${h}" },
+            "auth": { "idp": { "type": "static", "config": { "token": "$${k}" } } },
+            "mirror": { "snapshot": { "source": { "type": "postgres",
+                "transforms": [{ "type": "set", "config": { "v": "$${m}" } }] } } }
         });
+        doc["matrix"][0]["dlq"] =
+            serde_json::json!({ "sink": { "type": "jsonl", "config": { "p": "$${l}" } } });
         doc["pipeline"]["nodes"] = serde_json::json!({
             "n": { "kind": "source", "config": { "q": "$${i}" } },
             "t": { "kind": "transform", "transforms": [{ "type": "set", "config": { "v": "$${j}" } }] }
@@ -1332,6 +1347,12 @@ mod tests {
         assert_eq!(doc["pipeline"]["transforms"][0]["config"]["v"], "$${c}");
         assert_eq!(doc["pipeline"]["state"]["config"]["path"], "$${d}");
         assert_eq!(doc["matrix"][0]["source"]["config"]["q"], "$${e}");
+        assert_eq!(doc["auth"]["idp"]["config"]["token"], "$${k}");
+        assert_eq!(doc["matrix"][0]["dlq"]["sink"]["config"]["p"], "$${l}");
+        assert_eq!(
+            doc["mirror"]["snapshot"]["source"]["transforms"][0]["config"]["v"],
+            "$${m}"
+        );
         let mut v = doc["pipeline"]["source"]["config"].clone();
         unescape_value(&mut v);
         assert_eq!(v["q"], "${a}");
@@ -1729,6 +1750,29 @@ pipeline:
         assert_eq!(
             cfg.auth.as_ref().unwrap()["idp"]["config"]["token"],
             "Bearer topsecret"
+        );
+    }
+
+    #[test]
+    fn escaped_directives_in_auth_and_row_dlq_stay_literal_through_load() {
+        let cfg = PipelineConfig::from_text(
+            r#"
+version: 1
+auth:
+  idp: { type: static, config: { token: "$${vars.literal}" } }
+pipeline:
+  source: { type: rest, config: { base_url: https://x } }
+  sink:   { type: jsonl, config: { path: ./o.jsonl } }
+matrix:
+  - id: r
+    dlq: { sink: { type: jsonl, config: { path: "$${sinks.nope.config.path}" } } }
+"#,
+            std::path::Path::new("p.yaml"),
+        )
+        .expect("escaped tokens are not resolved");
+        assert_eq!(
+            cfg.auth.as_ref().unwrap()["idp"]["config"]["token"],
+            "$${vars.literal}"
         );
     }
 

@@ -7,14 +7,19 @@ use crate::serve::history::{ListFilter, RunHistory, RunRecord};
 /// How many recent runs to read.
 pub const HISTORY_LIMIT: usize = 200;
 
-/// Flatten run records (newest first) into per-row runs, plus the ids of the
-/// runs still in flight.
-pub fn from_records(records: &[RunRecord]) -> (Vec<HistoryRun>, Vec<String>) {
+pub use super::active::ActiveRun;
+
+/// Flatten run records (newest first) into per-row runs, plus the runs still
+/// in flight.
+pub fn from_records(records: &[RunRecord]) -> (Vec<HistoryRun>, Vec<ActiveRun>) {
     let mut runs = Vec::new();
     let mut active = Vec::new();
     for r in records {
         if !r.status.is_terminal() {
-            active.push(r.run_id.clone());
+            active.push(ActiveRun {
+                run_id: r.run_id.clone(),
+                selection: r.selection.clone(),
+            });
             continue;
         }
         let at = r.finished_at.or(r.started_at).unwrap_or(r.submitted_at);
@@ -54,7 +59,7 @@ pub fn belongs_to(r: &RunRecord, pipeline: &str) -> bool {
 pub async fn read(
     store: &dyn RunHistory,
     pipeline: &str,
-) -> Result<(Vec<HistoryRun>, Vec<String>), String> {
+) -> Result<(Vec<HistoryRun>, Vec<ActiveRun>), String> {
     read_scoped(store, pipeline, None).await
 }
 
@@ -64,7 +69,7 @@ pub async fn read_scoped(
     store: &dyn RunHistory,
     pipeline: &str,
     tenant: Option<&str>,
-) -> Result<(Vec<HistoryRun>, Vec<String>), String> {
+) -> Result<(Vec<HistoryRun>, Vec<ActiveRun>), String> {
     // Page through the server's runs (newest first) until this pipeline's
     // recent history is collected: on a busy server its runs can sit far
     // behind other pipelines' (#789 CLI-167).
@@ -162,7 +167,8 @@ mod tests {
             record("r1", RunStatus::Completed, vec![inv("a", None, None)]),
         ];
         let (runs, active) = from_records(&recs);
-        assert_eq!(active, vec!["r3"]);
+        let ids: Vec<&str> = active.iter().map(|a| a.run_id.as_str()).collect();
+        assert_eq!(ids, vec!["r3"]);
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].error.as_deref(), Some("boom"));
         assert_eq!(runs[1].run_id, "r1");

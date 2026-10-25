@@ -19,7 +19,7 @@ impl PostgresHistory {
         instance_id: String,
     ) -> Result<Self, HistoryError> {
         let pool = PgPoolOptions::new()
-            .max_connections(5)
+            .max_connections(super::sql::POOL_MAX_CONNECTIONS)
             .connect(url)
             .await
             .map_err(|e| classify_backend_error_with_context("Postgres connection failed", e))?;

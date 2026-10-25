@@ -483,7 +483,7 @@ impl AsyncJobConfig {
                 "async_job: `status.success` must list at least one terminal value".into(),
             ));
         }
-        if self.poll.interval_secs == 0 && self.poll.timeout_secs == 0 {
+        if self.poll.timeout_secs == 0 {
             return Err(faucet_core::FaucetError::Config(
                 "async_job: `poll.timeout_secs` must be > 0".into(),
             ));
@@ -739,6 +739,12 @@ mod tests {
         let mut empty_id = base.clone();
         empty_id.job_id = " ".into();
         assert!(empty_id.validate().is_err());
+
+        let mut no_timeout = base.clone();
+        no_timeout.poll.timeout_secs = 0;
+        assert!(no_timeout.poll.interval_secs > 0);
+        let err = no_timeout.validate().unwrap_err().to_string();
+        assert!(err.contains("poll.timeout_secs"), "{err}");
     }
 
     #[test]

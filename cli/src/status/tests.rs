@@ -230,6 +230,65 @@ async fn memory_state_and_unreachable_backends_are_unknown() {
 }
 
 #[tokio::test]
+async fn an_active_run_marks_only_the_rows_it_selected_and_never_hides_unknown() {
+    let t = target("", "  - id: b\n");
+    let (s, store) = stores(&t).await;
+    let auth = AuthCatalog::new();
+    put_outcome(store.as_ref(), "orders::a", vec![ev(60, None)]).await;
+    put_outcome(store.as_ref(), "orders::b", vec![ev(60, None)]).await;
+    let mut inp = inputs(&auth);
+    inp.active_runs = vec![ActiveRun {
+        run_id: "srv-1".into(),
+        selection: Some(crate::select::SelectionRequest {
+            only: vec!["a".into()],
+            ..Default::default()
+        }),
+    }];
+    let r = assemble(&t, Ok(&s), &inp).await.unwrap();
+    assert_eq!(r.rows[0].health, Health::Running);
+    assert_eq!(r.rows[1].health, Health::Ok, "{:?}", r.rows[1].reasons);
+
+    let text = "version: 1\nname: m\npipeline:\n  source: { type: csv, config: { path: a } }\n  sink: { type: stdout, config: {} }\n  state: { type: memory, config: {} }\n";
+    let cfg = PipelineConfig::from_text(text, Path::new("t.yaml")).unwrap();
+    let t = PipelineTarget::resolve(&cfg, "m").unwrap();
+    let s = Stores::build(&t, None).await.unwrap();
+    let mut inp = inputs(&auth);
+    inp.active_runs = vec!["srv-2".into()];
+    let r = assemble(&t, Ok(&s), &inp).await.unwrap();
+    assert_eq!(r.rows[0].health, Health::Unknown);
+    assert_eq!(r.exit_code, 1);
+}
+
+#[test]
+fn active_run_selection_membership() {
+    use crate::select::SelectionRequest;
+    let run = |sel: SelectionRequest| ActiveRun {
+        run_id: "r".into(),
+        selection: Some(sel),
+    };
+    assert!(ActiveRun::from("r").may_include("x"));
+    let skip = run(SelectionRequest {
+        skip: vec!["b*".into()],
+        ..Default::default()
+    });
+    assert!(skip.may_include("a") && !skip.may_include("b1"));
+    let select = run(SelectionRequest {
+        select: vec!["a".into()],
+        ..Default::default()
+    });
+    assert!(select.may_include("a") && !select.may_include("b"));
+    let tagged = run(SelectionRequest {
+        select: vec!["a".into()],
+        tags: vec!["t".into()],
+        ..Default::default()
+    });
+    assert!(
+        tagged.may_include("b"),
+        "a tag filter cannot be decided by id"
+    );
+}
+
+#[tokio::test]
 async fn children_aggregate_under_their_parent() {
     let t = target("", "  - id: kid\n    parent: a\n    parent_key: id\n");
     let (s, store) = stores(&t).await;

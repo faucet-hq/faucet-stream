@@ -315,6 +315,21 @@ impl FlowConfig {
 
 /// Substitute `${key}` tokens from `ctx`. Unknown tokens are left verbatim.
 /// Single-pass — a substituted value is never re-scanned.
+/// Render every string leaf (and object key) of a JSON body, so a captured
+/// value is inserted as JSON string content, never as raw JSON text.
+fn render_json(value: &Value, ctx: &HashMap<String, String>) -> Value {
+    match value {
+        Value::String(s) => Value::String(render(s, ctx)),
+        Value::Array(items) => Value::Array(items.iter().map(|v| render_json(v, ctx)).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (render(k, ctx), render_json(v, ctx)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 fn render(template: &str, ctx: &HashMap<String, String>) -> String {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
@@ -615,7 +630,12 @@ pub struct FlowProvider {
     state: Mutex<Option<Session>>,
     /// Logins so far; each session's number is exposed as [`FLOW_SESSION_KEY`].
     logins: std::sync::atomic::AtomicU64,
+    /// Recent `credential()` header values and the session that issued them.
+    issued: std::sync::Mutex<std::collections::VecDeque<(String, u64)>>,
 }
+
+/// How many issued header credentials are remembered for `invalidate`.
+const ISSUED_HEADERS_KEPT: usize = 256;
 
 /// Captured-context key holding the current session's number. A connector
 /// that consumes [`request_auth`](AuthProvider::request_auth) passes
@@ -643,22 +663,23 @@ impl FlowProvider {
             config,
             state: Mutex::new(None),
             logins: std::sync::atomic::AtomicU64::new(0),
+            issued: std::sync::Mutex::new(std::collections::VecDeque::new()),
         })
     }
 
-    /// A fresh clock context (`ts`, `nonce`) for signing.
+    /// A fresh clock context for signing: `ts` (Unix seconds) and `nonce`
+    /// (32 random hex characters, unique per signature).
     fn clock_ctx() -> HashMap<String, String> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
         let mut ctx = HashMap::new();
         ctx.insert("ts".to_owned(), now.to_string());
-        ctx.insert("nonce".to_owned(), format!("{now}{nanos}"));
+        ctx.insert(
+            "nonce".to_owned(),
+            uuid::Uuid::new_v4().simple().to_string(),
+        );
         ctx
     }
 
@@ -694,9 +715,7 @@ impl FlowProvider {
                     .collect();
                 builder = builder.form(&f);
             } else if let Some(json) = &req.json {
-                let rendered = render(&serde_json::to_string(json).unwrap_or_default(), &ctx);
-                let body: Value = serde_json::from_str(&rendered).unwrap_or_else(|_| json.clone());
-                builder = builder.json(&body);
+                builder = builder.json(&render_json(json, &ctx));
             }
             // Sign this login/pre-flight step itself (#541): a fresh clock,
             // captured values so far, then a header placement.
@@ -804,6 +823,23 @@ impl FlowProvider {
         Ok(ctx)
     }
 
+    fn remember_issued(&self, value: &str, session: u64) {
+        let mut issued = self.issued.lock().unwrap_or_else(|e| e.into_inner());
+        if issued.len() >= ISSUED_HEADERS_KEPT {
+            issued.pop_front();
+        }
+        issued.push_back((value.to_owned(), session));
+    }
+
+    fn issued_session(&self, value: &str) -> Option<u64> {
+        let issued = self.issued.lock().unwrap_or_else(|e| e.into_inner());
+        issued
+            .iter()
+            .rev()
+            .find(|(v, _)| v == value)
+            .map(|(_, s)| *s)
+    }
+
     fn request_auth_from_ctx(&self, captured: &HashMap<String, String>) -> RequestAuth {
         let mut ctx = captured.clone();
         ctx.extend(Self::clock_ctx());
@@ -821,6 +857,9 @@ impl AuthProvider for FlowProvider {
         // credential. Query/cookie/body placements need `request_auth`.
         for p in &auth.placements {
             if let CredentialPlacement::Header { name, value } = p {
+                if let Some(Ok(session)) = ctx.get(FLOW_SESSION_KEY).map(|c| c.parse::<u64>()) {
+                    self.remember_issued(value, session);
+                }
                 return Ok(Credential::Header {
                     name: name.clone(),
                     value: value.clone(),
@@ -842,16 +881,18 @@ impl AuthProvider for FlowProvider {
             // another caller already re-logged for: keep the new session. A
             // token that names no session (empty, or not a session number)
             // invalidates the live one.
-            let superseded = match (state.as_ref(), stale) {
-                (Some(s), Credential::Token(sent)) => {
+            let sent_session = match stale {
+                Credential::Token(sent) => sent.parse::<u64>().ok(),
+                Credential::Header { value, .. } => self.issued_session(value),
+                _ => None,
+            };
+            let superseded = match (state.as_ref(), sent_session) {
+                (Some(s), Some(sent)) => {
                     s.valid()
-                        && match (
-                            sent.parse::<u64>(),
+                        && matches!(
                             s.ctx.get(FLOW_SESSION_KEY).map(|c| c.parse::<u64>()),
-                        ) {
-                            (Ok(sent), Some(Ok(cur))) => sent < cur,
-                            _ => false,
-                        }
+                            Some(Ok(cur)) if sent < cur
+                        )
                 }
                 _ => false,
             };
@@ -885,6 +926,36 @@ impl AuthProvider for FlowProvider {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn render_json_escapes_captured_values_structurally() {
+        let c = ctx(&[("nonce", "ab\"c\\d"), ("k", "user")]);
+        let body = json!({"nonce": "${nonce}", "n": 3, "list": ["x-${k}"], "${k}": true});
+        let out = render_json(&body, &c);
+        assert_eq!(out["nonce"], json!("ab\"c\\d"));
+        assert_eq!(out["n"], json!(3));
+        assert_eq!(out["list"], json!(["x-user"]));
+        assert_eq!(out["user"], json!(true));
+    }
+
+    #[test]
+    fn render_json_cannot_add_keys() {
+        let c = ctx(&[("v", "x\", \"admin\": \"true")]);
+        let out = render_json(&json!({"a": "${v}"}), &c);
+        assert_eq!(out.as_object().unwrap().len(), 1);
+        assert_eq!(out["a"], json!("x\", \"admin\": \"true"));
+    }
+
+    #[test]
+    fn clock_ctx_nonce_is_random_and_unique() {
+        let a = FlowProvider::clock_ctx();
+        let b = FlowProvider::clock_ctx();
+        let (na, nb) = (&a["nonce"], &b["nonce"]);
+        assert_eq!(na.len(), 32);
+        assert!(na.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(na, nb);
+        assert!(!na.starts_with(&a["ts"]));
+    }
 
     fn ctx(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
@@ -1257,6 +1328,38 @@ mod tests {
         p.invalidate(&Credential::Bearer("whatever".into()))
             .await
             .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn concurrent_header_invalidations_of_one_session_log_in_once() {
+        let server = MockServer::start().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/login"))
+            .respond_with(CountingLogin(hits.clone()))
+            .mount(&server)
+            .await;
+        let cfg = json!({
+            "steps": [ { "request": { "method": "POST", "url": format!("{}/login", server.uri()) },
+                         "capture": { "sid": "$.sid" } } ],
+            "apply": [ { "into": "header", "name": "X", "value": "${sid}" } ]
+        });
+        let p = FlowProvider::from_config(&cfg).unwrap();
+        let stale = p.credential().await.unwrap();
+        let first = p.invalidate(&stale).await.unwrap();
+        let second = p.invalidate(&stale).await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert!(matches!(&first, Credential::Header { value, .. } if value == "S2"));
+        assert!(matches!(&second, Credential::Header { value, .. } if value == "S2"));
+        p.invalidate(&second).await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        p.invalidate(&Credential::Header {
+            name: "X".into(),
+            value: "unknown".into(),
+        })
+        .await
+        .unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 4);
     }
 

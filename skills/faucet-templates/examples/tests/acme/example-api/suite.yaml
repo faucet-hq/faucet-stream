@@ -22,6 +22,7 @@ suite:
       expect: { error: page_size }
   behavioral:
     - name: customer-record-shape
+      row: customers
       params: { api_token: suite_token }
       input:
         - { id: 1, displayName: Ada, address: { city: Paris, zip: "75001" } }

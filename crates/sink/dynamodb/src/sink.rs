@@ -3,7 +3,7 @@
 //! conditional item-by-item writes.
 
 use crate::config::{DynamoDbSinkConfig, OnConditionFailure};
-use crate::plan::{Op, OpKind, chunk_ops, plan_as, request_canon};
+use crate::plan::{Item, Op, OpKind, canonical_number, chunk_ops, plan_as, request_canon};
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::AttributeValue;
 use faucet_common_dynamodb::{
@@ -212,6 +212,9 @@ impl DynamoDbDriver {
         let table = &self.config.table_name;
         let what = format!("write to '{table}'");
         let on_fail = self.config.on_condition_failure;
+        let conditional = self.config.condition_expression.is_some();
+        let ambiguous = std::sync::atomic::AtomicBool::new(false);
+        let ambiguous = &ambiguous;
         self.config
             .retry
             .run_in(
@@ -229,6 +232,8 @@ impl DynamoDbDriver {
                             .set_condition_expression(self.config.condition_expression.clone())
                             .set_expression_attribute_names(self.names.clone())
                             .set_expression_attribute_values(self.values.clone())
+                            .customize()
+                            .config_override(sdk_retries(!conditional))
                             .send()
                             .await
                             .map(|_| ())
@@ -241,15 +246,52 @@ impl DynamoDbDriver {
                             .set_condition_expression(self.config.condition_expression.clone())
                             .set_expression_attribute_names(self.names.clone())
                             .set_expression_attribute_values(self.values.clone())
+                            .customize()
+                            .config_override(sdk_retries(!conditional))
                             .send()
                             .await
                             .map(|_| ())
                             .map_err(|e| sdk_error_parts(&e)),
                     };
+                    if matches!(&sent, Err((code, _)) if outcome_unknown(code.as_deref())) {
+                        ambiguous.store(true, std::sync::atomic::Ordering::Relaxed);
+                    } else if on_fail == OnConditionFailure::Fail
+                        && is_condition_failure(&sent)
+                        && ambiguous.load(std::sync::atomic::Ordering::Relaxed)
+                        && self.earlier_attempt_applied(op).await?
+                    {
+                        return Ok(Ok(()));
+                    }
                     classify_single(sent, on_fail)
                 },
             )
             .await
+    }
+
+    /// After an attempt whose outcome is unknown, whether it landed: a
+    /// consistent read finds the put item unchanged, or the deleted key gone.
+    async fn earlier_attempt_applied(&self, op: &Op) -> Result<bool, (Option<String>, String)> {
+        let key: Item = match &op.kind {
+            OpKind::Delete(key) => key.clone(),
+            OpKind::Put(item) => match self.keys.get() {
+                Some((_, names)) => item
+                    .iter()
+                    .filter(|(k, _)| names.contains(k))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                None => return Ok(false),
+            },
+        };
+        let found = self
+            .client
+            .get_item()
+            .table_name(&self.config.table_name)
+            .set_key(Some(key))
+            .consistent_read(true)
+            .send()
+            .await
+            .map_err(|e| sdk_error_parts(&e))?;
+        Ok(applied_by_earlier_attempt(&op.kind, found.item()))
     }
 
     /// Send one chunk, retrying unprocessed items; a validation failure falls
@@ -378,6 +420,55 @@ impl DynamoDbDriver {
 /// Map a single-item write result: a failed condition per
 /// `on_condition_failure`, a validation error as a row failure, anything
 /// else back to the retry loop.
+fn is_condition_failure(sent: &Result<(), (Option<String>, String)>) -> bool {
+    matches!(sent, Err((Some(code), _)) if code == "ConditionalCheckFailedException")
+}
+
+/// Whether the item read back shows an earlier attempt of `kind` landed.
+pub(crate) fn applied_by_earlier_attempt(kind: &OpKind, found: Option<&Item>) -> bool {
+    match kind {
+        OpKind::Put(item) => found.is_some_and(|f| items_equal(item, f)),
+        OpKind::Delete(_) => found.is_none(),
+    }
+}
+
+/// Item equality as DynamoDB stores it: numbers by value (it re-renders
+/// `2.0` as `2`), sets without order, lists and maps recursively.
+fn items_equal(a: &Item, b: &Item) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .all(|(k, v)| b.get(k).is_some_and(|w| attr_equal(v, w)))
+}
+
+fn attr_equal(a: &AttributeValue, b: &AttributeValue) -> bool {
+    use AttributeValue as A;
+    match (a, b) {
+        (A::N(x), A::N(y)) => number_key(x) == number_key(y),
+        (A::Ns(x), A::Ns(y)) => same_set(
+            x.iter().map(|n| number_key(n)),
+            y.iter().map(|n| number_key(n)),
+        ),
+        (A::Ss(x), A::Ss(y)) => same_set(x.iter().cloned(), y.iter().cloned()),
+        (A::Bs(x), A::Bs(y)) => same_set(
+            x.iter().map(|b| b.as_ref().to_vec()),
+            y.iter().map(|b| b.as_ref().to_vec()),
+        ),
+        (A::L(x), A::L(y)) => x.len() == y.len() && x.iter().zip(y).all(|(v, w)| attr_equal(v, w)),
+        (A::M(x), A::M(y)) => items_equal(x, y),
+        _ => a == b,
+    }
+}
+
+fn number_key(raw: &str) -> String {
+    canonical_number(raw).unwrap_or_else(|| raw.to_string())
+}
+
+fn same_set<T: Ord>(x: impl Iterator<Item = T>, y: impl Iterator<Item = T>) -> bool {
+    let x: std::collections::BTreeSet<T> = x.collect();
+    let y: std::collections::BTreeSet<T> = y.collect();
+    x == y
+}
+
 pub(crate) fn classify_single(
     sent: Result<(), (Option<String>, String)>,
     on_fail: OnConditionFailure,
@@ -397,6 +488,24 @@ pub(crate) fn classify_single(
         }
         Err(other) => Err(other),
     }
+}
+
+/// A per-request override: a conditional write gets no SDK-level retries, so
+/// only `classify_single` decides whether it is resent.
+fn sdk_retries(enabled: bool) -> aws_sdk_dynamodb::config::Builder {
+    let builder = aws_sdk_dynamodb::config::Builder::default();
+    if enabled {
+        builder
+    } else {
+        builder.retry_config(aws_sdk_dynamodb::config::retry::RetryConfig::disabled())
+    }
+}
+
+/// Whether a failed request may still have been applied: a transport failure
+/// with no service answer, or an internal server error. A retry of such a
+/// conditional write is read back when its condition then fails.
+fn outcome_unknown(code: Option<&str>) -> bool {
+    matches!(code, None | Some("InternalServerError" | "InternalFailure"))
 }
 
 #[faucet_core::async_trait]
@@ -620,6 +729,13 @@ mod tests {
             Ok(Err(m)) if m.contains("rejected")
         ));
         assert!(classify_single(c("ThrottlingException"), OnConditionFailure::Skip).is_err());
+        let transport = || Err((None, "connection reset".to_string()));
+        assert!(classify_single(transport(), OnConditionFailure::Fail).is_err());
+        assert!(classify_single(c("InternalServerError"), OnConditionFailure::Skip).is_err());
+        assert!(outcome_unknown(None));
+        assert!(outcome_unknown(Some("InternalServerError")));
+        assert!(outcome_unknown(Some("InternalFailure")));
+        assert!(!outcome_unknown(Some("ThrottlingException")));
     }
 
     async fn offline(mut config: DynamoDbSinkConfig) -> DynamoDbSink {
@@ -838,6 +954,187 @@ mod tests {
         let out = sink.write_batch_partial(&rows()).await.unwrap();
         assert!(out.iter().all(|o| o.is_err()), "{out:?}");
         assert!(sink.write_batch(&rows()).await.is_err());
+    }
+
+    fn garbled() -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200)
+            .insert_header("content-type", "application/x-amz-json-1.0")
+            .set_body_string("{not json")
+    }
+
+    fn conditional_fail_sink(uri: &str) -> DynamoDbSink {
+        let mut cfg = DynamoDbSinkConfig::new("t");
+        cfg.condition_expression = Some("attribute_not_exists(pk)".into());
+        cfg.on_condition_failure = OnConditionFailure::Fail;
+        mock_sink(uri, cfg)
+    }
+
+    const GET: &str = "DynamoDB_20120810.GetItem";
+
+    #[tokio::test]
+    async fn a_condition_failure_after_a_lost_response_that_landed_is_success() {
+        let server = MockServer::start().await;
+        on(&server, PUT, garbled(), 1).await;
+        on(&server, PUT, err(400, "ConditionalCheckFailedException"), 1).await;
+        on(&server, GET, ok(json!({"Item": {"pk": {"S": "a"}}})), 1).await;
+        let sink = conditional_fail_sink(&server.uri());
+        let out = sink
+            .write_batch_partial(&[json!({"pk": "a"})])
+            .await
+            .unwrap();
+        assert!(out[0].is_ok(), "{out:?}");
+        let gets = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.headers.get("x-amz-target").is_some_and(|v| v == GET))
+            .collect::<Vec<_>>();
+        assert_eq!(gets.len(), 1);
+        let body: Value = serde_json::from_slice(&gets[0].body).unwrap();
+        assert_eq!(body["ConsistentRead"], json!(true));
+        assert_eq!(body["Key"], json!({"pk": {"S": "a"}}));
+    }
+
+    #[tokio::test]
+    async fn a_condition_failure_after_a_lost_response_that_did_not_land_fails_the_row() {
+        let server = MockServer::start().await;
+        on(&server, PUT, garbled(), 1).await;
+        on(&server, PUT, err(400, "ConditionalCheckFailedException"), 1).await;
+        on(
+            &server,
+            GET,
+            ok(json!({"Item": {"pk": {"S": "a"}, "v": {"N": "9"}}})),
+            1,
+        )
+        .await;
+        let sink = conditional_fail_sink(&server.uri());
+        let out = sink
+            .write_batch_partial(&[json!({"pk": "a"})])
+            .await
+            .unwrap();
+        let e = out[0].as_ref().unwrap_err().to_string();
+        assert!(e.contains("condition_expression not met"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_condition_failure_without_a_lost_response_is_not_read_back() {
+        let server = MockServer::start().await;
+        on(&server, PUT, err(400, "ConditionalCheckFailedException"), 1).await;
+        let sink = conditional_fail_sink(&server.uri());
+        let out = sink
+            .write_batch_partial(&[json!({"pk": "a"})])
+            .await
+            .unwrap();
+        assert!(out[0].is_err());
+        let reqs = server.received_requests().await.unwrap();
+        assert!(
+            reqs.iter()
+                .all(|r| r.headers.get("x-amz-target").is_none_or(|v| v != GET))
+        );
+    }
+
+    #[test]
+    fn earlier_attempt_detection() {
+        let item: Item = [("pk".to_string(), AttributeValue::S("a".into()))].into();
+        let other: Item = [("pk".to_string(), AttributeValue::S("b".into()))].into();
+        assert!(applied_by_earlier_attempt(
+            &OpKind::Put(item.clone()),
+            Some(&item)
+        ));
+        assert!(!applied_by_earlier_attempt(
+            &OpKind::Put(item.clone()),
+            Some(&other)
+        ));
+        assert!(!applied_by_earlier_attempt(
+            &OpKind::Put(item.clone()),
+            None
+        ));
+        assert!(applied_by_earlier_attempt(
+            &OpKind::Delete(item.clone()),
+            None
+        ));
+        assert!(!applied_by_earlier_attempt(
+            &OpKind::Delete(item),
+            Some(&other)
+        ));
+    }
+
+    #[test]
+    fn earlier_attempt_detection_compares_as_dynamodb_stores() {
+        use AttributeValue as A;
+        let item = |pairs: Vec<(&str, AttributeValue)>| -> Item {
+            pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+        };
+        let landed = |sent: Item, stored: Item| {
+            applied_by_earlier_attempt(&OpKind::Put(sent), Some(&stored))
+        };
+        assert!(landed(
+            item(vec![
+                ("pk", A::S("a".into())),
+                ("price", A::N("2.0".into()))
+            ]),
+            item(vec![("pk", A::S("a".into())), ("price", A::N("2".into()))]),
+        ));
+        assert!(landed(
+            item(vec![("n", A::N("1e300".into()))]),
+            item(vec![("n", A::N("1E+300".into()))]),
+        ));
+        assert!(landed(
+            item(vec![("tags", A::Ss(vec!["x".into(), "y".into()]))]),
+            item(vec![("tags", A::Ss(vec!["y".into(), "x".into()]))]),
+        ));
+        assert!(landed(
+            item(vec![("ns", A::Ns(vec!["1.50".into(), "2".into()]))]),
+            item(vec![("ns", A::Ns(vec!["2".into(), "1.5".into()]))]),
+        ));
+        assert!(landed(
+            item(vec![(
+                "bs",
+                A::Bs(vec![
+                    aws_sdk_dynamodb::primitives::Blob::new(vec![1]),
+                    aws_sdk_dynamodb::primitives::Blob::new(vec![2]),
+                ])
+            )]),
+            item(vec![(
+                "bs",
+                A::Bs(vec![
+                    aws_sdk_dynamodb::primitives::Blob::new(vec![2]),
+                    aws_sdk_dynamodb::primitives::Blob::new(vec![1]),
+                ])
+            )]),
+        ));
+        assert!(landed(
+            item(vec![(
+                "nested",
+                A::M(item(vec![("l", A::L(vec![A::N("10.0".into())]))]))
+            )]),
+            item(vec![(
+                "nested",
+                A::M(item(vec![("l", A::L(vec![A::N("10".into())]))]))
+            )]),
+        ));
+        // Different values, list order and extra attributes still differ.
+        assert!(!landed(
+            item(vec![("price", A::N("2.0".into()))]),
+            item(vec![("price", A::N("2.01".into()))]),
+        ));
+        assert!(!landed(
+            item(vec![("l", A::L(vec![A::N("1".into()), A::N("2".into())]))]),
+            item(vec![("l", A::L(vec![A::N("2".into()), A::N("1".into())]))]),
+        ));
+        assert!(!landed(
+            item(vec![("a", A::S("1".into()))]),
+            item(vec![("a", A::S("1".into())), ("b", A::S("2".into()))]),
+        ));
+        assert!(!landed(
+            item(vec![("a", A::S("2".into()))]),
+            item(vec![("a", A::N("2".into()))]),
+        ));
+        assert!(!landed(
+            item(vec![("ss", A::Ss(vec!["x".into()]))]),
+            item(vec![("ss", A::Ss(vec!["x".into(), "y".into()]))]),
+        ));
     }
 
     #[tokio::test]

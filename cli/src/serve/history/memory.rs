@@ -275,15 +275,16 @@ impl RunHistory for MemoryHistory {
                 .cmp(&a.submitted_at)
                 .then_with(|| b.run_id.cmp(&a.run_id))
         });
-        // Cursor = last run_id seen on the previous page; skip past it.
-        if let Some(cursor) = &filter.cursor
-            && let Some(pos) = rows.iter().position(|r| &r.run_id == cursor)
-        {
-            rows.drain(..=pos);
+        if let Some(cursor) = &filter.cursor {
+            if let Some((ts, id)) = crate::serve::history::decode_run_cursor(cursor) {
+                rows.retain(|r| (r.submitted_at, r.run_id.as_str()) < (ts, id.as_str()));
+            } else if let Some(pos) = rows.iter().position(|r| &r.run_id == cursor) {
+                rows.drain(..=pos);
+            }
         }
         let limit = filter.limit.max(1);
         let next_cursor = if rows.len() > limit {
-            Some(rows[limit - 1].run_id.clone())
+            Some(crate::serve::history::encode_run_cursor(&rows[limit - 1]))
         } else {
             None
         };
@@ -1326,6 +1327,15 @@ impl RunHistory for MemoryHistory {
                 .lock()
                 .map_err(|_| HistoryError::Backend("template lock poisoned".into()))?;
             let versions = store.entry(id.clone()).or_default();
+            if let Some((_, latest)) = versions.iter().next_back()
+                && latest.kind != draft.kind
+            {
+                return Err(HistoryError::TemplateKindConflict {
+                    id,
+                    existing: latest.kind,
+                    requested: draft.kind,
+                });
+            }
             let high = hwm.entry(id.clone()).or_default();
             let next = versions.keys().copied().max().unwrap_or(0).max(*high) + 1;
             *high = next;
@@ -1345,7 +1355,7 @@ impl RunHistory for MemoryHistory {
             let all: Vec<u32> = versions.keys().copied().collect();
             (record, all)
         };
-        self.prune_template_versions(&record.id, all).await?;
+        self.prune_after_register(&record.id, all).await;
         Ok(record)
     }
 
@@ -1425,11 +1435,16 @@ impl RunHistory for MemoryHistory {
                 tests.remove(id);
             }
         }
+        let mut proofs = self
+            .template_tag_evidence
+            .lock()
+            .map_err(|_| HistoryError::Backend("template evidence lock poisoned".into()))?;
         match version {
             None => {
                 tags.remove(id);
                 launches.remove(id);
                 retired.remove(id);
+                proofs.remove(id);
                 self.template_deprecations
                     .lock()
                     .map_err(|_| {
@@ -1450,10 +1465,25 @@ impl RunHistory for MemoryHistory {
                     }
                 }
                 if versions.is_empty() {
+                    // The last version: cascade exactly as a whole-template delete.
                     store.remove(id);
                     tags.remove(id);
                     launches.remove(id);
+                    proofs.remove(id);
+                    tests.remove(id);
+                    self.template_deprecations
+                        .lock()
+                        .map_err(|_| {
+                            HistoryError::Backend("template deprecation lock poisoned".into())
+                        })?
+                        .remove(id);
                 } else {
+                    if let Some(p) = proofs.get_mut(id) {
+                        p.retain(|_, (pointed, _)| *pointed != v);
+                        if p.is_empty() {
+                            proofs.remove(id);
+                        }
+                    }
                     if let Some(t) = tags.get_mut(id) {
                         // A channel must never dangle at a deleted version.
                         t.retain(|_, pointed| *pointed != v);
@@ -1482,6 +1512,11 @@ impl RunHistory for MemoryHistory {
         version: u32,
         evidence: Option<&templates::EvidenceClaim>,
     ) -> Result<(), HistoryError> {
+        let store = self
+            .templates
+            .lock()
+            .map_err(|_| HistoryError::Backend("template lock poisoned".into()))?;
+        version_exists(&store, id, version)?;
         let mut tags = self
             .template_tags
             .lock()
@@ -1606,6 +1641,11 @@ impl RunHistory for MemoryHistory {
         launched_by: Option<&str>,
         evidence: Option<&templates::EvidenceClaim>,
     ) -> Result<Option<u32>, HistoryError> {
+        let store = self
+            .templates
+            .lock()
+            .map_err(|_| HistoryError::Backend("template lock poisoned".into()))?;
+        version_exists(&store, id, version)?;
         let mut launches = self
             .template_launches
             .lock()
@@ -1810,6 +1850,22 @@ fn missing_version(id: &str, version: u32) -> HistoryError {
 /// The evidence of one template's channels: tag → (version, result id).
 type TagEvidence = BTreeMap<String, (u32, String)>;
 
+/// A launch or channel move may only name a stored version.
+fn version_exists<V>(
+    store: &std::collections::HashMap<String, BTreeMap<u32, V>>,
+    id: &str,
+    version: u32,
+) -> Result<(), HistoryError> {
+    if store.get(id).is_some_and(|v| v.contains_key(&version)) {
+        Ok(())
+    } else {
+        Err(HistoryError::VersionNotFound {
+            id: id.to_string(),
+            version,
+        })
+    }
+}
+
 /// One version's recorded results, newest first.
 fn version_results(
     tests: &std::collections::HashMap<String, Vec<templates::TemplateTestResult>>,
@@ -1850,6 +1906,61 @@ mod tests {
         assert_eq!(h.template_register(&draft).await.unwrap().version, 3);
         h.template_delete("orders", None).await.unwrap();
         assert_eq!(h.template_register(&draft).await.unwrap().version, 4);
+    }
+
+    #[tokio::test]
+    async fn launches_and_channels_refuse_a_missing_version() {
+        let h = MemoryHistory::new(Duration::from_secs(60));
+        assert!(matches!(
+            h.template_launch("none", 1, None, None).await,
+            Err(HistoryError::VersionNotFound { version: 1, .. })
+        ));
+        assert!(matches!(
+            h.template_set_tag("none", "dev", 1, None).await,
+            Err(HistoryError::VersionNotFound { version: 1, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn deleting_the_last_version_cascades_like_a_whole_delete() {
+        use crate::serve::history::templates::{
+            DeprecationRecord, TemplateDraft, TemplateId, TemplateStatus,
+        };
+        let h = MemoryHistory::new(Duration::from_secs(60));
+        let draft = TemplateDraft {
+            id: TemplateId::parse("gone").unwrap(),
+            name: None,
+            description: None,
+            body: "version: 1\n".into(),
+            format: crate::serve::load::ConfigFormat::Yaml,
+            params: Default::default(),
+            created_by: None,
+            kind: crate::hub::TemplateKind::Pipeline,
+        };
+        h.template_register(&draft).await.unwrap();
+        h.template_set_tag("gone", "dev", 1, None).await.unwrap();
+        h.template_tag_evidence
+            .lock()
+            .unwrap()
+            .entry("gone".into())
+            .or_default()
+            .insert("dev".into(), (1, "r1".into()));
+        let marker = DeprecationRecord {
+            deprecated_at: Utc::now(),
+            deprecated_by: None,
+            reason: None,
+        };
+        h.template_set_deprecation("gone", Some(&marker))
+            .await
+            .unwrap();
+        h.template_delete("gone", Some(1)).await.unwrap();
+        assert!(h.template_deprecation("gone").await.unwrap().is_none());
+        assert!(!h.template_tag_evidence.lock().unwrap().contains_key("gone"));
+        h.template_register(&draft).await.unwrap();
+        assert_ne!(
+            h.template_state("gone").await.unwrap().status,
+            TemplateStatus::Deprecated
+        );
     }
 
     use super::*;
@@ -2016,7 +2127,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["c", "b"]
         );
-        assert_eq!(page.next_cursor.as_deref(), Some("b"));
+        let cursor = page.next_cursor.clone().unwrap();
+        assert!(cursor.ends_with("~b"), "{cursor}");
         // Next page from the cursor → a.
         let page2 = h
             .list(&ListFilter {
@@ -2035,6 +2147,24 @@ mod tests {
             vec!["a"]
         );
         assert!(page2.next_cursor.is_none());
+        // The cursor carries its position, so it survives the run's deletion.
+        h.delete("b").await.unwrap();
+        let after = h
+            .list(&ListFilter {
+                limit: 2,
+                cursor: Some(cursor),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            after
+                .runs
+                .iter()
+                .map(|r| r.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a"]
+        );
     }
 
     #[tokio::test]

@@ -111,7 +111,8 @@ pub struct MssqlSinkConfig {
     /// Staged bulk load (#528): stage each page to Azure Blob / ADLS and have
     /// SQL Server / Synapse pull it with `COPY INTO` instead of parameterized
     /// `INSERT`s. Absent ⇒ the ordinary insert path. Requires the crate's
-    /// `staging` feature at build time to execute.
+    /// `staging` feature at build time to execute. A staged page loads whole,
+    /// also under a DLQ, and the sink then declares no exactly-once writes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub staging: Option<MssqlStagingConfig>,
 }

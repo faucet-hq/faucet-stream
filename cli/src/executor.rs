@@ -403,9 +403,22 @@ pub(crate) struct RunObservers {
     pub(crate) lag: Arc<faucet_core::LagObserver>,
     /// Per-run row accounting (#879).
     pub(crate) rows: Arc<faucet_core::RowAccounts>,
+    /// Rows the `--limit` cap held back on the per-row path, which the pipeline
+    /// counts as accepted; [`Self::rows_snapshot`] moves them to skipped.
+    pub(crate) limit_padded: Arc<AtomicUsize>,
 }
 
 impl RunObservers {
+    /// The row accounts, with rows the `--limit` cap held back reported as
+    /// skipped rather than accepted.
+    pub(crate) fn rows_snapshot(&self) -> faucet_core::RowAccountsSnapshot {
+        let mut rows = self.rows.snapshot();
+        let padded = (self.limit_padded.load(Ordering::Relaxed) as u64).min(rows.accepted);
+        rows.accepted -= padded;
+        rows.skipped += padded;
+        rows
+    }
+
     /// Batch outcomes, when any write was attempted.
     pub(crate) fn batch_outcomes(&self) -> Option<faucet_core::BatchOutcomes> {
         let b = self.batches.snapshot();
@@ -1054,9 +1067,24 @@ async fn run_expanded_unredacted(
         // panic (surfaced as a JoinError, which doesn't carry the unit) can be
         // attributed to the right invocation.
         let mut task_meta: HashMap<tokio::task::Id, (String, Option<String>)> = HashMap::new();
+        let mut not_run: HashSet<String> = HashSet::new();
         for mut unit in units {
             if level_cancel.is_cancelled() && matches!(on_error, OnError::Stop) {
-                break;
+                not_run.insert(unit.node.id.clone());
+                // The level token also fires on an external cancel (serve
+                // cancel / timeout / drain), which no row failure caused.
+                let why = if cancel.is_cancelled() {
+                    CANCELLED_BEFORE_START
+                } else {
+                    STOPPED_BEFORE_START
+                };
+                outcomes.push(synthetic_outcome(
+                    &unit.node.id,
+                    unit.parent_record_key.clone(),
+                    why.to_string(),
+                    InvocationErrorKind::Skipped,
+                ));
+                continue;
             }
             let group_key = (unit.node.id.clone(), unit.parent_record_key.clone());
             if let Some(gi) = overwrite_task_group.get(&group_key) {
@@ -1154,8 +1182,18 @@ async fn run_expanded_unredacted(
             let outcome = match joined {
                 Ok((_id, outcome)) => outcome,
                 Err(e) if e.is_cancelled() => {
-                    // Expected after abort_all() — cancelled before/at an await.
-                    // Not counted as a failure or a success.
+                    // Aborted after the flush grace: reported skipped, not failed.
+                    let (row_id, parent_record_key) = task_meta
+                        .get(&e.id())
+                        .cloned()
+                        .unwrap_or_else(|| ("<unknown>".to_string(), None));
+                    not_run.insert(row_id.clone());
+                    outcomes.push(synthetic_outcome(
+                        &row_id,
+                        parent_record_key,
+                        "skipped: aborted by `on_error: stop` before it finished".to_string(),
+                        InvocationErrorKind::Skipped,
+                    ));
                     continue;
                 }
                 Err(e) => {
@@ -1331,7 +1369,7 @@ async fn run_expanded_unredacted(
         // as "failed" overall if any of its invocations failed).
         for id in ready {
             remaining.remove(&id);
-            if nodes_with_any_failure.contains(&id) {
+            if nodes_with_any_failure.contains(&id) || not_run.contains(&id) {
                 skipped_subtrees.insert(id.clone());
                 // Cascade to descendants in case we have multi-level chains.
                 if let Some(children) = children_of.get(&id) {
@@ -1346,7 +1384,14 @@ async fn run_expanded_unredacted(
 
         if had_level_failure && matches!(on_error, OnError::Stop) {
             tracing::error!("on_error: stop — aborting after first failure");
-            // Any unfinished work surfaces as "skipped"; we just break here.
+            for id in bfs_order.iter().filter(|id| remaining.contains(*id)) {
+                outcomes.push(synthetic_outcome(
+                    id,
+                    None,
+                    STOPPED_BEFORE_START.to_string(),
+                    InvocationErrorKind::Skipped,
+                ));
+            }
             break;
         }
     }
@@ -1355,6 +1400,10 @@ async fn run_expanded_unredacted(
         invocations: outcomes,
     })
 }
+
+const STOPPED_BEFORE_START: &str =
+    "skipped: `on_error: stop` ended the run before this row started";
+const CANCELLED_BEFORE_START: &str = "skipped: the run was cancelled before this row started";
 
 /// One scheduled invocation — a root runs once, a child runs once per parent
 /// record. Built by the level loop, consumed by [`run_unit`].
@@ -1802,6 +1851,7 @@ async fn run_unit(
             discovered,
             collected,
             opts,
+            &cancel,
         )
         .await;
     }
@@ -1909,7 +1959,7 @@ async fn run_unit(
         duration_ms,
         batches: observers.batch_outcomes(),
         source_lag: observers.lag.last(),
-        rows: Some(observers.rows.snapshot()).filter(|r| r.offered > 0 || r.unaccounted > 0),
+        rows: Some(observers.rows_snapshot()).filter(|r| r.offered > 0 || r.unaccounted > 0),
         ..Default::default()
     };
     match result {
@@ -2145,6 +2195,7 @@ async fn run_discovery(
     discovered: &DiscoveredDims,
     collected: &CollectedDims,
     opts: &ExecuteOptions,
+    cancel: &CancellationToken,
 ) -> InvocationOutcome {
     let started = std::time::Instant::now();
     let source_kind = node.source.kind.clone();
@@ -2160,6 +2211,8 @@ async fn run_discovery(
             binds = crate::sql_bind::bind_source_query(&source_kind, &mut cfg, pc)?;
             resolve_inplace(&mut cfg, pc)?;
         }
+        reject_unresolved_backfill_tokens(&cfg, "source")?;
+        crate::tenant_tokens::reject_unbound(&cfg, "source")?;
         let source = build_source(
             &source_kind,
             cfg,
@@ -2168,14 +2221,32 @@ async fn run_discovery(
         )
         .await?;
         source.set_run_clock(opts.clock.to_utc());
-        let records = source.fetch_with_context(&binds).await?;
-        let projection = crate::discovery_matrix::project_dedup_counted(&records, select);
+        let mut acc = crate::discovery_matrix::ProjectionAcc::new(select);
+        {
+            use futures::StreamExt as _;
+            let mut pages = source.stream_pages(&binds, faucet_core::DEFAULT_BATCH_SIZE);
+            loop {
+                let page = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => {
+                        return Err(CliError::from(faucet_core::FaucetError::Cancelled {
+                            operation: "fan_out discovery".into(),
+                        }));
+                    }
+                    page = pages.next() => page,
+                };
+                let Some(page) = page else { break };
+                acc.push(&page?.records);
+            }
+        }
+        let records = acc.records();
+        let projection = acc.finish();
         if projection.skipped > 0 {
             if projection.values.is_empty() {
                 tracing::warn!(
                     row = %node.id,
                     select,
-                    records = records.len(),
+                    records,
                     "fan_out.select matched no value in any record: the rows that fan out \
                      over it run zero times"
                 );
@@ -2184,7 +2255,7 @@ async fn run_discovery(
                     row = %node.id,
                     select,
                     skipped = projection.skipped,
-                    records = records.len(),
+                    records,
                     "fan_out.select was missing or null in some records; they were skipped"
                 );
             }
@@ -2241,16 +2312,26 @@ async fn run_discovery(
                 usage: None,
             }
         }
-        Err(e) => InvocationOutcome {
-            row_id: node.id.clone(),
-            parent_record_key: None,
-            run_id: None,
-            records_written: 0,
-            error: Some(e.to_string()),
-            error_kind: Some(classify_error(&e)),
-            metrics: Some(metrics(0)),
-            usage: None,
-        },
+        Err(e) => {
+            // A listing stopped by the run's cancel did not fail: it is skipped,
+            // like the rows the cancel kept from starting.
+            let stopped = cancel.is_cancelled()
+                && matches!(e, CliError::Faucet(FaucetError::Cancelled { .. }));
+            InvocationOutcome {
+                row_id: node.id.clone(),
+                parent_record_key: None,
+                run_id: None,
+                records_written: 0,
+                error: Some(e.to_string()),
+                error_kind: Some(if stopped {
+                    InvocationErrorKind::Skipped
+                } else {
+                    classify_error(&e)
+                }),
+                metrics: Some(metrics(0)),
+                usage: None,
+            }
+        }
     }
 }
 
@@ -2899,6 +2980,7 @@ async fn run_one_invocation(
     let mut transforms = node.transforms.clone();
     for t in &mut transforms {
         resolve_now_inplace(&mut t.config, opts.clock)?;
+        reject_unresolved_backfill_tokens(&t.config, "transform")?;
         if !fanout_ctx.is_empty() {
             resolve_inplace(&mut t.config, &fanout_ctx)?;
         }
@@ -3018,18 +3100,24 @@ async fn run_one_invocation(
     // profiling → [lineage sampler] → metadata → [--limit, fan-out capture] →
     // budget → destination. The budget is innermost so its ceilings count what
     // the destination accepts; a duration ceiling cancels the cooperative token.
-    let limit = opts.limit;
+    let limit_left = opts.limit.map(|n| Arc::new(AtomicUsize::new(n)));
     let capture_sink = capture
         .as_ref()
         .map(|p| (Arc::clone(&captured), Arc::clone(p)));
+    let tap_limit = limit_left.clone();
+    let tap_padded = Arc::clone(&observers.limit_padded);
     #[allow(unused_mut)]
     let mut builder = governance.sink_builder().inner_tap(move |s| {
-        let s: Box<dyn Sink> = match limit {
-            Some(n) => Box::new(LimitedSink::wrap(s, n)),
+        let s: Box<dyn Sink> = match &tap_limit {
+            Some(left) => {
+                Box::new(LimitedSink::sharing(s, Arc::clone(left)).counting_padded(tap_padded))
+            }
             None => s,
         };
         match capture_sink {
-            Some((buf, projection)) => Box::new(CapturingSink::wrap(s, buf, projection)),
+            Some((buf, projection)) => {
+                Box::new(CapturingSink::wrap(s, buf, projection).with_limit(tap_limit))
+            }
             None => s,
         }
     });
@@ -3134,6 +3222,17 @@ async fn run_one_invocation(
         (Ok(_), Some(verdict)) => Err(verdict.error()),
         _ => result,
     };
+    // The per-row path counts rows past the `--limit` cap as written; the cap
+    // knows how many really landed.
+    let result = match (result, opts.limit.zip(limit_left.as_ref())) {
+        (Ok(mut r), Some((cap, left))) => {
+            r.records_written = r
+                .records_written
+                .min(cap.saturating_sub(left.load(Ordering::Relaxed)));
+            Ok(r)
+        }
+        (other, _) => other,
+    };
 
     // ── Completeness reconciliation (#502) ───────────────────────────────────
     // On a successful root run, compare rows written against an authoritative
@@ -3150,7 +3249,14 @@ async fn run_one_invocation(
                 && !cancel.is_cancelled() =>
         {
             let written = r.records_written as u64;
-            match Box::pin(crate::reconcile::run(spec, &opts.auth, written)).await {
+            match Box::pin(crate::reconcile::run_with(
+                spec,
+                &opts.auth,
+                written,
+                Some(&cancel),
+            ))
+            .await
+            {
                 Ok(()) => result,
                 Err(e) => Err(e),
             }
@@ -3405,10 +3511,13 @@ async fn run_one_invocation(
             Ok(r) => {
                 notifier
                     .emit(
-                        NotifyEvent::run_success(
-                            pipeline.clone(),
-                            row.clone(),
-                            r.records_written as u64,
+                        keep_sla_open(
+                            NotifyEvent::run_success(
+                                pipeline.clone(),
+                                row.clone(),
+                                r.records_written as u64,
+                            ),
+                            !sla_violations.is_empty(),
                         )
                         .with_run(run_ctx.clone()),
                     )
@@ -3618,6 +3727,9 @@ async fn run_one_invocation(
                     .as_ref()
                     .and_then(|spec| spec.retention_days),
                 observed_at: chrono::Utc::now(),
+                // An overwrite group commits (swaps the staged file in) after
+                // this invocation returns.
+                final_file: !suppress_overwrite,
             };
             crate::local_outputs::record(handle.store.as_ref(), &outputs, &ctx).await;
         }
@@ -3787,6 +3899,20 @@ type StateStoreCache = Arc<Mutex<HashMap<String, Arc<dyn StateStore>>>>;
 tokio::task_local! {
     static DLQ_SINKS: DlqSinkCache;
     static STATE_STORES: StateStoreCache;
+}
+
+/// A success that also reported an SLA breach must not resolve that breach's
+/// incident only for the same run to reopen it.
+#[cfg(feature = "notify")]
+pub(crate) fn keep_sla_open(
+    event: crate::notify::NotifyEvent,
+    breaching: bool,
+) -> crate::notify::NotifyEvent {
+    if breaching {
+        event.keeping_open(crate::notify::EventKind::SlaBreach)
+    } else {
+        event
+    }
 }
 
 /// Classify a pipeline error into a notification event (#280). A circuit-breaker
@@ -4223,12 +4349,26 @@ struct CapturingSink {
     inner: Box<dyn Sink>,
     captured: Arc<Mutex<Vec<Value>>>,
     projection: Arc<Projection>,
+    limit: Option<Arc<AtomicUsize>>,
 }
 
 impl CapturingSink {
-    /// Record the rows `report` says landed (a capped inner sink may drop some).
-    async fn capture(&self, records: &[Value], report: &faucet_core::WriteReport) {
-        let n = (report.accepted + report.coalesced).min(records.len());
+    /// How many leading rows of a `len`-row page fit under the `--limit` cap
+    /// the wrapped [`LimitedSink`] shares; read before the write.
+    fn within_cap(&self, len: usize) -> usize {
+        self.limit
+            .as_ref()
+            .map_or(len, |left| left.load(Ordering::Relaxed).min(len))
+    }
+
+    /// Record the leading rows of the page the sink reports as landed
+    /// (accepted or coalesced), within the cap. Rows a sink declined by its
+    /// config (`max_records`, `on_key_error: skip`) never reached the
+    /// destination, so no child fans out over them.
+    async fn capture(&self, records: &[Value], take: usize, report: &faucet_core::WriteReport) {
+        let n = take
+            .min(report.accepted + report.coalesced)
+            .min(records.len());
         let mut buf = self.captured.lock().await;
         buf.extend(
             records
@@ -4247,7 +4387,13 @@ impl CapturingSink {
             inner,
             captured,
             projection,
+            limit: None,
         }
+    }
+
+    fn with_limit(mut self, limit: Option<Arc<AtomicUsize>>) -> Self {
+        self.limit = limit;
+        self
     }
 }
 
@@ -4265,8 +4411,9 @@ impl Sink for CapturingSink {
         &self,
         records: &[Value],
     ) -> Result<faucet_core::WriteReport, FaucetError> {
+        let take = self.within_cap(records.len());
         let report = self.inner.write_batch_reported(records).await?;
-        self.capture(records, &report).await;
+        self.capture(records, take, &report).await;
         Ok(report)
     }
 
@@ -4274,8 +4421,9 @@ impl Sink for CapturingSink {
         &self,
         page: &faucet_core::governance::GovernedPage<'_>,
     ) -> Result<faucet_core::WriteReport, FaucetError> {
+        let take = self.within_cap(page.len());
         let report = self.inner.write_governed(page).await?;
-        self.capture(page.records(), &report).await;
+        self.capture(page.records(), take, &report).await;
         Ok(report)
     }
 
@@ -4299,12 +4447,14 @@ impl Sink for CapturingSink {
         &self,
         records: &[Value],
     ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
+        let take = self.within_cap(records.len());
         let outcomes = self.inner.write_batch_partial(records).await?;
         let mut buf = self.captured.lock().await;
         buf.extend(
             records
                 .iter()
                 .zip(&outcomes)
+                .take(take)
                 .filter(|(_, o)| o.is_ok())
                 .map(|(r, _)| project_record(r, &self.projection)),
         );
@@ -4338,18 +4488,12 @@ impl Sink for CapturingSink {
         scope: &str,
         token: &str,
     ) -> Result<faucet_core::WriteReport, FaucetError> {
+        let take = self.within_cap(records.len());
         let report = self
             .inner
             .write_batch_idempotent_reported(records, scope, token)
             .await?;
-        let n = (report.accepted + report.coalesced).min(records.len());
-        let mut buf = self.captured.lock().await;
-        buf.extend(
-            records
-                .iter()
-                .take(n)
-                .map(|r| project_record(r, &self.projection)),
-        );
+        self.capture(records, take, &report).await;
         Ok(report)
     }
 }
@@ -4358,7 +4502,10 @@ impl Sink for CapturingSink {
 /// remaining budget before delegating.
 pub(crate) struct LimitedSink {
     inner: Box<dyn Sink>,
-    remaining: AtomicUsize,
+    remaining: Arc<AtomicUsize>,
+    /// Rows past the cap the per-row path reported as `Ok` (it has no way to
+    /// say skipped), for the caller to correct its counts.
+    padded: Arc<AtomicUsize>,
 }
 
 impl LimitedSink {
@@ -4386,10 +4533,22 @@ impl LimitedSink {
     }
 
     pub(crate) fn wrap(inner: Box<dyn Sink>, cap: usize) -> Self {
+        Self::sharing(inner, Arc::new(AtomicUsize::new(cap)))
+    }
+
+    /// A cap whose remaining budget other layers can read.
+    pub(crate) fn sharing(inner: Box<dyn Sink>, remaining: Arc<AtomicUsize>) -> Self {
         Self {
             inner,
-            remaining: AtomicUsize::new(cap),
+            remaining,
+            padded: Arc::default(),
         }
+    }
+
+    /// Count the rows the per-row path pads past the cap into `padded`.
+    pub(crate) fn counting_padded(mut self, padded: Arc<AtomicUsize>) -> Self {
+        self.padded = padded;
+        self
     }
 }
 
@@ -4404,8 +4563,9 @@ impl Sink for LimitedSink {
         write_batch_idempotent, last_committed_token, supports_columnar, write_batch_columnar,
         native_load_capabilities, load_native);
 
-    // The per-row path keeps the DLQ routing of the inner sink (#789 CLI-21);
-    // rows past the cap are dropped by design and reported as accepted.
+    // Rows past the cap read as `Ok` (a row outcome cannot say skipped); they
+    // are counted in `padded` so the caller reports them as skipped, and the
+    // capture skips them.
     async fn write_batch_partial(
         &self,
         records: &[Value],
@@ -4420,6 +4580,8 @@ impl Sink for LimitedSink {
         let accepted = outcomes.iter().filter(|o| o.is_ok()).count();
         self.remaining
             .fetch_sub(accepted.min(remaining), Ordering::Relaxed);
+        self.padded
+            .fetch_add(records.len() - take, Ordering::Relaxed);
         outcomes.resize_with(records.len(), || Ok(()));
         Ok(outcomes)
     }
@@ -5939,6 +6101,112 @@ matrix:
     }
 
     #[tokio::test]
+    async fn a_discovery_row_stops_on_cancel_and_refuses_leftover_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("ids.csv");
+        std::fs::write(&csv, "id\n1\n2\n1\n").unwrap();
+        let yaml = |path: &str| {
+            format!(
+                "version: 1\npipeline:\n  source: {{ type: csv, config: {{ path: {csv} }} }}\n  \
+                 sink: {{ type: jsonl, config: {{ path: '{out}' }} }}\nmatrix:\n  - id: r\n    \
+                 fan_out:\n      source: {{ type: csv, config: {{ path: '{path}' }} }}\n      \
+                 select: id\n      as: v\n",
+                csv = csv.display(),
+                out = dir.path().join("out-${r.v}.jsonl").display(),
+            )
+        };
+        let run = |yaml: String, cancelled: bool| async move {
+            let cfg = crate::config::parse_with_extension(&yaml, "yaml").unwrap();
+            let nodes = expand(&cfg).unwrap();
+            let node = nodes
+                .iter()
+                .find(|n| matches!(n.role, NodeRole::Discovery { .. }))
+                .expect("a discovery node")
+                .clone();
+            let NodeRole::Discovery {
+                select,
+                as_alias,
+                collect,
+                dims,
+            } = &node.role
+            else {
+                unreachable!()
+            };
+            let discovered: DiscoveredDims = Default::default();
+            let token = CancellationToken::new();
+            if cancelled {
+                token.cancel();
+            }
+            let out = run_discovery(
+                &node,
+                select,
+                as_alias,
+                *collect,
+                dims,
+                None,
+                &discovered,
+                &Default::default(),
+                &ExecuteOptions::for_tests("disc"),
+                &token,
+            )
+            .await;
+            let values = discovered
+                .lock()
+                .await
+                .values()
+                .next()
+                .map(|d| d.values.len());
+            (out, values)
+        };
+        let path = csv.display().to_string();
+        let (ok, values) = run(yaml(&path), false).await;
+        assert!(ok.error.is_none(), "{ok:?}");
+        assert_eq!(values, Some(2));
+        let (stopped, _) = run(yaml(&path), true).await;
+        assert_eq!(stopped.error_kind, Some(InvocationErrorKind::Skipped));
+        assert!(
+            stopped
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("fan_out discovery")),
+            "{stopped:?}"
+        );
+        let (refused, _) = run(yaml("${backfill.start}"), false).await;
+        assert!(
+            refused
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("backfill")),
+            "{refused:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backfill_token_in_a_transform_fails_outside_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("in.csv");
+        std::fs::write(&csv, "id\n1\n").unwrap();
+        let yaml = format!(
+            r#"version: 1
+pipeline:
+  source: {{ type: csv, config: {{ path: {csv} }} }}
+  sink:   {{ type: jsonl, config: {{ path: {out}/out.jsonl }} }}
+  transforms:
+    - {{ type: set, config: {{ values: {{ window: "${{backfill.unit}}" }} }} }}
+"#,
+            csv = csv.display(),
+            out = dir.path().display(),
+        );
+        let cfg = crate::config::parse_with_extension(&yaml, "yaml").unwrap();
+        let summary = run_expanded(expand(&cfg).unwrap(), ExecuteOptions::for_tests("bf"))
+            .await
+            .unwrap();
+        let err = summary.invocations[0].error.as_deref().unwrap();
+        assert!(err.contains("the transform config references"), "{err}");
+        assert!(!dir.path().join("out.jsonl").exists());
+    }
+
+    #[tokio::test]
     async fn a_keyless_parent_is_refused_for_a_child_that_keeps_state() {
         let dir = tempfile::tempdir().unwrap();
         let parent_csv = dir.path().join("parents.csv");
@@ -6340,6 +6608,54 @@ execution:
                 "a good that wrote records must have produced its output file"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn on_error_stop_reports_every_row_that_did_not_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let good_csv = dir.path().join("good.csv");
+        std::fs::write(&good_csv, "x\n1\n").unwrap();
+        let yaml = format!(
+            r#"version: 1
+pipeline:
+  source: {{ type: csv, config: {{ path: {good_csv} }} }}
+  sink:   {{ type: jsonl, config: {{ path: {out}, append: true }} }}
+matrix:
+  - id: bad
+    sink: {{ config: {{ path: {bad_dir} }} }}
+  - id: good
+  - id: next
+    depends_on: [good]
+  - id: child
+    parent: good
+execution:
+  max_concurrent: 1
+  on_error: stop
+"#,
+            good_csv = good_csv.display(),
+            out = dir.path().join("out.jsonl").display(),
+            bad_dir = dir.path().display(),
+        );
+        let cfg = crate::config::parse_with_extension(&yaml, "yaml").unwrap();
+        let mut opts = ExecuteOptions::for_tests("stopall");
+        opts.execution = cfg.execution.clone();
+        let summary = run_expanded(expand(&cfg).unwrap(), opts).await.unwrap();
+        let mut ids: Vec<&str> = summary
+            .invocations
+            .iter()
+            .map(|o| o.row_id.as_str())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, ["bad", "child", "good", "next"], "{summary:?}");
+        for row in ["next", "child"] {
+            let o = summary
+                .invocations
+                .iter()
+                .find(|o| o.row_id == row)
+                .unwrap();
+            assert_eq!(o.error_kind, Some(InvocationErrorKind::Skipped), "{o:?}");
+        }
+        assert!(summary.skipped_count() >= 2);
     }
 
     #[tokio::test]
@@ -7474,6 +7790,36 @@ matrix:
             .unwrap();
         assert_eq!(n, 1);
         assert_eq!(*captured.lock().await, vec![json!({"id": 7})]);
+    }
+
+    #[tokio::test]
+    async fn the_capture_skips_rows_past_the_limit_on_the_per_row_path() {
+        struct Plain;
+        #[async_trait]
+        impl Sink for Plain {
+            async fn write_batch(&self, r: &[Value]) -> Result<usize, FaucetError> {
+                Ok(r.len())
+            }
+        }
+        let left = Arc::new(AtomicUsize::new(2));
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = CapturingSink::wrap(
+            Box::new(LimitedSink::sharing(Box::new(Plain), Arc::clone(&left))),
+            Arc::clone(&captured),
+            Arc::new(Projection::Full),
+        )
+        .with_limit(Some(Arc::clone(&left)));
+        let page: Vec<Value> = (1..=5).map(|i| json!({ "id": i })).collect();
+        let outcomes = sink.write_batch_partial(&page).await.unwrap();
+        assert_eq!(outcomes.len(), 5);
+        assert_eq!(
+            *captured.lock().await,
+            vec![json!({"id": 1}), json!({"id": 2})]
+        );
+        assert_eq!(left.load(Ordering::Relaxed), 0);
+        let report = sink.write_batch_reported(&page).await.unwrap();
+        assert_eq!(report.skipped, 5);
+        assert_eq!(captured.lock().await.len(), 2);
     }
 
     #[tokio::test]

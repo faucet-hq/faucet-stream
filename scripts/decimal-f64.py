@@ -31,8 +31,9 @@ OWNERS = {"crates/core/src/fidelity.rs", "crates/core/src/json_numbers.rs"}
 WINDOW = 3
 
 FLOAT = re.compile(
-    r"\bas\s+f(?:32|64)\b|\.to_f(?:32|64)\(|\bf(?:32|64)::(?:from|try_from)\(|"
-    r"parse::<f(?:32|64)>|\bfrom_f(?:32|64)\("
+    r"\bas\s+f(?:32|64)\b|\.to_f(?:32|64)\(|\bf(?:32|64)::(?:from|try_from|from_str)\(|"
+    r"parse::<f(?:32|64)>|\bfrom_f(?:32|64)\(|\.as_f(?:32|64)\(|"
+    r":\s*(?:Option<\s*)?f(?:32|64)\b[^=;]*=[^;]*\.parse\("
 )
 DECIMAL = re.compile(
     r"[Dd]ecimal|NUMERIC|[Nn]umeric\b|MONEY|[Mm]oney\b|BigDecimal|rust_decimal|NUMBER\b"

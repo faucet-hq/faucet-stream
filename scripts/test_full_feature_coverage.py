@@ -15,6 +15,27 @@ ffc = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ffc)
 
 
+class FeatureTable(unittest.TestCase):
+    LIB = """//! ## Feature flags
+//!
+//! | Feature | Description |
+//! |---------|-------------|
+//! | `source-rest` *(default)* | REST |
+//! | `transform-cast`, `transform-drop` | built-in transforms |
+//! Prose naming `sink-gcs` does not count.
+"""
+
+    def test_every_backticked_name_in_the_first_cell_is_documented(self):
+        self.assertEqual(
+            ffc.documented_features(self.LIB),
+            {"source-rest", "transform-cast", "transform-drop"},
+        )
+
+    def test_a_feature_missing_from_the_table_is_reported(self):
+        features = {"default": [], "source-rest": [], "transform-cast": [], "sink-gcs": []}
+        self.assertEqual(ffc.undocumented(features, self.LIB), ["sink-gcs"])
+
+
 class Missing(unittest.TestCase):
     def test_a_feature_reached_through_an_aggregate_is_covered(self):
         features = {

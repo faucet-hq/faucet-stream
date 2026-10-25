@@ -540,3 +540,51 @@ async fn a_parent_value_cannot_rewrite_the_request_path() {
     );
     assert_eq!(received[0].url.query(), None);
 }
+
+struct HeaderBytes;
+
+impl wiremock::Match for HeaderBytes {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        let tenant = request
+            .headers
+            .get("x-tenant")
+            .map(|v| v.as_bytes().to_vec());
+        let accepts: Vec<&[u8]> = request
+            .headers
+            .get_all("x-accept")
+            .iter()
+            .map(|v| v.as_bytes())
+            .collect();
+        tenant.as_deref() == Some("Zürich".as_bytes())
+            && accepts == vec![b"a".as_slice(), b"b".as_slice()]
+    }
+}
+
+/// Header values that are not visible ASCII are sent as configured, and a
+/// header configured with several values keeps all of them.
+#[tokio::test]
+async fn opaque_and_repeated_header_values_are_sent_as_configured() {
+    use reqwest::header::{HeaderName, HeaderValue};
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/feed.xml"))
+        .and(HeaderBytes)
+        .respond_with(ResponseTemplate::new(200).set_body_string(items_doc(0, 1)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut config =
+        XmlStreamConfig::new(server.uri(), "/feed.xml").records_element_path("root.item");
+    config.headers.insert(
+        HeaderName::from_static("x-tenant"),
+        HeaderValue::from_bytes("Zürich".as_bytes()).unwrap(),
+    );
+    config
+        .headers
+        .append("x-accept", HeaderValue::from_static("a"));
+    config
+        .headers
+        .append("x-accept", HeaderValue::from_static("b"));
+    let records = XmlStream::new(config).fetch_all().await.unwrap();
+    assert_eq!(records.len(), 1);
+}

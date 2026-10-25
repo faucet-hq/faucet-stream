@@ -249,8 +249,10 @@ pub async fn submit_backfill(
     );
     let hash = range_hash(&descriptor);
 
-    let generation =
-        guard_prior_range(&loaded, &req, &base_name, &hash, &descriptor, &units).await?;
+    let RangeGuard {
+        generation,
+        mut marker,
+    } = guard_prior_range(&loaded, &req, &base_name, &hash, &descriptor, &units).await?;
 
     // Parse the RAW submitted document once; each unit rewrites a copy. The
     // raw body (not the default-merged config) is submitted so the runner's
@@ -319,6 +321,15 @@ pub async fn submit_backfill(
         .and_then(|o| o.accepted());
         match outcome {
             Ok(resp) => {
+                if let Some((store, key, value)) = marker.take() {
+                    store.put(&key, &value).await.map_err(|e| {
+                        ServeError::Internal(format!(
+                            "unit {} was submitted as run {} but recording the backfill \
+                             range failed: {e}",
+                            unit.id, resp.run_id
+                        ))
+                    })?;
+                }
                 submitted += 1;
                 reports.push(BackfillUnitRun {
                     unit: unit.id.clone(),
@@ -361,10 +372,18 @@ pub async fn submit_backfill(
 const QUEUE_FULL: &str =
     "run queue full — re-POST the same request with `\"resume\": true` to continue";
 
+/// The idempotency-key generation to submit with, and the range marker to
+/// record once the first unit is accepted (a first request that submits
+/// nothing leaves no marker behind; a `restart` records its marker up front).
+struct RangeGuard {
+    generation: u32,
+    marker: Option<(std::sync::Arc<dyn faucet_core::StateStore>, String, Value)>,
+}
+
 /// Refuse a range that was submitted before unless the caller chose `resume`
 /// or `restart` (audit #789 SERVE-13, the serve side of #321 H3). Without a
 /// `state:` block no unit keeps a bookmark, so a re-run is always fresh and
-/// nothing is recorded. Returns the idempotency-key generation to submit with.
+/// nothing is recorded.
 async fn guard_prior_range(
     loaded: &crate::serve::load::LoadedSubmission,
     req: &BackfillSubmitRequest,
@@ -372,14 +391,17 @@ async fn guard_prior_range(
     hash: &str,
     descriptor: &str,
     units: &[crate::backfill::plan::BackfillUnit],
-) -> Result<u32, ServeError> {
+) -> Result<RangeGuard, ServeError> {
     let roots: Vec<&crate::expand::ExpandedNode> = loaded
         .nodes
         .iter()
         .filter(|n| matches!(n.role, crate::expand::NodeRole::Root))
         .collect();
     let Some(spec) = roots.iter().find_map(|n| n.state.as_ref()) else {
-        return Ok(0);
+        return Ok(RangeGuard {
+            generation: 0,
+            marker: None,
+        });
     };
     let internal = |e: crate::error::CliError| ServeError::Internal(e.to_string());
     let store = crate::state::build_state_store(spec)
@@ -397,9 +419,15 @@ async fn guard_prior_range(
         ),
         None => None,
     };
+    let restart = prior.is_some() && req.restart;
     let generation = match prior {
         None => 0,
-        Some(p) if req.resume => return Ok(p.generation),
+        Some(p) if req.resume => {
+            return Ok(RangeGuard {
+                generation: p.generation,
+                marker: None,
+            });
+        }
         Some(p) if req.restart => {
             for node in &roots {
                 let Some(node_spec) = node.state.as_ref() else {
@@ -436,11 +464,24 @@ async fn guard_prior_range(
     };
     let value = serde_json::to_value(&marker)
         .map_err(|e| ServeError::Internal(format!("backfill range marker: {e}")))?;
-    store
-        .put(&key, &value)
-        .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?;
-    Ok(generation)
+    if restart {
+        // The units' bookmarks are already gone, so the new generation is
+        // recorded now: a restart that then submits nothing (queue full,
+        // draining) must leave a `resume` on fresh idempotency keys, not on
+        // the old runs' keys, which would replay them instead of re-running.
+        store
+            .put(&key, &value)
+            .await
+            .map_err(|e| ServeError::Internal(format!("backfill range marker: {e}")))?;
+        return Ok(RangeGuard {
+            generation,
+            marker: None,
+        });
+    }
+    Ok(RangeGuard {
+        generation,
+        marker: Some((store, key, value)),
+    })
 }
 
 /// The run (and pipeline) name of one unit: the range hash keeps the units of

@@ -158,3 +158,38 @@ async fn a_revoked_shared_token_is_refreshed_and_the_request_retried() {
     let records = stream.fetch_all().await.unwrap();
     assert_eq!(records.len(), 1);
 }
+
+#[tokio::test]
+async fn an_unauthenticated_graphql_error_refreshes_the_shared_token() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(header("authorization", "Bearer t0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "errors": [{"message": "Invalid token", "extensions": {"code": "UNAUTHENTICATED"}}]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(header("authorization", "Bearer t1"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"data": {"items": [{"id": 1}]}})),
+        )
+        .mount(&server)
+        .await;
+    let config = GraphqlStreamConfig::new(
+        format!("{}/graphql", server.uri()),
+        "query { items { id } }",
+    )
+    .records_path("$.data.items[*]");
+    let stream = GraphqlStream::new(config.clone())
+        .with_auth_provider(Arc::new(RevokedThenRefreshed::default()));
+    assert_eq!(stream.fetch_all().await.unwrap().len(), 1);
+
+    let unshared = GraphqlStream::new(
+        config.auth(faucet_source_graphql::GraphqlAuth::Bearer { token: "t0".into() }),
+    );
+    let err = unshared.fetch_all().await.unwrap_err().to_string();
+    assert!(err.contains("Invalid token"), "{err}");
+}

@@ -132,9 +132,13 @@ impl Shared {
         let mut meta = TableMeta::new();
         for r in rows {
             let (o, t, c, ty, scale) = r.map_err(|e| src_err("column metadata", &e))?;
+            let family = TypeFamily::from_data_type(&ty, scale);
+            let digits = matches!(family, TypeFamily::Timestamp | TypeFamily::TimestampTz)
+                .then(|| scale.and_then(|s| u8::try_from(s).ok()))
+                .flatten();
             meta.entry((o, t))
                 .or_default()
-                .insert(c, TypeFamily::from_data_type(&ty, scale));
+                .insert(c, crate::miner::ColumnType { family, digits });
         }
         Ok(meta)
     }

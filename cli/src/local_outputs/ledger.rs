@@ -43,6 +43,33 @@ pub struct LocalOutputObservation {
     /// default; `Some(0)` = keep forever.
     pub retention_days: Option<u32>,
     pub observed_at: DateTime<Utc>,
+    /// Identity of the file on disk when it was observed, so the GC can tell
+    /// that a different file now sits at the path. `None` = not known.
+    pub file_id: Option<FileIdentity>,
+}
+
+/// Device and inode of a file — what tells two files at one path apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileIdentity {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+impl FileIdentity {
+    /// The identity in `meta`, on platforms that expose one.
+    #[cfg(unix)]
+    pub fn of(meta: &std::fs::Metadata) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        Some(Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
+    }
+
+    #[cfg(not(unix))]
+    pub fn of(_meta: &std::fs::Metadata) -> Option<Self> {
+        None
+    }
 }
 
 /// A ledger row.
@@ -86,6 +113,10 @@ pub struct LocalOutputRecord {
     /// alone: the same path there is a different file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    /// Identity of the file faucet last wrote at this path. The GC refuses to
+    /// delete a file whose identity differs (somebody else's file now).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<FileIdentity>,
 }
 
 impl LocalOutputRecord {
@@ -108,6 +139,7 @@ impl LocalOutputRecord {
             deleted_at: None,
             deleted_bytes: None,
             host: super::local_host(),
+            file_id: obs.file_id,
         }
     }
 
@@ -131,6 +163,7 @@ impl LocalOutputRecord {
             self.first_written_at = obs.observed_at;
         }
         self.host = super::local_host();
+        self.file_id = obs.file_id;
         self.dataset_uri = obs.dataset_uri.clone();
         self.dataset_id = obs.dataset_id.clone();
         self.kind = obs.kind.clone();
@@ -359,9 +392,24 @@ pub enum SkipReason {
     RelativePath,
     /// Another host wrote the file; only a sweeper on that host may delete it.
     OtherHost,
+    /// The file at the path is not the one faucet wrote (a different device /
+    /// inode), so it is somebody else's and is left alone.
+    Changed,
 }
 
 impl SkipReason {
+    /// Every reason, in a fixed order — what the metrics iterate.
+    pub const ALL: [SkipReason; 8] = [
+        Self::PreExisting,
+        Self::AlreadyDeleted,
+        Self::NotOnDisk,
+        Self::InFlight,
+        Self::DeleteFailed,
+        Self::RelativePath,
+        Self::OtherHost,
+        Self::Changed,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::PreExisting => "pre_existing",
@@ -371,6 +419,7 @@ impl SkipReason {
             Self::DeleteFailed => "delete_failed",
             Self::RelativePath => "relative_path",
             Self::OtherHost => "other_host",
+            Self::Changed => "changed",
         }
     }
 
@@ -455,6 +504,7 @@ mod tests {
             replaced: false,
             retention_days: None,
             observed_at: ts(at),
+            file_id: None,
         }
     }
 

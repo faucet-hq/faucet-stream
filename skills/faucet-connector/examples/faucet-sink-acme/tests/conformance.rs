@@ -1,9 +1,10 @@
 use faucet_conformance as conf;
 use faucet_core::check::CheckContext;
 use faucet_core::{FaucetError, Sink, Value, json};
-use faucet_sink_acme::{AcmeSink, AcmeSinkConfig};
+use faucet_sink_acme::{AcmeSink, AcmeSinkConfig, DESCRIPTOR};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -148,4 +149,76 @@ async fn server_errors_are_typed_for_the_retry_policy() {
     let err = sink.write_batch(&[json!({"id": 1})]).await.unwrap_err();
     assert!(matches!(err, FaucetError::Sink(_)), "{err:?}");
     assert!(!err.is_retriable());
+}
+
+#[tokio::test]
+async fn descriptor_matches_the_built_sink() {
+    for extra in [json!({}), json!({ "write_mode": "upsert", "key": ["id"] })] {
+        let mut config =
+            json!({ "base_url": "http://127.0.0.1:9", "token": "t", "collection": "orders" });
+        config
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let sink = AcmeSink::from_value(config.clone()).unwrap();
+        conf::assert_descriptor_matches_sink(&DESCRIPTOR, "acme", &config, &sink);
+    }
+}
+
+#[tokio::test]
+async fn writes_end_at_the_call_deadline_and_on_cancel() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+        .mount(&server)
+        .await;
+    let uri = server.uri();
+    conf::calls::assert_sink_call_deadline(
+        || AcmeSink::new(AcmeSinkConfig::new(uri.clone(), "t", "orders")).unwrap(),
+        &[json!({ "id": 1 })],
+    )
+    .await;
+}
+
+/// Accepts the first `ok` bulk requests, then refuses every one after.
+struct FailAfter {
+    ok: usize,
+    seen: Arc<Mutex<usize>>,
+}
+
+impl Respond for FailAfter {
+    fn respond(&self, _req: &Request) -> ResponseTemplate {
+        let mut seen = self.seen.lock().unwrap();
+        *seen += 1;
+        if *seen <= self.ok {
+            ResponseTemplate::new(200)
+        } else {
+            ResponseTemplate::new(400).set_body_string("rejected")
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_failed_chunk_fails_only_its_rows_and_the_unsent_ones() {
+    let server = MockServer::start().await;
+    let seen = Arc::new(Mutex::new(0));
+    Mock::given(method("POST"))
+        .respond_with(FailAfter {
+            ok: 2,
+            seen: Arc::clone(&seen),
+        })
+        .mount(&server)
+        .await;
+    let mut config = AcmeSinkConfig::new(server.uri(), "t", "orders");
+    config.max_request_records = 2;
+    let sink = AcmeSink::new(config).unwrap();
+    let rows: Vec<Value> = (0..7).map(|i| json!({ "id": i })).collect();
+    let outcomes = sink.write_batch_partial(&rows).await.unwrap();
+    let failed: Vec<bool> = outcomes.iter().map(Result::is_err).collect();
+    assert_eq!(failed, [false, false, false, false, true, true, true]);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        3,
+        "nothing is sent after the failing chunk"
+    );
 }

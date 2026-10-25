@@ -360,6 +360,19 @@ async fn verify_and_rollback_endpoints_with_rbac() {
         count(&dst, "SELECT count(*) FROM dst WHERE name = 'old-one'").await,
         1
     );
+    // A rollback that errors (the run is already undone) is audited too.
+    let again = client
+        .post(format!("{base}/v1/runs/{run_id}/rollback"))
+        .bearer_auth("admin-tok")
+        .json(&json!({ "config": cfg }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        !again.status().is_success(),
+        "{}",
+        again.text().await.unwrap()
+    );
 
     // A run that recorded no invocation ids (it failed at load) cannot be
     // rolled back → 422; a matrix run with several invocations needs
@@ -429,6 +442,19 @@ async fn verify_and_rollback_endpoints_with_rbac() {
         .unwrap_or_default();
     assert!(actions.contains(&"verify"), "{audit}");
     assert!(actions.contains(&"run.rollback"), "{audit}");
+    let results: Vec<&str> = audit["entries"]
+        .as_array()
+        .or_else(|| audit.as_array())
+        .map(|a| {
+            a.iter()
+                .filter(|e| e["action"] == "run.rollback")
+                .filter_map(|e| e["result"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    for r in ["blocked", "ok", "error"] {
+        assert!(results.contains(&r), "{r}: {results:?}");
+    }
 }
 
 /// #789 SERVE-27: a run whose config has no `name:` executed under the

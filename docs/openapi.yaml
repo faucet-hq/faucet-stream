@@ -76,7 +76,7 @@ paths:
         - { name: since, in: query, schema: { type: string, format: date-time } }
         - { name: until, in: query, schema: { type: string, format: date-time } }
         - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 500 } }
-        - { name: cursor, in: query, schema: { type: string }, description: "Last run_id from the previous page." }
+        - { name: cursor, in: query, schema: { type: string }, description: "The previous page's `next_cursor` (`<submitted_at>~<run_id>`; a bare run_id is still accepted)." }
         - { name: tenant, in: query, schema: { type: string }, description: "Only runs started for this tenant (#709). A tenant-scoped principal always sees only its own tenant; naming another is a 404." }
       responses:
         "200":
@@ -1526,8 +1526,9 @@ paths:
       summary: Trigger a template once per tenant
       description: >
         A template trigger body plus `tenants` (`"all"` — every tenant not
-        suspended — or a list) and `concurrency` (submissions in flight,
-        default 4). Each tenant runs as itself; a tenant whose connection is
+        suspended — or a list) and `fanout_concurrency` (submissions in flight,
+        default 4; `concurrency` is the trigger body's per-run connector
+        concurrency). Each tenant runs as itself; a tenant whose connection is
         missing or needs re-authorization, that is suspended, or that is at
         its limit is `skipped`, not failed. An `idempotency_key` is suffixed
         `:<tenant>`. Each run carries the `fanout` label. Requires `RunWrite`
@@ -1550,7 +1551,7 @@ paths:
                       oneOf:
                         - { type: string, enum: [all] }
                         - { type: array, items: { type: string } }
-                    concurrency: { type: integer, minimum: 1, maximum: 64, default: 4 }
+                    fanout_concurrency: { type: integer, minimum: 1, maximum: 64, default: 4, description: "Submissions in flight at once." }
       responses:
         "200":
           description: One result per tenant.
@@ -1996,8 +1997,9 @@ paths:
       summary: Get one pipeline template
       description: >
         One version of a template — the launched (`stable`) one unless `version`
-        is given — including the stored config body, the template's whole release
-        state, and the launch log. Pass `version=newest` to open a `draft`
+        is given — including the stored config body (admins without a tenant
+        scope only; others get an empty `body` and `body_withheld: true`), the
+        template's whole release state, and the launch log. Pass `version=newest` to open a `draft`
         template, which has no `stable` version yet. Requires the `TemplateRead`
         permission (viewer).
       operationId: getTemplate
@@ -2540,6 +2542,37 @@ paths:
                       type: string
                       enum: [run_read, run_write, schema_read, doctor, trigger_fire, dlq_read, dlq_manage, catalog_read, template_read, template_admin, local_output_read, local_output_manage, audit_read, reload, identity]
         "401": { description: Missing or invalid bearer token }
+  /mcp:
+    post:
+      summary: Model Context Protocol transport (only with `--mcp`)
+      description: >
+        Mounted only when the server runs with `--mcp` (and was built with the
+        `mcp` feature). The body is one JSON-RPC 2.0 request; the response is
+        its JSON-RPC result or error. The route needs a read scope; mutating
+        tools additionally need `--mcp-allow-mutations` and the caller's
+        run-write scope, and the config-executing tools need the doctor scope.
+      operationId: mcp
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: A JSON-RPC 2.0 request.
+              properties:
+                jsonrpc: { type: string, example: "2.0" }
+                id: {}
+                method: { type: string, example: tools/list }
+                params: { type: object }
+      responses:
+        "200":
+          description: The JSON-RPC response (a tool failure is a JSON-RPC error, still 200).
+          content:
+            application/json:
+              schema: { type: object }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
   /healthz:
     get:
       summary: Liveness probe (unauthenticated)
@@ -2774,9 +2807,10 @@ components:
           type: object
           additionalProperties: { type: string }
           description: >-
-            Extra request headers. Refused with 422 on a clustered server, which
-            persists the run record (including this map) into the shared
-            run-history database for a peer to execute.
+            Extra request headers. Refused with 422 on a server with a
+            persistent run history (`--history sqlite:`/`postgres://`, clustered
+            or not), which stores the run record (including this map) in its
+            history database.
         extra_fields:
           type: object
           additionalProperties: true
@@ -3466,6 +3500,13 @@ components:
         deleted_at: { type: string, format: date-time, nullable: true, description: "When the GC collected the file. The record is kept." }
         deleted_bytes: { type: integer, nullable: true, description: "Bytes reclaimed when it was collected." }
         host: { type: string, nullable: true, description: "The host that last wrote the file; a sweeper on another host never deletes it." }
+        file_id:
+          type: object
+          nullable: true
+          description: Device and inode of the file faucet last wrote; a sweep leaves a file with a different identity alone.
+          properties:
+            dev: { type: integer }
+            ino: { type: integer }
         state:
           type: string
           enum: [present, expired, external, replaced]
@@ -3499,7 +3540,7 @@ components:
         skipped:
           type: string
           nullable: true
-          enum: [pre_existing, already_deleted, not_on_disk, in_flight, delete_failed, relative_path, other_host]
+          enum: [pre_existing, already_deleted, not_on_disk, in_flight, delete_failed, relative_path, other_host, changed]
           description: >
             Why the file was left alone. `pre_existing` = faucet did not create
             it; `not_on_disk` = already gone (a no-op, and the record is marked
@@ -3508,7 +3549,8 @@ components:
             in-flight grace window — so it is retried later; `relative_path` =
             a row recorded before paths were stored absolute (it would resolve
             against the sweeper's directory); `other_host` = another host wrote
-            it.
+            it; `changed` = a different file (another device / inode) now sits
+            at the recorded path.
         error: { type: string, nullable: true, description: "Detail for a delete_failed outcome." }
     SweepReport:
       type: object
@@ -3955,7 +3997,8 @@ components:
         - type: object
           required: [body, format, is_stable, launches]
           properties:
-            body: { type: string, description: "The config document, stored verbatim (interpolation directives unresolved)." }
+            body: { type: string, description: "The config document, stored verbatim (interpolation directives unresolved). Empty unless the caller is an admin with no tenant scope — see `body_withheld`." }
+            body_withheld: { type: boolean, description: "Present and true when `body` was withheld because the caller is not an unscoped admin (the stored config can hold inline credentials)." }
             format: { type: string, enum: [yaml, json] }
             is_stable: { type: boolean, description: "Whether the returned version is the currently launched one." }
             launches:

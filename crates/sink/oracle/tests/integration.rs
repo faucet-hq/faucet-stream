@@ -802,3 +802,69 @@ async fn oracle_concurrent_overwrite_runs_keep_their_own_rows() {
     );
     assert_eq!(staging_count(conn.clone()).await, "0");
 }
+
+/// A keyed per-row page fails only the row whose value cannot be bound; a
+/// chunk dropped under `on_unknown_field: drop` is reported skipped, not
+/// written; a JSON column keeps a string that looks like JSON a string.
+#[tokio::test(flavor = "multi_thread")]
+async fn oracle_per_row_failures_skips_and_json_strings() {
+    let Some((_container, conn)) = common::start_oracle().await else {
+        return;
+    };
+    common::exec(
+        &conn,
+        &[
+            "CREATE TABLE BINKEYED (ID NUMBER PRIMARY KEY, R RAW(16))",
+            "CREATE TABLE DROPS (ID NUMBER)",
+            "CREATE TABLE JDOCS (ID NUMBER, J JSON)",
+        ],
+    )
+    .await;
+
+    let mut cfg = OracleSinkConfig::new(conn.clone(), "BINKEYED");
+    cfg.write = WriteSpec {
+        write_mode: WriteMode::Upsert,
+        key: vec!["ID".into()],
+        delete_marker: None,
+        rollback: None,
+    };
+    let sink = OracleSink::new(cfg).await.expect("upsert sink");
+    let outcomes = sink
+        .write_batch_partial(&[
+            json!({"ID": 1, "R": "AQI="}),
+            json!({"ID": 2, "R": "%% not binary %%"}),
+            json!({"ID": 3, "R": "AQI="}),
+        ])
+        .await
+        .expect("per-row outcomes");
+    assert!(outcomes[0].is_ok() && outcomes[2].is_ok(), "{outcomes:?}");
+    let err = outcomes[1].as_ref().unwrap_err().to_string();
+    assert!(err.contains("base64"), "{err}");
+    assert_eq!(count(&conn, "BINKEYED").await, 2);
+
+    let mut cfg = OracleSinkConfig::new(conn.clone(), "DROPS");
+    cfg.column_mapping = OracleColumnMapping::AutoColumns {
+        on_unknown_field: OnUnknownField::Drop,
+    };
+    cfg.batch_size = 1;
+    let sink = OracleSink::new(cfg).await.expect("append sink");
+    let report = sink
+        .write_batch_reported(&[json!({"ID": 4}), json!({"ZZ": 1})])
+        .await
+        .expect("report");
+    assert_eq!((report.accepted, report.skipped), (1, 1), "{report:?}");
+    assert_eq!(count(&conn, "DROPS").await, 1);
+
+    let sink = OracleSink::new(OracleSinkConfig::new(conn.clone(), "JDOCS"))
+        .await
+        .expect("json sink");
+    sink.write_batch(&[
+        json!({"ID": 1, "J": "42"}),
+        json!({"ID": 2, "J": "{\"a\":1}"}),
+    ])
+    .await
+    .expect("json write");
+    let rows =
+        common::query_strings(&conn, "SELECT JSON_SERIALIZE(J) FROM JDOCS ORDER BY ID").await;
+    assert_eq!(rows, vec![Some("\"42\"".into()), Some("{\"a\":1}".into())]);
+}

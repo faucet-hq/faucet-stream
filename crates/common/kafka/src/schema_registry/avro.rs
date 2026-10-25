@@ -24,14 +24,133 @@ fn parse(
 /// writer schema fetched from the registry by ID.
 pub async fn decode(client: &SchemaRegistryClient, bytes: &[u8]) -> Result<Value, FaucetError> {
     let (schema_id, body) = envelope::decode(bytes)?;
-    let registered = client.get_schema(schema_id).await?;
-    let codec = parse(client, &registered.schema)?;
+    let codec = match client.compiled_for::<AvroDatumCodec>("avro", schema_id) {
+        Some(codec) => codec,
+        None => {
+            let registered = client.get_schema(schema_id).await?;
+            registered.expect_type("AVRO")?;
+            let codec = if registered.references.is_empty() {
+                parse(client, &registered.schema)?
+            } else {
+                let deps = client.references(&registered).await?;
+                let texts: Vec<&str> = deps.iter().map(|(_, s)| s.schema.as_str()).collect();
+                parse(client, &inline_references(&registered.schema, &texts)?)?
+            };
+            client.remember_compiled("avro", schema_id, codec.clone());
+            codec
+        }
+    };
     let mut cursor = std::io::Cursor::new(body);
     let avro_value = GenericDatumReader::builder(codec.schema())
         .build()
         .and_then(|r| r.read_value(&mut cursor))
         .map_err(|e| FaucetError::Source(format!("avro decode: {e}")))?;
     avro_to_json(&avro_value, &codec)
+}
+
+/// `schema` with every named type it uses from `references` defined inline at
+/// its first use, so it parses on its own.
+fn inline_references(schema: &str, references: &[&str]) -> Result<String, FaucetError> {
+    use serde_json::Map;
+    fn parse_json(text: &str) -> Result<Value, FaucetError> {
+        serde_json::from_str(text)
+            .map_err(|e| FaucetError::Source(format!("avro schema parse: {e}")))
+    }
+    fn fullname(obj: &Map<String, Value>, enclosing: Option<&str>) -> Option<String> {
+        let name = obj.get("name")?.as_str()?;
+        if name.contains('.') {
+            return Some(name.to_string());
+        }
+        match obj.get("namespace").and_then(Value::as_str).or(enclosing) {
+            Some(ns) if !ns.is_empty() => Some(format!("{ns}.{name}")),
+            _ => Some(name.to_string()),
+        }
+    }
+    fn namespace_of(full: &str) -> Option<String> {
+        full.rsplit_once('.').map(|(ns, _)| ns.to_string())
+    }
+    struct Inliner {
+        named: std::collections::HashMap<String, Value>,
+        defined: std::collections::HashSet<String>,
+    }
+    impl Inliner {
+        fn walk(&mut self, v: &Value, ns: Option<&str>) -> Value {
+            match v {
+                Value::String(s) => {
+                    let full = match ns {
+                        Some(ns) if !s.contains('.') && !ns.is_empty() => format!("{ns}.{s}"),
+                        _ => s.clone(),
+                    };
+                    for key in [&full, s] {
+                        if !self.defined.contains(key)
+                            && let Some(def) = self.named.get(key).cloned()
+                        {
+                            self.defined.insert(key.clone());
+                            let inner_ns = namespace_of(key);
+                            return self.walk(&def, inner_ns.as_deref());
+                        }
+                    }
+                    v.clone()
+                }
+                Value::Array(items) => {
+                    Value::Array(items.iter().map(|i| self.walk(i, ns)).collect())
+                }
+                Value::Object(obj) => {
+                    let full = fullname(obj, ns);
+                    if let Some(full) = &full
+                        && obj.contains_key("type")
+                    {
+                        self.defined.insert(full.clone());
+                    }
+                    let inner_ns = full.as_deref().and_then(namespace_of);
+                    let inner = inner_ns.as_deref().or(ns);
+                    let mut out = Map::new();
+                    for (k, val) in obj {
+                        let walked = match k.as_str() {
+                            "type" | "items" | "values" => self.walk(val, inner),
+                            "fields" => match val {
+                                Value::Array(fields) => Value::Array(
+                                    fields
+                                        .iter()
+                                        .map(|f| match f {
+                                            Value::Object(fo) => {
+                                                let mut fo = fo.clone();
+                                                if let Some(t) = fo.get("type").cloned() {
+                                                    fo.insert("type".into(), self.walk(&t, inner));
+                                                }
+                                                Value::Object(fo)
+                                            }
+                                            other => other.clone(),
+                                        })
+                                        .collect(),
+                                ),
+                                other => other.clone(),
+                            },
+                            _ => val.clone(),
+                        };
+                        out.insert(k.clone(), walked);
+                    }
+                    Value::Object(out)
+                }
+                other => other.clone(),
+            }
+        }
+    }
+    let mut named = std::collections::HashMap::new();
+    for text in references {
+        let def = parse_json(text)?;
+        if let Value::Object(obj) = &def
+            && let Some(full) = fullname(obj, None)
+        {
+            named.insert(full, def);
+        }
+    }
+    let mut inliner = Inliner {
+        named,
+        defined: Default::default(),
+    };
+    let main = parse_json(schema)?;
+    Ok(inliner.walk(&main, None).to_string())
 }
 
 /// Encode a JSON value as Avro under the named subject, registering or
@@ -106,6 +225,98 @@ mod tests {
         )
         .expect_err("u64");
         assert!(err.to_string().contains("json->avro"), "{err}");
+    }
+
+    #[test]
+    fn references_are_inlined_at_first_use() {
+        let address = r#"{"type":"record","name":"Address","namespace":"com.acme",
+            "fields":[{"name":"city","type":"string"},{"name":"zip","type":"Zip"}]}"#;
+        let zip = r#"{"type":"fixed","name":"Zip","namespace":"com.acme","size":2}"#;
+        let main = r#"{"type":"record","name":"User","namespace":"com.acme","fields":[
+            {"name":"home","type":"com.acme.Address"},
+            {"name":"work","type":["null","Address"]}]}"#;
+        let text = inline_references(main, &[zip, address]).unwrap();
+        let schema = Schema::parse_str(&text).unwrap();
+        let codec = AvroDatumCodec::new(schema);
+        let datum = codec
+            .from_json(
+                &serde_json::json!({"home": {"city": "x", "zip": "AQI="}, "work": null}),
+                BytesText::Base64,
+            )
+            .unwrap();
+        assert_eq!(
+            codec.to_json(&datum).unwrap(),
+            serde_json::json!({"home": {"city": "x", "zip": "AQI="}, "work": null})
+        );
+        assert!(inline_references("{", &[]).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_writer_schema_with_references_decodes() {
+        let server = MockServer::start().await;
+        let address = r#"{"type":"record","name":"Address","namespace":"com.acme","fields":[{"name":"city","type":"string"}]}"#;
+        let main = r#"{"type":"record","name":"User","namespace":"com.acme","fields":[{"name":"home","type":"com.acme.Address"}]}"#;
+        Mock::given(method("GET"))
+            .and(path("/schemas/ids/5"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema": main,
+                "references": [{"name": "com.acme.Address", "subject": "address", "version": 2}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/subjects/address/versions/2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "subject": "address", "version": 2, "id": 4, "schema": address
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = SchemaRegistryClient::new(&SchemaRegistryConfig::new(server.uri())).unwrap();
+        let (writer, _) = Schema::parse_str_with_list(main, [address]).unwrap();
+        let codec = AvroDatumCodec::new(
+            Schema::parse_str(&inline_references(main, &[address]).unwrap()).unwrap(),
+        );
+        let value = serde_json::json!({"home": {"city": "Lyon"}});
+        let datum = codec.from_json(&value, BytesText::Base64).unwrap();
+        drop(writer);
+        let payload = GenericDatumWriter::builder(codec.schema())
+            .build()
+            .and_then(|w| w.write_value_to_vec(datum))
+            .unwrap();
+        let bytes = envelope::encode(5, &payload);
+        assert_eq!(decode(&client, &bytes).await.unwrap(), value);
+        let cached = client
+            .compiled_for::<AvroDatumCodec>("avro", 5)
+            .expect("the resolved codec is cached by schema id");
+        assert_eq!(decode(&client, &bytes).await.unwrap(), value);
+        let again = client.compiled_for::<AvroDatumCodec>("avro", 5).unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&cached, &again),
+            "reused, not rebuilt"
+        );
+        assert!(
+            client
+                .compiled_for::<AvroDatumCodec>("protobuf", 5)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_schema_of_another_type_is_refused() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/schemas/ids/6"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema": "syntax = \"proto3\";", "schemaType": "PROTOBUF"
+            })))
+            .mount(&server)
+            .await;
+        let client = SchemaRegistryClient::new(&SchemaRegistryConfig::new(server.uri())).unwrap();
+        let err = decode(&client, &envelope::encode(6, &[0]))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("registered as PROTOBUF"), "{err}");
     }
 
     #[tokio::test]

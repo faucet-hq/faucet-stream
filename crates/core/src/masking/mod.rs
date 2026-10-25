@@ -70,6 +70,9 @@ pub fn apply_masking(records: Vec<Value>, masking: &CompiledMasking) -> MaskingO
 /// Recursively mask `node`, addressed by `path`. Returns nothing; mutates in
 /// place and appends any hits.
 fn mask_node(node: &mut Value, path: &str, m: &CompiledMasking, hits: &mut Vec<MaskHit>) {
+    if node.is_null() {
+        return;
+    }
     // 1. Does a rule match this node as a whole?
     if let Some((rule, detector)) = first_match(node, path, m) {
         match &rule.action {
@@ -549,6 +552,17 @@ mod tests {
         let out = apply_masking(vec![json!({"x": null})], &m);
         assert_eq!(out.records[0]["x"], json!(null));
         assert!(out.hits.is_empty());
+    }
+
+    #[test]
+    fn null_is_not_redacted() {
+        let m = compile(json!({
+            "rules": [{ "match": { "fields": ["ssn"] }, "action": { "type": "redact" } }]
+        }));
+        let out = apply_masking(vec![json!({"ssn": null}), json!({"ssn": "123"})], &m);
+        assert_eq!(out.records[0]["ssn"], json!(null));
+        assert_eq!(out.records[1]["ssn"], json!("***"));
+        assert_eq!(out.hits.len(), 1, "only the present value counts as masked");
     }
 
     #[test]

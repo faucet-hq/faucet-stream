@@ -98,32 +98,67 @@ pub struct Projection {
 
 /// [`project_dedup`], also counting the records it skipped. Pure.
 pub fn project_dedup_counted(records: &[Value], select: &str) -> Projection {
-    let path = select_path(select);
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut out: Vec<Value> = Vec::new();
-    let mut skipped = 0;
-    for rec in records {
-        let matches = match &path {
-            None => vec![rec.clone()],
-            Some(p) => faucet_core::util::extract_records(rec, Some(p)).unwrap_or_default(),
-        };
-        let mut any = false;
-        for v in matches {
-            if v.is_null() {
-                continue;
-            }
-            any = true;
-            if seen.insert(dedup_key(&v)) {
-                out.push(v);
-            }
-        }
-        if !any {
-            skipped += 1;
+    let mut acc = ProjectionAcc::new(select);
+    acc.push(records);
+    acc.finish()
+}
+
+/// [`project_dedup_counted`] fed page by page, holding only the distinct
+/// projected values, never the records.
+#[derive(Debug)]
+pub struct ProjectionAcc {
+    path: Option<String>,
+    seen: std::collections::HashSet<String>,
+    out: Vec<Value>,
+    skipped: usize,
+    records: usize,
+}
+
+impl ProjectionAcc {
+    pub fn new(select: &str) -> Self {
+        Self {
+            path: select_path(select),
+            seen: Default::default(),
+            out: Vec::new(),
+            skipped: 0,
+            records: 0,
         }
     }
-    Projection {
-        values: out,
-        skipped,
+
+    /// Project one page of records.
+    pub fn push(&mut self, records: &[Value]) {
+        self.records += records.len();
+        for rec in records {
+            let matches = match &self.path {
+                None => vec![rec.clone()],
+                Some(p) => faucet_core::util::extract_records(rec, Some(p)).unwrap_or_default(),
+            };
+            let mut any = false;
+            for v in matches {
+                if v.is_null() {
+                    continue;
+                }
+                any = true;
+                if self.seen.insert(dedup_key(&v)) {
+                    self.out.push(v);
+                }
+            }
+            if !any {
+                self.skipped += 1;
+            }
+        }
+    }
+
+    /// Records seen so far.
+    pub fn records(&self) -> usize {
+        self.records
+    }
+
+    pub fn finish(self) -> Projection {
+        Projection {
+            values: self.out,
+            skipped: self.skipped,
+        }
     }
 }
 

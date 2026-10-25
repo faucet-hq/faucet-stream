@@ -836,6 +836,8 @@ pub struct Stmts {
     // ── Data Movement Catalog (#279) ─────────────────────────────────────────
     /// One dataset body by id (the merge read + the detail head).
     pub catalog_select_dataset: String,
+    /// Row-lock one dataset before a read-modify-write of its body. Param: id.
+    pub catalog_lock_dataset: String,
     /// Upsert one dataset row (filter columns + body). Params: id, uri, kind,
     /// last_seen, body.
     /// Local-output ledger (#587). Read-modify-write on upsert (the sticky
@@ -853,6 +855,8 @@ pub struct Stmts {
     pub change_select: String,
     pub change_transition: String,
     pub change_transition_from: String,
+    /// Row-lock one change request for a compare-and-set. Param: id.
+    pub change_lock: String,
     pub change_delete: String,
     pub usage_delete_run: String,
     pub usage_delete_tenant: String,
@@ -1504,6 +1508,7 @@ impl Stmts {
                 WHERE run_id = $1 AND seq <= $2 AND seq <> $3"
                 .into(),
             catalog_select_dataset: "SELECT body FROM faucet_catalog_datasets WHERE id=$1".into(),
+            catalog_lock_dataset: "UPDATE faucet_catalog_datasets SET id=id WHERE id=$1".into(),
             local_output_select: "SELECT body FROM faucet_local_outputs WHERE id=$1".into(),
             local_output_upsert: "INSERT INTO faucet_local_outputs \
                 (id, path, dataset_id, pipeline, last_written_at, deleted_at, body) \
@@ -1528,6 +1533,7 @@ impl Stmts {
                 expires_at=excluded.expires_at, body=excluded.body, tenant=excluded.tenant"
                 .into(),
             change_select: "SELECT body FROM faucet_serve_changes WHERE id=$1".into(),
+            change_lock: "UPDATE faucet_serve_changes SET id=id WHERE id=$1".into(),
             change_transition: "UPDATE faucet_serve_changes SET status=$1, expires_at=$2, \
                 body=$3 WHERE id=$4 AND status=$5"
                 .into(),
@@ -2062,6 +2068,7 @@ impl Stmts {
                 WHERE run_id = ? AND seq <= ? AND seq <> ?"
                 .into(),
             catalog_select_dataset: "SELECT body FROM faucet_catalog_datasets WHERE id=?".into(),
+            catalog_lock_dataset: "UPDATE faucet_catalog_datasets SET id=id WHERE id=?".into(),
             local_output_select: "SELECT body FROM faucet_local_outputs WHERE id=?".into(),
             local_output_upsert: "INSERT INTO faucet_local_outputs \
                 (id, path, dataset_id, pipeline, last_written_at, deleted_at, body) \
@@ -2086,6 +2093,7 @@ impl Stmts {
                 expires_at=excluded.expires_at, body=excluded.body, tenant=excluded.tenant"
                 .into(),
             change_select: "SELECT body FROM faucet_serve_changes WHERE id=?".into(),
+            change_lock: "UPDATE faucet_serve_changes SET id=id WHERE id=?".into(),
             change_transition: "UPDATE faucet_serve_changes SET status=?, expires_at=?, \
                 body=? WHERE id=? AND status=?"
                 .into(),
@@ -2425,7 +2433,9 @@ pub fn classify_backend_error(e: sqlx::Error) -> HistoryError {
 }
 
 fn classified(message: String, e: &sqlx::Error) -> HistoryError {
-    if unreachable_of(e) {
+    if matches!(e, sqlx::Error::PoolTimedOut) {
+        HistoryError::PoolTimedOut(message)
+    } else if unreachable_of(e) {
         HistoryError::Unreachable(message)
     } else {
         HistoryError::BackendClassified {
@@ -2434,6 +2444,16 @@ fn classified(message: String, e: &sqlx::Error) -> HistoryError {
         }
     }
 }
+
+/// Pure pool-state test behind `RunHistory::pool_saturated`.
+pub fn saturated(size: u32, idle: usize, max: u32) -> bool {
+    size >= max && idle == 0
+}
+
+/// Pool size of the SQL history backends: one per background loop (claim,
+/// lease, log persist, log export, change expiry, trigger watchers) plus room
+/// for request handlers.
+pub const POOL_MAX_CONNECTIONS: u32 = 16;
 
 /// Whether a driver error means the database could not be reached, as opposed
 /// to the database answering with an error.
@@ -2865,25 +2885,30 @@ macro_rules! impl_sql_history {
                 use $crate::serve::history::sql;
                 let backend = $crate::serve::history::sql::classify_backend_error;
 
-                // Resolve the cursor's submitted_at for keyset pagination. An
-                // unknown cursor is ignored (page starts from the top), matching
-                // the memory backend.
-                let cursor_ts: Option<String> = match &filter.cursor {
-                    None => None,
-                    Some(c) => sqlx::query(&self.stmts.select_submitted)
-                        .bind(c)
-                        .fetch_optional(&self.pool)
-                        .await
-                        .map_err(backend)?
-                        .map(|r| r.try_get::<String, _>("submitted_at"))
-                        .transpose()
-                        .map_err(backend)?,
+                // Keyset pagination: a `<submitted_at>~<run_id>` cursor carries
+                // its own position; a bare run id (the older form) is looked up,
+                // and an unknown one starts from the top.
+                let decoded = filter
+                    .cursor
+                    .as_deref()
+                    .and_then($crate::serve::history::decode_run_cursor);
+                let (cursor_ts, cur_id): (Option<String>, Option<String>) = match (&filter.cursor, decoded) {
+                    (_, Some((ts, id))) => (Some(sql::fmt_ts(ts)), Some(id)),
+                    (None, None) => (None, None),
+                    (Some(c), None) => {
+                        let ts = sqlx::query(&self.stmts.select_submitted)
+                            .bind(c)
+                            .fetch_optional(&self.pool)
+                            .await
+                            .map_err(backend)?
+                            .map(|r| r.try_get::<String, _>("submitted_at"))
+                            .transpose()
+                            .map_err(backend)?;
+                        let id = ts.as_ref().map(|_| c.clone());
+                        (ts, id)
+                    }
                 };
-                let cur_id = if cursor_ts.is_some() {
-                    filter.cursor.as_deref()
-                } else {
-                    None
-                };
+                let cur_id = cur_id.as_deref();
 
                 // Multi-status via a comma-wrapped membership test: bind
                 // `,completed,failed,` and match `,<status>,` as a substring (the
@@ -2934,7 +2959,7 @@ macro_rules! impl_sql_history {
                     runs.push(sql::decode_body(&body)?);
                 }
                 let next_cursor = if runs.len() > limit {
-                    Some(runs[limit - 1].run_id.clone())
+                    Some($crate::serve::history::encode_run_cursor(&runs[limit - 1]))
                 } else {
                     None
                 };
@@ -4492,12 +4517,18 @@ macro_rules! impl_sql_history {
 
                 for obs in update.sources.iter().chain(std::iter::once(&update.sink)) {
                     let id = catalog::dataset_id(&obs.uri);
-                    // Read-merge-write; last-write-wins under cluster concurrency
-                    // (counters may undercount on a race — acceptable for
-                    // operational stats, never for correctness).
+                    // Read-merge-write under a row lock, so a concurrent
+                    // annotation (owners / consumers live in the same body) is
+                    // never overwritten by a body computed before it.
+                    let mut tx = self.pool.begin_with($begin_write).await.map_err(backend)?;
+                    sqlx::query(&self.stmts.catalog_lock_dataset)
+                        .bind(&id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(backend)?;
                     let existing = sqlx::query(&self.stmts.catalog_select_dataset)
                         .bind(&id)
-                        .fetch_optional(&self.pool)
+                        .fetch_optional(&mut *tx)
                         .await
                         .map_err(backend)?
                         .map(|r| r.try_get::<String, _>("body"))
@@ -4521,9 +4552,10 @@ macro_rules! impl_sql_history {
                         .bind(&ds.kind)
                         .bind(&now_s)
                         .bind(sql::encode_json(&ds, "catalog dataset")?)
-                        .execute(&self.pool)
+                        .execute(&mut *tx)
                         .await
                         .map_err(backend)?;
+                    tx.commit().await.map_err(backend)?;
                     if let Some(v) = new_version {
                         sqlx::query(&self.stmts.catalog_insert_schema_version)
                             .bind(&v.dataset_id)
@@ -4582,9 +4614,15 @@ macro_rules! impl_sql_history {
                 use $crate::serve::history::catalog;
                 use $crate::serve::history::sql;
                 let backend = $crate::serve::history::sql::classify_backend_error;
+                let mut tx = self.pool.begin_with($begin_write).await.map_err(backend)?;
+                sqlx::query(&self.stmts.catalog_lock_dataset)
+                    .bind(dataset_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(backend)?;
                 let Some(row) = sqlx::query(&self.stmts.catalog_select_dataset)
                     .bind(dataset_id)
-                    .fetch_optional(&self.pool)
+                    .fetch_optional(&mut *tx)
                     .await
                     .map_err(backend)?
                 else {
@@ -4600,9 +4638,10 @@ macro_rules! impl_sql_history {
                     .bind(&ds.kind)
                     .bind(sql::fmt_ts(ds.last_seen))
                     .bind(sql::encode_json(&ds, "catalog dataset")?)
-                    .execute(&self.pool)
+                    .execute(&mut *tx)
                     .await
                     .map_err(backend)?;
+                tx.commit().await.map_err(backend)?;
                 Ok(true)
             }
 
@@ -5331,18 +5370,40 @@ macro_rules! impl_sql_history {
             ) -> Result<bool, $crate::serve::history::HistoryError> {
                 use $crate::serve::history::sql;
                 let backend = $crate::serve::history::sql::classify_backend_error;
-                // The stored body is the encoding of the version the caller
-                // read, so comparing it is a compare-and-set on the whole row.
-                let done = sqlx::query(&self.stmts.change_transition_from)
+                use sqlx::Row as _;
+                // Compare-and-set on what identifies the version the caller
+                // read (status + `updated_at`), not on the encoded body text,
+                // which another binary version may render differently.
+                let mut tx = self.pool.begin_with($begin_write).await.map_err(backend)?;
+                sqlx::query(&self.stmts.change_lock)
+                    .bind(&change.id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(backend)?;
+                let Some(row) = sqlx::query(&self.stmts.change_select)
+                    .bind(&change.id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(backend)?
+                else {
+                    return Ok(false);
+                };
+                let body: String = row.try_get("body").map_err(backend)?;
+                let stored: $crate::serve::changes::ChangeRequest =
+                    sql::decode_json(&body, "change request")?;
+                if stored.status != before.status || stored.updated_at != before.updated_at {
+                    return Ok(false);
+                }
+                let done = sqlx::query(&self.stmts.change_transition)
                     .bind(change.status.as_str())
                     .bind(sql::fmt_ts(change.expires_at))
                     .bind(sql::encode_json(change, "change request")?)
                     .bind(&change.id)
                     .bind(before.status.as_str())
-                    .bind(sql::encode_json(before, "change request")?)
-                    .execute(&self.pool)
+                    .execute(&mut *tx)
                     .await
                     .map_err(backend)?;
+                tx.commit().await.map_err(backend)?;
                 Ok(done.rows_affected() == 1)
             }
 
@@ -5502,6 +5563,38 @@ macro_rules! impl_sql_history {
                         }
                     };
                     let max: i64 = row.try_get("v").map_err(backend)?;
+                    let latest = match sqlx::query(&self.stmts.template_select_latest)
+                        .bind(&id)
+                        .fetch_optional(&mut *tx)
+                        .await
+                    {
+                        Ok(latest) => latest,
+                        Err(e) if attempt < sql::CLAIM_ATTEMPTS => {
+                            let _ = tx.rollback().await;
+                            tracing::debug!(
+                                template = %id, attempt, error = %e,
+                                "template kind read lost a race; retrying"
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            let _ = tx.rollback().await;
+                            return Err(backend(e));
+                        }
+                    };
+                    if let Some(latest) = latest {
+                        let body: String = latest.try_get("body").map_err(backend)?;
+                        let existing: templates::TemplateRecord =
+                            sql::decode_json(&body, "pipeline template")?;
+                        if existing.kind != draft.kind {
+                            let _ = tx.rollback().await;
+                            return Err(HistoryError::TemplateKindConflict {
+                                id,
+                                existing: existing.kind,
+                                requested: draft.kind,
+                            });
+                        }
+                    }
                     let next = (max as u32).saturating_add(1);
                     let record = templates::TemplateRecord {
                         id: id.clone(),
@@ -5559,8 +5652,13 @@ macro_rules! impl_sql_history {
                             }
                             // Bound the version history so a template
                             // re-registered on every deploy can't grow forever.
-                            let keep = self.template_versions(&id).await?;
-                            self.prune_template_versions(&id, keep).await?;
+                            match self.template_versions(&id).await {
+                                Ok(keep) => self.prune_after_register(&id, keep).await,
+                                Err(e) => tracing::warn!(
+                                    template = %id, error = %e,
+                                    "listing template versions for pruning failed; pruning skipped"
+                                ),
+                            }
                             return Ok(record);
                         }
                         Err(e) if attempt < sql::CLAIM_ATTEMPTS => {
@@ -5662,37 +5760,53 @@ macro_rules! impl_sql_history {
                 let backend = $crate::serve::history::sql::classify_backend_error;
                 let result = match version {
                     Some(v) => {
-                        // Drop channels + launch entries aimed at this version
-                        // first, so no pointer can outlive what it points at.
-                        sqlx::query(&self.stmts.template_delete_tags_for_version)
+                        // One write transaction behind the version's row lock, so
+                        // a launch or channel move cannot land between the
+                        // cascade and the version delete and leave a pointer at a
+                        // version that no longer exists.
+                        let mut tx = self.pool.begin_with($begin_write).await.map_err(backend)?;
+                        let vs = v.to_string();
+                        sqlx::query(&self.stmts.template_lock_version)
                             .bind(id)
-                            .bind(v.to_string())
-                            .execute(&self.pool)
+                            .bind(&vs)
+                            .execute(&mut *tx)
                             .await
                             .map_err(backend)?;
-                        sqlx::query(&self.stmts.template_delete_launches_for_version)
+                        for stmt in [
+                            &self.stmts.template_delete_tags_for_version,
+                            &self.stmts.template_delete_launches_for_version,
+                            &self.stmts.template_delete_version_deprecation,
+                            &self.stmts.template_delete_tests_version,
+                        ] {
+                            sqlx::query(stmt)
+                                .bind(id)
+                                .bind(&vs)
+                                .execute(&mut *tx)
+                                .await
+                                .map_err(backend)?;
+                        }
+                        let deleted = sqlx::query(&self.stmts.template_delete_version)
                             .bind(id)
-                            .bind(v.to_string())
-                            .execute(&self.pool)
+                            .bind(&vs)
+                            .execute(&mut *tx)
                             .await
                             .map_err(backend)?;
-                        sqlx::query(&self.stmts.template_delete_version_deprecation)
+                        // The last version: the template-level deprecation goes too,
+                        // as a whole-template delete would remove it.
+                        let remaining = sqlx::query(&self.stmts.template_versions)
                             .bind(id)
-                            .bind(v.to_string())
-                            .execute(&self.pool)
+                            .fetch_all(&mut *tx)
                             .await
                             .map_err(backend)?;
-                        sqlx::query(&self.stmts.template_delete_tests_version)
-                            .bind(id)
-                            .bind(v.to_string())
-                            .execute(&self.pool)
-                            .await
-                            .map_err(backend)?;
-                        sqlx::query(&self.stmts.template_delete_version)
-                            .bind(id)
-                            .bind(v.to_string())
-                            .execute(&self.pool)
-                            .await
+                        if remaining.is_empty() {
+                            sqlx::query(&self.stmts.template_delete_deprecation)
+                                .bind(id)
+                                .execute(&mut *tx)
+                                .await
+                                .map_err(backend)?;
+                        }
+                        tx.commit().await.map_err(backend)?;
+                        Ok(deleted)
                     }
                     None => {
                         for stmt in [
@@ -5729,12 +5843,18 @@ macro_rules! impl_sql_history {
                 let backend = $crate::serve::history::sql::classify_backend_error;
                 let mut tx = self.pool.begin().await.map_err(backend)?;
                 let v = version.to_string();
-                sqlx::query(&self.stmts.template_lock_version)
+                let locked = sqlx::query(&self.stmts.template_lock_version)
                     .bind(id)
                     .bind(&v)
                     .execute(&mut *tx)
                     .await
                     .map_err(backend)?;
+                if locked.rows_affected() == 0 {
+                    return Err($crate::serve::history::HistoryError::VersionNotFound {
+                        id: id.to_string(),
+                        version,
+                    });
+                }
                 if let Some(claim) = evidence {
                     let rows = sqlx::query(&self.stmts.template_select_tests_version)
                         .bind(id)
@@ -5928,16 +6048,38 @@ macro_rules! impl_sql_history {
                     };
                     // The version's row lock serializes this move with a new
                     // test result for the same version (#856).
-                    if let Err(e) = sqlx::query(&self.stmts.template_lock_version)
+                    match sqlx::query(&self.stmts.template_lock_version)
                         .bind(id)
                         .bind(version.to_string())
                         .execute(&mut *tx)
                         .await
                     {
-                        if attempt < sql::CLAIM_ATTEMPTS {
-                            continue;
+                        Ok(r) if r.rows_affected() == 0 => {
+                            return Err(HistoryError::VersionNotFound {
+                                id: id.to_string(),
+                                version,
+                            });
                         }
-                        return Err(backend(e));
+                        Ok(_) => {}
+                        Err(_) if attempt < sql::CLAIM_ATTEMPTS => continue,
+                        Err(e) => return Err(backend(e)),
+                    }
+                    // Re-check under the lock: a concurrent launch of the same
+                    // version may have committed since the read above.
+                    let newest: Option<String> = match sqlx::query(&self.stmts.template_select_launches)
+                        .bind(id)
+                        .fetch_optional(&mut *tx)
+                        .await
+                    {
+                        Ok(row) => row
+                            .map(|r| r.try_get::<String, _>("version"))
+                            .transpose()
+                            .map_err(backend)?,
+                        Err(_) if attempt < sql::CLAIM_ATTEMPTS => continue,
+                        Err(e) => return Err(backend(e)),
+                    };
+                    if newest.as_deref() == Some(version.to_string().as_str()) {
+                        return Ok(None);
                     }
                     if let Some(claim) = evidence {
                         let rows = sqlx::query(&self.stmts.template_select_tests_version)
@@ -6299,6 +6441,14 @@ macro_rules! impl_sql_history {
                 }))
             }
 
+            fn pool_saturated(&self) -> bool {
+                $crate::serve::history::sql::saturated(
+                    self.pool.size(),
+                    self.pool.num_idle(),
+                    self.pool.options().get_max_connections(),
+                )
+            }
+
             fn degraded(&self) -> bool {
                 // A live SQL backend is never self-degraded; the FallbackHistory
                 // wrapper owns degradation when the backend becomes unreachable.
@@ -6336,6 +6486,13 @@ pub(crate) use impl_sql_history;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_pool_is_saturated_only_when_full_and_nothing_is_idle() {
+        assert!(super::saturated(16, 0, 16));
+        assert!(!super::saturated(16, 1, 16));
+        assert!(!super::saturated(3, 0, 16));
+    }
+
     use super::*;
 
     #[test]
@@ -6625,6 +6782,8 @@ mod tests {
         assert!(!unreachable_of(&sqlx::Error::RowNotFound));
         let err = classify_backend_error(sqlx::Error::PoolTimedOut);
         assert!(err.is_unreachable());
+        assert!(err.is_pool_timeout());
+        assert!(!classify_backend_error(sqlx::Error::PoolClosed).is_pool_timeout());
         assert_eq!(err.transience(), Transience::Transient);
         assert!(err.to_string().starts_with("run-history backend error:"));
         let err = classify_backend_error(db("08006"));

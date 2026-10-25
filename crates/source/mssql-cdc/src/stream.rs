@@ -30,7 +30,7 @@ use serde_json::Value;
 use tiberius::{QueryItem, ToSql};
 
 use faucet_common_mssql::{
-    MssqlPool, MssqlPooledConnection, build_pool, call_statement, replace_connection,
+    MssqlPool, MssqlPooledConnection, build_pool, call_statement, replace_connection_within,
     statement_call_context,
 };
 
@@ -142,7 +142,9 @@ impl MssqlCdcSource {
     /// Replace a connection a cut-short statement left desynced, so the pool
     /// never hands it out again.
     async fn recover(&self, conn: &mut MssqlPooledConnection<'_>) {
-        if let Err(e) = replace_connection(&self.config.connection, conn).await {
+        if let Err(e) =
+            replace_connection_within(&self.config.connection, conn, &self.calls.get()).await
+        {
             tracing::warn!(error = %e, "mssql-cdc: could not replace a desynced connection");
         }
     }

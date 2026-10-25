@@ -81,3 +81,59 @@ class Skills(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Flags(unittest.TestCase):
+    HELP = {
+        (): "Usage: faucet <COMMAND>\n\nOptions:\n      --log-level <LEVEL>  verbosity\n  -h, --help  Print help\n",
+        ("backfill",): (
+            "Usage: faucet backfill [OPTIONS]\n\nOptions:\n"
+            "      --to-bookmark <V>  upper bound; see --to-date\n"
+            "  -o, --output <FMT>  format\n"
+        ),
+    }
+
+    def cli(self):
+        c = cs.Cli("faucet")
+        c.help = lambda words: self.HELP.get(words)
+        c.subcommands = lambda words: {"backfill"} if words == () else set()
+        return c
+
+    def test_help_flags_reads_option_lines_only(self):
+        self.assertEqual(cs.help_flags(self.HELP[("backfill",)]), {"--to-bookmark", "--output"})
+
+    def test_a_flag_that_prefixes_a_real_one_is_reported(self):
+        errs = self.cli().check("faucet backfill --to 2026-01-01")
+        self.assertEqual(len(errs), 1)
+        self.assertIn("--to", errs[0])
+
+    def test_declared_and_global_flags_pass(self):
+        self.assertEqual(self.cli().check("faucet backfill --to-bookmark 5 -o json --log-level info"), [])
+
+
+class ExampleHubs(unittest.TestCase):
+    def test_assemble_hub_merges_sink_templates_and_lists_ids_and_suites(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            examples = Path(tmp) / "examples"
+            (examples / "source-templates" / "acme").mkdir(parents=True)
+            (examples / "source-templates" / "acme" / "api.yaml").write_text("kind: source-template\n")
+            (examples / "tests" / "acme" / "api").mkdir(parents=True)
+            (examples / "tests" / "acme" / "api" / "suite.yaml").write_text("version: 1\n")
+            (examples / "tests" / "acme" / "api" / "replay.yaml").write_text("runs: 2\n")
+            hub = Path(tmp) / "hub"
+            hub.mkdir()
+            ids, suites = cs.assemble_hub(examples, hub)
+            self.assertEqual(ids, ["acme/api"])
+            self.assertEqual(suites, ["tests/acme/api/suite.yaml"])
+            self.assertTrue((hub / "sink-templates" / cs.HUB_SINK).with_suffix(".yaml").is_file())
+
+    def test_hub_commands_lint_check_every_source_and_run_every_suite(self):
+        cmds = cs.hub_commands(Path("/h"), ["acme/a", "acme/b"], ["tests/x/suite.yaml"])
+        self.assertEqual(cmds[0], (["hub", "lint", "--hub", "/h"], None))
+        self.assertEqual(
+            [c[0][5] for c in cmds if c[0][1] == "check"], ["acme/a", "acme/b"]
+        )
+        self.assertEqual(cmds[-1], (["template", "test", "tests/x/suite.yaml"], "/h"))
+
+    def test_skill_examples_form_a_hub(self):
+        self.assertTrue(cs.example_hubs())

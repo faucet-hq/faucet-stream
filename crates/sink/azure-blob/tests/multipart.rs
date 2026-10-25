@@ -114,10 +114,33 @@ async fn a_blob_past_the_part_floor_uploads_in_parts_and_reads_back_whole() {
     )
     .await
     .expect("sink");
+    let meter = Arc::new(faucet_core::UsageMeter::new());
+    sink.set_roundtrip_recorder(Arc::new(
+        faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Sink,
+            "p",
+            "r",
+            "azure-blob",
+        )
+        .with_meter(meter.clone()),
+    ));
 
     let page: Vec<Value> = (0..RECORDS).map(wide_record).collect();
     assert_eq!(sink.write_batch(&page).await.expect("write"), RECORDS);
     sink.flush().await.expect("flush completes the upload");
+
+    // A single whole-object put records one `put`; the block path records at
+    // least two parts and the commit.
+    let puts = meter
+        .snapshot()
+        .sink_roundtrips
+        .get("put")
+        .copied()
+        .unwrap_or(0);
+    assert!(
+        puts >= 3,
+        "the blob went up in blocks: {puts} put round trip(s)"
+    );
 
     let store = verify_store(port);
     let mut listing = store.list(Some(&ObjPath::from("big/")));

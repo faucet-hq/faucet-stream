@@ -338,7 +338,7 @@ impl AzureBlobSinkConfig {
         self
     }
 
-    /// Cap records per uploaded object.
+    /// Set the per-object byte cap: a new object starts once this many encoded bytes are written.
     pub fn max_bytes_per_file(mut self, n: usize) -> Self {
         self.max_bytes_per_file = Some(n);
         self

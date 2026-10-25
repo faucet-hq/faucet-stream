@@ -33,6 +33,12 @@ fn label_write_err(
         history::HistoryError::StaleEvidence(why) => {
             crate::templates::bundle::stale_evidence(id, version, action, why)
         }
+        history::HistoryError::VersionNotFound { id, version } => {
+            CliError::UnknownPipelineTemplate {
+                id,
+                version: Some(version),
+            }
+        }
         other => registry_err(what, other),
     }
 }
@@ -40,6 +46,7 @@ fn label_write_err(
 pub(crate) fn registry_err(what: &str, e: history::HistoryError) -> CliError {
     match e {
         history::HistoryError::Degraded(m) => CliError::HistoryUnavailable(m),
+        e @ history::HistoryError::TemplateKindConflict { .. } => CliError::Config(e.to_string()),
         other => CliError::Internal(format!("{what}: {other}")),
     }
 }

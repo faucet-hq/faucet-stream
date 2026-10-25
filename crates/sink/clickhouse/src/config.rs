@@ -101,7 +101,8 @@ pub struct ClickHouseStagingConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
     /// Explicit S3-compatible endpoint (`host[:port]`, path-style) — for MinIO /
-    /// non-AWS stores. Overrides `region`.
+    /// non-AWS stores. Overrides `region`. An `http://` or `https://` prefix
+    /// is kept; without one the server fetches over `https://`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("x-faucet-resource" = "url"))]
     pub endpoint: Option<String>,

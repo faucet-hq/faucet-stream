@@ -431,6 +431,11 @@ pub struct GetResponse {
     /// Each stored version's test status (#856) — `passing` / `failing` /
     /// `untested` / `no_tests` — with its recent runs.
     pub tests: TestsView,
+    /// Set when `body` was withheld: the stored config can hold inline
+    /// credentials, so only an unscoped admin reads it (as with a run's
+    /// `config_body`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub body_withheld: bool,
 }
 
 /// The test view of a template's versions.
@@ -446,6 +451,7 @@ const DETAIL_TEST_RUNS: usize = 5;
 /// `GET /v1/templates/{id}[?version=N]` → 200 / 404.
 pub async fn get_template(
     State(server): State<ServerState>,
+    Extension(actor): Extension<AuthContext>,
     Path(id): Path<String>,
     Query(q): Query<VersionQuery>,
 ) -> Result<Json<GetResponse>, ServeError> {
@@ -458,7 +464,10 @@ pub async fn get_template(
         .await
         .map_err(|e| ServeError::Internal(e.to_string()))?
         .ok_or(ServeError::NotFound)?;
-    if q.clean {
+    let body_withheld = !reads_template_body(&actor);
+    if body_withheld {
+        template.body.clear();
+    } else if q.clean {
         template.body = crate::templates::clean_config_yaml(&template.body).map_err(map_err)?;
     }
     let state = crate::templates::template_state(&s, &id)
@@ -483,7 +492,13 @@ pub async fn get_template(
         is_stable,
         launches,
         tests: TestsView { versions },
+        body_withheld,
     }))
+}
+
+/// Whether `actor` may read a template's stored body.
+pub(crate) fn reads_template_body(actor: &AuthContext) -> bool {
+    actor.reads_template_bodies()
 }
 
 // ── GET /v1/templates/{id}/rows ─────────────────────────────────────────────
@@ -1396,9 +1411,52 @@ mod tests {
         id: &str,
         q: VersionQuery,
     ) -> Result<GetResponse, ServeError> {
-        get_template(State(state.clone()), Path(id.into()), Query(q))
+        get_template(
+            State(state.clone()),
+            Extension(actor()),
+            Path(id.into()),
+            Query(q),
+        )
+        .await
+        .map(|j| j.0)
+    }
+
+    #[tokio::test]
+    async fn only_an_unscoped_admin_reads_the_stored_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state();
+        register_demo(&state, &dir.path().join("o.jsonl")).await;
+        let as_admin = get(&state, "tpl-demo", VersionQuery::default())
             .await
-            .map(|j| j.0)
+            .unwrap();
+        assert!(!as_admin.body_withheld);
+        assert!(as_admin.template.body.contains("o.jsonl"));
+        for (role, tenant) in [
+            (Role::Viewer, None),
+            (Role::Operator, None),
+            (Role::Admin, Some("acme".to_string())),
+        ] {
+            let who = AuthContext {
+                principal: "p".into(),
+                role,
+                source_ip: None,
+                tenant,
+            };
+            let got = get_template(
+                State(state.clone()),
+                Extension(who),
+                Path("tpl-demo".into()),
+                Query(VersionQuery {
+                    version: None,
+                    clean: true,
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert!(got.body_withheld);
+            assert!(got.template.body.is_empty());
+        }
     }
 
     #[tokio::test]
@@ -2839,6 +2897,7 @@ tests:
 
         let got = get_template(
             State(state.clone()),
+            Extension(actor()),
             Path("tpl-demo".into()),
             Query(VersionQuery {
                 version: Some(VersionSelector::Pinned(1)),

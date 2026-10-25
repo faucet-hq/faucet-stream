@@ -84,6 +84,17 @@ pub fn evaluate_success(spec: &SlaSpec, prior: &SlaState, rows: u64) -> Vec<SlaV
 /// Checks that apply to a **failed** run: staleness of the last success. A
 /// pipeline with no recorded success yet cannot be measured (cold start).
 pub fn evaluate_failure(spec: &SlaSpec, prior: &SlaState, now_unix: i64) -> Vec<SlaViolation> {
+    staleness(spec, prior, now_unix)
+}
+
+/// Staleness for a **successful** run that arrives more than
+/// `max_staleness_secs` after the previous success: the data was stale until
+/// now, even though this run succeeded.
+pub fn evaluate_late_success(spec: &SlaSpec, prior: &SlaState, now_unix: i64) -> Vec<SlaViolation> {
+    staleness(spec, prior, now_unix)
+}
+
+fn staleness(spec: &SlaSpec, prior: &SlaState, now_unix: i64) -> Vec<SlaViolation> {
     match (spec.max_staleness_secs, prior.last_success_unix) {
         (Some(max_secs), Some(last)) => {
             let since_secs = now_unix.saturating_sub(last).max(0) as u64;
@@ -276,6 +287,17 @@ mod tests {
         // No staleness configured → nothing.
         let s = spec(None, Some(1), None);
         assert!(evaluate_failure(&s, &prior, 999_999).is_empty());
+    }
+
+    #[test]
+    fn a_success_after_a_long_gap_reports_staleness() {
+        let s = spec(Some(3600), None, None);
+        let prior = state_with(&[], Some(10_000));
+        assert!(evaluate_late_success(&s, &prior, 10_000 + 3600).is_empty());
+        let v = evaluate_late_success(&s, &prior, 10_000 + 3 * 86_400);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].kind(), "staleness");
+        assert!(evaluate_late_success(&s, &SlaState::default(), 999_999).is_empty());
     }
 
     #[test]

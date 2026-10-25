@@ -79,6 +79,16 @@ sink writes item by item (still `concurrency`-bounded). A failed condition is
 skipped by default, which makes re-delivery idempotent with conditions like
 `attribute_not_exists(pk)` or `attribute_not_exists(pk) OR #v < :v`.
 
+A conditional write is retried only by the sink's own retry loop (the AWS SDK's
+built-in retries are turned off for it), so the sink always knows when an
+earlier attempt's outcome was unknown: a transport failure, an unreadable reply,
+or an internal server error. With `on_condition_failure: fail`, a condition
+that then fails on the retry is checked with a consistent `GetItem`: when the
+item already equals the put item (or a deleted key is gone), the earlier
+attempt landed and the row succeeds; otherwise the row fails. The comparison
+follows how DynamoDB stores values: numbers by value (`2.0` matches the stored
+`2`), sets in any order, lists and maps element by element.
+
 ## Preflight
 
 `check()` runs `DescribeTable` and, for keyed modes, verifies `key` matches the

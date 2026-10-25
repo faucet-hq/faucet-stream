@@ -1,6 +1,6 @@
 import { api, toast } from "../api.js";
 import { navigate } from "../router.js";
-import { escapeHtml, fmtInt, fmtDuration, fmtCompact } from "../utils.js";
+import { escapeHtml, fmtInt, fmtDuration, fmtCompact, TERMINAL_RUN_STATUSES as TERMINAL } from "../utils.js";
 import { attachDatePicker } from "./date-picker.js";
 import { formatTs } from "../tz.js";
 import { currentTenant, tenantList, withTenant } from "../tenant.js";
@@ -95,7 +95,7 @@ export async function renderRuns(container) {
   }
 
   function maybePoll(runs) {
-    const active = runs.some((r) => r.status === "running" || r.status === "queued");
+    const active = runs.some((r) => !TERMINAL.includes(r.status));
     clearTimeout(pollTimer);
     if (active) pollTimer = setTimeout(() => load(true), 3000);
   }

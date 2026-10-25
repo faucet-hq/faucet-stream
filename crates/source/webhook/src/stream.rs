@@ -15,6 +15,7 @@ use tokio::sync::{Mutex, Notify};
 struct AppState {
     inbox: Mutex<Inbox>,
     max_payloads: Option<usize>,
+    max_buffered_bytes: usize,
     done: Notify,
     /// Optional shared secret required in the `Authorization` header.
     auth_token: Option<String>,
@@ -26,7 +27,11 @@ struct AppState {
 #[derive(Default)]
 struct Inbox {
     records: Vec<Value>,
+    bytes: usize,
     closed: bool,
+    /// Signatures of stored timestamped requests, by their signed timestamp,
+    /// so a repeat inside the tolerance window is not stored twice.
+    seen: HashMap<String, u64>,
 }
 
 /// How long a refused sender is told to wait before retrying.
@@ -40,6 +45,7 @@ impl WebhookDriver {
         Arc::new(AppState {
             inbox: Mutex::new(Inbox::default()),
             max_payloads: self.config.max_payloads,
+            max_buffered_bytes: self.config.max_buffered_bytes,
             done: Notify::new(),
             auth_token: self.config.auth_token.clone(),
             signature: self.config.signature.clone(),
@@ -173,6 +179,26 @@ fn server_result(
 
 /// Verify an HMAC signature over the raw body (and the signed timestamp, when
 /// configured) in constant time.
+/// For a request signed with a timestamp: its signature header value, its
+/// timestamp, and the oldest timestamp still inside the tolerance window.
+fn signed_request_key(
+    sig: &WebhookSignature,
+    headers: &axum::http::HeaderMap,
+    now_unix: u64,
+) -> Option<(String, u64, u64)> {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let ts = header(sig.timestamp_header.as_deref()?)?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    let provided = header(&sig.header)?.trim();
+    let provided = match sig.encoding {
+        SignatureEncoding::Hex => provided.to_ascii_lowercase(),
+        _ => provided.to_string(),
+    };
+    Some((provided, ts, now_unix.saturating_sub(sig.tolerance_secs)))
+}
+
 fn signature_ok(
     sig: &WebhookSignature,
     headers: &axum::http::HeaderMap,
@@ -325,6 +351,7 @@ async fn webhook_handler(
             return StatusCode::UNAUTHORIZED.into_response();
         }
     }
+    let mut replay_key: Option<(String, u64, u64)> = None;
     if let Some(sig) = &state.signature {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -333,6 +360,7 @@ async fn webhook_handler(
         if !signature_ok(sig, &headers, &body, now) {
             return StatusCode::UNAUTHORIZED.into_response();
         }
+        replay_key = signed_request_key(sig, &headers, now);
     }
 
     let value = match faucet_core::fidelity::from_slice(&body) {
@@ -347,23 +375,44 @@ async fn webhook_handler(
     };
 
     let mut inbox = state.inbox.lock().await;
+    if let Some((key, _, cutoff)) = &replay_key {
+        inbox.seen.retain(|_, ts| *ts >= *cutoff);
+        if inbox.seen.contains_key(key) {
+            // The same signed request was already stored: acknowledge it again.
+            return StatusCode::OK.into_response();
+        }
+    }
     // Decide under the lock so the cap is exact: concurrent in-flight POSTs
     // that have already been accepted can't push the Vec past `max_payloads`.
     // A payload that is not stored — over the cap, or after the window closed
     // — is refused with a retryable status rather than a `200` the sender
     // would read as delivered (API-14).
     let decision = decide_payload(inbox.records.len(), state.max_payloads);
-    if decision.done {
+    // An empty inbox always takes the payload, as the count cap does: a body
+    // larger than the byte cap (allowed by `max_body_bytes`) would otherwise
+    // be refused in every window and retried forever.
+    let over_bytes = state.max_buffered_bytes > 0
+        && !inbox.records.is_empty()
+        && inbox.bytes.saturating_add(body.len()) > state.max_buffered_bytes;
+    if decision.done || over_bytes {
         state.done.notify_one();
     }
-    if inbox.closed || !decision.accept {
+    if inbox.closed || !decision.accept || over_bytes {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [(axum::http::header::RETRY_AFTER, RETRY_AFTER_SECS)],
         )
             .into_response();
     }
+    inbox.bytes += body.len();
     inbox.records.push(value);
+    if state.max_buffered_bytes > 0 && inbox.bytes >= state.max_buffered_bytes {
+        // The window is full: emit it rather than wait for a refused POST.
+        state.done.notify_one();
+    }
+    if let Some((key, ts, _)) = replay_key {
+        inbox.seen.insert(key, ts);
+    }
     StatusCode::OK.into_response()
 }
 
@@ -481,9 +530,12 @@ mod tests {
         std::sync::Arc::new(super::AppState {
             inbox: tokio::sync::Mutex::new(super::Inbox {
                 records: Vec::new(),
+                bytes: 0,
                 closed,
+                seen: HashMap::new(),
             }),
             max_payloads,
+            max_buffered_bytes: 0,
             done: tokio::sync::Notify::new(),
             auth_token: None,
             signature: None,
@@ -653,6 +705,7 @@ mod tests {
         let state = Arc::new(AppState {
             inbox: Mutex::new(Inbox::default()),
             max_payloads: Some(max),
+            max_buffered_bytes: 0,
             done: Notify::new(),
             auth_token: None,
             signature: None,
@@ -700,6 +753,7 @@ mod tests {
         let state = Arc::new(AppState {
             inbox: Mutex::new(Inbox::default()),
             max_payloads: config.max_payloads,
+            max_buffered_bytes: config.max_buffered_bytes,
             done: Notify::new(),
             auth_token: config.auth_token.clone(),
             signature: None,
@@ -809,6 +863,7 @@ mod tests {
         let state = Arc::new(AppState {
             inbox: Mutex::new(Inbox::default()),
             max_payloads: Some(1),
+            max_buffered_bytes: 0,
             done: Notify::new(),
             auth_token: None,
             signature: None,

@@ -1490,6 +1490,51 @@ async fn a_minimal_message_driver_takes_the_defaults() {
     );
 }
 
+/// Publishes one message per group; every group after the first returns one
+/// outcome too many.
+struct ShortAfterFirst(std::sync::atomic::AtomicUsize);
+
+#[async_trait]
+impl MessageDriver for ShortAfterFirst {
+    fn connector_name(&self) -> &'static str {
+        "short"
+    }
+    fn group_size(&self) -> usize {
+        1
+    }
+    fn encode(&self, record: &Value) -> Result<OutboundMessage, FaucetError> {
+        Ok(OutboundMessage::new("d", record.to_string()))
+    }
+    async fn publish(
+        &self,
+        _: &CallSlot,
+        group: Vec<OutboundMessage>,
+    ) -> Result<Vec<crate::RowOutcome>, FaucetError> {
+        let call = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let n = if call == 0 {
+            group.len()
+        } else {
+            group.len() + 1
+        };
+        Ok((0..n).map(|_| Ok(())).collect())
+    }
+}
+
+#[tokio::test]
+async fn a_miscounted_later_group_fails_only_its_open_rows() {
+    let sink = DriverSink::new(MessageSinkDriver::new(ShortAfterFirst(
+        std::sync::atomic::AtomicUsize::new(0),
+    )));
+    let outcomes = sink
+        .write_batch_partial(&[json!(1), json!(2), json!(3)])
+        .await
+        .unwrap();
+    assert!(outcomes[0].is_ok(), "the delivered group stays delivered");
+    assert!(outcomes[1].is_err() && outcomes[2].is_err());
+    let msg = outcomes[1].as_ref().unwrap_err().to_string();
+    assert!(msg.contains("2 outcomes for a group of 1"), "{msg}");
+}
+
 /// A consumer that is empty on its first receive, then has one message,
 /// then is empty again; with the default limits it reads that one.
 struct Trickle(Mutex<Vec<Vec<InboundMessage>>>);

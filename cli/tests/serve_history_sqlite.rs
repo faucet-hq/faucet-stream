@@ -140,7 +140,8 @@ async fn list_orders_desc_filters_and_paginates() {
             .collect::<Vec<_>>(),
         vec!["c", "b"]
     );
-    assert_eq!(page.next_cursor.as_deref(), Some("b"));
+    let cursor = page.next_cursor.clone().unwrap();
+    assert!(cursor.ends_with("~b"), "{cursor}");
     // Next page from the cursor → [a].
     let page2 = h
         .list(&ListFilter {
@@ -159,6 +160,31 @@ async fn list_orders_desc_filters_and_paginates() {
         vec!["a"]
     );
     assert!(page2.next_cursor.is_none());
+    // The cursor carries its position, so it survives the run's deletion.
+    h.delete("b").await.unwrap();
+    let after = h
+        .list(&ListFilter {
+            limit: 2,
+            cursor: Some(cursor),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        after
+            .runs
+            .iter()
+            .map(|r| r.run_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a"]
+    );
+    h.upsert(&rec(
+        "b",
+        RunStatus::Completed,
+        t0 + ChronoDuration::seconds(1),
+    ))
+    .await
+    .unwrap();
 
     // Status filter.
     h.upsert(&rec(
@@ -914,6 +940,22 @@ mod templates {
         assert_eq!(again.version, 4);
     }
 
+    /// An id keeps one kind: a version of another kind is refused where the
+    /// version is assigned, and nothing is stored.
+    #[tokio::test]
+    async fn a_version_of_another_kind_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir, "tpl-kind.db").await;
+        s.template_register(&draft("orders", None)).await.unwrap();
+        let mut other = draft("orders", None);
+        other.kind = faucet_cli::hub::TemplateKind::SourceTemplate;
+        let err = s.template_register(&other).await.unwrap_err();
+        assert!(err.to_string().contains("is a pipeline"), "{err}");
+        assert_eq!(s.template_versions("orders").await.unwrap(), vec![1]);
+        s.template_delete("orders", None).await.unwrap();
+        s.template_register(&other).await.unwrap();
+    }
+
     #[tokio::test]
     async fn launch_log_drives_stable_previous_and_status() {
         let dir = tempfile::tempdir().unwrap();
@@ -1014,6 +1056,28 @@ mod templates {
         let st = s.template_state("legacy").await.unwrap();
         assert_eq!(st.status, TemplateStatus::Launched);
         assert!(st.deprecation.is_none());
+    }
+
+    #[tokio::test]
+    async fn deleting_the_last_version_clears_the_deprecation_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir, "tpl-last-version.db").await;
+        s.template_register(&draft("gone", None)).await.unwrap();
+        let marker = DeprecationRecord {
+            deprecated_at: Utc::now(),
+            deprecated_by: None,
+            reason: None,
+        };
+        s.template_set_deprecation("gone", Some(&marker))
+            .await
+            .unwrap();
+        s.template_delete("gone", Some(1)).await.unwrap();
+        assert!(s.template_deprecation("gone").await.unwrap().is_none());
+        s.template_register(&draft("gone", None)).await.unwrap();
+        assert_ne!(
+            s.template_state("gone").await.unwrap().status,
+            TemplateStatus::Deprecated
+        );
     }
 
     #[tokio::test]
@@ -1299,6 +1363,7 @@ async fn local_output_backends_agree() {
         replaced: false,
         retention_days: None,
         observed_at: at(when),
+        file_id: None,
     };
 
     // Deliberately includes three rows sharing one `last_written_at` — the tie
@@ -1572,6 +1637,27 @@ async fn change_requests_round_trip_and_filter() {
     second.reason = Some("carol approved".into());
     assert!(!store.change_transition_from(&second, &read).await.unwrap());
     assert!(store.change_transition_from(&second, &first).await.unwrap());
+    // A body another binary version rendered differently (an extra field this
+    // one does not know) still matches the version the caller read.
+    {
+        use sqlx::Connection as _;
+        let url = format!("sqlite:{}", dir.path().join("changes.db").display());
+        let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
+        let body: String = sqlx::query_scalar("SELECT body FROM faucet_serve_changes WHERE id='p'")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        let mut doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+        doc["from_a_newer_binary"] = serde_json::json!(true);
+        sqlx::query("UPDATE faucet_serve_changes SET body=? WHERE id='p'")
+            .bind(doc.to_string())
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+    let mut third = second.clone();
+    third.reason = Some("dave approved".into());
+    assert!(store.change_transition_from(&third, &second).await.unwrap());
     assert!(store.change_delete("p").await.unwrap());
     store
         .change_upsert(&mk("a", ChangeKind::Run, ChangeStatus::Pending, "bob", 30))
@@ -2194,4 +2280,114 @@ async fn a_history_unreachable_at_startup_is_reconnected() {
     assert!(!h.degraded());
     assert!(h.trigger_edge_rise("q").await.unwrap().is_some());
     assert!(missing.join("h.db").exists());
+}
+
+/// Run recording and annotation interleave without one overwriting the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_catalog_records_keep_every_annotation() {
+    use faucet_cli::serve::history::catalog::{
+        CatalogAnnotation, CatalogConsumer, CatalogUpdate, DatasetObservation, DatasetRole,
+        dataset_id,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let s = std::sync::Arc::new(store(&dir, "annotate.db").await);
+    fn obs(uri: &str, role: DatasetRole) -> DatasetObservation {
+        DatasetObservation {
+            uri: uri.into(),
+            kind: "csv".into(),
+            role,
+            schema: None,
+            records: 1,
+        }
+    }
+    fn update(run: String) -> CatalogUpdate {
+        CatalogUpdate {
+            run_id: run,
+            pipeline: "p".into(),
+            row: "default".into(),
+            recorded_at: Utc::now(),
+            sources: vec![obs("csv://src", DatasetRole::Source)],
+            sink: obs("csv://dst", DatasetRole::Sink),
+            column_lineage: None,
+        }
+    }
+    s.catalog_record(&update("r0".into())).await.unwrap();
+    let id = dataset_id("csv://dst");
+    let mut tasks = tokio::task::JoinSet::new();
+    for i in 0..20 {
+        let s = s.clone();
+        let id = id.clone();
+        tasks.spawn(async move {
+            s.catalog_record(&update(format!("r{i}"))).await.unwrap();
+            let ann = CatalogAnnotation {
+                owners: None,
+                consumers: vec![CatalogConsumer {
+                    name: format!("c{i}"),
+                    kind: None,
+                    contact: None,
+                    columns: Vec::new(),
+                    registered_by: "t".into(),
+                    registered_at: Utc::now(),
+                }],
+                replace_consumers: false,
+            };
+            assert!(s.catalog_annotate(&id, &ann).await.unwrap());
+        });
+    }
+    while let Some(r) = tasks.join_next().await {
+        r.unwrap();
+    }
+    let detail = s.catalog_get_dataset(&id).await.unwrap().unwrap();
+    assert_eq!(
+        detail.dataset.consumers.len(),
+        20,
+        "{:?}",
+        detail.dataset.consumers
+    );
+}
+
+#[cfg(feature = "templates")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn launches_and_channels_never_point_at_a_missing_version() {
+    use faucet_cli::serve::history::HistoryError;
+    use faucet_cli::serve::history::templates::{TemplateDraft, TemplateId};
+    let dir = tempfile::tempdir().unwrap();
+    let s = std::sync::Arc::new(store(&dir, "tpl-race.db").await);
+    let draft = TemplateDraft {
+        id: TemplateId::parse("race").unwrap(),
+        name: None,
+        description: None,
+        body: "version: 1\nname: race\n".into(),
+        format: faucet_cli::serve::load::ConfigFormat::Yaml,
+        params: Default::default(),
+        created_by: None,
+        kind: faucet_cli::hub::TemplateKind::Pipeline,
+    };
+    for _ in 0..2 {
+        s.template_register(&draft).await.unwrap();
+    }
+    assert!(matches!(
+        s.template_launch("race", 9, None, None).await,
+        Err(HistoryError::VersionNotFound { version: 9, .. })
+    ));
+    assert!(matches!(
+        s.template_set_tag("race", "dev", 9, None).await,
+        Err(HistoryError::VersionNotFound { version: 9, .. })
+    ));
+    s.template_launch("race", 1, None, None).await.unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let s = s.clone();
+        tasks.spawn(async move { s.template_launch("race", 2, None, None).await.unwrap() });
+    }
+    let mut appended = 0;
+    while let Some(r) = tasks.join_next().await {
+        appended += r.unwrap().is_some() as usize;
+    }
+    assert_eq!(
+        appended, 1,
+        "concurrent launches of one version append once"
+    );
+    let st = s.template_state("race").await.unwrap();
+    assert_eq!((st.stable, st.previous), (Some(2), Some(1)));
 }

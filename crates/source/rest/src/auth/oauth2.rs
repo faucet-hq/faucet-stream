@@ -9,11 +9,24 @@ use tokio::sync::Mutex;
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
     access_token: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_expiry")]
     expires_in: Option<u64>,
     #[allow(dead_code)]
     #[serde(default)]
     token_type: Option<String>,
+}
+
+/// `expires_in` as a number or a numeric string; any other value is treated
+/// as absent (the token is then cached until a 401) rather than failing.
+fn lenient_expiry<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(value.and_then(|v| {
+        let secs = super::token_endpoint::expiry_seconds(&v);
+        if secs.is_none() && !v.is_null() {
+            tracing::warn!("OAuth2 expires_in {v} is not a whole number of seconds; ignoring it");
+        }
+        secs
+    }))
 }
 
 /// Default fraction of `expires_in` after which the token is refreshed.
@@ -159,7 +172,7 @@ async fn fetch_oauth2_token_inner_with_client(
         };
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
+            let body = super::token_error_body(resp).await;
             if !last && is_transient_token_status(status, &body) {
                 tracing::warn!(
                     status,

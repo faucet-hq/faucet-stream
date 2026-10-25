@@ -137,16 +137,8 @@ impl MultipartUpload for S3Upload {
     fn abort(self: Box<Self>) -> BoxFuture<Result<(), FaucetError>> {
         Box::pin(async move {
             let o = &self.objects;
-            o.client
-                .abort_multipart_upload()
-                .bucket(&o.bucket)
-                .key(&self.key)
-                .upload_id(&self.upload_id)
-                .send()
-                .within(&o.calls, "put")
-                .await?
-                .map_err(|e| o.sdk_err("abort multipart", &self.key, e))?;
-            Ok(())
+            o.roundtrips.record("abort");
+            crate::objects::abort_multipart(&o.client, &o.bucket, &self.key, &self.upload_id).await
         })
     }
 }

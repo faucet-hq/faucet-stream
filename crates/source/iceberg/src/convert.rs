@@ -243,9 +243,9 @@ pub fn type_to_json_schema(ty: &Type) -> Value {
         Type::Primitive(p) => match p {
             PrimitiveType::Boolean => json!({ "type": "boolean" }),
             PrimitiveType::Int | PrimitiveType::Long => json!({ "type": "integer" }),
-            // Rows carry NaN / ±Infinity as strings and every digit of a
-            // decimal as a string, so the schema says so (#862 M-062).
-            PrimitiveType::Float | PrimitiveType::Double => json!({ "type": ["number", "string"] }),
+            // A non-finite value arrives as null, so a float column is
+            // nullable even when the table marks it required.
+            PrimitiveType::Float | PrimitiveType::Double => json!({ "type": ["number", "null"] }),
             PrimitiveType::Decimal { .. } => json!({ "type": "string", "format": "decimal" }),
             PrimitiveType::Date => json!({ "type": "string", "format": "date" }),
             PrimitiveType::Time => json!({ "type": "string", "format": "time" }),
@@ -787,7 +787,11 @@ mod tests {
         assert_eq!(p["id"], json!({"type": "integer"}));
         assert_eq!(p["flag"]["type"], json!(["boolean", "null"]));
         assert_eq!(p["n"]["type"], json!(["integer", "null"]));
-        assert_eq!(p["x"]["type"], json!(["number", "string", "null"]));
+        assert_eq!(p["x"]["type"], json!(["number", "null"]));
+        assert_eq!(
+            type_to_json_schema(&Type::Primitive(PrimitiveType::Float)),
+            json!({"type": ["number", "null"]})
+        );
         assert_eq!(p["dec"]["type"], json!(["string", "null"]));
         assert_eq!(p["dec"]["format"], "decimal");
         assert_eq!(p["d"]["format"], "date");

@@ -37,6 +37,76 @@ pub(crate) fn token_client() -> reqwest::Client {
         .clone()
 }
 
+/// JSON members whose values a token endpoint's error body may carry and an
+/// error message must never repeat.
+const SENSITIVE_MEMBERS: &[&str] = &[
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "client_secret",
+    "password",
+];
+
+/// A bounded, masked excerpt of a failed token response's body for an error
+/// message: at most [`faucet_core::util::DEFAULT_ERROR_BODY_MAX_LEN`] bytes
+/// are read, string values of credential members are replaced with `***`,
+/// and registered secrets are redacted.
+pub(crate) async fn token_error_body(mut resp: reqwest::Response) -> String {
+    let max = faucet_core::util::DEFAULT_ERROR_BODY_MAX_LEN;
+    let mut raw: Vec<u8> = Vec::new();
+    let mut more = false;
+    while let Ok(Some(chunk)) = resp.chunk().await {
+        raw.extend_from_slice(&chunk);
+        if raw.len() > max {
+            more = true;
+            break;
+        }
+    }
+    let text = mask_sensitive_members(&String::from_utf8_lossy(&raw));
+    let text = if more || text.len() > max {
+        let end = text.floor_char_boundary(max.min(text.len()));
+        format!("{}...(truncated)", &text[..end])
+    } else {
+        text
+    };
+    faucet_core::redact::redact(&text)
+}
+
+/// `text` with the string value of every [`SENSITIVE_MEMBERS`] key replaced
+/// by `***`. Works on a truncated document too (an unterminated value is
+/// masked to the end).
+fn mask_sensitive_members(text: &str) -> String {
+    let mut out = text.to_string();
+    for key in SENSITIVE_MEMBERS {
+        let needle = format!("\"{key}\"");
+        let mut from = 0;
+        while let Some(found) = out[from..].find(&needle) {
+            let after_key = from + found + needle.len();
+            let rest = &out[after_key..];
+            let trimmed = rest.trim_start();
+            let Some(after_colon) = trimmed.strip_prefix(':') else {
+                from = after_key;
+                continue;
+            };
+            let value = after_colon.trim_start();
+            if !value.starts_with('"') {
+                from = after_key;
+                continue;
+            }
+            let start = out.len() - value.len() + 1;
+            let bytes = out.as_bytes();
+            let mut end = start;
+            while end < bytes.len() && bytes[end] != b'"' {
+                end += if bytes[end] == b'\\' { 2 } else { 1 };
+            }
+            let end = end.min(out.len());
+            out.replace_range(start..end, "***");
+            from = start + 3;
+        }
+    }
+    out
+}
+
 /// Supported authentication methods.
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", content = "config", rename_all = "snake_case")]
@@ -405,6 +475,25 @@ mod tests {
 
 #[cfg(test)]
 mod debug_redaction_tests {
+    #[test]
+    fn mask_sensitive_members_hides_credential_values() {
+        let masked = super::mask_sensitive_members(
+            r#"{"error":"invalid","access_token" : "eyJ\"x","refresh_token":"r1","expires_in":5}"#,
+        );
+        assert_eq!(
+            masked,
+            r#"{"error":"invalid","access_token" : "***","refresh_token":"***","expires_in":5}"#
+        );
+        assert_eq!(
+            super::mask_sensitive_members(r#"{"id_token":"abc"#),
+            r#"{"id_token":"***"#
+        );
+        assert_eq!(
+            super::mask_sensitive_members(r#"{"access_token":null,"password"}"#),
+            r#"{"access_token":null,"password"}"#
+        );
+    }
+
     use super::*;
 
     #[test]

@@ -14,7 +14,10 @@ async fn registry() -> (MockServer, SchemaRegistryClient) {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/schemas/ids/7"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"schema": SCHEMA})))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"schema": SCHEMA, "schemaType": "JSON"})),
+        )
         .mount(&server)
         .await;
     let client = SchemaRegistryClient::new(&SchemaRegistryConfig::new(server.uri())).unwrap();

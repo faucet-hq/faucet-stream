@@ -809,15 +809,15 @@ if [ "$SERVE_ONLY" -eq 0 ]; then
 hdr "Introspection commands"
 step "version"                "$FAUCET" --version
 step "list connectors"        "$FAUCET" list
-step "schema source csv"      "$FAUCET" schema source csv
-step "schema sink jsonl"      "$FAUCET" schema sink jsonl
+step "schema source file"     "$FAUCET" schema source file
+step "schema sink file"       "$FAUCET" schema sink file
 step "schema sla"             "$FAUCET" schema sla
 step "schema contract"        "$FAUCET" schema contract
 step "schema masking"         "$FAUCET" schema masking
 [ "$HAVE_TRIGGERS" -eq 1 ] && step "schema triggers"  "$FAUCET" schema triggers
 step "schema catalog"         "$FAUCET" schema catalog
 step "schema test"            "$FAUCET" schema test
-step "init scaffold"          "$FAUCET" init --source csv --sink jsonl --output scaffold_demo.yaml --force scaffold_demo
+step "init scaffold"          "$FAUCET" init --source file --sink file --output scaffold_demo.yaml --force scaffold_demo
 
 hdr "Validate every generated config"
 VALIDATE_CFGS="01_basic 02_transforms 03_quality 04_contract 05_masking \
@@ -1010,7 +1010,7 @@ else
   hdr "Serve headless smoke test (--no-serve; port ${SERVE_PORT})"
   if command -v curl >/dev/null 2>&1; then
     ( cd "$DEMO_DIR" && exec "$FAUCET" serve --listen "127.0.0.1:${SERVE_PORT}" --no-auth ) \
-      >/tmp/faucet-serve.log 2>&1 &
+      >"${DEMO_DIR}/serve-smoke.log" 2>&1 &
     SERVE_PID=$!
     for _ in $(seq 1 30); do curl -sf "http://127.0.0.1:${SERVE_PORT}/healthz" >/dev/null 2>&1 && break; sleep 0.5; done
     step "serve /healthz"    curl -sf "http://127.0.0.1:${SERVE_PORT}/healthz"

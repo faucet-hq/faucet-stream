@@ -282,6 +282,8 @@ The source overrides `stream_pages` to tail the change stream natively. It accum
 
 The connector is fully resumable. After each emitted page the pipeline writes the `resume_token` of the last event to the configured `StateStore`. On the next run, `apply_start_bookmark` restores the token and the change stream opens with `resumeAfter: <token>` — MongoDB delivers events from exactly that point onwards.
 
+A library caller that reads the same source instance again without a stored bookmark resumes where the previous read ended — but only after a read that ran to its end without error. A read abandoned after a failed write leaves the position where it was, so the unwritten page is delivered again.
+
 **`start_from` precedence:** every variant places only a **fresh** run. Once a bookmark exists the connector always resumes from it — an explicit `resume_token` / `timestamp` no longer overrides it, because replaying from a fixed point every run rewrote committed pages under exactly-once, ignored a mirror's captured handoff position, and failed for good once the point left the oplog. To restart from an explicit position, clear the state (`faucet state reset`) first.
 
 - `earliest` opens at the oldest entry still in the oplog (read from `local.oplog.rs`), so it works on a replica set whose oplog has rolled; without read access to `local` — and always on a sharded cluster, where each shard keeps its own oplog behind mongos — it falls back to the beginning of time with a warning. A fresh `now` start persists the position it opened at before any change arrives, so a quiet first cycle followed by writes between runs loses nothing: the next run resumes from that position.

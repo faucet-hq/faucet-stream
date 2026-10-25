@@ -2,7 +2,10 @@
 
 use crate::config::AcmeSinkConfig;
 use faucet_core::check::{CheckContext, CheckReport, Probe};
+use faucet_core::io::{CallContext, CallSlot};
+use faucet_core::observability::RoundtripRecorder;
 use faucet_core::{FaucetError, RowOutcome, Sink, Value, WriteMode, async_trait, plan_writes};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const MAX_ERROR_BODY: usize = 512;
@@ -11,14 +14,19 @@ static WRITE_MODES: &[WriteMode] = &[WriteMode::Append, WriteMode::Upsert];
 /// acme sink connector.
 pub struct AcmeSink {
     config: AcmeSinkConfig,
-    client: reqwest::Client,
+    client: faucet_core::http::Client,
+    calls: CallSlot,
     collection_url: reqwest::Url,
     bulk_url: reqwest::Url,
     upsert_key: String,
 }
 
 impl AcmeSink {
-    /// Validates the config and builds the HTTP client once.
+    /// Validates the config and builds the HTTP client once. Every request
+    /// runs through `calls` (the request timeout, then the run's deadline,
+    /// cancel token and round-trip recorder once the pipeline installs them);
+    /// a bulk post is sent once, never retried, because an append is not
+    /// idempotent.
     pub fn new(config: AcmeSinkConfig) -> Result<Self, FaucetError> {
         config.validate()?;
         let collection_url = collection_url(&config.base_url, &config.collection)?;
@@ -27,13 +35,16 @@ impl AcmeSink {
             .path_segments_mut()
             .map_err(|_| FaucetError::Config("acme: base_url cannot take a path".into()))?
             .extend(["records", "bulk"]);
+        let timeout = Duration::from_secs(config.timeout_secs);
         let client = faucet_core::http::Client::builder()
-            .timeout(Duration::from_secs(config.timeout_secs))
-            .build_reqwest()?;
+            .timeout(timeout)
+            .build()?;
+        let calls = CallSlot::new(CallContext::new().with_timeout(timeout));
         let upsert_key = config.write.key.join(",");
         Ok(Self {
             config,
             client,
+            calls,
             collection_url,
             bulk_url,
             upsert_key,
@@ -57,11 +68,11 @@ impl AcmeSink {
         if self.config.write.dedups_by_key() {
             req = req.query(&[("mode", "upsert"), ("key", self.upsert_key.as_str())]);
         }
-        let resp = req.send().await?;
+        let resp = self.calls.call_once("post", self.client.send(req)).await?;
         let status = resp.status();
         if !status.is_success() {
             let url = resp.url().to_string();
-            let body = resp.text().await.unwrap_or_default();
+            let body = self.client.text(resp).await.unwrap_or_default();
             return Err(FaucetError::sink_status(
                 Some(status.as_u16()),
                 url,
@@ -102,7 +113,19 @@ impl Sink for AcmeSink {
     async fn write_batch_partial(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
         let mut outcomes: Vec<RowOutcome> = records.iter().map(|_| Ok(())).collect();
         if !self.config.write.dedups_by_key() {
-            self.send_all(records).await?;
+            // Chunks already posted stay `Ok`: routing them to the DLQ would
+            // append them a second time on replay. The failed chunk and the
+            // ones never sent fail row by row.
+            let size = self.config.max_request_records;
+            for (n, chunk) in records.chunks(size).enumerate() {
+                if let Err(e) = self.post(chunk).await {
+                    let message = format!("acme: {e}");
+                    for outcome in &mut outcomes[n * size..] {
+                        *outcome = Err(FaucetError::Sink(message.clone()));
+                    }
+                    break;
+                }
+            }
             return Ok(outcomes);
         }
         let plan = plan_writes(records, &self.config.write);
@@ -111,6 +134,14 @@ impl Sink for AcmeSink {
             outcomes[row] = Err(FaucetError::Sink(format!("acme: {reason}")));
         }
         Ok(outcomes)
+    }
+
+    fn set_call_context(&self, ctx: CallContext) {
+        self.calls.install(ctx);
+    }
+
+    fn set_roundtrip_recorder(&self, recorder: Arc<RoundtripRecorder>) {
+        self.calls.install_recorder(recorder);
     }
 
     fn supported_write_modes(&self) -> &'static [WriteMode] {
@@ -140,13 +171,12 @@ impl Sink for AcmeSink {
 
     async fn check(&self, ctx: &CheckContext) -> Result<CheckReport, FaucetError> {
         let started = Instant::now();
-        let result = self
+        let req = self
             .client
             .get(self.collection_url.clone())
             .bearer_auth(&self.config.token)
-            .timeout(ctx.timeout)
-            .send()
-            .await;
+            .timeout(ctx.timeout);
+        let result = self.calls.call_once("check", self.client.send(req)).await;
         let probe = match result {
             Ok(resp) if resp.status().is_success() => Probe::pass("connect", started.elapsed()),
             Ok(resp) => Probe::fail(
@@ -157,11 +187,7 @@ impl Sink for AcmeSink {
                     resp.status().as_u16()
                 ),
             ),
-            Err(e) => Probe::fail(
-                "connect",
-                started.elapsed(),
-                format!("request failed: {}", e.without_url()),
-            ),
+            Err(e) => Probe::fail("connect", started.elapsed(), format!("request failed: {e}")),
         };
         Ok(CheckReport::single(probe))
     }

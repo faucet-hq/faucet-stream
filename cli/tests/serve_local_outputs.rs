@@ -833,3 +833,72 @@ async fn a_viewer_can_look_but_not_delete() {
     let listed = list_outputs(&base, &client, "").await;
     assert_eq!(listed["can_manage"], true);
 }
+
+/// A `write_mode: overwrite` file output is swapped into place after the
+/// invocation records it, so the recorded file identity would always lag one
+/// swap behind and every cleanup would skip the file as "changed". The second
+/// run's output must still be collectable.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_overwritten_output_stays_collectable() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.csv");
+    let output = dir.path().join("snapshot.jsonl");
+    std::fs::write(&input, "id\n1\n").unwrap();
+    let port = free_port();
+    spawn_server(port, dir.path()).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+    let config = format!(
+        "version: 1\nname: lo-ovw\npipeline:\n  source: {{ type: csv, config: {{ path: {} }} }}\n  sink: {{ type: file, config: {{ path: {}, write_mode: overwrite }} }}\n",
+        input.display(),
+        output.display()
+    );
+    let mut last = String::new();
+    for _ in 0..2 {
+        let resp: Value = client
+            .post(format!("{base}/v1/runs"))
+            .bearer_auth("admin-tok")
+            .json(&serde_json::json!({ "config": config }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        last = resp["run_id"].as_str().unwrap().to_string();
+        let mut done = false;
+        for _ in 0..200 {
+            let rec: Value = client
+                .get(format!("{base}/v1/runs/{last}"))
+                .bearer_auth("admin-tok")
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            match rec["status"].as_str().unwrap() {
+                "completed" => {
+                    done = true;
+                    break;
+                }
+                "failed" | "cancelled" => panic!("run finished {rec}"),
+                _ => tokio::time::sleep(Duration::from_millis(25)).await,
+            }
+        }
+        assert!(done, "run did not complete in time");
+    }
+    assert!(output.exists());
+    let report: Value = client
+        .post(format!("{base}/v1/local-outputs/cleanup"))
+        .bearer_auth("admin-tok")
+        .json(&serde_json::json!({ "run_id": last }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(report["deleted"], 1, "{report}");
+    assert!(!output.exists(), "the overwritten output was collected");
+}

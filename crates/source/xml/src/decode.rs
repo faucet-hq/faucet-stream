@@ -185,8 +185,9 @@ fn decode_bytes(
                 let text = std::str::from_utf8(&buf).map_err(|e| {
                     FaucetError::Source(format!("decode `base64`: buffer is not UTF-8 text: {e}"))
                 })?;
+                let compact: String = text.split_ascii_whitespace().collect();
                 buf = base64::engine::general_purpose::STANDARD
-                    .decode(text.trim())
+                    .decode(compact)
                     .map_err(|e| FaucetError::Source(format!("decode `base64`: {e}")))?;
             }
             DecodeStep::Simple(SimpleStep::Gunzip) => {
@@ -223,6 +224,17 @@ fn read_capped(reader: impl Read, cap: u64, step: &str) -> Result<Vec<u8>, Fauce
 /// Check every `parse.records_path` at load time, so a typo fails the config
 /// rather than every run yielding zero records (API-62).
 pub fn validate_steps(steps: &[DecodeStep]) -> Result<(), FaucetError> {
+    if let Some(at) = steps
+        .iter()
+        .position(|s| matches!(s, DecodeStep::Parse { .. }))
+        && at + 1 < steps.len()
+    {
+        return Err(FaucetError::Config(format!(
+            "decode: `parse` (step {}) must be the last step; {} step(s) after it would never run",
+            at + 1,
+            steps.len() - at - 1
+        )));
+    }
     for step in steps {
         if let DecodeStep::Parse { parse } = step
             && let Some(path) = &parse.records_path

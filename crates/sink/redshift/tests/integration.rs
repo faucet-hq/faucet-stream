@@ -691,6 +691,70 @@ async fn copy_stages_the_page_and_removes_it_when_copy_fails() {
     pool.close().await;
 }
 
+/// A commit group of several `batch_size` chunks stages one object per
+/// chunk plus a manifest and loads them with one `COPY … MANIFEST`; every
+/// staged object is deleted afterwards.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chunked_group_loads_through_one_manifest_copy() {
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let _guard = serial().lock().await;
+    let (_container, port) = start_postgres().await;
+    let pool = seed_pool(port).await;
+    sqlx::query("CREATE TABLE events (id BIGINT)")
+        .execute(&pool)
+        .await
+        .expect("create table");
+    let s3 = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"\.jsonl$"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(2)
+        .mount(&s3)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"\.manifest$"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&s3)
+        .await;
+    Mock::given(method("DELETE"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(3)
+        .mount(&s3)
+        .await;
+    // SAFETY: tests in this binary run serially under `serial()`.
+    unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+    }
+    let mut cfg = insert_config(port, "events", 1);
+    cfg.write_strategy = RedshiftWriteStrategy::Copy;
+    cfg.copy = Some(
+        serde_json::from_value(json!({
+            "staging_bucket": "staging",
+            "iam_role": "arn:aws:iam::123456789012:role/load",
+            "region": "us-east-1",
+            "endpoint_url": s3.uri(),
+        }))
+        .expect("copy spec"),
+    );
+    let sink = RedshiftSink::new(cfg).await.expect("sink builds");
+    let err = match sink
+        .write_batch(&[json!({"id": 1}), json!({"id": 2})])
+        .await
+    {
+        Err(e) => e,
+        Ok(_) => sink
+            .flush()
+            .await
+            .expect_err("Postgres cannot run a Redshift COPY"),
+    };
+    assert!(err.to_string().contains("COPY failed"), "{err}");
+    s3.verify().await;
+    pool.close().await;
+}
+
 /// A record that shares no column with the table (a non-object or `{}`) is
 /// never written: the row path reports it
 /// skipped, the per-row path fails it on its own, so neither counts it written.

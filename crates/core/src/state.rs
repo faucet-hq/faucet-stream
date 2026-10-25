@@ -800,14 +800,7 @@ impl FileStateStore {
                 }
                 for (key, from) in renames {
                     if let Some(sidecar) = self.key_sidecar(&key) {
-                        tokio::fs::write(&sidecar, key.as_bytes())
-                            .await
-                            .map_err(|e| {
-                                FaucetError::State(format!(
-                                    "failed to write state key file {}: {e}",
-                                    sidecar.display()
-                                ))
-                            })?;
+                        write_synced(&sidecar, key.as_bytes()).await?;
                     }
                     let to = self.entry_path(&key);
                     if tokio::fs::try_exists(&to).await.unwrap_or(false) {
@@ -838,23 +831,7 @@ impl FileStateStore {
             .then(|| self.root.join(format!("{stem}.key")))
     }
 
-    /// Returns the root directory this store writes into.
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-}
-
-#[async_trait]
-impl StateStore for FileStateStore {
-    async fn get(&self, key: &str) -> Result<Option<Value>, FaucetError> {
-        validate_state_key(key)?;
-        self.migrate_legacy_names().await?;
-        self.read_entry(key, &self.entry_path(key)).await
-    }
-
-    async fn put(&self, key: &str, value: &Value) -> Result<(), FaucetError> {
-        validate_state_key(key)?;
-        let _guard = self.write_lock.lock().await;
+    async fn put_unlocked(&self, key: &str, value: &Value) -> Result<(), FaucetError> {
         self.ensure_root().await?;
         let bytes = serde_json::to_vec(value).map_err(|e| {
             FaucetError::State(format!("failed to serialize state for key '{key}': {e}"))
@@ -869,14 +846,7 @@ impl StateStore for FileStateStore {
         let tmp_path = self.temp_path(key);
 
         if let Some(sidecar) = self.key_sidecar(key) {
-            tokio::fs::write(&sidecar, key.as_bytes())
-                .await
-                .map_err(|e| {
-                    FaucetError::State(format!(
-                        "failed to write state key file {}: {e}",
-                        sidecar.display()
-                    ))
-                })?;
+            write_synced(&sidecar, key.as_bytes()).await?;
         }
 
         // Write the temp file and fsync it BEFORE the rename. `fs::write`
@@ -925,21 +895,7 @@ impl StateStore for FileStateStore {
         // never flushed. Directory fsync is a POSIX concept; on platforms that
         // don't allow opening a directory as a file (e.g. Windows) it is
         // skipped.
-        #[cfg(unix)]
-        {
-            let dir = tokio::fs::File::open(&self.root).await.map_err(|e| {
-                FaucetError::State(format!(
-                    "failed to open state dir {} for fsync: {e}",
-                    self.root.display()
-                ))
-            })?;
-            dir.sync_all().await.map_err(|e| {
-                FaucetError::State(format!(
-                    "failed to fsync state dir {}: {e}",
-                    self.root.display()
-                ))
-            })?;
-        }
+        sync_dir(&self.root).await?;
 
         tracing::debug!(
             key,
@@ -947,6 +903,62 @@ impl StateStore for FileStateStore {
             "state file written"
         );
         Ok(())
+    }
+
+    /// Returns the root directory this store writes into.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+}
+
+/// Write `bytes` to `path` and flush them to disk.
+async fn write_synced(path: &std::path::Path, bytes: &[u8]) -> Result<(), FaucetError> {
+    let err = |what: &str, e: std::io::Error| {
+        FaucetError::State(format!(
+            "failed to {what} state key file {}: {e}",
+            path.display()
+        ))
+    };
+    let mut file = tokio::fs::File::create(path)
+        .await
+        .map_err(|e| err("write", e))?;
+    file.write_all(bytes).await.map_err(|e| err("write", e))?;
+    file.sync_all().await.map_err(|e| err("fsync", e))
+}
+
+/// Make a rename or removal in `dir` durable. Directory fsync is a POSIX
+/// concept; elsewhere it is skipped.
+async fn sync_dir(dir: &std::path::Path) -> Result<(), FaucetError> {
+    #[cfg(unix)]
+    {
+        let handle = tokio::fs::File::open(dir).await.map_err(|e| {
+            FaucetError::State(format!(
+                "failed to open state dir {} for fsync: {e}",
+                dir.display()
+            ))
+        })?;
+        handle.sync_all().await.map_err(|e| {
+            FaucetError::State(format!("failed to fsync state dir {}: {e}", dir.display()))
+        })?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+#[async_trait]
+impl StateStore for FileStateStore {
+    async fn get(&self, key: &str) -> Result<Option<Value>, FaucetError> {
+        validate_state_key(key)?;
+        self.migrate_legacy_names().await?;
+        let path = self.entry_path(key);
+        self.read_entry(key, &path).await
+    }
+
+    async fn put(&self, key: &str, value: &Value) -> Result<(), FaucetError> {
+        validate_state_key(key)?;
+        let _guard = self.write_lock.lock().await;
+        self.put_unlocked(key, value).await
     }
 
     async fn delete(&self, key: &str) -> Result<(), FaucetError> {
@@ -960,9 +972,10 @@ impl StateStore for FileStateStore {
         };
         let mut paths = vec![self.entry_path(key)];
         paths.extend(self.key_sidecar(key));
+        let mut removed = false;
         for path in paths {
             match tokio::fs::remove_file(&path).await {
-                Ok(()) => {}
+                Ok(()) => removed = true,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
                     return Err(FaucetError::State(format!(
@@ -971,6 +984,9 @@ impl StateStore for FileStateStore {
                     )));
                 }
             }
+        }
+        if removed {
+            sync_dir(&self.root).await?;
         }
         if let Some(held) = held {
             held.remove(&lock_path)?;
@@ -1608,6 +1624,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn synced_writes_and_directory_syncs() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("k.key");
+        write_synced(&path, b"key").await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"key");
+        sync_dir(dir.path()).await.unwrap();
+        let missing = dir.path().join("missing");
+        assert!(write_synced(&missing.join("x"), b"x").await.is_err());
+        #[cfg(unix)]
+        assert!(matches!(
+            sync_dir(&missing).await,
+            Err(FaucetError::State(m)) if m.contains("for fsync")
+        ));
+    }
+
+    #[tokio::test]
     async fn file_delete_missing_key_is_ok() {
         let dir = TempDir::new().unwrap();
         let s = FileStateStore::new(dir.path());
@@ -1838,6 +1870,44 @@ mod tests {
             rotated.put("bk", &json!("v2")).await.unwrap();
             let new_only = FileStateStore::new(dir.path()).with_encryption(enc("new"));
             assert_eq!(new_only.get("bk").await.unwrap(), Some(json!("v2")));
+        }
+
+        #[tokio::test]
+        async fn a_legacy_unbound_file_is_read_unchanged_and_bound_on_next_write() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = FileStateStore::new(dir.path()).with_encryption(enc("k1"));
+            store.put("bk", &json!({"v": 1})).await.unwrap();
+            let path = store.entry_path("bk");
+            let legacy = enc("k1").encrypt(br#"{"v":1}"#);
+            std::fs::write(&path, &legacy).unwrap();
+            assert!(crate::encryption::is_unbound(&legacy));
+            // A read never writes: a concurrent writer in another process
+            // could otherwise be overwritten with the value read.
+            assert_eq!(store.get("bk").await.unwrap(), Some(json!({"v": 1})));
+            assert_eq!(std::fs::read(&path).unwrap(), legacy);
+            store.put("bk", &json!({"v": 2})).await.unwrap();
+            let after = std::fs::read(&path).unwrap();
+            assert!(is_encrypted(&after));
+            assert!(!crate::encryption::is_unbound(&after));
+            assert_eq!(store.get("bk").await.unwrap(), Some(json!({"v": 2})));
+        }
+
+        #[tokio::test]
+        async fn a_legacy_unbound_file_is_bound_by_compare_and_put() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = FileStateStore::new(dir.path()).with_encryption(enc("k1"));
+            store.put("bk", &json!(1)).await.unwrap();
+            let path = store.entry_path("bk");
+            std::fs::write(&path, enc("k1").encrypt(b"1")).unwrap();
+            assert!(
+                store
+                    .compare_and_put("bk", Some(&json!(1)), &json!(2))
+                    .await
+                    .unwrap()
+            );
+            let after = std::fs::read(&path).unwrap();
+            assert!(!crate::encryption::is_unbound(&after));
+            assert_eq!(store.get("bk").await.unwrap(), Some(json!(2)));
         }
 
         #[tokio::test]

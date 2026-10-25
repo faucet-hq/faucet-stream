@@ -86,8 +86,9 @@ The receive window ends as soon as **any** configured condition is met; the serv
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `max_body_bytes` | int | `1048576` | Max accepted request body size (1 MiB). Larger POSTs are rejected with `413 Payload Too Large` before buffering, so one huge request can't exhaust memory. |
+| `max_buffered_bytes` | int | `268435456` | Most request-body bytes held in memory for one window (256 MiB). A POST that would cross it closes the window — the stored payloads are emitted — and is refused with `503` + `Retry-After`. An empty window always takes one POST, however large (`max_body_bytes` bounds it), and closes once it reaches the bound. `0` removes the bound. |
 | `auth_token` | string \| null | `null` | Optional shared secret. When set, requests must carry it in the `Authorization` header (raw value or `Bearer <token>`); others get `401`. Comparison is constant-time. Strongly recommended whenever `listen_addr` isn't loopback. |
-| `signature` | object \| null | `null` | HMAC verification of the raw body for senders that sign requests: `header` (signature header), `secret`, `algorithm` (`sha256` default / `sha512`), `encoding` (`hex` default, case-insensitive / `base64`), optional `prefix` (e.g. `sha256=`), optional `timestamp_header` (then the signed content is `<timestamp>.<body>` and a timestamp more than `tolerance_secs` — default 300 — from now is refused; the timestamp must be plain unix seconds, as the content is rebuilt from its integer value). One signature per request in the `<timestamp>.<body>` layout is supported — schemes that sign another layout (`v0:<ts>:<body>`), pack `t=…,v1=…` into one header, send several signatures during key rotation, or use URL-safe / unpadded base64 cannot be verified. Checked in constant time; failures get `401`. |
+| `signature` | object \| null | `null` | HMAC verification of the raw body for senders that sign requests: `header` (signature header), `secret`, `algorithm` (`sha256` default / `sha512`), `encoding` (`hex` default, case-insensitive / `base64`), optional `prefix` (e.g. `sha256=`), optional `timestamp_header` (then the signed content is `<timestamp>.<body>` and a timestamp more than `tolerance_secs` — default 300 — from now is refused, and a request repeating one already stored in the window gets `200` without being stored again; the timestamp must be plain unix seconds, as the content is rebuilt from its integer value). One signature per request in the `<timestamp>.<body>` layout is supported — schemes that sign another layout (`v0:<ts>:<body>`), pack `t=…,v1=…` into one header, send several signatures during key rotation, or use URL-safe / unpadded base64 cannot be verified. Checked in constant time; failures get `401`. |
 
 ### Batching
 
@@ -180,7 +181,7 @@ The webhook source is **buffer-shaped**: it has no native streaming primitive, s
 
 - `batch_size` shapes only the **downstream** page size handed to the sink — it does not change server-side buffering, which always pushes into the in-memory `Vec` until the receive window ends.
 - `batch_size = 0` emits the entire flush window in one page. For this source it is functionally equivalent to any positive value larger than the received payload count.
-- To bound memory at **receive** time, tune `timeout_secs` and `max_payloads` (which cap how much is collected), not `batch_size`.
+- Memory at **receive** time is bounded by `max_buffered_bytes` (256 MiB by default); `timeout_secs` and `max_payloads` cap how much is collected, not `batch_size`.
 
 Every page carries `bookmark: None` — there is no incremental-replication or resume mode for a webhook receiver (see [Resume & state](#resume--state)).
 
@@ -318,7 +319,7 @@ This crate has no optional features of its own. Enable it in the CLI / umbrella 
 | Senders get `405 Method Not Allowed` | Only `POST` is routed. Ensure the client uses `POST` on the configured `path`. |
 | The run blocks indefinitely | `max_payloads` is unset and `timeout_secs` is very large, so the server waits the full window. The window always ends at `timeout_secs`; lower it or set `max_payloads`. |
 | Remote senders can't reach the server | The default `listen_addr` is loopback (`127.0.0.1`). Bind `0.0.0.0` to accept external traffic — and set `auth_token` (and/or front it with a gateway) when you do. |
-| Received more than `max_payloads`? | Won't happen — the cap is exact; surplus concurrent POSTs are accepted with `200` but dropped, never stored. |
+| Received more than `max_payloads`? | Won't happen — the cap is exact; surplus concurrent POSTs are refused with `503 Service Unavailable` and a `Retry-After` header, so the sender retries them later. |
 
 ## See also
 

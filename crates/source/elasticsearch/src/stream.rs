@@ -183,9 +183,9 @@ impl faucet_core::Source for ElasticsearchSource {
     /// pipeline-supplied hint through it would silently override an explicit
     /// config value.
     ///
-    /// When `batch_size = 0` the source issues a single non-scroll
-    /// `_search?size=10_000` and emits exactly one page. The scroll API is
-    /// not used and no scroll context needs to be cleared.
+    /// When `batch_size = 0` the source drains the whole result through the
+    /// scroll API (10 000 documents per request) and emits exactly one page;
+    /// the scroll context is cleared like any other.
     ///
     /// The Elasticsearch search source has no incremental-replication mode
     /// today, so every emitted page carries `bookmark: None`.

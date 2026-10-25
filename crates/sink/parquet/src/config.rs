@@ -151,6 +151,11 @@ impl ParquetSinkConfig {
             ParquetDestination::LocalPath { path } if path.is_empty() => {
                 Err("destination.path must not be empty".to_string())
             }
+            ParquetDestination::LocalPath { path } if url_scheme(path).is_some() => Err(format!(
+                "destination.path `{path}` is a URL, not a local path; use \
+                 `destination: {{ type: s3, bucket, prefix }}` for S3 (or faucet-sink-file / \
+                 faucet-sink-s3 / faucet-sink-gcs)"
+            )),
             ParquetDestination::S3(s3) if s3.bucket.is_empty() => {
                 Err("destination.bucket must not be empty".to_string())
             }
@@ -165,6 +170,15 @@ impl ParquetSinkConfig {
             _ => DEFAULT_SAMPLE_SIZE,
         }
     }
+}
+
+/// The scheme of a `scheme://…` URL (`s3`, `gs`, `https`, …).
+fn url_scheme(path: &str) -> Option<&str> {
+    let (scheme, _) = path.split_once("://")?;
+    let mut chars = scheme.chars();
+    let valid = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    valid.then_some(scheme)
 }
 
 /// Where the sink writes Parquet files.
@@ -346,6 +360,22 @@ mod tests {
     fn validate_rejects_empty_path() {
         let cfg = ParquetSinkConfig::local("");
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_a_url_as_a_local_path() {
+        for url in ["s3://bucket/key.parquet", "gs://b/k", "https://h/x"] {
+            let err = ParquetSinkConfig::local(url).validate().unwrap_err();
+            assert!(err.contains("is a URL"), "{err}");
+        }
+        assert!(
+            ParquetSinkConfig::local("./out/x.parquet")
+                .validate()
+                .is_ok()
+        );
+        assert!(ParquetSinkConfig::local("C:\\data\\out").validate().is_ok());
+        assert!(ParquetSinkConfig::local("/tmp/a://b").validate().is_ok());
+        assert_eq!(url_scheme("/tmp/a://b"), None);
     }
 
     #[test]

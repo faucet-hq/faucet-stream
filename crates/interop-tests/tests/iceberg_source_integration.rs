@@ -331,6 +331,19 @@ async fn discover_lists_tables_with_schemas() {
     assert_eq!(found[1].config_patch, json!({ "table": "db.b" }));
     assert_eq!(found[1].estimated_rows, Some(3));
     assert!(found[0].schema.as_ref().unwrap()["properties"]["id"].is_object());
+    let amount = &found[0].schema.as_ref().unwrap()["properties"]["amount"]["type"];
+    assert!(
+        amount.as_array().unwrap().contains(&json!("number")),
+        "{amount}"
+    );
+    assert!(
+        amount.as_array().unwrap().contains(&json!("null")),
+        "{amount}"
+    );
+    assert!(
+        !amount.as_array().unwrap().contains(&json!("string")),
+        "{amount}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -353,7 +353,7 @@ fn normalize_key(k: &str) -> String {
     out
 }
 
-fn is_secret_key(k: &str) -> bool {
+pub(crate) fn is_secret_key(k: &str) -> bool {
     let lk = normalize_key(k);
     SECRET_KEYS
         .iter()
@@ -380,7 +380,7 @@ fn is_literal(s: &str) -> bool {
 /// login-flow `capture:` block says *where to read* a token), or a one-/two-
 /// character constant (an API's documented placeholder `password: x`), which cannot be
 /// a real secret.
-fn looks_like_reference(s: &str) -> bool {
+pub(crate) fn looks_like_reference(s: &str) -> bool {
     s.is_empty()
         || (s.starts_with("${") && s.ends_with('}'))
         || s.starts_with("$.")
@@ -638,10 +638,7 @@ pub fn run_command(source: &SourceTemplate, sink: &SinkTemplate) -> String {
             continue;
         }
         if p.secret {
-            cmd.push_str(&format!(
-                " \\\n  --param {name}=\"${}\"",
-                name.to_ascii_uppercase()
-            ));
+            cmd.push_str(&format!(" \\\n  --param {name}"));
         } else {
             cmd.push_str(&format!(" \\\n  --param {name}=<{name}>"));
         }
@@ -1081,7 +1078,11 @@ per_stream:
             cmd.starts_with("faucet run --source acme --sink bigquery"),
             "{cmd}"
         );
-        assert!(cmd.contains("--param api_token=\"$API_TOKEN\""), "{cmd}");
+        assert!(cmd.contains("--param api_token \\"), "{cmd}");
+        assert!(
+            !cmd.contains("$API_TOKEN"),
+            "a secret never lands in argv: {cmd}"
+        );
         assert!(cmd.contains("--param bq_project=<bq_project>"), "{cmd}");
         assert!(
             !cmd.contains("out_dir"),

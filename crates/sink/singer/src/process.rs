@@ -138,9 +138,14 @@ impl TargetProcess {
         let stdout_task = tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
             loop {
-                let line = match faucet_common_singer::read_capped_line(&mut reader, max_line).await
+                let line = match faucet_common_singer::read_capped_utf8_line(&mut reader, max_line)
+                    .await
                 {
                     Ok(faucet_common_singer::CappedLine::Line(line)) => line,
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                        tracing::warn!(target: "faucet_sink_singer::target", error = %e, "skipping a stdout line");
+                        continue;
+                    }
                     Ok(faucet_common_singer::CappedLine::TooLong) => {
                         // An oversized line is not a STATE echo: skip it in
                         // bounded chunks rather than buffer it whole (API-44),

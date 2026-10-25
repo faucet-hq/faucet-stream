@@ -57,6 +57,34 @@ redis.call('SET', KEYS[1], ARGV[2])
 return 1
 "#;
 
+/// The most records one exactly-once page may carry: the page runs as one
+/// script, which blocks the server for its whole duration.
+pub(crate) const MAX_IDEMPOTENT_RECORDS: usize = 10_000;
+
+/// The most arguments one command may have inside the exactly-once script
+/// (Lua's `unpack` is bounded by its stack, about 8000 values).
+const MAX_SCRIPT_COMMAND_ARGS: usize = 7_000;
+
+/// Refuse an exactly-once page the script could not apply as one unit,
+/// before anything is sent.
+fn check_idempotent_page(commands: &[Vec<String>]) -> Result<(), FaucetError> {
+    if commands.len() > MAX_IDEMPOTENT_RECORDS {
+        return Err(FaucetError::Sink(format!(
+            "Redis exactly-once page of {} records exceeds {MAX_IDEMPOTENT_RECORDS}: the page \
+             runs as one script that blocks the server; lower the source's batch_size",
+            commands.len()
+        )));
+    }
+    if let Some(c) = commands.iter().find(|c| c.len() > MAX_SCRIPT_COMMAND_ARGS) {
+        return Err(FaucetError::Sink(format!(
+            "Redis exactly-once write: a record expands to a command of {} arguments, more \
+             than the {MAX_SCRIPT_COMMAND_ARGS} the script can apply atomically",
+            c.len()
+        )));
+    }
+    Ok(())
+}
+
 impl RedisSink {
     /// Create a new Redis sink from the given configuration.
     ///
@@ -121,6 +149,61 @@ impl RedisDriver {
                 .await?;
         }
         Ok(())
+    }
+
+    /// Pipeline `commands` in `batch_size` chunks, reporting each command's
+    /// error. A chunk whose call fails leaves its outcome unknown, so it and
+    /// every later command fail; when that is the first chunk nothing was
+    /// applied and the call's error is returned.
+    async fn run_commands_partial(
+        &self,
+        calls: &CallSlot,
+        commands: &[Vec<String>],
+    ) -> Result<Vec<Option<FaucetError>>, FaucetError> {
+        let mut conn = self.conn.clone();
+        let chunk = if self.config.batch_size == 0 {
+            commands.len().max(1)
+        } else {
+            self.config.batch_size
+        };
+        let mut out: Vec<Option<FaucetError>> = Vec::with_capacity(commands.len());
+        for (n, group) in commands.chunks(chunk).enumerate() {
+            let mut pipe = redis::pipe();
+            pipe.ignore_errors();
+            for args in group {
+                let mut cmd = redis::Cmd::new();
+                for a in args {
+                    cmd.arg(a);
+                }
+                pipe.add_command(cmd);
+            }
+            let results = calls
+                .call_once("pipeline", async {
+                    pipe.query_async::<Vec<redis::RedisResult<redis::Value>>>(&mut conn)
+                        .await
+                        .map_err(|e| {
+                            FaucetError::Sink(format!("Redis pipeline execution failed: {e}"))
+                        })
+                })
+                .await;
+            match results {
+                Ok(results) => out.extend(results.into_iter().map(|r| {
+                    r.err()
+                        .map(|e| FaucetError::Sink(format!("Redis command failed: {e}")))
+                })),
+                Err(e) if n == 0 => return Err(e),
+                Err(e) => {
+                    let msg = e.to_string();
+                    out.resize_with(commands.len(), || {
+                        Some(FaucetError::Sink(format!(
+                            "{msg} (the command may have been applied)"
+                        )))
+                    });
+                    return Ok(out);
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -203,17 +286,29 @@ impl SinkDriver for RedisDriver {
             return Ok(PageWrite::accepted(records.len()));
         }
         let mut failed = Vec::new();
+        let mut positions = Vec::with_capacity(records.len());
         let mut commands = Vec::with_capacity(records.len());
         for (i, r) in records.iter().enumerate() {
             match self.command(r) {
-                Ok(c) => commands.push(c),
+                Ok(c) => {
+                    positions.push(i);
+                    commands.push(c);
+                }
                 Err(e) => failed.push((i, e)),
             }
         }
+        let mut written = 0;
         if !commands.is_empty() {
-            self.run_commands(calls, &commands).await?;
+            let errors = self.run_commands_partial(calls, &commands).await?;
+            for (pos, e) in positions.into_iter().zip(errors) {
+                match e {
+                    None => written += 1,
+                    Some(e) => failed.push((pos, e)),
+                }
+            }
         }
-        Ok(PageWrite::accepted(commands.len()).with_failures(failed))
+        failed.sort_by_key(|(i, _)| *i);
+        Ok(PageWrite::accepted(written).with_failures(failed))
     }
 
     fn commit_tokens(&self) -> Option<&dyn CommitTokenDriver> {
@@ -246,6 +341,7 @@ impl CommitTokenDriver for RedisDriver {
             .iter()
             .map(|r| self.command(r))
             .collect::<Result<Vec<_>, _>>()?;
+        check_idempotent_page(&commands)?;
         let lua = redis::Script::new(IDEMPOTENT_SCRIPT);
         let mut script = lua.prepare_invoke();
         script.key(commit_token_key(scope));

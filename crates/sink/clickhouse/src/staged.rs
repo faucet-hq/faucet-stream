@@ -26,8 +26,10 @@ pub fn clickhouse_format(format: StagingFormat) -> Result<&'static str, FaucetEr
 /// Derive the HTTPS URL the ClickHouse server fetches, from a staged object's
 /// `scheme` / `bucket` / `key`. S3 uses the virtual-hosted endpoint (with an
 /// optional region); GCS uses the interoperability XML endpoint. An explicit
-/// `endpoint` override (host or host+path base, no scheme) wins and renders
-/// path-style — for S3-compatible stores / MinIO.
+/// `endpoint` override (host or host+path base) wins and renders path-style —
+/// for S3-compatible stores / MinIO; its `http://` or `https://` scheme is
+/// kept (`https://` when it has none). Each key segment is percent-encoded,
+/// so URL and glob characters in a table name or prefix stay literal.
 pub fn staged_https_url(
     scheme: StagingScheme,
     bucket: &str,
@@ -35,12 +37,21 @@ pub fn staged_https_url(
     region: Option<&str>,
     endpoint: Option<&str>,
 ) -> Result<String, FaucetError> {
+    let key = encode_key(key);
     if let Some(ep) = endpoint {
-        let ep = ep
-            .trim_end_matches('/')
-            .trim_start_matches("https://")
-            .trim_start_matches("http://");
-        return Ok(format!("https://{ep}/{bucket}/{key}"));
+        let ep = ep.trim_end_matches('/');
+        let (scheme, host) = match ep.split_once("://") {
+            Some((s, rest)) if s.eq_ignore_ascii_case("http") => ("http", rest),
+            Some((s, rest)) if s.eq_ignore_ascii_case("https") => ("https", rest),
+            Some((s, _)) => {
+                return Err(FaucetError::Config(format!(
+                    "clickhouse staging: endpoint scheme `{s}://` is not supported — use \
+                     http:// or https://"
+                )));
+            }
+            None => ("https", ep),
+        };
+        return Ok(format!("{scheme}://{host}/{bucket}/{key}"));
     }
     match scheme {
         StagingScheme::S3 => Ok(match region {
@@ -54,6 +65,25 @@ pub fn staged_https_url(
                 .into(),
         )),
     }
+}
+
+/// Percent-encode every byte of each `/`-separated key segment except the
+/// RFC 3986 unreserved characters.
+fn encode_key(key: &str) -> String {
+    key.split('/')
+        .map(|segment| {
+            segment
+                .bytes()
+                .map(|b| match b {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                        (b as char).to_string()
+                    }
+                    _ => format!("%{b:02X}"),
+                })
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Build the `INSERT INTO <table> SELECT * FROM <fn>('<url>'[, '<key>','<secret>'], '<Format>')`
@@ -156,6 +186,32 @@ mod tests {
             .unwrap(),
             "https://minio.local:9000/buk/k"
         );
+        let url = |ep| staged_https_url(StagingScheme::S3, "buk", "k", None, Some(ep)).unwrap();
+        assert_eq!(url("http://minio:9000/"), "http://minio:9000/buk/k");
+        assert_eq!(url("HTTP://minio:9000"), "http://minio:9000/buk/k");
+        assert_eq!(url("minio:9000"), "https://minio:9000/buk/k");
+        assert!(
+            staged_https_url(StagingScheme::S3, "b", "k", None, Some("ftp://h"))
+                .unwrap_err()
+                .to_string()
+                .contains("ftp://")
+        );
+    }
+
+    #[test]
+    fn key_segments_are_percent_encoded() {
+        assert_eq!(
+            staged_https_url(
+                StagingScheme::S3,
+                "buk",
+                "p x/t#1?/{a,b}*%.jsonl",
+                None,
+                None
+            )
+            .unwrap(),
+            "https://buk.s3.amazonaws.com/p%20x/t%231%3F/%7Ba%2Cb%7D%2A%25.jsonl"
+        );
+        assert_eq!(encode_key("a-b_c.d~/é"), "a-b_c.d~/%C3%A9");
     }
 
     #[test]

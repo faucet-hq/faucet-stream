@@ -158,3 +158,23 @@ fn csv_null_values_require_a_csv_body() {
     let err = RestStream::new(c).err().unwrap().to_string();
     assert!(err.contains("csv_null_values"), "{err}");
 }
+
+/// Several empty CSV header cells are named `column_<i>` (as Excel's are)
+/// instead of colliding on `""`, so every column is kept.
+#[tokio::test]
+async fn several_empty_csv_headers_are_named_by_position() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/export.csv"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("id,amount,,\n1,2,3,4\n"))
+        .mount(&server)
+        .await;
+    let mut c = RestStreamConfig::new(&server.uri(), "/export.csv");
+    c.pagination = PaginationStyle::None;
+    c.response_format = ResponseFormat::Csv;
+    let recs = RestStream::new(c).unwrap().fetch_all().await.unwrap();
+    assert_eq!(
+        recs,
+        vec![json!({"id": "1", "amount": "2", "column_2": "3", "column_3": "4"})]
+    );
+}

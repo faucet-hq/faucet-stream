@@ -99,7 +99,7 @@ pub(crate) fn key_canon(item: &Item, keys: &[String]) -> String {
 /// A DynamoDB number's value as `[-]<digits>e<exp>` with no leading or
 /// trailing zeros (`0` for zero), so equal numbers render equally. `None`
 /// for text that is not a decimal.
-fn canonical_number(raw: &str) -> Option<String> {
+pub(crate) fn canonical_number(raw: &str) -> Option<String> {
     let s = raw.trim();
     let (negative, s) = match s.as_bytes().first()? {
         b'-' => (true, &s[1..]),

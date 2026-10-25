@@ -39,6 +39,22 @@ pub struct EchoServer {
 impl EchoService for EchoServer {
     async fn list(&self, request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
         reject_stale_token(&request)?;
+        if request.metadata().get("x-expect").is_some() {
+            let tags: Vec<String> = request
+                .metadata()
+                .get_all("x-tag")
+                .iter()
+                .map(|v| v.to_str().unwrap_or_default().to_string())
+                .collect();
+            let bin = request
+                .metadata()
+                .get_bin("trace-bin")
+                .and_then(|v| v.to_bytes().ok())
+                .map(|b| b.to_vec());
+            if tags != ["a", "b"] || bin != Some(vec![1, 2, 3]) {
+                return Err(Status::invalid_argument(format!("{tags:?} {bin:?}")));
+            }
+        }
         let req = request.into_inner();
         if req.delay_ms > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(req.delay_ms.into())).await;

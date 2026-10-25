@@ -222,14 +222,6 @@ impl S3Source {
 
     /// The same whole-body read, without the `bytes` dependency the Parquet
     /// path brings — the binary formats (#604) need the bytes but not Arrow.
-    #[cfg(any(
-        feature = "arrow",
-        feature = "file-format-csv",
-        feature = "file-format-xml",
-        feature = "file-format-excel",
-        feature = "file-format-avro",
-        feature = "file-format-orc"
-    ))]
     async fn read_object_all(&self, key: &str) -> Result<Vec<u8>, FaucetError> {
         let reader = self.open_object_reader(key).await?;
         faucet_core::file_format::read_to_end_capped(reader, self.config.max_object_bytes, key)
@@ -256,6 +248,12 @@ impl S3Source {
     /// Fetch one object in the shape its configured `file_format` needs.
     async fn fetch(&self, key: &str) -> Result<Fetched, FaucetError> {
         Ok(match self.config.file_format {
+            // A checksum is only known at the end of the body, so a verified
+            // object is read whole first: none of its records reaches the sink
+            // unless the whole object verifies.
+            S3FileFormat::JsonLines if self.config.verify_checksum => Fetched::Lines(Box::pin(
+                std::io::Cursor::new(self.read_object_all(key).await?),
+            )),
             S3FileFormat::JsonLines => Fetched::Lines(self.open_object_reader(key).await?),
             S3FileFormat::RawText => Fetched::RawText(self.read_object_text(key).await?),
             S3FileFormat::JsonArray => Fetched::JsonArray(self.read_object_text(key).await?),
@@ -1224,7 +1222,7 @@ fn check_schema(
     key: &str,
 ) -> Result<(), FaucetError> {
     match reference {
-        Some(first) if first != schema => Err(FaucetError::Source(format!(
+        Some(first) if first.fields() != schema.fields() => Err(FaucetError::Source(format!(
             "S3 source: parquet schema mismatch — object '{key}' diverges from the first \
              object's schema"
         ))),

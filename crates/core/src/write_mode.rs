@@ -357,24 +357,45 @@ fn plan_writes_by(
 /// them from its own [`plan_writes`] over the page.
 pub fn plan_writes_ordered(page: &[Value], spec: &WriteSpec) -> Vec<WritePlan> {
     let mut plans = Vec::new();
-    let mut run: Vec<Value> = Vec::new();
-    let mut run_is_delete = None;
-    for rec in page {
-        let single = plan_writes(std::slice::from_ref(rec), spec);
-        if !single.failed.is_empty() {
+    let mut run_start: Option<usize> = None;
+    let mut run_is_delete = false;
+    let flush = |start: usize, end: usize, plans: &mut Vec<WritePlan>| {
+        let mut plan = plan_writes(&page[start..end], spec);
+        plan.failed.clear();
+        plans.push(plan);
+    };
+    for (i, rec) in page.iter().enumerate() {
+        if extract_key(rec, &spec.key).is_err() {
             continue;
         }
-        let is_delete = !single.deletes.is_empty();
-        if run_is_delete.is_some_and(|d| d != is_delete) {
-            plans.push(plan_writes(&std::mem::take(&mut run), spec));
+        let is_delete = match spec.write_mode {
+            WriteMode::Delete => true,
+            WriteMode::Upsert => is_delete_marked(rec, spec.delete_marker.as_ref()),
+            WriteMode::Append | WriteMode::Overwrite => false,
+        };
+        match run_start {
+            Some(start) if is_delete != run_is_delete => {
+                flush(start, i, &mut plans);
+                run_start = Some(i);
+            }
+            Some(_) => {}
+            None => run_start = Some(i),
         }
-        run_is_delete = Some(is_delete);
-        run.push(rec.clone());
+        run_is_delete = is_delete;
     }
-    if !run.is_empty() {
-        plans.push(plan_writes(&run, spec));
+    if let Some(start) = run_start {
+        flush(start, page.len(), &mut plans);
     }
     plans
+}
+
+/// The rows of a keyed page whose key cannot be read, with the reason —
+/// what [`plan_writes`] reports as `failed`, without planning the page.
+pub fn key_failures(page: &[Value], spec: &WriteSpec) -> Vec<(usize, String)> {
+    page.iter()
+        .enumerate()
+        .filter_map(|(i, rec)| extract_key(rec, &spec.key).err().map(|m| (i, m)))
+        .collect()
 }
 
 /// The key tuple of a record in `key` order, or `None` when a key column is
@@ -636,6 +657,46 @@ mod tests {
         let plan = plan_writes(&[json!({"id": null})], &upsert_spec(&["id"]));
         assert!(plan.upserts.is_empty());
         assert_eq!(plan.failed.len(), 1);
+    }
+
+    #[test]
+    fn ordered_plans_split_runs_and_skip_unkeyed_rows() {
+        let spec = WriteSpec {
+            write_mode: WriteMode::Upsert,
+            key: vec!["id".into()],
+            delete_marker: Some(DeleteMarker {
+                field: "op".into(),
+                values: vec!["d".into()],
+            }),
+            ..Default::default()
+        };
+        let page = vec![
+            json!({"id": 1, "v": "a"}),
+            json!({"v": "no key"}),
+            json!({"id": 1, "v": "b"}),
+            json!({"id": 2, "op": "d"}),
+            json!({"id": null}),
+            json!({"id": 3, "op": "d"}),
+            json!({"id": 2, "v": "c"}),
+        ];
+        let plans = plan_writes_ordered(&page, &spec);
+        assert_eq!(plans.len(), 3);
+        assert_eq!(plans[0].upserts, vec![json!({"id": 1, "v": "b"})]);
+        assert!(plans[0].deletes.is_empty() && plans[0].failed.is_empty());
+        assert_eq!(plans[1].deletes.len(), 2);
+        assert!(plans[1].upserts.is_empty() && plans[1].failed.is_empty());
+        assert_eq!(plans[2].upserts, vec![json!({"id": 2, "v": "c"})]);
+        let failures = key_failures(&page, &spec);
+        assert_eq!(
+            failures.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            plan_writes(&page, &spec)
+                .failed
+                .iter()
+                .map(|(i, _)| *i)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(failures.len(), 2);
+        assert!(plan_writes_ordered(&[], &spec).is_empty());
     }
 
     #[test]

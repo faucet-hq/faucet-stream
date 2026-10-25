@@ -28,7 +28,10 @@ use crate::state::StateStore;
 ///   for arrays and objects), so the number `1` and the string `"1"` no longer
 ///   share one key. A string renders as in scheme 2 unless it starts like a
 ///   tag (`_n.`, `_s.`, …), which is prefixed `_s.`.
-pub const KEY_SCHEME_VERSION: u32 = 3;
+/// * `4` — a string parent key equal to a marker segment (`__lease__`,
+///   `__status__`, `__sla__`, …) is prefixed `_s.`, so a child's key never
+///   equals its row's marker key.
+pub const KEY_SCHEME_VERSION: u32 = 4;
 
 /// Separator between key components.
 pub const KEY_SEPARATOR: &str = "::";
@@ -115,7 +118,11 @@ enum Sub {
     Encoded(String),
     /// A child invocation's parent-key value with its JSON type: its scheme-3
     /// rendering and the text earlier schemes rendered it from.
-    Typed { typed: String, text: String },
+    Typed {
+        typed: String,
+        text: String,
+        is_string: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -201,6 +208,7 @@ impl StateKey {
     /// as JSON), which [`legacy_renderings`](Self::legacy_renderings) keeps.
     pub fn with_parent_value(mut self, value: &serde_json::Value) -> Self {
         use serde_json::Value;
+        let is_string = value.is_string();
         let (typed, text) = match value {
             Value::String(s) => (typed_string(s), s.clone()),
             other => {
@@ -216,7 +224,11 @@ impl StateKey {
             }
         };
         if let Head::Parts { sub, .. } = &mut self.head {
-            *sub = Some(Sub::Typed { typed, text });
+            *sub = Some(Sub::Typed {
+                typed,
+                text,
+                is_string,
+            });
         }
         self
     }
@@ -342,6 +354,9 @@ impl StateKey {
         let current = self.render();
         let mut out: Vec<String> = Vec::new();
         for version in (1..KEY_SCHEME_VERSION).rev() {
+            if version < 4 && self.sub_is_marker_name() {
+                continue;
+            }
             let old = self.render_scheme(version);
             if old != current
                 && !out.contains(&old)
@@ -351,6 +366,27 @@ impl StateKey {
             }
         }
         out
+    }
+
+    /// Whether the parent-key value is a marker segment, which schemes before
+    /// 4 rendered as the row's marker key itself.
+    fn sub_is_marker_name(&self) -> bool {
+        match &self.head {
+            Head::Parts {
+                sub: Some(Sub::Parent(raw)),
+                ..
+            } => is_marker_name(raw),
+            Head::Parts {
+                sub:
+                    Some(Sub::Typed {
+                        text,
+                        is_string: true,
+                        ..
+                    }),
+                ..
+            } => is_marker_name(text),
+            _ => false,
+        }
     }
 
     /// Decode `key` under the namespace `[{tenant}::]{pipeline}`; `None` when it
@@ -409,8 +445,32 @@ impl StateKey {
     }
 }
 
+/// Segments a key uses for its markers.
+const MARKER_NAMES: &[&str] = &[
+    "__sla__",
+    "__profiling__",
+    "__status__",
+    "__lease__",
+    "__rollback__",
+    "__replication__",
+    "__backfill__",
+    "__serve_backfill__",
+];
+
+fn is_marker_name(raw: &str) -> bool {
+    MARKER_NAMES.contains(&raw)
+}
+
 fn render_sub(sub: &Sub, version: u32) -> String {
     match sub {
+        Sub::Parent(raw) if version >= 4 && is_marker_name(raw) => {
+            encode_component(&format!("_s.{raw}"), true)
+        }
+        Sub::Typed {
+            text,
+            is_string: true,
+            ..
+        } if version >= 4 && is_marker_name(text) => encode_component(&format!("_s.{text}"), true),
         Sub::Parent(raw) if version >= 3 => typed_string(raw),
         Sub::Parent(raw) if version >= 2 => encode_component(raw, true),
         Sub::Parent(raw) => raw.clone(),
@@ -553,6 +613,27 @@ mod tests {
     use super::*;
     use crate::state::MemoryStateStore;
     use serde_json::json;
+
+    #[test]
+    fn a_marker_named_parent_key_never_renders_as_the_marker() {
+        let lease = StateKey::invocation("p", "row").with_suffix(KeySuffix::Lease);
+        for key in [
+            StateKey::invocation("p", "row").with_parent_key("__lease__"),
+            StateKey::invocation("p", "row").with_parent_value(&serde_json::json!("__lease__")),
+        ] {
+            assert_eq!(key.render(), "p::row::_s.__lease__");
+            assert_ne!(key.render(), lease.render());
+            assert_eq!(key.render_scheme(3), lease.render());
+            assert!(
+                key.legacy_renderings().is_empty(),
+                "the marker is never adopted"
+            );
+            let parsed = StateKey::parse(None, "p", &key.render()).unwrap();
+            assert_eq!(parsed.render(), key.render());
+        }
+        let plain = StateKey::invocation("p", "row").with_parent_key("__other__");
+        assert_eq!(plain.render(), "p::row::__other__");
+    }
 
     #[test]
     fn a_path_like_parent_key_always_renders_a_valid_state_key() {

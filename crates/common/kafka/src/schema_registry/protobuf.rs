@@ -23,7 +23,27 @@ fn compiled(
     client: &SchemaRegistryClient,
     proto_source: &str,
 ) -> Result<Arc<(DescriptorPool, String)>, FaucetError> {
-    client.parsed("protobuf", proto_source, compile_proto)
+    client.parsed("protobuf", proto_source, |s| compile_proto(s, &[]))
+}
+
+/// [`compiled`] with the files the schema imports, each under its reference
+/// name.
+fn compiled_with(
+    client: &SchemaRegistryClient,
+    proto_source: &str,
+    imports: &[(String, String)],
+) -> Result<Arc<(DescriptorPool, String)>, FaucetError> {
+    if imports.is_empty() {
+        return compiled(client, proto_source);
+    }
+    let mut key = proto_source.to_string();
+    for (name, source) in imports {
+        key.push('\u{0}');
+        key.push_str(name);
+        key.push('\u{0}');
+        key.push_str(source);
+    }
+    client.parsed("protobuf", &key, |_| compile_proto(proto_source, imports))
 }
 
 /// JSON for a decoded message: every field present (proto3 defaults such as
@@ -40,9 +60,23 @@ fn message_to_json(message: &DynamicMessage) -> Result<Value, FaucetError> {
 /// Decode `bytes` (with Confluent envelope + message-index prefix) into JSON.
 pub async fn decode(client: &SchemaRegistryClient, bytes: &[u8]) -> Result<Value, FaucetError> {
     let (schema_id, body) = envelope::decode(bytes)?;
-    let registered = client.get_schema(schema_id).await?;
+    let compiled = match client.compiled_for::<(DescriptorPool, String)>("protobuf", schema_id) {
+        Some(compiled) => compiled,
+        None => {
+            let registered = client.get_schema(schema_id).await?;
+            registered.expect_type("PROTOBUF")?;
+            let imports: Vec<(String, String)> = client
+                .references(&registered)
+                .await?
+                .into_iter()
+                .map(|(name, s)| (name, s.schema))
+                .collect();
+            let compiled = compiled_with(client, &registered.schema, &imports)?;
+            client.remember_compiled("protobuf", schema_id, compiled.clone());
+            compiled
+        }
+    };
     let payload = parse_message_indexes(body)?;
-    let compiled = compiled(client, &registered.schema)?;
     let (pool, message_name) = &*compiled;
     let message_descriptor = pool.get_message_by_name(message_name).ok_or_else(|| {
         FaucetError::Source(format!(
@@ -89,7 +123,10 @@ pub async fn encode(
 /// v1 restriction: only single-message schemas (one top-level `message` block)
 /// are supported. The auto-selected message is the first one encountered.
 /// Multi-message support is a future enhancement.
-fn compile_proto(proto_source: &str) -> Result<(DescriptorPool, String), FaucetError> {
+fn compile_proto(
+    proto_source: &str,
+    imports: &[(String, String)],
+) -> Result<(DescriptorPool, String), FaucetError> {
     use protox::{
         Compiler,
         file::{ChainFileResolver, File, FileResolver, GoogleFileResolver},
@@ -98,14 +135,19 @@ fn compile_proto(proto_source: &str) -> Result<(DescriptorPool, String), FaucetE
     // Implement an in-memory resolver that serves our proto_source as "schema.proto".
     struct MemResolver {
         source: String,
+        imports: Vec<(String, String)>,
     }
     impl FileResolver for MemResolver {
         fn open_file(&self, name: &str) -> Result<File, protox::Error> {
-            if name == "schema.proto" {
-                File::from_source("schema.proto", &self.source)
-                    .map_err(|e| protox::Error::new(format!("parse error: {e}")))
+            let source = if name == "schema.proto" {
+                Some(&self.source)
             } else {
-                Err(protox::Error::file_not_found(name))
+                self.imports.iter().find(|(n, _)| n == name).map(|(_, s)| s)
+            };
+            match source {
+                Some(source) => File::from_source(name, source)
+                    .map_err(|e| protox::Error::new(format!("parse error: {e}"))),
+                None => Err(protox::Error::file_not_found(name)),
             }
         }
     }
@@ -114,10 +156,12 @@ fn compile_proto(proto_source: &str) -> Result<(DescriptorPool, String), FaucetE
     let mut chain = ChainFileResolver::new();
     chain.add(MemResolver {
         source: proto_source.to_owned(),
+        imports: imports.to_vec(),
     });
     chain.add(GoogleFileResolver::new());
 
     let mut compiler = Compiler::with_file_resolver(chain);
+    compiler.include_imports(true);
     compiler
         .open_file("schema.proto")
         .map_err(|e| FaucetError::Config(format!("protox compile: {e}")))?;
@@ -170,6 +214,75 @@ mod tests {
 
     const USER_PROTO: &str =
         "syntax = \"proto3\";\npackage example;\nmessage User { int64 id = 1; string name = 2; }\n";
+
+    #[tokio::test]
+    async fn a_schema_importing_a_referenced_file_decodes() {
+        let server = MockServer::start().await;
+        let address =
+            "syntax = \"proto3\";\npackage example;\nmessage Address { string city = 1; }\n";
+        let user = "syntax = \"proto3\";\npackage example;\nimport \"address.proto\";\nmessage Person { string name = 1; Address home = 2; }\n";
+        Mock::given(method("GET"))
+            .and(path("/schemas/ids/21"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema": user,
+                "schemaType": "PROTOBUF",
+                "references": [{"name": "address.proto", "subject": "address", "version": 1}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/subjects/address/versions/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema": address, "schemaType": "PROTOBUF"
+            })))
+            .mount(&server)
+            .await;
+        let client = SchemaRegistryClient::new(&SchemaRegistryConfig::new(server.uri())).unwrap();
+        let imports = vec![("address.proto".to_string(), address.to_string())];
+        let (pool, name) = compile_proto(user, &imports).unwrap();
+        assert_eq!(name, "example.Person");
+        assert!(compile_proto(user, &[]).is_err(), "the import is required");
+        let msg = DynamicMessage::deserialize(
+            pool.get_message_by_name(&name).unwrap(),
+            serde_json::json!({"name": "a", "home": {"city": "Lyon"}}),
+        )
+        .unwrap();
+        let mut payload = vec![0u8];
+        msg.encode(&mut payload).unwrap();
+        let decoded = decode(&client, &envelope::encode(21, &payload))
+            .await
+            .unwrap();
+        assert_eq!(decoded["home"]["city"], serde_json::json!("Lyon"));
+        assert_eq!(decoded["name"], serde_json::json!("a"));
+        let cached = client
+            .compiled_for::<(DescriptorPool, String)>("protobuf", 21)
+            .expect("the compiled schema is cached by schema id");
+        let again = decode(&client, &envelope::encode(21, &payload))
+            .await
+            .unwrap();
+        assert_eq!(again, decoded);
+        let reused = client
+            .compiled_for::<(DescriptorPool, String)>("protobuf", 21)
+            .unwrap();
+        assert!(Arc::ptr_eq(&cached, &reused), "reused, not rebuilt");
+    }
+
+    #[tokio::test]
+    async fn an_avro_schema_is_refused_by_the_protobuf_codec() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/schemas/ids/22"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema": "\"string\""
+            })))
+            .mount(&server)
+            .await;
+        let client = SchemaRegistryClient::new(&SchemaRegistryConfig::new(server.uri())).unwrap();
+        let err = decode(&client, &envelope::encode(22, &[0]))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("registered as AVRO"), "{err}");
+    }
 
     #[tokio::test]
     async fn protobuf_round_trip_through_mock_registry() {
@@ -247,14 +360,14 @@ mod tests {
     #[test]
     fn compile_proto_extracts_first_message_name() {
         let proto = "syntax = \"proto3\";\npackage acme;\nmessage Widget { string color = 1; }\n";
-        let (_, name) = compile_proto(proto).unwrap();
+        let (_, name) = compile_proto(proto, &[]).unwrap();
         assert_eq!(name, "acme.Widget");
     }
 
     #[test]
     fn compile_proto_rejects_syntax_errors() {
         let bad_proto = "this is not valid proto";
-        assert!(compile_proto(bad_proto).is_err());
+        assert!(compile_proto(bad_proto, &[]).is_err());
     }
 
     #[test]

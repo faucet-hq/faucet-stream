@@ -103,6 +103,8 @@ pub(crate) struct MssqlDriver {
     /// Whether the target has been confirmed present for this sink instance
     /// (#580). One check per run, not per page.
     table_ready: std::sync::atomic::AtomicBool,
+    /// Whether the `on_unknown_field: warn` warning has been logged.
+    unknown_warned: std::sync::atomic::AtomicBool,
     /// Per-sink run id for staged-object keys (#528).
     #[cfg(feature = "staging")]
     pub(crate) stage_run_id: String,
@@ -113,7 +115,7 @@ pub(crate) struct MssqlDriver {
     /// round-trip recorder. Every statement runs on its own connection call
     /// (`on_conn`), so the driver keeps the run's context here, installed by
     /// the adapter's `set_call_context`.
-    calls: faucet_core::CallSlot,
+    pub(crate) calls: faucet_core::CallSlot,
 }
 
 impl MssqlDriver {
@@ -156,6 +158,7 @@ impl MssqlDriver {
                 statement_timeout_secs,
             )),
             table_ready: std::sync::atomic::AtomicBool::new(false),
+            unknown_warned: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "staging")]
             stage_run_id: crate::staged::new_stage_run_id(),
             #[cfg(feature = "staging")]
@@ -527,7 +530,12 @@ impl MssqlDriver {
     /// the connection closes (SQL-37). Swap in a fresh connection so the stale
     /// one closes now and the server rolls its transaction back.
     async fn recover_desynced(&self, conn: &mut MssqlPooledConnection<'_>) {
-        if let Err(e) = faucet_common_mssql::replace_connection(&self.config.connection, conn).await
+        if let Err(e) = faucet_common_mssql::replace_connection_within(
+            &self.config.connection,
+            conn,
+            &self.calls.get(),
+        )
+        .await
         {
             tracing::error!(error = %e, "MSSQL: could not replace a timed-out connection");
             self.poisoned
@@ -553,7 +561,12 @@ impl MssqlDriver {
             MssqlColumnMapping::AutoColumns { .. } => self.column_infos().await?,
             MssqlColumnMapping::JsonColumn { .. } => Vec::new(),
         };
-        prepare_rows(&self.config.column_mapping, &infos, chunk)
+        prepare_rows(
+            &self.config.column_mapping,
+            &infos,
+            chunk,
+            &self.unknown_warned,
+        )
     }
 
     /// Insert rows within an **already-open** transaction — caller owns
@@ -759,6 +772,7 @@ impl MssqlDriver {
             &self.config.write.key,
             &infos,
             *on_unknown_field,
+            &self.unknown_warned,
             upserts,
         )
         .map_err(|e| (e, false))?;
@@ -1936,6 +1950,15 @@ impl MssqlDriver {
 /// Every statement goes through the driver's own call slot (`on_conn`), which
 /// the adapter keeps in step with the run's context; the slot each primitive
 /// receives carries the same context.
+impl MssqlDriver {
+    fn auto_columns(&self) -> bool {
+        matches!(
+            self.config.column_mapping,
+            MssqlColumnMapping::AutoColumns { .. }
+        )
+    }
+}
+
 #[async_trait]
 impl SinkDriver for MssqlDriver {
     fn call_context(&self) -> faucet_core::CallContext {
@@ -1964,7 +1987,11 @@ impl SinkDriver for MssqlDriver {
         policy: RowPolicy,
     ) -> Result<PageWrite, FaucetError> {
         match policy {
-            RowPolicy::PerRow => Ok(PageWrite::from_outcomes(self.write_partial(rows).await?)),
+            // `COPY INTO` loads a page whole, so a staged page succeeds or
+            // fails as a unit on the per-row path too.
+            RowPolicy::PerRow if self.config.staging.is_none() => {
+                Ok(PageWrite::from_outcomes(self.write_partial(rows).await?))
+            }
             _ => {
                 let n = self.write_whole(rows).await?;
                 Ok(PageWrite::reported(self.report(rows.len(), n)))
@@ -1972,13 +1999,34 @@ impl SinkDriver for MssqlDriver {
         }
     }
 
+    /// Upsert and delete need real key columns, which the JSON-column mode
+    /// lacks.
     fn write_modes(&self) -> &'static [faucet_core::WriteMode] {
-        &[
-            faucet_core::WriteMode::Append,
-            faucet_core::WriteMode::Upsert,
-            faucet_core::WriteMode::Delete,
-            faucet_core::WriteMode::Overwrite,
-        ]
+        if self.auto_columns() {
+            &[
+                faucet_core::WriteMode::Append,
+                faucet_core::WriteMode::Upsert,
+                faucet_core::WriteMode::Delete,
+                faucet_core::WriteMode::Overwrite,
+            ]
+        } else {
+            &[
+                faucet_core::WriteMode::Append,
+                faucet_core::WriteMode::Overwrite,
+            ]
+        }
+    }
+
+    /// The JSON-column mode writes whole records, so it reports no schema.
+    fn capabilities(&self, derived: faucet_core::Capabilities) -> faucet_core::Capabilities {
+        if self.auto_columns() {
+            derived
+        } else {
+            derived
+                .to_builder()
+                .schema_report(faucet_core::SchemaReport::Schemaless)
+                .build()
+        }
     }
 
     fn dedups_by_key(&self) -> bool {
@@ -1989,8 +2037,12 @@ impl SinkDriver for MssqlDriver {
         Some(self)
     }
 
+    /// Not with `staging:`: `COPY INTO` cannot commit with the watermark row.
     fn commit_tokens(&self) -> Option<&dyn CommitTokenDriver> {
-        Some(self)
+        self.config
+            .staging
+            .is_none()
+            .then_some(self as &dyn CommitTokenDriver)
     }
 
     /// Column-mapping mode only: the scope + key predicates address real
@@ -2136,7 +2188,7 @@ impl SchemaDriver for MssqlDriver {
     }
 
     fn evolvable(&self) -> bool {
-        true
+        self.auto_columns()
     }
 
     async fn evolve(

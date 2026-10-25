@@ -715,11 +715,11 @@ async fn append_and_overwrite_runs_are_undone() {
     );
 }
 
-/// A rollback whose sink finds nothing of the run (the config now names a
-/// different database) must not rewind the bookmark: the rows are still in
-/// the old destination, and an append run would load them twice.
+/// A rollback whose config now names a different database is refused before
+/// it touches anything: the bookmark stays, since the rows are still in the
+/// old destination and an append run would load them twice.
 #[tokio::test]
-async fn a_rollback_that_finds_nothing_leaves_the_bookmark_and_marker() {
+async fn a_refused_drifted_rollback_leaves_the_bookmark_and_marker() {
     use faucet_core::StateStore;
     let d = fresh().await;
     let cfg = load(&config_yaml(
@@ -751,7 +751,7 @@ async fn a_rollback_that_finds_nothing_leaves_the_bookmark_and_marker() {
         "upsert",
         "rollback: {}",
     ));
-    let report = faucet_cli::rollback::rollback(
+    let err = faucet_cli::rollback::rollback(
         &drifted,
         RollbackInputs {
             run_id: run_id.clone(),
@@ -763,17 +763,11 @@ async fn a_rollback_that_finds_nothing_leaves_the_bookmark_and_marker() {
         },
     )
     .await
-    .unwrap();
-    assert!(!report.outcome.applied, "{report:?}");
-    assert!(!report.bookmark_rewound);
+    .unwrap_err();
     assert!(
-        report
-            .outcome
-            .note
-            .as_deref()
-            .unwrap()
-            .contains("nothing of this run"),
-        "{report:?}"
+        err.to_string()
+            .contains("but the sink config now addresses"),
+        "{err}"
     );
     assert_eq!(
         store.get(&marker.state_key).await.unwrap(),
@@ -1584,4 +1578,30 @@ rollback: {{}}
         ],
         "the upserts are reverted and the cleaned-up rows are back"
     );
+}
+
+#[tokio::test]
+async fn a_rollback_against_another_destination_is_refused() {
+    let d = fresh().await;
+    let yaml = config_yaml(&d.src, &d.dst, &d.state, "upsert", "rollback: {}");
+    let cfg = load(&yaml);
+    let summary = run(&cfg).await;
+    assert!(!summary.had_failures(), "{summary:?}");
+    let run_id = summary.invocations[0].run_id.clone().expect("run id");
+    let moved = load(&yaml.replace("table_name: dst", "table_name: dst_eu"));
+    let err = faucet_cli::rollback::rollback(
+        &moved,
+        RollbackInputs {
+            run_id,
+            row: None,
+            dry_run: false,
+            force: true,
+            pipeline_name: "mirror".into(),
+            auth: Default::default(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("now addresses"), "{err}");
+    assert_eq!(rows(&d.dst).await.len(), 4, "nothing was undone");
 }

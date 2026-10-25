@@ -37,6 +37,23 @@ fn source_err(context: &str, e: impl std::fmt::Display) -> FaucetError {
 
 use faucet_core::CallExt as _;
 
+/// A catalog without nested namespaces: listing children of a namespace is
+/// unsupported, or a REST catalog rejects the `parent` filter (400, 405 or
+/// 501). Discovery treats that namespace as having no children.
+fn nested_listing_unsupported(e: &iceberg::Error) -> bool {
+    if e.kind() == iceberg::ErrorKind::FeatureUnsupported {
+        return true;
+    }
+    // The REST client reports any other status as `Unexpected`, with the
+    // status only in the error's context (rendered as `status: <code> …`).
+    e.kind() == iceberg::ErrorKind::Unexpected && {
+        let text = e.to_string();
+        ["status: 400 ", "status: 405 ", "status: 501 "]
+            .iter()
+            .any(|s| text.contains(s))
+    }
+}
+
 /// A source that reads an Apache Iceberg table.
 pub struct IcebergSource {
     config: IcebergSourceConfig,
@@ -332,16 +349,38 @@ impl faucet_core::Source for IcebergSource {
             .map_err(|e| source_err("could not list namespaces", e))?;
         let mut seen: HashSet<NamespaceIdent> = queue.iter().cloned().collect();
         let mut out = Vec::new();
+        let mut warned_nested = false;
         while let Some(ns) = queue.pop() {
-            if let Ok(children) = catalog
+            match catalog
                 .list_namespaces(Some(&ns))
                 .within(&self.calls, "list")
                 .await?
             {
-                for child in children {
-                    if seen.insert(child.clone()) {
-                        queue.push(child);
+                Ok(children) => {
+                    for child in children {
+                        if seen.insert(child.clone()) {
+                            queue.push(child);
+                        }
                     }
+                }
+                // Dropped while it was being listed: no tables to list either.
+                Err(e) if e.kind() == iceberg::ErrorKind::NamespaceNotFound => continue,
+                Err(e) if nested_listing_unsupported(&e) => {
+                    if !warned_nested {
+                        warned_nested = true;
+                        tracing::warn!(
+                            namespace = %ns.to_url_string(),
+                            error = %e,
+                            "iceberg: the catalog does not list nested namespaces; discovering \
+                             only the top-level ones"
+                        );
+                    }
+                }
+                Err(e) => {
+                    return Err(source_err(
+                        &format!("could not list the namespaces under {}", ns.to_url_string()),
+                        e,
+                    ));
                 }
             }
             let tables = catalog
@@ -492,5 +531,38 @@ impl faucet_core::Source for IcebergSource {
                 ),
             })
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_an_unsupported_or_rejected_parent_listing_means_no_nested_namespaces() {
+        use iceberg::{Error, ErrorKind};
+        let status = |code: &str| {
+            Error::new(ErrorKind::Unexpected, "unexpected status").with_context("status", code)
+        };
+        assert!(nested_listing_unsupported(&Error::new(
+            ErrorKind::FeatureUnsupported,
+            "x"
+        )));
+        for code in [
+            "400 Bad Request",
+            "405 Method Not Allowed",
+            "501 Not Implemented",
+        ] {
+            assert!(nested_listing_unsupported(&status(code)), "{code}");
+        }
+        assert!(!nested_listing_unsupported(&status("403 Forbidden")));
+        assert!(!nested_listing_unsupported(&status(
+            "500 Internal Server Error"
+        )));
+        // A vanished namespace is handled on its own (its tables are skipped).
+        assert!(!nested_listing_unsupported(&Error::new(
+            ErrorKind::NamespaceNotFound,
+            "x"
+        )));
     }
 }

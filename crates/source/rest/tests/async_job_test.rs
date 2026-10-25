@@ -830,3 +830,150 @@ async fn async_job_buffered_decode_parses_json() {
     let records = RestStream::new(cfg).unwrap().fetch_all().await.unwrap();
     assert_eq!(records, vec![json!({"id": 1}), json!({"id": 2})]);
 }
+
+#[tokio::test]
+async fn async_job_incremental_predicate_escapes_the_bookmark_and_skips_select_list_words() {
+    use wiremock::matchers::body_string_contains;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/jobs"))
+        .and(body_string_contains(
+            r#""SELECT Id, Offset FROM Lead WHERE SystemModstamp > 'a\\\\\\' OR 1=1 --'""#,
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "job-1" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/jobs/job-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "state": "Complete" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/jobs/job-1/result"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("id,name\n1,alice\n"))
+        .mount(&server)
+        .await;
+
+    let mut cfg = incremental_csv_config(&server);
+    let mut job = incremental_job();
+    job.submit.json = Some(json!({ "operation": "query", "query": "SELECT Id, Offset FROM Lead" }));
+    cfg.async_job = Some(job);
+    let stream = RestStream::new(cfg).unwrap();
+    stream
+        .apply_start_bookmark(json!(r"a\' OR 1=1 --"))
+        .await
+        .unwrap();
+    let ctx: HashMap<String, Value> = HashMap::new();
+    let mut pages = <RestStream as Source>::stream_pages(&stream, &ctx, 1000);
+    while let Some(page) = pages.next().await {
+        page.unwrap();
+    }
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn async_job_poll_fails_fast_when_the_status_path_matches_nothing() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/jobs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "job-1" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/jobs/job-1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "status": "Complete", "token": "s3cr3t-value" })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let stream = RestStream::new(incremental_csv_config(&server)).unwrap();
+    let ctx: HashMap<String, Value> = HashMap::new();
+    let started = std::time::Instant::now();
+    let mut pages = <RestStream as Source>::stream_pages(&stream, &ctx, 1000);
+    let err = loop {
+        match pages.next().await {
+            Some(Err(e)) => break e.to_string(),
+            Some(Ok(_)) => continue,
+            None => panic!("the run must fail"),
+        }
+    };
+    // The error names the path and the response's member names, never its
+    // values (a poll body can carry tokens and signed URLs).
+    assert!(
+        err.contains("`status.path`")
+            && err.contains("matched nothing")
+            && err.contains("top-level keys: ")
+            && err.contains("status")
+            && err.contains("token"),
+        "{err}"
+    );
+    assert!(
+        !err.contains("s3cr3t-value") && !err.contains("Complete"),
+        "{err}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    server.verify().await;
+}
+
+/// Poll responds with an explicit `null` status first (a queued job whose
+/// status is not set yet), then the success value.
+struct NullThenComplete(Arc<AtomicUsize>);
+impl Respond for NullThenComplete {
+    fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+        let n = self.0.fetch_add(1, Ordering::SeqCst);
+        let state = if n == 0 {
+            Value::Null
+        } else {
+            json!("Complete")
+        };
+        ResponseTemplate::new(200).set_body_json(json!({ "state": state }))
+    }
+}
+
+/// An explicit `null` status keeps polling; only a path that matches nothing
+/// fails fast.
+#[tokio::test]
+async fn async_job_poll_treats_a_null_status_as_pending() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/jobs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "job-1" })))
+        .mount(&server)
+        .await;
+    let polls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("GET"))
+        .and(path("/jobs/job-1"))
+        .respond_with(NullThenComplete(polls.clone()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/jobs/job-1/result"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("id\n1\n"))
+        .mount(&server)
+        .await;
+    let async_job: AsyncJobConfig = serde_json::from_value(json!({
+        "submit": { "method": "POST", "url": "/jobs" },
+        "job_id": "$.id",
+        "poll": { "url": "/jobs/${job_id}", "interval_secs": 1, "timeout_secs": 30 },
+        "status": { "path": "$.state", "success": ["Complete"], "failure": ["Failed"] },
+        "fetch": { "method": "GET", "url": "/jobs/${job_id}/result" }
+    }))
+    .unwrap();
+    let mut cfg = RestStreamConfig::new(&server.uri(), "").decode(vec![DecodeStep::Parse {
+        parse: ParseSpec {
+            format: ParseFormat::Csv,
+            records_path: None,
+            delimiter: None,
+            has_headers: true,
+            sheet: None,
+            header_row: 0,
+        },
+    }]);
+    cfg.async_job = Some(async_job);
+    let records = RestStream::new(cfg).unwrap().fetch_all().await.unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(polls.load(Ordering::SeqCst), 2);
+}

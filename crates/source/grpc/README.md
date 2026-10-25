@@ -128,7 +128,7 @@ faucet run pipeline.yaml
 |--------|----------|-------------|
 | `none` | *(none)* | No authentication (default). |
 | `bearer` | `{ token: <string> }` | Token sent as `authorization` request metadata. |
-| `metadata` | `{ entries: [{ key, value }, …] }` | Arbitrary metadata pairs attached to every request. Order is preserved and duplicate keys are allowed (gRPC permits both). |
+| `metadata` | `{ entries: [{ key, value }, …] }` | Arbitrary metadata pairs attached to every request. Order is preserved and duplicate keys are allowed (gRPC permits both); every value of a repeated key is sent. A key ending in `-bin` is binary metadata: give its value as base64. |
 
 ```yaml
 # Bearer token (via env indirection)

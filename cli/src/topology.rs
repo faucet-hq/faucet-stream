@@ -418,9 +418,28 @@ pub struct TopologyBudgets {
     /// Each sink node's governance and the ids its masking rules are scoped
     /// by, so the run can attach that node's governed DLQ (#870).
     governance: HashMap<String, (faucet_core::Governance, Vec<String>)>,
+    /// Rows each sink node's `--limit` cap held back on the per-row path,
+    /// which the node report counts as written.
+    limit_padded: HashMap<String, std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl TopologyBudgets {
+    /// Take the rows the `--limit` cap held back out of each sink node's
+    /// written count.
+    fn unpad(&self, reported: &mut faucet_core::topology::TopologyRun) {
+        use std::sync::atomic::Ordering;
+        for node in reported.nodes.iter_mut() {
+            if let Some(p) = self.limit_padded.get(&node.node_id) {
+                node.records = node.records.saturating_sub(p.load(Ordering::Relaxed));
+            }
+        }
+        for (id, records) in reported.result.per_sink.iter_mut() {
+            if let Some(p) = self.limit_padded.get(id) {
+                *records = records.saturating_sub(p.load(Ordering::Relaxed));
+            }
+        }
+    }
+
     /// `(sink node id, error)` for every node whose budget ran out.
     fn verdicts(&self) -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = self
@@ -1118,15 +1137,22 @@ async fn build_topology_inner(
                     map.insert((*id).clone(), p);
                 }
                 let limit = opts.limit;
+                let padded = std::sync::Arc::<std::sync::atomic::AtomicUsize>::default();
+                let tap_padded = std::sync::Arc::clone(&padded);
                 let governed = built
                     .governance
                     .sink_builder()
                     .inner_tap(move |s| match limit {
-                        Some(n) => Box::new(crate::executor::LimitedSink::wrap(s, n)) as Box<_>,
+                        Some(n) => Box::new(
+                            crate::executor::LimitedSink::wrap(s, n).counting_padded(tap_padded),
+                        ) as Box<_>,
                         None => s,
                     })
                     .build(sink);
                 if let Some(states) = budgets.as_mut() {
+                    if limit.is_some() {
+                        states.limit_padded.insert((*id).clone(), padded);
+                    }
                     if let Some(state) = governed.budget_state() {
                         states
                             .states
@@ -1144,6 +1170,9 @@ async fn build_topology_inner(
                 NodeKind::Sink(sink)
             }
             NodeSpec::Transform { transforms } => {
+                for t in transforms {
+                    crate::executor::reject_unresolved_backfill_tokens(&t.config, "transform")?;
+                }
                 let stages = compile_transforms(transforms)?;
                 let compiled = stages
                     .iter()
@@ -1467,7 +1496,9 @@ pub async fn run_topology(
     #[cfg(feature = "lineage")]
     let reaching_for_lineage = reaching_sources(cfg);
     #[cfg(feature = "lineage")]
-    if let (Some(em), Some(lc)) = (lineage.as_ref(), cfg.lineage.as_ref()) {
+    if !run.is_preview()
+        && let (Some(em), Some(lc)) = (lineage.as_ref(), cfg.lineage.as_ref())
+    {
         for (node_id, _) in cfg
             .pipeline
             .nodes
@@ -1535,6 +1566,7 @@ pub async fn run_topology(
     // needs to know which node failed — and needs that on a failed run too, where
     // `run_reported` would hand back only the error (#459, #789 CLI-18).
     let (mut reported, run_error) = topo.run_attributed(opts, governance).await;
+    budgets.unpad(&mut reported);
     drop(lease_watches);
     let cancelled = run.cancel.as_ref().is_some_and(|c| c.is_cancelled());
 
@@ -1560,7 +1592,10 @@ pub async fn run_topology(
             if node.error.is_some() || verdicts.iter().any(|(id, _)| *id == node.node_id) {
                 continue;
             }
-            if let Err(e) = crate::reconcile::run(spec, auth, node.records as u64).await {
+            if let Err(e) =
+                crate::reconcile::run_with(spec, auth, node.records as u64, run.cancel.as_ref())
+                    .await
+            {
                 verdicts.push((node.node_id.clone(), e.to_string()));
             }
         }
@@ -1571,6 +1606,39 @@ pub async fn run_topology(
         {
             node.error = Some(message.clone());
             node.error_kind = Some(faucet_core::topology::NodeErrorKind::Other);
+        }
+    }
+
+    // A cancelled run ends each sink node's lineage run with ABORT.
+    #[cfg(feature = "lineage")]
+    if cancelled
+        && !run.is_preview()
+        && let (Some(em), Some(lc)) = (lineage.as_ref(), cfg.lineage.as_ref())
+    {
+        for (node_id, _) in cfg
+            .pipeline
+            .nodes
+            .iter()
+            .filter(|(_, n)| matches!(n, NodeSpec::Sink { .. }))
+        {
+            let records = reported
+                .nodes
+                .iter()
+                .find(|n| &n.node_id == node_id)
+                .map_or(0, |n| n.records as u64);
+            if let Some(ctx) = lineage_ctx(
+                cfg,
+                &pipeline_name,
+                &run_id,
+                node_id,
+                &identities,
+                &reaching_for_lineage,
+                lc,
+                records,
+                None,
+            ) {
+                em.emit(faucet_lineage::EventType::Abort, &ctx).await;
+            }
         }
     }
 
@@ -1981,10 +2049,9 @@ async fn post_run_observability(cfg: &PipelineConfig, ctx: PostRun<'_>) -> Vec<(
             match (&node.error, node_failed_by_profile) {
                 (None, false) => {
                     notifier
-                        .emit(NotifyEvent::run_success(
-                            pipeline_name,
-                            row,
-                            node.records as u64,
+                        .emit(crate::executor::keep_sla_open(
+                            NotifyEvent::run_success(pipeline_name, row, node.records as u64),
+                            !violations.is_empty(),
                         ))
                         .await;
                 }

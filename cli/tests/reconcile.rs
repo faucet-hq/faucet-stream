@@ -70,6 +70,7 @@ fn count_probe(dir: &Path, n: u64) -> ReconcileSpec {
             count_field: Some("n".into()),
         },
         tolerance_pct: 0.0,
+        timeout_secs: 300,
     }
 }
 
@@ -113,4 +114,44 @@ async fn shortfall_fails_the_run() {
         summary.had_failures(),
         "a shortfall vs the authoritative count must fail the run"
     );
+}
+
+#[tokio::test]
+async fn a_negative_probe_count_fails_the_run_and_extra_probe_rows_are_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.csv");
+    let output = dir.path().join("out.jsonl");
+    std::fs::write(&input, "id\n1\n2\n").unwrap();
+    let cfg: PipelineConfig =
+        PipelineConfig::from_text(&pipeline_yaml(&input, &output), Path::new("recon.yaml"))
+            .unwrap();
+
+    let probe = |name: &str, body: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, body).unwrap();
+        ReconcileSpec {
+            count: CountProbe {
+                kind: "csv".into(),
+                config: json!({ "path": path.to_str().unwrap() }),
+                count_field: Some("n".into()),
+            },
+            tolerance_pct: 0.0,
+            timeout_secs: 300,
+        }
+    };
+    let negative = probe("neg.csv", "n\n-1\n");
+    let summary = run_expanded(expand(&cfg).unwrap(), opts_with_reconcile(Some(negative)))
+        .await
+        .unwrap();
+    assert!(summary.had_failures(), "a negative count is not a pass");
+
+    let rows: String = std::iter::once("n".to_string())
+        .chain((0..500).map(|_| "2".to_string()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let many = probe("many.csv", &rows);
+    let summary = run_expanded(expand(&cfg).unwrap(), opts_with_reconcile(Some(many)))
+        .await
+        .unwrap();
+    assert!(!summary.had_failures(), "the first probe row is the count");
 }

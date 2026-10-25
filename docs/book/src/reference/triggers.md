@@ -87,6 +87,7 @@ poll_interval_secs: 30      # how often to list the prefix (default 30)
 mode: per_object            # per_object (one run per new object) | batch (one run for all new objects)
 start_at: now               # now (only objects after the first startup) | beginning (all objects, incl. existing)
 lookback_secs: 86400        # how far behind the newest fired object a late-listed one still fires (default 24h)
+poll_timeout_secs: null     # optional limit on one whole poll (default: none — see below)
 ```
 
 An object is fired once, identified by its key, ETag and last-modified time
@@ -96,6 +97,18 @@ write time, so it can appear after newer objects already fired; any object
 last modified within `lookback_secs` of the newest fired one is still fired. A
 late `batch` gets its own idempotency key, so it is not taken for the earlier
 batch that shares its newest time.
+
+Every poll lists the whole prefix — object stores have no "changed since"
+listing — so its request cost grows with the number of objects under it; only
+objects not yet fired are kept in memory. Point the trigger at a landing prefix
+that is cleaned up or archived, and size `poll_interval_secs` to its listing
+cost.
+
+A large prefix may take minutes to list; that is not cut off. Instead each wait
+for the next listing page is bounded by `max(poll_interval_secs, 60)` seconds:
+a store that stops answering fails the poll (the watcher backs off and, after
+three failures in a row, reports unhealthy) rather than freezing it. Set
+`poll_timeout_secs` to also bound the whole poll — listing plus firing.
 
 **`${trigger.*}` tokens injected into the run config:**
 
@@ -162,7 +175,9 @@ it — and the objects after it still fire. A transient failure (the queue is
 full, the history store is unreachable) stops the poll and retries the same
 object next time. Either way the poll counts as failed: the watcher backs off,
 `faucet_serve_trigger_errors_total` counts it, and after repeated failures the
-watcher reports `healthy: false` with the `last_error`.
+watcher reports `healthy: false` (with `consecutive_failures`); the reason is
+in the server log (`trigger poll failed`) — `/readyz` is unauthenticated, so it
+carries no error text.
 
 ### `webhook`
 
@@ -246,6 +261,7 @@ queue:
   # group: my-consumer-group
 threshold: 1                # fire when depth >= threshold (default 1)
 poll_interval_secs: 30      # polling interval (default 30)
+poll_timeout_secs: 60       # a poll taking longer counts as failed (default max(poll_interval_secs, 60))
 ```
 
 Redis requires the `triggers-redis` feature; Kafka requires `triggers-kafka`.
@@ -375,8 +391,8 @@ See [Running a subset of streams](../cookbook/templates.md#running-a-subset-of-s
 ```
 
 A watcher whose client cannot be built at startup (an object-store or queue
-client error) is reported `healthy: false` with the reason in `last_error`
-straight away — it never polls. A degraded watcher (crashed and backing off) sets its `healthy` flag to `false`
+client error) is reported `healthy: false` straight away, with the reason in
+the server log — it never polls. A degraded watcher (crashed and backing off) sets its `healthy` flag to `false`
 but does **not** flip the top-level `status` to `not_ready` — the server keeps
 accepting runs from the other trigger paths.
 

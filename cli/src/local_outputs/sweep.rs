@@ -299,6 +299,10 @@ async fn apply(store: &dyn RunHistory, sel: Selection, opts: &SweepOptions) -> S
                 outcome.skipped = Some(SkipReason::InFlight);
                 return outcome;
             }
+            if replaced_since_recorded(&rec, &meta) {
+                outcome.skipped = Some(SkipReason::Changed);
+                return outcome;
+            }
             meta.len()
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -351,6 +355,15 @@ async fn apply(store: &dyn RunHistory, sel: Selection, opts: &SweepOptions) -> S
 /// Conservative on every unknown: a platform that cannot report mtime, or a
 /// timestamp the clock cannot make sense of, counts as "recently written" — the
 /// answer that leaves the file alone.
+/// Whether the file at the path is a different file from the one faucet
+/// recorded. A row recorded without an identity cannot tell, so it is not.
+fn replaced_since_recorded(rec: &LocalOutputRecord, meta: &std::fs::Metadata) -> bool {
+    match (rec.file_id, super::ledger::FileIdentity::of(meta)) {
+        (Some(recorded), Some(now)) => recorded != now,
+        _ => false,
+    }
+}
+
 fn written_recently(meta: &std::fs::Metadata, opts: &SweepOptions) -> bool {
     if opts.in_flight_grace.is_zero() {
         return false;
@@ -412,6 +425,7 @@ mod tests {
             replaced: false,
             retention_days: None,
             observed_at: ts(at),
+            file_id: None,
         }
     }
 
@@ -694,6 +708,41 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state(), super::super::LocalOutputState::Expired);
         assert_eq!(rows[0].deleted_bytes, Some(8));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_different_file_at_a_recorded_path_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.csv");
+        std::fs::write(&path, b"faucet").unwrap();
+        let mut o = obs(path.to_str().unwrap(), "2026-08-01T00:00:00Z");
+        o.file_id = super::super::FileIdentity::of(&std::fs::metadata(&path).unwrap());
+        assert!(o.file_id.is_some());
+        let store = store_with(&[o]).await;
+
+        let theirs = dir.path().join("theirs.csv");
+        std::fs::write(&theirs, b"user data").unwrap();
+        std::fs::rename(&theirs, &path).unwrap();
+
+        let report = run(&store, &SweepScope::All, &opts()).await.unwrap();
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.skipped_for(SkipReason::Changed), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), b"user data");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_recorded_file_is_still_collected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.jsonl");
+        std::fs::write(&path, b"x").unwrap();
+        let mut o = obs(path.to_str().unwrap(), "2026-08-01T00:00:00Z");
+        o.file_id = super::super::FileIdentity::of(&std::fs::metadata(&path).unwrap());
+        let store = store_with(&[o]).await;
+        let report = run(&store, &SweepScope::All, &opts()).await.unwrap();
+        assert_eq!(report.deleted, 1);
+        assert!(!path.exists());
     }
 
     #[tokio::test]

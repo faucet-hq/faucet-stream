@@ -418,11 +418,9 @@ fn render_default(v: &Value) -> String {
         Value::Null => "null".to_string(),
         Value::Bool(b) => b.to_string(),
         Value::Number(n) => n.to_string(),
-        Value::String(s) => format!("\"{}\"", s.replace('"', "\\\"")),
         Value::Array(a) if a.is_empty() => "[]".to_string(),
         Value::Object(o) if o.is_empty() => "{}".to_string(),
-        // Non-trivial composite defaults are rendered as compact JSON, which
-        // happens to be a valid YAML flow-style literal.
+        // Strings and composites render as JSON, a valid YAML flow literal.
         other => other.to_string(),
     }
 }
@@ -487,6 +485,15 @@ fn resolve_ref_borrowed<'a>(schema: &'a Value, defs: Option<&'a Value>) -> &'a V
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn string_defaults_round_trip_through_yaml() {
+        for s in ["\\d{4}", "C:\\data", "a\tb\nc", "say \"hi\"", "plain"] {
+            let rendered = render_default(&Value::String(s.to_string()));
+            let back: String = serde_yaml::from_str(&rendered).expect("valid yaml scalar");
+            assert_eq!(back, s, "{rendered}");
+        }
+    }
 
     #[test]
     fn empty_object_schema_emits_brace_placeholder() {

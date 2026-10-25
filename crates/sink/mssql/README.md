@@ -103,7 +103,7 @@ The `tls` block governs encryption for both connection forms:
 
 | `type` | Fields | Behavior |
 |--------|--------|----------|
-| `auto_columns` | `on_unknown_field: warn \| drop \| error` | Top-level JSON keys map to same-named table columns. The column set is the **union** of keys across the batch (a field present only in a later record is still written; rows missing a column → SQL `NULL`). `IDENTITY` columns are skipped automatically. Fields match columns exactly, else ignoring case (SQL Server's default collation compares identifiers that way). Keys with no matching column are handled by `on_unknown_field` (default `warn`); a record matching **no** column is an error under every setting — `write_batch` fails, and `write_batch_partial` reports that row as failed so it reaches the DLQ. |
+| `auto_columns` | `on_unknown_field: warn \| drop \| error` | Top-level JSON keys map to same-named table columns. The column set is the **union** of keys across the batch (a field present only in a later record is still written; rows missing a column → SQL `NULL`). `IDENTITY` columns are skipped automatically. Fields match columns exactly, else ignoring case (SQL Server's default collation compares identifiers that way). Keys with no matching column are handled by `on_unknown_field` (default `warn`, which drops them and logs one warning per sink, the first time such keys appear); a record matching **no** column is an error under every setting — `write_batch` fails, and `write_batch_partial` reports that row as failed so it reaches the DLQ. |
 | `json_column` | `column: <name>` | Each record is serialized to a JSON string inserted into a single `NVARCHAR(MAX)` (or native Azure SQL `JSON`) column. Schema-agnostic. Pair with `create_table: true` to create the table if absent. |
 
 ```yaml
@@ -223,6 +223,17 @@ sink:
       sas_token: "${env:MSSQL_STAGE_SAS}"          # SAS the server uses to READ the stage
 ```
 
+A staged page is one `COPY INTO`, so it lands or fails whole: under a `dlq:`
+the failed page follows `on_batch_error` rather than being split per row, and
+`delivery: exactly_once` is refused (the load cannot commit with the watermark
+row; use `write_mode: upsert` without `staging:` for an exactly-once mirror).
+
+The staged object is deleted per `cleanup` once the load finishes. The delete
+runs on its own 30-second budget rather than the run's deadline or cancellation,
+so a cancelled or timed-out `COPY INTO` still removes its blob (counted as a
+failed load for `cleanup: on_success`); if the load is abandoned mid-flight the
+delete runs on a background task.
+
 Build with the crate's `staging` feature (CLI: `--features sink-mssql-staging`,
 in `full`). **Azure only** (`az://…`), **CSV only**, and **`write_mode: append`
 only**: `COPY INTO` loads straight into the target table, so `overwrite`, `upsert`
@@ -253,7 +264,7 @@ With `isolate_row_failures: true` (default), a batch that fails is rolled back a
 
 ## Effectively-once delivery
 
-`MssqlSink` implements `Sink::supports_idempotent_writes` (returns `true`) and the two companion hooks:
+`MssqlSink` implements `Sink::supports_idempotent_writes` (returns `true` unless `staging:` is set) and the two companion hooks:
 
 - `write_batch_idempotent(records, scope, token)` — writes `records` and UPSERTs the `token` into a `_faucet_commit_token(scope NVARCHAR, token NVARCHAR)` watermark table inside the **same transaction** (respecting `transaction_per_batch`), so both commit together or neither does. A scope too long for the key column is stored as a shortened digest form; a watermark written under the form releases before faucet-core 1.13 used is still read, and the next commit moves it to the current form.
 - `last_committed_token(scope)` — reads the current watermark so the pipeline can skip already-committed pages on resume.
@@ -409,7 +420,7 @@ already landed a second time). See
 
 ## Capabilities
 
-Declares write modes `append` / `upsert` / `delete` / `overwrite`, idempotent (exactly-once) writes, keyed upsert and schema evolution with a reported schema. Cleanup needs `column_mapping: auto_columns`; a staged load needs a `staging:` block and the `staging` feature; keyed dedup needs `write_mode: upsert|delete` with a `key`. `faucet list --json` prints the declaration.
+Declares write modes `append` / `upsert` / `delete` / `overwrite`, idempotent (exactly-once) writes (not with a `staging:` block), keyed upsert and schema evolution with a reported schema. Upsert, delete, keyed upsert, schema evolution and cleanup need `column_mapping: auto_columns`; the `json_column` mode declares `append` / `overwrite` and a schemaless destination, so `faucet validate` refuses `write_mode: upsert|delete` and `on_drift: evolve` for it; a staged load needs a `staging:` block and the `staging` feature; keyed dedup needs `write_mode: upsert|delete` with a `key`. `faucet list --json` prints the declaration.
 
 ## Timeouts, cancellation and retries
 

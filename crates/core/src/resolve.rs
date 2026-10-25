@@ -216,8 +216,18 @@ pub fn is_metadata_ip(ip: std::net::IpAddr) -> bool {
             (v6.segments()[0] & 0xffc0) == 0xfe80
                 || v6 == std::net::Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254)
                 || v6.to_ipv4_mapped().is_some_and(v4_meta)
+                || embedded_ipv4(v6).is_some_and(v4_meta)
         }
     }
+}
+
+/// The IPv4 address carried in an IPv4-compatible (`::a.b.c.d`) or NAT64
+/// well-known-prefix (`64:ff9b::a.b.c.d`) IPv6 address.
+fn embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    let seg = v6.segments();
+    let prefix_ok = seg[..6] == [0, 0, 0, 0, 0, 0] || seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0];
+    let o = v6.octets();
+    prefix_ok.then(|| std::net::Ipv4Addr::new(o[12], o[13], o[14], o[15]))
 }
 
 /// The addresses `host` resolved to that a connection may use: every one
@@ -376,11 +386,13 @@ fn local_part(value: &str) -> Option<&str> {
 
 /// Whether a scheme-less value is a relative path (`jobs/${id}`) rather than
 /// `host[:port][/…]`: its first segment is neither dotted, ported nor
-/// `localhost`.
+/// `localhost`, and does not read as an IP address (`2852039166`, `0x7f000001`).
 fn is_relative_path(value: &str) -> bool {
     match value.split_once('/') {
         Some((first, _)) => {
-            !first.contains(['.', ':', '[']) && !first.eq_ignore_ascii_case("localhost")
+            !first.contains(['.', ':', '['])
+                && !first.eq_ignore_ascii_case("localhost")
+                && canonical_host(first).parse::<std::net::IpAddr>().is_err()
         }
         None => false,
     }
@@ -1559,7 +1571,11 @@ mod tests {
             "http://metadata.google.internal./x",
             "http://METADATA.google.internal/x",
             "http://[0:0:0:0:0:ffff:a9fe:a9fe]/",
+            "http://[::169.254.169.254]/latest",
+            "http://[64:ff9b::a9fe:a9fe]/latest",
             "postgres://u@db,2852039166:5432/x",
+            "2852039166/latest/meta-data",
+            "0xa9fea9fe/latest",
         ] {
             assert!(p.check_url(bad).is_err(), "{bad}");
         }
@@ -1571,6 +1587,11 @@ mod tests {
         let listed = ReferencePolicy::open().with_url_hosts(["api.example.com"]);
         assert!(listed.check_url("https://API.example.com./v1").is_ok());
         assert!(listed.check_url("https://0x7f000001/").is_err());
+        assert!(listed.check_url("2130706433/x").is_err());
+        assert!(listed.check_url("jobs/123").is_ok());
+        assert!(p.check_url("jobs/123").is_ok());
+        assert!(!is_metadata_ip("::1".parse().unwrap()));
+        assert!(!is_metadata_ip("64:ff9b::808:808".parse().unwrap()));
     }
 
     #[test]

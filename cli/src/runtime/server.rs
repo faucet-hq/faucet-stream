@@ -424,11 +424,31 @@ pub async fn submit(
     mut req: SubmitRequest,
     approval: Approval,
 ) -> Result<SubmitOutcome, ServeError> {
+    // A malformed request field is refused before anything is queued or
+    // proposed, so a change request never waits for approval only to fail
+    // when it executes.
+    crate::serve::runner::resolve_clock(req.clock.as_deref(), chrono::Utc::now())?;
+    // `0` is rejected rather than clamped: it would mean "no connections"
+    // (#610).
+    if req.concurrency == Some(0) {
+        return Err(ServeError::Unprocessable {
+            message: "concurrency must be greater than 0 — it is a connection/fetch count, not a `0 = unlimited` sentinel"
+                .into(),
+            details: None,
+        });
+    }
     let gated = req.approved_change.is_none()
         && (req.require_approval
             || (approval == Approval::Required
                 && state.requires_approval(crate::serve::changes::ChangeKind::Run)));
     if gated {
+        if let Some(cb) = req.callback.as_ref() {
+            cb.reject_persisted_headers(state.persistent_history())
+                .map_err(|message| ServeError::Unprocessable {
+                    message,
+                    details: None,
+                })?;
+        }
         let reason = req.reason.clone();
         let budget = req.budget.clone();
         let payload =
@@ -450,15 +470,6 @@ pub async fn submit(
     // A draining server takes no new work (#789 SERVE-25).
     if state.is_draining() {
         return Err(ServeError::Draining);
-    }
-    // `0` is rejected rather than clamped: it would mean "no connections"
-    // (#610).
-    if req.concurrency == Some(0) {
-        return Err(ServeError::Unprocessable {
-            message: "concurrency must be greater than 0 — it is a connection/fetch count, not a `0 = unlimited` sentinel"
-                .into(),
-            details: None,
-        });
     }
     // The selection names the run (#741): a label, so part of the
     // idempotency fingerprint.
@@ -870,18 +881,35 @@ pub async fn rollback(
     let nodes = loaded.nodes.clone();
     // A rollback undoes the destination and then rewinds the bookmark: it
     // finishes even if the client goes away, so it never stops between them.
-    let report = detached(None, async move {
+    let outcome = detached(None, async move {
         let _permit = permit;
         super::local::rollback_nodes(&run_as, &nodes, &inputs).await
     })
-    .await?
-    .map_err(cli_to_serve)?;
+    .await
+    .and_then(|r| r.map_err(cli_to_serve));
+    let report = match outcome {
+        Ok(report) => report,
+        Err(e) => {
+            crate::serve::audit::write_detail(
+                state,
+                &principal.actor(),
+                "run.rollback",
+                Some(id.to_string()),
+                crate::secrets::registry::redact_message(&e.to_string()),
+                "error",
+            )
+            .await;
+            return Err(e);
+        }
+    };
     let result = if req.dry_run {
         "dry_run"
     } else if report.outcome.applied {
         "ok"
-    } else {
+    } else if report.blocked() {
         "blocked"
+    } else {
+        "not_applied"
     };
     crate::serve::audit::write(
         state,
@@ -1145,6 +1173,12 @@ pub(crate) mod replay {
             match outcome {
                 Ok(o) => rec.records_written = o.records_written as u64,
                 Err(e) => {
+                    if let CliError::ReplayFailed {
+                        records_written, ..
+                    } = e
+                    {
+                        rec.records_written = *records_written as u64;
+                    }
                     rec.error = Some(crate::secrets::registry::redact_message(&e.to_string()))
                 }
             }

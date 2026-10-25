@@ -427,7 +427,10 @@ async fn a_missing_target_without_create_table_is_named() {
     c.create_table = false;
     let sink = MssqlSink::new(c).await.unwrap();
     let err = sink.write_batch(&page()).await.unwrap_err().to_string();
-    assert!(err.contains("t"), "{err}");
+    assert!(
+        err.contains("does not exist") && err.contains("create_table: false"),
+        "{err}"
+    );
 
     server.on_times(TABLE_PROBE, Reply::error("probe broke"), 1);
     let mut c = auto(&server, WriteMode::Append, &[]);
@@ -523,4 +526,19 @@ async fn hung_idempotent_statements_time_out() {
     server.on_times("MERGE", Reply::Hang, 1);
     let err = sink.write_batch(&page()).await.unwrap_err().to_string();
     assert!(err.contains("MSSQL merge"), "{err}");
+}
+
+#[tokio::test]
+async fn a_staged_page_loads_whole_on_the_per_row_path() {
+    let server = TdsServer::start().await.unwrap();
+    script_table(&server);
+    let mut c = auto(&server, WriteMode::Append, &[]);
+    c.staging = Some(
+        serde_json::from_value(json!({"location": "s3://bucket/stage/", "format": "csv"})).unwrap(),
+    );
+    let sink = MssqlSink::new(c).await.unwrap();
+    assert!(!sink.supports_idempotent_writes());
+    // The page goes to the staged load, not row-by-row `INSERT`s.
+    assert!(sink.write_batch_partial(&page()).await.is_err());
+    assert!(!server.saw("INSERT INTO"));
 }

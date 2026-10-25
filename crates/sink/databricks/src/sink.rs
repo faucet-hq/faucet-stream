@@ -519,6 +519,9 @@ impl DatabricksDriver {
     ) -> Result<(), FaucetError> {
         let m = build_matrix(records, cols)?;
         let target = self.target();
+        if eo.is_some() {
+            sql::check_replace_where_columns(&target, cols)?;
+        }
         if self.use_staging(m.estimated_bytes()) {
             let copy_options = self
                 .config

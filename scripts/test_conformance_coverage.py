@@ -74,6 +74,23 @@ def sink_caps(**flags):
     return caps
 
 
+class StripTest(unittest.TestCase):
+    def test_literals_are_emptied_and_comments_dropped(self):
+        src = 'let a = "x/*y{"; // c\nlet b = r#"}"#; /* n /* d */ */ let c = \'{\'; fn f<\'a>() {}'
+        out = cc.strip_comments(src)
+        self.assertNotIn("/*", out)
+        self.assertNotIn("//", out)
+        self.assertEqual(out.count("{"), out.count("}"))
+        self.assertIn("fn f<'a>()", out)
+
+    def test_ignored_functions_are_dropped(self):
+        src = "#[test]\nfn a() { x(); }\n#[test]\n#[ignore]\nfn b() { if y { z(); } }\nfn c() {}"
+        out = cc.drop_ignored_tests(src)
+        self.assertIn("fn a()", out)
+        self.assertNotIn("z()", out)
+        self.assertIn("fn c()", out)
+
+
 class CoverageTest(unittest.TestCase):
     def setUp(self):
         self.repos = []
@@ -110,6 +127,22 @@ class CoverageTest(unittest.TestCase):
         r = self.repo(sinks={"x": sink_caps(idempotent_writes=True)})
         r.crate("sink", "x", "", ALL_SINK_CALLS + "// assert_idempotent_replay(&s, c).await;")
         self.assertEqual(len(r.check()), 1)
+
+    def test_ignored_test_call_does_not_count(self):
+        r = self.repo(sinks={"x": sink_caps(idempotent_writes=True)})
+        r.crate(
+            "sink",
+            "x",
+            "",
+            ALL_SINK_CALLS
+            + '#[tokio::test]\n#[ignore = "needs a backend"]\nasync fn eo() { if true { assert_idempotent_replay(&s, c).await; } }',
+        )
+        self.assertEqual(len(r.check()), 1)
+
+    def test_override_after_a_comment_opener_inside_a_string_is_seen(self):
+        r = self.repo(sinks={"x": sink_caps()})
+        r.crate("sink", "x", 'const G: &str = "out/*.parquet";\nfn write_batch_partial(&self) {}\n/// end */\n', ALL_SINK_CALLS)
+        self.assertTrue(any("write_batch_partial" in e or "partial" in e for e in r.check()))
 
     def test_interop_conformance_file_counts(self):
         r = self.repo(sinks={"x-y": sink_caps(idempotent_writes=True)})

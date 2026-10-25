@@ -124,6 +124,8 @@ pub(crate) async fn governance_for(req: GovernanceRequest<'_>) -> CliResult<Gove
         );
     }
     #[cfg(feature = "policy")]
+    let mut classifier = None;
+    #[cfg(feature = "policy")]
     if let Some(spec) = &node.policy {
         if crate::policy::quarantines(spec) && node.dlq.is_none() {
             return Err(CliError::Config(format!(
@@ -132,11 +134,13 @@ pub(crate) async fn governance_for(req: GovernanceRequest<'_>) -> CliResult<Gove
                 node.id
             )));
         }
-        let compiled =
+        let compiled = Arc::new(
             faucet_core::CompiledPolicy::compile(&crate::policy::runtime_spec(spec, node))
-                .map_err(|e| CliError::Config(format!("policy: {e}")))?;
+                .map_err(|e| CliError::Config(format!("policy: {e}")))?,
+        );
+        classifier = Some(Arc::clone(&compiled));
         let mut p = faucet_core::PolicyGovernance::new(
-            Arc::new(compiled),
+            compiled,
             faucet_core::SinkFacts {
                 id: node.sink_ref.clone(),
                 kind: node.sink.kind.clone(),
@@ -166,7 +170,13 @@ pub(crate) async fn governance_for(req: GovernanceRequest<'_>) -> CliResult<Gove
         match profiling_scope_opt_out(node, opts) {
             Some(reason) => g = g.without(Pass::Profiling, reason),
             None => {
-                let p = Arc::new(Mutex::new(faucet_core::Profiler::new(spec.clone())));
+                #[allow(unused_mut)]
+                let mut profiler_value = faucet_core::Profiler::new(spec.clone());
+                #[cfg(feature = "policy")]
+                if let Some(c) = classifier.clone() {
+                    profiler_value = profiler_value.withhold_classified_values(c);
+                }
+                let p = Arc::new(Mutex::new(profiler_value));
                 g = g.with_profiler(Arc::clone(&p));
                 profiler = Some(p);
             }
@@ -303,14 +313,22 @@ pub(crate) fn topology_sink_governance(req: TopologySinkRequest<'_>) -> CliResul
                 req.node_id
             )));
         }
-        let compiled = faucet_core::CompiledPolicy::compile(&crate::policy::topology_runtime_spec(
-            policy_spec,
-            cfg,
-        ))
-        .map_err(|e| CliError::Config(format!("policy: {e}")))?;
+        let compiled = Arc::new(
+            faucet_core::CompiledPolicy::compile(&crate::policy::topology_runtime_spec(
+                policy_spec,
+                cfg,
+            ))
+            .map_err(|e| CliError::Config(format!("policy: {e}")))?,
+        );
+        if let Some(prof) = &profiler {
+            let mut guard = prof.lock().unwrap_or_else(|e| e.into_inner());
+            let taken =
+                std::mem::replace(&mut *guard, faucet_core::Profiler::new(Default::default()));
+            *guard = taken.withhold_classified_values(Arc::clone(&compiled));
+        }
         #[allow(unused_mut)]
         let mut p = faucet_core::PolicyGovernance::new(
-            Arc::new(compiled),
+            compiled,
             faucet_core::SinkFacts {
                 id: req.node_id.to_string(),
                 kind: req.kind.to_string(),

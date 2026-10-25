@@ -568,6 +568,19 @@ pub enum CliError {
     #[error("{failed} test case(s) failed")]
     TestsFailed { failed: usize },
 
+    /// A DLQ replay failed after some pages had already been written. Those
+    /// rows are in the sink; re-running the replay writes them again unless
+    /// the sink dedups by key.
+    #[error(
+        "dlq replay failed after writing {records_written} of {candidates} candidate record(s) \
+         (re-running replays them again unless the sink uses `write_mode: upsert`): {error}"
+    )]
+    ReplayFailed {
+        records_written: usize,
+        candidates: usize,
+        error: String,
+    },
+
     /// One or more `faucet backfill` units failed. The per-unit report is
     /// printed by the command (progress is already durably recorded, so
     /// `--resume` retries only the failures); `main` maps this to an exit

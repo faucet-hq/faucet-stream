@@ -1052,7 +1052,7 @@ matrix:
     fn keyed_writes_make_dlq_all_safe() {
         let keyed = crate::config::ConnectorSpec {
             kind: "sqlite".into(),
-            config: serde_json::json!({"write_mode": "upsert", "key": ["id"]}),
+            config: serde_json::json!({"column_mapping": "auto_map", "write_mode": "upsert", "key": ["id"]}),
             transforms: None,
             inherit_transforms: true,
             status: None,

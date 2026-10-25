@@ -50,6 +50,11 @@ or file that does not resolve refuses the start, and a token that still holds
 and files an auth config reads are then out of reach of every config the
 server loads (see [Server credentials](#server-credentials)).
 
+Principal names must be unique and non-empty. The names the server gives its
+own actors — `runtime`, and any name starting with `system:`, `trigger:` or
+`sync:` — are reserved and refuse the start, so audit records and change
+requests attributed to them can never be confused with a configured principal.
+
 The same file may carry an `approvals:` block — who may approve which
 [change requests](../cookbook/approvals.md), how many approvals each kind
 needs, whether a requester may approve their own, and how long a request
@@ -431,7 +436,7 @@ template) `POST /v1/templates/{id}/runs`, `run_template` and a template trigger.
 | `GET` | `/v1/connect/providers` | `200` | The `--connect-providers` providers |
 | `POST` | `/v1/tenants/{tenant}/runs` | `202` | A `POST /v1/runs` body, run as the tenant — operator / `RunWrite` |
 | `POST` | `/v1/tenants/{tenant}/templates/{id}/runs` | `202` | A template trigger, run as the tenant — operator / `RunWrite` |
-| `POST` | `/v1/templates/{id}/fanout` | `200` | Trigger a template once per tenant (`tenants: "all" \| [ids]`, `concurrency`) — operator / `RunWrite` |
+| `POST` | `/v1/templates/{id}/fanout` | `200` | Trigger a template once per tenant (`tenants: "all" \| [ids]`, `fanout_concurrency`) — operator / `RunWrite` |
 | `GET` | `/healthz` | `200` | Liveness (unauthenticated) |
 | `GET` | `/readyz` | `200`/`503` | Readiness (unauthenticated) |
 | `GET` | `/metrics` | `200` | Prometheus exposition (unauthenticated) |
@@ -472,6 +477,9 @@ Request body:
   the tenant a run is for, so two tenants sending the same key start two runs.
   The prefixes `tenant:`, `trig:`, `backfill:` and `change:` are reserved for
   the keys the server derives itself; a caller's key starting with one is a `400`.
+  The request is identified by the config as submitted (before references
+  resolve, merged with `--default-config`); a key claimed by the previous
+  release, which identified it by the resolved config, still replays.
 - **`clock`** — overrides the `${now.*}` clock for backfills (default: submit time).
 - **`concurrency`** — overrides this run's **connector** concurrency: how many
   concurrent connections/fetches the source and sink may use, whatever the
@@ -511,10 +519,12 @@ submitted config (submitted values win).
 
 Query parameters: `status`, `name`, `since`, `until` (RFC3339), `limit` (default
 50, max 500), `cursor`. Ordering is `(submitted_at DESC, run_id DESC)`; `cursor`
-is the last `run_id` from the previous page.
+is the previous page's `next_cursor` — the last row's sort key
+(`<submitted_at>~<run_id>`), so paging stays correct when that run is deleted or
+purged between requests. A bare `run_id` is still accepted.
 
 ```json
-{ "runs": [ { "run_id": "…", "status": "completed", … } ], "next_cursor": "0192…" }
+{ "runs": [ { "run_id": "…", "status": "completed", … } ], "next_cursor": "2026-10-01T12:00:00.000000000Z~0192…" }
 ```
 
 ### `GET /v1/runs/{id}` → `RunRecord`
@@ -687,7 +697,9 @@ unresolved (`${env:}` / `${file:}` / secret references stay tokens and resolve
 when the approved run executes), so a trigger that supplies a `secret: true`
 param or `env` overrides is refused with `422`. Responses mask what the reader
 may not see: callback `headers` for everyone but an admin, and the proposed
-`config` for a principal that cannot approve (a viewer). A tenant-scoped
+`config` for a principal that cannot approve (a viewer). The body a
+`template_register` change proposes is masked for everyone but an unscoped
+admin, as on `GET /v1/templates/{id}`; the plan is not. A tenant-scoped
 principal cannot `POST /v1/changes` (`403`); its gated template triggers
 become change requests on their own.
 
@@ -847,7 +859,13 @@ later), `not_on_disk` (already gone — a no-op, and the record is marked expire
 `already_deleted`, `delete_failed`, `relative_path` (a row recorded before paths
 were stored absolute — it would resolve against the sweeper's directory, not the
 writer's), or `other_host` (another host wrote the file; each row records its
-writer's host, and only a sweeper there deletes it).
+writer's host, and only a sweeper there deletes it). The host identity is the
+`FAUCET_HOST_ID` environment variable when set, else the host name: set it to a
+stable value (e.g. the StatefulSet pod name or the volume's name) when a
+container's host name changes on restart but its output volume persists, or
+outputs written before a restart are never collected. `changed` means the file
+at the recorded path is not the one faucet wrote (each row records the device
+and inode of the file it wrote): somebody else's file is never deleted.
 
 `in_flight` covers two cases, because one is not enough: the output's ledger row
 names a run that is currently executing, **or** the file itself was touched
@@ -889,7 +907,10 @@ this file" cannot be reconstructed after the fact.
 
 An output in state `external` is **never** previewed (`403`). faucet wrote to that
 file but did not create it, so its contents are not faucet's to hand out — the
-read-side twin of the retention GC's refusal to delete it.
+read-side twin of the retention GC's refusal to delete it. The GC's other two
+refusals apply as well (`409`): an output recorded with a relative path, and one
+written on another host (in a cluster, the same path on this host is a
+different file — preview it from the writing instance).
 
 The request names a **ledger id**, never a path: the path comes from the row the
 sink wrote, so a preview cannot be aimed at another file.
@@ -1048,8 +1069,9 @@ private hostname is a `422`), and a re-register can never change a template's
 kind under the same id. A trigger on a source template without `sink` is a `422`
 naming the field; `sink` on a pipeline template is a `422`; a trigger on a sink
 template is a `422` pointing at the source side. The composed run's `name` is
-the source template's, so its state keys (`{source}::{stream}`) survive a sink
-swap, and the run is labelled `sink_template` / `sink_template_version` beside
+the pairing (`{source}.{sink}`), so its state keys are scoped to that sink; a
+deployment overlay with `state_scope: source` names it after the source
+template so the keys survive a sink swap. The run is labelled `sink_template` / `sink_template_version` beside
 `template` / `template_version`. Registering a document with no `kind:` still
 works as a pipeline but is deprecated: add `kind: pipeline`.
 
@@ -1117,7 +1139,10 @@ re-launching the live version is a no-op, which keeps `previous` a real rollback
 target. `GET /v1/templates/{id}` returns `status`, `versions` (newest first),
 `stable` / `previous` / `newest`, `is_stable`, the `tags` pointer map, and the
 `launches` log — so a client can pin, promote, launch, or roll back without a
-second request. Use `?version=newest` to read a `draft` template.
+second request. Use `?version=newest` to read a `draft` template. The stored
+`body` is returned only to an admin with no tenant scope; anyone else gets an
+empty `body` and `body_withheld: true` (the parameter surface stays in
+`params`), the same rule as a run's `config_body`.
 
 The trigger body's `params` / `env` / `version` / `sink` / `sink_version` /
 `overlay` / `overlay_version` are template-specific; every other field (`name`, `labels`, `timeout_secs`,
@@ -1323,7 +1348,7 @@ no-op an hour later):
 | Host is link-local / cloud-metadata (`169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`, `100.100.100.200`, `metadata.google.internal`, …) | Closes the instance-metadata SSRF hole. Override by naming the host in `--callback-allow-host`. |
 | A **tenant-scoped** principal names a loopback, private, shared (`100.64.0.0/10`), unique-local (`fc00::/7`) or unspecified address, or `localhost` | A tenant cannot submit a config, so its callback must not reach the server's own host or network. Override by naming the host in `--callback-allow-host`. |
 | `--callback-allow-host` is set and the host is not in it | Explicit allowlist mode. |
-| `headers` supplied on a **clustered** server | A clustered submit persists the run record — including these values — into the shared run-history database for a peer to execute, which would store them in clear text. Authenticate without a request header (e.g. a capability token in a single-use URL path), or submit to a non-clustered server. |
+| `headers` supplied to a server with a **persistent run history** (`--history sqlite:` / `postgres://`, clustered or not) | The server stores the run record — including these values — in its history database, which would keep them in clear text. Authenticate without a request header (e.g. a capability token in a single-use URL path), or submit to a server with in-memory run history. |
 | `extra_fields` key collides with a faucet-emitted field | Would let a submission spoof the `status`/`event` a receiver keys off. |
 | `on` contains a non-terminal status | |
 | Supplied on `POST /v1/backfill` | One backfill POST fans out into N unit runs, so a single callback has no single run to describe. Poll the unit runs by their `backfill` label instead. |

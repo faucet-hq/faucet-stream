@@ -1313,44 +1313,85 @@ impl SpannerDriver {
         Ok(count)
     }
 
-    /// Write a batch and report per-row outcomes.
-    ///
-    /// Append mode delegates to `write_batch` (all-or-nothing per chunk). In
-    /// upsert/delete mode the good rows are applied and rows whose key could
-    /// not be extracted are reported as per-row `Err` so the pipeline routes
-    /// them to the DLQ.
+    /// Write a batch and report per-row outcomes: a row whose key cannot be
+    /// extracted or whose values cannot be encoded fails on its own (and is
+    /// DLQ-routed); the rest are committed.
     async fn write_rows(
         &self,
         calls: &CallSlot,
         records: &[Value],
     ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
-        if matches!(self.config.write.write_mode, faucet_core::WriteMode::Append) {
-            self.write_records(calls, records).await?;
-            return Ok(records.iter().map(|_| Ok(())).collect());
+        let mut outcomes: Vec<faucet_core::RowOutcome> = records.iter().map(|_| Ok(())).collect();
+        if records.is_empty() {
+            return Ok(outcomes);
         }
-
         let meta = self.require_meta(calls, records).await?;
-        validate_key_matches_pk(&self.config.write.key, &meta.pk, &self.config.table_name)?;
-        let plan = faucet_core::plan_writes(records, &self.config.write);
-
         let table = &self.config.table_name;
-        let mut planned: Vec<Planned> = Vec::with_capacity(plan.upserts.len() + plan.deletes.len());
-        {
+        let mode = self.config.write.write_mode.as_str();
+        let mut planned: Vec<Planned> = Vec::with_capacity(records.len());
+        if matches!(self.config.write.write_mode, faucet_core::WriteMode::Append) {
             let mut warned = self
                 .warned_fields
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for record in &plan.upserts {
-                let p =
-                    build_row_mutation(table, record, &meta, WriteOp::InsertOrUpdate, &mut warned)
-                        .map_err(|msg| FaucetError::Sink(format!("spanner upsert: {msg}")))?;
-                planned.push(p);
+            for (idx, record) in records.iter().enumerate() {
+                match build_row_mutation(table, record, &meta, WriteOp::InsertOrUpdate, &mut warned)
+                {
+                    Ok(p) => planned.push(p),
+                    Err(msg) => {
+                        outcomes[idx] = Err(FaucetError::Sink(format!("spanner append: {msg}")));
+                    }
+                }
             }
-        }
-        for key_tuple in &plan.deletes {
-            let p = build_delete_mutation(table, key_tuple, &meta)
-                .map_err(|msg| FaucetError::Sink(format!("spanner delete: {msg}")))?;
-            planned.push(p);
+        } else {
+            validate_key_matches_pk(&self.config.write.key, &meta.pk, table)?;
+            let plan = faucet_core::plan_writes(records, &self.config.write);
+            let mut failed_keys: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            {
+                let mut warned = self
+                    .warned_fields
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                for record in &plan.upserts {
+                    match build_row_mutation(
+                        table,
+                        record,
+                        &meta,
+                        WriteOp::InsertOrUpdate,
+                        &mut warned,
+                    ) {
+                        Ok(p) => planned.push(p),
+                        Err(msg) => {
+                            if let Some(k) =
+                                faucet_core::write_mode::record_key(record, &self.config.write.key)
+                            {
+                                failed_keys.insert(faucet_core::key_to_doc_id(&k, ""), msg);
+                            }
+                        }
+                    }
+                }
+            }
+            for key_tuple in &plan.deletes {
+                match build_delete_mutation(table, key_tuple, &meta) {
+                    Ok(p) => planned.push(p),
+                    Err(msg) => {
+                        failed_keys.insert(faucet_core::key_to_doc_id(key_tuple, ""), msg);
+                    }
+                }
+            }
+            if !failed_keys.is_empty() {
+                for (idx, record) in records.iter().enumerate() {
+                    let msg = faucet_core::write_mode::record_key(record, &self.config.write.key)
+                        .and_then(|k| failed_keys.get(&faucet_core::key_to_doc_id(&k, "")));
+                    if let Some(msg) = msg {
+                        outcomes[idx] = Err(FaucetError::Sink(format!("spanner {mode}: {msg}")));
+                    }
+                }
+            }
+            for (idx, msg) in &plan.failed {
+                outcomes[*idx] = Err(FaucetError::Sink(format!("spanner {mode}: {msg}")));
+            }
         }
         for chunk in chunk_by_cells(planned, self.config.batch_size, CELL_BUDGET) {
             self.client
@@ -1358,14 +1399,6 @@ impl SpannerDriver {
                 .within(calls, "commit")
                 .await?
                 .map_err(|e| sink_err("commit", e))?;
-        }
-
-        let mut outcomes: Vec<faucet_core::RowOutcome> = records.iter().map(|_| Ok(())).collect();
-        for (idx, msg) in &plan.failed {
-            outcomes[*idx] = Err(FaucetError::Sink(format!(
-                "spanner {}: {msg}",
-                self.config.write.write_mode.as_str()
-            )));
         }
         Ok(outcomes)
     }

@@ -144,9 +144,10 @@ fn a_fanout_token_inside_a_longer_sql_string_is_refused() {
     let yaml = "version: 1\nname: x\npipeline:\n  sources:\n    parents:\n      type: csv\n      \
                 config: { path: p.csv }\n    items:\n      type: sqlite\n      config:\n        \
                 database_url: 'sqlite::memory:'\n        query: \"SELECT * FROM t WHERE n = \
-                'k-${p.id}'\"\n  sinks:\n    out:\n      type: jsonl\n      config: { path: \
+                'k-${p.id}'\"\n  sinks:\n    trash:\n      type: jsonl\n      config: { path: \
+                t.jsonl }\n    out:\n      type: jsonl\n      config: { path: \
                 'o/${p.id}.jsonl' }\nmatrix:\n  - id: p\n    source: { ref: parents }\n    \
-                sink: { ref: out }\n  - id: c\n    parent: p\n    parent_key: id\n    source: { \
+                sink: { ref: trash }\n  - id: c\n    parent: p\n    parent_key: id\n    source: { \
                 ref: items }\n    sink: { ref: out }\n";
     let e = expand_err(yaml);
     assert!(e.contains("longer quoted string"), "{e}");

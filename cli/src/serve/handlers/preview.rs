@@ -203,6 +203,25 @@ fn source_spec(record: &LocalOutputRecord, rows: RowCap) -> Result<PreviewReques
             record.path
         )));
     }
+    // The same refusals the retention sweep applies: a relative path resolves
+    // against this process's working directory, and a path recorded on another
+    // host names a different file here.
+    if !record.fs_path().is_absolute() {
+        return Err(ServeError::Conflict(format!(
+            "`{}` was recorded as a relative path, so it cannot be located reliably \
+             from this server. Re-run the pipeline with an absolute output path.",
+            record.path
+        )));
+    }
+    if let (Some(writer), Some(here)) = (&record.host, crate::local_outputs::local_host())
+        && *writer != here
+    {
+        return Err(ServeError::Conflict(format!(
+            "`{}` was written on host `{writer}`; the same path on this host (`{here}`) is \
+             a different file. Preview it from the instance on `{writer}`.",
+            record.path
+        )));
+    }
     if !record.fs_path().exists() {
         return Err(ServeError::Conflict(format!(
             "`{}` is no longer on disk (removed outside faucet). The ledger row is \
@@ -341,6 +360,7 @@ mod tests {
             replaced: false,
             retention_days: None,
             observed_at: Utc::now(),
+            file_id: None,
         })
     }
 
@@ -462,6 +482,27 @@ mod tests {
             }
             other => panic!("expected Forbidden, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_relative_or_other_host_output_is_not_previewed() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = touch(dir.path(), "out.jsonl");
+        let mut r = record(FsPath::new("out.jsonl"), "jsonl");
+        match source_spec(&r, RowCap::Rows(10)).unwrap_err() {
+            ServeError::Conflict(m) => assert!(m.contains("relative path"), "{m}"),
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+        r = record(&p, "jsonl");
+        r.host = Some("definitely-another-host.invalid".into());
+        if crate::local_outputs::local_host().is_some() {
+            match source_spec(&r, RowCap::Rows(10)).unwrap_err() {
+                ServeError::Conflict(m) => assert!(m.contains("written on host"), "{m}"),
+                other => panic!("expected Conflict, got {other:?}"),
+            }
+        }
+        r.host = crate::local_outputs::local_host();
+        assert!(source_spec(&r, RowCap::Rows(10)).is_ok());
     }
 
     #[test]
@@ -594,6 +635,7 @@ mod tests {
             replaced: false,
             retention_days: None,
             observed_at: Utc::now(),
+            file_id: None,
         };
         state.history().local_output_record(&obs).await.unwrap();
         let id = crate::local_outputs::ledger::output_id(&path);
@@ -642,6 +684,7 @@ mod tests {
                 replaced: false,
                 retention_days: None,
                 observed_at: Utc::now(),
+                file_id: None,
             })
             .await
             .unwrap();
@@ -685,6 +728,7 @@ mod tests {
                 replaced: false,
                 retention_days: None,
                 observed_at: Utc::now(),
+                file_id: None,
             })
             .await
             .unwrap();
@@ -845,6 +889,7 @@ mod tests {
                 replaced: false,
                 retention_days: None,
                 observed_at: Utc::now(),
+                file_id: None,
             })
             .await
             .unwrap();

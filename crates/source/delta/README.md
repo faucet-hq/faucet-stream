@@ -16,7 +16,9 @@ Fabric) write.
 - **Projection pushdown** — `columns` limits the columns read.
 - **Partition-aware** — partition-column values are read from each add
   action's `partitionValues` in the log (authoritative, whatever the file path
-  looks like) and merged into every row, typed against the table schema.
+  looks like) and merged into every row, typed against the table schema and rendered like a
+  data column of the same type (timestamps RFC 3339, decimals at the column's
+  scale, binary as base64).
 - **Column mapping is refused** — a table with `delta.columnMapping.mode` set
   stores physical column names in its data files, which this source does not
   translate, so it fails the read instead of emitting `col-<uuid>` keys.

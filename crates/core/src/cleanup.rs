@@ -238,13 +238,17 @@ impl CleanupPolicy {
     }
 }
 
-/// The set of key tuples an invocation wrote, accumulated across pages.
+/// The set of distinct key tuples an invocation wrote, accumulated across
+/// pages. A key written more than once (an update repeated across pages, a
+/// retried write) is kept once, so the ceiling bounds distinct keys. Values
+/// compare by their exact JSON, so a typed store never loses a spelling.
 ///
 /// Deliberately stores only keys, not records: memory is O(rows in scope × key
 /// width) rather than O(payload).
 #[derive(Debug, Default)]
 pub struct SeenKeys {
     keys: Vec<KeyTuple>,
+    seen: std::collections::HashSet<String>,
     /// Set once the ceiling is breached. Sticky: a cleanup that lost track of
     /// even one key must not run at all.
     overflowed: bool,
@@ -279,11 +283,17 @@ impl SeenKeys {
             if !complete {
                 continue;
             }
+            let canonical = canonical_key_text(&tuple);
+            if self.seen.contains(&canonical) {
+                continue;
+            }
             if self.keys.len() >= max_keys {
                 self.overflowed = true;
-                self.keys.clear(); // free the buffer; the cleanup will refuse
+                self.keys = Vec::new(); // free the buffer; the cleanup will refuse
+                self.seen = std::collections::HashSet::new();
                 return;
             }
+            self.seen.insert(canonical);
             self.keys.push(KeyTuple(tuple));
         }
     }
@@ -317,6 +327,14 @@ impl SeenKeys {
              a delete of this size"
         ))
     }
+}
+
+fn canonical_key_text(tuple: &[(String, Value)]) -> String {
+    let parts: Vec<String> = tuple
+        .iter()
+        .map(|(_, v)| crate::util::canonical_json(v))
+        .collect();
+    serde_json::to_string(&parts).expect("a Vec<String> always serializes")
 }
 
 /// A sink wrapper that records the key tuples written through it (#478).
@@ -769,5 +787,19 @@ mod tests {
             .unwrap();
         assert!(t.finish(&policy).await.is_err());
         assert!(t.overflowed());
+    }
+
+    #[test]
+    fn repeated_keys_count_once_against_the_ceiling() {
+        let mut seen = SeenKeys::new();
+        let key = vec!["id".to_string()];
+        let page: Vec<Value> = (0..3).map(|i| json!({"id": i})).collect();
+        for _ in 0..10 {
+            seen.record_page(&page, &key, 3);
+        }
+        assert!(!seen.overflowed(), "3 distinct keys fit a ceiling of 3");
+        assert_eq!(seen.len(), 3);
+        seen.record_page(&[json!({"id": 3})], &key, 3);
+        assert!(seen.overflowed(), "a fourth distinct key trips it");
     }
 }

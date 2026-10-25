@@ -13,6 +13,7 @@
 use faucet_common_kafka::{CompressionType, KafkaAuth, KafkaValueFormat, OnKeyError};
 use faucet_core::idempotency::format_token;
 use faucet_core::{DEFAULT_BATCH_SIZE, Sink};
+use faucet_sink_kafka::config::KafkaExactlyOnceSpec;
 use faucet_sink_kafka::{Acks, KafkaSink, KafkaSinkConfig, KafkaSinkTopic};
 use rdkafka::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
@@ -152,24 +153,30 @@ async fn exactly_once_round_trip_and_no_duplicates_on_resume() {
 async fn a_transactional_id_prefix_isolates_commit_tokens() {
     let (_container, brokers) = start_kafka().await;
     let scope = "shared::row0";
-    let with_prefix = |prefix: Option<&str>| {
+    let with_prefix = |prefix: Option<&str>, migrate: bool| {
         let mut cfg = eo_config(&brokers, "eo_isolated");
-        cfg.transactional_id_prefix = prefix.map(str::to_string);
+        cfg.exactly_once = Some(KafkaExactlyOnceSpec {
+            transactional_id_prefix: prefix.map(str::to_string),
+            migrate_unprefixed_token: migrate,
+            ..KafkaExactlyOnceSpec::default()
+        });
         cfg
     };
 
-    let legacy = KafkaSink::new(with_prefix(None)).await.unwrap();
+    let legacy = KafkaSink::new(with_prefix(None, false)).await.unwrap();
     legacy
         .write_batch_idempotent(&[json!({"id": 1})], scope, &format_token(3))
         .await
         .unwrap();
     legacy.flush().await.unwrap();
 
-    let staging = KafkaSink::new(with_prefix(Some("staging"))).await.unwrap();
+    let staging = KafkaSink::new(with_prefix(Some("staging"), false))
+        .await
+        .unwrap();
     assert_eq!(
         staging.last_committed_token(scope).await.unwrap(),
-        Some(format_token(3)),
-        "before its first write a prefixed sink falls back to the bare-scope token"
+        None,
+        "a prefixed sink never adopts an unprefixed environment's token by default"
     );
     staging
         .write_batch_idempotent(&[json!({"id": 2})], scope, &format_token(7))
@@ -177,11 +184,13 @@ async fn a_transactional_id_prefix_isolates_commit_tokens() {
         .unwrap();
     staging.flush().await.unwrap();
 
-    let prod = KafkaSink::new(with_prefix(Some("prod"))).await.unwrap();
+    let prod = KafkaSink::new(with_prefix(Some("prod"), true))
+        .await
+        .unwrap();
     assert_eq!(
         prod.last_committed_token(scope).await.unwrap(),
         Some(format_token(3)),
-        "prod never sees staging's token, only the legacy one"
+        "a migrating sink reads the bare-scope token, never staging's"
     );
     prod.write_batch_idempotent(&[json!({"id": 3})], scope, &format_token(1))
         .await

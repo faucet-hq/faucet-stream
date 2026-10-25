@@ -47,7 +47,7 @@ Singer **target** as a faucet sink; the protocol types both share live in
 | `args` | string[] | `[]` | Extra args appended after faucet's `--config`/`--catalog`/`--state` |
 | `tap_config` | object | `{}` | The tap's config (secret-resolved by faucet; written to a private temp file) |
 | `catalog` | object | — | Singer catalog, passed as `--catalog` |
-| `state_key` | string | `singer:{executable}:{stream}` | State-store key for the resume bookmark |
+| `state_key` | string | `singer:{executable}:{stream}` (characters a state key cannot hold become `_` in the executable; a stream name that would make the key invalid is sanitized the same way and gets a short hash of the raw name appended, so distinct names never share a key) | State-store key for the resume bookmark |
 | `flush_on_state` | bool | `true` | Flush a page (and checkpoint) on every STATE message |
 | `idle_timeout_secs` | int / null | `3600` | Abort if no output arrives within this many seconds (`null` waits forever). Also bounds `--discover` |
 | `max_line_bytes` | int | `67108864` (64 MiB) | Longest tap output line accepted; a longer one fails the run instead of exhausting memory |

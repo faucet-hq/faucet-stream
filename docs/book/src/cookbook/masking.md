@@ -117,7 +117,7 @@ The `action` block is tagged by `type`:
 
 | `type` | Behavior | Options |
 |--------|----------|---------|
-| `redact` | Replace the value wholesale with a fixed `mask`. Irreversible, not joinable. | `mask` — any JSON value; default `"***"`. Set `mask: null` to null the field (e.g. for a nullable DB column). |
+| `redact` | Replace the value wholesale with a fixed `mask` (a `null` value is left `null`, so null checks still see it). Irreversible, not joinable. | `mask` — any JSON value; default `"***"`. Set `mask: null` to null the field (e.g. for a nullable DB column). |
 | `hash` | Replace with a hex digest — HMAC-SHA256 when a `key` is set, plain SHA-256 otherwise. Deterministic → joinable; irreversible. | — |
 | `tokenize` | Replace with a short opaque token derived from the keyed digest. Deterministic → joinable. | `prefix` — optional literal prepended to every token (e.g. `usr_`); when set it must be non-empty. |
 | `partial` | Reveal only the last `keep_last` characters, masking the rest. Preserves format/length for readability (e.g. `****1234`). | `keep_last` — trailing chars kept (default `4`); if `keep_last >= len` the whole value is masked, so a short value never leaks whole. `mask_char` — masking character (default `*`). |

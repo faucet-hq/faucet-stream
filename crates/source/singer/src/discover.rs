@@ -103,7 +103,7 @@ pub fn select_streams(catalog: &Value, target: &str) -> StreamSelection {
     let mut warnings: Vec<String> = Vec::new();
 
     let ids = catalog_stream_ids(&catalog);
-    if !ids.iter().any(|s| s == target) {
+    let Some(target) = resolve_stream_id(&catalog, &ids, target) else {
         warnings.push(format!(
             "stream '{target}' not found in the discovered catalog; available: {}",
             if ids.is_empty() {
@@ -117,23 +117,21 @@ pub fn select_streams(catalog: &Value, target: &str) -> StreamSelection {
             selected,
             warnings,
         };
-    }
+    };
 
     // Transitive closure of parents, starting from the target.
-    let mut to_select = vec![target.to_string()];
+    let mut to_select = vec![target.clone()];
     let mut i = 0;
     while i < to_select.len() {
         let cur = to_select[i].clone();
-        if let Some(parent) = parent_stream_id(&catalog, &cur)
-            && !to_select.contains(&parent)
-        {
-            if ids.iter().any(|s| s == &parent) {
-                to_select.push(parent);
-            } else {
-                warnings.push(format!(
+        if let Some(parent) = parent_stream_id(&catalog, &cur) {
+            match resolve_stream_id(&catalog, &ids, &parent) {
+                Some(id) if to_select.contains(&id) => {}
+                Some(id) => to_select.push(id),
+                None => warnings.push(format!(
                     "stream '{cur}' references parent '{parent}', which is not in the \
                      catalog — select the parent manually"
-                ));
+                )),
             }
         }
         i += 1;
@@ -271,6 +269,21 @@ fn mark_selected(stream: &mut Value) {
 
 /// Extract the stream ids from a Singer catalog (`tap_stream_id`, falling back
 /// to `stream`), in catalog order.
+/// The catalog id of the stream named `name`: `name` itself when it is an id,
+/// else the id of the entry whose `stream` (the name the tap uses on RECORD)
+/// is `name`.
+fn resolve_stream_id(catalog: &Value, ids: &[String], name: &str) -> Option<String> {
+    if ids.iter().any(|s| s == name) {
+        return Some(name.to_string());
+    }
+    catalog
+        .get("streams")?
+        .as_array()?
+        .iter()
+        .find(|s| s.get("stream").and_then(Value::as_str) == Some(name))
+        .and_then(stream_id)
+}
+
 pub fn catalog_stream_ids(catalog: &Value) -> Vec<String> {
     catalog
         .get("streams")

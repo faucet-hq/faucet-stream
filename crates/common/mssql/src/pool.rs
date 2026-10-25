@@ -134,18 +134,62 @@ pub async fn build_pool(
 /// caller (`bb8-tiberius` never reports a connection broken). Replacing the
 /// client drops — and so closes — the stale one, which makes the server roll
 /// its transaction back, and leaves a clean connection in the pool slot.
+///
+/// The reconnect is bounded by [`RECONNECT_TIMEOUT`]. On failure the stale
+/// client stays in the slot, so the caller must not reuse the connection.
 pub async fn replace_connection(
     cfg: &MssqlConnectionConfig,
     conn: &mut MssqlPooledConnection<'_>,
 ) -> Result<(), FaucetError> {
-    use bb8::ManageConnection;
-    let fresh = manager(build_config(cfg)?)
-        .connect()
-        .await
-        .map_err(|e| FaucetError::Sink(format!("MSSQL reconnect failed: {e}")))?;
+    replace_connection_within(cfg, conn, &faucet_core::CallContext::new()).await
+}
+
+/// How long reconnecting a desynced connection may take.
+pub const RECONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// [`replace_connection`], metered through `ctx`'s round-trip recorder.
+///
+/// The reconnect is bounded only by [`RECONNECT_TIMEOUT`]: `ctx`'s deadline
+/// and cancel token do not stop it. A statement is usually cut short by
+/// exactly that cancel or deadline, and the pool has no way to discard a
+/// connection, so skipping the reconnect would hand the desynced client to the
+/// next caller.
+pub async fn replace_connection_within(
+    cfg: &MssqlConnectionConfig,
+    conn: &mut MssqlPooledConnection<'_>,
+    ctx: &faucet_core::CallContext,
+) -> Result<(), FaucetError> {
+    let bounded = reconnect_context(ctx);
+    let fresh = reconnect(cfg, &bounded).await?;
     let stale = std::mem::replace(&mut **conn, fresh);
     drop(stale);
     Ok(())
+}
+
+/// The context a reconnect runs under: `ctx`'s recorder, no retry, and
+/// [`RECONNECT_TIMEOUT`] as the only bound.
+fn reconnect_context(ctx: &faucet_core::CallContext) -> faucet_core::CallContext {
+    let bounded = faucet_core::CallContext::new()
+        .without_retry()
+        .with_timeout(RECONNECT_TIMEOUT);
+    match ctx.recorder() {
+        Some(recorder) => bounded.with_recorder(recorder.clone()),
+        None => bounded,
+    }
+}
+
+async fn reconnect(
+    cfg: &MssqlConnectionConfig,
+    ctx: &faucet_core::CallContext,
+) -> Result<<ConnectionManager as bb8::ManageConnection>::Connection, FaucetError> {
+    use bb8::ManageConnection;
+    use faucet_core::CallExt as _;
+    let manager = manager(build_config(cfg)?);
+    manager
+        .connect()
+        .within_ctx(ctx, "reconnect")
+        .await?
+        .map_err(|e| FaucetError::Sink(format!("MSSQL reconnect failed: {e}")))
 }
 
 /// Run a query future under `timeout`. On elapse, returns the error produced by
@@ -207,6 +251,65 @@ where
 #[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_reconnect_ends_at_the_call_timeout_and_cancel() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _silent = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        let cfg = MssqlConnectionConfig {
+            connection_url: Some(format!("mssql://sa:p@127.0.0.1:{port}/db")),
+            ..Default::default()
+        };
+        let ctx = faucet_core::CallContext::new().with_timeout(Duration::from_millis(200));
+        let started = std::time::Instant::now();
+        let err = reconnect(&cfg, &ctx).await.unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(matches!(err, FaucetError::Timeout { .. }), "{err}");
+
+        let token = faucet_core::CancellationToken::new();
+        token.cancel();
+        let ctx = faucet_core::CallContext::new().with_cancel(token);
+        let err = reconnect(&cfg, &ctx).await.unwrap_err();
+        assert!(matches!(err, FaucetError::Cancelled { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_reconnect_outlives_the_run_cancel_and_deadline() {
+        let token = faucet_core::CancellationToken::new();
+        token.cancel();
+        let recorder = std::sync::Arc::new(faucet_core::observability::RoundtripRecorder::new(
+            faucet_core::observability::RoundtripSide::Source,
+            "p",
+            "r",
+            "mssql",
+        ));
+        let run = faucet_core::CallContext::new()
+            .with_cancel(token)
+            .with_deadline(tokio::time::Instant::now())
+            .with_timeout(Duration::from_millis(1))
+            .with_recorder(recorder);
+        let ctx = reconnect_context(&run);
+        assert!(!ctx.is_cancelled());
+        assert!(ctx.cancel().is_none());
+        assert!(ctx.deadline().is_none());
+        assert_eq!(ctx.timeout(), Some(RECONNECT_TIMEOUT));
+        assert!(ctx.recorder().is_some(), "the reconnect is still metered");
+        assert!(
+            reconnect_context(&faucet_core::CallContext::new())
+                .recorder()
+                .is_none()
+        );
+    }
 
     #[tokio::test]
     async fn timeout_passes_through_completed_future() {

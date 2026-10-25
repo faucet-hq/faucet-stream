@@ -62,8 +62,8 @@ pub mod spec;
 pub mod sweep;
 
 pub use ledger::{
-    LocalOutputFilter, LocalOutputObservation, LocalOutputRecord, LocalOutputState, SkipReason,
-    SweepOutcome, SweepReport, SweepScope,
+    FileIdentity, LocalOutputFilter, LocalOutputObservation, LocalOutputRecord, LocalOutputState,
+    SkipReason, SweepOutcome, SweepReport, SweepScope,
 };
 pub use record::{RecordContext, record};
 pub use spec::LocalOutputsSpec;
@@ -75,12 +75,27 @@ pub use sweep::{SweepOptions, select};
 /// files it produced age out on the same clock by default.
 pub const DEFAULT_RETENTION_DAYS: u32 = 7;
 
-/// This machine's host name, stamped on every ledger row so a sweeper never
-/// deletes a path another host wrote (#789 CLI-45). `None` when the platform
-/// cannot say.
+/// Environment variable naming a stable host identity for the ledger, used
+/// instead of the host name (which changes on every container restart).
+pub const HOST_ID_ENV: &str = "FAUCET_HOST_ID";
+
+/// This machine's identity, stamped on every ledger row so a sweeper never
+/// deletes a path another host wrote (#789 CLI-45): `FAUCET_HOST_ID` when set,
+/// else the host name. `None` when neither is available.
 pub fn local_host() -> Option<String> {
     static HOST: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    HOST.get_or_init(read_host).clone()
+    HOST.get_or_init(|| resolve_host(std::env::var(HOST_ID_ENV).ok(), read_host))
+        .clone()
+}
+
+fn resolve_host(
+    configured: Option<String>,
+    system: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    match configured.map(|v| v.trim().to_string()) {
+        Some(id) if !id.is_empty() => Some(id),
+        _ => system(),
+    }
 }
 
 #[cfg(unix)]
@@ -99,4 +114,30 @@ fn read_host() -> Option<String> {
 #[cfg(not(unix))]
 fn read_host() -> Option<String> {
     std::env::var("COMPUTERNAME").ok().filter(|h| !h.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_host;
+
+    #[test]
+    fn a_configured_host_id_wins_over_the_host_name() {
+        assert_eq!(
+            resolve_host(Some(" faucet-0 ".into()), || Some("pod-abc".into())),
+            Some("faucet-0".into())
+        );
+    }
+
+    #[test]
+    fn an_empty_or_missing_host_id_falls_back_to_the_host_name() {
+        assert_eq!(
+            resolve_host(Some("  ".into()), || Some("pod".into())),
+            Some("pod".into())
+        );
+        assert_eq!(
+            resolve_host(None, || Some("pod".into())),
+            Some("pod".into())
+        );
+        assert_eq!(resolve_host(None, || None), None);
+    }
 }

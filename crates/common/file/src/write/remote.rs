@@ -666,26 +666,49 @@ struct RemoteStream {
     parts: Vec<Upload>,
 }
 
-/// Parts still uploading when the stream is dropped unfinished are stopped.
+/// Parts still uploading when the stream is dropped unfinished are stopped,
+/// and the upload itself is discarded in the background so its parts are not
+/// left stored (and billed) on the backend.
 impl Drop for RemoteStream {
     fn drop(&mut self) {
         for p in self.parts.drain(..) {
             p.abort();
+        }
+        let Some(upload) = self.upload.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    if let Err(e) = upload.abort().await {
+                        tracing::warn!(
+                            error = %e,
+                            "remote file sink: discarding an unfinished multipart upload failed"
+                        );
+                    }
+                });
+            }
+            Err(_) => tracing::warn!(
+                "remote file sink: an unfinished multipart upload was dropped outside a runtime \
+                 and could not be discarded"
+            ),
         }
     }
 }
 
 impl RemoteStream {
     /// Await every part started so far; the first error, after all ended.
+    /// Each part stays in `self.parts` until it ends, so a drain that is
+    /// dropped mid-await leaves the rest for `Drop` to stop.
     async fn drain(&mut self) -> Result<(), FaucetError> {
-        let parts = std::mem::take(&mut self.parts);
         let mut first = Ok(());
-        for p in parts {
+        while let Some(p) = self.parts.first_mut() {
             let r = p.await.unwrap_or_else(|e| {
                 Err(FaucetError::Sink(format!(
                     "remote file sink: a part upload did not finish: {e}"
                 )))
             });
+            self.parts.remove(0);
             if first.is_ok() {
                 first = r;
             }
@@ -732,11 +755,14 @@ impl PartStream for RemoteStream {
     }
 
     async fn finish(mut self: Box<Self>) -> Result<(), FaucetError> {
+        // The upload stays in `self` while the parts drain, so a finish
+        // dropped before `complete` still discards it in `Drop`.
+        let drained = self.drain().await;
         let upload = self
             .upload
             .take()
             .expect("an upload is open until it finishes or aborts");
-        match self.drain().await {
+        match drained {
             Ok(()) => upload.complete().await,
             Err(e) => {
                 let _ = upload.abort().await;
@@ -844,6 +870,7 @@ pub(crate) mod tests {
         pub now: AtomicUsize,
         pub peak: AtomicUsize,
         pub parts_put: AtomicUsize,
+        pub uploads_aborted: AtomicUsize,
         pub renames: AtomicUsize,
         pub lists: AtomicUsize,
         pub upload_scratch: AtomicBool,
@@ -974,7 +1001,10 @@ pub(crate) mod tests {
             })
         }
         fn abort(self: Box<Self>) -> BoxFuture<Result<(), FaucetError>> {
-            Box::pin(async { Ok(()) })
+            Box::pin(async move {
+                self.mem.uploads_aborted.fetch_add(1, SeqCst);
+                Ok(())
+            })
         }
     }
 
@@ -1009,6 +1039,60 @@ pub(crate) mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
         assert!(mem.keys().is_empty(), "{:?}", mem.keys());
         assert_eq!(mem.parts_put.load(SeqCst), 0);
+        assert_eq!(
+            mem.uploads_aborted.load(SeqCst),
+            1,
+            "the dropped upload is discarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finish_dropped_while_parts_upload_discards_the_upload() {
+        let mem = Arc::new(Mem::default());
+        mem.delay_ms.store(300, SeqCst);
+        let parts = MemParts {
+            mem: mem.clone(),
+            size: 1,
+        };
+        let mut stream = Box::new(RemoteStream {
+            upload: Some(parts.start("a/w").await.unwrap()),
+            slots: Arc::new(tokio::sync::Semaphore::new(4)),
+            next: 1,
+            parts: Vec::new(),
+        });
+        stream.put(vec![1]).await.unwrap();
+        stream.put(vec![2]).await.unwrap();
+        let pending =
+            tokio::time::timeout(std::time::Duration::from_millis(20), stream.finish()).await;
+        assert!(pending.is_err(), "finish was still draining when dropped");
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert_eq!(
+            mem.uploads_aborted.load(SeqCst),
+            1,
+            "the upload is discarded"
+        );
+        assert_eq!(mem.parts_put.load(SeqCst), 0, "in-flight parts are stopped");
+        assert!(mem.keys().is_empty(), "{:?}", mem.keys());
+    }
+
+    #[tokio::test]
+    async fn a_finished_stream_is_not_discarded_on_drop() {
+        let mem = Arc::new(Mem::default());
+        let parts = MemParts {
+            mem: mem.clone(),
+            size: 1,
+        };
+        let mut stream = Box::new(RemoteStream {
+            upload: Some(parts.start("a/z").await.unwrap()),
+            slots: Arc::new(tokio::sync::Semaphore::new(4)),
+            next: 1,
+            parts: Vec::new(),
+        });
+        stream.put(vec![7]).await.unwrap();
+        stream.finish().await.unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(mem.uploads_aborted.load(SeqCst), 0);
+        assert_eq!(mem.keys(), vec!["a/z".to_string()]);
     }
 
     #[test]

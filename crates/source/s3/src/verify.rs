@@ -21,6 +21,11 @@ static CRC64NVME: crc::Crc<u64> = crc::Crc::<u64>::new(&crc::CRC_64_NVME);
 
 /// Length check for one object body. `None` when verification is disabled or
 /// the store reported no usable (non-negative) `Content-Length`.
+///
+/// Applied whatever the object's `Content-Encoding`: S3 stores the bytes it
+/// was given and serves them as stored (`Content-Encoding` is only metadata),
+/// and the SDK does not decode it, so `Content-Length` always counts the bytes
+/// on the wire.
 pub fn length_check(
     content_length: Option<i64>,
     verify_length: bool,
@@ -119,8 +124,15 @@ fn non_multipart_md5(etag: &str) -> Option<String> {
     }
 }
 
-fn mismatch(name: &str, got: &str, want: &str) -> Result<(), String> {
-    if got.eq_ignore_ascii_case(want) {
+/// Compare a computed digest with the advertised one. Base64 is
+/// case-sensitive (`A` and `a` are different bits); only the hex MD5 is not.
+fn mismatch(name: &str, got: &str, want: &str, hex: bool) -> Result<(), String> {
+    let same = if hex {
+        got.eq_ignore_ascii_case(want)
+    } else {
+        got == want
+    };
+    if same {
         Ok(())
     } else {
         Err(format!(
@@ -170,7 +182,7 @@ impl IntegrityCheck for CrcCheck {
             CrcDigest::W32(d) => B64.encode(d.finalize().to_be_bytes()),
             CrcDigest::W64(d) => B64.encode(d.finalize().to_be_bytes()),
         };
-        mismatch(me.name, &got, &me.expected_b64)
+        mismatch(me.name, &got, &me.expected_b64, false)
     }
 }
 
@@ -196,7 +208,7 @@ impl IntegrityCheck for Sha256Check {
     fn finalize(self: Box<Self>, _total: u64) -> Result<(), String> {
         use sha2::Digest as _;
         let got = B64.encode(self.hasher.finalize());
-        mismatch("SHA256", &got, &self.expected_b64)
+        mismatch("SHA256", &got, &self.expected_b64, false)
     }
 }
 
@@ -223,7 +235,7 @@ impl IntegrityCheck for Md5HexCheck {
         use md5::Digest as _;
         let digest = self.hasher.finalize();
         let got: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-        mismatch("MD5(ETag)", &got, &self.expected_hex)
+        mismatch("MD5(ETag)", &got, &self.expected_hex, true)
     }
 }
 
@@ -273,6 +285,13 @@ mod tests {
     // sha256 = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
     // crc32  = 0x3610a686 (CRC-32/ISO-HDLC, the zip CRC)
     // crc32c = 0x9a71bb4c (CRC-32C / iSCSI)
+
+    #[test]
+    fn base64_digests_compare_case_sensitively_hex_does_not() {
+        assert!(mismatch("CRC32", "NHIMHG==", "Nhimhg==", false).is_err());
+        assert!(mismatch("CRC32", "Nhimhg==", "Nhimhg==", false).is_ok());
+        assert!(mismatch("MD5(ETag)", "ABCDEF", "abcdef", true).is_ok());
+    }
 
     #[tokio::test]
     async fn sha256_match_and_mismatch() {

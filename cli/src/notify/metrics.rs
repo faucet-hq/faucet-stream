@@ -3,7 +3,7 @@
 //! - `faucet_notifications_sent_total{channel,event,outcome}` — deliveries
 //!   attempted; `outcome` ∈ `ok` | `error`.
 //! - `faucet_notifications_dropped_total{channel,reason}` — events not
-//!   delivered; `reason` ∈ `coalesced` | `channel_error` | `severity_gated`.
+//!   delivered; `reason` ∈ `coalesced` | `channel_error`.
 //! - `faucet_notification_dispatch_duration_seconds{channel}` — per-delivery
 //!   latency.
 //!

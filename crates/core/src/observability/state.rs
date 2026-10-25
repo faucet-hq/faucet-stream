@@ -129,6 +129,72 @@ impl StateStore for InstrumentedStateStore {
             }
         }
     }
+
+    async fn check(
+        &self,
+        ctx: &crate::check::CheckContext,
+    ) -> Result<crate::check::CheckReport, FaucetError> {
+        self.inner.check(ctx).await
+    }
+
+    fn supports_list(&self) -> bool {
+        self.inner.supports_list()
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<String>, FaucetError> {
+        self.count_error("list", self.inner.list(prefix).await)
+    }
+
+    fn supports_compare_and_put(&self) -> bool {
+        self.inner.supports_compare_and_put()
+    }
+
+    async fn compare_and_put(
+        &self,
+        key: &str,
+        expected: Option<&Value>,
+        value: &Value,
+    ) -> Result<bool, FaucetError> {
+        let base = self.base_labels();
+        let _timer = DurationGuard::new("faucet_state_put_duration_seconds", base.clone());
+        let written = self.count_error(
+            "compare_and_put",
+            self.inner.compare_and_put(key, expected, value).await,
+        )?;
+        if written {
+            counter!("faucet_state_put_total", base).increment(1);
+        }
+        Ok(written)
+    }
+
+    fn supports_atomic_batch(&self) -> bool {
+        self.inner.supports_atomic_batch()
+    }
+
+    async fn put_batch(&self, entries: &[(String, Value)]) -> Result<(), FaucetError> {
+        let base = self.base_labels();
+        let _timer = DurationGuard::new("faucet_state_put_duration_seconds", base.clone());
+        self.count_error("put_batch", self.inner.put_batch(entries).await)?;
+        counter!("faucet_state_put_total", base).increment(entries.len() as u64);
+        Ok(())
+    }
+}
+
+impl InstrumentedStateStore {
+    fn count_error<T>(
+        &self,
+        op: &'static str,
+        r: Result<T, FaucetError>,
+    ) -> Result<T, FaucetError> {
+        if let Err(e) = &r {
+            counter!(
+                "faucet_state_errors_total",
+                self.error_labels(op, error_kind(e))
+            )
+            .increment(1);
+        }
+        r
+    }
 }
 
 #[cfg(test)]
@@ -179,5 +245,116 @@ mod tests {
                 && matches!(v, DebugValue::Counter(c) if c >= 1)
         });
         assert!(found, "expected faucet_state_get_total{{outcome=miss}}");
+    }
+
+    struct Capable(MemoryStateStore);
+    #[async_trait]
+    impl StateStore for Capable {
+        async fn get(&self, key: &str) -> Result<Option<Value>, FaucetError> {
+            self.0.get(key).await
+        }
+        async fn put(&self, key: &str, value: &Value) -> Result<(), FaucetError> {
+            self.0.put(key, value).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), FaucetError> {
+            self.0.delete(key).await
+        }
+        fn supports_list(&self) -> bool {
+            true
+        }
+        async fn list(&self, _prefix: &str) -> Result<Vec<String>, FaucetError> {
+            Ok(vec!["from-inner".into()])
+        }
+        fn supports_compare_and_put(&self) -> bool {
+            true
+        }
+        async fn compare_and_put(
+            &self,
+            _key: &str,
+            _expected: Option<&Value>,
+            _value: &Value,
+        ) -> Result<bool, FaucetError> {
+            Err(FaucetError::State("inner cas".into()))
+        }
+        fn supports_atomic_batch(&self) -> bool {
+            true
+        }
+        async fn put_batch(&self, _entries: &[(String, Value)]) -> Result<(), FaucetError> {
+            Err(FaucetError::State("inner batch".into()))
+        }
+        async fn check(
+            &self,
+            _ctx: &crate::check::CheckContext,
+        ) -> Result<crate::check::CheckReport, FaucetError> {
+            Err(FaucetError::State("inner check".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn forwards_every_optional_capability_to_the_inner_store() {
+        let wrapped =
+            InstrumentedStateStore::new(Arc::new(Capable(MemoryStateStore::new())), labels());
+        assert!(wrapped.supports_list());
+        assert!(wrapped.supports_compare_and_put());
+        assert!(wrapped.supports_atomic_batch());
+        assert_eq!(wrapped.list("x").await.unwrap(), vec!["from-inner"]);
+        let e = wrapped
+            .compare_and_put("k", None, &json!(1))
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("inner cas"), "{e}");
+        let e = wrapped
+            .put_batch(&[("k".into(), json!(1))])
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("inner batch"), "{e}");
+        let e = wrapped
+            .check(&crate::check::CheckContext::default())
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("inner check"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn compare_and_put_and_batches_reach_a_real_store() {
+        let inner: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+        let wrapped = InstrumentedStateStore::new(Arc::clone(&inner), labels());
+        assert!(wrapped.compare_and_put("k", None, &json!(1)).await.unwrap());
+        assert!(!wrapped.compare_and_put("k", None, &json!(2)).await.unwrap());
+        wrapped
+            .put_batch(&[("a".into(), json!(1)), ("b".into(), json!(2))])
+            .await
+            .unwrap();
+        assert_eq!(inner.get("b").await.unwrap(), Some(json!(2)));
+    }
+
+    #[test]
+    fn implements_every_state_store_method() {
+        let traits = include_str!("../state.rs");
+        let start = traits.find("pub trait StateStore").expect("trait");
+        let body = &traits[start..];
+        let body = &body[..body.find("\n}\n").expect("trait end")];
+        let mine = include_str!("state.rs");
+        let impl_start = mine
+            .find("impl StateStore for InstrumentedStateStore")
+            .expect("impl");
+        let mine = &mine[impl_start..];
+        for line in body.lines() {
+            let t = line.trim_start();
+            let Some(rest) = t
+                .strip_prefix("async fn ")
+                .or_else(|| t.strip_prefix("fn "))
+            else {
+                continue;
+            };
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            assert!(
+                mine.contains(&format!("fn {name}(")),
+                "InstrumentedStateStore must forward `{name}`"
+            );
+        }
     }
 }

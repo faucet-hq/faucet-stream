@@ -189,7 +189,9 @@ async fn status_for(
     req: StatusRequest,
 ) -> Result<Json<StatusReport>, ServeError> {
     let (cfg, name) = resolve(state, actor, &req.source).await?;
-    let target = PipelineTarget::resolve(&cfg, &name).map_err(cli_to_serve)?;
+    let target = PipelineTarget::resolve_live(&cfg, &name)
+        .await
+        .map_err(cli_to_serve)?;
     let auth = crate::auth_catalog::build_auth_catalog(cfg.auth.as_ref()).map_err(cli_to_serve)?;
     let stores = Stores::build(&target, None)
         .await
@@ -361,7 +363,9 @@ async fn target_for(
             details: None,
         });
     }
-    let target = PipelineTarget::resolve(&cfg, &name).map_err(cli_to_serve)?;
+    let target = PipelineTarget::resolve_live(&cfg, &name)
+        .await
+        .map_err(cli_to_serve)?;
     Ok((cfg, target))
 }
 

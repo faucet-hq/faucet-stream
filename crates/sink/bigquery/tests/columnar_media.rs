@@ -41,7 +41,7 @@ fn dummy_service_account_json(oauth_server: &str) -> serde_json::Value {
         "type": "service_account",
         "project_id": "dummy",
         "private_key_id": "dummy",
-        "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQDNk6cKkWP/4NMu\nWb3s24YHfM639IXzPtTev06PUVVQnyHmT1bZgQ/XB6BvIRaReqAqnQd61PAGtX3e\n8XocTw+u/ZfiPJOf+jrXMkRBpiBh9mbyEIqBy8BC20OmsUc+O/YYh/qRccvRfPI7\n3XMabQ8eFWhI6z/t35oRpvEVFJnSIgyV4JR/L/cjtoKnxaFwjBzEnxPiwtdy4olU\nKO/1maklXexvlO7onC7CNmPAjuEZKzdMLzFszikCDnoKJC8k6+2GZh0/JDMAcAF4\nwxlKNQ89MpHVRXZ566uKZg0MqZqkq5RXPn6u7yvNHwZ0oahHT+8ixPPrAEjuPEKM\nUPzVRz71AgMBAAECggEAfdbVWLW5Befkvam3hea2+5xdmeN3n3elrJhkiXxbAhf3\nE1kbq9bCEHmdrokNnI34vz0SWBFCwIiWfUNJ4UxQKGkZcSZto270V8hwWdNMXUsM\npz6S2nMTxJkdp0s7dhAUS93o9uE2x4x5Z0XecJ2ztFGcXY6Lupu2XvnW93V9109h\nkY3uICLdbovJq7wS/fO/AL97QStfEVRWW2agIXGvoQG5jOwfPh86GZZRYP9b8VNw\ntkAUJe4qpzNbWs9AItXOzL+50/wsFkD/iWMGWFuU8DY5ZwsL434N+uzFlaD13wtZ\n63D+tNAxCSRBfZGQbd7WxJVFfZe/2vgjykKWsdyNAQKBgQDnEBgSI836HGSRk0Ub\nDwiEtdfh2TosV+z6xtyU7j/NwjugTOJEGj1VO/TMlZCEfpkYPLZt3ek2LdNL66n8\nDyxwzTT5Q3D/D0n5yE3mmxy13Qyya6qBYvqqyeWNwyotGM7hNNOix1v9lEMtH5Rd\nUT0gkThvJhtrV663bcAWCALmtQKBgQDjw2rYlMUp2TUIa2/E7904WOnSEG85d+nc\norhzthX8EWmPgw1Bbfo6NzH4HhebTw03j3NjZdW2a8TG/uEmZFWhK4eDvkx+rxAa\n6EwamS6cmQ4+vdep2Ac4QCSaTZj02YjHb06Be3gptvpFaFrotH2jnpXxggdiv8ul\n6x+ooCffQQKBgQCR3ykzGoOI6K/c75prELyR+7MEk/0TzZaAY1cSdq61GXBHLQKT\nd/VMgAN1vN51pu7DzGBnT/dRCvEgNvEjffjSZdqRmrAVdfN/y6LSeQ5RCfJgGXSV\nJoWVmMxhCNrxiX3h01Xgp/c9SYJ3VD54AzeR/dwg32/j/oEAsDraLciXGQKBgQDF\nMNc8k/DvfmJv27R06Ma6liA6AoiJVMxgfXD8nVUDW3/tBCVh1HmkFU1p54PArvxe\nchAQqoYQ3dUMBHeh6ZRJaYp2ATfxJlfnM99P1/eHFOxEXdBt996oUMBf53bZ5cyJ\n/lAVwnQSiZy8otCyUDHGivJ+mXkTgcIq8BoEwERFAQKBgQDmImBaFqoMSVihqHIf\nDa4WZqwM7ODqOx0JnBKrKO8UOc51J5e1vpwP/qRpNhUipoILvIWJzu4efZY7GN5C\nImF9sN3PP6Sy044fkVPyw4SYEisxbvp9tfw8Xmpj/pbmugkB2ut6lz5frmEBoJSN\n3osZlZTgx+pM3sO6ITV6U4ID2Q==\n-----END PRIVATE KEY-----\n",
+        "private_key": include_str!("fixtures/bigquery_test_key.pem"),
         "client_email": "dummy@developer.gserviceaccount.com",
         "client_id": "dummy",
         "auth_uri": "https://example.invalid/o/oauth2/auth",
@@ -238,12 +238,12 @@ async fn uploads(server: &MockServer) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The first batch of an overwrite run truncates with one Parquet load; later
-/// batches join a single `WRITE_APPEND` load finalized on flush rather than one
-/// load job per batch (SQL-36). Previously this asserted a Parquet load per
-/// batch, which is the per-batch quota burn SQL-36 removes.
+/// An overwrite run's batches all join one `WRITE_TRUNCATE` load finalized on
+/// flush, so nothing replaces the table before the run completes. This used
+/// to assert a truncating Parquet load committed by the first batch — the
+/// non-atomic replace being removed.
 #[tokio::test]
-async fn overwrite_truncates_once_then_appends() {
+async fn overwrite_batches_join_one_truncating_load_at_flush() {
     let server = MockServer::start().await;
     mount(&server).await;
     mount_resumable(&server).await;
@@ -282,20 +282,16 @@ async fn overwrite_truncates_once_then_appends() {
     sink.flush().await.expect("flush");
 
     let ups = uploads(&server).await;
-    assert_eq!(
-        ups.len(),
-        2,
-        "one truncating Parquet load, one append load: {ups:?}"
-    );
-    assert_eq!(ups[0].0, "multipart");
-    assert!(ups[0].1.contains("WRITE_TRUNCATE"));
     assert!(
-        ups[0].1.contains("\"mode\":\"REQUIRED\"") && ups[0].1.contains("the key"),
-        "the truncating load keeps the table's schema: {}",
-        ups[0].1
+        ups.iter().all(|(kind, _)| kind == "resumable"),
+        "no discrete load commits mid-run: {ups:?}"
     );
-    assert_eq!(ups[1].0, "resumable");
-    assert!(ups[1].1.contains("WRITE_APPEND"));
+    let opening = &ups[0].1;
+    assert!(opening.contains("WRITE_TRUNCATE"), "{opening}");
+    assert!(
+        !ups.iter().any(|(_, body)| body.contains("WRITE_APPEND")),
+        "one truncating session: {ups:?}"
+    );
 }
 
 /// Append runs load the first columnar batch as Parquet; later batches go

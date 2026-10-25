@@ -958,12 +958,16 @@ pub(crate) async fn enqueue(
                 message,
                 details: None,
             })?;
-        cb.reject_secrets_in_cluster(state.cluster().enabled())
+        cb.reject_persisted_headers(state.persistent_history())
             .map_err(|message| ServeError::Unprocessable {
                 message,
                 details: None,
             })?;
     }
+
+    // A malformed `clock` is the submission's error, not a run that fails
+    // once it is queued or claimed.
+    resolve_clock(req.clock.as_deref(), Utc::now())?;
 
     // Reserve a queue slot first, so a Fresh idempotency claim is always followed
     // by a spawned run (no orphaned claims — spec §20.2).
@@ -991,8 +995,10 @@ pub(crate) async fn enqueue(
 
     // Config fingerprint (sha256) — the idempotency identity AND the value
     // recorded on the `run.submit` audit entry (#205).
-    let merged = serde_json::to_value(&loaded.cfg).unwrap_or(serde_json::Value::Null);
-    let fp_config = idempotency::fingerprint(&merged, loaded.cfg.name.as_deref());
+    let fp_config = idempotency::fingerprint(
+        &submitted_document(&req, state.default_base().as_ref())?,
+        loaded.cfg.name.as_deref(),
+    );
 
     // Idempotency claim (if a key was supplied).
     if let Some(key) = &req.idempotency_key {
@@ -1008,15 +1014,33 @@ pub(crate) async fn enqueue(
             &req.labels,
         );
         let key = idempotency_scope(principal.tenant(), key);
-        match state
-            .history()
-            .claim_idempotency(&key, &fp, &run_id, state.idempotency_retention())
-            .await
-            .map_err(|e| match e {
-                // Degraded backend can't safely honor idempotency → 503, retry.
-                crate::serve::history::HistoryError::Degraded(m) => ServeError::Unavailable(m),
-                other => ServeError::Internal(other.to_string()),
-            })? {
+        let claim = |fp: String| {
+            let state = state.clone();
+            let key = key.clone();
+            let run_id = run_id.clone();
+            async move {
+                state
+                    .history()
+                    .claim_idempotency(&key, &fp, &run_id, state.idempotency_retention())
+                    .await
+                    .map_err(|e| match e {
+                        // Degraded backend can't safely honor idempotency → 503, retry.
+                        crate::serve::history::HistoryError::Degraded(m) => {
+                            ServeError::Unavailable(m)
+                        }
+                        other => ServeError::Internal(other.to_string()),
+                    })
+            }
+        };
+        let mut outcome = claim(fp).await?;
+        if matches!(outcome, Claim::Conflict) {
+            // A claim stored by an earlier release (or by an older peer during
+            // a rolling upgrade) holds the fingerprint of the resolved config.
+            // Accept it for one release so a retry spanning the upgrade
+            // replays instead of answering 409.
+            outcome = claim(legacy_request_fingerprint(&req, &loaded.cfg)).await?;
+        }
+        match outcome {
             Claim::Fresh => {}
             Claim::Replay(existing) => {
                 metrics::record_idempotency_hit();
@@ -1561,8 +1585,50 @@ fn classify_run(result: crate::error::CliResult<RunSummary>) -> Terminal {
     }
 }
 
+/// The submitted document as the caller sent it, merged onto the server's
+/// default config but before any reference resolves: what an idempotency key
+/// identifies, so a retry still matches after a resolved secret rotates or a
+/// discovered dataset list changes.
+fn submitted_document(
+    req: &SubmitRequest,
+    default_base: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, ServeError> {
+    let submitted: serde_json::Value = match req.config_format {
+        ConfigFormatWire::Yaml => serde_yaml::from_str(&req.config)
+            .map_err(|e| ServeError::BadConfig(format!("invalid YAML: {e}")))?,
+        ConfigFormatWire::Json => serde_json::from_str(&req.config)
+            .map_err(|e| ServeError::BadConfig(format!("invalid JSON: {e}")))?,
+    };
+    Ok(match default_base {
+        Some(base) => {
+            let mut merged = base.clone();
+            crate::merge::merge_value(&mut merged, submitted);
+            merged
+        }
+        None => submitted,
+    })
+}
+
+/// The request fingerprint releases before this one stored: the same request
+/// fields over the *resolved* config. Only compared on a conflict.
+// TODO(#930): drop after one release, once no claim can still hold it.
+#[doc(hidden)]
+pub fn legacy_request_fingerprint(
+    req: &SubmitRequest,
+    cfg: &crate::config::PipelineConfig,
+) -> String {
+    let merged = serde_json::to_value(cfg).unwrap_or(serde_json::Value::Null);
+    idempotency::request_fingerprint(
+        &idempotency::fingerprint(&merged, cfg.name.as_deref()),
+        req.clock.as_deref(),
+        req.timeout_secs,
+        req.concurrency,
+        &req.labels,
+    )
+}
+
 /// Parse the optional request `clock` (RFC3339), defaulting to `submitted_at`.
-fn resolve_clock(
+pub(crate) fn resolve_clock(
     flag: Option<&str>,
     default: DateTime<Utc>,
 ) -> Result<DateTime<FixedOffset>, ServeError> {
@@ -2343,6 +2409,27 @@ mod tests {
     }
 
     #[test]
+    fn the_idempotency_document_is_the_unresolved_submission() {
+        let req: SubmitRequest = serde_json::from_value(serde_json::json!({
+            "config": "version: 1\nname: n\npipeline:\n  source: { type: csv, config: { path: \"${env:IN}\" } }\n"
+        }))
+        .unwrap();
+        let base = serde_json::json!({"execution": {"max_concurrent": 2}});
+        let doc = submitted_document(&req, Some(&base)).unwrap();
+        assert_eq!(doc["pipeline"]["source"]["config"]["path"], "${env:IN}");
+        assert_eq!(doc["execution"]["max_concurrent"], 2);
+        let bad: SubmitRequest = serde_json::from_value(serde_json::json!({
+            "config": "{",
+            "config_format": "json"
+        }))
+        .unwrap();
+        assert!(matches!(
+            submitted_document(&bad, None),
+            Err(ServeError::BadConfig(_))
+        ));
+    }
+
+    #[test]
     fn resolve_clock_defaults_and_parses() {
         let default = Utc::now();
         assert_eq!(
@@ -2446,6 +2533,24 @@ mod tests {
         );
         // The reservation taken before the claim must have been released by the guard.
         assert_eq!(state.registry().queued(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_clock_is_refused_at_submit() {
+        let state = crate::serve::test_support::test_state();
+        let req: SubmitRequest = serde_json::from_value(serde_json::json!({
+            "config": "version: 1\npipeline:\n  source: { type: csv, config: { path: x.csv } }\n  sink: { type: jsonl, config: { path: out.jsonl } }\n",
+            "clock": "2026-10-01"
+        }))
+        .unwrap();
+        let err = submit(state.clone(), req, admin_actor()).await.unwrap_err();
+        assert!(
+            matches!(&err, ServeError::BadConfig(m) if m.contains("not RFC3339")),
+            "{err:?}"
+        );
+        assert_eq!(state.registry().queued(), 0);
+        let page = state.history().list(&Default::default()).await.unwrap();
+        assert!(page.runs.is_empty(), "no run is recorded");
     }
 
     #[tokio::test]

@@ -311,25 +311,18 @@ async fn the_json_document_path_is_lossless() {
 
     assert_eq!(landed.len(), sent.len());
     // MySQL's JSON type normalises numbers, so allow a last-bit float
-    // difference and the signed-zero normalisation — the same shape as
-    // Postgres's JSONB, asserted below so the claim is pinned rather than
-    // assumed.
-    fidelity::assert_round_trip(
-        &sent,
-        &landed,
-        Tolerance::exact()
-            .float_epsilon(1e-15)
-            .skipping("negative_zero"),
-    );
+    // difference; it keeps the sign of a zero, asserted below.
+    fidelity::assert_round_trip(&sent, &landed, Tolerance::exact().float_epsilon(1e-15));
 
     let floats = landed
         .iter()
         .find(|r| r[ROW_KEY] == json!("floats"))
         .expect("the floats row landed");
-    assert_eq!(
-        floats["negative_zero"].as_f64(),
-        Some(0.0),
-        "MySQL JSON is expected to normalise -0.0, got {}",
+    assert!(
+        floats["negative_zero"]
+            .as_f64()
+            .is_some_and(|f| f == 0.0 && f.is_sign_negative()),
+        "MySQL JSON is expected to keep -0.0, got {}",
         floats["negative_zero"]
     );
 }

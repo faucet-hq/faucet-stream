@@ -85,7 +85,7 @@ fn execute_page(
         metrics::fuel_consumed(module_label, result.fuel_consumed);
 
         let err_msg: String = match result.outcome {
-            Outcome::Emit(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Outcome::Emit(bytes) => match faucet_core::fidelity::from_slice(&bytes) {
                 Ok(v) => {
                     metrics::invocation(module_label, "ok");
                     out.push(v);
@@ -255,6 +255,16 @@ mod tests {
             (data (i32.const 200) "notjson")
             (func (export "transform") (param i32) (param i32) (result i64)
                 (i64.or (i64.shl (i64.const 200) (i64.const 32)) (i64.const 7))))"#
+        )
+    }
+
+    /// Emits `{"id":123456789012345678901234}` — an integer past `u64`.
+    fn big_integer_wat() -> String {
+        format!(
+            r#"(module {PREAMBLE}
+            (data (i32.const 200) "{{\22id\22:123456789012345678901234}}")
+            (func (export "transform") (param i32) (param i32) (result i64)
+                (i64.or (i64.shl (i64.const 200) (i64.const 32)) (i64.const 31))))"#
         )
     }
 
@@ -458,6 +468,13 @@ mod tests {
             t.run_page(vec![json!({"a": 1})]).unwrap(),
             Vec::<Value>::new()
         );
+    }
+
+    #[test]
+    fn a_big_integer_in_module_output_stays_exact() {
+        let (t, _f) = build(&big_integer_wat(), |_| {});
+        let out = t.run_page(vec![json!({"a": 1})]).unwrap();
+        assert_eq!(out, vec![json!({"id": "123456789012345678901234"})]);
     }
 
     #[test]

@@ -50,6 +50,20 @@ async fn restrict(path: &std::path::Path, mode: u32) -> Result<(), FaucetError> 
         .map_err(|e| io_error("restrict permissions of", path, e))
 }
 
+/// Make a rename into `path`'s directory durable.
+#[cfg(unix)]
+async fn sync_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
+    match path.parent() {
+        Some(dir) => tokio::fs::File::open(dir).await?.sync_all().await,
+        None => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+async fn sync_parent_dir(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 #[cfg(not(unix))]
 async fn restrict(_path: &std::path::Path, _mode: u32) -> Result<(), FaucetError> {
     Ok(())
@@ -81,7 +95,8 @@ impl StateStore for PrivateFileStore {
             let mut file = opts.open(&tmp).await?;
             file.write_all(&bytes).await?;
             file.sync_all().await?;
-            tokio::fs::rename(&tmp, &target).await
+            tokio::fs::rename(&tmp, &target).await?;
+            sync_parent_dir(&target).await
         }
         .await;
         if let Err(e) = written {
@@ -215,6 +230,17 @@ mod tests {
 #[cfg(test)]
 mod key_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sync_parent_dir_syncs_and_reports_a_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        sync_parent_dir(&dir.path().join("entry.json"))
+            .await
+            .unwrap();
+        let missing = dir.path().join("gone").join("entry.json");
+        assert!(sync_parent_dir(&missing).await.is_err());
+    }
     use serde_json::json;
 
     #[tokio::test]

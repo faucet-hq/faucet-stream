@@ -95,6 +95,44 @@ async fn a_directory_of_mixed_formats_reads_in_one_run() {
     assert!(err.contains("notes.md") && err.contains("strict"), "{err}");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn a_recursive_walk_lists_each_directory_once_through_symlinks() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(d, "top.jsonl", b"{\"a\":1}\n");
+    write(d, "sub/x.jsonl", b"{\"a\":2}\n");
+    std::os::unix::fs::symlink(d, d.join("sub/loop")).unwrap();
+    std::os::unix::fs::symlink(d.join("sub"), d.join("alias")).unwrap();
+    let deep = FileSource::new(FileSourceConfig::new(dir_str(d)).recursive(true)).unwrap();
+    let mut rows = read_all(&deep).await.unwrap();
+    rows.sort_by_key(|r| r["a"].as_i64());
+    assert_eq!(rows, vec![json!({"a": 1}), json!({"a": 2})]);
+}
+
+/// A directory reachable directly and through a symlink that sorts first is
+/// listed under its real path, whatever the directory order on disk.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_recursive_listing_prefers_the_real_path_over_a_symlinked_alias() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(d, "sub/x.jsonl", b"{\"a\":2}\n");
+    std::os::unix::fs::symlink(d.join("sub"), d.join("alias")).unwrap();
+    let deep = FileSource::new(FileSourceConfig::new(dir_str(d)).recursive(true)).unwrap();
+    let names: Vec<String> = deep
+        .discover()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|ds| ds.name)
+        .collect();
+    assert_eq!(
+        names,
+        vec![format!("sub{}x.jsonl", std::path::MAIN_SEPARATOR)]
+    );
+}
+
 #[tokio::test]
 async fn globs_recursion_explicit_formats_and_limits() {
     let dir = tempfile::tempdir().unwrap();
@@ -661,6 +699,35 @@ mod http {
         let mut cfg = FileSourceConfig::new("http://127.0.0.1:1/x.csv");
         cfg.http_retries = 0;
         assert!(read_all(&FileSource::new(cfg).unwrap()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn remote_error_text_omits_credentials_and_bounds_the_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/gone.csv"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("x".repeat(1 << 20)))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/down.csv"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let base = server.uri().replace("http://", "http://svc:hunter2@");
+        let gone = FileSource::new(FileSourceConfig::new(format!(
+            "{base}/gone.csv?token=s3cr3t"
+        )))
+        .unwrap();
+        let err = read_all(&gone).await.unwrap_err();
+        assert!(err.contains("404"), "{err}");
+        assert!(!err.contains("hunter2") && !err.contains("s3cr3t"), "{err}");
+        assert!(err.len() < 16 * 1024, "{}", err.len());
+        let mut cfg = FileSourceConfig::new(format!("{base}/down.csv?token=s3cr3t"));
+        cfg.http_retries = 0;
+        let err = read_all(&FileSource::new(cfg).unwrap()).await.unwrap_err();
+        assert!(err.contains("attempt"), "{err}");
+        assert!(!err.contains("hunter2") && !err.contains("s3cr3t"), "{err}");
     }
 
     #[tokio::test]

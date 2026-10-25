@@ -18,11 +18,50 @@ pub enum CappedLine {
     Eof,
 }
 
-/// Read the next line, refusing one longer than `max` bytes.
+/// Read the next line, refusing one longer than `max` bytes. Invalid UTF-8 is
+/// replaced; Singer messages use [`read_capped_utf8_line`].
 pub async fn read_capped_line<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     max: usize,
 ) -> std::io::Result<CappedLine> {
+    Ok(match read_capped_bytes(reader, max).await? {
+        Raw::Line(buf) => CappedLine::Line(String::from_utf8_lossy(&buf).into_owned()),
+        Raw::TooLong => CappedLine::TooLong,
+        Raw::Eof => CappedLine::Eof,
+    })
+}
+
+/// [`read_capped_line`] for Singer messages, which are UTF-8 JSON: a line that
+/// is not valid UTF-8 is consumed and returned as an
+/// [`InvalidData`](std::io::ErrorKind::InvalidData) error instead of having
+/// its bytes replaced, so the caller can report it; the next call reads the
+/// following line.
+pub async fn read_capped_utf8_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max: usize,
+) -> std::io::Result<CappedLine> {
+    Ok(match read_capped_bytes(reader, max).await? {
+        Raw::Line(buf) => CappedLine::Line(String::from_utf8(buf).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("line is not valid UTF-8: {}", e.utf8_error()),
+            )
+        })?),
+        Raw::TooLong => CappedLine::TooLong,
+        Raw::Eof => CappedLine::Eof,
+    })
+}
+
+enum Raw {
+    Line(Vec<u8>),
+    TooLong,
+    Eof,
+}
+
+async fn read_capped_bytes<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max: usize,
+) -> std::io::Result<Raw> {
     let mut buf = Vec::new();
     let limit = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
     let n = (&mut *reader)
@@ -30,7 +69,7 @@ pub async fn read_capped_line<R: AsyncBufRead + Unpin>(
         .read_until(b'\n', &mut buf)
         .await?;
     if n == 0 {
-        return Ok(CappedLine::Eof);
+        return Ok(Raw::Eof);
     }
     if buf.last() == Some(&b'\n') {
         buf.pop();
@@ -38,9 +77,9 @@ pub async fn read_capped_line<R: AsyncBufRead + Unpin>(
             buf.pop();
         }
     } else if buf.len() > max {
-        return Ok(CappedLine::TooLong);
+        return Ok(Raw::TooLong);
     }
-    Ok(CappedLine::Line(String::from_utf8_lossy(&buf).into_owned()))
+    Ok(Raw::Line(buf))
 }
 
 /// Longest stderr line kept for logs and the error tail (16 KiB).
@@ -99,6 +138,33 @@ pub async fn read_log_line<R: AsyncBufRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn invalid_utf8_is_an_error_and_the_next_line_still_reads() {
+        let input: &[u8] = b"{\"name\":\"Jos\xe9\"}\n{\"ok\":1}\n";
+        let mut r = tokio::io::BufReader::new(input);
+        let err = read_capped_utf8_line(&mut r, 1024).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("not valid UTF-8"), "{err}");
+        assert_eq!(
+            read_capped_utf8_line(&mut r, 1024).await.unwrap(),
+            CappedLine::Line("{\"ok\":1}".into())
+        );
+        assert_eq!(
+            read_capped_utf8_line(&mut r, 1024).await.unwrap(),
+            CappedLine::Eof
+        );
+        let mut lossy = tokio::io::BufReader::new(input);
+        assert_eq!(
+            read_capped_line(&mut lossy, 1024).await.unwrap(),
+            CappedLine::Line("{\"name\":\"Jos\u{FFFD}\"}".into())
+        );
+        let mut long = tokio::io::BufReader::new(&b"abcdef"[..]);
+        assert_eq!(
+            read_capped_utf8_line(&mut long, 3).await.unwrap(),
+            CappedLine::TooLong
+        );
+    }
 
     #[tokio::test]
     async fn log_lines_are_cut_and_the_rest_skipped() {

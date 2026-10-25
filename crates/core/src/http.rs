@@ -770,6 +770,12 @@ pub async fn status_error(resp: Response) -> FaucetError {
     }
 }
 
+/// Read a whole response body, refusing one above `limit` bytes (`None` lifts
+/// the limit) — for a connector holding a raw `reqwest` response.
+pub async fn read_body_limited(resp: Response, limit: Option<u64>) -> Result<Vec<u8>, FaucetError> {
+    read_limited(resp, limit).await
+}
+
 async fn read_limited(mut resp: Response, limit: Option<u64>) -> Result<Vec<u8>, FaucetError> {
     let too_large = |resp: &Response, limit: u64| {
         FaucetError::Custom(Box::new(ResponseTooLarge {

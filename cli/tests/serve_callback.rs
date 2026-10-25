@@ -444,3 +444,62 @@ async fn callbacks_resolve_names_and_never_follow_redirects() {
     );
     receiver.verify().await;
 }
+
+#[cfg(feature = "serve-history-sqlite")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn persistent_history_refuses_callback_headers() {
+    let port = free_port();
+    let dir = tempfile::tempdir().unwrap();
+    let mut args = args_on(port);
+    args.history = Some(format!("sqlite:{}", dir.path().join("h.db").display()));
+    let mut config = ServeConfig::from_args(args).unwrap();
+    config.log_level = "warn".into();
+    tokio::spawn(async move {
+        let _ = faucet_cli::serve::run_server(config, Default::default()).await;
+    });
+    let client = reqwest::Client::new();
+    for _ in 0..1200 {
+        if client
+            .get(format!("http://127.0.0.1:{port}/healthz"))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let input = dir.path().join("in.csv");
+    let output = dir.path().join("out.jsonl");
+    std::fs::write(&input, "id\n1\n").unwrap();
+    let resp = client
+        .post(format!("http://127.0.0.1:{port}/v1/runs"))
+        .json(&json!({
+            "config": ok_yaml(&input, &output),
+            "callback": {
+                "url": "https://caller.example/hook",
+                "headers": { "authorization": "Bearer t" }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 422);
+    let err: Value = resp.json().await.unwrap();
+    assert!(err.to_string().contains("persistent run history"), "{err}");
+    let resp = client
+        .post(format!("http://127.0.0.1:{port}/v1/runs"))
+        .json(&json!({
+            "config": ok_yaml(&input, &output),
+            "require_approval": true,
+            "callback": {
+                "url": "https://caller.example/hook",
+                "headers": { "authorization": "Bearer t" }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 422, "a change request is stored too");
+}

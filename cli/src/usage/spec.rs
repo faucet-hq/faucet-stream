@@ -38,7 +38,8 @@ pub struct PricingSpec {
     /// pipelines cross a cloud boundary.
     pub egress_per_gb: f64,
     /// Object storage request prices (S3 / GCS / Azure Blob), per 1,000
-    /// requests: `read` covers list/get/head, `write` covers put.
+    /// requests: `read` covers get/head, `write` covers put/post/copy/list
+    /// (list requests are billed like writes, as S3 / GCS class A).
     pub object_storage: ObjectStoragePricing,
     /// Warehouse compute.
     pub warehouse: WarehousePricing,

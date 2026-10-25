@@ -709,17 +709,6 @@ impl SinkDriver for ParquetDriver {
             (ParquetDestination::S3(_), None) => return Err(s3_writes_through_the_backend()),
         };
 
-        // Guard against object-store URLs that slipped into a LocalPath
-        // destination (e.g. `s3://` / `gs://`): treat them as object-store
-        // targets and skip rather than mis-probing the local filesystem.
-        let lower = path.to_ascii_lowercase();
-        if lower.starts_with("s3://") || lower.starts_with("gs://") {
-            return Ok(CheckReport::single(Probe::skip(
-                "io",
-                "object-store target not probed by doctor",
-            )));
-        }
-
         let start = std::time::Instant::now();
 
         // Mirror `build_store`'s parent-directory derivation: a `.parquet`

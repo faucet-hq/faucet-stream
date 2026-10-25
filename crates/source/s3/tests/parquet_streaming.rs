@@ -117,10 +117,28 @@ fn parquet_bytes(rows: i64, group: usize, payload_len: usize) -> Vec<u8> {
     out
 }
 
+#[allow(clippy::disallowed_methods)] // a test waits for its container
 async fn seed(endpoint: &str, key: &str, body: Vec<u8>) {
     let client = admin_client(endpoint).await;
-    // The bucket may already exist when a test seeds twice.
-    let _ = client.create_bucket().bucket(BUCKET).send().await;
+    // The bucket may already exist when a test seeds twice; a fresh MinIO can
+    // also refuse the first request, so retry until it answers.
+    for _ in 0..20 {
+        match client.create_bucket().bucket(BUCKET).send().await {
+            Ok(_) => break,
+            Err(e) => {
+                let code = e.as_service_error().and_then(|s| {
+                    aws_sdk_s3::error::ProvideErrorMetadata::code(s).map(str::to_string)
+                });
+                if matches!(
+                    code.as_deref(),
+                    Some("BucketAlreadyOwnedByYou" | "BucketAlreadyExists")
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
     client
         .put_object()
         .bucket(BUCKET)
@@ -382,4 +400,52 @@ async fn an_object_replaced_mid_read_fails_rather_than_mixing_versions() {
     }
     let error = error.expect("a replaced object must fail the read");
     assert!(error.contains("replaced"), "{error}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn objects_differing_only_in_writer_metadata_read_as_one_schema() {
+    let (_c, endpoint) = start_minio().await;
+    seed(&endpoint, "w-a.parquet", parquet_bytes(10, 10, 4)).await;
+    let tagged = {
+        let schema = Arc::new(
+            Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("payload", DataType::Utf8, false),
+            ])
+            .with_metadata(HashMap::from([(
+                "pandas".to_string(),
+                "{\"index_columns\":[]}".to_string(),
+            )])),
+        );
+        let mut out = Vec::new();
+        {
+            let mut w = ArrowWriter::try_new(&mut out, schema.clone(), None).expect("writer");
+            w.write(
+                &RecordBatch::try_new(
+                    schema,
+                    vec![
+                        Arc::new(Int64Array::from(vec![100i64])),
+                        Arc::new(StringArray::from(vec!["x"])),
+                    ],
+                )
+                .expect("batch"),
+            )
+            .expect("write");
+            w.close().expect("close");
+        }
+        out
+    };
+    seed(&endpoint, "w-b.parquet", tagged).await;
+
+    let source = build_source(&endpoint, config(100)).await;
+    let ctx: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut pages = source.stream_batches(&ctx, 100);
+    let mut rows = 0;
+    while let Some(page) = pages.next().await {
+        rows += page
+            .expect("writer metadata is not a schema difference")
+            .batch
+            .num_rows();
+    }
+    assert_eq!(rows, 11);
 }

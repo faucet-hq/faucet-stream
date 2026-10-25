@@ -178,14 +178,28 @@ pub(crate) fn build_insert_sql_cast(
 /// to the one column matching it ignoring case — SQL Server's default
 /// collation compares identifiers that way (#862 M-044). A field matching
 /// several columns only by case (a case-sensitive collation) is left as is.
-pub(crate) fn fold_to_columns(insertable: &[String], records: &[Value]) -> Vec<Value> {
-    records
-        .iter()
-        .map(|r| match r.as_object() {
-            Some(obj) => Value::Object(fold_record(insertable, obj)),
-            None => r.clone(),
-        })
-        .collect()
+/// Borrows `records` when every field already names a column exactly.
+pub(crate) fn fold_to_columns<'a>(
+    insertable: &[String],
+    records: &'a [Value],
+) -> std::borrow::Cow<'a, [Value]> {
+    let exact: std::collections::HashSet<&str> = insertable.iter().map(String::as_str).collect();
+    let needs_fold = records.iter().any(|r| {
+        r.as_object()
+            .is_some_and(|o| o.keys().any(|k| !exact.contains(k.as_str())))
+    });
+    if !needs_fold {
+        return std::borrow::Cow::Borrowed(records);
+    }
+    std::borrow::Cow::Owned(
+        records
+            .iter()
+            .map(|r| match r.as_object() {
+                Some(obj) => Value::Object(fold_record(insertable, obj)),
+                None => r.clone(),
+            })
+            .collect(),
+    )
 }
 /// Indices of the object records in `records` with no field naming a writable
 /// column: writing one would insert an all-`NULL` row, or nothing at all.
@@ -214,11 +228,13 @@ pub(crate) fn unmatched_row_error(index: usize) -> FaucetError {
 /// `insertable` is the set of writable table columns (IDENTITY columns already
 /// excluded), in table order. The column list is the insertable columns present
 /// in the first record. Record keys that match no insertable column are
-/// "unknown" and handled per `on_unknown`.
+/// "unknown" and handled per `on_unknown`; under `Warn` the warning is logged
+/// only the first time unknown keys are seen (`warned` records that).
 pub(crate) fn resolve_insert_columns(
     insertable: &[String],
     records: &[Value],
     on_unknown: OnUnknownField,
+    warned: &std::sync::atomic::AtomicBool,
 ) -> Result<Vec<String>, FaucetError> {
     let insertable_set: std::collections::HashSet<&str> =
         insertable.iter().map(|s| s.as_str()).collect();
@@ -242,10 +258,12 @@ pub(crate) fn resolve_insert_columns(
                 )));
             }
             OnUnknownField::Warn => {
-                tracing::warn!(
-                    ?unknown,
-                    "auto_columns: dropping record keys with no matching column"
-                );
+                if !warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        ?unknown,
+                        "auto_columns: dropping record keys with no matching column"
+                    );
+                }
             }
             OnUnknownField::Drop => {}
         }
@@ -361,16 +379,15 @@ pub(crate) fn group_by_present_columns<'a>(
     records: &'a [Value],
     columns: &[String],
 ) -> Vec<(Vec<String>, Vec<&'a Value>)> {
-    let mut groups: Vec<(Vec<String>, Vec<&'a Value>)> = Vec::new();
+    let mut groups: Vec<(Vec<bool>, Vec<&'a Value>)> = Vec::new();
     for record in records {
-        let present: Vec<String> = columns
+        let present: Vec<bool> = columns
             .iter()
-            .filter(|c| {
+            .map(|c| {
                 record
                     .as_object()
                     .is_some_and(|o| o.contains_key(c.as_str()))
             })
-            .cloned()
             .collect();
         match groups.iter_mut().find(|(p, _)| *p == present) {
             Some((_, rows)) => rows.push(record),
@@ -378,6 +395,17 @@ pub(crate) fn group_by_present_columns<'a>(
         }
     }
     groups
+        .into_iter()
+        .map(|(mask, rows)| {
+            let names = columns
+                .iter()
+                .zip(&mask)
+                .filter(|(_, p)| **p)
+                .map(|(c, _)| c.clone())
+                .collect();
+            (names, rows)
+        })
+        .collect()
 }
 
 pub(crate) fn auto_row_params_typed(
@@ -429,16 +457,14 @@ mod tests {
     #[test]
     fn fields_fold_to_columns_and_unmatched_rows_are_named() {
         let cols: Vec<String> = vec!["UserID".into(), "Kind".into(), "a".into(), "A".into()];
-        let folded = fold_to_columns(
-            &cols,
-            &[
-                json!({"userid": 1, "kind": "x"}),
-                json!({"a": 1, "zz": 2}),
-                json!({"Ux": 1}),
-                json!({"userid": 1, "UserID": 2}),
-                json!(3),
-            ],
-        );
+        let records = [
+            json!({"userid": 1, "kind": "x"}),
+            json!({"a": 1, "zz": 2}),
+            json!({"Ux": 1}),
+            json!({"userid": 1, "UserID": 2}),
+            json!(3),
+        ];
+        let folded = fold_to_columns(&cols, &records);
         assert_eq!(folded[0], json!({"UserID": 1, "Kind": "x"}));
         assert_eq!(folded[1], json!({"a": 1, "zz": 2}));
         assert_eq!(folded[3], json!({"userid": 1, "UserID": 2}));
@@ -446,6 +472,11 @@ mod tests {
             fold_to_columns(&cols, &[json!({"A": 1})])[0],
             json!({"A": 1})
         );
+        assert!(matches!(
+            fold_to_columns(&cols, &[json!({"A": 1, "a": 2})]),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert!(matches!(folded, std::borrow::Cow::Owned(_)));
         assert_eq!(unmatched_rows(&cols, &folded), vec![2]);
         assert!(unmatched_row_error(2).to_string().contains("record 2"));
     }
@@ -517,11 +548,52 @@ mod tests {
         );
     }
 
+    fn unwarned() -> std::sync::atomic::AtomicBool {
+        std::sync::atomic::AtomicBool::new(false)
+    }
+
+    #[test]
+    fn the_unknown_field_warning_waits_for_a_chunk_with_unknown_keys() {
+        use std::sync::atomic::Ordering;
+        let insertable = vec!["id".to_string()];
+        let warned = unwarned();
+        // A chunk that matches the table does not use up the one warning.
+        resolve_insert_columns(
+            &insertable,
+            &[json!({"id": 1})],
+            OnUnknownField::Warn,
+            &warned,
+        )
+        .unwrap();
+        assert!(!warned.load(Ordering::Relaxed));
+        // The first chunk with an unknown key logs it.
+        let cols = resolve_insert_columns(
+            &insertable,
+            &[json!({"id": 2, "discount": 5})],
+            OnUnknownField::Warn,
+            &warned,
+        )
+        .unwrap();
+        assert_eq!(cols, vec!["id".to_string()]);
+        assert!(warned.load(Ordering::Relaxed));
+        // `drop` and `error` never log.
+        let quiet = unwarned();
+        resolve_insert_columns(
+            &insertable,
+            &[json!({"x": 1})],
+            OnUnknownField::Drop,
+            &quiet,
+        )
+        .unwrap();
+        assert!(!quiet.load(Ordering::Relaxed));
+    }
+
     #[test]
     fn resolve_columns_fixes_from_first_record() {
         let insertable = vec!["id".to_string(), "name".to_string(), "age".to_string()];
         let records = vec![json!({"id": 1, "name": "a"}), json!({"id": 2, "name": "b"})];
-        let cols = resolve_insert_columns(&insertable, &records, OnUnknownField::Warn).unwrap();
+        let cols = resolve_insert_columns(&insertable, &records, OnUnknownField::Warn, &unwarned())
+            .unwrap();
         assert_eq!(cols, vec!["id".to_string(), "name".to_string()]);
     }
 
@@ -529,9 +601,15 @@ mod tests {
     fn resolve_columns_errors_on_unknown_when_configured() {
         let insertable = vec!["id".to_string()];
         let records = vec![json!({"id": 1, "extra": "x"})];
-        assert!(resolve_insert_columns(&insertable, &records, OnUnknownField::Error).is_err());
+        assert!(
+            resolve_insert_columns(&insertable, &records, OnUnknownField::Error, &unwarned())
+                .is_err()
+        );
         // Warn/Drop tolerate it.
-        assert!(resolve_insert_columns(&insertable, &records, OnUnknownField::Drop).is_ok());
+        assert!(
+            resolve_insert_columns(&insertable, &records, OnUnknownField::Drop, &unwarned())
+                .is_ok()
+        );
     }
 
     #[test]
@@ -545,7 +623,8 @@ mod tests {
             json!({ "id": 1 }),
             json!({ "id": 2, "name": "b", "email": "x@y" }),
         ];
-        let cols = resolve_insert_columns(&insertable, &records, OnUnknownField::Warn).unwrap();
+        let cols = resolve_insert_columns(&insertable, &records, OnUnknownField::Warn, &unwarned())
+            .unwrap();
         assert_eq!(
             cols,
             vec!["id".to_string(), "name".to_string(), "email".to_string()],
