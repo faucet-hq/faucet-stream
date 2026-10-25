@@ -80,7 +80,8 @@ pub fn shared_unit_destination(node: &crate::expand::ExpandedNode) -> Option<Str
 }
 
 /// How a sink would replace its whole destination on every backfill unit —
-/// `write_mode: overwrite`, or a file sink that truncates its one file —
+/// `write_mode: overwrite`, a file sink that truncates its one file, or a
+/// remote file writer republishing one fixed object (`if_exists: replace`) —
 /// when that destination does not vary per unit (no `${backfill.*}` /
 /// `${now.*}` token in the sink config). Each unit is its own run, so each
 /// would swap away every earlier window's rows.
@@ -97,8 +98,11 @@ pub fn replacing_unit_destination(node: &crate::expand::ExpandedNode) -> Option<
     {
         return Some("`write_mode: overwrite`".into());
     }
-    crate::registry::sink_truncating_path(&node.sink.kind, &node.sink.config)
-        .map(|path| format!("a file it rewrites each run ('{path}')"))
+    if let Some(path) = crate::registry::sink_truncating_path(&node.sink.kind, &node.sink.config) {
+        return Some(format!("a file it rewrites each run ('{path}')"));
+    }
+    crate::registry::sink_replaced_object(&node.sink.kind, &node.sink.config)
+        .map(|dest| format!("an object it rewrites each run ('{dest}')"))
 }
 
 /// The refusal for [`replacing_unit_destination`].

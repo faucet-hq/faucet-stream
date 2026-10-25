@@ -987,6 +987,36 @@ pipeline:
         assert_eq!(run_backfill(&cfg, one).await.unwrap().planned, 1);
     }
 
+    /// A remote object republished on every run keeps only the last window,
+    /// even one unit at a time.
+    #[cfg(feature = "sink-s3")]
+    #[tokio::test]
+    async fn units_may_not_republish_one_object() {
+        let cfg = parse_cfg(&SCOPED.replace(
+            "type: file\n    config: { path: ./out.jsonl, if_exists: append }",
+            "type: s3\n    config: { bucket: b, path: exports/orders.jsonl }",
+        ));
+        let opts = base_opts(time_range(
+            "2026-06-01",
+            "2026-06-03",
+            Some(crate::backfill::plan::WindowStep::Days(1)),
+        ));
+        let err = run_backfill(&cfg, opts).await.unwrap_err().to_string();
+        assert!(
+            err.contains("s3://b/exports/orders.jsonl") && err.contains("only the last"),
+            "{err}"
+        );
+        let appending = parse_cfg(&SCOPED.replace(
+            "type: file\n    config: { path: ./out.jsonl, if_exists: append }",
+            "type: s3\n    config: { bucket: b, prefix: exports/ }",
+        ));
+        let nodes = crate::expand::expand(&appending).unwrap();
+        assert_eq!(
+            super::super::spec::replacing_unit_destination(&nodes[0]),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn concurrent_units_may_not_share_a_file_destination() {
         let cfg = parse_cfg(SCOPED);
