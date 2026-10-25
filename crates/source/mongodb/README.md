@@ -208,7 +208,7 @@ filter:
   tenant_id: "{tenant_id}"      # resolved from the parent record's `tenant_id`
 ```
 
-A value that is exactly one placeholder takes the parent value with its JSON type: a numeric `id` binds as a number (matching an integer field), a boolean as a boolean, an object as a subdocument. A placeholder inside a longer string (`"order-{id}"`) or in a key is interpolated as text.
+A value that is exactly one placeholder takes the parent value with its JSON type: a numeric `id` binds as a number (matching an integer field), a boolean as a boolean, an object as a subdocument. A placeholder inside a longer string (`"order-{id}"`) or in a key is interpolated as text. To bind a whole value as text instead — a child field that stores the id as a string while the parent value is a number — write `"{id:str}"` (`{customer_id: "{customers.id:str}"}` matches `"7"`, not `7`). Until #933 a whole placeholder always bound as text, so a config that relied on that needs the `:str` form.
 
 ## Streaming & batching
 

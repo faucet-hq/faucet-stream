@@ -433,15 +433,28 @@ fn substitute_optional_value(
     value.as_ref().map(|v| substitute_tree(v, context))
 }
 
+/// Suffix of a whole-value placeholder that binds the parent value as text
+/// (`"{customers.id:str}"`).
+const TEXT_SUFFIX: &str = ":str";
+
 fn substitute_tree(value: &Value, context: &std::collections::HashMap<String, Value>) -> Value {
     match value {
         Value::String(s) => {
-            let whole = s
+            let key = s
                 .strip_prefix('{')
                 .and_then(|r| r.strip_suffix('}'))
-                .filter(|k| !k.contains(['{', '}']))
-                .and_then(|k| context.get(k));
-            match whole {
+                .filter(|k| !k.contains(['{', '}']));
+            // `{key:str}` binds the value as text, for a field that stores it
+            // as a string while the parent value is a number or boolean.
+            if let Some(base) = key.and_then(|k| k.strip_suffix(TEXT_SUFFIX))
+                && context.contains_key(base)
+            {
+                return Value::String(faucet_core::util::substitute_context(
+                    &format!("{{{base}}}"),
+                    context,
+                ));
+            }
+            match key.and_then(|k| context.get(k)) {
                 Some(typed) => typed.clone(),
                 None => Value::String(faucet_core::util::substitute_context(s, context)),
             }
@@ -682,6 +695,17 @@ mod tests {
     /// A whole-string placeholder keeps the context value's JSON type, so a
     /// numeric parent id matches an integer field; embedded placeholders and
     /// keys stay text.
+    #[test]
+    fn a_text_placeholder_binds_the_value_as_a_string() {
+        let ctx: std::collections::HashMap<String, Value> =
+            [("id".to_string(), json!(42)), ("s".to_string(), json!("x"))].into();
+        let filter = Some(json!({"a": "{id:str}", "b": "{s:str}", "c": "{nope:str}"}));
+        assert_eq!(
+            substitute_optional_value(&filter, &ctx).unwrap(),
+            json!({"a": "42", "b": "x", "c": "{nope:str}"})
+        );
+    }
+
     #[test]
     fn substitute_optional_value_keeps_the_type_of_a_whole_placeholder() {
         let ctx: std::collections::HashMap<String, Value> = [
