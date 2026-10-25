@@ -429,7 +429,21 @@ pub async fn admit_inline(
 /// Whether `tenant` is past its `max_concurrent_runs` now that a new run is
 /// recorded (the cluster re-check after admission). `Some(message)` when it is.
 pub async fn over_limit(state: &ServerState, tenant: &str) -> Result<Option<String>, ServeError> {
-    let rec = get_tenant(state, tenant).await?;
+    // Re-read after the record is written: a delete or suspension that began
+    // on another instance before this record existed is seen here, so the
+    // run backs out instead of landing for a tenant being deleted.
+    let rec = match get_tenant(state, tenant).await {
+        Ok(rec) => rec,
+        Err(ServeError::NotFound) => {
+            metrics::record_limit_rejection(tenant, "suspended");
+            return Ok(Some(format!("tenant '{tenant}' no longer exists")));
+        }
+        Err(e) => return Err(e),
+    };
+    if rec.suspended {
+        metrics::record_limit_rejection(tenant, "suspended");
+        return Ok(Some(format!("tenant '{tenant}' is suspended")));
+    }
     let Some(max) = rec.limits.max_concurrent_runs else {
         return Ok(None);
     };
@@ -958,6 +972,31 @@ pub struct DeleteReport {
 /// records, change requests, catalog rows, state keys, connections and
 /// connect sessions.
 /// Destination data is never touched. Refused while a run is active.
+/// Undo the suspension a refused delete set — only while the record is
+/// still exactly what the delete wrote. A record someone changed meanwhile
+/// (a limits edit, a deliberate suspension) is left as it is: the delete
+/// never writes an older snapshot over it.
+async fn reopen_admission(
+    state: &ServerState,
+    tenant: &str,
+    before: &TenantRecord,
+) -> Result<(), ServeError> {
+    let history = state.history();
+    let mut closed = before.clone();
+    closed.suspended = true;
+    match history.tenant_get(tenant).await.map_err(store_err)? {
+        Some(current) if current == closed => {
+            history.tenant_upsert(before).await.map_err(store_err)?;
+        }
+        Some(_) => tracing::warn!(
+            tenant,
+            "tenant changed while its delete was refused; leaving it suspended for review"
+        ),
+        None => {}
+    }
+    Ok(())
+}
+
 pub async fn delete_tenant(state: &ServerState, tenant: &str) -> Result<DeleteReport, ServeError> {
     let rec = get_tenant(state, tenant).await?;
     if active_runs(state, tenant, 1).await? > 0 {
@@ -983,7 +1022,7 @@ pub async fn delete_tenant(state: &ServerState, tenant: &str) -> Result<DeleteRe
     let _admission = lock.lock_owned().await;
     if active_runs(state, tenant, 1).await? > 0 {
         if !rec.suspended {
-            history.tenant_upsert(&rec).await.map_err(store_err)?;
+            reopen_admission(state, tenant, &rec).await?;
         }
         return Err(ServeError::Conflict(format!(
             "tenant '{tenant}' has runs queued or running; cancel them before deleting it"
@@ -1339,6 +1378,50 @@ mod tests {
         t.limits.max_concurrent_runs = Some(5);
         state.history().tenant_upsert(&t).await.unwrap();
         assert!(over_limit(&state, "acme").await.unwrap().is_none());
+    }
+
+    /// The post-record re-check backs a run out when the tenant was
+    /// suspended or deleted (by a delete on another instance) meanwhile.
+    #[tokio::test]
+    async fn over_limit_refuses_a_suspended_or_deleted_tenant() {
+        let (state, _) = state_with_vault();
+        let mut t = tenant("acme");
+        t.suspended = true;
+        state.history().tenant_upsert(&t).await.unwrap();
+        let msg = over_limit(&state, "acme")
+            .await
+            .unwrap()
+            .expect("suspended");
+        assert!(msg.contains("is suspended"), "{msg}");
+        let msg = over_limit(&state, "gone").await.unwrap().expect("deleted");
+        assert!(msg.contains("no longer exists"), "{msg}");
+    }
+
+    /// A refused delete lifts only its own suspension, and never writes its
+    /// starting snapshot over a record someone changed meanwhile.
+    #[tokio::test]
+    async fn a_refused_delete_does_not_revert_a_concurrent_edit() {
+        let (state, _) = state_with_vault();
+        let t = tenant("acme");
+        state.history().tenant_upsert(&t).await.unwrap();
+        // Untouched since the delete suspended it: the suspension is lifted.
+        let mut closed = t.clone();
+        closed.suspended = true;
+        state.history().tenant_upsert(&closed).await.unwrap();
+        reopen_admission(&state, "acme", &t).await.unwrap();
+        let now = state.history().tenant_get("acme").await.unwrap().unwrap();
+        assert!(!now.suspended);
+        // Edited meanwhile: left as it is.
+        let mut edited = closed.clone();
+        edited.limits.max_concurrent_runs = Some(3);
+        state.history().tenant_upsert(&edited).await.unwrap();
+        reopen_admission(&state, "acme", &t).await.unwrap();
+        let now = state.history().tenant_get("acme").await.unwrap().unwrap();
+        assert_eq!(now, edited);
+        // Gone: nothing is written back.
+        state.history().tenant_delete("acme").await.unwrap();
+        reopen_admission(&state, "acme", &t).await.unwrap();
+        assert!(state.history().tenant_get("acme").await.unwrap().is_none());
     }
 
     #[tokio::test]
