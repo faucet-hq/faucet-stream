@@ -430,6 +430,11 @@ impl MysqlCdcSource {
                 }
                 match next {
                     Ok(Some(Ok(event))) => {
+                        // Every event of a transaction that holds captured
+                        // rows is activity: an idle cut there would drop the
+                        // open transaction and stop at the same place again
+                        // next cycle.
+                        touch_if_open(&mut last_event, &buffer, std::time::Instant::now());
                         let header = event.header();
                         let ts_ms = u64::from(header.timestamp()) * 1_000;
                         // Events decompressed from a Transaction_payload carry
@@ -659,8 +664,11 @@ impl MysqlCdcSource {
                             emit!(pages.take());
                         }
                         // A stream that never pauses never lets the wait
-                        // above fire, so the idle timeout is checked here too.
-                        if std::time::Instant::now().duration_since(last_event) >= idle_timeout {
+                        // above fire, so the idle timeout is checked here too
+                        // (only between captured transactions).
+                        if buffer.is_empty()
+                            && std::time::Instant::now().duration_since(last_event) >= idle_timeout
+                        {
                             emit!(pages.take());
                             break;
                         }
@@ -1350,8 +1358,27 @@ fn interval_covered(have: &[(u64, u64)], lo: u64, hi: u64) -> bool {
     have.iter().any(|&(a, b)| a <= lo && hi <= b)
 }
 
+/// Count an event as activity when it arrives inside a transaction that has
+/// captured rows staged (`buffer` non-empty).
+fn touch_if_open(last_event: &mut std::time::Instant, buffer: &[Value], now: std::time::Instant) {
+    if !buffer.is_empty() {
+        *last_event = now;
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn events_inside_a_captured_transaction_keep_the_cycle_alive() {
+        let start = std::time::Instant::now();
+        let later = start + std::time::Duration::from_secs(60);
+        let mut last = start;
+        touch_if_open(&mut last, &[], later);
+        assert_eq!(last, start, "no open transaction: not activity");
+        touch_if_open(&mut last, &[serde_json::json!({"op": "u"})], later);
+        assert_eq!(last, later, "an open captured transaction is activity");
+    }
 
     #[test]
     fn an_undecided_xa_is_named_once_it_has_held_the_stream_for_a_minute() {
