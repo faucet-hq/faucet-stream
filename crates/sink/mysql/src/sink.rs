@@ -20,6 +20,9 @@ use sqlx::{MySqlConnection, MySqlPool, Row};
 /// (#456 L1).
 const SCOPE_COL_WIDTH: usize = 255;
 
+/// MySQL's identifier length limit (characters).
+const MYSQL_MAX_IDENT: usize = 64;
+
 /// Fit a pipeline scope into [`SCOPE_COL_WIDTH`].
 pub(crate) fn scope_key(scope: &str) -> String {
     faucet_core::idempotency::scope_key(scope, SCOPE_COL_WIDTH)
@@ -1172,9 +1175,28 @@ impl MysqlDriver {
         Ok(exists.is_some())
     }
 
-    /// Staging table name used while an overwrite run is in flight.
+    /// Staging table name used while an overwrite run is in flight, within
+    /// MySQL's 64-character identifier limit: a tokened name leaves room for
+    /// the swap's `_old` suffix, and a long table name is cut and hashed.
     fn staging_table_name(&self) -> String {
-        self.layout.staging_table()
+        let max = if self.layout.overwrite_run.is_some() {
+            MYSQL_MAX_IDENT - "_old".len()
+        } else {
+            MYSQL_MAX_IDENT
+        };
+        faucet_common_sql::bounded_staging_table(
+            &self.config.table_name,
+            self.layout.overwrite_run.as_deref(),
+            max,
+        )
+    }
+
+    /// The table part every tokened staging name of the target shares.
+    fn staging_base_name(&self) -> String {
+        faucet_common_sql::bounded_staging_base(
+            &self.config.table_name,
+            MYSQL_MAX_IDENT - "_old".len(),
+        )
     }
 
     /// The table the current-target-old is renamed to during the atomic swap.
@@ -1182,10 +1204,10 @@ impl MysqlDriver {
         match &self.layout.overwrite_run {
             // One per run, so two runs' swaps never rename onto one name.
             Some(_) => format!("{}_old", self.staging_table_name()),
-            None => format!(
-                "{}{}",
-                self.config.table_name,
-                faucet_core::idempotency::OVERWRITE_STAGING_OLD_SUFFIX
+            None => faucet_common_sql::bounded_table_name(
+                &self.config.table_name,
+                faucet_core::idempotency::OVERWRITE_STAGING_OLD_SUFFIX,
+                MYSQL_MAX_IDENT,
             ),
         }
     }
@@ -1195,7 +1217,7 @@ impl MysqlDriver {
         let pattern = format!(
             "{}%",
             faucet_core::idempotency::like_literal(
-                &faucet_core::idempotency::overwrite_staging_prefix(&self.config.table_name),
+                &faucet_core::idempotency::overwrite_staging_prefix(&self.staging_base_name()),
                 '\\'
             )
         );
@@ -1597,6 +1619,22 @@ impl SqlDriver for MysqlDriver {
 
     async fn table_exists(&self, table: &str) -> Result<bool, FaucetError> {
         MysqlDriver::table_exists(self, table).await
+    }
+
+    fn staging_table(&self) -> String {
+        self.staging_table_name()
+    }
+
+    fn staging_base(&self) -> String {
+        self.staging_base_name()
+    }
+
+    fn legacy_staging_table(&self) -> String {
+        faucet_common_sql::bounded_table_name(
+            &self.config.table_name,
+            faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX,
+            MYSQL_MAX_IDENT,
+        )
     }
 
     async fn overwrite_staging_tables(&self) -> Result<Vec<String>, FaucetError> {

@@ -42,9 +42,81 @@ pub fn missing_overwrite_staging_error(sink: &str, staging: &str) -> FaucetError
     ))
 }
 
+/// `<table><suffix>` within a backend's identifier limit of `max` bytes. A
+/// longer name is cut and given a hash of the full table name, so it stays
+/// distinct from the table and from other derived names (a backend would
+/// otherwise refuse it, or truncate it silently onto the target's name).
+pub fn bounded_table_name(table: &str, suffix: &str, max: usize) -> String {
+    if table.len() + suffix.len() <= max {
+        return format!("{table}{suffix}");
+    }
+    let hash = table.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    let tag = format!("_{:08x}", hash as u32);
+    let mut cut = max.saturating_sub(suffix.len() + tag.len());
+    while cut > 0 && !table.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{tag}{suffix}", &table[..cut])
+}
+
+/// The staging table of overwrite run `token` within `max` bytes
+/// (`<table>__faucet_ovw_<token>`, shortened by [`bounded_table_name`]); the
+/// untokened name without one.
+pub fn bounded_staging_table(table: &str, token: Option<&str>, max: usize) -> String {
+    bounded_table_name(
+        table,
+        &faucet_core::idempotency::overwrite_staging_suffix(token),
+        max,
+    )
+}
+
+/// The table part every tokened staging name of `table` shares under a
+/// `max`-byte limit (the `<base>` of `<base>__faucet_ovw_<token>`), for
+/// recognising other runs' staging.
+pub fn bounded_staging_base(table: &str, max: usize) -> String {
+    let probe = "0".repeat(faucet_core::idempotency::OVERWRITE_RUN_TOKEN_LEN);
+    let suffix = faucet_core::idempotency::overwrite_staging_suffix(Some(&probe));
+    let name = bounded_table_name(table, &suffix, max);
+    name.strip_suffix(suffix.as_str())
+        .unwrap_or(&name)
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staging_names_fit_the_limit_and_keep_a_shared_base() {
+        use faucet_core::idempotency::{new_overwrite_run_token, overwrite_staging_token};
+        let token = new_overwrite_run_token();
+        // Short names are untouched.
+        assert_eq!(
+            bounded_staging_table("t", Some(&token), 60),
+            format!("t__faucet_ovw_{token}")
+        );
+        assert_eq!(bounded_staging_base("t", 60), "t");
+        let long = "customer_subscription_invoice_lines_v2"; // 38 chars
+        let staging = bounded_staging_table(long, Some(&token), 60);
+        assert!(staging.len() <= 60, "{staging}");
+        let base = bounded_staging_base(long, 60);
+        assert!(staging.starts_with(&base));
+        assert_eq!(
+            overwrite_staging_token(&base, &staging),
+            Some(token.clone())
+        );
+        // Distinct tables stay distinct after the cut.
+        let other = "customer_subscription_invoice_lines_v3";
+        assert_ne!(
+            bounded_staging_base(long, 60),
+            bounded_staging_base(other, 60)
+        );
+        // A multi-byte table name is cut on a character boundary.
+        let wide = "é".repeat(40);
+        assert!(bounded_staging_table(&wide, Some(&token), 60).len() <= 60);
+    }
 
     #[test]
     fn missing_staging_names_the_sink_and_the_staging() {

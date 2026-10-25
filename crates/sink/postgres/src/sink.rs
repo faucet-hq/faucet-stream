@@ -266,18 +266,7 @@ const PG_MAX_IDENT: usize = 63;
 /// truncate it silently, and a staging name equal to the target would drop the
 /// target (#789 SQL-77).
 pub(crate) fn derived_table_name(table: &str, suffix: &str) -> String {
-    if table.len() + suffix.len() <= PG_MAX_IDENT {
-        return format!("{table}{suffix}");
-    }
-    let hash = table.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
-        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
-    });
-    let tag = format!("_{:08x}", hash as u32);
-    let mut cut = PG_MAX_IDENT.saturating_sub(suffix.len() + tag.len());
-    while cut > 0 && !table.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    format!("{}{tag}{suffix}", &table[..cut])
+    faucet_common_sql::bounded_table_name(table, suffix, PG_MAX_IDENT)
 }
 
 /// The staging table an overwrite of `table` loads into: `<table>__faucet_ovw`,
@@ -298,12 +287,7 @@ pub(crate) fn run_staging_table_name(table: &str, token: Option<&str>) -> String
 
 /// The table part every tokened staging name of `table` shares.
 pub(crate) fn run_staging_base(table: &str) -> String {
-    let probe = "0".repeat(faucet_core::idempotency::OVERWRITE_RUN_TOKEN_LEN);
-    let suffix = faucet_core::idempotency::overwrite_staging_suffix(Some(&probe));
-    let name = derived_table_name(table, &suffix);
-    name.strip_suffix(suffix.as_str())
-        .unwrap_or(&name)
-        .to_string()
+    faucet_common_sql::bounded_staging_base(table, PG_MAX_IDENT)
 }
 
 /// How a table's columns may be written: every non-generated column, and
