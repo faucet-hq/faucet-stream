@@ -32,8 +32,12 @@ impl SampleState {
         self.count.load(Ordering::Relaxed)
     }
     fn observe(&self, records: &[Value]) {
-        self.count
-            .fetch_add(records.len() as u64, Ordering::Relaxed);
+        self.observe_iter(records.len(), records.iter());
+    }
+    /// Count `n` records and sample from `records` (the same `n`) while the
+    /// sample has room, cloning only what it keeps.
+    fn observe_iter<'a>(&self, n: usize, records: impl Iterator<Item = &'a Value>) {
+        self.count.fetch_add(n as u64, Ordering::Relaxed);
         if self.cap == 0 {
             return;
         }
@@ -87,16 +91,17 @@ impl SampleState {
         }
         // Preserve first-seen field order across the sample.
         let mut order: Vec<String> = Vec::new();
-        let mut types: HashMap<String, String> = HashMap::new();
+        let mut types: HashMap<String, &'static str> = HashMap::new();
         for rec in sample.iter() {
             if let Value::Object(map) = rec {
                 for (k, v) in map {
-                    if !types.contains_key(k) {
-                        order.push(k.clone());
+                    match types.get_mut(k) {
+                        Some(t) => *t = merge_ol_type(t, ol_type_of(v)),
+                        None => {
+                            order.push(k.clone());
+                            types.insert(k.clone(), ol_type_of(v));
+                        }
                     }
-                    types
-                        .entry(k.clone())
-                        .or_insert_with(|| ol_type_of(v).to_string());
                 }
             }
         }
@@ -104,11 +109,24 @@ impl SampleState {
             fields: order
                 .into_iter()
                 .map(|k| {
-                    let t = types.remove(&k).unwrap_or_else(|| "string".into());
+                    let t = types.remove(&k).unwrap_or("string").to_string();
                     (k, t)
                 })
                 .collect(),
         }
+    }
+}
+
+/// The type a field has across the sample: a null says nothing (a field is
+/// `null` only when every sampled value is), integers widen to `number`, and
+/// any other disagreement is reported as `string`.
+fn merge_ol_type(seen: &'static str, next: &'static str) -> &'static str {
+    match (seen, next) {
+        (s, "null") => s,
+        ("null", n) => n,
+        (s, n) if s == n => s,
+        ("integer", "number") | ("number", "integer") => "number",
+        _ => "string",
     }
 }
 
@@ -268,17 +286,15 @@ impl Sink for SamplingSink {
     }
     async fn write_batch_partial(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
         let outcomes = self.inner.write_batch_partial(records).await?;
-        if outcomes.iter().all(Result::is_ok) {
-            self.state.observe(records);
-        } else {
-            let accepted: Vec<Value> = records
+        let accepted = outcomes.iter().filter(|o| o.is_ok()).count();
+        self.state.observe_iter(
+            accepted,
+            records
                 .iter()
                 .zip(&outcomes)
                 .filter(|(_, o)| o.is_ok())
-                .map(|(r, _)| r.clone())
-                .collect();
-            self.state.observe(&accepted);
-        }
+                .map(|(r, _)| r),
+        );
         Ok(outcomes)
     }
     #[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
@@ -460,6 +476,43 @@ impl Source for SamplingSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_types_merge_across_the_sample() {
+        let state = SampleState::new(10);
+        state.observe(&[
+            serde_json::json!({"id": 1, "deleted_at": null, "price": 10, "mixed": 1}),
+            serde_json::json!({"id": 2, "deleted_at": "2026-01-01", "price": 10.5, "mixed": "x"}),
+            serde_json::json!({"id": 3, "gone": null}),
+        ]);
+        let fields = state.inferred_schema().fields;
+        let ty = |n: &str| fields.iter().find(|(k, _)| k == n).unwrap().1.clone();
+        assert_eq!(ty("id"), "integer");
+        assert_eq!(
+            ty("deleted_at"),
+            "string",
+            "a leading null does not pin the type"
+        );
+        assert_eq!(ty("price"), "number", "integer then float widens to number");
+        assert_eq!(ty("mixed"), "string");
+        assert_eq!(ty("gone"), "null", "null only when every sample is null");
+    }
+
+    #[test]
+    fn observing_accepted_rows_counts_them_and_samples_only_what_fits() {
+        let state = SampleState::new(1);
+        let records = [
+            serde_json::json!({"a": 1}),
+            serde_json::json!({"a": 2}),
+            serde_json::json!({"a": 3}),
+        ];
+        state.observe_iter(2, records.iter().skip(1));
+        assert_eq!(state.count(), 2);
+        assert_eq!(
+            *state.sample.lock().unwrap(),
+            vec![serde_json::json!({"a": 2})]
+        );
+    }
 
     /// A change-stream double with its own multi-table hooks (#731).
     #[tokio::test]
