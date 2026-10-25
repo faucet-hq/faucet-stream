@@ -124,8 +124,8 @@ pub(crate) fn render_table(runs: &[RunRecord]) -> String {
             _ => "-".to_string(),
         };
         // Truncate long run ids (UUIDs) so the table stays aligned.
-        let id = if r.run_id.len() > 20 {
-            format!("{}…", &r.run_id[..19])
+        let id = if r.run_id.chars().count() > 20 {
+            format!("{}…", r.run_id.chars().take(19).collect::<String>())
         } else {
             r.run_id.clone()
         };
@@ -168,6 +168,20 @@ mod tests {
     }
     use crate::serve::history::{InvocationRecord, RunStatus};
     use chrono::{TimeZone, Utc};
+
+    /// A caller-chosen run id with a multibyte character at the truncation
+    /// point renders instead of panicking on a char boundary.
+    #[test]
+    fn a_multibyte_run_id_is_truncated_by_characters() {
+        let r = record(
+            "replay-2026-10-üüü-nightly-orders",
+            RunStatus::Completed,
+            1,
+            Some(1.0),
+        );
+        let out = render_table(&[r]);
+        assert!(out.contains("replay-2026-10-üüü-…"), "{out}");
+    }
 
     fn record(id: &str, status: RunStatus, rows: u64, elapsed: Option<f64>) -> RunRecord {
         let t = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
