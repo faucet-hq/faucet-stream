@@ -110,6 +110,29 @@ async fn a_recursive_walk_lists_each_directory_once_through_symlinks() {
     assert_eq!(rows, vec![json!({"a": 1}), json!({"a": 2})]);
 }
 
+/// A directory reachable directly and through a symlink that sorts first is
+/// listed under its real path, whatever the directory order on disk.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_recursive_listing_prefers_the_real_path_over_a_symlinked_alias() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(d, "sub/x.jsonl", b"{\"a\":2}\n");
+    std::os::unix::fs::symlink(d.join("sub"), d.join("alias")).unwrap();
+    let deep = FileSource::new(FileSourceConfig::new(dir_str(d)).recursive(true)).unwrap();
+    let names: Vec<String> = deep
+        .discover()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|ds| ds.name)
+        .collect();
+    assert_eq!(
+        names,
+        vec![format!("sub{}x.jsonl", std::path::MAIN_SEPARATOR)]
+    );
+}
+
 #[tokio::test]
 async fn globs_recursion_explicit_formats_and_limits() {
     let dir = tempfile::tempdir().unwrap();
