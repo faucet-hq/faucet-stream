@@ -281,7 +281,7 @@ pub async fn replay(
     )
     .await?;
 
-    let records_written = summary.invocations.iter().map(|i| i.records_written).sum();
+    let records_written = summary.invocations.iter().map(written_by).sum();
     if summary.had_failures() {
         let error = summary
             .invocations
@@ -301,6 +301,18 @@ pub async fn replay(
         records_written,
         dry_run: inputs.dry_run,
         failed_dlq: failed.to_string_lossy().into_owned(),
+    })
+}
+
+/// Rows an invocation wrote. A failed invocation's outcome carries
+/// `records_written: 0`, so its count comes from the usage meter, which tallies
+/// every batch the sink accepted before the failure.
+fn written_by(outcome: &crate::executor::InvocationOutcome) -> usize {
+    if outcome.error.is_none() {
+        return outcome.records_written;
+    }
+    outcome.usage.as_ref().map_or(outcome.records_written, |u| {
+        usize::try_from(u.usage.records_written).unwrap_or(usize::MAX)
     })
 }
 

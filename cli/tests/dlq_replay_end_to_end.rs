@@ -133,6 +133,51 @@ async fn a_failed_replay_reports_how_many_rows_landed() {
     );
 }
 
+/// A replay whose sink refuses the second page after the first one landed
+/// reports the rows that did land, not zero (an operator re-running it on an
+/// append sink would otherwise duplicate them).
+#[tokio::test]
+async fn a_replay_failing_on_its_second_page_reports_the_first_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let dlq = dir.path().join("dlq.jsonl");
+    let out = dir.path().join("out.jsonl");
+    // The pipeline reads the DLQ in pages of 1000 (`DEFAULT_BATCH_SIZE`).
+    let page = 1000;
+    let total = page + 500;
+    let body: String = (0..total)
+        .map(|i| envelope("quality", "QualityFailure", json!({"id": i})) + "\n")
+        .collect();
+    write_file(&dlq, &body);
+    let cfg_yaml = format!(
+        "version: 1\nname: replay\npipeline:\n  source: {{ type: csv, config: {{ path: /dev/null }} }}\n  sink: {{ type: jsonl, config: {{ path: {} }} }}\n",
+        out.display()
+    );
+    let cfg = parse_with_extension(&cfg_yaml, "yaml").unwrap();
+    let mut inputs = inputs("replay", false).await;
+    // The first page fits the budget and lands; the second is refused.
+    inputs.budget = Some(serde_json::from_value(json!({"max_records": page})).unwrap());
+    let err = dlq_replay::replay(&cfg, dlq.to_str().unwrap(), inputs)
+        .await
+        .unwrap_err();
+    assert_eq!(read_lines(&out).len(), page, "the first page landed");
+    match &err {
+        faucet_cli::error::CliError::ReplayFailed {
+            records_written,
+            candidates,
+            ..
+        } => {
+            assert_eq!(*records_written, page);
+            assert_eq!(*candidates, total);
+        }
+        other => panic!("expected ReplayFailed, got {other:?}"),
+    }
+    assert!(
+        err.to_string()
+            .contains(&format!("after writing {page} of {total}")),
+        "{err}"
+    );
+}
+
 #[tokio::test]
 async fn replay_dry_run_writes_nothing() {
     let dir = tempfile::tempdir().unwrap();
