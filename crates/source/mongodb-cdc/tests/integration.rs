@@ -188,6 +188,36 @@ async fn cdc_captures_crud_then_resumes_without_replay() {
     let (records3, _) = drain(&source).await;
     let keys: Vec<&Value> = records3.iter().map(|r| &r["document_key"]["_id"]).collect();
     assert_eq!(keys, vec![&json!(3)], "{records3:?}");
+
+    // A read abandoned after its page was taken (a failed sink write stops the
+    // pipeline polling) does not move the position: the next read on the same
+    // instance redelivers the page.
+    Client::with_uri_str(&uri)
+        .await
+        .expect("writer4 client")
+        .database(DB)
+        .collection::<Document>(COLL)
+        .insert_one(doc! { "_id": 4, "name": "erin" })
+        .await
+        .expect("insert4");
+    {
+        let ctx: HashMap<String, Value> = HashMap::new();
+        let mut pages = source.stream_pages(&ctx, 0);
+        loop {
+            let page = pages.next().await.expect("a page").expect("page");
+            if !page.records.is_empty() {
+                assert_eq!(page.records[0]["document_key"]["_id"], json!(4));
+                break;
+            }
+        }
+    }
+    let (records4, _) = drain(&source).await;
+    let keys: Vec<&Value> = records4.iter().map(|r| &r["document_key"]["_id"]).collect();
+    assert_eq!(
+        keys,
+        vec![&json!(4)],
+        "the unwritten page is redelivered: {records4:?}"
+    );
 }
 
 // --- instance trait methods (require a live replica set via new()) ---
