@@ -66,6 +66,10 @@
 //! 19. [`assert_batch_atomicity_truthful`] — a failed write of a batch
 //!     declared atomic lands no row; a per-row batch lands exactly its `Ok`
 //!     rows.
+//! 23. [`assert_cleanup_scoped`] — scoped cleanup deletes exactly the
+//!     unwritten rows of its scope and nothing outside it.
+//! 24. [`assert_rollback_truthful`] — rollback of a run deletes exactly that
+//!     run's rows; a dry run changes nothing.
 //!
 //! Streaming check:
 //! 22. [`assert_first_page_before_exhaustion`] — a source's first page arrives
@@ -151,9 +155,9 @@ where
 }
 
 pub use checks::{
-    assert_batch_atomicity_truthful, assert_driver_declarations_truthful,
+    assert_batch_atomicity_truthful, assert_cleanup_scoped, assert_driver_declarations_truthful,
     assert_driver_row_paths_agree, assert_overwrite_lifecycle, assert_partial_outcomes_truthful,
-    assert_replay_safe, assert_reported_rows_truthful,
+    assert_replay_safe, assert_reported_rows_truthful, assert_rollback_truthful,
 };
 
 use std::collections::HashMap;

@@ -1,4 +1,4 @@
-//! Capability checks 15–19 (RFC 0013, #878): each proves a sink that declares a
+//! Capability checks 15–19 and 23–24 (RFC 0013, #878): each proves a sink that declares a
 //! capability behaves as declared. [`crate::required`] names which of them a
 //! connector must run, and `scripts/conformance-coverage.py` enforces it.
 //!
@@ -410,6 +410,137 @@ pub async fn assert_driver_row_paths_agree<S: Sink + ?Sized>(sink: &S) {
         "[{label}] governed write left rows unaccounted: {report:?}"
     );
     flush(sink, "the row-path writes").await;
+}
+
+/// **Check 23.** A sink declaring scoped cleanup
+/// ([`Sink::cleanup_scope`]) deletes exactly the rows of the given scope that
+/// the run did not write, and nothing outside the scope. The sink must be
+/// configured `write_mode: upsert` with `key: ["id"]` over a destination with
+/// columns `id`, `scope_column` and `v`; `remaining_ids` lists the ids the
+/// destination holds. A cleanup that drops the scope predicate would delete
+/// other scopes' rows on every run.
+#[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
+pub async fn assert_cleanup_scoped<S, F, Fut>(sink: &S, scope_column: &str, remaining_ids: F)
+where
+    S: Sink + ?Sized,
+    F: Fn() -> Fut,
+    Fut: Future<Output = Vec<i64>>,
+{
+    let label = sink.connector_name();
+    let row = |id: i64, scope: &str| {
+        let mut r = serde_json::Map::new();
+        r.insert("id".into(), Value::from(id));
+        r.insert(scope_column.into(), Value::from(scope));
+        r.insert("v".into(), Value::from(format!("v{id}")));
+        Value::Object(r)
+    };
+    let seed = [row(951, "a"), row(952, "a"), row(953, "a"), row(954, "b")];
+    sink.write_batch(&seed)
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] cleanup seed write errored: {e}"));
+    flush(sink, "cleanup seed").await;
+    let mut seen = faucet_core::SeenKeys::new();
+    seen.record_page(
+        &[serde_json::json!({ "id": 951 })],
+        &["id".to_string()],
+        1000,
+    );
+    let scope = std::collections::BTreeMap::from([(scope_column.to_string(), Value::from("a"))]);
+    let deleted = sink
+        .cleanup_scope(&scope, &seen)
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] cleanup_scope errored: {e}"));
+    let mut ids: Vec<i64> = remaining_ids()
+        .await
+        .into_iter()
+        .filter(|i| (951..=954).contains(i))
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec![951, 954],
+        "[{label}] cleanup of scope a with only id 951 written must delete 952 and 953 \
+         and leave scope b alone"
+    );
+    assert_eq!(
+        deleted, 2,
+        "[{label}] cleanup_scope reported {deleted} deletions, 2 happened"
+    );
+}
+
+/// **Check 24.** A sink declaring rollback ([`Sink::rollback_run`]) undoes
+/// exactly one run's appended rows: a dry run counts them and changes
+/// nothing, the rollback deletes them, and rows other runs wrote stay. The
+/// destination must have columns `id`, `v` and `run_id_column`;
+/// `remaining_ids` lists the ids it holds.
+pub async fn assert_rollback_truthful<S, F, Fut>(sink: &S, run_id_column: &str, remaining_ids: F)
+where
+    S: Sink + ?Sized,
+    F: Fn() -> Fut,
+    Fut: Future<Output = Vec<i64>>,
+{
+    use faucet_core::rollback::{RollbackMode, RollbackOptions};
+    let label = sink.connector_name();
+    let row = |id: i64, run: &str| {
+        let mut r = serde_json::Map::new();
+        r.insert("id".into(), Value::from(id));
+        r.insert("v".into(), Value::from(format!("v{id}")));
+        r.insert(run_id_column.into(), Value::from(run));
+        Value::Object(r)
+    };
+    let seed = [
+        row(961, "conformance-r0"),
+        row(962, "conformance-r1"),
+        row(963, "conformance-r1"),
+    ];
+    sink.write_batch(&seed)
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] rollback seed write errored: {e}"));
+    flush(sink, "rollback seed").await;
+    let ids = || async {
+        let mut ids: Vec<i64> = remaining_ids()
+            .await
+            .into_iter()
+            .filter(|i| (961..=963).contains(i))
+            .collect();
+        ids.sort_unstable();
+        ids
+    };
+    let mut opts = RollbackOptions {
+        run_id_column: run_id_column.to_string(),
+        mode: RollbackMode::Append,
+        force: false,
+        dry_run: true,
+        later_runs: false,
+    };
+    let dry = sink
+        .rollback_run("conformance-r1", &opts)
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] dry-run rollback errored: {e}"));
+    assert_eq!(
+        dry.deleted, 2,
+        "[{label}] the dry run must count the run's 2 rows: {dry:?}"
+    );
+    assert!(!dry.applied, "[{label}] a dry run reported itself applied");
+    assert_eq!(
+        ids().await,
+        vec![961, 962, 963],
+        "[{label}] the dry run changed rows"
+    );
+    opts.dry_run = false;
+    let out = sink
+        .rollback_run("conformance-r1", &opts)
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] rollback errored: {e}"));
+    assert!(
+        out.applied && out.deleted == 2,
+        "[{label}] rollback reported {out:?}"
+    );
+    assert_eq!(
+        ids().await,
+        vec![961],
+        "[{label}] rollback must delete exactly the run's rows"
+    );
 }
 
 #[cfg(test)]
@@ -902,5 +1033,106 @@ mod tests {
                 .unwrap();
             assert_eq!(r.accepted, 2);
         }
+    }
+
+    /// A keyed in-memory sink with scoped cleanup and append rollback;
+    /// `broken` drops the scope / run predicate.
+    #[derive(Clone, Default)]
+    struct Destructive {
+        rows: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<i64, Value>>>,
+        broken: bool,
+    }
+
+    impl Destructive {
+        fn ids(&self) -> Vec<i64> {
+            self.rows.lock().unwrap().keys().copied().collect()
+        }
+    }
+
+    #[faucet_core::async_trait]
+    impl Sink for Destructive {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, faucet_core::FaucetError> {
+            let mut rows = self.rows.lock().unwrap();
+            for r in records {
+                rows.insert(r["id"].as_i64().unwrap(), r.clone());
+            }
+            Ok(records.len())
+        }
+        async fn cleanup_scope(
+            &self,
+            scope: &std::collections::BTreeMap<String, Value>,
+            seen: &faucet_core::SeenKeys,
+        ) -> Result<u64, faucet_core::FaucetError> {
+            let kept: Vec<i64> = seen
+                .keys()
+                .iter()
+                .map(|k| k.0[0].1.as_i64().unwrap())
+                .collect();
+            let mut rows = self.rows.lock().unwrap();
+            let before = rows.len();
+            rows.retain(|id, r| {
+                let in_scope = self.broken || scope.iter().all(|(c, v)| &r[c] == v);
+                !in_scope || kept.contains(id)
+            });
+            Ok((before - rows.len()) as u64)
+        }
+        async fn rollback_run(
+            &self,
+            run_id: &str,
+            opts: &faucet_core::rollback::RollbackOptions,
+        ) -> Result<faucet_core::rollback::RollbackOutcome, faucet_core::FaucetError> {
+            let mut rows = self.rows.lock().unwrap();
+            let doomed: Vec<i64> = rows
+                .iter()
+                .filter(|(_, r)| self.broken || r[&opts.run_id_column] == run_id)
+                .map(|(id, _)| *id)
+                .collect();
+            if !opts.dry_run {
+                for id in &doomed {
+                    rows.remove(id);
+                }
+            }
+            Ok(faucet_core::rollback::RollbackOutcome {
+                deleted: doomed.len() as u64,
+                applied: !opts.dry_run,
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn check23_passes_for_a_scoped_cleanup() {
+        let sink = Destructive::default();
+        let s = sink.clone();
+        assert_cleanup_scoped(&sink, "tenant", || std::future::ready(s.ids())).await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "leave scope b alone")]
+    async fn check23_fails_for_a_cleanup_that_ignores_the_scope() {
+        let sink = Destructive {
+            broken: true,
+            ..Default::default()
+        };
+        let s = sink.clone();
+        assert_cleanup_scoped(&sink, "tenant", || std::future::ready(s.ids())).await;
+    }
+
+    #[tokio::test]
+    async fn check24_passes_for_an_append_rollback() {
+        let sink = Destructive::default();
+        let s = sink.clone();
+        assert_rollback_truthful(&sink, "_faucet_run_id", || std::future::ready(s.ids())).await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "count the run's 2 rows")]
+    async fn check24_fails_for_a_rollback_that_ignores_the_run() {
+        let sink = Destructive {
+            broken: true,
+            ..Default::default()
+        };
+        let s = sink.clone();
+        assert_rollback_truthful(&sink, "_faucet_run_id", || std::future::ready(s.ids())).await;
     }
 }

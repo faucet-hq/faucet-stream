@@ -44,6 +44,8 @@ Each proves a sink behaves as a capability it declares says it does:
 | 20 | `assert_driver_declarations_truthful` | every lifecycle the sink does not declare is refused by its hook, the declared ones' probes answer (RFC 0014) |
 | 21 | `assert_driver_row_paths_agree` | the plain, reported, per-row and governed writes of a valid page agree (RFC 0014) |
 | 22 | `assert_first_page_before_exhaustion` | given a count of what the backend has served, a source's first page arrives before the whole result set was read (it streams rather than buffers) |
+| 23 | `assert_cleanup_scoped` | scoped cleanup deletes exactly the unwritten rows of its scope and nothing outside it |
+| 24 | `assert_rollback_truthful` | rollback of a run deletes exactly that run's rows; a dry run changes nothing |
 
 Checks 20 and 21 are required for a sink built on a family driver
 (`faucet_core::driver`, `faucet_common_sql::SqlDriver`); they run on any sink.

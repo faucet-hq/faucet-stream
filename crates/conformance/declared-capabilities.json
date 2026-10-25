@@ -149,6 +149,34 @@
       "summary": "a failed write of a batch declared atomic lands no row"
     },
     {
+      "id": "cleanup",
+      "role": "sink",
+      "triggers": [
+        {
+          "kind": "capability",
+          "arg": "cleanup"
+        }
+      ],
+      "assertions": [
+        "assert_cleanup_scoped"
+      ],
+      "summary": "cleanup deletes exactly the unwritten rows of its scope and nothing outside it"
+    },
+    {
+      "id": "rollback",
+      "role": "sink",
+      "triggers": [
+        {
+          "kind": "capability",
+          "arg": "rollback"
+        }
+      ],
+      "assertions": [
+        "assert_rollback_truthful"
+      ],
+      "summary": "rollback deletes exactly the run's rows, and a dry run changes nothing"
+    },
+    {
       "id": "call_deadline",
       "role": "sink",
       "triggers": [
