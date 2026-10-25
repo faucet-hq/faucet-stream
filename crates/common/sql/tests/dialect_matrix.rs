@@ -1162,3 +1162,39 @@ fn cleanup_journal_renders_binary_keys_as_base64() {
             .unwrap()
     );
 }
+
+/// Inside a page scope the engine reads a target's live columns once for every
+/// chunk of the page; outside one (or after it closes) every insert reads them.
+fn page_scope_reads_columns_once<D: SqlDialect>(d: D) {
+    let engine = SqlSinkEngine::new(d, WriteSpec::default());
+    let t = target(engine.dialect(), "t");
+    let mut rec = Recorder::new(&[("id", "bigint"), ("v", "text")]);
+    let rows = vec![json!({"id": 1, "v": "a"})];
+    {
+        let _page = engine.page_scope();
+        for _ in 0..3 {
+            futures_lite_block_on(engine.insert(&mut rec, &t, &rows, false)).unwrap();
+        }
+        let other = target(engine.dialect(), "u");
+        futures_lite_block_on(engine.insert(&mut rec, &other, &rows, false)).unwrap();
+    }
+    assert_eq!(
+        rec.catalog_reads,
+        2,
+        "{}: one read per target",
+        engine.dialect().name()
+    );
+    futures_lite_block_on(engine.insert(&mut rec, &t, &rows, false)).unwrap();
+    futures_lite_block_on(engine.insert(&mut rec, &t, &rows, false)).unwrap();
+    assert_eq!(
+        rec.catalog_reads,
+        4,
+        "{}: no cache outside a scope",
+        engine.dialect().name()
+    );
+}
+
+#[test]
+fn page_scope_reads_columns_once_per_target() {
+    every_dialect!(page_scope_reads_columns_once);
+}

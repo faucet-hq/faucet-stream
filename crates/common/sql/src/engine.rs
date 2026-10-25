@@ -17,6 +17,7 @@ use faucet_core::write_mode::{KeyTuple, WritePlan, WriteSpec};
 use faucet_core::{FaucetError, RowOutcome, SeenKeys, SqlBaseType, WriteMode, WriteReport};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A backend's connection, as the engine drives it: catalog reads and
@@ -142,6 +143,35 @@ pub struct SqlSinkEngine<D> {
     write: WriteSpec,
     options: EngineOptions,
     unmatched_warned: AtomicBool,
+    /// The live columns read during the current page write, so a page split
+    /// into `batch_size` chunks reads the catalog once (see [`PageColumns`]).
+    page_columns: Mutex<PageColumns>,
+}
+
+/// A page-scoped cache of a target's live columns. Active only while a
+/// [`PageScope`] is held: schema evolution runs between pages, so the column
+/// list cannot change inside one page write.
+#[derive(Debug, Default)]
+struct PageColumns {
+    depth: usize,
+    cached: Option<(TableTarget, Vec<TableColumn>)>,
+}
+
+/// Holds the engine's page column cache open; dropping the last scope clears
+/// it. See [`SqlSinkEngine::page_scope`].
+#[must_use = "the cache is cleared when the scope is dropped"]
+pub struct PageScope<'e> {
+    columns: &'e Mutex<PageColumns>,
+}
+
+impl Drop for PageScope<'_> {
+    fn drop(&mut self) {
+        let mut page = self.columns.lock().unwrap_or_else(|e| e.into_inner());
+        page.depth = page.depth.saturating_sub(1);
+        if page.depth == 0 {
+            page.cached = None;
+        }
+    }
 }
 
 impl<D: std::fmt::Debug> std::fmt::Debug for SqlSinkEngine<D> {
@@ -166,7 +196,48 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
             write,
             options: EngineOptions::default(),
             unmatched_warned: AtomicBool::new(false),
+            page_columns: Mutex::new(PageColumns::default()),
         }
+    }
+
+    /// Open a page scope: until it is dropped, [`insert`](Self::insert)
+    /// reads a target's live columns once and reuses them for every chunk.
+    pub fn page_scope(&self) -> PageScope<'_> {
+        self.page_columns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .depth += 1;
+        PageScope {
+            columns: &self.page_columns,
+        }
+    }
+
+    /// `target`'s live columns, from the page cache when a scope is open.
+    pub(crate) async fn live_columns<E: SqlExecutor + ?Sized>(
+        &self,
+        exec: &mut E,
+        target: &TableTarget,
+    ) -> Result<Vec<TableColumn>, FaucetError> {
+        let (scoped, hit) = {
+            let page = self.page_columns.lock().unwrap_or_else(|e| e.into_inner());
+            let hit = match &page.cached {
+                Some((t, cols)) if page.depth > 0 && t == target => Some(cols.clone()),
+                _ => None,
+            };
+            (page.depth > 0, hit)
+        };
+        if let Some(cols) = hit {
+            return Ok(cols);
+        }
+        if !scoped {
+            return exec.columns(target).await;
+        }
+        let cols = exec.columns(target).await?;
+        let mut page = self.page_columns.lock().unwrap_or_else(|e| e.into_inner());
+        if page.depth > 0 {
+            page.cached = Some((target.clone(), cols.clone()));
+        }
+        Ok(cols)
     }
 
     /// The same engine with `options`.
@@ -543,7 +614,7 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
         if records.is_empty() {
             return Ok(0);
         }
-        let columns = exec.columns(target).await?;
+        let columns = self.live_columns(exec, target).await?;
         let (written, statements) = self.insert_statements(target, &columns, records, upsert)?;
         for stmt in &statements {
             exec.execute(stmt).await?;

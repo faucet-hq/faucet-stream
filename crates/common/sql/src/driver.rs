@@ -574,6 +574,7 @@ impl<D: SqlDriver> SqlSinkDriver<D> {
             n => n,
         };
         let target = self.driver.target(&self.effective_table());
+        let _page = self.engine().page_scope();
         let mut total = 0;
         for part in records.chunks(chunk) {
             let mut conn = self.driver.begin().await?;
@@ -595,7 +596,7 @@ impl<D: SqlDriver> SqlSinkDriver<D> {
     /// The destination's live columns, for the dead-letter split.
     async fn live_columns(&self, table: &TableTarget) -> Result<Vec<TableColumn>, FaucetError> {
         let mut conn = self.driver.connection().await?;
-        conn.columns(table).await
+        self.engine().live_columns(&mut conn, table).await
     }
 
     /// The dead-letter path: write the good rows and fail each bad one alone
@@ -603,6 +604,7 @@ impl<D: SqlDriver> SqlSinkDriver<D> {
     /// the backend refuses).
     async fn write_rows_partial(&self, records: &[Value]) -> Result<PageWrite, FaucetError> {
         self.ensure_table_ready(records).await?;
+        let _page = self.engine().page_scope();
         let table = self.driver.target(&self.effective_table());
         if !self.engine().is_keyed() {
             if self.layout().json_column.is_some() {
