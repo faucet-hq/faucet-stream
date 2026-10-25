@@ -20,7 +20,7 @@ apply to windowed passes or across `requests:` entries.
 | `None` | after the first page |
 | `Cursor` | the next-token JSONPath is null/absent (or repeats) |
 | `CursorInBody` | the next-token JSONPath is null/absent (or repeats) — for POST-search APIs that take the cursor in the request body |
-| `PageNumber` | a page returns zero records (or an identical body repeats) |
+| `PageNumber` | a page returns zero records (or repeats the previous page; repeating an earlier, non-adjacent page fails the run, since rows may be unread) |
 | `Offset` | the offset reaches `total` (via `total_path`), or an empty page arrives (a short page alone does not stop it: servers clamp `limit`; `stop_when_short: true` opts in for servers that reject an offset past the end) |
 | `OffsetInBody` | like `Offset` (`total`, an empty page, or `stop_when_short: true`) — offset/limit are written into the JSON **request body** (POST-query APIs) |
 | `RecordFieldCursor` | a short page arrives — keyset paging by the running max/min of a **record field** |
