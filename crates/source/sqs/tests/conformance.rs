@@ -216,6 +216,8 @@ async fn messages_survive_a_downstream_failure_after_the_page_is_yielded() {
     cfg.wait_time_seconds = 1;
     cfg.idle_timeout_secs = Some(5);
     cfg.batch_size = 2;
+    // A held lease would hide the messages from the count; this checks deletion only.
+    cfg.visibility_extension_secs = 0;
 
     let source = SqsSource::new(cfg).await.expect("source");
     {
