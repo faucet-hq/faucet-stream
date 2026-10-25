@@ -919,3 +919,26 @@ async fn linting_one_file_resolves_a_hub_only_for_a_bundle() {
     .expect_err("a bundle outside a hub runs against the given --hub, where its sink is absent");
     assert!(err.to_string().contains("with findings"), "{err}");
 }
+
+/// Two different directories given as `--hub` are both searched, even when
+/// their paths differ only in `.` / `..` segments; the same directory given
+/// twice is searched once.
+#[test]
+fn distinct_hub_directories_are_not_deduplicated() {
+    use faucet_cli::hub::{HubLocation, hub_locations};
+    let base = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(base.path().join("a/hub")).unwrap();
+    std::fs::create_dir_all(base.path().join("hub")).unwrap();
+    let inner = base.path().join("a/./hub").display().to_string();
+    let outer = base.path().join("a/../hub").display().to_string();
+    let inner_again = base.path().join("a/hub").display().to_string();
+    let locs = hub_locations(&[inner.clone(), outer.clone(), inner_again]).unwrap();
+    let dirs: Vec<String> = locs
+        .iter()
+        .map(|l| match l {
+            HubLocation::Dir(p) => p.display().to_string(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(dirs, vec![inner, outer]);
+}

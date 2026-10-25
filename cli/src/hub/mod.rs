@@ -164,6 +164,22 @@ impl HubLocation {
         }
     }
 
+    /// Whether two locations name the same hub: the same repository, ref and
+    /// path, or the same directory (compared canonically when it exists).
+    /// Not [`Self::cache_key`], which folds distinct paths together.
+    pub fn same_hub(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Dir(a), Self::Dir(b)) => {
+                a == b
+                    || matches!(
+                        (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+                        (Ok(a), Ok(b)) if a == b
+                    )
+            }
+            (a, b) => a == b,
+        }
+    }
+
     /// Stable filesystem-safe key for the cache directory.
     pub fn cache_key(&self) -> String {
         let raw = match self {
@@ -237,7 +253,7 @@ pub fn hub_locations(flags: &[String]) -> CliResult<Vec<HubLocation>> {
     let mut out: Vec<HubLocation> = Vec::new();
     for g in given {
         let loc = HubLocation::parse(g)?;
-        if !out.iter().any(|o| o.cache_key() == loc.cache_key()) {
+        if !out.iter().any(|o| o.same_hub(&loc)) {
             out.push(loc);
         }
     }
