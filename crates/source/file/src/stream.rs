@@ -14,7 +14,6 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use tokio::io::AsyncBufReadExt;
 
 type Reader = Pin<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>>;
 
@@ -523,8 +522,7 @@ impl faucet_core::Source for FileSource {
                             // One line is bounded by `max_object_bytes`, so a
                             // body with no newline fails instead of being
                             // buffered whole.
-                            let reader = faucet_core::file_format::line_capped(reader, self.config.max_object_bytes);
-                            let mut lines = tokio::io::BufReader::new(reader).lines();
+                            let mut lines = faucet_core::file_format::capped_lines(reader, self.config.max_object_bytes);
                             let mut n = 0usize;
                             while let Some(line) = lines.next_line().await.map_err(|e| read_err(path, e))? {
                                 n += 1;

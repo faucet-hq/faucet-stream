@@ -145,7 +145,9 @@ pub struct GcsSourceConfig {
     /// Largest object, once decompressed, that a format read whole (JSON
     /// array, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet, and
     /// JSON Lines under `verify_checksum`) may reach; a larger one fails with
-    /// an error instead of exhausting memory. Default 2 GiB.
+    /// an error instead of exhausting memory. It also bounds one line of a
+    /// streamed JSON Lines object, so an object with no newline fails the same
+    /// way. Default 2 GiB.
     #[serde(default = "default_max_object_bytes")]
     pub max_object_bytes: u64,
     /// Optional storage-host override (e.g. `http://localhost:4443` for

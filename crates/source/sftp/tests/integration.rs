@@ -320,3 +320,44 @@ async fn a_whole_file_past_max_object_bytes_fails_with_its_name() {
         "{error}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_newline_free_jsonl_file_fails_at_max_object_bytes() {
+    // `jsonl` streams line by line; one line is still bounded by
+    // `max_object_bytes`, so a file with no newline fails instead of being
+    // buffered whole.
+    let long = format!("[{}]", vec!["{\"id\":1}"; 50].join(","));
+    let files = vec![
+        (
+            "a-short.jsonl".to_string(),
+            "{\"id\":1}\n{\"id\":2}\n".to_string(),
+        ),
+        ("b-long.jsonl".to_string(), long),
+    ];
+    let Some((_c, port)) = start_sftp(&files).await else {
+        return;
+    };
+    let conn = SftpConnectionConfig::with_password("127.0.0.1", USER, PASS).port(port);
+    let mut config = SftpSourceConfig::new(conn, "/data")
+        .format(SftpFormat::Jsonl)
+        .with_batch_size(1)
+        .concurrency(1);
+    config.max_object_bytes = 64;
+    let src = SftpSource::new(config).expect("config is valid");
+    let ctx: HashMap<String, Value> = HashMap::new();
+    let mut pages = src.stream_pages(&ctx, 1);
+    let mut records = 0;
+    let mut error = None;
+    while let Some(page) = pages.next().await {
+        match page {
+            Ok(p) => records += p.records.len(),
+            Err(e) => {
+                error = Some(e.to_string());
+                break;
+            }
+        }
+    }
+    assert_eq!(records, 2, "the short-lined file is read");
+    let error = error.expect("the newline-free file fails");
+    assert!(error.contains("max_object_bytes"), "{error}");
+}

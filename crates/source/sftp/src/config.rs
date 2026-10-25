@@ -141,8 +141,9 @@ pub struct SftpSourceConfig {
     pub parquet: faucet_core::ParquetReadOptions,
     /// Largest file, in bytes, a format read whole into memory (JSON array,
     /// raw text, CSV, XML, Excel, Avro, ORC) may reach; a larger one fails
-    /// with an error naming it instead of exhausting memory. `jsonl` and
-    /// `parquet` stream and are not capped. Default 2 GiB.
+    /// with an error naming it instead of exhausting memory. It also bounds one
+    /// line of a streamed `jsonl` file, so a file with no newline fails the
+    /// same way; `parquet` streams and is not capped. Default 2 GiB.
     #[serde(default = "default_max_object_bytes")]
     pub max_object_bytes: u64,
 }

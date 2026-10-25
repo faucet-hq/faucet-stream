@@ -547,6 +547,18 @@ pub fn line_capped<R>(reader: R, max: u64) -> LineCapped<R> {
     }
 }
 
+/// The lines of a JSON Lines body, none longer than `max` bytes (see
+/// [`line_capped`]). Every streamed JSON Lines reader uses it, so a body with
+/// no newline fails the same way in every source instead of being buffered
+/// whole.
+pub fn capped_lines<R: tokio::io::AsyncRead + Unpin>(
+    reader: R,
+    max: u64,
+) -> tokio::io::Lines<tokio::io::BufReader<LineCapped<R>>> {
+    use tokio::io::AsyncBufReadExt;
+    tokio::io::BufReader::new(line_capped(reader, max)).lines()
+}
+
 /// A reader whose lines are bounded (see [`line_capped`]).
 #[derive(Debug)]
 pub struct LineCapped<R> {
