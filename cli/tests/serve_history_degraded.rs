@@ -25,6 +25,8 @@ use tokio_util::sync::CancellationToken;
 const HEALTHY: u8 = 0;
 const UNREACHABLE: u8 = 1;
 const PERMANENT: u8 = 2;
+/// Every pooled connection checked out; new calls time out acquiring one.
+const SATURATED: u8 = 3;
 
 /// A primary that is healthy, unreachable, or answering with a permanent error.
 struct Flaky {
@@ -36,6 +38,9 @@ impl Flaky {
     fn check(&self) -> Result<(), HistoryError> {
         match self.mode.load(Ordering::SeqCst) {
             UNREACHABLE => Err(HistoryError::Unreachable("connection refused".into())),
+            SATURATED => Err(HistoryError::PoolTimedOut(
+                "pool timed out while waiting for an open connection".into(),
+            )),
             PERMANENT => Err(HistoryError::BackendClassified {
                 message: "UNIQUE constraint failed".into(),
                 transience: Transience::Permanent,
@@ -109,6 +114,9 @@ impl RunHistory for Flaky {
     fn degraded(&self) -> bool {
         false
     }
+    fn pool_saturated(&self) -> bool {
+        self.mode.load(Ordering::SeqCst) == SATURATED
+    }
 }
 
 fn flaky() -> (FallbackHistory, Arc<AtomicU8>) {
@@ -176,6 +184,30 @@ fn run(id: &str) -> RunRecord {
         None,
         chrono::Utc::now(),
     )
+}
+
+#[tokio::test]
+async fn a_saturated_pool_degrades_only_once_the_backend_stops_answering() {
+    let (fb, mode) = flaky();
+    let fb = fb.with_saturation_grace(Duration::from_secs(2));
+    fb.upsert(&run("r0")).await.unwrap();
+    mode.store(SATURATED, Ordering::SeqCst);
+    let err = fb.upsert(&run("r1")).await.unwrap_err();
+    assert!(err.is_pool_timeout(), "{err}");
+    assert!(
+        !fb.degraded(),
+        "a busy pool on a backend that just answered is load, not an outage"
+    );
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    fb.upsert(&run("r2")).await.unwrap();
+    assert!(
+        fb.degraded(),
+        "a pool that stays saturated with no answer for the grace is a hung backend"
+    );
+    assert!(
+        fb.get("r2").await.unwrap().is_some(),
+        "runs keep going in memory"
+    );
 }
 
 #[tokio::test]

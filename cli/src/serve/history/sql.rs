@@ -2433,7 +2433,9 @@ pub fn classify_backend_error(e: sqlx::Error) -> HistoryError {
 }
 
 fn classified(message: String, e: &sqlx::Error) -> HistoryError {
-    if unreachable_of(e) {
+    if matches!(e, sqlx::Error::PoolTimedOut) {
+        HistoryError::PoolTimedOut(message)
+    } else if unreachable_of(e) {
         HistoryError::Unreachable(message)
     } else {
         HistoryError::BackendClassified {
@@ -6780,6 +6782,8 @@ mod tests {
         assert!(!unreachable_of(&sqlx::Error::RowNotFound));
         let err = classify_backend_error(sqlx::Error::PoolTimedOut);
         assert!(err.is_unreachable());
+        assert!(err.is_pool_timeout());
+        assert!(!classify_backend_error(sqlx::Error::PoolClosed).is_pool_timeout());
         assert_eq!(err.transience(), Transience::Transient);
         assert!(err.to_string().starts_with("run-history backend error:"));
         let err = classify_backend_error(db("08006"));

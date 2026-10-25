@@ -411,6 +411,12 @@ pub enum HistoryError {
     /// degraded fallback.
     #[error("run-history backend error: {0}")]
     Unreachable(String),
+    /// No pooled connection became free within the acquire timeout. Counts
+    /// as [unreachable](Self::is_unreachable), but while the pool is
+    /// saturated and the backend is still answering other calls it is local
+    /// load, not an outage (see `FallbackHistory`).
+    #[error("run-history backend error: {0}")]
+    PoolTimedOut(String),
     /// A label move's evidence stopped deciding the version between the check
     /// and the write (#856); the move was not made.
     #[error("{0}")]
@@ -440,7 +446,9 @@ impl HistoryError {
             Self::BackendClassified { transience, .. } => *transience,
             // A degraded backend recovers on its own, so a caller retrying is
             // exactly the right response.
-            Self::Degraded(_) | Self::Unreachable(_) => Transience::Transient,
+            Self::Degraded(_) | Self::Unreachable(_) | Self::PoolTimedOut(_) => {
+                Transience::Transient
+            }
             _ => Transience::Unknown,
         }
     }
@@ -448,7 +456,13 @@ impl HistoryError {
     /// Whether the backend could not be reached at all (see
     /// [`Unreachable`](Self::Unreachable)).
     pub fn is_unreachable(&self) -> bool {
-        matches!(self, Self::Unreachable(_))
+        matches!(self, Self::Unreachable(_) | Self::PoolTimedOut(_))
+    }
+
+    /// Whether the call timed out waiting for a pooled connection (see
+    /// [`PoolTimedOut`](Self::PoolTimedOut)).
+    pub fn is_pool_timeout(&self) -> bool {
+        matches!(self, Self::PoolTimedOut(_))
     }
 
     /// Whether retrying the failed call could plausibly succeed. Everything but
