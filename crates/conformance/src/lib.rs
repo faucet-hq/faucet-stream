@@ -552,8 +552,8 @@ where
 /// - a declared idempotent/keyed mechanism actually dedups (reuses check 4);
 /// - `supports_schema_evolution()` implies `evolve_schema` is callable (not the
 ///   default "unsupported" error);
-/// - the honest-false branch: a non-idempotent sink's `write_batch_idempotent`
-///   delegates to `write_batch` and records no token.
+/// - the honest-false branch: a non-idempotent sink's `write_batch` adds a row
+///   and `last_committed_token` reports no token.
 ///
 /// Write a page and make it visible.
 ///
@@ -675,9 +675,10 @@ pub async fn assert_errors_not_panics<S: Source + ?Sized>(source: &S) {
 ///   `cdc_unwrap` convention) removes its keyed row. Only run when the sink
 ///   advertises `Delete`; the sink under test must be configured with a
 ///   matching `delete_marker`.
-/// - **Missing/null key** — [`plan_writes`](faucet_core::write_mode::plan_writes),
-///   the shared planner every upsert sink routes through, reports such rows as
-///   `failed` (destined for a DLQ) rather than writing them.
+/// - **Missing/null key** — the sink's own
+///   [`write_batch_partial`](Sink::write_batch_partial) reports a keyless or
+///   null-key row as failed (destined for a DLQ), or fails the page; such a
+///   row never lands.
 ///
 /// Records are keyed on `"id"`, so the sink under test must be configured
 /// `write_mode: upsert` with `key: ["id"]`. A sink advertising only `Append`
@@ -689,7 +690,7 @@ where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = usize>,
 {
-    use faucet_core::write_mode::{WriteMode, WriteSpec, plan_writes};
+    use faucet_core::write_mode::WriteMode;
 
     let label = sink.connector_name();
     let modes = sink.supported_write_modes();
@@ -761,31 +762,37 @@ where
     }
 
     // ── Missing / null key must be reported as failed, never silently written. ──
-    let spec = WriteSpec {
-        write_mode: WriteMode::Upsert,
-        key: vec!["id".to_string()],
-        delete_marker: None,
-        rollback: None,
-    };
-    let plan = plan_writes(
-        &[
-            serde_json::json!({ "id": 9, "v": "ok" }),
-            serde_json::json!({ "no_key": 1 }),
-            serde_json::json!({ "id": null }),
-        ],
-        &spec,
-    );
-    assert_eq!(
-        plan.upserts.len(),
-        1,
-        "[{label}] the one keyed row should be planned as an upsert"
-    );
-    assert_eq!(
-        plan.failed.len(),
-        2,
-        "[{label}] plan_writes did not report the missing-key and null-key rows as failed \
-         (they would be silently dropped or written): {:?}",
-        plan.failed
+    let page = [
+        serde_json::json!({ "id": 9, "v": "ok" }),
+        serde_json::json!({ "no_key": 1 }),
+        serde_json::json!({ "id": null }),
+    ];
+    let before = distinct_count().await;
+    match sink.write_batch_partial(&page).await {
+        Ok(outcomes) => {
+            assert_eq!(
+                outcomes.len(),
+                page.len(),
+                "[{label}] write_batch_partial returned {} outcomes for {} rows",
+                outcomes.len(),
+                page.len()
+            );
+            assert!(
+                outcomes[1].is_err() && outcomes[2].is_err(),
+                "[{label}] the missing-key and null-key rows were reported as written \
+                 (they must fail into the DLQ): {outcomes:?}"
+            );
+        }
+        Err(_) => { /* the page was refused as a whole — also truthful */ }
+    }
+    sink.flush()
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] flush after the keyless page errored: {e}"));
+    let after = distinct_count().await;
+    assert!(
+        after <= before + 1,
+        "[{label}] a keyless or null-key row landed: {} rows were added for one keyed row",
+        after - before
     );
 }
 
@@ -1446,6 +1453,60 @@ mod tests {
         assert_write_modes_truthful(&sink, || {
             let s = s.clone();
             async move { s.len() }
+        })
+        .await;
+    }
+
+    /// A keyed sink that converges and deletes by `id`, but writes a record
+    /// without a usable key as a new row and reports it written.
+    #[derive(Clone, Default)]
+    struct KeylessWritingSink {
+        rows: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Value>>>,
+    }
+
+    #[faucet_core::async_trait]
+    impl Sink for KeylessWritingSink {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, faucet_core::FaucetError> {
+            let mut rows = self.rows.lock().unwrap();
+            for (i, r) in records.iter().enumerate() {
+                let key = match r.get("id") {
+                    Some(v) if !v.is_null() => v.to_string(),
+                    _ => format!("keyless-{}-{i}", rows.len()),
+                };
+                if r.get(doubles::DELETE_MARKER_FIELD).and_then(Value::as_str)
+                    == Some(doubles::DELETE_MARKER_VALUE)
+                {
+                    rows.remove(&key);
+                } else {
+                    rows.insert(key, r.clone());
+                }
+            }
+            Ok(records.len())
+        }
+        fn dedups_by_key(&self) -> bool {
+            true
+        }
+        fn supported_write_modes(&self) -> &'static [faucet_core::write_mode::WriteMode] {
+            use faucet_core::write_mode::WriteMode;
+            &[WriteMode::Append, WriteMode::Upsert, WriteMode::Delete]
+        }
+        async fn write_batch_partial(
+            &self,
+            records: &[Value],
+        ) -> Result<Vec<faucet_core::RowOutcome>, faucet_core::FaucetError> {
+            self.write_batch(records).await?;
+            Ok(records.iter().map(|_| Ok(())).collect())
+        }
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "were reported as written")]
+    async fn check7_fails_for_a_sink_that_writes_keyless_rows() {
+        let sink = KeylessWritingSink::default();
+        let s = sink.clone();
+        assert_write_modes_truthful(&sink, || {
+            let s = s.clone();
+            async move { s.rows.lock().unwrap().len() }
         })
         .await;
     }

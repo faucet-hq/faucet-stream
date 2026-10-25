@@ -303,9 +303,12 @@ impl Sink for TestSink {
                 let keys = records
                     .iter()
                     .map(|r| {
-                        r.get(field).map(|v| v.to_string()).ok_or_else(|| {
-                            FaucetError::Sink(format!("record missing key `{field}`"))
-                        })
+                        r.get(field)
+                            .filter(|v| !v.is_null())
+                            .map(|v| v.to_string())
+                            .ok_or_else(|| {
+                                FaucetError::Sink(format!("record missing key `{field}`"))
+                            })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let mut map = self.keyed.lock().unwrap();
