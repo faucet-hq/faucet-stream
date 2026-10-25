@@ -170,6 +170,15 @@ fn plan_impact_walks_the_catalog_and_names_contracts_owners_and_consumers() {
     // Plan A dropping `email` (the column B renames and promises in its
     // contract): breaking at B, contract v7 named, owner + dashboard listed;
     // A's own consumer reads only `amount`, so it is not affected.
+    fs::write(
+        &a_path,
+        config_a(
+            d,
+            "  transforms:\n    - type: drop\n      config: { fields: [email] }\n",
+            &annotations,
+        ),
+    )
+    .unwrap();
     let sample = d.join("sample.jsonl");
     fs::write(&sample, "{\"id\": \"1\", \"amount\": \"10\"}\n").unwrap();
     let (code, plan, _) = json_out(
