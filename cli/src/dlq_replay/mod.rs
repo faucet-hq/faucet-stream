@@ -340,7 +340,7 @@ pub fn discard(
     let mut archived_to = Vec::new();
 
     for file in &files {
-        dec.verify_file(file)?;
+        let limit = dec.verify_file(file)?;
         let mut already = reader::discarded_lines(file)?;
         let mut ids = String::new();
         let archive = archive_path(file);
@@ -352,7 +352,7 @@ pub fn discard(
         let mut removed = String::new();
         let mut archived = false;
         let mut file_discarded = 0usize;
-        reader::for_each_line(file, |line| {
+        reader::for_each_verified_line(file, limit, |line| {
             let id = reader::line_id(line);
             if already.contains(&id)
                 || plan::discard_keep_line(line, dec, reason.as_deref(), before_ms)
@@ -741,6 +741,53 @@ mod tests {
             "{err}"
         );
         assert!(!reader::discard_sidecar(&file).exists());
+    }
+
+    /// A sealed DLQ of two flushes whose final trailer and one line of the
+    /// last flush were removed: the last flush is no longer covered by any
+    /// trailer, so its remaining lines are not read (they would hide the
+    /// removal), while the verified first flush still is.
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn lines_after_the_last_verifying_trailer_are_not_read() {
+        use faucet_common_file::sealed_lines::LineSeal;
+        let enc = faucet_core::CompiledEncryption::compile(&faucet_core::EncryptionSpec {
+            key: "k".into(),
+            previous_keys: vec![],
+            algorithm: Default::default(),
+        })
+        .unwrap();
+        let mut seal = LineSeal::new();
+        let mut lines = vec![String::from_utf8(seal.header(&enc)).unwrap()];
+        let push = |seal: &mut LineSeal, id: i64| {
+            let line = env_line("quality", "QualityFailure", id, json!({ "id": id }));
+            String::from_utf8(seal.seal(&enc, line.as_bytes())).unwrap()
+        };
+        lines.push(push(&mut seal, 1));
+        lines.push(String::from_utf8(seal.trailer(&enc)).unwrap());
+        for id in 2..=4 {
+            lines.push(push(&mut seal, id));
+        }
+        lines.push(String::from_utf8(seal.trailer(&enc)).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("dlq.jsonl");
+        let dec = DlqDecryptor::from_keys(&["k".to_string()]).unwrap();
+        std::fs::write(&file, lines.concat()).unwrap();
+        let scan = reader::scan_files(std::slice::from_ref(&file), &dec).unwrap();
+        assert_eq!(scan.envelopes.len(), 4);
+
+        // Drop line 3 (id 3) and the final trailer.
+        let tampered = [&lines[..4], &lines[5..6]].concat().concat();
+        std::fs::write(&file, tampered).unwrap();
+        let scan = reader::scan_files(std::slice::from_ref(&file), &dec).unwrap();
+        let ids: Vec<i64> = scan
+            .envelopes
+            .iter()
+            .map(|e| e.payload["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![1], "only the verified flush is read");
+        let out = discard(file.to_str().unwrap(), None, None, true, &dec).unwrap();
+        assert_eq!(out.discarded, 1, "only verified lines are discarded");
     }
 
     #[test]

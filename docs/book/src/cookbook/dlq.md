@@ -376,8 +376,10 @@ The `faucet dlq` verbs handle sealed files transparently:
 - With the key, `inspect`, `replay` and `discard` first check the file's
   whole-file integrity (header, trailers, line order): a file with lines
   removed, reordered or added is refused rather than read as a subset. Lines
-  after the last trailer — a flush a writer has not finished — are read with a
-  warning.
+  after the last trailer — a flush a writer has not finished — are not covered
+  by any trailer, so they are skipped with a warning (and read once the flush
+  completes). The check streams the file, so it needs no more memory than the
+  longest line.
 - `discard` keeps and archives lines **verbatim** (still sealed) — filtering
   decrypts only in memory; nothing is ever re-written in plaintext.
 - Rows that fail again during a `replay` land in the fresh failure DLQ sealed

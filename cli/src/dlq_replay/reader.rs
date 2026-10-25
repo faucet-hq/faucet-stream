@@ -123,55 +123,58 @@ impl DlqDecryptor {
     }
 
     /// Verify a sealed DLQ file's whole-file integrity (header, trailers and
-    /// line order) before its lines are read one by one. A file that is not
-    /// sealed, or whose first line the loaded keys cannot open, is not checked
-    /// (its lines are then counted as undecryptable). Only an unfinished last
-    /// flush (lines after the final trailer) is tolerated, with a warning.
-    pub fn verify_file(&self, file: &Path) -> Result<(), FaucetError> {
+    /// line order) before its lines are read one by one, streaming (memory is
+    /// bounded by the longest line). A file that is not sealed, or whose first
+    /// line the loaded keys cannot open, is not checked (its lines are then
+    /// counted as undecryptable). An unfinished last flush (lines after the
+    /// final verifying trailer) is tolerated with a warning, but its lines are
+    /// not covered by any trailer, so they are not read: the result is then
+    /// `Some(n)`, the number of non-blank lines the readers may take (see
+    /// [`for_each_verified_line`]). `None` = every line.
+    pub fn verify_file(&self, file: &Path) -> Result<Option<usize>, FaucetError> {
         #[cfg(feature = "encryption")]
         if let Some(enc) = &self.inner {
             if !starts_sealed(file)? {
-                return Ok(());
+                return Ok(None);
             }
-            use faucet_common_file::sealed_lines::{open, open_for_append};
-            use std::io::Read as _;
-            let mut raw = Vec::new();
-            open_lines(file)?.read_to_end(&mut raw).map_err(|e| {
-                FaucetError::Source(format!("reading DLQ file '{}': {e}", file.display()))
-            })?;
-            let first = String::from_utf8_lossy(&raw)
-                .lines()
-                .map(str::trim)
-                .find(|l| !l.is_empty())
-                .map(str::to_owned)
-                .unwrap_or_default();
+            use faucet_common_file::sealed_lines::{Verdict, Verifier};
             let opens_with_key = {
                 use base64::Engine as _;
-                base64::engine::general_purpose::STANDARD
-                    .decode(&first)
-                    .is_ok_and(|b| enc.open_line(&b).is_ok())
+                first_nonblank_line(file)?.is_some_and(|first| {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(first.trim())
+                        .is_ok_and(|b| enc.open_line(&b).is_ok())
+                })
             };
             if !opens_with_key {
-                return Ok(());
+                return Ok(None);
             }
-            if let Err(e) = open(&raw, enc) {
-                if open_for_append(&raw, enc).is_err() {
-                    return Err(FaucetError::Source(format!(
-                        "DLQ file '{}' failed its integrity check ({e}) — lines may have been \
-                         removed, reordered or added; it is not read",
-                        file.display()
-                    )));
+            let mut verifier = Verifier::new(enc);
+            for_each_line(file, |line| {
+                verifier.push(line);
+                Ok(())
+            })?;
+            return match verifier.finish() {
+                Ok(Verdict::UnfinishedTail { verified_lines }) => {
+                    tracing::warn!(
+                        file = %file.display(),
+                        "DLQ file ends in an unfinished flush (no verifying trailer after its \
+                         last lines); those lines are not covered by the integrity check and \
+                         are not read"
+                    );
+                    Ok(Some(verified_lines))
                 }
-                tracing::warn!(
-                    file = %file.display(),
-                    "DLQ file ends in an unfinished flush (no trailer after its last lines); \
-                     those lines are read without whole-file verification"
-                );
-            }
+                Ok(_) => Ok(None),
+                Err(e) => Err(FaucetError::Source(format!(
+                    "DLQ file '{}' failed its integrity check ({e}) — lines may have been \
+                     removed, reordered or added; it is not read",
+                    file.display()
+                ))),
+            };
         }
         #[cfg(not(feature = "encryption"))]
         let _ = file;
-        Ok(())
+        Ok(None)
     }
 
     /// Whether any key is loaded.
@@ -637,6 +640,11 @@ pub fn scan_files(files: &[PathBuf], dec: &DlqDecryptor) -> Result<ScanResult, F
 /// Whether `file`'s first non-blank line is sealed by the jsonl sink's
 /// `encryption:` block (reads one line).
 pub fn starts_sealed(file: &Path) -> Result<bool, FaucetError> {
+    Ok(first_nonblank_line(file)?.is_some_and(|l| l.trim().starts_with(SEALED_LINE_PREFIX)))
+}
+
+/// `file`'s first non-blank line, if any.
+fn first_nonblank_line(file: &Path) -> Result<Option<String>, FaucetError> {
     use std::io::BufRead;
     let read_err = |e: std::io::Error| {
         FaucetError::Source(format!("reading DLQ file '{}': {e}", file.display()))
@@ -645,10 +653,10 @@ pub fn starts_sealed(file: &Path) -> Result<bool, FaucetError> {
     for line in reader.lines() {
         let line = line.map_err(read_err)?;
         if !line.trim().is_empty() {
-            return Ok(line.trim().starts_with(SEALED_LINE_PREFIX));
+            return Ok(Some(line));
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 /// The tolerant-parse tallies of a [`scan_each`].
@@ -687,6 +695,25 @@ pub fn for_each_line(
     }
 }
 
+/// [`for_each_line`] limited to the first `limit` non-blank lines (all when
+/// `None`): the lines a [`DlqDecryptor::verify_file`] verdict covers.
+pub fn for_each_verified_line(
+    file: &Path,
+    limit: Option<usize>,
+    mut visit: impl FnMut(&str) -> Result<(), FaucetError>,
+) -> Result<(), FaucetError> {
+    let mut seen = 0usize;
+    for_each_line(file, |line| {
+        if !line.trim().is_empty() {
+            seen += 1;
+            if limit.is_some_and(|n| seen > n) {
+                return Ok(());
+            }
+        }
+        visit(line)
+    })
+}
+
 /// Classify every line of every file and hand each envelope to `visit`,
 /// reading line by line so memory stays bounded by the longest line.
 /// Discarded lines are skipped.
@@ -697,9 +724,9 @@ pub fn scan_each(
 ) -> Result<ScanTally, FaucetError> {
     let mut out = ScanTally::default();
     for file in files {
-        dec.verify_file(file)?;
+        let limit = dec.verify_file(file)?;
         let discarded = discarded_lines(file)?;
-        for_each_line(file, |line| {
+        for_each_verified_line(file, limit, |line| {
             if !discarded.is_empty() && discarded.contains(&line_id(line)) {
                 return Ok(());
             }
