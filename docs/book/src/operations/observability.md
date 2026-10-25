@@ -43,7 +43,9 @@ cardinality and never a Prometheus label.
   `faucet_source_lag_seconds{pipeline,row,connector}` — how far a CDC or
   streaming source is behind its head (unread WAL / binlog, unconsumed
   messages, age of the oldest unread change), polled at page boundaries and at
-  the end of a run. Sources without a head (query sources) emit nothing. See
+  the end of a run. Sources without a head (query sources) emit nothing.
+  `faucet_source_lag_stale{pipeline,row,connector}` is `1` while polling is
+  paused after a slow lag query (the lag gauges then hold their last value). See
   [Source lag](../cookbook/sla.md#source-lag).
 - **Sink:** `faucet_sink_records_total`, `faucet_sink_writes_total`,
   `faucet_sink_errors_total`, `faucet_sink_write_duration_seconds`,

@@ -113,6 +113,10 @@ carry the latest reading, and the end-of-run value is kept on the row's status
 marker. Between scheduled runs a gauge goes stale, so `faucet status --probe`
 (and `faucet doctor`) ask the source again from the stored bookmark. A lag
 query that fails is logged once and reported as no lag — it never fails a run.
+A lag query slower than 5 s is abandoned and polling pauses for 5 minutes
+(doubling on each further timeout, up to an hour) so it cannot hold pages;
+while paused, `faucet_source_lag_stale{pipeline,row,connector}` reads `1` and
+the lag gauges keep their last reading, so alert on it as "lag unknown".
 Some need extra grants: `pg_replication_slots` is readable by the replication
 role; MySQL needs `REPLICATION CLIENT` for `SHOW BINARY LOGS`; SQL Server needs
 `SELECT` on `cdc.lsn_time_mapping`.
