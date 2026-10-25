@@ -936,3 +936,46 @@ async fn a_deadline_during_cancel_confirmation_fails_as_unconfirmed() {
         "{msg}"
     );
 }
+
+/// R5-002 (#934): on the per-row (DLQ) upsert path a row whose value does not
+/// fit its column, or that carries a field the table lacks, fails on its own
+/// instead of failing the whole page; the rest are merged.
+#[tokio::test]
+async fn write_batch_partial_upsert_isolates_misshapen_rows() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    mount_query_done(&server, "job-shape").await;
+    mount_job_done(&server, "job-shape").await;
+
+    let cfg = config_with(|c| {
+        c.write.write_mode = faucet_core::WriteMode::Upsert;
+        c.write.key = vec!["id".into()];
+    });
+    let (sink, _sa) = build_sink(&server, cfg).await;
+    let outcomes = sink
+        .write_batch_partial(&[
+            json!({"id": 1, "name": "a"}),
+            json!({"id": 2, "name": {"nested": true}}),
+            json!({"id": 3, "extra": 1}),
+            json!({"name": "no key"}),
+        ])
+        .await
+        .expect("partial write");
+    assert!(outcomes[0].is_ok());
+    let msg = |i: usize| outcomes[i].as_ref().unwrap_err().to_string();
+    assert!(msg(1).contains("do not fit the column type"), "{}", msg(1));
+    assert!(msg(2).contains("`extra`"), "{}", msg(2));
+    assert!(outcomes[3].is_err(), "missing key");
+    let bodies = captured_query_bodies(&server).await;
+    let merged = bodies
+        .iter()
+        .map(|b| b.to_string())
+        .find(|b| b.contains("MERGE"))
+        .expect("a MERGE ran for the good row");
+    assert!(merged.contains("\\\"a\\\""), "{merged}");
+    assert!(
+        !merged.contains("nested") && !merged.contains("extra"),
+        "{merged}"
+    );
+}
