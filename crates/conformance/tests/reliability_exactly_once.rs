@@ -90,16 +90,27 @@ async fn a_crash_between_sink_commit_and_state_put_replays_nothing() {
     // ahead of the state store.
     let per_page = 4;
     let log = EventLog::new();
-    let sink = ScriptedSink::new(log.clone()).idempotent();
+    let sink = ScriptedSink::new(log.clone())
+        .idempotent()
+        .failing_at(Boundary::StatePut(1));
     let store = Arc::new(sink.state_store());
 
     let source1 = PagedSource::new(5, per_page);
-    let _ = Pipeline::new(&source1, &sink)
+    let run1 = Pipeline::new(&source1, &sink)
         .with_state_store(store.clone())
         .with_delivery(DeliveryMode::ExactlyOnce)
         .run()
         .await;
 
+    assert!(
+        run1.is_err(),
+        "run 1 must fail at its second bookmark write"
+    );
+    assert!(
+        log.any(|e| matches!(e, Event::StatePutFailed { .. })),
+        "the state-put failure must have been exercised: {:?}",
+        log.events()
+    );
     assert!(
         log.any(|e| matches!(e, Event::IdempotentWrite { .. })),
         "run 1 must have committed at least one page: {:?}",
@@ -331,6 +342,11 @@ async fn at_least_once_is_the_control_arm_and_does_duplicate() {
         .with_delivery(DeliveryMode::ExactlyOnce)
         .run()
         .await;
+    assert!(
+        eo_log.any(|e| matches!(e, Event::StatePutFailed { .. })),
+        "the exactly-once arm must hit the same state-put failure: {:?}",
+        eo_log.events()
+    );
     eo_sink.rearm(Boundary::Never);
     let eo_source2 = PagedSource::new(5, per_page);
     Pipeline::new(&eo_source2, &eo_sink)
