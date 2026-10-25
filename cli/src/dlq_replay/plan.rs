@@ -250,7 +250,8 @@ pub fn replay_target(
 /// dead-lettered records to what the destination holds, so nothing in it may
 /// replace the destination: `write_mode: overwrite` (which would swap in a
 /// table holding only the replayed rows) becomes `append`, and a file sink
-/// that replaces its file each run appends instead. A sink that can only
+/// that replaces its file each run appends instead (a remote sink without a
+/// fixed `path` writes new objects and is left as is). A sink that can only
 /// write one whole file (a local `.parquet` file) is refused.
 pub fn replay_sink_config(sink: &ConnectorSpec) -> CliResult<Value> {
     let mut cfg = sink.config.clone();
@@ -269,7 +270,7 @@ pub fn replay_sink_config(sink: &ConnectorSpec) -> CliResult<Value> {
         "jsonl" | "csv" => {
             map.insert("append".into(), Value::Bool(true));
         }
-        kind if IF_EXISTS_DLQ_KINDS.contains(&kind) => {
+        kind if IF_EXISTS_DLQ_KINDS.contains(&kind) && names_fixed_file(kind, &sink.config) => {
             let set = map.remove("if_exists").or_else(|| map.remove("mode"));
             let keep = set
                 .as_ref()
@@ -384,7 +385,17 @@ pub fn check_dlq_sink(sink: &ConnectorSpec, context: &str) -> CliResult<()> {
 /// File-writing sinks whose existing-file behaviour is the `if_exists` field.
 const IF_EXISTS_DLQ_KINDS: &[&str] = &["file", "s3", "gcs", "azure-blob", "sftp"];
 
-/// The DLQ sink config with appending forced on (#789 CLI-03). A dead-letter
+/// Whether an `if_exists` sink writes a fixed file name, so `if_exists`
+/// decides what happens to an existing file. A remote sink without `path`
+/// (sftp: `file_name`) names every file uniquely per run and never replaces
+/// one; the file writer refuses `if_exists` other than `replace` there.
+fn names_fixed_file(kind: &str, config: &Value) -> bool {
+    kind == "file" || crate::registry::sink_shared_destination(kind, config).is_some()
+}
+
+/// The DLQ sink config with appending forced on (#789 CLI-03) — for a remote
+/// sink only when it names a fixed object (`path` / `file_name`); without one
+/// every run writes new objects and nothing is replaced. A dead-letter
 /// file holds the only copy of rows whose bookmark has already moved on, so a
 /// DLQ must never replace it. An explicit replace setting, or a single-file
 /// format that cannot be appended to, is refused instead of silently changed.
@@ -407,7 +418,7 @@ pub fn dlq_append_config(sink: &ConnectorSpec, context: &str) -> CliResult<Value
             }
             map.insert("append".into(), Value::Bool(true));
         }
-        kind if IF_EXISTS_DLQ_KINDS.contains(&kind) => {
+        kind if IF_EXISTS_DLQ_KINDS.contains(&kind) && names_fixed_file(kind, &sink.config) => {
             let set = map.remove("if_exists").or_else(|| map.remove("mode"));
             match set.as_ref().and_then(Value::as_str) {
                 None | Some("append") => {
@@ -511,12 +522,24 @@ mod tests {
         let file = ok("file", json!({"path": "d.jsonl", "mode": "append"}));
         assert_eq!(file["if_exists"], "append");
         assert!(file.get("mode").is_none());
-        assert_eq!(ok("s3", json!({"bucket": "b"}))["if_exists"], "append");
+        assert_eq!(
+            ok("s3", json!({"bucket": "b", "path": "dlq.jsonl"}))["if_exists"],
+            "append"
+        );
+        // Without a fixed name every run writes new objects: left as is.
+        assert_eq!(ok("s3", json!({"bucket": "b"})), json!({"bucket": "b"}));
+        assert_eq!(
+            ok("gcs", json!({"bucket": "b", "if_exists": "replace"})),
+            json!({"bucket": "b", "if_exists": "replace"})
+        );
         assert_eq!(
             ok("sftp", json!({"path": "p", "if_exists": "error"}))["if_exists"],
             "error"
         );
-        let e = err("gcs", json!({"bucket": "b", "if_exists": "replace"}));
+        let e = err(
+            "gcs",
+            json!({"bucket": "b", "path": "d.jsonl", "if_exists": "replace"}),
+        );
         assert!(
             e.contains("row 'r' dlq") && e.contains("if_exists: replace"),
             "{e}"
@@ -973,10 +996,21 @@ matrix:
         assert!(c.get("mode").is_none());
         let c = replay_sink_config(&spec(
             "s3",
-            json!({"bucket": "b", "if_exists": "error_if_exists"}),
+            json!({"bucket": "b", "path": "o.jsonl", "if_exists": "error_if_exists"}),
         ))
         .unwrap();
         assert_eq!(c["if_exists"], "error_if_exists");
+        let c = replay_sink_config(&spec("s3", json!({"bucket": "b", "path": "o.jsonl"}))).unwrap();
+        assert_eq!(c["if_exists"], "append");
+        // A remote sink naming objects per run is left as is.
+        for kind in ["s3", "gcs", "azure-blob", "sftp"] {
+            let cfg = json!({"bucket": "b", "container": "c", "host": "h", "prefix": "p/"});
+            assert_eq!(
+                replay_sink_config(&spec(kind, cfg.clone())).unwrap(),
+                cfg,
+                "{kind}"
+            );
+        }
         let err = replay_sink_config(&spec(
             "parquet",
             json!({"destination": {"type": "local_path", "path": "o.parquet"}}),
@@ -994,6 +1028,22 @@ matrix:
             replay_sink_config(&spec("stdout", Value::Null)).unwrap(),
             Value::Null
         );
+    }
+
+    /// A replay to a remote sink that names objects per run still builds.
+    #[cfg(feature = "sink-s3")]
+    #[tokio::test]
+    async fn replay_to_a_path_less_object_store_sink_builds() {
+        for cfg in [
+            json!({"bucket": "b", "prefix": "exports/", "region": "us-east-1"}),
+            json!({"bucket": "b", "path": "o.jsonl", "region": "us-east-1"}),
+        ] {
+            let c = replay_sink_config(&spec("s3", cfg)).unwrap();
+            let auth = crate::auth_catalog::AuthCatalog::default();
+            crate::registry::build_sink("s3", c.clone(), &auth)
+                .await
+                .unwrap_or_else(|e| panic!("{c}: {e}"));
+        }
     }
 
     /// The replay node of an overwrite row with scoped cleanup appends and
