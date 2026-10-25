@@ -1197,12 +1197,31 @@ fn cycle_ended(max_cycle: Duration, elapsed: Duration, in_txn: bool) -> bool {
 /// The lineage identity of a publication: the server/database URL without
 /// credentials or connection parameters, plus the publication name.
 fn publication_uri(connection_url: &str, publication: &str) -> String {
-    let redacted = faucet_core::redact_uri_credentials(connection_url);
-    let base = redacted
-        .split(['?', '#'])
-        .next()
-        .unwrap_or(redacted.as_str());
-    format!("{base}?publication={publication}")
+    const SEGMENT: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
+        .add(b' ')
+        .add(b'#')
+        .add(b'%')
+        .add(b'/')
+        .add(b'?');
+    match crate::replication::parse_url(connection_url) {
+        Ok(c) => format!(
+            "postgres://{}:{}/{}?publication={publication}",
+            c.host,
+            c.port,
+            percent_encoding::utf8_percent_encode(&c.dbname, SEGMENT)
+        ),
+        // The source refuses such a URL when it connects; name it without
+        // credentials or connection parameters meanwhile.
+        Err(_) => {
+            let redacted = faucet_core::redact_uri_credentials(connection_url);
+            let base = redacted
+                .split(['?', '#'])
+                .next()
+                .unwrap_or(redacted.as_str())
+                .to_string();
+            format!("{base}?publication={publication}")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1864,14 +1883,40 @@ mod tests {
     fn dataset_uri_drops_connection_parameters() {
         assert_eq!(
             publication_uri(
-                "postgres://u:p@h/db?sslmode=verify-full&sslrootcert=/ca",
+                "postgres://u:p@h/db?sslmode=verify-full&sslrootcert=/ca&password=x",
                 "pub"
             ),
-            "postgres://h/db?publication=pub"
+            "postgres://h:5432/db?publication=pub"
         );
         assert_eq!(
-            publication_uri("postgres://h/db?sslmode=require#frag", "pub"),
-            "postgres://h/db?publication=pub"
+            publication_uri("postgres://u@h/db?sslmode=require#frag", "pub"),
+            "postgres://h:5432/db?publication=pub"
+        );
+    }
+
+    #[test]
+    fn dataset_uri_names_the_effective_database() {
+        let a = publication_uri("postgres://u@h/?dbname=a", "p");
+        let b = publication_uri("postgres://u@h/?dbname=b", "p");
+        assert_eq!(a, "postgres://h:5432/a?publication=p");
+        assert_ne!(a, b, "two databases are two datasets");
+        assert_eq!(
+            publication_uri("postgres://u@h:5432/app", "p"),
+            publication_uri("postgres://u@h/app", "p"),
+            "the default port names the same dataset"
+        );
+        assert_eq!(
+            publication_uri("postgres://u@h", "p"),
+            "postgres://h:5432/postgres?publication=p"
+        );
+        assert_eq!(
+            publication_uri("postgres://u@h/my%20db", "p"),
+            "postgres://h:5432/my%20db?publication=p"
+        );
+        assert_eq!(
+            publication_uri("postgres://:p@h/db?sslmode=require", "p"),
+            "postgres://h/db?publication=p",
+            "an unusable URL still drops credentials and parameters"
         );
     }
 }

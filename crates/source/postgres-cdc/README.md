@@ -347,7 +347,7 @@ Built on the [`pgwire-replication`](https://crates.io/crates/pgwire-replication)
 
 ## Lineage dataset URI
 
-`postgres://<host>:<port>/<db>?publication=<publication_name>` (credentials stripped) — e.g. `postgres://host:5432/app?publication=faucet_pub`.
+`postgres://<host>:<port>/<db>?publication=<publication_name>`, built from the parsed connection: the port defaults to `5432`, the database is the effective one (`?dbname=` wins over the path, `postgres` when neither is set), and credentials and every other connection parameter are left out — e.g. `postgres://host:5432/app?publication=faucet_pub`.
 
 ## Feature flags
 

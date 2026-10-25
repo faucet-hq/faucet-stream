@@ -162,6 +162,18 @@ async fn sslmode_prefer_falls_back_to_plaintext_on_a_server_without_tls() {
     let uri = source.dataset_uri();
     assert!(uri.ends_with("?publication=faucet_pub"), "{uri}");
     assert!(!uri.contains("sslmode"), "{uri}");
+    let parsed = url::Url::parse(&url).expect("url");
+    let db = parsed.path().trim_start_matches('/');
+    let db = if db.is_empty() { "postgres" } else { db };
+    assert_eq!(
+        uri,
+        format!(
+            "postgres://{}:{}/{db}?publication=faucet_pub",
+            parsed.host_str().unwrap(),
+            parsed.port().unwrap_or(5432)
+        ),
+        "built from the parsed host, port and database"
+    );
     let _ = source.fetch_all_incremental().await.expect("warm-up");
     ddl(&url, "INSERT INTO public.p VALUES (1);").await;
     let (records, _) = source.fetch_all_incremental().await.expect("fetch");

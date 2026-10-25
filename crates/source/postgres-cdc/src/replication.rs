@@ -229,15 +229,15 @@ pub struct ReplicationParams<'a> {
 // ── Helper: parse a postgres URL into (host, port, user, password, dbname) ─
 
 #[cfg_attr(test, derive(Debug))]
-struct PgCoords {
-    host: String,
-    port: u16,
+pub(crate) struct PgCoords {
+    pub(crate) host: String,
+    pub(crate) port: u16,
     user: String,
     password: String,
-    dbname: String,
+    pub(crate) dbname: String,
 }
 
-fn parse_url(url: &str) -> Result<PgCoords, FaucetError> {
+pub(crate) fn parse_url(url: &str) -> Result<PgCoords, FaucetError> {
     // Parse via the standard `url` crate so we can extract all components
     // without relying on sqlx accessor methods that may not be public.
     let parsed = url::Url::parse(url)
