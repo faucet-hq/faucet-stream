@@ -206,7 +206,6 @@ async fn discard_filters_sealed_envelopes_and_preserves_lines_verbatim() {
     )
     .await;
     let before = std::fs::read_to_string(&dlq).unwrap();
-    let kept_line = before.lines().nth(1).unwrap().to_string();
 
     let dec = DlqDecryptor::from_keys(&[KEY.to_string()]).unwrap();
     let outcome =
@@ -220,7 +219,8 @@ async fn discard_filters_sealed_envelopes_and_preserves_lines_verbatim() {
     assert_eq!(after, before);
     let scan = dlq_replay::reader::scan_files(std::slice::from_ref(&dlq), &dec).unwrap();
     assert_eq!(scan.envelopes.len(), 1);
-    assert!(before.lines().nth(1) == Some(kept_line.as_str()));
+    // The envelope the reader still serves is the kept `contract` one.
+    assert_eq!(scan.envelopes[0].payload, json!({"id": 2}));
     let archive = std::fs::read_to_string(dir.path().join("dlq.jsonl.archived")).unwrap();
     assert!(archive.contains(before.lines().next().unwrap()));
     assert!(!archive.contains("\"id\":1"), "archive stays sealed");
