@@ -654,6 +654,9 @@ pub fn bq_column_type(field_spec: &serde_json::Value) -> &'static str {
             // value into it on load.
             Some("date-time") => "TIMESTAMP",
             Some("date") => "DATE",
+            // Exact decimal text (e.g. OData `Edm.Decimal`) becomes an exact
+            // decimal column, never FLOAT64; BIGNUMERIC holds any scale up to 38.
+            Some("decimal") => "BIGNUMERIC",
             _ => "STRING",
         },
         Some("object") | Some("array") => "JSON",
@@ -741,6 +744,10 @@ mod tests {
         assert_eq!(bq_column_type(&json!({"type": "string"})), "STRING");
         assert_eq!(bq_column_type(&json!({"type": "object"})), "JSON");
         assert_eq!(bq_column_type(&json!({"type": "array"})), "JSON");
+        assert_eq!(
+            bq_column_type(&json!({"type": "string", "format": "decimal"})),
+            "BIGNUMERIC"
+        );
     }
 
     #[test]

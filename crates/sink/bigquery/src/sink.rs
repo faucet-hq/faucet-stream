@@ -555,6 +555,7 @@ fn json_schema_to_load_schema(schema: &Value) -> Option<Value> {
                 "JSON" => "JSON",
                 "TIMESTAMP" => "TIMESTAMP",
                 "DATE" => "DATE",
+                "BIGNUMERIC" => "BIGNUMERIC",
                 _ => "STRING",
             };
             serde_json::json!({ "name": n, "type": ty, "mode": "NULLABLE" })

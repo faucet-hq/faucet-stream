@@ -479,8 +479,9 @@ When `$metadata` is available, each emitted row's sink patch also carries the
 entity's column `schema` from its EDM types, so a typed sink declares real
 columns: `Edm.DateTimeOffset` / `Edm.Date` become timestamp / date strings and
 `Edm.Decimal` is declared as exact decimal text (`{"type": "string", "format":
-"decimal"}`), never a binary float column; `Edm.Double` / `Edm.Single` stay
-`number`.
+"decimal"}`), never a binary float column — the BigQuery sink creates it as
+`BIGNUMERIC`, which accepts the decimal values as numbers or text;
+`Edm.Double` / `Edm.Single` stay `number`.
 
 ### Response-decode pipeline (`decode`)
 
