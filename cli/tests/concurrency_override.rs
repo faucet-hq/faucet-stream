@@ -74,6 +74,7 @@ pipeline:
 /// this is the "ignored gracefully" half of the acceptance criteria.
 #[tokio::test]
 async fn an_override_on_a_knobless_connector_runs_normally() {
+    install_registry();
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("in.csv"), "id,name\n1,a\n2,b\n").unwrap();
     let out = dir.path().join("out.jsonl");
@@ -101,6 +102,7 @@ async fn an_override_on_a_knobless_connector_runs_normally() {
 /// whole point.
 #[test]
 fn the_override_replaces_an_explicit_config_value() {
+    install_registry();
     let mut cfg = json!({
         "connection_url": "postgres://u:p@h/db",
         "query": "SELECT 1",
@@ -116,6 +118,7 @@ fn the_override_replaces_an_explicit_config_value() {
 /// it is observable without a live database.
 #[test]
 fn two_overrides_of_one_config_produce_two_pool_sizes() {
+    install_registry();
     let base = json!({ "connection_url": "postgres://u:p@h/db", "query": "SELECT 1" });
 
     let mut big = base.clone();
@@ -129,4 +132,66 @@ fn two_overrides_of_one_config_produce_two_pool_sizes() {
     // And the untouched base still carries no knob, so an un-overridden run
     // keeps the connector's own default rather than inheriting a neighbour's.
     assert!(base.get("max_connections").is_none());
+}
+
+/// A source that remembers the config it was built from, so a test can see
+/// what the executor handed the factory.
+struct Capturing;
+
+#[faucet_core::async_trait]
+impl faucet_core::Source for Capturing {
+    async fn fetch_with_context(
+        &self,
+        _ctx: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<Vec<serde_json::Value>, faucet_core::FaucetError> {
+        Ok(vec![json!({"id": 1})])
+    }
+}
+
+static BUILT: std::sync::Mutex<Vec<serde_json::Value>> = std::sync::Mutex::new(Vec::new());
+
+/// Install this binary's connector registry (built-ins plus `pooled`) once,
+/// before any test builds a connector — the first build would otherwise
+/// install the built-ins alone.
+fn install_registry() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        faucet_cli::registry::PluginRegistry::with_builtins()
+            .register_source_with(
+                "pooled",
+                |cfg| {
+                    BUILT.lock().unwrap().push(cfg);
+                    Ok(Box::new(Capturing) as Box<dyn faucet_core::Source>)
+                },
+                || json!({"type": "object", "properties": {"max_connections": {"type": "integer"}}}),
+                "a source with a pool-size knob",
+            )
+            .install()
+            .expect("the registry installs before any connector is built");
+    });
+}
+
+/// The run-level override reaches the config the executor builds a
+/// knob-carrying source from, replacing the config's own value.
+#[tokio::test]
+async fn the_executor_hands_the_override_to_the_built_source() {
+    install_registry();
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.jsonl");
+    let yaml = format!(
+        "version: 1\nname: conc_pool\npipeline:\n  source:\n    type: pooled\n    config:\n      max_connections: 10\n  sink:\n    type: jsonl\n    config:\n      path: {}\n",
+        out.display()
+    );
+    let cfg = PipelineConfig::from_text(&yaml, &dir.path().join("p.yaml")).unwrap();
+    let summary = run_expanded(expand(&cfg).unwrap(), opts("conc_pool", Some(3)))
+        .await
+        .unwrap();
+    assert!(!summary.had_failures(), "{:?}", summary.invocations);
+    let built = BUILT.lock().unwrap().clone();
+    assert!(!built.is_empty(), "the plugin source was never built");
+    assert!(
+        built.iter().all(|c| c["max_connections"] == 3),
+        "the run-level override did not reach the built source: {built:?}"
+    );
 }
