@@ -312,6 +312,7 @@ impl OtlpLogExporter {
         // Leading single lines rejected before anything was accepted.
         let mut unproven = 0usize;
         let mut last_rejection = None;
+        let mut probed = false;
         let mut stack: Vec<&[ShipLine]> = vec![lines];
         while let Some(part) = stack.pop() {
             if part.is_empty() {
@@ -341,10 +342,35 @@ impl OtlpLogExporter {
                 Err(e) if e.payload_rejected => {
                     unproven += 1;
                     last_rejection = Some(e);
-                    // Two lines in a row rejected and none accepted: the
-                    // collector is refusing payloads, not one bad line.
-                    if unproven >= 2 {
+                    if unproven < 2 {
+                        continue;
+                    }
+                    // Two lines in a row rejected and none accepted: either
+                    // the collector refuses every payload or the batch opens
+                    // with two bad lines. The batch's last line, on its own,
+                    // tells them apart (once).
+                    let last = &lines[lines.len() - 1..];
+                    let pending_last = stack
+                        .first()
+                        .is_some_and(|p| p.as_ptr_range().end == lines.as_ptr_range().end);
+                    if probed || !pending_last {
                         break;
+                    }
+                    probed = true;
+                    match self.export_classified(run_attrs, last).await {
+                        Ok(rejected) => {
+                            accepted_any = true;
+                            out.handled += unproven + 1;
+                            out.dropped += unproven as u64 + rejected.min(1);
+                            unproven = 0;
+                            let bottom = stack[0];
+                            stack[0] = &bottom[..bottom.len() - 1];
+                        }
+                        Err(e) if e.payload_rejected => break,
+                        Err(e) => {
+                            out.error = Some(e);
+                            break;
+                        }
                     }
                 }
                 Err(e) => {
@@ -402,7 +428,7 @@ pub fn batches(lines: Vec<ShipLine>) -> Vec<Vec<ShipLine>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn line(seq: u64, attrs: &[(&str, &str)]) -> ShipLine {
@@ -531,7 +557,7 @@ mod tests {
 
     /// A collector that answers 400 to any request body `reject` matches,
     /// counting requests in `hits`.
-    async fn rejecting_collector(
+    pub(crate) async fn rejecting_collector(
         reject: fn(&[u8]) -> bool,
         hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) -> String {
@@ -672,6 +698,29 @@ mod tests {
         let one = ex.export_isolating(&BTreeMap::new(), &lines[..1]).await;
         assert_eq!((one.handled, one.dropped), (0, 0));
         assert!(one.error.is_some());
+    }
+
+    /// Two bad lines at the head of a batch are dropped once the collector
+    /// takes the batch's last line; the rest are delivered.
+    #[tokio::test]
+    async fn two_bad_head_lines_do_not_hold_back_the_batch() {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let endpoint = rejecting_collector(
+            |buf| buf.windows(6).any(|w| w == b"line 1" || w == b"line 2"),
+            hits.clone(),
+        )
+        .await;
+        let ex = OtlpLogExporter::new(&OtelConfig {
+            endpoint,
+            protocol: OtelProtocol::Http,
+            timeout_secs: 5,
+            ..Default::default()
+        })
+        .unwrap();
+        let lines: Vec<ShipLine> = (1..=8).map(|i| line(i, &[])).collect();
+        let out = ex.export_isolating(&BTreeMap::new(), &lines).await;
+        assert!(out.error.is_none(), "{:?}", out.error.map(|e| e.message));
+        assert_eq!((out.handled, out.dropped), (8, 2));
     }
 
     #[tokio::test]

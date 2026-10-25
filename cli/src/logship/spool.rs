@@ -542,6 +542,9 @@ pub struct PassReport {
     pub shipped: u64,
     /// At least one export failed.
     pub failed: bool,
+    /// An export failed for a reason other than the collector rejecting the
+    /// payload (unreachable, timed out): later runs of the pass skip export.
+    pub collector_down: bool,
     pub gauges: BufferGauges,
 }
 
@@ -602,10 +605,11 @@ pub async fn ship_pass(
     let ids = spool.run_ids();
     let bytes_drop = plan_bytes_drops(spool, &ids, opts.max_bytes);
     for id in ids {
-        // Once an export failed this pass the collector is not taking lines;
-        // the remaining runs still get their bounds and retention, but are not
-        // each made to wait out another export timeout.
-        let exporter = exporter.filter(|_| !report.failed);
+        // Once the collector could not be reached this pass, the remaining
+        // runs still get their bounds and retention, but are not each made to
+        // wait out another export timeout. One run's lines being rejected
+        // does not hold the others back.
+        let exporter = exporter.filter(|_| !report.collector_down);
         if let Some(r) =
             process_run(spool, &id, exporter, opts, now, &bytes_drop, &mut report).await
         {
@@ -768,6 +772,7 @@ async fn process_run(
                     c.last_error = Some(crate::secrets::registry::redact(&e.message).into_owned());
                     c.failing_since.get_or_insert(now);
                     report.failed = true;
+                    report.collector_down |= !e.payload_rejected;
                     metrics::export_error();
                     break;
                 }
@@ -1016,6 +1021,44 @@ mod tests {
         assert_eq!(attempted, 1, "only the first run is exported");
         for id in ["a", "b", "c"] {
             assert_eq!(r.run(id).unwrap().view.pending_lines, 1);
+        }
+    }
+
+    /// One run's lines being rejected does not stop the pass from exporting
+    /// the other runs.
+    #[tokio::test]
+    async fn a_rejected_run_does_not_stop_the_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = Spool::open(dir.path()).unwrap();
+        let mut w = SpoolWriter::new(spool.clone());
+        for (id, body) in [("a", "bad"), ("b", "ok-b"), ("c", "ok-c")] {
+            w.begin(
+                RunMeta {
+                    run_id: id.into(),
+                    ..Default::default()
+                },
+                10,
+            );
+            w.append(id, line(body, &now_ts()));
+            w.end(id);
+        }
+        let endpoint = crate::logship::otlp::tests::rejecting_collector(
+            |buf| buf.windows(3).any(|w| w == b"bad"),
+            Default::default(),
+        )
+        .await;
+        let ex = crate::logship::otlp::OtlpLogExporter::new(&faucet_core::OtelConfig {
+            endpoint,
+            protocol: faucet_core::OtelProtocol::Http,
+            timeout_secs: 5,
+            ..Default::default()
+        })
+        .unwrap();
+        let r = ship_pass(&spool, Some(&ex), opts(), Utc::now()).await;
+        assert!(r.failed && !r.collector_down);
+        assert_eq!(r.run("a").unwrap().view.pending_lines, 1);
+        for id in ["b", "c"] {
+            assert_eq!(r.run(id).unwrap().view.pending_lines, 0, "{id}");
         }
     }
 

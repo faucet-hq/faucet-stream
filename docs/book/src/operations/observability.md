@@ -323,8 +323,13 @@ observability:
 - **A malformed line never blocks a run.** When the collector refuses a batch
   as malformed (HTTP `400` / `413` / `422`, gRPC `InvalidArgument`), the batch
   is split until the offending line is found; that line is dropped (`reason`
-  `rejected`) and the rest delivered. Every other failure — the collector down,
-  throttling, a credential problem — is retried and nothing is dropped.
+  `rejected`) and the rest delivered. A line is dropped only once the
+  collector has accepted another line of the batch (when the first two lines
+  are refused, the batch's last line is tried on its own first), so a
+  collector that refuses every payload drops nothing; one run's refused lines
+  do not stop the other runs from shipping. Every other failure — the
+  collector down, throttling, a credential problem — is retried and nothing is
+  dropped.
 
 ### Was a run's log shipped?
 
