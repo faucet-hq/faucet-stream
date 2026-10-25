@@ -153,9 +153,9 @@ pub struct S3SourceConfig {
     /// a body that is read anyway — so it defaults to `true`.
     ///
     /// Skipped (with a debug log, not a failure) when the store advertises no
-    /// length, or when it reports a non-empty `Content-Encoding`: the body on
-    /// the wire is then transcoded and its length legitimately differs from
-    /// the stored object's.
+    /// length. Applied whatever the object's `Content-Encoding`: S3 serves an
+    /// object's bytes as stored and never transcodes them, so the advertised
+    /// length always matches the body on the wire.
     #[serde(default = "default_true")]
     pub verify_length: bool,
     /// Verify each object's body against the checksum the store advertises

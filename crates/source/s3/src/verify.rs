@@ -21,20 +21,11 @@ static CRC64NVME: crc::Crc<u64> = crc::Crc::<u64>::new(&crc::CRC_64_NVME);
 
 /// Length check for one object body. `None` when verification is disabled or
 /// the store reported no usable (non-negative) `Content-Length`.
-/// [`length_check`], skipped when the response reports a non-empty
-/// `Content-Encoding`: the body on the wire is then transcoded and its length
-/// legitimately differs from the stored object's.
-pub fn length_check_for(
-    content_length: Option<i64>,
-    content_encoding: Option<&str>,
-    verify_length: bool,
-) -> Option<Box<dyn IntegrityCheck>> {
-    if content_encoding.is_some_and(|e| !e.trim().is_empty()) {
-        return None;
-    }
-    length_check(content_length, verify_length)
-}
-
+///
+/// Applied whatever the object's `Content-Encoding`: S3 stores the bytes it
+/// was given and serves them as stored (`Content-Encoding` is only metadata),
+/// and the SDK does not decode it, so `Content-Length` always counts the bytes
+/// on the wire.
 pub fn length_check(
     content_length: Option<i64>,
     verify_length: bool,
@@ -300,14 +291,6 @@ mod tests {
         assert!(mismatch("CRC32", "NHIMHG==", "Nhimhg==", false).is_err());
         assert!(mismatch("CRC32", "Nhimhg==", "Nhimhg==", false).is_ok());
         assert!(mismatch("MD5(ETag)", "ABCDEF", "abcdef", true).is_ok());
-    }
-
-    #[test]
-    fn a_transcoded_body_skips_the_length_check() {
-        assert!(length_check_for(Some(10), Some("gzip"), true).is_none());
-        assert!(length_check_for(Some(10), Some(" "), true).is_some());
-        assert!(length_check_for(Some(10), None, true).is_some());
-        assert!(length_check_for(Some(10), None, false).is_none());
     }
 
     #[tokio::test]

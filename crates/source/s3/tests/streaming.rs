@@ -953,26 +953,6 @@ async fn verify_checksum_reads_a_multipart_object_with_a_composite_checksum() {
     assert_eq!(records.len(), part1.lines().count() + part2.lines().count());
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_content_encoded_object_is_read_without_a_length_check() {
-    let (_c, endpoint) = start_minio().await;
-    seed_bucket(&endpoint, &[]).await;
-    let client = build_admin_client(&endpoint).await;
-    client
-        .put_object()
-        .bucket(TEST_BUCKET)
-        .key("encoded.jsonl")
-        .content_encoding("identity-transcoded")
-        .body(ByteStream::from_static(b"{\"id\":1}\n{\"id\":2}\n"))
-        .send()
-        .await
-        .expect("put object");
-    let config = S3SourceConfig::new(TEST_BUCKET).file_format(S3FileFormat::JsonLines);
-    let source = build_source(&endpoint, config).await;
-    let records = collect_all(&source, DEFAULT_BATCH_SIZE).await;
-    assert_eq!(records.len(), 2);
-}
-
 /// A one-object S3 stand-in that answers every listing with `key` and every
 /// `GET` with `body` under a wrong (but well-formed) non-multipart ETag, so
 /// the checksum check fails only once the whole body has been read.
