@@ -39,16 +39,6 @@ const SAFE_DESCRIPTOR_KEYS: &[&str] = &[
     "query",
 ];
 
-/// Config keys that mark a source as doing incremental (bookmark-based) reads.
-const INCREMENTAL_KEYS: &[&str] = &[
-    "replication",
-    "incremental",
-    "cursor_field",
-    "replication_key",
-    "start_replication_value",
-    "bookmark_key",
-];
-
 /// Above this many matrix rows, prose output summarizes with counts instead of
 /// narrating every row (override with `--rows`).
 const SUMMARIZE_THRESHOLD: usize = 8;
@@ -158,9 +148,10 @@ fn row_explanation(node: &ExpandedNode) -> RowExplanation {
         key: key_field(&node.sink.config),
         delivery_guarantee: node.delivery_guarantee.to_string(),
         state: node.state.as_ref().map(|s| s.kind.clone()),
-        incremental: INCREMENTAL_KEYS
-            .iter()
-            .any(|k| node.source.config.get(*k).is_some()),
+        incremental: crate::registry::source_resumes_from_bookmark(
+            &node.source.kind,
+            &node.source.config,
+        ),
     }
 }
 
@@ -319,6 +310,37 @@ mod tests {
         let cfg = parse_with_extension(yaml, "yaml").unwrap();
         let nodes = expand(&cfg).unwrap();
         build_report(&cfg, &nodes)
+    }
+
+    /// A row is incremental only when its read mode says so, not when a
+    /// replication-related key merely exists.
+    #[test]
+    fn incremental_follows_the_read_mode_not_key_presence() {
+        let e = explain_yaml(
+            r#"version: 1
+name: inc
+pipeline:
+  sources:
+    full_sql: { type: postgres, config: { connection_url: "postgres://h/db", query: "SELECT 1", replication: { type: full } } }
+    inc_sql: { type: postgres, config: { connection_url: "postgres://h/db", query: "SELECT 1 WHERE u >= ${bookmark}", replication: { type: incremental, column: u } } }
+    full_api: { type: rest, config: { base_url: "https://x", path: "/", replication_method: { type: FullTable }, replication_key: updated_at } }
+    inc_api: { type: rest, config: { base_url: "https://x", path: "/", replication_method: { type: Incremental }, replication_key: updated_at } }
+  sink: { type: jsonl, config: { path: ./o.jsonl } }
+matrix:
+  - { id: a, source: { ref: full_sql }, sink: { config: { path: ./a.jsonl } } }
+  - { id: b, source: { ref: inc_sql }, sink: { config: { path: ./b.jsonl } } }
+  - { id: c, source: { ref: full_api }, sink: { config: { path: ./c.jsonl } } }
+  - { id: d, source: { ref: inc_api }, sink: { config: { path: ./d.jsonl } } }
+"#,
+        );
+        let inc: Vec<&str> = e
+            .rows
+            .iter()
+            .filter(|r| r.incremental)
+            .map(|r| r.id.as_str())
+            .collect();
+        assert_eq!(inc, vec!["b", "d"], "{e:?}");
+        assert_eq!(e.incremental_rows, 2);
     }
 
     /// Discovery and product rows are not counted as children (#789 CLI-162).
