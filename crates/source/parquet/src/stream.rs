@@ -695,7 +695,9 @@ async fn list_s3_prefix(
     // `object_store` matches a list prefix by whole path segments, while an
     // S3 key prefix is a plain string prefix (`events/2024-10` selects
     // `events/2024-10-01.parquet`). List the directory the prefix sits in and
-    // keep the keys that start with it.
+    // keep the keys that start with it. Keys never start with `/`, so a
+    // leading one (`/events/`) is dropped, as `object_store` paths drop it.
+    let prefix = prefix.trim_start_matches('/');
     let base = listing_base(prefix);
     let base_path = (!base.is_empty()).then(|| ObjectPath::from(base));
 
@@ -915,6 +917,11 @@ mod tests {
             4
         );
         assert_eq!(names(list_s3_prefix(&store, "").await.unwrap()).len(), 5);
+        assert_eq!(
+            names(list_s3_prefix(&store, "/events/2024-10/").await.unwrap()),
+            names(list_s3_prefix(&store, "events/2024-10/").await.unwrap()),
+            "a leading slash selects the same keys"
+        );
         assert_eq!(listing_base("a/b/c"), "a/b");
         assert_eq!(listing_base("abc"), "");
     }

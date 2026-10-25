@@ -141,4 +141,16 @@ async fn s3_objects_are_read_in_ranges_under_an_underscore_prefix() {
     }
     assert_eq!(ids(&streamed), ids(&eager));
     assert!(page_count >= 4, "row groups stream in pages: {page_count}");
+
+    // A leading slash on the prefix selects the same keys.
+    let slashed = ParquetS3Config::prefix(BUCKET, "/exports/_daily")
+        .region(REGION)
+        .endpoint_url(&endpoint);
+    let slashed = ParquetSource::new(ParquetSourceConfig::s3(slashed).batch_size(2))
+        .await
+        .unwrap();
+    assert_eq!(
+        ids(&slashed.fetch_with_context(&ctx).await.unwrap()),
+        ids(&eager)
+    );
 }
