@@ -1321,6 +1321,7 @@ pub async fn preview_records(
     cfg: &PipelineConfig,
     auth: &AuthCatalog,
     limit: usize,
+    allow_side_effects: bool,
 ) -> CliResult<Vec<(String, Vec<Value>)>> {
     if !cfg.matrix.is_empty() {
         return Err(CliError::MatrixAndNodesBothPresent);
@@ -1349,11 +1350,12 @@ pub async fn preview_records(
             let mut c = c;
             crate::preview_sample::bound_batch_size(&k, &mut c, limit);
             let source = build_source(&k, c, auth, None).await?;
-            let sample = crate::preview_sample::sample(
+            let sample = crate::preview_sample::sample_with(
                 source.as_ref(),
                 &[],
                 limit,
                 crate::preview_sample::PREVIEW_TIMEOUT,
+                allow_side_effects,
             )
             .await?;
             #[cfg(feature = "masking")]
@@ -1373,8 +1375,13 @@ pub async fn preview_records(
 
 /// Preview topology mode: build each `source` node and print the first
 /// `limit` records per source to stdout as JSON Lines.
-pub async fn preview(cfg: &PipelineConfig, auth: &AuthCatalog, limit: usize) -> CliResult<()> {
-    for (id, records) in preview_records(cfg, auth, limit).await? {
+pub async fn preview(
+    cfg: &PipelineConfig,
+    auth: &AuthCatalog,
+    limit: usize,
+    allow_side_effects: bool,
+) -> CliResult<()> {
+    for (id, records) in preview_records(cfg, auth, limit, allow_side_effects).await? {
         tracing::info!(node = %id, "previewing source node");
         for rec in records {
             println!("{}", serde_json::to_string(&rec).unwrap_or_default());
@@ -1389,7 +1396,7 @@ pub async fn preview_to_string(
     auth: &AuthCatalog,
     limit: usize,
 ) -> CliResult<String> {
-    let sources = preview_records(cfg, auth, limit).await?;
+    let sources = preview_records(cfg, auth, limit, false).await?;
     let doc: Vec<Value> = sources
         .into_iter()
         .map(|(id, records)| {

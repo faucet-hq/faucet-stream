@@ -399,7 +399,7 @@ Load from YAML/JSON or environment. Inspect the full JSON Schema with:
 ```bash
 faucet schema source kafka
 faucet validate pipeline.yaml
-faucet preview pipeline.yaml --limit 5   # consume a few messages and print to stdout
+faucet preview pipeline.yaml --limit 5 --allow-side-effects   # joins the consumer group; prints a few messages
 ```
 
 A complete working example ships at [`cli/examples/kafka_to_jsonl.yaml`](https://github.com/faucet-hq/faucet-stream/blob/main/cli/examples/kafka_to_jsonl.yaml).

@@ -178,6 +178,7 @@ fn preview_args(config: Option<PathBuf>, limit: usize) -> PreviewArgs {
         no_env_file: true,
         profile: None,
         selection: Default::default(),
+        allow_side_effects: false,
     }
 }
 

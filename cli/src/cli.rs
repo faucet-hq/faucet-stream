@@ -3045,6 +3045,12 @@ pub struct PreviewArgs {
     /// the selected run set.
     #[command(flatten)]
     pub selection: SelectionArgs,
+    /// Read a source whose read has side effects (a CDC source creates or
+    /// advances its replication slot, a Kafka source joins its consumer
+    /// group, a webhook / websocket source opens a listener). Refused without
+    /// this flag.
+    #[arg(long)]
+    pub allow_side_effects: bool,
 }
 
 /// `faucet init` arguments.
@@ -3179,8 +3185,10 @@ pub struct DevArgs {
     /// for the offline loop.
     #[arg(long)]
     pub sample: Option<PathBuf>,
-    /// (reserved) pull a capped read-only sample from the real source.
-    #[arg(long)]
+    /// Pull a capped, read-only sample (`--limit` records) from the real
+    /// source once at start, instead of `--sample`. Sources that consume
+    /// destructively or whose read has side effects are refused.
+    #[arg(long, conflicts_with = "sample")]
     pub live: bool,
     /// Cap for `--live` sampling.
     #[arg(long, default_value_t = 10)]

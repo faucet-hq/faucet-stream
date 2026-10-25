@@ -33,7 +33,7 @@ pub async fn run(args: PreviewArgs) -> CliResult<()> {
 
     // Topology mode (#71/#72): preview the source side of each source node.
     if crate::topology::is_topology(&cfg) {
-        return crate::topology::preview(&cfg, &auth, args.limit).await;
+        return crate::topology::preview(&cfg, &auth, args.limit, args.allow_side_effects).await;
     }
 
     let nodes = expand(&crate::partition::resolve_runtime(&cfg).await?)?;
@@ -58,11 +58,12 @@ pub async fn run(args: PreviewArgs) -> CliResult<()> {
         .iter()
         .map(compile_stage)
         .collect::<Result<Vec<_>, _>>()?;
-    let sample = crate::preview_sample::sample(
+    let sample = crate::preview_sample::sample_with(
         source.as_ref(),
         &compiled,
         args.limit,
         crate::preview_sample::PREVIEW_TIMEOUT,
+        args.allow_side_effects,
     )
     .await?;
     if sample.timed_out {
