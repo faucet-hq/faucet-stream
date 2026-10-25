@@ -610,12 +610,7 @@ pub(crate) async fn replace_rows_in_place(
 /// re-points their foreign keys at the renamed-away table (#789 SQL-129), and a
 /// `DELETE` would cascade into or be blocked by them.
 pub(crate) fn referenced_overwrite_error(table: &str, referenced_by: &[String]) -> FaucetError {
-    FaucetError::Config(format!(
-        "mysql overwrite: table '{table}' is referenced by a foreign key from {}; replacing its \
-         rows would cascade into, break or be blocked by those tables. Use write_mode: upsert, \
-         or drop the foreign key",
-        referenced_by.join(", ")
-    ))
+    faucet_common_sql::referenced_overwrite_error("mysql", table, referenced_by, false)
 }
 
 /// `(name, DATA_TYPE)` pairs as engine columns.

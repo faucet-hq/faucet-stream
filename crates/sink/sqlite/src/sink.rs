@@ -745,13 +745,12 @@ impl SqlDriver for SqliteDriver {
     async fn create_staging(&self) -> Result<(), FaucetError> {
         let referencing = self.referencing_tables().await?;
         if !referencing.is_empty() {
-            return Err(FaucetError::Config(format!(
-                "sqlite overwrite: table '{}' is referenced by a foreign key from {}; replacing \
-                 its rows would cascade into or break those tables. Use write_mode: upsert, or \
-                 drop the foreign key",
-                self.config.table_name,
-                referencing.join(", ")
-            )));
+            return Err(faucet_common_sql::referenced_overwrite_error(
+                "sqlite",
+                &self.config.table_name,
+                &referencing,
+                false,
+            ));
         }
         let create_sql: Option<String> =
             sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")

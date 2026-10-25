@@ -50,6 +50,7 @@ pub mod dialects;
 pub mod driver;
 pub mod engine;
 pub mod mapping;
+pub mod overwrite;
 pub mod statement;
 
 pub use dialect::{SqlDialect, TableTarget};
@@ -59,4 +60,5 @@ pub use engine::{
     no_match_message, split_page,
 };
 pub use mapping::{ColumnMatching, MapError, MatchedRow, TableColumn};
+pub use overwrite::referenced_overwrite_error;
 pub use statement::{Param, Statement, StatementKind};

@@ -101,6 +101,23 @@ pub(crate) fn staging_relax_sql(
     )))
 }
 
+/// The tables other than `target` whose enabled foreign keys reference it,
+/// as `schema.table`, for refusing an overwrite: the swap's `DELETE FROM
+/// target` would cascade into them (`ON DELETE CASCADE` / `SET NULL`) or fail
+/// only after the whole staging load (`NO ACTION`). `target_quoted` is the
+/// bracket-quoted table. Self-references are excluded: the swap replaces
+/// every row of the table at once.
+pub(crate) fn referencing_tables_sql(target_quoted: &str) -> String {
+    let lit = target_quoted.replace('\'', "''");
+    format!(
+        "SELECT DISTINCT OBJECT_SCHEMA_NAME(fk.parent_object_id) + N'.' + \
+         OBJECT_NAME(fk.parent_object_id) FROM sys.foreign_keys fk \
+         WHERE fk.referenced_object_id = OBJECT_ID(N'{lit}', N'U') \
+         AND fk.parent_object_id <> fk.referenced_object_id AND fk.is_disabled = 0 \
+         ORDER BY 1"
+    )
+}
+
 /// The overwrite swap, column lists built from the **target**: computed and
 /// `rowversion` columns are never copied; the IDENTITY column is copied with
 /// `IDENTITY_INSERT` where staging has a value (so identities survive the
@@ -372,6 +389,15 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::time::Duration;
+
+    #[test]
+    fn referencing_tables_probe_skips_self_references_and_disabled_keys() {
+        let sql = referencing_tables_sql("[dbo].[o'k]");
+        assert!(sql.contains("OBJECT_ID(N'[dbo].[o''k]', N'U')"), "{sql}");
+        assert!(sql.contains("fk.parent_object_id <> fk.referenced_object_id"));
+        assert!(sql.contains("fk.is_disabled = 0"));
+        assert!(sql.contains("FROM sys.foreign_keys fk"));
+    }
 
     fn info(name: &str, ty: &str, identity: bool) -> ColumnInfo {
         ColumnInfo {

@@ -430,12 +430,7 @@ pub(crate) const REFERENCING_TABLES_SQL: &str = "SELECT DISTINCT c.OWNER || '.' 
 /// swap's `DELETE FROM target` would cascade into them (`ON DELETE CASCADE` /
 /// `SET NULL`) or fail after the whole staging load (`NO ACTION`).
 pub(crate) fn referenced_overwrite_error(table: &str, referenced_by: &[String]) -> FaucetError {
-    FaucetError::Config(format!(
-        "oracle overwrite: table '{table}' is referenced by a foreign key from {}; replacing \
-         its rows would cascade into, break or be blocked by those tables. Use write_mode: \
-         upsert, or drop or disable the foreign key",
-        referenced_by.join(", ")
-    ))
+    faucet_common_sql::referenced_overwrite_error("oracle", table, referenced_by, true)
 }
 
 /// Column metadata (`:1` owner or NULL, `:2` table).

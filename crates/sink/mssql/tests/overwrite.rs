@@ -315,3 +315,74 @@ async fn overwrite_handles_identity_computed_and_rowversion_columns() {
     );
     assert_eq!(got[0].1, "generated");
 }
+
+/// A target another table references is refused at begin (before anything is
+/// staged) and again at the commit (a key added mid-run): the swap's
+/// `DELETE FROM target` would cascade into the child table.
+#[tokio::test(flavor = "multi_thread")]
+async fn overwrite_refuses_a_target_other_tables_reference() {
+    let _serial = SERIAL.lock().await;
+    let (_c, port) = start_mssql().await;
+    let cfg = conn_cfg(port);
+    let pool = build_pool(&cfg, 4).await.expect("pool");
+    exec(
+        &pool,
+        "CREATE TABLE dbo.t (id INT PRIMARY KEY, name NVARCHAR(255))",
+    )
+    .await;
+    exec(&pool, "INSERT INTO dbo.t (id, name) VALUES (1, 'old_a')").await;
+    exec(
+        &pool,
+        "CREATE TABLE dbo.child (cid INT PRIMARY KEY, parent INT NULL)",
+    )
+    .await;
+    exec(&pool, "INSERT INTO dbo.child (cid, parent) VALUES (7, 1)").await;
+
+    // Mid-run: begin succeeds, a cascading key appears, the commit refuses.
+    let sink = MssqlSink::new(overwrite_cfg(&cfg)).await.expect("sink");
+    sink.begin_overwrite().await.expect("begin");
+    sink.write_batch(&[json!({"id": 1, "name": "new_a"})])
+        .await
+        .expect("write");
+    exec(
+        &pool,
+        "ALTER TABLE dbo.child ADD CONSTRAINT fk_child_t FOREIGN KEY (parent) \
+         REFERENCES dbo.t (id) ON DELETE CASCADE",
+    )
+    .await;
+    let err = sink.commit_overwrite().await.unwrap_err().to_string();
+    assert!(
+        err.contains("is referenced by a foreign key from dbo.child"),
+        "{err}"
+    );
+    sink.abort_overwrite().await.expect("abort");
+    assert_eq!(names(&pool, "dbo.t").await, vec!["old_a"]);
+    let mut conn = pool.get().await.expect("checkout");
+    let rows = conn
+        .query("SELECT COUNT(*) FROM dbo.child", &[])
+        .await
+        .expect("query")
+        .into_first_result()
+        .await
+        .expect("result");
+    assert_eq!(rows[0].get::<i32, _>(0), Some(1), "the child row survives");
+    drop(conn);
+
+    // At begin, before anything is staged.
+    let sink = MssqlSink::new(overwrite_cfg(&cfg)).await.expect("sink");
+    let err = sink.begin_overwrite().await.unwrap_err().to_string();
+    assert!(
+        err.contains("is referenced by a foreign key from dbo.child"),
+        "{err}"
+    );
+
+    // Without the key the overwrite runs.
+    exec(&pool, "ALTER TABLE dbo.child DROP CONSTRAINT fk_child_t").await;
+    let sink = MssqlSink::new(overwrite_cfg(&cfg)).await.expect("sink");
+    sink.begin_overwrite().await.expect("begin without the key");
+    sink.write_batch(&[json!({"id": 2, "name": "new_b"})])
+        .await
+        .expect("write");
+    sink.commit_overwrite().await.expect("commit");
+    assert_eq!(names(&pool, "dbo.t").await, vec!["new_b"]);
+}
