@@ -1058,10 +1058,17 @@ async fn run_expanded_unredacted(
         for mut unit in units {
             if level_cancel.is_cancelled() && matches!(on_error, OnError::Stop) {
                 not_run.insert(unit.node.id.clone());
+                // The level token also fires on an external cancel (serve
+                // cancel / timeout / drain), which no row failure caused.
+                let why = if cancel.is_cancelled() {
+                    CANCELLED_BEFORE_START
+                } else {
+                    STOPPED_BEFORE_START
+                };
                 outcomes.push(synthetic_outcome(
                     &unit.node.id,
                     unit.parent_record_key.clone(),
-                    STOPPED_BEFORE_START.to_string(),
+                    why.to_string(),
                     InvocationErrorKind::Skipped,
                 ));
                 continue;
@@ -1383,6 +1390,7 @@ async fn run_expanded_unredacted(
 
 const STOPPED_BEFORE_START: &str =
     "skipped: `on_error: stop` ended the run before this row started";
+const CANCELLED_BEFORE_START: &str = "skipped: the run was cancelled before this row started";
 
 /// One scheduled invocation — a root runs once, a child runs once per parent
 /// record. Built by the level loop, consumed by [`run_unit`].
@@ -2291,16 +2299,26 @@ async fn run_discovery(
                 usage: None,
             }
         }
-        Err(e) => InvocationOutcome {
-            row_id: node.id.clone(),
-            parent_record_key: None,
-            run_id: None,
-            records_written: 0,
-            error: Some(e.to_string()),
-            error_kind: Some(classify_error(&e)),
-            metrics: Some(metrics(0)),
-            usage: None,
-        },
+        Err(e) => {
+            // A listing stopped by the run's cancel did not fail: it is skipped,
+            // like the rows the cancel kept from starting.
+            let stopped = cancel.is_cancelled()
+                && matches!(e, CliError::Faucet(FaucetError::Cancelled { .. }));
+            InvocationOutcome {
+                row_id: node.id.clone(),
+                parent_record_key: None,
+                run_id: None,
+                records_written: 0,
+                error: Some(e.to_string()),
+                error_kind: Some(if stopped {
+                    InvocationErrorKind::Skipped
+                } else {
+                    classify_error(&e)
+                }),
+                metrics: Some(metrics(0)),
+                usage: None,
+            }
+        }
     }
 }
 
@@ -6105,6 +6123,7 @@ matrix:
         assert!(ok.error.is_none(), "{ok:?}");
         assert_eq!(values, Some(2));
         let (stopped, _) = run(yaml(&path), true).await;
+        assert_eq!(stopped.error_kind, Some(InvocationErrorKind::Skipped));
         assert!(
             stopped
                 .error
