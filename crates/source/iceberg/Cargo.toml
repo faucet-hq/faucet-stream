@@ -48,6 +48,7 @@ iceberg-catalog-sql = "0.10.0"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "any"] }
 parquet = { version = "58", features = ["async"] }
 uuid.workspace = true
+wiremock = "0.6"
 
 [package.metadata.docs.rs]
 all-features = true
