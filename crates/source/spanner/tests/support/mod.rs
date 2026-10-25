@@ -28,7 +28,7 @@ pub struct Emulator {
 pub async fn start_emulator() -> Option<Emulator> {
     let container = faucet_conformance::containers::start_or_skip(
         || {
-            GenericImage::new("gcr.io/cloud-spanner-emulator/emulator", "latest")
+            GenericImage::new("gcr.io/cloud-spanner-emulator/emulator", "1.5.59")
                 .with_exposed_port(9010.tcp())
         },
         &Default::default(),

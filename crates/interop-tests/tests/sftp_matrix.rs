@@ -109,10 +109,13 @@ impl Remote for SftpRemote {
 async fn every_writable_format_takes_every_option_on_sftp() {
     let Some(container) = faucet_conformance::containers::start_or_skip(
         || {
-            GenericImage::new("atmoz/sftp", "alpine")
-                .with_exposed_port(22.tcp())
-                .with_wait_for(WaitFor::message_on_stderr("Server listening on"))
-                .with_cmd(vec![format!("{USER}:{PASS}:::data")])
+            GenericImage::new(
+                "atmoz/sftp",
+                "alpine@sha256:43dd1c023cf1bae487127d4b54660b0aee6e94c188a6599be36fb89ba115f961",
+            )
+            .with_exposed_port(22.tcp())
+            .with_wait_for(WaitFor::message_on_stderr("Server listening on"))
+            .with_cmd(vec![format!("{USER}:{PASS}:::data")])
         },
         &Default::default(),
     )

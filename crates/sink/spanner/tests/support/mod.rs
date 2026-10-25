@@ -25,7 +25,7 @@ pub async fn emulator_host() -> String {
     let (_container, host) = EMULATOR
         .get_or_init(|| async {
             let container = faucet_conformance::containers::start(|| {
-                GenericImage::new("gcr.io/cloud-spanner-emulator/emulator", "latest")
+                GenericImage::new("gcr.io/cloud-spanner-emulator/emulator", "1.5.59")
                     .with_exposed_port(ContainerPort::Tcp(9010))
             })
             .await;
