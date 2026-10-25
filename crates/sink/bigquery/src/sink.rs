@@ -1740,9 +1740,17 @@ impl BigQueryDriver {
     /// credentials, reusing `gcp_bigquery_client`'s re-exported `yup-oauth2` (no
     /// direct dependency). Used only by the `media_load` upload path — the
     /// `gcp_bigquery_client::Client` handles auth for every other call itself.
-    /// The token value is never logged.
-    async fn access_token(&self) -> Result<String, FaucetError> {
-        faucet_common_bigquery::access_token(&self.config.auth).await
+    /// The token value is never logged. Minted under the run's call context,
+    /// so the run's deadline and cancellation end a hung token exchange (it is
+    /// otherwise bounded only by `TOKEN_MINT_TIMEOUT`); not counted as a round
+    /// trip and not retried here.
+    async fn access_token(&self, calls: &CallSlot) -> Result<String, FaucetError> {
+        let ctx = calls.get().with_roundtrip_metering(false).without_retry();
+        ctx.call_once(
+            "token",
+            faucet_common_bigquery::access_token(&self.config.auth),
+        )
+        .await
     }
 
     /// Load one page into `table_id` via a bucket-free BigQuery **load job**:
@@ -1791,7 +1799,7 @@ impl BigQueryDriver {
         let boundary = media_boundary(media_gzipped);
         let body = build_multipart_related(&boundary, job_json, media_gzipped);
 
-        let token = self.access_token().await?;
+        let token = self.access_token(calls).await?;
         let url = format!(
             "{}/upload/bigquery/v2/projects/{}/jobs?uploadType=multipart",
             self.upload_base(),
@@ -2001,7 +2009,7 @@ impl BigQueryDriver {
                 false,
             ))
             .to_string();
-        let token = self.access_token().await?;
+        let token = self.access_token(calls).await?;
         let url = format!(
             "{}/upload/bigquery/v2/projects/{}/jobs?uploadType=resumable",
             self.upload_base(),
@@ -3828,7 +3836,7 @@ impl faucet_core::driver::ColumnarDriver for BigQueryDriver {
             let rows = faucet_core::record_batch_to_values(batch)?;
             return self.append_rows(calls, &rows).await;
         }
-        let token = self.access_token().await?;
+        let token = self.access_token(calls).await?;
         self.roundtrips.record("load");
         crate::load::write_columnar_media_in(
             &calls.get(),

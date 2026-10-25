@@ -2633,3 +2633,46 @@ async fn grouped_writer_creates_staging_even_when_the_target_exists() {
         "the writer must create staging when missing: {qs:?}"
     );
 }
+
+/// R4-004 (#934): the media upload path mints its OAuth token under the run's
+/// call context, so the run's deadline ends a hung token exchange promptly
+/// instead of waiting out the 60 s mint bound.
+#[tokio::test]
+async fn a_hung_token_mint_ends_at_the_run_deadline() {
+    let server = MockServer::start().await;
+    // The BigQuery client's own first token is served at once; the media
+    // upload's mint then hangs.
+    Mock::given(method("POST"))
+        .and(path(AUTH_TOKEN_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fake_token()))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(AUTH_TOKEN_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(fake_token())
+                .set_delay(std::time::Duration::from_secs(30)),
+        )
+        .mount(&server)
+        .await;
+    mount_table_schema(&server).await;
+    let (sink, _sa) = build_sink(&server, direct_media_config(&server)).await;
+    sink.set_call_context(
+        faucet_core::CallContext::new()
+            .with_deadline(tokio::time::Instant::now() + std::time::Duration::from_secs(2)),
+    );
+    sink.begin_overwrite().await.expect("begin");
+    let started = std::time::Instant::now();
+    let err = sink
+        .write_batch(&[json!({"id": 1, "name": "a"})])
+        .await
+        .expect_err("the deadline ends the mint");
+    assert!(err.to_string().contains("token call"), "{err}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(15),
+        "took {:?}: {err}",
+        started.elapsed()
+    );
+}
