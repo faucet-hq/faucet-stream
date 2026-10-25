@@ -325,10 +325,11 @@ A discarded envelope's payload stays in the file. When it must not be kept — P
 that reached the DLQ after a masking mistake, say — add `--purge`: every discarded
 envelope is removed from the file itself (an atomic rewrite), with no archive.
 Run it while nothing writes the DLQ; a file that changes while it is being
-read is refused, and lines appended between that check and the swap are carried
-over to the end of the rewritten file rather than lost. A writer that keeps the
-file open across the swap goes on writing to the replaced copy, so stop the
-pipeline first. An encrypted DLQ (below) is re-sealed
+read is refused. Complete lines appended between that check and the swap are
+carried over to the end of the rewritten file (re-sealed into its integrity
+chain for an encrypted DLQ) as a best effort, but a line still being written
+at that moment, or anything a writer that keeps the file open writes after the
+swap, goes to the replaced copy and is lost — so stop the pipeline first. An encrypted DLQ (below) is re-sealed
 as it is rewritten — a fresh header and an integrity trailer over the records
 kept, under the current key — so it still opens and the sink can keep
 appending to it; that needs the key (`--encryption-key`), and a file that fails

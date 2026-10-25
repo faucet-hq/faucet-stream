@@ -486,7 +486,8 @@ pub fn purge_with(location: &str, dec: &DlqDecryptor) -> CliResult<PurgeOutcome>
         ));
         let write_err =
             |e: std::io::Error| CliError::Internal(format!("writing '{}': {e}", tmp.display()));
-        let purged = if reader::starts_sealed(file)? {
+        let sealed = reader::starts_sealed(file)?;
+        let purged = if sealed {
             // A file sealed with whole-file integrity is verified and
             // re-sealed as a whole.
             let text = std::fs::read_to_string(file).map_err(|e| {
@@ -512,7 +513,7 @@ pub fn purge_with(location: &str, dec: &DlqDecryptor) -> CliResult<PurgeOutcome>
         }
         std::fs::rename(&tmp, file)
             .map_err(|e| CliError::Internal(format!("replacing '{}': {e}", file.display())))?;
-        copy_late_appends(&original, before.0, file)?;
+        copy_late_appends(&original, before.0, file, sealed.then_some(dec))?;
         let sidecar = reader::discard_sidecar(file);
         if let Err(e) = std::fs::remove_file(&sidecar)
             && e.kind() != std::io::ErrorKind::NotFound
@@ -555,13 +556,19 @@ fn append_to(path: &std::path::Path, body: &str) -> CliResult<()> {
     Ok(())
 }
 
-/// Carry over bytes a writer appended to the replaced file after it was
+/// Carry over lines a writer appended to the replaced file after it was
 /// checked: they land at the end of the purged file instead of being lost
-/// with the old one.
+/// with the old one. Only complete lines are carried (a line still being
+/// written stays behind, with a warning). With `sealed`, the file is sealed
+/// with whole-file integrity: the late lines belong to the old file's chain,
+/// so they are opened and re-sealed into the rewritten file under a new
+/// trailer rather than copied as bytes. Best effort: a writer that keeps the
+/// old file open past this point still writes to the replaced copy.
 fn copy_late_appends(
     original: &std::fs::File,
     mut copied: u64,
     dest: &std::path::Path,
+    sealed: Option<&DlqDecryptor>,
 ) -> CliResult<()> {
     use std::io::{Read, Seek, SeekFrom, Write};
     let err = |e: std::io::Error| {
@@ -571,28 +578,52 @@ fn copy_late_appends(
         ))
     };
     let mut src = original;
+    let mut partial = 0u64;
     loop {
         let len = original.metadata().map_err(err)?.len();
         if len <= copied {
-            return Ok(());
+            break;
         }
         src.seek(SeekFrom::Start(copied)).map_err(err)?;
         let mut tail = Vec::with_capacity((len - copied) as usize);
         src.take(len - copied).read_to_end(&mut tail).map_err(err)?;
-        let mut out = std::fs::OpenOptions::new()
-            .append(true)
-            .open(dest)
-            .map_err(err)?;
-        out.write_all(&tail)
-            .and_then(|()| out.sync_all())
-            .map_err(err)?;
-        copied += tail.len() as u64;
+        let complete = tail.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+        partial = (tail.len() - complete) as u64;
+        if complete == 0 {
+            break;
+        }
+        tail.truncate(complete);
+        let carried = match sealed {
+            Some(dec) => dec
+                .reseal_appended(dest, &String::from_utf8_lossy(&tail))
+                .map_err(CliError::from)?,
+            None => {
+                let mut out = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(dest)
+                    .map_err(err)?;
+                out.write_all(&tail)
+                    .and_then(|()| out.sync_all())
+                    .map_err(err)?;
+                tail.iter().filter(|b| **b == b'\n').count()
+            }
+        };
+        copied += complete as u64;
         tracing::warn!(
             file = %dest.display(),
-            bytes = tail.len(),
+            lines = carried,
             "dlq purge: lines appended during the purge were carried into the rewritten file"
         );
     }
+    if partial > 0 {
+        tracing::warn!(
+            file = %dest.display(),
+            bytes = partial,
+            "dlq purge: a line was still being written to the replaced file and was not \
+             carried over; purge only while nothing writes the DLQ"
+        );
+    }
+    Ok(())
 }
 
 /// The ids of the lines an earlier, interrupted discard already archived.
@@ -1022,10 +1053,74 @@ mod tests {
         let tmp = write(dir.path(), "dlq.jsonl.faucet-purge", "old-2\n");
         std::fs::rename(&tmp, &path).unwrap();
         writeln!(live, "late").unwrap();
-        copy_late_appends(&original, 12, &path).unwrap();
+        copy_late_appends(&original, 12, &path, None).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "old-2\nlate\n");
-        copy_late_appends(&original, 17, &path).unwrap();
+        copy_late_appends(&original, 17, &path, None).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "old-2\nlate\n");
+        // A line still being written is not carried as a torn fragment.
+        write!(live, "torn").unwrap();
+        copy_late_appends(&original, 17, &path, None).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old-2\nlate\n");
+    }
+
+    /// Lines a sealed writer appends to the replaced file during a purge are
+    /// re-sealed into the rewritten file's chain, so it still verifies whole,
+    /// reads them, and a writer can keep appending to it.
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn late_lines_of_a_sealed_dlq_are_resealed_not_copied() {
+        use faucet_common_file::sealed_lines::{LineSeal, Opened, open, open_for_append};
+        use std::io::Write;
+        let enc = faucet_core::CompiledEncryption::compile(&faucet_core::EncryptionSpec {
+            key: "k".into(),
+            previous_keys: vec![],
+            algorithm: Default::default(),
+        })
+        .unwrap();
+        let line = |id: i64| env_line("quality", "QualityFailure", id, json!({ "id": id }));
+        // The old file: header, two envelopes, trailer.
+        let mut old = LineSeal::new();
+        let mut body = old.header(&enc);
+        body.extend(old.seal(&enc, line(1).as_bytes()));
+        body.extend(old.seal(&enc, line(2).as_bytes()));
+        body.extend(old.trailer(&enc));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dlq.jsonl");
+        std::fs::write(&path, &body).unwrap();
+        let original = std::fs::File::open(&path).unwrap();
+        let mut live = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        // The purged file (envelope 1 removed), sealed under a fresh id.
+        let mut new = LineSeal::new();
+        let mut purged = new.header(&enc);
+        purged.extend(new.seal(&enc, line(2).as_bytes()));
+        purged.extend(new.trailer(&enc));
+        let tmp = dir.path().join("dlq.jsonl.faucet-purge");
+        std::fs::write(&tmp, &purged).unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+        // A flush lands in the old file after the swap: a line + its trailer.
+        let mut late = old.seal(&enc, line(3).as_bytes());
+        late.extend(old.trailer(&enc));
+        live.write_all(&late).unwrap();
+
+        let dec = DlqDecryptor::from_keys(&["k".to_string()]).unwrap();
+        copy_late_appends(&original, body.len() as u64, &path, Some(&dec)).unwrap();
+        let raw = std::fs::read(&path).unwrap();
+        let Opened::Sealed { plain, .. } = open(&raw, &enc).unwrap() else {
+            panic!("a verified sealed file");
+        };
+        assert_eq!(
+            String::from_utf8(plain).unwrap(),
+            format!("{}\n{}\n", line(2), line(3))
+        );
+        assert!(matches!(
+            open_for_append(&raw, &enc).unwrap(),
+            Opened::Sealed { .. }
+        ));
+        let scan = reader::scan_files(std::slice::from_ref(&path), &dec).unwrap();
+        assert_eq!(scan.envelopes.len(), 2);
     }
 
     #[test]

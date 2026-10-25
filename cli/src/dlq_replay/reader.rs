@@ -218,6 +218,74 @@ impl DlqDecryptor {
         )))
     }
 
+    /// Append the record lines of `tail` — sealed lines written to another
+    /// file's chain — to the sealed file `dest`: each record is opened and
+    /// sealed again into `dest`'s chain, which gets a new trailer, so `dest`
+    /// still verifies whole. Header and trailer lines of the other chain are
+    /// dropped; a line the keys cannot open is dropped with a warning.
+    /// Returns the records carried.
+    pub fn reseal_appended(&self, dest: &Path, tail: &str) -> Result<usize, FaucetError> {
+        #[cfg(feature = "encryption")]
+        if let Some(enc) = &self.inner {
+            use base64::Engine as _;
+            use faucet_common_file::sealed_lines::{Opened, open};
+            let mut records = Vec::new();
+            let mut unreadable = 0usize;
+            for line in tail.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                match base64::engine::general_purpose::STANDARD
+                    .decode(line)
+                    .map(|b| enc.open_line(&b))
+                {
+                    Ok(Ok(faucet_core::SealedLine::Data(plain))) => records.push(plain),
+                    Ok(Ok(_)) => {}
+                    _ => unreadable += 1,
+                }
+            }
+            if unreadable > 0 {
+                tracing::warn!(
+                    file = %dest.display(),
+                    lines = unreadable,
+                    "dlq purge: late lines the loaded keys can not open were not carried over"
+                );
+            }
+            if records.is_empty() {
+                return Ok(0);
+            }
+            let io = |e: std::io::Error| {
+                FaucetError::Source(format!("re-sealing '{}': {e}", dest.display()))
+            };
+            let raw = std::fs::read(dest).map_err(io)?;
+            let Opened::Sealed {
+                mut seal, body_len, ..
+            } = open(&raw, enc)?
+            else {
+                return Err(FaucetError::Source(format!(
+                    "re-sealing '{}': the rewritten file is not sealed",
+                    dest.display()
+                )));
+            };
+            let mut out = raw[..body_len].to_vec();
+            for r in &records {
+                out.extend(seal.seal(enc, r));
+            }
+            out.extend(seal.trailer(enc));
+            let tmp = dest.with_file_name(format!(
+                "{}.faucet-reseal",
+                dest.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("dlq.jsonl")
+            ));
+            std::fs::write(&tmp, &out).map_err(io)?;
+            std::fs::rename(&tmp, dest).map_err(io)?;
+            return Ok(records.len());
+        }
+        let _ = tail;
+        Err(FaucetError::Config(format!(
+            "DLQ file '{}' is encrypted; carrying lines into it needs the key",
+            dest.display()
+        )))
+    }
+
     fn decode(&self, line: &str) -> LineDecode {
         let trimmed = line.trim();
         if !trimmed.starts_with(SEALED_LINE_PREFIX) {
