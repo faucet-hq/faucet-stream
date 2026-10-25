@@ -498,7 +498,7 @@ pub async fn get_template(
 
 /// Whether `actor` may read a template's stored body.
 pub(crate) fn reads_template_body(actor: &AuthContext) -> bool {
-    actor.role == crate::serve::rbac::Role::Admin && actor.tenant.is_none()
+    actor.reads_template_bodies()
 }
 
 // ── GET /v1/templates/{id}/rows ─────────────────────────────────────────────

@@ -186,7 +186,10 @@ A template trigger that waits for approval stores the template body with its
 when the approved run executes — so a trigger carrying a `secret: true` param
 or `env` overrides is refused with `422`. Change-request responses hide
 callback `headers` from everyone but admins and the proposed `config` from
-principals that cannot approve.
+principals that cannot approve. The body a `template_register` change proposes
+is shown only to unscoped admins, the same rule `GET /v1/templates/{id}`
+applies to a registered body (it can hold inline credentials); its plan stays
+visible to every reviewer.
 
 `--approval-expiry-secs` sets the default window when the auth config does not.
 

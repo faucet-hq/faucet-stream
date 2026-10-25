@@ -398,6 +398,21 @@ async fn plan_approve_run_with_policy_budget_rejection_and_audit() {
     assert_eq!(change["plan"]["summary"]["template_kind"], "pipeline");
     assert!(change["plan"]["summary"]["previous_version"].is_null());
     assert_eq!(change["plan"]["rows"].as_array().unwrap().len(), 1);
+    // The proposed body follows the template-body rule: only an unscoped
+    // admin reads it; the plan stays visible to every reviewer.
+    let (code, as_op) = api.get("dave-tok", &format!("/v1/changes/{tid}")).await;
+    assert_eq!(code, 200, "{as_op}");
+    assert_ne!(as_op["payload"]["config"], tpl, "{as_op}");
+    assert_eq!(as_op["plan"]["summary"]["template"], "tpl-a");
+    let (code, as_admin) = api.get("admin-tok", &format!("/v1/changes/{tid}")).await;
+    assert_eq!(code, 200, "{as_admin}");
+    assert_eq!(as_admin["payload"]["config"], tpl);
+    let (_, listed) = api.get("bob-tok", "/v1/changes").await;
+    let listed = listed
+        .as_array()
+        .and_then(|l| l.iter().find(|c| c["id"] == tid.as_str()).cloned())
+        .expect("listed");
+    assert_ne!(listed["payload"]["config"], tpl, "{listed}");
     let (code, err) = api
         .post("dave-tok", &format!("/v1/changes/{tid}/approve"), json!({}))
         .await;

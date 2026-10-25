@@ -278,9 +278,17 @@ impl ChangeRequest {
     }
 
     /// The record as `actor` may read it: a callback's headers are masked for
-    /// everyone but an admin, and the proposed config for anyone who cannot
-    /// approve a change.
+    /// everyone but an admin, the proposed config for anyone who cannot
+    /// approve a change, and a proposed template body for anyone but an
+    /// unscoped admin (the rule `GET /v1/templates/{id}` applies to the
+    /// registered body).
     pub fn redacted_for(mut self, actor: &AuthContext) -> Self {
+        if self.kind == ChangeKind::TemplateRegister
+            && !actor.reads_template_bodies()
+            && let Some(config) = self.payload.get_mut("config")
+        {
+            *config = Value::String(REDACTED.to_string());
+        }
         if actor.role == Role::Admin {
             return self;
         }
@@ -1884,14 +1892,6 @@ mod tests {
         .unwrap_err();
         assert!(moved.contains("tenant"), "{moved}");
 
-    fn responses_mask_what_the_reader_may_not_see() {
-        let mut c = stored(
-            ChangeKind::Run,
-            json!({"config": "pipeline: {}", "callback": {"url": "u", "headers": {"authorization": "Bearer x"}}}),
-            "m",
-            1,
-        );
-        let who = |role| AuthContext {
         let mut sys = c.clone();
         sys.requester = "sync:origin".into();
         assert!(
@@ -1907,6 +1907,14 @@ mod tests {
     }
 
     #[test]
+    fn responses_mask_what_the_reader_may_not_see() {
+        let mut c = stored(
+            ChangeKind::Run,
+            json!({"config": "pipeline: {}", "callback": {"url": "u", "headers": {"authorization": "Bearer x"}}}),
+            "m",
+            1,
+        );
+        let who = |role| AuthContext {
             principal: "p".into(),
             role,
             source_ip: None,
@@ -1924,6 +1932,30 @@ mod tests {
             c.clone().redacted_for(&who(Role::Viewer)).payload,
             c.payload
         );
+
+        let register = stored(
+            ChangeKind::TemplateRegister,
+            json!({"config": "auth: {token: inline}", "tags": ["dev"]}),
+            "m",
+            1,
+        );
+        assert_eq!(
+            register.clone().redacted_for(&who(Role::Admin)).payload,
+            register.payload,
+            "an unscoped admin reads the proposed body"
+        );
+        let op = register.clone().redacted_for(&who(Role::Operator));
+        assert_eq!(
+            op.payload["config"], REDACTED,
+            "approvers below admin do not"
+        );
+        assert_eq!(op.payload["tags"], json!(["dev"]));
+        assert!(op.plan.is_some(), "the plan stays visible for review");
+        let scoped = register.clone().redacted_for(&AuthContext {
+            tenant: Some("acme".into()),
+            ..who(Role::Admin)
+        });
+        assert_eq!(scoped.payload["config"], REDACTED);
     }
 
     #[tokio::test]

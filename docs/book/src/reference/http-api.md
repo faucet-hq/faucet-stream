@@ -694,7 +694,9 @@ unresolved (`${env:}` / `${file:}` / secret references stay tokens and resolve
 when the approved run executes), so a trigger that supplies a `secret: true`
 param or `env` overrides is refused with `422`. Responses mask what the reader
 may not see: callback `headers` for everyone but an admin, and the proposed
-`config` for a principal that cannot approve (a viewer). A tenant-scoped
+`config` for a principal that cannot approve (a viewer). The body a
+`template_register` change proposes is masked for everyone but an unscoped
+admin, as on `GET /v1/templates/{id}`; the plan is not. A tenant-scoped
 principal cannot `POST /v1/changes` (`403`); its gated template triggers
 become change requests on their own.
 

@@ -319,6 +319,12 @@ impl AuthContext {
         self.tenant.as_deref().is_none_or(|own| tenant == Some(own))
     }
 
+    /// Whether this principal may read a stored template body, which can
+    /// hold inline credentials: unscoped admins only.
+    pub fn reads_template_bodies(&self) -> bool {
+        self.role == Role::Admin && self.tenant.is_none()
+    }
+
     /// Actor for a server-internal task (the change-request expiry sweep,
     /// #703) — `system:<name>`, an admin for audit attribution.
     pub fn system(name: &str) -> Self {
@@ -477,12 +483,6 @@ impl RbacConfig {
                     p.name
                 )));
             }
-            if let Some(t) = &p.tenant {
-                crate::serve::history::tenants::validate_tenant_id(t).map_err(|e| {
-                    CliError::Serve(format!("--auth-config: principal '{}': {e}", p.name))
-                })?;
-            }
-            if !seen_names.insert(p.name.clone()) {
             if is_server_identity(&p.name) {
                 return Err(CliError::Serve(format!(
                     "--auth-config: principal name '{}' is reserved for the server's own actors \
@@ -490,6 +490,12 @@ impl RbacConfig {
                     p.name
                 )));
             }
+            if let Some(t) = &p.tenant {
+                crate::serve::history::tenants::validate_tenant_id(t).map_err(|e| {
+                    CliError::Serve(format!("--auth-config: principal '{}': {e}", p.name))
+                })?;
+            }
+            if !seen_names.insert(p.name.clone()) {
                 return Err(CliError::Serve(format!(
                     "--auth-config: duplicate principal name '{}'",
                     p.name
@@ -1032,12 +1038,6 @@ mod tests {
         assert!(RbacConfig::new(vec![]).is_err());
         assert!(RbacConfig::new(vec![spec("", "t", Role::Admin)]).is_err());
         assert!(RbacConfig::new(vec![spec("a", "", Role::Admin)]).is_err());
-        // Duplicate name.
-        assert!(
-            RbacConfig::new(vec![
-                spec("a", "t1", Role::Admin),
-                spec("a", "t2", Role::Viewer),
-            ])
         for reserved in ["runtime", "system:x", "trigger:t", "sync:origin"] {
             let err = RbacConfig::new(vec![spec(reserved, "t", Role::Operator)])
                 .unwrap_err()
@@ -1049,6 +1049,12 @@ mod tests {
         assert!(is_server_identity("system:tenants"));
         assert!(!is_server_identity("ci:deploy"));
         assert!(!is_server_identity("runtime-ops"));
+        // Duplicate name.
+        assert!(
+            RbacConfig::new(vec![
+                spec("a", "t1", Role::Admin),
+                spec("a", "t2", Role::Viewer),
+            ])
             .is_err()
         );
         // Duplicate token.
