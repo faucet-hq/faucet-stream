@@ -541,10 +541,35 @@ pub async fn run(args: PlanArgs) -> CliResult<()> {
 
 async fn probe_summary(sink: &dyn faucet_core::Sink) -> String {
     let ctx = faucet_core::CheckContext::default();
-    match sink.check(&ctx).await {
-        Ok(report) => format!("{} probe(s)", report.probes.len()),
-        Err(e) => format!("probe unavailable: {e}"),
+    summarize_probes(sink.check(&ctx).await)
+}
+
+/// One line for a sink preflight: pass / fail / skip counts plus each failing
+/// probe's name and reason, redacted like `faucet doctor` output.
+fn summarize_probes(result: Result<faucet_core::CheckReport, faucet_core::FaucetError>) -> String {
+    use faucet_core::ProbeStatus;
+    let redact = crate::secrets::registry::redact;
+    let report = match result {
+        Ok(report) => report,
+        Err(e) => return format!("probe unavailable: {}", redact(&e.to_string())),
+    };
+    let (mut passed, mut skipped) = (0, 0);
+    let mut failed = Vec::new();
+    for p in &report.probes {
+        match &p.status {
+            ProbeStatus::Pass => passed += 1,
+            ProbeStatus::Skip { .. } => skipped += 1,
+            ProbeStatus::Fail { reason } => failed.push(format!("{}: {}", p.name, redact(reason))),
+        }
     }
+    let mut out = format!(
+        "{passed} passed, {} failed, {skipped} skipped",
+        failed.len()
+    );
+    if !failed.is_empty() {
+        out.push_str(&format!(" — FAILED {}", failed.join("; ")));
+    }
+    out
 }
 
 pub(crate) fn select_root<'a>(
@@ -1005,6 +1030,47 @@ mod tests {
         let err = super::run(args).await.unwrap_err().to_string();
         assert!(
             err.contains("removes messages") && err.contains("plan --live"),
+            "{err}"
+        );
+    }
+
+    /// A failing sink probe is reported as a failure with its redacted
+    /// reason, never as a bare probe count.
+    #[test]
+    fn a_failing_sink_probe_is_surfaced_and_redacted() {
+        use faucet_core::{CheckReport, Probe, ProbeStatus};
+        crate::secrets::registry::register("pl4n-s3cret-pw");
+        let probe = |name, status| Probe {
+            name,
+            status,
+            elapsed_ms: 1,
+            hint: None,
+        };
+        let line = summarize_probes(Ok(CheckReport {
+            probes: vec![
+                probe(
+                    "connect",
+                    ProbeStatus::Fail {
+                        reason: "password pl4n-s3cret-pw rejected".into(),
+                    },
+                ),
+                probe(
+                    "table",
+                    ProbeStatus::Skip {
+                        reason: "n/a".into(),
+                    },
+                ),
+                probe("auth", ProbeStatus::Pass),
+            ],
+        }));
+        assert!(line.starts_with("1 passed, 1 failed, 1 skipped"), "{line}");
+        assert!(line.contains("FAILED connect: password"), "{line}");
+        assert!(!line.contains("pl4n-s3cret-pw"), "{line}");
+        let err = summarize_probes(Err(faucet_core::FaucetError::Sink(
+            "dial pl4n-s3cret-pw".into(),
+        )));
+        assert!(
+            !err.contains("pl4n-s3cret-pw") && err.starts_with("probe unavailable"),
             "{err}"
         );
     }
