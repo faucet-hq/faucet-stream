@@ -79,6 +79,7 @@ pub async fn run(args: ReplicateArgs) -> CliResult<()> {
     // tracing subscriber is live and `CompiledReplication::compile`'s
     // non-upsert-sink warning is actually emitted (it would be lost otherwise).
     crate::obs::install(&cfg)?;
+    let _otel = crate::obs::flush_on_exit();
 
     let compiled = CompiledReplication::compile(spec, &cfg)?;
 

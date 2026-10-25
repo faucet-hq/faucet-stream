@@ -23,6 +23,7 @@ pub async fn run(args: BackfillArgs) -> CliResult<()> {
 
     let cfg = PipelineConfig::from_path_async(&path, args.profile.as_deref()).await?;
     crate::obs::install(&cfg)?;
+    let _otel = crate::obs::flush_on_exit();
 
     let spec = cfg.backfill.clone().unwrap_or_default();
     let tz = match args.timezone.as_deref().or(spec.timezone.as_deref()) {

@@ -226,6 +226,7 @@ pub async fn run(args: ScheduleArgs) -> CliResult<()> {
     let timezone = spec.timezone.clone();
 
     crate::obs::install(&cfg)?;
+    let _otel = crate::obs::flush_on_exit();
 
     let pipeline_name = cfg.name.clone().unwrap_or_else(|| {
         path.file_stem()
