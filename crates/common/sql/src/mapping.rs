@@ -6,6 +6,8 @@
 //! field present in only some records, rows carrying different column sets —
 //! is decided here once.
 
+use std::collections::{HashMap, HashSet};
+
 use serde_json::{Map, Value};
 
 /// How a record field is compared with a table column name.
@@ -137,11 +139,7 @@ pub fn match_record<'a>(
     obj: &'a Map<String, Value>,
     matching: ColumnMatching,
 ) -> Vec<(usize, &'a Value)> {
-    columns
-        .iter()
-        .enumerate()
-        .filter_map(|(i, c)| field_for(&c.name, columns, obj, matching).map(|v| (i, v)))
-        .collect()
+    ColumnIndex::new(columns, matching).match_record(obj)
 }
 
 /// Record fields that land in no column.
@@ -150,27 +148,126 @@ pub fn unmatched_fields<'a>(
     columns: &[TableColumn],
     matching: ColumnMatching,
 ) -> Vec<&'a str> {
-    obj.keys()
-        .filter(|k| match matching {
-            ColumnMatching::Exact => !columns.iter().any(|c| c.name == **k),
+    ColumnIndex::new(columns, matching).unmatched_fields(obj)
+}
+
+/// A target's columns indexed once for a [`ColumnMatching`], so mapping a
+/// record costs O(columns + fields) instead of a scan of the record for every
+/// column it lacks. Build it once per page and reuse it for every record.
+#[derive(Debug, Clone)]
+pub struct ColumnIndex<'c> {
+    columns: &'c [TableColumn],
+    matching: ColumnMatching,
+    exact: HashSet<&'c str>,
+    /// Number of columns per ASCII-lower-cased name.
+    folded: HashMap<String, usize>,
+    /// Upper-cased names (`UpperFold` only).
+    upper: Vec<String>,
+}
+
+impl<'c> ColumnIndex<'c> {
+    /// Index `columns` for `matching`.
+    pub fn new(columns: &'c [TableColumn], matching: ColumnMatching) -> Self {
+        let exact = columns.iter().map(|c| c.name.as_str()).collect();
+        let mut folded: HashMap<String, usize> = HashMap::new();
+        if matches!(
+            matching,
+            ColumnMatching::CaseInsensitive | ColumnMatching::FoldUnique
+        ) {
+            for c in columns {
+                *folded.entry(c.name.to_ascii_lowercase()).or_default() += 1;
+            }
+        }
+        let upper = if matching == ColumnMatching::UpperFold {
+            columns.iter().map(|c| c.name.clone()).collect()
+        } else {
+            Vec::new()
+        };
+        Self {
+            columns,
+            matching,
+            exact,
+            folded,
+            upper,
+        }
+    }
+
+    /// The `(column index, value)` cells `obj` carries, in table order; the
+    /// same result as [`field_for`] per column.
+    pub fn match_record<'a>(&self, obj: &'a Map<String, Value>) -> Vec<(usize, &'a Value)> {
+        let alternate: HashMap<String, &'a Value> = match self.matching {
+            ColumnMatching::Exact => HashMap::new(),
             ColumnMatching::CaseInsensitive => {
-                !columns.iter().any(|c| c.name.eq_ignore_ascii_case(k))
+                let mut m = HashMap::with_capacity(obj.len());
+                for (k, v) in obj {
+                    m.entry(k.to_ascii_lowercase()).or_insert(v);
+                }
+                m
             }
             ColumnMatching::FoldUnique => {
-                !columns.iter().any(|c| c.name == **k)
-                    && columns
-                        .iter()
-                        .filter(|c| c.name.eq_ignore_ascii_case(k))
-                        .count()
-                        != 1
+                let mut m = HashMap::with_capacity(obj.len());
+                for (k, v) in obj {
+                    let lower = k.to_ascii_lowercase();
+                    if !self.exact.contains(k.as_str()) && self.folded.get(&lower) == Some(&1) {
+                        m.insert(lower, v);
+                    }
+                }
+                m
             }
             ColumnMatching::UpperFold => {
-                let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
-                column_for_field(k, &names, ColumnMatching::UpperFold).is_none()
+                let mut m = HashMap::with_capacity(obj.len());
+                for (k, v) in obj {
+                    if !self.exact.contains(k.as_str()) {
+                        m.entry(k.to_uppercase()).or_insert(v);
+                    }
+                }
+                m
             }
-        })
-        .map(String::as_str)
-        .collect()
+        };
+        self.columns
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| {
+                if let Some(v) = obj.get(&c.name) {
+                    return Some((i, v));
+                }
+                let v = match self.matching {
+                    ColumnMatching::Exact => None,
+                    ColumnMatching::CaseInsensitive | ColumnMatching::FoldUnique => {
+                        alternate.get(&c.name.to_ascii_lowercase()).copied()
+                    }
+                    ColumnMatching::UpperFold => {
+                        if c.name != c.name.to_uppercase() {
+                            None
+                        } else {
+                            alternate.get(&c.name).copied()
+                        }
+                    }
+                };
+                v.map(|v| (i, v))
+            })
+            .collect()
+    }
+
+    /// Record fields that land in no column.
+    pub fn unmatched_fields<'a>(&self, obj: &'a Map<String, Value>) -> Vec<&'a str> {
+        obj.keys()
+            .filter(|k| match self.matching {
+                ColumnMatching::Exact => !self.exact.contains(k.as_str()),
+                ColumnMatching::CaseInsensitive => {
+                    !self.folded.contains_key(&k.to_ascii_lowercase())
+                }
+                ColumnMatching::FoldUnique => {
+                    !self.exact.contains(k.as_str())
+                        && self.folded.get(&k.to_ascii_lowercase()) != Some(&1)
+                }
+                ColumnMatching::UpperFold => {
+                    column_for_field(k, &self.upper, ColumnMatching::UpperFold).is_none()
+                }
+            })
+            .map(String::as_str)
+            .collect()
+    }
 }
 
 /// `obj` with every field renamed to the column it maps to under
@@ -203,17 +300,20 @@ pub struct MatchedRow<'a> {
 }
 
 impl<'a> MatchedRow<'a> {
-    /// The value for the column at `column`, if the record carries it.
+    /// The value for the column at `column`, if the record carries it
+    /// (`cells` is in table order, so this is a binary search).
     pub fn value(&self, column: usize) -> Option<&'a Value> {
         self.cells
-            .iter()
-            .find(|(c, _)| *c == column)
-            .map(|(_, v)| *v)
+            .binary_search_by_key(&column, |(c, _)| *c)
+            .ok()
+            .map(|i| self.cells[i].1)
     }
 
     /// Whether the record carries the column at `column`.
     pub fn carries(&self, column: usize) -> bool {
-        self.cells.iter().any(|(c, _)| *c == column)
+        self.cells
+            .binary_search_by_key(&column, |(c, _)| *c)
+            .is_ok()
     }
 }
 
@@ -257,9 +357,15 @@ pub fn map_records<'a>(
 /// Column indices carried by at least one row, in table order: the column set
 /// of an append, where a row missing one binds NULL.
 pub fn union_columns(rows: &[MatchedRow<'_>], width: usize) -> Vec<usize> {
-    (0..width)
-        .filter(|i| rows.iter().any(|r| r.carries(*i)))
-        .collect()
+    let mut seen = vec![false; width];
+    for row in rows {
+        for (c, _) in &row.cells {
+            if let Some(s) = seen.get_mut(*c) {
+                *s = true;
+            }
+        }
+    }
+    (0..width).filter(|i| seen[*i]).collect()
 }
 
 /// Rows grouped by the exact column set each carries, in first-seen order:
@@ -270,11 +376,20 @@ pub fn group_by_present<'r, 'a>(
     width: usize,
 ) -> Vec<(Vec<usize>, Vec<&'r MatchedRow<'a>>)> {
     let mut groups: Vec<(Vec<usize>, Vec<&'r MatchedRow<'a>>)> = Vec::new();
+    let mut slot: HashMap<Vec<usize>, usize> = HashMap::new();
     for row in rows {
-        let present: Vec<usize> = (0..width).filter(|i| row.carries(*i)).collect();
-        match groups.iter_mut().find(|(p, _)| *p == present) {
-            Some((_, members)) => members.push(row),
-            None => groups.push((present, vec![row])),
+        let present: Vec<usize> = row
+            .cells
+            .iter()
+            .map(|(c, _)| *c)
+            .filter(|c| *c < width)
+            .collect();
+        match slot.get(&present) {
+            Some(&i) => groups[i].1.push(row),
+            None => {
+                slot.insert(present.clone(), groups.len());
+                groups.push((present, vec![row]));
+            }
         }
     }
     groups
@@ -430,5 +545,66 @@ mod tests {
         assert!(rows[1].value(1).is_none());
         assert_eq!(TableColumn::new("x", "int4").sql_type(), Some("int4"));
         assert_eq!(TableColumn::untyped("x").sql_type(), None);
+    }
+
+    #[test]
+    fn column_index_agrees_with_field_for_under_every_matching() {
+        let c = cols(&["id", "Name", "NAME", "Total", "CODE", "Mixed"]);
+        let records = [
+            json!({"id": 1, "name": "a", "total": 2, "code": "x", "mixed": 3}),
+            json!({"ID": 1, "Name": "b", "TOTAL": 2, "Code": "y", "MIXED": 4}),
+            json!({"Id": 1, "nAmE": "c", "Total": 5, "total": 6, "CODE": "z"}),
+            json!({"other": 1}),
+            json!({}),
+        ];
+        for matching in [
+            ColumnMatching::Exact,
+            ColumnMatching::CaseInsensitive,
+            ColumnMatching::FoldUnique,
+            ColumnMatching::UpperFold,
+        ] {
+            let index = ColumnIndex::new(&c, matching);
+            for r in &records {
+                let o = r.as_object().unwrap();
+                let expected: Vec<(usize, &Value)> = c
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, col)| field_for(&col.name, &c, o, matching).map(|v| (i, v)))
+                    .collect();
+                assert_eq!(index.match_record(o), expected, "{matching:?} {r}");
+                assert_eq!(match_record(&c, o, matching), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn matched_row_lookups_and_grouping_follow_cells() {
+        let (a, b) = (json!(1), json!(2));
+        let rows = vec![
+            MatchedRow {
+                index: 0,
+                cells: vec![(0, &a), (3, &b)],
+            },
+            MatchedRow {
+                index: 1,
+                cells: vec![(1, &a)],
+            },
+            MatchedRow {
+                index: 2,
+                cells: vec![(0, &b), (3, &a)],
+            },
+        ];
+        assert_eq!(rows[0].value(3), Some(&b));
+        assert_eq!(rows[0].value(1), None);
+        assert!(rows[1].carries(1) && !rows[1].carries(0));
+        assert_eq!(union_columns(&rows, 4), vec![0, 1, 3]);
+        let groups = group_by_present(&rows, 4);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, vec![0, 3]);
+        assert_eq!(
+            groups[0].1.iter().map(|r| r.index).collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        assert_eq!(groups[1].0, vec![1]);
     }
 }

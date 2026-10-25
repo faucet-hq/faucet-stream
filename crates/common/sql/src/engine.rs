@@ -11,10 +11,7 @@
 //! paths, overwrite swaps and catalog queries.
 
 use crate::dialect::{SqlDialect, TableTarget};
-use crate::mapping::{
-    ColumnMatching, MatchedRow, TableColumn, group_by_present, match_record, union_columns,
-    unmatched_fields,
-};
+use crate::mapping::{ColumnIndex, MatchedRow, TableColumn, group_by_present, union_columns};
 use crate::statement::{Param, Statement, StatementKind};
 use faucet_core::write_mode::{KeyTuple, WritePlan, WriteSpec};
 use faucet_core::{FaucetError, RowOutcome, SeenKeys, SqlBaseType, WriteMode, WriteReport};
@@ -284,15 +281,15 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
         columns: &[TableColumn],
         records: &'a [Value],
     ) -> Result<Vec<MatchedRow<'a>>, FaucetError> {
-        let matching = self.dialect.column_matching();
+        let index_of = ColumnIndex::new(columns, self.dialect.column_matching());
         let mut rows = Vec::with_capacity(records.len());
         for (index, record) in records.iter().enumerate() {
             let obj = record.as_object().ok_or_else(not_object)?;
-            let cells = match_record(columns, obj, matching);
+            let cells = index_of.match_record(obj);
             if cells.is_empty() {
                 return Err(self.no_match_error(index, obj, columns, &target.name));
             }
-            self.warn_unmatched(obj, columns, matching, &target.name);
+            self.warn_unmatched(obj, &index_of, &target.name);
             rows.push(MatchedRow { index, cells });
         }
         Ok(rows)
@@ -311,14 +308,13 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
     fn warn_unmatched(
         &self,
         obj: &serde_json::Map<String, Value>,
-        columns: &[TableColumn],
-        matching: ColumnMatching,
+        index: &ColumnIndex<'_>,
         table: &str,
     ) {
         if !self.options.warn_unmatched_fields || self.unmatched_warned.load(Ordering::Relaxed) {
             return;
         }
-        let unmatched = unmatched_fields(obj, columns, matching);
+        let unmatched = index.unmatched_fields(obj);
         if !unmatched.is_empty() && !self.unmatched_warned.swap(true, Ordering::Relaxed) {
             tracing::warn!(
                 table = %table,
@@ -844,13 +840,13 @@ pub fn split_page<D: SqlDialect + ?Sized>(
     require_match: bool,
     validate: impl Fn(usize, &TableColumn, &Value) -> Option<String>,
 ) -> SplitPage {
-    let matching = dialect.column_matching();
+    let index = ColumnIndex::new(columns, dialect.column_matching());
     let mut outcomes = Vec::with_capacity(records.len());
     let mut writable = Vec::with_capacity(records.len());
     let mut positions = Vec::with_capacity(records.len());
     for (idx, record) in records.iter().enumerate() {
         let failure = record.as_object().and_then(|obj| {
-            let cells = match_record(columns, obj, matching);
+            let cells = index.match_record(obj);
             if require_match && cells.is_empty() {
                 return Some(no_match_message(dialect, idx, obj, columns, table));
             }
