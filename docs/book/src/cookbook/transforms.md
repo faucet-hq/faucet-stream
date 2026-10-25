@@ -218,7 +218,13 @@ modes — only the join separator differs.
 
 Two distinct keys that re-case to the same name error rather than
 silently overwriting (same collision rule as `flatten` and
-`spell_symbols`). An all-symbol key (`"!@#"`) tokenises to nothing and
+`spell_symbols`). With `on_collision: suffix` both are kept instead: a key
+already spelled in the target case keeps the base name, and every other
+colliding key takes the base name plus `_` and 8 hex digits derived from
+the source key itself (`Account_Id__c` → `account_id_c_<hash>`). The name
+depends only on the source key, so a key lands in the same column in every
+run and no two source keys share a suffixed column; once a key has
+collided it keeps its suffixed name for the rest of the run. An all-symbol key (`"!@#"`) tokenises to nothing and
 is kept as-is to avoid producing a blank key.
 
 Multi-char uppercase runs are left as one token: `"XMLParser"` →

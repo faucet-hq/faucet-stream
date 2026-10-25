@@ -122,7 +122,9 @@ struct KeysCaseConfig {
     /// Output convention for every key in the record.
     mode: KeyCaseMode,
     /// What to do when two distinct keys re-case to the same name:
-    /// `error` (default — fail loudly) or `suffix` (append `_2`, `_3`, …).
+    /// `error` (default — fail loudly) or `suffix` (append `_` and a short
+    /// hash of the source key to each colliding key not already in the
+    /// target case).
     #[serde(default)]
     on_collision: KeyCollision,
 }

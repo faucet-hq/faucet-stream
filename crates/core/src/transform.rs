@@ -169,10 +169,13 @@ pub enum KeyCollision {
     /// (the default — never silently drops a column).
     #[default]
     Error,
-    /// Disambiguate colliding keys by appending `_2`, `_3`, … in the order
-    /// the keys are first seen in the run (the first keeps the base name). A
-    /// source key keeps its name for the whole run, even in a record where
-    /// the key it collided with is absent.
+    /// Disambiguate colliding keys: a key already spelled in the target case
+    /// keeps the base name, and every other colliding key takes the base name
+    /// plus `_` and 8 hex digits derived from the source key itself
+    /// (`Account_Id__c` → `account_id_c_<hash>`), so a source key always maps
+    /// to the same column and no two source keys share one. A key that
+    /// collided keeps its suffixed name for the rest of the run, even in a
+    /// record where the key it collided with is absent.
     Suffix,
 }
 
@@ -1097,8 +1100,8 @@ pub enum CompiledTransform {
     KeysCase {
         mode: KeyCaseMode,
         on_collision: KeyCollision,
-        /// The output name each source key took under `on_collision: suffix`,
-        /// shared by every clone of this transform for the run.
+        /// The source keys that collided under `on_collision: suffix`, shared
+        /// by every clone of this transform for the run.
         assignments: KeyCaseAssignments,
     },
     #[cfg(feature = "transform-select")]
@@ -1618,58 +1621,74 @@ fn rename_keys(value: Value, re: &Regex, replacement: &str) -> Result<Value, Fau
 
 // ── KeysCase ──────────────────────────────────────────────────────────────────
 
-/// The output name each source key took under [`KeyCollision::Suffix`], per
-/// object path, learned over the run. A key keeps the name it was first given
-/// whichever other keys a later record carries, so one source field never
-/// lands in two destination columns.
+/// Source keys that collided under [`KeyCollision::Suffix`] earlier in the
+/// run, per object path. Only colliding keys are recorded (bounded by
+/// [`MAX_REMEMBERED_COLLISIONS`]), so a key that collided once keeps its
+/// suffixed name for the rest of the run.
 #[cfg(feature = "transform-keys-case")]
 #[derive(Debug, Clone, Default)]
-pub struct KeyCaseAssignments(
-    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, KeyCaseScope>>>,
-);
+pub struct KeyCaseAssignments(std::sync::Arc<KeyCaseMemory>);
 
 #[cfg(feature = "transform-keys-case")]
 #[derive(Debug, Default)]
-struct KeyCaseScope {
-    by_source: std::collections::HashMap<String, String>,
-    taken: std::collections::HashSet<String>,
+struct KeyCaseMemory {
+    any: std::sync::atomic::AtomicBool,
+    collided: std::sync::Mutex<std::collections::HashSet<String>>,
 }
+
+/// Ceiling on remembered colliding keys per compiled `keys_case`.
+#[cfg(feature = "transform-keys-case")]
+const MAX_REMEMBERED_COLLISIONS: usize = 10_000;
 
 #[cfg(feature = "transform-keys-case")]
 impl KeyCaseAssignments {
-    /// The output name for `source` (re-cased to `recased`) in the object at
-    /// `path`: the one it was given before, else `recased`, else the first
-    /// free `recased_2`, `recased_3`, ….
-    fn name_for(&self, path: &str, source: &str, recased: String) -> String {
-        let mut guard = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        let scope = guard.entry(path.to_owned()).or_default();
-        if let Some(name) = scope.by_source.get(source) {
-            return name.clone();
-        }
-        let name = if scope.taken.contains(&recased) {
-            let mut n = 2usize;
-            let mut candidate = format!("{recased}_{n}");
-            while scope.taken.contains(&candidate) {
-                n += 1;
-                candidate = format!("{recased}_{n}");
-            }
-            candidate
-        } else {
-            recased
-        };
-        scope.taken.insert(name.clone());
-        scope.by_source.insert(source.to_owned(), name.clone());
-        name
+    fn entry(path: &str, source: &str) -> String {
+        format!("{path}\u{1f}{source}")
     }
+
+    fn remembers(&self, path: &str, source: &str) -> bool {
+        if !self.0.any.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        let guard = self.0.collided.lock().unwrap_or_else(|p| p.into_inner());
+        guard.contains(&Self::entry(path, source))
+    }
+
+    fn remember(&self, path: &str, sources: &[&str]) {
+        let mut guard = self.0.collided.lock().unwrap_or_else(|p| p.into_inner());
+        for source in sources {
+            if guard.len() >= MAX_REMEMBERED_COLLISIONS {
+                break;
+            }
+            guard.insert(Self::entry(path, source));
+        }
+        self.0.any.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// The name a colliding source key takes under [`KeyCollision::Suffix`]: the
+/// re-cased name plus a short hash of the **source key itself**, so the same
+/// source key always lands in the same column, whatever other keys a record
+/// or a run carries, and no two source keys share a suffixed column.
+#[cfg(feature = "transform-keys-case")]
+fn suffixed_key_name(recased: &str, source: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in source.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{recased}_{:08x}", (h ^ (h >> 32)) as u32)
 }
 
 /// Recursively re-case every key in the record according to `mode`.
 ///
 /// When two distinct keys within the same object re-case to the same name,
 /// `on_collision` decides: [`KeyCollision::Error`] fails the record (default,
-/// never drops a column); [`KeyCollision::Suffix`] appends `_2`, `_3`, … in
-/// the order the keys were first seen in the run, and a key keeps its name
-/// for the rest of the run (see [`KeyCaseAssignments`]).
+/// never drops a column); [`KeyCollision::Suffix`] keeps the base name for a
+/// key already spelled in the target case and gives every other colliding
+/// key the base name plus a short hash of the source key
+/// ([`suffixed_key_name`]). A key that collided once keeps that name for the
+/// rest of the run (see [`KeyCaseAssignments`]).
 #[cfg(feature = "transform-keys-case")]
 fn keys_case(
     value: Value,
@@ -1680,29 +1699,66 @@ fn keys_case(
 ) -> Result<Value, FaucetError> {
     match value {
         Value::Object(map) => {
+            let recased: Vec<String> = map
+                .keys()
+                .map(|k| {
+                    let tokens = tokenize_key(k);
+                    if tokens.is_empty() {
+                        // An all-symbol key tokenises to nothing — keep the
+                        // original key instead of producing a blank one.
+                        k.clone()
+                    } else {
+                        apply_key_case(tokens, mode)
+                    }
+                })
+                .collect();
+            let mut colliding: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            {
+                let mut first: std::collections::HashMap<&str, usize> =
+                    std::collections::HashMap::with_capacity(recased.len());
+                for (i, r) in recased.iter().enumerate() {
+                    if let Some(&j) = first.get(r.as_str()) {
+                        if on_collision == KeyCollision::Error {
+                            return Err(FaucetError::Transform(format!(
+                                "keys_case produced a duplicate key '{r}'; two distinct \
+                                 keys re-case to the same name under mode {mode:?} (set \
+                                 on_collision: suffix to disambiguate)"
+                            )));
+                        }
+                        colliding.insert(i);
+                        colliding.insert(j);
+                    } else {
+                        first.insert(r.as_str(), i);
+                    }
+                }
+            }
+            if !colliding.is_empty() {
+                let keys: Vec<&str> = map
+                    .keys()
+                    .enumerate()
+                    .filter(|(i, _)| colliding.contains(i))
+                    .map(|(_, k)| k.as_str())
+                    .collect();
+                assignments.remember(path, &keys);
+            }
             let mut new_map = Map::with_capacity(map.len());
-            for (k, v) in map {
-                let tokens = tokenize_key(&k);
-                let recased = if tokens.is_empty() {
-                    // An all-symbol key tokenises to nothing — keep the
-                    // original key instead of producing a blank one.
-                    k.clone()
-                } else {
-                    apply_key_case(tokens, mode)
-                };
+            for ((k, v), r) in map.into_iter().zip(recased) {
                 let child_path = format!("{path}\u{1f}{k}");
                 let new_v = keys_case(v, mode, on_collision, assignments, &child_path)?;
-                let final_key = match on_collision {
-                    KeyCollision::Error if new_map.contains_key(&recased) => {
-                        return Err(FaucetError::Transform(format!(
-                            "keys_case produced a duplicate key '{recased}'; two distinct \
-                             keys re-case to the same name under mode {mode:?} (set \
-                             on_collision: suffix to disambiguate)"
-                        )));
-                    }
-                    KeyCollision::Error => recased,
-                    KeyCollision::Suffix => assignments.name_for(path, &k, recased),
+                let final_key = if on_collision == KeyCollision::Suffix
+                    && k != r
+                    && assignments.remembers(path, &k)
+                {
+                    suffixed_key_name(&r, &k)
+                } else {
+                    r
                 };
+                if new_map.contains_key(&final_key) {
+                    return Err(FaucetError::Transform(format!(
+                        "keys_case produced a duplicate key '{final_key}' from source key \
+                         '{k}'; rename one of the source keys"
+                    )));
+                }
                 new_map.insert(final_key, new_v);
             }
             Ok(Value::Object(new_map))
@@ -2856,10 +2912,15 @@ mod tests {
         let obj = result.as_object().unwrap();
         // Both columns survive under unique names (order/backend-independent).
         let keys: std::collections::BTreeSet<&str> = obj.keys().map(String::as_str).collect();
+        let suffixed = super::suffixed_key_name("account_id", "AccountId");
         assert_eq!(
             keys,
-            ["account_id", "account_id_2"].into_iter().collect(),
+            ["account_id", suffixed.as_str()].into_iter().collect(),
             "got {keys:?}"
+        );
+        assert_eq!(
+            obj["account_id"], 2,
+            "the key already in snake case keeps the base name"
         );
         let vals: std::collections::BTreeSet<i64> =
             obj.values().filter_map(Value::as_i64).collect();
@@ -2880,9 +2941,13 @@ mod tests {
         );
         let obj = result.as_object().unwrap();
         let keys: std::collections::BTreeSet<&str> = obj.keys().map(String::as_str).collect();
+        let (a, b) = (
+            super::suffixed_key_name("foo", "Foo"),
+            super::suffixed_key_name("foo", "FOO"),
+        );
         assert_eq!(
             keys,
-            ["foo", "foo_2", "foo_3"].into_iter().collect(),
+            ["foo", a.as_str(), b.as_str()].into_iter().collect(),
             "got {keys:?}"
         );
         let vals: std::collections::BTreeSet<i64> =
@@ -2917,6 +2982,81 @@ mod tests {
         assert_ne!(col(&first, "A"), col(&first, "B"));
         // A nested object is its own scope: its lone key takes the base name.
         assert_eq!(third["n"], json!({"account_id_c": 1}));
+    }
+
+    #[cfg(feature = "transform-keys-case")]
+    #[test]
+    fn keys_case_suffix_never_puts_two_source_keys_in_one_suffixed_column_across_runs() {
+        let fresh = || {
+            compiled(&[RecordTransform::KeysCase {
+                mode: KeyCaseMode::Snake,
+                on_collision: KeyCollision::Suffix,
+            }])
+        };
+        let col = |v: &Value, want: &str| {
+            v.as_object()
+                .unwrap()
+                .iter()
+                .find(|(_, x)| *x == want)
+                .map(|(k, _)| k.clone())
+                .unwrap()
+        };
+        // Two runs (two compiles) whose colliding keys arrive in either order.
+        let run1 = apply_all(json!({"Account_Id__c": "B", "AccountId__c": "A"}), &fresh());
+        let run2 = apply_all(json!({"AccountId__c": "A", "Account_Id__c": "B"}), &fresh());
+        assert_eq!(col(&run1, "A"), col(&run2, "A"));
+        assert_eq!(col(&run1, "B"), col(&run2, "B"));
+        assert_ne!(col(&run1, "A"), col(&run1, "B"));
+        assert_eq!(
+            col(&run1, "A"),
+            super::suffixed_key_name("account_id_c", "AccountId__c")
+        );
+        // A run that never sees the collision keeps the base name, which no
+        // suffixed column ever shares.
+        let run3 = apply_all(json!({"Account_Id__c": "B"}), &fresh());
+        assert_eq!(col(&run3, "B"), "account_id_c");
+    }
+
+    #[cfg(feature = "transform-keys-case")]
+    #[test]
+    fn keys_case_suffix_remembers_only_colliding_keys() {
+        let t = compiled(&[RecordTransform::KeysCase {
+            mode: KeyCaseMode::Snake,
+            on_collision: KeyCollision::Suffix,
+        }]);
+        for i in 0..200 {
+            let mut m = Map::new();
+            m.insert(format!("Id{i}"), json!(i));
+            apply_all(json!({ "prices": Value::Object(m) }), &t);
+        }
+        let CompiledTransform::KeysCase { assignments, .. } = &t[0] else {
+            panic!("keys_case")
+        };
+        assert!(
+            assignments.0.collided.lock().unwrap().is_empty(),
+            "keys that never collide are not stored"
+        );
+        apply_all(json!({"AccountId": 1, "account_id": 2}), &t);
+        assert_eq!(assignments.0.collided.lock().unwrap().len(), 2);
+    }
+
+    #[cfg(feature = "transform-keys-case")]
+    #[test]
+    fn keys_case_suffix_refuses_a_suffixed_name_a_source_key_already_uses() {
+        let taken = super::suffixed_key_name("account_id", "AccountId");
+        let mut rec = Map::new();
+        rec.insert("AccountId".into(), json!(1));
+        rec.insert("account_id".into(), json!(2));
+        rec.insert(taken, json!(3));
+        let err = super::apply_all(
+            Value::Object(rec),
+            &compiled(&[RecordTransform::KeysCase {
+                mode: KeyCaseMode::Snake,
+                on_collision: KeyCollision::Suffix,
+            }]),
+        )
+        .expect_err("a clash with an existing key never drops a value");
+        assert!(err.to_string().contains("duplicate key"), "{err}");
     }
 
     #[cfg(feature = "transform-keys-case")]
