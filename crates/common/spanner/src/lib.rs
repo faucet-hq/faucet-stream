@@ -232,10 +232,11 @@ async fn credentials_from_str(json: &str) -> Result<CredentialsFile, FaucetError
         .map_err(|e| FaucetError::Auth(format!("spanner inline key: {e}")))
 }
 
-/// Quote a Spanner identifier with backticks, doubling any embedded backtick.
-/// Spanner uses GoogleSQL backtick quoting (like BigQuery/MySQL).
+/// Quote a Spanner identifier with backticks. GoogleSQL quoted identifiers
+/// take string-literal escapes, so an embedded backslash or backtick is
+/// backslash-escaped (a doubled backtick would end the identifier).
 pub fn quote_ident_spanner(ident: &str) -> String {
-    format!("`{}`", ident.replace('`', "``"))
+    format!("`{}`", ident.replace('\\', "\\\\").replace('`', "\\`"))
 }
 
 #[cfg(test)]
@@ -318,9 +319,10 @@ mod tests {
     }
 
     #[test]
-    fn quote_ident_doubles_backticks() {
+    fn quote_ident_backslash_escapes() {
         assert_eq!(quote_ident_spanner("plain"), "`plain`");
-        assert_eq!(quote_ident_spanner("we`ird"), "`we``ird`");
+        assert_eq!(quote_ident_spanner("we`ird"), "`we\\`ird`");
+        assert_eq!(quote_ident_spanner("a\\b"), "`a\\\\b`");
     }
 
     #[tokio::test]
