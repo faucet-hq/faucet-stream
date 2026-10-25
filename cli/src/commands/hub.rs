@@ -169,8 +169,9 @@ async fn check(a: HubCheckArgs) -> CliResult<()> {
         }
         println!("{}", pretty(&v)?);
     } else {
-        println!(
-            "{} × {} ({}): {}",
+        let mut out = String::new();
+        out.push_str(&format!(
+            "{} × {} ({}): {}\n",
             cell.source,
             cell.sink,
             cell.sink_kind,
@@ -179,10 +180,10 @@ async fn check(a: HubCheckArgs) -> CliResult<()> {
             } else {
                 "INCOMPATIBLE"
             }
-        );
+        ));
         for p in &cell.streams {
-            println!(
-                "  ✓ {:<32} {}{}",
+            out.push_str(&format!(
+                "  ✓ {:<32} {}{}\n",
                 p.stream,
                 p.describe(),
                 if p.key.is_empty() {
@@ -190,19 +191,19 @@ async fn check(a: HubCheckArgs) -> CliResult<()> {
                 } else {
                     format!(" (key: {})", p.key.join(", "))
                 }
-            );
+            ));
         }
         for i in &cell.incompatible {
-            println!("  ✗ {:<32} {}", i.stream, i.reason);
+            out.push_str(&format!("  ✗ {:<32} {}\n", i.stream, i.reason));
         }
         if let Some(c) = &overlaid {
-            println!(
-                "  overlay '{}' sets: {}",
+            out.push_str(&format!(
+                "  overlay '{}' sets: {}\n",
                 c.overlay.as_deref().unwrap_or_default(),
                 c.overlay_contributes.join(", ")
-            );
+            ));
             for w in &c.warnings {
-                println!("  warning: {w}");
+                out.push_str(&format!("  warning: {w}\n"));
             }
         }
         if cell.compatible {
@@ -210,8 +211,9 @@ async fn check(a: HubCheckArgs) -> CliResult<()> {
             if let Some(o) = &a.pair.overlay {
                 cmd.push_str(&format!(" --overlay {o}"));
             }
-            println!("\n{cmd}");
+            out.push_str(&format!("\n{cmd}\n"));
         }
+        print!("{}", terminal_safe(&out));
     }
     let fallback = sides
         .source
@@ -446,7 +448,16 @@ fn render_list(
             out.push_str(&format!("  {}  {why}\n", p.display()));
         }
     }
-    Ok(out)
+    Ok(terminal_safe(&out))
+}
+
+/// Template text from a hub (descriptions, stream names, reasons) with every
+/// control character but the line break replaced, so a catalog entry cannot
+/// move the cursor, recolour or rewrite the operator's terminal output.
+fn terminal_safe(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() && c != '\n' { ' ' } else { c })
+        .collect()
 }
 
 /// `faucet hub matrix [--format table|markdown|json]` — the source × sink
@@ -491,7 +502,7 @@ async fn matrix(a: HubMatrixArgs) -> CliResult<()> {
                 s.push('\n');
             }
             s.push_str("\n✓ = every stream compatible; n/m = compatible streams out of m\n");
-            s
+            terminal_safe(&s)
         }
     };
     match &a.out {
@@ -604,9 +615,9 @@ async fn lint(a: HubLintArgs) -> CliResult<()> {
         );
     } else {
         for (t, f) in &findings {
-            println!("{t}:");
+            println!("{}:", terminal_safe(t));
             for line in f {
-                println!("  - {line}");
+                println!("  - {}", terminal_safe(line));
             }
         }
         if findings.is_empty() {
@@ -716,7 +727,7 @@ async fn rows(a: crate::cli::HubRowsArgs) -> CliResult<()> {
     if a.json {
         println!("{}", pretty(&report)?);
     } else {
-        print!("{}", hub::rows::render_human(&report));
+        print!("{}", terminal_safe(&hub::rows::render_human(&report)));
     }
     match &report.error {
         Some(e) => Err(CliError::Config(e.clone())),
@@ -939,6 +950,20 @@ mod tests {
         })
         .await
         .expect("one file lints clean");
+    }
+
+    /// Catalog text is printed without terminal control sequences, so a
+    /// description cannot rewrite or recolour the listing.
+    #[test]
+    fn list_output_carries_no_control_characters() {
+        let dir = std::path::Path::new(&repo_hub()).to_path_buf();
+        let mut cat = Catalog::load(&dir).unwrap();
+        cat.sources[0].1.description = Some("ok\u{1b}[2K\u{1b}[1A\u{7}spoofed\u{9b}31m".into());
+        cat.incompatible
+            .push(("x.yaml".into(), "why\u{1b}]0;title\u{7}".into()));
+        let out = render_list(&cat, None, hub::trust::SortBy::Name, false).unwrap();
+        assert!(!out.chars().any(|c| c.is_control() && c != '\n'), "{out:?}");
+        assert!(out.contains("ok [2K [1A spoofed 31m"), "{out}");
     }
 
     #[test]
