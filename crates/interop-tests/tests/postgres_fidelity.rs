@@ -191,10 +191,11 @@ async fn decimals_money_bytes_and_timestamps_keep_their_canonical_rendering() {
     fidelity::assert_round_trip(&sent, &streamed, tol);
     assert_instant(&streamed[0]["at"]);
 
-    // A query the text cast cannot wrap (duplicate names) reads NUMERIC natively.
+    // A query the text cast cannot wrap (a data-modifying WITH) reads NUMERIC natively.
     let native = query(
         &url,
-        "SELECT dec_scale, dec_scale FROM typed WHERE __fidelity_id = 'typed'",
+        "WITH d AS (UPDATE typed SET dec_scale = dec_scale WHERE false RETURNING 1) \
+         SELECT dec_scale FROM typed WHERE __fidelity_id = 'typed'",
     )
     .await
     .fetch_all()
