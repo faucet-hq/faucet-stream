@@ -184,6 +184,27 @@ fn check_reached(kind: &str, hooks: &'static [&'static str], reached: &[&str], s
     );
 }
 
+/// Record `hook` when the wrapper's answer is not the probe's distinctive one.
+fn answer(wrong: &mut Vec<&'static str>, hook: &'static str, matches_probe: bool) {
+    if !matches_probe {
+        wrong.push(hook);
+    }
+}
+
+/// A wrapper that reaches the inner hook but returns its own value reverts
+/// the declaration for everything behind it: fail unless the hook is skipped.
+fn check_answers(kind: &str, wrong: &[&'static str], skip: &[&str]) {
+    let changed: Vec<&str> = wrong
+        .iter()
+        .copied()
+        .filter(|h| !skip.contains(h))
+        .collect();
+    assert!(
+        changed.is_empty(),
+        "{kind} hooks whose answer the wrapper does not return: {changed:?}"
+    );
+}
+
 type Recorded = Arc<Mutex<Vec<&'static str>>>;
 
 fn hit(calls: &Recorded, name: &'static str) {
@@ -439,6 +460,7 @@ impl Sink for HookSink {
 #[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
 pub async fn assert_sink_forwards_every_hook(sink: &dyn Sink, probe: &HookSink, skip: &[&str]) {
     let page = [json!({"id": 1})];
+    let mut wrong: Vec<&'static str> = Vec::new();
     let _ = sink.write_batch(&page).await;
     let _ = sink.write_batch_reported(&page).await;
     if let Ok(governed) = faucet_core::governance::Governance::new()
@@ -472,27 +494,64 @@ pub async fn assert_sink_forwards_every_hook(sink: &dyn Sink, probe: &HookSink, 
             },
         )
         .await;
-    let _ = sink.supports_idempotent_writes();
+    answer(
+        &mut wrong,
+        "supports_idempotent_writes",
+        sink.supports_idempotent_writes(),
+    );
     let _ = sink.sink_guarantee();
     let _ = sink.capabilities();
-    let _ = sink.write_batch_is_replay_safe();
+    answer(
+        &mut wrong,
+        "write_batch_is_replay_safe",
+        sink.write_batch_is_replay_safe(),
+    );
     let _ = sink.dedups_by_key();
     let _ = sink.supported_write_modes();
-    let _ = sink.current_schema().await;
-    let _ = sink.supports_schema_evolution();
+    answer(
+        &mut wrong,
+        "current_schema",
+        matches!(sink.current_schema().await, Ok(Some(_))),
+    );
+    answer(
+        &mut wrong,
+        "supports_schema_evolution",
+        sink.supports_schema_evolution(),
+    );
     let _ = sink.evolve_schema(&SchemaEvolution::default()).await;
-    let _ = sink.supports_cleanup();
-    let _ = sink.supports_staged_load();
-    let _ = sink.cleanup_scope(&BTreeMap::new(), &SeenKeys::new()).await;
+    answer(&mut wrong, "supports_cleanup", sink.supports_cleanup());
+    answer(
+        &mut wrong,
+        "supports_staged_load",
+        sink.supports_staged_load(),
+    );
+    answer(
+        &mut wrong,
+        "cleanup_scope",
+        matches!(
+            sink.cleanup_scope(&BTreeMap::new(), &SeenKeys::new()).await,
+            Ok(3)
+        ),
+    );
     let _ = sink.write_batch_idempotent(&page, "scope", "tok").await;
     let _ = sink
         .write_batch_idempotent_reported(&page, "scope", "tok")
         .await;
-    let _ = sink.last_committed_token("scope").await;
-    let _ = sink.is_overwrite();
+    answer(
+        &mut wrong,
+        "last_committed_token",
+        matches!(
+            sink.last_committed_token("scope")
+                .await
+                .as_ref()
+                .map(|t| t.as_deref()),
+            Ok(Some("tok"))
+        ),
+    );
+    answer(&mut wrong, "is_overwrite", sink.is_overwrite());
     let _ = sink.begin_overwrite().await;
     let _ = sink.commit_overwrite().await;
-    let _ = sink.supports_rollback();
+    answer(&mut wrong, "supports_rollback", sink.supports_rollback());
     let _ = sink
         .rollback_run(
             "run",
@@ -507,19 +566,32 @@ pub async fn assert_sink_forwards_every_hook(sink: &dyn Sink, probe: &HookSink, 
         .await;
     let _ = sink.forget_run("run").await;
     let _ = sink.rewind_commit_token("scope", None).await;
-    let _ = sink.readback_source();
+    answer(
+        &mut wrong,
+        "readback_source",
+        sink.readback_source().is_some_and(|(k, _)| k == "hook"),
+    );
     let _ = sink.abort_overwrite().await;
     let _ = sink.complete_run().await;
-    let _ = sink.overwrite_staging_exists().await;
+    answer(
+        &mut wrong,
+        "overwrite_staging_exists",
+        matches!(sink.overwrite_staging_exists().await, Ok(Some(true))),
+    );
     let _ = sink.config_schema();
     let _ = sink.connector_name();
     sink.set_roundtrip_recorder(recorder(RoundtripSide::Sink));
     sink.set_call_context(faucet_core::io::CallContext::new());
-    let _ = sink.dataset_uri();
+    answer(
+        &mut wrong,
+        "dataset_uri",
+        sink.dataset_uri() == "hook://dataset",
+    );
     let _ = sink.local_outputs().await;
     let _ = sink.check(&CheckContext::default()).await;
 
     check_reached("Sink", SINK_HOOKS, &probe.reached(), skip);
+    check_answers("Sink", &wrong, skip);
 }
 
 faucet_core::__faucet_if_arrow! {
@@ -771,6 +843,7 @@ pub async fn assert_source_forwards_every_hook(
 ) {
     let ctx = HashMap::new();
     let record = json!({"id": 1});
+    let mut wrong: Vec<&'static str> = Vec::new();
     let _ = source.fetch_with_context(&ctx).await;
     let _ = source.fetch_all().await;
     let _ = source.fetch_with_context_incremental(&ctx).await;
@@ -785,16 +858,32 @@ pub async fn assert_source_forwards_every_hook(
     let _ = source.config_schema();
     let _ = source.state_key();
     let _ = source.apply_start_bookmark(json!(1)).await;
-    let _ = source.capture_resume_position().await;
+    answer(
+        &mut wrong,
+        "capture_resume_position",
+        matches!(source.capture_resume_position().await, Ok(Some(v)) if v == json!(7)),
+    );
     let _ = source.lag().await;
     let _ = source.state_schema();
     let _ = source.migrate_state(1, json!(1));
-    let _ = source.supports_exactly_once();
-    let _ = source.consumes_destructively();
+    answer(
+        &mut wrong,
+        "supports_exactly_once",
+        source.supports_exactly_once(),
+    );
+    answer(
+        &mut wrong,
+        "consumes_destructively",
+        source.consumes_destructively(),
+    );
     let _ = source.replay_guarantee();
     let _ = source.capabilities();
-    let _ = source.is_shardable();
-    let _ = source.enumerate_shards(2).await;
+    answer(&mut wrong, "is_shardable", source.is_shardable());
+    answer(
+        &mut wrong,
+        "enumerate_shards",
+        source.enumerate_shards(2).await.is_ok_and(|s| s.len() == 2),
+    );
     let _ = source.apply_shard(&ShardSpec::whole()).await;
     let _ = source
         .range_digest(
@@ -806,11 +895,23 @@ pub async fn assert_source_forwards_every_hook(
             &["id".to_string()],
         )
         .await;
-    let _ = source.supports_discover();
+    answer(&mut wrong, "supports_discover", source.supports_discover());
     let _ = source.discover().await;
-    let _ = source.record_table(&record);
-    let _ = source.position_le(&json!(1), &json!(2));
-    let _ = source.record_covered(&record, &json!(1));
+    answer(
+        &mut wrong,
+        "record_table",
+        source.record_table(&record).as_deref() == Some("hook"),
+    );
+    answer(
+        &mut wrong,
+        "position_le",
+        source.position_le(&json!(1), &json!(2)) == Some(true),
+    );
+    answer(
+        &mut wrong,
+        "record_covered",
+        source.record_covered(&record, &json!(1)) == Some(true),
+    );
     let _ = source.read_completeness();
     let _ = source.position_min(&[json!(2), json!(1)]);
     let _ = source.connector_name();
@@ -822,4 +923,5 @@ pub async fn assert_source_forwards_every_hook(
     let _ = source.check(&CheckContext::default()).await;
 
     check_reached("Source", SOURCE_HOOKS, &probe.reached(), skip);
+    check_answers("Source", &wrong, skip);
 }
