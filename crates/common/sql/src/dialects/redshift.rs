@@ -51,9 +51,12 @@ impl SqlDialect for Redshift {
         }
     }
 
+    /// Scale 19 keeps every 64-bit integer (19 integer digits) and 19
+    /// fractional digits; a later value with more fractional digits is
+    /// rounded by the database (precision is capped at 38).
     fn widened_type_name(&self, from: Option<SqlBaseType>, to: SqlBaseType) -> &'static str {
         match (from, to) {
-            (Some(SqlBaseType::Integer), SqlBaseType::Double) => "DECIMAL(38,10)",
+            (Some(SqlBaseType::Integer), SqlBaseType::Double) => "DECIMAL(38,19)",
             _ => self.type_name(to),
         }
     }

@@ -1198,3 +1198,22 @@ fn page_scope_reads_columns_once<D: SqlDialect>(d: D) {
 fn page_scope_reads_columns_once_per_target() {
     every_dialect!(page_scope_reads_columns_once);
 }
+
+/// An integer column widened for fractions keeps every 64-bit integer and at
+/// least 19 fractional digits (the bounded-precision backends cap at 38).
+fn integer_to_fraction_widening_keeps_19_fractional_digits<D: SqlDialect>(d: D) {
+    let t = d.widened_type_name(Some(SqlBaseType::Integer), SqlBaseType::Double);
+    let scale = t.rsplit_once(',').and_then(|(_, s)| {
+        s.trim_matches(|c: char| !c.is_ascii_digit())
+            .parse::<u32>()
+            .ok()
+    });
+    if let Some(scale) = scale {
+        assert!(scale >= 19, "{}: {t}", d.name());
+    }
+}
+
+#[test]
+fn matrix_integer_to_fraction_widening() {
+    every_dialect!(integer_to_fraction_widening_keeps_19_fractional_digits);
+}

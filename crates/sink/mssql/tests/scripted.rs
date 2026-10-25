@@ -360,7 +360,7 @@ async fn schema_reads_and_evolves() {
 
     for (needle, expected) in [
         ("ADD [extra]", "MSSQL ADD COLUMN extra failed"),
-        ("[id] DECIMAL(38,10)", "MSSQL ALTER COLUMN id failed"),
+        ("[id] DECIMAL(38,19)", "MSSQL ALTER COLUMN id failed"),
         ("[id] bigint NULL", "MSSQL relax NULL id failed"),
     ] {
         server.on_times(needle, Reply::error("ddl refused"), 1);
