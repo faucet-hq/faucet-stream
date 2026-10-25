@@ -15436,7 +15436,7 @@
                       ]
                     },
                     "replication_key_ordered": {
-                      "description": "Declares that the query returns records in ascending `replication_key`\norder. Only then may a run that stops before the last page (`max_pages`,\nor a cursor loop) advance the bookmark: otherwise unread pages could\nhold older keys the next run would skip, so the bookmark stays put.",
+                      "description": "Declares that the query returns records in ascending `replication_key`\norder. An incremental run that stops before the last page (`max_pages`,\nor a cursor loop) can resume past the pages it read only with this set\nand a `replication_bind` pushing the bookmark to the server; otherwise\nthe run fails, since the bookmark could not advance. With `max_pages`,\n`validate` refuses this flag without a `replication_bind`.",
                       "type": [
                         "boolean",
                         "string"

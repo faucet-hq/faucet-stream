@@ -247,9 +247,11 @@ pub struct GraphqlStreamConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replication_bind: Option<GraphqlReplicationBind>,
     /// Declares that the query returns records in ascending `replication_key`
-    /// order. Only then may a run that stops before the last page (`max_pages`,
-    /// or a cursor loop) advance the bookmark: otherwise unread pages could
-    /// hold older keys the next run would skip, so the bookmark stays put.
+    /// order. An incremental run that stops before the last page (`max_pages`,
+    /// or a cursor loop) can resume past the pages it read only with this set
+    /// and a `replication_bind` pushing the bookmark to the server; otherwise
+    /// the run fails, since the bookmark could not advance. With `max_pages`,
+    /// `validate` refuses this flag without a `replication_bind`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub replication_key_ordered: bool,
     /// Responses to treat as throttling and retry — including a `200` whose
@@ -455,6 +457,20 @@ impl GraphqlStreamConfig {
         if let Some(state_key) = &self.state_key {
             faucet_core::state::validate_state_key(state_key)?;
         }
+        if incremental
+            && self.replication_key_ordered
+            && self.max_pages.is_some()
+            && self.replication_bind.is_none()
+        {
+            return Err(FaucetError::Config(
+                "GraphQL source: `replication_key_ordered` with `max_pages` needs a \
+                 `replication_bind`: without one the bookmark is only a client-side filter, so \
+                 every run would start at page 1, re-read the same `max_pages` pages and never \
+                 reach the rest. Push the bookmark to the server with `replication_bind`, or \
+                 raise or remove `max_pages`"
+                    .into(),
+            ));
+        }
         let Some(bind) = &self.replication_bind else {
             return Ok(());
         };
@@ -490,6 +506,18 @@ impl GraphqlStreamConfig {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn ordered_max_pages_without_a_bind_is_refused() {
+        let mut c = GraphqlStreamConfig::new("https://h/graphql", "query { x }").max_pages(3);
+        c.replication_method = ReplicationMethod::Incremental;
+        c.replication_key = Some("updatedAt".into());
+        c.replication_key_ordered = true;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("needs a `replication_bind`"), "{err}");
+        c.max_pages = None;
+        c.validate().unwrap();
+    }
 
     #[test]
     fn default_config() {
