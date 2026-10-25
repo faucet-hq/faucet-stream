@@ -373,8 +373,8 @@ const QUEUE_FULL: &str =
     "run queue full — re-POST the same request with `\"resume\": true` to continue";
 
 /// The idempotency-key generation to submit with, and the range marker to
-/// record once the first unit is accepted (a request that submits nothing
-/// leaves no marker behind).
+/// record once the first unit is accepted (a first request that submits
+/// nothing leaves no marker behind; a `restart` records its marker up front).
 struct RangeGuard {
     generation: u32,
     marker: Option<(std::sync::Arc<dyn faucet_core::StateStore>, String, Value)>,
@@ -419,6 +419,7 @@ async fn guard_prior_range(
         ),
         None => None,
     };
+    let restart = prior.is_some() && req.restart;
     let generation = match prior {
         None => 0,
         Some(p) if req.resume => {
@@ -463,6 +464,20 @@ async fn guard_prior_range(
     };
     let value = serde_json::to_value(&marker)
         .map_err(|e| ServeError::Internal(format!("backfill range marker: {e}")))?;
+    if restart {
+        // The units' bookmarks are already gone, so the new generation is
+        // recorded now: a restart that then submits nothing (queue full,
+        // draining) must leave a `resume` on fresh idempotency keys, not on
+        // the old runs' keys, which would replay them instead of re-running.
+        store
+            .put(&key, &value)
+            .await
+            .map_err(|e| ServeError::Internal(format!("backfill range marker: {e}")))?;
+        return Ok(RangeGuard {
+            generation,
+            marker: None,
+        });
+    }
     Ok(RangeGuard {
         generation,
         marker: Some((store, key, value)),

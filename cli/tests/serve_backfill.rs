@@ -8,7 +8,7 @@ use faucet_cli::serve::{ServeConfig, run_server};
 use serde_json::{Value, json};
 use std::time::Duration;
 
-fn test_config(listen: &str) -> ServeConfig {
+fn test_config_with(listen: &str, concurrent: usize, queued: usize) -> ServeConfig {
     let args = faucet_cli::cli::ServeArgs {
         listen: listen.into(),
         auth_token: None,
@@ -18,8 +18,8 @@ fn test_config(listen: &str) -> ServeConfig {
         admin_token: None,
         no_auth: true,
         allow_unauthenticated_network: false,
-        max_concurrent_runs: Some(2),
-        max_queued_runs: Some(32),
+        max_concurrent_runs: Some(concurrent),
+        max_queued_runs: Some(queued),
         default_config: None,
         history: None,
         cors_origin: vec![],
@@ -62,11 +62,18 @@ fn test_config(listen: &str) -> ServeConfig {
 }
 
 async fn boot() -> (String, reqwest::Client, tokio::task::JoinHandle<()>) {
+    boot_with(2, 32).await
+}
+
+async fn boot_with(
+    concurrent: usize,
+    queued: usize,
+) -> (String, reqwest::Client, tokio::task::JoinHandle<()>) {
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = probe.local_addr().unwrap().port();
     drop(probe);
     let listen = format!("127.0.0.1:{port}");
-    let cfg = test_config(&listen);
+    let cfg = test_config_with(&listen, concurrent, queued);
     let server = tokio::spawn(async move {
         let _ = run_server(cfg, Default::default()).await;
     });
@@ -455,5 +462,92 @@ async fn a_backfill_that_submits_nothing_leaves_no_range_marker() {
         "a failed first attempt must not block a retry: {retried}"
     );
     wait_completed(&client, &url, 2).await;
+    server.abort();
+}
+
+/// A `restart` that submits nothing (the queue is full) still moves the range
+/// to a new generation, so the `resume` its response asks for runs every unit
+/// again instead of replaying the runs from before the restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_that_submits_nothing_still_starts_a_new_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.db").display().to_string();
+    seed_sqlite(&src).await;
+    let out_dir = dir.path().join("out").display().to_string();
+    let state_dir = dir.path().join("state");
+    let config = format!(
+        "{}  state:\n    type: file\n    config: {{ path: \"{}\" }}\n",
+        scoped_config(&src, &out_dir),
+        state_dir.display()
+    );
+    let (url, client, server) = boot_with(1, 1).await;
+    let backfill = |extra: Value| {
+        let client = client.clone();
+        let url = url.clone();
+        let mut b = json!({
+            "config": config,
+            "from": "2026-06-01",
+            "to": "2026-06-02",
+            "window": "1d",
+        });
+        b.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().cloned().unwrap_or_default());
+        async move {
+            let r = client
+                .post(format!("{url}/v1/backfill"))
+                .json(&b)
+                .send()
+                .await
+                .unwrap();
+            let status = r.status().as_u16();
+            (status, r.json::<Value>().await.unwrap())
+        }
+    };
+
+    let (status, first) = backfill(json!({})).await;
+    assert_eq!(status, 202, "{first}");
+    let first_run = first["units"][0]["run_id"].as_str().unwrap().to_string();
+    wait_completed(&client, &url, 1).await;
+
+    // Occupy the one execution slot and the one queue slot with slow runs.
+    let slow = format!(
+        "version: 1\nname: slow\npipeline:\n  source:\n    type: sqlite\n    config:\n      database_url: \"sqlite://{src}\"\n      query: \"WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 15000000) SELECT count(*) AS n FROM c\"\n  sink:\n    type: jsonl\n    config:\n      path: \"{out_dir}/slow.jsonl\"\n"
+    );
+    let mut accepted = 0;
+    for _ in 0..200 {
+        let r = client
+            .post(format!("{url}/v1/runs"))
+            .json(&json!({"config": slow}))
+            .send()
+            .await
+            .unwrap();
+        if r.status().as_u16() == 202 {
+            accepted += 1;
+            if accepted == 2 {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(accepted, 2, "one slow run running and one queued");
+
+    let (status, restarted) = backfill(json!({"restart": true})).await;
+    assert_eq!(status, 202, "{restarted}");
+    assert_eq!(restarted["submitted"], 0, "{restarted}");
+    assert_eq!(
+        restarted["units"][0]["status"], "not_submitted",
+        "{restarted}"
+    );
+
+    wait_completed(&client, &url, 3).await;
+    let (status, resumed) = backfill(json!({"resume": true})).await;
+    assert_eq!(status, 202, "{resumed}");
+    assert_eq!(resumed["units"][0]["status"], "submitted", "{resumed}");
+    assert_ne!(
+        resumed["units"][0]["run_id"],
+        first_run.as_str(),
+        "resume after the restart runs the unit again: {resumed}"
+    );
     server.abort();
 }
