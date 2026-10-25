@@ -195,7 +195,10 @@ xml:
 ```
 
 On read, every `<order>` element in the document becomes a record, at any depth.
-When no element of that name exists, the document root's children are used
+The default name, `record`, is matched only directly under the root or as the
+only child of single wrapper elements (`<export><rows><record/>…</rows></export>`),
+so a field of a row that happens to be called `record` is never taken for the
+rows. When no element of that name exists, the document root's children are used
 instead — right for the common `<rows><row/>…</rows>` shape without forcing
 every config to spell it out. A root with several differently-named children is
 an error naming `xml.record_element`, rather than a guess.

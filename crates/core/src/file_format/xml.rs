@@ -19,7 +19,8 @@ use serde_json::{Map, Value};
 /// Parse XML bytes into records.
 ///
 /// `record_element` names the repeated element, matched at any depth. The
-/// default name (`record`) is matched only directly under the root. When no
+/// default name (`record`) is matched only directly under the root or under
+/// a chain of single (non-repeated) wrapper elements. When no
 /// element of that name exists, the document root's direct children are used instead — right for the
 /// common `<rows><row/>…</rows>` shape without forcing every config to spell it
 /// out, and reported in the error when neither yields anything.
@@ -27,15 +28,12 @@ pub fn decode(bytes: &[u8], record_element: &str) -> Result<Vec<Value>, FaucetEr
     let doc = to_json(bytes)?;
     let mut out = Vec::new();
     if record_element == super::default_record_element() {
-        // The default name is not a declaration: match it only directly under
-        // the root (where the writer puts it), so a nested field that happens
-        // to be called `record` never replaces the real rows.
-        if let Some(found) = doc
-            .as_object()
-            .and_then(|m| m.values().next())
-            .and_then(Value::as_object)
-            .and_then(|root| root.get(record_element))
-        {
+        // The default name is not a declaration: match it directly under the
+        // root (where the writer puts it) or under a chain of single wrapper
+        // elements (`<export><rows><record/>…`), never inside a repeated
+        // element, so a nested field that happens to be called `record` never
+        // replaces the real rows.
+        if let Some(found) = default_records(&doc, record_element) {
             collect_value(found, &mut out);
         }
     } else {
@@ -83,6 +81,30 @@ fn collect(v: &Value, key: &str, out: &mut Vec<Value>) {
                 pending.extend(items.iter().rev().map(Work::Visit));
             }
             Work::Visit(_) => {}
+        }
+    }
+}
+
+/// The default record element: directly under the root, or as the only
+/// child of a chain of single (non-repeated) wrapper elements below it
+/// (`<export><rows><record/>…</rows></export>`). An element that has other
+/// children besides `name` is a record itself, so its `name` field is data.
+fn default_records<'a>(doc: &'a Value, name: &str) -> Option<&'a Value> {
+    let root = doc.as_object()?.values().next()?.as_object()?;
+    if let Some(found) = root.get(name) {
+        return Some(found);
+    }
+    let mut map = root;
+    loop {
+        let mut real = map
+            .iter()
+            .filter(|(k, _)| !k.starts_with('@') && *k != "#text");
+        match (real.next(), real.next()) {
+            (Some((k, found)), None) if k == name => return Some(found),
+            (Some((_, Value::Object(child))), None) => {
+                map = child;
+            }
+            _ => return None,
         }
     }
 }
@@ -411,6 +433,27 @@ mod tests {
         assert_eq!(
             decode(xml, "id").expect("decode"),
             vec![json!("1"), json!("2")]
+        );
+    }
+
+    #[test]
+    fn the_default_record_name_is_found_below_single_wrapper_elements() {
+        let xml = b"<export><rows><record><id>1</id></record>\
+                    <record><id>2</id></record></rows></export>";
+        assert_eq!(
+            decode(xml, "record").expect("decode"),
+            vec![json!({"id": "1"}), json!({"id": "2"})]
+        );
+        let xml = b"<response><meta a=\"1\"><records><record><id>1</id></record></records></meta></response>";
+        assert_eq!(
+            decode(xml, "record").expect("decode"),
+            vec![json!({"id": "1"})]
+        );
+        // One row that carries a `record` field is still one row.
+        let xml = b"<exports><item><id>1</id><record>A-1</record></item></exports>";
+        assert_eq!(
+            decode(xml, "record").expect("decode"),
+            vec![json!({"id": "1", "record": "A-1"})]
         );
     }
 
