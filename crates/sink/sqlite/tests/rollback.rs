@@ -700,3 +700,42 @@ async fn rollback_finds_keys_stored_untyped_or_as_booleans() {
         );
     }
 }
+
+/// Undoing a run that created the TEXT key `"007"` deletes only that row: a
+/// row keyed `'7'` an earlier run wrote spells the same number but is not
+/// the run's, so it is neither a conflict nor deleted (#934). Likewise a
+/// journaled `"true"` does not reach a row keyed `'1'`.
+#[tokio::test]
+async fn undoing_a_text_key_leaves_rows_spelling_the_same_number() {
+    let (_dir, url) =
+        fresh_db("CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT, _faucet_run_id TEXT)").await;
+    exec(
+        &url,
+        "INSERT INTO users VALUES ('7', 'seven', 'r0'), ('1', 'one', 'r0')",
+    )
+    .await;
+    let sink = SqliteSink::new(upsert_config(&url, "r1")).await.unwrap();
+    sink.write_batch(&[
+        json!({"id": "007", "name": "padded", RUN_COL: "r1"}),
+        json!({"id": "true", "name": "flag", RUN_COL: "r1"}),
+    ])
+    .await
+    .unwrap();
+    let out = sink
+        .rollback_run("r1", &opts(RollbackMode::Upsert))
+        .await
+        .unwrap();
+    assert!(out.applied, "{out:?}");
+    assert_eq!(out.conflicts, 0, "{out:?}");
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .unwrap();
+    let left: Vec<String> = sqlx::query_scalar("SELECT id FROM users ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    assert_eq!(left, ["1", "7"]);
+}

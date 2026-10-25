@@ -703,7 +703,8 @@ fn stored_forms(text: &str) -> Vec<Value> {
     forms
 }
 
-/// `(k1 IN (?, ?) AND k2 IN (?)) OR …` matching every stored form of each
+/// `((k1 = ? AND typeof(k1) = 'text') OR (k1 IN (?) AND typeof(k1) IN …)) OR …`
+/// matching every stored form of each
 /// entry's key, with its bind values in order.
 fn stored_keys_predicate<E: std::borrow::Borrow<JournalEntry>>(
     key: &[String],
@@ -722,10 +723,24 @@ fn stored_keys_predicate<E: std::borrow::Borrow<JournalEntry>>(
                     let col = quote_ident_sqlite(c);
                     match v {
                         Value::String(text) => {
-                            let forms = stored_forms(text);
-                            let marks = vec!["?"; forms.len()].join(", ");
-                            binds.extend(forms);
-                            format!("{col} IN ({marks})")
+                            // The text form matches only a text-stored key and
+                            // the numeric forms only a numerically stored one:
+                            // a TEXT column would otherwise coerce `7` to `'7'`
+                            // and match a row keyed `'7'` for a journaled
+                            // `"007"`.
+                            let mut forms = stored_forms(text).into_iter();
+                            binds.extend(forms.next());
+                            let numeric: Vec<Value> = forms.collect();
+                            if numeric.is_empty() {
+                                format!("({col} = ? AND typeof({col}) = 'text')")
+                            } else {
+                                let marks = vec!["?"; numeric.len()].join(", ");
+                                binds.extend(numeric);
+                                format!(
+                                    "(({col} = ? AND typeof({col}) = 'text') OR ({col} IN \
+                                     ({marks}) AND typeof({col}) IN ('integer', 'real')))"
+                                )
+                            }
                         }
                         Value::Null => format!("{col} IS NULL"),
                         other => {
