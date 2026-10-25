@@ -17907,7 +17907,7 @@
                       "default": true
                     },
                     "verify_checksum": {
-                      "description": "Verify each object's body against the checksum the store advertises\n(#161). Stronger than the length check but costs a hash over the full\nbody, so it defaults to `false`. When the store advertises no usable\nchecksum for an object, verification is skipped for that object (a\ndebug log notes it); the length check still applies.",
+                      "description": "Verify each object's body against the checksum the store advertises\n(#161). Stronger than the length check but costs a hash over the full\nbody, so it defaults to `false`. When the store advertises no usable\nchecksum for an object, verification is skipped for that object (a\ndebug log notes it); the length check still applies. A JSON Lines\nobject is then read whole (up to `max_object_bytes`) and verified\nbefore any of its records is emitted.",
                       "type": [
                         "boolean",
                         "string"
@@ -17971,7 +17971,7 @@
                     },
                     "max_object_bytes": {
                       "default": 2147483648,
-                      "description": "Largest object, once decompressed, that a format read whole (JSON\narray, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet) may\nreach; a larger one fails with an error instead of exhausting memory.\nDefault 2 GiB.",
+                      "description": "Largest object, once decompressed, that a format read whole (JSON\narray, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet, and\nJSON Lines under `verify_checksum`) may reach; a larger one fails with\nan error instead of exhausting memory. Default 2 GiB.",
                       "format": "uint64",
                       "minimum": 0,
                       "type": [
@@ -21573,7 +21573,7 @@
                     },
                     "max_object_bytes": {
                       "default": 2147483648,
-                      "description": "Largest object, once decompressed, that a format read whole (JSON\narray, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet) may\nreach; a larger one fails with an error instead of exhausting memory.\nDefault 2 GiB.",
+                      "description": "Largest object, once decompressed, that a format read whole (JSON\narray, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet, and\nJSON Lines under `verify_checksum`) may reach; a larger one fails with\nan error instead of exhausting memory. Default 2 GiB.",
                       "format": "uint64",
                       "minimum": 0,
                       "type": [
@@ -23247,7 +23247,7 @@
                       "default": true
                     },
                     "verify_checksum": {
-                      "description": "Verify each object's body against the checksum the store advertises\n(#161). Stronger than the length check but costs a hash over the full\nbody, so it defaults to `false`. When the store advertises no usable\nchecksum for an object, verification is skipped for that object (a\ndebug log notes it); the length check still applies.",
+                      "description": "Verify each object's body against the checksum the store advertises\n(#161). Stronger than the length check but costs a hash over the full\nbody, so it defaults to `false`. When the store advertises no usable\nchecksum for an object, verification is skipped for that object (a\ndebug log notes it); the length check still applies. A JSON Lines\nobject is then read whole (up to `max_object_bytes`) and verified\nbefore any of its records is emitted.",
                       "type": [
                         "boolean",
                         "string"
@@ -23311,7 +23311,7 @@
                     },
                     "max_object_bytes": {
                       "default": 2147483648,
-                      "description": "Largest object, once decompressed, that a format read whole (JSON\narray, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet) may\nreach; a larger one fails with an error instead of exhausting memory.\nDefault 2 GiB.",
+                      "description": "Largest object, once decompressed, that a format read whole (JSON\narray, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet, and\nJSON Lines under `verify_checksum`) may reach; a larger one fails with\nan error instead of exhausting memory. Default 2 GiB.",
                       "format": "uint64",
                       "minimum": 0,
                       "type": [
@@ -23832,7 +23832,7 @@
                     },
                     "max_object_bytes": {
                       "default": 2147483648,
-                      "description": "Largest object, once decompressed, that a format read whole (JSON\narray, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet) may\nreach; a larger one fails with an error instead of exhausting memory.\nDefault 2 GiB.",
+                      "description": "Largest object, once decompressed, that a format read whole (JSON\narray, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet, and\nJSON Lines under `verify_checksum`) may reach; a larger one fails with\nan error instead of exhausting memory. Default 2 GiB.",
                       "format": "uint64",
                       "minimum": 0,
                       "type": [

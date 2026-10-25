@@ -972,3 +972,89 @@ async fn a_content_encoded_object_is_read_without_a_length_check() {
     let records = collect_all(&source, DEFAULT_BATCH_SIZE).await;
     assert_eq!(records.len(), 2);
 }
+
+/// A one-object S3 stand-in that answers every listing with `key` and every
+/// `GET` with `body` under a wrong (but well-formed) non-multipart ETag, so
+/// the checksum check fails only once the whole body has been read.
+async fn mismatched_etag_server(key: &'static str, body: String) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let body = body.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&request);
+                let (content_type, payload) = if head.contains("list-type=2") {
+                    (
+                        "application/xml",
+                        format!(
+                            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                             <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                             <Name>{TEST_BUCKET}</Name><Prefix></Prefix><KeyCount>1</KeyCount>\
+                             <MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>\
+                             <Contents><Key>{key}</Key>\
+                             <LastModified>2026-01-01T00:00:00.000Z</LastModified>\
+                             <ETag>&quot;00000000000000000000000000000000&quot;</ETag>\
+                             <Size>{}</Size><StorageClass>STANDARD</StorageClass></Contents>\
+                             </ListBucketResult>",
+                            body.len()
+                        ),
+                    )
+                } else {
+                    ("application/x-ndjson", body)
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
+                     ETag: \"00000000000000000000000000000000\"\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
+/// Under `verify_checksum` a JSON Lines object is verified before any of its
+/// records is emitted: a mismatch fails the read with no page delivered.
+#[tokio::test(flavor = "multi_thread")]
+async fn verify_checksum_emits_no_json_lines_record_from_a_mismatched_object() {
+    let endpoint = mismatched_etag_server("rows.jsonl", jsonl_body(1, 5)).await;
+    let config = S3SourceConfig::new(TEST_BUCKET)
+        .file_format(S3FileFormat::JsonLines)
+        .with_batch_size(2)
+        .verify_checksum(true);
+    let source = build_source(&endpoint, config).await;
+    let ctx: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut pages = source.stream_pages(&ctx, 2);
+    let first = pages.next().await.expect("the stream yields an outcome");
+    let err = match first {
+        Ok(page) => panic!("a page was emitted before verification: {:?}", page.records),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.to_lowercase().contains("checksum") || err.contains("md5"),
+        "{err}"
+    );
+
+    // Without `verify_checksum` the same object streams normally.
+    let config = S3SourceConfig::new(TEST_BUCKET)
+        .file_format(S3FileFormat::JsonLines)
+        .with_batch_size(2);
+    let source = build_source(&endpoint, config).await;
+    let records = collect_all(&source, 2).await;
+    assert_eq!(records.len(), 5);
+}

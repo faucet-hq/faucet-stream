@@ -478,14 +478,6 @@ impl GcsSource {
 
     /// The same whole-body read, without the `bytes` dependency the Parquet
     /// path brings — the shared formats (#604) need the bytes but not Arrow.
-    #[cfg(any(
-        feature = "arrow",
-        feature = "file-format-csv",
-        feature = "file-format-xml",
-        feature = "file-format-excel",
-        feature = "file-format-avro",
-        feature = "file-format-orc"
-    ))]
     async fn read_object_all(&self, key: &str) -> Result<Vec<u8>, FaucetError> {
         let reader = self.open_object_reader(key).await?;
         faucet_core::file_format::read_to_end_capped(reader, self.config.max_object_bytes, key)

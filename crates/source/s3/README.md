@@ -14,7 +14,7 @@ Built on the official `aws-sdk-s3` client (built once, reused across every read)
 - **Nine file formats** — `json_lines`, `json_array`, `raw_text`, `parquet`, plus `csv`, `xml`, `xlsx`, `avro` and `orc` via [file formats](#file-formats-604).
 - **Apache Parquet (Arrow columnar)** — behind the `arrow` feature, a fourth format `file_format: parquet` decodes each object via the Arrow Parquet reader and, when the sink is also Arrow-native (Parquet / Delta), moves records end-to-end as Arrow `RecordBatch`es with no `serde_json::Value` in between. See [Arrow columnar (Parquet) mode](#arrow-columnar-parquet-mode).
 - **Parallel object reads** — up to `concurrency` objects fetched at once (default 10), on the streaming path as well as the batch one. The streaming prefetch is *ordered*, so records still arrive in listing order and a failing object is still blamed at its own position.
-- **True line-level streaming** — for `json_lines` / `raw_text`, object bodies are decoded line-by-line via `tokio::io::AsyncBufReadExt`, so client memory is bounded at `O(batch_size)` regardless of file or scan size.
+- **True line-level streaming** — for `json_lines` / `raw_text`, object bodies are decoded line-by-line via `tokio::io::AsyncBufReadExt`, so client memory is bounded at `O(batch_size)` regardless of file or scan size (except `json_lines` under `verify_checksum`, which reads each object whole first).
 - **Prefix listing with pagination** — handles truncated `ListObjectsV2` responses transparently and honours an optional `max_objects` cap.
 - **S3-compatible** — custom `endpoint_url` for MinIO, LocalStack, R2, and other S3-API services.
 - **Optional compression** — behind the `compression` feature: `gzip` / `zstd` / `auto` (suffix-detected per object key), so a single run can mix compressed and uncompressed objects.
@@ -95,12 +95,12 @@ finished: scratch objects (`*.faucet-tmp`, `*.faucet-tmp-body`, `-old`,
 | `file_format` | enum | `json_lines` | How object bodies are parsed — `json_lines`, `json_array`, `raw_text`, `parquet`, `csv`, `xml`, `xlsx`. See below. |
 | `include` | string | *(unset)* | Glob over the whole object key selecting what to read (e.g. `exports/*.parquet`). Without it, zero-byte folder markers and keys with a `_`- or `.`-prefixed segment below the prefix (`_SUCCESS`, `_temporary/…`, `.crc`) are skipped; with it, exactly the matching keys are read. |
 | `max_objects` | int | *(all)* | Cap on the number of objects read. `None` reads every matching object. |
-| `max_object_bytes` | int | `2147483648` | Largest object, once decompressed, that a whole-object format (JSON array, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet) may reach; a larger one fails the run instead of exhausting memory. |
+| `max_object_bytes` | int | `2147483648` | Largest object, once decompressed, that a whole-object format (JSON array, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet, and JSON Lines under `verify_checksum`) may reach; a larger one fails the run instead of exhausting memory. |
 | `concurrency` | int | `10` | Maximum number of objects fetched concurrently. Clamped to `≥ 1` at runtime. |
 | `batch_size` | int | `1000` | Records per emitted `StreamPage`. See [Streaming & batching](#streaming--batching). Rejected above `MAX_BATCH_SIZE` (1,000,000) by `faucet_core::validate_batch_size`. |
 | `compression` | enum | `auto` | *(requires the `compression` feature)* Per-object decompression codec — `none` / `gzip` / `zstd` / `auto`. |
 | `verify_length` | bool | `true` | Verify each object's byte count against the advertised `Content-Length`; a short (truncated) or over-long transfer fails with `FaucetError::Source`. Skipped (debug-logged) when the store reports no length. Disable only for a store with unreliable `Content-Length`. See [Read-integrity verification](#read-integrity-verification). |
-| `verify_checksum` | bool | `false` | Also verify the body against the checksum S3 stores for the object. Sets `ChecksumMode::Enabled` on each `GetObject` and checks the strongest available of SHA-256 / CRC-64-NVME / CRC-32C / CRC-32 / non-multipart ETag-MD5. Costs a hash over the full body. |
+| `verify_checksum` | bool | `false` | Also verify the body against the checksum S3 stores for the object. Sets `ChecksumMode::Enabled` on each `GetObject` and checks the strongest available of SHA-256 / CRC-64-NVME / CRC-32C / CRC-32 / non-multipart ETag-MD5. Costs a hash over the full body. A JSON Lines object is then read whole (up to `max_object_bytes`) and verified before any record is emitted. |
 
 ### File formats (`S3FileFormat`)
 
@@ -251,7 +251,7 @@ pipeline:
 
 Behaviour by format:
 
-- **`json_lines`** — the object body is decoded line-by-line via `tokio::io::AsyncBufReadExt::lines`, so client-side memory stays bounded at `O(batch_size)` lines regardless of file or scan size. Records flow across object boundaries — a single page may carry lines drawn from multiple objects.
+- **`json_lines`** — the object body is decoded line-by-line via `tokio::io::AsyncBufReadExt::lines`, so client-side memory stays bounded at `O(batch_size)` lines regardless of file or scan size. Under `verify_checksum: true` each object is read whole and verified before its lines are decoded (a checksum is known only at the end of the body), so no record of a corrupt object reaches the sink; memory is then up to `concurrency` whole objects, each capped by `max_object_bytes`. Records flow across object boundaries — a single page may carry lines drawn from multiple objects.
 - **`raw_text`** — each object contributes exactly one `{key, content}` record. The whole body is held in one `String` (the record *is* the file), then accumulated into the same `batch_size` buffer.
 - **`json_array`** — the array can only be validated once the closing `]` is observed, so each object is buffered fully, then its elements are chunked into pages of `batch_size`. This bounds *page* size but not *peak per-object* memory.
 
@@ -388,7 +388,7 @@ To run a full pipeline, wrap the source with any sink in `faucet_core::Pipeline`
 - **Client reuse** — the `aws-sdk-s3` `Client` is built once in `S3Source::new()` (resolving region and `endpoint_url`) and reused for every list and get. No per-object client construction.
 - **Paginated listing** — `list_objects_v2` follows `next_continuation_token` until the response is no longer truncated, stopping early once `max_objects` is reached.
 - **Parallel reads** — `stream_pages` fetches listed keys through an ordered `futures::stream::buffered(concurrency)` look-ahead, so up to `concurrency` `GetObject` calls are in flight while the current object is being decoded; the eager batch path uses `buffer_unordered(concurrency)`. `concurrency: 0` is clamped to 1.
-- **What the look-ahead holds** — for `json_lines` it is only the open body readers (opening an object does not download it), and for `parquet` only the footer metadata, so peak memory stays `O(batch_size)`; for `json_array` / `raw_text` it is up to `concurrency` whole object bodies, which is the memory bound the knob advertises.
+- **What the look-ahead holds** — for `json_lines` it is only the open body readers (opening an object does not download it), and for `parquet` only the footer metadata, so peak memory stays `O(batch_size)`; for `json_array` / `raw_text`, and for `json_lines` under `verify_checksum`, it is up to `concurrency` whole object bodies, which is the memory bound the knob advertises.
 - **Streaming decode** — `json_lines` / `raw_text` open each body as an `AsyncBufRead` and decode line-by-line; only `json_array` buffers a full object before parsing.
 
 Throughput scales with `concurrency` and is ultimately bounded by S3 / network bandwidth — benchmark with your own object sizes and parallelism.
