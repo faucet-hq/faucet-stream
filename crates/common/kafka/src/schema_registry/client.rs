@@ -75,7 +75,13 @@ pub struct SchemaRegistryClient {
     calls: Arc<faucet_core::CallSlot>,
     /// Schemas fetched by subject and version, for references.
     versions: Arc<Mutex<LruCache<(String, i32), RegistrySchema>>>,
+    /// The built codec / descriptor pool / validator per codec and schema
+    /// id. A registered schema id never changes, so a hit skips fetching the
+    /// schema and resolving its references again.
+    compiled: Arc<std::sync::Mutex<CompiledCache>>,
 }
+
+type CompiledCache = LruCache<(&'static str, u32), Arc<dyn std::any::Any + Send + Sync>>;
 
 impl SchemaRegistryClient {
     pub fn new(config: &SchemaRegistryConfig) -> Result<Self, FaucetError> {
@@ -93,6 +99,7 @@ impl SchemaRegistryClient {
             register_cache: Arc::new(Mutex::new(LruCache::new(capacity))),
             parsed: Arc::new(std::sync::Mutex::new(LruCache::new(capacity))),
             versions: Arc::new(Mutex::new(LruCache::new(capacity))),
+            compiled: Arc::new(std::sync::Mutex::new(LruCache::new(capacity))),
             calls: Arc::new(faucet_core::CallSlot::new(
                 faucet_core::CallContext::new().without_timeout(),
             )),
@@ -134,6 +141,34 @@ impl SchemaRegistryClient {
             c.put(key, built.clone() as Arc<dyn std::any::Any + Send + Sync>);
         }
         Ok(built)
+    }
+
+    /// The value a codec of `kind` built for `schema_id` and stored with
+    /// [`remember_compiled`](Self::remember_compiled), if still cached.
+    pub fn compiled_for<T>(&self, kind: &'static str, schema_id: u32) -> Option<Arc<T>>
+    where
+        T: Send + Sync + 'static,
+    {
+        let hit = self
+            .compiled
+            .lock()
+            .ok()
+            .and_then(|mut c| c.get(&(kind, schema_id)).cloned())?;
+        hit.downcast::<T>().ok()
+    }
+
+    /// Store what a codec of `kind` built for `schema_id` (with every
+    /// reference resolved), so later messages with that id reuse it.
+    pub fn remember_compiled<T>(&self, kind: &'static str, schema_id: u32, value: Arc<T>)
+    where
+        T: Send + Sync + 'static,
+    {
+        if let Ok(mut c) = self.compiled.lock() {
+            c.put(
+                (kind, schema_id),
+                value as Arc<dyn std::any::Any + Send + Sync>,
+            );
+        }
     }
 
     fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {

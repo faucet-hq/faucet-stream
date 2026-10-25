@@ -16,24 +16,32 @@ pub async fn decode(
     let json: Value = faucet_core::fidelity::from_slice(body)
         .map_err(|e| FaucetError::Source(format!("json-schema decode: {e}")))?;
     if validate {
-        let registered = client.get_schema(schema_id).await?;
-        registered.expect_type("JSON")?;
-        let references: Vec<(String, String)> = client
-            .references(&registered)
-            .await?
-            .into_iter()
-            .map(|(name, s)| (name, s.schema))
-            .collect();
-        let mut key = registered.schema.clone();
-        for (name, text) in &references {
-            key.push('\u{0}');
-            key.push_str(name);
-            key.push('\u{0}');
-            key.push_str(text);
-        }
-        let validator = client.parsed("json-schema", &key, |_| {
-            compile(&registered.schema, &references)
-        })?;
+        let validator = match client.compiled_for::<jsonschema::Validator>("json-schema", schema_id)
+        {
+            Some(validator) => validator,
+            None => {
+                let registered = client.get_schema(schema_id).await?;
+                registered.expect_type("JSON")?;
+                let references: Vec<(String, String)> = client
+                    .references(&registered)
+                    .await?
+                    .into_iter()
+                    .map(|(name, s)| (name, s.schema))
+                    .collect();
+                let mut key = registered.schema.clone();
+                for (name, text) in &references {
+                    key.push('\u{0}');
+                    key.push_str(name);
+                    key.push('\u{0}');
+                    key.push_str(text);
+                }
+                let validator = client.parsed("json-schema", &key, |_| {
+                    compile(&registered.schema, &references)
+                })?;
+                client.remember_compiled("json-schema", schema_id, validator.clone());
+                validator
+            }
+        };
         // Validate the payload as the producer wrote it: the fidelity parse
         // turns numbers JSON cannot hold exactly into strings, which a schema
         // declaring `integer` / `number` would refuse. A number beyond the
@@ -140,9 +148,19 @@ mod tests {
             decode(&client, &good, true).await.unwrap(),
             serde_json::json!({"qty": 3})
         );
+        let cached = client
+            .compiled_for::<jsonschema::Validator>("json-schema", 31)
+            .expect("the validator is cached by schema id");
         let bad = envelope::encode(31, br#"{"qty": 0}"#);
         let err = decode(&client, &bad, true).await.unwrap_err();
         assert!(err.to_string().contains("validation failed"), "{err}");
+        let reused = client
+            .compiled_for::<jsonschema::Validator>("json-schema", 31)
+            .unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&cached, &reused),
+            "reused, not rebuilt"
+        );
     }
 
     #[tokio::test]

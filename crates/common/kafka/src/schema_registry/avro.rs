@@ -24,14 +24,21 @@ fn parse(
 /// writer schema fetched from the registry by ID.
 pub async fn decode(client: &SchemaRegistryClient, bytes: &[u8]) -> Result<Value, FaucetError> {
     let (schema_id, body) = envelope::decode(bytes)?;
-    let registered = client.get_schema(schema_id).await?;
-    registered.expect_type("AVRO")?;
-    let codec = if registered.references.is_empty() {
-        parse(client, &registered.schema)?
-    } else {
-        let deps = client.references(&registered).await?;
-        let texts: Vec<&str> = deps.iter().map(|(_, s)| s.schema.as_str()).collect();
-        parse(client, &inline_references(&registered.schema, &texts)?)?
+    let codec = match client.compiled_for::<AvroDatumCodec>("avro", schema_id) {
+        Some(codec) => codec,
+        None => {
+            let registered = client.get_schema(schema_id).await?;
+            registered.expect_type("AVRO")?;
+            let codec = if registered.references.is_empty() {
+                parse(client, &registered.schema)?
+            } else {
+                let deps = client.references(&registered).await?;
+                let texts: Vec<&str> = deps.iter().map(|(_, s)| s.schema.as_str()).collect();
+                parse(client, &inline_references(&registered.schema, &texts)?)?
+            };
+            client.remember_compiled("avro", schema_id, codec.clone());
+            codec
+        }
     };
     let mut cursor = std::io::Cursor::new(body);
     let avro_value = GenericDatumReader::builder(codec.schema())
@@ -279,7 +286,20 @@ mod tests {
             .unwrap();
         let bytes = envelope::encode(5, &payload);
         assert_eq!(decode(&client, &bytes).await.unwrap(), value);
+        let cached = client
+            .compiled_for::<AvroDatumCodec>("avro", 5)
+            .expect("the resolved codec is cached by schema id");
         assert_eq!(decode(&client, &bytes).await.unwrap(), value);
+        let again = client.compiled_for::<AvroDatumCodec>("avro", 5).unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&cached, &again),
+            "reused, not rebuilt"
+        );
+        assert!(
+            client
+                .compiled_for::<AvroDatumCodec>("protobuf", 5)
+                .is_none()
+        );
     }
 
     #[tokio::test]

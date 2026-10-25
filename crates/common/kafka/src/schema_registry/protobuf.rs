@@ -60,16 +60,23 @@ fn message_to_json(message: &DynamicMessage) -> Result<Value, FaucetError> {
 /// Decode `bytes` (with Confluent envelope + message-index prefix) into JSON.
 pub async fn decode(client: &SchemaRegistryClient, bytes: &[u8]) -> Result<Value, FaucetError> {
     let (schema_id, body) = envelope::decode(bytes)?;
-    let registered = client.get_schema(schema_id).await?;
-    registered.expect_type("PROTOBUF")?;
+    let compiled = match client.compiled_for::<(DescriptorPool, String)>("protobuf", schema_id) {
+        Some(compiled) => compiled,
+        None => {
+            let registered = client.get_schema(schema_id).await?;
+            registered.expect_type("PROTOBUF")?;
+            let imports: Vec<(String, String)> = client
+                .references(&registered)
+                .await?
+                .into_iter()
+                .map(|(name, s)| (name, s.schema))
+                .collect();
+            let compiled = compiled_with(client, &registered.schema, &imports)?;
+            client.remember_compiled("protobuf", schema_id, compiled.clone());
+            compiled
+        }
+    };
     let payload = parse_message_indexes(body)?;
-    let imports: Vec<(String, String)> = client
-        .references(&registered)
-        .await?
-        .into_iter()
-        .map(|(name, s)| (name, s.schema))
-        .collect();
-    let compiled = compiled_with(client, &registered.schema, &imports)?;
     let (pool, message_name) = &*compiled;
     let message_descriptor = pool.get_message_by_name(message_name).ok_or_else(|| {
         FaucetError::Source(format!(
@@ -247,6 +254,17 @@ mod tests {
             .unwrap();
         assert_eq!(decoded["home"]["city"], serde_json::json!("Lyon"));
         assert_eq!(decoded["name"], serde_json::json!("a"));
+        let cached = client
+            .compiled_for::<(DescriptorPool, String)>("protobuf", 21)
+            .expect("the compiled schema is cached by schema id");
+        let again = decode(&client, &envelope::encode(21, &payload))
+            .await
+            .unwrap();
+        assert_eq!(again, decoded);
+        let reused = client
+            .compiled_for::<(DescriptorPool, String)>("protobuf", 21)
+            .unwrap();
+        assert!(Arc::ptr_eq(&cached, &reused), "reused, not rebuilt");
     }
 
     #[tokio::test]
