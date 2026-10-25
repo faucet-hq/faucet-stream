@@ -18,8 +18,6 @@ faucet-source-mssql-cdc descriptor: connection preflight in new(); pinned by src
 faucet-source-oracle-cdc descriptor: connection preflight in new() and needs Oracle Instant Client; pinned by src/descriptor.rs unit tests
 faucet-source-mongodb-cdc descriptor: `hello` round trip in new(); pinned by src/descriptor.rs unit tests
 faucet-sink-postgres descriptor: eager connection pool in new(); pinned by src/descriptor.rs unit tests
-faucet-sink-mysql descriptor: eager connection pool in new(); pinned by src/descriptor.rs unit tests
-faucet-sink-mssql descriptor: eager connection pool in new(); pinned by src/descriptor.rs unit tests
 faucet-sink-oracle descriptor: connects in new() and needs Oracle Instant Client; pinned by src/descriptor.rs unit tests
 faucet-sink-redis descriptor: the connection manager opens in new(); pinned by src/descriptor.rs unit tests
 
