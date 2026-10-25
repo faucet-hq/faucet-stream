@@ -343,10 +343,17 @@ ordinary streams run deletes nothing.
 - The run's bookmarks are held back until the delete succeeds. A crash, a
   cancel or a failed delete leaves the old bookmark, so the next run
   re-reads the table and deletes again rather than skipping it.
-- Up to 1,000,000 keys are tracked (`DEFAULT_COMPLETE_READ_MAX_KEYS`); a
-  larger table fails the run with nothing deleted, as does a sink whose
-  delete request cannot carry every key (MongoDB, Elasticsearch, BigQuery and
-  Spanner bound it). Rebuild such a destination with an overwrite snapshot.
+- Up to `resnapshot_max_keys` distinct keys are tracked (default 1,000,000,
+  `DEFAULT_COMPLETE_READ_MAX_KEYS`). A larger table fails that run once with
+  nothing deleted (`refused_overflow`), but its position **is** saved, so the
+  next run resumes streaming instead of re-reading the table forever; raise
+  the ceiling or rebuild the destination with an overwrite snapshot to remove
+  the stale rows. A sink whose delete request cannot carry every key
+  (MongoDB, Elasticsearch, BigQuery and Spanner bound it) fails the delete the
+  same way as any failed delete.
+- `resnapshot_deletes: false` keeps the resnapshot without the delete: any
+  sink is accepted, and the destination keeps the rows of items deleted
+  during the gap (the behaviour before complete reads existed).
 
 ### Metrics
 

@@ -22169,6 +22169,24 @@
                         "null"
                       ]
                     },
+                    "resnapshot_deletes": {
+                      "default": true,
+                      "description": "`on_gap: resnapshot`: after the re-read, delete the destination rows of\nitems it did not see (default `true`; the sink must support cleanup).\n`false` keeps the resnapshot for any sink but leaves the destination\nrows of items deleted while their stream records were trimmed.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ]
+                    },
+                    "resnapshot_max_keys": {
+                      "default": 1000000,
+                      "description": "`on_gap: resnapshot`: the most distinct keys the re-read tracks for its\ndelete (default 1,000,000; memory grows with it). A table with more\nitems fails that run once with nothing deleted; its position is saved,\nso the next run resumes streaming.",
+                      "format": "uint",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "string"
+                      ]
+                    },
                     "retry": {
                       "$ref": "#/$defs/source_dynamodb__RetryPolicy",
                       "default": {
@@ -30545,7 +30563,7 @@
         },
         {
           "const": "resnapshot",
-          "description": "Re-read the whole table (emitted as `op: \"r\"` envelopes), then resume\nthe stream from the trim horizon. The run is a complete read: afterwards\nthe destination rows of items it did not see (deleted while their stream\nrecords were trimmed) are deleted, so the sink must support cleanup, with\n`write_mode: upsert` and a `key`.",
+          "description": "Re-read the whole table (emitted as `op: \"r\"` envelopes), then resume\nthe stream from the trim horizon. The run is a complete read: afterwards\nthe destination rows of items it did not see (deleted while their stream\nrecords were trimmed) are deleted, so the sink must support cleanup, with\n`write_mode: upsert` and a `key`. `resnapshot_deletes: false` skips that\ndelete (and the requirement).",
           "type": "string"
         }
       ]

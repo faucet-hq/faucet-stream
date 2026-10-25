@@ -1068,9 +1068,24 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                 source_drains_on_cancel,
                 row_accounts: self.row_accounts.clone(),
             };
-            let cleanup = self.cleanup.clone().filter(|p| {
-                p.trigger != crate::cleanup::CleanupTrigger::CompleteRead || complete_read.is_some()
-            });
+            let cleanup = self
+                .cleanup
+                .clone()
+                .filter(|p| {
+                    p.trigger != crate::cleanup::CleanupTrigger::CompleteRead
+                        || complete_read.is_some()
+                })
+                .map(
+                    |p| match complete_read.as_ref().and_then(|s| s.max_keys()) {
+                        // The source's own ceiling (its config) wins for a complete read.
+                        Some(max) if p.trigger == crate::cleanup::CleanupTrigger::CompleteRead => {
+                            let mut p = (*p).clone();
+                            p.max_keys = max;
+                            Arc::new(p)
+                        }
+                        _ => p,
+                    },
+                );
             if cleanup.is_some() && !wrapped_sink.supports_cleanup() {
                 return Err(FaucetError::Config(format!(
                     "cleanup is configured but sink '{}' does not support scoped cleanup",
@@ -1138,12 +1153,24 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                                         );
                                     }
                                     Err(e) => {
-                                        let outcome = if tracker.overflowed() {
+                                        let overflowed = tracker.overflowed();
+                                        let outcome = if overflowed {
                                             "refused_overflow"
                                         } else {
                                             "failed"
                                         };
                                         crate::observability::cleanup_run(&name, &row, outcome);
+                                        if overflowed && let Some(h) = &holding {
+                                            // Keeping the position back would make
+                                            // every later run read the whole dataset
+                                            // again and overflow the same way. Save
+                                            // it, skip the delete, and fail this run
+                                            // once with the way out.
+                                            h.release().await?;
+                                            return Err(complete_read_overflow_error(
+                                                policy.max_keys,
+                                            ));
+                                        }
                                         return Err(e);
                                     }
                                 }
@@ -7655,6 +7682,20 @@ mod tests {
     }
 }
 
+/// The error a complete read fails with when it wrote more keys than its
+/// cleanup can track. The run's position has been saved, so the next run
+/// resumes instead of reading the whole dataset again.
+fn complete_read_overflow_error(max_keys: usize) -> FaucetError {
+    FaucetError::Config(format!(
+        "cleanup: the complete read wrote more than {max_keys} distinct keys, so it could not \
+         tell which destination rows are absent from the source. Nothing was deleted, and the \
+         run's position was saved so the next run resumes instead of reading the whole dataset \
+         again; destination rows of items deleted at the source are kept. Raise the source's \
+         complete-read key ceiling (DynamoDB: `resnapshot_max_keys`) or rebuild the destination \
+         with an overwrite snapshot to remove them"
+    ))
+}
+
 #[cfg(test)]
 mod cleanup_tests {
     //! Pipeline wiring for scoped cleanup (#478). The pure policy/accumulator
@@ -7903,6 +7944,69 @@ mod cleanup_tests {
             .expect_err("the failed delete fails the run");
         assert!(err.to_string().contains("cleanup failed"), "{err}");
         assert_eq!(stored(&store).await, None);
+    }
+
+    #[tokio::test]
+    async fn an_overflowing_complete_read_saves_its_position_and_fails_once() {
+        let sink = CleanupSink::whole();
+        let source = complete_read_source(true, true);
+        let store: Arc<dyn StateStore> = Arc::new(crate::state::MemoryStateStore::new());
+        let tight = Arc::new(CleanupPolicy::for_complete_read(vec!["id".into()], 1).unwrap());
+        let err = Pipeline::new(&source, &sink)
+            .with_state_store(Arc::clone(&store))
+            .with_cleanup(tight)
+            .run()
+            .await
+            .expect_err("an overflow fails the run");
+        let msg = err.to_string();
+        assert!(msg.contains("more than 1 distinct keys"), "{msg}");
+        assert!(msg.contains("position was saved"), "{msg}");
+        assert!(sink.calls().is_empty(), "nothing is deleted");
+        assert_eq!(
+            stored(&store).await,
+            Some(json!(2)),
+            "the position is saved so the next run does not read everything again"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_source_ceiling_replaces_the_policy_ceiling_for_a_complete_read() {
+        let sink = CleanupSink::whole();
+        let mut source = complete_read_source(true, true);
+        source.signal = crate::cleanup::ReadCompleteness::new().with_max_keys(1);
+        let store: Arc<dyn StateStore> = Arc::new(crate::state::MemoryStateStore::new());
+        let err = Pipeline::new(&source, &sink)
+            .with_state_store(Arc::clone(&store))
+            .with_cleanup(whole_policy())
+            .run()
+            .await
+            .expect_err("the source's ceiling of 1 is exceeded by 2 keys");
+        assert!(
+            err.to_string().contains("more than 1 distinct keys"),
+            "{err}"
+        );
+
+        let sink = CleanupSink::whole();
+        let mut source = complete_read_source(true, true);
+        source.signal = crate::cleanup::ReadCompleteness::new().with_max_keys(5);
+        let tight = Arc::new(CleanupPolicy::for_complete_read(vec!["id".into()], 1).unwrap());
+        Pipeline::new(&source, &sink)
+            .with_cleanup(tight)
+            .run()
+            .await
+            .expect("the source raised the ceiling above the policy's");
+        assert_eq!(sink.calls(), vec![vec!["1".to_string(), "2".to_string()]]);
+    }
+
+    #[test]
+    fn read_completeness_floors_its_ceiling() {
+        assert_eq!(crate::cleanup::ReadCompleteness::new().max_keys(), None);
+        assert_eq!(
+            crate::cleanup::ReadCompleteness::new()
+                .with_max_keys(0)
+                .max_keys(),
+            Some(1)
+        );
     }
 
     #[tokio::test]

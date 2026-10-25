@@ -106,6 +106,8 @@ impl DynamoDbSource {
         let streams =
             faucet_common_dynamodb::build_streams_client(region, endpoint, &config.credentials)
                 .await?;
+        let complete_read =
+            faucet_core::ReadCompleteness::new().with_max_keys(config.resnapshot_max_keys);
         Ok(Self {
             config,
             client,
@@ -115,7 +117,7 @@ impl DynamoDbSource {
             lag: Mutex::new(LagTracker::default()),
             lag_warned: std::sync::atomic::AtomicBool::new(false),
             calls: CallSlot::new(CallContext::new()),
-            complete_read: faucet_core::ReadCompleteness::new(),
+            complete_read,
         })
     }
 
@@ -290,8 +292,12 @@ impl DynamoDbSource {
     }
 
     /// Whether a run that finds a gap reads the whole table (`on_gap: resnapshot`).
+    /// Whether a resnapshot is a complete read whose cleanup deletes the
+    /// destination rows of items it did not see.
     fn resnapshots(&self) -> bool {
-        self.config.mode == ReadMode::Streams && self.config.on_gap == OnGap::Resnapshot
+        self.config.mode == ReadMode::Streams
+            && self.config.on_gap == OnGap::Resnapshot
+            && self.config.resnapshot_deletes
     }
 
     fn with_lag(&self, f: impl FnOnce(&mut LagTracker)) {
@@ -349,10 +355,17 @@ impl DynamoDbSource {
                         self.config.table_name
                     )))?,
                     OnGap::Resnapshot => {
-                        tracing::warn!(table = %self.config.table_name, reasons = %reasons,
-                            "dynamodb streams: bookmark is past the trim horizon; resnapshotting \
-                             (a complete read: destination rows of items it does not see are \
-                             deleted after the run)");
+                        if self.resnapshots() {
+                            tracing::warn!(table = %self.config.table_name, reasons = %reasons,
+                                "dynamodb streams: bookmark is past the trim horizon; \
+                                 resnapshotting (a complete read: destination rows of items it \
+                                 does not see are deleted after the run)");
+                        } else {
+                            tracing::warn!(table = %self.config.table_name, reasons = %reasons,
+                                "dynamodb streams: bookmark is past the trim horizon; \
+                                 resnapshotting without deletes (resnapshot_deletes: false): \
+                                 destination rows of items deleted during the gap are kept");
+                        }
                         let keys = key_schema(&self.describe_table().await?)?;
                         let capture = capture_bookmark(&arn, &described);
                         let mut snap = self.scan_stream(

@@ -55,7 +55,8 @@ pub enum OnGap {
     /// the stream from the trim horizon. The run is a complete read: afterwards
     /// the destination rows of items it did not see (deleted while their stream
     /// records were trimmed) are deleted, so the sink must support cleanup, with
-    /// `write_mode: upsert` and a `key`.
+    /// `write_mode: upsert` and a `key`. `resnapshot_deletes: false` skips that
+    /// delete (and the requirement).
     Resnapshot,
 }
 
@@ -123,6 +124,18 @@ pub struct DynamoDbSourceConfig {
     /// Reaction to a bookmark older than the trim horizon.
     #[serde(default)]
     pub on_gap: OnGap,
+    /// `on_gap: resnapshot`: after the re-read, delete the destination rows of
+    /// items it did not see (default `true`; the sink must support cleanup).
+    /// `false` keeps the resnapshot for any sink but leaves the destination
+    /// rows of items deleted while their stream records were trimmed.
+    #[serde(default = "default_true")]
+    pub resnapshot_deletes: bool,
+    /// `on_gap: resnapshot`: the most distinct keys the re-read tracks for its
+    /// delete (default 1,000,000; memory grows with it). A table with more
+    /// items fails that run once with nothing deleted; its position is saved,
+    /// so the next run resumes streaming.
+    #[serde(default = "default_resnapshot_max_keys")]
+    pub resnapshot_max_keys: usize,
     /// Base wait between `GetRecords` calls per shard, in ms (floored at 200).
     #[serde(default = "default_poll_interval_ms")]
     pub poll_interval_ms: u64,
@@ -181,6 +194,9 @@ fn default_shard_concurrency() -> usize {
 fn default_batch_size() -> usize {
     faucet_core::DEFAULT_BATCH_SIZE
 }
+fn default_resnapshot_max_keys() -> usize {
+    faucet_core::DEFAULT_COMPLETE_READ_MAX_KEYS
+}
 
 /// DynamoDB's `TotalSegments` ceiling.
 pub const MAX_SEGMENTS: u32 = 1_000_000;
@@ -208,6 +224,8 @@ impl DynamoDbSourceConfig {
             stream_arn: None,
             start_position: StreamStart::default(),
             on_gap: OnGap::default(),
+            resnapshot_deletes: true,
+            resnapshot_max_keys: default_resnapshot_max_keys(),
             poll_interval_ms: default_poll_interval_ms(),
             records_per_request: default_records_per_request(),
             shard_concurrency: default_shard_concurrency(),
@@ -237,6 +255,9 @@ impl DynamoDbSourceConfig {
         }
         if self.max_concurrency == 0 {
             return err("max_concurrency must be at least 1".into());
+        }
+        if self.resnapshot_max_keys == 0 {
+            return err("resnapshot_max_keys must be at least 1".into());
         }
         if self.page_limit == Some(0) {
             return err("page_limit must be at least 1".into());

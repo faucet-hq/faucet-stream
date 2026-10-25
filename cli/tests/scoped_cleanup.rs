@@ -680,3 +680,19 @@ fn on_gap_fail_needs_no_cleanup_capable_sink() {
     let cfg = PipelineConfig::from_text(&yaml, &path).expect("config parses");
     expand(&cfg).expect("a stream that fails on a gap never deletes");
 }
+
+#[test]
+fn a_resnapshot_without_deletes_needs_no_cleanup_capable_sink() {
+    let yaml = dynamodb_resnapshot("    type: jsonl\n    config: { path: \"./out.jsonl\" }")
+        .replace(
+            "on_gap: resnapshot",
+            "on_gap: resnapshot, resnapshot_deletes: false",
+        );
+    let path = std::path::PathBuf::from("p.yaml");
+    let cfg = PipelineConfig::from_text(&yaml, &path).expect("config parses");
+    expand(&cfg).expect("a resnapshot that deletes nothing needs no cleanup");
+    let err = expand_err(&dynamodb_resnapshot(
+        "    type: jsonl\n    config: { path: \"./out.jsonl\" }",
+    ));
+    assert!(err.contains("resnapshot_deletes: false"), "{err}");
+}
