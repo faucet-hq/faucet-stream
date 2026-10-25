@@ -1950,6 +1950,15 @@ impl MssqlDriver {
 /// Every statement goes through the driver's own call slot (`on_conn`), which
 /// the adapter keeps in step with the run's context; the slot each primitive
 /// receives carries the same context.
+impl MssqlDriver {
+    fn auto_columns(&self) -> bool {
+        matches!(
+            self.config.column_mapping,
+            MssqlColumnMapping::AutoColumns { .. }
+        )
+    }
+}
+
 #[async_trait]
 impl SinkDriver for MssqlDriver {
     fn call_context(&self) -> faucet_core::CallContext {
@@ -1990,13 +1999,34 @@ impl SinkDriver for MssqlDriver {
         }
     }
 
+    /// Upsert and delete need real key columns, which the JSON-column mode
+    /// lacks.
     fn write_modes(&self) -> &'static [faucet_core::WriteMode] {
-        &[
-            faucet_core::WriteMode::Append,
-            faucet_core::WriteMode::Upsert,
-            faucet_core::WriteMode::Delete,
-            faucet_core::WriteMode::Overwrite,
-        ]
+        if self.auto_columns() {
+            &[
+                faucet_core::WriteMode::Append,
+                faucet_core::WriteMode::Upsert,
+                faucet_core::WriteMode::Delete,
+                faucet_core::WriteMode::Overwrite,
+            ]
+        } else {
+            &[
+                faucet_core::WriteMode::Append,
+                faucet_core::WriteMode::Overwrite,
+            ]
+        }
+    }
+
+    /// The JSON-column mode writes whole records, so it reports no schema.
+    fn capabilities(&self, derived: faucet_core::Capabilities) -> faucet_core::Capabilities {
+        if self.auto_columns() {
+            derived
+        } else {
+            derived
+                .to_builder()
+                .schema_report(faucet_core::SchemaReport::Schemaless)
+                .build()
+        }
     }
 
     fn dedups_by_key(&self) -> bool {
@@ -2158,7 +2188,7 @@ impl SchemaDriver for MssqlDriver {
     }
 
     fn evolvable(&self) -> bool {
-        true
+        self.auto_columns()
     }
 
     async fn evolve(

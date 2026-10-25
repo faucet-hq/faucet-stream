@@ -219,4 +219,25 @@ async fn conformance_declared_capabilities() {
     faucet_conformance::assert_driver_declarations_truthful(&sink).await;
     faucet_conformance::assert_driver_row_paths_agree(&sink).await;
     faucet_conformance::assert_driver_declarations_truthful(&overwrite).await;
+
+    // JSON-column mode has no key columns and nothing to evolve.
+    let mut jcfg = MssqlSinkConfig::new(cfg.connection_url.clone().unwrap(), "dbo.jd");
+    jcfg.connection.tls = cfg.tls.clone();
+    let json = MssqlSink::new(jcfg).await.expect("json sink");
+    assert_eq!(
+        json.supported_write_modes(),
+        &[WriteMode::Append, WriteMode::Overwrite]
+    );
+    assert!(!json.supports_schema_evolution());
+    assert_eq!(
+        json.capabilities().schema_report(),
+        faucet_core::SchemaReport::Schemaless
+    );
+    faucet_conformance::assert_descriptor_matches_sink(
+        &faucet_sink_mssql::DESCRIPTOR,
+        "mssql",
+        &serde_json::json!({"table": "dbo.jd"}),
+        &json,
+    );
+    faucet_conformance::assert_driver_declarations_truthful(&json).await;
 }

@@ -1131,6 +1131,14 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         let sink_caps = crate::registry::sink_capabilities(&merged_sink.kind, &merged_sink.config);
         if !sink_caps.supports_write_mode(mode) {
             let capable = crate::registry::sink_kinds_where(|c| c.supports_write_mode(mode));
+            if capable.contains(&merged_sink.kind.as_str()) {
+                return Err(CliError::Config(format!(
+                    "row '{}': write_mode '{}' is not supported by sink '{}' with this \
+                     configuration; it needs another setting of the sink (for a SQL sink, \
+                     column mapping rather than a JSON column — see `faucet schema sink {}`)",
+                    ids[i], requested_mode, merged_sink.kind, merged_sink.kind
+                )));
+            }
             let sinks = if matches!(mode, faucet_core::WriteMode::Overwrite) {
                 format!("overwrite sinks: {}", capable.join(", "))
             } else {
@@ -5475,16 +5483,42 @@ pipeline:
 
     #[test]
     fn evolve_on_postgres_passes() {
-        // postgres is evolution-capable; on_drift: evolve must expand.
+        // postgres is evolution-capable in column-mapping mode; on_drift:
+        // evolve must expand.
         let c = cfg(r#"
 version: 1
 pipeline:
   source: { type: rest, config: { base_url: https://x } }
-  sink:   { type: postgres, config: {} }
+  sink:   { type: postgres, config: { column_mapping: auto_map } }
   schema:
     on_drift: evolve
 "#);
         assert!(expand(&c).is_ok());
+    }
+
+    #[test]
+    fn json_column_sql_sinks_refuse_evolve_and_keyed_modes() {
+        for sink in [
+            "{ type: postgres, config: {} }",
+            "{ type: mysql, config: { connection_url: 'mysql://h/d', table_name: t } }",
+            "{ type: sqlite, config: { database_url: 'sqlite::memory:', table_name: t } }",
+            "{ type: mssql, config: { connection_url: 'server=h', table: t } }",
+        ] {
+            let evolve = cfg(&format!(
+                "version: 1\npipeline:\n  source: {{ type: rest, config: {{ base_url: https://x }} }}\n  sink: {sink}\n  schema:\n    on_drift: evolve\n"
+            ));
+            let err = expand(&evolve).unwrap_err().to_string();
+            assert!(err.contains("evolve"), "{sink}: {err}");
+            let upsert = sink.replace("config: {", "config: { write_mode: upsert, key: [id],");
+            let upsert = cfg(&format!(
+                "version: 1\npipeline:\n  source: {{ type: rest, config: {{ base_url: https://x }} }}\n  sink: {upsert}\n"
+            ));
+            let err = expand(&upsert).unwrap_err().to_string();
+            assert!(
+                err.contains("upsert") && err.contains("with this configuration"),
+                "{sink}: {err}"
+            );
+        }
     }
 
     /// #752: a child row writing a truncating file sink at a fixed path would

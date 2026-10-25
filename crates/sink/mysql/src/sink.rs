@@ -1482,6 +1482,12 @@ impl MysqlDriver {
     }
 }
 
+impl MysqlDriver {
+    fn auto_map(&self) -> bool {
+        matches!(self.config.column_mapping, MysqlColumnMapping::AutoMap)
+    }
+}
+
 #[async_trait]
 impl SqlDriver for MysqlDriver {
     type Dialect = Mysql;
@@ -1842,7 +1848,37 @@ impl SqlDriver for MysqlDriver {
     }
 
     fn evolution(&self) -> Option<&dyn SqlEvolution> {
-        Some(self)
+        self.auto_map().then_some(self as &dyn SqlEvolution)
+    }
+
+    /// Upsert and delete need real key columns, which the JSON-column mode
+    /// lacks.
+    fn write_modes(&self) -> &'static [faucet_core::WriteMode] {
+        if self.auto_map() {
+            &[
+                faucet_core::WriteMode::Append,
+                faucet_core::WriteMode::Upsert,
+                faucet_core::WriteMode::Delete,
+                faucet_core::WriteMode::Overwrite,
+            ]
+        } else {
+            &[
+                faucet_core::WriteMode::Append,
+                faucet_core::WriteMode::Overwrite,
+            ]
+        }
+    }
+
+    /// The JSON-column mode writes whole records, so it reports no schema.
+    fn capabilities(&self, derived: faucet_core::Capabilities) -> faucet_core::Capabilities {
+        if self.auto_map() {
+            derived
+        } else {
+            derived
+                .to_builder()
+                .schema_report(faucet_core::SchemaReport::Schemaless)
+                .build()
+        }
     }
 
     /// A binary value `binary_encoding` refuses fails only its own row.

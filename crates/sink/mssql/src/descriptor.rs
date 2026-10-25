@@ -9,21 +9,36 @@ pub const DESCRIPTOR: ConnectorDescriptor = ConnectorDescriptor::new("mssql", ca
 fn capabilities(config: &Value) -> Capabilities {
     let kind_level = config.is_null();
     let column_mapped = kind_level || tag(config, "column_mapping") == Some("auto_columns");
+    // The JSON-column mode stores whole records: no key columns, nothing to evolve.
+    let json = !kind_level && matches!(tag(config, "column_mapping"), None | Some("json_column"));
     Capabilities::builder()
-        .write_modes([
+        .write_modes(write_modes(json))
+        .idempotent_writes(kind_level || !is_set(config, "staging"))
+        .keyed_upsert(!json)
+        .keyed_dedup(!kind_level && dedups_by_key(config))
+        .cleanup(column_mapped)
+        .schema_evolution(!json)
+        .schema_report(if json {
+            SchemaReport::Schemaless
+        } else {
+            SchemaReport::Reported
+        })
+        .staged_load(cfg!(feature = "staging") && (kind_level || is_set(config, "staging")))
+        .build()
+}
+
+fn write_modes(json: bool) -> impl Iterator<Item = WriteMode> {
+    let modes: &[WriteMode] = if json {
+        &[WriteMode::Append, WriteMode::Overwrite]
+    } else {
+        &[
             WriteMode::Append,
             WriteMode::Upsert,
             WriteMode::Delete,
             WriteMode::Overwrite,
-        ])
-        .idempotent_writes(kind_level || !is_set(config, "staging"))
-        .keyed_upsert(true)
-        .keyed_dedup(!kind_level && dedups_by_key(config))
-        .cleanup(column_mapped)
-        .schema_evolution(true)
-        .schema_report(SchemaReport::Reported)
-        .staged_load(cfg!(feature = "staging") && (kind_level || is_set(config, "staging")))
-        .build()
+        ]
+    };
+    modes.iter().copied()
 }
 
 #[cfg(test)]
@@ -35,15 +50,25 @@ mod tests {
     fn column_mapping_gates_cleanup() {
         let json_column = DESCRIPTOR.capabilities(&json!({"table": "t"}));
         assert!(!json_column.cleanup() && !json_column.rollback() && !json_column.keyed_dedup());
-        assert!(json_column.idempotent_writes() && json_column.keyed_upsert());
-        assert!(json_column.overwrite() && json_column.schema_evolution());
+        assert!(json_column.idempotent_writes() && !json_column.keyed_upsert());
+        assert!(json_column.overwrite() && !json_column.schema_evolution());
         assert!(!json_column.scoped_overwrite() && !json_column.staged_load());
-        assert_eq!(json_column.schema_report(), SchemaReport::Reported);
+        assert_eq!(json_column.schema_report(), SchemaReport::Schemaless);
+        assert_eq!(
+            json_column.write_modes(),
+            [WriteMode::Append, WriteMode::Overwrite]
+        );
 
         let mapped = DESCRIPTOR.capabilities(&json!({
             "column_mapping": {"type": "auto_columns"}, "write_mode": "delete", "key": ["id"]
         }));
         assert!(mapped.cleanup() && !mapped.rollback() && mapped.keyed_dedup());
+        assert!(mapped.keyed_upsert() && mapped.schema_evolution());
+        assert_eq!(mapped.schema_report(), SchemaReport::Reported);
+        assert_eq!(mapped.write_modes().len(), 4);
+        let explicit = DESCRIPTOR
+            .capabilities(&json!({"column_mapping": {"type": "json_column", "column": "d"}}));
+        assert!(!explicit.keyed_upsert() && !explicit.schema_evolution());
         assert!(
             !DESCRIPTOR
                 .capabilities(&json!({"column_mapping": {"type": "json_column", "column": "d"}}))
@@ -74,6 +99,7 @@ mod tests {
     fn kind_level_view() {
         let kind = DESCRIPTOR.capabilities(&Value::Null);
         assert!(kind.cleanup() && !kind.rollback() && !kind.keyed_dedup());
+        assert!(kind.keyed_upsert() && kind.schema_evolution());
         assert_eq!(kind.staged_load(), cfg!(feature = "staging"));
         assert_eq!(DESCRIPTOR.kind(), "mssql");
     }

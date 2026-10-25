@@ -420,7 +420,7 @@ already landed a second time). See
 
 ## Capabilities
 
-Declares write modes `append` / `upsert` / `delete` / `overwrite`, idempotent (exactly-once) writes (not with a `staging:` block), keyed upsert and schema evolution with a reported schema. Cleanup needs `column_mapping: auto_columns`; a staged load needs a `staging:` block and the `staging` feature; keyed dedup needs `write_mode: upsert|delete` with a `key`. `faucet list --json` prints the declaration.
+Declares write modes `append` / `upsert` / `delete` / `overwrite`, idempotent (exactly-once) writes (not with a `staging:` block), keyed upsert and schema evolution with a reported schema. Upsert, delete, keyed upsert, schema evolution and cleanup need `column_mapping: auto_columns`; the `json_column` mode declares `append` / `overwrite` and a schemaless destination, so `faucet validate` refuses `write_mode: upsert|delete` and `on_drift: evolve` for it; a staged load needs a `staging:` block and the `staging` feature; keyed dedup needs `write_mode: upsert|delete` with a `key`. `faucet list --json` prints the declaration.
 
 ## Timeouts, cancellation and retries
 

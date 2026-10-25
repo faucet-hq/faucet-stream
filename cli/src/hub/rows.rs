@@ -1292,7 +1292,7 @@ pipeline:
       config:
         connection_url: "sqlite::memory:"
         table: "${param.table}"
-        auto_map: true
+        column_mapping: auto_map
         write_mode: upsert
         key: [id]
         delete_marker: { field: op, values: [d] }
