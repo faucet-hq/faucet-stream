@@ -157,6 +157,7 @@ the assertions that prove it:
 | `call_deadline` | (every source and sink) | `assert_source_call_deadline` / `assert_sink_call_deadline` |
 | `exactly_once` *(source)* | declares `exactly_once` | `assert_bookmark_roundtrip` |
 | `discover` *(source)* | declares `discover` | `assert_discover_roundtrips` |
+| `streaming` *(source)* | overrides `stream_pages` | `assert_first_page_before_exhaustion` (exempt, with the reason, where the backend exposes no served-record count) |
 
 CI's `Doc counts` job runs `scripts/conformance-coverage.py`, which fails when a
 built-in connector declares a capability and none of its conformance tests

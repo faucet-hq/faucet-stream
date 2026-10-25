@@ -237,6 +237,13 @@ pub const REQUIREMENTS: &[Requirement] = &[
         assertions: &["assert_source_call_deadline"],
         summary: "a read from a hung backend ends at the call deadline and on cancel",
     },
+    Requirement {
+        id: "streaming",
+        role: Role::Source,
+        triggers: &[Trigger::Overrides("stream_pages")],
+        assertions: &["assert_first_page_before_exhaustion"],
+        summary: "the first page arrives before the backend has served the whole result set",
+    },
 ];
 
 /// The requirements that apply to `role`.

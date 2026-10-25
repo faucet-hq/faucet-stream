@@ -64,6 +64,58 @@ async fn conformance_batch_size_zero_single_page() {
     faucet_conformance::assert_batch_size_zero_single_page(&source).await;
 }
 
+// ── Check 22: the first page arrives before the API is exhausted ─────────────
+
+/// Serves `?page=N` (1-based) with 100 records up to page 10, then an empty
+/// page, counting the records served.
+struct PagedItems(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl wiremock::Respond for PagedItems {
+    fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
+        let page: usize = req
+            .url
+            .query_pairs()
+            .find(|(k, _)| k == "page")
+            .and_then(|(_, v)| v.parse().ok())
+            .unwrap_or(1);
+        let data: Vec<_> = if (1..=10).contains(&page) {
+            self.0.fetch_add(100, std::sync::atomic::Ordering::SeqCst);
+            ((page - 1) * 100..page * 100)
+                .map(|i| json!({ "id": i }))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        ResponseTemplate::new(200).set_body_json(json!({ "data": data }))
+    }
+}
+
+#[tokio::test]
+async fn conformance_first_page_before_exhaustion() {
+    let server = MockServer::start().await;
+    let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    Mock::given(method("GET"))
+        .and(path("/items"))
+        .respond_with(PagedItems(std::sync::Arc::clone(&served)))
+        .mount(&server)
+        .await;
+    let source = RestStream::new(
+        RestStreamConfig::new(&server.uri(), "/items")
+            .records_path("$.data[*]")
+            .pagination(PaginationStyle::PageNumber {
+                param_name: "page".into(),
+                start_page: 1,
+                page_size: None,
+                page_size_param: None,
+            }),
+    )
+    .unwrap();
+    faucet_conformance::assert_first_page_before_exhaustion(&source, 100, 1_000, || {
+        served.load(std::sync::atomic::Ordering::SeqCst)
+    })
+    .await;
+}
+
 // ── Check 10: connector_name non-empty (offline) ──────────────────────────────
 
 #[test]

@@ -16,7 +16,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use faucet_conformance::{
     assert_batch_size_zero_single_page, assert_bounded_memory, assert_config_schema_valid_value,
-    assert_connector_name_nonempty, assert_errors_not_panics, assert_preflight_check_wellformed,
+    assert_connector_name_nonempty, assert_errors_not_panics, assert_first_page_before_exhaustion,
+    assert_preflight_check_wellformed,
 };
 use faucet_core::Source;
 use faucet_source_elasticsearch::{ElasticsearchSource, ElasticsearchSourceConfig};
@@ -99,6 +100,22 @@ async fn mount_paged_responder(server: &MockServer, responder: PagedResponder) {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"succeeded": true})))
         .mount(server)
         .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_first_page_before_exhaustion() {
+    // Check 22: the first scroll page is yielded before the later scroll
+    // requests are made, so the server has served far fewer than all docs.
+    let server = MockServer::start().await;
+    let responder = PagedResponder::new(25, 250);
+    let served = Arc::clone(&responder.inner);
+    mount_paged_responder(&server, responder).await;
+    let config = ElasticsearchSourceConfig::new(server.uri(), "test").with_batch_size(250);
+    let source = ElasticsearchSource::new(config).expect("source new");
+    assert_first_page_before_exhaustion(&source, 250, 6_250, || {
+        served.cursor.load(Ordering::SeqCst).min(served.pages) * served.page_size
+    })
+    .await;
 }
 
 #[test]

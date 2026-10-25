@@ -240,6 +240,20 @@
         "assert_source_call_deadline"
       ],
       "summary": "a read from a hung backend ends at the call deadline and on cancel"
+    },
+    {
+      "id": "streaming",
+      "role": "source",
+      "triggers": [
+        {
+          "kind": "overrides",
+          "arg": "stream_pages"
+        }
+      ],
+      "assertions": [
+        "assert_first_page_before_exhaustion"
+      ],
+      "summary": "the first page arrives before the backend has served the whole result set"
     }
   ],
   "sources": {
