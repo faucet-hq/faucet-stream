@@ -4043,7 +4043,8 @@ fn resolve_xml_body_fields(
 ///   and every field the connector schema annotates `x-faucet-resource: url`
 ///   take percent-encoded values ([`crate::interpolate::interpolate_record_path`]);
 /// * every field annotated `path` refuses a value holding a path separator or
-///   `..` ([`crate::interpolate::interpolate_record_file_path`]).
+///   `..`, and a whole-field token refuses an absolute or `~` path
+///   ([`crate::interpolate::interpolate_record_file_path`]).
 ///
 /// The generic pass then finds no token left in them.
 fn resolve_resource_fields(
@@ -4208,6 +4209,19 @@ mod xml_body_tests {
         let whole = HashMap::from([("p".into(), json!({"name": "out/../../x"}))]);
         let mut cfg = json!({"path": "${p.name}"});
         assert!(resolve_resource_fields(false, "file", &mut cfg, &whole).is_err());
+        for anchored in [
+            "/home/svc/.ssh/authorized_keys",
+            "\\\\host\\share",
+            "C:\\x",
+            "~/x",
+        ] {
+            let ctx = HashMap::from([("p".into(), json!({ "name": anchored }))]);
+            let mut cfg = json!({"path": "${p.name}"});
+            assert!(
+                resolve_resource_fields(false, "file", &mut cfg, &ctx).is_err(),
+                "{anchored}"
+            );
+        }
         let fine = HashMap::from([("p".into(), json!({"name": "out/x.jsonl"}))]);
         let mut cfg = json!({"path": "${p.name}"});
         resolve_resource_fields(false, "file", &mut cfg, &fine).unwrap();

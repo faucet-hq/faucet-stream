@@ -183,7 +183,8 @@ Three stages resolve placeholders:
   get an embedded token percent-encoded into one segment, a file or object path
   (a file sink's `path`, a SQLite `database_url`, a `prefix`) refuses a value
   holding `/`, `\`, NUL or `..` (a field that is exactly one token takes the
-  value whole; a file path still may not climb out with `..`), and a SQL
+  value whole as a relative path — it may not be absolute, start with `~` or
+  climb out with `..`), and a SQL
   source's query gets it as a bind parameter.
 
 Reference cycles surface as a clear `InterpolationCycle` error.
