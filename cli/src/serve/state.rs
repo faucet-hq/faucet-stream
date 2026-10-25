@@ -76,6 +76,10 @@ struct Inner {
     references: Arc<crate::serve::references::ServeReferencePolicy>,
     /// Set when shutdown begins: new work is refused and `/readyz` is 503.
     draining: std::sync::atomic::AtomicBool,
+    /// Clustered terminal records whose owner-fenced write failed (the
+    /// history backend was unreachable), retried by the lease loop so a run
+    /// this instance finished never stays `running` in the shared store.
+    pending_finalize: std::sync::Mutex<Vec<crate::serve::runner::PendingFinalize>>,
 }
 
 impl ServerState {
@@ -127,6 +131,7 @@ impl ServerState {
                 allow_subprocess_connectors: config.allow_subprocess_connectors,
                 references: Arc::new(config.references.clone()),
                 draining: std::sync::atomic::AtomicBool::new(false),
+                pending_finalize: std::sync::Mutex::new(Vec::new()),
             }),
         }
     }
@@ -365,6 +370,26 @@ impl ServerState {
     /// Whether run records are stored in a SQL history backend.
     pub fn persistent_history(&self) -> bool {
         self.inner.persistent_history
+    }
+
+    /// Keep a terminal record whose owner-fenced write failed for a retry.
+    pub(crate) fn queue_finalize(&self, pending: crate::serve::runner::PendingFinalize) {
+        self.inner
+            .pending_finalize
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(pending);
+    }
+
+    /// Take every queued terminal record (the caller re-queues what fails).
+    pub(crate) fn take_pending_finalize(&self) -> Vec<crate::serve::runner::PendingFinalize> {
+        std::mem::take(
+            &mut *self
+                .inner
+                .pending_finalize
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     pub fn cluster(&self) -> &crate::serve::cluster::ClusterHandle {

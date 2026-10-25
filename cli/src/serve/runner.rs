@@ -2024,21 +2024,17 @@ async fn finalize(state: &ServerState, run_id: &str, started: DateTime<Utc>, ter
         // Owner-fenced: if another instance reclaimed this run (lease expired),
         // our write is a no-op and we discard our result — the reclaimer is now
         // authoritative (#197).
-        match state.history().finalize_owned(&rec).await {
-            Ok(true) => {
-                metrics::record_run_finished(status, reason);
-                record_tenant_run(&rec);
-                // Only the instance that won the owner-fenced write fires the
-                // callback, so a reclaimed run cannot deliver twice (#481).
-                crate::serve::callback::fire(&rec).await;
-            }
-            Ok(false) => tracing::warn!(
+        let pending = PendingFinalize { rec, reason };
+        if let Err(e) = finalize_owned(state, &pending).await {
+            // The row still says `running` and this instance keeps renewing
+            // its lease, so no peer re-runs it; the lease loop retries the
+            // write until the backend takes it.
+            tracing::error!(
                 run_id,
-                "finalize: run was reclaimed by another instance; discarding result"
-            ),
-            Err(e) => {
-                tracing::error!(run_id, error = %e, "finalize: owner-fenced write failed")
-            }
+                error = %e,
+                "finalize: owner-fenced write failed; retrying from the lease loop"
+            );
+            state.queue_finalize(pending);
         }
     } else {
         if let Err(e) = state.history().upsert(&rec).await {
@@ -2052,6 +2048,58 @@ async fn finalize(state: &ServerState, run_id: &str, started: DateTime<Utc>, ter
         record_tenant_run(&rec);
         crate::serve::callback::fire(&rec).await;
     }
+}
+
+/// A clustered terminal record waiting for its owner-fenced write.
+pub(crate) struct PendingFinalize {
+    rec: RunRecord,
+    reason: &'static str,
+}
+
+/// The owner-fenced terminal write of a clustered run and, when this instance
+/// won it, the completion side effects. `Err` means the backend did not take
+/// the write and it must be retried.
+async fn finalize_owned(
+    state: &ServerState,
+    pending: &PendingFinalize,
+) -> Result<(), crate::serve::history::HistoryError> {
+    let rec = &pending.rec;
+    // Owner-fenced: if another instance reclaimed this run (lease expired),
+    // our write is a no-op and we discard our result — the reclaimer is now
+    // authoritative (#197).
+    if state.history().finalize_owned(rec).await? {
+        metrics::record_run_finished(rec.status, pending.reason);
+        record_tenant_run(rec);
+        // Only the instance that won the owner-fenced write fires the
+        // callback, so a reclaimed run cannot deliver twice (#481).
+        crate::serve::callback::fire(rec).await;
+    } else {
+        tracing::warn!(
+            run_id = %rec.run_id,
+            "finalize: run was reclaimed by another instance; discarding result"
+        );
+    }
+    Ok(())
+}
+
+/// Retry every terminal record whose owner-fenced write failed earlier;
+/// a record that fails again stays queued. Returns how many were written.
+pub(crate) async fn retry_pending_finalize(state: &ServerState) -> usize {
+    let mut written = 0;
+    for pending in state.take_pending_finalize() {
+        match finalize_owned(state, &pending).await {
+            Ok(()) => written += 1,
+            Err(e) => {
+                tracing::warn!(
+                    run_id = %pending.rec.run_id,
+                    error = %e,
+                    "finalize: owner-fenced write still failing; will retry"
+                );
+                state.queue_finalize(pending);
+            }
+        }
+    }
+    written
 }
 
 /// Finalize every `sharded` parent whose shards are all terminal but which no
@@ -2140,6 +2188,118 @@ fn recount_refusal(tenant: &str, recount: Result<Option<String>, ServeError>) ->
 #[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
+
+    /// A memory store whose owner-fenced finalize fails while `down` is set.
+    struct FlakyFinalize {
+        inner: crate::serve::history::memory::MemoryHistory,
+        down: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::serve::history::RunHistory for FlakyFinalize {
+        async fn claim_idempotency(
+            &self,
+            key: &str,
+            fingerprint: &str,
+            run_id: &str,
+            window: Duration,
+        ) -> Result<Claim, crate::serve::history::HistoryError> {
+            self.inner
+                .claim_idempotency(key, fingerprint, run_id, window)
+                .await
+        }
+        async fn upsert(&self, rec: &RunRecord) -> Result<(), crate::serve::history::HistoryError> {
+            self.inner.upsert(rec).await
+        }
+        async fn get(
+            &self,
+            id: &str,
+        ) -> Result<Option<RunRecord>, crate::serve::history::HistoryError> {
+            self.inner.get(id).await
+        }
+        async fn list(
+            &self,
+            f: &crate::serve::history::ListFilter,
+        ) -> Result<crate::serve::history::ListPage, crate::serve::history::HistoryError> {
+            self.inner.list(f).await
+        }
+        async fn delete(
+            &self,
+            id: &str,
+        ) -> Result<crate::serve::history::DeleteOutcome, crate::serve::history::HistoryError>
+        {
+            self.inner.delete(id).await
+        }
+        async fn purge_expired(
+            &self,
+            retain_for: Duration,
+        ) -> Result<usize, crate::serve::history::HistoryError> {
+            self.inner.purge_expired(retain_for).await
+        }
+        async fn recover_orphans(&self) -> Result<usize, crate::serve::history::HistoryError> {
+            self.inner.recover_orphans().await
+        }
+        fn degraded(&self) -> bool {
+            false
+        }
+        async fn finalize_owned(
+            &self,
+            rec: &RunRecord,
+        ) -> Result<bool, crate::serve::history::HistoryError> {
+            if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::serve::history::HistoryError::Backend("down".into()));
+            }
+            self.inner.upsert(rec).await.map(|_| true)
+        }
+    }
+
+    /// A clustered terminal write the backend refuses is kept and retried by
+    /// the lease loop, so the run does not stay `running` (#934 R1-004).
+    #[tokio::test]
+    async fn a_failed_cluster_finalize_is_retried_until_it_lands() {
+        let mut config = crate::serve::test_support::test_config();
+        config.cluster.enabled = true;
+        let history = std::sync::Arc::new(FlakyFinalize {
+            inner: crate::serve::history::memory::MemoryHistory::new(Duration::from_secs(60)),
+            down: std::sync::atomic::AtomicBool::new(true),
+        });
+        let state = ServerState::new(
+            &config,
+            None,
+            CancellationToken::new(),
+            history.clone(),
+            crate::serve::logs::LogHub::new(),
+            None,
+            #[cfg(feature = "triggers")]
+            crate::serve::triggers::health::TriggersHandle::empty(),
+        );
+        let started = Utc::now();
+        let mut rec = RunRecord::queued("r1".into(), None, BTreeMap::new(), None, started);
+        rec.status = RunStatus::Running;
+        state.history().upsert(&rec).await.unwrap();
+        finalize(
+            &state,
+            "r1",
+            started,
+            Terminal::Completed {
+                records: 3,
+                invs: Vec::new(),
+            },
+        )
+        .await;
+        let now = state.history().get("r1").await.unwrap().unwrap();
+        assert_eq!(now.status, RunStatus::Running);
+        // Still down: the record stays queued.
+        assert_eq!(retry_pending_finalize(&state).await, 0);
+        history
+            .down
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(retry_pending_finalize(&state).await, 1);
+        let done = state.history().get("r1").await.unwrap().unwrap();
+        assert_eq!(done.status, RunStatus::Completed);
+        assert_eq!(done.records_written, 3);
+        assert_eq!(retry_pending_finalize(&state).await, 0);
+    }
 
     /// A caller's config runs with the caller reference policy scoped over
     /// it, so its HTTP clients check every request and redirect hop (#881).
