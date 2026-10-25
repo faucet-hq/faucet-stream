@@ -192,9 +192,36 @@ impl SqlDialect for Postgres {
         scope_types: &[Option<&str>],
         key: &[String],
     ) -> Result<Option<String>, FaucetError> {
+        self.cleanup_absent_keys_typed_sql(target, scope, scope_types, key, &[])
+    }
+
+    /// A `bytea` key renders as unwrapped base64 (the form the writes
+    /// decode), not `json_build_object`'s `\x…` hex text.
+    fn cleanup_absent_keys_typed_sql(
+        &self,
+        target: &TableTarget,
+        scope: &[String],
+        scope_types: &[Option<&str>],
+        key: &[String],
+        key_types: &[Option<&str>],
+    ) -> Result<Option<String>, FaucetError> {
         let pairs = key
             .iter()
-            .map(|k| format!("{}, t.{}", self.quote_literal(k), quote(k)))
+            .enumerate()
+            .map(|(i, k)| {
+                let col = format!("t.{}", quote(k));
+                let value = if key_types
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|t| t.trim().eq_ignore_ascii_case("bytea"))
+                {
+                    format!("replace(encode({col}, 'base64'), E'\\n', '')")
+                } else {
+                    col
+                };
+                format!("{}, {value}", self.quote_literal(k))
+            })
             .collect::<Vec<_>>()
             .join(", ");
         let delete = self.cleanup_delete_sql(target, scope, scope_types, key)?;

@@ -1112,3 +1112,53 @@ fn overwrite_runs_stage_under_their_own_name<D: SqlDialect>(d: D) {
 fn matrix_overwrite_staging_names() {
     every_dialect!(overwrite_runs_stage_under_their_own_name);
 }
+
+/// The cleanup journal read renders a binary key as unwrapped base64 — the
+/// form the writes decode — on MySQL and PostgreSQL; other keys stay raw and
+/// a dialect without the typed override falls back to the untyped query.
+#[test]
+fn cleanup_journal_renders_binary_keys_as_base64() {
+    use faucet_common_sql::dialects::{Mysql, Postgres, Sqlite};
+    let key = ["id".to_string(), "n".to_string()];
+    let types = [Some("VARBINARY(16)"), Some("INT")];
+    let m = Mysql
+        .cleanup_absent_keys_typed_sql(&target(&Mysql, "t"), &[], &[], &key, &types)
+        .unwrap()
+        .unwrap();
+    assert!(
+        m.contains("'id', REPLACE(TO_BASE64(`t`.`id`), CHAR(10 USING ascii), '')"),
+        "{m}"
+    );
+    assert!(m.contains("'n', `t`.`n`"), "{m}");
+    let untyped = Mysql
+        .cleanup_absent_keys_sql(&target(&Mysql, "t"), &[], &[], &key)
+        .unwrap()
+        .unwrap();
+    assert!(!untyped.contains("TO_BASE64"), "{untyped}");
+
+    let p = Postgres
+        .cleanup_absent_keys_typed_sql(
+            &target(&Postgres, "t"),
+            &[],
+            &[],
+            &key,
+            &[Some("bytea"), Some("int4")],
+        )
+        .unwrap()
+        .unwrap();
+    assert!(
+        p.contains("'id', replace(encode(t.\"id\", 'base64'), E'\\n', '')"),
+        "{p}"
+    );
+    assert!(p.contains("'n', t.\"n\""), "{p}");
+
+    let s = Sqlite
+        .cleanup_absent_keys_typed_sql(&target(&Sqlite, "t"), &[], &[], &key, &types)
+        .unwrap();
+    assert_eq!(
+        s,
+        Sqlite
+            .cleanup_absent_keys_sql(&target(&Sqlite, "t"), &[], &[], &key)
+            .unwrap()
+    );
+}

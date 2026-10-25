@@ -155,8 +155,23 @@ impl SqlExecutor for MysqlExec<'_> {
 
     async fn fetch_text(&mut self, stmt: &Statement<'_>) -> Result<Vec<String>, FaucetError> {
         let mut q = sqlx::query(&stmt.sql);
+        // Bound as the delete it previews binds them: a binary scope value is
+        // decoded, or the journal would match no row the delete removes.
         for p in &stmt.params {
-            q = bind_value(q, p.value.as_ref());
+            q = match p.value.as_ref() {
+                Value::String(s) if p.sql_type.is_some_and(is_binary_type) => {
+                    bind_binary(q, s, self.binary).map_err(|e| {
+                        FaucetError::Sink(format!(
+                            "cleanup: reading keys to journal: column {}: {e}",
+                            p.column
+                        ))
+                    })?
+                }
+                _ if p.non_integer_text().is_some() => {
+                    q.bind(p.non_integer_text().expect("checked"))
+                }
+                v => bind_value(q, v),
+            };
         }
         let rows = q
             .fetch_all(&mut *self.conn)

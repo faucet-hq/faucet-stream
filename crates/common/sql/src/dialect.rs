@@ -378,6 +378,22 @@ pub trait SqlDialect: Send + Sync {
         Ok(None)
     }
 
+    /// [`cleanup_absent_keys_sql`](Self::cleanup_absent_keys_sql) given the
+    /// key columns' types (`key_types`, parallel to `key`), so a dialect can
+    /// render a key whose JSON form would not bind back (binary bytes) the way
+    /// its writes bind it. Default: ignores the types.
+    fn cleanup_absent_keys_typed_sql(
+        &self,
+        target: &TableTarget,
+        scope: &[String],
+        scope_types: &[Option<&str>],
+        key: &[String],
+        key_types: &[Option<&str>],
+    ) -> Result<Option<String>, FaucetError> {
+        let _ = key_types;
+        self.cleanup_absent_keys_sql(target, scope, scope_types, key)
+    }
+
     /// How a cleanup names its destination in a "column does not exist"
     /// error.
     fn cleanup_table_display(&self, target: &TableTarget) -> String {

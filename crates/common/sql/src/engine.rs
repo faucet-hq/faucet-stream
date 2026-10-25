@@ -715,8 +715,15 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
         if self.write.journals()
             && let Some(run_id) = self.write.rollback_run_id()
         {
-            self.journal_cleanup(exec, target, &scope_cols, &scope_types_ref, &params, run_id)
-                .await?;
+            self.journal_cleanup(
+                exec,
+                target,
+                &scope_cols,
+                (&scope_types_ref, &key_types_ref),
+                &params,
+                run_id,
+            )
+            .await?;
         }
         let deleted = exec
             .execute(&Statement::new(StatementKind::CleanupDelete, sql, params))
@@ -737,14 +744,14 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
         exec: &mut E,
         target: &TableTarget,
         scope_cols: &[String],
-        scope_types: &[Option<&str>],
+        (scope_types, key_types): (&[Option<&str>], &[Option<&str>]),
         params: &[Param<'_>],
         run_id: &str,
     ) -> Result<(), FaucetError> {
         let key = &self.write.key;
         let sql = self
             .dialect
-            .cleanup_absent_keys_sql(target, scope_cols, scope_types, key)?
+            .cleanup_absent_keys_typed_sql(target, scope_cols, scope_types, key, key_types)?
             .ok_or_else(|| {
                 FaucetError::Sink(format!(
                     "{}: a scoped cleanup cannot be journaled for rollback",
