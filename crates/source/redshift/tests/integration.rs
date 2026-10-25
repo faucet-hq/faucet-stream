@@ -526,3 +526,41 @@ async fn queries_are_metered_on_the_installed_recorder() {
     let trips = meter.snapshot().source_roundtrips;
     assert!(trips.values().sum::<u64>() >= 1, "{trips:?}");
 }
+
+/// A fractional `NUMERIC(p,s)` cursor keeps the rows tied at a bookmark like
+/// `123.5`: the bookmark binds at its own scale, never through a bare
+/// `NUMERIC` (which Redshift reads as `DECIMAL(18,0)` and rounds up).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fractional_numeric_cursor_keeps_tied_rows() {
+    let _guard = serial().lock().await;
+    let (_container, port) = start_postgres().await;
+    let pool = seed_pool(port).await;
+    sqlx::query("CREATE TABLE seqs (id BIGINT PRIMARY KEY, seq NUMERIC(12,3))")
+        .execute(&pool)
+        .await
+        .expect("create table");
+    sqlx::query("INSERT INTO seqs (id, seq) VALUES (1, 100.000), (2, 123.500)")
+        .execute(&pool)
+        .await
+        .expect("seed");
+    let mut config = full_config(port, "SELECT id, seq FROM seqs", 1000);
+    config.replication = RedshiftReplication::Incremental {
+        column: "seq".into(),
+        initial_value: json!(0),
+    };
+    let source = RedshiftSource::new(config).expect("source");
+    let (records, bookmark) = drain(&source).await;
+    assert_eq!(records.len(), 2);
+    source
+        .apply_start_bookmark(bookmark.expect("bookmark"))
+        .await
+        .expect("apply bookmark");
+    sqlx::query("INSERT INTO seqs (id, seq) VALUES (3, 123.500), (4, 123.700)")
+        .execute(&pool)
+        .await
+        .expect("late rows");
+    pool.close().await;
+    let (records, _) = drain(&source).await;
+    let ids: Vec<i64> = records.iter().map(|r| r["id"].as_i64().unwrap()).collect();
+    assert_eq!(ids, vec![3, 4]);
+}

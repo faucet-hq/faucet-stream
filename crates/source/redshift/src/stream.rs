@@ -104,6 +104,7 @@ impl RedshiftSource {
         let Some(ctx) = incr else {
             return (sql, binds);
         };
+        let cast = bookmark_cast(cast, &ctx.start.value);
         if sql.contains(BOOKMARK_TOKEN) {
             let marker = format!("CAST(${} AS {cast})", binds.len() + 1);
             sql = sql.replace(BOOKMARK_TOKEN, &marker);
@@ -152,6 +153,32 @@ impl RedshiftSource {
             })?;
         cast_type(&name)
     }
+}
+
+/// The cast a bookmark binds through. The server describes a column's type
+/// without its precision and scale, and a bare `NUMERIC` / `DECIMAL` on
+/// Redshift is `DECIMAL(18,0)`, which would round a fractional bookmark and
+/// skip the rows just above it. A decimal cursor is cast at the widest
+/// precision and the bookmark's own scale instead, which is exact (the
+/// bookmark is rendered at the column's scale).
+fn bookmark_cast(cast: &str, bookmark: &Value) -> String {
+    let base = cast.trim().to_ascii_uppercase();
+    if !matches!(base.as_str(), "NUMERIC" | "DECIMAL") {
+        return cast.to_string();
+    }
+    let text = match bookmark {
+        Value::String(s) => s.trim().to_string(),
+        Value::Number(n) => n.to_string(),
+        _ => String::new(),
+    };
+    let mantissa = text.split(['e', 'E']).next().unwrap_or("");
+    let scale = mantissa
+        .split_once('.')
+        .map_or(0, |(_, frac)| {
+            frac.chars().filter(char::is_ascii_digit).count()
+        })
+        .min(37);
+    format!("NUMERIC(38,{scale})")
 }
 
 /// A server-reported type name usable in `CAST(… AS <name>)`.
@@ -552,6 +579,29 @@ mod tests {
                 json!("2026-01-01")
             ]
         );
+    }
+
+    #[test]
+    fn a_decimal_bookmark_is_cast_at_its_own_scale() {
+        assert_eq!(bookmark_cast("NUMERIC", &json!("123.5")), "NUMERIC(38,1)");
+        assert_eq!(bookmark_cast("numeric", &json!("0.001")), "NUMERIC(38,3)");
+        assert_eq!(bookmark_cast("DECIMAL", &json!(7)), "NUMERIC(38,0)");
+        assert_eq!(bookmark_cast("NUMERIC", &json!(1.25)), "NUMERIC(38,2)");
+        assert_eq!(bookmark_cast("TIMESTAMP", &json!("123.5")), "TIMESTAMP");
+    }
+
+    #[tokio::test]
+    async fn a_decimal_cursor_never_binds_through_a_bare_numeric() {
+        let mut c = base_config();
+        c.replication = RedshiftReplication::Incremental {
+            column: "amount".into(),
+            initial_value: json!("123.500"),
+        };
+        let s = source(c);
+        let incr = s.incremental_ctx();
+        let (sql, _) = s.resolve_query(&HashMap::new(), incr.as_ref(), "NUMERIC");
+        assert!(sql.contains("CAST($1 AS NUMERIC(38,3))"), "{sql}");
+        assert!(!sql.contains("AS NUMERIC)"), "{sql}");
     }
 
     #[test]
