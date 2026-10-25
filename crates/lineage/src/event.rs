@@ -67,6 +67,25 @@ pub const ERROR_MESSAGE_FACET_URL: &str = "https://openlineage.io/spec/facets/1-
 /// Schema URL of the OpenLineage `OutputStatisticsOutputDatasetFacet`.
 pub const OUTPUT_STATISTICS_FACET_URL: &str = "https://openlineage.io/spec/facets/1-0-2/OutputStatisticsOutputDatasetFacet.json#/$defs/OutputStatisticsOutputDatasetFacet";
 
+/// `_schemaURL` of the parent run facet.
+pub const PARENT_RUN_FACET_URL: &str =
+    "https://openlineage.io/spec/facets/1-0-1/ParentRunFacet.json#/$defs/ParentRunFacet";
+
+/// `_schemaURL` of the nominal time facet.
+pub const NOMINAL_TIME_FACET_URL: &str =
+    "https://openlineage.io/spec/facets/1-0-1/NominalTimeRunFacet.json#/$defs/NominalTimeRunFacet";
+
+/// `_schemaURL` of the source code job facet.
+pub const SOURCE_CODE_FACET_URL: &str =
+    "https://openlineage.io/spec/facets/1-0-1/SourceCodeJobFacet.json#/$defs/SourceCodeJobFacet";
+
+/// `_schemaURL` of the schema dataset facet.
+pub const SCHEMA_FACET_URL: &str =
+    "https://openlineage.io/spec/facets/1-1-1/SchemaDatasetFacet.json#/$defs/SchemaDatasetFacet";
+
+/// `_schemaURL` of the column lineage dataset facet.
+pub const COLUMN_LINEAGE_FACET_URL: &str = "https://openlineage.io/spec/facets/1-2-0/ColumnLineageDatasetFacet.json#/$defs/ColumnLineageDatasetFacet";
+
 /// Why a run failed (OpenLineage `errorMessage` run facet).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -245,7 +264,7 @@ impl SchemaDatasetFacet {
     pub fn new(fields: Vec<SchemaField>) -> Self {
         Self {
             producer: PRODUCER.into(),
-            schema_url: OL_SCHEMA_URL.into(),
+            schema_url: SCHEMA_FACET_URL.into(),
             fields,
         }
     }
