@@ -155,13 +155,19 @@ pub fn owner_token_var(repo: &str) -> String {
 /// one org and the public hub can be read in one invocation, then the global
 /// `FAUCET_GITHUB_TOKEN` / `GITHUB_TOKEN`.
 pub fn github_token(repo: &str) -> Option<String> {
+    github_token_from(repo, |var| std::env::var(var).ok())
+}
+
+/// [`github_token`] reading variables through `lookup` instead of the process
+/// environment.
+pub fn github_token_from(repo: &str, lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
     [
         owner_token_var(repo),
         "FAUCET_GITHUB_TOKEN".into(),
         "GITHUB_TOKEN".into(),
     ]
     .into_iter()
-    .find_map(|var| std::env::var(var).ok().filter(|t| !t.trim().is_empty()))
+    .find_map(|var| lookup(&var).filter(|t| !t.trim().is_empty()))
 }
 
 impl GithubHub {

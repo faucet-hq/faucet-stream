@@ -198,6 +198,7 @@ fn csv_config(input: &std::path::Path, output: &std::path::Path, name: &str) -> 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
 async fn plan_approve_run_with_policy_budget_rejection_and_audit() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("in.csv");
@@ -707,6 +708,7 @@ async fn plan_approve_run_with_policy_budget_rejection_and_audit() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
 async fn require_approval_turns_submissions_into_change_requests() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("in.csv");
@@ -877,6 +879,7 @@ async fn require_approval_turns_submissions_into_change_requests() {
 /// from the loaded config, so a documented `${env:…}` webhook URL resolves.
 #[cfg(feature = "notify")]
 #[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
 async fn change_requested_notifications_resolve_env_references() {
     use wiremock::matchers::{body_string_contains, method};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -887,6 +890,8 @@ async fn change_requested_notifications_resolve_env_references() {
         .expect(1)
         .mount(&hook)
         .await;
+    // SAFETY: every test in this binary is `#[serial]`, so no other thread
+    // reads the environment while it changes; the variable is removed below.
     unsafe { std::env::set_var("FAUCET_789_APPROVER_HOOK", format!("{}/hook", hook.uri())) };
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("in.csv");
@@ -921,6 +926,8 @@ async fn change_requested_notifications_resolve_env_references() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     hook.verify().await;
+    // SAFETY: as above.
+    unsafe { std::env::remove_var("FAUCET_789_APPROVER_HOOK") };
 }
 
 /// Review of #868 (cli F6, F7): under `--require-approval template_launch` a
@@ -928,6 +935,7 @@ async fn change_requested_notifications_resolve_env_references() {
 /// refused directly but stays possible through an approved `template_delete` /
 /// `template_deprecate` change request, which takes the launch approval rule.
 #[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
 async fn gated_deletes_and_retirements_run_through_change_requests() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("in.csv");
@@ -1053,6 +1061,7 @@ async fn gated_deletes_and_retirements_run_through_change_requests() {
 /// A configured principal may not take a server actor's name, so a removed
 /// principal can never pass as one when its approved change executes.
 #[test]
+#[serial_test::serial]
 fn an_auth_config_principal_may_not_take_a_server_actor_name() {
     let dir = tempfile::tempdir().unwrap();
     for name in ["trigger:nightly", "system:expiry", "sync:origin", "runtime"] {
