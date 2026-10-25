@@ -216,6 +216,9 @@ async fn supported_write_modes_includes_upsert_and_delete() {
 
     let mut scfg = MssqlSinkConfig::new(cfg.connection_url.clone().unwrap(), "dbo.t");
     scfg.connection.tls = cfg.tls.clone();
+    scfg.column_mapping = MssqlColumnMapping::AutoColumns {
+        on_unknown_field: OnUnknownField::Warn,
+    };
     let sink = MssqlSink::new(scfg).await.expect("sink");
 
     let modes = sink.supported_write_modes();
