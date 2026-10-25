@@ -424,6 +424,19 @@ pub async fn submit(
     mut req: SubmitRequest,
     approval: Approval,
 ) -> Result<SubmitOutcome, ServeError> {
+    // A malformed request field is refused before anything is queued or
+    // proposed, so a change request never waits for approval only to fail
+    // when it executes.
+    crate::serve::runner::resolve_clock(req.clock.as_deref(), chrono::Utc::now())?;
+    // `0` is rejected rather than clamped: it would mean "no connections"
+    // (#610).
+    if req.concurrency == Some(0) {
+        return Err(ServeError::Unprocessable {
+            message: "concurrency must be greater than 0 — it is a connection/fetch count, not a `0 = unlimited` sentinel"
+                .into(),
+            details: None,
+        });
+    }
     let gated = req.approved_change.is_none()
         && (req.require_approval
             || (approval == Approval::Required
@@ -457,15 +470,6 @@ pub async fn submit(
     // A draining server takes no new work (#789 SERVE-25).
     if state.is_draining() {
         return Err(ServeError::Draining);
-    }
-    // `0` is rejected rather than clamped: it would mean "no connections"
-    // (#610).
-    if req.concurrency == Some(0) {
-        return Err(ServeError::Unprocessable {
-            message: "concurrency must be greater than 0 — it is a connection/fetch count, not a `0 = unlimited` sentinel"
-                .into(),
-            details: None,
-        });
     }
     // The selection names the run (#741): a label, so part of the
     // idempotency fingerprint.

@@ -1592,7 +1592,7 @@ fn submitted_document(
 }
 
 /// Parse the optional request `clock` (RFC3339), defaulting to `submitted_at`.
-fn resolve_clock(
+pub(crate) fn resolve_clock(
     flag: Option<&str>,
     default: DateTime<Utc>,
 ) -> Result<DateTime<FixedOffset>, ServeError> {

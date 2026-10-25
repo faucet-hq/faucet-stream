@@ -692,6 +692,31 @@ async fn require_approval_turns_submissions_into_change_requests() {
     };
     let config = csv_config(&input, &output, "gated");
 
+    // A malformed field is refused at submit, not after approval.
+    let (code, err) = api
+        .post(
+            "bob-tok",
+            "/v1/runs",
+            json!({ "config": config, "clock": "2026-10-01" }),
+        )
+        .await;
+    assert_eq!(code, 400, "{err}");
+    assert!(err.to_string().contains("RFC3339"), "{err}");
+    let (code, err) = api
+        .post(
+            "bob-tok",
+            "/v1/runs",
+            json!({ "config": config, "concurrency": 0 }),
+        )
+        .await;
+    assert_eq!(code, 422, "{err}");
+    let (_, pending) = api.get("admin-tok", "/v1/changes?status=pending").await;
+    assert_eq!(
+        pending.as_array().map(Vec::len),
+        Some(0),
+        "no change request was created: {pending}"
+    );
+
     // POST /v1/runs answers with a pending change request, not a run.
     let (code, resp) = api
         .post(
