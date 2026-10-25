@@ -445,3 +445,37 @@ async fn concurrent_overwrite_runs_keep_their_own_rows() {
         assert!(!table_exists(&url, &format!("users__faucet_ovw_{t}")).await);
     }
 }
+
+/// A run whose staging another run dropped (it judged the run abandoned)
+/// must not re-create it from its next page: the commit would then swap in
+/// only the pages written since. The write fails and the target keeps its rows.
+#[tokio::test]
+async fn a_dropped_staging_is_not_recreated_from_a_page() {
+    use faucet_core::idempotency::new_overwrite_run_token;
+    let (_dir, url) = fresh_db("CREATE TABLE users (id INTEGER, name TEXT)").await;
+    seed(&url, "INSERT INTO users VALUES (0, 'old')").await;
+    let token = new_overwrite_run_token();
+    let sink = || async {
+        SqliteSink::new(overwrite_config(&url, SqliteColumnMapping::AutoMap))
+            .await
+            .unwrap()
+            .with_overwrite_run(&token)
+            .unwrap()
+    };
+    sink().await.begin_overwrite().await.unwrap();
+    seed(&url, &format!("DROP TABLE users__faucet_ovw_{token}")).await;
+    let err = sink()
+        .await
+        .write_batch(&[json!({"id": 1, "name": "late"})])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(&format!(
+            "overwrite staging 'users__faucet_ovw_{token}' is missing"
+        )),
+        "{err}"
+    );
+    assert!(!table_exists(&url, &format!("users__faucet_ovw_{token}")).await);
+    assert_eq!(names(&url, "users").await, ["old"]);
+}

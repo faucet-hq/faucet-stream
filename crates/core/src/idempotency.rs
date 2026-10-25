@@ -290,9 +290,14 @@ pub const OVERWRITE_RUN_TOKEN_LEN: usize = 14;
 
 /// How long another run's tokened staging is presumed in use. A `begin`
 /// drops a sibling run's staging only once its token is older than this —
-/// the staging of a crashed run; a live run is never that old in practice.
+/// the staging of a crashed run. Liveness is judged from the token's start
+/// time alone (there is no heartbeat), so the bound is generous: a week,
+/// well past any single full refresh. A token stamped ahead of this host's
+/// clock (another instance's clock runs fast) counts as live, and the SQL
+/// sinks refuse to re-create a staging that was dropped while its target
+/// exists rather than swapping in a partial table.
 pub const ABANDONED_OVERWRITE_STAGING: std::time::Duration =
-    std::time::Duration::from_secs(24 * 60 * 60);
+    std::time::Duration::from_secs(7 * 24 * 60 * 60);
 
 /// A fresh overwrite run token (see [`OVERWRITE_RUN_KEY`]): lowercase hex,
 /// valid unquoted in every SQL dialect, ordered by start time.
@@ -406,11 +411,14 @@ pub fn overwrite_run_abandoned(token: &str, own: Option<&str>, now_secs: u64) ->
     let Some(started) = overwrite_run_started(token) else {
         return false;
     };
-    // Tokens keep 32 bits of seconds; read one from the future as one era
-    // back rather than as abandoned forever.
+    // Tokens keep 32 bits of seconds. A start less than half the range
+    // ahead of now is another host's fast clock: live. Further ahead is the
+    // previous era (the 32-bit wrap), read as one era back.
     let now = now_secs & 0xffff_ffff;
     let age = if started <= now {
         now - started
+    } else if started - now < (1 << 31) {
+        return false;
     } else {
         now + (1 << 32) - started
     };
@@ -788,6 +796,21 @@ mod overwrite_run_tests {
             None,
             (1 << 32) + day
         ));
+    }
+
+    /// A token stamped ahead of this host's clock is another instance's fast
+    /// clock, so its run is live — never "one era old" and dropped (#934).
+    #[test]
+    fn a_token_from_a_fast_clock_is_live() {
+        let start = 0x6700_0000u64;
+        let token = overwrite_run_token_at(start, "cccccc");
+        for behind in [1, 3600, ABANDONED_OVERWRITE_STAGING.as_secs() * 4] {
+            assert!(
+                !overwrite_run_abandoned(&token, None, start - behind),
+                "{behind}s behind"
+            );
+        }
+        assert!(ABANDONED_OVERWRITE_STAGING.as_secs() >= 7 * 24 * 60 * 60);
     }
 }
 

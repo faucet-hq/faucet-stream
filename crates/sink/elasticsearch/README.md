@@ -113,7 +113,7 @@ does exactly that). Under the CLI every instance of one run shares its run
 token, so two overwrite runs against the same alias each resolve their own
 staging index: neither drops nor swaps in the other's, and the last commit
 wins. A tokened `begin` drops the staging behind the untokened marker, and
-another run's staging only once that run's token is more than 24 hours old (a
+another run's staging only once that run's token is more than 7 days old (a
 crashed run's). Without a token (a library caller) the single untokened marker
 is used, and a `begin` drops whatever staging it finds behind it, so two such
 runs against one alias must not overlap.

@@ -504,6 +504,22 @@ impl<D: SqlDriver> SqlSinkDriver<D> {
             self.table_ready.store(true, Ordering::Relaxed);
             return Ok(());
         }
+        if self.engine().write_spec().is_overwrite()
+            && self.driver.table_exists(&layout.table).await?
+        {
+            // Begin cloned the existing target into staging. Staging missing
+            // now means it was dropped (another run's sweep judged this run
+            // abandoned) or begin never ran: re-creating it from this page
+            // would let the commit swap in only the pages written since.
+            if !self.driver.staging_exists().await? {
+                return Err(crate::missing_overwrite_staging_error(
+                    self.driver.connector_name(),
+                    &self.driver.table_display(&self.driver.staging_table()),
+                ));
+            }
+            self.table_ready.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
         let target = self.driver.target(&self.effective_table());
         let Some(sql) =
             self.engine()

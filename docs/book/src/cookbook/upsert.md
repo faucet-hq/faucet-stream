@@ -405,7 +405,11 @@ other's staging: each swaps in exactly its own rows, and the last commit wins.
 
 Staging a crashed run left behind is cleaned up by a later run of the same
 table, with one rule: a run drops another run's staging only once that run's
-token is more than 24 hours old, because a younger one may still be in use. It
+token is more than 7 days old, because a younger one may still be in use (a
+token stamped ahead of the dropping host's clock counts as in use). Should a
+run that is still going lose its staging anyway, the SQL sinks' next write
+fails rather than re-creating the staging from that page, so its commit never
+swaps in a partial table. It
 also drops the untokened staging (`<table>__faucet_ovw`, the untokened marker
 alias, the untokened `.faucet-overwrite-…` area) an earlier release left. On the
 file sinks a move into place that such a run recorded is not finished; the new

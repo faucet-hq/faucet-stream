@@ -258,6 +258,18 @@ impl MssqlDriver {
             self.table_ready.store(true, Ordering::Relaxed);
             return Ok(());
         }
+        // Begin cloned an existing target into staging: never re-create a
+        // staging another run dropped from this page.
+        if self.config.write.is_overwrite() && self.table_exists(&self.config.table).await? {
+            if !self.table_exists(&self.staging_literal()).await? {
+                return Err(faucet_common_sql::missing_overwrite_staging_error(
+                    "mssql",
+                    &self.staging_literal(),
+                ));
+            }
+            self.table_ready.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
         // A page with nothing inferable leaves the table uncreated so the next
         // page can try, rather than emitting a zero-column CREATE.
         let key: &[String] = if self.config.write.dedups_by_key() {

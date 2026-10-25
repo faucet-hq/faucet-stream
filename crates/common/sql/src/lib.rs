@@ -60,5 +60,5 @@ pub use engine::{
     no_match_message, split_page,
 };
 pub use mapping::{ColumnMatching, MapError, MatchedRow, TableColumn};
-pub use overwrite::referenced_overwrite_error;
+pub use overwrite::{missing_overwrite_staging_error, referenced_overwrite_error};
 pub use statement::{Param, Statement, StatementKind};

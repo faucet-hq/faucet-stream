@@ -174,7 +174,7 @@ by its begin, writer and commit instances, and stages in its own
 `.faucet-overwrite-<name>.run-<token>` directory: two overwrite runs of one output
 at once never drop or move in each other's files, and the last commit wins. A
 tokened begin drops the untokened `.faucet-overwrite-<name>` directory, and
-another run's directory only once that run's token is more than 24 hours old (a
+another run's directory only once that run's token is more than 7 days old (a
 crashed run's); an interrupted move such a directory recorded is not finished,
 because the new run replaces every file of the template when it commits. A
 library caller without a token keeps the single untokened directory, so two such
