@@ -444,3 +444,57 @@ async fn a_fenced_instance_shortens_the_flush_grace() {
     maintain_leases(&state, &mut health, Duration::from_secs(20)).await;
     assert_eq!(state.cluster().flush_grace(normal), normal);
 }
+
+/// A claim stored by the previous release holds the fingerprint of the
+/// resolved config; a retry of the same request after the upgrade replays it
+/// instead of answering 409, while a different request still conflicts.
+#[cfg(all(feature = "source-csv", feature = "sink-jsonl"))]
+#[tokio::test]
+async fn a_claim_from_the_previous_release_still_replays() {
+    use faucet_cli::serve::runner::{SubmitRequest, legacy_request_fingerprint, submit};
+    let history: Arc<dyn RunHistory> = Arc::new(MemoryHistory::new(Duration::from_secs(60)));
+    let state = ServerState::new(
+        &config(),
+        None,
+        CancellationToken::new(),
+        history.clone(),
+        LogHub::new(),
+        None,
+        TriggersHandle::from_compiled(&[]),
+    );
+    let yaml = "version: 1\nname: legacy\npipeline:\n  source: { type: csv, config: { path: x.csv } }\n  sink: { type: jsonl, config: { path: out.jsonl } }\n";
+    let req: SubmitRequest =
+        serde_json::from_value(serde_json::json!({"config": yaml, "idempotency_key": "k"}))
+            .unwrap();
+    let cfg =
+        faucet_cli::config::PipelineConfig::from_text(yaml, std::path::Path::new("submitted.yaml"))
+            .unwrap();
+    history.upsert(&run("prior")).await.unwrap();
+    history
+        .claim_idempotency(
+            "k",
+            &legacy_request_fingerprint(&req, &cfg),
+            "prior",
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    let actor = faucet_cli::serve::rbac::AuthContext {
+        principal: "t".into(),
+        role: faucet_cli::serve::rbac::Role::Admin,
+        source_ip: None,
+        tenant: None,
+    };
+    let replayed = submit(state.clone(), req.clone(), actor.clone())
+        .await
+        .expect("replay");
+    assert_eq!(replayed.run_id, "prior");
+
+    let mut other = req;
+    other.labels.insert("team".into(), "x".into());
+    let err = submit(state, other, actor).await.unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("idempotency"),
+        "{err}"
+    );
+}

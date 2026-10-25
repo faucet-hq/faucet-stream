@@ -1014,15 +1014,33 @@ pub(crate) async fn enqueue(
             &req.labels,
         );
         let key = idempotency_scope(principal.tenant(), key);
-        match state
-            .history()
-            .claim_idempotency(&key, &fp, &run_id, state.idempotency_retention())
-            .await
-            .map_err(|e| match e {
-                // Degraded backend can't safely honor idempotency → 503, retry.
-                crate::serve::history::HistoryError::Degraded(m) => ServeError::Unavailable(m),
-                other => ServeError::Internal(other.to_string()),
-            })? {
+        let claim = |fp: String| {
+            let state = state.clone();
+            let key = key.clone();
+            let run_id = run_id.clone();
+            async move {
+                state
+                    .history()
+                    .claim_idempotency(&key, &fp, &run_id, state.idempotency_retention())
+                    .await
+                    .map_err(|e| match e {
+                        // Degraded backend can't safely honor idempotency → 503, retry.
+                        crate::serve::history::HistoryError::Degraded(m) => {
+                            ServeError::Unavailable(m)
+                        }
+                        other => ServeError::Internal(other.to_string()),
+                    })
+            }
+        };
+        let mut outcome = claim(fp).await?;
+        if matches!(outcome, Claim::Conflict) {
+            // A claim stored by an earlier release (or by an older peer during
+            // a rolling upgrade) holds the fingerprint of the resolved config.
+            // Accept it for one release so a retry spanning the upgrade
+            // replays instead of answering 409.
+            outcome = claim(legacy_request_fingerprint(&req, &loaded.cfg)).await?;
+        }
+        match outcome {
             Claim::Fresh => {}
             Claim::Replay(existing) => {
                 metrics::record_idempotency_hit();
@@ -1589,6 +1607,24 @@ fn submitted_document(
         }
         None => submitted,
     })
+}
+
+/// The request fingerprint releases before this one stored: the same request
+/// fields over the *resolved* config. Only compared on a conflict.
+// TODO(#930): drop after one release, once no claim can still hold it.
+#[doc(hidden)]
+pub fn legacy_request_fingerprint(
+    req: &SubmitRequest,
+    cfg: &crate::config::PipelineConfig,
+) -> String {
+    let merged = serde_json::to_value(cfg).unwrap_or(serde_json::Value::Null);
+    idempotency::request_fingerprint(
+        &idempotency::fingerprint(&merged, cfg.name.as_deref()),
+        req.clock.as_deref(),
+        req.timeout_secs,
+        req.concurrency,
+        &req.labels,
+    )
 }
 
 /// Parse the optional request `clock` (RFC3339), defaulting to `submitted_at`.

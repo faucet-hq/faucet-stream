@@ -477,6 +477,9 @@ Request body:
   the tenant a run is for, so two tenants sending the same key start two runs.
   The prefixes `tenant:`, `trig:`, `backfill:` and `change:` are reserved for
   the keys the server derives itself; a caller's key starting with one is a `400`.
+  The request is identified by the config as submitted (before references
+  resolve, merged with `--default-config`); a key claimed by the previous
+  release, which identified it by the resolved config, still replays.
 - **`clock`** — overrides the `${now.*}` clock for backfills (default: submit time).
 - **`concurrency`** — overrides this run's **connector** concurrency: how many
   concurrent connections/fetches the source and sink may use, whatever the
