@@ -122,25 +122,40 @@ impl SingerSourceConfig {
     /// The effective state-store key: the configured `state_key`, or the
     /// derived default `singer:{executable}:{stream}`.
     ///
-    /// The derived key is sanitized so a path-style `executable` (e.g.
-    /// `/opt/taps/tap-csv`) still yields a valid state key — `validate_state_key`
-    /// only permits `[A-Za-z0-9_\-:.]`, so any other character (notably `/`) is
-    /// replaced with `_`. The stream name is sanitized the same way (keeping
-    /// `:`), so `Sheet 1` or `public/orders` derive a usable key while every
-    /// already-valid name keeps its key.
+    /// The executable is sanitized so a path-style one (e.g.
+    /// `/opt/taps/tap-csv`) still yields a valid key: every character outside
+    /// `[A-Za-z0-9_.-]` becomes `_`. The stream name is kept as is whenever the
+    /// key is valid with it (`validate_state_key` allows `[A-Za-z0-9_.:/-]`
+    /// with no empty or dot-led `/` segments), so `public/orders` keeps its
+    /// key. Otherwise it is sanitized the same way (keeping `:`) and a short
+    /// hash of the raw name is appended, so `Sheet 1` and `Sheet_1` never
+    /// share a key.
     pub fn effective_state_key(&self) -> String {
-        self.state_key.clone().unwrap_or_else(|| {
-            format!(
-                "singer:{}:{}",
-                sanitize(&self.executable),
-                self.stream
-                    .chars()
-                    .map(|c| if c == ':' { c } else { sanitize_char(c) })
-                    .collect::<String>()
-            )
-        })
+        if let Some(key) = &self.state_key {
+            return key.clone();
+        }
+        let prefix = format!("singer:{}:", sanitize(&self.executable));
+        let raw = format!("{prefix}{}", self.stream);
+        if faucet_core::state::validate_state_key(&raw).is_ok() {
+            return raw;
+        }
+        let suffix = format!(
+            "-{:08x}",
+            faucet_core::shard::shard_hash(&self.stream) >> 32
+        );
+        let room = MAX_STATE_KEY_LEN.saturating_sub(prefix.len() + suffix.len());
+        let stream: String = self
+            .stream
+            .chars()
+            .map(|c| if c == ':' { c } else { sanitize_char(c) })
+            .take(room)
+            .collect();
+        format!("{prefix}{stream}{suffix}")
     }
 }
+
+/// The longest key `validate_state_key` accepts.
+const MAX_STATE_KEY_LEN: usize = 256;
 
 /// Replace characters not allowed in a state key with `_`.
 fn sanitize(s: &str) -> String {
@@ -194,15 +209,27 @@ mod tests {
 
     #[test]
     fn derived_state_key_is_valid_for_any_stream_name() {
-        for (stream, key) in [
-            ("Sheet 1", "singer:tap-x:Sheet_1"),
-            ("public/orders", "singer:tap-x:public_orders"),
+        let key = |stream: &str| SingerSourceConfig::new("tap-x", stream).effective_state_key();
+        for (stream, expected) in [
+            ("public/orders", "singer:tap-x:public/orders"),
+            ("Sheet_1", "singer:tap-x:Sheet_1"),
             ("a:b.c-d_e", "singer:tap-x:a:b.c-d_e"),
         ] {
-            let got = SingerSourceConfig::new("tap-x", stream).effective_state_key();
-            assert_eq!(got, key);
-            faucet_core::state::validate_state_key(&got).expect("derived key must be valid");
+            assert_eq!(key(stream), expected, "a valid name keeps its key");
         }
+        let spaced = key("Sheet 1");
+        assert!(spaced.starts_with("singer:tap-x:Sheet_1-"), "{spaced}");
+        assert_ne!(spaced, key("Sheet_1"));
+        assert_ne!(spaced, key("Sheet/1 "));
+        assert_ne!(key("a//b"), key("a__b"));
+        let long = key(&format!("{} x", "s".repeat(400)));
+        assert!(long.len() <= 256, "{}", long.len());
+        for stream in ["Sheet 1", "a//b", "/lead", ".hidden", "ünï", "", "x y"] {
+            let got = key(stream);
+            faucet_core::state::validate_state_key(&got)
+                .unwrap_or_else(|e| panic!("{stream:?} -> {got}: {e}"));
+        }
+        faucet_core::state::validate_state_key(&long).expect("long name");
     }
 
     #[test]
