@@ -2568,7 +2568,8 @@ pub struct RunArgs {
     pub output: RunOutput,
 
     /// Supply a value for a `params:` entry declared by the config (#444):
-    /// `--param tenant_id=acme`. Repeatable. Values are coerced to the declared
+    /// `--param tenant_id=acme`, or bare `--param api_token` to read it from
+    /// `$API_TOKEN` (the name upper-cased). Repeatable. Values are coerced to the declared
     /// type, so `--param page=50` satisfies a `type: int` param. A param with a
     /// `default` needs no flag; a `required` one errors when unsupplied.
     #[arg(long = "param", value_name = "NAME=VALUE")]
@@ -2838,7 +2839,8 @@ pub struct ValidateArgs {
     pub show_composed: bool,
 
     /// Supply a value for a declared `params:` entry (#444), e.g.
-    /// `--param tenant_id=acme`. Repeatable. Without any `--param`, a `required`
+    /// `--param tenant_id=acme`, or bare `--param api_token` to read it from
+    /// `$API_TOKEN` (the name upper-cased). Repeatable. Without any `--param`, a `required`
     /// param is validated against a type-shaped placeholder — so a
     /// parameterized config validates in CI without inventing real values.
     /// Passing at least one `--param` switches to strict binding, checking that
