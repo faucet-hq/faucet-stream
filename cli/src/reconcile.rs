@@ -122,14 +122,16 @@ pub fn extract_count(records: &[Value], field: Option<&str>) -> Result<u64, Stri
 }
 
 /// A count read from a numeric value or numeric string: `None` when the value
-/// is not numeric, `Err` when it is but is negative or fractional.
+/// is not numeric, `Err` when it is but is negative or has a non-zero
+/// fractional part. A whole value written as a float (`1500.0`, `"3.000"`,
+/// `1e3`) is a count.
 fn as_count(v: &Value) -> Option<Result<u64, &'static str>> {
     let (whole, number) = match v {
         Value::Number(n) => (n.as_u64(), n.as_f64()),
         Value::String(s) => {
             let s = s.trim();
             (
-                s.parse::<u64>().ok(),
+                s.parse::<u64>().ok().or_else(|| zero_fraction(s)),
                 s.parse::<f64>().ok().filter(|f| f.is_finite()),
             )
         }
@@ -138,9 +140,22 @@ fn as_count(v: &Value) -> Option<Result<u64, &'static str>> {
     match (whole, number) {
         (Some(n), _) => Some(Ok(n)),
         (None, Some(f)) if f < 0.0 => Some(Err("is negative")),
+        // 2^64: every whole f64 below it converts to u64 exactly.
+        (None, Some(f)) if f.fract() == 0.0 && f < 18_446_744_073_709_551_616.0 => {
+            Some(Ok(f as u64))
+        }
         (None, Some(_)) => Some(Err("is not a whole number")),
         (None, None) => None,
     }
+}
+
+/// `"123.000"` → `123`, read exactly from the text (no float round trip).
+fn zero_fraction(s: &str) -> Option<u64> {
+    let (int, frac) = s.split_once('.')?;
+    if !frac.bytes().all(|b| b == b'0') {
+        return None;
+    }
+    int.parse::<u64>().ok()
 }
 
 fn json_type(v: &Value) -> &'static str {
@@ -245,6 +260,35 @@ mod tests {
         }
         assert_eq!(extract_count(&[json!(7)], None).unwrap(), 7);
         assert!(extract_count(&[json!(true)], None).is_err());
+    }
+
+    #[test]
+    fn a_whole_count_written_as_a_float_is_accepted() {
+        for (v, n) in [
+            (json!(1500.0), 1500),
+            (json!(1e3), 1000),
+            (json!("3.000"), 3),
+            (json!("3."), 3),
+            (json!(" 12.0 "), 12),
+            (json!("18446744073709551615.0"), u64::MAX),
+        ] {
+            assert_eq!(
+                extract_count(&[json!({ "n": v })], Some("n")).unwrap(),
+                n,
+                "{v}"
+            );
+            assert_eq!(
+                extract_count(std::slice::from_ref(&v), None).unwrap(),
+                n,
+                "{v}"
+            );
+        }
+        for v in [json!(1e30), json!("-3.0"), json!("3.10")] {
+            assert!(
+                extract_count(&[json!({ "n": v })], Some("n")).is_err(),
+                "{v}"
+            );
+        }
     }
 
     #[test]
