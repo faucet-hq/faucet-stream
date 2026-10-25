@@ -373,6 +373,12 @@ fn visit_config_values_mut<F: FnMut(&mut Value, bool) -> CliResult<()>>(
     // (like `pipeline.source.config`); secrets placed there must resolve too.
     if let Some(r) = cfg.replication.as_mut() {
         f(&mut r.snapshot.source.config, true)?;
+        // Transform configs are unescaped when compiled, so a resolved value
+        // here is escaped like `pipeline.transforms` (the `mirror` walk below
+        // then finds no directive left in them).
+        for t in r.snapshot.source.transforms.iter_mut().flatten() {
+            f(&mut t.config, true)?;
+        }
     }
     for spec in cfg.pipeline.sources.values_mut() {
         f(&mut spec.config, true)?;
@@ -773,6 +779,51 @@ pipeline:
         let built =
             crate::interpolate::unescaped(cfg.pipeline.source.as_ref().unwrap().config.clone());
         assert_eq!(built["token"], stored);
+    }
+
+    #[tokio::test]
+    async fn a_secret_in_a_mirror_snapshot_transform_comes_out_as_stored() {
+        let stored = "ab$${cd ${aws-sm:x}";
+        let mut set = ResolverSet::default();
+        set.insert(Arc::new(FakeResolver {
+            scheme: "vault",
+            value: stored.into(),
+        }));
+        let cfg_yaml = r#"
+version: 1
+name: m
+pipeline:
+  source: { type: postgres-cdc, config: { connection_url: "postgres://h/db", slot_name: s, publication: p } }
+  sink: { type: jsonl, config: { path: ./o.jsonl } }
+  transforms:
+    - { type: set, config: { values: { salt: "${vault:kv/app#salt}" } } }
+mirror:
+  mode: snapshot_then_cdc
+  snapshot:
+    source:
+      type: postgres
+      config: { connection_url: "postgres://h/db", query: "SELECT 1" }
+      transforms:
+        - { type: set, config: { values: { salt: "${vault:kv/app#salt}" } } }
+"#;
+        let mut cfg = PipelineConfig::from_text(cfg_yaml, std::path::Path::new("m.yaml")).unwrap();
+        resolve_secrets_with(&mut cfg, &set).await.unwrap();
+        let snapshot = cfg
+            .replication
+            .as_ref()
+            .unwrap()
+            .snapshot
+            .source
+            .transforms
+            .as_ref()
+            .unwrap();
+        let built = crate::interpolate::unescaped(snapshot[0].config.clone());
+        assert_eq!(built["values"]["salt"], stored);
+        let cdc = crate::interpolate::unescaped(cfg.pipeline.transforms[0].config.clone());
+        assert_eq!(
+            cdc["values"]["salt"], stored,
+            "both halves of the mirror agree"
+        );
     }
 
     #[test]
