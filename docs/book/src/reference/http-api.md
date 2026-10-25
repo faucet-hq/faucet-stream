@@ -50,6 +50,11 @@ or file that does not resolve refuses the start, and a token that still holds
 and files an auth config reads are then out of reach of every config the
 server loads (see [Server credentials](#server-credentials)).
 
+Principal names must be unique and non-empty. The names the server gives its
+own actors — `runtime`, and any name starting with `system:`, `trigger:` or
+`sync:` — are reserved and refuse the start, so audit records and change
+requests attributed to them can never be confused with a configured principal.
+
 The same file may carry an `approvals:` block — who may approve which
 [change requests](../cookbook/approvals.md), how many approvals each kind
 needs, whether a requester may approve their own, and how long a request

@@ -287,6 +287,17 @@ pub struct AuthContext {
     pub tenant: Option<String>,
 }
 
+/// Whether `name` is one the server gives its own actors (`system:<task>`,
+/// `trigger:<name>`, `sync:<origin>`, `runtime`). No `--auth-config`
+/// principal may take such a name, so a requester that holds one was never a
+/// configured principal.
+pub fn is_server_identity(name: &str) -> bool {
+    name == "runtime"
+        || ["system:", "trigger:", "sync:"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+}
+
 impl AuthContext {
     /// The tenant a listing is filtered to (#709): a tenant-scoped principal
     /// always sees its own tenant — naming another is a 404, so existence
@@ -472,6 +483,13 @@ impl RbacConfig {
                 })?;
             }
             if !seen_names.insert(p.name.clone()) {
+            if is_server_identity(&p.name) {
+                return Err(CliError::Serve(format!(
+                    "--auth-config: principal name '{}' is reserved for the server's own actors \
+                     (`runtime` and names starting with `system:`, `trigger:` or `sync:`)",
+                    p.name
+                )));
+            }
                 return Err(CliError::Serve(format!(
                     "--auth-config: duplicate principal name '{}'",
                     p.name
@@ -1020,6 +1038,17 @@ mod tests {
                 spec("a", "t1", Role::Admin),
                 spec("a", "t2", Role::Viewer),
             ])
+        for reserved in ["runtime", "system:x", "trigger:t", "sync:origin"] {
+            let err = RbacConfig::new(vec![spec(reserved, "t", Role::Operator)])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("reserved"), "{reserved}: {err}");
+        }
+        RbacConfig::new(vec![spec("ci:deploy", "t", Role::Operator)])
+            .expect("other names with a colon stay valid");
+        assert!(is_server_identity("system:tenants"));
+        assert!(!is_server_identity("ci:deploy"));
+        assert!(!is_server_identity("runtime-ops"));
             .is_err()
         );
         // Duplicate token.

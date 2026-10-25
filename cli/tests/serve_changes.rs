@@ -981,3 +981,23 @@ async fn gated_deletes_and_retirements_run_through_change_requests() {
     let (code, _) = api.get("viewer-tok", "/v1/templates/tpl-d?version=1").await;
     assert_eq!(code, 404);
 }
+
+/// A configured principal may not take a server actor's name, so a removed
+/// principal can never pass as one when its approved change executes.
+#[test]
+fn an_auth_config_principal_may_not_take_a_server_actor_name() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["trigger:nightly", "system:expiry", "sync:origin", "runtime"] {
+        let auth_path = dir.path().join("auth.yaml");
+        std::fs::write(
+            &auth_path,
+            format!("principals:\n  - {{ name: \"{name}\", token: t1, role: operator }}\n"),
+        )
+        .unwrap();
+        let err = faucet_cli::serve::ServeConfig::from_args(serve_args(0, auth_path, Vec::new()))
+            .err()
+            .unwrap_or_else(|| panic!("{name} accepted"))
+            .to_string();
+        assert!(err.contains("reserved"), "{name}: {err}");
+    }
+}

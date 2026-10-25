@@ -1450,7 +1450,7 @@ fn requester_still_authorized(
     };
     let name = change.requester.as_str();
     let Some((role, tenant)) = rbac.principal(name) else {
-        if name == "runtime" || name.contains(':') {
+        if crate::serve::rbac::is_server_identity(name) {
             return Ok(());
         }
         return Err(format!(
@@ -1862,14 +1862,6 @@ mod tests {
             requester_still_authorized(&mode(vec![spec("bob", Role::Operator, Some("acme"))]), &c)
                 .unwrap_err();
         assert!(scoped.contains("tenant"), "{scoped}");
-        let mut sys = c.clone();
-        sys.requester = "sync:origin".into();
-        assert!(
-            requester_still_authorized(&mode(vec![spec("amy", Role::Admin, None)]), &sys).is_ok()
-        );
-    }
-
-    #[test]
 
         // An unscoped principal that proposed through a tenant route.
         let mut routed = c.clone();
@@ -1900,6 +1892,21 @@ mod tests {
             1,
         );
         let who = |role| AuthContext {
+        let mut sys = c.clone();
+        sys.requester = "sync:origin".into();
+        assert!(
+            requester_still_authorized(&mode(vec![spec("amy", Role::Admin, None)]), &sys).is_ok()
+        );
+        // A removed principal whose name merely contains a colon is not a
+        // server actor.
+        let mut colon = c.clone();
+        colon.requester = "ci:deploy".into();
+        let gone = requester_still_authorized(&mode(vec![spec("amy", Role::Admin, None)]), &colon)
+            .unwrap_err();
+        assert!(gone.contains("no longer a principal"), "{gone}");
+    }
+
+    #[test]
             principal: "p".into(),
             role,
             source_ip: None,
