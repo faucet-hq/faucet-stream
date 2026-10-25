@@ -549,12 +549,14 @@ fn redact_secret_kv_values(s: &str) -> String {
 ///
 /// Matches case-insensitively after stripping `-`/`_`/space, so `api_key`,
 /// `api-key`, and `apikey` all match one entry: an exact name (`password`,
-/// `sig`, `sas`, `auth`, `code`, `jwt`, …) or a credential suffix
+/// `sig`, `sas`, `auth`, `auth_code`, `jwt`, …) or a credential suffix
 /// (`…token`, `…secret`, `…password`, `…signature`, `…credential`, `…apikey`,
 /// …), which covers `api_token`, `auth_token`, `X-Amz-Security-Token`,
 /// `X-Amz-Signature` and `X-Goog-Signature`. Over-redacting a harmless
-/// parameter costs little; missing a credential leaks it. A bare `key` is
-/// left alone: it names the dataset in some URIs (`redis://…?key=list`).
+/// parameter costs little; missing a credential leaks it. A bare `key` and a
+/// bare `code` are left alone, and so are pagination cursors (`pageToken`,
+/// `nextToken`, …): the URI is also a catalog / lineage dataset identity, and
+/// such parameters name the dataset (`redis://…?key=list`, `…/rates?code=USD`).
 fn is_secret_kv_key(key: &str) -> bool {
     let norm: String = key
         .trim()
@@ -570,7 +572,9 @@ fn is_secret_kv_key(key: &str) -> bool {
         "sas",
         "auth",
         "authorization",
-        "code",
+        "authcode",
+        "authorizationcode",
+        "oauthcode",
         "jwt",
         "accesskeyid",
     ];
@@ -590,6 +594,22 @@ fn is_secret_kv_key(key: &str) -> bool {
         "sharedaccesskey",
         "signingkey",
     ];
+    // Pagination and sync cursors end in `token` but name a position, not a
+    // credential, and a dataset URI may carry one.
+    const CURSORS: &[&str] = &[
+        "pagetoken",
+        "nextpagetoken",
+        "nexttoken",
+        "pagingtoken",
+        "continuationtoken",
+        "cursortoken",
+        "synctoken",
+        "resumetoken",
+        "starttoken",
+    ];
+    if CURSORS.contains(&norm.as_str()) {
+        return false;
+    }
     EXACT.contains(&norm.as_str()) || SUFFIXES.iter().any(|s| norm.ends_with(s))
 }
 
@@ -1503,7 +1523,8 @@ mod tests {
             "passwd",
             "pass",
             "signature",
-            "code",
+            "auth_code",
+            "authorization_code",
             "jwt",
             "client_password",
         ] {
@@ -1514,7 +1535,17 @@ mod tests {
                 "{key}"
             );
         }
-        for key in ["region", "limit", "page", "key", "monkey_business"] {
+        for key in [
+            "region",
+            "limit",
+            "page",
+            "key",
+            "monkey_business",
+            "code",
+            "pageToken",
+            "next_token",
+            "continuationToken",
+        ] {
             let uri = format!("https://h/p?{key}=v");
             assert_eq!(redact_uri_credentials(&uri), uri, "{key}");
         }
