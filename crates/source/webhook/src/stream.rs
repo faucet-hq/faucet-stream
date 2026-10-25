@@ -388,7 +388,11 @@ async fn webhook_handler(
     // — is refused with a retryable status rather than a `200` the sender
     // would read as delivered (API-14).
     let decision = decide_payload(inbox.records.len(), state.max_payloads);
+    // An empty inbox always takes the payload, as the count cap does: a body
+    // larger than the byte cap (allowed by `max_body_bytes`) would otherwise
+    // be refused in every window and retried forever.
     let over_bytes = state.max_buffered_bytes > 0
+        && !inbox.records.is_empty()
         && inbox.bytes.saturating_add(body.len()) > state.max_buffered_bytes;
     if decision.done || over_bytes {
         state.done.notify_one();
@@ -402,6 +406,10 @@ async fn webhook_handler(
     }
     inbox.bytes += body.len();
     inbox.records.push(value);
+    if state.max_buffered_bytes > 0 && inbox.bytes >= state.max_buffered_bytes {
+        // The window is full: emit it rather than wait for a refused POST.
+        state.done.notify_one();
+    }
     if let Some((key, ts, _)) = replay_key {
         inbox.seen.insert(key, ts);
     }

@@ -196,6 +196,33 @@ async fn buffered_bytes_are_bounded_per_window() {
     );
 }
 
+/// A body larger than `max_buffered_bytes` (but within `max_body_bytes`) is
+/// still taken into an empty window, which it fills and closes, rather than
+/// being refused in every window.
+#[tokio::test]
+async fn a_body_over_the_byte_cap_is_taken_into_an_empty_window() {
+    let addr = free_addr();
+    let source = WebhookSource::new(
+        WebhookSourceConfig::new()
+            .listen_addr(addr.clone())
+            .max_buffered_bytes(8)
+            .timeout_secs(30),
+    );
+    let started = std::time::Instant::now();
+    let run = tokio::spawn(async move { source.fetch_all().await });
+    let url = format!("http://{addr}/webhook");
+    let client = reqwest::Client::new();
+    let body = r#"{"n":1,"pad":"xxxxxxxx"}"#;
+    let first = post_until_up(&client, &url, || client.post(&url).body(body)).await;
+    assert_eq!(first.status(), 200);
+    let records = run.await.unwrap().unwrap();
+    assert_eq!(records, vec![json!({"n": 1, "pad": "xxxxxxxx"})]);
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "a full window closes without waiting for the timeout"
+    );
+}
+
 /// API-49: an invalid path is a config error, not a router panic, and a
 /// substituted parent value is percent-encoded into one segment.
 #[tokio::test]

@@ -19679,7 +19679,7 @@
                       "default": 1048576
                     },
                     "max_buffered_bytes": {
-                      "description": "Most request-body bytes held in memory for one window (default:\n256 MiB). Once a POST would cross it the window closes, the payloads\nalready stored are emitted, and that POST and later ones are refused\nwith `503 Service Unavailable` + `Retry-After`. `0` removes the bound.",
+                      "description": "Most request-body bytes held in memory for one window (default:\n256 MiB). Once a POST would cross it the window closes, the payloads\nalready stored are emitted, and that POST and later ones are refused\nwith `503 Service Unavailable` + `Retry-After`. An empty window always\ntakes one POST, however large (`max_body_bytes` bounds it), and closes\nonce it reaches the bound. `0` removes the bound.",
                       "type": [
                         "integer",
                         "string"

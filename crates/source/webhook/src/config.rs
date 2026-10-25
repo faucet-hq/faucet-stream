@@ -32,7 +32,9 @@ pub struct WebhookSourceConfig {
     /// Most request-body bytes held in memory for one window (default:
     /// 256 MiB). Once a POST would cross it the window closes, the payloads
     /// already stored are emitted, and that POST and later ones are refused
-    /// with `503 Service Unavailable` + `Retry-After`. `0` removes the bound.
+    /// with `503 Service Unavailable` + `Retry-After`. An empty window always
+    /// takes one POST, however large (`max_body_bytes` bounds it), and closes
+    /// once it reaches the bound. `0` removes the bound.
     pub max_buffered_bytes: usize,
     /// Optional shared secret. When set, every request must carry it in the
     /// `Authorization` header (either the raw token or `Bearer <token>`);
