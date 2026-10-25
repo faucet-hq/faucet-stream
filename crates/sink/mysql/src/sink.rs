@@ -2609,8 +2609,8 @@ mod tests {
         assert_eq!(
             sql,
             "DELETE FROM `assoc` WHERE `assoc`.`contact_id` = ? \
-             AND NOT EXISTS (SELECT 1 FROM `faucet_cleanup_keys` c \
-             WHERE c.`id` = `assoc`.`id`)"
+             AND NOT EXISTS (SELECT 1 FROM `faucet_cleanup_keys` _faucet_seen \
+             WHERE _faucet_seen.`id` = `assoc`.`id`)"
         );
     }
 
@@ -2624,8 +2624,8 @@ mod tests {
         assert_eq!(
             sql,
             "DELETE FROM `t` WHERE `t`.`tenant` = ? AND `t`.`contact_id` = ? \
-             AND NOT EXISTS (SELECT 1 FROM `faucet_cleanup_keys` c \
-             WHERE c.`a` = `t`.`a` AND c.`b` = `t`.`b`)"
+             AND NOT EXISTS (SELECT 1 FROM `faucet_cleanup_keys` _faucet_seen \
+             WHERE _faucet_seen.`a` = `t`.`a` AND _faucet_seen.`b` = `t`.`b`)"
         );
     }
 

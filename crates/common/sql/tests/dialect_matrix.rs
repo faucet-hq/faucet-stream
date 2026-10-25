@@ -1217,3 +1217,40 @@ fn integer_to_fraction_widening_keeps_19_fractional_digits<D: SqlDialect>(d: D) 
 fn matrix_integer_to_fraction_widening() {
     every_dialect!(integer_to_fraction_widening_keeps_19_fractional_digits);
 }
+
+/// The written-key table's alias in a cleanup delete must not shadow a target
+/// table named like it, or the join compares the keys table with itself and
+/// the delete removes nothing.
+fn cleanup_delete_alias_never_shadows_the_target<D: SqlDialect>(d: D) {
+    for name in ["c", "t", "_faucet_seen"] {
+        let target = target(&d, name);
+        let sql = d
+            .cleanup_delete_sql(
+                &target,
+                &["tenant".to_string()],
+                &[None],
+                &["id".to_string()],
+            )
+            .unwrap();
+        let keys = d.cleanup_keys_table();
+        let after = sql
+            .split(&format!("FROM {keys} "))
+            .nth(1)
+            .unwrap_or_else(|| panic!("{}: {sql}", d.name()));
+        let alias = after.split_whitespace().next().unwrap();
+        let outer_named = sql.starts_with(&format!("DELETE FROM {} WHERE", target.reference));
+        if outer_named {
+            assert_ne!(
+                alias.trim_matches(['`', '"', '[', ']']),
+                name,
+                "{}: the keys alias shadows the target: {sql}",
+                d.name()
+            );
+        }
+    }
+}
+
+#[test]
+fn matrix_cleanup_alias() {
+    every_cleanup_dialect!(cleanup_delete_alias_never_shadows_the_target);
+}

@@ -1,6 +1,6 @@
 //! SQLite.
 
-use crate::dialect::{SqlDialect, TableTarget};
+use crate::dialect::{SqlDialect, TableTarget, seen_alias};
 use crate::mapping::ColumnMatching;
 use faucet_core::rollback::JournalSql;
 use faucet_core::{FaucetError, SqlBaseType};
@@ -144,6 +144,7 @@ impl SqlDialect for Sqlite {
         key: &[String],
     ) -> Result<String, FaucetError> {
         let t = &target.reference;
+        let seen = seen_alias(target);
         let scope_pred = scope
             .iter()
             .map(|c| format!("{t}.{} = ?", quote_ident(c)))
@@ -153,12 +154,12 @@ impl SqlDialect for Sqlite {
             .iter()
             .map(|k| {
                 let q = quote_ident(k);
-                format!("{t}.{q} = c.{q}")
+                format!("{t}.{q} = {seen}.{q}")
             })
             .collect::<Vec<_>>()
             .join(" AND ");
         Ok(format!(
-            "DELETE FROM {t} WHERE {}NOT EXISTS (SELECT 1 FROM {} c WHERE {join_pred})",
+            "DELETE FROM {t} WHERE {}NOT EXISTS (SELECT 1 FROM {} {seen} WHERE {join_pred})",
             crate::dialect::scope_and(&scope_pred),
             self.cleanup_keys_table()
         ))

@@ -32,6 +32,22 @@ impl TableTarget {
     }
 }
 
+/// The alias of the written-key table in a cleanup delete. The target is
+/// referenced by its own name there, so a short alias such as `c` would shadow
+/// a target table of that name and turn the join into a self-comparison.
+pub const SEEN: &str = "_faucet_seen";
+
+/// The written-key alias for `target`: [`SEEN`], or a second spelling when
+/// the target table itself carries that name.
+pub fn seen_alias(target: &TableTarget) -> &'static str {
+    let bare = target.name.rsplit('.').next().unwrap_or(&target.name);
+    if bare.eq_ignore_ascii_case(SEEN) {
+        "_faucet_seen_keys"
+    } else {
+        SEEN
+    }
+}
+
 /// `"<scope_pred> AND "`, or nothing for an empty scope (a complete-read
 /// cleanup over the whole destination).
 pub fn scope_and(scope_pred: &str) -> String {
@@ -336,6 +352,7 @@ pub trait SqlDialect: Send + Sync {
         key: &[String],
     ) -> Result<String, FaucetError> {
         let t = &target.reference;
+        let seen = seen_alias(target);
         let scope_pred = scope
             .iter()
             .enumerate()
@@ -352,12 +369,12 @@ pub trait SqlDialect: Send + Sync {
             .iter()
             .map(|k| {
                 let q = self.quote(k)?;
-                Ok(format!("c.{q} = {t}.{q}"))
+                Ok(format!("{seen}.{q} = {t}.{q}"))
             })
             .collect::<Result<Vec<_>, FaucetError>>()?
             .join(" AND ");
         Ok(format!(
-            "DELETE FROM {t} WHERE {}NOT EXISTS (SELECT 1 FROM {} c WHERE {join_pred})",
+            "DELETE FROM {t} WHERE {}NOT EXISTS (SELECT 1 FROM {} {seen} WHERE {join_pred})",
             scope_and(&scope_pred),
             self.cleanup_keys_table()
         ))
