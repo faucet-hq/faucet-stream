@@ -37,6 +37,7 @@ fn serve_args(
     history: Option<String>,
     providers: std::path::PathBuf,
     triggers: Option<std::path::PathBuf>,
+    require_approval: Vec<String>,
 ) -> faucet_cli::cli::ServeArgs {
     let auth_path = dir.join("auth.yaml");
     std::fs::write(&auth_path, AUTH_CONFIG).unwrap();
@@ -81,7 +82,7 @@ fn serve_args(
         callback_allow_host: Vec::new(),
         mcp: false,
         mcp_allow_mutations: false,
-        require_approval: Vec::new(),
+        require_approval,
         approval_expiry_secs: 86_400,
         vault_key: Some("test-vault-key-0123456789abcdef0123".into()),
         vault_previous_key: Vec::new(),
@@ -147,6 +148,16 @@ async fn spawn_with(
     idp: &str,
     triggers: Option<std::path::PathBuf>,
 ) -> Api {
+    spawn_full(dir, history, idp, triggers, Vec::new()).await
+}
+
+async fn spawn_full(
+    dir: &std::path::Path,
+    history: Option<String>,
+    idp: &str,
+    triggers: Option<std::path::PathBuf>,
+    require_approval: Vec<String>,
+) -> Api {
     let providers = dir.join("providers.yaml");
     std::fs::write(
         &providers,
@@ -157,7 +168,12 @@ async fn spawn_with(
     .unwrap();
     let port = free_port();
     let mut config = faucet_cli::serve::ServeConfig::from_args(serve_args(
-        port, dir, history, providers, triggers,
+        port,
+        dir,
+        history,
+        providers,
+        triggers,
+        require_approval,
     ))
     .unwrap();
     config.log_level = "warn".into();
@@ -1239,6 +1255,53 @@ async fn a_tenant_over_its_concurrency_limit_is_refused_with_429() {
         .post("admin-tok", &format!("/v1/runs/{run_id}/cancel"), json!({}))
         .await;
     assert!(code == 202 || code == 200, "cancel returned {code}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unscoped_principals_gated_tenant_route_run_executes_once_approved() {
+    let dir = tempfile::tempdir().unwrap();
+    let api_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rows"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{"id": 1}])))
+        .mount(&api_mock)
+        .await;
+    let api = spawn_full(
+        dir.path(),
+        None,
+        &api_mock.uri(),
+        None,
+        vec!["run".to_string()],
+    )
+    .await;
+    let (code, t) = api
+        .post("admin-tok", "/v1/tenants", json!({"id": "acme"}))
+        .await;
+    assert_eq!(code, 201, "{t}");
+    let out = dir.path().join("routed.jsonl");
+    let config = format!(
+        "version: 1\nname: routed-sync\npipeline:\n  source:\n    type: rest\n    config:\n      base_url: \"{}\"\n      path: /rows\n  sink:\n    type: jsonl\n    config:\n      path: \"{}\"\n",
+        api_mock.uri(),
+        out.display()
+    );
+    let (code, pending) = api
+        .post("op-tok", "/v1/tenants/acme/runs", json!({"config": config}))
+        .await;
+    assert_eq!(code, 202, "{pending}");
+    assert_eq!(pending["status"], "pending_approval", "{pending}");
+    let id = pending["change_id"].as_str().unwrap().to_string();
+    assert_eq!(pending["change"]["tenant"], "acme", "{pending}");
+
+    let (code, done) = api
+        .post("admin-tok", &format!("/v1/changes/{id}/approve"), json!({}))
+        .await;
+    assert_eq!(code, 200, "{done}");
+    assert_eq!(done["status"], "executed", "{done}");
+    let run_id = done["run_id"].as_str().expect("executed change has a run");
+    let rec = api.wait_run(run_id).await;
+    assert_eq!(rec["status"], "completed", "{rec}");
+    assert_eq!(rec["tenant"], "acme", "{rec}");
+    assert_eq!(lines(&out), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

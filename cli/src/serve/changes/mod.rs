@@ -1470,7 +1470,14 @@ fn requester_still_authorized(
             change.requester_role
         ));
     }
-    if tenant != change.tenant.as_deref() {
+    // `change.tenant` is the tenant the change runs under: the requester's own
+    // scope or the tenant route an unscoped principal proposed it through. An
+    // unscoped principal may act for any tenant, so only a principal that is
+    // now scoped to a different tenant (or scoped at all, for an untenanted
+    // change) has lost the right to run it.
+    if let Some(scope) = tenant
+        && Some(scope) != change.tenant.as_deref()
+    {
         return Err(format!(
             "requester '{name}' is no longer scoped to the tenant this change was \
              requested for, so the approved change cannot run on its behalf"
@@ -1863,6 +1870,28 @@ mod tests {
     }
 
     #[test]
+
+        // An unscoped principal that proposed through a tenant route.
+        let mut routed = c.clone();
+        routed.tenant = Some("acme".into());
+        assert!(
+            requester_still_authorized(&mode(vec![spec("bob", Role::Operator, None)]), &routed)
+                .is_ok()
+        );
+        assert!(
+            requester_still_authorized(
+                &mode(vec![spec("bob", Role::Operator, Some("acme"))]),
+                &routed
+            )
+            .is_ok()
+        );
+        let moved = requester_still_authorized(
+            &mode(vec![spec("bob", Role::Operator, Some("globex"))]),
+            &routed,
+        )
+        .unwrap_err();
+        assert!(moved.contains("tenant"), "{moved}");
+
     fn responses_mask_what_the_reader_may_not_see() {
         let mut c = stored(
             ChangeKind::Run,
