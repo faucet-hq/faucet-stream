@@ -310,8 +310,12 @@ cloud-metadata address, and a host *name* is judged by the addresses it
 resolves to when the connection is made: the client's resolver drops
 link-local / metadata addresses (so `169.254.169.254.nip.io`, or a name
 re-pointed after the submit-time check, is never connected to) unless the
-policy lists that name exactly. Behind an HTTP proxy the proxy resolves the
-target, so this check cannot apply there. A GCS `storage_host` that is not a
+policy lists that name exactly. Behind an HTTP proxy (set in the
+environment, the system settings or the connector) the proxy resolves the
+target, so a caller-submitted run resolves the name itself first and refuses
+it when any address is link-local / metadata; a name the server cannot
+resolve is left to the proxy, and an answer that changes between that check
+and the proxy's own lookup is not covered. A GCS `storage_host` that is not a
 `googleapis.com` endpoint never receives the server's own credentials
 (`application_default` or a key file); a Snowflake `account` must be an
 account identifier, so its request URL always names a Snowflake host.
