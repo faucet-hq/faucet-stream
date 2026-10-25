@@ -1434,3 +1434,35 @@ fn rusqlite_free_read(db: &std::path::Path, needle_tenant: &str) -> String {
     );
     text
 }
+
+/// A tenant run builds the config's own `auth:` providers from the same
+/// unescaped value `faucet run` does: `$${x}` is sent as `${x}`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tenant_run_sends_an_escaped_auth_value_unescaped() {
+    let dir = tempfile::tempdir().unwrap();
+    let api_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/items"))
+        .and(header("authorization", "Bearer abc${x}"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{"id": 1}])))
+        .mount(&api_server)
+        .await;
+    let api = spawn(dir.path(), None, &api_server.uri()).await;
+    let (code, t) = api
+        .post("admin-tok", "/v1/tenants", json!({"id": "esc"}))
+        .await;
+    assert_eq!(code, 201, "{t}");
+    let out = dir.path().join("esc.jsonl");
+    let config = format!(
+        "version: 1\nname: esc-sync\nauth:\n  idp: {{ type: static, config: {{ token: \"abc$${{x}}\" }} }}\npipeline:\n  source:\n    type: rest\n    config:\n      base_url: \"{}\"\n      path: /items\n      auth: {{ ref: idp }}\n  sink:\n    type: jsonl\n    config:\n      path: \"{}\"\n",
+        api_server.uri(),
+        out.display()
+    );
+    let (code, run) = api
+        .post("op-tok", "/v1/tenants/esc/runs", json!({"config": config}))
+        .await;
+    assert_eq!(code, 202, "{run}");
+    let rec = api.wait_run(run["run_id"].as_str().unwrap()).await;
+    assert_eq!(rec["status"], "completed", "{rec}");
+    assert_eq!(lines(&out), 1);
+}

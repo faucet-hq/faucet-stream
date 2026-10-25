@@ -25,16 +25,22 @@ pub fn build_auth_catalog(specs: Option<&HashMap<String, Value>>) -> CliResult<A
         return Ok(catalog);
     };
     for (name, spec) in specs {
-        let spec = &crate::interpolate::unescaped(spec.clone());
-        register_key_material(spec);
-        let provider =
-            faucet_auth::build_provider(spec).map_err(|e| CliError::AuthProviderBuild {
-                name: name.clone(),
-                message: e.to_string(),
-            })?;
+        let provider = build_provider(spec).map_err(|e| CliError::AuthProviderBuild {
+            name: name.clone(),
+            message: e.to_string(),
+        })?;
         catalog.insert(name.clone(), provider);
     }
     Ok(catalog)
+}
+
+/// Build one provider from a config-authored `auth:` spec. The load leaves
+/// `$${` escapes in `auth:` specs, so every caller that builds one goes through
+/// here to see the same value.
+pub fn build_provider(spec: &Value) -> Result<SharedAuthProvider, faucet_core::FaucetError> {
+    let spec = crate::interpolate::unescaped(spec.clone());
+    register_key_material(&spec);
+    faucet_auth::build_provider(&spec)
 }
 
 /// Register a `google_service_account` key's private key (and the raw key
@@ -105,7 +111,8 @@ pub async fn legacy_persist_status(
     names.sort();
     let mut out = Vec::with_capacity(names.len());
     for name in names {
-        if let Ok(key) = faucet_auth::legacy_persisted_refresh_key(&specs[name]).await {
+        let spec = crate::interpolate::unescaped(specs[name].clone());
+        if let Ok(key) = faucet_auth::legacy_persisted_refresh_key(&spec).await {
             out.push((name.clone(), key));
         }
     }
@@ -149,6 +156,13 @@ pub fn resolve(catalog: &AuthCatalog, name: &str) -> CliResult<SharedAuthProvide
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_provider_is_built_from_the_unescaped_spec() {
+        let spec = serde_json::json!({"type": "static", "config": {"token": "abc$${x}"}});
+        let cred = build_provider(&spec).unwrap().credential().await.unwrap();
+        assert_eq!(cred, faucet_core::Credential::Bearer("abc${x}".into()));
+    }
 
     #[tokio::test]
     async fn legacy_persist_status_covers_only_persisting_refresh_providers() {

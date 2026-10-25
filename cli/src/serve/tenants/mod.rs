@@ -253,7 +253,7 @@ fn catalog_builder(state: ServerState, tenant: String, names: BTreeSet<String>) 
             let provider = if names.contains(name) {
                 connection_provider(&state, &tenant, name, spec)
             } else {
-                faucet_auth::build_provider(spec)
+                crate::auth_catalog::build_provider(spec)
             }
             .map_err(|e| crate::error::CliError::AuthProviderBuild {
                 name: name.clone(),
@@ -1176,6 +1176,24 @@ mod tests {
             updated_at: now,
             updated_by: "t".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_tenant_run_unescapes_config_authored_auth_like_faucet_run() {
+        let build = catalog_builder(
+            crate::serve::test_support::test_state(),
+            "acme".into(),
+            BTreeSet::new(),
+        );
+        let specs = std::collections::HashMap::from([(
+            "idp".to_string(),
+            serde_json::json!({"type": "static", "config": {"token": "abc$${x}"}}),
+        )]);
+        let catalog = build(Some(&specs)).unwrap();
+        let cred = catalog["idp"].credential().await.unwrap();
+        assert_eq!(cred, faucet_core::Credential::Bearer("abc${x}".into()));
+        let cli = crate::auth_catalog::build_auth_catalog(Some(&specs)).unwrap();
+        assert_eq!(cli["idp"].credential().await.unwrap(), cred);
     }
 
     fn state_with_vault() -> (ServerState, Arc<Vault>) {
