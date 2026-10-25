@@ -539,6 +539,22 @@ async fn a_selection_runs_the_subset_from_every_http_path() {
         .await;
     assert_eq!(code, 422, "{v}");
     assert!(v.to_string().contains("names no stream"), "{v}");
+    // A request-supplied overlay may not reference a value bound after it is
+    // checked: a whole-scalar param token in a notification URL is refused.
+    let (code, v) = api
+        .post(
+            "/v1/templates/crm/runs",
+            json!({ "sink": "files",
+                    "params": { "api_root": "http://elsewhere.example/" },
+                    "overlay": { "kind": "deployment", "name": "ops",
+                        "notifications": [{ "name": "n", "on": ["run_success"],
+                            "channel": { "type": "webhook",
+                                "config": { "url": "${param.api_root}" } } }] },
+                    "selection": { "select": ["deal_lines"], "include_parents": "eligible" } }),
+        )
+        .await;
+    assert_eq!(code, 403, "{v}");
+    assert!(v.to_string().contains("${param.api_root}"), "{v}");
 
     // Unknown stream → 400 naming the valid ones.
     let (code, v) = api

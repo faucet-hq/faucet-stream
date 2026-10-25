@@ -1082,11 +1082,39 @@ fn url_findings(doc: &Value, policy: &ReferencePolicy, found: &mut Findings) {
 /// local path (system trees, the server's credential files, the caller path
 /// roots) and every URL it names — under the caller `policy`.
 pub fn screen_caller_fragment(doc: &Value, policy: &ReferencePolicy) -> Result<(), ServeError> {
+    refuse_bound_tokens(doc)?;
     screen_subprocess(doc, policy, false)?;
     screen_references(doc, policy)?;
     let mut found = data_path_findings(doc, true, Some(policy));
     url_findings(doc, policy, &mut found);
     findings_error(found)
+}
+
+/// Refuse a caller fragment that references a value bound after screening
+/// (`${param.*}`, `${vars.*}`, a template or row token): the fragment is
+/// screened as written, so a value substituted into it later could name any
+/// URL, path or host. Only the clock / backfill / partition tokens are kept.
+fn refuse_bound_tokens(doc: &Value) -> Result<(), ServeError> {
+    use crate::interpolate::{Directive, iter_directives};
+    let mut refused = std::collections::BTreeSet::new();
+    for_each_string(doc, &mut |s| {
+        for (token, dir) in iter_directives(s) {
+            if let Directive::Deferred { id, .. } = dir
+                && !STATIC_PATH_TOKENS.contains(&id)
+            {
+                refused.insert(token.to_string());
+            }
+        }
+    });
+    if refused.is_empty() {
+        return Ok(());
+    }
+    Err(ServeError::Forbidden(format!(
+        "the document references values bound after it is checked ({}); a request-supplied \
+         document may use only literal values and the `${{now.*}}`, `${{backfill.*}}` and \
+         `${{partition.*}}` tokens — register it as a deployment overlay to use params",
+        refused.into_iter().collect::<Vec<_>>().join(", ")
+    )))
 }
 
 /// The connector kinds `doc` names anywhere as a `type:` whose schema declares
@@ -1825,6 +1853,23 @@ mod tests {
             serde_json::json!({ "x": "https://${env:FAUCET_FRAGMENT_OK}/hook" }),
             "may not come from a token",
         );
+        // A value bound after screening (params, vars, row tokens) is refused
+        // wherever it appears; the clock tokens stay usable.
+        forbidden(
+            serde_json::json!({ "notifications": [{ "channel": { "type": "webhook",
+                "config": { "url": "${param.api_root}" } } }] }),
+            "${param.api_root}",
+        );
+        forbidden(
+            serde_json::json!({ "state": { "type": "postgres", "config": { "url": "${vars.db}" } } }),
+            "${vars.db}",
+        );
+        screen_caller_fragment(
+            &serde_json::json!({ "state": { "type": "file", "config": {
+                "path": format!("{inside}/${{now.date}}") } } }),
+            &caller,
+        )
+        .expect("a clock token is not a bound value");
         let err = screen_caller_fragment(
             &serde_json::json!({ "dlq": { "sink": { "type": "singer", "config": {} } } }),
             &caller,
