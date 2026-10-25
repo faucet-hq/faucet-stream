@@ -106,6 +106,9 @@ async fn clickhouse_sink_and_source_keep_the_corpus_and_decimals() {
         ),
         ("typed", typed, Tolerance::exact()),
     ] {
+        // The sink receives the nested values as JSON (not pre-stringified),
+        // so how it encodes them is what the read-back below checks.
+        let written = sent.clone();
         let mut sent = sent;
         if table == "corpus" {
             for f in NESTED {
@@ -117,7 +120,7 @@ async fn clickhouse_sink_and_source_keep_the_corpus_and_decimals() {
             faucet_sink_clickhouse::ClickHouseSinkConfig::new(&base, table),
         )
         .expect("sink");
-        sink.write_batch(std::slice::from_ref(&sent))
+        sink.write_batch(std::slice::from_ref(&written))
             .await
             .expect("write");
         sink.flush().await.expect("flush");
@@ -129,6 +132,21 @@ async fn clickhouse_sink_and_source_keep_the_corpus_and_decimals() {
         )
         .expect("source");
         fidelity::assert_corpus_read(&source, &[sent], tol).await;
+        if table == "corpus" {
+            // The skipped nested fields: the stored text must parse back to
+            // exactly the value written.
+            use faucet_core::Source as _;
+            let landed = source.fetch_all().await.expect("read back");
+            let landed = landed.first().expect("one row");
+            for f in NESTED {
+                let text = landed[f]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{f} landed as {}", landed[f]));
+                let back: serde_json::Value = serde_json::from_str(text)
+                    .unwrap_or_else(|e| panic!("{f} landed as non-JSON text {text:?}: {e}"));
+                assert_eq!(back, written[f], "{f} changed in the round trip");
+            }
+        }
     }
 }
 
