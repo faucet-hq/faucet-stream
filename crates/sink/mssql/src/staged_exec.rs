@@ -45,6 +45,8 @@ impl MssqlDriver {
         )
         .await?;
 
+        let cleanup =
+            crate::staged::StagedCleanup::new(uploader, vec![staged], staging.spec.cleanup);
         let run = async {
             let mut conn = self.checkout().await?;
             self.on_conn(&mut conn, "copy", false, async |c| {
@@ -59,17 +61,9 @@ impl MssqlDriver {
             .await
         }
         .await;
-        let cleaned = ctx
-            .call_once("cleanup", async {
-                uploader
-                    .cleanup(&[staged], staging.spec.cleanup, run.is_ok())
-                    .await;
-                Ok(())
-            })
-            .await;
-        if let Err(e) = cleaned {
-            tracing::warn!(error = %e, "MSSQL staged object cleanup did not finish");
-        }
+        // On its own bounded context, so a cancelled or deadlined load still
+        // removes what it staged.
+        cleanup.finish(run.is_ok()).await;
         run?;
         tracing::debug!(records = records.len(), "MSSQL staged load written");
         Ok(records.len())

@@ -228,6 +228,12 @@ the failed page follows `on_batch_error` rather than being split per row, and
 `delivery: exactly_once` is refused (the load cannot commit with the watermark
 row; use `write_mode: upsert` without `staging:` for an exactly-once mirror).
 
+The staged object is deleted per `cleanup` once the load finishes. The delete
+runs on its own 30-second budget rather than the run's deadline or cancellation,
+so a cancelled or timed-out `COPY INTO` still removes its blob (counted as a
+failed load for `cleanup: on_success`); if the load is abandoned mid-flight the
+delete runs on a background task.
+
 Build with the crate's `staging` feature (CLI: `--features sink-mssql-staging`,
 in `full`). **Azure only** (`az://…`), **CSV only**, and **`write_mode: append`
 only**: `COPY INTO` loads straight into the target table, so `overwrite`, `upsert`

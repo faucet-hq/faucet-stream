@@ -12,8 +12,66 @@
 //! fails the load rather than landing in the wrong column.
 
 use faucet_core::FaucetError;
-use faucet_core::staging::{StageUploader, StagedFile, StagingFormat, StagingScheme};
+use faucet_core::io::CallContext;
+use faucet_core::staging::{
+    StageUploader, StagedFile, StagingCleanup, StagingFormat, StagingScheme,
+};
 use serde_json::Value;
+
+/// How long the clean-up of staged objects may take once the load is done.
+/// It runs on its own context, past the run's deadline and cancellation, so a
+/// cut load still removes what it staged.
+pub(crate) const STAGE_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Staged objects whose clean-up is still owed. [`StagedCleanup::finish`]
+/// runs it; dropped before that (the load future was abandoned), it runs the
+/// clean-up for a failed load on a spawned task.
+pub(crate) struct StagedCleanup {
+    pending: Option<(StageUploader, Vec<StagedFile>, StagingCleanup)>,
+}
+
+impl StagedCleanup {
+    pub(crate) fn new(
+        uploader: StageUploader,
+        files: Vec<StagedFile>,
+        policy: StagingCleanup,
+    ) -> Self {
+        Self {
+            pending: Some((uploader, files, policy)),
+        }
+    }
+
+    /// Clean up per the policy and whether the load `succeeded`.
+    pub(crate) async fn finish(mut self, succeeded: bool) {
+        if let Some((uploader, files, policy)) = self.pending.take() {
+            clean_staged(uploader, files, policy, succeeded).await;
+        }
+    }
+}
+
+impl Drop for StagedCleanup {
+    fn drop(&mut self) {
+        if let Some((uploader, files, policy)) = self.pending.take()
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            handle.spawn(clean_staged(uploader, files, policy, false));
+        }
+    }
+}
+
+/// Best-effort delete of staged objects, bounded by its own timeout rather
+/// than the run's call context.
+async fn clean_staged(
+    uploader: StageUploader,
+    files: Vec<StagedFile>,
+    policy: StagingCleanup,
+    succeeded: bool,
+) {
+    uploader
+        .with_call_context(CallContext::new().with_timeout(STAGE_CLEANUP_TIMEOUT))
+        .cleanup(&files, policy, succeeded)
+        .await;
+}
 
 /// Stage one page to `uploader`'s object store and build the `COPY INTO`
 /// statement for it. The upload + URL derivation + SQL build are all here (and
@@ -325,5 +383,87 @@ mod tests {
         assert!(sql.contains("FILE_TYPE = 'CSV'"));
         assert!(sql.contains("FIRSTROW = 2"));
         assert!(sql.contains("Shared Access Signature"));
+    }
+
+    fn staged_fixture() -> (
+        std::sync::Arc<object_store::memory::InMemory>,
+        faucet_core::staging::StagingLocation,
+    ) {
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let loc = faucet_core::staging::StagingLocation::parse("az://container/stage").unwrap();
+        (store, loc)
+    }
+
+    async fn stage_one(uploader: &StageUploader) -> StagedFile {
+        let spec: faucet_core::staging::StagingSpec = serde_json::from_value(serde_json::json!({
+            "location": "az://container/stage",
+            "format": "csv",
+        }))
+        .unwrap();
+        uploader
+            .stage_page(
+                &spec,
+                "dbo.t",
+                "run-1",
+                0,
+                &[serde_json::json!({"id": 1})],
+                None,
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn exists(store: &object_store::memory::InMemory, key: &str) -> bool {
+        use object_store::ObjectStoreExt as _;
+        store
+            .head(&object_store::path::Path::from(key.to_string()))
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_load_still_deletes_what_it_staged() {
+        let (store, loc) = staged_fixture();
+        let file = stage_one(&StageUploader::new(store.clone(), loc.clone())).await;
+        assert!(exists(&store, &file.key).await);
+        // The run's context is already cancelled, as after a cut COPY INTO.
+        let cancel = faucet_core::CancellationToken::new();
+        cancel.cancel();
+        let uploader = StageUploader::new(store.clone(), loc)
+            .with_call_context(CallContext::new().with_cancel(cancel));
+        StagedCleanup::new(uploader, vec![file.clone()], StagingCleanup::Always)
+            .finish(false)
+            .await;
+        assert!(!exists(&store, &file.key).await);
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_load_deletes_what_it_staged() {
+        let (store, loc) = staged_fixture();
+        let uploader = StageUploader::new(store.clone(), loc);
+        let file = stage_one(&uploader).await;
+        drop(StagedCleanup::new(
+            uploader,
+            vec![file.clone()],
+            StagingCleanup::Always,
+        ));
+        for _ in 0..1000 {
+            if !exists(&store, &file.key).await {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("the staged object was not deleted");
+    }
+
+    #[tokio::test]
+    async fn a_finished_cleanup_follows_the_policy() {
+        let (store, loc) = staged_fixture();
+        let uploader = StageUploader::new(store.clone(), loc);
+        let file = stage_one(&uploader).await;
+        StagedCleanup::new(uploader, vec![file.clone()], StagingCleanup::OnSuccess)
+            .finish(false)
+            .await;
+        assert!(exists(&store, &file.key).await);
     }
 }
