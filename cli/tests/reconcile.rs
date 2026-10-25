@@ -70,6 +70,7 @@ fn count_probe(dir: &Path, n: u64) -> ReconcileSpec {
             count_field: Some("n".into()),
         },
         tolerance_pct: 0.0,
+        timeout_secs: 300,
     }
 }
 
@@ -135,6 +136,7 @@ async fn a_negative_probe_count_fails_the_run_and_extra_probe_rows_are_ignored()
                 count_field: Some("n".into()),
             },
             tolerance_pct: 0.0,
+            timeout_secs: 300,
         }
     };
     let negative = probe("neg.csv", "n\n-1\n");

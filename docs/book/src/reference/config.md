@@ -1262,10 +1262,13 @@ reconcile:
       query: "SELECT count(*) AS n FROM orders WHERE updated_at >= '${now.date}'"
     count_field: n             # required when the probe row has more than one numeric field
   tolerance_pct: 0.0           # allow this % shortfall before failing (default 0)
+  timeout_secs: 300            # time the probe may take to return its count (default 300)
 ```
 
 The count probe is any faucet source (a SQL `count(*)`, an OData `$count`
-endpoint via `rest`, …); its first returned record supplies the count. The run
+endpoint via `rest`, …); its first returned record supplies the count. A probe
+that has not returned within `timeout_secs` fails the run, so raise it for a
+count that is slow to compute. The run
 fails when `rows_written < authoritative × (1 − tolerance_pct/100)`. Compares
 rows **written** to the destination, so it is most meaningful for straight
 loads / full-refreshes. The count describes one dataset, so `reconcile:` is

@@ -3315,6 +3315,13 @@
           "type": "number",
           "format": "double",
           "default": 0.0
+        },
+        "timeout_secs": {
+          "description": "Seconds the count probe may take to return its first record before the\nrun fails. Default 300. Raise it for an authoritative count that is\nslow to compute (a `count(*)` on a busy warehouse).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 300
         }
       },
       "additionalProperties": false,

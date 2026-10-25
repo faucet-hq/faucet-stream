@@ -30,6 +30,15 @@ pub struct ReconcileSpec {
     /// shortfall before failing.
     #[serde(default)]
     pub tolerance_pct: f64,
+    /// Seconds the count probe may take to return its first record before the
+    /// run fails. Default 300. Raise it for an authoritative count that is
+    /// slow to compute (a `count(*)` on a busy warehouse).
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_timeout_secs() -> u64 {
+    crate::preview_sample::PROBE_TIMEOUT.as_secs()
 }
 
 /// A source that yields the authoritative count.
@@ -51,8 +60,8 @@ pub struct CountProbe {
 }
 
 impl ReconcileSpec {
-    /// Fail-fast validation: a non-empty probe `type` and a finite,
-    /// non-negative `tolerance_pct` in `[0, 100)`.
+    /// Fail-fast validation: a non-empty probe `type`, a finite,
+    /// non-negative `tolerance_pct` in `[0, 100)` and a non-zero `timeout_secs`.
     pub fn validate(&self) -> Result<(), FaucetError> {
         if self.count.kind.trim().is_empty() {
             return Err(FaucetError::Config(
@@ -64,6 +73,11 @@ impl ReconcileSpec {
                 "reconcile: tolerance_pct must be in [0, 100), got {}",
                 self.tolerance_pct
             )));
+        }
+        if self.timeout_secs == 0 {
+            return Err(FaucetError::Config(
+                "reconcile: timeout_secs must be greater than 0".into(),
+            ));
         }
         Ok(())
     }
@@ -198,7 +212,7 @@ pub async fn run(
 }
 
 /// [`run`] that stops when `cancel` fires. The probe reads only its first
-/// record, under [`crate::preview_sample::PROBE_TIMEOUT`].
+/// record, within `spec.timeout_secs`.
 pub async fn run_with(
     spec: &ReconcileSpec,
     auth: &crate::auth_catalog::AuthCatalog,
@@ -214,7 +228,7 @@ pub async fn run_with(
     let first = crate::preview_sample::probe_first_record(
         &*source,
         "the reconcile count probe",
-        crate::preview_sample::PROBE_TIMEOUT,
+        std::time::Duration::from_secs(spec.timeout_secs),
         cancel,
     )
     .await?;
@@ -368,6 +382,7 @@ mod tests {
                 count_field: Some("n".into()),
             },
             tolerance_pct: 0.0,
+            timeout_secs: 300,
         };
         let auth = crate::auth_catalog::AuthCatalog::new();
         // Wrote >= 5 → complete.
@@ -386,6 +401,7 @@ mod tests {
                 count_field: None,
             },
             tolerance_pct: 150.0,
+            timeout_secs: 300,
         };
         assert!(bad_tol.validate().is_err());
         let empty_kind = ReconcileSpec {
@@ -395,7 +411,26 @@ mod tests {
                 count_field: None,
             },
             tolerance_pct: 0.0,
+            timeout_secs: 300,
         };
         assert!(empty_kind.validate().is_err());
+    }
+
+    #[test]
+    fn the_probe_timeout_defaults_to_five_minutes_and_must_be_positive() {
+        let spec: ReconcileSpec =
+            serde_json::from_value(json!({"count": {"type": "postgres"}})).unwrap();
+        assert_eq!(spec.timeout_secs, 300);
+        assert!(spec.validate().is_ok());
+        let slow: ReconcileSpec =
+            serde_json::from_value(json!({"count": {"type": "postgres"}, "timeout_secs": 1800}))
+                .unwrap();
+        assert_eq!(slow.timeout_secs, 1800);
+        let zero = ReconcileSpec {
+            timeout_secs: 0,
+            ..spec
+        };
+        let err = zero.validate().unwrap_err().to_string();
+        assert!(err.contains("timeout_secs"), "{err}");
     }
 }
