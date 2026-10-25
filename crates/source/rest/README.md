@@ -515,7 +515,7 @@ job → poll a status endpoint until terminal → fetch the result → hand it t
 | `job_id` | JSONPath to the job id in the submit response. |
 | `poll` | `{ url, method, interval_secs (5), timeout_secs (1800) }` — `${job_id}` substituted. `interval_secs` is the **ceiling** on the poll cadence, not a fixed wait: polling starts at 1s and doubles up to the cap, so a fast job is noticed in ~1s while a long one isn't hammered. A value of `0` is treated as `1`. `async_job` cannot be combined with `requests:` (every entry would submit the same job). |
 | `lookback` | Incremental only: re-read margin subtracted from the persisted bookmark (`45s` / `30m` / `6h`, default `5m`) — see below. |
-| `status` | `{ path, success: [...], failure: [...] }` — classify the poll response. |
+| `status` | `{ path, success: [...], failure: [...] }` — classify the poll response. A value in neither list (or an explicit `null`, a status not set yet) keeps polling; a `path` that matches nothing, or matches an object or array, fails the run at once with an error naming the path and the response's top-level member names (never its values). |
 | `fetch` | `{ method, url \| url_from, headers, query, json }` — result download; body flows through `decode:`. Set **exactly one** of `url` (a `${job_id}`-templated path) or `url_from` (a JSONPath into the last poll body — see below). |
 
 ```yaml

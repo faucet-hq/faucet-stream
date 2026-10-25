@@ -259,6 +259,53 @@ fn jsonpath_first_string(v: &Value, path: &str) -> Option<String> {
     }
 }
 
+/// Read an async job's status from a poll response: `Some(text)` for a
+/// string, number or boolean, `None` for an explicit `null` (not set yet).
+/// A path that matches nothing or a non-scalar is an error naming the path
+/// and the response's shape (its top-level member names), never its values:
+/// a poll body can carry tokens and signed URLs.
+fn poll_status(body: &Value, path: &str) -> Result<Option<String>, FaucetError> {
+    match jsonpath_first_value(body, path) {
+        Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s)),
+        Some(Value::Number(n)) => Ok(Some(n.to_string())),
+        Some(Value::Bool(b)) => Ok(Some(b.to_string())),
+        found => {
+            let matched = match found {
+                None => "matched nothing",
+                Some(Value::Array(_)) => "matched an array",
+                _ => "matched an object",
+            };
+            Err(FaucetError::Source(format!(
+                "async_job: `status.path` {path:?} {matched} in the poll response ({}); it \
+                 must select a string, number or boolean",
+                json_shape(body)
+            )))
+        }
+    }
+}
+
+/// A response's shape for an error message: its top-level member names (at
+/// most 20), or its JSON type. No values.
+fn json_shape(body: &Value) -> String {
+    const MAX: usize = 20;
+    match body {
+        Value::Object(map) if map.is_empty() => "an empty object".to_string(),
+        Value::Object(map) => {
+            let mut keys: Vec<&str> = map.keys().take(MAX).map(String::as_str).collect();
+            if map.len() > MAX {
+                keys.push("…");
+            }
+            format!("top-level keys: {}", keys.join(", "))
+        }
+        Value::Array(a) => format!("an array of {} element(s)", a.len()),
+        Value::String(_) => "a string".to_string(),
+        Value::Number(_) => "a number".to_string(),
+        Value::Bool(_) => "a boolean".to_string(),
+        Value::Null => "null".to_string(),
+    }
+}
+
 /// First JSONPath match as an owned [`Value`] (type-preserving). Used by the
 /// resumable-cursor bookmark (#547) so a numeric cursor stays a number.
 fn jsonpath_first_value(v: &Value, path: &str) -> Option<Value> {
@@ -2324,17 +2371,15 @@ impl RestDriver {
                     poll_json.as_ref(),
                 )
                 .await?;
-            let Some(status) = jsonpath_first_string(&body, &job.status.path) else {
-                let text = body.to_string();
-                let end = text.floor_char_boundary(512.min(text.len()));
-                return Err(FaucetError::Source(format!(
-                    "async_job: `status.path` {:?} matched no string, number or boolean in the \
-                     poll response: {}",
-                    job.status.path,
-                    faucet_core::redact::redact(&text[..end])
-                )));
+            // An explicit `null` is a status not set yet (a queued job), so it
+            // keeps polling; a path matching nothing, or a non-scalar, fails.
+            let status = poll_status(&body, &job.status.path)?;
+            let outcome = match &status {
+                Some(s) => job.status.classify(s),
+                None => JobOutcome::Pending,
             };
-            match job.status.classify(&status) {
+            let status = status.unwrap_or_else(|| "null".to_string());
+            match outcome {
                 JobOutcome::Success => break body,
                 JobOutcome::Failure => {
                     let detail = job
@@ -4147,6 +4192,44 @@ impl RestDriver {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn poll_status_reads_scalars_treats_null_as_unset_and_names_only_the_shape() {
+        let body = serde_json::json!({"s": "done", "n": 3, "b": true, "z": null, "o": {}, "a": []});
+        assert_eq!(poll_status(&body, "$.s").unwrap().as_deref(), Some("done"));
+        assert_eq!(poll_status(&body, "$.n").unwrap().as_deref(), Some("3"));
+        assert_eq!(poll_status(&body, "$.b").unwrap().as_deref(), Some("true"));
+        assert_eq!(poll_status(&body, "$.z").unwrap(), None);
+        let e = poll_status(&body, "$.o").unwrap_err().to_string();
+        assert!(
+            e.contains("matched an object") && e.contains("top-level keys: "),
+            "{e}"
+        );
+        let e = poll_status(&body, "$.a").unwrap_err().to_string();
+        assert!(e.contains("matched an array"), "{e}");
+        let e = poll_status(&body, "$.missing").unwrap_err().to_string();
+        assert!(e.contains("matched nothing") && !e.contains("done"), "{e}");
+    }
+
+    #[test]
+    fn json_shape_lists_at_most_twenty_keys_and_no_values() {
+        let wide: serde_json::Map<String, Value> = (0..25)
+            .map(|i| (format!("k{i:02}"), Value::from("v")))
+            .collect();
+        let shape = json_shape(&Value::Object(wide));
+        assert!(
+            shape.ends_with("k19, …") && !shape.contains("k20"),
+            "{shape}"
+        );
+        assert_eq!(json_shape(&serde_json::json!({})), "an empty object");
+        assert_eq!(
+            json_shape(&serde_json::json!([1, 2])),
+            "an array of 2 element(s)"
+        );
+        assert_eq!(json_shape(&serde_json::json!("x")), "a string");
+        assert_eq!(json_shape(&serde_json::json!(1)), "a number");
+        assert_eq!(json_shape(&serde_json::json!(false)), "a boolean");
+        assert_eq!(json_shape(&Value::Null), "null");
+    }
 
     #[tokio::test]
     async fn matcher_hits_count_per_call_scope() {
