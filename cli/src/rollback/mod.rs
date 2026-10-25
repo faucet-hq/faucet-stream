@@ -377,7 +377,18 @@ async fn rollback_node_leased(
                 pending.undo = Some(earlier.unwrap_or_default());
                 store.put(&marker_k, &marker_value(&pending)?).await?;
             }
-            sink.rollback_run(&marker.run_id, &opts).await?
+            match sink.rollback_run(&marker.run_id, &opts).await {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    // The sink reported failure, so its undo transaction did
+                    // not commit: drop this attempt's pending record, or a
+                    // retry that finds nothing would take it for a commit.
+                    if !inputs.dry_run && earlier.is_none() {
+                        store.put(&marker_k, &marker_value(&marker)?).await?;
+                    }
+                    return Err(e.into());
+                }
+            }
         }
     };
     let blocked = outcome.conflicts > 0 && !inputs.force;

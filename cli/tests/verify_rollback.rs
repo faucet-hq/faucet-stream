@@ -1497,6 +1497,66 @@ async fn a_pending_undo_that_finds_nothing_finishes_the_rewind() {
     );
 }
 
+/// An attempt whose sink undo fails leaves no pending record, so a retry
+/// that finds nothing of the run still leaves the bookmark alone.
+#[tokio::test]
+async fn a_failed_undo_attempt_does_not_count_as_committed() {
+    let d = fresh().await;
+    exec(&d.dst, "DROP TABLE dst").await;
+    exec(
+        &d.dst,
+        "CREATE TABLE dst (id INTEGER, name TEXT, _faucet_run_id TEXT)",
+    )
+    .await;
+    let cfg = load(&config_yaml(
+        &d.src,
+        &d.dst,
+        &d.state,
+        "append",
+        "rollback: {}",
+    ));
+    let run_id = run(&cfg).await.invocations[0].run_id.clone().unwrap();
+    let inputs = || RollbackInputs {
+        run_id: run_id.clone(),
+        row: None,
+        dry_run: false,
+        force: false,
+        pipeline_name: "mirror".into(),
+        auth: Default::default(),
+    };
+    exec(&d.dst, "DROP TABLE dst").await;
+    exec(&d.dst, "CREATE TABLE dst (id INTEGER, name TEXT)").await;
+    faucet_cli::rollback::rollback(&cfg, inputs())
+        .await
+        .expect_err("the undo fails before it commits");
+    exec(&d.dst, "DROP TABLE dst").await;
+    let marker = faucet_cli::rollback::list(&cfg, "mirror", None)
+        .await
+        .unwrap()
+        .remove(0);
+    assert!(marker.undo.is_none(), "{marker:?}");
+
+    exec(
+        &d.dst,
+        "CREATE TABLE dst (id INTEGER, name TEXT, _faucet_run_id TEXT)",
+    )
+    .await;
+    let report = faucet_cli::rollback::rollback(&cfg, inputs())
+        .await
+        .unwrap();
+    assert!(!report.outcome.applied, "{report:?}");
+    assert!(!report.bookmark_rewound, "{report:?}");
+    assert!(
+        report
+            .outcome
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("nothing of this run was found"),
+        "{report:?}"
+    );
+}
+
 /// A run's scoped cleanup deletes are journaled in its transaction, so a
 /// rollback restores the rows the cleanup removed (#706).
 #[tokio::test]
