@@ -10,7 +10,11 @@ the pages it never read, and keeping none would re-read the same pages every run
 while each run looked green. Set `assume_ordered: true` when the feed returns
 records in ascending `replication_key` order and the bookmark is pushed to the
 server with a `replication_bind` — a truncated incremental pass then persists the
-largest key it read and the next run's first request starts after it. Without a
+largest key it read and the next run's first request starts **at** it. The bind
+must compare inclusively (`>=`, e.g. `template: "gte|${bookmark}"`): rows that
+share the last key read can sit on the first unread page, and a strict `>`
+server filter would skip them for good (the re-read rows at that key arrive
+again, so pair it with an upsert sink). Without a
 `replication_bind` the combination is refused at load time: the next run would
 start at page 1 again and re-read the same pages. `assume_ordered` does not
 apply to windowed passes or across `requests:` entries.

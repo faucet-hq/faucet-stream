@@ -168,7 +168,9 @@ source:
   loop) advances the bookmark only with `replication_key_ordered: true`
   (sort the query ascending by the key, e.g. `sortKey: UPDATED_AT`) **and** a
   `replication_bind`, so the next run starts on the server where this one
-  stopped. Otherwise the pass fails: the bookmark could not advance and every
+  stopped. The bind must compare inclusively (`updated_at:>=${bookmark}`):
+  rows sharing the last key read can sit on the first unread page, and a
+  strict `>` filter would skip them for good. Otherwise the pass fails: the bookmark could not advance and every
   run would re-read the same pages. `validate` refuses
   `replication_key_ordered` + `max_pages` without a `replication_bind`. A
   GraphQL `errors[]` response fails the run before any bookmark is written.

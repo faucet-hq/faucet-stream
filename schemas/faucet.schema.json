@@ -14910,7 +14910,7 @@
                       "default": null
                     },
                     "assume_ordered": {
-                      "description": "The feed returns records in ascending `replication_key` order, so an\nincremental pass that `max_pages` cuts short may persist the largest key\nit read and resume after it next run. Without it such a pass fails the\nrun. Requires a `replication_bind` when `max_pages` is set: only a\nbookmark the server filters on moves the next run past the pages\nalready read. Ignored for windowed passes, with `persist_cursor`, and\nacross `requests:` entries (a truncated entry fails the run).",
+                      "description": "The feed returns records in ascending `replication_key` order, so an\nincremental pass that `max_pages` cuts short may persist the largest key\nit read and resume from it next run. Without it such a pass fails the\nrun. Requires a `replication_bind` when `max_pages` is set: only a\nbookmark the server filters on moves the next run past the pages\nalready read. The bind must compare **inclusively** (`>=`, e.g. a\n`gte|${bookmark}` template): rows sharing the last key read may sit on\nthe first unread page, and an exclusive (`>`) server filter would skip\nthem; the client-side filter is inclusive, so the re-read rows at that\nkey arrive again (pair with an upsert sink). Ignored for windowed\npasses, with `persist_cursor`, and across `requests:` entries (a\ntruncated entry fails the run).",
                       "type": [
                         "boolean",
                         "string"

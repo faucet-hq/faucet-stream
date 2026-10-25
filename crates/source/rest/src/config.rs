@@ -193,11 +193,16 @@ pub struct RestStreamConfig {
     pub max_pages: Option<usize>,
     /// The feed returns records in ascending `replication_key` order, so an
     /// incremental pass that `max_pages` cuts short may persist the largest key
-    /// it read and resume after it next run. Without it such a pass fails the
+    /// it read and resume from it next run. Without it such a pass fails the
     /// run. Requires a `replication_bind` when `max_pages` is set: only a
     /// bookmark the server filters on moves the next run past the pages
-    /// already read. Ignored for windowed passes, with `persist_cursor`, and
-    /// across `requests:` entries (a truncated entry fails the run).
+    /// already read. The bind must compare **inclusively** (`>=`, e.g. a
+    /// `gte|${bookmark}` template): rows sharing the last key read may sit on
+    /// the first unread page, and an exclusive (`>`) server filter would skip
+    /// them; the client-side filter is inclusive, so the re-read rows at that
+    /// key arrive again (pair with an upsert sink). Ignored for windowed
+    /// passes, with `persist_cursor`, and across `requests:` entries (a
+    /// truncated entry fails the run).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub assume_ordered: bool,
     /// Fixed delay between page requests, in seconds — a politeness knob for
