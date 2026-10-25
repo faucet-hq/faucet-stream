@@ -412,8 +412,8 @@ fails rather than re-creating the staging from that page, so its commit never
 swaps in a partial table. It
 also drops the untokened staging (`<table>__faucet_ovw`, the untokened marker
 alias, the untokened `.faucet-overwrite-…` area) an earlier release left. On the
-file sinks a move into place that such a run recorded is not finished; the new
-run replaces every file of the template when it commits. Until
+file sinks a move into place that another run's commit recorded and stopped
+half-way is finished first, so the output never stays part old, part new. Until
 then, `faucet status --probe` reports the leftover staging as `present`. You may
 drop a leftover `<table>__faucet_ovw_<token>` yourself once you know its run is
 gone. Library callers that drive the lifecycle without a token keep the single

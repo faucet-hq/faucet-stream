@@ -611,6 +611,50 @@ impl StorageBackend for RemoteBackend {
             .await
     }
 
+    async fn read_swap_run_marker(
+        &self,
+        run: Option<&str>,
+        name: &str,
+    ) -> Result<Option<String>, FaucetError> {
+        let key = format!("{}{name}", self.run_prefix(run));
+        if !self.client.exists(&key).await? {
+            return Ok(None);
+        }
+        let to = self
+            .scratch
+            .path()
+            .join(format!("o-{}", name.replace('/', "_")));
+        self.client.download(&key, &to).await?;
+        let text = std::fs::read_to_string(&to);
+        let _ = std::fs::remove_file(&to);
+        text.map(Some).map_err(|e| {
+            FaucetError::Sink(format!(
+                "remote file sink: reading the overwrite marker: {e}"
+            ))
+        })
+    }
+
+    async fn list_swap_run(&self, run: Option<&str>) -> Result<Vec<String>, FaucetError> {
+        let prefix = self.run_prefix(run);
+        let keys = self.client.list(&prefix).await?;
+        Ok(direct_children(&prefix, keys))
+    }
+
+    async fn promote_from_swap_run(
+        &self,
+        run: Option<&str>,
+        name: &str,
+    ) -> Result<(), FaucetError> {
+        let from = format!("{}{name}", self.run_prefix(run));
+        let to = self.key(Area::Destination, name);
+        match self.client.rename(&from, &to).await {
+            Ok(()) => Ok(()),
+            // Another begin finished this move first.
+            Err(_) if !self.client.exists(&from).await? && self.client.exists(&to).await? => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     async fn promote(&self, name: &str) -> Result<(), FaucetError> {
         self.client
             .rename(

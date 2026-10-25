@@ -357,9 +357,9 @@ impl FileWriter {
     /// At a tokened begin: drop the untokened swap area (an earlier
     /// release's, or a run's without a token) and every tokened one another
     /// run abandoned ([`faucet_core::idempotency::overwrite_run_abandoned`]).
-    /// A live run's area and this run's own are never touched. An interrupted
-    /// move such an area recorded is not finished: this run replaces every
-    /// file of the template when it commits.
+    /// A live run's area and this run's own are never touched. A move such an
+    /// area recorded was finished first by
+    /// [`finish_other_runs_moves`](Self::finish_other_runs_moves).
     async fn sweep_swap_areas(&self) -> Result<(), FaucetError> {
         let Some(own) = self.overwrite_run.get() else {
             return Ok(());
@@ -839,6 +839,7 @@ impl FileWriter {
     pub async fn begin_overwrite(&self) -> Result<(), FaucetError> {
         self.backend.prepare(Area::Destination).await?;
         self.finish_interrupted_move().await?;
+        self.finish_other_runs_moves().await?;
         self.clear_swap().await?;
         self.sweep_swap_areas().await?;
         self.backend.prepare(Area::Swap).await?;
@@ -880,6 +881,7 @@ impl FileWriter {
         if self.finish_interrupted_move().await? {
             return Ok(());
         }
+        self.finish_other_runs_moves().await?;
         self.clear_swap().await
     }
 
@@ -916,6 +918,71 @@ impl FileWriter {
         })?;
         self.backend.publish(&scratch, Area::Swap, name).await?;
         self.backend.settle().await
+    }
+
+    /// At a tokened begin or abort: finish every move another run's commit
+    /// recorded ([`COMMIT_MARKER`] in its swap area, or in the untokened area
+    /// an earlier release used) and stopped half-way, then drop that area. A
+    /// crashed commit would otherwise leave the destination part old, part
+    /// new until the next successful overwrite, since every run stages in an
+    /// area of its own.
+    async fn finish_other_runs_moves(&self) -> Result<(), FaucetError> {
+        let Some(own) = self.overwrite_run.get() else {
+            return Ok(());
+        };
+        let mut runs: Vec<Option<String>> = vec![None];
+        runs.extend(
+            self.backend
+                .swap_runs()
+                .await?
+                .into_iter()
+                .filter(|t| t != own)
+                .map(Some),
+        );
+        for run in runs {
+            let run = run.as_deref();
+            let Some(text) = self
+                .backend
+                .read_swap_run_marker(run, COMMIT_MARKER)
+                .await?
+            else {
+                continue;
+            };
+            let names: Vec<String> = text
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(String::from)
+                .collect();
+            tracing::warn!(
+                run = run.unwrap_or("untokened"),
+                files = names.len(),
+                "file sink: finishing another overwrite run's move into place that stopped half-way"
+            );
+            let staged: std::collections::HashSet<String> =
+                self.backend.list_swap_run(run).await?.into_iter().collect();
+            let to_move: Vec<String> = names
+                .iter()
+                .filter(|n| staged.contains(n.as_str()))
+                .cloned()
+                .collect();
+            let moves = stream::iter(to_move)
+                .map(|name| async move { self.backend.promote_from_swap_run(run, &name).await })
+                .buffer_unordered(SWAP_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await;
+            moves.into_iter().collect::<Result<Vec<()>, _>>()?;
+            let kept: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
+            let stale: Vec<String> = self
+                .existing(Area::Destination)
+                .await?
+                .into_iter()
+                .map(|(_, n)| n)
+                .filter(|n| !kept.contains(n.as_str()))
+                .collect();
+            self.delete_all(Area::Destination, stale).await?;
+            self.backend.drop_swap_run(run).await?;
+        }
+        Ok(())
     }
 
     /// Finish the move a commit started, when its marker is there.

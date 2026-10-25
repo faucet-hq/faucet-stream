@@ -266,6 +266,55 @@ impl StorageBackend for LocalBackend {
         .await
     }
 
+    async fn read_swap_run_marker(
+        &self,
+        run: Option<&str>,
+        name: &str,
+    ) -> Result<Option<String>, FaucetError> {
+        let path = self
+            .dir
+            .join(self.template.swap_run_dir_name(run))
+            .join(name);
+        fs(move || match std::fs::read_to_string(&path) {
+            Ok(text) => Ok(Some(text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(io_err("reading the overwrite marker", &path, e)),
+        })
+        .await
+    }
+
+    async fn list_swap_run(&self, run: Option<&str>) -> Result<Vec<String>, FaucetError> {
+        let view = Self {
+            run_swap: std::sync::OnceLock::from(
+                self.dir.join(self.template.swap_run_dir_name(run)),
+            ),
+            ..self.clone()
+        };
+        view.list(Area::Swap).await
+    }
+
+    async fn promote_from_swap_run(
+        &self,
+        run: Option<&str>,
+        name: &str,
+    ) -> Result<(), FaucetError> {
+        let from = self
+            .dir
+            .join(self.template.swap_run_dir_name(run))
+            .join(name);
+        let dest = self.path(Area::Destination, name);
+        fs(move || match std::fs::rename(&from, &dest) {
+            Ok(()) => {
+                sync_parent(&dest);
+                Ok(())
+            }
+            // Another begin finished this move first.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && dest.exists() => Ok(()),
+            Err(e) => Err(io_err("moving into place", &dest, e)),
+        })
+        .await
+    }
+
     async fn promote(&self, name: &str) -> Result<(), FaucetError> {
         let from = self.path(Area::Swap, name);
         let dest = self.path(Area::Destination, name);

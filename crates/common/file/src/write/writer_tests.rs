@@ -1440,6 +1440,47 @@ async fn concurrent_remote_overwrite_runs_keep_their_own_files() {
     assert!(w.join_overwrite_run("../x").is_err());
 }
 
+/// A run's commit that stopped half-way through its move (its commit
+/// marker still in its own area) is finished by the next tokened begin —
+/// another run's area, live or not, and the untokened one an earlier release
+/// left — rather than leaving the destination part old, part new (#934).
+#[tokio::test]
+async fn a_tokened_begin_finishes_other_runs_interrupted_moves() {
+    use faucet_core::idempotency::new_overwrite_run_token;
+    for crashed in [Some(new_overwrite_run_token()), None] {
+        let mem = Arc::new(Mem::default());
+        let tag = overwrite_remote(&mem).template().swap_dir_name();
+        let area = match &crashed {
+            Some(t) => format!("pre/d/{tag}.run-{t}"),
+            None => format!("pre/d/{tag}"),
+        };
+        {
+            let mut o = mem.objects.lock().unwrap();
+            // part 1 not yet moved, part 2 moved, old part 3 not yet removed.
+            o.insert(format!("{area}/part-00001.jsonl"), b"new1\n".to_vec());
+            o.insert(
+                format!("{area}/{COMMIT_MARKER}"),
+                b"part-00001.jsonl\npart-00002.jsonl".to_vec(),
+            );
+            o.insert("pre/d/part-00001.jsonl".into(), b"old1\n".to_vec());
+            o.insert("pre/d/part-00002.jsonl".into(), b"new2\n".to_vec());
+            o.insert("pre/d/part-00003.jsonl".into(), b"old3\n".to_vec());
+        }
+        let w = overwrite_remote(&mem);
+        w.join_overwrite_run(&new_overwrite_run_token()).unwrap();
+        w.begin_overwrite().await.unwrap();
+        let keys = mem.keys();
+        assert!(
+            !keys.iter().any(|k| k.starts_with(&format!("{area}/"))),
+            "{keys:?}"
+        );
+        let o = mem.objects.lock().unwrap();
+        assert_eq!(o["pre/d/part-00001.jsonl"], b"new1\n".to_vec());
+        assert_eq!(o["pre/d/part-00002.jsonl"], b"new2\n".to_vec());
+        assert!(!o.contains_key("pre/d/part-00003.jsonl"), "{crashed:?}");
+    }
+}
+
 /// The same race against a local directory.
 #[tokio::test]
 async fn concurrent_local_overwrite_runs_keep_their_own_files() {

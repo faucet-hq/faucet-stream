@@ -190,6 +190,41 @@ pub trait StorageBackend: Send + Sync {
         Ok(())
     }
 
+    /// The text of marker `name` in overwrite run `run`'s swap area (`None`:
+    /// the untokened area), or `None` when it is not there. Lets a begin
+    /// finish a commit another run left half-done. Default: none (no other
+    /// run's area is visible).
+    async fn read_swap_run_marker(
+        &self,
+        run: Option<&str>,
+        name: &str,
+    ) -> Result<Option<String>, FaucetError> {
+        let _ = (run, name);
+        Ok(None)
+    }
+
+    /// The names of the files directly in overwrite run `run`'s swap area.
+    /// Default: none.
+    async fn list_swap_run(&self, run: Option<&str>) -> Result<Vec<String>, FaucetError> {
+        let _ = run;
+        Ok(Vec::new())
+    }
+
+    /// Move `name` from overwrite run `run`'s swap area into the destination
+    /// (see [`promote`](Self::promote)). A file already moved (missing from
+    /// the area, present in the destination) is not an error. Default:
+    /// refused.
+    async fn promote_from_swap_run(
+        &self,
+        run: Option<&str>,
+        name: &str,
+    ) -> Result<(), FaucetError> {
+        let _ = (run, name);
+        Err(FaucetError::Sink(
+            "file sink: this storage backend cannot reach another overwrite run's files".into(),
+        ))
+    }
+
     /// A non-mutating preflight probe of the storage (reachability,
     /// credentials). `None` when the backend has none, so the sink's own
     /// probe answers. Default: `None`.
@@ -325,6 +360,32 @@ macro_rules! delegate_storage_backend {
                 run: ::std::option::Option<&str>,
             ) -> ::std::result::Result<(), $crate::__private::FaucetError> {
                 $crate::write::StorageBackend::drop_swap_run(&self.$field, run).await
+            }
+            async fn read_swap_run_marker(
+                &self,
+                run: ::std::option::Option<&str>,
+                name: &str,
+            ) -> ::std::result::Result<
+                ::std::option::Option<::std::string::String>,
+                $crate::__private::FaucetError,
+            > {
+                $crate::write::StorageBackend::read_swap_run_marker(&self.$field, run, name).await
+            }
+            async fn list_swap_run(
+                &self,
+                run: ::std::option::Option<&str>,
+            ) -> ::std::result::Result<
+                ::std::vec::Vec<::std::string::String>,
+                $crate::__private::FaucetError,
+            > {
+                $crate::write::StorageBackend::list_swap_run(&self.$field, run).await
+            }
+            async fn promote_from_swap_run(
+                &self,
+                run: ::std::option::Option<&str>,
+                name: &str,
+            ) -> ::std::result::Result<(), $crate::__private::FaucetError> {
+                $crate::write::StorageBackend::promote_from_swap_run(&self.$field, run, name).await
             }
             async fn check(
                 &self,
