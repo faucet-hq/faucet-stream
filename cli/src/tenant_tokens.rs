@@ -87,10 +87,77 @@ fn bind_str(s: &str, tenant: &TenantValues, field: Field) -> Result<String, Stri
 /// Bind every `${tenant.*}` token in a parsed document. With `tenant: None`,
 /// any token is an error naming why: the run was not started for a tenant.
 pub fn bind_document(doc: &mut Value, tenant: Option<&TenantValues>) -> Result<(), String> {
-    bind_in(doc, tenant, Field::Plain)
+    let kinds = TemplateKinds::of(doc);
+    bind_in(doc, tenant, Field::Plain, &kinds, None)
 }
 
-fn bind_in(doc: &mut Value, tenant: Option<&TenantValues>, field: Field) -> Result<(), String> {
+/// Whether an object is a source or a sink connector spec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Source,
+    Sink,
+}
+
+/// The connector kind of each named source / sink template, so a matrix row
+/// or topology node that picks one by `ref` (and names no `type`) has its
+/// fields classified by the template's kind.
+#[derive(Debug, Default)]
+struct TemplateKinds {
+    sources: BTreeMap<String, String>,
+    sinks: BTreeMap<String, String>,
+}
+
+impl TemplateKinds {
+    fn of(doc: &Value) -> Self {
+        let pipeline = doc.get("pipeline");
+        let named = |key: &str| -> BTreeMap<String, String> {
+            pipeline
+                .and_then(|p| p.get(key))
+                .and_then(Value::as_object)
+                .into_iter()
+                .flatten()
+                .filter_map(|(name, spec)| {
+                    let kind = spec.get("type").and_then(Value::as_str)?;
+                    Some((name.clone(), kind.to_string()))
+                })
+                .collect()
+        };
+        let mut kinds = Self {
+            sources: named("sources"),
+            sinks: named("sinks"),
+        };
+        for (key, map) in [("source", &mut kinds.sources), ("sink", &mut kinds.sinks)] {
+            if let Some(kind) = pipeline
+                .and_then(|p| p.get(key))
+                .and_then(|s| s.get("type"))
+                .and_then(Value::as_str)
+            {
+                map.entry("default".to_string())
+                    .or_insert_with(|| kind.to_string());
+            }
+        }
+        kinds
+    }
+
+    /// The kind a `type`-less spec in `role` resolves to through its `ref`
+    /// (else the `default` template).
+    fn resolve(&self, role: Role, spec: &serde_json::Map<String, Value>) -> Option<String> {
+        let name = spec.get("ref").and_then(Value::as_str).unwrap_or("default");
+        match role {
+            Role::Source => self.sources.get(name),
+            Role::Sink => self.sinks.get(name),
+        }
+        .cloned()
+    }
+}
+
+fn bind_in(
+    doc: &mut Value,
+    tenant: Option<&TenantValues>,
+    field: Field,
+    kinds: &TemplateKinds,
+    role: Option<Role>,
+) -> Result<(), String> {
     match doc {
         Value::String(s) if crate::interpolate::contains_unescaped(s, PREFIX) => match tenant {
             Some(t) => {
@@ -99,22 +166,37 @@ fn bind_in(doc: &mut Value, tenant: Option<&TenantValues>, field: Field) -> Resu
             }
             None => Err(unbound_message(s)),
         },
-        Value::Array(a) => a.iter_mut().try_for_each(|v| bind_in(v, tenant, field)),
+        Value::Array(a) => a
+            .iter_mut()
+            .try_for_each(|v| bind_in(v, tenant, field, kinds, None)),
         Value::Object(m) => {
-            let kind = m.get("type").and_then(Value::as_str).map(str::to_string);
+            // A topology node names its role in `kind`.
+            let role = role.or(match m.get("kind").and_then(Value::as_str) {
+                Some("source") => Some(Role::Source),
+                Some("sink") => Some(Role::Sink),
+                _ => None,
+            });
+            let kind = m
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| role.and_then(|r| kinds.resolve(r, m)));
             m.iter_mut().try_for_each(|(k, v)| match (k.as_str(), v) {
-                ("config", Value::Object(cfg)) => cfg
-                    .iter_mut()
-                    .try_for_each(|(k, v)| bind_in(v, tenant, config_field(kind.as_deref(), k))),
-                (_, v) => bind_in(v, tenant, Field::Plain),
+                ("config", Value::Object(cfg)) => cfg.iter_mut().try_for_each(|(k, v)| {
+                    bind_in(v, tenant, config_field(kind.as_deref(), k), kinds, None)
+                }),
+                ("source", v) => bind_in(v, tenant, Field::Plain, kinds, Some(Role::Source)),
+                ("sink", v) => bind_in(v, tenant, Field::Plain, kinds, Some(Role::Sink)),
+                (_, v) => bind_in(v, tenant, Field::Plain, kinds, None),
             })
         }
         _ => Ok(()),
     }
 }
 
-/// The kind of a connector config field; a row override without `type`
-/// counts every `query` / `sql` field as SQL.
+/// The kind of a connector config field; a spec whose kind is unknown (no
+/// `type`, and no template it resolves to) counts every `query` / `sql` field
+/// as SQL.
 fn config_field(kind: Option<&str>, key: &str) -> Field {
     if crate::sql_bind::IDENTIFIER_FIELDS.contains(&key) {
         return Field::Identifier;
@@ -209,6 +291,50 @@ mod tests {
         let mut rest = json!({"source": {"type": "rest", "config": {"query": "${tenant.name}"}}});
         bind_document(&mut rest, Some(&t)).unwrap();
         assert_eq!(rest["source"]["config"]["query"], "O'Reilly");
+    }
+
+    #[test]
+    fn a_row_picking_a_template_by_ref_is_classified_by_its_kind() {
+        let doc = |row_query: &str| {
+            json!({
+                "pipeline": {
+                    "sources": {
+                        "gql": {"type": "graphql", "config": {}},
+                        "db": {"type": "postgres", "config": {}},
+                    },
+                    "sink": {"type": "postgres", "config": {}},
+                },
+                "matrix": [
+                    {"source": {"ref": "gql", "config": {"query": row_query}}},
+                ],
+                "nodes_check": {"kind": "source", "ref": "gql", "config": {"query": row_query}},
+            })
+        };
+        // GraphQL `query` text is not SQL: a non-identifier name binds.
+        let mut ok = doc("{ orgs(name: \"${tenant.name}\") { id } }");
+        bind_document(&mut ok, Some(&acme())).unwrap();
+        assert_eq!(
+            ok["matrix"][0]["source"]["config"]["query"],
+            "{ orgs(name: \"Acme Corp\") { id } }"
+        );
+        assert_eq!(
+            ok["nodes_check"]["config"]["query"],
+            "{ orgs(name: \"Acme Corp\") { id } }"
+        );
+        // A row on the SQL template still takes only identifiers.
+        let mut sql = json!({
+            "pipeline": {"sources": {"db": {"type": "postgres", "config": {}}}},
+            "matrix": [{"source": {"ref": "db", "config": {"query": "x = '${tenant.name}'"}}}],
+        });
+        let err = bind_document(&mut sql, Some(&acme())).unwrap_err();
+        assert!(err.contains("a SQL query"), "{err}");
+        // No `ref`: the `default` template (the singular `pipeline.source`).
+        let mut dflt = json!({
+            "pipeline": {"source": {"type": "graphql", "config": {}}},
+            "matrix": [{"source": {"config": {"query": "${tenant.name}"}}}],
+        });
+        bind_document(&mut dflt, Some(&acme())).unwrap();
+        assert_eq!(dflt["matrix"][0]["source"]["config"]["query"], "Acme Corp");
     }
 
     #[test]

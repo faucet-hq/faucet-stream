@@ -185,7 +185,10 @@ curl -X POST localhost:8080/v1/tenants/acme/templates/crm-contacts/runs \
   is never read as another `${…}` directive); in a SQL source's query and in a
   `table` / `table_name` / `collection` / `index` / `schema` / `dataset` field
   the value must be a plain identifier (letters, digits, `_`, `.`, `-`, `$`),
-  otherwise the run is refused;
+  otherwise the run is refused (so a name with a space cannot sit inside a
+  quoted SQL literal either). A matrix row or node that picks its source by
+  `ref` is classified by that template's connector; only a spec whose kind
+  cannot be told treats every `query` / `sql` field as SQL;
 - keeps its bookmarks at `acme::crm-contacts::<row>` (and its SLA, profiling
   and rollback markers beside them), so tenants never share a bookmark;
 - carries `tenant` on its run record, usage records, audit entries and change
