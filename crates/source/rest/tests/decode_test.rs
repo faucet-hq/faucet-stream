@@ -120,3 +120,26 @@ fn decode_with_pagination_is_rejected() {
         }]);
     assert!(RestStream::new(cfg).is_err());
 }
+
+/// A response nested deeper than the shared XML depth limit fails the read
+/// with a typed error instead of building a value deep enough to overflow
+/// the stack.
+#[tokio::test]
+async fn a_deeply_nested_xml_response_is_refused() {
+    let depth = 200_000;
+    let body = format!("{}x{}", "<a>".repeat(depth), "</a>".repeat(depth));
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/deep"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+    let stream = RestStream::new(RestStreamConfig::new(&server.uri(), "/deep").decode(vec![
+        DecodeStep::Parse {
+            parse: parse(ParseFormat::Xml),
+        },
+    ]))
+    .unwrap();
+    let err = stream.fetch_all().await.unwrap_err();
+    assert!(err.to_string().contains("nesting exceeds"), "{err}");
+}

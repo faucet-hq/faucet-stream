@@ -136,6 +136,19 @@ pub async fn check_http_response(
     Err(FaucetError::HttpStatus { status, url, body })
 }
 
+/// The deepest element nesting any XML → JSON converter accepts. A deeper
+/// document is refused with a typed error: the JSON value it would build is
+/// as deep as the document, and dropping or serialising such a value recurses
+/// once per level, so a hostile or broken document could overflow the stack.
+pub const MAX_XML_DEPTH: usize = 256;
+
+/// The error for an XML document nested deeper than [`MAX_XML_DEPTH`].
+pub fn xml_too_deep() -> FaucetError {
+    FaucetError::Transform(format!(
+        "XML nesting exceeds {MAX_XML_DEPTH} levels — refusing to convert the document"
+    ))
+}
+
 /// Default maximum body length for error responses.
 pub const DEFAULT_ERROR_BODY_MAX_LEN: usize = 2048;
 

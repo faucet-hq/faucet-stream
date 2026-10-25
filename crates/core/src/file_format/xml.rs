@@ -340,10 +340,9 @@ fn finish(obj: Map<String, Value>, text: String) -> Value {
     }
 }
 
-/// The deepest element nesting [`to_json`] accepts. Deeper documents are
-/// refused with a typed error: the resulting value is nested once per level,
-/// and walking or dropping an unbounded one would overflow the stack.
-pub const MAX_XML_DEPTH: usize = 256;
+/// The deepest element nesting [`to_json`] accepts (shared by every XML
+/// converter, see [`crate::util::MAX_XML_DEPTH`]).
+pub use crate::util::MAX_XML_DEPTH;
 
 /// Compact XML → JSON.
 pub fn to_json(bytes: &[u8]) -> Result<Value, FaucetError> {

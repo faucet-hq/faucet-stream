@@ -502,6 +502,10 @@ fn xml_to_json(bytes: &[u8]) -> Result<Value, FaucetError> {
         let text = match &event {
             Event::Eof => break,
             Event::Start(e) => {
+                // `stack[0]` is the synthetic document root.
+                if stack.len() > faucet_core::util::MAX_XML_DEPTH {
+                    return Err(faucet_core::util::xml_too_deep());
+                }
                 stack.push((attrs(e)?, String::new()));
                 continue;
             }
@@ -918,6 +922,17 @@ mod tests {
             matches!(err, FaucetError::Source(_)),
             "malformed XML must surface as FaucetError::Source, got {err:?}"
         );
+    }
+
+    #[test]
+    fn xml_to_json_refuses_nesting_beyond_the_shared_limit() {
+        let max = faucet_core::util::MAX_XML_DEPTH;
+        let doc = |d: usize| format!("{}x{}", "<a>".repeat(d), "</a>".repeat(d));
+        assert!(xml_to_json(doc(max).as_bytes()).is_ok());
+        for d in [max + 1, 500_000] {
+            let err = xml_to_json(doc(d).as_bytes()).unwrap_err();
+            assert!(err.to_string().contains("nesting exceeds"), "{err}");
+        }
     }
 
     #[test]

@@ -10,17 +10,13 @@ use serde_json::{Map, Value, json};
 
 use crate::xmltext::{attributes, event_text};
 
-/// Deepest element nesting the XML converters accept. A deeper document is
-/// refused with a typed error: the JSON value it would build is as deep as the
-/// document, and dropping or serialising such a value recurses once per level,
-/// so a hostile or broken response could overflow the worker's stack.
-pub const MAX_XML_DEPTH: usize = 256;
+/// Deepest element nesting the XML converters accept (shared with every other
+/// XML → JSON converter in faucet).
+pub use faucet_core::util::MAX_XML_DEPTH;
 
 /// The error for a document nested deeper than [`MAX_XML_DEPTH`].
 pub(crate) fn too_deep() -> FaucetError {
-    FaucetError::Transform(format!(
-        "XML nesting exceeds {MAX_XML_DEPTH} levels — refusing to convert the document"
-    ))
+    faucet_core::util::xml_too_deep()
 }
 
 /// Convert an XML string to a JSON value.
