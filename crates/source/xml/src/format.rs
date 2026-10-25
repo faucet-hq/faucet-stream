@@ -29,7 +29,7 @@ pub async fn parse_csv(
     while let Some(rec) = records.next().await {
         let rec = rec.map_err(|e| FaucetError::Source(format!("rest: CSV parse error: {e}")))?;
         if has_headers && headers.is_none() {
-            let names: Vec<String> = rec.iter().map(str::to_string).collect();
+            let names = name_empty_headers(rec.iter().map(str::to_string).collect());
             check_unique_headers(&names, "CSV")?;
             headers = Some(names);
             continue;
@@ -45,6 +45,20 @@ pub async fn parse_csv(
         out.push(Value::Object(obj));
     }
     Ok(out)
+}
+
+/// Name empty CSV header cells `column_<i>` (as the Excel path does) when
+/// more than one is empty, so a header row like `id,amount,,` keeps every
+/// column instead of colliding on `""`. A single empty name is kept as is.
+fn name_empty_headers(mut names: Vec<String>) -> Vec<String> {
+    if names.iter().filter(|n| n.is_empty()).count() > 1 {
+        for (i, name) in names.iter_mut().enumerate() {
+            if name.is_empty() {
+                *name = format!("column_{i}");
+            }
+        }
+    }
+    names
 }
 
 /// Refuse a header row that repeats a name: rows are keyed by header, so the
@@ -204,6 +218,22 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("Excel header \"amount\" repeats"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn empty_csv_headers_are_named_only_when_they_would_collide() {
+        let recs = parse_csv(b"id,amount,,\n1,2,3,4\n", b',', true)
+            .await
+            .unwrap();
+        assert_eq!(recs[0]["column_2"], "3");
+        assert_eq!(recs[0]["column_3"], "4");
+        let recs = parse_csv(b"id,,x\n1,2,3\n", b',', true).await.unwrap();
+        assert_eq!(recs[0][""], "2");
+        let err = parse_csv(b"column_2,,\n1,2,3\n", b',', true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("\"column_2\" repeats"), "{err}");
     }
 
     #[tokio::test]

@@ -561,3 +561,44 @@ async fn a_repeated_csv_header_fails_instead_of_dropping_a_column() {
         "{err}"
     );
 }
+
+/// Several empty CSV header cells are named `column_<i>` (as Excel's are)
+/// instead of colliding on `""`; a header that still repeats is refused.
+#[tokio::test]
+async fn decode_pipeline_names_empty_csv_headers() {
+    let server = MockServer::start().await;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(b"id,amount,,\n1,2,3,4\n");
+    Mock::given(method("POST"))
+        .and(path("/report"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(format!("<r><reportBytes>{b64}</reportBytes></r>")),
+        )
+        .mount(&server)
+        .await;
+    let mut config = XmlStreamConfig::new(server.uri(), "/report")
+        .method(reqwest::Method::POST)
+        .body("<runReport/>")
+        .decode(vec![
+            DecodeStep::Extract {
+                extract: "reportBytes".into(),
+            },
+            DecodeStep::Simple(SimpleStep::Base64),
+            DecodeStep::Parse {
+                parse: ParseSpec {
+                    format: ParseFormat::Csv,
+                    records_path: None,
+                    delimiter: None,
+                    has_headers: true,
+                    sheet: None,
+                    header_row: 0,
+                },
+            },
+        ]);
+    config.batch_size = 0;
+    let records = XmlStream::new(config).fetch_all().await.unwrap();
+    assert_eq!(
+        records,
+        vec![serde_json::json!({"id": "1", "amount": "2", "column_2": "3", "column_3": "4"})]
+    );
+}

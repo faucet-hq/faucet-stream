@@ -129,9 +129,23 @@ fn csv_record_to_object(
 /// The header row's names; a repeated name is refused, since rows are keyed by
 /// header and the later column would silently replace the earlier one.
 fn header_names(rec: &csv_async::StringRecord) -> Result<Vec<String>, FaucetError> {
-    let names: Vec<String> = rec.iter().map(str::to_string).collect();
+    let names = name_empty_headers(rec.iter().map(str::to_string).collect());
     check_unique_headers(&names, "CSV")?;
     Ok(names)
+}
+
+/// Name empty CSV header cells `column_<i>` (as the Excel path does) when
+/// more than one is empty, so a header row like `id,amount,,` keeps every
+/// column instead of colliding on `""`. A single empty name is kept as is.
+fn name_empty_headers(mut names: Vec<String>) -> Vec<String> {
+    if names.iter().filter(|n| n.is_empty()).count() > 1 {
+        for (i, name) in names.iter_mut().enumerate() {
+            if name.is_empty() {
+                *name = format!("column_{i}");
+            }
+        }
+    }
+    names
 }
 
 fn check_unique_headers(names: &[String], what: &str) -> Result<(), FaucetError> {
@@ -775,6 +789,20 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn empty_csv_headers_are_named_only_when_they_would_collide() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            super::name_empty_headers(names(&["id", "", "x", ""])),
+            names(&["id", "column_1", "x", "column_3"])
+        );
+        assert_eq!(
+            super::name_empty_headers(names(&["id", "", "x"])),
+            names(&["id", "", "x"])
+        );
+        let collided = super::name_empty_headers(names(&["column_1", "", ""]));
+        assert!(super::check_unique_headers(&collided, "CSV").is_err());
+    }
 
     mod jsonl {
         use super::super::*;

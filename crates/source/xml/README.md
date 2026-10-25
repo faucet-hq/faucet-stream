@@ -334,7 +334,7 @@ A declarative chain applied to the raw response body **before** record extractio
 | `extract: "<dot.path>"` | Element text at the dot-path (namespace-insensitive, trailing-match) becomes the buffer. |
 | `base64` / `gunzip` | Decode base64 text / gzip-decompress the buffer (at most 1 GiB decompressed). |
 | `unzip: { member: "*.csv" }` | Select a member from a zip archive. The glob (or, without `member`, the archive) must match exactly one file; several matches fail with their names. At most 1 GiB decompressed. |
-| `parse: { format: csv\|xlsx\|xml\|json, header_row, delimiter, has_headers, sheet, records_path }` | Parse the bytes into records. An invalid `records_path` JSONPath fails at config load. |
+| `parse: { format: csv\|xlsx\|xml\|json, header_row, delimiter, has_headers, sheet, records_path }` | Parse the bytes into records. An invalid `records_path` JSONPath fails at config load. CSV/Excel rows are keyed by header name: empty Excel header cells, and several empty CSV header cells, are named `column_<i>` by position, and a header name that still repeats fails the read. |
 
 Example — a SOAP `runReport` report service returns a base64-encoded XLSX inside `<reportBytes>`:
 
