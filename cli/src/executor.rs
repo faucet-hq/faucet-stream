@@ -403,9 +403,22 @@ pub(crate) struct RunObservers {
     pub(crate) lag: Arc<faucet_core::LagObserver>,
     /// Per-run row accounting (#879).
     pub(crate) rows: Arc<faucet_core::RowAccounts>,
+    /// Rows the `--limit` cap held back on the per-row path, which the pipeline
+    /// counts as accepted; [`Self::rows_snapshot`] moves them to skipped.
+    pub(crate) limit_padded: Arc<AtomicUsize>,
 }
 
 impl RunObservers {
+    /// The row accounts, with rows the `--limit` cap held back reported as
+    /// skipped rather than accepted.
+    pub(crate) fn rows_snapshot(&self) -> faucet_core::RowAccountsSnapshot {
+        let mut rows = self.rows.snapshot();
+        let padded = (self.limit_padded.load(Ordering::Relaxed) as u64).min(rows.accepted);
+        rows.accepted -= padded;
+        rows.skipped += padded;
+        rows
+    }
+
     /// Batch outcomes, when any write was attempted.
     pub(crate) fn batch_outcomes(&self) -> Option<faucet_core::BatchOutcomes> {
         let b = self.batches.snapshot();
@@ -1946,7 +1959,7 @@ async fn run_unit(
         duration_ms,
         batches: observers.batch_outcomes(),
         source_lag: observers.lag.last(),
-        rows: Some(observers.rows.snapshot()).filter(|r| r.offered > 0 || r.unaccounted > 0),
+        rows: Some(observers.rows_snapshot()).filter(|r| r.offered > 0 || r.unaccounted > 0),
         ..Default::default()
     };
     match result {
@@ -3092,10 +3105,13 @@ async fn run_one_invocation(
         .as_ref()
         .map(|p| (Arc::clone(&captured), Arc::clone(p)));
     let tap_limit = limit_left.clone();
+    let tap_padded = Arc::clone(&observers.limit_padded);
     #[allow(unused_mut)]
     let mut builder = governance.sink_builder().inner_tap(move |s| {
         let s: Box<dyn Sink> = match &tap_limit {
-            Some(left) => Box::new(LimitedSink::sharing(s, Arc::clone(left))),
+            Some(left) => {
+                Box::new(LimitedSink::sharing(s, Arc::clone(left)).counting_padded(tap_padded))
+            }
             None => s,
         };
         match capture_sink {
@@ -4342,10 +4358,14 @@ impl CapturingSink {
             .map_or(len, |left| left.load(Ordering::Relaxed).min(len))
     }
 
-    /// Record the page's rows within the cap. A sink that succeeds wrote or
-    /// deliberately declined each of them, so every one is a parent record.
-    async fn capture(&self, records: &[Value], take: usize) {
-        let n = take.min(records.len());
+    /// Record the leading rows of the page the sink reports as landed
+    /// (accepted or coalesced), within the cap. Rows a sink declined by its
+    /// config (`max_records`, `on_key_error: skip`) never reached the
+    /// destination, so no child fans out over them.
+    async fn capture(&self, records: &[Value], take: usize, report: &faucet_core::WriteReport) {
+        let n = take
+            .min(report.accepted + report.coalesced)
+            .min(records.len());
         let mut buf = self.captured.lock().await;
         buf.extend(
             records
@@ -4390,7 +4410,7 @@ impl Sink for CapturingSink {
     ) -> Result<faucet_core::WriteReport, FaucetError> {
         let take = self.within_cap(records.len());
         let report = self.inner.write_batch_reported(records).await?;
-        self.capture(records, take).await;
+        self.capture(records, take, &report).await;
         Ok(report)
     }
 
@@ -4400,7 +4420,7 @@ impl Sink for CapturingSink {
     ) -> Result<faucet_core::WriteReport, FaucetError> {
         let take = self.within_cap(page.len());
         let report = self.inner.write_governed(page).await?;
-        self.capture(page.records(), take).await;
+        self.capture(page.records(), take, &report).await;
         Ok(report)
     }
 
@@ -4470,7 +4490,7 @@ impl Sink for CapturingSink {
             .inner
             .write_batch_idempotent_reported(records, scope, token)
             .await?;
-        self.capture(records, take).await;
+        self.capture(records, take, &report).await;
         Ok(report)
     }
 }
@@ -4480,6 +4500,9 @@ impl Sink for CapturingSink {
 pub(crate) struct LimitedSink {
     inner: Box<dyn Sink>,
     remaining: Arc<AtomicUsize>,
+    /// Rows past the cap the per-row path reported as `Ok` (it has no way to
+    /// say skipped), for the caller to correct its counts.
+    padded: Arc<AtomicUsize>,
 }
 
 impl LimitedSink {
@@ -4512,7 +4535,17 @@ impl LimitedSink {
 
     /// A cap whose remaining budget other layers can read.
     pub(crate) fn sharing(inner: Box<dyn Sink>, remaining: Arc<AtomicUsize>) -> Self {
-        Self { inner, remaining }
+        Self {
+            inner,
+            remaining,
+            padded: Arc::default(),
+        }
+    }
+
+    /// Count the rows the per-row path pads past the cap into `padded`.
+    pub(crate) fn counting_padded(mut self, padded: Arc<AtomicUsize>) -> Self {
+        self.padded = padded;
+        self
     }
 }
 
@@ -4527,7 +4560,9 @@ impl Sink for LimitedSink {
         write_batch_idempotent, last_committed_token, supports_columnar, write_batch_columnar,
         native_load_capabilities, load_native);
 
-    // Rows past the cap read as accepted; the executor clamps the count and the capture skips them.
+    // Rows past the cap read as `Ok` (a row outcome cannot say skipped); they
+    // are counted in `padded` so the caller reports them as skipped, and the
+    // capture skips them.
     async fn write_batch_partial(
         &self,
         records: &[Value],
@@ -4542,6 +4577,8 @@ impl Sink for LimitedSink {
         let accepted = outcomes.iter().filter(|o| o.is_ok()).count();
         self.remaining
             .fetch_sub(accepted.min(remaining), Ordering::Relaxed);
+        self.padded
+            .fetch_add(records.len() - take, Ordering::Relaxed);
         outcomes.resize_with(records.len(), || Ok(()));
         Ok(outcomes)
     }

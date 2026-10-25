@@ -418,9 +418,28 @@ pub struct TopologyBudgets {
     /// Each sink node's governance and the ids its masking rules are scoped
     /// by, so the run can attach that node's governed DLQ (#870).
     governance: HashMap<String, (faucet_core::Governance, Vec<String>)>,
+    /// Rows each sink node's `--limit` cap held back on the per-row path,
+    /// which the node report counts as written.
+    limit_padded: HashMap<String, std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl TopologyBudgets {
+    /// Take the rows the `--limit` cap held back out of each sink node's
+    /// written count.
+    fn unpad(&self, reported: &mut faucet_core::topology::TopologyRun) {
+        use std::sync::atomic::Ordering;
+        for node in reported.nodes.iter_mut() {
+            if let Some(p) = self.limit_padded.get(&node.node_id) {
+                node.records = node.records.saturating_sub(p.load(Ordering::Relaxed));
+            }
+        }
+        for (id, records) in reported.result.per_sink.iter_mut() {
+            if let Some(p) = self.limit_padded.get(id) {
+                *records = records.saturating_sub(p.load(Ordering::Relaxed));
+            }
+        }
+    }
+
     /// `(sink node id, error)` for every node whose budget ran out.
     fn verdicts(&self) -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = self
@@ -1118,15 +1137,22 @@ async fn build_topology_inner(
                     map.insert((*id).clone(), p);
                 }
                 let limit = opts.limit;
+                let padded = std::sync::Arc::<std::sync::atomic::AtomicUsize>::default();
+                let tap_padded = std::sync::Arc::clone(&padded);
                 let governed = built
                     .governance
                     .sink_builder()
                     .inner_tap(move |s| match limit {
-                        Some(n) => Box::new(crate::executor::LimitedSink::wrap(s, n)) as Box<_>,
+                        Some(n) => Box::new(
+                            crate::executor::LimitedSink::wrap(s, n).counting_padded(tap_padded),
+                        ) as Box<_>,
                         None => s,
                     })
                     .build(sink);
                 if let Some(states) = budgets.as_mut() {
+                    if limit.is_some() {
+                        states.limit_padded.insert((*id).clone(), padded);
+                    }
                     if let Some(state) = governed.budget_state() {
                         states
                             .states
@@ -1540,6 +1566,7 @@ pub async fn run_topology(
     // needs to know which node failed — and needs that on a failed run too, where
     // `run_reported` would hand back only the error (#459, #789 CLI-18).
     let (mut reported, run_error) = topo.run_attributed(opts, governance).await;
+    budgets.unpad(&mut reported);
     drop(lease_watches);
     let cancelled = run.cancel.as_ref().is_some_and(|c| c.is_cancelled());
 
