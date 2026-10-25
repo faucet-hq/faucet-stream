@@ -32,6 +32,8 @@ pub struct QueueDepthWatcher {
     confirmed: Option<u64>,
     poll: Duration,
     compiled: std::sync::Arc<super::compiled::CompiledTrigger>,
+    /// `poll_timeout_secs`; `None` = the default for the poll interval.
+    poll_timeout: Option<Duration>,
 }
 
 impl QueueDepthWatcher {
@@ -49,7 +51,15 @@ impl QueueDepthWatcher {
             confirmed: None,
             poll,
             compiled,
+            poll_timeout: None,
         }
+    }
+
+    /// Bound each poll by `poll_timeout_secs` instead of the default.
+    #[must_use]
+    pub fn with_poll_timeout(mut self, limit: Option<Duration>) -> Self {
+        self.poll_timeout = limit;
+        self
     }
 }
 
@@ -63,6 +73,13 @@ impl Watcher for QueueDepthWatcher {
     }
     fn poll_interval(&self) -> Duration {
         self.poll
+    }
+
+    fn poll_timeout(&self) -> Option<Duration> {
+        Some(
+            self.poll_timeout
+                .unwrap_or_else(|| super::watcher::default_poll_timeout(self.poll)),
+        )
     }
 
     async fn poll(&mut self, state: &ServerState) -> Result<bool, super::watcher::PollError> {

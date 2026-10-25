@@ -138,6 +138,7 @@ impl CompiledTriggers {
             let webhook_path = match &t.kind {
                 TriggerKind::ObjectArrival {
                     poll_interval_secs,
+                    poll_timeout_secs,
                     store,
                     ..
                 } => {
@@ -147,6 +148,7 @@ impl CompiledTriggers {
                             t.name
                         ));
                     }
+                    validate_poll_timeout(&t.name, *poll_timeout_secs)?;
                     require_feature(&t.name, store_feature(store))?;
                     validate_store(&t.name, store)?;
                     None
@@ -170,6 +172,7 @@ impl CompiledTriggers {
                 }
                 TriggerKind::QueueDepth {
                     poll_interval_secs,
+                    poll_timeout_secs,
                     queue,
                     threshold,
                 } => {
@@ -179,6 +182,7 @@ impl CompiledTriggers {
                             t.name
                         ));
                     }
+                    validate_poll_timeout(&t.name, *poll_timeout_secs)?;
                     if *threshold == 0 {
                         return Err(format!("triggers: '{}' threshold must be >= 1", t.name));
                     }
@@ -291,6 +295,15 @@ fn validate_schedule(trigger: &str, cron: &str, timezone: &str) -> Result<(), St
 
 #[cfg(not(feature = "schedule"))]
 fn validate_schedule(_trigger: &str, _cron: &str, _timezone: &str) -> Result<(), String> {
+    Ok(())
+}
+
+fn validate_poll_timeout(name: &str, secs: Option<u64>) -> Result<(), String> {
+    if secs == Some(0) {
+        return Err(format!(
+            "triggers: '{name}' poll_timeout_secs must be >= 1 (omit it for the default)"
+        ));
+    }
     Ok(())
 }
 
@@ -429,6 +442,19 @@ mod tests {
             err.contains("threshold must be >= 1") || err.contains("triggers-redis"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn rejects_a_zero_poll_timeout() {
+        for kind in [
+            "object_arrival\n    store: { type: s3, bucket: b }",
+            "queue_depth\n    queue: { type: redis, url: \"redis://x\", key: k }",
+        ] {
+            let err = compile_err(&format!(
+                "version: 1\ntriggers:\n  - name: p\n    type: {kind}\n    config: ./x.yaml\n    poll_timeout_secs: 0\n"
+            ));
+            assert!(err.contains("poll_timeout_secs must be >= 1"), "{err}");
+        }
     }
 
     #[test]

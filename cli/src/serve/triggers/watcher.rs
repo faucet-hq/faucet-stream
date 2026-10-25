@@ -12,28 +12,42 @@ use tokio_util::sync::CancellationToken;
 pub const UNHEALTHY_THRESHOLD: u64 = 3;
 /// Backoff ceiling so a persistently-failing watcher still retries periodically.
 pub const MAX_BACKOFF: Duration = Duration::from_secs(60);
-/// Shortest time one poll may take before it counts as failed.
+/// Shortest default time one poll (or, for `object_arrival`, one listing
+/// page) may take before it counts as failed.
 pub const POLL_TIMEOUT_FLOOR: Duration = Duration::from_secs(60);
 
-/// Run one poll, bounded by `limit` and stopped by `shutdown` (`None`). A
-/// poll that hangs on an unresponsive backend becomes an error the
-/// supervisor records, instead of freezing the watcher while it reads healthy.
+/// The default stall limit for a watcher polling every `interval`.
+pub fn default_poll_timeout(interval: Duration) -> Duration {
+    interval.max(POLL_TIMEOUT_FLOOR)
+}
+
+/// Run one poll, bounded by `limit` (when set) and stopped by `shutdown`
+/// (`None`). A poll that hangs on an unresponsive backend becomes an error
+/// the supervisor records, instead of freezing the watcher while it reads
+/// healthy.
 pub async fn poll_bounded<W: Watcher + ?Sized>(
     watcher: &mut W,
     state: &ServerState,
-    limit: Duration,
+    limit: Option<Duration>,
     shutdown: &CancellationToken,
 ) -> Option<Result<bool, PollError>> {
+    let poll = async {
+        match limit {
+            Some(limit) => match tokio::time::timeout(limit, watcher.poll(state)).await {
+                Ok(r) => r,
+                Err(_) => Err(PollError::from(format!(
+                    "poll did not finish within {}s (raise the trigger's poll_timeout_secs if \
+                     a poll legitimately takes longer)",
+                    limit.as_secs()
+                ))),
+            },
+            None => watcher.poll(state).await,
+        }
+    };
     tokio::select! {
         biased;
         _ = shutdown.cancelled() => None,
-        r = tokio::time::timeout(limit, watcher.poll(state)) => Some(match r {
-            Ok(r) => r,
-            Err(_) => Err(PollError::from(format!(
-                "poll did not finish within {}s",
-                limit.as_secs()
-            ))),
-        }),
+        r = poll => Some(r),
     }
 }
 
@@ -78,6 +92,12 @@ pub trait Watcher: Send + Sync {
     fn name(&self) -> &str;
     fn kind(&self) -> &'static str;
     fn poll_interval(&self) -> Duration;
+    /// Longest one whole poll may take before it counts as failed; `None`
+    /// leaves the whole poll unbounded (the watcher bounds its own I/O).
+    /// Default: [`default_poll_timeout`] of the poll interval.
+    fn poll_timeout(&self) -> Option<Duration> {
+        Some(default_poll_timeout(self.poll_interval()))
+    }
     /// Do one cycle. `Ok(true)` = something fired; `Ok(false)` = idle.
     async fn poll(&mut self, state: &ServerState) -> Result<bool, PollError>;
 }
@@ -112,7 +132,7 @@ pub async fn run_supervised<W: Watcher>(
                 break;
             }
             _ = tokio::time::sleep(wait) => {
-                let limit = watcher.poll_interval().max(POLL_TIMEOUT_FLOOR);
+                let limit = watcher.poll_timeout();
                 let Some(outcome) = poll_bounded(&mut watcher, &state, limit, &shutdown).await else {
                     tracing::info!(trigger = watcher.name(), "trigger watcher stopping");
                     break;
@@ -174,13 +194,13 @@ mod tests {
     async fn a_hung_poll_times_out_and_shutdown_stops_it() {
         let state = crate::serve::test_support::test_state();
         let token = CancellationToken::new();
-        let out = poll_bounded(&mut Hangs, &state, POLL_TIMEOUT_FLOOR, &token).await;
+        let out = poll_bounded(&mut Hangs, &state, Some(POLL_TIMEOUT_FLOOR), &token).await;
         let err = out.expect("not shut down").unwrap_err();
         assert!(err.message.contains("did not finish within 60s"), "{err}");
         assert!(!err.counted);
         token.cancel();
         assert!(
-            poll_bounded(&mut Hangs, &state, POLL_TIMEOUT_FLOOR, &token)
+            poll_bounded(&mut Hangs, &state, Some(POLL_TIMEOUT_FLOOR), &token)
                 .await
                 .is_none()
         );

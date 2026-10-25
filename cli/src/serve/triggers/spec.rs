@@ -79,6 +79,13 @@ pub enum TriggerKind {
         /// once. Default: 86400 (24 hours).
         #[serde(default = "default_lookback_secs")]
         lookback_secs: u64,
+        /// Longest one poll (listing the prefix and firing what is new) may
+        /// take before it counts as failed. Default: no limit on the whole
+        /// poll; instead each listing page must arrive within
+        /// `max(poll_interval_secs, 60)` seconds, so a stalled request fails
+        /// while a long listing of a large prefix keeps going.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        poll_timeout_secs: Option<u64>,
     },
     Webhook {
         #[serde(default = "default_webhook_methods")]
@@ -97,6 +104,10 @@ pub enum TriggerKind {
         threshold: u64,
         #[serde(default = "default_poll_secs")]
         poll_interval_secs: u64,
+        /// Longest one poll (reading the depth and firing) may take before it
+        /// counts as failed. Default: `max(poll_interval_secs, 60)`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        poll_timeout_secs: Option<u64>,
     },
     /// Fire on a cron schedule (#709; needs the `schedule` feature). With
     /// `tenants`, each tick fans out one run per tenant.

@@ -202,6 +202,10 @@ pub struct ObjectArrivalWatcher {
     /// Whether the stored cursor has been read (once, on the first poll).
     resumed: bool,
     compiled: Arc<super::compiled::CompiledTrigger>,
+    /// Limit on the whole poll (`poll_timeout_secs`); `None` = unbounded.
+    poll_timeout: Option<Duration>,
+    /// Longest wait for the next listing page before the poll fails.
+    page_timeout: Duration,
 }
 
 impl ObjectArrivalWatcher {
@@ -259,7 +263,24 @@ impl ObjectArrivalWatcher {
             cursor,
             resumed: false,
             compiled,
+            poll_timeout: None,
+            page_timeout: super::watcher::default_poll_timeout(poll),
         }
+    }
+
+    /// Bound the whole poll (`poll_timeout_secs`); without it only each
+    /// listing page is bounded.
+    #[must_use]
+    pub fn with_poll_timeout(mut self, limit: Option<Duration>) -> Self {
+        self.poll_timeout = limit;
+        self
+    }
+
+    /// Override how long the watcher waits for the next listing page.
+    #[must_use]
+    pub fn with_page_timeout(mut self, limit: Duration) -> Self {
+        self.page_timeout = limit;
+        self
     }
 
     /// Resume from the cursor a previous process stored, so objects that
@@ -312,7 +333,18 @@ impl ObjectArrivalWatcher {
         let prefix_path = self.prefix.as_deref().map(object_store::path::Path::from);
         let mut stream = self.store.list(prefix_path.as_ref());
         let mut out = Vec::new();
-        while let Some(meta) = stream.next().await {
+        // Bound each wait for the store, not the whole listing: a large
+        // prefix takes as long as it takes while pages keep arriving.
+        loop {
+            let next = tokio::time::timeout(self.page_timeout, stream.next())
+                .await
+                .map_err(|_| {
+                    format!(
+                        "listing objects: no response from the store within {}s",
+                        self.page_timeout.as_secs()
+                    )
+                })?;
+            let Some(meta) = next else { break };
             let meta = meta.map_err(|e| format!("listing objects: {e}"))?;
             let o = ListedObject {
                 key: meta.location.to_string(),
@@ -340,6 +372,10 @@ impl Watcher for ObjectArrivalWatcher {
 
     fn poll_interval(&self) -> Duration {
         self.poll
+    }
+
+    fn poll_timeout(&self) -> Option<Duration> {
+        self.poll_timeout
     }
 
     async fn poll(&mut self, state: &ServerState) -> Result<bool, super::watcher::PollError> {

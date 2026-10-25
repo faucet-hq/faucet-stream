@@ -440,6 +440,191 @@ async fn object_arrival_cursor_survives_a_restart() {
     );
 }
 
+/// An object store whose listing yields one entry per `delay`, or never
+/// yields at all (`stall`): a large prefix vs. a hung request.
+#[cfg(feature = "triggers-object-store")]
+#[derive(Debug)]
+struct Paced {
+    inner: object_store::memory::InMemory,
+    delay: Duration,
+    stall: bool,
+}
+
+#[cfg(feature = "triggers-object-store")]
+impl std::fmt::Display for Paced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Paced")
+    }
+}
+
+#[cfg(feature = "triggers-object-store")]
+#[async_trait::async_trait]
+impl object_store::ObjectStore for Paced {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        use futures::StreamExt;
+        if self.stall {
+            return futures::stream::pending().boxed();
+        }
+        let delay = self.delay;
+        self.inner
+            .list(prefix)
+            .then(move |item| async move {
+                tokio::time::sleep(delay).await;
+                item
+            })
+            .boxed()
+    }
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// A listing that keeps progressing is never cut off however long it takes
+/// in total; a listing whose next page never arrives fails the poll.
+#[cfg(feature = "triggers-object-store")]
+#[tokio::test]
+async fn object_arrival_bounds_each_listing_page_not_the_whole_poll() {
+    use faucet_cli::serve::triggers::object_arrival::ObjectArrivalWatcher;
+    use faucet_cli::serve::triggers::spec::{ArrivalMode, StartAt};
+    use faucet_cli::serve::triggers::watcher::{Watcher, poll_bounded};
+    use object_store::path::Path as OPath;
+    use object_store::{ObjectStore, ObjectStoreExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let csv = dir.path().join("in.csv");
+    std::fs::write(&csv, "a\n1\n").unwrap();
+    let out = dir.path().join("out.jsonl");
+    let inline = inline_pipeline(csv.to_str().unwrap(), out.to_str().unwrap());
+    let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml::from_str(&format!(
+        "version: 1\ntriggers:\n  - name: drop\n    type: object_arrival\n    mode: batch\n    store: {{ type: s3, bucket: b }}\n    config: {}\n",
+        serde_json::to_string(&inline).unwrap()
+    ))
+    .unwrap();
+    let compiled = CompiledTriggers::compile(file).unwrap();
+    let state = build_state(&compiled);
+    let inner = object_store::memory::InMemory::new();
+    for i in 0..4 {
+        inner
+            .put(
+                &OPath::from(format!("incoming/{i}.json")),
+                b"{}".to_vec().into(),
+            )
+            .await
+            .unwrap();
+    }
+    let watcher = |store: Arc<dyn ObjectStore>| {
+        ObjectArrivalWatcher::new(
+            Arc::new(compiled.triggers[0].clone()),
+            store,
+            "b".into(),
+            None,
+            ArrivalMode::Batch,
+            Duration::from_secs(1),
+            StartAt::Beginning,
+            chrono::Utc::now(),
+        )
+        .with_page_timeout(Duration::from_millis(600))
+    };
+    let shutdown = CancellationToken::new();
+
+    let slow: Arc<dyn ObjectStore> = Arc::new(Paced {
+        inner,
+        delay: Duration::from_millis(250),
+        stall: false,
+    });
+    let mut w = watcher(slow);
+    assert_eq!(w.poll_timeout(), None, "no whole-poll limit by default");
+    let started = std::time::Instant::now();
+    let fired = {
+        let limit = w.poll_timeout();
+        poll_bounded(&mut w, &state, limit, &shutdown)
+    }
+    .await
+    .expect("not shut down")
+    .expect("a listing that keeps progressing is not cut off");
+    assert!(fired);
+    assert!(
+        started.elapsed() > Duration::from_millis(600),
+        "the listing took longer than one page's limit in total"
+    );
+
+    let hung: Arc<dyn ObjectStore> = Arc::new(Paced {
+        inner: object_store::memory::InMemory::new(),
+        delay: Duration::ZERO,
+        stall: true,
+    });
+    let mut w = watcher(hung);
+    let err = {
+        let limit = w.poll_timeout();
+        poll_bounded(&mut w, &state, limit, &shutdown)
+    }
+    .await
+    .expect("not shut down")
+    .unwrap_err();
+    assert!(
+        err.message.contains("no response from the store within"),
+        "{err}"
+    );
+
+    let mut w = watcher(Arc::new(object_store::memory::InMemory::new()))
+        .with_poll_timeout(Some(Duration::from_secs(5)));
+    assert_eq!(w.poll_timeout(), Some(Duration::from_secs(5)));
+    assert!(
+        !{
+            let limit = w.poll_timeout();
+            poll_bounded(&mut w, &state, limit, &shutdown)
+        }
+        .await
+        .unwrap()
+        .unwrap()
+    );
+}
+
 #[cfg(feature = "triggers-object-store")]
 #[tokio::test]
 async fn object_arrival_enqueues_one_run_per_object_and_dedupes() {
@@ -574,12 +759,19 @@ async fn queue_depth_fires_once_on_rising_edge() {
             readings: Arc::new(vec![0, 9, 9, 0, 7]),
             idx: Arc::new(AtomicU64::new(0)),
         };
-        let mut w = QueueDepthWatcher::new(
+        let w = QueueDepthWatcher::new(
             Arc::new(compiled.triggers[0].clone()),
             Box::new(probe),
             5,
             Duration::from_secs(30),
         );
+        assert_eq!(
+            w.poll_timeout(),
+            Some(Duration::from_secs(60)),
+            "default: max(poll interval, 60s)"
+        );
+        let mut w = w.with_poll_timeout(Some(Duration::from_secs(90)));
+        assert_eq!(w.poll_timeout(), Some(Duration::from_secs(90)));
 
         assert!(!w.poll(&state).await.unwrap(), "depth 0: no fire");
         assert!(w.poll(&state).await.unwrap(), "depth 9: rising edge fires");
@@ -1327,7 +1519,7 @@ async fn an_object_arrival_trigger_spawns_a_watcher_with_its_lookback() {
         dir.path().join("o.jsonl").to_str().unwrap(),
     );
     let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml::from_str(&format!(
-        "version: 1\ntriggers:\n  - name: drop\n    type: object_arrival\n    store: {{ type: s3, bucket: b, region: us-east-1, endpoint: \"http://127.0.0.1:9\" }}\n    lookback_secs: 3600\n    poll_interval_secs: 3600\n    config: {}\n",
+        "version: 1\ntriggers:\n  - name: drop\n    type: object_arrival\n    store: {{ type: s3, bucket: b, region: us-east-1, endpoint: \"http://127.0.0.1:9\" }}\n    lookback_secs: 3600\n    poll_interval_secs: 3600\n    poll_timeout_secs: 120\n    config: {}\n",
         serde_json::to_string(&inline).unwrap()
     ))
     .unwrap();
