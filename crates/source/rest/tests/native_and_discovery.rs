@@ -919,3 +919,40 @@ async fn key_bounds_probe_waits_out_a_rate_limit_and_sends_only_configured_optio
         .count();
     assert_eq!(probes, 3, "the rate-limited probe is retried, not fatal");
 }
+
+/// A configured `cross-company` scope reaches both key-bound probes, so the
+/// bounds cover the same companies the data pages read.
+#[tokio::test]
+async fn key_bounds_probes_carry_a_configured_cross_company_scope() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/Ledger"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "value": [{ "RecId": 1 }] })),
+        )
+        .mount(&server)
+        .await;
+    let mut cfg = ledger_partitioned(&server.uri());
+    cfg.query_params
+        .insert("cross-company".to_string(), "true".to_string());
+    assert_eq!(drain_records(cfg).await, 1);
+    let requests = server.received_requests().await.unwrap();
+    for order in ["RecId asc", "RecId desc"] {
+        let probe = requests
+            .iter()
+            .find(|r| {
+                let pairs: Vec<(String, String)> = r.url.query_pairs().into_owned().collect();
+                pairs.contains(&("$top".to_string(), "1".to_string()))
+                    && pairs.contains(&("$orderby".to_string(), order.to_string()))
+            })
+            .unwrap_or_else(|| panic!("no {order} key-bound probe"));
+        assert!(
+            probe
+                .url
+                .query_pairs()
+                .any(|(k, v)| k == "cross-company" && v == "true"),
+            "the {order} probe must carry cross-company: {}",
+            probe.url
+        );
+    }
+}
