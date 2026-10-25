@@ -114,7 +114,7 @@ pub struct VerifyOutcome {
 impl VerifyOutcome {
     /// Differing keys (the exit code of `faucet verify`).
     pub fn differing_keys(&self) -> usize {
-        self.report.differences.len()
+        usize::try_from(self.report.differing_keys()).unwrap_or(usize::MAX)
     }
 }
 
@@ -350,7 +350,7 @@ pub async fn verify_node_guarded(
     }
     if total > spec.max_differences {
         report.differences.truncate(spec.max_differences);
-        report.truncated = true;
+        report.differences_found = Some(total as u64);
     }
 
     metrics::record(
@@ -1078,8 +1078,13 @@ mod tests {
         };
         let out = verify_node(&node, &spec, &repair_inputs()).await.unwrap();
         assert_eq!(out.report.differences.len(), 2);
-        assert!(out.report.truncated);
+        // The cap limits the listing, not the scan: every difference found
+        // was repaired, so the report is healed.
+        assert!(!out.report.truncated);
+        assert_eq!(out.report.differences_found, Some(5));
+        assert_eq!(out.differing_keys(), 5);
         assert_eq!(out.report.repaired_upserts, Some(5), "{out:?}");
+        assert!(out.report.healed(), "{out:?}");
 
         let check = VerifyInputs {
             repair: false,

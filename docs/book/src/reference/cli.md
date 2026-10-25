@@ -765,9 +765,11 @@ faucet verify pipeline.yaml --row orders --max-differences 50
 | `--json` | Emit the machine-readable report. |
 | `--env-file <path>` / `--no-env-file` / `--profile <name>` | Same config-load handling as `run`. |
 
-A scan that stops early (`max_rows_scanned`, or the report truncated at
-`max_differences`) is not a pass: the command exits non-zero even when no
-difference was found yet. Rows are matched on the sink's `key` or `verify.key`; a keyless table is
+A scan that stops early (`max_rows_scanned`) is not a pass: the command exits
+non-zero even when no difference was found yet. `max_differences` caps only the
+listing: the report's `differences_found` keeps the full count (the exit code),
+a repair covers every difference found, and a post-run repair that re-synced
+all of them leaves the run green. Rows are matched on the sink's `key` or `verify.key`; a keyless table is
 refused. The `verify:` block (see [config](./config.md#verify)) also runs the
 comparison after every successful run. Cookbook: [Content
 verification](../cookbook/verify.md).

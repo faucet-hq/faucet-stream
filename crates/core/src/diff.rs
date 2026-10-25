@@ -728,6 +728,11 @@ pub struct VerifyReport {
     pub differences: Vec<Difference>,
     /// The scan stopped at `max_rows_scanned`; `differences` is a lower bound.
     pub truncated: bool,
+    /// How many differing keys the scan found, when `differences` lists only
+    /// the first of them (the `max_differences` reporting cap); `None` when
+    /// it lists every one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub differences_found: Option<u64>,
     /// Rows written back by `--repair` (upserts), if repair ran.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repaired_upserts: Option<u64>,
@@ -759,14 +764,24 @@ impl VerifyReport {
         self.differences.is_empty() && !self.truncated
     }
 
-    /// Whether a repair re-synced every reported difference (and the report is
-    /// complete), so the destination now matches.
+    /// Differing keys the scan found — beyond the listed ones when the report
+    /// was capped.
+    pub fn differing_keys(&self) -> u64 {
+        self.differences_found
+            .unwrap_or(self.differences.len() as u64)
+            .max(self.differences.len() as u64)
+    }
+
+    /// Whether a repair re-synced every difference found (and the scan was
+    /// complete), so the destination now matches. A reporting cap
+    /// (`differences_found`) does not count against it.
     pub fn healed(&self) -> bool {
-        if self.truncated || self.differences.is_empty() {
+        let found = self.differing_keys();
+        if self.truncated || found == 0 {
             return false;
         }
         let repaired = self.repaired_upserts.unwrap_or(0) + self.repaired_deletes.unwrap_or(0);
-        repaired >= self.differences.len() as u64
+        repaired >= found
     }
 }
 
@@ -1323,6 +1338,17 @@ mod tests {
         assert!(r.healed());
         r.truncated = true;
         assert!(!r.healed(), "a truncated report cannot claim to be healed");
+        // A reporting cap is not an incomplete scan: healed when every
+        // difference found was repaired.
+        r.truncated = false;
+        let listed = r.differences.len() as u64;
+        r.differences_found = Some(listed + 3);
+        assert_eq!(r.differing_keys(), listed + 3);
+        r.repaired_upserts = Some(listed + 2);
+        r.repaired_deletes = Some(0);
+        assert!(!r.healed(), "two found differences were not repaired");
+        r.repaired_deletes = Some(1);
+        assert!(r.healed());
     }
 
     #[test]

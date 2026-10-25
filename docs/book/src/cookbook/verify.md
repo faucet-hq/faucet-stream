@@ -55,7 +55,9 @@ With a single integer key on two range-readable SQL sources (`postgres`,
 Any other key shape, or a source that cannot read a key range (a file, an
 API), compares the whole dataset in one keyed pass. `verify.max_rows_scanned`
 caps how much either side may read — the read stops once it passes the cap, in
-either mode — and a capped report is marked `truncated`. A range (or, in a
+either mode — and a report whose scan was capped is marked `truncated`
+(`max_differences` only shortens the listing; `differences_found` then holds
+the full count). A range (or, in a
 whole-dataset pass, the dataset) a side could not finish reading is not diffed,
 so the cap never reports unread rows as missing.
 

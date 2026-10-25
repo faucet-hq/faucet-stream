@@ -111,11 +111,13 @@ pub fn render_human(outcome: &VerifyOutcome) -> String {
         out.push_str(&format!(
             "  {} differing key(s): {missing} missing in destination, {extra} extra in destination, \
              {changed} changed, {dup} duplicated{}\n",
-            r.differences.len(),
+            r.differing_keys(),
             if r.truncated {
-                " (report truncated)"
+                " (report truncated)".to_string()
+            } else if r.differences_found.is_some() {
+                format!(" (counts cover the first {} listed)", r.differences.len())
             } else {
-                ""
+                String::new()
             }
         ));
         for d in r.differences.iter().take(25) {

@@ -3337,9 +3337,14 @@ async fn run_one_invocation(
                             _ => String::new(),
                         },
                         if outcome.report.truncated {
-                            "; report truncated"
+                            "; report truncated".to_string()
+                        } else if outcome.report.differences_found.is_some() {
+                            format!(
+                                "; counts cover the first {} listed",
+                                outcome.report.differences.len()
+                            )
                         } else {
-                            ""
+                            String::new()
                         },
                     );
                     if spec.fail_on_difference {
