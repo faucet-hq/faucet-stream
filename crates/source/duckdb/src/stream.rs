@@ -37,22 +37,82 @@ pub struct DuckdbSource {
     calls: faucet_core::CallSlot,
 }
 
-/// Interrupts the connection's running query when dropped, unless disarmed
-/// once the query has finished.
+/// One query's claim on the connection's interrupt handle.
+///
+/// The handle is shared by every call on the connection, so interrupting it
+/// blindly could stop another call's query. The reader marks the query running
+/// while it holds the connection, and [`QueryRun::interrupt`] fires the handle
+/// only while that is so (both under one lock, so the reader cannot finish and
+/// hand the connection over in between). An interrupt that arrives before the
+/// query starts makes the reader skip it.
+#[derive(Clone)]
+struct QueryRun {
+    state: Arc<Mutex<QueryState>>,
+    handle: Arc<duckdb::InterruptHandle>,
+}
+
+#[derive(Default)]
+struct QueryState {
+    running: bool,
+    stopped: bool,
+}
+
+impl QueryRun {
+    fn new(handle: Arc<duckdb::InterruptHandle>) -> Self {
+        Self {
+            state: Arc::default(),
+            handle,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, QueryState> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Run `query` (on the blocking thread, holding the connection) as this
+    /// run's query, unless it was interrupted before it started.
+    fn run<T>(&self, query: impl FnOnce() -> Result<T, FaucetError>) -> Result<T, FaucetError> {
+        {
+            let mut state = self.lock();
+            if state.stopped {
+                return Err(FaucetError::Cancelled {
+                    operation: "duckdb query".into(),
+                });
+            }
+            state.running = true;
+        }
+        let out = query();
+        self.lock().running = false;
+        out
+    }
+
+    /// Stop this run's query: interrupt it if it is running, else keep it
+    /// from starting. Never touches another call's query.
+    fn interrupt(&self) {
+        let mut state = self.lock();
+        state.stopped = true;
+        if state.running {
+            self.handle.interrupt();
+        }
+    }
+}
+
+/// Interrupts its query when dropped, unless disarmed once the query has
+/// finished.
 struct InterruptOnDrop {
-    handle: Option<Arc<duckdb::InterruptHandle>>,
+    run: Option<QueryRun>,
 }
 
 impl InterruptOnDrop {
     fn disarm(&mut self) {
-        self.handle = None;
+        self.run = None;
     }
 }
 
 impl Drop for InterruptOnDrop {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            handle.interrupt();
+        if let Some(run) = self.run.take() {
+            run.interrupt();
         }
     }
 }
@@ -420,14 +480,17 @@ fn collect_blocking(
     conn: &Arc<Mutex<Connection>>,
     query: &str,
     binds: &[Value],
+    run: &QueryRun,
 ) -> Result<Vec<Value>, FaucetError> {
     let guard = conn
         .lock()
         .map_err(|_| FaucetError::Source("duckdb connection mutex poisoned".into()))?;
     let mut out = Vec::new();
-    run_query(&guard, query, binds, |rows| {
-        out.extend(rows);
-        Ok(true)
+    run.run(|| {
+        run_query(&guard, query, binds, |rows| {
+            out.extend(rows);
+            Ok(true)
+        })
     })?;
     Ok(out)
 }
@@ -439,6 +502,7 @@ fn stream_blocking(
     binds: &[Value],
     batch_size: usize,
     tx: &mpsc::Sender<Result<StreamPage, FaucetError>>,
+    run: &QueryRun,
 ) -> Result<(), FaucetError> {
     let guard = conn
         .lock()
@@ -451,25 +515,27 @@ fn stream_blocking(
     let cap = if batch_size == 0 { 1024 } else { batch_size };
     let mut buffer: Vec<Value> = Vec::with_capacity(cap);
     let mut open = true;
-    run_query(&guard, query, binds, |rows| {
-        for row in rows {
-            buffer.push(row);
-            if buffer.len() >= chunk {
-                let page = std::mem::replace(&mut buffer, Vec::with_capacity(cap));
-                // Receiver dropped (stream cancelled) → stop cleanly.
-                if tx
-                    .blocking_send(Ok(StreamPage {
-                        records: page,
-                        bookmark: None,
-                    }))
-                    .is_err()
-                {
-                    open = false;
-                    return Ok(false);
+    run.run(|| {
+        run_query(&guard, query, binds, |rows| {
+            for row in rows {
+                buffer.push(row);
+                if buffer.len() >= chunk {
+                    let page = std::mem::replace(&mut buffer, Vec::with_capacity(cap));
+                    // Receiver dropped (stream cancelled) → stop cleanly.
+                    if tx
+                        .blocking_send(Ok(StreamPage {
+                            records: page,
+                            bookmark: None,
+                        }))
+                        .is_err()
+                    {
+                        open = false;
+                        return Ok(false);
+                    }
                 }
             }
-        }
-        Ok(true)
+            Ok(true)
+        })
     })?;
     if open && !buffer.is_empty() {
         let _ = tx.blocking_send(Ok(StreamPage {
@@ -500,7 +566,11 @@ impl faucet_core::Source for DuckdbSource {
         let conn = self.conn.clone();
         let (query_str, binds) = resolve_query(&self.config, context);
         let query_label = self.config.query.clone();
-        let task = tokio::task::spawn_blocking(move || collect_blocking(&conn, &query_str, &binds));
+        let run = QueryRun::new(self.interrupt.clone());
+        let reader = run.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            collect_blocking(&conn, &query_str, &binds, &reader)
+        });
         let records = self
             .calls
             .call_once("query", async {
@@ -510,7 +580,7 @@ impl faucet_core::Source for DuckdbSource {
             .await
             .inspect_err(|e| {
                 if cut_short(e) {
-                    self.interrupt.interrupt();
+                    run.interrupt();
                 }
             })?;
         tracing::info!(
@@ -540,8 +610,11 @@ impl faucet_core::Source for DuckdbSource {
         let query_label = self.config.query.clone();
         let (tx, mut rx) = mpsc::channel::<Result<StreamPage, FaucetError>>(4);
 
+        let run = QueryRun::new(self.interrupt.clone());
+        let reader_run = run.clone();
         let reader = tokio::task::spawn_blocking(move || {
-            if let Err(e) = stream_blocking(&conn, &query_str, &binds, batch_size, &tx) {
+            if let Err(e) = stream_blocking(&conn, &query_str, &binds, batch_size, &tx, &reader_run)
+            {
                 let _ = tx.blocking_send(Err(e));
             }
         });
@@ -550,7 +623,7 @@ impl faucet_core::Source for DuckdbSource {
         // at a cancel, `--limit`, a sink error — interrupts a query still
         // running instead of leaving it to hold the connection.
         let guard = InterruptOnDrop {
-            handle: Some(self.interrupt.clone()),
+            run: Some(run.clone()),
         };
         Box::pin(async_stream::try_stream! {
             let mut guard = guard;
@@ -565,7 +638,7 @@ impl faucet_core::Source for DuckdbSource {
                     .await
                     .inspect_err(|e| {
                         if cut_short(e) {
-                            self.interrupt.interrupt();
+                            run.interrupt();
                         }
                     })?;
                 let Some(item) = next else { break };
@@ -731,6 +804,60 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(next, 42);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::disallowed_methods)] // test pacing: let the reader settle / start
+    async fn interrupting_a_finished_run_leaves_the_next_query_alone() {
+        let source = DuckdbSource::new(DuckdbSourceConfig::new(":memory:", "SELECT 1 AS n"))
+            .await
+            .unwrap();
+        let ctx = HashMap::new();
+        // Read the only page, then drop the stream before its final poll:
+        // the reader is done, so the guard must not interrupt anything.
+        {
+            let mut stream = source.stream_pages(&ctx, 0);
+            let page = futures::StreamExt::next(&mut stream)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(page.records.len(), 1);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // A query another call runs on the shared connection is not stopped
+        // by a finished run's interrupt.
+        let finished = QueryRun::new(source.interrupt.clone());
+        finished.run(|| Ok(())).unwrap();
+        let conn = source.conn.clone();
+        let other = QueryRun::new(source.interrupt.clone());
+        let task = tokio::task::spawn_blocking(move || {
+            collect_blocking(
+                &conn,
+                "SELECT count(*) AS n FROM range(20000000)",
+                &[],
+                &other,
+            )
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        finished.interrupt();
+        let rows = task.await.unwrap().unwrap();
+        assert_eq!(rows[0]["n"], json!(20000000));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_interrupted_before_it_starts_is_skipped() {
+        let source = DuckdbSource::new(DuckdbSourceConfig::new(":memory:", "SELECT 1"))
+            .await
+            .unwrap();
+        let run = QueryRun::new(source.interrupt.clone());
+        run.interrupt();
+        let err = collect_blocking(&source.conn, "SELECT 1", &[], &run).unwrap_err();
+        assert!(matches!(err, FaucetError::Cancelled { .. }), "{err}");
+        let next = QueryRun::new(source.interrupt.clone());
+        assert_eq!(
+            collect_blocking(&source.conn, "SELECT 1 AS n", &[], &next).unwrap()[0]["n"],
+            json!(1)
+        );
     }
 
     #[tokio::test]
