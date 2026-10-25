@@ -743,26 +743,38 @@ pub async fn verify(
         auth,
         clock: chrono::Utc::now().fixed_offset(),
     };
-    // A repair writes: it finishes even if the client goes away.
+    // A repair writes: it finishes even if the client goes away, and its
+    // audit record is written with it, whatever the outcome.
+    let (audit_state, actor) = (state.clone(), principal.actor());
     let outcome = detached(None, async move {
         let _permit = permit;
-        super::local::verify(&run_as, &cfg, &spec, inputs).await
+        let outcome = super::local::verify(&run_as, &cfg, &spec, inputs).await;
+        match &outcome {
+            Ok(o) => {
+                let result = if o.report.equal() {
+                    "equal"
+                } else {
+                    "different"
+                };
+                crate::serve::audit::write(&audit_state, &actor, "verify", None, None, result)
+                    .await;
+            }
+            Err(e) => {
+                crate::serve::audit::write_detail(
+                    &audit_state,
+                    &actor,
+                    "verify",
+                    None,
+                    crate::secrets::registry::redact_message(&e.to_string()),
+                    "error",
+                )
+                .await;
+            }
+        }
+        outcome
     })
     .await?
     .map_err(cli_to_serve)?;
-    crate::serve::audit::write(
-        state,
-        &principal.actor(),
-        "verify",
-        None,
-        None,
-        if outcome.report.equal() {
-            "equal"
-        } else {
-            "different"
-        },
-    )
-    .await;
     Ok(serde_json::to_value(outcome).unwrap_or(Value::Null))
 }
 
@@ -880,46 +892,51 @@ pub async fn rollback(
     };
     let nodes = loaded.nodes.clone();
     // A rollback undoes the destination and then rewinds the bookmark: it
-    // finishes even if the client goes away, so it never stops between them.
-    let outcome = detached(None, async move {
+    // finishes even if the client goes away, so it never stops between them,
+    // and its audit record is written with it, whatever the outcome.
+    let (audit_state, actor, run_id) = (state.clone(), principal.actor(), id.to_string());
+    let dry_run = req.dry_run;
+    let report = detached(None, async move {
         let _permit = permit;
-        super::local::rollback_nodes(&run_as, &nodes, &inputs).await
-    })
-    .await
-    .and_then(|r| r.map_err(cli_to_serve));
-    let report = match outcome {
-        Ok(report) => report,
-        Err(e) => {
-            crate::serve::audit::write_detail(
-                state,
-                &principal.actor(),
-                "run.rollback",
-                Some(id.to_string()),
-                crate::secrets::registry::redact_message(&e.to_string()),
-                "error",
-            )
-            .await;
-            return Err(e);
+        let outcome = super::local::rollback_nodes(&run_as, &nodes, &inputs)
+            .await
+            .map_err(cli_to_serve);
+        match &outcome {
+            Ok(report) => {
+                let result = if dry_run {
+                    "dry_run"
+                } else if report.outcome.applied {
+                    "ok"
+                } else if report.blocked() {
+                    "blocked"
+                } else {
+                    "not_applied"
+                };
+                crate::serve::audit::write(
+                    &audit_state,
+                    &actor,
+                    "run.rollback",
+                    Some(run_id),
+                    None,
+                    result,
+                )
+                .await;
+            }
+            Err(e) => {
+                crate::serve::audit::write_detail(
+                    &audit_state,
+                    &actor,
+                    "run.rollback",
+                    Some(run_id),
+                    crate::secrets::registry::redact_message(&e.to_string()),
+                    "error",
+                )
+                .await;
+            }
         }
-    };
-    let result = if req.dry_run {
-        "dry_run"
-    } else if report.outcome.applied {
-        "ok"
-    } else if report.blocked() {
-        "blocked"
-    } else {
-        "not_applied"
-    };
-    crate::serve::audit::write(
-        state,
-        &principal.actor(),
-        "run.rollback",
-        Some(id.to_string()),
-        None,
-        result,
-    )
-    .await;
+        outcome
+    })
+    .await??;
     Ok(report)
 }
 
@@ -1002,6 +1019,7 @@ pub async fn replay_dlq(
     let (run_as, cfg, from) = (principal.clone(), loaded.cfg.clone(), req.from.clone());
     let (reason, failed_dlq, row) = (req.reason.clone(), req.failed_dlq.clone(), req.row.clone());
     let (all_rows, dry_run, task_cancel) = (req.all_rows, req.dry_run, cancel.clone());
+    let (audit_state, actor) = (state.clone(), principal.actor());
     let outcome = detached(Some(cancel.clone()), async move {
         let (_permit, _token) = (permit, token);
         let outcome = super::local::replay_dlq(
@@ -1027,19 +1045,12 @@ pub async fn replay_dlq(
         if let Some(rec) = started {
             rec.finish(&outcome, task_cancel.is_cancelled()).await;
         }
+        let result_label = if outcome.is_ok() { "ok" } else { "error" };
+        crate::serve::audit::write(&audit_state, &actor, "dlq.replay", None, None, result_label)
+            .await;
         outcome
     })
     .await?;
-    let result_label = if outcome.is_ok() { "ok" } else { "error" };
-    crate::serve::audit::write(
-        state,
-        &principal.actor(),
-        "dlq.replay",
-        None,
-        None,
-        result_label,
-    )
-    .await;
     let outcome = outcome.map_err(cli_to_serve)?;
     let mut body = serde_json::to_value(outcome).unwrap_or(Value::Null);
     if let Some(obj) = body.as_object_mut() {
@@ -1216,7 +1227,7 @@ pub(crate) mod replay {
 // ── trigger_template ─────────────────────────────────────────────────────────
 
 #[cfg(feature = "templates")]
-pub use templates::{TriggerOutcome, trigger_template};
+pub use templates::{TriggerOutcome, screen_template_inputs, trigger_template};
 
 #[cfg(feature = "templates")]
 mod templates {
@@ -1282,18 +1293,22 @@ mod templates {
         refused
     }
 
-    /// Run a registered template (#444): resolve the version, materialize it
-    /// with the caller's params (composing a sink template, applying an
-    /// overlay), label the run with its provenance and [`super::submit`] it.
-    pub async fn trigger_template(
-        state: ServerState,
-        principal: Principal,
-        id: String,
-        mut body: TriggerBody,
-    ) -> Result<TriggerOutcome, ServeError> {
+    /// The request-supplied inputs of a template run, checked before anything
+    /// is materialized: a tenant's run may not override the environment or
+    /// skip the test gate, and an inline overlay is screened as caller input.
+    /// Every path that materializes a template for a server principal (HTTP,
+    /// MCP, a dry run) goes through it.
+    pub async fn screen_template_inputs(
+        state: &ServerState,
+        principal: &Principal,
+        id: &str,
+        env: &std::collections::BTreeMap<String, String>,
+        allow_untested: bool,
+        overlay: Option<&crate::templates::OverlayChoice>,
+    ) -> Result<(), ServeError> {
         let actor = principal.actor();
         let tenant = principal.tenant().map(str::to_string);
-        if tenant.is_some() && !body.env.is_empty() {
+        if tenant.is_some() && !env.is_empty() {
             return Err(ServeError::Forbidden(
                 "a tenant-scoped principal may not override a template's environment (`env`)"
                     .into(),
@@ -1301,9 +1316,9 @@ mod templates {
         }
         // A run for a tenant never runs a version whose tests are not passing
         // (#856): `allow_untested` is an operator's escape hatch.
-        if tenant.is_some() && body.allow_untested {
+        if tenant.is_some() && allow_untested {
             crate::serve::audit::write_target_detail(
-                &state,
+                state,
                 &actor,
                 "template.run",
                 format!("template:{id}"),
@@ -1317,10 +1332,33 @@ mod templates {
                     .into(),
             ));
         }
-        let overlay = body.overlay_choice();
-        if let Some(crate::templates::OverlayChoice::Inline(doc)) = &overlay {
-            screen_inline_overlay(&state, &actor, &id, tenant.as_deref(), doc).await?;
+        if let Some(crate::templates::OverlayChoice::Inline(doc)) = overlay {
+            screen_inline_overlay(state, &actor, id, tenant.as_deref(), doc).await?;
         }
+        Ok(())
+    }
+
+    /// Run a registered template (#444): resolve the version, materialize it
+    /// with the caller's params (composing a sink template, applying an
+    /// overlay), label the run with its provenance and [`super::submit`] it.
+    pub async fn trigger_template(
+        state: ServerState,
+        principal: Principal,
+        id: String,
+        mut body: TriggerBody,
+    ) -> Result<TriggerOutcome, ServeError> {
+        let actor = principal.actor();
+        let tenant = principal.tenant().map(str::to_string);
+        let overlay = body.overlay_choice();
+        screen_template_inputs(
+            &state,
+            &principal,
+            &id,
+            &body.env,
+            body.allow_untested,
+            overlay.as_ref(),
+        )
+        .await?;
         let supplied: SuppliedParams = std::mem::take(&mut body.params).into_iter().collect();
         // An unpinned request means `stable` — the launched version.
         let s = state.history();

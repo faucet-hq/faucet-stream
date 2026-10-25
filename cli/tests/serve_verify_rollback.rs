@@ -251,6 +251,20 @@ async fn verify_and_rollback_endpoints_with_rbac() {
     assert_eq!(clean["differences"].as_array().unwrap().len(), 0, "{clean}");
     assert_eq!(clean["strategy"], "range");
 
+    // A verify that fails once admitted is audited too.
+    let unknown_row = client
+        .post(format!("{base}/v1/verify"))
+        .bearer_auth("op-tok")
+        .json(&json!({ "config": cfg, "row": "no-such-row" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        !unknown_row.status().is_success(),
+        "{}",
+        unknown_row.text().await.unwrap()
+    );
+
     exec(&dst, "UPDATE dst SET name = 'TWO' WHERE id = 2").await;
     let drifted: Value = client
         .post(format!("{base}/v1/verify"))
@@ -454,6 +468,19 @@ async fn verify_and_rollback_endpoints_with_rbac() {
         .unwrap_or_default();
     for r in ["blocked", "ok", "error"] {
         assert!(results.contains(&r), "{r}: {results:?}");
+    }
+    let verify_results: Vec<&str> = audit["entries"]
+        .as_array()
+        .or_else(|| audit.as_array())
+        .map(|a| {
+            a.iter()
+                .filter(|e| e["action"] == "verify")
+                .filter_map(|e| e["result"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    for r in ["equal", "error"] {
+        assert!(verify_results.contains(&r), "{r}: {verify_results:?}");
     }
 }
 

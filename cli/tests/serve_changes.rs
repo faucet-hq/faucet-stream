@@ -616,6 +616,34 @@ async fn plan_approve_run_with_policy_budget_rejection_and_audit() {
         serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     let rec = api.wait_run(sub["run_id"].as_str().unwrap()).await;
     assert_eq!(rec["status"], "completed", "{rec}");
+    // A dry run on the server screens a request-supplied overlay the same way
+    // a real run does, before anything is materialized.
+    let (_, r) = api
+        .post(
+            "dave-tok",
+            "/mcp",
+            json!({ "jsonrpc": "2.0", "id": 14, "method": "tools/call", "params": {
+                "name": "run_template", "arguments": { "id": "tpl-mcp", "dry_run": true,
+                    "overlay": { "kind": "deployment", "name": "ops",
+                        "state": { "type": "file", "config": { "path": "${file:/etc/hostname}" } } } }
+            }}),
+        )
+        .await;
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    let msg = r["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(msg.contains("inline `overlay`"), "{msg}");
+    let (_, r) = api
+        .post(
+            "dave-tok",
+            "/mcp",
+            json!({ "jsonrpc": "2.0", "id": 15, "method": "tools/call", "params": {
+                "name": "run_template", "arguments": { "id": "tpl-mcp", "dry_run": true }
+            }}),
+        )
+        .await;
+    assert!(!r["result"]["isError"].as_bool().unwrap_or(false), "{r}");
 
     // A proposal whose config cannot be planned comes back as a tool error
     // carrying the server error's `code: message` rendering.

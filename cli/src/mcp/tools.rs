@@ -1219,8 +1219,23 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
             .unwrap_or(false),
     };
     let selection = selection_arg(args)?;
-    if !dry_run && let Some(server) = &ctx.server {
-        return run_template_on_server(server, id, version, supplied, env, sink, selection).await;
+    if let Some(server) = &ctx.server {
+        if !dry_run {
+            return run_template_on_server(server, id, version, supplied, env, sink, selection)
+                .await;
+        }
+        // A dry run on a server checks the request's own inputs exactly as a
+        // real run does before materializing anything with them.
+        crate::runtime::server::screen_template_inputs(
+            &server.state,
+            &crate::runtime::Principal::new(server.actor.clone(), crate::runtime::Origin::Trusted),
+            id,
+            &env,
+            sink.allow_untested,
+            sink.overlay.as_ref(),
+        )
+        .await
+        .map_err(|e| e.api_error().error.message)?;
     }
     let materialized = crate::templates::materialize_for_run_selected(
         store,
