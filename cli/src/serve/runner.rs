@@ -2021,7 +2021,10 @@ async fn finalize(state: &ServerState, run_id: &str, started: DateTime<Utc>, ter
         // Owner-fenced: if another instance reclaimed this run (lease expired),
         // our write is a no-op and we discard our result — the reclaimer is now
         // authoritative (#197).
-        let pending = PendingFinalize::Run { rec, reason };
+        let pending = PendingFinalize::Run {
+            rec: Box::new(rec),
+            reason,
+        };
         if let Err(e) = write_pending(state, &pending).await {
             // The row still says `running` and this instance keeps renewing
             // its lease, so no peer re-runs it; the lease loop retries the
@@ -2051,7 +2054,7 @@ async fn finalize(state: &ServerState, run_id: &str, started: DateTime<Utc>, ter
 pub(crate) enum PendingFinalize {
     /// A whole run's owner-fenced terminal record.
     Run {
-        rec: RunRecord,
+        rec: Box<RunRecord>,
         reason: &'static str,
     },
     /// One shard's owner-fenced terminal state.
