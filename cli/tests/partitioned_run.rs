@@ -161,19 +161,45 @@ async fn chunks_are_serialised_by_the_shared_concurrency_limit() {
 async fn each_chunk_gets_a_distinct_valid_state_key() {
     // Chunk ids become part of the state key, so they must be unique and pass
     // core's state-key charset validation — otherwise resumable partitioned runs
-    // would collide or be rejected at run time.
+    // would collide or be rejected at run time. Run the chunks against a file
+    // state store and read back the keys the executor actually wrote.
+    use faucet_core::StateStore;
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("out.jsonl");
+    let state = dir.path().join("state");
     seed(dir.path(), 3);
-    let yaml = config(dir.path(), &out, 2, 1);
-    let cfg = PipelineConfig::from_text(&yaml, &dir.path().join("p.yaml")).unwrap();
+    let yaml = config(dir.path(), &out, 2, 1).replace(
+        "\npartition:",
+        &format!(
+            "\n  state:\n    type: file\n    config:\n      path: \"{}\"\npartition:",
+            state.display()
+        ),
+    );
+    let path = dir.path().join("p.yaml");
+    std::fs::write(&path, &yaml).unwrap();
+    let cfg = PipelineConfig::from_text(&yaml, &path).unwrap();
     let nodes = expand(&cfg).unwrap();
+    let ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
+    let summary = run_expanded(nodes, opts("partitioned", Some(4)))
+        .await
+        .unwrap();
+    assert!(!summary.had_failures(), "{:?}", summary.invocations);
 
+    let stored = faucet_core::FileStateStore::new(&state)
+        .list("partitioned::")
+        .await
+        .unwrap();
     let mut keys = std::collections::BTreeSet::new();
-    for n in &nodes {
-        let key = format!("partitioned::{}", n.id);
+    for id in &ids {
+        let key = faucet_core::StateKey::invocation("partitioned", id).render();
         faucet_core::state::validate_state_key(&key)
             .unwrap_or_else(|e| panic!("state key {key} is invalid: {e}"));
+        assert!(
+            stored
+                .iter()
+                .any(|s| s == &key || s.starts_with(&format!("{key}::"))),
+            "no state was written under {key}: {stored:?}"
+        );
         assert!(keys.insert(key.clone()), "duplicate state key {key}");
     }
     assert_eq!(keys.len(), 3);
