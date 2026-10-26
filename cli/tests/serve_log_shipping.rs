@@ -425,6 +425,65 @@ async fn outage_then_restart_delivers_every_line_exactly_once() {
     assert!(v.delivered_at.is_some());
 }
 
+/// The watermark only moves over a delivered prefix: when the collector
+/// rejects the first two lines, takes the batch's last line on its own and
+/// then fails on the third, lines 3 onward stay pending.
+#[tokio::test]
+async fn a_failure_after_the_last_line_probe_keeps_the_middle_pending() {
+    let (col, ep, _srv) = start_http().await;
+    *col.status_for.lock().unwrap() = Some(|body: &[u8]| {
+        let has = |n: &[u8]| body.windows(n.len()).any(|w| w == n);
+        if has(b"rejected-line") {
+            Some(400)
+        } else if has(b"flaky-line") {
+            Some(503)
+        } else {
+            None
+        }
+    });
+    let h = MemoryHistory::new(Duration::from_secs(60));
+    record_run(&h, "run-p", "orders", None).await;
+    let base = seq_at(chrono::Utc::now() - chrono::Duration::seconds(10)) & !0xFFF;
+    let texts = [
+        "rejected-line a",
+        "rejected-line b",
+        "flaky-line",
+        "ok 3",
+        "ok 4",
+        "ok 5",
+        "ok 6",
+        "ok 7",
+    ];
+    let lines: Vec<RunLogLine> = texts
+        .iter()
+        .enumerate()
+        .map(|(i, t)| line(base + i as u64, t))
+        .collect();
+    h.record_run_logs("run-p", &lines).await.unwrap();
+    let cfg = export_config(Some(otel(&ep, faucet_core::OtelProtocol::Http)));
+    let ex = LogExport::from_config(&cfg);
+    let s = ex.ship_once(&h).await.unwrap();
+    assert!(s.failed);
+    let rec = h.get("run-p").await.unwrap().unwrap();
+    let v = ex.view(&h, &rec).await;
+    assert_eq!(v.dropped_lines, 2);
+    assert_eq!(v.pending_lines, 6, "flaky-line and everything after it");
+    // Once the collector recovers, every remaining line is delivered.
+    *col.status_for.lock().unwrap() = Some(|body: &[u8]| {
+        body.windows(13)
+            .any(|w| w == b"rejected-line")
+            .then_some(400)
+    });
+    ex.ship_once(&h).await.unwrap();
+    let v = ex.view(&h, &h.get("run-p").await.unwrap().unwrap()).await;
+    assert_eq!(v.pending_lines, 0);
+    let bodies: Vec<String> = col.records().into_iter().map(|r| r.body).collect();
+    assert!(
+        bodies.iter().any(|b| b.contains("flaky-line")),
+        "{bodies:?}"
+    );
+}
+
 #[tokio::test]
 async fn retention_follows_delivery_and_bounds_drop_the_oldest() {
     let (col, ep) = start_grpc().await;

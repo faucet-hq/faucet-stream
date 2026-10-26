@@ -41,6 +41,8 @@ pub struct Collector {
     pub down: Arc<AtomicBool>,
     /// Acknowledge, but report one rejected record (OTLP partial success).
     pub reject: Arc<AtomicBool>,
+    /// An HTTP status to answer a request body with instead (HTTP only).
+    pub status_for: Arc<Mutex<Option<fn(&[u8]) -> Option<u16>>>>,
 }
 
 fn value(v: &Option<opentelemetry_proto::tonic::common::v1::AnyValue>) -> String {
@@ -186,6 +188,9 @@ impl wiremock::Respond for HttpResponder {
     fn respond(&self, req: &wiremock::Request) -> wiremock::ResponseTemplate {
         if self.0.is_down() {
             return wiremock::ResponseTemplate::new(503).set_body_string("down");
+        }
+        if let Some(status) = (*self.0.status_for.lock().unwrap()).and_then(|f| f(&req.body)) {
+            return wiremock::ResponseTemplate::new(status).set_body_string("refused");
         }
         match ExportLogsServiceRequest::decode(req.body.as_slice()) {
             Ok(r) => {

@@ -1062,6 +1062,39 @@ mod tests {
         }
     }
 
+    /// A failure after the batch's last line was probed leaves the cursor at
+    /// the delivered prefix: the undelivered middle stays pending.
+    #[tokio::test]
+    async fn a_failure_after_the_probe_keeps_the_middle_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = Spool::open(dir.path()).unwrap();
+        let mut w = SpoolWriter::new(spool.clone());
+        w.begin(
+            RunMeta {
+                run_id: "p".into(),
+                ..Default::default()
+            },
+            100,
+        );
+        for i in 1..=8 {
+            w.append("p", line(&format!("line {i}"), &now_ts()));
+        }
+        w.end("p");
+        let endpoint = crate::logship::otlp::tests::probe_then_transient_collector().await;
+        let ex = crate::logship::otlp::OtlpLogExporter::new(&faucet_core::OtelConfig {
+            endpoint,
+            protocol: faucet_core::OtelProtocol::Http,
+            timeout_secs: 5,
+            ..Default::default()
+        })
+        .unwrap();
+        let r = ship_pass(&spool, Some(&ex), opts(), Utc::now()).await;
+        assert!(r.failed && r.collector_down);
+        let run = r.run("p").unwrap();
+        assert_eq!(run.view.dropped_lines, 2);
+        assert_eq!(run.view.pending_lines, 6, "lines 3..=8 stay pending");
+    }
+
     /// Files faucet did not write are not runs: they are never shipped or
     /// removed, even when the spool directory is shared.
     #[tokio::test]
