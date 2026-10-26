@@ -1124,16 +1124,12 @@ pub(crate) async fn enqueue(
         // direction; either retries.
         #[cfg(feature = "tenants")]
         if let Some(t) = rec.tenant.as_deref()
-            && let Some(msg) =
+            && let Some(refusal) =
                 recount_refusal(t, crate::serve::tenants::over_limit(&state, t).await)
-            && state
-                .history()
-                .cancel_pending(&run_id)
-                .await
-                .unwrap_or(false)
         {
+            back_out_pending(&state, &run_id).await;
             release_orphaned_claim(&state, &req, &run_id).await;
-            return Err(ServeError::TooManyRequests(msg));
+            return Err(refusal);
         }
         // Release the local queue reservation (cluster runs are bounded by the
         // claim loop + semaphore, not the submit-side queue).
@@ -2165,12 +2161,38 @@ fn schedule_log_drop(state: ServerState, run_id: String) {
     });
 }
 
-/// The cluster re-count's verdict once the run is recorded: the refusal
-/// message when the tenant is over its limit. A failed re-count admits the run
-/// (logged) — the record already exists and a peer may have claimed it, so an
-/// error here must not report a failure for a run that will still execute.
+/// Withdraw a clustered run recorded for a tenant that must not have it
+/// (#789 SERVE-43): a run still pending is removed with its tenant link, so
+/// nothing names a tenant a concurrent delete is removing; one a peer
+/// already claimed is asked to cancel.
 #[cfg(feature = "tenants")]
-fn recount_refusal(tenant: &str, recount: Result<Option<String>, ServeError>) -> Option<String> {
+async fn back_out_pending(state: &ServerState, run_id: &str) {
+    let history = state.history();
+    match history.cancel_pending(run_id).await {
+        Ok(true) => {
+            if let Err(e) = history.delete(run_id).await {
+                tracing::warn!(run_id, error = %e, "could not remove a backed-out run record");
+            }
+        }
+        Ok(false) => {
+            if let Err(e) = history.request_cancel(run_id).await {
+                tracing::warn!(run_id, error = %e, "could not cancel a backed-out run a peer claimed");
+            }
+        }
+        Err(e) => tracing::warn!(run_id, error = %e, "could not back out a clustered run"),
+    }
+}
+
+/// The cluster re-count's verdict once the run is recorded: the refusal
+/// when the tenant is gone, suspended or over its limit. A failed re-count
+/// admits the run (logged) — the record already exists and a peer may have
+/// claimed it, so an error here must not report a failure for a run that
+/// will still execute.
+#[cfg(feature = "tenants")]
+fn recount_refusal(
+    tenant: &str,
+    recount: Result<Option<ServeError>, ServeError>,
+) -> Option<ServeError> {
     match recount {
         Ok(refusal) => refusal,
         Err(e) => {
@@ -2347,14 +2369,36 @@ mod tests {
     #[cfg(feature = "tenants")]
     #[test]
     fn a_failed_cluster_recount_admits_the_recorded_run() {
-        assert_eq!(recount_refusal("acme", Ok(None)), None);
+        assert!(recount_refusal("acme", Ok(None)).is_none());
+        assert!(matches!(
+            recount_refusal("acme", Ok(Some(ServeError::TooManyRequests("over".into())))),
+            Some(ServeError::TooManyRequests(m)) if m == "over"
+        ));
+        assert!(recount_refusal("acme", Err(ServeError::Internal("db".into()))).is_none());
+    }
+
+    /// A run backed out after the cluster re-count is removed while still
+    /// pending, so no record names a tenant a concurrent delete removed; one
+    /// a peer already claimed is left to its owner and asked to cancel.
+    #[cfg(feature = "tenants")]
+    #[tokio::test]
+    async fn a_backed_out_pending_run_leaves_no_record() {
+        let state = crate::serve::test_support::test_state_clustered();
+        let mut rec = RunRecord::queued("r1".into(), None, Default::default(), None, Utc::now());
+        rec.status = RunStatus::Pending;
+        rec.tenant = Some("acme".into());
+        state.history().upsert(&rec).await.unwrap();
+        back_out_pending(&state, "r1").await;
+        assert!(state.history().get("r1").await.unwrap().is_none());
+
+        rec.run_id = "r2".into();
+        rec.status = RunStatus::Running;
+        state.history().upsert(&rec).await.unwrap();
+        back_out_pending(&state, "r2").await;
         assert_eq!(
-            recount_refusal("acme", Ok(Some("over".into()))).as_deref(),
-            Some("over")
-        );
-        assert_eq!(
-            recount_refusal("acme", Err(ServeError::Internal("db".into()))),
-            None
+            state.history().get("r2").await.unwrap().unwrap().status,
+            RunStatus::Running,
+            "a claimed run stays with the instance running it"
         );
     }
 

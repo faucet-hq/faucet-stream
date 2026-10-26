@@ -1151,9 +1151,9 @@ pub(crate) mod replay {
         #[cfg(feature = "tenants")]
         if state.cluster().enabled()
             && let Some(t) = tenant
-            && let Some(msg) = crate::serve::tenants::over_limit(state, t).await?
+            && let Some(refusal) = crate::serve::tenants::over_limit(state, t).await?
         {
-            return Err(ServeError::TooManyRequests(msg));
+            return Err(refusal);
         }
         Ok(guard)
     }

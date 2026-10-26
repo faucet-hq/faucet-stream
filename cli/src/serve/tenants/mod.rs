@@ -434,9 +434,14 @@ pub async fn admit_inline(
     Ok((Admission { _guard: guard }, rec.limits.budget()))
 }
 
-/// Whether `tenant` is past its `max_concurrent_runs` now that a new run is
-/// recorded (the cluster re-check after admission). `Some(message)` when it is.
-pub async fn over_limit(state: &ServerState, tenant: &str) -> Result<Option<String>, ServeError> {
+/// Whether a run just recorded for `tenant` must back out (the cluster
+/// re-check after admission): `Some(refusal)` with the status admission
+/// itself gives — 404 for a tenant that no longer exists, 409 for a
+/// suspended one, 429 only for a tenant past its `max_concurrent_runs`.
+pub async fn over_limit(
+    state: &ServerState,
+    tenant: &str,
+) -> Result<Option<ServeError>, ServeError> {
     // Re-read after the record is written: a delete or suspension that began
     // on another instance before this record existed is seen here, so the
     // run backs out instead of landing for a tenant being deleted.
@@ -444,13 +449,15 @@ pub async fn over_limit(state: &ServerState, tenant: &str) -> Result<Option<Stri
         Ok(rec) => rec,
         Err(ServeError::NotFound) => {
             metrics::record_limit_rejection(tenant, "suspended");
-            return Ok(Some(format!("tenant '{tenant}' no longer exists")));
+            return Ok(Some(ServeError::NotFound));
         }
         Err(e) => return Err(e),
     };
     if rec.suspended {
         metrics::record_limit_rejection(tenant, "suspended");
-        return Ok(Some(format!("tenant '{tenant}' is suspended")));
+        return Ok(Some(ServeError::Conflict(format!(
+            "tenant '{tenant}' is suspended"
+        ))));
     }
     let Some(max) = rec.limits.max_concurrent_runs else {
         return Ok(None);
@@ -458,10 +465,10 @@ pub async fn over_limit(state: &ServerState, tenant: &str) -> Result<Option<Stri
     let active = active_runs(state, tenant, max as usize + 1).await?;
     if active > max as usize {
         metrics::record_limit_rejection(tenant, "max_concurrent_runs");
-        return Ok(Some(format!(
+        return Ok(Some(ServeError::TooManyRequests(format!(
             "tenant '{tenant}' already has {active} run(s) queued or running across the cluster \
              (limit max_concurrent_runs = {max})"
-        )));
+        ))));
     }
     Ok(None)
 }
@@ -1382,10 +1389,13 @@ mod tests {
             state.history().upsert(&rec).await.unwrap();
             state.history().tenant_run_link(id, "acme").await.unwrap();
         }
-        let msg = over_limit(&state, "acme")
+        let refusal = over_limit(&state, "acme")
             .await
             .unwrap()
             .expect("two runs, limit one");
+        let ServeError::TooManyRequests(msg) = refusal else {
+            panic!("a run past the limit is a 429: {refusal:?}");
+        };
         assert!(msg.contains("across the cluster"), "{msg}");
         assert!(msg.contains("already has 2 run(s)"), "{msg}");
         t.limits.max_concurrent_runs = Some(5);
@@ -1401,13 +1411,21 @@ mod tests {
         let mut t = tenant("acme");
         t.suspended = true;
         state.history().tenant_upsert(&t).await.unwrap();
-        let msg = over_limit(&state, "acme")
+        let refusal = over_limit(&state, "acme")
             .await
             .unwrap()
             .expect("suspended");
+        // The status admission gives, not a 429 that tells the client (or a
+        // trigger fan-out) to retry a refusal no retry can clear.
+        let ServeError::Conflict(msg) = refusal else {
+            panic!("a suspended tenant is a 409: {refusal:?}");
+        };
         assert!(msg.contains("is suspended"), "{msg}");
-        let msg = over_limit(&state, "gone").await.unwrap().expect("deleted");
-        assert!(msg.contains("no longer exists"), "{msg}");
+        let refusal = over_limit(&state, "gone").await.unwrap().expect("deleted");
+        assert!(
+            matches!(refusal, ServeError::NotFound),
+            "a deleted tenant is a 404: {refusal:?}"
+        );
     }
 
     /// A refused delete lifts only its own suspension, and never writes its
