@@ -98,7 +98,7 @@ static POOL_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Build a session pool synchronously (call from a blocking thread). Pool
 /// creations in one process are serialised, and a transient `ORA-24447` is
-/// retried up to [`POOL_INIT_ATTEMPTS`] times with a doubling pause.
+/// retried up to `POOL_INIT_ATTEMPTS` times with a doubling pause.
 pub fn build_pool_blocking(
     cfg: &OracleConnectionConfig,
     max_connections: u32,

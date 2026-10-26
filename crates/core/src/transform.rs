@@ -1623,7 +1623,7 @@ fn rename_keys(value: Value, re: &Regex, replacement: &str) -> Result<Value, Fau
 
 /// Source keys that collided under [`KeyCollision::Suffix`] earlier in the
 /// run, per object path. Only colliding keys are recorded (bounded by
-/// [`MAX_REMEMBERED_COLLISIONS`]), so a key that collided once keeps its
+/// `MAX_REMEMBERED_COLLISIONS`), so a key that collided once keeps its
 /// suffixed name for the rest of the run.
 #[cfg(feature = "transform-keys-case")]
 #[derive(Debug, Clone, Default)]
