@@ -149,8 +149,9 @@ async fn cancel_stops_unstarted_shards_and_the_run_ends_cancelled() {
 }
 
 /// A source-sharded run submitted to a cluster runs every shard and ends
-/// `completed`, its log stream closing once the last local shard finishes.
-#[cfg(all(feature = "source-sqlite", feature = "sink-stdout"))]
+/// `completed`, its log stream closing once the last local shard finishes —
+/// and the shards together read every row exactly once.
+#[cfg(all(feature = "source-sqlite", feature = "sink-sqlite"))]
 #[tokio::test]
 async fn a_sharded_run_completes_across_its_shards() {
     let dir = tempfile::tempdir().unwrap();
@@ -173,6 +174,7 @@ async fn a_sharded_run_completes_across_its_shards() {
                 .unwrap();
         }
     }
+    let out_db = dir.path().join("out.db");
     let url = format!("sqlite:{}", dir.path().join("h.db").display());
     let port = free_port();
     let mut config = faucet_cli::serve::ServeConfig::from_args(args(port, url)).unwrap();
@@ -197,8 +199,9 @@ async fn a_sharded_run_completes_across_its_shards() {
     let yaml = format!(
         "version: 1\nname: sharded\nshard: {{ count: 2 }}\npipeline:\n  \
          source: {{ type: sqlite, config: {{ database_url: \"sqlite:{}\", query: \"SELECT id, v FROM t\", shard: {{ key: id }} }} }}\n  \
-         sink: {{ type: stdout, config: {{}} }}\n",
+         sink: {{ type: sqlite, config: {{ database_url: \"sqlite:{}?mode=rwc\", table_name: out, create_table: true, column_mapping: auto_map }} }}\n",
         db.display(),
+        out_db.display(),
     );
     let resp: serde_json::Value = client
         .post(format!("{base}/v1/runs"))
@@ -227,6 +230,18 @@ async fn a_sharded_run_completes_across_its_shards() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(status, "completed");
+    // Both shards ran and the PK ranges partition the table: every id landed
+    // once, none twice, none lost at a range boundary.
+    use sqlx::Connection as _;
+    let mut conn = sqlx::SqliteConnection::connect(&format!("sqlite:{}", out_db.display()))
+        .await
+        .unwrap();
+    let (rows, distinct, lo, hi): (i64, i64, i64, i64) =
+        sqlx::query_as("SELECT count(*), count(DISTINCT id), min(id), max(id) FROM out")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!((rows, distinct, lo, hi), (20, 20, 1, 20));
 }
 
 /// Review of #868 (cli F9): `shard:` takes effect only in a cluster, so the
