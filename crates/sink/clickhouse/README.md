@@ -114,6 +114,11 @@ fails the write naming the field. Every insert also sends
 `input_format_skip_unknown_fields=0`, so the server rejects an unknown field
 instead of dropping it.
 
+A nested object or array bound for a `String` / `FixedString` column (the type
+`create_table` gives nested fields) is sent as its JSON text, so it lands as
+that text on every server version; an `Array(…)` or other typed column still
+receives the value itself.
+
 The HTTP client uses a 30 s connect and a 300 s idle-read timeout, so a
 half-open connection fails the request instead of hanging the run.
 
