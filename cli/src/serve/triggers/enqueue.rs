@@ -21,10 +21,15 @@ pub enum FireOutcome {
     /// An error building or submitting the run.
     Error(String),
     /// The submission was refused for a reason a retry cannot fix (a bad
-    /// config, a failed validation, a missing tenant, an event value its
-    /// placement refuses). A polling watcher skips past the event and reports
-    /// it; inside a tenant fan-out it becomes that tenant's own outcome.
+    /// config, a failed validation, a missing template or tenant). A polling
+    /// watcher skips past the event and reports it; inside a tenant fan-out
+    /// it becomes that tenant's own outcome.
     Failed(String),
+    /// A value the event's sender chose was refused (where the config places
+    /// it, or by the server's reference policy), or one the config needs was
+    /// missing: the sender's error, not the trigger's. Watchers treat it like
+    /// [`FireOutcome::Failed`]; the webhook answers 422 and stays healthy.
+    Refused(String),
 }
 
 impl FireOutcome {
@@ -59,13 +64,14 @@ pub async fn resolve_config_text(
 /// retry) or substituting the event into it (never will).
 pub enum ResolveError {
     Read(String),
-    Substitute(String),
+    Substitute(context::SubstituteError),
 }
 
 impl std::fmt::Display for ResolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ResolveError::Read(e) | ResolveError::Substitute(e) => f.write_str(e),
+            ResolveError::Read(e) => f.write_str(e),
+            ResolveError::Substitute(e) => f.write_str(&e.message),
         }
     }
 }
@@ -223,7 +229,7 @@ fn fold_tenant(
         return (outcome, None);
     };
     match outcome {
-        FireOutcome::Failed(e) => (FireOutcome::Coalesced, Some(e)),
+        FireOutcome::Failed(e) | FireOutcome::Refused(e) => (FireOutcome::Coalesced, Some(e)),
         FireOutcome::Error(e) => {
             tracing::warn!(trigger, tenant = %t, error = %e, "tenant fire failed; retrying");
             (FireOutcome::Error(e), None)
@@ -377,12 +383,16 @@ async fn fire_one(
                 // so a watcher skips past it rather than stalling on it.
                 Err(ResolveError::Substitute(e)) => {
                     metrics::error(compiled.name(), kind);
-                    return FireOutcome::Failed(e);
+                    return if e.by_sender {
+                        FireOutcome::Refused(e.message)
+                    } else {
+                        FireOutcome::Failed(e.message)
+                    };
                 }
             };
             if let Err(e) = screen_event_values(state, tenant, &sub.event_values) {
                 metrics::error(compiled.name(), kind);
-                return FireOutcome::Failed(e);
+                return FireOutcome::Refused(e);
             }
             let text = sub.text;
             let mut req = build_submit_request(compiled, event, text, fired_at);

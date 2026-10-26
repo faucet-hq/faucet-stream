@@ -127,12 +127,16 @@ pub async fn handle(
             })
         }
         // The request itself cannot run (a value it sent is refused where the
-        // config places it): the caller's error, not the trigger's.
-        FireOutcome::Failed(msg) => Err(ServeError::Unprocessable {
+        // config places it, or one the config needs is missing): the
+        // caller's error, not the trigger's.
+        FireOutcome::Refused(msg) => Err(ServeError::Unprocessable {
             message: msg,
             details: None,
         }),
-        FireOutcome::Error(msg) => {
+        // The trigger cannot run whatever is sent (its config does not
+        // validate, its template or tenant is gone, a policy refuses it): the
+        // operator's to fix, so the trigger reports unhealthy.
+        FireOutcome::Failed(msg) | FireOutcome::Error(msg) => {
             state
                 .triggers()
                 .record_err(&name, msg.clone(), super::watcher::UNHEALTHY_THRESHOLD);

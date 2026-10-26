@@ -140,7 +140,13 @@ lands:
 
 A refused fire never runs: a webhook answers `422` (the trigger stays healthy),
 and an `object_arrival` watcher skips the object and reports it, then fires the
-objects after it.
+objects after it. A webhook also answers `422` when the config uses a header or
+query value the request did not send.
+
+A webhook trigger that cannot run whatever is sent — its config does not
+validate, its template or tenant is gone, a policy refuses it — answers `500`
+and, after three such fires in a row, reports unhealthy on `/readyz`: the
+operator has something to fix, not the sender.
 
 *`mode: per_object` — one token set per object:*
 

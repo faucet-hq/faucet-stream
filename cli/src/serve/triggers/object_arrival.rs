@@ -413,7 +413,7 @@ impl Watcher for ObjectArrivalWatcher {
                             self.cursor.commit(&o);
                             fired = true;
                         }
-                        FireOutcome::Failed(e) => {
+                        FireOutcome::Failed(e) | FireOutcome::Refused(e) => {
                             tracing::error!(
                                 trigger = self.compiled.name(),
                                 object = %o.key,
@@ -454,7 +454,7 @@ impl Watcher for ObjectArrivalWatcher {
                         }
                         fired = true;
                     }
-                    FireOutcome::Failed(e) => {
+                    FireOutcome::Failed(e) | FireOutcome::Refused(e) => {
                         tracing::error!(
                             trigger = self.compiled.name(),
                             objects = new.len(),

@@ -1331,6 +1331,59 @@ async fn webhook_debounce_is_not_consumed_by_a_failed_fire() {
     }
 }
 
+/// A trigger whose own config cannot run answers a server error and turns
+/// unhealthy: the sender did nothing wrong and must not be told it did.
+#[tokio::test(flavor = "multi_thread")]
+async fn webhook_trigger_that_cannot_run_reports_unhealthy_not_the_callers_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let inline = serde_json::json!({
+        "version": 99,
+        "pipeline": {
+            "source": { "type": "csv", "config": { "path": "in.csv" } },
+            "sink": { "type": "stdout", "config": {} }
+        }
+    });
+    let yaml = format!(
+        "version: 1\ntriggers:\n  - name: hook\n    type: webhook\n    methods: [POST]\n    config: {}\n",
+        serde_json::to_string(&inline).unwrap()
+    );
+    let triggers = dir.path().join("triggers.yaml");
+    std::fs::write(&triggers, yaml).unwrap();
+    let token = "test-token";
+    let base = spawn_serve_with_triggers(free_port(), Some(token), &triggers).await;
+    let client = reqwest::Client::new();
+    for attempt in 0..3 {
+        let resp = client
+            .post(format!("{base}/v1/triggers/hook"))
+            .bearer_auth(token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_server_error(),
+            "attempt {attempt}: {}",
+            resp.status()
+        );
+    }
+    let ready: serde_json::Value = client
+        .get(format!("{base}/readyz"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let hook = ready["triggers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "hook")
+        .unwrap()
+        .clone();
+    assert_eq!(hook["healthy"], false, "{ready}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn webhook_query_values_are_percent_decoded() {
     let dir = tempfile::tempdir().unwrap();
@@ -1383,6 +1436,42 @@ async fn webhook_query_values_are_percent_decoded() {
     assert_eq!(refused.status(), 422);
     let body = refused.text().await.unwrap();
     assert!(body.contains("trigger.query.out"), "{body}");
+    // A value the config needs but the request left out is also the
+    // sender's error.
+    let missing = reqwest::Client::new()
+        .post(format!("{base}/v1/triggers/hook"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 422);
+    for _ in 0..3 {
+        let again = reqwest::Client::new()
+            .post(format!("{base}/v1/triggers/hook?out=%2Fopt%2Fx"))
+            .bearer_auth(token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(again.status(), 422);
+    }
+    let ready: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base}/readyz"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        ready["triggers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["healthy"] == true),
+        "{ready}"
+    );
 }
 
 /// #789 SERVE-21: an object whose run cannot start is skipped and reported —

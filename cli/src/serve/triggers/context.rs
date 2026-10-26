@@ -125,7 +125,34 @@ pub fn substitute(
     name: &str,
     fired_at: &str,
 ) -> Result<String, String> {
-    substitute_tracked(text, event, name, fired_at).map(|s| s.text)
+    substitute_tracked(text, event, name, fired_at)
+        .map(|s| s.text)
+        .map_err(|e| e.message)
+}
+
+/// Why a substitution failed, and whether the event's sender caused it (a
+/// value it sent is refused where the config places it, or a header or
+/// query value the config needs is missing) rather than the trigger's own
+/// configuration (a malformed document, a token the trigger never has).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubstituteError {
+    pub message: String,
+    pub by_sender: bool,
+}
+
+impl SubstituteError {
+    fn config(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            by_sender: false,
+        }
+    }
+}
+
+impl std::fmt::Display for SubstituteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
 }
 
 /// A value the event's sender chose (a webhook body, header or query value,
@@ -154,7 +181,7 @@ pub fn substitute_tracked(
     event: &TriggerEvent,
     name: &str,
     fired_at: &str,
-) -> Result<Substitution, String> {
+) -> Result<Substitution, SubstituteError> {
     if !text.contains("${trigger.") {
         return Ok(Substitution {
             text: text.to_string(),
@@ -162,11 +189,11 @@ pub fn substitute_tracked(
         });
     }
     let mut doc: serde_yaml::Value = serde_yaml::from_str(text)
-        .map_err(|e| format!("pipeline config is not valid YAML: {e}"))?;
+        .map_err(|e| SubstituteError::config(format!("pipeline config is not valid YAML: {e}")))?;
     let mut event_values = Vec::new();
     substitute_value(&mut doc, None, event, name, fired_at, &mut event_values)?;
-    let text =
-        serde_yaml::to_string(&doc).map_err(|e| format!("re-rendering pipeline config: {e}"))?;
+    let text = serde_yaml::to_string(&doc)
+        .map_err(|e| SubstituteError::config(format!("re-rendering pipeline config: {e}")))?;
     Ok(Substitution { text, event_values })
 }
 
@@ -177,7 +204,7 @@ fn substitute_value(
     name: &str,
     fired_at: &str,
     seen: &mut Vec<EventValue>,
-) -> Result<(), String> {
+) -> Result<(), SubstituteError> {
     match v {
         serde_yaml::Value::String(s) if s.contains("${trigger.") => {
             *s = substitute_with(s, event, name, fired_at, Some(Placement { key, seen }))?;
@@ -207,7 +234,7 @@ pub fn substitute_plain(
     name: &str,
     fired_at: &str,
 ) -> Result<String, String> {
-    substitute_with(text, event, name, fired_at, None)
+    substitute_with(text, event, name, fired_at, None).map_err(|e| e.message)
 }
 
 /// Where a config substitution lands: the mapping key of the scalar, and the
@@ -242,7 +269,7 @@ fn substitute_with(
     name: &str,
     fired_at: &str,
     mut placement: Option<Placement<'_>>,
-) -> Result<String, String> {
+) -> Result<String, SubstituteError> {
     let sql = placement
         .as_ref()
         .and_then(|p| p.key)
@@ -260,7 +287,7 @@ fn substitute_with(
         out.push_str(&rest[..start]);
         let after = &rest[start + 2..];
         let Some(end) = after.find('}') else {
-            return Err("unterminated `${trigger.…}` token".into());
+            return Err(SubstituteError::config("unterminated `${trigger.…}` token"));
         };
         let token = &after[8..end];
         let leads = out.is_empty() && start == 0;
@@ -268,18 +295,26 @@ fn substitute_with(
         // reach the text around it.
         let whole = leads && after[end + 1..].is_empty();
         let Some(v) = event.lookup(token, name, fired_at) else {
-            return Err(format!(
-                "unknown `${{trigger.{token}}}` token for {} trigger '{name}'",
-                event.type_label()
-            ));
+            // A header or query value the request did not carry is the
+            // sender's to supply; any other unknown token is the config's.
+            return Err(SubstituteError {
+                message: format!(
+                    "unknown `${{trigger.{token}}}` token for {} trigger '{name}'",
+                    event.type_label()
+                ),
+                by_sender: sender_chosen(event, token),
+            });
         };
         match placement.as_mut() {
             Some(p) => {
                 if sender_chosen(event, token) {
                     if let Some(why) = placement_refusal(&v, &out, whole, sql, free_text) {
-                        return Err(format!(
-                            "the `${{trigger.{token}}}` value {why}; the event was not run"
-                        ));
+                        return Err(SubstituteError {
+                            message: format!(
+                                "the `${{trigger.{token}}}` value {why}; the event was not run"
+                            ),
+                            by_sender: true,
+                        });
                     }
                     p.seen.push(EventValue {
                         token: token.to_string(),
@@ -589,6 +624,40 @@ mod tests {
         assert_eq!(tagged.trim(), "x: !Keep b");
         assert!(substitute("a: [${trigger.bucket}", &obj(), "t", "now").is_err());
         assert!(substitute("a: ${trigger.bucket", &obj(), "t", "now").is_err());
+    }
+
+    /// A refusal the sender caused is told apart from a config error, so the
+    /// webhook can answer the sender's mistakes with 422 and keep reporting
+    /// the trigger's own as failures.
+    #[test]
+    fn a_substitution_error_says_whether_the_sender_caused_it() {
+        let hook = TriggerEvent::Webhook {
+            method: "POST".into(),
+            body: "a/../b".into(),
+            headers: Default::default(),
+            query: Default::default(),
+            idem: "i".into(),
+        };
+        let by_sender = |doc: &str| {
+            substitute_tracked(doc, &hook, "n", "f")
+                .unwrap_err()
+                .by_sender
+        };
+        assert!(by_sender("p: in/${trigger.body}\n"), "a refused value");
+        assert!(
+            by_sender("p: ${trigger.header.x-missing}\n"),
+            "a missing header"
+        );
+        assert!(
+            by_sender("p: ${trigger.query.missing}\n"),
+            "a missing query value"
+        );
+        assert!(
+            !by_sender("p: ${trigger.object_key}\n"),
+            "a token webhooks never have"
+        );
+        assert!(!by_sender("p: [${trigger.body}\n"), "a malformed document");
+        assert!(!by_sender("p: ${trigger.body\n"), "an unterminated token");
     }
 
     #[test]
