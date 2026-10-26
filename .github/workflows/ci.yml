@@ -483,7 +483,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Tests that read docs
         run: >-
-          cargo test -p faucet-cli --all-features
+          cargo test --no-fail-fast -p faucet-cli --all-features
           --test serve_openapi --test compat_doc --test capability_matrix
           --test hub_catalog --test docs_config_blocks --test shipped_features
 
@@ -1132,8 +1132,13 @@ jobs:
           CARGO_PROFILE_DEV_DEBUG: "0"
           CARGO_PROFILE_TEST_DEBUG: "0"
           IGNORE_RE: '(/tests?/|/examples?/|/benches?/|build\.rs$|crates/sink/clickhouse/src/staged_exec\.rs$|crates/sink/mssql/src/staged_exec\.rs$)'
+          # Every phase runs with --no-fail-fast and the step only fails at the
+          # end, so one red run names every failing test (#948).
+          RETRY_LOG_KEEP: ${{ runner.temp }}/coverage-tests.log
         run: |
           retry() { scripts/retry-on-image-pull.sh "$@"; }
+          failed=()
+          : > "$RETRY_LOG_KEEP"
           cargo llvm-cov clean --workspace
           rm -f target/*.profraw
           eval "$(cargo llvm-cov show-env --sh)"
@@ -1143,38 +1148,53 @@ jobs:
           # The staged-load execution shims need a live warehouse that can reach
           # a live bucket, so they are excluded here, in codecov.yml, and in
           # scripts/patch-coverage.py (all three kept in sync).
-          retry cargo test --workspace --exclude faucet-cli --all-features --test '*'
+          retry cargo test --no-fail-fast --workspace --exclude faucet-cli --all-features --test '*' \
+            || failed+=("integration (libraries)")
           # Report this batch before deleting its executables: llvm-cov maps the
           # profile data through the binaries, so a deleted binary's counts are lost.
-          cargo llvm-cov report --lcov --output-path integration-libs.lcov --ignore-filename-regex "$IGNORE_RE"
+          cargo llvm-cov report --lcov --output-path integration-libs.lcov --ignore-filename-regex "$IGNORE_RE" \
+            || echo "::warning::no coverage report for integration-libs.lcov"
           cargo test --workspace --exclude faucet-cli --all-features --test '*' --no-run --message-format=json 2>/dev/null \
             | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true) | .executable // empty' \
-            | while read -r exe; do rm -f "$exe" "${exe}.d"; done
+            | while read -r exe; do rm -f "$exe" "${exe}.d"; done || true
           rm -f target/*.profraw
           docker ps -aq | xargs -r docker rm -f >/dev/null
           docker system prune -af --volumes >/dev/null
           df -h /
-          retry cargo test -p faucet-cli --all-features --test '*'
-          cargo llvm-cov report --lcov --output-path integration-cli.lcov --ignore-filename-regex "$IGNORE_RE"
+          retry cargo test --no-fail-fast -p faucet-cli --all-features --test '*' \
+            || failed+=("integration (faucet-cli)")
+          cargo llvm-cov report --lcov --output-path integration-cli.lcov --ignore-filename-regex "$IGNORE_RE" \
+            || echo "::warning::no coverage report for integration-cli.lcov"
           # Both scripts merge a file's records across reports (a line hit in either counts).
           # One newline between reports, so a file without a trailing one
           # cannot run its `end_of_record` into the next report's `SF:`.
-          for f in integration-libs.lcov integration-cli.lcov; do cat "$f"; echo; done > integration.lcov
+          for f in integration-libs.lcov integration-cli.lcov; do cat "$f" 2>/dev/null; echo; done > integration.lcov
 
           echo "::group::teardown before the unit phase"
           df -h /
           cargo test -p faucet-cli --all-features --test '*' --no-run --message-format=json 2>/dev/null \
             | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true) | .executable // empty' \
-            | while read -r exe; do rm -f "$exe" "${exe}.d"; done
+            | while read -r exe; do rm -f "$exe" "${exe}.d"; done || true
           rm -f target/*.profraw
           docker ps -aq | xargs -r docker rm -f >/dev/null
           docker system prune -af --volumes >/dev/null
           df -h /
           echo "::endgroup::"
 
-          retry cargo test --workspace --all-features --lib --bins
-          cargo llvm-cov report --lcov --output-path unit.lcov --ignore-filename-regex "$IGNORE_RE"
-          for f in integration.lcov unit.lcov; do cat "$f"; echo; done > lcov.info
+          retry cargo test --no-fail-fast --workspace --all-features --lib --bins \
+            || failed+=("unit")
+          cargo llvm-cov report --lcov --output-path unit.lcov --ignore-filename-regex "$IGNORE_RE" \
+            || echo "::warning::no coverage report for unit.lcov"
+          for f in integration.lcov unit.lcov; do cat "$f" 2>/dev/null; echo; done > lcov.info
+          if [ ${#failed[@]} -gt 0 ]; then
+            echo "::error::failing test phases: ${failed[*]} (every failing test is listed by the next step and in the job summary)"
+            exit 1
+          fi
+      - name: List every failing test
+        if: ${{ failure() && (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true') }}
+        env:
+          RETRY_LOG_KEEP: ${{ runner.temp }}/coverage-tests.log
+        run: python3 scripts/failing_tests.py --summary "$GITHUB_STEP_SUMMARY" "$RETRY_LOG_KEEP"
       - name: Keep the coverage reports
         # So a failing coverage gate can be read line by line (Codecov only
         # receives the report after the gates pass).

@@ -117,7 +117,14 @@ their data directory, and Azurite runs with `--inMemoryPersistence`.
 
 The **required `Coverage` job** runs every test in the workspace under
 `cargo-llvm-cov` — unit tests *and* the Docker-backed integration tests in each
-crate's `tests/` directory — and enforces two gates on the lines a PR changes:
+crate's `tests/` directory — and enforces two gates on the lines a PR changes.
+It runs every test binary in all three phases (library integration tests,
+`faucet-cli` integration tests, unit tests) with `--no-fail-fast` and fails
+only at the end, so one red run reports every failure: the **List every
+failing test** step and the job summary name each failing test with its
+binary, panic location and the `cargo test` target to rerun
+(`scripts/failing_tests.py`, which also works on a downloaded job log).
+
 
 | Gate | Script | Measures | Floor |
 |---|---|---|---|
