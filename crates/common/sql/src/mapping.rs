@@ -300,20 +300,24 @@ pub struct MatchedRow<'a> {
 }
 
 impl<'a> MatchedRow<'a> {
-    /// The value for the column at `column`, if the record carries it
-    /// (`cells` is in table order, so this is a binary search).
+    /// The value for the column at `column`, if the record carries it.
+    /// `cells` is built in table order, so this is a binary search; cells a
+    /// caller reordered are still found (by a scan).
     pub fn value(&self, column: usize) -> Option<&'a Value> {
-        self.cells
-            .binary_search_by_key(&column, |(c, _)| *c)
-            .ok()
-            .map(|i| self.cells[i].1)
+        self.position(column).map(|i| self.cells[i].1)
     }
 
     /// Whether the record carries the column at `column`.
     pub fn carries(&self, column: usize) -> bool {
-        self.cells
-            .binary_search_by_key(&column, |(c, _)| *c)
-            .is_ok()
+        self.position(column).is_some()
+    }
+
+    fn position(&self, column: usize) -> Option<usize> {
+        match self.cells.binary_search_by_key(&column, |(c, _)| *c) {
+            Ok(i) => Some(i),
+            Err(_) if self.cells.is_sorted_by_key(|(c, _)| *c) => None,
+            Err(_) => self.cells.iter().position(|(c, _)| *c == column),
+        }
     }
 }
 
@@ -606,5 +610,11 @@ mod tests {
             vec![0, 2]
         );
         assert_eq!(groups[1].0, vec![1]);
+        // Cells a caller reordered are still found.
+        let mut row = rows[2].clone();
+        row.cells.reverse();
+        assert_eq!(row.value(0), Some(&b));
+        assert_eq!(row.value(3), Some(&a));
+        assert!(row.carries(0) && !row.carries(1));
     }
 }
