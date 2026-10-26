@@ -52,6 +52,19 @@ ignore = [
     # drop these two ids once object_store/opendal move past 0.41.
     { id = "RUSTSEC-2026-0194", reason = "only transitive quick-xml 0.39 (object_store/opendal) and 0.31 (azure dev-dep) remain (2026-10-07)" },
     { id = "RUSTSEC-2026-0195", reason = "only transitive quick-xml 0.39 / 0.31 remain; NsReader unused (2026-10-07)" },
+    # 2026-10-26 — zstd-rs advisories. zstd-sys is on the patched 2.1.2
+    # (RUSTSEC-2026-0410) and async-compression (our async .zst reader/writer)
+    # on zstd 0.14.3 / zstd-safe 8.2.0. zstd 0.13.3 / zstd-safe 7.3.0 remain
+    # because parquet, arrow-ipc, apache-avro, iceberg, orc-rust, mysql_common
+    # and tonic require zstd 0.13 in their newest releases, and faucet-core's
+    # public `SyncCompressWriter::Zstd` wraps a 0.13 encoder (moving it is a
+    # breaking change). None of them calls `with_context` (0391) or `Seekable`
+    # (0398). 0403 is reachable: a streaming `zstd::Decoder` reading a
+    # legacy-format frame that fails to decode. Scoped by
+    # scripts/advisory-scope.py; drop when the zstd 0.13 users move to 0.14.
+    { id = "RUSTSEC-2026-0391", reason = "only zstd 0.13.3 via upstream crates remains; with_context unused (2026-10-26)" },
+    { id = "RUSTSEC-2026-0398", reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; Seekable unused (2026-10-26)" },
+    { id = "RUSTSEC-2026-0403", reason = "only zstd-safe 7.3.0 via zstd 0.13 remains (upstream pins + faucet-core public type); legacy-frame decode errors only (2026-10-26)" },
 ]
 
 [licenses]

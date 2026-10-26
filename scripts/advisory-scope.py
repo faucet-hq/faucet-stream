@@ -16,6 +16,8 @@ import tomllib
 SCOPED = {
     ("RUSTSEC-2026-0194", "RUSTSEC-2026-0195"): ("quick-xml", {"0.39.4"}, (0, 41, 0)),
     ("RUSTSEC-2026-0387",): ("crypto-bigint", {"0.5.5"}, (0, 7, 6)),
+    ("RUSTSEC-2026-0391",): ("zstd", {"0.13.3"}, (0, 14, 3)),
+    ("RUSTSEC-2026-0398", "RUSTSEC-2026-0403"): ("zstd-safe", {"7.3.0"}, (8, 2, 0)),
 }
 
 
