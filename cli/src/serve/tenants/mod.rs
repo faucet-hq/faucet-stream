@@ -976,10 +976,6 @@ pub struct DeleteReport {
     pub state_keys_not_deleted: Vec<String>,
 }
 
-/// Delete a tenant and everything it owns in faucet: its runs, usage
-/// records, change requests, catalog rows, state keys, connections and
-/// connect sessions.
-/// Destination data is never touched. Refused while a run is active.
 /// Undo the suspension a refused delete set — only while the record is
 /// still exactly what the delete wrote. A record someone changed meanwhile
 /// (a limits edit, a deliberate suspension) is left as it is: the delete
@@ -1005,6 +1001,10 @@ async fn reopen_admission(
     Ok(())
 }
 
+/// Delete a tenant and everything it owns in faucet: its runs, usage
+/// records, change requests, catalog rows, state keys, connections and
+/// connect sessions.
+/// Destination data is never touched. Refused while a run is active.
 pub async fn delete_tenant(state: &ServerState, tenant: &str) -> Result<DeleteReport, ServeError> {
     let rec = get_tenant(state, tenant).await?;
     if active_runs(state, tenant, 1).await? > 0 {
