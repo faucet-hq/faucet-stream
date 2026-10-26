@@ -174,8 +174,10 @@ impl ClientBuilder {
     }
 
     /// Route every request through the proxy at `url`. A malformed URL fails
-    /// [`build`](Self::build).
+    /// [`build`](Self::build). Undoes an earlier [`no_proxy`](Self::no_proxy)
+    /// for the reference-policy screening: requests may go through a proxy.
     pub fn proxy(mut self, url: &str) -> Self {
+        self.direct_only = false;
         match reqwest::Proxy::all(url) {
             Ok(p) => self.inner = self.inner.proxy(p),
             Err(e) => {
@@ -244,6 +246,8 @@ impl ClientBuilder {
         mut self,
         f: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
     ) -> Self {
+        // The step may add a proxy; screen as if one could apply.
+        self.direct_only = false;
         self.inner = f(self.inner);
         self
     }
@@ -253,6 +257,7 @@ impl ClientBuilder {
         mut self,
         f: impl FnOnce(reqwest::ClientBuilder) -> Result<reqwest::ClientBuilder, FaucetError>,
     ) -> Result<Self, FaucetError> {
+        self.direct_only = false;
         self.inner = f(self.inner)?;
         Ok(self)
     }
@@ -1422,6 +1427,23 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_proxy_after_no_proxy_is_screened_again() {
+        let direct = |b: ClientBuilder| b.build().unwrap().direct_only;
+        assert!(direct(Client::builder().no_proxy()));
+        assert!(!direct(Client::builder()));
+        assert!(!direct(
+            Client::builder()
+                .no_proxy()
+                .proxy("http://proxy.example:3128")
+        ));
+        assert!(!direct(Client::builder().no_proxy().configure(|b| b)));
+        assert!(!direct(
+            Client::builder().no_proxy().try_configure(Ok).unwrap()
+        ));
+        assert!(direct(Client::builder().configure(|b| b).no_proxy()));
     }
 
     #[tokio::test]
