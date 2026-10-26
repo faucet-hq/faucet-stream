@@ -24,8 +24,37 @@ struct Inner {
     health: DashMap<String, TriggerHealth>,
     /// name → compiled webhook trigger (for the webhook route handler).
     webhooks: std::collections::HashMap<String, Arc<CompiledTrigger>>,
-    /// Webhook leading-edge debounce: trigger name → last-accepted-fire epoch millis.
-    debounce: DashMap<String, i64>,
+    /// Webhook leading-edge debounce: trigger name → the last accepted fire.
+    debounce: DashMap<String, Window>,
+}
+
+/// One trigger's debounce window: when its last fire was accepted, and
+/// whether that fire is still being submitted.
+#[derive(Debug, Clone, Copy)]
+struct Window {
+    stamp: i64,
+    in_flight: bool,
+}
+
+impl Default for Window {
+    fn default() -> Self {
+        Self {
+            stamp: i64::MIN,
+            in_flight: false,
+        }
+    }
+}
+
+/// What a webhook request inside the debounce window does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arm {
+    /// Fire, remembering the stamp this one replaced.
+    Fire { previous: i64 },
+    /// An accepted fire already covers this window: coalesce.
+    Coalesce,
+    /// The fire this would join is still being submitted and may not go
+    /// through: the caller retries rather than being told it coalesced.
+    Busy,
 }
 
 #[derive(Clone)]
@@ -90,34 +119,56 @@ impl TriggersHandle {
 
     /// [`allow_fire`](Self::allow_fire) that returns the stamp it replaced, so
     /// a fire that does not go through can be undone with
-    /// [`disarm_fire`](Self::disarm_fire). `None` = coalesce.
+    /// [`disarm_fire`](Self::disarm_fire). `None` = do not fire now.
     pub fn arm_fire(&self, name: &str, window_ms: i64, now_ms: i64) -> Option<i64> {
-        if window_ms <= 0 {
-            return Some(i64::MIN);
-        }
-        let mut e = self
-            .inner
-            .debounce
-            .entry(name.to_string())
-            .or_insert(i64::MIN);
-        if now_ms.saturating_sub(*e) >= window_ms {
-            let previous = *e;
-            *e = now_ms;
-            Some(previous)
-        } else {
-            None
+        match self.arm(name, window_ms, now_ms) {
+            Arm::Fire { previous } => Some(previous),
+            Arm::Coalesce | Arm::Busy => None,
         }
     }
 
-    /// Undo an [`arm_fire`](Self::arm_fire) whose fire was dropped or failed,
-    /// so the caller's retry is not coalesced into a run that never started.
-    /// A later accepted fire (a different stamp) is left alone.
-    pub fn disarm_fire(&self, name: &str, armed_ms: i64, previous: i64) {
-        if let Some(mut e) = self.inner.debounce.get_mut(name)
-            && *e == armed_ms
-        {
-            *e = previous;
+    /// Arm the debounce window for a fire at `now_ms`. The fire is marked in
+    /// flight until [`settle_fire`](Self::settle_fire) says how it ended.
+    pub fn arm(&self, name: &str, window_ms: i64, now_ms: i64) -> Arm {
+        if window_ms <= 0 {
+            return Arm::Fire { previous: i64::MIN };
         }
+        let mut e = self.inner.debounce.entry(name.to_string()).or_default();
+        if now_ms.saturating_sub(e.stamp) >= window_ms {
+            let previous = e.stamp;
+            *e = Window {
+                stamp: now_ms,
+                in_flight: true,
+            };
+            Arm::Fire { previous }
+        } else if e.in_flight {
+            Arm::Busy
+        } else {
+            Arm::Coalesce
+        }
+    }
+
+    /// End the fire armed at `armed_ms`: a committed fire keeps the window, any
+    /// other is undone so the caller's retry is not coalesced into a run that
+    /// never started. A later accepted fire (a different stamp) is left alone.
+    pub fn settle_fire(&self, name: &str, armed_ms: i64, previous: i64, committed: bool) {
+        if let Some(mut e) = self.inner.debounce.get_mut(name)
+            && e.stamp == armed_ms
+        {
+            if committed {
+                e.in_flight = false;
+            } else {
+                *e = Window {
+                    stamp: previous,
+                    in_flight: false,
+                };
+            }
+        }
+    }
+
+    /// Undo an [`arm_fire`](Self::arm_fire) whose fire was dropped or failed.
+    pub fn disarm_fire(&self, name: &str, armed_ms: i64, previous: i64) {
+        self.settle_fire(name, armed_ms, previous, false);
     }
 
     pub fn record_ok(&self, name: &str, fired_at: Option<String>) {
@@ -259,5 +310,26 @@ mod tests {
         // Disarming an unknown trigger is a no-op.
         h.disarm_fire("nope", 1, 0);
         assert_eq!(h.arm_fire("b", 0, 1), Some(i64::MIN));
+    }
+
+    /// A request inside the window of a fire still being submitted is told to
+    /// retry, not that it coalesced; once that fire is committed, it coalesces;
+    /// once it failed, the retry fires (#934).
+    #[test]
+    fn a_request_behind_an_unsettled_fire_retries_instead_of_coalescing() {
+        let h = TriggersHandle::from_compiled(&[webhook("a")]);
+        let window = 60_000;
+        let Arm::Fire { previous } = h.arm("a", window, 1_000) else {
+            panic!("first fire")
+        };
+        assert_eq!(h.arm("a", window, 2_000), Arm::Busy);
+        h.settle_fire("a", 1_000, previous, true);
+        assert_eq!(h.arm("a", window, 3_000), Arm::Coalesce);
+        let Arm::Fire { previous } = h.arm("a", window, 70_000) else {
+            panic!("window elapsed")
+        };
+        assert_eq!(h.arm("a", window, 70_500), Arm::Busy);
+        h.settle_fire("a", 70_000, previous, false);
+        assert!(matches!(h.arm("a", window, 71_000), Arm::Fire { .. }));
     }
 }
