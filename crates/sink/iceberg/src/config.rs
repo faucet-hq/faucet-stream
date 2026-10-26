@@ -49,8 +49,23 @@ pub struct CatalogInner {
     pub credential: Option<String>,
 
     /// Arbitrary catalog properties passed through to the catalog builder
-    /// (e.g. S3 region, endpoint, access key).
+    /// and the warehouse file IO (e.g. S3 region, endpoint, access key).
+    /// Keys that name an endpoint (`*endpoint*`, `*uri`, `*url`, a proxy,
+    /// `gcs.service.path`) or a local file (`*-file`, `*_file`, `*.file`,
+    /// `warehouse`) are checked like the typed fields by a host that confines
+    /// configs (`faucet serve`).
     #[serde(default)]
+    #[schemars(extend("x-faucet-resource-keys" = {
+        "*endpoint*": "url",
+        "*uri": "url",
+        "*url": "url",
+        "*proxy*": "url",
+        "gcs.service.path": "url",
+        "*-file": "path",
+        "*_file": "path",
+        "*.file": "path",
+        "warehouse": "path"
+    }))]
     pub properties: HashMap<String, String>,
 }
 
@@ -424,6 +439,53 @@ impl IcebergSinkConfig {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn catalog_properties_name_their_endpoints_and_files() {
+        use faucet_core::resolve::{ReferencePolicy, ResourceKind, annotated_resources};
+        let schema = serde_json::to_value(schemars::schema_for!(IcebergSinkConfig)).unwrap();
+        let config = serde_json::json!({
+            "catalog": {
+                "type": "rest",
+                "uri": "http://lake:8181",
+                "properties": {
+                    "s3.endpoint": "http://10.0.0.7:9000",
+                    "gcs.service.path": "http://10.0.0.8",
+                    "gcs.credentials-file": "/etc/key.json",
+                    "s3.region": "us-east-1"
+                }
+            },
+            "namespace": ["db"],
+            "table": "t"
+        });
+        let mut found: Vec<(String, ResourceKind)> = annotated_resources(&schema, &config)
+            .into_iter()
+            .filter(|r| r.pointer.starts_with("/catalog/properties/"))
+            .map(|r| (r.pointer, r.kind))
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "/catalog/properties/gcs.credentials-file".into(),
+                    ResourceKind::Path
+                ),
+                (
+                    "/catalog/properties/gcs.service.path".into(),
+                    ResourceKind::Url
+                ),
+                ("/catalog/properties/s3.endpoint".into(), ResourceKind::Url),
+            ]
+        );
+        let policy = ReferencePolicy::open().with_url_hosts(["lake"]);
+        let refused = annotated_resources(&schema, &config)
+            .iter()
+            .filter(|r| r.pointer.starts_with("/catalog/properties/"))
+            .filter(|r| r.kind == ResourceKind::Url && policy.check(r).is_err())
+            .count();
+        assert_eq!(refused, 2);
+    }
     use super::*;
 
     fn minimal_config_json() -> serde_json::Value {
