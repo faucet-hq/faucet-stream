@@ -44,9 +44,10 @@ use crate::encode::{
 
 pub(crate) use crate::statements::Prepared;
 use crate::statements::{
-    cleanup_key_typing, delete_statements, insert_statements, key_load_statements,
-    merge_statements, overwrite_swap_sql, poison_check, prepare_rows, referencing_tables_sql,
-    staging_create_sql, staging_relax_sql, with_call, writable,
+    child_references_sql, cleanup_key_typing, delete_statements, group_referencing_keys,
+    insert_statements, key_load_statements, merge_statements, overwrite_swap_sql, poison_check,
+    prepare_rows, referencing_keys_sql, staging_create_sql, staging_relax_sql, target_database,
+    with_call, writable,
 };
 
 /// Microsoft SQL Server sink.
@@ -457,40 +458,64 @@ impl MssqlDriver {
     }
 
     /// Refuse an overwrite of a table other tables reference by an enabled
-    /// foreign key, on the DDL connection `conn` (a one-connection pool).
+    /// foreign key, on the DDL connection `conn` (a one-connection pool): any
+    /// key whose `ON DELETE` rewrites the child, and a `NO ACTION` key while
+    /// some child row references the target. The catalog read is the target's
+    /// own database for a three-part name.
     async fn refuse_referenced_target(
         &self,
         conn: &mut MssqlPooledConnection<'_>,
     ) -> Result<(), FaucetError> {
-        let probe = referencing_tables_sql(&self.table_quoted);
-        let rows = self
-            .on_conn(conn, "query", true, async |c| {
-                c.simple_query(probe.as_str())
-                    .await
-                    .map_err(|e| {
-                        FaucetError::Sink(format!("mssql overwrite: foreign-key probe: {e}"))
-                    })?
-                    .into_first_result()
-                    .await
-                    .map_err(|e| {
-                        FaucetError::Sink(format!("mssql overwrite: foreign-key probe: {e}"))
-                    })
-            })
-            .await?;
-        let referenced_by: Vec<String> = rows
-            .iter()
-            .filter_map(|row| row.try_get::<&str, _>(0).ok().flatten().map(str::to_string))
-            .collect();
+        let db = target_database(&self.config.table);
+        let probe = referencing_keys_sql(&self.table_quoted, db)?;
+        let rows = self.probe_rows(conn, &probe).await?;
+        let keys = group_referencing_keys(rows.iter().filter_map(|row| {
+            Some((
+                row.try_get::<i32, _>(0).ok().flatten()?,
+                row.try_get::<&str, _>(1).ok().flatten()?.to_string(),
+                row.try_get::<&str, _>(2).ok().flatten()?.to_string(),
+                row.try_get::<i32, _>(3).ok().flatten()?,
+                row.try_get::<&str, _>(4).ok().flatten()?.to_string(),
+            ))
+        }));
+        let mut referenced_by = std::collections::BTreeSet::new();
+        for key in &keys {
+            let refused = key.rewrites_child()
+                || !self
+                    .probe_rows(conn, &child_references_sql(key, db)?)
+                    .await?
+                    .is_empty();
+            if refused {
+                referenced_by.insert(key.display(db));
+            }
+        }
         if referenced_by.is_empty() {
             Ok(())
         } else {
             Err(faucet_common_sql::referenced_overwrite_error(
                 "mssql",
                 &self.config.table,
-                &referenced_by,
+                &referenced_by.into_iter().collect::<Vec<_>>(),
                 true,
             ))
         }
+    }
+
+    /// One foreign-key probe query on `conn`, its first result set.
+    async fn probe_rows(
+        &self,
+        conn: &mut MssqlPooledConnection<'_>,
+        sql: &str,
+    ) -> Result<Vec<tiberius::Row>, FaucetError> {
+        self.on_conn(conn, "query", true, async |c| {
+            c.simple_query(sql)
+                .await
+                .map_err(|e| FaucetError::Sink(format!("mssql overwrite: foreign-key probe: {e}")))?
+                .into_first_result()
+                .await
+                .map_err(|e| FaucetError::Sink(format!("mssql overwrite: foreign-key probe: {e}")))
+        })
+        .await
     }
 
     /// The bracket-quoted relation the append/insert path targets. For

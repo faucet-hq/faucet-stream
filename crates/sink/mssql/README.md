@@ -468,12 +468,15 @@ the identity to the server needs no `ALTER`. No `key` is needed; the target tabl
 exist.
 
 A target that **other** tables reference through an enabled foreign key
-(`sys.foreign_keys`) is refused (a `Config` error naming those tables) before
+(`sys.foreign_keys` of the target's database, also for a three-part
+`db.schema.table`) is refused (a `Config` error naming those tables) before
 any row is staged, and checked again just before the swap: its `DELETE` would
-cascade into them (`ON DELETE CASCADE`), null their references (`ON DELETE SET
-NULL`) or fail after the whole load (`NO ACTION`). Use `write_mode: upsert`, or
-drop or disable the foreign key. A self-reference is allowed (every row is
-replaced at once).
+cascade into them (`ON DELETE CASCADE`), null or reset their references (`ON
+DELETE SET NULL` / `SET DEFAULT`) — refused whatever those tables hold — or,
+for a `NO ACTION` key, fail after the whole load while some row of the
+referencing table still points at the target (a `NO ACTION` key whose table
+holds no such row is allowed). Use `write_mode: upsert`, or drop or disable
+the foreign key. A self-reference is allowed (every row is replaced at once).
 
 
 **Leftover staging.** `overwrite_staging_exists()` probes for the `<table>__faucet_ovw` table read-only; `faucet status --probe` uses it to report staging a crashed or aborted overwrite left behind (`present` / `absent`). Under the CLI each overwrite run stages in its own `<table>__faucet_ovw_<token>` (the run token is shared by the run's begin, writer and commit instances, so a concurrent overwrite of the same table neither drops nor shares it); the probe then also reports any run's tokened staging. A run's begin drops the untokened `<table>__faucet_ovw` and another run's tokened staging only once that run's token is more than 7 days old (an abandoned crash); a younger one may still be in use and is left alone.
