@@ -14,7 +14,7 @@
 //!    parameters. So a caller-supplied free-text value (no `values:` set) that
 //!    is spliced into a longer string may not carry a quote, a backtick, `;`,
 //!    a backslash or a control character; unquoted in SQL text it takes only
-//!    identifier-like text, and in a URL no `?`, `#`, `&`, whitespace or `..`
+//!    a number, and in a URL no `?`, `#`, `&`, whitespace or `..`
 //!    segment. A whole-value reference, or a param with a closed `values:`
 //!    set, is unaffected.
 //! 2. **No re-interpolation of caller input.** Env/file/secret directives are
@@ -610,20 +610,21 @@ fn always_quoted(s: &str, token: &str) -> bool {
     })
 }
 
-/// Why a value may not stand unquoted in SQL text, if it may not: only
-/// identifier-like text (letters, digits, `_ . : @ + -`, no `--`) is kept,
-/// so the value fills one SQL token and cannot add a condition or a clause.
+/// Why a value may not stand unquoted in SQL text, if it may not: only a
+/// numeric literal (`-?digits[.digits]`) is kept. Any other text could name a
+/// column (`tenant_id = tenant_id`) or form an expression, and so change
+/// which rows a predicate matches.
 fn unquoted_sql_refusal(value: &Value) -> Option<String> {
     let Value::String(s) = value else {
         return None;
     };
-    if let Some(c) = s
-        .chars()
-        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '@' | '+' | '-')))
-    {
-        return Some(format!("`{}`", c.escape_default()));
-    }
-    s.contains("--").then(|| "`--`".to_string())
+    let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+    let unsigned = s.strip_prefix('-').unwrap_or(s);
+    let numeric = match unsigned.split_once('.') {
+        Some((int, frac)) => digits(int) && digits(frac),
+        None => digits(unsigned),
+    };
+    (!numeric).then(|| "text other than a number".to_string())
 }
 
 /// Why a value may not be spliced into a URL, if it may not: it may not add
@@ -645,7 +646,7 @@ fn url_refusal(value: &Value) -> Option<String> {
 
 /// Refuse a caller-supplied free-text value embedded in a longer string when
 /// it carries a character that could rewrite the text around it. In SQL text
-/// a splice not enclosed in quotes takes only identifier-like text, and a
+/// a splice not enclosed in quotes takes only a number, and a
 /// splice in a URL may not add a query, fragment or `..` segment. The value
 /// still works as a whole value (`field: ${param.x}`), or with a closed
 /// `values:` set.
@@ -963,7 +964,7 @@ mod tests {
         bind_document(&mut d, &supplied(&[]), BindMode::Strict).unwrap();
     }
 
-    /// An unquoted SQL splice takes only identifier-like text; a URL splice
+    /// An unquoted SQL splice takes only a number; a URL splice
     /// may not add a query, fragment or `..` segment.
     #[test]
     fn unquoted_sql_and_url_splices_are_narrower() {
@@ -985,6 +986,16 @@ mod tests {
             "1 OR 1=1",
             "0=0",
             "1)--",
+            "tenant_id",
+            "0+tenant_id",
+            "tenant_id-0",
+            "1e9",
+            "t.id",
+            "@@version",
+            "acme-42.eu",
+            "-",
+            "1.",
+            ".5",
             "x/../../admin",
             "a?all=1",
             "a#b",
@@ -993,11 +1004,13 @@ mod tests {
             let err = bind(bad).unwrap_err().to_string();
             assert!(err.contains("param 't'"), "{bad}: {err}");
         }
-        let d = bind("acme-42.eu").unwrap();
-        assert_eq!(
-            d["source"]["query"],
-            "SELECT * FROM orders WHERE tenant_id = acme-42.eu"
-        );
+        for good in ["42", "-7", "3.5"] {
+            let d = bind(good).unwrap();
+            assert_eq!(
+                d["source"]["query"],
+                format!("SELECT * FROM orders WHERE tenant_id = {good}")
+            );
+        }
         // Quoted in SQL, the earlier quote rule is the guard; other fields
         // take free text.
         let mut d = json!({

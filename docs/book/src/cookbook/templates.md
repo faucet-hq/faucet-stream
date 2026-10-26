@@ -80,8 +80,10 @@ for a param without a `values:` set may not carry a quote (`'`, `"`, `` ` ``),
 `;`, a backslash or a control character when it is spliced into a longer string
 (`query: "… WHERE account = '${param.account}'"`); such a trigger is refused.
 In a SQL field (`query`, `sql`, `statement`, `*_query`) a splice that is not
-enclosed in quotes (`WHERE id = ${param.id}`) takes only identifier-like text
-(letters, digits, `_ . : @ + -`, no `--`), and in a URL field (`url`, `*_url`,
+enclosed in quotes (`WHERE id = ${param.id}`) takes only a number (`42`,
+`-7`, `3.5`) — text that could name a column or form an expression is refused,
+so quote the splice (`'${param.id}'`) or declare the param `int` / `float` — and
+in a URL field (`url`, `*_url`,
 `path`, `endpoint`) a spliced value may not carry `?`, `#`, `&`, whitespace or
 a `..` segment.
 For a param a lower-trust caller fills into a query, declare a closed `values:`
