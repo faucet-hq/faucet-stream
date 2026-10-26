@@ -221,3 +221,32 @@ async fn conformance_driver_truthful() {
     let conn = support::connection("conf-driver", &support::emulator_host().await);
     assert_eq!(support::count_rows(&conn, "t").await, 12);
 }
+
+/// Check 23: scoped cleanup deletes only the unwritten rows of its scope.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_cleanup_scoped() {
+    let conn = support::create_database(
+        "conf-cleanup",
+        vec![
+            "CREATE TABLE c (id INT64 NOT NULL, tenant STRING(MAX), v STRING(MAX)) \
+             PRIMARY KEY (id)"
+                .to_string(),
+        ],
+    )
+    .await;
+    let mut cfg = SpannerSinkConfig::new(
+        conn.project_id.clone(),
+        conn.instance.clone(),
+        conn.database.clone(),
+        "c",
+    );
+    cfg.connection.emulator_host = conn.emulator_host.clone();
+    cfg.write = WriteSpec {
+        write_mode: WriteMode::Upsert,
+        key: vec!["id".to_string()],
+        delete_marker: None,
+        rollback: None,
+    };
+    let sink = SpannerSink::new(cfg).await.expect("sink");
+    faucet_conformance::assert_cleanup_scoped(&sink, "tenant", || support::ids(&conn, "c")).await;
+}

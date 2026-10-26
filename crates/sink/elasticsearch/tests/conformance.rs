@@ -305,6 +305,33 @@ async fn conformance_overwrite_lifecycle() {
     .await;
 }
 
+/// Check 23: scoped cleanup deletes only the unwritten documents of its
+/// scope, against the stand-in cluster (`_bulk` by `_id`, `_delete_by_query`).
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_cleanup_scoped() {
+    let server = MockServer::start().await;
+    let cluster = fake_cluster::FakeCluster::default();
+    Mock::given(wiremock::matchers::any())
+        .respond_with(cluster.clone())
+        .mount(&server)
+        .await;
+    let mut cfg = ElasticsearchSinkConfig::new(server.uri(), "c");
+    cfg.write.write_mode = WriteMode::Upsert;
+    cfg.write.key = vec!["id".to_string()];
+    let sink = ElasticsearchSink::new(cfg).unwrap();
+    faucet_conformance::assert_cleanup_scoped(&sink, "tenant", || {
+        let cluster = cluster.clone();
+        async move {
+            let st = cluster.0.lock().unwrap();
+            st.indices
+                .get("c")
+                .map(|(docs, _)| docs.iter().filter_map(|d| d["id"].as_i64()).collect())
+                .unwrap_or_default()
+        }
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn conformance_roundtrips_recorded() {
     let server = MockServer::start().await;

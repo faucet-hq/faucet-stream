@@ -1,6 +1,9 @@
 //! A small stateful Elasticsearch stand-in for the overwrite lifecycle: indices
 //! with their documents and mappings, aliases, `_bulk` (honouring
-//! `require_alias`), `_aliases`, `_refresh`, create and delete.
+//! `require_alias`; an action with an `_id` replaces or deletes that
+//! document), `_aliases`, `_refresh`, `_delete_by_query` (`term` filters and
+//! `must_not` ids), create and delete. A document written with an `_id` is
+//! stored with it under `_id`.
 
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -126,6 +129,41 @@ impl Respond for FakeCluster {
                 ResponseTemplate::new(200).set_body_json(json!({"acknowledged": true}))
             }
             ("POST", [_, "_refresh"]) => ResponseTemplate::new(200).set_body_json(json!({})),
+            ("POST", [index, "_delete_by_query"]) => {
+                let body: Value = serde_json::from_slice(&req.body).unwrap();
+                let Some((docs, _)) = st.indices.get_mut(*index) else {
+                    return not_found();
+                };
+                let query = &body["query"]["bool"];
+                let terms: Vec<(String, Value)> = query["filter"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|t| t["term"].as_object().cloned().into_iter().flatten())
+                    .collect();
+                let kept_ids: Vec<&str> = query["must_not"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|m| m["ids"]["values"].as_array().into_iter().flatten())
+                    .filter_map(Value::as_str)
+                    .collect();
+                let matches = |d: &Value| {
+                    terms
+                        .iter()
+                        .all(|(field, v)| d.get(field.trim_end_matches(".keyword")) == Some(v))
+                        && !d
+                            .get("_id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| kept_ids.contains(&id))
+                };
+                let before = docs.len();
+                docs.retain(|d| !matches(d));
+                let deleted = before - docs.len();
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "deleted": deleted, "failures": [], "version_conflicts": 0, "timed_out": false
+                }))
+            }
             ("POST", ["_aliases"]) => {
                 let body: Value = serde_json::from_slice(&req.body).unwrap();
                 for action in body["actions"].as_array().unwrap() {
@@ -176,7 +214,17 @@ impl Respond for FakeCluster {
                     };
                     match resolved {
                         Some(index) => {
-                            st.indices.get_mut(&index).unwrap().0.push(doc);
+                            let docs = &mut st.indices.get_mut(&index).unwrap().0;
+                            if let Some(id) = meta.get("_id").and_then(Value::as_str) {
+                                docs.retain(|d| d.get("_id").and_then(Value::as_str) != Some(id));
+                                if kind != "delete" {
+                                    let mut doc = doc;
+                                    doc["_id"] = json!(id);
+                                    docs.push(doc);
+                                }
+                            } else {
+                                docs.push(doc);
+                            }
                             items.push(json!({ kind: { "_index": index, "status": 201 } }));
                         }
                         None => {

@@ -88,14 +88,6 @@ faucet-source-iceberg streaming: data files are read through the iceberg FileIO,
 faucet-source-grpc streaming: messages arrive through a tonic server stream from the test server, which counts nothing
 faucet-source-singer streaming: records come from a child process's stdout, which exposes no served-record count
 
-# Scoped cleanup and rollback (checks 23/24, #930). These sinks prove the same
-# contract in dedicated suites against their real backends or a stateful fake.
-faucet-sink-postgres cleanup: proven against PostgreSQL by tests/cleanup.rs (scope isolation, empty seen set, composite keys)
-faucet-sink-mysql cleanup: proven against MySQL by tests/cleanup.rs (scope isolation, empty seen set, composite keys)
-faucet-sink-mssql cleanup: proven by tests/scripted.rs against the TDS fake; SQL Server containers do not run on every runner
-faucet-sink-mongodb cleanup: proven against MongoDB by tests/cleanup.rs
+# Scoped cleanup (check 23, #930). BigQuery has no emulator; the single-statement
+# delete is pinned against a statement fake.
 faucet-sink-bigquery cleanup: no emulator; the single-statement delete is pinned by tests/cleanup.rs against a statement fake
-faucet-sink-elasticsearch cleanup: proven against Elasticsearch by tests/hardening.rs (_delete_by_query scope)
-faucet-sink-spanner cleanup: proven against the Spanner emulator by tests/emulator.rs
-faucet-sink-postgres rollback: proven against PostgreSQL by tests/rollback.rs (append, upsert journal, overwrite)
-faucet-sink-mysql rollback: proven against MySQL by tests/rollback.rs (append, upsert journal, overwrite)

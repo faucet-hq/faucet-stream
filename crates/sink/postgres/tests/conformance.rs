@@ -232,3 +232,46 @@ async fn conformance_driver_declarations_and_row_paths() {
     faucet_conformance::assert_driver_declarations_truthful(&jsonb).await;
     faucet_conformance::assert_driver_row_paths_agree(&jsonb).await;
 }
+
+/// The ids `table` holds.
+async fn ids_in(url: String, table: &'static str) -> Vec<i64> {
+    let pool = sqlx::PgPool::connect(&url).await.expect("pool connect");
+    let ids: Vec<i64> = sqlx::query_scalar(&format!("SELECT id FROM {table} ORDER BY id"))
+        .fetch_all(&pool)
+        .await
+        .expect("select ids");
+    pool.close().await;
+    ids
+}
+
+/// Checks 23 and 24: scoped cleanup deletes only the unwritten rows of its
+/// scope, and rollback deletes exactly the run's rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_cleanup_scoped_and_rollback_truthful() {
+    let (_container, url, _sink) = fresh_sink().await;
+    let pool = sqlx::PgPool::connect(&url).await.expect("pool connect");
+    for ddl in [
+        "CREATE TABLE c (id BIGINT PRIMARY KEY, tenant TEXT, v TEXT)",
+        "CREATE TABLE r (id BIGINT PRIMARY KEY, v TEXT, _faucet_run_id TEXT)",
+    ] {
+        sqlx::query(ddl).execute(&pool).await.expect("create table");
+    }
+    pool.close().await;
+
+    let mut cfg = PostgresSinkConfig::new(&url, "c").column_mapping(PostgresColumnMapping::AutoMap);
+    cfg.write = WriteSpec {
+        write_mode: WriteMode::Upsert,
+        key: vec!["id".to_string()],
+        delete_marker: None,
+        rollback: None,
+    };
+    let sink = PostgresSink::new(cfg).await.expect("cleanup sink");
+    faucet_conformance::assert_cleanup_scoped(&sink, "tenant", || ids_in(url.clone(), "c")).await;
+
+    let cfg = PostgresSinkConfig::new(&url, "r").column_mapping(PostgresColumnMapping::AutoMap);
+    let sink = PostgresSink::new(cfg).await.expect("rollback sink");
+    faucet_conformance::assert_rollback_truthful(&sink, "_faucet_run_id", || {
+        ids_in(url.clone(), "r")
+    })
+    .await;
+}

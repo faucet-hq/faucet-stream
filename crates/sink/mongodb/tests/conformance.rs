@@ -158,6 +158,41 @@ mod idempotent {
         let overwrite = MongoSink::new(config).await.expect("overwrite sink new");
         faucet_conformance::assert_overwrite_lifecycle(&overwrite, count).await;
     }
+    /// Check 23: scoped cleanup deletes only the unwritten documents of its
+    /// scope.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn conformance_cleanup_scoped() {
+        let (_container, uri) = start_mongo_repl_set().await;
+        let mut config = MongoSinkConfig::new(&uri, DB, "c");
+        config.write.write_mode = faucet_core::WriteMode::Upsert;
+        config.write.key = vec!["id".to_string()];
+        let sink = MongoSink::new(config).await.expect("cleanup sink new");
+        faucet_conformance::assert_cleanup_scoped(&sink, "tenant", || {
+            let uri = uri.clone();
+            async move {
+                use futures::TryStreamExt;
+                let client = Client::with_uri_str(&uri).await.expect("client");
+                let docs: Vec<Document> = client
+                    .database(DB)
+                    .collection::<Document>("c")
+                    .find(doc! {})
+                    .await
+                    .expect("find")
+                    .try_collect()
+                    .await
+                    .expect("collect");
+                docs.iter()
+                    .filter_map(|d| match d.get("id") {
+                        Some(mongodb::bson::Bson::Int32(v)) => Some(i64::from(*v)),
+                        Some(mongodb::bson::Bson::Int64(v)) => Some(*v),
+                        _ => None,
+                    })
+                    .collect()
+            }
+        })
+        .await;
+    }
+
     /// RFC 0014: the sink runs on the family-neutral sink driver with the
     /// staging, commit-token and cleanup groups.
     #[tokio::test(flavor = "multi_thread")]

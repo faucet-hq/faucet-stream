@@ -241,3 +241,45 @@ async fn conformance_declared_capabilities() {
     );
     faucet_conformance::assert_driver_declarations_truthful(&json).await;
 }
+
+/// Check 23: scoped cleanup deletes only the unwritten rows of its scope.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_cleanup_scoped() {
+    let container =
+        faucet_conformance::containers::start(|| MssqlServer::default().with_accept_eula()).await;
+    let port = container
+        .get_host_port_ipv4(1433)
+        .await
+        .expect("mssql host port");
+    let cfg = conn_cfg(port);
+    let pool = build_pool(&cfg, 4).await.expect("pool");
+    exec(
+        &pool,
+        "CREATE TABLE dbo.c (id BIGINT PRIMARY KEY, tenant NVARCHAR(64), v NVARCHAR(200))",
+    )
+    .await;
+    let mut scfg = MssqlSinkConfig::new(cfg.connection_url.clone().unwrap(), "dbo.c");
+    scfg.connection.tls = cfg.tls.clone();
+    scfg.column_mapping = MssqlColumnMapping::AutoColumns {
+        on_unknown_field: OnUnknownField::Warn,
+    };
+    scfg.write = WriteSpec {
+        write_mode: WriteMode::Upsert,
+        key: vec!["id".to_string()],
+        delete_marker: None,
+        rollback: None,
+    };
+    let sink = MssqlSink::new(scfg).await.expect("sink");
+    faucet_conformance::assert_cleanup_scoped(&sink, "tenant", || async {
+        let mut conn = pool.get().await.expect("checkout");
+        let rows = conn
+            .query("SELECT id FROM dbo.c ORDER BY id", &[])
+            .await
+            .expect("select ids")
+            .into_first_result()
+            .await
+            .expect("ids");
+        rows.iter().filter_map(|r| r.get::<i64, _>("id")).collect()
+    })
+    .await;
+}
