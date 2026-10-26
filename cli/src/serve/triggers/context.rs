@@ -307,6 +307,7 @@ impl Walk<'_> {
                         key,
                         landing,
                         seen: self.seen,
+                        escape: true,
                     }),
                 )?;
             }
@@ -383,12 +384,44 @@ pub fn substitute_plain(
     substitute_with(text, event, name, fired_at, None).map_err(|e| e.message)
 }
 
+/// Substitute every `${trigger.<token>}` in a template trigger's param
+/// `param`, checking each sender-chosen value as config substitution does.
+/// Where the template places the param is not known here, so the value is
+/// judged by the param's name and its own shape: no `..` segment in a value
+/// that reads as a path, no whole statement for a param named like one, and
+/// the returned values go through the caller reference policy.
+pub fn substitute_param(
+    text: &str,
+    param: &str,
+    event: &TriggerEvent,
+    name: &str,
+    fired_at: &str,
+) -> Result<Substitution, SubstituteError> {
+    let mut event_values = Vec::new();
+    let text = substitute_with(
+        text,
+        event,
+        name,
+        fired_at,
+        Some(Placement {
+            key: Some(param),
+            landing: Landing::Unknown,
+            seen: &mut event_values,
+            escape: false,
+        }),
+    )?;
+    Ok(Substitution { text, event_values })
+}
+
 /// Where a config substitution lands: the mapping key of the scalar, and the
 /// sender-chosen values placed so far.
 struct Placement<'a> {
     key: Option<&'a str>,
     landing: Landing,
     seen: &'a mut Vec<EventValue>,
+    /// Write `${` in a value as `$${` (a config document goes through the
+    /// interpolation pass next; a template param does not).
+    escape: bool,
 }
 
 /// Keys that may hold a statement, for a scalar outside any connector or
@@ -512,7 +545,11 @@ fn substitute_with(
                         leads,
                     });
                 }
-                out.push_str(&v.replace("${", "$${"));
+                if p.escape {
+                    out.push_str(&v.replace("${", "$${"));
+                } else {
+                    out.push_str(&v);
+                }
             }
             None => out.push_str(&v),
         }

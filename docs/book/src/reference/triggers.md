@@ -143,6 +143,14 @@ lands:
   `--allow-path-root`, and never the system trees or the server's credential
   files).
 
+A `template:` trigger's `params` are checked the same way. Where the template
+places a param is not known when the trigger fires, so a sender value in a
+param is judged by the param's name and the value itself: no `..` segment in a
+value that reads as a path, no whole value for a param named `query`, `sql`,
+`statement`, `where` or `filter`, no quote, `;` or backslash when spliced into
+free text, and a URL or a leading absolute path must pass the caller reference
+policy.
+
 A refused fire never runs: a webhook answers `422` (the trigger stays healthy),
 and an `object_arrival` watcher skips the object and reports it, then fires the
 objects after it. A webhook also answers `422` when the config uses a header or

@@ -1735,3 +1735,31 @@ async fn an_abandoned_webhook_request_keeps_its_fire_and_its_debounce_window() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["status"], "coalesced", "{body}");
 }
+
+/// A template trigger's params are held to the same checks as a config
+/// trigger's values: a URL the sender put in a header is refused with 422
+/// before any template is looked up.
+#[cfg(feature = "templates")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_template_trigger_refuses_a_sender_url_its_policy_does_not_allow() {
+    let dir = tempfile::tempdir().unwrap();
+    let triggers = dir.path().join("triggers.yaml");
+    std::fs::write(
+        &triggers,
+        "version: 1\ntriggers:\n  - name: hook\n    type: webhook\n    methods: [POST]\n    template:\n      id: rest-tpl\n      params:\n        api_root: \"${trigger.header.x-host}\"\n",
+    )
+    .unwrap();
+    let token = "test-token";
+    let base = spawn_serve_with_triggers(free_port(), Some(token), &triggers).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/triggers/hook"))
+        .bearer_auth(token)
+        .header("x-host", "http://169.254.169.254/latest")
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 422);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("trigger.header.x-host"), "{body}");
+}
