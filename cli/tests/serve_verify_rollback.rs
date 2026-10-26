@@ -9,13 +9,9 @@
 use serde_json::{Value, json};
 use std::time::Duration;
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+#[path = "support/ports.rs"]
+mod ports;
+use ports::free_port;
 
 const AUTH_CONFIG: &str = "principals:\n\
     \x20 - name: alice\n\
@@ -388,32 +384,36 @@ async fn verify_and_rollback_endpoints_with_rbac() {
         again.text().await.unwrap()
     );
 
-    // A run that recorded no invocation ids (it failed at load) cannot be
+    // A run that recorded no invocation ids (it was accepted, then refused
+    // before any pipeline ran — its budget does not allow the sink) cannot be
     // rolled back → 422; a matrix run with several invocations needs
     // `invocation_id` → 400.
-    let broken = config_yaml(&src, &dst, &state, "rollback: {}\nverify:\n  ranges: 0");
-    let failed: Value = client
+    let plain = config_yaml(
+        &src,
+        &dst,
+        &state,
+        "rollback: {}\nbudget:\n  allowed_sinks: [nope]",
+    );
+    let resp = client
         .post(format!("{base}/v1/runs"))
         .bearer_auth("op-tok")
-        .json(&json!({ "config": broken }))
+        .json(&json!({ "config": plain }))
         .send()
         .await
-        .unwrap()
-        .json()
+        .unwrap();
+    assert_eq!(resp.status(), 202, "the run is accepted");
+    let accepted: Value = resp.json().await.unwrap();
+    let fid = accepted["run_id"].as_str().expect("a run id").to_string();
+    let rec = wait_terminal(&client, &base, &fid).await;
+    assert_eq!(rec["status"], "failed", "{rec}");
+    let r = client
+        .post(format!("{base}/v1/runs/{fid}/rollback"))
+        .bearer_auth("admin-tok")
+        .json(&json!({ "config": cfg }))
+        .send()
         .await
         .unwrap();
-    if let Some(fid) = failed["run_id"].as_str() {
-        let rec = wait_terminal(&client, &base, fid).await;
-        assert_eq!(rec["status"], "failed", "{rec}");
-        let r = client
-            .post(format!("{base}/v1/runs/{fid}/rollback"))
-            .bearer_auth("admin-tok")
-            .json(&json!({ "config": cfg }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(r.status(), 422, "{}", r.text().await.unwrap());
-    }
+    assert_eq!(r.status(), 422, "{}", r.text().await.unwrap());
     let two_rows = format!(
         "{cfg}matrix:\n  - id: a\n  - id: b\n    source:\n      config: {{ query: \"SELECT id, name FROM src WHERE id = 1\" }}\n"
     );
