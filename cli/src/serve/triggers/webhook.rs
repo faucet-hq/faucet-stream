@@ -107,10 +107,24 @@ pub async fn handle(
         idem,
     };
     let fired_at = chrono::Utc::now().to_rfc3339();
-    let outcome = enqueue::fire(&state, &compiled, event, &fired_at).await;
-    if let Some(a) = armed.as_mut() {
-        a.committed = outcome.committed();
-    }
+    // The fire runs on its own task, which also settles the debounce window:
+    // a request abandoned while its fire is submitting (a client or proxy
+    // timeout) neither cancels a run that is already recorded nor undoes the
+    // window that run holds, so the sender's retry is coalesced.
+    let fire = tokio::spawn({
+        let state = state.clone();
+        let fired_at = fired_at.clone();
+        async move {
+            let outcome = enqueue::fire(&state, &compiled, event, &fired_at).await;
+            if let Some(mut a) = armed {
+                a.committed = outcome.committed();
+            }
+            outcome
+        }
+    });
+    let outcome = fire
+        .await
+        .map_err(|e| ServeError::Internal(format!("webhook fire task failed: {e}")))?;
     match outcome {
         FireOutcome::Enqueued(run_id) => {
             state.triggers().record_ok(&name, Some(fired_at));
@@ -145,9 +159,9 @@ pub async fn handle(
     }
 }
 
-/// A debounce window this request armed; settled when the request ends —
-/// kept when its fire was committed, undone otherwise (a failed fire, or a
-/// request abandoned before the fire returned).
+/// A debounce window this request armed; settled when its fire ends — kept
+/// when the fire was committed, undone otherwise (a failed fire, or a fire
+/// task that panicked).
 struct Armed {
     state: ServerState,
     name: String,

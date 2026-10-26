@@ -1638,3 +1638,100 @@ async fn an_object_arrival_trigger_spawns_a_watcher_with_its_lookback() {
             .unwrap();
     }
 }
+
+/// A webhook request abandoned while its fire is still submitting (a client
+/// or proxy timeout) does not cancel the fire or undo its debounce window:
+/// the run is still recorded, and the sender's retry is coalesced instead of
+/// starting a second run.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_abandoned_webhook_request_keeps_its_fire_and_its_debounce_window() {
+    use axum::extract::{Path, RawQuery, State};
+    use axum::http::{HeaderMap, Method, StatusCode};
+    use faucet_cli::serve::triggers::webhook::handle;
+
+    let dir = tempfile::tempdir().unwrap();
+    let csv = dir.path().join("in.csv");
+    std::fs::write(&csv, "a,b\n1,2\n").unwrap();
+    let out = dir.path().join("out.jsonl");
+    // The pipeline config is a FIFO: reading it blocks until the test writes
+    // it, which holds the fire mid-submit while the request is abandoned.
+    let fifo = dir.path().join("pipeline.yaml");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml::from_str(&format!(
+        "version: 1\ntriggers:\n  - name: hook\n    type: webhook\n    methods: [POST]\n    debounce_secs: 60\n    config: {}\n",
+        fifo.display()
+    ))
+    .unwrap();
+    let compiled = CompiledTriggers::compile(file).unwrap();
+    let state = build_state(&compiled);
+    let call = |state: ServerState| {
+        handle(
+            State(state),
+            Path("hook".to_string()),
+            Method::POST,
+            HeaderMap::new(),
+            RawQuery(None),
+            String::new(),
+        )
+    };
+    // The request gives up while the fire waits on its config.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), call(state.clone()))
+            .await
+            .is_err()
+    );
+    let text = serde_yaml::to_string(&inline_pipeline(
+        csv.to_str().unwrap(),
+        out.to_str().unwrap(),
+    ))
+    .unwrap();
+    let fifo_w = fifo.clone();
+    tokio::task::spawn_blocking(move || std::fs::write(fifo_w, text))
+        .await
+        .unwrap()
+        .unwrap();
+    // The abandoned fire still records its run.
+    let mut runs = 0;
+    for _ in 0..200 {
+        runs = state
+            .history()
+            .list(&ListFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .runs
+            .len();
+        if runs > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(runs, 1, "the abandoned request's fire went through");
+    // The retry inside the window is coalesced (it may first be asked to
+    // wait while the fire settles), never fired again.
+    let mut answer = None;
+    for _ in 0..200 {
+        match tokio::time::timeout(Duration::from_secs(2), call(state.clone()))
+            .await
+            .expect("the retry is answered without reading the config again")
+        {
+            Ok((status, body)) => {
+                answer = Some((status, body.0));
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+        }
+    }
+    let (status, body) = answer.expect("the retry was answered");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "coalesced", "{body}");
+}
