@@ -280,9 +280,11 @@ async fn two_process_cluster_reassigns_on_kill() {
         sleep(Duration::from_millis(500)).await;
     }
 
-    // Every run reached a terminal state on the survivor B — the acceptance proof
-    // that B reclaimed and finished the runs A had not yet completed when killed.
-    let mut terminal = 0;
+    // Every run completed on the survivor B — the acceptance proof that B
+    // reclaimed and *re-ran* the runs A had not finished. A `failed` run would
+    // mean an orphan was poisoned instead of requeued, so only `completed`
+    // counts (a run re-executed after the kill may write twice: at-least-once).
+    let mut statuses = Vec::new();
     for id in &run_ids {
         let v: serde_json::Value = client
             .get(format!("http://127.0.0.1:{port_b}/v1/runs/{id}"))
@@ -292,18 +294,12 @@ async fn two_process_cluster_reassigns_on_kill() {
             .json()
             .await
             .unwrap();
-        if matches!(
-            v["status"].as_str().unwrap_or(""),
-            "completed" | "failed" | "cancelled"
-        ) {
-            terminal += 1;
-        }
+        statuses.push((id.clone(), v["status"].as_str().unwrap_or("").to_string()));
     }
     drop(b); // SIGKILL the survivor before the assertion (so a fail still reaps it).
-    assert_eq!(
-        terminal,
-        run_ids.len(),
-        "every run reached a terminal state on the survivor B"
+    assert!(
+        statuses.iter().all(|(_, s)| s == "completed"),
+        "every run completed on the survivor B: {statuses:?}"
     );
 }
 
