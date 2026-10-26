@@ -177,7 +177,13 @@ tokened begin drops the untokened `.faucet-overwrite-<name>` directory, and
 another run's directory only once that run's token is more than 7 days old (a
 crashed run's). A move into place that another run's commit (or the untokened
 directory) recorded and stopped half-way is finished first, by the next begin
-or abort, so the output never stays part old, part new. A
+or abort, so the output never stays part old, part new: at once when that
+commit failed, or once its marker is an hour old when its process was killed
+mid-move (it may still be moving files until then). Only the newest such move
+is finished; an older one, or one a later commit has replaced since, is dropped
+without moving its files. The last finished commit is recorded in a hidden
+`.faucet-overwrite-<name>.commits/` directory beside the destination, which
+stays. A
 library caller without a token keeps the single untokened directory, so two such
 runs of one output must not overlap.
 

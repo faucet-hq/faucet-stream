@@ -121,9 +121,16 @@ async fn another_runs_interrupted_overwrite_is_finished_by_the_next_run() {
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with('.'))
+            .filter(|n| n.starts_with('.') && !n.ends_with(".commits"))
             .collect();
         assert!(left.is_empty(), "{left:?}");
+        let ledger = dir.path().join(".faucet-overwrite-o-_part_.jsonl.commits");
+        let kept: Vec<_> = std::fs::read_dir(&ledger)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(kept, ["last"], "only the commit ledger stays");
     }
 }
 

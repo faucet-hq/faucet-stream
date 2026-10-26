@@ -79,7 +79,10 @@ async fn a_refused_delete_fails_the_overwrite_abort() {
     let server = MockServer::start().await;
     mount(
         &server,
-        |r: &Request| r.url.path().ends_with(".faucet-commit"),
+        |r: &Request| {
+            let path = r.url.path();
+            path.ends_with(".faucet-commit") || path.contains(".commits")
+        },
         ResponseTemplate::new(404),
     )
     .await;
@@ -101,7 +104,10 @@ async fn aborting_an_overwrite_deletes_the_swap_marker() {
     let server = MockServer::start().await;
     mount(
         &server,
-        |r: &Request| r.url.path().ends_with(".faucet-commit"),
+        |r: &Request| {
+            let path = r.url.path();
+            path.ends_with(".faucet-commit") || path.contains(".commits")
+        },
         ResponseTemplate::new(404),
     )
     .await;
@@ -126,7 +132,10 @@ async fn a_refused_rewrite_fails_the_overwrite_commit() {
     let server = MockServer::start().await;
     mount(
         &server,
-        |r: &Request| r.url.path().ends_with(".faucet-commit"),
+        |r: &Request| {
+            let path = r.url.path();
+            path.ends_with(".faucet-commit") || path.contains(".commits")
+        },
         ResponseTemplate::new(404),
     )
     .await;

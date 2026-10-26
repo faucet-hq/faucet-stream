@@ -896,7 +896,22 @@ impl FileWriter {
             names,
         };
         self.put_marker(COMMIT_MARKER, &marker.render()).await?;
-        self.move_into_place(marker.seq, marker.names).await
+        let result = self.move_into_place(marker.seq, marker.names.clone()).await;
+        if result.is_err() {
+            self.release_marker(marker).await;
+        }
+        result
+    }
+
+    /// After this run's move into place failed: rewrite its commit marker
+    /// without an owner, so the next run finishes the move at once instead
+    /// of waiting out [`COMMIT_LEASE`]. Best effort: a failed rewrite only
+    /// leaves the lease to expire.
+    async fn release_marker(&self, mut marker: CommitMarker) {
+        marker.written = Some(0);
+        if let Err(e) = self.put_marker(COMMIT_MARKER, &marker.render()).await {
+            tracing::warn!(error = %e, "file sink: could not release the overwrite commit marker");
+        }
     }
 
     /// `write_mode: overwrite`: discard the open file and the swap area. A
@@ -1136,7 +1151,10 @@ impl FileWriter {
             files = marker.names.len(),
             "file sink: finishing an overwrite that stopped while moving its files into place"
         );
-        self.move_into_place(marker.seq, marker.names).await?;
+        if let Err(e) = self.move_into_place(marker.seq, marker.names.clone()).await {
+            self.release_marker(marker).await;
+            return Err(e);
+        }
         Ok(OwnMove::Finished)
     }
 

@@ -420,7 +420,11 @@ swaps in a partial table. It
 also drops the untokened staging (`<table>__faucet_ovw`, the untokened marker
 alias, the untokened `.faucet-overwrite-…` area) an earlier release left. On the
 file sinks a move into place that another run's commit recorded and stopped
-half-way is finished first, so the output never stays part old, part new. Until
+half-way is finished first, so the output never stays part old, part new — at
+once when that commit failed, or once its marker is an hour old when its process
+was killed mid-move; only the newest such move is finished, and the last
+finished commit is recorded in a hidden `.faucet-overwrite-….commits` entry
+beside the destination. Until
 then, `faucet status --probe` reports the leftover staging as `present`. You may
 drop a leftover `<table>__faucet_ovw_<token>` yourself once you know its run is
 gone. Library callers that drive the lifecycle without a token keep the single
