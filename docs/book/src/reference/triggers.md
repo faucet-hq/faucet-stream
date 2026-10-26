@@ -119,12 +119,28 @@ and `bucket: ${trigger.bucket}` all yield a plain string, and a value holding
 string (`size: ${trigger.size}` gives `"42"`). Mapping keys are not substituted.
 
 A token spliced into a longer string is plain text of that string — never a
-bound SQL parameter or an escaped path. So an event value (a webhook body, query
-value or header, an object key) spliced into a longer string may not carry a
-quote (`'`, `"`, `` ` ``), `;`, a backslash, a control character or a `..` path
-segment; such a fire is refused (a `500` for a webhook, an object skipped and
-logged). Keep tokens out of SQL text, and use a token as the whole value when it
-must carry any text.
+bound SQL parameter or an escaped path. A value the event's sender chooses (a
+webhook body, query value or header, an object key) is checked against where it
+lands:
+
+- anywhere: no `..` path segment (unless a whole value with whitespace, such as
+  a body), and no control character when spliced;
+- spliced into a query (a `query`, `sql`, `statement`, `where` or `filter` key)
+  or into free text (a string with spaces or quotes around the token): no quote
+  (`'`, `"`, `` ` ``), `;` or backslash. A path, URL or name (`in/${trigger.object_key}`,
+  `s3://bucket/${trigger.object_key}`) may hold them;
+- inside a URL's host (`https://${trigger.header.x-region}.api.example`): host
+  name characters only (letters, digits, `.`, `-`);
+- as a whole `query`/`sql` value: refused — a sender never supplies a whole
+  statement;
+- a URL, or an absolute path that starts the value, must be one the server's
+  caller reference policy allows (`--allow-url-host`, `--allow-url-scheme`,
+  `--allow-path-root`, and never the system trees or the server's credential
+  files).
+
+A refused fire never runs: a webhook answers `422` (the trigger stays healthy),
+and an `object_arrival` watcher skips the object and reports it, then fires the
+objects after it.
 
 *`mode: per_object` — one token set per object:*
 
