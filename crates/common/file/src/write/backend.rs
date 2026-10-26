@@ -225,6 +225,26 @@ pub trait StorageBackend: Send + Sync {
         ))
     }
 
+    /// The overwrite commit ledger of this output: the sequence of the last
+    /// overwrite commit that finished moving its files into place, as the
+    /// text [`write_commit_record`](Self::write_commit_record) stored, or
+    /// `None` when there is none. A recovery of another run's interrupted
+    /// commit reads it so it never moves an older commit's files over a newer
+    /// one. Default: `None` (no ledger; such a backend also sees no other
+    /// run's area).
+    async fn read_commit_record(&self) -> Result<Option<String>, FaucetError> {
+        Ok(None)
+    }
+
+    /// Replace the overwrite commit ledger (see
+    /// [`read_commit_record`](Self::read_commit_record)) with `text`. It lives
+    /// beside the swap areas (`.faucet-overwrite-<tag>.commits/last`), which
+    /// readers of the output skip. Default: nothing stored.
+    async fn write_commit_record(&self, text: &str) -> Result<(), FaucetError> {
+        let _ = text;
+        Ok(())
+    }
+
     /// A non-mutating preflight probe of the storage (reachability,
     /// credentials). `None` when the backend has none, so the sink's own
     /// probe answers. Default: `None`.
@@ -386,6 +406,20 @@ macro_rules! delegate_storage_backend {
                 name: &str,
             ) -> ::std::result::Result<(), $crate::__private::FaucetError> {
                 $crate::write::StorageBackend::promote_from_swap_run(&self.$field, run, name).await
+            }
+            async fn read_commit_record(
+                &self,
+            ) -> ::std::result::Result<
+                ::std::option::Option<::std::string::String>,
+                $crate::__private::FaucetError,
+            > {
+                $crate::write::StorageBackend::read_commit_record(&self.$field).await
+            }
+            async fn write_commit_record(
+                &self,
+                text: &str,
+            ) -> ::std::result::Result<(), $crate::__private::FaucetError> {
+                $crate::write::StorageBackend::write_commit_record(&self.$field, text).await
             }
             async fn check(
                 &self,

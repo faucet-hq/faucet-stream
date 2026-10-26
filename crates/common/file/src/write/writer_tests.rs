@@ -1531,3 +1531,252 @@ async fn concurrent_local_overwrite_runs_keep_their_own_files() {
     assert_eq!(left, ["data.jsonl"]);
     assert!(!open().swap_area_exists().await.unwrap());
 }
+
+/// A commit marker as a run writes it, `age_secs` old.
+fn marker_text(seq: u128, age_secs: u64, names: &[&str]) -> String {
+    CommitMarker {
+        seq,
+        written: Some(unix_secs() - age_secs),
+        names: names.iter().map(|n| n.to_string()).collect(),
+    }
+    .render()
+}
+
+fn overwrite_local(dir: &Path) -> impl Fn(Option<&str>) -> FileWriter + '_ {
+    move |token| {
+        let mut s = per_flush();
+        s.write_mode = FileWriteMode::Overwrite;
+        let w = local(dir, "out/data-{part}.jsonl", s);
+        if let Some(t) = token {
+            w.join_overwrite_run(t).unwrap();
+        }
+        w
+    }
+}
+
+/// Run A crashed half-way through its commit; run C committed after it. A
+/// later begin must not move A's older files over C's output once A's owner
+/// is gone: the commit ledger orders the two, and A's area is dropped.
+#[tokio::test]
+async fn a_begin_never_replays_an_older_crashed_commit_over_a_newer_one() {
+    use faucet_core::idempotency::new_overwrite_run_token;
+    let dir = tempfile::tempdir().unwrap();
+    let open = overwrite_local(dir.path());
+    let out = dir.path().join("out");
+    let (a, c, d) = (
+        new_overwrite_run_token(),
+        new_overwrite_run_token(),
+        new_overwrite_run_token(),
+    );
+    open(Some(&a)).begin_overwrite().await.unwrap();
+    open(Some(&c)).begin_overwrite().await.unwrap();
+    let wa = open(Some(&a));
+    wa.write_rows(&[json!({"run": "a"})]).await.unwrap();
+    wa.flush().await.unwrap();
+    let wc = open(Some(&c));
+    wc.write_rows(&[json!({"run": "c"})]).await.unwrap();
+    wc.flush().await.unwrap();
+    // A wrote its marker and stopped before moving anything.
+    let tag = open(None).template().swap_dir_name();
+    let a_area = out.join(format!("{tag}.run-{a}"));
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::fs::write(
+        a_area.join(COMMIT_MARKER),
+        marker_text(now_ns, 0, &["data-00001.jsonl"]),
+    )
+    .unwrap();
+    open(Some(&c)).commit_overwrite().await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(out.join("data-00001.jsonl")).unwrap(),
+        "{\"run\":\"c\"}\n"
+    );
+    // A's owner is gone now.
+    std::fs::write(
+        a_area.join(COMMIT_MARKER),
+        marker_text(now_ns, 2 * COMMIT_LEASE.as_secs(), &["data-00001.jsonl"]),
+    )
+    .unwrap();
+    open(Some(&d)).begin_overwrite().await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(out.join("data-00001.jsonl")).unwrap(),
+        "{\"run\":\"c\"}\n",
+        "the older crashed commit replaced the newer one"
+    );
+    assert!(!a_area.exists(), "the superseded area is dropped");
+
+    // A's own retry of its commit is refused, not replayed.
+    let a2 = new_overwrite_run_token();
+    open(Some(&a2)).begin_overwrite().await.unwrap();
+    let w = open(Some(&a2));
+    w.write_rows(&[json!({"run": "a2"})]).await.unwrap();
+    w.flush().await.unwrap();
+    let a2_area = out.join(format!("{tag}.run-{a2}"));
+    std::fs::write(
+        a2_area.join(COMMIT_MARKER),
+        marker_text(1, 0, &["data-00001.jsonl"]),
+    )
+    .unwrap();
+    let err = open(Some(&a2)).commit_overwrite().await.unwrap_err();
+    assert!(err.to_string().contains("later overwrite"), "{err}");
+    assert!(!a2_area.join(COMMIT_MARKER).exists());
+    assert_eq!(
+        std::fs::read_to_string(out.join("data-00001.jsonl")).unwrap(),
+        "{\"run\":\"c\"}\n"
+    );
+}
+
+/// Of two crashed commits whose owners are gone, only the newer is finished;
+/// a commit whose owner is still inside its lease is left to its owner.
+#[tokio::test]
+async fn a_begin_finishes_only_the_newest_gone_commit_and_never_a_live_one() {
+    use faucet_core::idempotency::new_overwrite_run_token;
+    let dir = tempfile::tempdir().unwrap();
+    let open = overwrite_local(dir.path());
+    let out = dir.path().join("out");
+    let tag = open(None).template().swap_dir_name();
+    let stage = |token: &str, body: &str, seq: u128, age: u64| {
+        let area = out.join(format!("{tag}.run-{token}"));
+        std::fs::create_dir_all(&area).unwrap();
+        std::fs::write(area.join("data-00001.jsonl"), body).unwrap();
+        std::fs::write(
+            area.join(COMMIT_MARKER),
+            marker_text(seq, age, &["data-00001.jsonl"]),
+        )
+        .unwrap();
+        area
+    };
+    let old = 2 * COMMIT_LEASE.as_secs();
+    let (x, y) = (new_overwrite_run_token(), new_overwrite_run_token());
+    let ax = stage(&x, "x\n", 10, old);
+    let ay = stage(&y, "y\n", 20, old);
+    open(Some(&new_overwrite_run_token()))
+        .begin_overwrite()
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(out.join("data-00001.jsonl")).unwrap(),
+        "y\n"
+    );
+    assert!(!ax.exists() && !ay.exists());
+
+    // A live commit (inside its lease) is not taken over.
+    let z = new_overwrite_run_token();
+    let az = stage(&z, "z\n", u128::MAX / 2, 0);
+    open(Some(&new_overwrite_run_token()))
+        .begin_overwrite()
+        .await
+        .unwrap();
+    assert!(az.join(COMMIT_MARKER).exists() && az.join("data-00001.jsonl").exists());
+    assert_eq!(
+        std::fs::read_to_string(out.join("data-00001.jsonl")).unwrap(),
+        "y\n"
+    );
+    // Its owner then finishes it without error.
+    open(Some(&z)).commit_overwrite().await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(out.join("data-00001.jsonl")).unwrap(),
+        "z\n"
+    );
+    assert!(!az.exists());
+}
+
+/// An owner still moving its files after another run took its commit over
+/// (past the lease) finishes without error: a file already moved is fine.
+#[tokio::test]
+async fn an_owner_finishes_a_commit_another_run_took_over() {
+    use faucet_core::idempotency::new_overwrite_run_token;
+    let dir = tempfile::tempdir().unwrap();
+    let open = overwrite_local(dir.path());
+    let out = dir.path().join("out");
+    let a = new_overwrite_run_token();
+    open(Some(&a)).begin_overwrite().await.unwrap();
+    let w = open(Some(&a));
+    w.write_rows(&rows(2)).await.unwrap();
+    w.flush().await.unwrap();
+    w.write_rows(&rows(1)).await.unwrap();
+    w.flush().await.unwrap();
+    let tag = open(None).template().swap_dir_name();
+    let area = out.join(format!("{tag}.run-{a}"));
+    let names = vec![
+        "data-00001.jsonl".to_string(),
+        "data-00002.jsonl".to_string(),
+    ];
+    // The other run already moved part 1.
+    std::fs::rename(area.join(&names[0]), out.join(&names[0])).unwrap();
+    let owner = open(Some(&a));
+    // The move it had listed finds the file already in place.
+    owner.promote_own(&names[0]).await.unwrap();
+    owner.move_into_place(5, names.clone()).await.unwrap();
+    assert!(out.join(&names[0]).exists() && out.join(&names[1]).exists());
+    // Every file already moved and the area gone: still no error.
+    owner.move_into_place(5, names).await.unwrap();
+    // A file missing from both places is still an error.
+    std::fs::create_dir_all(&area).unwrap();
+    std::fs::write(area.join("data-00003.jsonl"), "x\n").unwrap();
+    assert!(owner.promote_own("data-00004.jsonl").await.is_err());
+}
+
+#[test]
+fn commit_markers_parse_render_and_keep_earlier_releases_readable() {
+    let m = CommitMarker {
+        seq: 42,
+        written: Some(7),
+        names: vec!["a".into(), "b".into()],
+    };
+    assert_eq!(CommitMarker::parse(&m.render()), m);
+    let legacy = CommitMarker::parse("a\n\nb");
+    assert_eq!((legacy.seq, legacy.written), (0, None));
+    assert_eq!(legacy.names, ["a", "b"]);
+    assert!(!legacy.owner_alive(100));
+    assert!(m.owner_alive(7 + COMMIT_LEASE.as_secs() - 1));
+    assert!(!m.owner_alive(7 + COMMIT_LEASE.as_secs()));
+    assert!(m.owner_alive(1), "a marker from a fast clock is live");
+    let junk = CommitMarker::parse("#faucet-commit x y\nc");
+    assert_eq!((junk.seq, junk.written, junk.names.len()), (0, None, 1));
+}
+
+/// The same ordering on a remote store: the ledger lives beside the swap
+/// areas and a later begin drops the older crashed commit.
+#[tokio::test]
+async fn a_remote_begin_never_replays_an_older_crashed_commit() {
+    use faucet_core::idempotency::new_overwrite_run_token;
+    let mem = Arc::new(Mem::default());
+    let tag = overwrite_remote(&mem).template().swap_dir_name();
+    let run = |token: &str| {
+        let w = overwrite_remote(&mem);
+        w.join_overwrite_run(token).unwrap();
+        w
+    };
+    let (a, c) = (new_overwrite_run_token(), new_overwrite_run_token());
+    run(&c).begin_overwrite().await.unwrap();
+    let wc = run(&c);
+    wc.write_rows(&[json!({"run": "c"})]).await.unwrap();
+    wc.flush().await.unwrap();
+    let a_area = format!("pre/d/{tag}.run-{a}");
+    mem.objects.lock().unwrap().insert(
+        format!("{a_area}/part-00001.jsonl"),
+        b"{\"run\":\"a\"}\n".to_vec(),
+    );
+    let marker = |age| marker_text(5, age, &["part-00001.jsonl"]).into_bytes();
+    mem.objects
+        .lock()
+        .unwrap()
+        .insert(format!("{a_area}/{COMMIT_MARKER}"), marker(0));
+    run(&c).commit_overwrite().await.unwrap();
+    let ledger = format!("pre/d/{tag}.commits/last");
+    assert!(mem.keys().contains(&ledger), "{:?}", mem.keys());
+    mem.objects.lock().unwrap().insert(
+        format!("{a_area}/{COMMIT_MARKER}"),
+        marker(2 * COMMIT_LEASE.as_secs()),
+    );
+    run(&new_overwrite_run_token())
+        .begin_overwrite()
+        .await
+        .unwrap();
+    let o = mem.objects.lock().unwrap();
+    assert_eq!(o["pre/d/part-00001.jsonl"], b"{\"run\":\"c\"}\n".to_vec());
+    assert!(!o.keys().any(|k| k.starts_with(&format!("{a_area}/"))));
+}

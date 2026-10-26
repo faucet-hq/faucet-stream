@@ -315,6 +315,38 @@ impl StorageBackend for LocalBackend {
         .await
     }
 
+    async fn read_commit_record(&self) -> Result<Option<String>, FaucetError> {
+        let path = self
+            .dir
+            .join(self.template.commit_ledger_dir_name())
+            .join(super::layout::COMMIT_LEDGER_FILE);
+        fs(move || match std::fs::read_to_string(&path) {
+            Ok(text) => Ok(Some(text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(io_err("reading the overwrite commit ledger", &path, e)),
+        })
+        .await
+    }
+
+    async fn write_commit_record(&self, text: &str) -> Result<(), FaucetError> {
+        let dir = self.dir.join(self.template.commit_ledger_dir_name());
+        let text = text.to_string();
+        fs(move || {
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| io_err("creating the overwrite commit ledger", &dir, e))?;
+            let path = dir.join(super::layout::COMMIT_LEDGER_FILE);
+            let tmp = dir.join(format!("{}.tmp", super::layout::COMMIT_LEDGER_FILE));
+            std::fs::write(&tmp, text.as_bytes())
+                .and_then(|()| std::fs::File::open(&tmp)?.sync_all())
+                .map_err(|e| io_err("writing the overwrite commit ledger", &tmp, e))?;
+            std::fs::rename(&tmp, &path)
+                .map_err(|e| io_err("writing the overwrite commit ledger", &path, e))?;
+            sync_parent(&path);
+            Ok(())
+        })
+        .await
+    }
+
     async fn promote(&self, name: &str) -> Result<(), FaucetError> {
         let from = self.path(Area::Swap, name);
         let dest = self.path(Area::Destination, name);
