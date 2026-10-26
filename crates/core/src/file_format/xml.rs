@@ -88,7 +88,8 @@ fn collect(v: &Value, key: &str, out: &mut Vec<Value>) {
 /// The default record element: directly under the root, or as the only
 /// child of a chain of single (non-repeated) wrapper elements below it
 /// (`<export><rows><record/>…</rows></export>`). An element that has other
-/// children besides `name` is a record itself, so its `name` field is data.
+/// children besides `name` is a record itself, so its `name` field is data;
+/// so is a `name` below a wrapper that holds only text.
 fn default_records<'a>(doc: &'a Value, name: &str) -> Option<&'a Value> {
     let root = doc.as_object()?.values().next()?.as_object()?;
     if let Some(found) = root.get(name) {
@@ -100,7 +101,11 @@ fn default_records<'a>(doc: &'a Value, name: &str) -> Option<&'a Value> {
             .iter()
             .filter(|(k, _)| !k.starts_with('@') && *k != "#text");
         match (real.next(), real.next()) {
-            (Some((k, found)), None) if k == name => return Some(found),
+            (Some((k, found)), None) if k == name => {
+                // A text-only element is a field of a one-row document, not
+                // the record list.
+                return matches!(found, Value::Object(_) | Value::Array(_)).then_some(found);
+            }
             (Some((_, Value::Object(child))), None) => {
                 map = child;
             }
@@ -448,11 +453,22 @@ mod tests {
             decode(xml, "record").expect("decode"),
             vec![json!({"id": "1"})]
         );
-        // One row that carries a `record` field is still one row.
+        // One row that carries a `record` field is still one row, also when
+        // that field is its only one.
         let xml = b"<exports><item><id>1</id><record>A-1</record></item></exports>";
         assert_eq!(
             decode(xml, "record").expect("decode"),
             vec![json!({"id": "1", "record": "A-1"})]
+        );
+        let xml = b"<exports><item><record>A-1</record></item></exports>";
+        assert_eq!(
+            decode(xml, "record").expect("decode"),
+            vec![json!({"record": "A-1"})]
+        );
+        let xml = b"<exports><rows><record><id>1</id></record></rows></exports>";
+        assert_eq!(
+            decode(xml, "record").expect("decode"),
+            vec![json!({"id": "1"})]
         );
     }
 
