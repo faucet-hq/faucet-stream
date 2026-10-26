@@ -113,6 +113,7 @@ pub async fn scope(state: &ServerState, tenant: &str) -> Result<TenantScope, Ser
         )));
     }
     let mut connections = BTreeMap::new();
+    let mut operator_connections = BTreeSet::new();
     let mut blocked = BTreeMap::new();
     for c in state
         .history()
@@ -130,7 +131,10 @@ pub async fn scope(state: &ServerState, tenant: &str) -> Result<TenantScope, Ser
                 );
             }
             ConnectionStatus::Active => {
-                let spec = open_connection(&rt, &c)?;
+                let (spec, hosted) = open_connection(&rt, &c)?;
+                if hosted {
+                    operator_connections.insert(c.name.clone());
+                }
                 connections.insert(c.name.clone(), spec);
             }
         }
@@ -143,6 +147,7 @@ pub async fn scope(state: &ServerState, tenant: &str) -> Result<TenantScope, Ser
             labels: rec.labels.clone(),
         },
         connections,
+        operator_connections,
         blocked,
         budget: rec.limits.budget(),
         build_catalog: catalog_builder(state.clone(), tenant.to_string(), names),
@@ -153,8 +158,9 @@ pub async fn scope(state: &ServerState, tenant: &str) -> Result<TenantScope, Ser
 /// Unseal a connection's provider spec, refresh its client credentials from
 /// the current hosted-OAuth provider (so rotating a client secret in the
 /// providers file reaches existing connections), and register its secrets
-/// with the redaction registry for the life of the process.
-fn open_connection(rt: &TenantsRuntime, c: &ConnectionRecord) -> Result<Value, ServeError> {
+/// with the redaction registry for the life of the process. The flag is
+/// whether the provider's endpoint came from the server's providers file.
+fn open_connection(rt: &TenantsRuntime, c: &ConnectionRecord) -> Result<(Value, bool), ServeError> {
     let vault = rt.require_vault()?;
     let mut spec = vault
         .open_for(&c.sealed, &Vault::connection_context(&c.tenant, &c.name))
@@ -164,12 +170,14 @@ fn open_connection(rt: &TenantsRuntime, c: &ConnectionRecord) -> Result<Value, S
                 c.name, c.tenant
             ))
         })?;
+    let mut hosted = false;
     if let Some(provider) = c
         .connect_provider
         .as_deref()
         .and_then(|p| rt.providers.get(p))
         && let Some(cfg) = spec.get_mut("config").and_then(Value::as_object_mut)
     {
+        hosted = true;
         cfg.insert(
             "token_url".into(),
             Value::String(provider.token_url.clone()),
@@ -184,7 +192,7 @@ fn open_connection(rt: &TenantsRuntime, c: &ConnectionRecord) -> Result<Value, S
         );
     }
     register_secrets(&spec);
-    Ok(spec)
+    Ok((spec, hosted))
 }
 
 /// Whether a provider-config key holds a credential.
@@ -668,7 +676,7 @@ impl ReauthWatch {
         else {
             return false;
         };
-        let Ok(spec) = open_connection(&self.state.tenants(), &rec) else {
+        let Ok((spec, _)) = open_connection(&self.state.tenants(), &rec) else {
             return false;
         };
         match build_connection_inner(&self.state, &self.tenant, &self.name, &spec) {
@@ -1732,6 +1740,75 @@ mod tests {
         assert!((sc.build_catalog)(None).unwrap().is_empty());
         specs.insert("bad".to_string(), serde_json::json!({"type": "nope"}));
         assert!((sc.build_catalog)(Some(&specs)).is_err());
+        // The hosted connection's endpoint is the operator's: a host allow-list
+        // that omits the IdP does not refuse it, while a connection the tenant
+        // wrote is still held to the list.
+        assert!(sc.operator_connections.contains("crm"));
+        let mut own = conn(
+            &v,
+            "acme",
+            "own",
+            serde_json::json!({"type": "oauth2", "config": {
+                "token_url": "https://idp.elsewhere/token", "client_id": "c", "client_secret": "s"}}),
+        );
+        own.connect_provider = None;
+        state.history().connection_upsert(&own).await.unwrap();
+        let sc = std::sync::Arc::new(scope(&state, "acme").await.unwrap());
+        assert!(!sc.operator_connections.contains("own"));
+        let refs =
+            crate::serve::references::ServeReferencePolicy::from_args(&crate::cli::ReferenceArgs {
+                allow_url_host: vec!["data.example".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        let caller = crate::serve::load::BodyOrigin::Caller {
+            allow_subprocess: false,
+        };
+        let body = |auth: &str| {
+            serde_json::json!({ "version": 1, "pipeline": {
+                "source": { "type": "rest", "config": {
+                    "base_url": "https://data.example", "path": "/x", "auth": { "ref": auth } } },
+                "sink": { "type": "jsonl", "config": { "path": "out.jsonl" } } } })
+            .to_string()
+        };
+        let load = |auth: &'static str| {
+            let (sc, refs) = (sc.clone(), refs.clone());
+            async move {
+                crate::serve::load::load_submission_with(
+                    &body(auth),
+                    crate::serve::load::ConfigFormat::Json,
+                    None,
+                    None,
+                    caller,
+                    Some(sc),
+                    &refs,
+                )
+                .await
+            }
+        };
+        let err = load("own").await.unwrap_err();
+        assert!(
+            matches!(&err, ServeError::Forbidden(m) if m.contains("connection own")),
+            "{err:?}"
+        );
+        // Drop the tenant-written one: the hosted one alone loads.
+        state
+            .history()
+            .connection_delete("acme", "own")
+            .await
+            .unwrap();
+        let sc2 = std::sync::Arc::new(scope(&state, "acme").await.unwrap());
+        let loaded = crate::serve::load::load_submission_with(
+            &body("crm"),
+            crate::serve::load::ConfigFormat::Json,
+            None,
+            None,
+            caller,
+            Some(sc2),
+            &refs,
+        )
+        .await;
+        assert!(loaded.is_ok(), "{:?}", loaded.err());
     }
 
     #[tokio::test]

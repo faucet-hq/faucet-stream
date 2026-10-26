@@ -1466,6 +1466,10 @@ pub struct TenantScope {
     /// unsealed; injected into the config's `auth:` catalog (a connection
     /// shadows a catalog entry of the same name).
     pub connections: std::collections::BTreeMap<String, Value>,
+    /// Connections whose endpoint the server's `--connect-providers` file sets
+    /// (a hosted OAuth connection): screened under the operator's policy,
+    /// not the tenant's, because the tenant did not choose its URL.
+    pub operator_connections: std::collections::BTreeSet<String>,
     /// Connections that need re-authorization, with why. A run referencing
     /// one is refused.
     pub blocked: std::collections::BTreeMap<String, String>,
@@ -1706,11 +1710,22 @@ pub async fn load_submission_with(
             },
             Some(t.values.id.as_str()),
         );
+        let (hosted, written): (Vec<_>, Vec<_>) = t
+            .connections
+            .iter()
+            .partition(|(n, _)| t.operator_connections.contains(*n));
         screen_auth_providers(
-            t.connections
-                .iter()
+            written
+                .into_iter()
                 .map(|(n, spec)| (format!("connection {n}"), spec)),
             &tenant_refs,
+            true,
+        )?;
+        screen_auth_providers(
+            hosted
+                .into_iter()
+                .map(|(n, spec)| (format!("connection {n}"), spec)),
+            &ReferencePolicy::open(),
             true,
         )?;
         let catalog = cfg.auth.get_or_insert_with(Default::default);
