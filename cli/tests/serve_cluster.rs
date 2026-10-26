@@ -4,6 +4,9 @@
 #![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 #![cfg(all(feature = "serve", feature = "serve-history-sqlite"))]
 
+#[path = "support/ports.rs"]
+mod ports;
+
 use faucet_cli::serve::history::sqlite::SqliteHistory;
 use faucet_cli::serve::history::{RunHistory, RunRecord, RunStatus};
 use std::time::Duration;
@@ -154,13 +157,7 @@ async fn two_process_cluster_reassigns_on_kill() {
         out.display(),
     );
 
-    fn free_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    }
+    use ports::free_port;
 
     let port_a = free_port();
     let port_b = free_port();

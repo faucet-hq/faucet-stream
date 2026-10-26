@@ -7,13 +7,9 @@ use faucet_cli::serve::history::sqlite::SqliteHistory;
 use faucet_cli::serve::history::{RunHistory, RunRecord, RunStatus, ShardInsert, ShardOutcome};
 use std::time::Duration;
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+#[path = "support/ports.rs"]
+mod ports;
+use ports::free_port;
 
 fn args(port: u16, history: String) -> faucet_cli::cli::ServeArgs {
     faucet_cli::cli::ServeArgs {

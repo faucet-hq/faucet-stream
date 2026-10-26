@@ -14,13 +14,9 @@
 use serde_json::{Value, json};
 use std::time::Duration;
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+#[path = "support/ports.rs"]
+mod ports;
+use ports::free_port;
 
 /// alice = admin, bob + dave = operators, carol = viewer. Runs may be approved
 /// by any operator or admin except the requester; template changes by admins.

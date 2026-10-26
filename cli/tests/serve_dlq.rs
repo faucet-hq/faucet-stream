@@ -8,13 +8,9 @@
 use serde_json::{Value, json};
 use std::time::Duration;
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+#[path = "support/ports.rs"]
+mod ports;
+use ports::free_port;
 
 /// `admin-tok` → admin (operator+), `viewer-tok` → viewer (read-only).
 const AUTH_CONFIG: &str = "principals:\n\

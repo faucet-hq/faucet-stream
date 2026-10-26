@@ -16,10 +16,9 @@ use std::time::Duration;
 
 const SECRET: &str = "s3cr3t-874-dir-value";
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
+#[path = "support/ports.rs"]
+mod ports;
+use ports::free_port;
 
 async fn spawn(db: &std::path::Path) -> String {
     let port = free_port();

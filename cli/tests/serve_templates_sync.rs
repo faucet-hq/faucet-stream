@@ -17,13 +17,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const BODY: &str = "version: 1\nname: nightly\npipeline:\n  source: {type: rest, config: {base_url: \"https://x\", path: /e}}\n  sink: {type: stdout, config: {}}\ntests:\n  suite:\n    auto: {defaults_baseline: true}\n";
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+#[path = "support/ports.rs"]
+mod ports;
+use ports::free_port;
 
 fn args(port: u16, sync: Option<std::path::PathBuf>) -> ServeArgs {
     ServeArgs {

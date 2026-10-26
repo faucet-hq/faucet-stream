@@ -12,12 +12,9 @@ use std::time::Duration;
 
 // ── shared helpers ────────────────────────────────────────────────────────────
 
-fn free_port() -> u16 {
-    // The TcpListener is dropped immediately after obtaining the port. There is a
-    // small TOCTOU window; acceptable for integration tests on a loopback interface.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
-}
+#[path = "support/ports.rs"]
+mod ports;
+use ports::free_port;
 
 fn args_on(port: u16, token: Option<&str>) -> ServeArgs {
     ServeArgs {
@@ -107,6 +104,21 @@ fn csv_to_jsonl_yaml(input: &std::path::Path, output: &std::path::Path) -> Strin
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 /// Auth middleware: /healthz is public; /v1/* requires a valid Bearer token.
+/// Concurrent callers are never handed the same port, so two servers of one
+/// test binary cannot end up on one port.
+#[test]
+fn free_ports_are_never_handed_out_twice() {
+    let threads: Vec<_> = (0..8)
+        .map(|_| std::thread::spawn(|| (0..50).map(|_| free_port()).collect::<Vec<_>>()))
+        .collect();
+    let ports: Vec<u16> = threads
+        .into_iter()
+        .flat_map(|t| t.join().unwrap())
+        .collect();
+    let distinct: std::collections::HashSet<_> = ports.iter().collect();
+    assert_eq!(distinct.len(), ports.len());
+}
+
 #[tokio::test]
 async fn auth_required_when_token_set() {
     let port = free_port();

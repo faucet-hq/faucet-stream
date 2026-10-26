@@ -100,13 +100,9 @@ fn openapi_paths_match_canonical_routes() {
     );
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+#[path = "support/ports.rs"]
+mod ports;
+use ports::free_port;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn every_documented_route_is_wired_on_the_live_server() {

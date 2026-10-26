@@ -12,13 +12,9 @@ use std::time::Duration;
 #[path = "support/serve_routes.rs"]
 mod serve_routes;
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+#[path = "support/ports.rs"]
+mod ports;
+use ports::free_port;
 
 /// Three principals: `admin-tok` → admin, `viewer-tok` → viewer,
 /// `operator-tok` → operator.
