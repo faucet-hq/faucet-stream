@@ -123,16 +123,21 @@ bound SQL parameter or an escaped path. A value the event's sender chooses (a
 webhook body, query value or header, an object key) is checked against where it
 lands:
 
-- anywhere: no `..` path segment (unless a whole value with whitespace, such as
-  a body), and no control character when spliced;
-- spliced into a query (a `query`, `sql`, `statement`, `where` or `filter` key)
-  or into free text (a string with spaces or quotes around the token): no quote
-  (`'`, `"`, `` ` ``), `;` or backslash. A path, URL or name (`in/${trigger.object_key}`,
+- spliced into a longer string: no `..` path segment and no control character;
+  as a whole value: no `..` path segment when the field names a path or URL
+  (a body used whole as data may hold one);
+- spliced into a SQL statement (a field the connector's schema marks as SQL,
+  such as a SQL source's `query`) or into free text (a string with spaces or
+  quotes around the token): no quote (`'`, `"`, `` ` ``), `;` or backslash. A
+  path, URL or name (`in/${trigger.object_key}`,
   `s3://bucket/${trigger.object_key}`) may hold them;
 - inside a URL's host (`https://${trigger.header.x-region}.api.example`): host
   name characters only (letters, digits, `.`, `-`);
-- as a whole `query`/`sql` value: refused — a sender never supplies a whole
-  statement;
+- as the whole of a SQL field: refused — a sender never supplies a whole
+  statement. A GraphQL `query` or a search or document-store `filter` is not
+  SQL and takes a whole value. Outside any connector or transform the trigger
+  can name, a whole `query`, `sql`, `statement`, `where` or `filter` value is
+  refused;
 - a URL, or an absolute path that starts the value, must be one the server's
   caller reference policy allows (`--allow-url-host`, `--allow-url-scheme`,
   `--allow-path-root`, and never the system trees or the server's credential

@@ -46,6 +46,7 @@ pub struct SnowflakeSourceConfig {
     /// are resolved against the parent-record context at runtime; resolved
     /// values are sent as positional bind parameters at the position of their
     /// token, interleaved with [`params`](Self::params) in textual order.
+    #[schemars(extend("x-faucet-sql" = true))]
     pub query: String,
     /// Positional bind parameters for the query, one per `?` marker the query
     /// holds, in order (a `?` inside a string literal, quoted identifier or

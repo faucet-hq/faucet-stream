@@ -106,6 +106,19 @@ pub sandbox: bool,
 not load from its own triggers file, wherever the connector appears (template,
 row override, topology node, fan-out source, DLQ sink, …).
 
+A field whose value is a SQL statement the connector runs as written (a
+source's `query`) is marked so a server that places values it did not author
+into a config can tell it from a field that only shares the name (a GraphQL
+document, a search filter):
+
+```rust
+#[schemars(extend("x-faucet-sql" = true))]
+pub query: String,
+```
+
+A webhook or object-arrival trigger refuses a sender-chosen value that would
+be the whole of such a field.
+
 ### Resumability
 
 If your source can resume, implement two methods:

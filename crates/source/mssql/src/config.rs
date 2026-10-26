@@ -57,6 +57,7 @@ pub struct MssqlSourceConfig {
     pub connection: MssqlConnectionConfig,
     /// SQL query to run. Use `@P1`, `@P2`, … for [`params`](Self::params), and
     /// the literal `@bookmark` token to bind the incremental cursor server-side.
+    #[schemars(extend("x-faucet-sql" = true))]
     pub query: String,
     /// Positional bind parameters for the query (`@P1`…`@Pn`). Defaults to empty.
     #[serde(default)]

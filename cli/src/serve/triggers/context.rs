@@ -191,40 +191,186 @@ pub fn substitute_tracked(
     let mut doc: serde_yaml::Value = serde_yaml::from_str(text)
         .map_err(|e| SubstituteError::config(format!("pipeline config is not valid YAML: {e}")))?;
     let mut event_values = Vec::new();
-    substitute_value(&mut doc, None, event, name, fired_at, &mut event_values)?;
+    let root = doc.clone();
+    let mut walk = Walk {
+        event,
+        name,
+        fired_at,
+        root: &root,
+        seen: &mut event_values,
+    };
+    walk.value(&mut doc, None, &Scope::Unknown)?;
     let text = serde_yaml::to_string(&doc)
         .map_err(|e| SubstituteError::config(format!("re-rendering pipeline config: {e}")))?;
     Ok(Substitution { text, event_values })
 }
 
-fn substitute_value(
-    v: &mut serde_yaml::Value,
-    key: Option<&str>,
-    event: &TriggerEvent,
-    name: &str,
-    fired_at: &str,
-    seen: &mut Vec<EventValue>,
-) -> Result<(), SubstituteError> {
-    match v {
-        serde_yaml::Value::String(s) if s.contains("${trigger.") => {
-            *s = substitute_with(s, event, name, fired_at, Some(Placement { key, seen }))?;
-        }
-        serde_yaml::Value::Sequence(items) => {
-            for item in items {
-                substitute_value(item, key, event, name, fired_at, seen)?;
-            }
-        }
-        serde_yaml::Value::Mapping(map) => {
-            for (k, item) in map.iter_mut() {
-                substitute_value(item, k.as_str(), event, name, fired_at, seen)?;
-            }
-        }
-        serde_yaml::Value::Tagged(tagged) => {
-            substitute_value(&mut tagged.value, key, event, name, fired_at, seen)?;
-        }
-        _ => {}
+/// The top-level fields of a connector or transform kind that hold a SQL
+/// statement and that name a path or URL, read from its config schema
+/// (`x-faucet-sql`, `x-faucet-resource`), so a plugin is judged like a
+/// built-in.
+#[derive(Debug, Default)]
+struct KindFields {
+    sql: std::collections::BTreeSet<String>,
+    resources: std::collections::BTreeSet<String>,
+}
+
+fn kind_fields(kind: &str) -> std::sync::Arc<KindFields> {
+    type Cache = std::sync::RwLock<std::collections::HashMap<String, std::sync::Arc<KindFields>>>;
+    static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(hit) = cache.read().ok().and_then(|c| c.get(kind).cloned()) {
+        return hit;
     }
-    Ok(())
+    let mut fields = KindFields::default();
+    let schemas = [
+        crate::registry::source_schema(kind).ok(),
+        crate::registry::sink_schema(kind).ok(),
+        crate::transforms::transform_schema(kind).ok(),
+    ];
+    for schema in schemas.iter().flatten() {
+        fields.sql.extend(faucet_core::resolve::sql_fields(schema));
+        fields.resources.extend(
+            faucet_core::resolve::annotated_fields(schema)
+                .into_iter()
+                .filter(|(path, kind)| {
+                    !path.contains(['.', '[', '{'])
+                        && *kind != faucet_core::resolve::ResourceKind::Command
+                })
+                .map(|(path, _)| path),
+        );
+    }
+    let fields = std::sync::Arc::new(fields);
+    if let Ok(mut c) = cache.write() {
+        c.insert(kind.to_string(), std::sync::Arc::clone(&fields));
+    }
+    fields
+}
+
+/// What the walk knows about the node it is at.
+#[derive(Clone)]
+enum Scope {
+    /// Outside any connector or transform the walk could name.
+    Unknown,
+    /// The config object of a known kind: its children are its fields.
+    Object(std::sync::Arc<KindFields>),
+    /// A direct field of a known kind's config.
+    Field(std::sync::Arc<KindFields>),
+    /// Nested below a known kind's top-level fields.
+    Inside,
+}
+
+/// What a scalar's placement says about the value landing in it.
+#[derive(Clone, Copy)]
+enum Landing {
+    /// The kind's schema says it: whether the field is a SQL statement, and
+    /// whether it names a path or URL.
+    Known { sql: bool, path: bool },
+    /// No kind to ask: judged by the key's name and the value's shape.
+    Unknown,
+}
+
+struct Walk<'a> {
+    event: &'a TriggerEvent,
+    name: &'a str,
+    fired_at: &'a str,
+    root: &'a serde_yaml::Value,
+    seen: &'a mut Vec<EventValue>,
+}
+
+impl Walk<'_> {
+    fn value(
+        &mut self,
+        v: &mut serde_yaml::Value,
+        key: Option<&str>,
+        scope: &Scope,
+    ) -> Result<(), SubstituteError> {
+        match v {
+            serde_yaml::Value::String(s) if s.contains("${trigger.") => {
+                let landing = match scope {
+                    Scope::Unknown => Landing::Unknown,
+                    Scope::Field(f) => Landing::Known {
+                        sql: key.is_some_and(|k| f.sql.contains(k)),
+                        path: key.is_some_and(|k| f.resources.contains(k)),
+                    },
+                    Scope::Object(_) | Scope::Inside => Landing::Known {
+                        sql: false,
+                        path: false,
+                    },
+                };
+                *s = substitute_with(
+                    s,
+                    self.event,
+                    self.name,
+                    self.fired_at,
+                    Some(Placement {
+                        key,
+                        landing,
+                        seen: self.seen,
+                    }),
+                )?;
+            }
+            serde_yaml::Value::Sequence(items) => {
+                for item in items {
+                    self.value(item, key, scope)?;
+                }
+            }
+            serde_yaml::Value::Mapping(map) => {
+                let kind = mapping_kind(map, key, self.root);
+                for (k, item) in map.iter_mut() {
+                    let child = match (&kind, scope) {
+                        (Some(kind), _) => {
+                            let f = kind_fields(kind);
+                            if k.as_str() == Some("config") {
+                                Scope::Object(f)
+                            } else {
+                                Scope::Field(f)
+                            }
+                        }
+                        (None, Scope::Object(f)) => Scope::Field(std::sync::Arc::clone(f)),
+                        (None, Scope::Unknown) => Scope::Unknown,
+                        (None, _) => Scope::Inside,
+                    };
+                    self.value(item, k.as_str(), &child)?;
+                }
+            }
+            serde_yaml::Value::Tagged(tagged) => {
+                self.value(&mut tagged.value, key, scope)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+/// The connector or transform kind a mapping configures: its own `type`, or
+/// — for a matrix row's `source:` / `sink:` override — the `type` of the
+/// template its `ref` (else the default template) names.
+fn mapping_kind(
+    map: &serde_yaml::Mapping,
+    key: Option<&str>,
+    root: &serde_yaml::Value,
+) -> Option<String> {
+    if let Some(t) = map.get("type").and_then(serde_yaml::Value::as_str) {
+        return Some(t.to_string());
+    }
+    let side = match key {
+        Some("source") => "source",
+        Some("sink") => "sink",
+        _ => return None,
+    };
+    let pipeline = root.get("pipeline")?;
+    let named = pipeline.get(format!("{side}s"));
+    let template = match map.get("ref").and_then(serde_yaml::Value::as_str) {
+        Some(r) => named.and_then(|n| n.get(r)),
+        None => pipeline
+            .get(side)
+            .or_else(|| named.and_then(|n| n.get("default"))),
+    }?;
+    template
+        .get("type")
+        .and_then(serde_yaml::Value::as_str)
+        .map(str::to_string)
 }
 
 /// Substitute every `${trigger.<token>}` in one string with the raw value.
@@ -241,11 +387,23 @@ pub fn substitute_plain(
 /// sender-chosen values placed so far.
 struct Placement<'a> {
     key: Option<&'a str>,
+    landing: Landing,
     seen: &'a mut Vec<EventValue>,
 }
 
-/// Config keys whose value is SQL.
+/// Keys that may hold a statement, for a scalar outside any connector or
+/// transform the walk could name.
 const SQL_KEYS: &[&str] = &["query", "sql", "statement", "where", "filter"];
+
+/// Whether the field a value lands in runs it as a statement.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Statement {
+    No,
+    /// The kind's schema marks the field as SQL.
+    Sql,
+    /// No kind to ask, and the key's name is one a statement often has.
+    Maybe,
+}
 
 /// Whether `token` takes its value from the event's sender rather than the
 /// trigger's own configuration.
@@ -270,10 +428,31 @@ fn substitute_with(
     fired_at: &str,
     mut placement: Option<Placement<'_>>,
 ) -> Result<String, SubstituteError> {
-    let sql = placement
-        .as_ref()
-        .and_then(|p| p.key)
-        .is_some_and(|k| SQL_KEYS.contains(&k.to_ascii_lowercase().as_str()));
+    let statement = match placement.as_ref() {
+        None => Statement::No,
+        Some(Placement {
+            landing: Landing::Known { sql, .. },
+            ..
+        }) => {
+            if *sql {
+                Statement::Sql
+            } else {
+                Statement::No
+            }
+        }
+        Some(Placement {
+            landing: Landing::Unknown,
+            key,
+            ..
+        }) => {
+            if key.is_some_and(|k| SQL_KEYS.contains(&k.to_ascii_lowercase().as_str())) {
+                Statement::Maybe
+            } else {
+                Statement::No
+            }
+        }
+    };
+    let sql = statement != Statement::No;
     // A scalar with no whitespace or quotes around its tokens is a path, a URL
     // or a name; anything else (a query, free text) is treated as text a
     // quote or `;` could rewrite.
@@ -308,7 +487,18 @@ fn substitute_with(
         match placement.as_mut() {
             Some(p) => {
                 if sender_chosen(event, token) {
-                    if let Some(why) = placement_refusal(&v, &out, whole, sql, free_text) {
+                    // A whole value is checked for `..` only where it names a
+                    // path or URL: a body parsed as data may hold the text.
+                    let path_field = match p.landing {
+                        Landing::Known { path, .. } => path,
+                        Landing::Unknown => {
+                            !v.chars().any(char::is_whitespace)
+                                && !v.trim_start().starts_with(['{', '['])
+                        }
+                    };
+                    if let Some(why) =
+                        placement_refusal(&v, &out, whole, statement, p.key, path_field, free_text)
+                    {
                         return Err(SubstituteError {
                             message: format!(
                                 "the `${{trigger.{token}}}` value {why}; the event was not run"
@@ -348,31 +538,47 @@ fn without_tokens(text: &str) -> String {
 }
 
 /// Why a sender-chosen value may not land where it does, if it may not. `before`
-/// is the scalar's text ahead of the value.
+/// is the scalar's text ahead of the value; `path_field` says whether a whole
+/// value lands in a field naming a path or URL.
 fn placement_refusal(
     v: &str,
     before: &str,
     whole: bool,
-    sql: bool,
+    statement: Statement,
+    key: Option<&str>,
+    path_field: bool,
     free_text: bool,
 ) -> Option<String> {
-    // A whole value cannot reach the text around it; one that reads as a
-    // path (no whitespace) still may not climb directories.
+    // A whole value cannot reach the text around it; one that names a path
+    // still may not climb directories.
     if !whole && v.chars().any(char::is_control) {
         return Some("contains a control character".into());
     }
-    let path_like = !whole || !v.chars().any(char::is_whitespace);
+    let path_like = !whole || path_field;
     if path_like && v.split(['/', '\\']).any(|seg| seg == "..") {
         return Some(
             "contains a `..` path segment, which could climb out of the directory the config names"
                 .into(),
         );
     }
-    if sql && whole {
-        return Some(
-            "would be a whole SQL statement; splice it into a query the config writes instead"
-                .into(),
-        );
+    if whole {
+        match statement {
+            Statement::Sql => {
+                return Some(
+                    "would be a whole SQL statement; splice it into a query the config writes \
+                     instead"
+                        .into(),
+                );
+            }
+            Statement::Maybe => {
+                return Some(format!(
+                    "would be the whole `{}` value, which may be a statement the connector runs; \
+                     splice it into one the config writes instead",
+                    key.unwrap_or_default()
+                ));
+            }
+            Statement::No => {}
+        }
     }
     if !whole
         && free_text
@@ -532,14 +738,84 @@ mod tests {
             let err = substitute(host, &hook(bad), "n", "f").unwrap_err();
             assert!(err.contains("host"), "{bad}: {err}");
         }
+        // Outside any connector the key's name is all there is to go on.
         let err = substitute("query: ${trigger.body}\n", &hook("x"), "n", "f").unwrap_err();
-        assert!(err.contains("whole SQL statement"), "{err}");
+        assert!(err.contains("whole `query` value"), "{err}");
         // A value from the trigger's own configuration is not the sender's.
         let sub = substitute_tracked("b: ${trigger.bucket}/x\n", &obj("k"), "n", "f").unwrap();
         assert!(sub.event_values.is_empty());
         let sub = substitute_tracked("p: ${trigger.object_key}\n", &obj("/abs"), "n", "f").unwrap();
         assert!(sub.event_values[0].leads);
         assert_eq!(without_tokens("a${trigger.x}b${trigger.y"), "ab");
+    }
+
+    fn body_hook(body: &str) -> TriggerEvent {
+        TriggerEvent::Webhook {
+            method: "POST".into(),
+            body: body.into(),
+            headers: Default::default(),
+            query: Default::default(),
+            idem: "i".into(),
+        }
+    }
+
+    /// A whole value is refused as a statement only in a field the
+    /// connector's schema marks as SQL: a GraphQL document, a search or a
+    /// document-store filter is not one (#934).
+    #[cfg(all(
+        feature = "source-postgres",
+        feature = "source-graphql",
+        feature = "source-elasticsearch",
+        feature = "source-mongodb"
+    ))]
+    #[test]
+    fn a_whole_value_is_a_statement_only_where_the_schema_says_sql() {
+        let doc = |kind: &str, key: &str| {
+            format!(
+                "pipeline:\n  source:\n    type: {kind}\n    config:\n      {key}: ${{trigger.body}}\n"
+            )
+        };
+        let gql = "{ orders(first: 10) { id } }";
+        let sub = substitute(&doc("graphql", "query"), &body_hook(gql), "n", "f").unwrap();
+        assert!(sub.contains("orders(first: 10)"), "{sub}");
+        for (kind, key, body) in [
+            ("elasticsearch", "query", r#"{"match":{"a":"b"}}"#),
+            ("mongodb", "filter", r#"{"a":1}"#),
+        ] {
+            substitute(&doc(kind, key), &body_hook(body), "n", "f").unwrap();
+        }
+        let err =
+            substitute(&doc("postgres", "query"), &body_hook("SELECT 1"), "n", "f").unwrap_err();
+        assert!(err.contains("whole SQL statement"), "{err}");
+        // A matrix row's override is judged by the template it selects.
+        let row = "pipeline:\n  sources:\n    pg: {type: postgres, config: {query: x}}\n    gql: {type: graphql, config: {query: x}}\nmatrix:\n  - id: a\n    source: {ref: pg, config: {query: \"${trigger.body}\"}}\n";
+        assert!(substitute(row, &body_hook("SELECT 1"), "n", "f").is_err());
+        let row = row.replace("ref: pg", "ref: gql");
+        substitute(&row, &body_hook(gql), "n", "f").unwrap();
+        // Nested below a SQL source's top-level fields is not the statement.
+        let nested = "pipeline:\n  source:\n    type: postgres\n    config:\n      replication:\n        query: ${trigger.body}\n";
+        substitute(nested, &body_hook("SELECT 1"), "n", "f").unwrap();
+    }
+
+    /// A whole value is checked for a `..` segment only where it names a
+    /// path or URL; a body parsed as data may hold the text (#934).
+    #[cfg(feature = "source-csv")]
+    #[test]
+    fn a_whole_value_is_checked_for_dot_dot_only_where_it_names_a_path() {
+        let json = r#"{"u":"a/../b","v":".."}"#;
+        // Outside any connector: compact JSON is not a path.
+        let sub = substitute("payload: ${trigger.body}\n", &body_hook(json), "n", "f").unwrap();
+        assert_eq!(parsed(&sub)["payload"], json);
+        let err = substitute("p: ${trigger.body}\n", &body_hook("a/../b"), "n", "f").unwrap_err();
+        assert!(err.contains("`..`"), "{err}");
+        // A connector's path field refuses it whole; another field takes it.
+        let path =
+            "pipeline:\n  source:\n    type: csv\n    config:\n      path: ${trigger.body}\n";
+        let err = substitute(path, &body_hook("in/../../etc"), "n", "f").unwrap_err();
+        assert!(err.contains("`..`"), "{err}");
+        let other =
+            "pipeline:\n  source:\n    type: csv\n    config:\n      delimiter: ${trigger.body}\n";
+        substitute(other, &body_hook("a/../b"), "n", "f").unwrap();
     }
 
     #[test]

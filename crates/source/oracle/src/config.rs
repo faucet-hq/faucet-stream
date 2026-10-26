@@ -64,6 +64,7 @@ pub struct OracleSourceConfig {
     pub connection: OracleConnectionConfig,
     /// SQL query. Bind [`params`](Self::params) with `:1`, `:2`, …, and the
     /// incremental cursor with `:bookmark`.
+    #[schemars(extend("x-faucet-sql" = true))]
     pub query: String,
     /// Positional bind values for `:1`…`:n`.
     #[serde(default)]

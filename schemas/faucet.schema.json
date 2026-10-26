@@ -16077,7 +16077,8 @@
                     },
                     "query": {
                       "description": "SQL query to execute.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-sql": true
                     },
                     "params": {
                       "description": "Bind parameters for the query. Defaults to empty.",
@@ -16461,7 +16462,8 @@
                     },
                     "query": {
                       "description": "SQL query to execute.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-sql": true
                     },
                     "max_connections": {
                       "description": "Maximum number of connections in the pool. Defaults to 10.",
@@ -16632,7 +16634,8 @@
                     },
                     "query": {
                       "description": "SQL query to run. Use `@P1`, `@P2`, … for [`params`](Self::params), and\nthe literal `@bookmark` token to bind the incremental cursor server-side.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-sql": true
                     },
                     "params": {
                       "description": "Positional bind parameters for the query (`@P1`…`@Pn`). Defaults to empty.",
@@ -16783,7 +16786,8 @@
                     },
                     "query": {
                       "description": "SQL query to execute.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-sql": true
                     },
                     "max_connections": {
                       "description": "Maximum number of connections in the pool. Defaults to 10.",
@@ -16910,7 +16914,8 @@
                     },
                     "query": {
                       "description": "SQL query to execute.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-sql": true
                     },
                     "read_only": {
                       "description": "Open the database read-only. Defaults to `false` (read-write).\n\nSet `true` to attach to a database file another process holds open —\nDuckDB permits multiple read-only connections to one file but only a\nsingle read-write connection.",
@@ -18799,7 +18804,8 @@
                     },
                     "query": {
                       "description": "SQL query to execute. May contain `${field.path}` parent-context tokens\n(resolved to positional binds at runtime) and, for incremental\nreplication, a `${bookmark}` token.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-sql": true
                     },
                     "params": {
                       "description": "Positional bind parameters for the query, applied in `$1, $2, …` order\nbefore any context- or bookmark-derived values. Defaults to empty.",
@@ -19169,7 +19175,8 @@
                     },
                     "query": {
                       "description": "SQL `SELECT` query to run. The output format is set via the request\nsettings (`JSONCompactEachRowWithNamesAndTypes`, decoded by column\ntype), so **do not** append a `FORMAT` clause. Use\nthe literal `@bookmark` token to push the incremental cursor down into\nthe `WHERE` clause; use `{key}` tokens to inject parent-context values in\na matrix child.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-sql": true
                     },
                     "batch_size": {
                       "description": "Records per emitted [`StreamPage`](faucet_core::StreamPage). `0` emits\nthe whole result set as a single page. Defaults to\n[`DEFAULT_BATCH_SIZE`].",
@@ -20915,7 +20922,8 @@
                     },
                     "query": {
                       "description": "GoogleSQL query to run. Use named parameters (`@name`) for\n[`params`](Self::params), and the named parameter `@bookmark` to bind\nthe incremental cursor server-side.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-sql": true
                     },
                     "params": {
                       "description": "Named bind parameters for the query. Values must be scalars (string,\ninteger, float, or boolean) — Spanner parameters are typed, and\nnull/array/object values have no unambiguous parameter type.",
@@ -21320,7 +21328,8 @@
                     },
                     "sql": {
                       "description": "The SQL statement to run. May contain `:name` parameter markers (see\n[`parameters`](Self::parameters)) and a `${bookmark}` token for\nincremental replication.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-sql": true
                     },
                     "auth": {
                       "description": "Authentication (PAT / OAuth bearer), inline or via a shared `auth: { ref }`.",
@@ -21732,7 +21741,8 @@
                     },
                     "query": {
                       "description": "SQL statement to execute. May contain `${field.path}` placeholders that\nare resolved against the parent-record context at runtime as\npositional `?` markers; matched values are appended to\n[`params`](Self::params) when the query is sent.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-sql": true
                     },
                     "use_legacy_sql": {
                       "description": "Whether to use BigQuery's legacy SQL dialect. Defaults to `false`\n(Standard SQL). Set to `true` only for tables that use legacy\n`[project:dataset.table]` references.",
@@ -21949,7 +21959,8 @@
                     },
                     "query": {
                       "description": "SQL statement to execute. May contain `${field.path}` placeholders that\nare resolved against the parent-record context at runtime; resolved\nvalues are sent as positional bind parameters at the position of their\ntoken, interleaved with [`params`](Self::params) in textual order.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-sql": true
                     },
                     "params": {
                       "description": "Positional bind parameters for the query, one per `?` marker the query\nholds, in order (a `?` inside a string literal, quoted identifier or\ncomment is not a marker). Snowflake's SQL REST API uses 1-based positional\nbinds in the JSON request body (see the `bindings` field in the\n[SQL API docs](https://docs.snowflake.com/en/developer-guide/sql-api/submitting-requests#using-bind-variables-in-a-statement)).",
@@ -22605,7 +22616,8 @@
                     },
                     "query": {
                       "description": "SQL query. Bind [`params`](Self::params) with `:1`, `:2`, …, and the\nincremental cursor with `:bookmark`.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-sql": true
                     },
                     "replication": {
                       "$ref": "#/$defs/source_oracle__OracleReplication",
