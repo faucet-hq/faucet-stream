@@ -337,9 +337,8 @@ async fn topology_runs_and_json_log_format_report_log_export() {
     let path = dir.path().join("topo.yaml");
     std::fs::write(&path, topo).unwrap();
     faucet(&["run", path.to_str().unwrap()]).await.unwrap();
-    faucet(&["run", path.to_str().unwrap(), "--output", "json"])
-        .await
-        .unwrap();
+    let summary = run_binary_json(&path).await;
+    assert_eq!(summary["log_export"]["status"], "exported", "{summary}");
     let cfg = write_config(dir.path(), &ep, "grpc", &spool, "");
     faucet_cli::cli::set_log_format(faucet_cli::cli::LogFormat::Json);
     let r = faucet(&["run", cfg.to_str().unwrap()]).await;
@@ -385,9 +384,35 @@ async fn run_output_json_reports_log_export() {
     let (col, ep) = start_grpc().await;
     let dir = tempfile::tempdir().unwrap();
     let cfg = write_config(dir.path(), &ep, "grpc", &dir.path().join("spool"), "");
-    faucet(&["run", cfg.to_str().unwrap(), "--output", "json"])
-        .await
-        .unwrap();
+    // The binary prints the summary on stdout; read the `log_export` it reports.
+    let summary = run_binary_json(&cfg).await;
+    assert_eq!(summary["log_export"]["status"], "exported", "{summary}");
+    assert_eq!(summary["log_export"]["pending_lines"], 0, "{summary}");
     faucet(&["run", cfg.to_str().unwrap()]).await.unwrap();
     assert!(col.request_count() >= 2);
+}
+
+/// `faucet run <cfg> --output json` as a child process, its stdout parsed.
+async fn run_binary_json(cfg: &Path) -> serde_json::Value {
+    let cfg = cfg.to_path_buf();
+    let out = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_faucet"))
+            .args(["run", "--output", "json"])
+            .arg(&cfg)
+            .output()
+            .expect("faucet runs")
+    })
+    .await
+    .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout is not JSON ({e}): {}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    })
 }
