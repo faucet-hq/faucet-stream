@@ -5,10 +5,18 @@
 
 /// Every non-raw string literal in `src` as `(line, contents)`.
 pub fn literals(src: &str) -> Vec<(usize, &str)> {
+    literal_spans(src, false)
+        .into_iter()
+        .map(|(at, lit)| (src[..at].matches('\n').count() + 1, lit))
+        .collect()
+}
+
+/// Every string literal in `src` as `(byte offset of its opening, contents)`;
+/// raw strings (`r"…"`, `r#"…"#`) are included when `raw` is set.
+pub fn literal_spans(src: &str, raw: bool) -> Vec<(usize, &str)> {
     let b = src.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
-    let line_of = |at: usize| src[..at].matches('\n').count() + 1;
     while i < b.len() {
         if src[i..].starts_with("//") {
             i = src[i..].find('\n').map_or(b.len(), |j| i + j);
@@ -28,9 +36,11 @@ pub fn literals(src: &str) -> Vec<(usize, &str)> {
             }
             if b.get(j) == Some(&b'"') {
                 let close = format!("\"{}", "#".repeat(hashes));
-                i = src[j + 1..]
-                    .find(&close)
-                    .map_or(b.len(), |k| j + 1 + k + close.len());
+                let end = src[j + 1..].find(&close).map_or(b.len(), |k| j + 1 + k);
+                if raw {
+                    out.push((i, &src[j + 1..end]));
+                }
+                i = (end + close.len()).min(b.len());
                 continue;
             }
         }
@@ -54,7 +64,7 @@ pub fn literals(src: &str) -> Vec<(usize, &str)> {
                 j += if b[j] == b'\\' { 2 } else { 1 };
             }
             let end = j.min(b.len());
-            out.push((line_of(i), &src[start..end]));
+            out.push((i, &src[start..end]));
             i = end + 1;
             continue;
         }
