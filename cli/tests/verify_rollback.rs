@@ -1497,8 +1497,9 @@ async fn a_pending_undo_that_finds_nothing_finishes_the_rewind() {
     );
 }
 
-/// An attempt whose sink undo fails leaves no pending record, so a retry
-/// that finds nothing of the run still leaves the bookmark alone.
+/// An attempt whose sink undo fails with the run still all in the
+/// destination leaves no pending record, so a retry that finds nothing of the
+/// run still leaves the bookmark alone.
 #[tokio::test]
 async fn a_failed_undo_attempt_does_not_count_as_committed() {
     let d = fresh().await;
@@ -1524,8 +1525,11 @@ async fn a_failed_undo_attempt_does_not_count_as_committed() {
         pipeline_name: "mirror".into(),
         auth: Default::default(),
     };
-    exec(&d.dst, "DROP TABLE dst").await;
-    exec(&d.dst, "CREATE TABLE dst (id INTEGER, name TEXT)").await;
+    exec(
+        &d.dst,
+        "CREATE TRIGGER hold BEFORE DELETE ON dst BEGIN SELECT RAISE(ABORT, 'deletes are paused'); END",
+    )
+    .await;
     faucet_cli::rollback::rollback(&cfg, inputs())
         .await
         .expect_err("the undo fails before it commits");
