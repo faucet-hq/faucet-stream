@@ -35,8 +35,8 @@ pub enum MssqlReplication {
     /// that share a cursor value (ties, late commits, `DATETIME`'s 1/300 s
     /// ticks) are never skipped. Every page carries a bookmark, so a crash
     /// replays at most one page. Write `@bookmark` in the query (with `>=`)
-    /// to apply the cursor further inside it, e.g. in a CTE; a strict `>` is
-    /// refused. The query must not have a top-level `ORDER BY` (without
+    /// to apply the cursor further inside it, e.g. in a subquery or join; a
+    /// strict `>` is refused. The query must not have a top-level `ORDER BY` (without
     /// `TOP` / `OFFSET`) or start with a CTE, and every column must be named:
     /// T-SQL forbids those in a derived table, and `validate` refuses the
     /// first two. Rows whose `column` is NULL are never read.

@@ -6985,7 +6985,7 @@
           }
         },
         {
-          "description": "Only rows not yet read, in `column` order, resuming from the stored\nbookmark (or `initial_value` on the first run).\n\nThe source wraps the query as\n`SELECT * FROM (<query>) AS q WHERE q.[column] >= <bookmark> ORDER BY q.[column]`\nand drops the rows it already emitted at the bookmark value, so rows\nthat share a cursor value (ties, late commits, `DATETIME`'s 1/300 s\nticks) are never skipped. Every page carries a bookmark, so a crash\nreplays at most one page. Write `@bookmark` in the query (with `>=`)\nto apply the cursor further inside it, e.g. in a CTE; a strict `>` is\nrefused. The query must not end in a top-level `ORDER BY` (T-SQL\nforbids it in a derived table). Rows whose `column` is NULL are never\nread.",
+          "description": "Only rows not yet read, in `column` order, resuming from the stored\nbookmark (or `initial_value` on the first run).\n\nThe source wraps the query as\n`SELECT * FROM (<query>) AS q WHERE q.[column] >= <bookmark> ORDER BY q.[column]`\nand drops the rows it already emitted at the bookmark value, so rows\nthat share a cursor value (ties, late commits, `DATETIME`'s 1/300 s\nticks) are never skipped. Every page carries a bookmark, so a crash\nreplays at most one page. Write `@bookmark` in the query (with `>=`)\nto apply the cursor further inside it, e.g. in a subquery or join; a\nstrict `>` is refused. The query must not have a top-level `ORDER BY` (without\n`TOP` / `OFFSET`) or start with a CTE, and every column must be named:\nT-SQL forbids those in a derived table, and `validate` refuses the\nfirst two. Rows whose `column` is NULL are never read.",
           "type": "object",
           "properties": {
             "column": {
