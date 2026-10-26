@@ -716,10 +716,11 @@ async fn object_arrival_enqueues_one_run_per_object_and_dedupes() {
     );
 }
 
+// Compiled only with a queue backend: without one the test is absent, not
+// reported green with nothing run.
+#[cfg(any(feature = "triggers-redis", feature = "triggers-kafka"))]
 #[tokio::test]
 async fn queue_depth_fires_once_on_rising_edge() {
-    // Only run when the queue_depth module is compiled (any backend feature).
-    #[cfg(any(feature = "triggers-redis", feature = "triggers-kafka"))]
     {
         use async_trait::async_trait;
         use faucet_cli::serve::triggers::queue_depth::{DepthProbe, QueueDepthWatcher};
@@ -1055,13 +1056,9 @@ async fn queue_depth_edges_survive_a_restart_and_fire_once_across_instances() {
 
 use faucet_cli::cli::ServeArgs;
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+#[path = "support/ports.rs"]
+mod ports;
+use ports::free_port;
 
 /// Spawn a real `faucet serve` instance with the given triggers file and bearer
 /// token, then wait for `/healthz`. Returns the base URL.
