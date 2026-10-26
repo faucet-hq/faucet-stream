@@ -2391,3 +2391,36 @@ async fn launches_and_channels_never_point_at_a_missing_version() {
     let st = s.template_state("race").await.unwrap();
     assert_eq!((st.stable, st.previous), (Some(2), Some(1)));
 }
+
+/// `tenant_replace` writes only while the stored tenant still equals the
+/// expected record, in one statement.
+#[tokio::test]
+async fn tenant_replace_is_a_compare_and_set() {
+    use faucet_cli::serve::history::tenants::TenantRecord;
+    let dir = tempfile::tempdir().unwrap();
+    let h = store(&dir, "tenant-cas.db").await;
+    let now = Utc::now();
+    let t = TenantRecord {
+        id: "acme".into(),
+        name: None,
+        labels: BTreeMap::new(),
+        limits: Default::default(),
+        notifications: Vec::new(),
+        notifications_sealed: None,
+        suspended: true,
+        created_at: now,
+        updated_at: now,
+        created_by: "t".into(),
+    };
+    let mut reopened = t.clone();
+    reopened.suspended = false;
+    assert!(!h.tenant_replace(&t, &reopened).await.unwrap(), "missing");
+    h.tenant_upsert(&t).await.unwrap();
+    let mut edited = t.clone();
+    edited.limits.max_concurrent_runs = Some(3);
+    h.tenant_upsert(&edited).await.unwrap();
+    assert!(!h.tenant_replace(&t, &reopened).await.unwrap(), "changed");
+    assert_eq!(h.tenant_get("acme").await.unwrap().unwrap(), edited);
+    assert!(h.tenant_replace(&edited, &reopened).await.unwrap());
+    assert_eq!(h.tenant_get("acme").await.unwrap().unwrap(), reopened);
+}

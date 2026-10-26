@@ -908,6 +908,19 @@ impl RunHistory for MemoryHistory {
         Ok(())
     }
 
+    async fn tenant_replace(
+        &self,
+        expected: &tenants::TenantRecord,
+        new: &tenants::TenantRecord,
+    ) -> Result<bool, HistoryError> {
+        let mut st = self.tenant_state()?;
+        if st.tenants.get(&expected.id) != Some(expected) {
+            return Ok(false);
+        }
+        st.tenants.insert(new.id.clone(), new.clone());
+        Ok(true)
+    }
+
     async fn tenant_get(&self, id: &str) -> Result<Option<tenants::TenantRecord>, HistoryError> {
         Ok(self.tenant_state()?.tenants.get(id).cloned())
     }

@@ -861,6 +861,9 @@ pub struct Stmts {
     pub usage_delete_run: String,
     pub usage_delete_tenant: String,
     pub tenant_upsert: String,
+    /// Replace a tenant's body only while it still equals the expected one.
+    /// Params: updated_at, new body, id, expected body.
+    pub tenant_replace: String,
     pub tenant_select: String,
     pub tenant_list: String,
     pub tenant_delete: String,
@@ -1547,6 +1550,9 @@ impl Stmts {
                 VALUES ($1,$2,$3) \
                 ON CONFLICT (id) DO UPDATE SET updated_at=excluded.updated_at, body=excluded.body"
                 .into(),
+            tenant_replace: "UPDATE faucet_tenants SET updated_at=$1, body=$2 \
+                WHERE id=$3 AND body=$4"
+                .into(),
             tenant_select: "SELECT body FROM faucet_tenants WHERE id=$1".into(),
             tenant_list: "SELECT body FROM faucet_tenants ORDER BY id".into(),
             tenant_delete: "DELETE FROM faucet_tenants WHERE id=$1".into(),
@@ -2106,6 +2112,9 @@ impl Stmts {
             tenant_upsert: "INSERT INTO faucet_tenants (id, updated_at, body) \
                 VALUES (?,?,?) \
                 ON CONFLICT (id) DO UPDATE SET updated_at=excluded.updated_at, body=excluded.body"
+                .into(),
+            tenant_replace: "UPDATE faucet_tenants SET updated_at=?, body=? \
+                WHERE id=? AND body=?"
                 .into(),
             tenant_select: "SELECT body FROM faucet_tenants WHERE id=?".into(),
             tenant_list: "SELECT body FROM faucet_tenants ORDER BY id".into(),
@@ -5106,6 +5115,25 @@ macro_rules! impl_sql_history {
                     .await
                     .map_err(backend)?;
                 Ok(())
+            }
+
+            async fn tenant_replace(
+                &self,
+                expected: &$crate::serve::history::tenants::TenantRecord,
+                new: &$crate::serve::history::tenants::TenantRecord,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let n = sqlx::query(&self.stmts.tenant_replace)
+                    .bind(sql::fmt_ts(new.updated_at))
+                    .bind(sql::encode_json(new, "tenant")?)
+                    .bind(&expected.id)
+                    .bind(sql::encode_json(expected, "tenant")?)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?
+                    .rows_affected();
+                Ok(n > 0)
             }
 
             async fn tenant_get(

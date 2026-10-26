@@ -619,6 +619,13 @@ impl RunHistory for FallbackHistory {
     ) -> Result<(), HistoryError> {
         strict!(self, p => p.tenant_upsert(tenant), f => f.tenant_upsert(tenant))
     }
+    async fn tenant_replace(
+        &self,
+        expected: &super::tenants::TenantRecord,
+        new: &super::tenants::TenantRecord,
+    ) -> Result<bool, HistoryError> {
+        strict!(self, p => p.tenant_replace(expected, new), f => f.tenant_replace(expected, new))
+    }
     async fn tenant_get(
         &self,
         id: &str,

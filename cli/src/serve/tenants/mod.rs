@@ -988,15 +988,20 @@ async fn reopen_admission(
     let history = state.history();
     let mut closed = before.clone();
     closed.suspended = true;
-    match history.tenant_get(tenant).await.map_err(store_err)? {
-        Some(current) if current == closed => {
-            history.tenant_upsert(before).await.map_err(store_err)?;
-        }
-        Some(_) => tracing::warn!(
+    if !history
+        .tenant_replace(&closed, before)
+        .await
+        .map_err(store_err)?
+        && history
+            .tenant_get(tenant)
+            .await
+            .map_err(store_err)?
+            .is_some()
+    {
+        tracing::warn!(
             tenant,
             "tenant changed while its delete was refused; leaving it suspended for review"
-        ),
-        None => {}
+        );
     }
     Ok(())
 }
@@ -1430,6 +1435,134 @@ mod tests {
         state.history().tenant_delete("acme").await.unwrap();
         reopen_admission(&state, "acme", &t).await.unwrap();
         assert!(state.history().tenant_get("acme").await.unwrap().is_none());
+    }
+
+    /// Commits an edit to the tenant right after every read of it, the way
+    /// an admin's change on another instance lands between a read and the
+    /// write that follows it.
+    struct EditAfterRead(crate::serve::history::memory::MemoryHistory, AtomicBool);
+
+    #[async_trait::async_trait]
+    impl crate::serve::history::RunHistory for EditAfterRead {
+        async fn claim_idempotency(
+            &self,
+            k: &str,
+            f: &str,
+            r: &str,
+            w: std::time::Duration,
+        ) -> Result<crate::serve::history::Claim, crate::serve::history::HistoryError> {
+            self.0.claim_idempotency(k, f, r, w).await
+        }
+        async fn upsert(&self, rec: &RunRecord) -> Result<(), crate::serve::history::HistoryError> {
+            self.0.upsert(rec).await
+        }
+        async fn get(
+            &self,
+            id: &str,
+        ) -> Result<Option<RunRecord>, crate::serve::history::HistoryError> {
+            self.0.get(id).await
+        }
+        async fn list(
+            &self,
+            f: &crate::serve::history::ListFilter,
+        ) -> Result<crate::serve::history::ListPage, crate::serve::history::HistoryError> {
+            self.0.list(f).await
+        }
+        async fn delete(
+            &self,
+            id: &str,
+        ) -> Result<crate::serve::history::DeleteOutcome, crate::serve::history::HistoryError>
+        {
+            self.0.delete(id).await
+        }
+        async fn purge_expired(
+            &self,
+            d: std::time::Duration,
+        ) -> Result<usize, crate::serve::history::HistoryError> {
+            self.0.purge_expired(d).await
+        }
+        async fn recover_orphans(&self) -> Result<usize, crate::serve::history::HistoryError> {
+            Ok(0)
+        }
+        fn degraded(&self) -> bool {
+            false
+        }
+        async fn tenant_upsert(
+            &self,
+            t: &TenantRecord,
+        ) -> Result<(), crate::serve::history::HistoryError> {
+            self.0.tenant_upsert(t).await
+        }
+        async fn tenant_get(
+            &self,
+            id: &str,
+        ) -> Result<Option<TenantRecord>, crate::serve::history::HistoryError> {
+            let read = self.0.tenant_get(id).await?;
+            if let Some(mut edited) = read.clone() {
+                edited.limits.max_concurrent_runs = Some(7);
+                self.0.tenant_upsert(&edited).await?;
+                self.1.store(true, Ordering::SeqCst);
+            }
+            Ok(read)
+        }
+        async fn tenant_replace(
+            &self,
+            expected: &TenantRecord,
+            new: &TenantRecord,
+        ) -> Result<bool, crate::serve::history::HistoryError> {
+            self.0.tenant_replace(expected, new).await
+        }
+    }
+
+    /// Lifting a refused delete's suspension compares and writes in one
+    /// step: an edit committed after any read the delete made survives.
+    #[tokio::test]
+    async fn reopening_admission_never_writes_over_an_edit_made_after_a_read() {
+        use crate::serve::history::RunHistory as _;
+        let config = crate::serve::test_support::test_config();
+        let store = Arc::new(EditAfterRead(
+            crate::serve::history::memory::MemoryHistory::new(std::time::Duration::from_secs(60)),
+            AtomicBool::new(false),
+        ));
+        let state = ServerState::new(
+            &config,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            store.clone(),
+            crate::serve::logs::LogHub::new(),
+            None,
+            #[cfg(feature = "triggers")]
+            crate::serve::triggers::health::TriggersHandle::empty(),
+        );
+        let t = tenant("acme");
+        let mut closed = t.clone();
+        closed.suspended = true;
+        store.0.tenant_upsert(&closed).await.unwrap();
+        reopen_admission(&state, "acme", &t).await.unwrap();
+        let now = store.0.tenant_get("acme").await.unwrap().unwrap();
+        let edited = store.1.load(Ordering::SeqCst);
+        assert!(
+            !edited || now.limits.max_concurrent_runs == Some(7),
+            "the delete's snapshot was written over an edit made after its read: {now:?}"
+        );
+        if !edited {
+            assert_eq!(now, t, "the delete's own suspension is lifted");
+        }
+    }
+
+    #[tokio::test]
+    async fn tenant_replace_writes_only_over_the_expected_record() {
+        use crate::serve::history::RunHistory as _;
+        let h =
+            crate::serve::history::memory::MemoryHistory::new(std::time::Duration::from_secs(60));
+        let t = tenant("acme");
+        let mut other = t.clone();
+        other.suspended = true;
+        assert!(!h.tenant_replace(&t, &other).await.unwrap(), "missing");
+        h.tenant_upsert(&t).await.unwrap();
+        assert!(h.tenant_replace(&t, &other).await.unwrap());
+        assert!(!h.tenant_replace(&t, &t).await.unwrap(), "changed");
+        assert_eq!(h.tenant_get("acme").await.unwrap().unwrap(), other);
     }
 
     #[tokio::test]
