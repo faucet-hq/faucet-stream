@@ -339,7 +339,7 @@ impl SeenKeys {
     /// so the caller decides whether to fail the run or log — but never to
     /// delete.
     pub fn overflow_error(&self, max_keys: usize) -> FaucetError {
-        FaucetError::Config(format!(
+        FaucetError::Sink(format!(
             "cleanup: this invocation wrote more than {max_keys} rows in the claimed scope, \
              so the set of written keys could not be tracked. Nothing was deleted — a \
              partial delete would remove rows the run actually wrote. Narrow the scope \

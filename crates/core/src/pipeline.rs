@@ -7749,7 +7749,8 @@ mod tests {
 /// cleanup can track. The run's position has been saved, so the next run
 /// resumes instead of reading the whole dataset again.
 fn complete_read_overflow_error(max_keys: usize) -> FaucetError {
-    FaucetError::Config(format!(
+    // A runtime outcome of the data's size, not a configuration mistake.
+    FaucetError::Sink(format!(
         "cleanup: the complete read wrote more than {max_keys} distinct keys, so it could not \
          tell which destination rows are absent from the source. Nothing was deleted, and the \
          run's position was saved so the next run resumes instead of reading the whole dataset \
@@ -8021,6 +8022,10 @@ mod cleanup_tests {
             .run()
             .await
             .expect_err("an overflow fails the run");
+        assert!(
+            matches!(err, FaucetError::Sink(_)),
+            "a runtime outcome, not a configuration error: {err:?}"
+        );
         let msg = err.to_string();
         assert!(msg.contains("more than 1 distinct keys"), "{msg}");
         assert!(msg.contains("position was saved"), "{msg}");
@@ -8151,6 +8156,7 @@ mod cleanup_tests {
             .finish(&p)
             .await
             .expect_err("an overflowed tracker must refuse");
+        assert!(matches!(err, FaucetError::Sink(_)), "{err:?}");
         assert!(err.to_string().contains("Nothing was deleted"), "{err}");
         assert!(
             sink.calls().is_empty(),
