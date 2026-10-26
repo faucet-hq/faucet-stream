@@ -1069,7 +1069,11 @@ async fn verify_honours_columns_destination_key_and_limits() {
         .await
         .unwrap();
     assert_eq!(capped.report.differences.len(), 1);
-    assert!(capped.report.truncated, "{capped:?}");
+    // The reporting cap is not an incomplete scan: the count of every
+    // differing key is kept in `differences_found` (#934 R2-010).
+    assert!(!capped.report.truncated, "{capped:?}");
+    assert_eq!(capped.report.differences_found, Some(4), "{capped:?}");
+    assert_eq!(capped.report.differing_keys(), 4);
 
     let budget = faucet_cli::verify::verify(
         &cfg,
