@@ -65,12 +65,12 @@ impl SqlDialect for ClickHouse {
         }
     }
 
-    /// Scale 19 keeps every 64-bit integer (19 integer digits) and 19
-    /// fractional digits; a later value with more fractional digits is
-    /// rounded by the database (precision is capped at 38).
+    /// `Decimal(76, 38)` (a 256-bit decimal): 38 integer and 38 fractional
+    /// digits, so every 64-bit integer, every float up to 10^38 and every
+    /// fraction a double carries stay exact.
     fn widened_type_name(&self, from: Option<SqlBaseType>, to: SqlBaseType) -> &'static str {
         match (from, to) {
-            (Some(SqlBaseType::Integer), SqlBaseType::Double) => "Nullable(Decimal(38, 19))",
+            (Some(SqlBaseType::Integer), SqlBaseType::Double) => "Nullable(Decimal(76, 38))",
             _ => self.type_name(to),
         }
     }

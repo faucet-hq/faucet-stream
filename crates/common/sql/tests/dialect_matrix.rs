@@ -1199,23 +1199,32 @@ fn page_scope_reads_columns_once_per_target() {
     every_dialect!(page_scope_reads_columns_once);
 }
 
-/// An integer column widened for fractions keeps every 64-bit integer and at
-/// least 19 fractional digits (the bounded-precision backends cap at 38).
-fn integer_to_fraction_widening_keeps_19_fractional_digits<D: SqlDialect>(d: D) {
+/// An integer column widened for fractions never narrows the integer range
+/// an earlier release gave it (28 integer digits: every 64-bit integer and
+/// floats up to 10^28). A backend whose decimals go past 38 digits also keeps
+/// at least 19 fractional digits; one capped at 38 cannot have both.
+fn integer_to_fraction_widening_keeps_its_integer_range<D: SqlDialect>(d: D) {
     let t = d.widened_type_name(Some(SqlBaseType::Integer), SqlBaseType::Double);
-    let scale = t.rsplit_once(',').and_then(|(_, s)| {
-        s.trim_matches(|c: char| !c.is_ascii_digit())
-            .parse::<u32>()
-            .ok()
-    });
-    if let Some(scale) = scale {
-        assert!(scale >= 19, "{}: {t}", d.name());
+    let Some((p, s)) = t.split_once('(').and_then(|(_, rest)| {
+        let (p, s) = rest.split_once(',')?;
+        let digits = |x: &str| {
+            x.trim_matches(|c: char| !c.is_ascii_digit())
+                .parse::<u32>()
+                .ok()
+        };
+        Some((digits(p)?, digits(s)?))
+    }) else {
+        return;
+    };
+    assert!(p - s >= 28, "{}: {t} narrows the integer range", d.name());
+    if p > 38 {
+        assert!(s >= 19, "{}: {t}", d.name());
     }
 }
 
 #[test]
 fn matrix_integer_to_fraction_widening() {
-    every_dialect!(integer_to_fraction_widening_keeps_19_fractional_digits);
+    every_dialect!(integer_to_fraction_widening_keeps_its_integer_range);
 }
 
 /// The written-key table's alias in a cleanup delete must not shadow a target

@@ -1188,7 +1188,7 @@ fn build_add_column_sql(
 }
 
 /// The type an evolving column widens to. An integer column that starts
-/// receiving fractions becomes `DECIMAL(38,19)` — exact for every `BIGINT` —
+/// receiving fractions becomes `DECIMAL(38,10)` — exact for every `BIGINT` —
 /// rather than `FLOAT`, which would round stored values above 2^53 in place
 /// (#862 M-045).
 fn widened_keyword(
@@ -2499,7 +2499,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             sql,
-            "ALTER TABLE [t] ALTER COLUMN [v] DECIMAL(38,19) NOT NULL"
+            "ALTER TABLE [t] ALTER COLUMN [v] DECIMAL(38,10) NOT NULL"
         );
         let sql = build_alter_type_sql("[t]", "v", "BIGINT", Some(true)).unwrap();
         assert_eq!(sql, "ALTER TABLE [t] ALTER COLUMN [v] BIGINT NULL");
