@@ -660,6 +660,23 @@ async fn rollback_finds_keys_stored_untyped_or_as_booleans() {
             json!(true),
             "1",
         ),
+        // Review of #949: a TEXT column stores `true` as '1' and `7.5` as
+        // '7.5'; an INTEGER column stores the text "007" as 7.
+        (
+            "CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT, _faucet_run_id TEXT)",
+            json!(true),
+            "'1'",
+        ),
+        (
+            "CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT, _faucet_run_id TEXT)",
+            json!(7.5),
+            "'7.5'",
+        ),
+        (
+            "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, _faucet_run_id TEXT)",
+            json!("007"),
+            "7",
+        ),
     ] {
         let (_dir, url) = fresh_db(create).await;
         let sink = SqliteSink::new(upsert_config(&url, "r1")).await.unwrap();
@@ -738,4 +755,39 @@ async fn undoing_a_text_key_leaves_rows_spelling_the_same_number() {
         .unwrap();
     pool.close().await;
     assert_eq!(left, ["1", "7"]);
+}
+
+/// Review of #949: a boolean key in a TEXT column is stored as `'1'`; the
+/// journal holds `"true"`, which the text `'true'` also spells. Undoing the
+/// run deletes the `'1'` it created and leaves the `'true'` another run
+/// wrote, without counting it as a conflict.
+#[tokio::test]
+async fn undoing_a_boolean_text_key_leaves_the_row_spelling_its_text() {
+    let (_dir, url) =
+        fresh_db("CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT, _faucet_run_id TEXT)").await;
+    exec(&url, "INSERT INTO users VALUES ('true', 'text', 'r0')").await;
+    let sink = SqliteSink::new(upsert_config(&url, "r1")).await.unwrap();
+    sink.write_batch(&[json!({"id": true, "name": "flag", RUN_COL: "r1"})])
+        .await
+        .unwrap();
+    let out = sink
+        .rollback_run("r1", &opts(RollbackMode::Upsert))
+        .await
+        .unwrap();
+    assert_eq!(
+        (out.deleted, out.conflicts, out.applied),
+        (1, 0, true),
+        "{out:?}"
+    );
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .unwrap();
+    let left: Vec<String> = sqlx::query_scalar("SELECT id FROM users ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    assert_eq!(left, ["true"]);
 }
