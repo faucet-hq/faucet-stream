@@ -979,3 +979,78 @@ async fn write_batch_partial_upsert_isolates_misshapen_rows() {
         "{merged}"
     );
 }
+
+/// Review of #949 (H4): the per-row check reads each row as it is written. An
+/// upsert is checked without its `delete_marker` field (`__op` from
+/// `cdc_unwrap`, not a table column) and a delete by its key alone, so a CDC
+/// mirror with a DLQ merges instead of quarantining every row.
+#[tokio::test]
+async fn write_batch_partial_upsert_checks_rows_as_written_with_a_delete_marker() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    mount_query_done(&server, "job-marker").await;
+    mount_job_done(&server, "job-marker").await;
+
+    let cfg = config_with(|c| {
+        c.write.write_mode = faucet_core::WriteMode::Upsert;
+        c.write.key = vec!["id".into()];
+        c.write.delete_marker = Some(faucet_core::DeleteMarker {
+            field: "__op".into(),
+            values: vec!["d".into()],
+        });
+    });
+    let (sink, _sa) = build_sink(&server, cfg).await;
+    let outcomes = sink
+        .write_batch_partial(&[
+            json!({"id": 1, "name": "a", "__op": "u"}),
+            json!({"id": 2, "name": {"old": true}, "gone": 1, "__op": "d"}),
+            json!({"id": 3, "name": "c", "extra": 1, "__op": "u"}),
+        ])
+        .await
+        .expect("partial write");
+    assert!(outcomes[0].is_ok(), "{:?}", outcomes[0]);
+    assert!(
+        outcomes[1].is_ok(),
+        "a delete reads only its key: {:?}",
+        outcomes[1]
+    );
+    let msg = outcomes[2].as_ref().unwrap_err().to_string();
+    assert!(msg.contains("`extra`") && !msg.contains("__op"), "{msg}");
+    let tx = captured_query_bodies(&server)
+        .await
+        .into_iter()
+        .map(|b| b.to_string())
+        .find(|b| b.contains("BEGIN TRANSACTION"))
+        .expect("tx");
+    assert!(tx.contains("MERGE INTO"), "{tx}");
+    assert!(tx.contains("DELETE FROM"), "{tx}");
+    assert!(!tx.contains("__op"), "{tx}");
+}
+
+/// `write_mode: delete` reads only the key, so other fields of a row (columns
+/// or not, whatever their shape) never fail it.
+#[tokio::test]
+async fn write_batch_partial_delete_ignores_non_key_fields() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    mount_query_done(&server, "job-del").await;
+    mount_job_done(&server, "job-del").await;
+
+    let cfg = config_with(|c| {
+        c.write.write_mode = faucet_core::WriteMode::Delete;
+        c.write.key = vec!["id".into()];
+    });
+    let (sink, _sa) = build_sink(&server, cfg).await;
+    let outcomes = sink
+        .write_batch_partial(&[
+            json!({"id": 1, "name": {"nested": true}, "extra": 1}),
+            json!({"id": {"not": "an int"}}),
+        ])
+        .await
+        .expect("partial write");
+    assert!(outcomes[0].is_ok(), "{:?}", outcomes[0]);
+    let msg = outcomes[1].as_ref().unwrap_err().to_string();
+    assert!(msg.contains("do not fit the column type"), "{msg}");
+}

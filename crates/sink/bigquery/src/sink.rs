@@ -639,6 +639,19 @@ fn csv_header(raw: &[u8], delimiter: u8) -> Option<Vec<String>> {
     Some(cells)
 }
 
+/// `record` reduced to its `key` fields: what a keyed delete reads of it.
+fn key_fields(record: &Value, key: &[String]) -> Value {
+    let mut out = serde_json::Map::new();
+    if let Some(obj) = record.as_object() {
+        for k in key {
+            if let Some(v) = obj.get(k) {
+                out.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    Value::Object(out)
+}
+
 /// A `multipart/related` boundary that is guaranteed absent from the payload:
 /// derived from a hash of the NDJSON so it is deterministic (testable) yet
 /// effectively never a substring of the data.
@@ -2923,12 +2936,25 @@ impl BigQueryDriver {
                 records.iter().map(|_| Ok(())).collect();
             // A row whose value does not fit its column, or that carries a
             // field the table lacks, fails on its own (DLQ-routable) rather
-            // than failing the whole page.
+            // than failing the whole page. Each row is checked as it is
+            // written: an upsert without its `delete_marker` field, a delete
+            // by its key alone. A row without a usable key is left to the
+            // planner, which reports it.
             let columns = self.target_schema(calls).await?;
             let mut kept_at = Vec::with_capacity(records.len());
             let mut kept = Vec::with_capacity(records.len());
             for (i, r) in records.iter().enumerate() {
-                let one = std::slice::from_ref(r);
+                let single = faucet_core::plan_writes(std::slice::from_ref(r), &self.config.write);
+                let written = if let Some(upsert) = single.upserts.into_iter().next() {
+                    upsert
+                } else if !single.deletes.is_empty() {
+                    key_fields(r, &self.config.write.key)
+                } else {
+                    kept_at.push(i);
+                    kept.push(r.clone());
+                    continue;
+                };
+                let one = std::slice::from_ref(&written);
                 let bad = idempotent::shape_mismatches(&columns, one, 10);
                 let unknown = idempotent::unknown_fields(&columns, one);
                 if !bad.is_empty() {
