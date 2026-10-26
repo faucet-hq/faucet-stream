@@ -35,6 +35,9 @@ impl Record {
     }
 }
 
+/// Picks an HTTP status for a request body, or `None` to accept it.
+pub type StatusFor = fn(&[u8]) -> Option<u16>;
+
 #[derive(Clone, Default)]
 pub struct Collector {
     pub requests: Arc<Mutex<Vec<ExportLogsServiceRequest>>>,
@@ -42,7 +45,7 @@ pub struct Collector {
     /// Acknowledge, but report one rejected record (OTLP partial success).
     pub reject: Arc<AtomicBool>,
     /// An HTTP status to answer a request body with instead (HTTP only).
-    pub status_for: Arc<Mutex<Option<fn(&[u8]) -> Option<u16>>>>,
+    pub status_for: Arc<Mutex<Option<StatusFor>>>,
 }
 
 fn value(v: &Option<opentelemetry_proto::tonic::common::v1::AnyValue>) -> String {
