@@ -114,14 +114,7 @@ async fn seed_bucket(endpoint: &str, objects: &[(String, String)]) {
 /// env vars because the source's `build_client` honours the standard AWS
 /// credential chain and has no field for inline credentials.
 async fn build_source(endpoint: &str, config: S3SourceConfig) -> S3Source {
-    // SAFETY: the credentials are identical for every MinIO run, so the value
-    // is the same across overlapping tests; re-applying the same constants on
-    // entry keeps the thread-unsafe set benign.
-    unsafe {
-        std::env::set_var("AWS_ACCESS_KEY_ID", ACCESS_KEY);
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", SECRET_KEY);
-        std::env::set_var("AWS_DEFAULT_REGION", REGION);
-    }
+    set_test_env();
     let config = config
         .endpoint_url(endpoint.to_string())
         .region(REGION.to_string());
@@ -205,13 +198,7 @@ async fn conformance_discover_roundtrips() {
 /// never loads another test's credentials.
 #[tokio::test(flavor = "multi_thread")]
 async fn conformance_errors_not_panics() {
-    // SAFETY: identical constant credentials across all runs in this test
-    // binary; re-applying the same values keeps the thread-unsafe set benign.
-    unsafe {
-        std::env::set_var("AWS_ACCESS_KEY_ID", ACCESS_KEY);
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", SECRET_KEY);
-        std::env::set_var("AWS_DEFAULT_REGION", REGION);
-    }
+    set_test_env();
     let config = S3SourceConfig::new("does-not-exist")
         .endpoint_url("http://127.0.0.1:1".to_string())
         .region(REGION.to_string());
@@ -273,12 +260,7 @@ async fn conformance_call_deadline() {
         .await
         .expect("listener");
     let endpoint = hung.http_url();
-    // SAFETY: the same constants every other test here sets.
-    unsafe {
-        std::env::set_var("AWS_ACCESS_KEY_ID", ACCESS_KEY);
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", SECRET_KEY);
-        std::env::set_var("AWS_DEFAULT_REGION", REGION);
-    }
+    set_test_env();
     faucet_conformance::calls::assert_source_call_deadline(|| {
         let config = S3SourceConfig::new("hung")
             .endpoint_url(endpoint.clone())
@@ -313,12 +295,7 @@ async fn conformance_call_deadline_bounds_a_stalled_body() {
     .await
     .expect("server");
     let endpoint = server.http_url();
-    // SAFETY: the same constants every other test here sets.
-    unsafe {
-        std::env::set_var("AWS_ACCESS_KEY_ID", ACCESS_KEY);
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", SECRET_KEY);
-        std::env::set_var("AWS_DEFAULT_REGION", REGION);
-    }
+    set_test_env();
     faucet_conformance::calls::assert_source_call_deadline(|| {
         let config = S3SourceConfig::new("stalled")
             .endpoint_url(endpoint.clone())
@@ -326,4 +303,19 @@ async fn conformance_call_deadline_bounds_a_stalled_body() {
         block_on(S3Source::new(config)).expect("source builds offline")
     })
     .await;
+}
+
+/// Set the AWS variables every test in this binary shares, once per process:
+/// `setenv` racing another thread's `getenv` is undefined behaviour even when
+/// both sides write the same value.
+fn set_test_env() {
+    static ENV: std::sync::Once = std::sync::Once::new();
+    // SAFETY: the writes run once, before any client in this binary reads the
+    // variables (every caller blocks on the `Once` until they are done), and
+    // std's own environment reads take the same lock as these writes.
+    ENV.call_once(|| unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", ACCESS_KEY);
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", SECRET_KEY);
+        std::env::set_var("AWS_DEFAULT_REGION", REGION);
+    });
 }

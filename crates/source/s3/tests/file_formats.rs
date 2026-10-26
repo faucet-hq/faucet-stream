@@ -79,13 +79,7 @@ async fn seed(endpoint: &str, objects: &[(String, Vec<u8>)]) {
 }
 
 async fn build_source(endpoint: &str, config: S3SourceConfig) -> S3Source {
-    // SAFETY: every test boots its own container with the same default MinIO
-    // credentials, so overlapping writes set an identical value.
-    unsafe {
-        std::env::set_var("AWS_ACCESS_KEY_ID", ACCESS_KEY);
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", SECRET_KEY);
-        std::env::set_var("AWS_DEFAULT_REGION", REGION);
-    }
+    set_test_env();
     S3Source::new(
         config
             .endpoint_url(endpoint.to_string())
@@ -321,4 +315,19 @@ mod containers {
         assert_eq!(rows[2], json!({"id": 3, "name": "grace"}));
         assert_eq!(columnar_rows(&src).await, 3);
     }
+}
+
+/// Set the AWS variables every test in this binary shares, once per process:
+/// `setenv` racing another thread's `getenv` is undefined behaviour even when
+/// both sides write the same value.
+fn set_test_env() {
+    static ENV: std::sync::Once = std::sync::Once::new();
+    // SAFETY: the writes run once, before any client in this binary reads the
+    // variables (every caller blocks on the `Once` until they are done), and
+    // std's own environment reads take the same lock as these writes.
+    ENV.call_once(|| unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", ACCESS_KEY);
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", SECRET_KEY);
+        std::env::set_var("AWS_DEFAULT_REGION", REGION);
+    });
 }

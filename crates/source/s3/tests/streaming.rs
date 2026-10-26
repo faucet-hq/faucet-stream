@@ -99,16 +99,7 @@ async fn seed_bucket(endpoint: &str, objects: &[(String, String)]) {
 /// env vars because the source's `build_client` honours the standard AWS
 /// credential chain and has no field for inline credentials.
 async fn build_source(endpoint: &str, config: S3SourceConfig) -> S3Source {
-    // SAFETY: tests are serialised on these env vars because each test
-    // creates its own container/bucket and the credentials are identical
-    // for every MinIO run, so the value is the same across overlapping
-    // tests. The thread-unsafe set is fine here because each test
-    // re-applies the same constants on entry.
-    unsafe {
-        std::env::set_var("AWS_ACCESS_KEY_ID", ACCESS_KEY);
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", SECRET_KEY);
-        std::env::set_var("AWS_DEFAULT_REGION", REGION);
-    }
+    set_test_env();
     let config = config
         .endpoint_url(endpoint.to_string())
         .region(REGION.to_string());
@@ -1083,4 +1074,19 @@ async fn a_newline_free_jsonl_object_fails_at_max_object_bytes() {
         }
     };
     assert!(err.to_string().contains("max_object_bytes"), "{err}");
+}
+
+/// Set the AWS variables every test in this binary shares, once per process:
+/// `setenv` racing another thread's `getenv` is undefined behaviour even when
+/// both sides write the same value.
+fn set_test_env() {
+    static ENV: std::sync::Once = std::sync::Once::new();
+    // SAFETY: the writes run once, before any client in this binary reads the
+    // variables (every caller blocks on the `Once` until they are done), and
+    // std's own environment reads take the same lock as these writes.
+    ENV.call_once(|| unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", ACCESS_KEY);
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", SECRET_KEY);
+        std::env::set_var("AWS_DEFAULT_REGION", REGION);
+    });
 }

@@ -28,11 +28,16 @@ async fn start_emulator() -> Option<(ContainerAsync<CloudSdk>, String)> {
     Some((container, format!("127.0.0.1:{port}")))
 }
 
-/// A setup/admin client scoped to `PROJECT`, pointed at the emulator.
-async fn setup_client() -> Client {
+/// A setup/admin client pointed at this test's emulator, scoped to
+/// `PROJECT`. The emulator host is passed on the client's own config, never
+/// through `PUBSUB_EMULATOR_HOST`, so no test writes the process environment.
+async fn setup_client(host: &str) -> Client {
+    // `ClientConfig` is `#[non_exhaustive]`, so struct-update syntax is
+    // unavailable — reassign the fields we need after `default()`.
     #[allow(clippy::field_reassign_with_default)]
     let config = {
-        let mut config = ClientConfig::default(); // reads PUBSUB_EMULATOR_HOST
+        let mut config = ClientConfig::default();
+        config.environment = gcloud_gax::conn::Environment::Emulator(host.to_string());
         config.project_id = Some(PROJECT.to_string());
         config
     };
@@ -62,14 +67,8 @@ async fn conformance_bounded_memory() {
         eprintln!("skipping pubsub conformance_bounded_memory: Docker unavailable");
         return;
     };
-    // SAFETY: this test is the only writer of the var; the setup client below is
-    // built after this line, and the connector reads `emulator_host` from its
-    // explicit config rather than the env var.
-    unsafe {
-        std::env::set_var("PUBSUB_EMULATOR_HOST", &host);
-    }
 
-    let client = setup_client().await;
+    let client = setup_client(&host).await;
     let topic = client
         .create_topic("conf-src-t", None, None)
         .await
