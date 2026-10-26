@@ -126,9 +126,11 @@ impl EventLog {
     /// must never be persisted covering data the sink has not confirmed. A test
     /// asserts the returned counts against the data each bookmark claims.
     ///
-    /// A plain write counts once a later flush succeeds (a buffering sink only
-    /// makes rows durable at flush; after a failed flush they are not); an
-    /// idempotent write commits its page atomically and counts at once.
+    /// A plain write counts once the next flush succeeds (a buffering sink only
+    /// makes rows durable at flush). Rows pending when a flush fails never
+    /// count, even after a later successful flush: the failed flush may have
+    /// discarded them. An idempotent write commits its page atomically and
+    /// counts at once.
     pub fn writes_before_each_bookmark(&self) -> Vec<usize> {
         let mut durable = Durable::default();
         let mut out = Vec::new();
@@ -159,7 +161,8 @@ impl EventLog {
 }
 
 /// Records a sink has made durable, as an event log shows them: plain writes
-/// wait for the next successful flush, idempotent writes commit at once.
+/// wait for the next successful flush (a failed flush drops them), idempotent
+/// writes commit at once.
 #[derive(Debug, Default)]
 struct Durable {
     pending: usize,
@@ -172,6 +175,9 @@ impl Durable {
             Event::Write(n) => self.pending += n,
             Event::IdempotentWrite { records, .. } => self.confirmed += records,
             Event::Flush => self.confirmed += std::mem::take(&mut self.pending),
+            // A failed flush may have discarded what it held: a later flush
+            // succeeding does not make those rows durable.
+            Event::FlushFailed => self.pending = 0,
             _ => {}
         }
     }
@@ -1162,6 +1168,21 @@ mod tests {
             key: "k".into(),
             value: json!({"at": 4}),
         });
+        assert_bookmarks_backed_by_writes(&log, claims);
+    }
+
+    #[test]
+    #[should_panic(expected = "durability violated")]
+    fn rows_a_failed_flush_held_are_not_credited_by_a_later_flush() {
+        let log = EventLog::new();
+        log.push(Event::Write(4));
+        log.push(Event::FlushFailed);
+        log.push(Event::Flush);
+        log.push(Event::StatePut {
+            key: "k".into(),
+            value: json!({"at": 4}),
+        });
+        assert_eq!(log.writes_before_each_bookmark(), vec![0]);
         assert_bookmarks_backed_by_writes(&log, claims);
     }
 

@@ -144,6 +144,15 @@ cleanup safety, the DLQ boundary, panic isolation, state migration and
 quarantine on every write path (RFC 0013). See the
 [reliability testing guide](../../docs/book/src/operations/reliability-testing.md).
 
+### What the durability helpers count
+
+`EventLog::writes_before_each_bookmark` and `assert_bookmarks_backed_by_writes`
+count a plain `Write` as durable only once the next `Flush` succeeds: a
+buffering sink makes rows durable at flush, and rows pending when a flush
+fails (`FlushFailed`) never count, even after a later successful flush. An
+`IdempotentWrite` commits its page atomically and counts at once. (Before this
+release a plain write counted as soon as it was logged.)
+
 ## Forwarding harnesses (for wrappers)
 
 A wrapper (a source or sink that holds another one) must forward every
@@ -166,7 +175,9 @@ async fn my_wrapper_forwards_every_hook() {
 `HookSource` / `HookSink` answer every hook differently from the trait default
 and record which hooks were reached; `assert_source_forwards_every_hook` /
 `assert_sink_forwards_every_hook` call every hook through the wrapper and name
-the ones that never reached the inner connector. A name in the skip list that
+the ones that never reached the inner connector, or whose answer the wrapper
+changed on the way back (a hook that is reached but answered differently is
+not forwarded either). A name in the skip list that
 is not a hook fails the assertion, so the list cannot go stale. `SOURCE_HOOKS`
 and `SINK_HOOKS` are the canonical hook lists; a test in this crate checks them
 against the trait definitions, so a hook added to either trait without being
