@@ -74,6 +74,7 @@ pub const SOURCE_HOOKS: &[&str] = &[
     "stream_native",
     "config_schema",
     "state_key",
+    "legacy_state_keys",
     "apply_start_bookmark",
     "capture_resume_position",
     "lag",
@@ -703,6 +704,10 @@ impl Source for HookSource {
         self.hit("state_key");
         Some("hook".into())
     }
+    fn legacy_state_keys(&self) -> Vec<String> {
+        self.hit("legacy_state_keys");
+        vec!["hook-old".into()]
+    }
     async fn apply_start_bookmark(&self, _bookmark: Value) -> Result<(), FaucetError> {
         self.hit("apply_start_bookmark");
         Ok(())
@@ -857,6 +862,11 @@ pub async fn assert_source_forwards_every_hook(
     drain(source.stream_native(&ctx, NativeFormat::NdJson, 10)).await;
     let _ = source.config_schema();
     let _ = source.state_key();
+    answer(
+        &mut wrong,
+        "legacy_state_keys",
+        source.legacy_state_keys() == ["hook-old"],
+    );
     let _ = source.apply_start_bookmark(json!(1)).await;
     answer(
         &mut wrong,
@@ -922,6 +932,13 @@ pub async fn assert_source_forwards_every_hook(
     let _ = source.dataset_uri();
     let _ = source.check(&CheckContext::default()).await;
 
+    // `forward_source!` stops forwarding the earlier keys of a wrapper that
+    // renames the key, so skipping `state_key` skips them too.
+    let mut skip = skip.to_vec();
+    if skip.contains(&"state_key") && !skip.contains(&"legacy_state_keys") {
+        skip.push("legacy_state_keys");
+    }
+    let skip = skip.as_slice();
     check_reached("Source", SOURCE_HOOKS, &probe.reached(), skip);
     check_answers("Source", &wrong, skip);
 }

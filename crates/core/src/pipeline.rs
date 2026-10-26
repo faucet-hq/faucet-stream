@@ -779,6 +779,14 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
             // Bookmark resume — goes through the wrapped state store so the
             // get is instrumented too.
             let state_key = self.source.state_key();
+            // A key the source used to derive differently: move its bookmark
+            // to the current key (raw, before the versioned envelope layer).
+            if let (Some(store), Some(key)) = (wrapped_state_store.as_ref(), state_key.as_ref()) {
+                let legacy = self.source.legacy_state_keys();
+                if !legacy.is_empty() {
+                    crate::state_key::migrate_state_key(store.as_ref(), key, &legacy).await?;
+                }
+            }
             let codec = crate::state_version::StateCodec::for_source(
                 &wrapped_source,
                 self.legacy_state_writes,
@@ -3630,6 +3638,61 @@ mod tests {
             ),
             other => panic!("expected Config error, got {other:?}"),
         }
+    }
+
+    /// A source whose natural key changed: it names the key it used before.
+    struct RenamedKeySource {
+        applied: std::sync::Mutex<Vec<Value>>,
+    }
+    #[async_trait]
+    impl Source for RenamedKeySource {
+        async fn fetch_with_context(
+            &self,
+            _context: &std::collections::HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            Ok(vec![json!({"id": 1})])
+        }
+        fn state_key(&self) -> Option<String> {
+            Some("src:new".to_string())
+        }
+        fn legacy_state_keys(&self) -> Vec<String> {
+            vec!["src:old".to_string()]
+        }
+        async fn apply_start_bookmark(&self, bookmark: Value) -> Result<(), FaucetError> {
+            self.applied.lock().unwrap().push(bookmark);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn pipeline_run_moves_a_bookmark_from_a_legacy_key() {
+        let store: Arc<dyn StateStore> = Arc::new(crate::state::MemoryStateStore::new());
+        store.put("src:old", &json!("old-pos")).await.unwrap();
+        let source = RenamedKeySource {
+            applied: std::sync::Mutex::new(Vec::new()),
+        };
+        Pipeline::new(&source, &MockSink::new())
+            .with_state_store(Arc::clone(&store))
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(*source.applied.lock().unwrap(), vec![json!("old-pos")]);
+        assert!(
+            store.get("src:old").await.unwrap().is_none(),
+            "old key removed"
+        );
+
+        // The current key wins once it holds a bookmark.
+        store.put("src:old", &json!("stale")).await.unwrap();
+        let again = RenamedKeySource {
+            applied: std::sync::Mutex::new(Vec::new()),
+        };
+        Pipeline::new(&again, &MockSink::new())
+            .with_state_store(Arc::clone(&store))
+            .run()
+            .await
+            .unwrap();
+        assert_ne!(*again.applied.lock().unwrap(), vec![json!("stale")]);
     }
 
     /// Deterministic-replay source that records every applied bookmark and

@@ -205,6 +205,16 @@ pub trait Source: Send + Sync {
         None
     }
 
+    /// Earlier renderings of this source's natural
+    /// [`state_key`](Self::state_key), newest first. When the current key holds
+    /// nothing, the pipeline moves a bookmark found under one of these to it
+    /// before reading ([`migrate_state_key`](crate::migrate_state_key)), so
+    /// changing how a source derives its key does not restart a resumable run.
+    /// Return nothing when the key was configured explicitly. Default: none.
+    fn legacy_state_keys(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Apply a bookmark loaded from a [`StateStore`](crate::state::StateStore)
     /// as this run's starting point.
     ///

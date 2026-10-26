@@ -244,6 +244,14 @@ macro_rules! forward_source {
                 self.$inner.state_key()
             }
         });
+        $crate::__faucet_forward_filter!(legacy_state_keys [$($skip)*] {
+            fn legacy_state_keys(&self) -> ::std::vec::Vec<::std::string::String>
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.legacy_state_keys()
+            }
+        });
         $crate::__faucet_forward_filter!(apply_start_bookmark [$($skip)*] {
             fn apply_start_bookmark<'life0, 'async_trait>(
                 &'life0 self,
@@ -1155,6 +1163,10 @@ macro_rules! __faucet_forward_filter {
     (stream_native [stream_native $($rest:ident)*] $item:tt) => {};
     (config_schema [config_schema $($rest:ident)*] $item:tt) => {};
     (state_key [state_key $($rest:ident)*] $item:tt) => {};
+    (legacy_state_keys [legacy_state_keys $($rest:ident)*] $item:tt) => {};
+    // A wrapper that renames the key must not hand its inner's earlier keys
+    // over to the new one.
+    (legacy_state_keys [state_key $($rest:ident)*] $item:tt) => {};
     (apply_start_bookmark [apply_start_bookmark $($rest:ident)*] $item:tt) => {};
     (capture_resume_position [capture_resume_position $($rest:ident)*] $item:tt) => {};
     (lag [lag $($rest:ident)*] $item:tt) => {};
@@ -1247,6 +1259,7 @@ macro_rules! __faucet_forward_known {
     (@source [stream_native $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
     (@source [config_schema $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
     (@source [state_key $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
+    (@source [legacy_state_keys $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
     (@source [apply_start_bookmark $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
     (@source [capture_resume_position $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
     (@source [lag $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
