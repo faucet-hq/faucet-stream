@@ -122,3 +122,57 @@ async fn conformance_call_deadline() {
     })
     .await;
 }
+
+// ── Check 22: the first page arrives before the result set is exhausted ──────
+// `system.processes` reports how many rows a running query has read; once the
+// query has finished it is gone, which counts as the whole result served.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_first_page_before_exhaustion() {
+    let Some((_c, base)) = start_clickhouse().await else {
+        return;
+    };
+    let total = 1_000_000;
+    let batch = 1_000;
+    let source = ClickHouseSource::new(
+        ClickHouseSourceConfig::new(
+            &base,
+            format!(
+                "SELECT number AS id, repeat('x', 100) AS pad FROM numbers({total}) \
+                 /* faucet-check-22 */"
+            ),
+        )
+        .with_batch_size(batch),
+    )
+    .expect("source");
+    let client = reqwest::Client::new();
+    let served = faucet_conformance::served_probe(|| {
+        let client = client.clone();
+        let base = base.clone();
+        async move {
+            let body = client
+                .post(&base)
+                .body(
+                    "SELECT toString(sum(read_rows)), toString(count()) FROM system.processes \
+                     WHERE query LIKE '%faucet-check-22%' AND query NOT LIKE '%system.processes%' \
+                     FORMAT TSV",
+                )
+                .send()
+                .await
+                .expect("probe send")
+                .text()
+                .await
+                .expect("probe body");
+            let mut cols = body.trim().split('\t');
+            let read: usize = cols.next().expect("read_rows").parse().expect("a count");
+            let running: usize = cols.next().expect("count").parse().expect("a count");
+            if running == 0 { total } else { read }
+        }
+    });
+    faucet_conformance::assert_first_page_before_exhaustion(&source, batch, total, &served).await;
+    // The counter is live: once the stream is drained it has seen every row.
+    assert!(
+        served() >= total,
+        "the served-row counter missed rows: {}",
+        served()
+    );
+}

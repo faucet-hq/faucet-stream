@@ -179,3 +179,42 @@ async fn conformance_call_deadline() {
     faucet_conformance::calls::assert_source_call_deadline(|| built.lock().unwrap().pop().unwrap())
         .await;
 }
+
+// ── Check 22: the first page arrives before the result set is exhausted ──────
+// A full scan of `events` counts every row the server reads in the reading
+// connection's `Handler_read_*` status, which `performance_schema` exposes to
+// another connection while the statement is still sending rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_first_page_before_exhaustion() {
+    let (_container, url) = start_mysql().await;
+    let total = 50_000;
+    let batch = 100;
+    seed_events(&url, total as i64).await;
+    let probe = sqlx::MySqlPool::connect(&url).await.expect("probe pool");
+    let source = MysqlSource::new(
+        MysqlSourceConfig::new(&url, "SELECT id, REPEAT('x', 200) AS pad FROM events")
+            .with_batch_size(batch),
+    )
+    .await
+    .expect("source new");
+    let served = faucet_conformance::served_probe(|| async {
+        sqlx::query_scalar::<_, String>(
+            "SELECT CAST(COALESCE(SUM(CAST(VARIABLE_VALUE AS UNSIGNED)), 0) AS CHAR) \
+             FROM performance_schema.status_by_thread \
+             WHERE VARIABLE_NAME LIKE 'Handler_read%' \
+               AND THREAD_ID <> PS_CURRENT_THREAD_ID()",
+        )
+        .fetch_one(&probe)
+        .await
+        .expect("read handler status")
+        .parse::<usize>()
+        .expect("a count")
+    });
+    faucet_conformance::assert_first_page_before_exhaustion(&source, batch, total, &served).await;
+    // The counter is live: once the stream is drained it has seen every row.
+    assert!(
+        served() >= total,
+        "the served-row counter missed rows: {}",
+        served()
+    );
+}

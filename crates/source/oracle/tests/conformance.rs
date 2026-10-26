@@ -98,3 +98,56 @@ async fn conformance_call_deadline() {
     faucet_conformance::calls::assert_source_call_deadline(|| built.lock().unwrap().pop().unwrap())
         .await;
 }
+
+/// Check 22: the first page arrives before the result set is exhausted. Every
+/// produced row calls `SERVED_ROW`, which draws from an uncached sequence;
+/// another session reads how far it has advanced when the first page arrives.
+/// Oracle produces rows per fetch call, so a few thousand rows are enough.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_first_page_before_exhaustion() {
+    let Some((_container, conn)) = common::start_oracle().await else {
+        return;
+    };
+    common::exec(
+        &conn,
+        &[
+            "CREATE SEQUENCE SERVED START WITH 1 NOCACHE",
+            "CREATE FUNCTION SERVED_ROW RETURN NUMBER IS BEGIN RETURN SERVED.NEXTVAL; END;",
+        ],
+    )
+    .await;
+    let total = 5_000;
+    let batch = 100;
+    let mut cfg = OracleSourceConfig::new(
+        conn.clone(),
+        format!(
+            "SELECT LEVEL AS ID, SERVED_ROW() AS N, RPAD('x', 200, 'x') AS PAD \
+             FROM DUAL CONNECT BY LEVEL <= {total}"
+        ),
+    );
+    cfg.batch_size = batch;
+    let source = OracleSource::new(cfg).await.expect("source");
+    let served = faucet_conformance::served_probe(|| {
+        let conn = conn.clone();
+        async move {
+            let next = common::query_strings(
+                &conn,
+                "SELECT TO_CHAR(LAST_NUMBER) FROM USER_SEQUENCES WHERE SEQUENCE_NAME = 'SERVED'",
+            )
+            .await;
+            let next: usize = next[0]
+                .as_deref()
+                .expect("a value")
+                .parse()
+                .expect("a count");
+            next - 1
+        }
+    });
+    faucet_conformance::assert_first_page_before_exhaustion(&source, batch, total, &served).await;
+    // The counter is live: once the stream is drained it has seen every row.
+    assert!(
+        served() >= total,
+        "the served-row counter missed rows: {}",
+        served()
+    );
+}

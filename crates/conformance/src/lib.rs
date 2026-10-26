@@ -117,6 +117,7 @@ pub mod calls;
 mod checks;
 #[cfg(feature = "containers")]
 pub mod containers;
+pub mod counting;
 pub mod doubles;
 pub mod fidelity;
 pub mod forwarding;
@@ -350,6 +351,22 @@ pub async fn assert_first_page_before_exhaustion<S, F>(
     while let Some(page) = stream.next().await {
         page.unwrap_or_else(|e| panic!("[{label}] stream_pages errored: {e}"));
     }
+}
+
+/// A synchronous `produced` counter for [`assert_first_page_before_exhaustion`]
+/// that reads the count with an async query — a sequence's value, a server's
+/// progress view, a counting writer — on the calling runtime.
+///
+/// Must be called from a multi-threaded tokio runtime
+/// (`#[tokio::test(flavor = "multi_thread")]`): the query runs under
+/// [`tokio::task::block_in_place`].
+pub fn served_probe<F, Fut>(query: F) -> impl Fn() -> usize
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = usize>,
+{
+    let handle = tokio::runtime::Handle::current();
+    move || tokio::task::block_in_place(|| handle.block_on(query()))
 }
 
 // ── Check 3: bookmark round-trip (resumable sources) ─────────────────────────

@@ -49,20 +49,18 @@ faucet-source-mssql-cdc exactly_once: assert_bookmark_roundtrip runs in an #[ign
 # Check 22 (`streaming`) needs a count of the records the backend has served
 # when the first page arrives. The HTTP-backed sources prove it against a
 # counting wiremock fake (rest, elasticsearch, bigquery, snowflake,
-# databricks). For the sources below no such count is observable in CI: the
-# backend streams through a driver, broker client, store client or child
-# process that exposes no served-record counter, so check 2
-# (`assert_bounded_memory`) is the evidence there.
-faucet-source-clickhouse streaming: rows arrive through the clickhouse client's streaming cursor; the test server exposes no served-row count
-faucet-source-duckdb streaming: an embedded engine in the same process; there is no separate backend whose served rows can be counted
+# databricks), the file source against a counting HTTP server, and the SQL
+# sources against a server-side counter (a sequence advanced per row for
+# postgres, redshift and oracle; `performance_schema` handler reads for mysql;
+# `system.processes` for clickhouse; `sys.dm_exec_requests` for mssql). For
+# the sources below no such count is observable in CI: the backend streams
+# through a driver, broker client, store client or child process that exposes
+# no served-record counter, so check 2 (`assert_bounded_memory`) is the
+# evidence there.
+faucet-source-duckdb streaming: an embedded engine owned by the source's own connection; a query cannot report progress outside it, and the database cannot be opened by a second connection to observe it
 faucet-source-mongodb streaming: documents arrive through the driver's cursor batches; the test server exposes no served-document count
-faucet-source-mssql streaming: rows arrive through the TDS row stream; the test server exposes no served-row count
-faucet-source-mysql streaming: rows arrive through the sqlx row stream; the test server exposes no served-row count
-faucet-source-oracle streaming: rows arrive through ODPI-C fetch batches; the test server exposes no served-row count
-faucet-source-postgres streaming: rows arrive through the sqlx row stream; the test server exposes no served-row count
-faucet-source-redshift streaming: rows arrive through the Postgres-wire row stream; the test server exposes no served-row count
 faucet-source-spanner streaming: rows arrive through ExecuteStreamingSql on the emulator, which exposes no served-row count
-faucet-source-sqlite streaming: an embedded database file read in-process; no separate backend whose served rows can be counted
+faucet-source-sqlite streaming: an embedded engine stepped inside the source's own connection; a query cannot report progress outside it (no side-effecting functions), and under WAL a reader blocks no writer that could probe it
 faucet-source-mongodb-cdc streaming: a change stream has no end of result set to be served before the first page
 faucet-source-mssql-cdc streaming: CDC polling has no end of result set to be served before the first page
 faucet-source-mysql-cdc streaming: a binlog stream has no end of result set to be served before the first page
@@ -80,9 +78,8 @@ faucet-source-azure-blob streaming: objects are read through the object-store cl
 faucet-source-gcs streaming: objects are read through the storage client from fake-gcs-server, which exposes no served-byte count
 faucet-source-s3 streaming: objects are read through the S3 client from MinIO / LocalStack, which exposes no served-byte count
 faucet-source-sftp streaming: files are read over an SSH session, which exposes no served-byte count
-faucet-source-file streaming: local files are read directly; there is no backend whose served records can be counted
-faucet-source-csv streaming: local files are read directly; there is no backend whose served records can be counted
-faucet-source-parquet streaming: row groups are read through object_store from local files or S3, which exposes no served-row count
+faucet-source-csv streaming: deprecated (#779) and local-file only, with no observable read count; the CLI builds `type: csv` with faucet-source-file, whose check 22 runs against a counting server
+faucet-source-parquet streaming: deprecated (#779; the CLI reads local Parquet with faucet-source-file); Parquet is read by byte range from a seekable file (footer first), so no counting stream can stand in front of it
 faucet-source-delta streaming: table files are read through deltalake's object store, which exposes no served-row count
 faucet-source-iceberg streaming: data files are read through the iceberg FileIO, which exposes no served-row count
 faucet-source-grpc streaming: messages arrive through a tonic server stream from the test server, which counts nothing

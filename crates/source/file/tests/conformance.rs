@@ -128,3 +128,29 @@ async fn conformance_call_deadline() {
     })
     .await;
 }
+
+/// Check 22: the first page arrives before the body is exhausted. A local
+/// file's reads cannot be counted from outside the source, so the JSON Lines
+/// body is served over HTTP by a server that counts each line the socket
+/// accepted — the same line decoder reads both. 200k lines (~20 MB) outrun
+/// every socket buffer on the way.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_first_page_before_exhaustion() {
+    let total = 200_000;
+    let batch = 500;
+    let server = faucet_conformance::counting::CountingLinesServer::start(
+        "events.jsonl",
+        "application/x-ndjson",
+        total,
+        |i| format!("{{\"id\":{i},\"pad\":\"{}\"}}", "x".repeat(80)),
+    )
+    .await
+    .expect("counting server");
+    let source =
+        FileSource::new(FileSourceConfig::new(server.url()).with_batch_size(batch)).unwrap();
+    faucet_conformance::assert_first_page_before_exhaustion(&source, batch, total, || {
+        server.served()
+    })
+    .await;
+    assert_eq!(server.served(), total, "the counter saw every line");
+}
