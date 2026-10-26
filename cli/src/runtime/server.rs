@@ -748,7 +748,7 @@ pub async fn verify(
     let (audit_state, actor) = (state.clone(), principal.actor());
     let outcome = detached(None, async move {
         let _permit = permit;
-        let outcome = super::local::verify(&run_as, &cfg, &spec, inputs).await;
+        let outcome = caught("verify", super::local::verify(&run_as, &cfg, &spec, inputs)).await;
         match &outcome {
             Ok(o) => {
                 let result = if o.report.equal() {
@@ -898,9 +898,12 @@ pub async fn rollback(
     let dry_run = req.dry_run;
     let report = detached(None, async move {
         let _permit = permit;
-        let outcome = super::local::rollback_nodes(&run_as, &nodes, &inputs)
-            .await
-            .map_err(cli_to_serve);
+        let outcome = caught(
+            "rollback",
+            super::local::rollback_nodes(&run_as, &nodes, &inputs),
+        )
+        .await
+        .map_err(cli_to_serve);
         match &outcome {
             Ok(report) => {
                 let result = if dry_run {
@@ -1022,24 +1025,27 @@ pub async fn replay_dlq(
     let (audit_state, actor) = (state.clone(), principal.actor());
     let outcome = detached(Some(cancel.clone()), async move {
         let (_permit, _token) = (permit, token);
-        let outcome = super::local::replay_dlq(
-            &run_as,
-            &cfg,
-            &from,
-            crate::dlq_replay::ReplayInputs {
-                reason: reason.as_deref(),
-                failed_dlq: failed_dlq.as_deref(),
-                row: row.as_deref(),
-                all_rows,
-                dry_run,
-                pipeline_name,
-                execution: cfg.execution.clone(),
-                auth,
-                clock: chrono::Utc::now().fixed_offset(),
-                decryptor,
-                budget,
-                cancel: Some(task_cancel.clone()),
-            },
+        let outcome = caught(
+            "DLQ replay",
+            super::local::replay_dlq(
+                &run_as,
+                &cfg,
+                &from,
+                crate::dlq_replay::ReplayInputs {
+                    reason: reason.as_deref(),
+                    failed_dlq: failed_dlq.as_deref(),
+                    row: row.as_deref(),
+                    all_rows,
+                    dry_run,
+                    pipeline_name,
+                    execution: cfg.execution.clone(),
+                    auth,
+                    clock: chrono::Utc::now().fixed_offset(),
+                    decryptor,
+                    budget,
+                    cancel: Some(task_cancel.clone()),
+                },
+            ),
         )
         .await;
         if let Some(rec) = started {
@@ -1060,6 +1066,28 @@ pub async fn replay_dlq(
         }
     }
     Ok(body)
+}
+
+/// Await `work`, turning a panic inside it into an error, so the audit and
+/// run-record writes that follow it in the same task still happen.
+async fn caught<T>(
+    what: &str,
+    work: impl std::future::Future<Output = Result<T, crate::error::CliError>>,
+) -> Result<T, crate::error::CliError> {
+    use futures::FutureExt as _;
+    match std::panic::AssertUnwindSafe(work).catch_unwind().await {
+        Ok(result) => result,
+        Err(panic) => {
+            let why = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            Err(crate::error::CliError::Internal(format!(
+                "{what} panicked: {why}"
+            )))
+        }
+    }
 }
 
 /// Run `work` on a task of its own and await it. The request future that
@@ -1548,6 +1576,61 @@ mod templates {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A panic in rollback, verify or replay work becomes an error inside its
+    /// task, so the audit written after it in the same task still lands.
+    #[tokio::test]
+    async fn a_panic_in_detached_work_still_reaches_the_audit_after_it() {
+        let state = crate::serve::test_support::test_state();
+        let audit_state = state.clone();
+        let outcome = detached(None, async move {
+            let outcome: Result<(), crate::error::CliError> =
+                caught("rollback", async { panic!("sink blew up") }).await;
+            if let Err(e) = &outcome {
+                crate::serve::audit::write_detail(
+                    &audit_state,
+                    &crate::serve::rbac::AuthContext::system("t"),
+                    "run.rollback",
+                    Some("r1".into()),
+                    e.to_string(),
+                    "error",
+                )
+                .await;
+            }
+            outcome
+        })
+        .await
+        .expect("the task itself does not fail");
+        let err = outcome.unwrap_err().to_string();
+        assert!(err.contains("rollback panicked: sink blew up"), "{err}");
+        let audit = state
+            .history()
+            .list_audit(&crate::serve::history::AuditFilter {
+                limit: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            audit
+                .iter()
+                .any(|a| a.action == "run.rollback" && a.result == "error"),
+            "{audit:?}"
+        );
+        let owned: Result<(), _> = caught("verify", async {
+            std::panic::panic_any(String::from("owned"))
+        })
+        .await;
+        assert!(
+            owned
+                .unwrap_err()
+                .to_string()
+                .contains("verify panicked: owned")
+        );
+        let opaque: Result<(), _> = caught("replay", async { std::panic::panic_any(7u8) }).await;
+        assert!(opaque.unwrap_err().to_string().contains("unknown panic"));
+        assert_eq!(caught("x", async { Ok(3) }).await.unwrap(), 3);
+    }
 
     /// A dropped request cancels detached work cooperatively and lets it
     /// finish (here: record that it saw the cancel) instead of dropping it.
