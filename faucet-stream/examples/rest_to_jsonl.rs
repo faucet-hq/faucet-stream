@@ -51,6 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         vec![TransformStage::Map(RecordTransform::KeysCase {
             mode: KeyCaseMode::Snake,
             on_collision: Default::default(),
+            suffix_keys: Vec::new(),
         })],
         Labels::for_named("rest"),
     )?;

@@ -192,13 +192,13 @@ let result = Pipeline::new(&source, &sink)
 Transform records as they flow through the pipeline. `RecordTransform` covers per-record (1→1) operations; stage-level variants add filter, explode, and CDC-unwrap.
 
 ```rust
-use faucet_core::{RecordTransform, KeyCaseMode};
+use faucet_core::{KeyCaseMode, KeyCollision, RecordTransform};
 
 // Flatten nested objects: {"user": {"id": 1}} -> {"user__id": 1}
 RecordTransform::Flatten { separator: "__".into() };
 
 // Convert keys to snake_case (or camel / pascal / kebab / screaming_snake / dot)
-RecordTransform::KeysCase { mode: KeyCaseMode::Snake };
+RecordTransform::KeysCase { mode: KeyCaseMode::Snake, on_collision: KeyCollision::Error, suffix_keys: vec![] };
 
 // Regex key renaming
 RecordTransform::RenameKeys { pattern: r"^_sdc_".into(), replacement: "".into() };

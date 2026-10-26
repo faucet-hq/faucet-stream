@@ -1291,6 +1291,7 @@ async fn test_keys_case_snake_transform() {
         vec![TransformStage::Map(RecordTransform::KeysCase {
             mode: KeyCaseMode::Snake,
             on_collision: KeyCollision::Error,
+            suffix_keys: Vec::new(),
         })],
         Labels::for_named("rest"),
     )
@@ -1362,6 +1363,7 @@ async fn test_chained_transforms_keys_case_then_flatten() {
             TransformStage::Map(RecordTransform::KeysCase {
                 mode: KeyCaseMode::Snake,
                 on_collision: KeyCollision::Error,
+                suffix_keys: Vec::new(),
             }),
             TransformStage::Map(RecordTransform::Flatten {
                 separator: "_".into(),

@@ -1290,6 +1290,7 @@ mod tests {
         let compiled = compile(&[TransformStage::Map(RecordTransform::KeysCase {
             mode: KeyCaseMode::Snake,
             on_collision: Default::default(),
+            suffix_keys: Vec::new(),
         })]);
         let out = apply_stages(json!({"FooBar": 1}), &compiled).unwrap();
         assert_eq!(out, vec![json!({"foo_bar": 1})]);
@@ -1961,6 +1962,7 @@ mod tests {
         let compiled = compile(&[TransformStage::Map(RecordTransform::KeysCase {
             mode: KeyCaseMode::Snake,
             on_collision: Default::default(),
+            suffix_keys: Vec::new(),
         })]);
         let page = vec![json!({"FooBar": 1}), json!({"BazQux": 2})];
         let via_page = apply_stages_to_page(page.clone(), &compiled).unwrap();
@@ -2011,6 +2013,7 @@ mod tests {
             TransformStage::Map(RecordTransform::KeysCase {
                 mode: KeyCaseMode::Snake,
                 on_collision: Default::default(),
+                suffix_keys: Vec::new(),
             })
         );
         assert!(dbg.starts_with("Map"), "{dbg}");
@@ -2047,6 +2050,7 @@ mod tests {
         let map = compile(&[TransformStage::Map(RecordTransform::KeysCase {
             mode: KeyCaseMode::Snake,
             on_collision: Default::default(),
+            suffix_keys: Vec::new(),
         })]);
         assert_eq!(format!("{:?}", map[0]), "Map(<compiled>)");
 
@@ -2076,6 +2080,7 @@ mod tests {
             TransformStage::Map(RecordTransform::KeysCase {
                 mode: KeyCaseMode::Snake,
                 on_collision: Default::default(),
+                suffix_keys: Vec::new(),
             }),
             TransformStage::Custom(Arc::new(|v| vec![v])),
             TransformStage::PageFn(Arc::new(Ok)),
@@ -2114,6 +2119,7 @@ mod tests {
             TransformStage::Map(RecordTransform::KeysCase {
                 mode: KeyCaseMode::Snake,
                 on_collision: Default::default(),
+                suffix_keys: Vec::new(),
             }),
             TransformStage::Custom(Arc::new(|v| vec![v])),
             TransformStage::PageFn(Arc::new(Ok)),

@@ -218,13 +218,34 @@ modes — only the join separator differs.
 
 Two distinct keys that re-case to the same name error rather than
 silently overwriting (same collision rule as `flatten` and
-`spell_symbols`). With `on_collision: suffix` both are kept instead: a key
-already spelled in the target case keeps the base name, and every other
-colliding key takes the base name plus `_` and 8 hex digits derived from
-the source key itself (`Account_Id__c` → `account_id_c_<hash>`). The name
-depends only on the source key, so a key lands in the same column in every
-run and no two source keys share a suffixed column; once a key has
-collided it keeps its suffixed name for the rest of the run. An all-symbol key (`"!@#"`) tokenises to nothing and
+`spell_symbols`). To keep both, set `on_collision: suffix` and list in
+`suffix_keys` every spelling except the one that should keep the base name:
+
+```yaml
+- type: keys_case
+  config:
+    mode: snake
+    on_collision: suffix
+    suffix_keys: [Account_Id__c]   # AccountId__c keeps account_id_c
+```
+
+A listed key is always written as the base name plus `_` and 8 hex digits
+derived from the source key itself (`Account_Id__c` →
+`account_id_c_<hash>`), in every record and every run, also where the key it
+collides with is absent. Every other key keeps its re-cased name. So the
+column a source key lands in depends on the key alone, and no two source keys
+ever share a column across records, runs or matrix rows. A collision between
+two keys that are not listed still fails the record, naming the keys to list.
+
+The list is required because no rule can decide this from the data: a run
+that happens to see only one spelling has no way to tell whether a colliding
+spelling exists elsewhere. Picking the owner of the base name by "first seen"
+lets one column hold two different source fields across runs, and suffixing
+every key not already in the target case would rename nearly every column.
+`suffix_keys` is accepted only with `on_collision: suffix`, and a key already
+spelled in the target case cannot be listed (it keeps the base name).
+
+An all-symbol key (`"!@#"`) tokenises to nothing and
 is kept as-is to avoid producing a blank key.
 
 Multi-char uppercase runs are left as one token: `"XMLParser"` →
