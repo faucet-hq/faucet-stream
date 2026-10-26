@@ -9,6 +9,9 @@ use faucet_cli::cli::ServeArgs;
 use faucet_cli::serve::ServeConfig;
 use std::time::Duration;
 
+#[path = "support/serve_routes.rs"]
+mod serve_routes;
+
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -299,105 +302,15 @@ async fn audit_log_records_actions_and_is_admin_only() {
 // route rather than a hand-picked sample, so a new mutating route that nobody
 // classified fails here instead of quietly becoming viewer-reachable.
 
-/// Every (method, route-template) the router registers under the current
-/// feature set — the same inventory `serve_openapi.rs` checks the spec against.
-/// Duplicated deliberately: if the two ever disagree, one of them is wrong and
-/// this test is the one that decides whether a route is safe.
+/// Every authenticated (method, route-template) the router registers under the
+/// current feature set — the same inventory `serve_openapi.rs` checks the spec
+/// and the live router against (`tests/support/serve_routes.rs`), so a route
+/// added there is classified here too.
 fn all_v1_routes() -> Vec<(axum::http::Method, &'static str)> {
-    use axum::http::Method;
-    #[allow(unused_mut)]
-    let mut v: Vec<(Method, &'static str)> = vec![
-        (Method::POST, "/v1/runs"),
-        (Method::GET, "/v1/runs"),
-        (Method::GET, "/v1/runs/{id}"),
-        (Method::DELETE, "/v1/runs/{id}"),
-        (Method::POST, "/v1/runs/{id}/cancel"),
-        (Method::GET, "/v1/runs/{id}/logs"),
-        (Method::GET, "/v1/schemas"),
-        (Method::GET, "/v1/schemas/{kind}/{name}"),
-        (Method::POST, "/v1/doctor"),
-        (Method::POST, "/v1/backfill"),
-        (Method::POST, "/v1/plan"),
-        (Method::POST, "/v1/dlq/inspect"),
-        (Method::POST, "/v1/dlq/replay"),
-        (Method::POST, "/v1/dlq/discard"),
-        (Method::GET, "/v1/audit"),
-        (Method::POST, "/v1/reload"),
-        (Method::GET, "/v1/whoami"),
-        (Method::POST, "/mcp"),
-        (Method::POST, "/v1/changes"),
-        (Method::GET, "/v1/changes"),
-        (Method::GET, "/v1/changes/{id}"),
-        (Method::POST, "/v1/changes/{id}/approve"),
-        (Method::POST, "/v1/changes/{id}/reject"),
-        (Method::GET, "/v1/status"),
-        (Method::POST, "/v1/status"),
-        (Method::GET, "/v1/mirror/{name}"),
-        (Method::POST, "/v1/mirror/{name}"),
-        (Method::GET, "/v1/state/{pipeline}/{row}"),
-        (Method::PUT, "/v1/state/{pipeline}/{row}"),
-        (Method::DELETE, "/v1/state/{pipeline}/{row}"),
-    ];
-    #[cfg(feature = "triggers")]
-    v.extend([
-        (Method::POST, "/v1/triggers/{name}"),
-        (Method::PUT, "/v1/triggers/{name}"),
-    ]);
-    #[cfg(feature = "catalog")]
-    v.extend([
-        (Method::GET, "/v1/catalog/datasets"),
-        (Method::GET, "/v1/catalog/datasets/{id}"),
-        (Method::GET, "/v1/catalog/lineage"),
-        (Method::POST, "/v1/catalog/datasets/{id}/consumers"),
-        (Method::GET, "/v1/usage"),
-        (Method::GET, "/v1/local-outputs"),
-        (Method::DELETE, "/v1/local-outputs/{id}"),
-        (Method::POST, "/v1/local-outputs/cleanup"),
-        (Method::GET, "/v1/local-outputs/{id}/preview"),
-    ]);
-    #[cfg(feature = "templates")]
-    v.extend([
-        (Method::POST, "/v1/templates"),
-        (Method::GET, "/v1/templates"),
-        (Method::GET, "/v1/templates/{id}"),
-        (Method::GET, "/v1/templates/{id}/rows"),
-        (Method::DELETE, "/v1/templates/{id}"),
-        (Method::POST, "/v1/templates/{id}/runs"),
-        (Method::POST, "/v1/templates/{id}/tags"),
-        (Method::POST, "/v1/templates/{id}/launch"),
-        (Method::POST, "/v1/templates/{id}/rollback"),
-        (Method::POST, "/v1/templates/{id}/deprecate"),
-        (
-            Method::POST,
-            "/v1/templates/{id}/versions/{version}/deprecate",
-        ),
-        (Method::POST, "/v1/templates/{id}/versions/{version}/test"),
-        (Method::GET, "/v1/templates/{id}/versions/{version}/tests"),
-    ]);
-    #[cfg(feature = "templates-sync")]
-    v.extend([
-        (Method::POST, "/v1/templates/sync"),
-        (Method::POST, "/v1/templates/{id}/publish"),
-    ]);
-    #[cfg(feature = "tenants")]
-    v.extend([
-        (Method::GET, "/v1/tenants"),
-        (Method::POST, "/v1/tenants"),
-        (Method::GET, "/v1/tenants/{tenant}"),
-        (Method::PATCH, "/v1/tenants/{tenant}"),
-        (Method::DELETE, "/v1/tenants/{tenant}"),
-        (Method::GET, "/v1/tenants/{tenant}/connections"),
-        (Method::POST, "/v1/tenants/{tenant}/connections"),
-        (Method::GET, "/v1/tenants/{tenant}/connections/{name}"),
-        (Method::PUT, "/v1/tenants/{tenant}/connections/{name}"),
-        (Method::DELETE, "/v1/tenants/{tenant}/connections/{name}"),
-        (Method::POST, "/v1/tenants/{tenant}/connect/{provider}"),
-        (Method::POST, "/v1/tenants/{tenant}/runs"),
-        (Method::POST, "/v1/tenants/{tenant}/templates/{id}/runs"),
-        (Method::POST, "/v1/templates/{id}/fanout"),
-        (Method::GET, "/v1/connect/providers"),
-    ]);
-    v
+    serve_routes::authenticated_routes()
+        .into_iter()
+        .map(|(m, p)| (m.parse().expect("an HTTP method"), p))
+        .collect()
 }
 
 /// A route is *mutating* if it can change server- or destination-side state.
