@@ -10551,12 +10551,23 @@
               "default": null
             },
             "properties": {
-              "description": "Arbitrary catalog properties passed through to the catalog builder\n(e.g. S3 region, endpoint, access key).",
+              "description": "Arbitrary catalog properties passed through to the catalog builder\nand the warehouse file IO (e.g. S3 region, endpoint, access key).\nKeys that name an endpoint (`*endpoint*`, `*uri`, `*url`, a proxy,\n`gcs.service.path`) or a local file (`*-file`, `*_file`, `*.file`,\n`warehouse`) are checked like the typed fields by a host that confines\nconfigs (`faucet serve`).",
               "type": "object",
               "additionalProperties": {
                 "type": "string"
               },
-              "default": {}
+              "default": {},
+              "x-faucet-resource-keys": {
+                "*endpoint*": "url",
+                "*uri": "url",
+                "*url": "url",
+                "*proxy*": "url",
+                "gcs.service.path": "url",
+                "*-file": "path",
+                "*_file": "path",
+                "*.file": "path",
+                "warehouse": "path"
+              }
             },
             "type": {
               "type": "string",
@@ -10596,12 +10607,23 @@
               "default": null
             },
             "properties": {
-              "description": "Arbitrary catalog properties passed through to the catalog builder\n(e.g. S3 region, endpoint, access key).",
+              "description": "Arbitrary catalog properties passed through to the catalog builder\nand the warehouse file IO (e.g. S3 region, endpoint, access key).\nKeys that name an endpoint (`*endpoint*`, `*uri`, `*url`, a proxy,\n`gcs.service.path`) or a local file (`*-file`, `*_file`, `*.file`,\n`warehouse`) are checked like the typed fields by a host that confines\nconfigs (`faucet serve`).",
               "type": "object",
               "additionalProperties": {
                 "type": "string"
               },
-              "default": {}
+              "default": {},
+              "x-faucet-resource-keys": {
+                "*endpoint*": "url",
+                "*uri": "url",
+                "*url": "url",
+                "*proxy*": "url",
+                "gcs.service.path": "url",
+                "*-file": "path",
+                "*_file": "path",
+                "*.file": "path",
+                "warehouse": "path"
+              }
             },
             "type": {
               "type": "string",
@@ -10641,12 +10663,23 @@
               "default": null
             },
             "properties": {
-              "description": "Arbitrary catalog properties passed through to the catalog builder\n(e.g. S3 region, endpoint, access key).",
+              "description": "Arbitrary catalog properties passed through to the catalog builder\nand the warehouse file IO (e.g. S3 region, endpoint, access key).\nKeys that name an endpoint (`*endpoint*`, `*uri`, `*url`, a proxy,\n`gcs.service.path`) or a local file (`*-file`, `*_file`, `*.file`,\n`warehouse`) are checked like the typed fields by a host that confines\nconfigs (`faucet serve`).",
               "type": "object",
               "additionalProperties": {
                 "type": "string"
               },
-              "default": {}
+              "default": {},
+              "x-faucet-resource-keys": {
+                "*endpoint*": "url",
+                "*uri": "url",
+                "*url": "url",
+                "*proxy*": "url",
+                "gcs.service.path": "url",
+                "*-file": "path",
+                "*_file": "path",
+                "*.file": "path",
+                "warehouse": "path"
+              }
             },
             "type": {
               "type": "string",
@@ -10686,12 +10719,23 @@
               "default": null
             },
             "properties": {
-              "description": "Arbitrary catalog properties passed through to the catalog builder\n(e.g. S3 region, endpoint, access key).",
+              "description": "Arbitrary catalog properties passed through to the catalog builder\nand the warehouse file IO (e.g. S3 region, endpoint, access key).\nKeys that name an endpoint (`*endpoint*`, `*uri`, `*url`, a proxy,\n`gcs.service.path`) or a local file (`*-file`, `*_file`, `*.file`,\n`warehouse`) are checked like the typed fields by a host that confines\nconfigs (`faucet serve`).",
               "type": "object",
               "additionalProperties": {
                 "type": "string"
               },
-              "default": {}
+              "default": {},
+              "x-faucet-resource-keys": {
+                "*endpoint*": "url",
+                "*uri": "url",
+                "*url": "url",
+                "*proxy*": "url",
+                "gcs.service.path": "url",
+                "*-file": "path",
+                "*_file": "path",
+                "*.file": "path",
+                "warehouse": "path"
+              }
             },
             "type": {
               "type": "string",
@@ -21121,7 +21165,7 @@
                       }
                     },
                     "storage_options": {
-                      "description": "Extra `storage_options` passed verbatim to delta-rs (e.g. a MinIO\nendpoint override, or any object-store key the [`DeltaCredentials`]\nenum does not model). Keys set here **win** over credential-derived\nkeys. Keys that name an endpoint (`*endpoint*`, `*_url`, a proxy, an\nauthority host) or a local file (`*_file`, `*_path`, a service-account\nor application-credentials file) are checked like the typed fields by a\nhost that confines configs (`faucet serve`).",
+                      "description": "Extra `storage_options` passed verbatim to delta-rs (e.g. a MinIO\nendpoint override, or any object-store key the [`DeltaCredentials`]\nenum does not model). Keys set here **win** over credential-derived\nkeys. Keys that name an endpoint (`*endpoint*`, `*_url`, `*_uri`,\n`*_host`, a proxy, an authority host) or a local file (`*_file`,\n`*_path`, a service-account or application-credentials file) are checked\nlike the typed fields by a host that confines configs (`faucet serve`).",
                       "type": "object",
                       "additionalProperties": {
                         "type": "string"
@@ -21130,6 +21174,8 @@
                       "x-faucet-resource-keys": {
                         "*endpoint*": "url",
                         "*_url": "url",
+                        "*_uri": "url",
+                        "*_host": "url",
                         "url": "url",
                         "*proxy": "url",
                         "*authority_host": "url",
@@ -28292,7 +28338,7 @@
                       }
                     },
                     "storage_options": {
-                      "description": "Extra `storage_options` passed verbatim to delta-rs (e.g. a MinIO\nendpoint override, or any object-store key the [`DeltaCredentials`]\nenum does not model). Keys set here **win** over credential-derived\nkeys. Keys that name an endpoint (`*endpoint*`, `*_url`, a proxy, an\nauthority host) or a local file (`*_file`, `*_path`, a service-account\nor application-credentials file) are checked like the typed fields by a\nhost that confines configs (`faucet serve`).",
+                      "description": "Extra `storage_options` passed verbatim to delta-rs (e.g. a MinIO\nendpoint override, or any object-store key the [`DeltaCredentials`]\nenum does not model). Keys set here **win** over credential-derived\nkeys. Keys that name an endpoint (`*endpoint*`, `*_url`, `*_uri`,\n`*_host`, a proxy, an authority host) or a local file (`*_file`,\n`*_path`, a service-account or application-credentials file) are checked\nlike the typed fields by a host that confines configs (`faucet serve`).",
                       "type": "object",
                       "additionalProperties": {
                         "type": "string"
@@ -28301,6 +28347,8 @@
                       "x-faucet-resource-keys": {
                         "*endpoint*": "url",
                         "*_url": "url",
+                        "*_uri": "url",
+                        "*_host": "url",
                         "url": "url",
                         "*proxy": "url",
                         "*authority_host": "url",
@@ -31126,8 +31174,19 @@
                 "type": "string"
               },
               "default": {},
-              "description": "Arbitrary catalog properties passed through to the catalog builder\n(e.g. S3 region, endpoint, access key).",
-              "type": "object"
+              "description": "Arbitrary catalog properties passed through to the catalog builder\nand the warehouse file IO (e.g. S3 region, endpoint, access key).\nKeys that name an endpoint (`*endpoint*`, `*uri`, `*url`, a proxy,\n`gcs.service.path`) or a local file (`*-file`, `*_file`, `*.file`,\n`warehouse`) are checked like the typed fields by a host that confines\nconfigs (`faucet serve`).",
+              "type": "object",
+              "x-faucet-resource-keys": {
+                "*-file": "path",
+                "*.file": "path",
+                "*_file": "path",
+                "*endpoint*": "url",
+                "*proxy*": "url",
+                "*uri": "url",
+                "*url": "url",
+                "gcs.service.path": "url",
+                "warehouse": "path"
+              }
             },
             "type": {
               "const": "rest",
@@ -31171,8 +31230,19 @@
                 "type": "string"
               },
               "default": {},
-              "description": "Arbitrary catalog properties passed through to the catalog builder\n(e.g. S3 region, endpoint, access key).",
-              "type": "object"
+              "description": "Arbitrary catalog properties passed through to the catalog builder\nand the warehouse file IO (e.g. S3 region, endpoint, access key).\nKeys that name an endpoint (`*endpoint*`, `*uri`, `*url`, a proxy,\n`gcs.service.path`) or a local file (`*-file`, `*_file`, `*.file`,\n`warehouse`) are checked like the typed fields by a host that confines\nconfigs (`faucet serve`).",
+              "type": "object",
+              "x-faucet-resource-keys": {
+                "*-file": "path",
+                "*.file": "path",
+                "*_file": "path",
+                "*endpoint*": "url",
+                "*proxy*": "url",
+                "*uri": "url",
+                "*url": "url",
+                "gcs.service.path": "url",
+                "warehouse": "path"
+              }
             },
             "type": {
               "const": "glue",
@@ -31216,8 +31286,19 @@
                 "type": "string"
               },
               "default": {},
-              "description": "Arbitrary catalog properties passed through to the catalog builder\n(e.g. S3 region, endpoint, access key).",
-              "type": "object"
+              "description": "Arbitrary catalog properties passed through to the catalog builder\nand the warehouse file IO (e.g. S3 region, endpoint, access key).\nKeys that name an endpoint (`*endpoint*`, `*uri`, `*url`, a proxy,\n`gcs.service.path`) or a local file (`*-file`, `*_file`, `*.file`,\n`warehouse`) are checked like the typed fields by a host that confines\nconfigs (`faucet serve`).",
+              "type": "object",
+              "x-faucet-resource-keys": {
+                "*-file": "path",
+                "*.file": "path",
+                "*_file": "path",
+                "*endpoint*": "url",
+                "*proxy*": "url",
+                "*uri": "url",
+                "*url": "url",
+                "gcs.service.path": "url",
+                "warehouse": "path"
+              }
             },
             "type": {
               "const": "sql",
@@ -31261,8 +31342,19 @@
                 "type": "string"
               },
               "default": {},
-              "description": "Arbitrary catalog properties passed through to the catalog builder\n(e.g. S3 region, endpoint, access key).",
-              "type": "object"
+              "description": "Arbitrary catalog properties passed through to the catalog builder\nand the warehouse file IO (e.g. S3 region, endpoint, access key).\nKeys that name an endpoint (`*endpoint*`, `*uri`, `*url`, a proxy,\n`gcs.service.path`) or a local file (`*-file`, `*_file`, `*.file`,\n`warehouse`) are checked like the typed fields by a host that confines\nconfigs (`faucet serve`).",
+              "type": "object",
+              "x-faucet-resource-keys": {
+                "*-file": "path",
+                "*.file": "path",
+                "*_file": "path",
+                "*endpoint*": "url",
+                "*proxy*": "url",
+                "*uri": "url",
+                "*url": "url",
+                "gcs.service.path": "url",
+                "warehouse": "path"
+              }
             },
             "type": {
               "const": "hms",

@@ -28,14 +28,16 @@ pub struct DeltaConnection {
     /// Extra `storage_options` passed verbatim to delta-rs (e.g. a MinIO
     /// endpoint override, or any object-store key the [`DeltaCredentials`]
     /// enum does not model). Keys set here **win** over credential-derived
-    /// keys. Keys that name an endpoint (`*endpoint*`, `*_url`, a proxy, an
-    /// authority host) or a local file (`*_file`, `*_path`, a service-account
-    /// or application-credentials file) are checked like the typed fields by a
-    /// host that confines configs (`faucet serve`).
+    /// keys. Keys that name an endpoint (`*endpoint*`, `*_url`, `*_uri`,
+    /// `*_host`, a proxy, an authority host) or a local file (`*_file`,
+    /// `*_path`, a service-account or application-credentials file) are checked
+    /// like the typed fields by a host that confines configs (`faucet serve`).
     #[serde(default)]
     #[schemars(extend("x-faucet-resource-keys" = {
         "*endpoint*": "url",
         "*_url": "url",
+        "*_uri": "url",
+        "*_host": "url",
         "url": "url",
         "*proxy": "url",
         "*authority_host": "url",
@@ -278,6 +280,55 @@ mod tests {
             .filter(|r| policy.check(r).is_err())
             .count();
         assert_eq!(refused, 2);
+    }
+
+    #[test]
+    fn credential_uri_and_host_storage_options_are_resources() {
+        use faucet_core::resolve::{ReferencePolicy, ResourceKind, annotated_resources};
+        let schema = serde_json::to_value(schemars::schema_for!(DeltaConnection)).unwrap();
+        let config = json!({
+            "table_uri": "s3://bucket/tbl",
+            "storage_options": {
+                "AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://10.0.0.5:8500/v1/kv/x",
+                "aws_container_credentials_relative_uri": "/v2/credentials",
+                "azure_fabric_workload_host": "10.0.0.6",
+                "AWS_REGION": "us-east-1"
+            }
+        });
+        let mut found: Vec<(String, ResourceKind)> = annotated_resources(&schema, &config)
+            .into_iter()
+            .filter(|r| r.pointer != "/table_uri")
+            .map(|r| (r.pointer, r.kind))
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "/storage_options/AWS_CONTAINER_CREDENTIALS_FULL_URI".into(),
+                    ResourceKind::Url
+                ),
+                (
+                    "/storage_options/aws_container_credentials_relative_uri".into(),
+                    ResourceKind::Url
+                ),
+                (
+                    "/storage_options/azure_fabric_workload_host".into(),
+                    ResourceKind::Url
+                ),
+            ]
+        );
+        let policy = ReferencePolicy::open().with_url_hosts(["bucket"]);
+        let refused: Vec<String> = annotated_resources(&schema, &config)
+            .into_iter()
+            .filter(|r| policy.check(r).is_err())
+            .map(|r| r.pointer)
+            .collect();
+        assert!(
+            refused.contains(&"/storage_options/AWS_CONTAINER_CREDENTIALS_FULL_URI".to_string())
+                && refused.contains(&"/storage_options/azure_fabric_workload_host".to_string()),
+            "{refused:?}"
+        );
     }
 
     #[test]
