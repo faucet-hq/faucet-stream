@@ -113,7 +113,16 @@ pub async fn handle(
                 retry_after_secs: 5,
             })
         }
-        FireOutcome::Error(msg) | FireOutcome::Failed(msg) => {
+        // The request itself cannot run (a value it sent is refused where the
+        // config places it): the caller's error, not the trigger's.
+        FireOutcome::Failed(msg) => {
+            disarm();
+            Err(ServeError::Unprocessable {
+                message: msg,
+                details: None,
+            })
+        }
+        FireOutcome::Error(msg) => {
             disarm();
             state
                 .triggers()

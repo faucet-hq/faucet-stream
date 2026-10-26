@@ -21,8 +21,9 @@ pub enum FireOutcome {
     /// An error building or submitting the run.
     Error(String),
     /// The submission was refused for a reason a retry cannot fix (a bad
-    /// config, a failed validation, a missing tenant). Only produced inside a
-    /// tenant fan-out, where it becomes that tenant's own outcome.
+    /// config, a failed validation, a missing tenant, an event value its
+    /// placement refuses). A polling watcher skips past the event and reports
+    /// it; inside a tenant fan-out it becomes that tenant's own outcome.
     Failed(String),
 }
 
@@ -48,15 +49,85 @@ pub async fn resolve_config_text(
     name: &str,
     fired_at: &str,
 ) -> Result<String, String> {
+    resolve_config(config, event, name, fired_at)
+        .await
+        .map(|s| s.text)
+        .map_err(|e| e.to_string())
+}
+
+/// Why a fired config could not be produced: reading it (may clear on a
+/// retry) or substituting the event into it (never will).
+pub enum ResolveError {
+    Read(String),
+    Substitute(String),
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResolveError::Read(e) | ResolveError::Substitute(e) => f.write_str(e),
+        }
+    }
+}
+
+/// [`resolve_config_text`], also returning the sender-chosen values the
+/// substitution placed.
+pub async fn resolve_config(
+    config: &PipelineRef,
+    event: &TriggerEvent,
+    name: &str,
+    fired_at: &str,
+) -> Result<context::Substitution, ResolveError> {
     let raw = match config {
         PipelineRef::Path(p) => tokio::fs::read_to_string(p)
             .await
-            .map_err(|e| format!("reading pipeline config '{p}': {e}"))?,
-        PipelineRef::Inline(v) => {
-            serde_yaml::to_string(v).map_err(|e| format!("serializing inline pipeline: {e}"))?
-        }
+            .map_err(|e| ResolveError::Read(format!("reading pipeline config '{p}': {e}")))?,
+        PipelineRef::Inline(v) => serde_yaml::to_string(v)
+            .map_err(|e| ResolveError::Read(format!("serializing inline pipeline: {e}")))?,
     };
-    context::substitute(&raw, event, name, fired_at)
+    context::substitute_tracked(&raw, event, name, fired_at).map_err(ResolveError::Substitute)
+}
+
+/// Hold the values an event's sender chose to the limits a caller-submitted
+/// config has: a URL or an absolute local path from the event must be one
+/// the server's caller reference policy allows. The trigger's own config is
+/// the operator's; what the sender put into it is not.
+pub fn screen_event_values(
+    state: &ServerState,
+    tenant: Option<&str>,
+    values: &[context::EventValue],
+) -> Result<(), String> {
+    let policy = state.references().for_origin(
+        crate::serve::load::BodyOrigin::Caller {
+            allow_subprocess: false,
+        },
+        tenant,
+    );
+    for v in values {
+        let field = format!("trigger.{}", v.token);
+        let value = v.value.trim();
+        if value.contains("://") {
+            if let Err(e) = policy.check_url(value) {
+                return Err(format!(
+                    "`${{{field}}}` names a URL the server's reference policy does not allow \
+                     ({}); the event was not run",
+                    e.reason
+                ));
+            }
+        } else if v.leads
+            && (value.starts_with('/') || value.starts_with('~') || value.starts_with("file:"))
+        {
+            crate::serve::load::refuse_request_path_with(
+                &field,
+                value,
+                true,
+                tenant.is_some(),
+                &policy,
+            )
+            .map_err(|e| e.api_error().error.message)?;
+        }
+    }
+    Ok(())
 }
 
 /// Build the `SubmitRequest` for an already-resolved config text. Pure.
@@ -295,13 +366,25 @@ async fn fire_one(
     };
     let result = match (&compiled.spec.config, &compiled.spec.template) {
         (Some(config), _) => {
-            let text = match resolve_config_text(config, event, compiled.name(), fired_at).await {
-                Ok(t) => t,
-                Err(e) => {
+            let sub = match resolve_config(config, event, compiled.name(), fired_at).await {
+                Ok(s) => s,
+                Err(ResolveError::Read(e)) => {
                     metrics::error(compiled.name(), kind);
                     return FireOutcome::Error(e);
                 }
+                // The event itself cannot be substituted (an unknown token, a
+                // value its placement refuses): a retry gives the same answer,
+                // so a watcher skips past it rather than stalling on it.
+                Err(ResolveError::Substitute(e)) => {
+                    metrics::error(compiled.name(), kind);
+                    return FireOutcome::Failed(e);
+                }
             };
+            if let Err(e) = screen_event_values(state, tenant, &sub.event_values) {
+                metrics::error(compiled.name(), kind);
+                return FireOutcome::Failed(e);
+            }
+            let text = sub.text;
             let mut req = build_submit_request(compiled, event, text, fired_at);
             req.idempotency_key = req.idempotency_key.map(idem);
             // A trigger declared in the server's triggers file is a standing

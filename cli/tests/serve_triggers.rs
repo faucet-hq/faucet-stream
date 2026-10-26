@@ -1371,6 +1371,21 @@ async fn webhook_query_values_are_percent_decoded() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert!(target.exists(), "the decoded path was written");
+    // A path the sender chose is held to the caller reference policy: one
+    // outside the allowed roots is refused with 422, and the trigger stays
+    // healthy (the request was at fault, not the trigger).
+    let refused = reqwest::Client::new()
+        .post(format!(
+            "{base}/v1/triggers/hook?out=%2Fopt%2Ffaucet-elsewhere%2Fout.jsonl"
+        ))
+        .bearer_auth(token)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 422);
+    let body = refused.text().await.unwrap();
+    assert!(body.contains("trigger.query.out"), "{body}");
 }
 
 /// #789 SERVE-21: an object whose run cannot start is skipped and reported —
