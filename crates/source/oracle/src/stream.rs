@@ -370,6 +370,15 @@ impl Source for OracleSource {
         }
     }
 
+    fn legacy_state_keys(&self) -> Vec<String> {
+        match (&self.config.replication, &self.config.state_key) {
+            (OracleReplication::Incremental { .. }, None) => {
+                crate::query::legacy_state_keys(&self.config)
+            }
+            _ => Vec::new(),
+        }
+    }
+
     async fn apply_start_bookmark(&self, bookmark: Value) -> Result<(), FaucetError> {
         let start = CursorBookmark::from_state(bookmark)?;
         *self.start_bookmark.lock().expect("bookmark mutex") = Some(start);

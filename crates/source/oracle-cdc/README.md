@@ -59,7 +59,7 @@ Connection fields are documented in [`faucet-common-oracle`](https://crates.io/c
 | `statement_timeout_secs` | `600` | Per-round-trip call timeout (`0` disables). |
 | `flush_table` | `FAUCET_LOGMNR_FLUSH` | Table committed to before each window to force the log writer to flush redo up to the window's end. Created if missing. |
 | `on_unsupported` | `fail` | `fail` or `skip` for changes LogMiner cannot render. |
-| `state_key` | `oracle-cdc:<service>:<table>` | Bookmark key (a digest for several tables). |
+| `state_key` | `oracle-cdc:<host>_<port>_<service>:<table>` | Bookmark key (a digest for several tables; the connect string stands in for host, port and service in that form). A bookmark under the earlier `oracle-cdc:<service>:<table>` key is moved to it on the first run. |
 
 ```yaml
 source:
