@@ -121,11 +121,18 @@ serve:
   Changing `auth.token` or `auth.rbacConfig` rolls the serve pods, so a rotated
   token or a removed principal stops working at once; after rotating a value in
   `auth.existingSecret`, run `kubectl rollout restart deployment/<release>-faucet-stream`.
+  The roll is driven by a `checksum/serve-auth` pod annotation that is a
+  **salted** digest of the credentials, never a plain hash a reader of pod
+  metadata could test guesses against; the salt is `auth.checksumSalt`, else a
+  random one kept in the auth Secret.
   **GitOps (Argo CD, `helm template | kubectl apply`)**: the generated token
   relies on Helm's `lookup`, which is empty when the chart renders without
   cluster access, so each sync would mint a new token and overwrite the Secret
   while running pods keep the old one. Create the Secret yourself and set
-  `auth.existingSecret` (or `auth.token`) for those renderers.
+  `auth.existingSecret` (or `auth.token`) for those renderers, and with an
+  inline `auth.token` / `auth.rbacConfig` also set `auth.checksumSalt` (any
+  random string, kept constant) so each render does not pick a new salt and
+  roll the pods.
 - **History**: `memory` (ephemeral), `sqlite` (needs `persistence.enabled` for
   durability), or `postgres` (required for `cluster.enabled` multi-instance
   failover). The URL reaches the pod as the `FAUCET_SERVE_HISTORY` env var,

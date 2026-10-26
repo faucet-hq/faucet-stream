@@ -107,6 +107,40 @@ true
 {{- end -}}
 
 {{/*
+The salt mixed into the `checksum/serve-auth` pod annotation, so the
+annotation never publishes a bare digest of a credential (pod annotations are
+readable far more widely than Secrets). `serve.auth.checksumSalt` when set
+(set it when rendering without cluster access, e.g. `helm template` / Argo
+CD); else the salt stored in the auth Secret; else a fresh random one, kept in
+the auth Secret. Memoised so every template of one render sees the same salt.
+*/}}
+{{- define "faucet-stream.serveAuthChecksumSalt" -}}
+{{- if not (hasKey .Values.serve.auth "_checksumSalt") -}}
+{{- $salt := .Values.serve.auth.checksumSalt -}}
+{{- if not $salt -}}
+{{- $sec := (lookup "v1" "Secret" .Release.Namespace (include "faucet-stream.authSecretName" .)) -}}
+{{- if and $sec (hasKey (default dict $sec.data) "checksum-salt") -}}
+{{- $salt = index $sec.data "checksum-salt" | b64dec -}}
+{{- else -}}
+{{- $salt = randAlphaNum 32 -}}
+{{- end -}}
+{{- end -}}
+{{- $_ := set .Values.serve.auth "_checksumSalt" $salt -}}
+{{- end -}}
+{{- index .Values.serve.auth "_checksumSalt" -}}
+{{- end -}}
+
+{{/*
+The `checksum/serve-auth` annotation value for `material` (the explicit token
+or the rendered RBAC principal list): a salted digest, so a change rolls the
+pods without exposing a guessable hash of the credential.
+Usage: {{ include "faucet-stream.serveAuthChecksum" (dict "root" . "material" $m) }}
+*/}}
+{{- define "faucet-stream.serveAuthChecksum" -}}
+{{- printf "%s\n%s" (include "faucet-stream.serveAuthChecksumSalt" .root) .material | sha256sum -}}
+{{- end -}}
+
+{{/*
 Shared env block for every faucet pod. Renders user env, the chart Secret (if
 created), and (for serve token auth) the auth token from its Secret.
 Usage: {{- include "faucet-stream.env" . | nindent 12 }}

@@ -1,9 +1,13 @@
 # A changed explicit token or inline RBAC principal list must roll the serve
-# pods, since the server reads both once at startup.
+# pods, since the server reads both once at startup. The annotation is a
+# salted digest (sha256 of "<salt>\n<token>"), never the token's bare hash.
 # expect-not: generated a random serve token
-# expect: checksum/serve-auth: 467f61fcb0f1734bee6b3ee9933e43700c39357e00f420f70318239d2a128f34
+# expect: checksum/serve-auth: 453bb6d62843e2f78dd5472329dcdcd8e6bd36c077a021dd0606d8a52d14345a
+# expect-not: 467f61fcb0f1734bee6b3ee9933e43700c39357e00f420f70318239d2a128f34
+# expect: checksum-salt: "fixture-salt"
 serve:
   enabled: true
   auth:
     mode: token
     token: rotate-me
+    checksumSalt: fixture-salt

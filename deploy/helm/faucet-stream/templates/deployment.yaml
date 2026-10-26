@@ -46,9 +46,9 @@ spec:
                is stable and must not restart pods on every render. */}}
         {{- if not .Values.serve.auth.existingSecret }}
         {{- if and (eq .Values.serve.auth.mode "token") .Values.serve.auth.token }}
-        checksum/serve-auth: {{ .Values.serve.auth.token | sha256sum }}
+        checksum/serve-auth: {{ include "faucet-stream.serveAuthChecksum" (dict "root" . "material" .Values.serve.auth.token) }}
         {{- else if and (eq .Values.serve.auth.mode "rbac") .Values.serve.auth.rbacConfig }}
-        checksum/serve-auth: {{ toYaml .Values.serve.auth.rbacConfig | sha256sum }}
+        checksum/serve-auth: {{ include "faucet-stream.serveAuthChecksum" (dict "root" . "material" (toYaml .Values.serve.auth.rbacConfig)) }}
         {{- end }}
         {{- end }}
         {{- if .Values.otel.logs.enabled }}
