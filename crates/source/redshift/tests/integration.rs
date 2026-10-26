@@ -530,10 +530,23 @@ async fn queries_are_metered_on_the_installed_recorder() {
 /// A fractional `NUMERIC(p,s)` cursor keeps the rows tied at a bookmark like
 /// `123.5`: the bookmark binds at its own scale, never through a bare
 /// `NUMERIC` (which Redshift reads as `DECIMAL(18,0)` and rounds up).
+///
+/// PostgreSQL reads a bare `NUMERIC` as unconstrained, so the row results alone
+/// cannot tell the two casts apart; the container logs every statement and the
+/// test asserts the cast the source actually sent.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_fractional_numeric_cursor_keeps_tied_rows() {
     let _guard = serial().lock().await;
-    let (_container, port) = start_postgres().await;
+    let container: ContainerAsync<Postgres> = faucet_conformance::containers::start(|| {
+        Postgres::default()
+            .with_tag("16-alpine")
+            .with_cmd(["postgres", "-c", "log_statement=all"])
+    })
+    .await;
+    let port = container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("postgres port");
     let pool = seed_pool(port).await;
     sqlx::query("CREATE TABLE seqs (id BIGINT PRIMARY KEY, seq NUMERIC(12,3))")
         .execute(&pool)
@@ -563,4 +576,23 @@ async fn a_fractional_numeric_cursor_keeps_tied_rows() {
     let (records, _) = drain(&source).await;
     let ids: Vec<i64> = records.iter().map(|r| r["id"].as_i64().unwrap()).collect();
     assert_eq!(ids, vec![3, 4]);
+    let logs =
+        String::from_utf8_lossy(&container.stderr_to_vec().await.expect("logs")).into_owned();
+    // Statements span several log lines, so match the casts themselves.
+    let sent: Vec<&str> = logs
+        .match_indices("CAST($1 AS NUMERIC")
+        .map(|(i, _)| {
+            let rest = &logs[i..];
+            &rest[..rest.find(')').map_or(rest.len(), |e| e + 1)]
+        })
+        .collect();
+    assert!(!sent.is_empty(), "no incremental statement logged:\n{logs}");
+    assert!(
+        sent.iter().all(|c| *c != "CAST($1 AS NUMERIC)"),
+        "a bare NUMERIC cast was sent: {sent:#?}"
+    );
+    assert!(
+        sent.contains(&"CAST($1 AS NUMERIC(38,3)"),
+        "the resumed run binds the bookmark at its scale: {sent:#?}"
+    );
 }
