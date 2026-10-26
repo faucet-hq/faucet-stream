@@ -14953,6 +14953,13 @@
                       "minimum": 0,
                       "default": null
                     },
+                    "allow_repeated_pages": {
+                      "description": "Keep paging when a `PageNumber` / `Offset` / `OffsetInBody` page holds\nthe same records as an earlier, non-adjacent page of the pass, instead\nof failing the run. For feeds whose pages can legitimately repeat (a\nsparse report returning `[{\"count\": 0}]` on several pages). Requires\n`max_pages`, which then bounds a server that cycles pages. A page\nidentical to the page just before it still ends paging.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ]
+                    },
                     "assume_ordered": {
                       "description": "The feed returns records in ascending `replication_key` order, so an\nincremental pass that `max_pages` cuts short may persist the largest key\nit read and resume from it next run. Without it such a pass fails the\nrun. Requires a `replication_bind` when `max_pages` is set: only a\nbookmark the server filters on moves the next run past the pages\nalready read. The bind must compare **inclusively** (`>=`, e.g. a\n`gte|${bookmark}` template): rows sharing the last key read may sit on\nthe first unread page, and an exclusive (`>`) server filter would skip\nthem; the client-side filter is inclusive, so the re-read rows at that\nkey arrive again (pair with an upsert sink). Ignored for windowed\npasses, with `persist_cursor`, and across `requests:` entries (a\ntruncated entry fails the run).",
                       "type": [

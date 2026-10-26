@@ -1592,7 +1592,10 @@ impl RestDriver {
                 let window_bookmark: Option<Value> =
                     pass.as_ref().map(|w| Value::String(w.end.to_rfc3339()));
 
-                let mut state = PaginationState::default();
+                let mut state = PaginationState {
+                    allow_repeated_pages: self.config.allow_repeated_pages,
+                    ..PaginationState::default()
+                };
                 // #547: on resume, seed the stored cursor into the first request
                 // (query param for `Cursor`, body field for `CursorInBody`).
                 if self.config.persist_cursor

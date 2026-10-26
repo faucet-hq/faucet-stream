@@ -995,6 +995,58 @@ async fn a_200_error_body_mid_pagination_fails_instead_of_ending_green() {
 }
 
 #[tokio::test]
+async fn repeated_sparse_pages_fail_unless_allowed() {
+    // A report whose pages 2 and 4 carry the same records: by default the
+    // non-adjacent repeat fails the run; `allow_repeated_pages` (bounded by
+    // `max_pages`) reads every page.
+    let server = MockServer::start().await;
+    let pages = [
+        json!({"items": [{"id": 1}]}),
+        json!({"items": [{"count": 0}]}),
+        json!({"items": [{"id": 3}]}),
+        json!({"items": [{"count": 0}]}),
+        json!({"items": [{"id": 5}]}),
+        json!({"items": []}),
+    ];
+    for (i, body) in pages.iter().enumerate() {
+        Mock::given(method("GET"))
+            .and(path("/api/report"))
+            .and(query_param("page", (i + 1).to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body.clone()))
+            .mount(&server)
+            .await;
+    }
+    let config = || {
+        RestStreamConfig::new(&server.uri(), "/api/report")
+            .records_path("$.items[*]")
+            .pagination(PaginationStyle::PageNumber {
+                param_name: "page".into(),
+                start_page: 1,
+                page_size: None,
+                page_size_param: None,
+            })
+    };
+    let err = RestStream::new(config())
+        .unwrap()
+        .fetch_all()
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("allow_repeated_pages"), "{err}");
+
+    let err = RestStream::new(config().allow_repeated_pages(true))
+        .err()
+        .expect("allow_repeated_pages without max_pages is refused");
+    assert!(err.to_string().contains("needs `max_pages`"), "{err}");
+
+    let records = RestStream::new(config().allow_repeated_pages(true).max_pages(20))
+        .unwrap()
+        .fetch_all()
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 5, "{records:?}");
+}
+
+#[tokio::test]
 async fn a_nested_records_path_with_no_children_is_an_empty_page() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

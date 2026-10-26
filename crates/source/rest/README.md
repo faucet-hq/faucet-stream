@@ -121,6 +121,7 @@ the secrets/redaction boundary like any other config string.
 | `allow_missing_records_path` | bool | `false` | By default a response in which `records_path` resolves to nothing — the key is absent, not an empty array — fails the run (it is usually an error body served with HTTP 200, or a renamed field) instead of ending pagination green. Set `true` for APIs that omit the records key on an empty result. |
 | `drop_key_prefixes` | list | `[]` | Drop per-record keys starting with any of these prefixes — protocol control fields (OData's `@odata.etag`, JSON:API's `links`, HAL's `_links`) are metadata, not data, and are often invalid column names downstream. An `odata:` block implies `@odata.`, so existing OData configs need no change (#654). |
 | `max_pages` | int / null | unset | Optional cap on pages fetched per pass, across **all** pagination styles. Unset by default — every style stops on its own end signal and loop guards. A pass the cap cuts short keeps only a `persist_cursor` bookmark; an incremental or windowed pass it cuts short **fails the run** (a record-derived or window bookmark would skip the unread pages, and keeping none would re-read them every run), unless `assume_ordered` is set. |
+| `allow_repeated_pages` | bool | `false` | Keep paging when a `PageNumber` / `Offset` / `OffsetInBody` page holds the same records as an earlier, non-adjacent page of the pass, instead of failing the run — for feeds whose pages can legitimately repeat. Requires `max_pages` (refused at load time otherwise), which then bounds a server that cycles pages. A page identical to the page just before it still ends paging. |
 | `assume_ordered` | bool | `false` | The feed returns records in ascending `replication_key` order: an incremental pass `max_pages` cuts short persists the largest key it read and resumes from it next run. With `max_pages` it requires a `replication_bind` (refused at load time otherwise) — only a bookmark the server filters on moves the next run past the pages already read. The bind must compare **inclusively** (`>=`, e.g. `template: "gte|${bookmark}"`): rows sharing the last key read can sit on the first unread page, and a strict `>` filter would skip them for good. The rows re-read at that key arrive again, so pair it with an upsert sink. Ignored for windowed passes, with `persist_cursor`, and across `requests:` entries — a `requests:` run that `max_pages` cuts short fails its incremental pass, because the per-entry bookmarks cannot be consolidated. |
 | `request_delay` | int (seconds) / null | `null` | Delay between consecutive page requests. |
 
@@ -982,7 +983,10 @@ stops instead of looping; a next link pointing back at a URL already fetched
 counts as a repeat. A page (`PageNumber` / `Offset` / `OffsetInBody`)
 identical to the **previous** one is dropped and paging stops; one identical
 to an earlier, non-adjacent page fails the run, since the server is cycling or
-two pages hold identical records and rows may be unread.
+two pages hold identical records and rows may be unread. For a feed whose pages
+can legitimately repeat (a sparse report returning `[{"count": 0}]` on several
+pages), set `allow_repeated_pages: true` together with `max_pages`: the repeat
+is paged past and the cap bounds a server that cycles.
 
 An HTTP **`204 No Content`** (or any 2xx with an empty body) is treated as an empty page, so a feed that ends with a `204` after its last data page (e.g. `$top`/`$skip` paging) terminates cleanly rather than erroring.
 

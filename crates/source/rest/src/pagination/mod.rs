@@ -233,6 +233,10 @@ pub struct PaginationState {
     /// cursor value, so the next `>=` page drops exactly those.
     #[doc(hidden)]
     pub record_cursor_boundary: std::collections::HashMap<String, usize>,
+    /// `allow_repeated_pages`: a page repeating an earlier, non-adjacent page
+    /// is paged past instead of failing the pass.
+    #[doc(hidden)]
+    pub allow_repeated_pages: bool,
 }
 
 impl PaginationState {
@@ -263,18 +267,20 @@ impl PaginationState {
     /// stops). A repeat of an earlier, non-adjacent page is an error: either
     /// the server is cycling, or two pages legitimately hold identical
     /// records, and in both cases stopping green could leave rows unread.
+    /// With `allow_repeated_pages` it is paged past (`Ok(false)`).
     fn page_repeats(&mut self, fp: u64, style: &str) -> Result<bool, FaucetError> {
         if self.previous_page_fingerprint == Some(fp) {
             return Ok(true);
         }
-        if self.seen_page_fingerprints.insert(fp) {
+        if self.seen_page_fingerprints.insert(fp) || self.allow_repeated_pages {
             return Ok(false);
         }
         Err(FaucetError::Source(format!(
             "rest: {style} pagination returned a page identical to an earlier, non-adjacent \
              page of this pass; the server is cycling pages (or two pages carry identical \
-             records), so rows may be unread. Check the paging parameters, or set \
-             `max_pages` if the feed legitimately repeats"
+             records), so rows may be unread. Check the paging parameters (an `Offset` \
+             `total_path` ends paging on the server's own count); if pages can legitimately \
+             repeat, set `allow_repeated_pages: true` together with `max_pages`"
         )))
     }
 }
