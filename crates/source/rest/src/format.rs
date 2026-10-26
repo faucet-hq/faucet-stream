@@ -296,8 +296,10 @@ where
         let mut headers: Option<Vec<String>> = None;
         let mut buf: Vec<u8> = Vec::with_capacity(NDJSON_STREAM_CHUNK + 4096);
         while let Some(rec) = records.next().await {
-            let rec =
-                rec.map_err(|e| FaucetError::Source(format!("rest: CSV parse error: {e}")))?;
+            let rec = rec.map_err(|e| match e.kind() {
+                csv_async::ErrorKind::Io(io) => read_error("CSV", io),
+                _ => FaucetError::Source(format!("rest: CSV parse error: {e}")),
+            })?;
             if has_headers && headers.is_none() {
                 headers = Some(header_names(&rec)?);
                 continue;
@@ -385,8 +387,10 @@ where
         let mut headers: Option<Vec<String>> = None;
         let mut page: Vec<Value> = Vec::with_capacity(if page_size == 0 { 1024 } else { page_size });
         while let Some(rec) = records.next().await {
-            let rec =
-                rec.map_err(|e| FaucetError::Source(format!("rest: CSV parse error: {e}")))?;
+            let rec = rec.map_err(|e| match e.kind() {
+                csv_async::ErrorKind::Io(io) => read_error("CSV", io),
+                _ => FaucetError::Source(format!("rest: CSV parse error: {e}")),
+            })?;
             if has_headers && headers.is_none() {
                 headers = Some(header_names(&rec)?);
                 continue;
@@ -405,6 +409,22 @@ where
         if !page.is_empty() {
             yield page;
         }
+    }
+}
+
+/// A read error from a streamed body, worded for a line over the cap a
+/// [`line_capped`](faucet_core::file_format::line_capped) reader enforces.
+fn read_error(what: &str, e: &std::io::Error) -> FaucetError {
+    match e
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<faucet_core::file_format::LineTooLong>())
+    {
+        Some(too_long) => FaucetError::Source(format!(
+            "rest: a {what} line is longer than {} bytes (the HTTP client's response size \
+             limit) — is the body missing its newlines?",
+            too_long.max
+        )),
+        None => FaucetError::Source(format!("rest: {what} read error: {e}")),
     }
 }
 
@@ -449,7 +469,7 @@ where
         while let Some(line) = lines
             .next_line()
             .await
-            .map_err(|e| FaucetError::Source(format!("rest: JSONL read error: {e}")))?
+            .map_err(|e| read_error("JSONL", &e))?
         {
             n += 1;
             if let Some(v) = jsonl_line(&line, n)? {
