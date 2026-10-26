@@ -287,7 +287,9 @@ async fn every_documented_route_is_wired_on_the_live_server() {
         probe_timeout_secs: 5,
         env_file: None,
         no_env_file: true,
-        no_ui: false,
+        // The console's SPA fallback answers an unrouted path with the same
+        // JSON 404 a handler gives, which would hide an unwired route.
+        no_ui: true,
         cluster: false,
         cluster_poll_secs: 2,
         cluster_max_attempts: 3,
@@ -343,6 +345,20 @@ async fn every_documented_route_is_wired_on_the_live_server() {
         .into_iter()
         .filter(|(_, p)| !p.starts_with("/v1/triggers"))
         .collect();
+
+    // The probe must tell an unrouted path from a handler 404: an undocumented
+    // path gets a bare routing 404 with no error envelope.
+    let unrouted = client
+        .get(format!("{base}/v1/probe-no-such-route"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unrouted.status().as_u16(), 404);
+    let body = unrouted.text().await.unwrap_or_default();
+    assert!(
+        !body.contains("\"error\""),
+        "an unrouted path must not look like a handler 404: {body:?}"
+    );
 
     for (method, template) in &routes {
         // Unknown id so {id} routes hit their handler's NotFound, not bare 404.
