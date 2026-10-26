@@ -9,6 +9,9 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+#[path = "support/rust_source.rs"]
+mod rust_source;
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -54,7 +57,10 @@ fn strip_histogram_suffix(name: &str) -> String {
     name.to_string()
 }
 
-/// Every metric name defined anywhere in the Rust source tree.
+/// Every metric name defined in the Rust source tree: a `faucet_*` name in a
+/// string literal of non-test code. Comments, doc comments and test modules
+/// do not count, so a renamed metric whose old name survives in a comment
+/// ("renamed from faucet_x") is not mistaken for a live one.
 fn defined_metrics(root: &Path) -> BTreeSet<String> {
     let mut defined = BTreeSet::new();
     let dirs = [
@@ -69,7 +75,9 @@ fn defined_metrics(root: &Path) -> BTreeSet<String> {
                 walk(&path, defined);
             } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
                 let text = std::fs::read_to_string(&path).expect("read source file");
-                defined.extend(metric_tokens(&text));
+                for (_, lit) in rust_source::literals(rust_source::non_test(&text)) {
+                    defined.extend(metric_tokens(lit));
+                }
             }
         }
     }
@@ -87,6 +95,24 @@ fn referenced_metrics(path: &Path) -> BTreeSet<String> {
         .into_iter()
         .map(|m| strip_histogram_suffix(&m))
         .collect()
+}
+
+/// A metric name that survives only in a comment, a doc comment or a test
+/// module is not "defined"; one in a string literal of live code is.
+#[test]
+fn only_live_string_literals_define_a_metric() {
+    let src = concat!(
+        "//! renamed from faucet_old_doc_total\n",
+        "// was faucet_old_comment_total\n",
+        "/* faucet_old_block_total */\n",
+        "fn f() { counter!(\"faucet_live_total\"); }\n",
+        "#[cfg(test)]\nmod tests { const X: &str = \"faucet_test_only_total\"; }\n",
+    );
+    let found: BTreeSet<String> = rust_source::literals(rust_source::non_test(src))
+        .into_iter()
+        .flat_map(|(_, l)| metric_tokens(l))
+        .collect();
+    assert_eq!(found, BTreeSet::from(["faucet_live_total".to_string()]));
 }
 
 #[test]
