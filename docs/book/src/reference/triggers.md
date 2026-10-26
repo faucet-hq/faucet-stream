@@ -215,7 +215,10 @@ debounce_secs: 0            # leading-edge debounce window in seconds (default 0
 > **Leading-edge debounce:** when `debounce_secs > 0`, the first request is
 > accepted and any further requests that arrive within `debounce_secs` of that
 > accepted fire are coalesced — they return `200 { "status": "coalesced" }` and
-> enqueue no run. The window re-arms once `debounce_secs` have fully elapsed
+> enqueue no run. A request that arrives while the accepted fire is still
+> being submitted gets `503` and should retry: that fire may not go through,
+> and if it fails (or its request is abandoned) the window is undone so the
+> retry fires. The window re-arms once `debounce_secs` have fully elapsed
 > since the last accepted fire. Debounce is webhook-only; polling triggers
 > (`object_arrival`, `queue_depth`) pace themselves via `poll_interval_secs`.
 
