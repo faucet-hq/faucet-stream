@@ -1109,7 +1109,11 @@ submitted config before it is merged into the (trusted) template body: its
 path (a `file` state store, a file DLQ sink), every URL (a notification
 webhook, an `http` DLQ sink) and any connector that runs a program are held to
 the [caller reference policy](#reference-policy) — refused with `403` (`422`
-for a subprocess connector without `--allow-subprocess-connectors`). A run for
+for a subprocess connector without `--allow-subprocess-connectors`). It may use
+literal values and the `${now.*}`, `${backfill.*}` and `${partition.*}` tokens
+only: a `${param.*}`, `${vars.*}` or row token is refused (`403`), because its
+value would be bound after the screen. An MCP `run_template` dry run applies the
+same checks. A run for
 a tenant (a tenant-scoped principal, or `POST /v1/tenants/{tenant}/…`) may not
 carry an inline overlay at all (`403`); register the overlay and name it
 instead. Every refusal is audited as a denied `template.run`.
