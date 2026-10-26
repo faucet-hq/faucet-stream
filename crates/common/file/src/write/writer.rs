@@ -1060,7 +1060,7 @@ impl FileWriter {
                 gone.push((run, marker));
             }
         }
-        gone.sort_by(|a, b| b.1.seq.cmp(&a.1.seq));
+        gone.sort_by_key(|g| std::cmp::Reverse(g.1.seq));
         let last = self.last_commit_seq().await?;
         for (i, (run, marker)) in gone.into_iter().enumerate() {
             let run = run.as_deref();
