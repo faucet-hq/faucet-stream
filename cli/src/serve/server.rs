@@ -569,6 +569,9 @@ pub async fn maintain_leases(
     if state.history().recover_degraded().await {
         tracing::info!("run-history backend recovered");
     }
+    // Terminal records whose write failed go first: until they land the rows
+    // read `running`, and their lease is renewed below so no peer re-runs them.
+    crate::serve::runner::retry_pending_finalize(state).await;
     let mut renewed = true;
     if let Err(e) = state.history().renew_leases().await {
         tracing::warn!(error = %e, "lease heartbeat (renew_leases) failed");

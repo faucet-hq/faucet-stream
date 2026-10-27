@@ -13,6 +13,7 @@ pub struct PostgresSourceConfig {
     #[schemars(extend("x-faucet-resource" = "url"))]
     pub connection_url: String,
     /// SQL query to execute.
+    #[schemars(extend("x-faucet-sql" = true))]
     pub query: String,
     /// Bind parameters for the query. Defaults to empty.
     #[serde(default)]

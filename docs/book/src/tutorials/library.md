@@ -50,7 +50,7 @@ transforms to any source. It wraps a `Box<dyn Source>` with a flat list of
 
 ```rust,ignore
 use faucet_stream::{
-    KeyCaseMode, Labels, RecordTransform, Source, TransformingSource,
+    KeyCaseMode, KeyCollision, Labels, RecordTransform, Source, TransformingSource,
 };
 
 let inner: Box<dyn Source> = Box::new(my_source);
@@ -58,7 +58,11 @@ let source = TransformingSource::new(
     inner,
     vec![
         RecordTransform::Flatten { separator: "__".into() },
-        RecordTransform::KeysCase { mode: KeyCaseMode::Snake },
+        RecordTransform::KeysCase {
+            mode: KeyCaseMode::Snake,
+            on_collision: KeyCollision::Error,
+            suffix_keys: vec![],
+        },
         RecordTransform::custom(|mut record| {
             if let serde_json::Value::Object(ref mut map) = record {
                 map.insert("_ingested_at".into(), serde_json::json!("2026-05-28T00:00:00Z"));

@@ -55,6 +55,7 @@ pub struct RedshiftSourceConfig {
     /// SQL query to execute. May contain `${field.path}` parent-context tokens
     /// (resolved to positional binds at runtime) and, for incremental
     /// replication, a `${bookmark}` token.
+    #[schemars(extend("x-faucet-sql" = true))]
     pub query: String,
     /// Positional bind parameters for the query, applied in `$1, $2, …` order
     /// before any context- or bookmark-derived values. Defaults to empty.

@@ -478,7 +478,7 @@ run leaves no table) when `create_table: true`. Works in both `auto_map` and JSO
 column modes.
 
 
-**Leftover staging.** `overwrite_staging_exists()` probes for the `<table>__faucet_ovw` table read-only; `faucet status --probe` uses it to report staging a crashed or aborted overwrite left behind (`present` / `absent`). Under the CLI each overwrite run stages in its own `<table>__faucet_ovw_<token>` (the run token is shared by the run's begin, writer and commit instances, so a concurrent overwrite of the same table neither drops nor shares it); the probe then also reports any run's tokened staging. A run's begin drops the untokened `<table>__faucet_ovw` and another run's tokened staging only once that run's token is more than 24 hours old (an abandoned crash); a younger one may still be in use and is left alone.
+**Leftover staging.** `overwrite_staging_exists()` probes for the `<table>__faucet_ovw` table read-only; `faucet status --probe` uses it to report staging a crashed or aborted overwrite left behind (`present` / `absent`). Under the CLI each overwrite run stages in its own `<table>__faucet_ovw_<token>` (the run token is shared by the run's begin, writer and commit instances, so a concurrent overwrite of the same table neither drops nor shares it); the probe then also reports any run's tokened staging. A run's begin drops the untokened `<table>__faucet_ovw` and another run's tokened staging only once that run's token is more than 7 days old (an abandoned crash); a younger one may still be in use and is left alone.
 
 ## Rollback (`faucet rollback`, #706)
 

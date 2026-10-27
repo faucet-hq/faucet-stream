@@ -304,7 +304,7 @@ See the [effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-
 Under `on_drift: evolve`, `MssqlSink::evolve_schema()` applies additive DDL:
 
 - **New columns** → `ALTER TABLE … ADD`, guarded with `IF NOT EXISTS (SELECT 1 FROM sys.columns …)` (idempotent).
-- **Lossless widenings** (e.g. integer → number) → `ALTER COLUMN` to the wider type — gated on `allow_type_widening`. An integer column that starts receiving fractions becomes `DECIMAL(38,10)` (exact for every `BIGINT`; `FLOAT` would round stored values above 2^53), and the statement re-states the column's current `NULL` / `NOT NULL` so the session's `ANSI_NULL_DFLT` setting cannot flip it.
+- **Lossless widenings** (e.g. integer → number) → `ALTER COLUMN` to the wider type — gated on `allow_type_widening`. An integer column that starts receiving fractions becomes `DECIMAL(38,10)` (exact for every `BIGINT` and for values up to 28 integer and 10 fractional digits — precision is capped at 38, so the server rounds a later value with more fractional digits; declare the column with the scale the data needs to keep more; `FLOAT` would round stored values above 2^53), and the statement re-states the column's current `NULL` / `NOT NULL` so the session's `ANSI_NULL_DFLT` setting cannot flip it.
 - **Nullability relaxations** → `ALTER COLUMN … NULL`. MSSQL's `ALTER COLUMN` requires the full type spec, so the column's exact declared type is re-stated from `sys.columns` — length, precision, scale and collation (`DECIMAL(38,10)`, `DATETIME2(3)`, `VARCHAR(20) COLLATE …`) — and only its nullability changes. A column whose type cannot be re-stated (CLR types) fails the evolution instead of being rewritten.
 
 After an evolution the cached AutoColumns set is dropped so the next write re-discovers any newly-added column. Incompatible changes (narrowing / type swaps) are never auto-applied — they are routed by `on_incompatible` (`fail` or `quarantine`). See the [schema-drift cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift.html).
@@ -467,8 +467,19 @@ only when some record supplied an identity value — a run whose records leave
 the identity to the server needs no `ALTER`. No `key` is needed; the target table must already
 exist.
 
+A target that **other** tables reference through an enabled foreign key
+(`sys.foreign_keys` of the target's database, also for a three-part
+`db.schema.table`) is refused (a `Config` error naming those tables) before
+any row is staged, and checked again just before the swap: its `DELETE` would
+cascade into them (`ON DELETE CASCADE`), null or reset their references (`ON
+DELETE SET NULL` / `SET DEFAULT`) — refused whatever those tables hold — or,
+for a `NO ACTION` key, fail after the whole load while some row of the
+referencing table still points at the target (a `NO ACTION` key whose table
+holds no such row is allowed). Use `write_mode: upsert`, or drop or disable
+the foreign key. A self-reference is allowed (every row is replaced at once).
 
-**Leftover staging.** `overwrite_staging_exists()` probes for the `<table>__faucet_ovw` table read-only; `faucet status --probe` uses it to report staging a crashed or aborted overwrite left behind (`present` / `absent`). Under the CLI each overwrite run stages in its own `<table>__faucet_ovw_<token>` (the run token is shared by the run's begin, writer and commit instances, so a concurrent overwrite of the same table neither drops nor shares it); the probe then also reports any run's tokened staging. A run's begin drops the untokened `<table>__faucet_ovw` and another run's tokened staging only once that run's token is more than 24 hours old (an abandoned crash); a younger one may still be in use and is left alone.
+
+**Leftover staging.** `overwrite_staging_exists()` probes for the `<table>__faucet_ovw` table read-only; `faucet status --probe` uses it to report staging a crashed or aborted overwrite left behind (`present` / `absent`). Under the CLI each overwrite run stages in its own `<table>__faucet_ovw_<token>` (the run token is shared by the run's begin, writer and commit instances, so a concurrent overwrite of the same table neither drops nor shares it); the probe then also reports any run's tokened staging. A run's begin drops the untokened `<table>__faucet_ovw` and another run's tokened staging only once that run's token is more than 7 days old (an abandoned crash); a younger one may still be in use and is left alone.
 
 ## Value fidelity
 

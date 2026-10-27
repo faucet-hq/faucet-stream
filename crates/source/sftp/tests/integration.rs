@@ -36,10 +36,13 @@ async fn start_sftp_inner(
 ) -> Option<(ContainerAsync<GenericImage>, u16)> {
     let container = faucet_conformance::containers::start_or_skip(
         || {
-            let mut image = GenericImage::new("atmoz/sftp", "alpine")
-                .with_exposed_port(22.tcp())
-                .with_wait_for(WaitFor::message_on_stderr("Server listening on"))
-                .with_cmd(vec![format!("{USER}:{PASS}:::data")]);
+            let mut image = GenericImage::new(
+                "atmoz/sftp",
+                "alpine@sha256:43dd1c023cf1bae487127d4b54660b0aee6e94c188a6599be36fb89ba115f961",
+            )
+            .with_exposed_port(22.tcp())
+            .with_wait_for(WaitFor::message_on_stderr("Server listening on"))
+            .with_cmd(vec![format!("{USER}:{PASS}:::data")]);
             for (name, body) in files {
                 image = image.with_copy_to(
                     format!("/home/{USER}/data/{name}"),
@@ -319,4 +322,45 @@ async fn a_whole_file_past_max_object_bytes_fails_with_its_name() {
         error.contains("b-big.json") && error.contains("max_object_bytes"),
         "{error}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_newline_free_jsonl_file_fails_at_max_object_bytes() {
+    // `jsonl` streams line by line; one line is still bounded by
+    // `max_object_bytes`, so a file with no newline fails instead of being
+    // buffered whole.
+    let long = format!("[{}]", vec!["{\"id\":1}"; 50].join(","));
+    let files = vec![
+        (
+            "a-short.jsonl".to_string(),
+            "{\"id\":1}\n{\"id\":2}\n".to_string(),
+        ),
+        ("b-long.jsonl".to_string(), long),
+    ];
+    let Some((_c, port)) = start_sftp(&files).await else {
+        return;
+    };
+    let conn = SftpConnectionConfig::with_password("127.0.0.1", USER, PASS).port(port);
+    let mut config = SftpSourceConfig::new(conn, "/data")
+        .format(SftpFormat::Jsonl)
+        .with_batch_size(1)
+        .concurrency(1);
+    config.max_object_bytes = 64;
+    let src = SftpSource::new(config).expect("config is valid");
+    let ctx: HashMap<String, Value> = HashMap::new();
+    let mut pages = src.stream_pages(&ctx, 1);
+    let mut records = 0;
+    let mut error = None;
+    while let Some(page) = pages.next().await {
+        match page {
+            Ok(p) => records += p.records.len(),
+            Err(e) => {
+                error = Some(e.to_string());
+                break;
+            }
+        }
+    }
+    assert_eq!(records, 2, "the short-lined file is read");
+    let error = error.expect("the newline-free file fails");
+    assert!(error.contains("max_object_bytes"), "{error}");
 }

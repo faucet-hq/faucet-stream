@@ -187,6 +187,56 @@ pub(crate) fn committed_clamps(
     out
 }
 
+/// Outside member mode, where each partition the bookmark does not name
+/// starts: the group's committed offset when it has one (never below the log
+/// start), else where `auto.offset.reset` starts it. Also returns the
+/// committed offsets that fell below the log start.
+pub(crate) fn plain_pins(
+    unseeked: &[(String, i32)],
+    committed: &Committed,
+    watermarks: &HashMap<(String, i32), (i64, i64)>,
+    earliest: bool,
+) -> (Vec<(String, i32, i64)>, Vec<Clamp>) {
+    let lows: HashMap<(String, i32), i64> = watermarks
+        .iter()
+        .map(|(tp, (low, _))| (tp.clone(), *low))
+        .collect();
+    let none = HashMap::new();
+    let clamps = committed_clamps(unseeked, committed, &none, &lows);
+    let mut pins = member_seeds(unseeked, committed, &none, watermarks, earliest);
+    for tp in unseeked {
+        if let Some(c) = committed.get(tp).copied().flatten() {
+            let (start, _) = clamp_to_log_start(c, lows.get(tp).copied());
+            pins.push((tp.0.clone(), tp.1, start));
+        }
+    }
+    pins.sort();
+    (pins, clamps)
+}
+
+/// The group's committed offsets of `tps`; empty when the lookup fails (the
+/// partitions then start at `auto.offset.reset`).
+fn group_committed(consumer: &BaseConsumer<BookmarkContext>, tps: &[(String, i32)]) -> Committed {
+    if tps.is_empty() {
+        return HashMap::new();
+    }
+    let mut query = TopicPartitionList::with_capacity(tps.len());
+    for (t, p) in tps {
+        query.add_partition(t, *p);
+    }
+    match consumer.committed_offsets(query, COMMITTED_LOOKUP_TIMEOUT) {
+        Ok(c) => committed_map(&c),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "kafka source: committed-offsets lookup failed; partitions without a bookmark \
+                 start at auto_offset_reset"
+            );
+            HashMap::new()
+        }
+    }
+}
+
 /// Where a re-assigned partition resumes outside member mode: the start
 /// bookmark, advanced by what this run already delivered. `None` when neither
 /// knows any partition.
@@ -391,8 +441,10 @@ impl BookmarkContext {
                     (Vec::new(), Vec::new(), HashMap::new())
                 };
                 // Outside member mode, pin every partition the bookmark does
-                // not name to where `auto.offset.reset` would start it, so the
-                // start is known exactly (see `assign_floors`).
+                // not name to the group's committed offset when it has one
+                // (clamped to the log start), else to where
+                // `auto.offset.reset` would start it, so the start is known
+                // exactly (see `assign_floors`).
                 let pins = if member {
                     Vec::new()
                 } else {
@@ -405,13 +457,24 @@ impl BookmarkContext {
                         .filter(|tp| !seeked.contains(tp))
                         .collect();
                     let watermarks = batch_watermarks(base_consumer, &unseeked, &lookups);
-                    member_seeds(
+                    let group = group_committed(base_consumer, &unseeked);
+                    let (pins, clamps) = plain_pins(
                         &unseeked,
-                        &HashMap::new(),
-                        &HashMap::new(),
+                        &group,
                         &watermarks,
                         self.earliest.load(Ordering::Acquire),
-                    )
+                    );
+                    for (topic, partition, start, lost) in clamps {
+                        tracing::warn!(
+                            topic = %topic,
+                            partition,
+                            log_start = start,
+                            lost,
+                            "kafka source: the group's committed offset fell out of topic \
+                             retention; resuming at the log start (the deleted records are gone)"
+                        );
+                    }
+                    pins
                 };
                 for (topic, partition, offset) in &pins {
                     if let Err(e) =
@@ -916,6 +979,26 @@ mod tests {
         assert_eq!(
             committed_clamps(&assigned, &committed, &seeks, &lows),
             vec![("t".to_string(), 0, 20, 15)]
+        );
+    }
+
+    #[test]
+    fn plain_pins_start_at_the_group_committed_offset_when_there_is_one() {
+        let tp = |p: i32| ("t".to_string(), p);
+        let unseeked = vec![tp(0), tp(1), tp(2)];
+        let committed: HashMap<_, _> = [(tp(0), Some(7)), (tp(1), Some(1)), (tp(2), None)].into();
+        let marks: HashMap<_, _> = [(tp(0), (0, 50)), (tp(1), (4, 50)), (tp(2), (2, 50))].into();
+        let (pins, clamps) = plain_pins(&unseeked, &committed, &marks, false);
+        assert_eq!(
+            pins,
+            vec![("t".into(), 0, 7), ("t".into(), 1, 4), ("t".into(), 2, 50)],
+            "committed 0 resumes there, 1 is clamped to the log start, 2 follows latest"
+        );
+        assert_eq!(clamps, vec![("t".to_string(), 1, 4, 3)]);
+        let (pins, _) = plain_pins(&unseeked, &HashMap::new(), &marks, true);
+        assert_eq!(
+            pins,
+            vec![("t".into(), 0, 0), ("t".into(), 1, 4), ("t".into(), 2, 2)]
         );
     }
 

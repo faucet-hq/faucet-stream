@@ -546,13 +546,9 @@ async fn cli_tests_a_registered_version_and_a_template_file() {
 
 // ── HTTP ────────────────────────────────────────────────────────────────────
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+#[path = "support/ports.rs"]
+mod ports;
+use ports::free_port;
 
 const AUTH: &str = "principals:\n\
     \x20 - { name: alice, token: admin-tok, role: admin }\n\

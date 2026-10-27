@@ -113,6 +113,7 @@ pub async fn scope(state: &ServerState, tenant: &str) -> Result<TenantScope, Ser
         )));
     }
     let mut connections = BTreeMap::new();
+    let mut operator_connections = BTreeSet::new();
     let mut blocked = BTreeMap::new();
     for c in state
         .history()
@@ -130,7 +131,10 @@ pub async fn scope(state: &ServerState, tenant: &str) -> Result<TenantScope, Ser
                 );
             }
             ConnectionStatus::Active => {
-                let spec = open_connection(&rt, &c)?;
+                let (spec, hosted) = open_connection(&rt, &c)?;
+                if hosted {
+                    operator_connections.insert(c.name.clone());
+                }
                 connections.insert(c.name.clone(), spec);
             }
         }
@@ -143,6 +147,7 @@ pub async fn scope(state: &ServerState, tenant: &str) -> Result<TenantScope, Ser
             labels: rec.labels.clone(),
         },
         connections,
+        operator_connections,
         blocked,
         budget: rec.limits.budget(),
         build_catalog: catalog_builder(state.clone(), tenant.to_string(), names),
@@ -153,8 +158,9 @@ pub async fn scope(state: &ServerState, tenant: &str) -> Result<TenantScope, Ser
 /// Unseal a connection's provider spec, refresh its client credentials from
 /// the current hosted-OAuth provider (so rotating a client secret in the
 /// providers file reaches existing connections), and register its secrets
-/// with the redaction registry for the life of the process.
-fn open_connection(rt: &TenantsRuntime, c: &ConnectionRecord) -> Result<Value, ServeError> {
+/// with the redaction registry for the life of the process. The flag is
+/// whether the provider's endpoint came from the server's providers file.
+fn open_connection(rt: &TenantsRuntime, c: &ConnectionRecord) -> Result<(Value, bool), ServeError> {
     let vault = rt.require_vault()?;
     let mut spec = vault
         .open_for(&c.sealed, &Vault::connection_context(&c.tenant, &c.name))
@@ -164,12 +170,14 @@ fn open_connection(rt: &TenantsRuntime, c: &ConnectionRecord) -> Result<Value, S
                 c.name, c.tenant
             ))
         })?;
+    let mut hosted = false;
     if let Some(provider) = c
         .connect_provider
         .as_deref()
         .and_then(|p| rt.providers.get(p))
         && let Some(cfg) = spec.get_mut("config").and_then(Value::as_object_mut)
     {
+        hosted = true;
         cfg.insert(
             "token_url".into(),
             Value::String(provider.token_url.clone()),
@@ -184,7 +192,7 @@ fn open_connection(rt: &TenantsRuntime, c: &ConnectionRecord) -> Result<Value, S
         );
     }
     register_secrets(&spec);
-    Ok(spec)
+    Ok((spec, hosted))
 }
 
 /// Whether a provider-config key holds a credential.
@@ -426,20 +434,41 @@ pub async fn admit_inline(
     Ok((Admission { _guard: guard }, rec.limits.budget()))
 }
 
-/// Whether `tenant` is past its `max_concurrent_runs` now that a new run is
-/// recorded (the cluster re-check after admission). `Some(message)` when it is.
-pub async fn over_limit(state: &ServerState, tenant: &str) -> Result<Option<String>, ServeError> {
-    let rec = get_tenant(state, tenant).await?;
+/// Whether a run just recorded for `tenant` must back out (the cluster
+/// re-check after admission): `Some(refusal)` with the status admission
+/// itself gives — 404 for a tenant that no longer exists, 409 for a
+/// suspended one, 429 only for a tenant past its `max_concurrent_runs`.
+pub async fn over_limit(
+    state: &ServerState,
+    tenant: &str,
+) -> Result<Option<ServeError>, ServeError> {
+    // Re-read after the record is written: a delete or suspension that began
+    // on another instance before this record existed is seen here, so the
+    // run backs out instead of landing for a tenant being deleted.
+    let rec = match get_tenant(state, tenant).await {
+        Ok(rec) => rec,
+        Err(ServeError::NotFound) => {
+            metrics::record_limit_rejection(tenant, "suspended");
+            return Ok(Some(ServeError::NotFound));
+        }
+        Err(e) => return Err(e),
+    };
+    if rec.suspended {
+        metrics::record_limit_rejection(tenant, "suspended");
+        return Ok(Some(ServeError::Conflict(format!(
+            "tenant '{tenant}' is suspended"
+        ))));
+    }
     let Some(max) = rec.limits.max_concurrent_runs else {
         return Ok(None);
     };
     let active = active_runs(state, tenant, max as usize + 1).await?;
     if active > max as usize {
         metrics::record_limit_rejection(tenant, "max_concurrent_runs");
-        return Ok(Some(format!(
+        return Ok(Some(ServeError::TooManyRequests(format!(
             "tenant '{tenant}' already has {active} run(s) queued or running across the cluster \
              (limit max_concurrent_runs = {max})"
-        )));
+        ))));
     }
     Ok(None)
 }
@@ -654,7 +683,7 @@ impl ReauthWatch {
         else {
             return false;
         };
-        let Ok(spec) = open_connection(&self.state.tenants(), &rec) else {
+        let Ok((spec, _)) = open_connection(&self.state.tenants(), &rec) else {
             return false;
         };
         match build_connection_inner(&self.state, &self.tenant, &self.name, &spec) {
@@ -954,6 +983,36 @@ pub struct DeleteReport {
     pub state_keys_not_deleted: Vec<String>,
 }
 
+/// Undo the suspension a refused delete set — only while the record is
+/// still exactly what the delete wrote. A record someone changed meanwhile
+/// (a limits edit, a deliberate suspension) is left as it is: the delete
+/// never writes an older snapshot over it.
+async fn reopen_admission(
+    state: &ServerState,
+    tenant: &str,
+    before: &TenantRecord,
+) -> Result<(), ServeError> {
+    let history = state.history();
+    let mut closed = before.clone();
+    closed.suspended = true;
+    if !history
+        .tenant_replace(&closed, before)
+        .await
+        .map_err(store_err)?
+        && history
+            .tenant_get(tenant)
+            .await
+            .map_err(store_err)?
+            .is_some()
+    {
+        tracing::warn!(
+            tenant,
+            "tenant changed while its delete was refused; leaving it suspended for review"
+        );
+    }
+    Ok(())
+}
+
 /// Delete a tenant and everything it owns in faucet: its runs, usage
 /// records, change requests, catalog rows, state keys, connections and
 /// connect sessions.
@@ -983,7 +1042,7 @@ pub async fn delete_tenant(state: &ServerState, tenant: &str) -> Result<DeleteRe
     let _admission = lock.lock_owned().await;
     if active_runs(state, tenant, 1).await? > 0 {
         if !rec.suspended {
-            history.tenant_upsert(&rec).await.map_err(store_err)?;
+            reopen_admission(state, tenant, &rec).await?;
         }
         return Err(ServeError::Conflict(format!(
             "tenant '{tenant}' has runs queued or running; cancel them before deleting it"
@@ -1330,15 +1389,198 @@ mod tests {
             state.history().upsert(&rec).await.unwrap();
             state.history().tenant_run_link(id, "acme").await.unwrap();
         }
-        let msg = over_limit(&state, "acme")
+        let refusal = over_limit(&state, "acme")
             .await
             .unwrap()
             .expect("two runs, limit one");
+        let ServeError::TooManyRequests(msg) = refusal else {
+            panic!("a run past the limit is a 429: {refusal:?}");
+        };
         assert!(msg.contains("across the cluster"), "{msg}");
         assert!(msg.contains("already has 2 run(s)"), "{msg}");
         t.limits.max_concurrent_runs = Some(5);
         state.history().tenant_upsert(&t).await.unwrap();
         assert!(over_limit(&state, "acme").await.unwrap().is_none());
+    }
+
+    /// The post-record re-check backs a run out when the tenant was
+    /// suspended or deleted (by a delete on another instance) meanwhile.
+    #[tokio::test]
+    async fn over_limit_refuses_a_suspended_or_deleted_tenant() {
+        let (state, _) = state_with_vault();
+        let mut t = tenant("acme");
+        t.suspended = true;
+        state.history().tenant_upsert(&t).await.unwrap();
+        let refusal = over_limit(&state, "acme")
+            .await
+            .unwrap()
+            .expect("suspended");
+        // The status admission gives, not a 429 that tells the client (or a
+        // trigger fan-out) to retry a refusal no retry can clear.
+        let ServeError::Conflict(msg) = refusal else {
+            panic!("a suspended tenant is a 409: {refusal:?}");
+        };
+        assert!(msg.contains("is suspended"), "{msg}");
+        let refusal = over_limit(&state, "gone").await.unwrap().expect("deleted");
+        assert!(
+            matches!(refusal, ServeError::NotFound),
+            "a deleted tenant is a 404: {refusal:?}"
+        );
+    }
+
+    /// A refused delete lifts only its own suspension, and never writes its
+    /// starting snapshot over a record someone changed meanwhile.
+    #[tokio::test]
+    async fn a_refused_delete_does_not_revert_a_concurrent_edit() {
+        let (state, _) = state_with_vault();
+        let t = tenant("acme");
+        state.history().tenant_upsert(&t).await.unwrap();
+        // Untouched since the delete suspended it: the suspension is lifted.
+        let mut closed = t.clone();
+        closed.suspended = true;
+        state.history().tenant_upsert(&closed).await.unwrap();
+        reopen_admission(&state, "acme", &t).await.unwrap();
+        let now = state.history().tenant_get("acme").await.unwrap().unwrap();
+        assert!(!now.suspended);
+        // Edited meanwhile: left as it is.
+        let mut edited = closed.clone();
+        edited.limits.max_concurrent_runs = Some(3);
+        state.history().tenant_upsert(&edited).await.unwrap();
+        reopen_admission(&state, "acme", &t).await.unwrap();
+        let now = state.history().tenant_get("acme").await.unwrap().unwrap();
+        assert_eq!(now, edited);
+        // Gone: nothing is written back.
+        state.history().tenant_delete("acme").await.unwrap();
+        reopen_admission(&state, "acme", &t).await.unwrap();
+        assert!(state.history().tenant_get("acme").await.unwrap().is_none());
+    }
+
+    /// Commits an edit to the tenant right after every read of it, the way
+    /// an admin's change on another instance lands between a read and the
+    /// write that follows it.
+    struct EditAfterRead(crate::serve::history::memory::MemoryHistory, AtomicBool);
+
+    #[async_trait::async_trait]
+    impl crate::serve::history::RunHistory for EditAfterRead {
+        async fn claim_idempotency(
+            &self,
+            k: &str,
+            f: &str,
+            r: &str,
+            w: std::time::Duration,
+        ) -> Result<crate::serve::history::Claim, crate::serve::history::HistoryError> {
+            self.0.claim_idempotency(k, f, r, w).await
+        }
+        async fn upsert(&self, rec: &RunRecord) -> Result<(), crate::serve::history::HistoryError> {
+            self.0.upsert(rec).await
+        }
+        async fn get(
+            &self,
+            id: &str,
+        ) -> Result<Option<RunRecord>, crate::serve::history::HistoryError> {
+            self.0.get(id).await
+        }
+        async fn list(
+            &self,
+            f: &crate::serve::history::ListFilter,
+        ) -> Result<crate::serve::history::ListPage, crate::serve::history::HistoryError> {
+            self.0.list(f).await
+        }
+        async fn delete(
+            &self,
+            id: &str,
+        ) -> Result<crate::serve::history::DeleteOutcome, crate::serve::history::HistoryError>
+        {
+            self.0.delete(id).await
+        }
+        async fn purge_expired(
+            &self,
+            d: std::time::Duration,
+        ) -> Result<usize, crate::serve::history::HistoryError> {
+            self.0.purge_expired(d).await
+        }
+        async fn recover_orphans(&self) -> Result<usize, crate::serve::history::HistoryError> {
+            Ok(0)
+        }
+        fn degraded(&self) -> bool {
+            false
+        }
+        async fn tenant_upsert(
+            &self,
+            t: &TenantRecord,
+        ) -> Result<(), crate::serve::history::HistoryError> {
+            self.0.tenant_upsert(t).await
+        }
+        async fn tenant_get(
+            &self,
+            id: &str,
+        ) -> Result<Option<TenantRecord>, crate::serve::history::HistoryError> {
+            let read = self.0.tenant_get(id).await?;
+            if let Some(mut edited) = read.clone() {
+                edited.limits.max_concurrent_runs = Some(7);
+                self.0.tenant_upsert(&edited).await?;
+                self.1.store(true, Ordering::SeqCst);
+            }
+            Ok(read)
+        }
+        async fn tenant_replace(
+            &self,
+            expected: &TenantRecord,
+            new: &TenantRecord,
+        ) -> Result<bool, crate::serve::history::HistoryError> {
+            self.0.tenant_replace(expected, new).await
+        }
+    }
+
+    /// Lifting a refused delete's suspension compares and writes in one
+    /// step: an edit committed after any read the delete made survives.
+    #[tokio::test]
+    async fn reopening_admission_never_writes_over_an_edit_made_after_a_read() {
+        use crate::serve::history::RunHistory as _;
+        let config = crate::serve::test_support::test_config();
+        let store = Arc::new(EditAfterRead(
+            crate::serve::history::memory::MemoryHistory::new(std::time::Duration::from_secs(60)),
+            AtomicBool::new(false),
+        ));
+        let state = ServerState::new(
+            &config,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            store.clone(),
+            crate::serve::logs::LogHub::new(),
+            None,
+            #[cfg(feature = "triggers")]
+            crate::serve::triggers::health::TriggersHandle::empty(),
+        );
+        let t = tenant("acme");
+        let mut closed = t.clone();
+        closed.suspended = true;
+        store.0.tenant_upsert(&closed).await.unwrap();
+        reopen_admission(&state, "acme", &t).await.unwrap();
+        let now = store.0.tenant_get("acme").await.unwrap().unwrap();
+        let edited = store.1.load(Ordering::SeqCst);
+        assert!(
+            !edited || now.limits.max_concurrent_runs == Some(7),
+            "the delete's snapshot was written over an edit made after its read: {now:?}"
+        );
+        if !edited {
+            assert_eq!(now, t, "the delete's own suspension is lifted");
+        }
+    }
+
+    #[tokio::test]
+    async fn tenant_replace_writes_only_over_the_expected_record() {
+        use crate::serve::history::RunHistory as _;
+        let h =
+            crate::serve::history::memory::MemoryHistory::new(std::time::Duration::from_secs(60));
+        let t = tenant("acme");
+        let mut other = t.clone();
+        other.suspended = true;
+        assert!(!h.tenant_replace(&t, &other).await.unwrap(), "missing");
+        h.tenant_upsert(&t).await.unwrap();
+        assert!(h.tenant_replace(&t, &other).await.unwrap());
+        assert!(!h.tenant_replace(&t, &t).await.unwrap(), "changed");
+        assert_eq!(h.tenant_get("acme").await.unwrap().unwrap(), other);
     }
 
     #[tokio::test]
@@ -1649,6 +1891,75 @@ mod tests {
         assert!((sc.build_catalog)(None).unwrap().is_empty());
         specs.insert("bad".to_string(), serde_json::json!({"type": "nope"}));
         assert!((sc.build_catalog)(Some(&specs)).is_err());
+        // The hosted connection's endpoint is the operator's: a host allow-list
+        // that omits the IdP does not refuse it, while a connection the tenant
+        // wrote is still held to the list.
+        assert!(sc.operator_connections.contains("crm"));
+        let mut own = conn(
+            &v,
+            "acme",
+            "own",
+            serde_json::json!({"type": "oauth2", "config": {
+                "token_url": "https://idp.elsewhere/token", "client_id": "c", "client_secret": "s"}}),
+        );
+        own.connect_provider = None;
+        state.history().connection_upsert(&own).await.unwrap();
+        let sc = std::sync::Arc::new(scope(&state, "acme").await.unwrap());
+        assert!(!sc.operator_connections.contains("own"));
+        let refs =
+            crate::serve::references::ServeReferencePolicy::from_args(&crate::cli::ReferenceArgs {
+                allow_url_host: vec!["data.example".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        let caller = crate::serve::load::BodyOrigin::Caller {
+            allow_subprocess: false,
+        };
+        let body = |auth: &str| {
+            serde_json::json!({ "version": 1, "pipeline": {
+                "source": { "type": "rest", "config": {
+                    "base_url": "https://data.example", "path": "/x", "auth": { "ref": auth } } },
+                "sink": { "type": "jsonl", "config": { "path": "out.jsonl" } } } })
+            .to_string()
+        };
+        let load = |auth: &'static str| {
+            let (sc, refs) = (sc.clone(), refs.clone());
+            async move {
+                crate::serve::load::load_submission_with(
+                    &body(auth),
+                    crate::serve::load::ConfigFormat::Json,
+                    None,
+                    None,
+                    caller,
+                    Some(sc),
+                    &refs,
+                )
+                .await
+            }
+        };
+        let err = load("own").await.unwrap_err();
+        assert!(
+            matches!(&err, ServeError::Forbidden(m) if m.contains("connection own")),
+            "{err:?}"
+        );
+        // Drop the tenant-written one: the hosted one alone loads.
+        state
+            .history()
+            .connection_delete("acme", "own")
+            .await
+            .unwrap();
+        let sc2 = std::sync::Arc::new(scope(&state, "acme").await.unwrap());
+        let loaded = crate::serve::load::load_submission_with(
+            &body("crm"),
+            crate::serve::load::ConfigFormat::Json,
+            None,
+            None,
+            caller,
+            Some(sc2),
+            &refs,
+        )
+        .await;
+        assert!(loaded.is_ok(), "{:?}", loaded.err());
     }
 
     #[tokio::test]

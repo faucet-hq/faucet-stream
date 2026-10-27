@@ -42,7 +42,7 @@ async fn conformance_connector_name_nonempty() {
 async fn spawn_fake_gcs_inner() -> Option<(ContainerAsync<GenericImage>, String, String)> {
     let container = faucet_conformance::containers::start_or_skip(
         || {
-            GenericImage::new("fsouza/fake-gcs-server", "latest")
+            GenericImage::new("fsouza/fake-gcs-server", "1.56.1")
                 .with_exposed_port(4443.tcp())
                 .with_wait_for(WaitFor::message_on_stderr("server started at"))
                 .with_cmd(vec![

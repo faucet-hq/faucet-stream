@@ -20,6 +20,9 @@ use sqlx::{MySqlConnection, MySqlPool, Row};
 /// (#456 L1).
 const SCOPE_COL_WIDTH: usize = 255;
 
+/// MySQL's identifier length limit (characters).
+const MYSQL_MAX_IDENT: usize = 64;
+
 /// Fit a pipeline scope into [`SCOPE_COL_WIDTH`].
 pub(crate) fn scope_key(scope: &str) -> String {
     faucet_core::idempotency::scope_key(scope, SCOPE_COL_WIDTH)
@@ -152,8 +155,23 @@ impl SqlExecutor for MysqlExec<'_> {
 
     async fn fetch_text(&mut self, stmt: &Statement<'_>) -> Result<Vec<String>, FaucetError> {
         let mut q = sqlx::query(&stmt.sql);
+        // Bound as the delete it previews binds them: a binary scope value is
+        // decoded, or the journal would match no row the delete removes.
         for p in &stmt.params {
-            q = bind_value(q, p.value.as_ref());
+            q = match p.value.as_ref() {
+                Value::String(s) if p.sql_type.is_some_and(is_binary_type) => {
+                    bind_binary(q, s, self.binary).map_err(|e| {
+                        FaucetError::Sink(format!(
+                            "cleanup: reading keys to journal: column {}: {e}",
+                            p.column
+                        ))
+                    })?
+                }
+                _ if p.non_integer_text().is_some() => {
+                    q.bind(p.non_integer_text().expect("checked"))
+                }
+                v => bind_value(q, v),
+            };
         }
         let rows = q
             .fetch_all(&mut *self.conn)
@@ -610,12 +628,7 @@ pub(crate) async fn replace_rows_in_place(
 /// re-points their foreign keys at the renamed-away table (#789 SQL-129), and a
 /// `DELETE` would cascade into or be blocked by them.
 pub(crate) fn referenced_overwrite_error(table: &str, referenced_by: &[String]) -> FaucetError {
-    FaucetError::Config(format!(
-        "mysql overwrite: table '{table}' is referenced by a foreign key from {}; replacing its \
-         rows would cascade into, break or be blocked by those tables. Use write_mode: upsert, \
-         or drop the foreign key",
-        referenced_by.join(", ")
-    ))
+    faucet_common_sql::referenced_overwrite_error("mysql", table, referenced_by, false)
 }
 
 /// `(name, DATA_TYPE)` pairs as engine columns.
@@ -1177,9 +1190,28 @@ impl MysqlDriver {
         Ok(exists.is_some())
     }
 
-    /// Staging table name used while an overwrite run is in flight.
+    /// Staging table name used while an overwrite run is in flight, within
+    /// MySQL's 64-character identifier limit: a tokened name leaves room for
+    /// the swap's `_old` suffix, and a long table name is cut and hashed.
     fn staging_table_name(&self) -> String {
-        self.layout.staging_table()
+        let max = if self.layout.overwrite_run.is_some() {
+            MYSQL_MAX_IDENT - "_old".len()
+        } else {
+            MYSQL_MAX_IDENT
+        };
+        faucet_common_sql::bounded_staging_table(
+            &self.config.table_name,
+            self.layout.overwrite_run.as_deref(),
+            max,
+        )
+    }
+
+    /// The table part every tokened staging name of the target shares.
+    fn staging_base_name(&self) -> String {
+        faucet_common_sql::bounded_staging_base(
+            &self.config.table_name,
+            MYSQL_MAX_IDENT - "_old".len(),
+        )
     }
 
     /// The table the current-target-old is renamed to during the atomic swap.
@@ -1187,10 +1219,10 @@ impl MysqlDriver {
         match &self.layout.overwrite_run {
             // One per run, so two runs' swaps never rename onto one name.
             Some(_) => format!("{}_old", self.staging_table_name()),
-            None => format!(
-                "{}{}",
-                self.config.table_name,
-                faucet_core::idempotency::OVERWRITE_STAGING_OLD_SUFFIX
+            None => faucet_common_sql::bounded_table_name(
+                &self.config.table_name,
+                faucet_core::idempotency::OVERWRITE_STAGING_OLD_SUFFIX,
+                MYSQL_MAX_IDENT,
             ),
         }
     }
@@ -1200,7 +1232,7 @@ impl MysqlDriver {
         let pattern = format!(
             "{}%",
             faucet_core::idempotency::like_literal(
-                &faucet_core::idempotency::overwrite_staging_prefix(&self.config.table_name),
+                &faucet_core::idempotency::overwrite_staging_prefix(&self.staging_base_name()),
                 '\\'
             )
         );
@@ -1602,6 +1634,22 @@ impl SqlDriver for MysqlDriver {
 
     async fn table_exists(&self, table: &str) -> Result<bool, FaucetError> {
         MysqlDriver::table_exists(self, table).await
+    }
+
+    fn staging_table(&self) -> String {
+        self.staging_table_name()
+    }
+
+    fn staging_base(&self) -> String {
+        self.staging_base_name()
+    }
+
+    fn legacy_staging_table(&self) -> String {
+        faucet_common_sql::bounded_table_name(
+            &self.config.table_name,
+            faucet_core::idempotency::OVERWRITE_STAGING_SUFFIX,
+            MYSQL_MAX_IDENT,
+        )
     }
 
     async fn overwrite_staging_tables(&self) -> Result<Vec<String>, FaucetError> {
@@ -2561,8 +2609,8 @@ mod tests {
         assert_eq!(
             sql,
             "DELETE FROM `assoc` WHERE `assoc`.`contact_id` = ? \
-             AND NOT EXISTS (SELECT 1 FROM `faucet_cleanup_keys` c \
-             WHERE c.`id` = `assoc`.`id`)"
+             AND NOT EXISTS (SELECT 1 FROM `faucet_cleanup_keys` _faucet_seen \
+             WHERE _faucet_seen.`id` = `assoc`.`id`)"
         );
     }
 
@@ -2576,8 +2624,8 @@ mod tests {
         assert_eq!(
             sql,
             "DELETE FROM `t` WHERE `t`.`tenant` = ? AND `t`.`contact_id` = ? \
-             AND NOT EXISTS (SELECT 1 FROM `faucet_cleanup_keys` c \
-             WHERE c.`a` = `t`.`a` AND c.`b` = `t`.`b`)"
+             AND NOT EXISTS (SELECT 1 FROM `faucet_cleanup_keys` _faucet_seen \
+             WHERE _faucet_seen.`a` = `t`.`a` AND _faucet_seen.`b` = `t`.`b`)"
         );
     }
 

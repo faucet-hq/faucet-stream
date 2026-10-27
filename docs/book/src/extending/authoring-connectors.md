@@ -939,6 +939,18 @@ async fn conformance_errors_not_panics() {
 }
 ```
 
+A source that overrides `stream_pages` must call
+`assert_first_page_before_exhaustion` (requirement `streaming`): serve the
+result from a counting fake (a wiremock `Respond` that adds each response's
+record count, or `faucet_conformance::counting::CountingLinesServer` for a
+line-delimited body) so `served()` is what the backend has handed over. For a
+database, count on the server: a sequence the query advances per row, or the
+server's own progress view (`performance_schema`, `system.processes`,
+`sys.dm_exec_requests`), read with `faucet_conformance::served_probe` from a
+second connection. Where the backend exposes no such count (an embedded
+engine, a broker), list the crate in `conformance-coverage-exempt.txt` with
+the reason.
+
 Resumable sources also add `assert_bookmark_roundtrip` (persist a bookmark,
 re-run, confirm the stream resumes at exactly that position). For a **sink**,
 use `assert_idempotent_replay` and `assert_capabilities_truthful` — both take a

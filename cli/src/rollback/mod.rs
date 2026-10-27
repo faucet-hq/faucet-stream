@@ -303,6 +303,17 @@ async fn rollback_node_leased(
         m.remove("rollback");
     }
     let sink = build_sink(&node.sink.kind, sink_cfg, &inputs.auth).await?;
+    rollback_with_sink(node, store, marker, inputs, sink.as_ref()).await
+}
+
+/// [`rollback_node_leased`] once the sink is built.
+async fn rollback_with_sink(
+    node: &ExpandedNode,
+    store: Arc<dyn StateStore>,
+    marker: RunMarker,
+    inputs: &RollbackInputs,
+    sink: &dyn Sink,
+) -> CliResult<RollbackReport> {
     if !sink.supports_rollback() {
         return Err(CliError::Config(format!(
             "rollback: sink '{}' cannot undo a run (supported: {}; SQL sinks need column mapping)",
@@ -377,7 +388,30 @@ async fn rollback_node_leased(
                 pending.undo = Some(earlier.unwrap_or_default());
                 store.put(&marker_k, &marker_value(&pending)?).await?;
             }
-            sink.rollback_run(&marker.run_id, &opts).await?
+            match sink.rollback_run(&marker.run_id, &opts).await {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    // A failed undo may still have changed the destination
+                    // (auto-committing DDL, a commit whose acknowledgement was
+                    // lost), so the pending record stays unless a re-read
+                    // shows the run is still all there: only then a retry
+                    // that finds nothing cannot be this attempt's doing.
+                    if !inputs.dry_run && earlier.is_none() {
+                        let probe = RollbackOptions {
+                            dry_run: true,
+                            ..opts.clone()
+                        };
+                        let untouched = matches!(
+                            sink.rollback_run(&marker.run_id, &probe).await,
+                            Ok(o) if !nothing_undone(&o)
+                        );
+                        if untouched {
+                            store.put(&marker_k, &marker_value(&marker)?).await?;
+                        }
+                    }
+                    return Err(e.into());
+                }
+            }
         }
     };
     let blocked = outcome.conflicts > 0 && !inputs.force;
@@ -690,6 +724,153 @@ mod tests {
             ..base
         };
         assert!(!ok.blocked());
+    }
+
+    /// A sink whose undo of run "r" commits and then, `fail` times, reports
+    /// an error (`commits: false`: fails before committing).
+    struct FlakyUndo {
+        commits: bool,
+        undone: std::sync::atomic::AtomicBool,
+        fail: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Sink for FlakyUndo {
+        async fn write_batch(&self, _r: &[Value]) -> Result<usize, faucet_core::FaucetError> {
+            Ok(0)
+        }
+        fn config_schema(&self) -> Value {
+            json!({})
+        }
+        fn dataset_uri(&self) -> String {
+            "fake://t".into()
+        }
+        fn supports_rollback(&self) -> bool {
+            true
+        }
+        async fn rollback_run(
+            &self,
+            _run_id: &str,
+            opts: &RollbackOptions,
+        ) -> Result<RollbackOutcome, faucet_core::FaucetError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let found = |applied| {
+                if self.undone.load(SeqCst) {
+                    RollbackOutcome::nothing("no rows carry this run id")
+                } else {
+                    RollbackOutcome {
+                        deleted: 4,
+                        applied,
+                        ..Default::default()
+                    }
+                }
+            };
+            if opts.dry_run {
+                return Ok(found(false));
+            }
+            let out = found(true);
+            if self.commits {
+                self.undone.store(true, SeqCst);
+            }
+            if self.fail.load(SeqCst) > 0 {
+                self.fail.fetch_sub(1, SeqCst);
+                return Err(faucet_core::FaucetError::Sink(
+                    "connection lost waiting for the commit".into(),
+                ));
+            }
+            self.undone.store(true, SeqCst);
+            Ok(out)
+        }
+    }
+
+    fn flaky_case() -> (ExpandedNode, RunMarker, RollbackInputs) {
+        let node = crate::expand::expand(
+            &crate::config::PipelineConfig::from_text(
+                "version: 1\nname: p\npipeline:\n  source: {type: csv, config: {path: x.csv}}\n  sink: {type: sqlite, config: {database_url: 'sqlite::memory:', table_name: t, column_mapping: auto_map}}\n  state: {type: memory}\n",
+                std::path::Path::new("p.yaml"),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .remove(0);
+        let mut marker = marker_for(
+            "r",
+            "p",
+            &node,
+            "p::row",
+            Utc::now().fixed_offset(),
+            "fake://t".into(),
+            "_faucet_run_id".into(),
+        );
+        marker.bookmark_before = Some(json!({"seen": 1}));
+        let inputs = RollbackInputs {
+            run_id: "r".into(),
+            row: None,
+            dry_run: false,
+            force: false,
+            pipeline_name: "p".into(),
+            auth: Default::default(),
+        };
+        (node, marker, inputs)
+    }
+
+    async fn stored_marker(store: &dyn StateStore) -> RunMarker {
+        let v = store
+            .get(&state::marker_key("p::row", "r"))
+            .await
+            .unwrap()
+            .expect("the marker");
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// The undo committed but the sink reported an error: the pending record
+    /// stays, so a retry that finds nothing finishes the bookmark rewind.
+    #[tokio::test]
+    async fn an_undo_that_committed_before_its_error_finishes_on_retry() {
+        let store: Arc<dyn StateStore> = Arc::new(faucet_core::MemoryStateStore::new());
+        store.put("p::row", &json!({"seen": 9})).await.unwrap();
+        let sink = FlakyUndo {
+            commits: true,
+            undone: Default::default(),
+            fail: 1.into(),
+        };
+        let (node, marker, inputs) = flaky_case();
+        rollback_with_sink(&node, store.clone(), marker, &inputs, &sink)
+            .await
+            .expect_err("the commit acknowledgement was lost");
+        let pending = stored_marker(store.as_ref()).await;
+        assert!(pending.undo.is_some(), "{pending:?}");
+        let report = rollback_with_sink(&node, store.clone(), pending, &inputs, &sink)
+            .await
+            .unwrap();
+        assert!(report.outcome.applied, "{report:?}");
+        assert!(report.bookmark_rewound);
+        assert_eq!(store.get("p::row").await.unwrap(), Some(json!({"seen": 1})));
+    }
+
+    /// An undo that failed with the run still all in the destination drops
+    /// the pending record: a later retry that finds nothing is not taken for
+    /// this attempt's commit.
+    #[tokio::test]
+    async fn an_undo_that_left_the_run_in_place_drops_the_pending_record() {
+        let store: Arc<dyn StateStore> = Arc::new(faucet_core::MemoryStateStore::new());
+        let sink = FlakyUndo {
+            commits: false,
+            undone: Default::default(),
+            fail: 1.into(),
+        };
+        let (node, marker, inputs) = flaky_case();
+        store
+            .put(
+                &state::marker_key("p::row", "r"),
+                &marker_value(&marker).unwrap(),
+            )
+            .await
+            .unwrap();
+        rollback_with_sink(&node, store.clone(), marker, &inputs, &sink)
+            .await
+            .expect_err("the undo failed");
+        assert!(stored_marker(store.as_ref()).await.undo.is_none());
     }
 
     #[tokio::test]

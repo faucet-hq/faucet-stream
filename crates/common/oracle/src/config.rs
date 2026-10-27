@@ -261,28 +261,61 @@ impl OracleConnectionConfig {
         format!("oracle://{host}:{port}/{db}")
     }
 
-    /// A short, key-safe scope (service / SID / host) used when deriving state keys.
+    /// A short, key-safe scope used when deriving state keys: the host form
+    /// names host, port and service / SID (two databases with the same
+    /// service name on different hosts get different keys); the
+    /// `connect_string` form is the connect string itself.
     pub fn scope_label(&self) -> String {
+        let raw = match (&self.host, &self.connect_string) {
+            (Some(host), _) => {
+                let port = self.port.unwrap_or(if self.tls.enabled {
+                    DEFAULT_TCPS_PORT
+                } else {
+                    DEFAULT_TCP_PORT
+                });
+                let db = self
+                    .service_name
+                    .as_deref()
+                    .or(self.sid.as_deref())
+                    .unwrap_or_default();
+                format!("{}_{port}_{}", host.trim(), db.trim())
+            }
+            (None, Some(cs)) => cs.clone(),
+            (None, None) => "oracle".to_string(),
+        };
+        key_safe(&raw)
+    }
+
+    /// The scope [`scope_label`](Self::scope_label) rendered before it named
+    /// the host and port (service / SID / host / connect string, first set),
+    /// when that differs — for moving a bookmark stored under the old key.
+    pub fn legacy_scope_label(&self) -> Option<String> {
         let raw = self
             .service_name
             .as_deref()
             .or(self.sid.as_deref())
             .or(self.host.as_deref())
             .or(self.connect_string.as_deref())
-            .unwrap_or("oracle")
-            .trim();
-        let label: String = raw
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        label.trim_matches('_').to_string()
+            .unwrap_or("oracle");
+        let old = key_safe(raw.trim());
+        (old != self.scope_label()).then_some(old)
     }
+}
+
+/// `raw` with every character outside `[A-Za-z0-9_.-]` replaced by `_`, and
+/// leading / trailing `_` trimmed.
+fn key_safe(raw: &str) -> String {
+    let label: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    label.trim_matches('_').to_string()
 }
 
 fn cfg_err(msg: &str) -> FaucetError {
@@ -516,7 +549,7 @@ mod tests {
         assert!(dbg.contains("***"));
         assert!(!dbg.contains("topsecret"));
         assert_eq!(cfg.display_uri(), "oracle://h:1521/S");
-        assert_eq!(cfg.scope_label(), "S");
+        assert_eq!(cfg.scope_label(), "h_1521_S");
     }
 
     #[test]
@@ -526,7 +559,37 @@ mod tests {
             sid: Some("ORCL".into()),
             ..host_cfg()
         };
-        assert_eq!(cfg.scope_label(), "ORCL");
+        assert_eq!(cfg.scope_label(), "db.example.com_1521_ORCL");
+        assert_eq!(cfg.legacy_scope_label().as_deref(), Some("ORCL"));
         assert_eq!(OracleConnectionConfig::default().scope_label(), "oracle");
+        assert_eq!(OracleConnectionConfig::default().legacy_scope_label(), None);
+    }
+
+    #[test]
+    fn scope_label_separates_hosts_sharing_a_service_name() {
+        let a = host_cfg();
+        let b = OracleConnectionConfig {
+            host: Some("db2.example.com".into()),
+            ..host_cfg()
+        };
+        assert_ne!(a.scope_label(), b.scope_label());
+        assert_eq!(a.legacy_scope_label(), b.legacy_scope_label());
+        let other_port = OracleConnectionConfig {
+            port: Some(1522),
+            ..host_cfg()
+        };
+        assert_ne!(a.scope_label(), other_port.scope_label());
+        let cs = OracleConnectionConfig {
+            connect_string: Some("db:1521/FREEPDB1".into()),
+            host: None,
+            service_name: None,
+            ..host_cfg()
+        };
+        assert_eq!(cs.scope_label(), "db_1521_FREEPDB1");
+        assert_eq!(
+            cs.legacy_scope_label(),
+            None,
+            "unchanged for a connect string"
+        );
     }
 }

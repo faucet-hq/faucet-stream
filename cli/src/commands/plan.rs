@@ -319,12 +319,6 @@ pub async fn plan_node(
         }
         let case = resolved_case_from_node(node, input, clock);
         let run = run_case(&case).await?;
-        let inferred = faucet_core::schema::infer_schema(&run.written);
-        #[cfg(feature = "catalog")]
-        {
-            planned_output_schema = Some(inferred.clone());
-        }
-
         // Build the sink ONLY to probe it and read its live schema — never to
         // write. `check()` is best-effort; `current_schema()` yields the delta.
         // An unresolved secret directive would be sent as the credential, so
@@ -342,6 +336,16 @@ pub async fn plan_node(
             Some(s) => s.current_schema().await.ok().flatten(),
             None => None,
         };
+        // Inferred the way the runtime drift pass infers a page: numeric text
+        // bound for a numeric column counts as that column's type.
+        let inferred = match &sink_schema {
+            Some(dest) => faucet_core::drift::infer_page_schema(dest, &run.written),
+            None => faucet_core::schema::infer_schema(&run.written),
+        };
+        #[cfg(feature = "catalog")]
+        {
+            planned_output_schema = Some(inferred.clone());
+        }
         report.sink_probe = match &sink {
             Some(s) => Some(probe_summary(s.as_ref()).await),
             None if !unresolved.is_empty() => Some(
@@ -537,10 +541,35 @@ pub async fn run(args: PlanArgs) -> CliResult<()> {
 
 async fn probe_summary(sink: &dyn faucet_core::Sink) -> String {
     let ctx = faucet_core::CheckContext::default();
-    match sink.check(&ctx).await {
-        Ok(report) => format!("{} probe(s)", report.probes.len()),
-        Err(e) => format!("probe unavailable: {e}"),
+    summarize_probes(sink.check(&ctx).await)
+}
+
+/// One line for a sink preflight: pass / fail / skip counts plus each failing
+/// probe's name and reason, redacted like `faucet doctor` output.
+fn summarize_probes(result: Result<faucet_core::CheckReport, faucet_core::FaucetError>) -> String {
+    use faucet_core::ProbeStatus;
+    let redact = crate::secrets::registry::redact;
+    let report = match result {
+        Ok(report) => report,
+        Err(e) => return format!("probe unavailable: {}", redact(&e.to_string())),
+    };
+    let (mut passed, mut skipped) = (0, 0);
+    let mut failed = Vec::new();
+    for p in &report.probes {
+        match &p.status {
+            ProbeStatus::Pass => passed += 1,
+            ProbeStatus::Skip { .. } => skipped += 1,
+            ProbeStatus::Fail { reason } => failed.push(format!("{}: {}", p.name, redact(reason))),
+        }
     }
+    let mut out = format!(
+        "{passed} passed, {} failed, {skipped} skipped",
+        failed.len()
+    );
+    if !failed.is_empty() {
+        out.push_str(&format!(" — FAILED {}", failed.join("; ")));
+    }
+    out
 }
 
 pub(crate) fn select_root<'a>(
@@ -737,6 +766,52 @@ mod tests {
         };
         super::run(args).await.expect("plan runs");
         assert!(!out.exists(), "plan must not write to the sink");
+    }
+
+    /// Numeric text bound for a numeric column is that column's type, as the
+    /// runtime drift pass reads it — not an incompatible change.
+    #[cfg(all(feature = "catalog", feature = "sink-sqlite", feature = "source-csv"))]
+    #[tokio::test]
+    async fn numeric_text_for_a_numeric_column_is_not_incompatible() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("d.db");
+        let url = format!("sqlite:{}?mode=rwc", db.display());
+        let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+        sqlx::query("CREATE TABLE t (id INTEGER, amount REAL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        let cfg = crate::config::PipelineConfig::from_text(
+            &format!(
+                "version: 1\npipeline:\n  source: {{ type: csv, config: {{ path: in.csv }} }}\n  sink: {{ type: sqlite, config: {{ database_url: \"sqlite:{}\", table_name: t, column_mapping: auto_map }} }}\n",
+                db.display()
+            ),
+            std::path::Path::new("p.yaml"),
+        )
+        .unwrap();
+        let nodes = crate::expand::expand(&cfg).unwrap();
+        let report = plan_node(
+            &cfg,
+            &nodes[0],
+            &Default::default(),
+            PlanOptions {
+                sample: Some((
+                    vec![serde_json::json!({"id": 1, "amount": "12.50"})],
+                    "fixture".into(),
+                )),
+                impact: None,
+            },
+        )
+        .await
+        .unwrap();
+        let sample = report.sample.expect("a sample report");
+        assert!(sample.sink_schema.is_some(), "{sample:?}");
+        assert!(
+            sample.schema_delta.incompatible.is_empty(),
+            "{:?}",
+            sample.schema_delta
+        );
     }
 
     #[test]
@@ -955,6 +1030,47 @@ mod tests {
         let err = super::run(args).await.unwrap_err().to_string();
         assert!(
             err.contains("removes messages") && err.contains("plan --live"),
+            "{err}"
+        );
+    }
+
+    /// A failing sink probe is reported as a failure with its redacted
+    /// reason, never as a bare probe count.
+    #[test]
+    fn a_failing_sink_probe_is_surfaced_and_redacted() {
+        use faucet_core::{CheckReport, Probe, ProbeStatus};
+        crate::secrets::registry::register("pl4n-s3cret-pw");
+        let probe = |name, status| Probe {
+            name,
+            status,
+            elapsed_ms: 1,
+            hint: None,
+        };
+        let line = summarize_probes(Ok(CheckReport {
+            probes: vec![
+                probe(
+                    "connect",
+                    ProbeStatus::Fail {
+                        reason: "password pl4n-s3cret-pw rejected".into(),
+                    },
+                ),
+                probe(
+                    "table",
+                    ProbeStatus::Skip {
+                        reason: "n/a".into(),
+                    },
+                ),
+                probe("auth", ProbeStatus::Pass),
+            ],
+        }));
+        assert!(line.starts_with("1 passed, 1 failed, 1 skipped"), "{line}");
+        assert!(line.contains("FAILED connect: password"), "{line}");
+        assert!(!line.contains("pl4n-s3cret-pw"), "{line}");
+        let err = summarize_probes(Err(faucet_core::FaucetError::Sink(
+            "dial pl4n-s3cret-pw".into(),
+        )));
+        assert!(
+            !err.contains("pl4n-s3cret-pw") && err.starts_with("probe unavailable"),
             "{err}"
         );
     }

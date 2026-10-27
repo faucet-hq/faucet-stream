@@ -701,7 +701,11 @@ async fn load_native_uses_the_explicit_schema_and_honours_create_table_false() {
     config.create_table = false;
     config.schema = Some(json!({
         "type": "object",
-        "properties": {"Id": {"type": "integer"}, "When": {"type": "string", "format": "date"}}
+        "properties": {
+            "Id": {"type": "integer"},
+            "When": {"type": "string", "format": "date"},
+            "Total": {"type": "string", "format": "decimal"}
+        }
     }));
     let (sink, _sa) = build_sink(&server, config).await;
     sink.load_native(
@@ -726,7 +730,8 @@ async fn load_native_uses_the_explicit_schema_and_honours_create_table_false() {
     );
     assert!(
         body.contains("\"name\":\"Id\",\"type\":\"INTEGER\"")
-            && body.contains("\"name\":\"When\",\"type\":\"DATE\""),
+            && body.contains("\"name\":\"When\",\"type\":\"DATE\"")
+            && body.contains("\"name\":\"Total\",\"type\":\"BIGNUMERIC\""),
         "{body}"
     );
 }

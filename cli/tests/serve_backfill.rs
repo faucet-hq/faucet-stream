@@ -418,6 +418,28 @@ pipeline:
     let body = resp.text().await.unwrap();
     assert!(body.contains("write_mode: overwrite"), "{body}");
 
+    // Several windows into one fixed object in replace mode → 400 too.
+    let object = r#"
+version: 1
+name: plain
+pipeline:
+  source: { type: sqlite, config: { database_url: "sqlite::memory:", query: "SELECT '${backfill.start}' AS s" } }
+  sink:   { type: s3, config: { bucket: b, path: exports/orders.jsonl } }
+"#;
+    let resp = client
+        .post(format!("{url}/v1/backfill"))
+        .json(
+            &json!({ "config": object, "from": "2026-06-01", "to": "2026-06-03", "window": "1d" }),
+        )
+        .send()
+        .await
+        .unwrap();
+    if cfg!(feature = "sink-s3") {
+        assert_eq!(resp.status(), 400);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("s3://b/exports/orders.jsonl"), "{body}");
+    }
+
     server.abort();
 }
 

@@ -3881,6 +3881,7 @@ mod tests {
         let stage = compile_stage(&TransformStage::Map(RecordTransform::KeysCase {
             mode: KeyCaseMode::Snake,
             on_collision: Default::default(),
+            suffix_keys: Vec::new(),
         }))
         .unwrap();
         let (sink, store) = CollectSink::new();

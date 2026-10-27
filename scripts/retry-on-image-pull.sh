@@ -4,6 +4,8 @@
 # pull error (scripts/pull_flake.py). A test that fails for any other reason
 # fails the job on its first run, so a flaky test cannot pass by being re-run.
 #   scripts/retry-on-image-pull.sh cargo test --workspace --all-features
+# With RETRY_LOG_KEEP set, the last attempt's output is appended to that file
+# (scripts/failing_tests.py summarises it).
 set -uo pipefail
 
 FLAKE_CHECK="$(dirname "$0")/pull_flake.py"
@@ -16,6 +18,9 @@ for attempt in $(seq 1 "$attempts"); do
   "$@" 2>&1 | tee "$log"
   status=${PIPESTATUS[0]}
   echo "::endgroup::"
+  if [ -n "${RETRY_LOG_KEEP:-}" ] && { [ "$status" -eq 0 ] || ! python3 "$FLAKE_CHECK" "$log" || [ "$attempt" -eq "$attempts" ]; }; then
+    cat "$log" >> "$RETRY_LOG_KEEP"
+  fi
   if [ "$status" -eq 0 ]; then
     exit 0
   fi

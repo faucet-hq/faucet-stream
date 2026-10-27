@@ -70,7 +70,35 @@ pub fn is_client_missing(message: &str) -> bool {
     message.contains("DPI-1047") || message.contains("DPI-1072")
 }
 
-/// Build a session pool synchronously (call from a blocking thread).
+/// How many times pool creation is tried when OCI reports a transient
+/// worker-thread-pool start failure ([`is_transient_pool_init`]).
+pub const POOL_INIT_ATTEMPTS: u32 = 5;
+
+/// Pause before the first retry of a transient pool-creation failure; it
+/// doubles on each later one.
+pub const POOL_INIT_BACKOFF: Duration = Duration::from_millis(200);
+
+/// True when `message` is OCI failing to start its worker thread pool
+/// (`ORA-24447`). That happens when several session pools initialise at once
+/// on a loaded host, and clears on a retry (#945).
+pub fn is_transient_pool_init(message: &str) -> bool {
+    message.contains("ORA-24447")
+}
+
+/// The pause before retry `attempt` (1-based) of a transient pool-creation
+/// failure.
+pub fn pool_init_backoff(attempt: u32) -> Duration {
+    POOL_INIT_BACKOFF * 2u32.saturating_pow(attempt.saturating_sub(1))
+}
+
+/// Serialises session-pool creation in this process: OCI initialises a
+/// per-pool worker thread pool, and many at once on a loaded host fail with
+/// `ORA-24447`.
+static POOL_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Build a session pool synchronously (call from a blocking thread). Pool
+/// creations in one process are serialised, and a transient `ORA-24447` is
+/// retried up to `POOL_INIT_ATTEMPTS` times with a doubling pause.
 pub fn build_pool_blocking(
     cfg: &OracleConnectionConfig,
     max_connections: u32,
@@ -83,7 +111,24 @@ pub fn build_pool_blocking(
         .connection_increment(1)
         .external_auth(cfg.external_auth)
         .get_mode(GetMode::TimedWait(POOL_WAIT));
-    builder.build().map_err(|e| {
+    let mut attempt = 1;
+    let built = loop {
+        let result = {
+            let _serial = POOL_INIT.lock().unwrap_or_else(|p| p.into_inner());
+            builder.build()
+        };
+        match result {
+            Err(e) if attempt < POOL_INIT_ATTEMPTS && is_transient_pool_init(&e.to_string()) => {
+                tracing::warn!(attempt, error = %e, "oracle pool creation: retrying a transient OCI failure");
+                #[allow(clippy::disallowed_methods)]
+                // runs on a blocking thread, outside any CallContext
+                std::thread::sleep(pool_init_backoff(attempt));
+                attempt += 1;
+            }
+            other => break other,
+        }
+    };
+    built.map_err(|e| {
         let msg = e.to_string();
         if is_client_missing(&msg) {
             FaucetError::Config(format!(
@@ -169,6 +214,23 @@ mod tests {
         assert!(CLIENT_HINT.contains("faucet-stream:full)"));
         assert_eq!(call_timeout(0), None);
         assert_eq!(call_timeout(5), Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn only_a_worker_thread_pool_start_failure_is_retried() {
+        assert!(is_transient_pool_init(
+            "OCI Error: ORA-24447: OCI worker thread pool failed to initialize"
+        ));
+        assert!(!is_transient_pool_init(
+            "ORA-01017: invalid username/password"
+        ));
+        assert!(!is_transient_pool_init(
+            "DPI-1047: Cannot locate a 64-bit Oracle Client library"
+        ));
+        assert_eq!(pool_init_backoff(1), POOL_INIT_BACKOFF);
+        assert_eq!(pool_init_backoff(3), POOL_INIT_BACKOFF * 4);
+        let total: Duration = (1..POOL_INIT_ATTEMPTS).map(pool_init_backoff).sum();
+        assert!(total < Duration::from_secs(10), "{total:?}");
     }
 
     #[test]

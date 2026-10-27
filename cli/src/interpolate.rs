@@ -182,17 +182,20 @@ pub fn interpolate_record_path(input: &str, ctx: &HashMap<String, Value>) -> Cli
 /// embedded in a longer path (`./out/${parent.id}.jsonl`) must stay one
 /// name: a value holding a path separator or NUL, or one that is `.` or
 /// `..`, is refused. A field that is exactly one token takes the value whole
-/// but still may not climb out with a `..` component or carry NUL.
+/// as a relative path: it may not be absolute (`/…`, `\…`, `C:…`), start
+/// with `~`, climb out with a `..` component or carry NUL.
 pub fn interpolate_record_file_path(
     input: &str,
     ctx: &HashMap<String, Value>,
 ) -> CliResult<String> {
     if is_single_token(input) {
         let out = interpolate_record(input, ctx)?;
-        if out.contains('\0') || out.split(['/', '\\']).any(|c| c == "..") {
+        if out.contains('\0') || out.split(['/', '\\']).any(|c| c == "..") || leaves_relative(&out)
+        {
             return Err(CliError::Config(format!(
-                "`{input}` resolved to `{out}`, a path that climbs out of its directory or \
-                 holds NUL"
+                "`{input}` resolved to `{out}`, a path that is absolute, starts at a home \
+                 directory, climbs out of its directory or holds NUL; a record value may only \
+                 name a path relative to where the pipeline runs"
             )));
         }
         return Ok(out);
@@ -210,6 +213,14 @@ pub fn interpolate_record_file_path(
             Ok(Some(raw))
         }
     })
+}
+
+/// Whether a path is anchored somewhere other than the working directory:
+/// absolute, a Windows drive or UNC prefix, or `~`.
+fn leaves_relative(path: &str) -> bool {
+    let b = path.as_bytes();
+    path.starts_with(['/', '\\', '~'])
+        || (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':')
 }
 
 fn is_single_token(input: &str) -> bool {

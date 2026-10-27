@@ -99,7 +99,7 @@ impl Remote for GcsRemote {
 async fn every_writable_format_takes_every_option_on_gcs() {
     let Some(container) = faucet_conformance::containers::start_or_skip(
         || {
-            GenericImage::new("fsouza/fake-gcs-server", "latest")
+            GenericImage::new("fsouza/fake-gcs-server", "1.56.1")
                 .with_exposed_port(4443.tcp())
                 .with_wait_for(WaitFor::message_on_stderr("server started at"))
                 .with_cmd(vec![

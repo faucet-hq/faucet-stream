@@ -312,6 +312,11 @@ impl OtlpLogExporter {
         // Leading single lines rejected before anything was accepted.
         let mut unproven = 0usize;
         let mut last_rejection = None;
+        let mut probed = false;
+        // The batch's last line, delivered out of order by the probe: it
+        // joins `handled` only once every line before it is handled, so
+        // `handled` stays a delivered prefix.
+        let mut tail: Option<u64> = None;
         let mut stack: Vec<&[ShipLine]> = vec![lines];
         while let Some(part) = stack.pop() {
             if part.is_empty() {
@@ -341,10 +346,36 @@ impl OtlpLogExporter {
                 Err(e) if e.payload_rejected => {
                     unproven += 1;
                     last_rejection = Some(e);
-                    // Two lines in a row rejected and none accepted: the
-                    // collector is refusing payloads, not one bad line.
-                    if unproven >= 2 {
+                    if unproven < 2 {
+                        continue;
+                    }
+                    // Two lines in a row rejected and none accepted: either
+                    // the collector refuses every payload or the batch opens
+                    // with two bad lines. The batch's last line, on its own,
+                    // tells them apart (once).
+                    let last = &lines[lines.len() - 1..];
+                    let pending_last = stack
+                        .first()
+                        .is_some_and(|p| p.as_ptr_range().end == lines.as_ptr_range().end);
+                    if probed || !pending_last {
                         break;
+                    }
+                    probed = true;
+                    match self.export_classified(run_attrs, last).await {
+                        Ok(rejected) => {
+                            accepted_any = true;
+                            out.handled += unproven;
+                            out.dropped += unproven as u64;
+                            tail = Some(rejected.min(1));
+                            unproven = 0;
+                            let bottom = stack[0];
+                            stack[0] = &bottom[..bottom.len() - 1];
+                        }
+                        Err(e) if e.payload_rejected => break,
+                        Err(e) => {
+                            out.error = Some(e);
+                            break;
+                        }
                     }
                 }
                 Err(e) => {
@@ -352,6 +383,13 @@ impl OtlpLogExporter {
                     break;
                 }
             }
+        }
+        if let Some(dropped) = tail
+            && out.error.is_none()
+            && out.handled + 1 == lines.len()
+        {
+            out.handled += 1;
+            out.dropped += dropped;
         }
         if !accepted_any && unproven > 0 && out.error.is_none() {
             out.error = last_rejection.map(|e| ExportError {
@@ -402,7 +440,7 @@ pub fn batches(lines: Vec<ShipLine>) -> Vec<Vec<ShipLine>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn line(seq: u64, attrs: &[(&str, &str)]) -> ShipLine {
@@ -531,7 +569,7 @@ mod tests {
 
     /// A collector that answers 400 to any request body `reject` matches,
     /// counting requests in `hits`.
-    async fn rejecting_collector(
+    pub(crate) async fn rejecting_collector(
         reject: fn(&[u8]) -> bool,
         hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) -> String {
@@ -672,6 +710,66 @@ mod tests {
         let one = ex.export_isolating(&BTreeMap::new(), &lines[..1]).await;
         assert_eq!((one.handled, one.dropped), (0, 0));
         assert!(one.error.is_some());
+    }
+
+    /// Two bad lines at the head of a batch are dropped once the collector
+    /// takes the batch's last line; the rest are delivered.
+    #[tokio::test]
+    async fn two_bad_head_lines_do_not_hold_back_the_batch() {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let endpoint = rejecting_collector(
+            |buf| buf.windows(6).any(|w| w == b"line 1" || w == b"line 2"),
+            hits.clone(),
+        )
+        .await;
+        let ex = OtlpLogExporter::new(&OtelConfig {
+            endpoint,
+            protocol: OtelProtocol::Http,
+            timeout_secs: 5,
+            ..Default::default()
+        })
+        .unwrap();
+        let lines: Vec<ShipLine> = (1..=8).map(|i| line(i, &[])).collect();
+        let out = ex.export_isolating(&BTreeMap::new(), &lines).await;
+        assert!(out.error.is_none(), "{:?}", out.error.map(|e| e.message));
+        assert_eq!((out.handled, out.dropped), (8, 2));
+    }
+
+    /// A collector that rejects lines 1 and 2 and fails transiently on any
+    /// request carrying line 3: the probe delivers line 8 out of order,
+    /// then the export of line 3 fails.
+    pub(crate) async fn probe_then_transient_collector() -> String {
+        let respond: Respond = Box::new(|buf| {
+            let has = |n: &[u8]| buf.windows(n.len()).any(|w| w == n);
+            if has(b"line 1") || has(b"line 2") {
+                b"HTTP/1.1 400 Bad Request\r\nconnection: close\r\ncontent-length: 7\r\n\r\nbad req"
+                    .to_vec()
+            } else if has(b"line 3") {
+                b"HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
+                    .to_vec()
+            } else {
+                b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 0\r\n\r\n".to_vec()
+            }
+        });
+        scripted_collector(std::sync::Arc::new(respond), Default::default()).await
+    }
+
+    /// `handled` is a delivered prefix: a failure after the probe leaves the
+    /// probed last line outside it, so nothing between is skipped.
+    #[tokio::test]
+    async fn a_failure_after_the_probe_keeps_handled_a_delivered_prefix() {
+        let ex = OtlpLogExporter::new(&OtelConfig {
+            endpoint: probe_then_transient_collector().await,
+            protocol: OtelProtocol::Http,
+            timeout_secs: 5,
+            ..Default::default()
+        })
+        .unwrap();
+        let lines: Vec<ShipLine> = (1..=8).map(|i| line(i, &[])).collect();
+        let out = ex.export_isolating(&BTreeMap::new(), &lines).await;
+        let e = out.error.expect("line 3 failed");
+        assert!(!e.payload_rejected);
+        assert_eq!((out.handled, out.dropped), (2, 2));
     }
 
     #[tokio::test]

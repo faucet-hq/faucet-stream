@@ -342,13 +342,17 @@ async fn overwrite_staging_insert_failure_surfaces_error() {
     let server = MockServer::start().await;
     mount_token_endpoint(&server).await;
     mount_table_schema(&server).await;
+    // Only the page insert fails: the writer's staging create (#934 R5-001)
+    // succeeds first.
     Mock::given(method("POST"))
         .and(path(format!("/projects/{PROJECT_ID}/queries")))
+        .and(wiremock::matchers::body_string_contains("INSERT INTO"))
         .respond_with(ResponseTemplate::new(500).set_body_json(json!({
             "error": {"code": 500, "message": "backend error"}
         })))
         .mount(&server)
         .await;
+    mount_query_and_job(&server, "job-ddl").await;
 
     let (sink, _sa) = build_sink(&server, config_overwrite()).await;
     let err = sink
@@ -2589,5 +2593,86 @@ async fn an_undecodable_staging_listing_fails_begin() {
         err.to_string()
             .contains("BigQuery staging listing decode failed"),
         "{err}"
+    );
+}
+
+/// R5-001 (#934): a grouped writer whose first page finds the target already
+/// there (a sibling writer just created it on a first run) still makes sure
+/// the shared staging table exists before loading into it, rather than
+/// assuming the sibling's staging create already landed.
+#[tokio::test]
+async fn grouped_writer_creates_staging_even_when_the_target_exists() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    mount_query_and_job(&server, "job-sib").await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/upload/bigquery/v2/projects/{PROJECT_ID}/jobs"
+        )))
+        .and(query_param("uploadType", "multipart"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(done_job("load-sib")))
+        .mount(&server)
+        .await;
+    mount_jobs_get_done(&server, "load-sib").await;
+
+    let mut config = config_overwrite();
+    config.media_load = true;
+    config.overwrite_staging = true;
+    config.upload_base_url = Some(server.uri());
+    let config = with_sa_auth(config, &server);
+    let (sink, _sa) = build_sink(&server, config).await;
+    // No begin on this instance: another one ran it.
+    sink.write_batch(&[json!({"id": 1, "name": "a"})])
+        .await
+        .expect("staged load");
+    let qs = queries(&server).await;
+    assert!(
+        qs.iter()
+            .any(|q| q.starts_with("CREATE TABLE IF NOT EXISTS") && q.contains(" LIKE ")),
+        "the writer must create staging when missing: {qs:?}"
+    );
+}
+
+/// R4-004 (#934): the media upload path mints its OAuth token under the run's
+/// call context, so the run's deadline ends a hung token exchange promptly
+/// instead of waiting out the 60 s mint bound.
+#[tokio::test]
+async fn a_hung_token_mint_ends_at_the_run_deadline() {
+    let server = MockServer::start().await;
+    // The BigQuery client's own first token is served at once; the media
+    // upload's mint then hangs.
+    Mock::given(method("POST"))
+        .and(path(AUTH_TOKEN_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fake_token()))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(AUTH_TOKEN_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(fake_token())
+                .set_delay(std::time::Duration::from_secs(30)),
+        )
+        .mount(&server)
+        .await;
+    mount_table_schema(&server).await;
+    let (sink, _sa) = build_sink(&server, direct_media_config(&server)).await;
+    sink.set_call_context(
+        faucet_core::CallContext::new()
+            .with_deadline(tokio::time::Instant::now() + std::time::Duration::from_secs(2)),
+    );
+    sink.begin_overwrite().await.expect("begin");
+    let started = std::time::Instant::now();
+    let err = sink
+        .write_batch(&[json!({"id": 1, "name": "a"})])
+        .await
+        .expect_err("the deadline ends the mint");
+    assert!(err.to_string().contains("token call"), "{err}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(15),
+        "took {:?}: {err}",
+        started.elapsed()
     );
 }

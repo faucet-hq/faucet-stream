@@ -31,7 +31,7 @@ use std::pin::Pin;
 /// let inner: Box<dyn Source> = build_inner();
 /// let wrapped = TransformingSource::new(
 ///     inner,
-///     vec![TransformStage::Map(RecordTransform::KeysCase { mode: KeyCaseMode::Snake, on_collision: Default::default() })],
+///     vec![TransformStage::Map(RecordTransform::KeysCase { mode: KeyCaseMode::Snake, on_collision: Default::default(), suffix_keys: Vec::new() })],
 ///     Labels::for_named("rest"),
 /// ).unwrap();
 /// ```
@@ -579,6 +579,7 @@ mod tests {
             vec![TransformStage::Map(RecordTransform::KeysCase {
                 mode: KeyCaseMode::Snake,
                 on_collision: Default::default(),
+                suffix_keys: Vec::new(),
             })],
             Labels::for_named("test"),
         )
@@ -650,6 +651,7 @@ mod tests {
             vec![TransformStage::Map(RecordTransform::KeysCase {
                 mode: KeyCaseMode::Snake,
                 on_collision: Default::default(),
+                suffix_keys: Vec::new(),
             })],
             Labels::for_named("test"),
         )
@@ -713,6 +715,7 @@ mod tests {
             vec![TransformStage::Map(RecordTransform::KeysCase {
                 mode: KeyCaseMode::Snake,
                 on_collision: Default::default(),
+                suffix_keys: Vec::new(),
             })],
             Labels::for_named("test"),
         )
@@ -753,6 +756,7 @@ mod tests {
             vec![TransformStage::Map(RecordTransform::KeysCase {
                 mode: KeyCaseMode::Snake,
                 on_collision: Default::default(),
+                suffix_keys: Vec::new(),
             })],
             Labels::for_named("t"),
         )
@@ -798,6 +802,7 @@ mod tests {
             vec![TransformStage::Map(RecordTransform::KeysCase {
                 mode: KeyCaseMode::Snake,
                 on_collision: Default::default(),
+                suffix_keys: Vec::new(),
             })],
             Labels::for_named("test"),
         )
@@ -917,6 +922,7 @@ mod tests {
             vec![TransformStage::Map(RecordTransform::KeysCase {
                 mode: KeyCaseMode::Snake,
                 on_collision: Default::default(),
+                suffix_keys: Vec::new(),
             })],
             Labels::for_named("test"),
         )
@@ -987,6 +993,7 @@ mod tests {
                 vec![TransformStage::Map(RecordTransform::KeysCase {
                     mode: KeyCaseMode::Snake,
                     on_collision: Default::default(),
+                    suffix_keys: Vec::new(),
                 })],
                 Labels::for_named("test"),
             )
@@ -1259,6 +1266,7 @@ mod columnar_tests {
                 crate::transform::RecordTransform::KeysCase {
                     mode: crate::transform::KeyCaseMode::Snake,
                     on_collision: crate::transform::KeyCollision::Error,
+                    suffix_keys: Vec::new(),
                 },
             )],
             Labels::for_named("t"),

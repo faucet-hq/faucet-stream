@@ -254,7 +254,7 @@ impl Watcher for ScheduleWatcher {
             FireOutcome::Dropped(reason) => {
                 Err(format!("tick {tick} dropped ({reason}); retrying").into())
             }
-            FireOutcome::Error(e) | FireOutcome::Failed(e) => Err(
+            FireOutcome::Error(e) | FireOutcome::Failed(e) | FireOutcome::Refused(e) => Err(
                 super::watcher::PollError::fired(format!("tick {tick}: {e}")),
             ),
             FireOutcome::Enqueued(_) | FireOutcome::Coalesced => unreachable!("committed above"),

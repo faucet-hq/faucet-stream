@@ -12,6 +12,7 @@ pub struct SqliteSourceConfig {
     #[schemars(extend("x-faucet-resource" = "path"))]
     pub database_url: String,
     /// SQL query to execute.
+    #[schemars(extend("x-faucet-sql" = true))]
     pub query: String,
     /// Maximum number of connections in the pool. Defaults to 10.
     #[serde(default = "default_max_connections")]

@@ -547,6 +547,18 @@ pub fn line_capped<R>(reader: R, max: u64) -> LineCapped<R> {
     }
 }
 
+/// The lines of a JSON Lines body, none longer than `max` bytes (see
+/// [`line_capped`]). Every streamed JSON Lines reader uses it (or
+/// [`line_capped`] under its own line reader), so a body with no newline fails
+/// the same way in every source instead of being buffered whole.
+pub fn capped_lines<R: tokio::io::AsyncRead + Unpin>(
+    reader: R,
+    max: u64,
+) -> tokio::io::Lines<tokio::io::BufReader<LineCapped<R>>> {
+    use tokio::io::AsyncBufReadExt;
+    tokio::io::BufReader::new(line_capped(reader, max)).lines()
+}
+
 /// A reader whose lines are bounded (see [`line_capped`]).
 #[derive(Debug)]
 pub struct LineCapped<R> {
@@ -572,17 +584,37 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for LineCapped<R> {
             if self.since_newline > self.max {
                 return std::task::Poll::Ready(Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!(
-                        "a line is longer than `max_object_bytes` ({} bytes) — is the file \
-                         missing its newlines? raise `max_object_bytes` to read it",
-                        self.max
-                    ),
+                    LineTooLong { max: self.max },
                 )));
             }
         }
         polled
     }
 }
+
+/// The error a [`LineCapped`] reader fails with (inside an `InvalidData`
+/// I/O error) once a line passes its cap. A caller whose cap is not
+/// `max_object_bytes` finds it with
+/// `io_error.get_ref().and_then(|e| e.downcast_ref::<LineTooLong>())` and
+/// words the error for its own setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineTooLong {
+    /// The cap, in bytes.
+    pub max: u64,
+}
+
+impl std::fmt::Display for LineTooLong {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a line is longer than `max_object_bytes` ({} bytes) — is the file missing its \
+             newlines? raise `max_object_bytes` to read it",
+            self.max
+        )
+    }
+}
+
+impl std::error::Error for LineTooLong {}
 
 /// The error for a file past `max_object_bytes`.
 pub fn check_object_size(len: u64, max: u64, what: &str) -> Result<(), FaucetError> {
@@ -811,6 +843,13 @@ mod tests {
         let err = lines.next_line().await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("max_object_bytes"), "{err}");
+        assert_eq!(
+            err.get_ref()
+                .and_then(|e| e.downcast_ref::<LineTooLong>())
+                .copied(),
+            Some(LineTooLong { max: 64 }),
+            "the cap is readable from the error"
+        );
     }
 
     #[tokio::test]

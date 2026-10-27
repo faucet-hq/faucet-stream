@@ -462,26 +462,95 @@ fn register_secret_values(env: &HashMap<String, String>) {
     }
 }
 
-/// Lower-case key names that hold a credential inside a JSON value or a URL
-/// query / connection string.
-const SECRET_KEY_PARTS: &[&str] = &[
+/// Words that make a key name a credential wherever they appear in its last
+/// word (`password`, `db_password`, `client_secret`, `access_token`).
+const SECRET_WORDS: &[&str] = &[
     "password",
     "passwd",
-    "pwd",
+    "passphrase",
     "secret",
     "token",
-    "key",
     "credential",
-    "auth",
-    "private",
-    "sig",
-    "signature",
 ];
 
+/// Last words that name a credential on their own.
+const SECRET_LAST_WORDS: &[&str] = &[
+    "pwd",
+    "auth",
+    "authorization",
+    "sig",
+    "signature",
+    "apikey",
+    "accesskey",
+    "secretkey",
+    "privatekey",
+];
+
+/// Words that turn a trailing `key` into a credential (`api_key`,
+/// `AccountKey`); any other `key` names a column (`partition_key`).
+const KEY_QUALIFIERS: &[&str] = &[
+    "api",
+    "access",
+    "secret",
+    "private",
+    "client",
+    "account",
+    "signing",
+    "master",
+    "encryption",
+    "shared",
+    "subscription",
+    "app",
+    "service",
+    "storage",
+    "sas",
+    "auth",
+    "hmac",
+];
+
+/// Lower-case words of a key name, split at non-alphanumerics and camelCase
+/// boundaries (`x-api-key`, `AccountKey`, `partition_key`).
+fn key_words(key: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut prev_lower = false;
+    for c in key.chars() {
+        if !c.is_ascii_alphanumeric() {
+            if !cur.is_empty() {
+                words.push(std::mem::take(&mut cur));
+            }
+            prev_lower = false;
+            continue;
+        }
+        if c.is_ascii_uppercase() && prev_lower && !cur.is_empty() {
+            words.push(std::mem::take(&mut cur));
+        }
+        prev_lower = c.is_ascii_lowercase() || c.is_ascii_digit();
+        cur.push(c.to_ascii_lowercase());
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    words
+}
+
+/// Whether a key name inside a JSON value or a URL query / connection string
+/// names a credential. Matched by its last word, so `sort_key`, `key_field`,
+/// `author` and `signature_field` name columns, not secrets.
 fn is_secret_key(key: &str) -> bool {
-    let k = key.to_ascii_lowercase();
-    // A bare `key` / `keys` names columns (an upsert key, a message key).
-    k != "key" && k != "keys" && SECRET_KEY_PARTS.iter().any(|p| k.contains(p))
+    if key.trim().contains(char::is_whitespace) {
+        return false;
+    }
+    let words = key_words(key);
+    let Some(last) = words.last() else {
+        return false;
+    };
+    if SECRET_WORDS.iter().any(|w| last.contains(w)) || SECRET_LAST_WORDS.contains(&last.as_str()) {
+        return true;
+    }
+    matches!(last.as_str(), "key" | "keys")
+        && words.len() >= 2
+        && KEY_QUALIFIERS.contains(&words[words.len() - 2].as_str())
 }
 
 /// Name parts that mark a whole `*_JSON` value as a credential block (an
@@ -564,6 +633,70 @@ fn urlencoding_decode(s: &str) -> Result<String, ()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn secret_keys_are_matched_by_their_last_word() {
+        for k in [
+            "password",
+            "db_password",
+            "clientSecret",
+            "access_token",
+            "x-api-key",
+            "api_key",
+            "AccountKey",
+            "SharedAccessSignature",
+            "sig",
+            "PWD",
+            "Authorization",
+            "auth",
+            "private_key",
+            "apikey",
+        ] {
+            assert!(is_secret_key(k), "{k}");
+        }
+        for k in [
+            "key",
+            "keys",
+            "partition_key",
+            "sort_key",
+            "message_key",
+            "key_field",
+            "author",
+            "signature_field",
+            "keyspace",
+            "password_field",
+            "token_url",
+            "private",
+            "WHERE api_key ",
+        ] {
+            assert!(!is_secret_key(k), "{k}");
+        }
+    }
+
+    #[test]
+    fn column_names_and_queries_register_nothing() {
+        assert!(
+            embedded_secrets(
+                "FAUCET_SINK_DYNAMODB_CONFIG_JSON",
+                r#"{"partition_key":"customer_id","sort_key":"order_ts","author":"someone"}"#
+            )
+            .is_empty()
+        );
+        assert!(
+            embedded_secrets(
+                "FAUCET_SOURCE_PG_QUERY",
+                "SELECT * FROM t WHERE sort_key = 'customer_id'"
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            embedded_secrets(
+                "FAUCET_SOURCE_X_CONNECTION_STRING",
+                "AccountName=acct;AccountKey=k3y-5521;EndpointSuffix=core"
+            ),
+            vec!["k3y-5521".to_string()]
+        );
+    }
 
     #[test]
     fn a_url_password_is_collected_raw_and_percent_decoded() {

@@ -155,6 +155,7 @@ pub struct DatabricksSourceConfig {
     /// The SQL statement to run. May contain `:name` parameter markers (see
     /// [`parameters`](Self::parameters)) and a `${bookmark}` token for
     /// incremental replication.
+    #[schemars(extend("x-faucet-sql" = true))]
     pub sql: String,
     /// Authentication (PAT / OAuth bearer), inline or via a shared `auth: { ref }`.
     pub auth: AuthSpec<DatabricksAuth>,

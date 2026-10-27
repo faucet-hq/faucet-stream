@@ -36,6 +36,8 @@ source:
 | `stream_arn` | table's `LatestStreamArn` | Streams only |
 | `start_position` | `trim_horizon` | `trim_horizon` or `latest`, for shards with no bookmark |
 | `on_gap` | `fail` | `fail` or `resnapshot` (see below) |
+| `resnapshot_deletes` | `true` | `on_gap: resnapshot`: delete destination rows of items the re-read did not see; `false` keeps them and needs no cleanup-capable sink |
+| `resnapshot_max_keys` | `1000000` | `on_gap: resnapshot`: most distinct keys the re-read tracks for its delete |
 | `poll_interval_ms` | `1000` | Per-shard wait when caught up (floored at 200) |
 | `records_per_request` | `1000` | `GetRecords` `Limit` (1–1000) |
 | `shard_concurrency` | `4` | Shards read at once; every readable shard still gets turns |
@@ -125,8 +127,12 @@ TTL expirations arrive as `op: "d"` with `user_identity.principal_id =
   next run). An ordinary streams run never deletes. The sink must support
   cleanup with `write_mode: upsert` and a `key` (`postgres`, `mysql`, `mssql`,
   `sqlite`, `mongodb`, `elasticsearch`, `bigquery`, `spanner`); `faucet
-  validate` refuses `on_gap: resnapshot` otherwise. Up to 1,000,000 keys are
-  tracked — see [complete reads](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html#complete-reads-dynamodb-on_gap-resnapshot).
+  validate` refuses `on_gap: resnapshot` otherwise, unless
+  `resnapshot_deletes: false` (re-read the table, delete nothing, keep the
+  rows of items deleted during the gap). Up to `resnapshot_max_keys`
+  (default 1,000,000) distinct keys are tracked; a re-read that writes more
+  fails once with nothing deleted and saves its position, so the next run
+  resumes streaming — see [complete reads](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html#complete-reads-dynamodb-on_gap-resnapshot).
 - **`faucet mirror`** — `capture_resume_position` returns every current shard at
   its trim horizon, so a CDC run after the snapshot replays the retained window
   and converges.

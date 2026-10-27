@@ -192,12 +192,11 @@ async fn replication_bind_writes_into_defaulted_variables() {
     );
 }
 
-/// A run cut short by `max_pages` over results not ordered by the key keeps
-/// the start bookmark: the newest key on page 1 would otherwise make the next
-/// run skip the older keys on the unread pages. Declared-ordered results do
-/// advance it.
+/// A run cut short by `max_pages` advances the bookmark only for results
+/// ordered by the key with a `replication_bind`; otherwise the bookmark could
+/// not advance and every run would re-read the same pages, so the pass fails.
 #[tokio::test]
-async fn a_truncated_run_advances_the_bookmark_only_for_ordered_results() {
+async fn a_truncated_run_advances_the_bookmark_only_for_ordered_bound_results() {
     let server = MockServer::start().await;
     let api = Api::default();
     // Sorted by id; row 1 was updated last.
@@ -212,21 +211,32 @@ async fn a_truncated_run_advances_the_bookmark_only_for_ordered_results() {
         .mount(&server)
         .await;
     let start = json!("2026-01-01T00:00:00Z");
-    for (ordered, expected) in [
-        (false, start.clone()),
-        (true, json!("2026-01-09T00:00:00Z")),
-    ] {
-        let mut cfg = config(&server).max_pages(1);
-        cfg.replication_key_ordered = ordered;
-        let source = GraphqlStream::new(cfg);
-        source.apply_start_bookmark(start.clone()).await.unwrap();
-        let ctx = std::collections::HashMap::new();
-        let pages: Vec<_> = source.stream_pages(&ctx, 2).collect().await;
-        let last = pages
-            .into_iter()
-            .filter_map(|p| p.unwrap().bookmark)
-            .last()
-            .expect("a bookmark is emitted");
-        assert_eq!(last, expected, "ordered = {ordered}");
-    }
+    let ctx = std::collections::HashMap::new();
+
+    let mut cfg = config(&server).max_pages(1);
+    cfg.replication_key_ordered = true;
+    let source = GraphqlStream::new(cfg);
+    source.apply_start_bookmark(start.clone()).await.unwrap();
+    let pages: Vec<_> = source.stream_pages(&ctx, 2).collect().await;
+    let last = pages
+        .into_iter()
+        .filter_map(|p| p.unwrap().bookmark)
+        .last()
+        .expect("a bookmark is emitted");
+    assert_eq!(last, json!("2026-01-09T00:00:00Z"));
+
+    let source = GraphqlStream::new(config(&server).max_pages(1));
+    source.apply_start_bookmark(start.clone()).await.unwrap();
+    let pages: Vec<_> = source.stream_pages(&ctx, 2).collect().await;
+    assert!(
+        pages
+            .iter()
+            .all(|p| p.as_ref().map_or(true, |p| p.bookmark.is_none())),
+        "no bookmark is persisted"
+    );
+    let err = pages
+        .into_iter()
+        .find_map(Result::err)
+        .expect("an unordered truncated pass fails");
+    assert!(err.to_string().contains("cannot advance"), "{err}");
 }

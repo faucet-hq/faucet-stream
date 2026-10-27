@@ -253,3 +253,60 @@ async fn conformance_driver_declarations_and_row_paths() {
     faucet_conformance::assert_driver_declarations_truthful(&json).await;
     faucet_conformance::assert_driver_row_paths_agree(&json).await;
 }
+
+/// A temp database holding `create`, and the ids its table `name` holds.
+async fn table_with(create: &str) -> (TempDir, String) {
+    let dir = TempDir::new().expect("tempdir");
+    let url = format!("sqlite://{}?mode=rwc", dir.path().join("c.db").display());
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .expect("connect");
+    sqlx::query(create).execute(&pool).await.expect("create");
+    pool.close().await;
+    (dir, url)
+}
+
+async fn ids_in(url: String, table: &'static str) -> Vec<i64> {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .expect("connect");
+    let rows = sqlx::query(&format!("SELECT id FROM {table} ORDER BY id"))
+        .fetch_all(&pool)
+        .await
+        .expect("select");
+    pool.close().await;
+    rows.iter().map(|r| r.get::<i64, _>("id")).collect()
+}
+
+/// Check 23: scoped cleanup deletes only the unwritten rows of its scope.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_cleanup_scoped() {
+    let (_dir, url) =
+        table_with("CREATE TABLE c (id INTEGER PRIMARY KEY, tenant TEXT, v TEXT)").await;
+    let mut cfg = SqliteSinkConfig::new(&url, "c").column_mapping(SqliteColumnMapping::AutoMap);
+    cfg.write = WriteSpec {
+        write_mode: WriteMode::Upsert,
+        key: vec!["id".to_string()],
+        delete_marker: None,
+        rollback: None,
+    };
+    let sink = SqliteSink::new(cfg).await.expect("sink");
+    faucet_conformance::assert_cleanup_scoped(&sink, "tenant", || ids_in(url.clone(), "c")).await;
+}
+
+/// Check 24: rollback deletes exactly the run's rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_rollback_truthful() {
+    let (_dir, url) =
+        table_with("CREATE TABLE r (id INTEGER PRIMARY KEY, v TEXT, _faucet_run_id TEXT)").await;
+    let cfg = SqliteSinkConfig::new(&url, "r").column_mapping(SqliteColumnMapping::AutoMap);
+    let sink = SqliteSink::new(cfg).await.expect("sink");
+    faucet_conformance::assert_rollback_truthful(&sink, "_faucet_run_id", || {
+        ids_in(url.clone(), "r")
+    })
+    .await;
+}

@@ -19,6 +19,17 @@ type Tx<'c> = sqlx::Transaction<'c, sqlx::Sqlite>;
 /// SQLite's default bind-variable ceiling.
 const MAX_SQLITE_PARAMS: usize = 32766;
 
+/// SQLite's default ceiling on the terms of one compound `SELECT`.
+const MAX_COMPOUND_TERMS: usize = 500;
+
+/// What the rows matching one journaled key say about it: whether any row
+/// matches, and whether one of them still carries the run being undone.
+#[derive(Debug, Clone, Copy, Default)]
+struct Reach {
+    any: bool,
+    mine: bool,
+}
+
 fn journal_sql() -> JournalSql {
     faucet_common_sql::SqlDialect::journal_sql(&faucet_common_sql::dialects::Sqlite)
         .expect("the sqlite dialect journals")
@@ -201,6 +212,9 @@ impl SqliteDriver {
     }
 
     /// Journaled keys whose current row was written by another run since.
+    /// A key text can stand for several stored keys (`"true"` for the text
+    /// `'true'` and for the `'1'` a boolean became), so an entry conflicts
+    /// only when none of the rows it reaches still carries this run.
     async fn count_conflicts(
         &self,
         tx: &mut Tx<'_>,
@@ -215,27 +229,58 @@ impl SqliteDriver {
         if !columns.iter().any(|c| c == run_col) {
             return Ok(0);
         }
+        let reach = self.entry_reach(tx, entries, run_id, run_col).await?;
+        Ok(reach.iter().filter(|r| r.any && !r.mine).count() as u64)
+    }
+
+    /// Per entry, whether some row matches its key and whether one of those
+    /// carries `run_id` in `run_col`.
+    async fn entry_reach<E: std::borrow::Borrow<JournalEntry>>(
+        &self,
+        tx: &mut Tx<'_>,
+        entries: &[E],
+        run_id: &str,
+        run_col: &str,
+    ) -> Result<Vec<Reach>, FaucetError> {
         let key = &self.config.write.key;
         let table_ref = quote_ident_sqlite(&self.config.table_name);
-        let per = ((MAX_SQLITE_PARAMS - 1) / (key.len().max(1) * MAX_KEY_FORMS)).max(1);
-        let mut total = 0u64;
-        for chunk in entries.chunks(per) {
-            let (predicate, binds) = stored_keys_predicate(key, chunk);
-            let count_sql = format!(
-                "SELECT count(*) FROM {table_ref} WHERE ({predicate}) AND {c} IS NOT ?",
-                c = quote_ident_sqlite(run_col)
-            );
-            let mut q = sqlx::query_scalar::<_, i64>(&count_sql);
+        let c = quote_ident_sqlite(run_col);
+        let per = (MAX_SQLITE_PARAMS / (key.len().max(1) * MAX_KEY_FORMS + 1))
+            .clamp(1, MAX_COMPOUND_TERMS);
+        let mut reach = vec![Reach::default(); entries.len()];
+        for (n, chunk) in entries.chunks(per).enumerate() {
+            let mut binds = Vec::new();
+            let terms: Vec<String> = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    binds.push(Value::String(run_id.to_string()));
+                    let predicate = entry_predicate(key, e.borrow(), &mut binds);
+                    format!("SELECT {i}, {c} IS ? FROM {table_ref} WHERE {predicate}")
+                })
+                .collect();
+            let sql = terms.join(" UNION ALL ");
+            let mut q = sqlx::query(&sql);
             for v in &binds {
-                q = bind_key_value_scalar(q, v);
+                q = crate::sink::bind_value(q, v);
             }
-            q = q.bind(run_id);
-            total += q
-                .fetch_one(&mut **tx)
+            let rows = q
+                .fetch_all(&mut **tx)
                 .await
-                .map_err(|e| sink_err("count conflicts", e))? as u64;
+                .map_err(|e| sink_err("match journaled keys", e))?;
+            for r in rows {
+                let i: i64 = r.get(0);
+                let mine: bool = r.get(1);
+                if let Some(slot) = usize::try_from(i)
+                    .ok()
+                    .and_then(|i| reach.get_mut(n * per + i))
+                {
+                    slot.any = true;
+                    slot.mine |= mine;
+                }
+            }
         }
-        Ok(total)
+        Ok(reach)
     }
 
     /// Journaled keys with a before-image whose row is gone. Only called when
@@ -285,28 +330,58 @@ impl SqliteDriver {
     /// Delete the rows of journaled keys the run created. The journal holds
     /// each key as text; the row holds it as the upsert stored it (`true` as
     /// `1`, an integer in an untyped column as an integer), so every stored
-    /// form of the text is matched.
+    /// form of the text is matched. When some row of an entry still carries
+    /// this run, only such rows are deleted: another row reached by the same
+    /// text (`'true'` beside the `'1'` a boolean became) is not the run's.
     async fn delete_journaled(
         &self,
         tx: &mut Tx<'_>,
         entries: &[&JournalEntry],
+        run_id: &str,
+        run_col: &str,
     ) -> Result<u64, FaucetError> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let columns = self.columns_of(tx, &self.config.table_name).await?;
+        let (mine, other): (Vec<&JournalEntry>, Vec<&JournalEntry>) =
+            if columns.iter().any(|c| c == run_col) {
+                let reach = self.entry_reach(tx, entries, run_id, run_col).await?;
+                let (m, o): (Vec<_>, Vec<_>) =
+                    entries.iter().zip(&reach).partition(|(_, r)| r.mine);
+                (
+                    m.into_iter().map(|(e, _)| *e).collect(),
+                    o.into_iter().map(|(e, _)| *e).collect(),
+                )
+            } else {
+                (Vec::new(), entries.to_vec())
+            };
         let key = &self.config.write.key;
         let table_ref = quote_ident_sqlite(&self.config.table_name);
-        let per = (MAX_SQLITE_PARAMS / (key.len().max(1) * MAX_KEY_FORMS)).max(1);
+        let per = ((MAX_SQLITE_PARAMS - 1) / (key.len().max(1) * MAX_KEY_FORMS)).max(1);
         let mut deleted = 0u64;
-        for chunk in entries.chunks(per) {
-            let (predicate, binds) = stored_keys_predicate(key, chunk);
-            let sql = format!("DELETE FROM {table_ref} WHERE {predicate}");
-            let mut q = sqlx::query(&sql);
-            for v in &binds {
-                q = crate::sink::bind_value(q, v);
+        for (group, only_mine) in [(&mine, true), (&other, false)] {
+            for chunk in group.chunks(per) {
+                let (predicate, mut binds) = stored_keys_predicate(key, chunk);
+                let sql = if only_mine {
+                    binds.push(Value::String(run_id.to_string()));
+                    format!(
+                        "DELETE FROM {table_ref} WHERE ({predicate}) AND {} IS ?",
+                        quote_ident_sqlite(run_col)
+                    )
+                } else {
+                    format!("DELETE FROM {table_ref} WHERE {predicate}")
+                };
+                let mut q = sqlx::query(&sql);
+                for v in &binds {
+                    q = crate::sink::bind_value(q, v);
+                }
+                deleted += q
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|e| sink_err("delete created rows", e))?
+                    .rows_affected();
             }
-            deleted += q
-                .execute(&mut **tx)
-                .await
-                .map_err(|e| sink_err("delete created rows", e))?
-                .rows_affected();
         }
         Ok(deleted)
     }
@@ -435,7 +510,9 @@ impl SqliteDriver {
                 note: Some("dry run".into()),
             });
         }
-        let deleted = self.delete_journaled(tx, &deletes).await?;
+        let deleted = self
+            .delete_journaled(tx, &deletes, run_id, &opts.run_id_column)
+            .await?;
         let restored = if restores.is_empty() {
             0
         } else {
@@ -669,42 +746,66 @@ fn bind_key_value_scalar<'q>(
 ) -> sqlx::query::QueryScalar<'q, sqlx::Sqlite, i64, sqlx::sqlite::SqliteArguments<'q>> {
     match v {
         Value::Null => q.bind(None::<String>),
+        Value::Bool(b) => q.bind(*b),
         Value::String(s) => q.bind(s.clone()),
         Value::Number(n) if n.is_i64() => q.bind(n.as_i64()),
+        Value::Number(n) if n.is_u64() => q.bind(n.to_string()),
         Value::Number(n) => q.bind(n.as_f64()),
         other => q.bind(other.to_string()),
     }
 }
 
-/// Most stored forms one journaled key value can have (text, number, `1`/`0`).
+/// Most JSON values one journaled key text can stand for (text, integer and
+/// float, or text and boolean).
 const MAX_KEY_FORMS: usize = 3;
 
-/// The values a key column may hold for one journaled (text) key value: the
-/// text itself, the number it spells, and `1` / `0` for `true` / `false` —
-/// how an upsert stored it under each column affinity. A journal already
-/// treats these as one key (`7` and `"7"` journal alike).
-fn stored_forms(text: &str) -> Vec<Value> {
-    let mut forms = vec![Value::String(text.to_string())];
-    if let Ok(i) = text.parse::<i64>() {
-        forms.push(Value::from(i));
-    } else if let Some(n) = text
-        .parse::<f64>()
-        .ok()
-        .filter(|f| f.is_finite())
-        .and_then(serde_json::Number::from_f64)
-    {
-        forms.push(Value::Number(n));
+/// The journal canonical text of one key value.
+fn canonical_text(v: &Value) -> Option<String> {
+    let tuple = faucet_core::write_mode::KeyTuple(vec![(String::new(), v.clone())]);
+    match canonical_key(&tuple).0.into_iter().next()?.1 {
+        Value::String(s) => Some(s),
+        _ => None,
     }
+}
+
+/// The JSON values an upsert could have keyed by `text`: every value whose
+/// journal canonical text is `text` — the string itself, the integer and the
+/// integral float it spells (`7` and `7.0` both journal as `"7"`), a
+/// non-integral number, or the boolean. `"007"` stands for the string only:
+/// no number journals as `"007"`.
+fn key_origins(text: &str) -> Vec<Value> {
+    let mut forms = vec![Value::String(text.to_string())];
     match text {
-        "true" => forms.push(Value::from(1)),
-        "false" => forms.push(Value::from(0)),
-        _ => {}
+        "true" => forms.push(Value::Bool(true)),
+        "false" => forms.push(Value::Bool(false)),
+        _ => {
+            if let Ok(n) = serde_json::from_str::<serde_json::Number>(text) {
+                let n = Value::Number(n);
+                if canonical_text(&n).as_deref() == Some(text) {
+                    if let Some(f) = n
+                        .as_i64()
+                        .filter(|i| i.unsigned_abs() < (1u64 << 53))
+                        .and_then(|i| serde_json::Number::from_f64(i as f64))
+                    {
+                        forms.push(n);
+                        forms.push(Value::Number(f));
+                    } else {
+                        forms.push(n);
+                    }
+                }
+            }
+        }
     }
     forms
 }
 
-/// `(k1 IN (?, ?) AND k2 IN (?)) OR …` matching every stored form of each
-/// entry's key, with its bind values in order.
+/// `(k1 = ? OR k1 = ? …) AND …` per entry, joined with `OR`, matching the row
+/// each origin of the entry's key ([`key_origins`]) addresses, with its bind
+/// values in order. Each value is bound as the upsert binds it and compared
+/// with the key column directly, so SQLite applies the column's affinity just
+/// as it did when the upsert stored and matched the key: `true` reaches the
+/// `'1'` a TEXT column stored for it, `"007"` the `7` an INTEGER column
+/// stored, and nothing reaches a row the key's values could not have written.
 fn stored_keys_predicate<E: std::borrow::Borrow<JournalEntry>>(
     key: &[String],
     entries: &[E],
@@ -712,33 +813,35 @@ fn stored_keys_predicate<E: std::borrow::Borrow<JournalEntry>>(
     let mut binds = Vec::new();
     let rows: Vec<String> = entries
         .iter()
-        .map(|e| {
-            let cols: Vec<String> = e
-                .borrow()
-                .tuple(key)
-                .0
-                .iter()
-                .map(|(c, v)| {
-                    let col = quote_ident_sqlite(c);
-                    match v {
-                        Value::String(text) => {
-                            let forms = stored_forms(text);
-                            let marks = vec!["?"; forms.len()].join(", ");
-                            binds.extend(forms);
-                            format!("{col} IN ({marks})")
-                        }
-                        Value::Null => format!("{col} IS NULL"),
-                        other => {
-                            binds.push(other.clone());
-                            format!("{col} = ?")
-                        }
-                    }
-                })
-                .collect();
-            format!("({})", cols.join(" AND "))
-        })
+        .map(|e| entry_predicate(key, e.borrow(), &mut binds))
         .collect();
     (rows.join(" OR "), binds)
+}
+
+/// One entry's part of [`stored_keys_predicate`].
+fn entry_predicate(key: &[String], entry: &JournalEntry, binds: &mut Vec<Value>) -> String {
+    let cols: Vec<String> = entry
+        .tuple(key)
+        .0
+        .iter()
+        .map(|(c, v)| {
+            let col = quote_ident_sqlite(c);
+            match v {
+                Value::String(text) => {
+                    let forms = key_origins(text);
+                    let alts = vec![format!("{col} = ?"); forms.len()].join(" OR ");
+                    binds.extend(forms);
+                    format!("({alts})")
+                }
+                Value::Null => format!("{col} IS NULL"),
+                other => {
+                    binds.push(other.clone());
+                    format!("{col} = ?")
+                }
+            }
+        })
+        .collect();
+    format!("({})", cols.join(" AND "))
 }
 
 /// The plan's distinct keys as `(canonical, typed)` pairs: the canonical
@@ -790,6 +893,21 @@ fn positional_key_select(table_ref: &str, key: &[String], row_expr: &str, rows: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_origins_are_the_values_that_journal_as_the_text() {
+        use serde_json::json;
+        assert_eq!(key_origins("true"), vec![json!("true"), json!(true)]);
+        assert_eq!(key_origins("7"), vec![json!("7"), json!(7), json!(7.0)]);
+        assert_eq!(key_origins("7.5"), vec![json!("7.5"), json!(7.5)]);
+        assert_eq!(key_origins("007"), vec![json!("007")]);
+        assert_eq!(key_origins("-0"), vec![json!("-0")]);
+        assert_eq!(key_origins("abc"), vec![json!("abc")]);
+        for v in key_origins("7").iter().chain(&key_origins("7.5")) {
+            let text = canonical_text(v).unwrap();
+            assert!(text == "7" || text == "7.5", "{v} journals as {text}");
+        }
+    }
 
     #[test]
     fn row_json_expr_quotes_names_and_identifiers() {

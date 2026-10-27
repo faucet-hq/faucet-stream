@@ -6,6 +6,7 @@
 
 use super::context::TriggerEvent;
 use super::enqueue::{self, FireOutcome};
+use super::health::Arm;
 use crate::serve::error::ServeError;
 use crate::serve::state::ServerState;
 use crate::serve::triggers::spec::TriggerKind;
@@ -48,29 +49,38 @@ pub async fn handle(
 
     // Leading-edge debounce: coalesce fires that arrive within `debounce_secs` of
     // the last accepted fire for this trigger. The first fire (and any after the
-    // window has fully elapsed) is accepted; the rest return `coalesced`.
-    // The window is armed now and undone below when the fire does not go
-    // through, so a retry of a dropped or failed fire is not coalesced.
-    let mut armed: Option<(i64, i64)> = None;
+    // window has fully elapsed) is accepted; the rest return `coalesced` once
+    // that fire is committed, and are asked to retry while it is still being
+    // submitted (it may not go through). The window is armed now and settled by
+    // a guard, so a fire that fails — or whose request is abandoned — is undone.
+    let mut armed: Option<Armed> = None;
     if debounce_secs > 0 {
         let now_ms = chrono::Utc::now().timestamp_millis();
         match state
             .triggers()
-            .arm_fire(&name, (debounce_secs as i64) * 1000, now_ms)
+            .arm(&name, (debounce_secs as i64) * 1000, now_ms)
         {
-            Some(previous) => armed = Some((now_ms, previous)),
-            None => {
+            Arm::Fire { previous } => {
+                armed = Some(Armed {
+                    state: state.clone(),
+                    name: name.clone(),
+                    at: now_ms,
+                    previous,
+                    committed: false,
+                })
+            }
+            Arm::Coalesce => {
                 crate::serve::triggers::metrics::coalesced(&name);
                 return Ok((StatusCode::OK, Json(json!({ "status": "coalesced" }))));
             }
+            Arm::Busy => {
+                return Err(ServeError::Unavailable(format!(
+                    "webhook trigger '{name}' is still submitting the fire this request would \
+                     join; retry shortly"
+                )));
+            }
         }
     }
-    let disarm = || {
-        if let Some((now_ms, previous)) = armed {
-            state.triggers().disarm_fire(&name, now_ms, previous);
-        }
-    };
-
     // Idempotency key: dedupe header value, else a per-request UUID.
     let idem = dedupe_header
         .as_ref()
@@ -97,7 +107,25 @@ pub async fn handle(
         idem,
     };
     let fired_at = chrono::Utc::now().to_rfc3339();
-    match enqueue::fire(&state, &compiled, event, &fired_at).await {
+    // The fire runs on its own task, which also settles the debounce window:
+    // a request abandoned while its fire is submitting (a client or proxy
+    // timeout) neither cancels a run that is already recorded nor undoes the
+    // window that run holds, so the sender's retry is coalesced.
+    let fire = tokio::spawn({
+        let state = state.clone();
+        let fired_at = fired_at.clone();
+        async move {
+            let outcome = enqueue::fire(&state, &compiled, event, &fired_at).await;
+            if let Some(mut a) = armed {
+                a.committed = outcome.committed();
+            }
+            outcome
+        }
+    });
+    let outcome = fire
+        .await
+        .map_err(|e| ServeError::Internal(format!("webhook fire task failed: {e}")))?;
+    match outcome {
         FireOutcome::Enqueued(run_id) => {
             state.triggers().record_ok(&name, Some(fired_at));
             Ok((
@@ -107,19 +135,46 @@ pub async fn handle(
         }
         FireOutcome::Coalesced => Ok((StatusCode::OK, Json(json!({ "status": "coalesced" })))),
         FireOutcome::Dropped(reason) => {
-            disarm();
             tracing::warn!(trigger = %name, %reason, "webhook fire dropped");
             Err(ServeError::QueueFull {
                 retry_after_secs: 5,
             })
         }
-        FireOutcome::Error(msg) | FireOutcome::Failed(msg) => {
-            disarm();
+        // The request itself cannot run (a value it sent is refused where the
+        // config places it, or one the config needs is missing): the
+        // caller's error, not the trigger's.
+        FireOutcome::Refused(msg) => Err(ServeError::Unprocessable {
+            message: msg,
+            details: None,
+        }),
+        // The trigger cannot run whatever is sent (its config does not
+        // validate, its template or tenant is gone, a policy refuses it): the
+        // operator's to fix, so the trigger reports unhealthy.
+        FireOutcome::Failed(msg) | FireOutcome::Error(msg) => {
             state
                 .triggers()
                 .record_err(&name, msg.clone(), super::watcher::UNHEALTHY_THRESHOLD);
             Err(ServeError::Internal(msg))
         }
+    }
+}
+
+/// A debounce window this request armed; settled when its fire ends — kept
+/// when the fire was committed, undone otherwise (a failed fire, or a fire
+/// task that panicked).
+struct Armed {
+    state: ServerState,
+    name: String,
+    at: i64,
+    previous: i64,
+    committed: bool,
+}
+
+impl Drop for Armed {
+    fn drop(&mut self) {
+        self.state
+            .triggers()
+            .settle_fire(&self.name, self.at, self.previous, self.committed);
     }
 }
 

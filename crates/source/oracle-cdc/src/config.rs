@@ -212,7 +212,22 @@ impl OracleCdcSourceConfig {
         if let Some(k) = &self.state_key {
             return k.clone();
         }
-        let scope = self.connection.scope_label();
+        self.key_for_scope(self.connection.scope_label())
+    }
+
+    /// Keys the SCN bookmark was stored under by releases whose scope did not
+    /// name the host and port; empty when the key is configured explicitly.
+    pub fn legacy_state_keys(&self) -> Vec<String> {
+        if self.state_key.is_some() {
+            return Vec::new();
+        }
+        self.connection
+            .legacy_scope_label()
+            .map(|scope| vec![self.key_for_scope(scope)])
+            .unwrap_or_default()
+    }
+
+    fn key_for_scope(&self, scope: String) -> String {
         let scope = if scope.is_empty() {
             "oracle".into()
         } else {
@@ -305,16 +320,30 @@ mod tests {
     #[test]
     fn state_keys() {
         let one = OracleCdcSourceConfig::new(conn(), vec!["APP.ORDERS".into()]);
-        assert_eq!(one.resolved_state_key(), "oracle-cdc:FREEPDB1:APP.ORDERS");
+        let scope = conn().scope_label();
+        assert!(scope.contains("FREEPDB1") && scope != "FREEPDB1", "{scope}");
+        assert_eq!(
+            one.resolved_state_key(),
+            format!("oracle-cdc:{scope}:APP.ORDERS")
+        );
+        assert_eq!(
+            one.legacy_state_keys(),
+            vec!["oracle-cdc:FREEPDB1:APP.ORDERS".to_string()]
+        );
         let a = OracleCdcSourceConfig::new(conn(), vec!["A.X".into(), "A.Y".into()]);
         let b = OracleCdcSourceConfig::new(conn(), vec!["A.Y".into(), "A.X".into()]);
         assert_eq!(a.resolved_state_key(), b.resolved_state_key());
-        assert!(a.resolved_state_key().starts_with("oracle-cdc:FREEPDB1:"));
+        assert!(
+            a.resolved_state_key()
+                .starts_with(&format!("oracle-cdc:{scope}:"))
+        );
+        assert!(a.legacy_state_keys()[0].starts_with("oracle-cdc:FREEPDB1:"));
         let explicit = OracleCdcSourceConfig {
             state_key: Some("mine".into()),
             ..one
         };
         assert_eq!(explicit.resolved_state_key(), "mine");
+        assert!(explicit.legacy_state_keys().is_empty());
         let odd = OracleCdcSourceConfig::new(conn(), vec!["A.T$1".into()]);
         faucet_core::state::validate_state_key(&odd.resolved_state_key()).unwrap();
     }

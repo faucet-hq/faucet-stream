@@ -184,6 +184,13 @@ serve:
     #   principals:
     #     - { name: ci,    token: "...", role: operator }
     #     - { name: admin, token: "...", role: admin }
+    # Salt for the `checksum/serve-auth` pod annotation that rolls the pods
+    # when `token` / `rbacConfig` changes (the annotation is a salted digest,
+    # never a plain hash of a credential). Empty = a random salt kept in the
+    # auth Secret. Set it (any random string, kept constant) when rendering
+    # without cluster access (`helm template`, Argo CD), or every render picks
+    # a new salt and rolls the pods.
+    checksumSalt: ""
 
   # Run-history backend: "memory" | "sqlite" | "postgres"
   history:

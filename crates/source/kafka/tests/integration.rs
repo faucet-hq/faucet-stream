@@ -573,3 +573,45 @@ async fn binary_keys_and_repeated_headers_keep_their_fidelity() {
     );
     assert!(records[0]["timestamp"].is_i64());
 }
+
+/// Outside member mode, a partition without a bookmark starts at the offset
+/// the consumer group already committed (e.g. after a sharded run), not at
+/// `auto.offset.reset: latest`, which would skip the backlog.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unbookmarked_partition_starts_at_the_group_committed_offset() {
+    use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer};
+    use rdkafka::{Offset, TopicPartitionList};
+
+    let (_container, brokers) = start_kafka().await;
+    let topic = "committed-start";
+    let msgs: Vec<String> = (1..=4).map(|i| format!(r#"{{"id":{i}}}"#)).collect();
+    let refs: Vec<(Option<&str>, &str)> = msgs.iter().map(|m| (None, m.as_str())).collect();
+    produce(&brokers, topic, &refs).await;
+
+    let group = "g-committed-start";
+    let commit_brokers = brokers.clone();
+    tokio::task::spawn_blocking(move || {
+        let committer: BaseConsumer = ClientConfig::new()
+            .set("bootstrap.servers", &commit_brokers)
+            .set("group.id", group)
+            .set("enable.auto.commit", "false")
+            .create()
+            .unwrap();
+        let mut tpl = TopicPartitionList::new();
+        tpl.add_partition_offset(topic, 0, Offset::Offset(2))
+            .unwrap();
+        committer.commit(&tpl, CommitMode::Sync).unwrap();
+    })
+    .await
+    .unwrap();
+
+    let mut cfg = source_config(&brokers, topic, group, 2);
+    cfg.auto_offset_reset = OffsetReset::Latest;
+    let source = KafkaSource::new(cfg).await.unwrap();
+    let records = source.fetch_all().await.unwrap();
+    let ids: Vec<i64> = records
+        .iter()
+        .map(|r| r["value"]["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, vec![3, 4]);
+}

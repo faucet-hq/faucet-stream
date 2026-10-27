@@ -74,13 +74,7 @@ async fn seed(endpoint: &str) -> Client {
 }
 
 async fn build_sink(endpoint: &str, config: S3SinkConfig) -> S3Sink {
-    // SAFETY: every test boots its own container with the same default MinIO
-    // credentials, so overlapping writes set an identical value.
-    unsafe {
-        std::env::set_var("AWS_ACCESS_KEY_ID", ACCESS_KEY);
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", SECRET_KEY);
-        std::env::set_var("AWS_DEFAULT_REGION", REGION);
-    }
+    set_test_env();
     S3Sink::new(
         config
             .endpoint_url(endpoint.to_string())
@@ -248,4 +242,19 @@ async fn an_empty_write_leaves_no_object() {
 #[tokio::test]
 async fn avro_objects_round_trip() {
     round_trip(S3SinkFormat::Avro, FileFormat::Avro, ".avro").await;
+}
+
+/// Set the AWS variables every test in this binary shares, once per process:
+/// `setenv` racing another thread's `getenv` is undefined behaviour even when
+/// both sides write the same value.
+fn set_test_env() {
+    static ENV: std::sync::Once = std::sync::Once::new();
+    // SAFETY: the writes run once, before any client in this binary reads the
+    // variables (every caller blocks on the `Once` until they are done), and
+    // std's own environment reads take the same lock as these writes.
+    ENV.call_once(|| unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", ACCESS_KEY);
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", SECRET_KEY);
+        std::env::set_var("AWS_DEFAULT_REGION", REGION);
+    });
 }

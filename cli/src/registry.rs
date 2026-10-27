@@ -1250,6 +1250,26 @@ pub fn sink_truncating_path<'a>(kind: &str, cfg: &'a Value) -> Option<&'a str> {
     }
 }
 
+/// The fixed object a remote file-writer sink (`s3`, `gcs`, `azure-blob`,
+/// `sftp`) replaces every run: a `path` (or sftp `file_name`) in
+/// `if_exists: replace` (the default). Each run republishes that object, so
+/// only the last run's rows survive. `None` for a sink naming its objects
+/// uniquely per run, or one that appends / refuses an existing object.
+pub fn sink_replaced_object(kind: &str, cfg: &Value) -> Option<String> {
+    if !matches!(kind, "s3" | "gcs" | "azure-blob" | "sftp") {
+        return None;
+    }
+    let if_exists = cfg
+        .get("if_exists")
+        .or_else(|| cfg.get("mode"))
+        .and_then(Value::as_str)
+        .unwrap_or("replace");
+    if !matches!(if_exists, "replace" | "overwrite") {
+        return None;
+    }
+    sink_shared_destination(kind, cfg)
+}
+
 /// Where a sink on the shared file writer puts a fixed set of file names, as
 /// one comparable string (`file:<path>`, `s3://bucket/key`, `gs://…`,
 /// `az://account/container/key`, `sftp://host:port/dir/name`). Two writers
@@ -4712,6 +4732,44 @@ mod truncating_tests {
             None
         );
         assert_eq!(d("postgres", json!({"table": "t"})), None);
+    }
+
+    #[test]
+    fn replaced_object_needs_a_fixed_name_in_replace_mode() {
+        let r = |k: &str, v: Value| sink_replaced_object(k, &v);
+        assert_eq!(
+            r("s3", json!({"bucket": "b", "path": "exports/orders.jsonl"})).as_deref(),
+            Some("s3://b/exports/orders.jsonl")
+        );
+        assert_eq!(
+            r(
+                "gcs",
+                json!({"bucket": "b", "path": "x.csv", "if_exists": "overwrite"})
+            )
+            .as_deref(),
+            Some("gs://b/x.csv")
+        );
+        assert_eq!(
+            r(
+                "sftp",
+                json!({"host": "h", "path": "/d", "file_name": "x.csv", "mode": "replace"})
+            )
+            .as_deref(),
+            Some("sftp://h:22//d/x.csv")
+        );
+        assert_eq!(r("s3", json!({"bucket": "b", "prefix": "p/"})), None);
+        assert_eq!(
+            r(
+                "azure-blob",
+                json!({"container": "c", "path": "x.csv", "if_exists": "append"})
+            ),
+            None
+        );
+        assert_eq!(
+            r("s3", json!({"bucket": "b", "path": "x", "mode": "error"})),
+            None
+        );
+        assert_eq!(r("file", json!({"path": "x.jsonl"})), None);
     }
 
     #[test]

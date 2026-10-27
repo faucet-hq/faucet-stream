@@ -68,9 +68,14 @@ pub async fn migrate_state(
     migrate_state_with(target, stores, row, check, false).await
 }
 
+/// How many times a bookmark that changes under `migrate --state` is re-read
+/// and migrated before the key is reported as refused.
+const MIGRATE_ATTEMPTS: usize = 5;
+
 /// [`migrate_state`], with `force` overriding a live run's lease. Each key is
-/// re-read immediately before it is rewritten, so a bookmark a run persisted
-/// after the listing is migrated rather than overwritten with the older value.
+/// written with a compare-and-put against the value just read, so a bookmark
+/// a run persisted meanwhile is re-read and migrated rather than overwritten
+/// with the older value.
 pub async fn migrate_state_with(
     target: &crate::pipeline_state::PipelineTarget,
     stores: &crate::pipeline_state::ops::Stores,
@@ -110,38 +115,64 @@ pub async fn migrate_state_with(
             );
         }
         for e in selected {
-            let current = if check {
-                Some(e.value.clone())
-            } else {
-                match stores.for_key(&e.key) {
-                    Some(store) => store.get(&e.key.key).await?,
-                    None => Some(e.value.clone()),
-                }
-            };
-            let Some(value) = current else { continue };
-            let stored = StoredState::parse(&value);
-            let resolved = resolve_with(
-                &e.key.key,
-                &value,
-                &codec.owner,
-                codec.schema,
-                |from, data| match &kind {
-                    Some(k) => crate::registry::migrate_source_state(k, from, data),
-                    None => Ok(data),
-                },
-            );
-            let (action, detail, write) = match resolved {
-                Err(err) => ("refused", Some(err.to_string()), None),
-                Ok(res) if res.migrated_from.is_some() => ("migrated", None, Some(res.data)),
-                Ok(res) if res.legacy => ("enveloped", None, Some(res.data)),
-                Ok(_) => ("current", None, None),
-            };
-            if let (Some(data), false) = (&write, check) {
+            let mut attempt = 0;
+            let (stored, action, detail) = loop {
+                attempt += 1;
+                let current = if check {
+                    Some(e.value.clone())
+                } else {
+                    match stores.for_key(&e.key) {
+                        Some(store) => store.get(&e.key.key).await?,
+                        None => Some(e.value.clone()),
+                    }
+                };
+                let Some(value) = current else {
+                    break (None, "", None);
+                };
+                let stored = StoredState::parse(&value);
+                let resolved = resolve_with(
+                    &e.key.key,
+                    &value,
+                    &codec.owner,
+                    codec.schema,
+                    |from, data| match &kind {
+                        Some(k) => crate::registry::migrate_source_state(k, from, data),
+                        None => Ok(data),
+                    },
+                );
+                let (action, detail, write) = match resolved {
+                    Err(err) => ("refused", Some(err.to_string()), None),
+                    Ok(res) if res.migrated_from.is_some() => ("migrated", None, Some(res.data)),
+                    Ok(res) if res.legacy => ("enveloped", None, Some(res.data)),
+                    Ok(_) => ("current", None, None),
+                };
+                let (Some(data), false) = (&write, check) else {
+                    break (Some(stored), action, detail);
+                };
                 let store = stores.for_key(&e.key).ok_or_else(|| {
                     CliError::Config(format!("no state store holds '{}'", e.key.key))
                 })?;
-                store.put(&e.key.key, &codec.encode(data)).await?;
-            }
+                // Only replace the value this pass read: a run that persisted a
+                // newer bookmark meanwhile is re-read and migrated, never
+                // overwritten with the older one.
+                if store
+                    .compare_and_put(&e.key.key, Some(&value), &codec.encode(data))
+                    .await?
+                {
+                    break (Some(stored), action, detail);
+                }
+                if attempt >= MIGRATE_ATTEMPTS {
+                    break (
+                        Some(stored),
+                        "refused",
+                        Some(format!(
+                            "the bookmark kept changing while it was migrated ({attempt} attempts); \
+                             re-run once the pipeline is idle"
+                        )),
+                    );
+                }
+            };
+            let Some(stored) = stored else { continue };
             keys.push(StateKeyMigration {
                 row: r.id.clone(),
                 key: e.key.key.clone(),
@@ -287,8 +318,7 @@ pub async fn run(args: MigrateArgs) -> CliResult<()> {
         return Ok(());
     }
 
-    std::fs::write(&path, rendered)
-        .map_err(|e| CliError::Config(format!("cannot write '{}': {e}", path.display())))?;
+    crate::commands::fmt::write_atomically(&path, &rendered)?;
     println!(
         "{}: migrated ({} rule{} applied):",
         path.display(),
@@ -696,6 +726,110 @@ sink:\n  type: jsonl\n  config: { path: out.jsonl }\n";
         })
         .await
         .expect("--check passes on a current config");
+    }
+
+    /// A store where a run persists a newer bookmark just before the
+    /// migration writes — the first write only.
+    struct RunPersistsFirst {
+        inner: faucet_core::MemoryStateStore,
+        newer: serde_json::Value,
+        raced: std::sync::atomic::AtomicBool,
+    }
+
+    impl RunPersistsFirst {
+        async fn race(&self, key: &str) {
+            use faucet_core::StateStore as _;
+            if !self.raced.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                self.inner.put(key, &self.newer).await.unwrap();
+            }
+        }
+    }
+
+    #[faucet_core::async_trait]
+    impl faucet_core::StateStore for RunPersistsFirst {
+        async fn get(
+            &self,
+            key: &str,
+        ) -> Result<Option<serde_json::Value>, faucet_core::FaucetError> {
+            self.inner.get(key).await
+        }
+        async fn put(
+            &self,
+            key: &str,
+            value: &serde_json::Value,
+        ) -> Result<(), faucet_core::FaucetError> {
+            self.race(key).await;
+            self.inner.put(key, value).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), faucet_core::FaucetError> {
+            self.inner.delete(key).await
+        }
+        fn supports_list(&self) -> bool {
+            true
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, faucet_core::FaucetError> {
+            self.inner.list(prefix).await
+        }
+        fn supports_compare_and_put(&self) -> bool {
+            true
+        }
+        async fn compare_and_put(
+            &self,
+            key: &str,
+            expected: Option<&serde_json::Value>,
+            value: &serde_json::Value,
+        ) -> Result<bool, faucet_core::FaucetError> {
+            self.race(key).await;
+            self.inner.compare_and_put(key, expected, value).await
+        }
+    }
+
+    /// A bookmark a run persists while `migrate --state` works on the key is
+    /// migrated, never overwritten with the older value the migration read.
+    #[tokio::test]
+    async fn state_migration_never_overwrites_a_newer_bookmark() {
+        use faucet_core::StateStore;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("orders.yaml");
+        std::fs::write(
+            &cfg,
+            format!(
+                "version: 1\nname: orders\npipeline:\n  source: {{ type: csv, config: {{ path: {in_csv} }} }}\n  sink: {{ type: jsonl, config: {{ path: {out} }} }}\n  state: {{ type: memory }}\nmatrix:\n  - id: a\n",
+                in_csv = dir.path().join("in.csv").display(),
+                out = dir.path().join("out.jsonl").display(),
+            ),
+        )
+        .unwrap();
+        let load = crate::cli::StateLoadArgs {
+            json: true,
+            env_file: None,
+            no_env_file: true,
+            profile: None,
+        };
+        let (_, target, _) = crate::commands::state::load(Some(&cfg), &load)
+            .await
+            .unwrap();
+        let store = std::sync::Arc::new(RunPersistsFirst {
+            inner: faucet_core::MemoryStateStore::new(),
+            newer: serde_json::json!({ "id": 5 }),
+            raced: Default::default(),
+        });
+        store
+            .inner
+            .put("orders::a", &serde_json::json!({ "id": 2 }))
+            .await
+            .unwrap();
+        let stores = crate::pipeline_state::ops::Stores::build(&target, Some(store.clone()))
+            .await
+            .unwrap();
+        let report = migrate_state_with(&target, &stores, None, false, false)
+            .await
+            .unwrap();
+        assert_eq!(report.keys.len(), 1, "{report:?}");
+        assert_eq!(report.keys[0].action, "enveloped", "{report:?}");
+        let stored = store.get("orders::a").await.unwrap().unwrap();
+        let resolved = faucet_core::state_version::StoredState::parse(&stored);
+        assert_eq!(resolved.data, serde_json::json!({ "id": 5 }), "{stored}");
     }
 
     #[tokio::test]

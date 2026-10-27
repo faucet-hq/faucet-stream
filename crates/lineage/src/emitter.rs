@@ -111,7 +111,7 @@ impl LineageEmitter {
             let run_id = p.run_id.clone()?;
             Some(ParentRunFacet {
                 producer: PRODUCER.into(),
-                schema_url: OL_SCHEMA_URL.into(),
+                schema_url: PARENT_RUN_FACET_URL.into(),
                 run: ParentRunRef { run_id },
                 job: ParentJobRef {
                     namespace: p.namespace.clone(),
@@ -126,7 +126,7 @@ impl LineageEmitter {
             .map(|e| ErrorMessageRunFacet::new(faucet_core::redact::redact(e)));
         let nominal_time = Some(NominalTimeRunFacet {
             producer: PRODUCER.into(),
-            schema_url: OL_SCHEMA_URL.into(),
+            schema_url: NOMINAL_TIME_FACET_URL.into(),
             nominal_start_time: ctx.started_at.to_rfc3339(),
             nominal_end_time: ctx.finished_at.map(|t| t.to_rfc3339()),
         });
@@ -134,7 +134,7 @@ impl LineageEmitter {
         // Job facets.
         let source_code = ctx.source_code.as_ref().map(|src| SourceCodeJobFacet {
             producer: PRODUCER.into(),
-            schema_url: OL_SCHEMA_URL.into(),
+            schema_url: SOURCE_CODE_FACET_URL.into(),
             language: "yaml".into(),
             source_code: src.clone(),
         });
@@ -191,7 +191,13 @@ impl LineageEmitter {
 
         RunEvent {
             event_type: ev,
-            event_time: ctx.finished_at.unwrap_or(ctx.started_at).to_rfc3339(),
+            // A RUNNING heartbeat is stamped when it is sent; START and the
+            // terminal events carry the run's own start / finish times.
+            event_time: match ev {
+                EventType::Running => chrono::Utc::now(),
+                _ => ctx.finished_at.unwrap_or(ctx.started_at),
+            }
+            .to_rfc3339(),
             run: Run {
                 run_id: ctx.run_id.clone(),
                 facets: RunFacets {
@@ -290,7 +296,7 @@ fn column_facet(cl: &ColumnLineage, in_ns: &str, in_name: &str) -> ColumnLineage
     }
     ColumnLineageDatasetFacet {
         producer: PRODUCER.into(),
-        schema_url: OL_SCHEMA_URL.into(),
+        schema_url: COLUMN_LINEAGE_FACET_URL.into(),
         fields,
     }
 }
@@ -354,6 +360,43 @@ mod tests {
             column_lineage: None,
             source_code: None,
         }
+    }
+
+    #[test]
+    fn running_events_carry_the_send_time_and_facets_their_own_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg(dir.path().join("ol.jsonl"));
+        c.include_column_lineage = true;
+        c.include_schema_facet = true;
+        let em = LineageEmitter::new(c).unwrap();
+        let mut ctx = lifecycle();
+        ctx.started_at = Utc::now() - chrono::Duration::hours(2);
+        let before = Utc::now();
+        let running = em.build(EventType::Running, &ctx);
+        let at = chrono::DateTime::parse_from_rfc3339(&running.event_time).unwrap();
+        assert!(
+            at >= before,
+            "a heartbeat is stamped when sent, not at run start"
+        );
+        let start = em.build(EventType::Start, &ctx);
+        assert_eq!(start.event_time, ctx.started_at.to_rfc3339());
+        let nominal = running.run.facets.nominal_time.unwrap();
+        assert_eq!(nominal.schema_url, NOMINAL_TIME_FACET_URL);
+        assert_eq!(
+            schema_facet(&InferredSchema {
+                fields: vec![("a".into(), "string".into())]
+            })
+            .schema_url,
+            SCHEMA_FACET_URL
+        );
+        let cl = column_facet(
+            &ColumnLineage {
+                edges: Default::default(),
+            },
+            "ns",
+            "n",
+        );
+        assert_eq!(cl.schema_url, COLUMN_LINEAGE_FACET_URL);
     }
 
     #[tokio::test]

@@ -131,12 +131,7 @@ async fn conformance_capabilities_truthful() {
 
     // The sink honours the standard AWS credential chain — pass MinIO creds via
     // env vars (same approach as batching.rs).
-    // SAFETY: constants; overlapping tests write the same values.
-    unsafe {
-        std::env::set_var("AWS_ACCESS_KEY_ID", ACCESS_KEY);
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", SECRET_KEY);
-        std::env::set_var("AWS_DEFAULT_REGION", REGION);
-    }
+    set_test_env();
     let config = S3SinkConfig::new(TEST_BUCKET)
         .prefix(PREFIX)
         .endpoint_url(endpoint.clone())
@@ -210,12 +205,7 @@ async fn conformance_call_deadline() {
         .await
         .expect("listener");
     let endpoint = hung.http_url();
-    // SAFETY: the same constants every other test here sets.
-    unsafe {
-        std::env::set_var("AWS_ACCESS_KEY_ID", ACCESS_KEY);
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", SECRET_KEY);
-        std::env::set_var("AWS_DEFAULT_REGION", REGION);
-    }
+    set_test_env();
     faucet_conformance::calls::assert_sink_call_deadline(
         || {
             let config = S3SinkConfig::new("hung")
@@ -281,12 +271,7 @@ async fn declared_capabilities() {
         .send()
         .await
         .expect("create bucket");
-    // SAFETY: constants; overlapping tests write the same values.
-    unsafe {
-        std::env::set_var("AWS_ACCESS_KEY_ID", ACCESS_KEY);
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", SECRET_KEY);
-        std::env::set_var("AWS_DEFAULT_REGION", REGION);
-    }
+    set_test_env();
     let admin_ref = &admin;
 
     let sink = S3Sink::new(
@@ -322,4 +307,19 @@ async fn declared_capabilities() {
         visible_records(admin_ref, "ovw/").await
     })
     .await;
+}
+
+/// Set the AWS variables every test in this binary shares, once per process:
+/// `setenv` racing another thread's `getenv` is undefined behaviour even when
+/// both sides write the same value.
+fn set_test_env() {
+    static ENV: std::sync::Once = std::sync::Once::new();
+    // SAFETY: the writes run once, before any client in this binary reads the
+    // variables (every caller blocks on the `Once` until they are done), and
+    // std's own environment reads take the same lock as these writes.
+    ENV.call_once(|| unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", ACCESS_KEY);
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", SECRET_KEY);
+        std::env::set_var("AWS_DEFAULT_REGION", REGION);
+    });
 }

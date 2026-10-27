@@ -689,18 +689,44 @@ async fn a_source_and_a_sink_compose_across_two_hubs() {
 #[cfg(feature = "hub-remote")]
 #[test]
 fn a_per_owner_github_token_takes_precedence() {
-    use faucet_cli::hub::remote::{github_token, owner_token_var};
+    use faucet_cli::hub::remote::{github_token_from, owner_token_var};
     let var = owner_token_var("zz-hub-cli-696/private-hub");
     assert_eq!(var, "FAUCET_GITHUB_TOKEN_ZZ_HUB_CLI_696");
-    // SAFETY: the variable name is unique to this test.
-    unsafe { std::env::set_var(&var, "owner-token") };
+    // The lookup stands in for the environment, so no test mutates the
+    // process environment while others read it.
+    let env = |pairs: &'static [(&'static str, &'static str)]| {
+        move |name: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.to_string())
+        }
+    };
+    let repo = "zz-hub-cli-696/private-hub";
+    let all: &'static [(&str, &str)] = &[
+        ("FAUCET_GITHUB_TOKEN_ZZ_HUB_CLI_696", "owner-token"),
+        ("FAUCET_GITHUB_TOKEN", "global-token"),
+        ("GITHUB_TOKEN", "gh-token"),
+    ];
     assert_eq!(
-        github_token("zz-hub-cli-696/private-hub").as_deref(),
+        github_token_from(repo, env(all)).as_deref(),
         Some("owner-token")
     );
+    let blank_owner: &'static [(&str, &str)] = &[
+        ("FAUCET_GITHUB_TOKEN_ZZ_HUB_CLI_696", "  "),
+        ("FAUCET_GITHUB_TOKEN", "global-token"),
+    ];
+    assert_eq!(
+        github_token_from(repo, env(blank_owner)).as_deref(),
+        Some("global-token")
+    );
+    assert_eq!(
+        github_token_from("other/hub", env(all)).as_deref(),
+        Some("global-token")
+    );
+    assert_eq!(github_token_from(repo, env(&[])), None);
     let loc = faucet_cli::hub::HubLocation::parse("github:zz-hub-cli-696/private-hub").unwrap();
     assert!(faucet_cli::hub::remote::GithubHub::new(&loc, "http://127.0.0.1:1").is_ok());
-    unsafe { std::env::remove_var(&var) };
 }
 
 #[cfg(feature = "hub-remote")]

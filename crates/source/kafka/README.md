@@ -98,7 +98,7 @@ All fields are keys under `source.config`.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `auto_offset_reset` | `earliest` \| `latest` | `latest` | Where to start a partition that has **no** bookmarked offset — i.e. a first-ever run or a newly-added partition. Resumed partitions always start from their bookmark. |
+| `auto_offset_reset` | `earliest` \| `latest` | `latest` | Where to start a partition that has **no** bookmarked offset and no offset committed by the consumer group (`group_id`) — i.e. a first-ever run or a newly-added partition. Resumed partitions always start from their bookmark; a partition without one starts at the group's committed offset when the group has one (for example after a sharded member-mode run). |
 | `on_decode_error` | `fail` \| `skip` | `fail` | What to do when one message fails to decode. `fail` aborts the batch; `skip` drops the message and logs a `WARN`. |
 | `extra_client_config` | object | `{}` | Raw librdkafka client properties passed straight to the consumer. These can override anything set by `auth` or the typed fields above — use with care. |
 
@@ -399,7 +399,7 @@ Load from YAML/JSON or environment. Inspect the full JSON Schema with:
 ```bash
 faucet schema source kafka
 faucet validate pipeline.yaml
-faucet preview pipeline.yaml --limit 5   # consume a few messages and print to stdout
+faucet preview pipeline.yaml --limit 5 --allow-side-effects   # joins the consumer group; prints a few messages
 ```
 
 A complete working example ships at [`cli/examples/kafka_to_jsonl.yaml`](https://github.com/faucet-hq/faucet-stream/blob/main/cli/examples/kafka_to_jsonl.yaml).

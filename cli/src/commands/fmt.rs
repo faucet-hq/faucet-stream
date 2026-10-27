@@ -244,7 +244,7 @@ fn canonicalize_yaml(value: serde_yaml::Value) -> serde_yaml::Value {
 
 /// Replace `path` with `contents` atomically: a sibling temp file renamed
 /// over it, so an interrupted `fmt` never leaves a truncated config.
-fn write_atomically(path: &Path, contents: &str) -> CliResult<()> {
+pub(crate) fn write_atomically(path: &Path, contents: &str) -> CliResult<()> {
     let fail =
         |e: std::io::Error| CliError::Config(format!("cannot write '{}': {e}", path.display()));
     // Rewrite a symlink's target, never the link itself.

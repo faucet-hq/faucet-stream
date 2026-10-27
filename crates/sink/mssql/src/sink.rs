@@ -44,9 +44,10 @@ use crate::encode::{
 
 pub(crate) use crate::statements::Prepared;
 use crate::statements::{
-    cleanup_key_typing, delete_statements, insert_statements, key_load_statements,
-    merge_statements, overwrite_swap_sql, poison_check, prepare_rows, staging_create_sql,
-    staging_relax_sql, with_call, writable,
+    child_references_sql, cleanup_key_typing, delete_statements, group_referencing_keys,
+    insert_statements, key_load_statements, merge_statements, overwrite_swap_sql, poison_check,
+    prepare_rows, referencing_keys_sql, staging_create_sql, staging_relax_sql, target_database,
+    with_call, writable,
 };
 
 /// Microsoft SQL Server sink.
@@ -258,6 +259,18 @@ impl MssqlDriver {
             self.table_ready.store(true, Ordering::Relaxed);
             return Ok(());
         }
+        // Begin cloned an existing target into staging: never re-create a
+        // staging another run dropped from this page.
+        if self.config.write.is_overwrite() && self.table_exists(&self.config.table).await? {
+            if !self.table_exists(&self.staging_literal()).await? {
+                return Err(faucet_common_sql::missing_overwrite_staging_error(
+                    "mssql",
+                    &self.staging_literal(),
+                ));
+            }
+            self.table_ready.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
         // A page with nothing inferable leaves the table uncreated so the next
         // page can try, rather than emitting a zero-column CREATE.
         let key: &[String] = if self.config.write.dedups_by_key() {
@@ -442,6 +455,67 @@ impl MssqlDriver {
             }
         }
         Ok(())
+    }
+
+    /// Refuse an overwrite of a table other tables reference by an enabled
+    /// foreign key, on the DDL connection `conn` (a one-connection pool): any
+    /// key whose `ON DELETE` rewrites the child, and a `NO ACTION` key while
+    /// some child row references the target. The catalog read is the target's
+    /// own database for a three-part name.
+    async fn refuse_referenced_target(
+        &self,
+        conn: &mut MssqlPooledConnection<'_>,
+    ) -> Result<(), FaucetError> {
+        let db = target_database(&self.config.table);
+        let probe = referencing_keys_sql(&self.table_quoted, db)?;
+        let rows = self.probe_rows(conn, &probe).await?;
+        let keys = group_referencing_keys(rows.iter().filter_map(|row| {
+            Some((
+                row.try_get::<i32, _>(0).ok().flatten()?,
+                row.try_get::<&str, _>(1).ok().flatten()?.to_string(),
+                row.try_get::<&str, _>(2).ok().flatten()?.to_string(),
+                row.try_get::<i32, _>(3).ok().flatten()?,
+                row.try_get::<&str, _>(4).ok().flatten()?.to_string(),
+            ))
+        }));
+        let mut referenced_by = std::collections::BTreeSet::new();
+        for key in &keys {
+            let refused = key.rewrites_child()
+                || !self
+                    .probe_rows(conn, &child_references_sql(key, db)?)
+                    .await?
+                    .is_empty();
+            if refused {
+                referenced_by.insert(key.display(db));
+            }
+        }
+        if referenced_by.is_empty() {
+            Ok(())
+        } else {
+            Err(faucet_common_sql::referenced_overwrite_error(
+                "mssql",
+                &self.config.table,
+                &referenced_by.into_iter().collect::<Vec<_>>(),
+                true,
+            ))
+        }
+    }
+
+    /// One foreign-key probe query on `conn`, its first result set.
+    async fn probe_rows(
+        &self,
+        conn: &mut MssqlPooledConnection<'_>,
+        sql: &str,
+    ) -> Result<Vec<tiberius::Row>, FaucetError> {
+        self.on_conn(conn, "query", true, async |c| {
+            c.simple_query(sql)
+                .await
+                .map_err(|e| FaucetError::Sink(format!("mssql overwrite: foreign-key probe: {e}")))?
+                .into_first_result()
+                .await
+                .map_err(|e| FaucetError::Sink(format!("mssql overwrite: foreign-key probe: {e}")))
+        })
+        .await
     }
 
     /// The bracket-quoted relation the append/insert path targets. For
@@ -1625,6 +1699,9 @@ impl MssqlDriver {
         if first_run {
             return Ok(());
         }
+        // Before any row is staged: the swap's `DELETE FROM target` would
+        // cascade into (or be blocked by) referencing tables.
+        self.refuse_referenced_target(&mut conn).await?;
         self.control(
             &mut conn,
             &staging_create_sql(staging, target, &target_infos)?,
@@ -1672,6 +1749,8 @@ impl MssqlDriver {
         swap.push(format!("DROP TABLE {staging}"));
 
         let mut conn = self.checkout().await?;
+        // Again at the swap: a foreign key may have been added mid-run.
+        self.refuse_referenced_target(&mut conn).await?;
         self.control(&mut conn, "BEGIN TRAN").await?;
         for stmt in swap {
             if let Err(e) = self.control(&mut conn, &stmt).await {

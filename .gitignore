@@ -49,6 +49,8 @@ docs/superpowers/
 !/scripts/retry-on-image-pull.sh
 !/scripts/pull_flake.py
 !/scripts/test_pull_flake.py
+!/scripts/failing_tests.py
+!/scripts/test_failing_tests.py
 !/scripts/docker-hub-mirror.sh
 !/scripts/semver-exclude.py
 !/scripts/test_integration_coverage.py

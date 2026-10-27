@@ -14,13 +14,9 @@
 use serde_json::{Value, json};
 use std::time::Duration;
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+#[path = "support/ports.rs"]
+mod ports;
+use ports::free_port;
 
 /// alice = admin, bob + dave = operators, carol = viewer. Runs may be approved
 /// by any operator or admin except the requester; template changes by admins.
@@ -198,6 +194,7 @@ fn csv_config(input: &std::path::Path, output: &std::path::Path, name: &str) -> 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
 async fn plan_approve_run_with_policy_budget_rejection_and_audit() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("in.csv");
@@ -616,6 +613,34 @@ async fn plan_approve_run_with_policy_budget_rejection_and_audit() {
         serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     let rec = api.wait_run(sub["run_id"].as_str().unwrap()).await;
     assert_eq!(rec["status"], "completed", "{rec}");
+    // A dry run on the server screens a request-supplied overlay the same way
+    // a real run does, before anything is materialized.
+    let (_, r) = api
+        .post(
+            "dave-tok",
+            "/mcp",
+            json!({ "jsonrpc": "2.0", "id": 14, "method": "tools/call", "params": {
+                "name": "run_template", "arguments": { "id": "tpl-mcp", "dry_run": true,
+                    "overlay": { "kind": "deployment", "name": "ops",
+                        "state": { "type": "file", "config": { "path": "${file:/etc/hostname}" } } } }
+            }}),
+        )
+        .await;
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    let msg = r["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(msg.contains("inline `overlay`"), "{msg}");
+    let (_, r) = api
+        .post(
+            "dave-tok",
+            "/mcp",
+            json!({ "jsonrpc": "2.0", "id": 15, "method": "tools/call", "params": {
+                "name": "run_template", "arguments": { "id": "tpl-mcp", "dry_run": true }
+            }}),
+        )
+        .await;
+    assert!(!r["result"]["isError"].as_bool().unwrap_or(false), "{r}");
 
     // A proposal whose config cannot be planned comes back as a tool error
     // carrying the server error's `code: message` rendering.
@@ -679,6 +704,7 @@ async fn plan_approve_run_with_policy_budget_rejection_and_audit() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
 async fn require_approval_turns_submissions_into_change_requests() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("in.csv");
@@ -849,6 +875,7 @@ async fn require_approval_turns_submissions_into_change_requests() {
 /// from the loaded config, so a documented `${env:…}` webhook URL resolves.
 #[cfg(feature = "notify")]
 #[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
 async fn change_requested_notifications_resolve_env_references() {
     use wiremock::matchers::{body_string_contains, method};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -859,6 +886,8 @@ async fn change_requested_notifications_resolve_env_references() {
         .expect(1)
         .mount(&hook)
         .await;
+    // SAFETY: every test in this binary is `#[serial]`, so no other thread
+    // reads the environment while it changes; the variable is removed below.
     unsafe { std::env::set_var("FAUCET_789_APPROVER_HOOK", format!("{}/hook", hook.uri())) };
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("in.csv");
@@ -893,6 +922,8 @@ async fn change_requested_notifications_resolve_env_references() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     hook.verify().await;
+    // SAFETY: as above.
+    unsafe { std::env::remove_var("FAUCET_789_APPROVER_HOOK") };
 }
 
 /// Review of #868 (cli F6, F7): under `--require-approval template_launch` a
@@ -900,6 +931,7 @@ async fn change_requested_notifications_resolve_env_references() {
 /// refused directly but stays possible through an approved `template_delete` /
 /// `template_deprecate` change request, which takes the launch approval rule.
 #[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
 async fn gated_deletes_and_retirements_run_through_change_requests() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("in.csv");
@@ -1025,6 +1057,7 @@ async fn gated_deletes_and_retirements_run_through_change_requests() {
 /// A configured principal may not take a server actor's name, so a removed
 /// principal can never pass as one when its approved change executes.
 #[test]
+#[serial_test::serial]
 fn an_auth_config_principal_may_not_take_a_server_actor_name() {
     let dir = tempfile::tempdir().unwrap();
     for name in ["trigger:nightly", "system:expiry", "sync:origin", "runtime"] {

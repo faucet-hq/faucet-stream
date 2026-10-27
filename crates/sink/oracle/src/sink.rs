@@ -390,6 +390,13 @@ impl Inner {
         if !self.config.create_table {
             return Err(faucet_core::missing_target_error("oracle sink", table));
         }
+        // Begin cloned an existing target into staging: never re-create a
+        // staging another run dropped from this page.
+        if self.config.write.is_overwrite() && self.table_exists(conn, &self.target)? {
+            return Err(faucet_common_sql::missing_overwrite_staging_error(
+                "oracle", table,
+            ));
+        }
         let planned = match &self.config.column_mapping {
             OracleColumnMapping::JsonColumn { column } => {
                 Some(create_json_table_sql(quoted, column)?)

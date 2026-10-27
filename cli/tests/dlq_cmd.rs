@@ -227,6 +227,25 @@ async fn replay_runs_under_the_configs_resilience_block() {
     assert_eq!(landed.lines().count(), 2, "{landed}");
 }
 
+/// The replay really runs under `resilience:`: a sink that keeps failing trips
+/// the configured circuit breaker, which only the resilience policy can do —
+/// without it the replay fails with the sink's own error.
+#[tokio::test]
+async fn replay_trips_the_configs_circuit_breaker() {
+    let dir = tempfile::tempdir().unwrap();
+    let dlq = dlq_file(dir.path());
+    let cfg = write(
+        dir.path(),
+        "breaker.yaml",
+        "version: 1\nname: replay\nresilience: { retry: { max_attempts: 1 }, circuit_breaker: { consecutive_failures: 1, cooldown_secs: 1 } }\npipeline:\n  source: { type: csv, config: { path: /dev/null } }\n  sink: { type: http, config: { url: \"http://127.0.0.1:9/never\" } }\n",
+    );
+    let err = dlq::run(replay_args(cfg, &dlq, false, true))
+        .await
+        .expect_err("the sink is unreachable")
+        .to_string();
+    assert!(err.to_lowercase().contains("circuit"), "{err}");
+}
+
 /// A shared DLQ holds another row's envelopes: the default replay skips them
 /// and says so; `--all-rows` replays them too.
 #[tokio::test]

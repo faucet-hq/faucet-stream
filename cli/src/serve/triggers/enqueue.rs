@@ -21,9 +21,15 @@ pub enum FireOutcome {
     /// An error building or submitting the run.
     Error(String),
     /// The submission was refused for a reason a retry cannot fix (a bad
-    /// config, a failed validation, a missing tenant). Only produced inside a
-    /// tenant fan-out, where it becomes that tenant's own outcome.
+    /// config, a failed validation, a missing template or tenant). A polling
+    /// watcher skips past the event and reports it; inside a tenant fan-out
+    /// it becomes that tenant's own outcome.
     Failed(String),
+    /// A value the event's sender chose was refused (where the config places
+    /// it, or by the server's reference policy), or one the config needs was
+    /// missing: the sender's error, not the trigger's. Watchers treat it like
+    /// [`FireOutcome::Failed`]; the webhook answers 422 and stays healthy.
+    Refused(String),
 }
 
 impl FireOutcome {
@@ -48,15 +54,86 @@ pub async fn resolve_config_text(
     name: &str,
     fired_at: &str,
 ) -> Result<String, String> {
+    resolve_config(config, event, name, fired_at)
+        .await
+        .map(|s| s.text)
+        .map_err(|e| e.to_string())
+}
+
+/// Why a fired config could not be produced: reading it (may clear on a
+/// retry) or substituting the event into it (never will).
+pub enum ResolveError {
+    Read(String),
+    Substitute(context::SubstituteError),
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResolveError::Read(e) => f.write_str(e),
+            ResolveError::Substitute(e) => f.write_str(&e.message),
+        }
+    }
+}
+
+/// [`resolve_config_text`], also returning the sender-chosen values the
+/// substitution placed.
+pub async fn resolve_config(
+    config: &PipelineRef,
+    event: &TriggerEvent,
+    name: &str,
+    fired_at: &str,
+) -> Result<context::Substitution, ResolveError> {
     let raw = match config {
         PipelineRef::Path(p) => tokio::fs::read_to_string(p)
             .await
-            .map_err(|e| format!("reading pipeline config '{p}': {e}"))?,
-        PipelineRef::Inline(v) => {
-            serde_yaml::to_string(v).map_err(|e| format!("serializing inline pipeline: {e}"))?
-        }
+            .map_err(|e| ResolveError::Read(format!("reading pipeline config '{p}': {e}")))?,
+        PipelineRef::Inline(v) => serde_yaml::to_string(v)
+            .map_err(|e| ResolveError::Read(format!("serializing inline pipeline: {e}")))?,
     };
-    context::substitute(&raw, event, name, fired_at)
+    context::substitute_tracked(&raw, event, name, fired_at).map_err(ResolveError::Substitute)
+}
+
+/// Hold the values an event's sender chose to the limits a caller-submitted
+/// config has: a URL or an absolute local path from the event must be one
+/// the server's caller reference policy allows. The trigger's own config is
+/// the operator's; what the sender put into it is not.
+pub fn screen_event_values(
+    state: &ServerState,
+    tenant: Option<&str>,
+    values: &[context::EventValue],
+) -> Result<(), String> {
+    let policy = state.references().for_origin(
+        crate::serve::load::BodyOrigin::Caller {
+            allow_subprocess: false,
+        },
+        tenant,
+    );
+    for v in values {
+        let field = format!("trigger.{}", v.token);
+        let value = v.value.trim();
+        if value.contains("://") {
+            if let Err(e) = policy.check_url(value) {
+                return Err(format!(
+                    "`${{{field}}}` names a URL the server's reference policy does not allow \
+                     ({}); the event was not run",
+                    e.reason
+                ));
+            }
+        } else if v.leads
+            && (value.starts_with('/') || value.starts_with('~') || value.starts_with("file:"))
+        {
+            crate::serve::load::refuse_request_path_with(
+                &field,
+                value,
+                true,
+                tenant.is_some(),
+                &policy,
+            )
+            .map_err(|e| e.api_error().error.message)?;
+        }
+    }
+    Ok(())
 }
 
 /// Build the `SubmitRequest` for an already-resolved config text. Pure.
@@ -152,7 +229,7 @@ fn fold_tenant(
         return (outcome, None);
     };
     match outcome {
-        FireOutcome::Failed(e) => (FireOutcome::Coalesced, Some(e)),
+        FireOutcome::Failed(e) | FireOutcome::Refused(e) => (FireOutcome::Coalesced, Some(e)),
         FireOutcome::Error(e) => {
             tracing::warn!(trigger, tenant = %t, error = %e, "tenant fire failed; retrying");
             (FireOutcome::Error(e), None)
@@ -295,13 +372,29 @@ async fn fire_one(
     };
     let result = match (&compiled.spec.config, &compiled.spec.template) {
         (Some(config), _) => {
-            let text = match resolve_config_text(config, event, compiled.name(), fired_at).await {
-                Ok(t) => t,
-                Err(e) => {
+            let sub = match resolve_config(config, event, compiled.name(), fired_at).await {
+                Ok(s) => s,
+                Err(ResolveError::Read(e)) => {
                     metrics::error(compiled.name(), kind);
                     return FireOutcome::Error(e);
                 }
+                // The event itself cannot be substituted (an unknown token, a
+                // value its placement refuses): a retry gives the same answer,
+                // so a watcher skips past it rather than stalling on it.
+                Err(ResolveError::Substitute(e)) => {
+                    metrics::error(compiled.name(), kind);
+                    return if e.by_sender {
+                        FireOutcome::Refused(e.message)
+                    } else {
+                        FireOutcome::Failed(e.message)
+                    };
+                }
             };
+            if let Err(e) = screen_event_values(state, tenant, &sub.event_values) {
+                metrics::error(compiled.name(), kind);
+                return FireOutcome::Refused(e);
+            }
+            let text = sub.text;
             let mut req = build_submit_request(compiled, event, text, fired_at);
             req.idempotency_key = req.idempotency_key.map(idem);
             // A trigger declared in the server's triggers file is a standing
@@ -323,8 +416,34 @@ async fn fire_one(
             .and_then(|o| o.accepted())
             .map(|r| r.run_id)
         }
+        #[cfg(feature = "templates")]
         (None, Some(tpl)) => {
-            submit_template(state, compiled, tpl, event, fired_at, actor, idem).await
+            // The params of a template trigger are bound into the template,
+            // which loads as the server's own: what the sender put into them
+            // is held to the same checks as a config trigger's values.
+            let (body, event_values) = match template_body_tracked(compiled, tpl, event, fired_at) {
+                Ok(b) => b,
+                Err(e) => {
+                    metrics::error(compiled.name(), kind);
+                    return if e.by_sender {
+                        FireOutcome::Refused(e.message)
+                    } else {
+                        FireOutcome::Failed(e.message)
+                    };
+                }
+            };
+            if let Err(e) = screen_event_values(state, tenant, &event_values) {
+                metrics::error(compiled.name(), kind);
+                return FireOutcome::Refused(e);
+            }
+            submit_template(state, tpl, body, actor, idem).await
+        }
+        #[cfg(not(feature = "templates"))]
+        (None, Some(_)) => {
+            let _ = (actor, idem);
+            Err(crate::serve::error::ServeError::BadConfig(
+                "a template trigger needs a build with the `templates` feature".into(),
+            ))
         }
         (None, None) => Err(crate::serve::error::ServeError::BadConfig(
             "trigger has neither config nor template".into(),
@@ -377,32 +496,59 @@ pub fn template_body(
     event: &TriggerEvent,
     fired_at: &str,
 ) -> Result<crate::serve::handlers::templates::TriggerBody, String> {
+    template_body_tracked(compiled, tpl, event, fired_at)
+        .map(|(body, _)| body)
+        .map_err(|e| e.message)
+}
+
+/// [`template_body`], also returning the sender-chosen values placed in its
+/// params, for the caller to check against the server's reference policy.
+#[cfg(feature = "templates")]
+pub fn template_body_tracked(
+    compiled: &CompiledTrigger,
+    tpl: &super::spec::TemplateTrigger,
+    event: &TriggerEvent,
+    fired_at: &str,
+) -> Result<
+    (
+        crate::serve::handlers::templates::TriggerBody,
+        Vec<context::EventValue>,
+    ),
+    context::SubstituteError,
+> {
     fn selector(
         field: &str,
         v: &Option<String>,
-    ) -> Result<Option<crate::serve::history::templates::VersionSelector>, String> {
+    ) -> Result<Option<crate::serve::history::templates::VersionSelector>, context::SubstituteError>
+    {
         v.as_ref()
             .map(|s| {
-                serde_json::from_value(serde_json::Value::String(s.clone()))
-                    .map_err(|e| format!("template {field} '{s}': {e}"))
+                serde_json::from_value(serde_json::Value::String(s.clone())).map_err(|e| {
+                    context::SubstituteError {
+                        message: format!("template {field} '{s}': {e}"),
+                        by_sender: false,
+                    }
+                })
             })
             .transpose()
     }
     let mut params = std::collections::BTreeMap::new();
+    let mut event_values = Vec::new();
     for (k, v) in &tpl.params {
-        let v =
-            match v {
-                serde_json::Value::String(s) => serde_json::Value::String(
-                    context::substitute_plain(s, event, compiled.name(), fired_at)?,
-                ),
-                other => other.clone(),
-            };
+        let v = match v {
+            serde_json::Value::String(s) => {
+                let sub = context::substitute_param(s, k, event, compiled.name(), fired_at)?;
+                event_values.extend(sub.event_values);
+                serde_json::Value::String(sub.text)
+            }
+            other => other.clone(),
+        };
         params.insert(k.clone(), v);
     }
     let name = compiled.name();
     let mut labels = context::labels(name, event);
     labels.extend(compiled.spec.run.labels.clone());
-    Ok(crate::serve::handlers::templates::TriggerBody {
+    let body = crate::serve::handlers::templates::TriggerBody {
         params,
         version: selector("version", &tpl.version)?,
         sink: tpl.sink.clone(),
@@ -428,43 +574,25 @@ pub fn template_body(
         standing_approval: true,
         allow_untested: tpl.allow_untested,
         ..Default::default()
-    })
+    };
+    Ok((body, event_values))
 }
 
 #[cfg(feature = "templates")]
 async fn submit_template(
     state: &ServerState,
-    compiled: &CompiledTrigger,
     tpl: &super::spec::TemplateTrigger,
-    event: &TriggerEvent,
-    fired_at: &str,
+    mut body: crate::serve::handlers::templates::TriggerBody,
     actor: crate::serve::rbac::AuthContext,
     idem: impl Fn(String) -> String,
 ) -> Result<String, crate::serve::error::ServeError> {
     use crate::runtime::server::{TriggerOutcome, trigger_template};
-    let mut body = template_body(compiled, tpl, event, fired_at)
-        .map_err(crate::serve::error::ServeError::BadConfig)?;
     body.idempotency_key = body.idempotency_key.map(idem);
     let principal = crate::runtime::Principal::new(actor, crate::runtime::Origin::Trusted);
     match trigger_template(state.clone(), principal, tpl.id.clone(), body).await? {
         TriggerOutcome::Run(r) => Ok(r.run.run_id),
         TriggerOutcome::PendingApproval(c) => Ok(format!("change:{}", c.id)),
     }
-}
-
-#[cfg(not(feature = "templates"))]
-async fn submit_template(
-    _state: &ServerState,
-    _compiled: &CompiledTrigger,
-    _tpl: &super::spec::TemplateTrigger,
-    _event: &TriggerEvent,
-    _fired_at: &str,
-    _actor: crate::serve::rbac::AuthContext,
-    _idem: impl Fn(String) -> String,
-) -> Result<String, crate::serve::error::ServeError> {
-    Err(crate::serve::error::ServeError::BadConfig(
-        "a template trigger needs a build with the `templates` feature".into(),
-    ))
 }
 
 #[cfg(test)]
@@ -564,6 +692,68 @@ mod tests {
             ..tpl
         };
         assert!(template_body(&c, &bad_token, &e, "now").is_err());
+    }
+
+    /// What a sender puts into a template trigger's params is checked like a
+    /// config trigger's values: a URL or absolute path against the caller
+    /// reference policy, a `..` segment, a whole statement (#934 R1-007).
+    #[cfg(feature = "templates")]
+    #[tokio::test]
+    async fn a_template_trigger_checks_the_values_its_sender_put_in_its_params() {
+        use crate::serve::triggers::spec::TemplateTrigger;
+        let state = crate::serve::test_support::test_state();
+        let mut c = compiled_webhook();
+        c.spec.config = None;
+        let tpl = |param: &str, value: &str| TemplateTrigger {
+            id: "rest-tpl".into(),
+            version: None,
+            params: std::collections::BTreeMap::from([(
+                param.to_string(),
+                serde_json::json!(value),
+            )]),
+            sink: None,
+            sink_version: None,
+            overlay: None,
+            overlay_version: None,
+            allow_untested: false,
+        };
+        let hook = |host: &str| TriggerEvent::Webhook {
+            method: "POST".into(),
+            body: "SELECT 1".into(),
+            headers: [("x-host".to_string(), host.to_string())].into(),
+            query: Default::default(),
+            idem: "i".into(),
+        };
+        let header = "${trigger.header.x-host}";
+        let (body, values) = template_body_tracked(
+            &c,
+            &tpl("api_root", header),
+            &hook("http://169.254.169.254/latest"),
+            "f",
+        )
+        .unwrap();
+        assert_eq!(body.params["api_root"], "http://169.254.169.254/latest");
+        assert!(values[0].leads);
+        let err = screen_event_values(&state, None, &values).unwrap_err();
+        assert!(err.contains("trigger.header.x-host"), "{err}");
+        for (param, value, host) in [
+            ("dir", header, "in/../../etc"),
+            ("query", "${trigger.body}", "x"),
+            ("filter", "id = '${trigger.header.x-host}'", "a'b"),
+        ] {
+            let err = template_body_tracked(&c, &tpl(param, value), &hook(host), "f").unwrap_err();
+            assert!(err.by_sender, "{param}: {}", err.message);
+        }
+        // A plain value the sender chose is fine.
+        let (body, values) =
+            template_body_tracked(&c, &tpl("region", header), &hook("eu-1"), "f").unwrap();
+        assert_eq!(body.params["region"], "eu-1");
+        screen_event_values(&state, None, &values).unwrap();
+        // Through a fire, the refusal is the sender's, before any template
+        // is looked up.
+        c.spec.template = Some(tpl("api_root", header));
+        let outcome = fire(&state, &c, hook("http://169.254.169.254/latest"), "f").await;
+        assert!(matches!(outcome, FireOutcome::Refused(_)), "{outcome:?}");
     }
 
     #[cfg(feature = "tenants")]

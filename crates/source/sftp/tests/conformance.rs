@@ -57,10 +57,13 @@ fn conformance_connector_name_nonempty() {
 async fn start_sftp_inner() -> Option<(ContainerAsync<GenericImage>, u16)> {
     let container = faucet_conformance::containers::start_or_skip(
         || {
-            GenericImage::new("atmoz/sftp", "latest")
-                .with_exposed_port(22.tcp())
-                .with_wait_for(WaitFor::message_on_stderr("Server listening on"))
-                .with_cmd(vec![format!("{USER}:{PASS}:::{UPLOAD_DIR}")])
+            GenericImage::new(
+                "atmoz/sftp",
+                "latest@sha256:0960390462a4441dbb63698d7c185b76a41ffcee7b78ff4adf275f3e66f9c475",
+            )
+            .with_exposed_port(22.tcp())
+            .with_wait_for(WaitFor::message_on_stderr("Server listening on"))
+            .with_cmd(vec![format!("{USER}:{PASS}:::{UPLOAD_DIR}")])
         },
         &Default::default(),
     )

@@ -249,7 +249,10 @@ async fn read_message(socket: &mut TcpStream) -> Option<(u8, Vec<u8>)> {
 
 async fn write_message(socket: &mut TcpStream, payload: &[u8], end: bool) {
     let chunks: Vec<&[u8]> = payload.chunks(4000).collect();
-    let last = chunks.len() - 1;
+    let Some(last) = chunks.len().checked_sub(1) else {
+        // Nothing to send: a stalled reply with no rows before its DONE.
+        return;
+    };
     for (i, chunk) in chunks.into_iter().enumerate() {
         let status = u8::from(end && i == last);
         let mut packet = vec![TABULAR, status, 0, 0, 0, 0, (i + 1) as u8, 0];
@@ -281,8 +284,10 @@ async fn serve(mut socket: TcpStream, script: Arc<Mutex<Script>>) {
                 match reply {
                     Reply::Hang => return drain(socket).await,
                     Reply::Stall(inner) => {
+                        // Everything but the final DONE token, so the client
+                        // waits for a completion that never comes.
                         let mut tokens = encode_reply(&inner);
-                        tokens.truncate(tokens.len() - 13);
+                        tokens.truncate(tokens.len().saturating_sub(13));
                         write_message(&mut socket, &tokens, false).await;
                         return drain(socket).await;
                     }
@@ -562,5 +567,29 @@ mod tests {
         assert_eq!(socket.read(&mut [0u8; 8]).await.unwrap(), 0);
         assert!(server.saw("WAIT") && server.saw("SELECT"));
         assert_eq!(server.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_done_only_reply_keeps_the_connection_open() {
+        let server = TdsServer::start().await.unwrap();
+        server.on("STALL", Reply::Stall(Box::new(Reply::Done(1))));
+        let mut socket = TcpStream::connect(("127.0.0.1", server.port()))
+            .await
+            .unwrap();
+        let mut packet = vec![0x01, 0x01, 0, 0, 0, 0, 1, 0];
+        packet.extend(ucs2("STALL"));
+        let len = packet.len() as u16;
+        packet[2..4].copy_from_slice(&len.to_be_bytes());
+        socket.write_all(&packet).await.unwrap();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            socket.read(&mut [0u8; 8]),
+        )
+        .await;
+        assert!(
+            read.is_err(),
+            "a stalled DONE must leave the socket open and silent, got {read:?}"
+        );
+        assert!(server.saw("STALL"));
     }
 }

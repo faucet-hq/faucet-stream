@@ -14,6 +14,7 @@ pub struct DuckdbSourceConfig {
     #[schemars(extend("x-faucet-resource" = "path"))]
     pub database: String,
     /// SQL query to execute.
+    #[schemars(extend("x-faucet-sql" = true))]
     pub query: String,
     /// Open the database read-only. Defaults to `false` (read-write).
     ///

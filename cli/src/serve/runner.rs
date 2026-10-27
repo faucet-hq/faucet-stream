@@ -518,11 +518,7 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
 
         let Some(body) = run.config_body.clone() else {
             tracing::error!(run_id, shard_id, "claimed shard's run has no stored config");
-            let _ = state
-                .history()
-                .finalize_shard(&run_id, &shard_id, ShardOutcome::Failed)
-                .await;
-            maybe_finalize_parent(&state, &run_id).await;
+            finalize_shard(&state, &run_id, &shard_id, ShardOutcome::Failed).await;
             return;
         };
         let loaded = match crate::runtime::server::reload(&state, &run, &body).await {
@@ -534,11 +530,7 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
                     error = %e.api_error().error.message,
                     "re-loading shard config failed"
                 );
-                let _ = state
-                    .history()
-                    .finalize_shard(&run_id, &shard_id, ShardOutcome::Failed)
-                    .await;
-                maybe_finalize_parent(&state, &run_id).await;
+                finalize_shard(&state, &run_id, &shard_id, ShardOutcome::Failed).await;
                 return;
             }
         };
@@ -621,20 +613,7 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
             }
         }
 
-        match state
-            .history()
-            .finalize_shard(&run_id, &shard_id, outcome)
-            .await
-        {
-            Ok(true) => {}
-            Ok(false) => tracing::warn!(
-                run_id,
-                shard_id,
-                "shard was reclaimed by another instance; discarding result"
-            ),
-            Err(e) => tracing::error!(run_id, shard_id, error = %e, "finalize_shard failed"),
-        }
-        maybe_finalize_parent(&state, &run_id).await;
+        finalize_shard(&state, &run_id, &shard_id, outcome).await;
         // The last of this run's shards on this instance closes its log
         // buffer: SSE readers get `End`, the tail is persisted and the
         // buffer is dropped after the drain window (#789 SERVE-35).
@@ -767,6 +746,28 @@ async fn execute_shard(
         _ => ShardOutcome::Failed,
     };
     (outcome, shutdown)
+}
+
+/// The owner-fenced terminal write of one shard, then the parent's finalize
+/// once every shard is terminal. A write the backend refuses is queued and
+/// retried from the lease loop: until it lands the shard row reads `running`
+/// under this instance's renewed lease, so no peer reclaims it and the parent
+/// would otherwise stay `sharded` for good.
+async fn finalize_shard(state: &ServerState, run_id: &str, shard_id: &str, outcome: ShardOutcome) {
+    let pending = PendingFinalize::Shard {
+        run_id: run_id.to_string(),
+        shard_id: shard_id.to_string(),
+        outcome,
+    };
+    if let Err(e) = write_pending(state, &pending).await {
+        tracing::error!(
+            run_id,
+            shard_id,
+            error = %e,
+            "finalize_shard failed; retrying from the lease loop"
+        );
+        state.queue_finalize(pending);
+    }
 }
 
 /// Finalize a `Sharded` parent run once all its shards are terminal. The last
@@ -1124,16 +1125,12 @@ pub(crate) async fn enqueue(
         // direction; either retries.
         #[cfg(feature = "tenants")]
         if let Some(t) = rec.tenant.as_deref()
-            && let Some(msg) =
+            && let Some(refusal) =
                 recount_refusal(t, crate::serve::tenants::over_limit(&state, t).await)
-            && state
-                .history()
-                .cancel_pending(&run_id)
-                .await
-                .unwrap_or(false)
         {
+            back_out_pending(&state, &run_id).await;
             release_orphaned_claim(&state, &req, &run_id).await;
-            return Err(ServeError::TooManyRequests(msg));
+            return Err(refusal);
         }
         // Release the local queue reservation (cluster runs are bounded by the
         // claim loop + semaphore, not the submit-side queue).
@@ -2024,21 +2021,20 @@ async fn finalize(state: &ServerState, run_id: &str, started: DateTime<Utc>, ter
         // Owner-fenced: if another instance reclaimed this run (lease expired),
         // our write is a no-op and we discard our result — the reclaimer is now
         // authoritative (#197).
-        match state.history().finalize_owned(&rec).await {
-            Ok(true) => {
-                metrics::record_run_finished(status, reason);
-                record_tenant_run(&rec);
-                // Only the instance that won the owner-fenced write fires the
-                // callback, so a reclaimed run cannot deliver twice (#481).
-                crate::serve::callback::fire(&rec).await;
-            }
-            Ok(false) => tracing::warn!(
+        let pending = PendingFinalize::Run {
+            rec: Box::new(rec),
+            reason,
+        };
+        if let Err(e) = write_pending(state, &pending).await {
+            // The row still says `running` and this instance keeps renewing
+            // its lease, so no peer re-runs it; the lease loop retries the
+            // write until the backend takes it.
+            tracing::error!(
                 run_id,
-                "finalize: run was reclaimed by another instance; discarding result"
-            ),
-            Err(e) => {
-                tracing::error!(run_id, error = %e, "finalize: owner-fenced write failed")
-            }
+                error = %e,
+                "finalize: owner-fenced write failed; retrying from the lease loop"
+            );
+            state.queue_finalize(pending);
         }
     } else {
         if let Err(e) = state.history().upsert(&rec).await {
@@ -2052,6 +2048,107 @@ async fn finalize(state: &ServerState, run_id: &str, started: DateTime<Utc>, ter
         record_tenant_run(&rec);
         crate::serve::callback::fire(&rec).await;
     }
+}
+
+/// A clustered terminal write waiting for the backend to take it.
+pub(crate) enum PendingFinalize {
+    /// A whole run's owner-fenced terminal record.
+    Run {
+        rec: Box<RunRecord>,
+        reason: &'static str,
+    },
+    /// One shard's owner-fenced terminal state.
+    Shard {
+        run_id: String,
+        shard_id: String,
+        outcome: ShardOutcome,
+    },
+}
+
+impl PendingFinalize {
+    fn run_id(&self) -> &str {
+        match self {
+            PendingFinalize::Run { rec, .. } => &rec.run_id,
+            PendingFinalize::Shard { run_id, .. } => run_id,
+        }
+    }
+}
+
+/// Write one pending terminal state and, when this instance won it, run its
+/// completion side effects. `Err` means the backend did not take the write
+/// and it must be retried.
+async fn write_pending(
+    state: &ServerState,
+    pending: &PendingFinalize,
+) -> Result<(), crate::serve::history::HistoryError> {
+    match pending {
+        PendingFinalize::Run { rec, reason } => finalize_owned(state, rec, reason).await,
+        PendingFinalize::Shard {
+            run_id,
+            shard_id,
+            outcome,
+        } => {
+            if !state
+                .history()
+                .finalize_shard(run_id, shard_id, *outcome)
+                .await?
+            {
+                tracing::warn!(
+                    run_id,
+                    shard_id,
+                    "shard was reclaimed by another instance; discarding result"
+                );
+            }
+            maybe_finalize_parent(state, run_id).await;
+            Ok(())
+        }
+    }
+}
+
+/// The owner-fenced terminal write of a clustered run and, when this instance
+/// won it, the completion side effects. `Err` means the backend did not take
+/// the write and it must be retried.
+async fn finalize_owned(
+    state: &ServerState,
+    rec: &RunRecord,
+    reason: &'static str,
+) -> Result<(), crate::serve::history::HistoryError> {
+    // Owner-fenced: if another instance reclaimed this run (lease expired),
+    // our write is a no-op and we discard our result — the reclaimer is now
+    // authoritative (#197).
+    if state.history().finalize_owned(rec).await? {
+        metrics::record_run_finished(rec.status, reason);
+        record_tenant_run(rec);
+        // Only the instance that won the owner-fenced write fires the
+        // callback, so a reclaimed run cannot deliver twice (#481).
+        crate::serve::callback::fire(rec).await;
+    } else {
+        tracing::warn!(
+            run_id = %rec.run_id,
+            "finalize: run was reclaimed by another instance; discarding result"
+        );
+    }
+    Ok(())
+}
+
+/// Retry every terminal write (a run's or a shard's) that failed earlier; one
+/// that fails again stays queued. Returns how many were written.
+pub(crate) async fn retry_pending_finalize(state: &ServerState) -> usize {
+    let mut written = 0;
+    for pending in state.take_pending_finalize() {
+        match write_pending(state, &pending).await {
+            Ok(()) => written += 1,
+            Err(e) => {
+                tracing::warn!(
+                    run_id = %pending.run_id(),
+                    error = %e,
+                    "finalize: owner-fenced write still failing; will retry"
+                );
+                state.queue_finalize(pending);
+            }
+        }
+    }
+    written
 }
 
 /// Finalize every `sharded` parent whose shards are all terminal but which no
@@ -2117,12 +2214,38 @@ fn schedule_log_drop(state: ServerState, run_id: String) {
     });
 }
 
-/// The cluster re-count's verdict once the run is recorded: the refusal
-/// message when the tenant is over its limit. A failed re-count admits the run
-/// (logged) — the record already exists and a peer may have claimed it, so an
-/// error here must not report a failure for a run that will still execute.
+/// Withdraw a clustered run recorded for a tenant that must not have it
+/// (#789 SERVE-43): a run still pending is removed with its tenant link, so
+/// nothing names a tenant a concurrent delete is removing; one a peer
+/// already claimed is asked to cancel.
 #[cfg(feature = "tenants")]
-fn recount_refusal(tenant: &str, recount: Result<Option<String>, ServeError>) -> Option<String> {
+async fn back_out_pending(state: &ServerState, run_id: &str) {
+    let history = state.history();
+    match history.cancel_pending(run_id).await {
+        Ok(true) => {
+            if let Err(e) = history.delete(run_id).await {
+                tracing::warn!(run_id, error = %e, "could not remove a backed-out run record");
+            }
+        }
+        Ok(false) => {
+            if let Err(e) = history.request_cancel(run_id).await {
+                tracing::warn!(run_id, error = %e, "could not cancel a backed-out run a peer claimed");
+            }
+        }
+        Err(e) => tracing::warn!(run_id, error = %e, "could not back out a clustered run"),
+    }
+}
+
+/// The cluster re-count's verdict once the run is recorded: the refusal
+/// when the tenant is gone, suspended or over its limit. A failed re-count
+/// admits the run (logged) — the record already exists and a peer may have
+/// claimed it, so an error here must not report a failure for a run that
+/// will still execute.
+#[cfg(feature = "tenants")]
+fn recount_refusal(
+    tenant: &str,
+    recount: Result<Option<ServeError>, ServeError>,
+) -> Option<ServeError> {
     match recount {
         Ok(refusal) => refusal,
         Err(e) => {
@@ -2140,6 +2263,171 @@ fn recount_refusal(tenant: &str, recount: Result<Option<String>, ServeError>) ->
 #[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
+
+    /// A memory store whose owner-fenced finalize fails while `down` is set.
+    struct FlakyFinalize {
+        inner: crate::serve::history::memory::MemoryHistory,
+        down: std::sync::atomic::AtomicBool,
+        shards: std::sync::Mutex<Vec<(String, String, ShardOutcome)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::serve::history::RunHistory for FlakyFinalize {
+        async fn claim_idempotency(
+            &self,
+            key: &str,
+            fingerprint: &str,
+            run_id: &str,
+            window: Duration,
+        ) -> Result<Claim, crate::serve::history::HistoryError> {
+            self.inner
+                .claim_idempotency(key, fingerprint, run_id, window)
+                .await
+        }
+        async fn upsert(&self, rec: &RunRecord) -> Result<(), crate::serve::history::HistoryError> {
+            self.inner.upsert(rec).await
+        }
+        async fn get(
+            &self,
+            id: &str,
+        ) -> Result<Option<RunRecord>, crate::serve::history::HistoryError> {
+            self.inner.get(id).await
+        }
+        async fn list(
+            &self,
+            f: &crate::serve::history::ListFilter,
+        ) -> Result<crate::serve::history::ListPage, crate::serve::history::HistoryError> {
+            self.inner.list(f).await
+        }
+        async fn delete(
+            &self,
+            id: &str,
+        ) -> Result<crate::serve::history::DeleteOutcome, crate::serve::history::HistoryError>
+        {
+            self.inner.delete(id).await
+        }
+        async fn purge_expired(
+            &self,
+            retain_for: Duration,
+        ) -> Result<usize, crate::serve::history::HistoryError> {
+            self.inner.purge_expired(retain_for).await
+        }
+        async fn recover_orphans(&self) -> Result<usize, crate::serve::history::HistoryError> {
+            self.inner.recover_orphans().await
+        }
+        fn degraded(&self) -> bool {
+            false
+        }
+        async fn finalize_owned(
+            &self,
+            rec: &RunRecord,
+        ) -> Result<bool, crate::serve::history::HistoryError> {
+            if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::serve::history::HistoryError::Backend("down".into()));
+            }
+            self.inner.upsert(rec).await.map(|_| true)
+        }
+        async fn finalize_shard(
+            &self,
+            run_id: &str,
+            shard_id: &str,
+            outcome: ShardOutcome,
+        ) -> Result<bool, crate::serve::history::HistoryError> {
+            if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::serve::history::HistoryError::Backend("down".into()));
+            }
+            self.shards
+                .lock()
+                .unwrap()
+                .push((run_id.into(), shard_id.into(), outcome));
+            Ok(true)
+        }
+    }
+
+    /// A clustered terminal write the backend refuses is kept and retried by
+    /// the lease loop, so the run does not stay `running` (#934 R1-004).
+    #[tokio::test]
+    async fn a_failed_cluster_finalize_is_retried_until_it_lands() {
+        let mut config = crate::serve::test_support::test_config();
+        config.cluster.enabled = true;
+        let history = std::sync::Arc::new(FlakyFinalize {
+            inner: crate::serve::history::memory::MemoryHistory::new(Duration::from_secs(60)),
+            down: std::sync::atomic::AtomicBool::new(true),
+            shards: Default::default(),
+        });
+        let state = ServerState::new(
+            &config,
+            None,
+            CancellationToken::new(),
+            history.clone(),
+            crate::serve::logs::LogHub::new(),
+            None,
+            #[cfg(feature = "triggers")]
+            crate::serve::triggers::health::TriggersHandle::empty(),
+        );
+        let started = Utc::now();
+        let mut rec = RunRecord::queued("r1".into(), None, BTreeMap::new(), None, started);
+        rec.status = RunStatus::Running;
+        state.history().upsert(&rec).await.unwrap();
+        finalize(
+            &state,
+            "r1",
+            started,
+            Terminal::Completed {
+                records: 3,
+                invs: Vec::new(),
+            },
+        )
+        .await;
+        let now = state.history().get("r1").await.unwrap().unwrap();
+        assert_eq!(now.status, RunStatus::Running);
+        // Still down: the record stays queued.
+        assert_eq!(retry_pending_finalize(&state).await, 0);
+        history
+            .down
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(retry_pending_finalize(&state).await, 1);
+        let done = state.history().get("r1").await.unwrap().unwrap();
+        assert_eq!(done.status, RunStatus::Completed);
+        assert_eq!(done.records_written, 3);
+        assert_eq!(retry_pending_finalize(&state).await, 0);
+    }
+
+    /// A shard's terminal write the backend refuses is retried by the lease
+    /// loop like a whole run's, so the shard (and its parent) does not stay
+    /// `running` / `sharded` for good (#934 R1-004).
+    #[tokio::test]
+    async fn a_failed_shard_finalize_is_retried_until_it_lands() {
+        let mut config = crate::serve::test_support::test_config();
+        config.cluster.enabled = true;
+        let history = std::sync::Arc::new(FlakyFinalize {
+            inner: crate::serve::history::memory::MemoryHistory::new(Duration::from_secs(60)),
+            down: std::sync::atomic::AtomicBool::new(true),
+            shards: Default::default(),
+        });
+        let state = ServerState::new(
+            &config,
+            None,
+            CancellationToken::new(),
+            history.clone(),
+            crate::serve::logs::LogHub::new(),
+            None,
+            #[cfg(feature = "triggers")]
+            crate::serve::triggers::health::TriggersHandle::empty(),
+        );
+        finalize_shard(&state, "r1", "0", ShardOutcome::Completed).await;
+        assert!(history.shards.lock().unwrap().is_empty());
+        assert_eq!(retry_pending_finalize(&state).await, 0);
+        history
+            .down
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(retry_pending_finalize(&state).await, 1);
+        assert_eq!(
+            *history.shards.lock().unwrap(),
+            vec![("r1".to_string(), "0".to_string(), ShardOutcome::Completed)]
+        );
+        assert_eq!(retry_pending_finalize(&state).await, 0);
+    }
 
     /// A caller's config runs with the caller reference policy scoped over
     /// it, so its HTTP clients check every request and redirect hop (#881).
@@ -2187,14 +2475,36 @@ mod tests {
     #[cfg(feature = "tenants")]
     #[test]
     fn a_failed_cluster_recount_admits_the_recorded_run() {
-        assert_eq!(recount_refusal("acme", Ok(None)), None);
+        assert!(recount_refusal("acme", Ok(None)).is_none());
+        assert!(matches!(
+            recount_refusal("acme", Ok(Some(ServeError::TooManyRequests("over".into())))),
+            Some(ServeError::TooManyRequests(m)) if m == "over"
+        ));
+        assert!(recount_refusal("acme", Err(ServeError::Internal("db".into()))).is_none());
+    }
+
+    /// A run backed out after the cluster re-count is removed while still
+    /// pending, so no record names a tenant a concurrent delete removed; one
+    /// a peer already claimed is left to its owner and asked to cancel.
+    #[cfg(feature = "tenants")]
+    #[tokio::test]
+    async fn a_backed_out_pending_run_leaves_no_record() {
+        let state = crate::serve::test_support::test_state_clustered();
+        let mut rec = RunRecord::queued("r1".into(), None, Default::default(), None, Utc::now());
+        rec.status = RunStatus::Pending;
+        rec.tenant = Some("acme".into());
+        state.history().upsert(&rec).await.unwrap();
+        back_out_pending(&state, "r1").await;
+        assert!(state.history().get("r1").await.unwrap().is_none());
+
+        rec.run_id = "r2".into();
+        rec.status = RunStatus::Running;
+        state.history().upsert(&rec).await.unwrap();
+        back_out_pending(&state, "r2").await;
         assert_eq!(
-            recount_refusal("acme", Ok(Some("over".into()))).as_deref(),
-            Some("over")
-        );
-        assert_eq!(
-            recount_refusal("acme", Err(ServeError::Internal("db".into()))),
-            None
+            state.history().get("r2").await.unwrap().unwrap().status,
+            RunStatus::Running,
+            "a claimed run stays with the instance running it"
         );
     }
 

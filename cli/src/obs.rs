@@ -103,6 +103,32 @@ pub fn install(cfg: &PipelineConfig) -> CliResult<()> {
     Ok(())
 }
 
+/// Flushes buffered OTLP telemetry when dropped, so a command that returns
+/// early with an error still exports the traces and metrics of the run that
+/// failed (no-op without the `otel` feature). Hold it for the command's whole
+/// body: `let _otel = obs::flush_on_exit();`.
+#[must_use = "telemetry is flushed when the guard drops; bind it to a variable"]
+pub struct FlushOnExit(());
+
+/// A [`FlushOnExit`] guard.
+pub fn flush_on_exit() -> FlushOnExit {
+    FlushOnExit(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Guards dropped on this thread (tests count their own flushes).
+    pub(crate) static FLUSHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl Drop for FlushOnExit {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        FLUSHES.with(|n| n.set(n.get() + 1));
+        faucet_core::shutdown_otel();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

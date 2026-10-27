@@ -250,15 +250,23 @@ async fn a_failed_state_put_keeps_the_previous_bookmark_rather_than_a_partial_on
             records_through_page(page, 3)
         );
     }
-    // A failed bookmark write is a durability failure and must not be reported
-    // as a clean success, because the caller would then advance its own state.
-    if let Ok(ref r) = outcome {
-        assert!(
-            r.bookmark.is_some(),
-            "a run that could not persist its bookmark must not report success \
-             with nothing to resume from"
-        );
-    }
+    // A failed bookmark write is a durability failure and must fail the run:
+    // reported as a success, the caller would advance its own state while the
+    // durable bookmark lags (or the store is broken).
+    assert!(
+        outcome.is_err(),
+        "a run whose bookmark write failed must not report success: {outcome:?}"
+    );
+    let failed_at = log
+        .position(|e| matches!(e, Event::StatePutFailed { .. }))
+        .expect("exercised above");
+    assert!(
+        !log.events()[failed_at..]
+            .iter()
+            .any(|e| matches!(e, Event::StatePut { .. })),
+        "the run went on persisting bookmarks after a failed one: {:?}",
+        log.events()
+    );
 }
 
 #[tokio::test]

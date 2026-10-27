@@ -15,12 +15,14 @@
 
 use faucet_conformance::{
     assert_bounded_memory, assert_config_schema_valid_value, assert_connector_name_nonempty,
-    assert_errors_not_panics,
+    assert_errors_not_panics, assert_first_page_before_exhaustion,
 };
 use faucet_source_snowflake::{SnowflakeAuth, SnowflakeSource, SnowflakeSourceConfig};
 use serde_json::{Value, json};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use wiremock::matchers::{body_string_contains, method, path, query_param};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 const HANDLE: &str = "conformance-handle";
 const NUM_PARTITIONS: usize = 12;
@@ -54,21 +56,48 @@ fn conformance_config_schema_valid() {
     assert_config_schema_valid_value(&schema, "faucet-source-snowflake");
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn conformance_bounded_memory() {
-    let server = MockServer::start().await;
+/// Answers with `body` and counts the rows it has served.
+struct Counted {
+    body: Value,
+    rows: usize,
+    served: Arc<AtomicUsize>,
+}
 
+impl Counted {
+    fn new(served: &Arc<AtomicUsize>, rows: usize, body: Value) -> Self {
+        Self {
+            body,
+            rows,
+            served: Arc::clone(served),
+        }
+    }
+}
+
+impl Respond for Counted {
+    fn respond(&self, _req: &Request) -> ResponseTemplate {
+        self.served.fetch_add(self.rows, Ordering::SeqCst);
+        ResponseTemplate::new(200).set_body_json(self.body.clone())
+    }
+}
+
+/// Mount the partitioned result; returns the served-row count.
+async fn mount_partitions(server: &MockServer) -> Arc<AtomicUsize> {
+    let served = Arc::new(AtomicUsize::new(0));
     // Initial statement submission returns partition 0 inline + the full
     // partition manifest.
     Mock::given(method("POST"))
         .and(path("/api/v2/statements"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "code": "090001",
-            "statementHandle": HANDLE,
-            "resultSetMetaData": metadata(),
-            "data": rows_for_partition(0),
-        })))
-        .mount(&server)
+        .respond_with(Counted::new(
+            &served,
+            ROWS_PER_PARTITION,
+            json!({
+                "code": "090001",
+                "statementHandle": HANDLE,
+                "resultSetMetaData": metadata(),
+                "data": rows_for_partition(0),
+            }),
+        ))
+        .mount(server)
         .await;
 
     // Partitions 1..NUM_PARTITIONS are fetched on demand.
@@ -76,13 +105,52 @@ async fn conformance_bounded_memory() {
         Mock::given(method("GET"))
             .and(path(format!("/api/v2/statements/{HANDLE}")))
             .and(query_param("partition", p.to_string()))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "code": "090001",
-                "data": rows_for_partition(p),
-            })))
-            .mount(&server)
+            .respond_with(Counted::new(
+                &served,
+                ROWS_PER_PARTITION,
+                json!({
+                    "code": "090001",
+                    "data": rows_for_partition(p),
+                }),
+            ))
+            .mount(server)
             .await;
     }
+
+    served
+}
+
+fn bounded_source(server: &MockServer) -> SnowflakeSource {
+    let config = SnowflakeSourceConfig::new(
+        "xy12345",
+        "WH",
+        "DB",
+        "PUBLIC",
+        SnowflakeAuth::OAuth { token: "t".into() },
+        "SELECT id FROM events",
+    )
+    .with_batch_size(250);
+    SnowflakeSource::new(config)
+        .expect("source new")
+        .with_endpoint_base(server.uri())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_first_page_before_exhaustion() {
+    let server = MockServer::start().await;
+    let served = mount_partitions(&server).await;
+    let source = bounded_source(&server);
+    assert_first_page_before_exhaustion(&source, 250, NUM_PARTITIONS * ROWS_PER_PARTITION, || {
+        served.load(Ordering::SeqCst)
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_bounded_memory() {
+    let server = MockServer::start().await;
+
+    mount_partitions(&server).await;
 
     // Config batch_size must equal the batch passed to the battery — this
     // overriding source treats its config batch_size as authoritative.

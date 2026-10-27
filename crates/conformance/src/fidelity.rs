@@ -284,15 +284,33 @@ pub fn diff_round_trip(sent: &[Value], landed: &[Value], tol: &Tolerance) -> Vec
             }
         }
     }
-    // A row the destination invented is a fidelity failure too — a duplicate
-    // from a bad retry shows up here rather than being silently tolerated.
+    // A row the destination invented is a fidelity failure too, and so is an
+    // extra copy of a sent row (a duplicate from a bad retry): each key may
+    // land at most as many times as it was sent.
     let sent_keys: BTreeSet<String> = sent.iter().map(key_of).collect();
+    let mut sent_count: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for s in sent {
+        *sent_count.entry(key_of(s)).or_default() += 1;
+    }
+    let mut landed_count: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     for l in landed {
         let row = key_of(l);
         if !sent_keys.contains(&row) {
             out.push(Mismatch {
                 row,
                 field: "<row>".into(),
+                sent: Value::Null,
+                landed: l.clone(),
+            });
+            continue;
+        }
+        let seen = landed_count.entry(row.clone()).or_default();
+        *seen += 1;
+        if *seen > sent_count[&row] {
+            out.push(Mismatch {
+                row,
+                field: "<duplicate>".into(),
                 sent: Value::Null,
                 landed: l.clone(),
             });
@@ -421,6 +439,20 @@ mod tests {
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].field, "<row>");
         assert_eq!(d[0].row, "integers");
+    }
+
+    #[test]
+    fn a_duplicated_landed_row_is_reported() {
+        let mut landed = corpus();
+        landed.extend(corpus());
+        let d = diff_round_trip(&corpus(), &landed, &Tolerance::exact());
+        assert_eq!(d.len(), corpus().len(), "{d:?}");
+        assert!(d.iter().all(|m| m.field == "<duplicate>"));
+        let twice = [corpus(), corpus()].concat();
+        assert!(
+            diff_round_trip(&twice, &twice, &Tolerance::exact()).is_empty(),
+            "a key sent twice may land twice"
+        );
     }
 
     #[test]

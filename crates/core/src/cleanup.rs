@@ -119,8 +119,15 @@ pub enum ReadState {
 
 /// A shared signal through which a source reports a complete read of its
 /// dataset. Cheap to clone; the source keeps one and hands out clones.
+///
+/// It may also carry the ceiling on keys the complete-read cleanup tracks
+/// ([`with_max_keys`](Self::with_max_keys)), so a source can expose it as
+/// config; without one the caller's policy ceiling applies.
 #[derive(Debug, Clone, Default)]
-pub struct ReadCompleteness(std::sync::Arc<std::sync::atomic::AtomicU8>);
+pub struct ReadCompleteness {
+    state: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    max_keys: Option<usize>,
+}
 
 impl ReadCompleteness {
     const PARTIAL: u8 = 0;
@@ -130,6 +137,19 @@ impl ReadCompleteness {
     /// A signal in [`ReadState::Partial`].
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Set the ceiling on keys a complete-read cleanup tracks (floored at 1).
+    /// It replaces the policy's [`CleanupPolicy::max_keys`].
+    #[must_use]
+    pub fn with_max_keys(mut self, max_keys: usize) -> Self {
+        self.max_keys = Some(max_keys.max(1));
+        self
+    }
+
+    /// The ceiling set by [`with_max_keys`](Self::with_max_keys), if any.
+    pub fn max_keys(&self) -> Option<usize> {
+        self.max_keys
     }
 
     /// Back to [`ReadState::Partial`] (start of a run).
@@ -149,7 +169,7 @@ impl ReadCompleteness {
 
     /// The current state.
     pub fn state(&self) -> ReadState {
-        match self.0.load(std::sync::atomic::Ordering::Acquire) {
+        match self.state.load(std::sync::atomic::Ordering::Acquire) {
             Self::READING => ReadState::Reading,
             Self::COMPLETE => ReadState::Complete,
             _ => ReadState::Partial,
@@ -157,7 +177,7 @@ impl ReadCompleteness {
     }
 
     fn set(&self, v: u8) {
-        self.0.store(v, std::sync::atomic::Ordering::Release);
+        self.state.store(v, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -319,7 +339,7 @@ impl SeenKeys {
     /// so the caller decides whether to fail the run or log — but never to
     /// delete.
     pub fn overflow_error(&self, max_keys: usize) -> FaucetError {
-        FaucetError::Config(format!(
+        FaucetError::Sink(format!(
             "cleanup: this invocation wrote more than {max_keys} rows in the claimed scope, \
              so the set of written keys could not be tracked. Nothing was deleted — a \
              partial delete would remove rows the run actually wrote. Narrow the scope \

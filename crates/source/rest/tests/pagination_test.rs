@@ -590,6 +590,44 @@ fn page_number_alternating_pages_stop() {
     let b = json!({"items": [{"id": 2}]});
     assert!(style.advance(&a, &no_headers(), &mut state, 1).unwrap());
     assert!(style.advance(&b, &no_headers(), &mut state, 1).unwrap());
+    // A non-adjacent repeat may hide unread pages: it fails instead of
+    // stopping green.
+    let err = style.advance(&a, &no_headers(), &mut state, 1).unwrap_err();
+    assert!(err.to_string().contains("non-adjacent"), "{err}");
+}
+
+#[test]
+fn page_number_allowed_repeats_page_past_a_non_adjacent_repeat() {
+    let style = PaginationStyle::PageNumber {
+        param_name: "page".into(),
+        start_page: 1,
+        page_size: None,
+        page_size_param: None,
+    };
+    let mut state = PaginationState {
+        allow_repeated_pages: true,
+        ..PaginationState::default()
+    };
+    let a = json!({"items": [{"id": 1}]});
+    let b = json!({"items": [{"id": 2}]});
+    assert!(style.advance(&a, &no_headers(), &mut state, 1).unwrap());
+    assert!(style.advance(&b, &no_headers(), &mut state, 1).unwrap());
+    assert!(style.advance(&a, &no_headers(), &mut state, 1).unwrap());
+    // An adjacent repeat still ends paging.
+    assert!(!style.advance(&a, &no_headers(), &mut state, 1).unwrap());
+}
+
+#[test]
+fn page_number_adjacent_repeat_stops_and_drops_the_page() {
+    let style = PaginationStyle::PageNumber {
+        param_name: "page".into(),
+        start_page: 1,
+        page_size: None,
+        page_size_param: None,
+    };
+    let mut state = PaginationState::default();
+    let a = json!({"items": [{"id": 1}]});
+    assert!(style.advance(&a, &no_headers(), &mut state, 1).unwrap());
     assert!(!style.advance(&a, &no_headers(), &mut state, 1).unwrap());
     assert!(state.current_page_is_duplicate);
 }

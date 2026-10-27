@@ -121,7 +121,8 @@ the secrets/redaction boundary like any other config string.
 | `allow_missing_records_path` | bool | `false` | By default a response in which `records_path` resolves to nothing — the key is absent, not an empty array — fails the run (it is usually an error body served with HTTP 200, or a renamed field) instead of ending pagination green. Set `true` for APIs that omit the records key on an empty result. |
 | `drop_key_prefixes` | list | `[]` | Drop per-record keys starting with any of these prefixes — protocol control fields (OData's `@odata.etag`, JSON:API's `links`, HAL's `_links`) are metadata, not data, and are often invalid column names downstream. An `odata:` block implies `@odata.`, so existing OData configs need no change (#654). |
 | `max_pages` | int / null | unset | Optional cap on pages fetched per pass, across **all** pagination styles. Unset by default — every style stops on its own end signal and loop guards. A pass the cap cuts short keeps only a `persist_cursor` bookmark; an incremental or windowed pass it cuts short **fails the run** (a record-derived or window bookmark would skip the unread pages, and keeping none would re-read them every run), unless `assume_ordered` is set. |
-| `assume_ordered` | bool | `false` | The feed returns records in ascending `replication_key` order: an incremental pass `max_pages` cuts short persists the largest key it read and resumes after it next run. With `max_pages` it requires a `replication_bind` (refused at load time otherwise) — only a bookmark the server filters on moves the next run past the pages already read. Ignored for windowed passes, with `persist_cursor`, and across `requests:` entries — a `requests:` run that `max_pages` cuts short fails its incremental pass, because the per-entry bookmarks cannot be consolidated. |
+| `allow_repeated_pages` | bool | `false` | Keep paging when a `PageNumber` / `Offset` / `OffsetInBody` page holds the same records as an earlier, non-adjacent page of the pass, instead of failing the run — for feeds whose pages can legitimately repeat. Requires `max_pages` (refused at load time otherwise), which then bounds a server that cycles pages. A page identical to the page just before it still ends paging. |
+| `assume_ordered` | bool | `false` | The feed returns records in ascending `replication_key` order: an incremental pass `max_pages` cuts short persists the largest key it read and resumes from it next run. With `max_pages` it requires a `replication_bind` (refused at load time otherwise) — only a bookmark the server filters on moves the next run past the pages already read. The bind must compare **inclusively** (`>=`, e.g. `template: "gte|${bookmark}"`): rows sharing the last key read can sit on the first unread page, and a strict `>` filter would skip them for good. The rows re-read at that key arrive again, so pair it with an upsert sink. Ignored for windowed passes, with `persist_cursor`, and across `requests:` entries — a `requests:` run that `max_pages` cuts short fails its incremental pass, because the per-entry bookmarks cannot be consolidated. |
 | `request_delay` | int (seconds) / null | `null` | Delay between consecutive page requests. |
 
 **Body & keyset pagination.** Two styles page without a query param or a response token:
@@ -479,8 +480,9 @@ When `$metadata` is available, each emitted row's sink patch also carries the
 entity's column `schema` from its EDM types, so a typed sink declares real
 columns: `Edm.DateTimeOffset` / `Edm.Date` become timestamp / date strings and
 `Edm.Decimal` is declared as exact decimal text (`{"type": "string", "format":
-"decimal"}`), never a binary float column; `Edm.Double` / `Edm.Single` stay
-`number`.
+"decimal"}`), never a binary float column — the BigQuery sink creates it as
+`BIGNUMERIC`, which accepts the decimal values as numbers or text;
+`Edm.Double` / `Edm.Single` stay `number`.
 
 ### Response-decode pipeline (`decode`)
 
@@ -494,7 +496,7 @@ extraction (replaces `response_format` parsing; requires `pagination: none`):
 | `base64` | `base64` | Base64-decode the buffer. |
 | `gunzip` | `gunzip` | Gzip-decompress (at most 1 GiB decompressed). |
 | `unzip` | `{ unzip: { member: "*.csv" } }` | Extract a zip member (glob; the whole archive if omitted). Exactly one file must match — several matches fail with their names. At most 1 GiB decompressed. |
-| `parse` | `{ parse: { format: json\|csv\|xlsx\|xml, … } }` | Terminal: parse bytes → records. |
+| `parse` | `{ parse: { format: json\|csv\|xlsx\|xml, … } }` | Terminal: parse bytes → records. An `xml` document nested deeper than 256 elements is refused (`XML nesting exceeds 256 levels`), as in the `xml` source. |
 
 ```yaml
 decode:
@@ -972,13 +974,19 @@ The `pagination` field selects a `PaginationStyle` (tagged by `type`). `max_page
 | `CursorInBody` | `next_token_path`, `body_cursor_field` | POST-search endpoints: the next-page cursor is read from the response body and written **into the request JSON body** at `body_cursor_field` (rather than a query param). Stops when the cursor is null/absent or repeats. E.g. a CRM `POST …/search` — `$.paging.next.after` → `after`. A JSON Pointer (`/variables/after`) targets a nested location (a new key of an existing object, or an existing value). |
 | `LinkHeader` | — | No `rel="next"` in the `Link` response header, or the same link repeats. |
 | `NextLinkInBody` | `next_link_path` | Next-page URL is absent, null, empty, or repeats. |
-| `PageNumber` | `param_name`, `start_page`, `page_size`, `page_size_param` | A zero-record page, or a body already returned earlier in the pass (content-stagnation detection for APIs that clamp out-of-range pages). |
+| `PageNumber` | `param_name`, `start_page`, `page_size`, `page_size_param` | A zero-record page, or the same records as the previous page (content-stagnation detection for APIs that clamp out-of-range pages); a repeat of an earlier, non-adjacent page fails the run. |
 | `Offset` | `offset_param`, `limit_param`, `limit`, `total_path`, `rows_path`, `stop_when_short` *(optional)* | A zero-record page, offset reaches `total` (via `total_path`), or an identical repeated page. Without `total_path` a short page does **not** stop paging — the server may cap `limit` — so the walk ends on the empty page after it; set `stop_when_short: true` for a server that never caps a page but rejects an offset past the end (`400`/`416`). The offset advances by the records received, or by the matches of `rows_path` (required when `records_path` fans out to nested children or `record_ancestors` is set). |
 
 "Repeats" means any cursor, link or page already seen in the same pass, not
-only the previous one, so a server alternating between two cursors or two
-pages (A→B→A) stops instead of looping; a next link pointing back at a URL
-already fetched counts as a repeat.
+only the previous one, so a server alternating between two cursors (A→B→A)
+stops instead of looping; a next link pointing back at a URL already fetched
+counts as a repeat. A page (`PageNumber` / `Offset` / `OffsetInBody`)
+identical to the **previous** one is dropped and paging stops; one identical
+to an earlier, non-adjacent page fails the run, since the server is cycling or
+two pages hold identical records and rows may be unread. For a feed whose pages
+can legitimately repeat (a sparse report returning `[{"count": 0}]` on several
+pages), set `allow_repeated_pages: true` together with `max_pages`: the repeat
+is paged past and the cap bounds a server that cycles.
 
 An HTTP **`204 No Content`** (or any 2xx with an empty body) is treated as an empty page, so a feed that ends with a `204` after its last data page (e.g. `$top`/`$skip` paging) terminates cleanly rather than erroring.
 

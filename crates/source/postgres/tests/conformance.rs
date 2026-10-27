@@ -136,3 +136,46 @@ async fn conformance_call_deadline() {
     faucet_conformance::calls::assert_source_call_deadline(|| built.lock().unwrap().pop().unwrap())
         .await;
 }
+
+// ── Check 22: the first page arrives before the result set is exhausted ──────
+// Every produced row calls `nextval('served')`; sequences are not
+// transactional, so another connection reads how many rows the server had
+// produced when the first page arrived.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_first_page_before_exhaustion() {
+    let (_container, url) = start_postgres().await;
+    let probe = sqlx::PgPool::connect(&url).await.expect("probe pool");
+    sqlx::query("CREATE SEQUENCE served")
+        .execute(&probe)
+        .await
+        .expect("create sequence");
+    let total = 50_000;
+    let batch = 100;
+    let source = PostgresSource::new(
+        PostgresSourceConfig::new(
+            &url,
+            format!(
+                "SELECT g AS id, nextval('served') AS n, repeat('x', 200) AS pad \
+                 FROM generate_series(1, {total}) g"
+            ),
+        )
+        .with_batch_size(batch),
+    )
+    .await
+    .expect("source new");
+    let served = faucet_conformance::served_probe(|| async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM served",
+        )
+        .fetch_one(&probe)
+        .await
+        .expect("read sequence") as usize
+    });
+    faucet_conformance::assert_first_page_before_exhaustion(&source, batch, total, &served).await;
+    // The counter is live: once the stream is drained it has seen every row.
+    assert!(
+        served() >= total,
+        "the served-row counter missed rows: {}",
+        served()
+    );
+}

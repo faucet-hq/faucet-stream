@@ -114,11 +114,7 @@ async fn s3_objects_are_read_in_ranges_under_an_underscore_prefix() {
             .await
             .unwrap();
     }
-    // SAFETY: the only test in this binary; nothing else reads the environment.
-    unsafe {
-        std::env::set_var("AWS_ACCESS_KEY_ID", ACCESS_KEY);
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", SECRET_KEY);
-    }
+    set_test_env();
     let s3 = ParquetS3Config::prefix(BUCKET, "exports/_daily")
         .region(REGION)
         .endpoint_url(&endpoint);
@@ -141,4 +137,30 @@ async fn s3_objects_are_read_in_ranges_under_an_underscore_prefix() {
     }
     assert_eq!(ids(&streamed), ids(&eager));
     assert!(page_count >= 4, "row groups stream in pages: {page_count}");
+
+    // A leading slash on the prefix selects the same keys.
+    let slashed = ParquetS3Config::prefix(BUCKET, "/exports/_daily")
+        .region(REGION)
+        .endpoint_url(&endpoint);
+    let slashed = ParquetSource::new(ParquetSourceConfig::s3(slashed).batch_size(2))
+        .await
+        .unwrap();
+    assert_eq!(
+        ids(&slashed.fetch_with_context(&ctx).await.unwrap()),
+        ids(&eager)
+    );
+}
+
+/// Set the AWS variables every test in this binary shares, once per process:
+/// `setenv` racing another thread's `getenv` is undefined behaviour even when
+/// both sides write the same value.
+fn set_test_env() {
+    static ENV: std::sync::Once = std::sync::Once::new();
+    // SAFETY: the writes run once, before any client in this binary reads the
+    // variables (every caller blocks on the `Once` until they are done), and
+    // std's own environment reads take the same lock as these writes.
+    ENV.call_once(|| unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", ACCESS_KEY);
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", SECRET_KEY);
+    });
 }

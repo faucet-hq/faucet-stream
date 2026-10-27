@@ -343,10 +343,17 @@ ordinary streams run deletes nothing.
 - The run's bookmarks are held back until the delete succeeds. A crash, a
   cancel or a failed delete leaves the old bookmark, so the next run
   re-reads the table and deletes again rather than skipping it.
-- Up to 1,000,000 keys are tracked (`DEFAULT_COMPLETE_READ_MAX_KEYS`); a
-  larger table fails the run with nothing deleted, as does a sink whose
-  delete request cannot carry every key (MongoDB, Elasticsearch, BigQuery and
-  Spanner bound it). Rebuild such a destination with an overwrite snapshot.
+- Up to `resnapshot_max_keys` distinct keys are tracked (default 1,000,000,
+  `DEFAULT_COMPLETE_READ_MAX_KEYS`). A larger table fails that run once with
+  nothing deleted (`refused_overflow`), but its position **is** saved, so the
+  next run resumes streaming instead of re-reading the table forever; raise
+  the ceiling or rebuild the destination with an overwrite snapshot to remove
+  the stale rows. A sink whose delete request cannot carry every key
+  (MongoDB, Elasticsearch, BigQuery and Spanner bound it) fails the delete the
+  same way as any failed delete.
+- `resnapshot_deletes: false` keeps the resnapshot without the delete: any
+  sink is accepted, and the destination keeps the rows of items deleted
+  during the gap (the behaviour before complete reads existed).
 
 ### Metrics
 
@@ -405,11 +412,19 @@ other's staging: each swaps in exactly its own rows, and the last commit wins.
 
 Staging a crashed run left behind is cleaned up by a later run of the same
 table, with one rule: a run drops another run's staging only once that run's
-token is more than 24 hours old, because a younger one may still be in use. It
+token is more than 7 days old, because a younger one may still be in use (a
+token stamped ahead of the dropping host's clock counts as in use). Should a
+run that is still going lose its staging anyway, the SQL sinks' next write
+fails rather than re-creating the staging from that page, so its commit never
+swaps in a partial table. It
 also drops the untokened staging (`<table>__faucet_ovw`, the untokened marker
 alias, the untokened `.faucet-overwrite-…` area) an earlier release left. On the
-file sinks a move into place that such a run recorded is not finished; the new
-run replaces every file of the template when it commits. Until
+file sinks a move into place that another run's commit recorded and stopped
+half-way is finished first, so the output never stays part old, part new — at
+once when that commit failed, or once its marker is an hour old when its process
+was killed mid-move; only the newest such move is finished, and the last
+finished commit is recorded in a hidden `.faucet-overwrite-….commits` entry
+beside the destination. Until
 then, `faucet status --probe` reports the leftover staging as `present`. You may
 drop a leftover `<table>__faucet_ovw_<token>` yourself once you know its run is
 gone. Library callers that drive the lifecycle without a token keep the single
@@ -422,11 +437,11 @@ gone. Library callers that drive the lifecycle without a token keep the single
 | `postgres` | one transaction: `TRUNCATE` + `INSERT … SELECT` from a `LIKE` staging clone + `DROP`. Generated columns are recomputed, identity columns keep the staged values (`OVERRIDING SYSTEM VALUE`), and a target other tables reference by foreign key is emptied with `DELETE` under deferred constraints (a cascading reference, or a non-`DEFERRABLE` / `RESTRICT` one whose table holds references, is refused up front) |
 | `sqlite` | one transaction: `DELETE` + `INSERT … SELECT` from a `SELECT … WHERE 0` clone + `DROP` |
 | `mysql` | `CREATE TABLE staging LIKE target`, then an atomic `RENAME TABLE` swap (MySQL auto-commits DDL, so a transaction can't span it). A target with foreign keys or triggers is instead refilled in place — `DELETE` + `INSERT … SELECT` in one transaction — so they survive (its triggers fire for those rows); a target **other** tables reference by foreign key is refused before the run |
-| `mssql` | one transaction: `DELETE` + `INSERT` (explicit non-IDENTITY column list) from a `SELECT … INTO … WHERE 1=0` clone + `DROP` |
+| `mssql` | one transaction: `DELETE` + `INSERT` (explicit non-IDENTITY column list) from a `SELECT … INTO … WHERE 1=0` clone + `DROP`; a target **other** tables reference by an enabled foreign key is refused before the run and again at the swap (a `NO ACTION` key is allowed while its table holds no row referencing the target; a cascading / `SET NULL` / `SET DEFAULT` one never is) |
 | `mongodb` | load a `{collection}__faucet_ovw_<token>` staging collection created with the target's options and secondary indexes, then atomic `renameCollection(dropTarget: true)` (needs the rename privilege; unsupported on sharded collections) |
 | `bigquery` | **bucket-free** — load a `LIKE` temp table via the query API, then `BEGIN TRANSACTION; TRUNCATE; INSERT … SELECT; COMMIT` (preserves the target's partitioning/clustering); no GCS staging bucket required |
 | `elasticsearch` | index into a fresh physical index `{index}-faucet-ovw-…` (mappings copied from the current target) through the marker alias `{index}-faucet-ovw-staging-<token>`, so any sink instance can commit; then an atomic `POST /_aliases` swap repoints the read alias and the old index is dropped |
-| `oracle` | load a `CREATE TABLE … AS SELECT * FROM target WHERE 1 = 0` staging table, then one transaction: `DELETE` + `INSERT … SELECT` over the insertable columns + `DROP` (a first run renames staging into place); a target **other** tables reference by an enabled foreign key is refused before the run and again at the swap |
+| `oracle` | load a `CREATE TABLE … AS SELECT * FROM target WHERE 1 = 0` staging table, then one transaction: `DELETE` + `INSERT … SELECT` over the insertable columns + `DROP` (a first run renames staging into place); a target **other** tables reference by an enabled foreign key is refused before the run and again at the swap (an `INITIALLY DEFERRED` `NO ACTION` key is allowed: it is checked at the swap's commit) |
 | `databricks` | load a `CREATE TABLE … LIKE` staging Delta table, then one atomic `INSERT OVERWRITE target SELECT * FROM staging` + `DROP` (a first run renames staging into place) |
 | `file` | files written into a hidden `.faucet-overwrite-*.run-<token>` directory beside the destination, each renamed into place on commit; parts the run did not write are removed |
 | `s3` / `gcs` / `azure-blob` | objects written under a hidden `.faucet-overwrite-*/` key prefix (marked by a `.faucet-staging` object, so any sink instance can commit), copied into place on commit, then stale parts deleted. Each object is replaced atomically; the set is swapped object by object, so a reader listing mid-commit can see new and old parts together |

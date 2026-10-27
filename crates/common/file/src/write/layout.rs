@@ -30,6 +30,12 @@ pub const SWAP_PREFIX: &str = ".faucet-overwrite-";
 /// as they are (a `~` comes back percent-encoded from some), so the token is
 /// recognised by its exact shape at the end of this template's own name.
 pub const SWAP_RUN_SEPARATOR: &str = ".run-";
+/// What follows a template's swap area name in the name of the directory
+/// holding its overwrite commit ledger.
+pub const COMMIT_LEDGER_SUFFIX: &str = ".commits";
+/// The file in that directory holding the sequence of the last finished
+/// overwrite commit.
+pub const COMMIT_LEDGER_FILE: &str = "last";
 /// Digits in a part number (`00001`).
 pub const PART_WIDTH: usize = 5;
 
@@ -189,6 +195,13 @@ impl NameTemplate {
             })
             .collect();
         format!("{SWAP_PREFIX}{tag}")
+    }
+
+    /// The directory holding this template's overwrite commit ledger
+    /// (`<swap_dir_name>.commits`), beside the swap areas. Never a swap
+    /// area itself: no run token follows the name.
+    pub fn commit_ledger_dir_name(&self) -> String {
+        format!("{}{COMMIT_LEDGER_SUFFIX}", self.swap_dir_name())
     }
 
     /// The swap area's name for overwrite run `run`

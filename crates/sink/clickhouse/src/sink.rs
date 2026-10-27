@@ -33,9 +33,9 @@ pub(crate) struct ClickHouseDriver {
     /// small page is not merely slow — it trips "too many parts", a hard
     /// failure. Merging pages is the fix the engine actually wants.
     pub(crate) pending: tokio::sync::Mutex<faucet_core::PageAccumulator>,
-    /// The target's column names, loaded once; `Some(None)` when the table
-    /// could not be described.
-    known_columns: tokio::sync::Mutex<Option<Option<std::collections::HashSet<String>>>>,
+    /// The target's columns (name → type), loaded once; `Some(None)` when
+    /// the table could not be described.
+    known_columns: tokio::sync::Mutex<Option<Option<ColumnTypes>>>,
     pub(crate) config: ClickHouseSinkConfig,
     pub(crate) client: faucet_core::http::Client,
     /// Resolved once in [`ClickHouseSink::new`] so the hot path never re-parses.
@@ -126,8 +126,11 @@ pub(crate) fn staged_request(
     apply_auth(req, connection)
 }
 
-/// `SELECT name FROM system.columns` for `table` (`db.table` or a bare name
-/// in the session database), one `{"name": …}` object per line.
+/// Column name → ClickHouse type name.
+type ColumnTypes = std::collections::HashMap<String, String>;
+
+/// `SELECT name, type FROM system.columns` for `table` (`db.table` or a bare
+/// name in the session database), one `{"name": …, "type": …}` per line.
 fn columns_query(table: &str) -> String {
     let (db, name) = match table.split_once('.') {
         Some((db, name)) => (
@@ -137,28 +140,88 @@ fn columns_query(table: &str) -> String {
         None => ("currentDatabase()".to_string(), table),
     };
     format!(
-        "SELECT name FROM system.columns WHERE database = {db} AND table = {} FORMAT JSONEachRow",
+        "SELECT name, type FROM system.columns WHERE database = {db} AND table = {} FORMAT JSONEachRow",
         faucet_common_clickhouse::sql_literal(&Value::String(name.to_string()))
     )
 }
 
 /// Parse a [`columns_query`] response.
-fn parse_columns(body: &str) -> std::collections::HashSet<String> {
+fn parse_columns(body: &str) -> ColumnTypes {
     body.lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .filter_map(|v| v.get("name").and_then(Value::as_str).map(str::to_owned))
+        .filter_map(|v| {
+            let name = v.get("name").and_then(Value::as_str)?.to_owned();
+            let ty = v
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            Some((name, ty))
+        })
         .collect()
 }
 
+/// Whether a ClickHouse column type stores text (`String` / `FixedString`,
+/// possibly under `Nullable` / `LowCardinality`).
+fn is_text_type(ty: &str) -> bool {
+    let mut t = ty.trim();
+    loop {
+        let inner = ["Nullable(", "LowCardinality("]
+            .iter()
+            .find_map(|w| t.strip_prefix(w).and_then(|r| r.strip_suffix(')')));
+        match inner {
+            Some(i) => t = i.trim(),
+            None => break,
+        }
+    }
+    t == "String" || t.starts_with("FixedString(")
+}
+
+/// Records whose object/array values bound for a text column are replaced by
+/// their JSON text; `None` when no record needs it. `JSONEachRow` reads such a
+/// value into a `String` column only as a quoted string.
+fn nested_as_text(records: &[Value], columns: &ColumnTypes) -> Option<Vec<Value>> {
+    let needs = |o: &serde_json::Map<String, Value>| {
+        o.iter().any(|(k, v)| {
+            (v.is_object() || v.is_array()) && columns.get(k).is_some_and(|t| is_text_type(t))
+        })
+    };
+    if !records.iter().filter_map(Value::as_object).any(needs) {
+        return None;
+    }
+    Some(
+        records
+            .iter()
+            .map(|r| match r.as_object() {
+                Some(o) if needs(o) => Value::Object(
+                    o.iter()
+                        .map(|(k, v)| {
+                            let text = (v.is_object() || v.is_array())
+                                && columns.get(k).is_some_and(|t| is_text_type(t));
+                            let v = if text {
+                                Value::String(v.to_string())
+                            } else {
+                                v.clone()
+                            };
+                            (k.clone(), v)
+                        })
+                        .collect(),
+                ),
+                _ => r.clone(),
+            })
+            .collect(),
+    )
+}
+
 /// Record fields (first-seen order) that are not in `known`.
-fn missing_fields(records: &[Value], known: &std::collections::HashSet<String>) -> Vec<String> {
+fn missing_fields(records: &[Value], known: &ColumnTypes) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for key in records
         .iter()
         .filter_map(Value::as_object)
         .flat_map(|o| o.keys())
     {
-        if !known.contains(key) && !out.contains(key) {
+        if !known.contains_key(key) && !out.contains(key) {
             out.push(key.clone());
         }
     }
@@ -278,9 +341,23 @@ impl ClickHouseDriver {
         for column in planned.iter().filter(|c| missing.contains(&c.name)) {
             self.execute_statement(calls, &add_column_sql(&self.config.table, column))
                 .await?;
-            cols.insert(column.name.clone());
+            cols.insert(
+                column.name.clone(),
+                ClickHouse.type_name(column.base_type).to_string(),
+            );
         }
         Ok(())
+    }
+
+    /// `records` with nested values for text columns rendered as JSON text
+    /// (after [`Self::ensure_columns`] loaded the column types).
+    async fn encode_nested<'a>(&self, records: &'a [Value]) -> std::borrow::Cow<'a, [Value]> {
+        let known = self.known_columns.lock().await;
+        match known.as_ref().and_then(Option::as_ref) {
+            Some(cols) => nested_as_text(records, cols)
+                .map_or(std::borrow::Cow::Borrowed(records), std::borrow::Cow::Owned),
+            None => std::borrow::Cow::Borrowed(records),
+        }
     }
 
     /// Run one statement and return the response body.
@@ -456,6 +533,8 @@ impl ClickHouseDriver {
         self.flush_pending(calls).await?;
         self.ensure_table_ready(calls, records).await?;
         self.ensure_columns(calls, records).await?;
+        let encoded = self.encode_nested(records).await;
+        let records: &[Value] = &encoded;
         if self.config.staging.is_some() {
             self.write_page(calls, records).await?;
             return Ok(records.iter().map(|_| Ok(())).collect());
@@ -491,6 +570,8 @@ impl ClickHouseDriver {
         }
         self.ensure_table_ready(calls, records).await?;
         self.ensure_columns(calls, records).await?;
+        let encoded = self.encode_nested(records).await;
+        let records: &[Value] = &encoded;
 
         // Staged bulk load (#528): stage the whole page and let the server pull
         // it — no row body, no `batch_size` re-chunking.
@@ -751,14 +832,41 @@ mod tests {
     }
 
     #[test]
+    fn nested_values_for_text_columns_become_json_text() {
+        assert!(is_text_type("String"));
+        assert!(is_text_type("Nullable(String)"));
+        assert!(is_text_type("LowCardinality(Nullable(String))"));
+        assert!(is_text_type("FixedString(16)"));
+        assert!(!is_text_type("Array(String)"));
+        assert!(!is_text_type("Nullable(Int64)"));
+        let cols: ColumnTypes = [
+            ("s".to_string(), "Nullable(String)".to_string()),
+            ("a".to_string(), "Array(Int64)".to_string()),
+            ("n".to_string(), "Int64".to_string()),
+        ]
+        .into();
+        let recs = vec![
+            json!({"s": [], "a": [1, 2], "n": 1}),
+            json!({"s": {"k": [1, "x"]}, "n": 2}),
+            json!({"s": "plain", "n": 3}),
+        ];
+        let out = nested_as_text(&recs, &cols).unwrap();
+        assert_eq!(out[0], json!({"s": "[]", "a": [1, 2], "n": 1}));
+        assert_eq!(out[1], json!({"s": "{\"k\":[1,\"x\"]}", "n": 2}));
+        assert_eq!(out[2], recs[2]);
+        assert!(nested_as_text(&recs[2..], &cols).is_none());
+        assert!(nested_as_text(&[json!({"a": [1]})], &cols).is_none());
+    }
+
+    #[test]
     fn column_helpers() {
         assert_eq!(
             columns_query("db.t"),
-            "SELECT name FROM system.columns WHERE database = 'db' AND table = 't' FORMAT JSONEachRow"
+            "SELECT name, type FROM system.columns WHERE database = 'db' AND table = 't' FORMAT JSONEachRow"
         );
         assert!(columns_query("t").contains("database = currentDatabase() AND table = 't'"));
-        let cols = parse_columns("{\"name\":\"id\"}\nnot json\n{\"x\":1}\n");
-        assert_eq!(cols, ["id".to_string()].into());
+        let cols = parse_columns("{\"name\":\"id\",\"type\":\"Int64\"}\nnot json\n{\"x\":1}\n");
+        assert_eq!(cols, [("id".to_string(), "Int64".to_string())].into());
         let recs = vec![json!({"id": 1, "b": true}), json!({"b": false}), json!(1)];
         assert_eq!(missing_fields(&recs, &cols), vec!["b"]);
         let planned = faucet_core::plan_columns(&recs[..1]).unwrap();

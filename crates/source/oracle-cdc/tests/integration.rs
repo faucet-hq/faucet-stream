@@ -130,9 +130,16 @@ async fn oracle_logminer_cdc_end_to_end() {
     let caps = source.capabilities();
     assert!(caps.reports_lag() && caps.table_routing());
     assert!(source.supports_exactly_once());
+    let key = source.state_key().unwrap();
+    assert!(
+        key.starts_with("oracle-cdc:")
+            && key.contains("FREEPDB1")
+            && key.ends_with(":FAUCET.CDC_T"),
+        "{key}"
+    );
     assert_eq!(
-        source.state_key().unwrap(),
-        "oracle-cdc:FREEPDB1:FAUCET.CDC_T"
+        source.legacy_state_keys(),
+        vec!["oracle-cdc:FREEPDB1:FAUCET.CDC_T".to_string()]
     );
     let report = source
         .check(&faucet_core::check::CheckContext::default())

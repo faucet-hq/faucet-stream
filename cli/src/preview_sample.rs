@@ -33,6 +33,18 @@ pub fn destructive_read_refusal(kind: &str, command: &str) -> String {
     )
 }
 
+/// The refusal for sampling a source whose read has side effects (its
+/// connector declares `read_side_effects`): a CDC source creates or advances a
+/// replication slot / capture position, a Kafka source joins (and rebalances)
+/// the consumer group, a webhook or websocket source opens a listener.
+pub fn side_effecting_read_refusal(kind: &str, command: &str) -> String {
+    format!(
+        "{command} would read a `{kind}` source, and reading it has side effects (a \
+         replication slot, a consumer-group rebalance, a listener); pass \
+         --allow-side-effects to read it anyway, or use an offline sample"
+    )
+}
+
 /// Apply every rule of a config's `masking:` policy to previewed records — a
 /// preview has no destination, so `applies_to` scoping does not narrow it,
 /// as in `faucet test`.
@@ -79,16 +91,34 @@ pub fn bound_batch_size(kind: &str, config: &mut Value, limit: usize) {
 
 /// Read pages from `source`, transform each, and stop once `limit` records
 /// are collected or `timeout` passes. A source error ends the preview with
-/// that error. A source that consumes destructively is refused before any
-/// read.
+/// that error. A source that consumes destructively, or whose read has side
+/// effects, is refused before any read.
 pub async fn sample(
     source: &dyn Source,
     stages: &[CompiledStage],
     limit: usize,
     timeout: Duration,
 ) -> CliResult<Sample> {
+    sample_with(source, stages, limit, timeout, false).await
+}
+
+/// [`sample`], reading a source whose read has side effects when
+/// `allow_side_effects` is set (`faucet preview --allow-side-effects`).
+pub async fn sample_with(
+    source: &dyn Source,
+    stages: &[CompiledStage],
+    limit: usize,
+    timeout: Duration,
+    allow_side_effects: bool,
+) -> CliResult<Sample> {
     if source.consumes_destructively() {
         return Err(crate::error::CliError::Config(destructive_read_refusal(
+            source.connector_name(),
+            "a preview",
+        )));
+    }
+    if !allow_side_effects && source.capabilities().read_side_effects() {
+        return Err(crate::error::CliError::Config(side_effecting_read_refusal(
             source.connector_name(),
             "a preview",
         )));
@@ -401,5 +431,44 @@ mod tests {
         assert_eq!(reads(), 0, "a refused probe must not read");
         queue.fetch_all().await.unwrap();
         assert_eq!(reads(), 1);
+    }
+
+    /// A source whose read has side effects (a replication slot, a consumer
+    /// group, a listener) is refused before any read unless the caller allows
+    /// it.
+    #[tokio::test]
+    async fn a_source_whose_read_has_side_effects_needs_an_explicit_allow() {
+        struct Cdc(std::sync::atomic::AtomicUsize);
+        #[faucet_core::async_trait]
+        impl Source for Cdc {
+            async fn fetch_with_context(
+                &self,
+                _: &HashMap<String, Value>,
+            ) -> Result<Vec<Value>, FaucetError> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(vec![serde_json::json!({"id": 1})])
+            }
+            fn capabilities(&self) -> faucet_core::Capabilities {
+                faucet_core::Capabilities::of_source(self)
+                    .to_builder()
+                    .read_side_effects(true)
+                    .build()
+            }
+            fn connector_name(&self) -> &'static str {
+                "postgres-cdc"
+            }
+        }
+        let cdc = Cdc(Default::default());
+        let err = sample(&cdc, &[], 10, PREVIEW_TIMEOUT).await.unwrap_err();
+        assert!(
+            err.to_string().contains("`postgres-cdc` source")
+                && err.to_string().contains("--allow-side-effects"),
+            "{err}"
+        );
+        assert_eq!(cdc.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let read = sample_with(&cdc, &[], 10, PREVIEW_TIMEOUT, true)
+            .await
+            .unwrap();
+        assert_eq!(read.records.len(), 1);
     }
 }

@@ -25,6 +25,17 @@ produced it, and every sink reads the same rendering back.
 | Date, time of day | `YYYY-MM-DD`, `HH:MM:SS[.fff…]` | `"2026-02-28"`, `"12:30:00.5"` |
 | Binary — `BYTEA`, `BLOB`, `VARBINARY`, Arrow `Binary`, Avro `bytes` | standard **base64** with padding | `"AAEC/f7/"` |
 
+**Exception — MySQL `DATETIME`.** The `mysql` query source and the
+`mysql-cdc` source render a zone-less `DATETIME` as RFC 3339 at `+00:00`
+(`"2024-01-03T04:05:06.123456+00:00"`), not as a local date-time. The query
+source has always read it that way, and the CDC source matches it so a
+`faucet mirror` snapshot and its change stream agree (#933 changed the CDC
+rendering from `"2024-01-03 04:05:06.123456"`). The `+00:00` is a
+convention, not an offset MySQL stored: a column holding wall-clock local
+times keeps those wall-clock values, so treat the offset as "as stored" rather
+than converting them as UTC instants. `TIMESTAMP` is a real instant and is
+rendered in UTC as usual.
+
 Temporal values are never truncated. A converter that knows the column's unit
 (Arrow `Timestamp(µs)`, Avro `timestamp-micros`) renders that unit's fixed
 number of fractional digits; a driver value whose unit is not known renders as

@@ -316,6 +316,24 @@ fn jsonpath_first_value(v: &Value, path: &str) -> Option<Value> {
 /// Name the likely cause when a signed `fetch.url_from` download is refused
 /// (#768): transient failures were already retried, and the job is never
 /// resubmitted behind the caller's back.
+/// A streamed response body as a reader whose lines are capped at the HTTP
+/// client's response size limit (`None` = no limit), so a body with no newline
+/// fails instead of being buffered whole by the line decoder.
+fn line_capped_body<S, E>(
+    body: S,
+    limit: Option<u64>,
+) -> impl tokio::io::AsyncRead + Unpin + Send + 'static
+where
+    S: futures::Stream<Item = Result<tokio_util::bytes::Bytes, E>> + Unpin + Send + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    use futures::TryStreamExt as _;
+    faucet_core::file_format::line_capped(
+        tokio_util::io::StreamReader::new(body.map_err(std::io::Error::other)),
+        limit.unwrap_or(u64::MAX),
+    )
+}
+
 fn fetch_url_error(e: FaucetError, job: &crate::async_job::AsyncJobConfig) -> FaucetError {
     match e {
         FaucetError::HttpStatus { status, .. }
@@ -1396,9 +1414,10 @@ impl RestDriver {
                             .await
                             .map_err(|e| fetch_url_error(e, job))?;
                         let resp_headers_streamed = resp.headers().clone();
-                        use futures::TryStreamExt as _;
-                        let body = resp.bytes_stream().map_err(std::io::Error::other);
-                        let reader = tokio_util::io::StreamReader::new(body);
+                        let reader = line_capped_body(
+                            resp.bytes_stream(),
+                            self.stream_client.max_response_bytes(),
+                        );
                         let mut pages = Box::pin(crate::format::jsonl_reader_to_value_pages(
                             reader,
                             csv_page_size,
@@ -1427,9 +1446,10 @@ impl RestDriver {
                             .map_err(|e| fetch_url_error(e, job))?;
                         // Read the locator before the body is consumed.
                         let resp_headers_streamed = resp.headers().clone();
-                        use futures::TryStreamExt as _;
-                        let body = resp.bytes_stream().map_err(std::io::Error::other);
-                        let reader = tokio_util::io::StreamReader::new(body);
+                        let reader = line_capped_body(
+                            resp.bytes_stream(),
+                            self.stream_client.max_response_bytes(),
+                        );
                         let mut pages =
                             Box::pin(crate::format::csv_reader_to_value_pages_with_nulls(
                                 reader,
@@ -1572,7 +1592,10 @@ impl RestDriver {
                 let window_bookmark: Option<Value> =
                     pass.as_ref().map(|w| Value::String(w.end.to_rfc3339()));
 
-                let mut state = PaginationState::default();
+                let mut state = PaginationState {
+                    allow_repeated_pages: self.config.allow_repeated_pages,
+                    ..PaginationState::default()
+                };
                 // #547: on resume, seed the stored cursor into the first request
                 // (query param for `Cursor`, body field for `CursorInBody`).
                 if self.config.persist_cursor
@@ -4192,6 +4215,37 @@ impl RestDriver {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn a_streamed_body_without_newlines_fails_at_the_response_limit() {
+        use futures::StreamExt as _;
+        let chunks = |n: usize| {
+            futures::stream::iter((0..n).map(|_| {
+                Ok::<_, std::io::Error>(tokio_util::bytes::Bytes::from_static(b"xxxxxxxx"))
+            }))
+        };
+        // 80 bytes on one line against a 32-byte limit: the line decoder stops
+        // at the limit instead of collecting the whole body.
+        let reader = line_capped_body(chunks(10), Some(32));
+        let mut pages = Box::pin(crate::format::jsonl_reader_to_value_pages(reader, 10));
+        let err = pages.next().await.unwrap().unwrap_err().to_string();
+        assert!(err.contains("longer than 32 bytes"), "{err}");
+        assert!(err.contains("response size limit"), "{err}");
+        let reader = line_capped_body(chunks(10), Some(32));
+        let mut pages = Box::pin(crate::format::csv_reader_to_value_pages_with_nulls(
+            reader,
+            crate::format::CsvDialect::default(),
+            10,
+            Vec::new(),
+        ));
+        let err = pages.next().await.unwrap().unwrap_err().to_string();
+        assert!(err.contains("a CSV line is longer than 32 bytes"), "{err}");
+        // No limit: the same body reads (and fails only as invalid JSON).
+        let reader = line_capped_body(chunks(10), None);
+        let mut pages = Box::pin(crate::format::jsonl_reader_to_value_pages(reader, 10));
+        let err = pages.next().await.unwrap().unwrap_err().to_string();
+        assert!(err.contains("not valid JSON"), "{err}");
+    }
+
     #[test]
     fn poll_status_reads_scalars_treats_null_as_unset_and_names_only_the_shape() {
         let body = serde_json::json!({"s": "done", "n": 3, "b": true, "z": null, "o": {}, "a": []});

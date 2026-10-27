@@ -168,7 +168,7 @@ async fn a_resnapshot_deletes_rows_whose_items_vanished_in_the_gap() {
     // run reads the table again rather than skipping the delete.
     store.put(&key, &gapped).await.unwrap();
     let failing = FailingCleanup(KeyedSink::default());
-    let fourth = unwrapped(DynamoDbSource::new(cfg).await.unwrap());
+    let fourth = unwrapped(DynamoDbSource::new(cfg.clone()).await.unwrap());
     let policy = CleanupPolicy::for_complete_read(vec!["pk".into()], 1000).unwrap();
     let err = Pipeline::new(&fourth, &failing)
         .with_state_store(Arc::clone(&store))
@@ -177,7 +177,69 @@ async fn a_resnapshot_deletes_rows_whose_items_vanished_in_the_gap() {
         .await
         .expect_err("the failed delete fails the run");
     assert!(err.to_string().contains("delete refused"), "{err}");
-    assert_eq!(store.get(&key).await.unwrap(), Some(gapped));
+    assert_eq!(store.get(&key).await.unwrap(), Some(gapped.clone()));
+
+    // More items than `resnapshot_max_keys`: the run fails once with nothing
+    // deleted, but saves its position so the next run resumes streaming.
+    let overflow_sink = KeyedSink::default();
+    overflow_sink
+        .rows
+        .lock()
+        .unwrap()
+        .insert("ghost".into(), serde_json::json!({"pk": "ghost"}));
+    let mut tight = cfg_resnapshot(&endpoint);
+    tight.resnapshot_max_keys = 2;
+    let fifth = unwrapped(DynamoDbSource::new(tight).await.unwrap());
+    let err = run(&fifth, &overflow_sink, &store)
+        .await
+        .expect_err("three items overflow a ceiling of two");
+    assert!(err.to_string().contains("position was saved"), "{err}");
+    assert_eq!(*overflow_sink.cleanups.lock().unwrap(), 0);
+    assert!(overflow_sink.keys().contains("ghost"), "nothing is deleted");
+    let saved = StoredState::parse(&store.get(&key).await.unwrap().unwrap()).data;
+    assert!(
+        !StreamBookmark::from_value(&saved)
+            .shards
+            .contains_key("shardId-00000000000000000000-deadbeef"),
+        "the position past the gap is saved, so the next run does not loop"
+    );
+
+    // `resnapshot_deletes: false`: the table is re-read, nothing is deleted,
+    // and the position is saved.
+    store.put(&key, &gapped).await.unwrap();
+    let keep_sink = KeyedSink::default();
+    keep_sink
+        .rows
+        .lock()
+        .unwrap()
+        .insert("ghost".into(), serde_json::json!({"pk": "ghost"}));
+    let mut keep = cfg_resnapshot(&endpoint);
+    keep.resnapshot_deletes = false;
+    let sixth = unwrapped(DynamoDbSource::new(keep).await.unwrap());
+    assert!(sixth.read_completeness().is_none());
+    run(&sixth, &keep_sink, &store)
+        .await
+        .expect("a resnapshot without deletes succeeds");
+    assert_eq!(*keep_sink.cleanups.lock().unwrap(), 0);
+    assert_eq!(
+        keep_sink.keys(),
+        ["ghost", "o0", "o1", "o2"].map(String::from).into()
+    );
+    let saved = StoredState::parse(&store.get(&key).await.unwrap().unwrap()).data;
+    assert!(
+        !StreamBookmark::from_value(&saved)
+            .shards
+            .contains_key("shardId-00000000000000000000-deadbeef")
+    );
+}
+
+fn cfg_resnapshot(endpoint: &str) -> faucet_source_dynamodb::DynamoDbSourceConfig {
+    let mut cfg = config(endpoint, "orders");
+    cfg.mode = ReadMode::Streams;
+    cfg.on_gap = OnGap::Resnapshot;
+    cfg.idle_termination_secs = Some(3);
+    cfg.shard_concurrency = 1;
+    cfg
 }
 
 struct FailingCleanup(KeyedSink);

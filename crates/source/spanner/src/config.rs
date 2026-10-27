@@ -75,6 +75,7 @@ pub struct SpannerSourceConfig {
     /// GoogleSQL query to run. Use named parameters (`@name`) for
     /// [`params`](Self::params), and the named parameter `@bookmark` to bind
     /// the incremental cursor server-side.
+    #[schemars(extend("x-faucet-sql" = true))]
     pub query: String,
     /// Named bind parameters for the query. Values must be scalars (string,
     /// integer, float, or boolean) — Spanner parameters are typed, and

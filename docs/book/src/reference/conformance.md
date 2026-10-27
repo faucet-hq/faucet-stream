@@ -119,6 +119,8 @@ Five more prove a sink behaves as a capability it declares says it does
 | `assert_replay_safe` | a plain write the sink calls replay-safe, retried after a lost response, does not duplicate rows |
 | `assert_overwrite_lifecycle` | `write_mode: overwrite` keeps staged rows out of the destination until commit, and an abort leaves it as it was |
 | `assert_batch_atomicity_truthful` | a failed write of a batch declared `atomic` lands no row; a `per_row` batch lands exactly its `Ok` rows |
+| `assert_cleanup_scoped` | `cleanup_scope` deletes exactly the rows of its scope the run did not write, and nothing in another scope |
+| `assert_rollback_truthful` | `rollback_run` deletes exactly one run's appended rows; a dry run counts them and changes nothing |
 
 Two more prove a sink's declarations match its lifecycle hooks (RFC 0014). A
 sink built on a [family driver](../extending/authoring-connectors.md#start-from-a-family-driver)
@@ -152,11 +154,14 @@ the assertions that prove it:
 | `partial_outcomes` | overrides `write_batch_partial` | `assert_partial_outcomes_truthful` |
 | `row_accounting` | overrides `write_batch_reported` | `assert_reported_rows_truthful` |
 | `atomic_batches` | declares `BatchAtomicity::Atomic` for some config | `assert_batch_atomicity_truthful` |
+| `cleanup` | declares `cleanup` | `assert_cleanup_scoped` |
+| `rollback` | declares `rollback` | `assert_rollback_truthful` |
 | `driver_declarations` | is built on a family driver (holds a `DriverSink<`, or implements `SinkDriver`, `SqlDriver`, `MessageDriver` or `HttpDriver`) | `assert_driver_declarations_truthful` |
 | `driver_row_paths` | is built on a family driver | `assert_driver_row_paths_agree` |
 | `call_deadline` | (every source and sink) | `assert_source_call_deadline` / `assert_sink_call_deadline` |
 | `exactly_once` *(source)* | declares `exactly_once` | `assert_bookmark_roundtrip` |
 | `discover` *(source)* | declares `discover` | `assert_discover_roundtrips` |
+| `streaming` *(source)* | overrides `stream_pages` | `assert_first_page_before_exhaustion` (exempt, with the reason, where the backend exposes no served-record count) |
 
 CI's `Doc counts` job runs `scripts/conformance-coverage.py`, which fails when a
 built-in connector declares a capability and none of its conformance tests

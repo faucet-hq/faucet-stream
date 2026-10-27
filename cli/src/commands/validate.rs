@@ -374,37 +374,7 @@ async fn report(cfg: PipelineConfig, args: ValidateArgs) -> CliResult<()> {
         }
     }
 
-    for node in &nodes {
-        // Verifying the schema lookup also catches unknown connector kinds.
-        source_schema(&node.source.kind)?;
-        // A discovery row (#501) enumerates a value-set and has no sink — its
-        // `sink` field is a never-built placeholder, so skip the sink check.
-        if !matches!(node.role, NodeRole::Discovery { .. }) {
-            sink_schema(&node.sink.kind)?;
-        }
-        for t in &node.transforms {
-            if !available_transforms().contains(&t.kind.as_str()) {
-                return Err(CliError::UnknownTransform {
-                    name: format!("{} (row '{}')", t.kind, node.id),
-                    available: available_transforms().join(", "),
-                });
-            }
-        }
-        if let Some(state) = &node.state
-            && !available_state_kinds().contains(&state.kind.as_str())
-        {
-            return Err(CliError::UnknownStateStore {
-                name: format!("{} (row '{}')", state.kind, node.id),
-                available: available_state_kinds().join(", "),
-            });
-        }
-    }
-
-    // Transform *kinds* are checked above; this compiles each chain so a bad
-    // transform *config* fails validation too.
-    check_transforms(&nodes)?;
-    check_connector_configs(&nodes)?;
-    check_dlq_all_safety(&nodes)?;
+    row_problems(&nodes)?;
 
     // Data-flow policy (#702): the static verdict per row. Reported in both
     // output modes; any violation makes the config invalid (exit code =
@@ -617,6 +587,70 @@ fn row_line(node: &crate::expand::ExpandedNode) -> String {
     )
 }
 
+/// Check every row — connector kinds, transform kinds and configs, state
+/// store kind, connector configs, `dlq_all` safety — and report every problem
+/// found across all rows together. One problem keeps its own error; several
+/// are listed in one error.
+pub(crate) fn row_problems(nodes: &[crate::expand::ExpandedNode]) -> CliResult<()> {
+    let mut problems: Vec<CliError> = Vec::new();
+    for node in nodes {
+        let one = std::slice::from_ref(node);
+        // Verifying the schema lookup also catches unknown connector kinds.
+        let mut kinds_known = true;
+        if let Err(e) = source_schema(&node.source.kind) {
+            problems.push(e);
+            kinds_known = false;
+        }
+        // A discovery row (#501) enumerates a value-set and has no sink — its
+        // `sink` field is a never-built placeholder, so skip the sink check.
+        if !matches!(node.role, NodeRole::Discovery { .. })
+            && let Err(e) = sink_schema(&node.sink.kind)
+        {
+            problems.push(e);
+            kinds_known = false;
+        }
+        let mut transforms_known = true;
+        for t in &node.transforms {
+            if !available_transforms().contains(&t.kind.as_str()) {
+                transforms_known = false;
+                problems.push(CliError::UnknownTransform {
+                    name: format!("{} (row '{}')", t.kind, node.id),
+                    available: available_transforms().join(", "),
+                });
+            }
+        }
+        if let Some(state) = &node.state
+            && !available_state_kinds().contains(&state.kind.as_str())
+        {
+            problems.push(CliError::UnknownStateStore {
+                name: format!("{} (row '{}')", state.kind, node.id),
+                available: available_state_kinds().join(", "),
+            });
+        }
+        // Transform *kinds* are checked above; this compiles each chain so a
+        // bad transform *config* fails validation too.
+        if transforms_known && let Err(e) = check_transforms(one) {
+            problems.push(e);
+        }
+        if kinds_known {
+            problems.extend(check_connector_configs(one).err());
+            problems.extend(check_dlq_all_safety(one).err());
+        }
+    }
+    match problems.len() {
+        0 => Ok(()),
+        1 => Err(problems.remove(0)),
+        n => Err(CliError::Config(format!(
+            "{n} problems:\n{}",
+            problems
+                .iter()
+                .map(|e| format!("  - {e}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ))),
+    }
+}
+
 /// Deserialize every row's connector `config` into its typed struct.
 ///
 /// `expand` leaves `config` an opaque `Value`, so a structurally wrong
@@ -756,6 +790,33 @@ mod tests {
         super::run(args)
             .await
             .expect("the shipped mirror example validates");
+    }
+
+    /// Problems in several rows are reported together, not one per run.
+    #[test]
+    fn every_rows_problems_are_reported_together() {
+        let cfg = crate::config::parse_with_extension(
+            r#"
+version: 1
+pipeline:
+  source: { type: csv, config: { path: in.csv } }
+  sink:   { type: jsonl, config: { path: ./o } }
+matrix:
+  - id: a
+    sink: { config: { path: ./a } }
+    transforms: [{ type: set, config: { fields: { x: 1 } } }]
+  - id: b
+    sink: { config: { path: ./b } }
+    transforms: [{ type: set, config: { fields: { x: 1 } } }]
+"#,
+            "yaml",
+        )
+        .unwrap();
+        let err = super::row_problems(&expand(&cfg).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("2 problems"), "{err}");
+        assert!(err.contains("row 'a'") && err.contains("row 'b'"), "{err}");
     }
 
     #[test]

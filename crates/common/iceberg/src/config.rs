@@ -78,8 +78,23 @@ pub struct CatalogInner {
     pub credential: Option<String>,
 
     /// Arbitrary catalog properties passed through to the catalog builder
-    /// (e.g. S3 region, endpoint, access key).
+    /// and the warehouse file IO (e.g. S3 region, endpoint, access key).
+    /// Keys that name an endpoint (`*endpoint*`, `*uri`, `*url`, a proxy,
+    /// `gcs.service.path`) or a local file (`*-file`, `*_file`, `*.file`,
+    /// `warehouse`) are checked like the typed fields by a host that confines
+    /// configs (`faucet serve`).
     #[serde(default)]
+    #[schemars(extend("x-faucet-resource-keys" = {
+        "*endpoint*": "url",
+        "*uri": "url",
+        "*url": "url",
+        "*proxy*": "url",
+        "gcs.service.path": "url",
+        "*-file": "path",
+        "*_file": "path",
+        "*.file": "path",
+        "warehouse": "path"
+    }))]
     pub properties: HashMap<String, String>,
 }
 
@@ -211,6 +226,49 @@ mod tests {
 
     fn cat(v: serde_json::Value) -> CatalogConfig {
         serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn endpoint_and_file_properties_are_resources() {
+        use faucet_core::resolve::{ReferencePolicy, ResourceKind, annotated_resources};
+        let schema = serde_json::to_value(schemars::schema_for!(CatalogInner)).unwrap();
+        let config = serde_json::json!({
+            "warehouse": "s3://lake/wh",
+            "properties": {
+                "s3.endpoint": "http://10.0.0.7:9000",
+                "gcs.service.path": "http://10.0.0.8",
+                "oauth2-server-uri": "http://10.0.0.9/token",
+                "uri": "http://10.0.0.10",
+                "gcs.credentials-file": "/etc/key.json",
+                "s3.region": "us-east-1",
+                "s3.path-style-access": "true"
+            }
+        });
+        let mut found: Vec<(String, ResourceKind)> = annotated_resources(&schema, &config)
+            .into_iter()
+            .filter(|r| r.pointer.starts_with("/properties/"))
+            .map(|r| (r.pointer, r.kind))
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "/properties/gcs.credentials-file".into(),
+                    ResourceKind::Path
+                ),
+                ("/properties/gcs.service.path".into(), ResourceKind::Url),
+                ("/properties/oauth2-server-uri".into(), ResourceKind::Url),
+                ("/properties/s3.endpoint".into(), ResourceKind::Url),
+                ("/properties/uri".into(), ResourceKind::Url),
+            ]
+        );
+        let policy = ReferencePolicy::open().with_url_hosts(["lake"]);
+        let refused = annotated_resources(&schema, &config)
+            .iter()
+            .filter(|r| r.kind == ResourceKind::Url && policy.check(r).is_err())
+            .count();
+        assert_eq!(refused, 4);
     }
 
     #[test]

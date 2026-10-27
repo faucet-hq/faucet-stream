@@ -745,13 +745,12 @@ impl SqlDriver for SqliteDriver {
     async fn create_staging(&self) -> Result<(), FaucetError> {
         let referencing = self.referencing_tables().await?;
         if !referencing.is_empty() {
-            return Err(FaucetError::Config(format!(
-                "sqlite overwrite: table '{}' is referenced by a foreign key from {}; replacing \
-                 its rows would cascade into or break those tables. Use write_mode: upsert, or \
-                 drop the foreign key",
-                self.config.table_name,
-                referencing.join(", ")
-            )));
+            return Err(faucet_common_sql::referenced_overwrite_error(
+                "sqlite",
+                &self.config.table_name,
+                &referencing,
+                false,
+            ));
         }
         let create_sql: Option<String> =
             sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
@@ -1266,8 +1265,8 @@ mod tests {
         assert_eq!(
             sql,
             "DELETE FROM `assoc` WHERE `assoc`.`contact_id` = ? \
-             AND NOT EXISTS (SELECT 1 FROM temp.`faucet_cleanup_keys` c \
-             WHERE `assoc`.`id` = c.`id`)"
+             AND NOT EXISTS (SELECT 1 FROM temp.`faucet_cleanup_keys` _faucet_seen \
+             WHERE `assoc`.`id` = _faucet_seen.`id`)"
         );
     }
 
@@ -1278,8 +1277,8 @@ mod tests {
         assert_eq!(
             sql,
             "DELETE FROM `t` WHERE `t`.`tenant` = ? AND `t`.`contact_id` = ? \
-             AND NOT EXISTS (SELECT 1 FROM temp.`faucet_cleanup_keys` c \
-             WHERE `t`.`a` = c.`a` AND `t`.`b` = c.`b`)"
+             AND NOT EXISTS (SELECT 1 FROM temp.`faucet_cleanup_keys` _faucet_seen \
+             WHERE `t`.`a` = _faucet_seen.`a` AND `t`.`b` = _faucet_seen.`b`)"
         );
     }
 

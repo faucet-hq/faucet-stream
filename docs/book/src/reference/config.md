@@ -183,7 +183,8 @@ Three stages resolve placeholders:
   get an embedded token percent-encoded into one segment, a file or object path
   (a file sink's `path`, a SQLite `database_url`, a `prefix`) refuses a value
   holding `/`, `\`, NUL or `..` (a field that is exactly one token takes the
-  value whole; a file path still may not climb out with `..`), and a SQL
+  value whole as a relative path — it may not be absolute, start with `~` or
+  climb out with `..`), and a SQL
   source's query gets it as a bind parameter.
 
 Reference cycles surface as a clear `InterpolationCycle` error.
@@ -474,8 +475,11 @@ matrix:
 
 Semantics:
 
-- A **`fan_out:` row** runs its source once, projects `select` (a dot-path,
-  optionally `$`-prefixed; `$` = whole record) from each record, and **dedups**
+- A **`fan_out:` row** runs its source once, projects `select` (a JSONPath
+  such as `$.items[*].id`; a bare path is read as `$.<path>`, a dot path whose
+  keys JSONPath shorthand cannot spell — `account-id`, `meta.2fa_id`,
+  `Account Name` — looks
+  each key up verbatim, and `$` = whole record) from each record, and **dedups**
   (first-seen order; null / missing values skipped). It has **no sink** and
   writes nothing. It runs once per pipeline run, cached across all dependents.
 - The discovery `source` is either a `{ ref: <name> }` to a `pipeline.sources`

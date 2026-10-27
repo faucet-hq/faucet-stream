@@ -688,6 +688,10 @@ impl Source for OracleCdcSource {
         Some(self.shared.state_key.clone())
     }
 
+    fn legacy_state_keys(&self) -> Vec<String> {
+        self.shared.config.legacy_state_keys()
+    }
+
     async fn apply_start_bookmark(&self, bookmark: Value) -> Result<(), FaucetError> {
         *self.pending.lock().expect("pending mutex") = Some(Position::from_value(&bookmark)?);
         Ok(())

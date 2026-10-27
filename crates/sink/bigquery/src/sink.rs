@@ -555,6 +555,7 @@ fn json_schema_to_load_schema(schema: &Value) -> Option<Value> {
                 "JSON" => "JSON",
                 "TIMESTAMP" => "TIMESTAMP",
                 "DATE" => "DATE",
+                "BIGNUMERIC" => "BIGNUMERIC",
                 _ => "STRING",
             };
             serde_json::json!({ "name": n, "type": ty, "mode": "NULLABLE" })
@@ -636,6 +637,19 @@ fn csv_header(raw: &[u8], delimiter: u8) -> Option<Vec<String>> {
     }
     cells.push(String::from_utf8(cell).ok()?);
     Some(cells)
+}
+
+/// `record` reduced to its `key` fields: what a keyed delete reads of it.
+fn key_fields(record: &Value, key: &[String]) -> Value {
+    let mut out = serde_json::Map::new();
+    if let Some(obj) = record.as_object() {
+        for k in key {
+            if let Some(v) = obj.get(k) {
+                out.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    Value::Object(out)
 }
 
 /// A `multipart/related` boundary that is guaranteed absent from the payload:
@@ -1665,25 +1679,27 @@ impl BigQueryDriver {
         // `begin_overwrite` may have run on a *different* sink instance (the
         // executor drives it on a throwaway sink for group-level overwrite), so
         // this instance can't trust an in-memory flag — it verifies the real
-        // target table instead. A target that already existed had its staging
-        // clone created by `begin_overwrite`; a missing/schemaless one is created
-        // here from this page's sample (the schema `CREATE … LIKE` needs),
-        // followed by its staging clone.
-        if first_page && !self.target_has_schema(calls).await? {
-            if !self.config.create_table {
-                return Err(FaucetError::Sink(format!(
-                    "BigQuery overwrite target {}.{}.{} does not exist (or has no \
-                     schema) and `create_table` is disabled",
-                    self.config.project_id, self.config.dataset_id, self.config.table_id
-                )));
+        // target table instead. A missing/schemaless target is created here
+        // from this page's sample (the schema `CREATE … LIKE` needs).
+        if first_page {
+            if !self.target_has_schema(calls).await? {
+                if !self.config.create_table {
+                    return Err(FaucetError::Sink(format!(
+                        "BigQuery overwrite target {}.{}.{} does not exist (or has no \
+                         schema) and `create_table` is disabled",
+                        self.config.project_id, self.config.dataset_id, self.config.table_id
+                    )));
+                }
+                self.create_target_from_sample(calls, records).await?;
+                self.table_ready.store(true, Ordering::Release);
             }
-            self.create_target_from_sample(calls, records).await?;
-            self.table_ready.store(true, Ordering::Release);
-            // `IF NOT EXISTS`, never `OR REPLACE`: the writers of a grouped
-            // overwrite share this staging table, and one whose probe raced
-            // another's create must not drop the pages that one already
-            // staged. A stale staging table from a crashed run was dropped by
-            // `stage`.
+            // Every writer makes sure staging exists, not only the one that
+            // created the target: another writer of a grouped first run may
+            // see the target its sibling just created before that sibling's
+            // staging create lands. `IF NOT EXISTS`, never `OR REPLACE`: the
+            // writers share this staging table, and one must not drop the
+            // pages another already staged. A stale staging table from a
+            // crashed run was dropped by `stage`.
             self.run_ddl(
                 calls,
                 format!(
@@ -1738,9 +1754,17 @@ impl BigQueryDriver {
     /// credentials, reusing `gcp_bigquery_client`'s re-exported `yup-oauth2` (no
     /// direct dependency). Used only by the `media_load` upload path — the
     /// `gcp_bigquery_client::Client` handles auth for every other call itself.
-    /// The token value is never logged.
-    async fn access_token(&self) -> Result<String, FaucetError> {
-        faucet_common_bigquery::access_token(&self.config.auth).await
+    /// The token value is never logged. Minted under the run's call context,
+    /// so the run's deadline and cancellation end a hung token exchange (it is
+    /// otherwise bounded only by `TOKEN_MINT_TIMEOUT`); not counted as a round
+    /// trip and not retried here.
+    async fn access_token(&self, calls: &CallSlot) -> Result<String, FaucetError> {
+        let ctx = calls.get().with_roundtrip_metering(false).without_retry();
+        ctx.call_once(
+            "token",
+            faucet_common_bigquery::access_token(&self.config.auth),
+        )
+        .await
     }
 
     /// Load one page into `table_id` via a bucket-free BigQuery **load job**:
@@ -1789,7 +1813,7 @@ impl BigQueryDriver {
         let boundary = media_boundary(media_gzipped);
         let body = build_multipart_related(&boundary, job_json, media_gzipped);
 
-        let token = self.access_token().await?;
+        let token = self.access_token(calls).await?;
         let url = format!(
             "{}/upload/bigquery/v2/projects/{}/jobs?uploadType=multipart",
             self.upload_base(),
@@ -1999,7 +2023,7 @@ impl BigQueryDriver {
                 false,
             ))
             .to_string();
-        let token = self.access_token().await?;
+        let token = self.access_token(calls).await?;
         let url = format!(
             "{}/upload/bigquery/v2/projects/{}/jobs?uploadType=resumable",
             self.upload_base(),
@@ -2907,15 +2931,55 @@ impl BigQueryDriver {
 
         if !matches!(self.config.write.write_mode, faucet_core::WriteMode::Append) {
             self.ensure_table_ready(calls, records).await?;
-            let plan = faucet_core::plan_writes(records, &self.config.write);
-            self.run_upsert_script(calls, &plan, None).await?;
+            let mode = self.config.write.write_mode.as_str();
             let mut outcomes: Vec<faucet_core::RowOutcome> =
                 records.iter().map(|_| Ok(())).collect();
+            // A row whose value does not fit its column, or that carries a
+            // field the table lacks, fails on its own (DLQ-routable) rather
+            // than failing the whole page. Each row is checked as it is
+            // written: an upsert without its `delete_marker` field, a delete
+            // by its key alone. A row without a usable key is left to the
+            // planner, which reports it.
+            let columns = self.target_schema(calls).await?;
+            let mut kept_at = Vec::with_capacity(records.len());
+            let mut kept = Vec::with_capacity(records.len());
+            for (i, r) in records.iter().enumerate() {
+                let single = faucet_core::plan_writes(std::slice::from_ref(r), &self.config.write);
+                let written = if let Some(upsert) = single.upserts.into_iter().next() {
+                    upsert
+                } else if !single.deletes.is_empty() {
+                    key_fields(r, &self.config.write.key)
+                } else {
+                    kept_at.push(i);
+                    kept.push(r.clone());
+                    continue;
+                };
+                let one = std::slice::from_ref(&written);
+                let bad = idempotent::shape_mismatches(&columns, one, 10);
+                let unknown = idempotent::unknown_fields(&columns, one);
+                if !bad.is_empty() {
+                    outcomes[i] = Err(FaucetError::Sink(format!(
+                        "bigquery {mode}: value(s) at {} do not fit the column type",
+                        bad.join(", ").replace("(record 0: ", "(")
+                    )));
+                } else if !unknown.is_empty() {
+                    outcomes[i] = Err(FaucetError::Sink(format!(
+                        "bigquery {mode}: field(s) {} are not columns of the table",
+                        unknown
+                            .iter()
+                            .map(|f| format!("`{f}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                } else {
+                    kept_at.push(i);
+                    kept.push(r.clone());
+                }
+            }
+            let plan = faucet_core::plan_writes(&kept, &self.config.write);
+            self.run_upsert_script(calls, &plan, None).await?;
             for (idx, msg) in &plan.failed {
-                outcomes[*idx] = Err(FaucetError::Sink(format!(
-                    "bigquery {}: {msg}",
-                    self.config.write.write_mode.as_str()
-                )));
+                outcomes[kept_at[*idx]] = Err(FaucetError::Sink(format!("bigquery {mode}: {msg}")));
             }
             return Ok(outcomes);
         }
@@ -3799,7 +3863,7 @@ impl faucet_core::driver::ColumnarDriver for BigQueryDriver {
             let rows = faucet_core::record_batch_to_values(batch)?;
             return self.append_rows(calls, &rows).await;
         }
-        let token = self.access_token().await?;
+        let token = self.access_token(calls).await?;
         self.roundtrips.record("load");
         crate::load::write_columnar_media_in(
             &calls.get(),

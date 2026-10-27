@@ -50,13 +50,18 @@ pub mod dialects;
 pub mod driver;
 pub mod engine;
 pub mod mapping;
+pub mod overwrite;
 pub mod statement;
 
 pub use dialect::{SqlDialect, TableTarget};
 pub use driver::{InsertPath, SqlDriver, SqlEvolution, SqlFuture, SqlLayout, SqlSinkDriver};
 pub use engine::{
-    EngineOptions, EvolutionStep, SplitPage, SqlExecutor, SqlSinkEngine, check_cleanup_columns,
-    no_match_message, split_page,
+    EngineOptions, EvolutionStep, PageScope, SplitPage, SqlExecutor, SqlSinkEngine,
+    check_cleanup_columns, no_match_message, split_page,
 };
-pub use mapping::{ColumnMatching, MapError, MatchedRow, TableColumn};
+pub use mapping::{ColumnIndex, ColumnMatching, MapError, MatchedRow, TableColumn};
+pub use overwrite::{
+    bounded_staging_base, bounded_staging_table, bounded_table_name,
+    missing_overwrite_staging_error, referenced_overwrite_error,
+};
 pub use statement::{Param, Statement, StatementKind};

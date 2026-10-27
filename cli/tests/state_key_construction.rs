@@ -6,6 +6,9 @@
 
 use std::path::{Path, PathBuf};
 
+#[path = "support/rust_source.rs"]
+mod rust_source;
+
 const MARKERS: [&str; 8] = [
     "__sla__",
     "__profiling__",
@@ -52,18 +55,19 @@ fn non_test(text: &str) -> &str {
     text
 }
 
-/// `format!` calls whose first string literal is `s`.
+/// String literals (raw ones too) passed to something that builds a string
+/// from parts: `format!` / `format_args!` / `concat!` (also when rustfmt moves
+/// the literal to the next line), `push_str`, or `+`.
 fn format_literals(text: &str) -> Vec<(usize, String)> {
-    let mut out = Vec::new();
-    for (i, _) in text.match_indices("format!(\"") {
-        let start = i + "format!(\"".len();
-        let Some(len) = text[start..].find('"') else {
-            continue;
-        };
-        let line = text[..i].matches('\n').count() + 1;
-        out.push((line, text[start..start + len].to_string()));
-    }
-    out
+    const BUILDERS: [&str; 5] = ["format!(", "format_args!(", "concat!(", "push_str(", "+"];
+    rust_source::literal_spans(text, true)
+        .into_iter()
+        .filter(|(at, _)| {
+            let before = text[..*at].trim_end();
+            BUILDERS.iter().any(|b| before.ends_with(b))
+        })
+        .map(|(at, lit)| (text[..at].matches('\n').count() + 1, lit.to_string()))
+        .collect()
 }
 
 fn offenders() -> Vec<String> {
@@ -210,5 +214,33 @@ fn the_scan_finds_a_raw_key() {
     assert_eq!(
         non_test("a\n#[cfg(test)]\n#[allow(dead_code)] // why\nmod tests {}"),
         "a\n"
+    );
+}
+
+/// The scan sees a key however the string is built: a rustfmt-wrapped
+/// `format!`, a raw string, `concat!`, `push_str` and `+`.
+#[test]
+fn the_scan_sees_every_way_a_key_string_is_built() {
+    let src = concat!(
+        "fn a(p: &str, r: &str) -> String {\n",
+        "    let key = format!(\n        \"{}::{}::__status__\",\n        p, r\n    );\n",
+        "    let k2 = format!(r\"{}::__lease__\", p);\n",
+        "    let k3 = concat!(\"::__sla__\", \"x\");\n",
+        "    let mut k4 = String::new();\n    k4.push_str(\"::__rollback__\");\n",
+        "    let k5 = p.to_string() + \"::__profiling__\";\n",
+        "    let note = \"__status__ is a marker\";\n",
+        "}\n",
+    );
+    let found: Vec<String> = format_literals(src).into_iter().map(|(_, l)| l).collect();
+    assert_eq!(
+        found,
+        vec![
+            "{}::{}::__status__",
+            "{}::__lease__",
+            "::__sla__",
+            "::__rollback__",
+            "::__profiling__",
+        ],
+        "a bare literal that is not built into a string is not a key"
     );
 }

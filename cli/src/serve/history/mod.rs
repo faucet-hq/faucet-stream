@@ -1455,6 +1455,24 @@ pub trait RunHistory: Send + Sync {
         ))
     }
 
+    /// Replace tenant `expected.id` with `new` only while the stored record
+    /// is still exactly `expected`; returns whether it was replaced. The
+    /// default reads then writes (not atomic); the built-in backends compare
+    /// and write in one step.
+    async fn tenant_replace(
+        &self,
+        expected: &tenants::TenantRecord,
+        new: &tenants::TenantRecord,
+    ) -> Result<bool, HistoryError> {
+        match self.tenant_get(&expected.id).await? {
+            Some(current) if current == *expected => {
+                self.tenant_upsert(new).await?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// One tenant by id. Default: `None`.
     async fn tenant_get(&self, id: &str) -> Result<Option<tenants::TenantRecord>, HistoryError> {
         let _ = id;

@@ -13,6 +13,7 @@ pub struct MysqlSourceConfig {
     #[schemars(extend("x-faucet-resource" = "url"))]
     pub connection_url: String,
     /// SQL query to execute.
+    #[schemars(extend("x-faucet-sql" = true))]
     pub query: String,
     /// Maximum number of connections in the pool. Defaults to 10.
     #[serde(default = "default_max_connections")]

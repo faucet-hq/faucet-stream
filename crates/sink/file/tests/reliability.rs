@@ -79,6 +79,61 @@ async fn an_interrupted_overwrite_is_finished_by_the_next_run() {
     assert!(!dir.path().join("o-00003.jsonl").exists());
 }
 
+/// Under the CLI every overwrite run stages in an area of its own, so the
+/// next run's begin must finish a crashed commit of *another* run (and of the
+/// untokened area an earlier release used), not only its own (#934).
+#[tokio::test]
+async fn another_runs_interrupted_overwrite_is_finished_by_the_next_run() {
+    use faucet_core::idempotency::new_overwrite_run_token;
+    for crashed in [Some(new_overwrite_run_token()), None] {
+        let dir = tempfile::tempdir().unwrap();
+        for n in 1..=3 {
+            std::fs::write(dir.path().join(format!("o-0000{n}.jsonl")), "{\"old\":1}\n").unwrap();
+        }
+        let cfg = json!({
+            "path": p(dir.path(), "o-{part}.jsonl"),
+            "write_mode": "overwrite",
+            "max_records_per_file": 1,
+        });
+        let open = |token: &Option<String>| match token {
+            Some(t) => sink(cfg.clone()).with_overwrite_run(t).unwrap(),
+            None => sink(cfg.clone()),
+        };
+        open(&crashed).begin_overwrite().await.unwrap();
+        let w = open(&crashed);
+        w.write_batch(&rows(0, 2)).await.unwrap();
+        w.flush().await.unwrap();
+        let blocker = dir.path().join("o-00002.jsonl");
+        std::fs::remove_file(&blocker).unwrap();
+        std::fs::create_dir(&blocker).unwrap();
+        std::fs::write(blocker.join("x"), b"").unwrap();
+        assert!(open(&crashed).commit_overwrite().await.is_err());
+        std::fs::remove_dir_all(&blocker).unwrap();
+
+        // The next run, with a token of its own.
+        let next = Some(new_overwrite_run_token());
+        open(&next).begin_overwrite().await.unwrap();
+        assert_eq!(lines(&dir.path().join("o-00001.jsonl")), rows(0, 1));
+        assert_eq!(lines(&dir.path().join("o-00002.jsonl")), rows(1, 1));
+        assert!(!dir.path().join("o-00003.jsonl").exists(), "{crashed:?}");
+        open(&next).abort_overwrite().await.unwrap();
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with('.') && !n.ends_with(".commits"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+        let ledger = dir.path().join(".faucet-overwrite-o-_part_.jsonl.commits");
+        let kept: Vec<_> = std::fs::read_dir(&ledger)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(kept, ["last"], "only the commit ledger stays");
+    }
+}
+
 /// C5: an abort after the move started finishes it rather than leaving the
 /// destination half old, half new.
 #[tokio::test]

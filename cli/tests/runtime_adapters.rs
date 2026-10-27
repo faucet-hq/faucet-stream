@@ -90,6 +90,77 @@ fn calls(text: &str, needle: &str) -> Vec<usize> {
         .collect()
 }
 
+/// `text` with whitespace after every `::` removed, so a path split across
+/// lines (`runner::\n    submit(`) reads as one.
+fn joined_paths(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("::") {
+        out.push_str(&rest[..i + 2]);
+        rest = rest[i + 2..].trim_start();
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Gate functions an adapter may not import, by the module that defines them:
+/// importing one (`use …::runner::{self, submit}`, or `submit as go`) would
+/// let an unqualified call skip the path-qualified scan above.
+const FORBIDDEN_IMPORTS: [(&str, &str); 9] = [
+    ("runner", "submit"),
+    ("runner", "submit_gated"),
+    ("runner", "load_for"),
+    ("runner", "load_selected"),
+    ("runner", "policy_gate"),
+    ("runner", "apply_request_budget"),
+    ("tenants", "admit"),
+    ("load", "load_submission"),
+    ("executor", "run_expanded"),
+];
+
+/// Whether `ident` occurs in `text` as a whole identifier.
+fn has_ident(text: &str, ident: &str) -> bool {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    text.match_indices(ident).any(|(i, _)| {
+        !text[..i].chars().next_back().is_some_and(is_ident)
+            && !text[i + ident.len()..].chars().next().is_some_and(is_ident)
+    })
+}
+
+/// `use` statements of `text` that import a forbidden gate function, as
+/// `(line, module::item)`.
+fn forbidden_imports(text: &str) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(k) = text[from..].find("use ") {
+        let at = from + k;
+        let starts_statement = text[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| c == '\n' || c == ' ' || c == '\t' || c == ';' || c == '{');
+        let Some(end) = text[at..].find(';') else {
+            break;
+        };
+        let stmt = text[at..at + end]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if starts_statement {
+            for (module, item) in FORBIDDEN_IMPORTS {
+                if let Some(m) = stmt.find(&format!("{module}::")) {
+                    let imported = &stmt[m + module.len() + 2..];
+                    if has_ident(imported, item) {
+                        let line = text[..at].matches('\n').count() + 1;
+                        out.push((line, format!("{module}::{item}")));
+                    }
+                }
+            }
+        }
+        from = at + end;
+    }
+    out
+}
+
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -114,8 +185,15 @@ fn adapters_go_through_the_runtime() {
         assert!(!files.is_empty(), "{dir} has no source files");
         for path in files {
             let text = std::fs::read_to_string(&path).unwrap();
+            let code = joined_paths(non_test(&text));
+            for (line, what) in forbidden_imports(&code) {
+                bad.push(format!(
+                    "{}:{line}: imports `{what}` — call the runtime instead",
+                    rel(&root, &path)
+                ));
+            }
             for (needle, instead) in ADAPTER_FORBIDDEN {
-                for line in calls(non_test(&text), needle) {
+                for line in calls(&code, needle) {
                     bad.push(format!(
                         "{}:{line}: `{needle}` — call {instead}",
                         rel(&root, &path)
@@ -163,4 +241,23 @@ fn the_scanner_sees_a_violation_and_skips_tests() {
     assert!(calls(non_test(src), "run_expanded").is_empty());
     let gated = "fn a() {}\n#[cfg(all(test, feature = \"x\"))]\n#[allow(dead_code)]\nmod tests { load_submission(); }\n";
     assert!(calls(non_test(gated), "load_submission").is_empty());
+}
+
+/// An imported or line-split gate call is caught; unrelated imports are not.
+#[test]
+fn the_scanner_sees_imported_and_split_calls() {
+    let imported = "use crate::serve::runner::{self, submit as go};\nfn a() { go(x); }\n";
+    assert_eq!(
+        forbidden_imports(&joined_paths(imported)),
+        vec![(1, "runner::submit".to_string())]
+    );
+    let nested = "use crate::serve::{\n    runner::{self,\n        load_for},\n};\n";
+    assert_eq!(
+        forbidden_imports(&joined_paths(nested)),
+        vec![(1, "runner::load_for".to_string())]
+    );
+    let split = "fn a() { runner::\n        submit(&state, req); }\n";
+    assert_eq!(calls(&joined_paths(split), "runner::submit("), vec![1]);
+    let fine = "use crate::serve::runner::{self, ConfigFormatWire, SubmitOutcome, SubmitRequest};\nuse crate::serve::tenants::{self, connect};\n";
+    assert!(forbidden_imports(&joined_paths(fine)).is_empty());
 }

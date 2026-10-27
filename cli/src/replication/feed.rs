@@ -400,6 +400,7 @@ mod tests {
                 "native_output_formats",
                 "stream_native",
                 "apply_start_bookmark",
+                "legacy_state_keys",
                 "capture_resume_position",
                 "lag",
                 "is_shardable",

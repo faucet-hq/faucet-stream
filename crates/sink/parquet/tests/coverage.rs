@@ -217,12 +217,7 @@ async fn doctor_check_probes_an_s3_destination_with_head_bucket() {
         endpoint_url: Some("http://127.0.0.1:9".to_string()),
         allow_http: true,
     }));
-    // SAFETY: constants; concurrent writes converge to the same value (mirrors
-    // the existing `s3_destination_builds_*` test in roundtrip.rs).
-    unsafe {
-        std::env::set_var("AWS_ACCESS_KEY_ID", "test");
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
-    }
+    set_test_env();
     let sink = ParquetSink::new(cfg).await.unwrap();
 
     let report = sink.check(&CheckContext::default()).await.unwrap();
@@ -335,4 +330,18 @@ async fn single_file_flush_publishes_and_drop_discards() {
         sink.write_batch(&[json!({"id": 4})]).await.unwrap();
     }
     assert_eq!(rows_in(&read_file(&target).await), 3);
+}
+
+/// Set the AWS variables every test in this binary shares, once per process:
+/// `setenv` racing another thread's `getenv` is undefined behaviour even when
+/// both sides write the same value.
+fn set_test_env() {
+    static ENV: std::sync::Once = std::sync::Once::new();
+    // SAFETY: the writes run once, before any client in this binary reads the
+    // variables (every caller blocks on the `Once` until they are done), and
+    // std's own environment reads take the same lock as these writes.
+    ENV.call_once(|| unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+    });
 }

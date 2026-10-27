@@ -25,7 +25,7 @@ pub async fn emulator_host() -> String {
     let (_container, host) = EMULATOR
         .get_or_init(|| async {
             let container = faucet_conformance::containers::start(|| {
-                GenericImage::new("gcr.io/cloud-spanner-emulator/emulator", "latest")
+                GenericImage::new("gcr.io/cloud-spanner-emulator/emulator", "1.5.59")
                     .with_exposed_port(ContainerPort::Tcp(9010))
             })
             .await;
@@ -134,4 +134,22 @@ pub async fn count_rows(conn: &SpannerConnection, table: &str) -> usize {
         .expect("count row present");
     let c = row.column_by_name::<i64>("c").expect("count decode");
     c as usize
+}
+
+/// The `id` values `table` holds, via a raw client.
+#[allow(dead_code)] // used by the conformance battery only
+pub async fn ids(conn: &SpannerConnection, table: &str) -> Vec<i64> {
+    let client = conn.connect().await.expect("ids client");
+    let mut tx = client.single().await.expect("single txn");
+    let mut iter = tx
+        .query(Statement::new(format!(
+            "SELECT id FROM `{table}` ORDER BY id"
+        )))
+        .await
+        .expect("ids query");
+    let mut out = Vec::new();
+    while let Some(row) = iter.next().await.expect("ids row") {
+        out.push(row.column_by_name::<i64>("id").expect("id decode"));
+    }
+    out
 }

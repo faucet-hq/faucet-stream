@@ -117,6 +117,33 @@ pub enum FidelityError {
     /// An epoch offset outside the range a date-time can represent.
     #[error("epoch value {0} is outside the representable date-time range")]
     OutOfRange(i64),
+    /// A decimal whose exponent would write out more than
+    /// [`MAX_DECIMAL_DIGITS`] digits (`"1e999999999999"`). The text is
+    /// shortened to its first 64 characters.
+    #[error("{0:?} has an exponent too large to write out (more than {MAX_DECIMAL_DIGITS} digits)")]
+    TooManyDigits(String),
+}
+
+/// The most characters a decimal is written out to positionally: enough for
+/// the widest decimal type a database holds (PostgreSQL `NUMERIC`: 131 072
+/// integer and 16 383 fractional digits). A literal whose exponent would go
+/// further is refused rather than expanded, since the expansion is sized by
+/// the exponent alone (`"1e999999999999"` would be a terabyte).
+pub const MAX_DECIMAL_DIGITS: usize = 160_000;
+
+fn too_many_digits(text: &str) -> FidelityError {
+    FidelityError::TooManyDigits(text.trim().chars().take(64).collect())
+}
+
+/// The length of [`render_decimal`]'s output for `digits × 10^-scale`.
+fn rendered_len(digits: &str, scale: i64) -> i128 {
+    let digits = digits.len() as i128;
+    let scale = i128::from(scale);
+    if scale <= 0 {
+        if digits == 0 { 1 } else { digits - scale + 1 }
+    } else {
+        digits.max(scale + 1) + 2
+    }
 }
 
 /// `(negative, digits without leading zeros, scale)` of a decimal literal:
@@ -144,8 +171,17 @@ fn parse_decimal(text: &str) -> Option<(bool, String, i64)> {
     Some((neg, digits, scale))
 }
 
-/// Positional text of `digits × 10^-scale`, keeping the scale's trailing zeros.
-fn render_decimal(negative: bool, digits: &str, scale: i64) -> String {
+/// Positional text of `digits × 10^-scale`, keeping the scale's trailing
+/// zeros; `None` when it would be longer than [`MAX_DECIMAL_DIGITS`].
+fn render_decimal(negative: bool, digits: &str, scale: i64) -> Option<String> {
+    if rendered_len(digits, scale) > MAX_DECIMAL_DIGITS as i128 {
+        return None;
+    }
+    Some(render_positional(negative, digits, scale))
+}
+
+/// [`render_decimal`] without the length bound; callers check it first.
+fn render_positional(negative: bool, digits: &str, scale: i64) -> String {
     let mut out = String::new();
     if scale <= 0 {
         if digits.is_empty() {
@@ -191,15 +227,27 @@ pub fn decimal_text(text: &str) -> Result<Value, FidelityError> {
     }
     let (neg, digits, scale) =
         parse_decimal(text).ok_or_else(|| FidelityError::NotANumber(text.to_string()))?;
-    Ok(Value::String(render_decimal(neg, &digits, scale)))
+    render_decimal(neg, &digits, scale)
+        .map(Value::String)
+        .ok_or_else(|| too_many_digits(text))
 }
 
 /// An exact decimal `unscaled × 10^-scale` (the Arrow / driver representation)
-/// as a JSON string.
+/// as a JSON string. A scale so far out that the positional text would pass
+/// [`MAX_DECIMAL_DIGITS`] is written in exponent form (`"12E+999999999"`),
+/// still exact.
 pub fn decimal_from_i128(unscaled: i128, scale: i32) -> Value {
     let digits = unscaled.unsigned_abs().to_string();
     let digits = digits.trim_start_matches('0');
-    Value::String(render_decimal(unscaled < 0, digits, i64::from(scale)))
+    Value::String(
+        render_decimal(unscaled < 0, digits, i64::from(scale)).unwrap_or_else(|| {
+            format!(
+                "{}{digits}E{:+}",
+                if unscaled < 0 { "-" } else { "" },
+                -i64::from(scale)
+            )
+        }),
+    )
 }
 
 /// An integer as a JSON number when a `Value` holds it exactly (`i64` / `u64`
@@ -263,7 +311,7 @@ pub fn number_text(text: &str) -> Result<Value, FidelityError> {
     if digits.is_empty() {
         return Ok(Value::Number(0.into()));
     }
-    let positional = render_decimal(neg, &digits, scale);
+    let positional = render_decimal(neg, &digits, scale).ok_or_else(|| too_many_digits(text))?;
     for candidate in [t.trim_start_matches('+'), positional.as_str()] {
         if crate::json_numbers::is_exact(candidate)
             && let Ok(Value::Number(n)) = serde_json::from_str::<Value>(candidate)
@@ -565,6 +613,40 @@ pub fn unscoped_non_finite() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exponents_are_written_out_only_up_to_the_digit_bound() {
+        for huge in [
+            "1e999999999999",
+            "1e-999999999999",
+            "-5E+9223372036854775807",
+            "1e-9223372036854775807",
+        ] {
+            assert!(
+                matches!(decimal_text(huge), Err(FidelityError::TooManyDigits(_))),
+                "{huge}"
+            );
+            assert!(
+                matches!(number_text(huge), Err(FidelityError::TooManyDigits(_))),
+                "{huge}"
+            );
+        }
+        let long = format!("1e{}", "9".repeat(200));
+        assert!(decimal_text(&long).is_err());
+        let err = decimal_text(&format!("{}e999999999", "1".repeat(100))).unwrap_err();
+        assert!(err.to_string().len() < 200, "{err}");
+        // Zero needs no digits, and the widest database decimals still fit.
+        assert_eq!(decimal_text("0e999999999999").unwrap(), json!("0"));
+        assert_eq!(number_text("0e999999999999").unwrap(), json!(0));
+        let wide = decimal_text("1e131071").unwrap();
+        assert_eq!(wide.as_str().unwrap().len(), 131_072);
+        let deep = decimal_text("1e-16383").unwrap();
+        assert_eq!(deep.as_str().unwrap().len(), 16_385);
+        // An out-of-range driver scale falls back to exact exponent form.
+        assert_eq!(decimal_from_i128(12, i32::MIN), json!("12E+2147483648"));
+        assert_eq!(decimal_from_i128(-12, i32::MAX), json!("-12E-2147483647"));
+        assert_eq!(decimal_from_i128(-125, 2), json!("-1.25"));
+    }
     use serde_json::json;
 
     #[test]

@@ -96,7 +96,18 @@ async fn oracle_query_source_end_to_end() {
         initial_value: json!(11),
     };
     let source = OracleSource::new(inc).await.expect("source");
-    assert!(source.state_key().unwrap().starts_with("oracle:FREEPDB1:"));
+    let key = source.state_key().unwrap();
+    assert!(
+        key.starts_with("oracle:") && key.contains("FREEPDB1"),
+        "{key}"
+    );
+    let legacy = source.legacy_state_keys();
+    assert_eq!(
+        legacy.len(),
+        1,
+        "the pre-host-scope key is offered for migration"
+    );
+    assert!(legacy[0].starts_with("oracle:FREEPDB1:"), "{legacy:?}");
     let pages = drain(&source).await;
     let rows: Vec<Value> = pages.iter().flat_map(|p| p.records.clone()).collect();
     assert_eq!(rows.len(), 2);

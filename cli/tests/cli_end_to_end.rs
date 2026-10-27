@@ -7,6 +7,9 @@ use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
 
+#[path = "support/example_features.rs"]
+mod example_features;
+
 /// Helper: a config that reads two records from a CSV file and writes them
 /// as JSONL. Uses absolute paths so the test isn't sensitive to cwd.
 fn csv_to_jsonl_yaml(csv: &Path, out: &Path) -> String {
@@ -675,13 +678,23 @@ pipeline:
     let cfg = dir.path().join("pipeline.yaml");
     fs::write(&cfg, yaml).unwrap();
 
-    Command::cargo_bin("faucet")
+    let out = Command::cargo_bin("faucet")
         .unwrap()
         .args(["run"])
         .arg(&cfg)
         .assert()
         .success()
-        .stderr(contains("wrote 2 records"));
+        .stderr(contains("wrote 2 records"))
+        .get_output()
+        .clone();
+    // The ignore branch strips `name` before the sink sees the page. Without
+    // the drift pass the sink would get `name` and warn that it matches no
+    // column, so the absence of that warning is what proves the policy ran.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("match no table column"),
+        "the sink saw the unknown column, so the ignore policy did not run:\n{stderr}"
+    );
 
     // Both rows landed with only the in-schema `id` column; `name` was stripped.
     assert_eq!(sqlite_query(&db, "SELECT count(*) FROM t;"), "2");
@@ -887,69 +900,12 @@ fn shipped_example_yamls_pass_validate() {
             continue;
         }
         // Skip examples that require a feature the test binary wasn't built
-        // with.  In CI `--all-features` covers everything; local feature-
-        // specific test runs (e.g. `--features serve`) must not trip on
-        // example YAMLs that need the orthogonal `schedule` feature (or vice
-        // versa).
-        #[cfg(not(feature = "schedule"))]
+        // with (shared with `examples_roundtrip`). In CI `--all-features`
+        // covers everything.
+        if example_features::missing_feature(&fs::read_to_string(&path).unwrap_or_default())
+            .is_some()
         {
-            let yaml_text = fs::read_to_string(&path).unwrap_or_default();
-            if yaml_text.contains("\nschedule:") || yaml_text.starts_with("schedule:") {
-                continue;
-            }
-        }
-        // `masking:` is a deny_unknown_fields key gated on the `masking`
-        // feature; a build without it can't parse those examples.
-        #[cfg(not(feature = "masking"))]
-        {
-            let yaml_text = fs::read_to_string(&path).unwrap_or_default();
-            if yaml_text.contains("\n  masking:") || yaml_text.contains("\nmasking:") {
-                continue;
-            }
-        }
-        // `policy:` is a deny_unknown_fields key gated on the `policy`
-        // feature; a build without it can't parse those examples.
-        #[cfg(not(feature = "policy"))]
-        {
-            let yaml_text = fs::read_to_string(&path).unwrap_or_default();
-            if yaml_text.contains("\npolicy:") {
-                continue;
-            }
-        }
-        // `notifications:` is a deny_unknown_fields key gated on the `notify`
-        // feature; a build without it can't parse those examples.
-        #[cfg(not(feature = "notify"))]
-        {
-            let yaml_text = fs::read_to_string(&path).unwrap_or_default();
-            if yaml_text.contains("\nnotifications:") {
-                continue;
-            }
-        }
-        // `catalog:` is a deny_unknown_fields key gated on the `catalog`
-        // feature; a build without it can't parse those examples.
-        #[cfg(not(feature = "catalog"))]
-        {
-            let yaml_text = fs::read_to_string(&path).unwrap_or_default();
-            if yaml_text.contains("\ncatalog:") || yaml_text.starts_with("catalog:") {
-                continue;
-            }
-        }
-        // The `sql` / `wasm` transforms are feature-gated, and `validate` now
-        // compiles every transform chain — so an example using one cannot
-        // validate in a build that lacks it.
-        #[cfg(not(feature = "transform-sql"))]
-        {
-            let yaml_text = fs::read_to_string(&path).unwrap_or_default();
-            if yaml_text.contains("type: sql") {
-                continue;
-            }
-        }
-        #[cfg(not(feature = "transform-wasm"))]
-        {
-            let yaml_text = fs::read_to_string(&path).unwrap_or_default();
-            if yaml_text.contains("type: wasm") {
-                continue;
-            }
+            continue;
         }
         count += 1;
         let mut cmd = Command::cargo_bin("faucet").unwrap();

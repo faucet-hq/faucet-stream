@@ -392,11 +392,13 @@ pub async fn case<R: Remote>(
                 std::slice::from_ref(&second),
             )
             .await;
-            return match res {
-                Err(FaucetError::Sink(m)) if m.contains("already exists") => Ok(()),
-                Err(e) => Err(format!("error_if_exists failed oddly: {e}")),
-                Ok(()) => Err("error_if_exists overwrote an existing object".into()),
-            };
+            match res {
+                // The refused run must leave the first run's objects exactly
+                // as they were: checked by the read-back below.
+                Err(FaucetError::Sink(m)) if m.contains("already exists") => first.clone(),
+                Err(e) => return Err(format!("error_if_exists failed oddly: {e}")),
+                Ok(()) => return Err("error_if_exists overwrote an existing object".into()),
+            }
         }
     };
     let (back, bodies) = read_back(r, &prefix, &dir.path().join("2"), enc).await?;

@@ -315,3 +315,143 @@ async fn overwrite_handles_identity_computed_and_rowversion_columns() {
     );
     assert_eq!(got[0].1, "generated");
 }
+
+/// A target another table references is refused at begin (before anything is
+/// staged) and again at the commit (a key added mid-run): the swap's
+/// `DELETE FROM target` would cascade into the child table.
+#[tokio::test(flavor = "multi_thread")]
+async fn overwrite_refuses_a_target_other_tables_reference() {
+    let _serial = SERIAL.lock().await;
+    let (_c, port) = start_mssql().await;
+    let cfg = conn_cfg(port);
+    let pool = build_pool(&cfg, 4).await.expect("pool");
+    exec(
+        &pool,
+        "CREATE TABLE dbo.t (id INT PRIMARY KEY, name NVARCHAR(255))",
+    )
+    .await;
+    exec(&pool, "INSERT INTO dbo.t (id, name) VALUES (1, 'old_a')").await;
+    exec(
+        &pool,
+        "CREATE TABLE dbo.child (cid INT PRIMARY KEY, parent INT NULL)",
+    )
+    .await;
+    exec(&pool, "INSERT INTO dbo.child (cid, parent) VALUES (7, 1)").await;
+
+    // Mid-run: begin succeeds, a cascading key appears, the commit refuses.
+    let sink = MssqlSink::new(overwrite_cfg(&cfg)).await.expect("sink");
+    sink.begin_overwrite().await.expect("begin");
+    sink.write_batch(&[json!({"id": 1, "name": "new_a"})])
+        .await
+        .expect("write");
+    exec(
+        &pool,
+        "ALTER TABLE dbo.child ADD CONSTRAINT fk_child_t FOREIGN KEY (parent) \
+         REFERENCES dbo.t (id) ON DELETE CASCADE",
+    )
+    .await;
+    let err = sink.commit_overwrite().await.unwrap_err().to_string();
+    assert!(
+        err.contains("is referenced by a foreign key from dbo.child"),
+        "{err}"
+    );
+    sink.abort_overwrite().await.expect("abort");
+    assert_eq!(names(&pool, "dbo.t").await, vec!["old_a"]);
+    let mut conn = pool.get().await.expect("checkout");
+    let rows = conn
+        .query("SELECT COUNT(*) FROM dbo.child", &[])
+        .await
+        .expect("query")
+        .into_first_result()
+        .await
+        .expect("result");
+    assert_eq!(rows[0].get::<i32, _>(0), Some(1), "the child row survives");
+    drop(conn);
+
+    // At begin, before anything is staged.
+    let sink = MssqlSink::new(overwrite_cfg(&cfg)).await.expect("sink");
+    let err = sink.begin_overwrite().await.unwrap_err().to_string();
+    assert!(
+        err.contains("is referenced by a foreign key from dbo.child"),
+        "{err}"
+    );
+
+    // Without the key the overwrite runs.
+    exec(&pool, "ALTER TABLE dbo.child DROP CONSTRAINT fk_child_t").await;
+    let sink = MssqlSink::new(overwrite_cfg(&cfg)).await.expect("sink");
+    sink.begin_overwrite().await.expect("begin without the key");
+    sink.write_batch(&[json!({"id": 2, "name": "new_b"})])
+        .await
+        .expect("write");
+    sink.commit_overwrite().await.expect("commit");
+    assert_eq!(names(&pool, "dbo.t").await, vec!["new_b"]);
+}
+
+/// A `NO ACTION` key blocks the swap's `DELETE` only while a child row
+/// references the target, so it is refused only then; a key whose `ON
+/// DELETE` rewrites the child is refused whatever the child holds, also for
+/// a three-part target in another database (whose catalog holds the key).
+#[tokio::test(flavor = "multi_thread")]
+async fn overwrite_refuses_no_action_keys_only_while_referenced_and_reads_other_databases() {
+    let _serial = SERIAL.lock().await;
+    let (_c, port) = start_mssql().await;
+    let cfg = conn_cfg(port);
+    let pool = build_pool(&cfg, 4).await.expect("pool");
+    exec(
+        &pool,
+        "CREATE TABLE dbo.t (id INT PRIMARY KEY, name NVARCHAR(255))",
+    )
+    .await;
+    exec(&pool, "INSERT INTO dbo.t (id, name) VALUES (1, 'old_a')").await;
+    exec(
+        &pool,
+        "CREATE TABLE dbo.kid (cid INT PRIMARY KEY, a INT NULL, b INT NULL, \
+         CONSTRAINT fk_kid_t FOREIGN KEY (a) REFERENCES dbo.t (id))",
+    )
+    .await;
+    exec(&pool, "INSERT INTO dbo.kid (cid, a) VALUES (1, NULL)").await;
+
+    // The NO ACTION key references nothing: the overwrite runs.
+    let sink = MssqlSink::new(overwrite_cfg(&cfg)).await.expect("sink");
+    sink.begin_overwrite()
+        .await
+        .expect("begin, key unreferenced");
+    sink.write_batch(&[json!({"id": 2, "name": "new_b"})])
+        .await
+        .expect("write");
+    sink.commit_overwrite().await.expect("commit");
+    assert_eq!(names(&pool, "dbo.t").await, vec!["new_b"]);
+
+    // A child row now references the target: refused at begin.
+    exec(&pool, "INSERT INTO dbo.kid (cid, a) VALUES (2, 2)").await;
+    let sink = MssqlSink::new(overwrite_cfg(&cfg)).await.expect("sink");
+    let err = sink.begin_overwrite().await.unwrap_err().to_string();
+    assert!(
+        err.contains("is referenced by a foreign key from dbo.kid"),
+        "{err}"
+    );
+    assert_eq!(names(&pool, "dbo.t").await, vec!["new_b"]);
+
+    // A cascading key in another database.
+    exec(&pool, "CREATE DATABASE otherdb").await;
+    exec(
+        &pool,
+        "EXEC otherdb.sys.sp_executesql N'CREATE TABLE dbo.customers \
+         (id INT PRIMARY KEY, name NVARCHAR(255))'",
+    )
+    .await;
+    exec(
+        &pool,
+        "EXEC otherdb.sys.sp_executesql N'CREATE TABLE dbo.orders (oid INT PRIMARY KEY, \
+         cid INT NULL REFERENCES dbo.customers (id) ON DELETE CASCADE)'",
+    )
+    .await;
+    let mut other = overwrite_cfg(&cfg);
+    other.table = "otherdb.dbo.customers".into();
+    let sink = MssqlSink::new(other).await.expect("sink");
+    let err = sink.begin_overwrite().await.unwrap_err().to_string();
+    assert!(
+        err.contains("is referenced by a foreign key from otherdb.dbo.orders"),
+        "{err}"
+    );
+}

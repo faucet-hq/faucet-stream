@@ -9,11 +9,9 @@
 //! Each test starts its own emulator container and holds the handle until it
 //! returns, so the container is stopped and removed when the test ends —
 //! testcontainers-rs has no reaper, so a forgotten handle is a leaked
-//! container. `PUBSUB_EMULATOR_HOST` is process-global (the SDK's
-//! `ClientConfig::default()` — used both by the setup client here and by the
-//! connector's `build_client` — reads it and switches to the emulator
-//! environment, no auth), so the tests are serialized by [`EMULATOR_LOCK`] and
-//! the variable is rewritten under that lock for each test's own port.
+//! container. Every client — the setup client here and the connector's — gets
+//! the emulator host on its own config, so no test writes the process
+//! environment; [`EMULATOR_LOCK`] runs one emulator at a time.
 
 use faucet_common_pubsub::PubsubMessage;
 use faucet_core::{CheckContext, Source};
@@ -32,8 +30,7 @@ use testcontainers_modules::testcontainers::ContainerAsync;
 /// they would address different `projects/<id>/…` namespaces.
 const PROJECT: &str = "faucet-test";
 
-/// Serializes the tests: `PUBSUB_EMULATOR_HOST` is one process-wide variable
-/// and each test's emulator listens on its own mapped port.
+/// Runs one emulator container at a time.
 static EMULATOR_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// One test's Pub/Sub emulator: the container (stopped + removed on drop),
@@ -44,9 +41,8 @@ struct Emulator {
     _guard: MutexGuard<'static, ()>,
 }
 
-/// Start an emulator for the calling test and point `PUBSUB_EMULATOR_HOST` at
-/// it. Held for the test's lifetime; dropping it stops the container and lets
-/// the next test start.
+/// Start an emulator for the calling test. Held for the test's lifetime;
+/// dropping it stops the container and lets the next test start.
 async fn emulator() -> Emulator {
     let guard = EMULATOR_LOCK.lock().await;
     let container = faucet_conformance::containers::start(CloudSdk::pubsub).await;
@@ -55,12 +51,6 @@ async fn emulator() -> Emulator {
         .await
         .expect("pubsub emulator host port");
     let host = format!("127.0.0.1:{port}");
-    // SAFETY: every reader of this variable in the process is one of these
-    // tests, and they hold `EMULATOR_LOCK` while running; nothing reads it
-    // concurrently with this write.
-    unsafe {
-        std::env::set_var("PUBSUB_EMULATOR_HOST", &host);
-    }
     Emulator {
         _container: container,
         host,
@@ -68,13 +58,16 @@ async fn emulator() -> Emulator {
     }
 }
 
-/// A setup/admin client pointed at the emulator, scoped to `PROJECT`.
-async fn setup_client() -> Client {
+/// A setup/admin client pointed at this test's emulator, scoped to
+/// `PROJECT`. The emulator host is passed on the client's own config, never
+/// through `PUBSUB_EMULATOR_HOST`, so no test writes the process environment.
+async fn setup_client(host: &str) -> Client {
     // `ClientConfig` is `#[non_exhaustive]`, so struct-update syntax is
-    // unavailable — reassign the one field we need after `default()`.
+    // unavailable — reassign the fields we need after `default()`.
     #[allow(clippy::field_reassign_with_default)]
     let config = {
-        let mut config = ClientConfig::default(); // reads PUBSUB_EMULATOR_HOST
+        let mut config = ClientConfig::default();
+        config.environment = gcloud_gax::conn::Environment::Emulator(host.to_string());
         config.project_id = Some(PROJECT.to_string());
         config
     };
@@ -139,7 +132,7 @@ async fn publish(client: &Client, topic_id: &str, messages: Vec<PubsubMessage>) 
 async fn source_json_multipage_attributes_and_check() {
     let emu = emulator().await;
     let host = emu.host.as_str();
-    let client = setup_client().await;
+    let client = setup_client(host).await;
     create_topic_sub(&client, "src-json-t", "src-json-s").await;
     publish(
         &client,
@@ -197,7 +190,7 @@ async fn source_json_multipage_attributes_and_check() {
 async fn source_value_format_string() {
     let emu = emulator().await;
     let host = emu.host.as_str();
-    let client = setup_client().await;
+    let client = setup_client(host).await;
     create_topic_sub(&client, "src-str-t", "src-str-s").await;
     publish(
         &client,
@@ -233,7 +226,7 @@ async fn source_value_format_string() {
 async fn source_value_format_bytes() {
     let emu = emulator().await;
     let host = emu.host.as_str();
-    let client = setup_client().await;
+    let client = setup_client(host).await;
     create_topic_sub(&client, "src-bytes-t", "src-bytes-s").await;
     publish(&client, "src-bytes-t", vec![msg(&[1, 2, 3], &[], "")]).await;
 
@@ -256,7 +249,7 @@ async fn source_value_format_bytes() {
 async fn on_decode_error_skips_or_keeps_the_raw_payload() {
     let emu = emulator().await;
     let host = emu.host.as_str();
-    let client = setup_client().await;
+    let client = setup_client(host).await;
     create_topic_sub(&client, "dec-t", "dec-skip").await;
     let topic = client.topic("dec-t");
     client
@@ -316,7 +309,7 @@ async fn on_decode_error_skips_or_keeps_the_raw_payload() {
 async fn held_messages_are_not_redelivered_while_a_page_is_assembled() {
     let emu = emulator().await;
     let host = emu.host.as_str();
-    let client = setup_client().await;
+    let client = setup_client(host).await;
     let topic = client
         .create_topic("lease-t", None, None)
         .await
@@ -371,7 +364,7 @@ async fn held_messages_are_not_redelivered_while_a_page_is_assembled() {
 async fn max_messages_strands_no_pulled_tail() {
     let emu = emulator().await;
     let host = emu.host.as_str();
-    let client = setup_client().await;
+    let client = setup_client(host).await;
     create_topic_sub(&client, "src-max-t", "src-max-s").await;
     publish(
         &client,
@@ -411,7 +404,7 @@ async fn max_messages_strands_no_pulled_tail() {
 async fn pulls_and_acks_are_counted_on_the_installed_recorder() {
     let emu = emulator().await;
     let host = emu.host.as_str();
-    let client = setup_client().await;
+    let client = setup_client(host).await;
     create_topic_sub(&client, "src-rec-t", "src-rec-s").await;
     publish(&client, "src-rec-t", vec![msg(b"{\"a\":1}", &[], "")]).await;
 

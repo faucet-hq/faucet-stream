@@ -169,7 +169,10 @@ async fn bootstrap_marker(
 /// The snapshot finished: seed the CDC bookmark from the marker's position
 /// (the one the snapshot was taken against, whatever another process may have
 /// written to the bookmark since) and mark the hand-off — refusing when the
-/// marker changed under this process.
+/// marker changed under this process. The marker is claimed before the
+/// bookmark is touched, so a process that lost the race never rewinds the
+/// bookmark of the one that won. The claim keeps `snapshot_done: false`, so a
+/// crash before the hand-off completes redoes the snapshot.
 async fn hand_off_to_cdc(
     store: &dyn faucet_core::StateStore,
     marker_k: &str,
@@ -177,6 +180,26 @@ async fn hand_off_to_cdc(
     marker: &ReplicationState,
     marker_raw: Option<&serde_json::Value>,
 ) -> CliResult<()> {
+    let changed = || {
+        CliError::Config(format!(
+            "mirror: the phase marker `{marker_k}` changed while this process ran the \
+             snapshot — another mirror process is running this pipeline"
+        ))
+    };
+    // Any value other than the one read: alternate the phase of the pending
+    // marker so a retried hand-off also differs from what it read.
+    let claim = ReplicationState {
+        phase: match marker.phase {
+            Phase::Cdc => Phase::Snapshot,
+            Phase::Snapshot => Phase::Cdc,
+        },
+        snapshot_done: false,
+        position: marker.position.clone(),
+    }
+    .to_value()?;
+    if !store.compare_and_put(marker_k, marker_raw, &claim).await? {
+        return Err(changed());
+    }
     store.put(cdc_k, &marker.position).await?;
     let done = ReplicationState {
         phase: Phase::Cdc,
@@ -184,11 +207,8 @@ async fn hand_off_to_cdc(
         position: marker.position.clone(),
     }
     .to_value()?;
-    if !store.compare_and_put(marker_k, marker_raw, &done).await? {
-        return Err(CliError::Config(format!(
-            "mirror: the phase marker `{marker_k}` changed while this process ran the \
-             snapshot — another mirror process is running this pipeline"
-        )));
+    if !store.compare_and_put(marker_k, Some(&claim), &done).await? {
+        return Err(changed());
     }
     Ok(())
 }
@@ -431,12 +451,36 @@ mod tests {
         );
         let done = ReplicationState::from_value(store.get(m).await.unwrap().unwrap()).unwrap();
         assert!(done.snapshot_done);
-        // A second hand-off against the stale marker is refused.
+        // A second hand-off against the stale marker is refused, and leaves
+        // the bookmark the winner's CDC has since advanced alone.
+        store.put(c, &serde_json::json!("0/950")).await.unwrap();
         assert!(
             hand_off_to_cdc(&store, m, c, &marker, raw.as_ref())
                 .await
                 .is_err()
         );
+        assert_eq!(
+            store.get(c).await.unwrap(),
+            Some(serde_json::json!("0/950"))
+        );
+        // A hand-off interrupted after its claim leaves a marker that redoes
+        // the snapshot, and a retry against that marker completes.
+        let pending = ReplicationState {
+            phase: Phase::Cdc,
+            snapshot_done: false,
+            position: serde_json::json!("0/100"),
+        };
+        store.put(m, &pending.to_value().unwrap()).await.unwrap();
+        assert_eq!(
+            crate::replication::state::plan_from_marker(Some(&pending)),
+            crate::replication::state::Plan::ResumeSnapshot
+        );
+        let raw = store.get(m).await.unwrap();
+        hand_off_to_cdc(&store, m, c, &pending, raw.as_ref())
+            .await
+            .unwrap();
+        let done = ReplicationState::from_value(store.get(m).await.unwrap().unwrap()).unwrap();
+        assert!(done.snapshot_done && done.phase == Phase::Cdc);
     }
     use super::*;
     use crate::config::ConnectorSpec;

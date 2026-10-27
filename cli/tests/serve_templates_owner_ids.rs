@@ -11,13 +11,9 @@ use faucet_cli::cli::ServeArgs;
 use faucet_cli::serve::config::ServeConfig;
 use serde_json::{Value, json};
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+#[path = "support/ports.rs"]
+mod ports;
+use ports::free_port;
 
 fn args(port: u16) -> ServeArgs {
     ServeArgs {

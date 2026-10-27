@@ -17,6 +17,16 @@ pub const SWAP_MARKER: &str = ".faucet-swap";
 /// place. It lists them, one name per line, so an interrupted move can be
 /// finished.
 pub const COMMIT_MARKER: &str = ".faucet-commit";
+/// The first line of a [`COMMIT_MARKER`]: `#faucet-commit <seq> <written>`,
+/// the commit's sequence (ordering commits of one output) and the Unix
+/// second the marker was written (its owner's lease). A marker an earlier
+/// release wrote has no such line.
+const COMMIT_HEADER: &str = "#faucet-commit ";
+/// How long after its commit marker was written another run may take over a
+/// commit that has not finished: until then its owner counts as alive. An
+/// owner still moving files after a takeover finishes without error, since
+/// every move tolerates a file already moved.
+pub const COMMIT_LEASE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 /// Files moved or deleted at once when an overwrite run's files are moved
 /// into place.
 const SWAP_CONCURRENCY: usize = 8;
@@ -357,9 +367,9 @@ impl FileWriter {
     /// At a tokened begin: drop the untokened swap area (an earlier
     /// release's, or a run's without a token) and every tokened one another
     /// run abandoned ([`faucet_core::idempotency::overwrite_run_abandoned`]).
-    /// A live run's area and this run's own are never touched. An interrupted
-    /// move such an area recorded is not finished: this run replaces every
-    /// file of the template when it commits.
+    /// A live run's area and this run's own are never touched. A move such an
+    /// area recorded was finished first by
+    /// [`finish_other_runs_moves`](Self::finish_other_runs_moves).
     async fn sweep_swap_areas(&self) -> Result<(), FaucetError> {
         let Some(own) = self.overwrite_run.get() else {
             return Ok(());
@@ -839,6 +849,7 @@ impl FileWriter {
     pub async fn begin_overwrite(&self) -> Result<(), FaucetError> {
         self.backend.prepare(Area::Destination).await?;
         self.finish_interrupted_move().await?;
+        self.finish_other_runs_moves().await?;
         self.clear_swap().await?;
         self.sweep_swap_areas().await?;
         self.backend.prepare(Area::Swap).await?;
@@ -848,11 +859,22 @@ impl FileWriter {
     /// `write_mode: overwrite`: move every file in the swap area into place,
     /// delete this template's files the run did not write, and drop the swap
     /// area. The files to move are recorded first, so a move that stops
-    /// half-way is finished by the next commit, abort or run.
+    /// half-way is finished by the next commit, abort or run — unless a later
+    /// commit of the same output finished first, which the commit ledger
+    /// records.
     pub async fn commit_overwrite(&self) -> Result<(), FaucetError> {
         self.backend.settle().await?;
-        if self.finish_interrupted_move().await? {
-            return Ok(());
+        match self.finish_interrupted_move().await? {
+            OwnMove::None => {}
+            OwnMove::Finished => return Ok(()),
+            OwnMove::Superseded => {
+                return Err(FaucetError::Sink(format!(
+                    "file sink: this run's earlier commit into '{}' stopped half-way and a later \
+                     overwrite of the same output finished since, so this run's files were \
+                     discarded; the destination holds the later run's output",
+                    self.backend.describe(Area::Destination, "")
+                )));
+            }
         }
         if !self.backend.exists(Area::Swap, SWAP_MARKER).await? {
             return Err(FaucetError::Sink(format!(
@@ -867,8 +889,29 @@ impl FileWriter {
             .into_iter()
             .map(|(_, n)| n)
             .collect();
-        self.put_marker(COMMIT_MARKER, &names.join("\n")).await?;
-        self.move_into_place(names).await
+        let seq = self.next_commit_seq().await?;
+        let marker = CommitMarker {
+            seq,
+            written: Some(unix_secs()),
+            names,
+        };
+        self.put_marker(COMMIT_MARKER, &marker.render()).await?;
+        let result = self.move_into_place(marker.seq, marker.names.clone()).await;
+        if result.is_err() {
+            self.release_marker(marker).await;
+        }
+        result
+    }
+
+    /// After this run's move into place failed: rewrite its commit marker
+    /// without an owner, so the next run finishes the move at once instead
+    /// of waiting out [`COMMIT_LEASE`]. Best effort: a failed rewrite only
+    /// leaves the lease to expire.
+    async fn release_marker(&self, mut marker: CommitMarker) {
+        marker.written = Some(0);
+        if let Err(e) = self.put_marker(COMMIT_MARKER, &marker.render()).await {
+            tracing::warn!(error = %e, "file sink: could not release the overwrite commit marker");
+        }
     }
 
     /// `write_mode: overwrite`: discard the open file and the swap area. A
@@ -877,9 +920,10 @@ impl FileWriter {
     pub async fn abort_overwrite(&self) -> Result<(), FaucetError> {
         self.discard().await;
         self.backend.cancel().await;
-        if self.finish_interrupted_move().await? {
+        if self.finish_interrupted_move().await? != OwnMove::None {
             return Ok(());
         }
+        self.finish_other_runs_moves().await?;
         self.clear_swap().await
     }
 
@@ -918,10 +962,167 @@ impl FileWriter {
         self.backend.settle().await
     }
 
-    /// Finish the move a commit started, when its marker is there.
-    async fn finish_interrupted_move(&self) -> Result<bool, FaucetError> {
+    /// The sequence of the last overwrite commit of this output that
+    /// finished, from the commit ledger; `None` when none is recorded.
+    async fn last_commit_seq(&self) -> Result<Option<u128>, FaucetError> {
+        Ok(self
+            .backend
+            .read_commit_record()
+            .await?
+            .and_then(|t| t.trim().parse::<u128>().ok()))
+    }
+
+    /// Record that the commit with sequence `seq` finished, unless the ledger
+    /// already holds a later one.
+    async fn record_commit(&self, seq: u128) -> Result<(), FaucetError> {
+        if self
+            .last_commit_seq()
+            .await?
+            .is_some_and(|last| last >= seq)
+        {
+            return Ok(());
+        }
+        self.backend.write_commit_record(&seq.to_string()).await
+    }
+
+    /// The sequences of the commit markers other runs' swap areas hold (the
+    /// untokened area's included).
+    async fn other_commit_seqs(&self) -> Result<Vec<u128>, FaucetError> {
+        let own = self.overwrite_run.get();
+        let mut runs: Vec<Option<String>> = Vec::new();
+        if own.is_some() {
+            runs.push(None);
+        }
+        runs.extend(
+            self.backend
+                .swap_runs()
+                .await?
+                .into_iter()
+                .filter(|t| Some(t) != own)
+                .map(Some),
+        );
+        let mut seqs = Vec::new();
+        for run in runs {
+            if let Some(text) = self
+                .backend
+                .read_swap_run_marker(run.as_deref(), COMMIT_MARKER)
+                .await?
+            {
+                seqs.push(CommitMarker::parse(&text).seq);
+            }
+        }
+        Ok(seqs)
+    }
+
+    /// A sequence for a commit starting now: later than the last finished
+    /// commit and than every commit marker another run left, and otherwise
+    /// the wall clock in nanoseconds. So a commit that starts after another
+    /// one stopped half-way always orders after it, whatever the clocks.
+    async fn next_commit_seq(&self) -> Result<u128, FaucetError> {
+        let floor = self
+            .other_commit_seqs()
+            .await?
+            .into_iter()
+            .chain(self.last_commit_seq().await?)
+            .max()
+            .unwrap_or(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        Ok(now.max(floor.saturating_add(1)))
+    }
+
+    /// At a tokened begin or abort: settle the commits other runs recorded
+    /// ([`COMMIT_MARKER`] in their swap areas, or in the untokened area an
+    /// earlier release used) and never finished. Only a commit whose owner is
+    /// gone — its marker older than [`COMMIT_LEASE`], or one an earlier
+    /// release wrote — is touched. Of those, the newest is finished when no
+    /// later commit has finished since (the commit ledger) and no live commit
+    /// is newer; every other one is dropped without moving its files, so the
+    /// destination never goes back to an older run's output. A crashed
+    /// commit would otherwise leave the destination part old, part new until
+    /// the next successful overwrite, since every run stages in an area of
+    /// its own.
+    async fn finish_other_runs_moves(&self) -> Result<(), FaucetError> {
+        let Some(own) = self.overwrite_run.get() else {
+            return Ok(());
+        };
+        let mut runs: Vec<Option<String>> = vec![None];
+        runs.extend(
+            self.backend
+                .swap_runs()
+                .await?
+                .into_iter()
+                .filter(|t| t != own)
+                .map(Some),
+        );
+        let now = unix_secs();
+        let mut gone: Vec<(Option<String>, CommitMarker)> = Vec::new();
+        let mut newest_live: Option<u128> = None;
+        for run in runs {
+            let Some(text) = self
+                .backend
+                .read_swap_run_marker(run.as_deref(), COMMIT_MARKER)
+                .await?
+            else {
+                continue;
+            };
+            let marker = CommitMarker::parse(&text);
+            if marker.owner_alive(now) {
+                newest_live = newest_live.max(Some(marker.seq));
+            } else {
+                gone.push((run, marker));
+            }
+        }
+        gone.sort_by_key(|g| std::cmp::Reverse(g.1.seq));
+        let last = self.last_commit_seq().await?;
+        for (i, (run, marker)) in gone.into_iter().enumerate() {
+            let run = run.as_deref();
+            let newest = i == 0
+                && last.is_none_or(|l| marker.seq > l)
+                && newest_live.is_none_or(|l| marker.seq > l);
+            if newest {
+                tracing::warn!(
+                    run = run.unwrap_or("untokened"),
+                    files = marker.names.len(),
+                    "file sink: finishing another overwrite run's move into place that stopped half-way"
+                );
+                let staged: std::collections::HashSet<String> =
+                    self.backend.list_swap_run(run).await?.into_iter().collect();
+                let to_move: Vec<String> = marker
+                    .names
+                    .iter()
+                    .filter(|n| staged.contains(n.as_str()))
+                    .cloned()
+                    .collect();
+                let moves = stream::iter(to_move)
+                    .map(|name| async move { self.backend.promote_from_swap_run(run, &name).await })
+                    .buffer_unordered(SWAP_CONCURRENCY)
+                    .collect::<Vec<_>>()
+                    .await;
+                moves.into_iter().collect::<Result<Vec<()>, _>>()?;
+                self.delete_unlisted(&marker.names).await?;
+                self.record_commit(marker.seq).await?;
+            } else {
+                tracing::warn!(
+                    run = run.unwrap_or("untokened"),
+                    files = marker.names.len(),
+                    "file sink: dropping another overwrite run's move into place that stopped \
+                     half-way, since a later commit of this output replaced it"
+                );
+            }
+            self.backend.drop_swap_run(run).await?;
+        }
+        Ok(())
+    }
+
+    /// Finish the move this run's commit started, when its marker is there:
+    /// [`OwnMove::Superseded`] (and the area dropped) when a later commit of
+    /// the output has finished since.
+    async fn finish_interrupted_move(&self) -> Result<OwnMove, FaucetError> {
         if !self.backend.exists(Area::Swap, COMMIT_MARKER).await? {
-            return Ok(false);
+            return Ok(OwnMove::None);
         }
         let to = self.backend.scratch_path(Area::Swap, COMMIT_MARKER);
         self.backend.fetch(Area::Swap, COMMIT_MARKER, &to).await?;
@@ -930,21 +1131,34 @@ impl FileWriter {
         let text = text.map_err(|e| {
             FaucetError::Sink(format!("file sink: reading the overwrite marker: {e}"))
         })?;
-        let names: Vec<String> = text
-            .lines()
-            .filter(|l| !l.is_empty())
-            .map(String::from)
-            .collect();
+        let marker = CommitMarker::parse(&text);
+        if self
+            .last_commit_seq()
+            .await?
+            .is_some_and(|last| last > marker.seq)
+        {
+            tracing::warn!(
+                area = %self.backend.describe(Area::Swap, ""),
+                "file sink: dropping this run's overwrite that stopped while moving its files into \
+                 place, since a later commit of this output finished"
+            );
+            self.clear_swap().await?;
+            self.backend.delete(Area::Swap, COMMIT_MARKER).await?;
+            return Ok(OwnMove::Superseded);
+        }
         tracing::warn!(
             area = %self.backend.describe(Area::Swap, ""),
-            files = names.len(),
+            files = marker.names.len(),
             "file sink: finishing an overwrite that stopped while moving its files into place"
         );
-        self.move_into_place(names).await?;
-        Ok(true)
+        if let Err(e) = self.move_into_place(marker.seq, marker.names.clone()).await {
+            self.release_marker(marker).await;
+            return Err(e);
+        }
+        Ok(OwnMove::Finished)
     }
 
-    async fn move_into_place(&self, names: Vec<String>) -> Result<(), FaucetError> {
+    async fn move_into_place(&self, seq: u128, names: Vec<String>) -> Result<(), FaucetError> {
         let staged: std::collections::HashSet<String> =
             self.backend.list(Area::Swap).await?.into_iter().collect();
         let to_move: Vec<String> = names
@@ -953,11 +1167,41 @@ impl FileWriter {
             .cloned()
             .collect();
         let moves = stream::iter(to_move)
-            .map(|name| async move { self.backend.promote(&name).await })
+            .map(|name| async move { self.promote_own(&name).await })
             .buffer_unordered(SWAP_CONCURRENCY)
             .collect::<Vec<_>>()
             .await;
         moves.into_iter().collect::<Result<Vec<()>, _>>()?;
+        self.delete_unlisted(&names).await?;
+        // Only an unfinished commit another run left can be replayed over
+        // this one later, so the ledger is kept once one has been seen.
+        if !self.other_commit_seqs().await?.is_empty() || self.last_commit_seq().await?.is_some() {
+            self.record_commit(seq).await?;
+        }
+        self.clear_swap().await?;
+        self.backend.delete(Area::Swap, COMMIT_MARKER).await
+    }
+
+    /// Move `name` from this run's swap area into place. A file another run
+    /// already moved (it took over this commit after [`COMMIT_LEASE`]) is
+    /// not an error.
+    async fn promote_own(&self, name: &str) -> Result<(), FaucetError> {
+        match self.backend.promote(name).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if !self.backend.exists(Area::Swap, name).await?
+                    && self.backend.exists(Area::Destination, name).await?
+                {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    /// Delete this template's destination files not in `names`.
+    async fn delete_unlisted(&self, names: &[String]) -> Result<(), FaucetError> {
         let kept: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
         let stale: Vec<String> = self
             .existing(Area::Destination)
@@ -966,9 +1210,7 @@ impl FileWriter {
             .map(|(_, n)| n)
             .filter(|n| !kept.contains(n.as_str()))
             .collect();
-        self.delete_all(Area::Destination, stale).await?;
-        self.clear_swap().await?;
-        self.backend.delete(Area::Swap, COMMIT_MARKER).await
+        self.delete_all(Area::Destination, stale).await
     }
 
     /// Delete everything in the swap area but the commit marker, the swap
@@ -991,6 +1233,72 @@ impl FileWriter {
         }
         self.backend.delete_many(area, &names).await
     }
+}
+
+/// What [`FileWriter`]'s own interrupted commit came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnMove {
+    /// No commit of this run had started.
+    None,
+    /// Its move into place was finished now.
+    Finished,
+    /// A later commit of the output finished first; the area was dropped.
+    Superseded,
+}
+
+/// A parsed [`COMMIT_MARKER`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommitMarker {
+    /// The commit's sequence; 0 for a marker an earlier release wrote.
+    seq: u128,
+    /// The Unix second it was written; `None` for an earlier release's.
+    written: Option<u64>,
+    /// The files the commit moves into place.
+    names: Vec<String>,
+}
+
+impl CommitMarker {
+    fn parse(text: &str) -> Self {
+        let mut lines = text.lines().peekable();
+        let mut seq = 0;
+        let mut written = None;
+        if let Some(header) = lines.peek().and_then(|l| l.strip_prefix(COMMIT_HEADER)) {
+            let mut fields = header.split_whitespace();
+            seq = fields.next().and_then(|f| f.parse().ok()).unwrap_or(0);
+            written = fields.next().and_then(|f| f.parse().ok());
+            lines.next();
+        }
+        Self {
+            seq,
+            written,
+            names: lines.filter(|l| !l.is_empty()).map(String::from).collect(),
+        }
+    }
+
+    fn render(&self) -> String {
+        let mut out = format!(
+            "{COMMIT_HEADER}{} {}\n",
+            self.seq,
+            self.written.unwrap_or(0)
+        );
+        out.push_str(&self.names.join("\n"));
+        out
+    }
+
+    /// Whether the run that wrote it may still be moving its files: written
+    /// less than [`COMMIT_LEASE`] before `now`, or after it (another host's
+    /// fast clock). An earlier release's marker has no owner left.
+    fn owner_alive(&self, now: u64) -> bool {
+        self.written
+            .is_some_and(|w| w > now || now - w < COMMIT_LEASE.as_secs())
+    }
+}
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// What the next write needs of the published file.

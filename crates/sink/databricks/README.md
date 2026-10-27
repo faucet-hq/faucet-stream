@@ -150,7 +150,7 @@ need the crate's `staging` feature.
   token shared by the run's begin, writer and commit instances, so a concurrent
   overwrite of the same table neither drops nor shares it; a tokened `begin` also
   drops the untokened `<table>__faucet_ovw`, and another run's staging only once
-  its token is more than 24 hours old (an abandoned crash). Without a token the
+  its token is more than 7 days old (an abandoned crash). Without a token the
   staging is `<table>__faucet_ovw`, and the `faucet status --probe` check also
   reports any run's tokened staging (from `information_schema.tables`); every page lands in it; `commit` runs one
   `INSERT OVERWRITE TABLE t SELECT * FROM <staging>` (with an explicit column

@@ -158,7 +158,7 @@ when the config loads.
 | Source | Token in the query | Notes |
 |---|---|---|
 | `postgres`, `redshift`, `databricks` | `${bookmark}` | redshift casts it to the cursor column's type, read by describing the query |
-| `mysql`, `mssql`, `clickhouse` | `@bookmark` | `mssql`: the query must not end in a top-level `ORDER BY` (T-SQL refuses one in a derived table). `clickhouse`: an RFC 3339 bookmark is compared as `parseDateTime64BestEffort(…)` |
+| `mysql`, `mssql`, `clickhouse` | `@bookmark` | `mssql`: the query must not have a top-level `ORDER BY` (without `TOP` / `OFFSET`) or start with a CTE (`WITH …`), and every column must be named — T-SQL refuses those in a derived table, and `faucet validate` refuses the first two; put the token in a subquery or join instead. `clickhouse`: an RFC 3339 bookmark is compared as `parseDateTime64BestEffort(…)` |
 | `oracle` | `:bookmark` | bound as a named bind variable |
 | `spanner` | `@bookmark` | binds by its JSON type, so cast it in your query (`TIMESTAMP(@bookmark)`); the outer filter casts to the column type for you |
 

@@ -1,0 +1,10 @@
+# Without a configured salt the annotation still never carries the token's
+# bare sha256: a random salt is minted and kept in the auth Secret.
+# expect: checksum/serve-auth:
+# expect: checksum-salt:
+# expect-not: 467f61fcb0f1734bee6b3ee9933e43700c39357e00f420f70318239d2a128f34
+serve:
+  enabled: true
+  auth:
+    mode: token
+    token: rotate-me

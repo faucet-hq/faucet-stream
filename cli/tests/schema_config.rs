@@ -168,6 +168,25 @@ fn committed_schema_covers_current_build() {
     }
 }
 
+/// Under the `full` build (every feature, which is what generates the
+/// committed file) the other direction holds too: every node of the committed
+/// schema must still be emitted, so a removed field, enum value or connector
+/// cannot linger in `schemas/faucet.schema.json`.
+#[cfg(feature = "full")]
+#[test]
+fn committed_schema_has_nothing_the_full_build_dropped() {
+    let current = config_schema();
+    let committed: Value = serde_json::from_str(include_str!("../../schemas/faucet.schema.json"))
+        .expect("committed schema parses");
+    if let Err(path) = is_subset(&committed, &current, String::new()) {
+        panic!(
+            "schemas/faucet.schema.json still carries `{path}`, which the full build no longer \
+             emits — regenerate with \
+             `cargo run --all-features -- schema config > schemas/faucet.schema.json`"
+        );
+    }
+}
+
 /// Every node in `sub` must be present (deep-equal) in `sup`. Returns the JSON
 /// pointer of the first divergence on failure.
 fn is_subset(sub: &Value, sup: &Value, path: String) -> Result<(), String> {

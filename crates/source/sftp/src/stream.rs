@@ -15,7 +15,6 @@ use futures::stream::StreamExt;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::pin::Pin;
-use tokio::io::AsyncBufReadExt;
 
 /// One remote file's payload, fetched in the shape its `format` decodes from.
 ///
@@ -498,8 +497,13 @@ impl faucet_core::Source for SftpSource {
                 };
                 match payload {
                     Fetched::Lines(handle) => {
-                        let reader = tokio::io::BufReader::new(reads.reader(handle));
-                        let mut lines = reader.lines();
+                        // One line is bounded by `max_object_bytes`, so a
+                        // file with no newline fails instead of being
+                        // buffered whole.
+                        let mut lines = faucet_core::file_format::capped_lines(
+                            reads.reader(handle),
+                            self.config.max_object_bytes,
+                        );
                         let mut line_num = 0usize;
                         while let Some(line) = lines.next_line().await.map_err(|e| {
                             FaucetError::Source(format!("SFTP read '{file}' failed: {e}"))

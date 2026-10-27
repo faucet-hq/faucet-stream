@@ -298,11 +298,21 @@ impl Sink for TestSink {
         *self.write_calls.lock().unwrap() += records.len();
         match &self.key_field {
             Some(field) => {
+                // Resolve every key before touching the map, so a page with a
+                // keyless record writes nothing (the page is atomic).
+                let keys = records
+                    .iter()
+                    .map(|r| {
+                        r.get(field)
+                            .filter(|v| !v.is_null())
+                            .map(|v| v.to_string())
+                            .ok_or_else(|| {
+                                FaucetError::Sink(format!("record missing key `{field}`"))
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
                 let mut map = self.keyed.lock().unwrap();
-                for r in records {
-                    let key = r.get(field).map(|v| v.to_string()).ok_or_else(|| {
-                        FaucetError::Sink(format!("record missing key `{field}`"))
-                    })?;
+                for (r, key) in records.iter().zip(keys) {
                     // A delete-marked record removes its keyed row (upsert
                     // sinks with a `delete_marker`); otherwise insert/overwrite.
                     if self.is_delete_marked(r) {
@@ -343,14 +353,16 @@ impl Sink for TestSink {
         scope: &str,
         token: &str,
     ) -> Result<usize, FaucetError> {
-        // Store the token opaquely (last-write-wins). Monotonicity is enforced
-        // by the pipeline via `last_committed_token`, not by the sink — the
-        // double models a real atomic-watermark commit faithfully.
+        // Rows first, token only once they landed: the page and its watermark
+        // commit together or not at all (a failed page leaves the previous
+        // token). The token is stored opaquely (last-write-wins); monotonicity
+        // is enforced by the pipeline via `last_committed_token`.
+        let written = self.write_batch(records).await?;
         self.tokens
             .lock()
             .unwrap()
             .insert(scope.to_string(), token.to_string());
-        self.write_batch(records).await
+        Ok(written)
     }
 
     async fn last_committed_token(&self, scope: &str) -> Result<Option<String>, FaucetError> {
@@ -1276,6 +1288,28 @@ mod tests {
     use futures::StreamExt;
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn a_failed_idempotent_page_commits_neither_rows_nor_token() {
+        let sink = TestSink::idempotent("id");
+        sink.write_batch_idempotent(&[json!({"id": 1})], "s", "0001")
+            .await
+            .unwrap();
+        let err = sink
+            .write_batch_idempotent(&[json!({"id": 2}), json!({"v": 3})], "s", "0002")
+            .await;
+        assert!(err.is_err());
+        assert_eq!(
+            sink.last_committed_token("s").await.unwrap().as_deref(),
+            Some("0001"),
+            "the failed page must not advance the watermark"
+        );
+        assert_eq!(
+            sink.keyed.lock().unwrap().len(),
+            1,
+            "no row of the failed page landed"
+        );
+    }
 
     #[test]
     fn delete_marker_tracks_the_cdc_unwrap_default() {

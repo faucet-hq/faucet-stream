@@ -103,9 +103,10 @@ pub fn decode_value(
             })?;
             Ok(Value::Number(n.into()))
         }
-        (TypeCode::Float64 | TypeCode::Float32, Kind::NumberValue(f)) => {
-            Ok(faucet_core::fidelity::float64(*f))
-        }
+        // FLOAT32 travels as the f64 widening of the f32; render it through its
+        // single-precision shortest form so `0.1` stays `0.1` (#885).
+        (TypeCode::Float32, Kind::NumberValue(f)) => Ok(faucet_core::fidelity::float32(*f as f32)),
+        (TypeCode::Float64, Kind::NumberValue(f)) => Ok(faucet_core::fidelity::float64(*f)),
         // FLOAT64 NaN / Infinity / -Infinity arrive as strings; JSON has no
         // representation for them, so they become a counted `null` (#885).
         (TypeCode::Float64 | TypeCode::Float32, Kind::StringValue(s)) => {
@@ -211,6 +212,25 @@ mod tests {
             struct_type: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn float32_renders_single_precision_shortest_form() {
+        let widened = f64::from(0.1f32);
+        let v = decode_value(
+            &pv(Kind::NumberValue(widened)),
+            Some(&ty(TypeCode::Float32)),
+            "x",
+        )
+        .unwrap();
+        assert_eq!(v, json!(0.1));
+        let v = decode_value(
+            &pv(Kind::NumberValue(widened)),
+            Some(&ty(TypeCode::Float64)),
+            "x",
+        )
+        .unwrap();
+        assert_eq!(v, json!(widened), "FLOAT64 keeps its full value");
     }
 
     #[test]

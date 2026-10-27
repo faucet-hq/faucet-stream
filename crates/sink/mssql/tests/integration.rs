@@ -442,10 +442,23 @@ async fn review_862_unmatched_fields_widening_and_nested_text() {
         .into_first_result()
         .await
         .unwrap();
-    assert_eq!(
-        r[0].get::<&str, _>("v"),
-        Some("9007199254740993.0000000000")
+    // The widened column's scale is the dialect's choice; the stored value
+    // must survive it exactly, with that many fractional zeros.
+    let widened = faucet_common_sql::SqlDialect::widened_type_name(
+        &faucet_common_sql::dialects::Mssql,
+        Some(faucet_core::SqlBaseType::Integer),
+        faucet_core::SqlBaseType::Double,
     );
+    let scale: usize = widened
+        .trim_start_matches("DECIMAL(")
+        .trim_end_matches(')')
+        .split(',')
+        .nth(1)
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or_else(|| panic!("widened type {widened} has no scale"));
+    assert!(scale > 0, "{widened}");
+    let expected = format!("9007199254740993.{}", "0".repeat(scale));
+    assert_eq!(r[0].get::<&str, _>("v"), Some(expected.as_str()));
     assert_eq!(r[0].get::<i32, _>("n"), Some(0));
     drop(conn);
 

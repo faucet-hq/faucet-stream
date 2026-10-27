@@ -125,15 +125,20 @@ impl EventLog {
     /// This is the shape the core durability guarantee is stated in: a bookmark
     /// must never be persisted covering data the sink has not confirmed. A test
     /// asserts the returned counts against the data each bookmark claims.
+    ///
+    /// A plain write counts once the next flush succeeds (a buffering sink only
+    /// makes rows durable at flush). Rows pending when a flush fails never
+    /// count, even after a later successful flush: the failed flush may have
+    /// discarded them. An idempotent write commits its page atomically and
+    /// counts at once.
     pub fn writes_before_each_bookmark(&self) -> Vec<usize> {
-        let mut confirmed = 0usize;
+        let mut durable = Durable::default();
         let mut out = Vec::new();
         for e in self.events() {
-            match e {
-                Event::Write(n) | Event::IdempotentWrite { records: n, .. } => confirmed += n,
-                Event::StatePut { .. } => out.push(confirmed),
-                _ => {}
+            if let Event::StatePut { .. } = e {
+                out.push(durable.confirmed);
             }
+            durable.observe(&e);
         }
         out
     }
@@ -155,6 +160,29 @@ impl EventLog {
     }
 }
 
+/// Records a sink has made durable, as an event log shows them: plain writes
+/// wait for the next successful flush (a failed flush drops them), idempotent
+/// writes commit at once.
+#[derive(Debug, Default)]
+struct Durable {
+    pending: usize,
+    confirmed: usize,
+}
+
+impl Durable {
+    fn observe(&mut self, event: &Event) {
+        match event {
+            Event::Write(n) => self.pending += n,
+            Event::IdempotentWrite { records, .. } => self.confirmed += records,
+            Event::Flush => self.confirmed += std::mem::take(&mut self.pending),
+            // A failed flush may have discarded what it held: a later flush
+            // succeeding does not make those rows durable.
+            Event::FlushFailed => self.pending = 0,
+            _ => {}
+        }
+    }
+}
+
 /// Assert the core durability guarantee over an [`EventLog`]: **no bookmark is
 /// persisted before the sink confirmed the data that bookmark claims.**
 ///
@@ -170,23 +198,21 @@ pub fn assert_bookmarks_backed_by_writes(
     log: &EventLog,
     records_claimed: impl Fn(&Value) -> usize,
 ) {
-    let mut confirmed = 0usize;
+    let mut durable = Durable::default();
     for (i, event) in log.events().into_iter().enumerate() {
-        match event {
-            Event::Write(n) | Event::IdempotentWrite { records: n, .. } => confirmed += n,
-            Event::StatePut { ref value, .. } => {
-                let value = &faucet_core::state_version::peel_versioned(value);
-                let claimed = records_claimed(value);
-                assert!(
-                    claimed <= confirmed,
-                    "durability violated at event {i}: bookmark {value} claims {claimed} \
-                     records are durable, but only {confirmed} had been confirmed by the sink. \
-                     A resumed run would start after this bookmark and never re-read the \
-                     difference.\nfull log: {:?}",
-                    log.events()
-                );
-            }
-            _ => {}
+        durable.observe(&event);
+        let confirmed = durable.confirmed;
+        if let Event::StatePut { ref value, .. } = event {
+            let value = &faucet_core::state_version::peel_versioned(value);
+            let claimed = records_claimed(value);
+            assert!(
+                claimed <= confirmed,
+                "durability violated at event {i}: bookmark {value} claims {claimed} \
+                 records are durable, but only {confirmed} had been confirmed by the sink. \
+                 A resumed run would start after this bookmark and never re-read the \
+                 difference.\nfull log: {:?}",
+                log.events()
+            );
         }
     }
 }
@@ -945,7 +971,15 @@ mod tests {
         assert_eq!(log.records_written(), 5);
         // The guarantee shape: each bookmark is backed by that many confirmed
         // records.
-        assert_eq!(log.writes_before_each_bookmark(), vec![2, 5]);
+        // Unflushed plain writes are not durable yet, so neither bookmark is
+        // backed; after a flush the same writes count.
+        assert_eq!(log.writes_before_each_bookmark(), vec![0, 0]);
+        log.push(Event::Flush);
+        log.push(Event::StatePut {
+            key: "k".into(),
+            value: json!({"at": 5}),
+        });
+        assert_eq!(log.writes_before_each_bookmark(), vec![0, 0, 5]);
     }
 
     #[tokio::test]
@@ -1095,11 +1129,13 @@ mod tests {
     fn guarantee_holds_when_the_bookmark_follows_its_writes() {
         let log = EventLog::new();
         log.push(Event::Write(3));
+        log.push(Event::Flush);
         log.push(Event::StatePut {
             key: "k".into(),
             value: json!({"at": 3}),
         });
         log.push(Event::Write(2));
+        log.push(Event::Flush);
         log.push(Event::StatePut {
             key: "k".into(),
             value: json!({"at": 5}),
@@ -1120,6 +1156,51 @@ mod tests {
         });
         log.push(Event::Write(3));
         assert_bookmarks_backed_by_writes(&log, claims);
+    }
+
+    #[test]
+    #[should_panic(expected = "durability violated")]
+    fn guarantee_fails_when_the_bookmark_follows_a_failed_flush() {
+        let log = EventLog::new();
+        log.push(Event::Write(4));
+        log.push(Event::FlushFailed);
+        log.push(Event::StatePut {
+            key: "k".into(),
+            value: json!({"at": 4}),
+        });
+        assert_bookmarks_backed_by_writes(&log, claims);
+    }
+
+    #[test]
+    #[should_panic(expected = "durability violated")]
+    fn rows_a_failed_flush_held_are_not_credited_by_a_later_flush() {
+        let log = EventLog::new();
+        log.push(Event::Write(4));
+        log.push(Event::FlushFailed);
+        log.push(Event::Flush);
+        log.push(Event::StatePut {
+            key: "k".into(),
+            value: json!({"at": 4}),
+        });
+        assert_eq!(log.writes_before_each_bookmark(), vec![0]);
+        assert_bookmarks_backed_by_writes(&log, claims);
+    }
+
+    #[test]
+    fn a_flushed_write_and_an_idempotent_write_back_their_bookmarks() {
+        let log = EventLog::new();
+        log.push(Event::Write(2));
+        log.push(Event::Flush);
+        log.push(Event::IdempotentWrite {
+            records: 2,
+            token: "t".into(),
+        });
+        log.push(Event::StatePut {
+            key: "k".into(),
+            value: json!({"at": 4}),
+        });
+        assert_bookmarks_backed_by_writes(&log, claims);
+        assert_eq!(log.writes_before_each_bookmark(), vec![4]);
     }
 
     #[test]

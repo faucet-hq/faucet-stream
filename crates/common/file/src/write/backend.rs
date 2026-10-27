@@ -190,6 +190,61 @@ pub trait StorageBackend: Send + Sync {
         Ok(())
     }
 
+    /// The text of marker `name` in overwrite run `run`'s swap area (`None`:
+    /// the untokened area), or `None` when it is not there. Lets a begin
+    /// finish a commit another run left half-done. Default: none (no other
+    /// run's area is visible).
+    async fn read_swap_run_marker(
+        &self,
+        run: Option<&str>,
+        name: &str,
+    ) -> Result<Option<String>, FaucetError> {
+        let _ = (run, name);
+        Ok(None)
+    }
+
+    /// The names of the files directly in overwrite run `run`'s swap area.
+    /// Default: none.
+    async fn list_swap_run(&self, run: Option<&str>) -> Result<Vec<String>, FaucetError> {
+        let _ = run;
+        Ok(Vec::new())
+    }
+
+    /// Move `name` from overwrite run `run`'s swap area into the destination
+    /// (see [`promote`](Self::promote)). A file already moved (missing from
+    /// the area, present in the destination) is not an error. Default:
+    /// refused.
+    async fn promote_from_swap_run(
+        &self,
+        run: Option<&str>,
+        name: &str,
+    ) -> Result<(), FaucetError> {
+        let _ = (run, name);
+        Err(FaucetError::Sink(
+            "file sink: this storage backend cannot reach another overwrite run's files".into(),
+        ))
+    }
+
+    /// The overwrite commit ledger of this output: the sequence of the last
+    /// overwrite commit that finished moving its files into place, as the
+    /// text [`write_commit_record`](Self::write_commit_record) stored, or
+    /// `None` when there is none. A recovery of another run's interrupted
+    /// commit reads it so it never moves an older commit's files over a newer
+    /// one. Default: `None` (no ledger; such a backend also sees no other
+    /// run's area).
+    async fn read_commit_record(&self) -> Result<Option<String>, FaucetError> {
+        Ok(None)
+    }
+
+    /// Replace the overwrite commit ledger (see
+    /// [`read_commit_record`](Self::read_commit_record)) with `text`. It lives
+    /// beside the swap areas (`.faucet-overwrite-<tag>.commits/last`), which
+    /// readers of the output skip. Default: nothing stored.
+    async fn write_commit_record(&self, text: &str) -> Result<(), FaucetError> {
+        let _ = text;
+        Ok(())
+    }
+
     /// A non-mutating preflight probe of the storage (reachability,
     /// credentials). `None` when the backend has none, so the sink's own
     /// probe answers. Default: `None`.
@@ -325,6 +380,46 @@ macro_rules! delegate_storage_backend {
                 run: ::std::option::Option<&str>,
             ) -> ::std::result::Result<(), $crate::__private::FaucetError> {
                 $crate::write::StorageBackend::drop_swap_run(&self.$field, run).await
+            }
+            async fn read_swap_run_marker(
+                &self,
+                run: ::std::option::Option<&str>,
+                name: &str,
+            ) -> ::std::result::Result<
+                ::std::option::Option<::std::string::String>,
+                $crate::__private::FaucetError,
+            > {
+                $crate::write::StorageBackend::read_swap_run_marker(&self.$field, run, name).await
+            }
+            async fn list_swap_run(
+                &self,
+                run: ::std::option::Option<&str>,
+            ) -> ::std::result::Result<
+                ::std::vec::Vec<::std::string::String>,
+                $crate::__private::FaucetError,
+            > {
+                $crate::write::StorageBackend::list_swap_run(&self.$field, run).await
+            }
+            async fn promote_from_swap_run(
+                &self,
+                run: ::std::option::Option<&str>,
+                name: &str,
+            ) -> ::std::result::Result<(), $crate::__private::FaucetError> {
+                $crate::write::StorageBackend::promote_from_swap_run(&self.$field, run, name).await
+            }
+            async fn read_commit_record(
+                &self,
+            ) -> ::std::result::Result<
+                ::std::option::Option<::std::string::String>,
+                $crate::__private::FaucetError,
+            > {
+                $crate::write::StorageBackend::read_commit_record(&self.$field).await
+            }
+            async fn write_commit_record(
+                &self,
+                text: &str,
+            ) -> ::std::result::Result<(), $crate::__private::FaucetError> {
+                $crate::write::StorageBackend::write_commit_record(&self.$field, text).await
             }
             async fn check(
                 &self,

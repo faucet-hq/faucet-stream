@@ -1116,6 +1116,29 @@ pub const SANDBOX_ANNOTATION: &str = "x-faucet-sandbox";
 /// The top-level config fields `schema` marks with [`SANDBOX_ANNOTATION`],
 /// across every `oneOf` / `anyOf` / `allOf` branch of the root.
 pub fn sandbox_fields(schema: &Value) -> Vec<String> {
+    flagged_fields(schema, SANDBOX_ANNOTATION)
+}
+
+/// The JSON Schema keyword (value `true`) on a top-level string config field
+/// whose value is a SQL statement the connector runs as written (a source's
+/// `query`). A host that places values it did not author into a config uses
+/// it to tell a SQL statement from a field that only shares its name (a
+/// GraphQL document, a search or document-store filter):
+///
+/// ```ignore
+/// #[schemars(extend("x-faucet-sql" = true))]
+/// pub query: String,
+/// ```
+pub const SQL_ANNOTATION: &str = "x-faucet-sql";
+
+/// The top-level config fields `schema` marks with [`SQL_ANNOTATION`],
+/// across every `oneOf` / `anyOf` / `allOf` branch of the root.
+pub fn sql_fields(schema: &Value) -> Vec<String> {
+    flagged_fields(schema, SQL_ANNOTATION)
+}
+
+/// The top-level config fields `schema` marks with the boolean `annotation`.
+fn flagged_fields(schema: &Value, annotation: &str) -> Vec<String> {
     let mut alts = Vec::new();
     alternatives(schema, schema, &mut alts, 0);
     let mut out = BTreeSet::new();
@@ -1128,7 +1151,7 @@ pub fn sandbox_fields(schema: &Value) -> Vec<String> {
             alternatives(schema, field, &mut field_alts, 0);
             if field_alts
                 .iter()
-                .any(|n| n.get(SANDBOX_ANNOTATION) == Some(&Value::Bool(true)))
+                .any(|n| n.get(annotation) == Some(&Value::Bool(true)))
             {
                 out.insert(name.clone());
             }
@@ -1195,6 +1218,23 @@ mod tests {
             "$defs": {"Flag": {"type": "boolean", "x-faucet-sandbox": true}}
         });
         assert_eq!(sandbox_fields(&s), vec!["confine", "lock", "sandbox"]);
+        assert!(sql_fields(&s).is_empty());
+    }
+
+    #[test]
+    fn sql_fields_are_read_from_the_root_and_its_branches() {
+        let s = json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "x-faucet-sql": true},
+                "filter": {"type": "string"},
+                "sandbox": {"type": "boolean", "x-faucet-sandbox": true}
+            },
+            "oneOf": [{"properties": {"sql": {"$ref": "#/$defs/Sql"}}}],
+            "$defs": {"Sql": {"type": "string", "x-faucet-sql": true}}
+        });
+        assert_eq!(sql_fields(&s), vec!["query", "sql"]);
+        assert_eq!(sandbox_fields(&s), vec!["sandbox"]);
     }
 
     fn schema() -> Value {

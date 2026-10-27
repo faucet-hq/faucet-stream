@@ -2491,7 +2491,8 @@ fn check_complete_read_cleanup(
         return Err(CliError::Config(format!(
             "{what}, but sink '{sink_kind}' with this config cannot delete them (cleanup-capable \
              sinks: {}) — the destination would keep rows of deleted records. Use one of those \
-             sinks, or `on_gap: fail`",
+             sinks, set `resnapshot_deletes: false` to re-read without deleting (rows of records \
+             deleted during the gap are kept), or `on_gap: fail`",
             crate::registry::sink_kinds_where(|c| c.cleanup()).join(", ")
         )));
     }

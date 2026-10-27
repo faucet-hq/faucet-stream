@@ -32,7 +32,7 @@ pub async fn start() -> Option<(Container, String, Client)> {
     }));
     let container = containers::start_or_skip(
         || {
-            GenericImage::new("amazon/dynamodb-local", "latest")
+            GenericImage::new("amazon/dynamodb-local", "3.3.2")
                 .with_exposed_port(8000.tcp())
                 .with_wait_for(WaitFor::message_on_stdout("CorsParams"))
         },

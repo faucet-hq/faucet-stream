@@ -106,6 +106,7 @@ const CALLER: BodyOrigin = BodyOrigin::Caller {
 };
 
 #[tokio::test]
+#[serial_test::serial]
 async fn a_new_connector_field_is_confined_without_serve_changes() {
     install();
     let root = tempfile::tempdir().unwrap();
@@ -173,6 +174,7 @@ async fn a_new_connector_field_is_confined_without_serve_changes() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn url_hosts_and_env_follow_the_flags() {
     install();
     let refs = ServeReferencePolicy::from_args(&ReferenceArgs {
@@ -200,7 +202,8 @@ async fn url_hosts_and_env_follow_the_flags() {
     .unwrap_err();
     assert!(err.contains("elsewhere.example.com"), "{err}");
 
-    // SAFETY: test-only variables, set before any load reads them.
+    // SAFETY: every test in this binary is `#[serial]`, so no other thread
+    // reads the environment while these test-only variables are set.
     unsafe {
         std::env::set_var("FAUCET_881_ALLOWED", "ok");
         std::env::set_var("FAUCET_881_DENIED", "secret-value");

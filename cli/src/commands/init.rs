@@ -161,7 +161,7 @@ async fn run_singer_discover(args: &InitArgs) -> CliResult<()> {
     // Inline the catalog as compact JSON (YAML is a JSON superset, so a
     // single-line flow mapping parses correctly — unlike `${file:…}`, which
     // would insert the file's contents as a *string*, not an object).
-    let catalog_inline = serde_json::to_string(&catalog)
+    let catalog_inline = serde_json::to_string(&inert_directives(catalog))
         .map_err(|e| CliError::Config(format!("failed to serialize catalog: {e}")))?;
     let name = args.name.as_deref().unwrap_or(DEFAULT_NAME);
     let body = render_singer_config(name, executable, &catalog_inline, &streams, target);
@@ -216,8 +216,15 @@ fn render_singer_config(
     let discovered = if streams.is_empty() {
         "(none discovered)".to_string()
     } else {
-        streams.join(", ")
+        streams
+            .iter()
+            .map(|s| comment_text(s))
+            .collect::<Vec<_>>()
+            .join(", ")
     };
+    let name = yaml_scalar(name);
+    let executable = yaml_scalar(executable);
+    let stream = yaml_scalar(stream);
     let requires = crate::requires::default_requirement();
     format!(
         "version: 1\n\
@@ -233,7 +240,7 @@ fn render_singer_config(
          \x20     catalog: {catalog_inline}\n\
          \x20     # stream is REQUIRED. Discovered streams: {discovered}\n\
          \x20     # Set it to one of the above; leaving it empty fails `faucet doctor`.\n\
-         \x20     stream: \"{stream}\"\n\
+         \x20     stream: {stream}\n\
          \x20     # The tap's own config (secret-resolved by faucet). Fill in as the tap needs:\n\
          \x20     tap_config: {{}}\n\
          \x20 sink:\n\
@@ -241,6 +248,43 @@ fn render_singer_config(
          \x20   config:\n\
          \x20     path: ./out/records.jsonl\n"
     )
+}
+
+/// Escape every `${` in tap-supplied catalog text (keys and values) to
+/// `$${`, so a description such as `amount in ${currency}` stays literal text
+/// instead of becoming an interpolation directive when the config loads.
+#[cfg(feature = "source-singer")]
+fn inert_directives(v: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    let esc = |s: String| s.replace("${", "$${");
+    match v {
+        Value::String(s) => Value::String(esc(s)),
+        Value::Array(items) => Value::Array(items.into_iter().map(inert_directives).collect()),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(k, v)| (esc(k), inert_directives(v)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// A user- or tap-supplied string as a double-quoted YAML scalar (JSON string
+/// syntax is valid YAML) with `${` escaped, so it can neither break the
+/// document structure nor become a directive.
+#[cfg(feature = "source-singer")]
+fn yaml_scalar(s: &str) -> String {
+    serde_json::Value::String(s.replace("${", "$${")).to_string()
+}
+
+/// Tap text placed in a YAML comment: one line, no control characters, no
+/// directive.
+#[cfg(feature = "source-singer")]
+fn comment_text(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .replace("${", "$${")
 }
 
 fn resolve_kinds(args: &InitArgs) -> CliResult<(String, String)> {
@@ -561,6 +605,39 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("catalog.json")).unwrap(),
             "{}"
+        );
+    }
+
+    /// Tap-supplied catalog text with `${…}` (and a stream name that is not
+    /// a plain YAML word) loads as literal text, never as a directive.
+    #[cfg(feature = "source-singer")]
+    #[test]
+    fn a_discovered_catalog_is_inlined_without_live_directives() {
+        let catalog = serde_json::json!({"streams": [{
+            "tap_stream_id": "orders: ${env:HOME}",
+            "schema": {"properties": {"amount": {"description": "amount in ${env:HOME}"}}}
+        }]});
+        use super::{inert_directives, render_singer_config};
+        let inline = serde_json::to_string(&inert_directives(catalog)).unwrap();
+        let body = render_singer_config(
+            "t",
+            "tap-x",
+            &inline,
+            &["orders: ${env:HOME}".to_string()],
+            "orders: ${env:HOME}",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.yaml");
+        std::fs::write(&path, &body).unwrap();
+        let cfg =
+            crate::config::PipelineConfig::from_path_tolerating_secrets(&path, None).expect(&body);
+        let config =
+            crate::interpolate::unescaped(cfg.pipeline.source.as_ref().unwrap().config.clone());
+        assert_eq!(config["stream"], "orders: ${env:HOME}", "{body}");
+        assert_eq!(
+            config["catalog"]["streams"][0]["schema"]["properties"]["amount"]["description"],
+            "amount in ${env:HOME}",
+            "{body}"
         );
     }
 

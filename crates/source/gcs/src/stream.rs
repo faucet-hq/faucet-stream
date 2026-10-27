@@ -11,7 +11,6 @@ use google_cloud_storage::client::{Storage, StorageControl};
 use serde_json::Value;
 use std::pin::Pin;
 use std::sync::Mutex;
-use tokio::io::AsyncBufReadExt;
 
 /// One object's payload, fetched in the shape its `file_format` decodes from.
 ///
@@ -762,8 +761,7 @@ impl faucet_core::Source for GcsSource {
                         // One line is bounded by `max_object_bytes`, so an
                         // object with no newline fails instead of being
                         // buffered whole.
-                        let reader = faucet_core::file_format::line_capped(reader, self.config.max_object_bytes);
-                        let mut lines = tokio::io::BufReader::new(reader).lines();
+                        let mut lines = faucet_core::file_format::capped_lines(reader, self.config.max_object_bytes);
                         let mut line_num: usize = 0;
                         while let Some(line) = lines
                             .next_line()

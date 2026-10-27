@@ -119,12 +119,47 @@ and `bucket: ${trigger.bucket}` all yield a plain string, and a value holding
 string (`size: ${trigger.size}` gives `"42"`). Mapping keys are not substituted.
 
 A token spliced into a longer string is plain text of that string — never a
-bound SQL parameter or an escaped path. So an event value (a webhook body, query
-value or header, an object key) spliced into a longer string may not carry a
-quote (`'`, `"`, `` ` ``), `;`, a backslash, a control character or a `..` path
-segment; such a fire is refused (a `500` for a webhook, an object skipped and
-logged). Keep tokens out of SQL text, and use a token as the whole value when it
-must carry any text.
+bound SQL parameter or an escaped path. A value the event's sender chooses (a
+webhook body, query value or header, an object key) is checked against where it
+lands:
+
+- spliced into a longer string: no `..` path segment and no control character;
+  as a whole value: no `..` path segment when the field names a path or URL
+  (a body used whole as data may hold one);
+- spliced into a SQL statement (a field the connector's schema marks as SQL,
+  such as a SQL source's `query`) or into free text (a string with spaces or
+  quotes around the token): no quote (`'`, `"`, `` ` ``), `;` or backslash. A
+  path, URL or name (`in/${trigger.object_key}`,
+  `s3://bucket/${trigger.object_key}`) may hold them;
+- inside a URL's host (`https://${trigger.header.x-region}.api.example`): host
+  name characters only (letters, digits, `.`, `-`);
+- as the whole of a SQL field: refused — a sender never supplies a whole
+  statement. A GraphQL `query` or a search or document-store `filter` is not
+  SQL and takes a whole value. Outside any connector or transform the trigger
+  can name, a whole `query`, `sql`, `statement`, `where` or `filter` value is
+  refused;
+- a URL, or an absolute path that starts the value, must be one the server's
+  caller reference policy allows (`--allow-url-host`, `--allow-url-scheme`,
+  `--allow-path-root`, and never the system trees or the server's credential
+  files).
+
+A `template:` trigger's `params` are checked the same way. Where the template
+places a param is not known when the trigger fires, so a sender value in a
+param is judged by the param's name and the value itself: no `..` segment in a
+value that reads as a path, no whole value for a param named `query`, `sql`,
+`statement`, `where` or `filter`, no quote, `;` or backslash when spliced into
+free text, and a URL or a leading absolute path must pass the caller reference
+policy.
+
+A refused fire never runs: a webhook answers `422` (the trigger stays healthy),
+and an `object_arrival` watcher skips the object and reports it, then fires the
+objects after it. A webhook also answers `422` when the config uses a header or
+query value the request did not send.
+
+A webhook trigger that cannot run whatever is sent — its config does not
+validate, its template or tenant is gone, a policy refuses it — answers `500`
+and, after three such fires in a row, reports unhealthy on `/readyz`: the
+operator has something to fix, not the sender.
 
 *`mode: per_object` — one token set per object:*
 
@@ -199,7 +234,10 @@ debounce_secs: 0            # leading-edge debounce window in seconds (default 0
 > **Leading-edge debounce:** when `debounce_secs > 0`, the first request is
 > accepted and any further requests that arrive within `debounce_secs` of that
 > accepted fire are coalesced — they return `200 { "status": "coalesced" }` and
-> enqueue no run. The window re-arms once `debounce_secs` have fully elapsed
+> enqueue no run. A request that arrives while the accepted fire is still
+> being submitted gets `503` and should retry: that fire may not go through,
+> and if it fails (or its request is abandoned) the window is undone so the
+> retry fires. The window re-arms once `debounce_secs` have fully elapsed
 > since the last accepted fire. Debounce is webhook-only; polling triggers
 > (`object_arrival`, `queue_depth`) pace themselves via `poll_interval_secs`.
 

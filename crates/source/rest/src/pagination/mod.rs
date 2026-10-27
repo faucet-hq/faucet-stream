@@ -233,6 +233,10 @@ pub struct PaginationState {
     /// cursor value, so the next `>=` page drops exactly those.
     #[doc(hidden)]
     pub record_cursor_boundary: std::collections::HashMap<String, usize>,
+    /// `allow_repeated_pages`: a page repeating an earlier, non-adjacent page
+    /// is paged past instead of failing the pass.
+    #[doc(hidden)]
+    pub allow_repeated_pages: bool,
 }
 
 impl PaginationState {
@@ -258,9 +262,26 @@ impl PaginationState {
         }
     }
 
-    /// Record `fp` as seen; `true` when an earlier page this pass had it.
-    fn page_repeats(&mut self, fp: u64) -> bool {
-        self.previous_page_fingerprint == Some(fp) || !self.seen_page_fingerprints.insert(fp)
+    /// Record `fp` as seen. `Ok(true)` when the previous page had it (a
+    /// server re-returning its last page: the caller drops the repeat and
+    /// stops). A repeat of an earlier, non-adjacent page is an error: either
+    /// the server is cycling, or two pages legitimately hold identical
+    /// records, and in both cases stopping green could leave rows unread.
+    /// With `allow_repeated_pages` it is paged past (`Ok(false)`).
+    fn page_repeats(&mut self, fp: u64, style: &str) -> Result<bool, FaucetError> {
+        if self.previous_page_fingerprint == Some(fp) {
+            return Ok(true);
+        }
+        if self.seen_page_fingerprints.insert(fp) || self.allow_repeated_pages {
+            return Ok(false);
+        }
+        Err(FaucetError::Source(format!(
+            "rest: {style} pagination returned a page identical to an earlier, non-adjacent \
+             page of this pass; the server is cycling pages (or two pages carry identical \
+             records), so rows may be unread. Check the paging parameters (an `Offset` \
+             `total_path` ends paging on the server's own count); if pages can legitimately \
+             repeat, set `allow_repeated_pages: true` together with `max_pages`"
+        )))
     }
 }
 
@@ -469,7 +490,7 @@ impl PaginationStyle {
                 // would loop until `max_pages` and duplicate records. Stop if
                 // this page's body is identical to the previous one (#78/#15).
                 let fp = page_fingerprint(state, body);
-                if state.page_repeats(fp) {
+                if state.page_repeats(fp, "PageNumber")? {
                     tracing::warn!(
                         "pagination loop detected: PageNumber returned an identical page — stopping"
                     );
@@ -522,7 +543,7 @@ impl PaginationStyle {
                 // be mistaken for stagnation.
                 if has_next && total_path.is_none() {
                     let fp = page_fingerprint(state, body);
-                    if state.page_repeats(fp) {
+                    if state.page_repeats(fp, "Offset")? {
                         tracing::warn!(
                             "pagination loop detected: Offset returned an identical page \
                              (server likely ignoring the offset parameter) — stopping"
@@ -567,7 +588,7 @@ impl PaginationStyle {
                 // Content-stagnation guard: a server ignoring the body offset
                 // would re-return the identical page forever.
                 let fp = page_fingerprint(state, body);
-                if state.page_repeats(fp) {
+                if state.page_repeats(fp, "OffsetInBody")? {
                     tracing::warn!(
                         "pagination loop detected: OffsetInBody returned an identical page \
                          (server likely ignoring the body offset) — stopping"

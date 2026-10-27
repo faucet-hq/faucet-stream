@@ -22,6 +22,20 @@ pub fn quote_ident(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
 }
 
+/// Whether a MySQL column type (`VARBINARY(16)`, `blob`, …) stores raw bytes.
+fn is_binary_type(sql_type: &str) -> bool {
+    let base = sql_type
+        .trim()
+        .split(|c: char| c == '(' || c.is_whitespace())
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        base.as_str(),
+        "binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob"
+    )
+}
+
 fn placeholder(_n: usize) -> String {
     "?".to_string()
 }
@@ -152,10 +166,38 @@ impl SqlDialect for Mysql {
         scope_types: &[Option<&str>],
         key: &[String],
     ) -> Result<Option<String>, FaucetError> {
+        self.cleanup_absent_keys_typed_sql(target, scope, scope_types, key, &[])
+    }
+
+    /// A binary key renders as unwrapped base64 (the form the writes decode),
+    /// not `JSON_OBJECT`'s `"base64:typeNN:…"` text, which binds back as a
+    /// string matching no row.
+    fn cleanup_absent_keys_typed_sql(
+        &self,
+        target: &TableTarget,
+        scope: &[String],
+        scope_types: &[Option<&str>],
+        key: &[String],
+        key_types: &[Option<&str>],
+    ) -> Result<Option<String>, FaucetError> {
         let t = &target.reference;
         let pairs = key
             .iter()
-            .map(|k| format!("{}, {t}.{}", self.quote_literal(k), quote_ident(k)))
+            .enumerate()
+            .map(|(i, k)| {
+                let col = format!("{t}.{}", quote_ident(k));
+                let value = if key_types
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .is_some_and(is_binary_type)
+                {
+                    format!("REPLACE(TO_BASE64({col}), CHAR(10 USING ascii), '')")
+                } else {
+                    col
+                };
+                format!("{}, {value}", self.quote_literal(k))
+            })
             .collect::<Vec<_>>()
             .join(", ");
         let delete = self.cleanup_delete_sql(target, scope, scope_types, key)?;

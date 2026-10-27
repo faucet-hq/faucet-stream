@@ -207,11 +207,15 @@ async fn case(
         Run::ErrorIfExists => {
             let mut c = cfg.clone();
             c["mode"] = json!("error_if_exists");
-            return match write(&c, std::slice::from_ref(&second)).await {
-                Err(FaucetError::Sink(m)) if m.contains("already exists") => Ok(()),
-                Err(e) => Err(format!("error_if_exists failed oddly: {e}")),
-                Ok(_) => Err("error_if_exists overwrote an existing file".into()),
-            };
+            match write(&c, std::slice::from_ref(&second)).await {
+                // The refused run must leave the first run's files exactly as
+                // they were: checked by the read-back below.
+                Err(FaucetError::Sink(m)) if m.contains("already exists") => {
+                    (Ok(initial), first.clone())
+                }
+                Err(e) => return Err(format!("error_if_exists failed oddly: {e}")),
+                Ok(_) => return Err("error_if_exists overwrote an existing file".into()),
+            }
         }
     };
     let sink = sink.map_err(|e| format!("second run: {e}"))?;

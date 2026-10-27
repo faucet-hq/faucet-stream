@@ -146,7 +146,7 @@ impl Watcher for QueueDepthWatcher {
 fn uncommitted_result(outcome: FireOutcome) -> Result<bool, super::watcher::PollError> {
     use super::watcher::PollError;
     match outcome {
-        FireOutcome::Failed(e) => Err(PollError::fired(format!(
+        FireOutcome::Failed(e) | FireOutcome::Refused(e) => Err(PollError::fired(format!(
             "queue_depth run cannot start: {e}"
         ))),
         FireOutcome::Error(e) => Err(PollError::fired(format!("queue_depth fire failed: {e}"))),

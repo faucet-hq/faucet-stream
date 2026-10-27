@@ -43,7 +43,9 @@ cardinality and never a Prometheus label.
   `faucet_source_lag_seconds{pipeline,row,connector}` — how far a CDC or
   streaming source is behind its head (unread WAL / binlog, unconsumed
   messages, age of the oldest unread change), polled at page boundaries and at
-  the end of a run. Sources without a head (query sources) emit nothing. See
+  the end of a run. Sources without a head (query sources) emit nothing.
+  `faucet_source_lag_stale{pipeline,row,connector}` is `1` while polling is
+  paused after a slow lag query (the lag gauges then hold their last value). See
   [Source lag](../cookbook/sla.md#source-lag).
 - **Sink:** `faucet_sink_records_total`, `faucet_sink_writes_total`,
   `faucet_sink_errors_total`, `faucet_sink_write_duration_seconds`,
@@ -321,8 +323,13 @@ observability:
 - **A malformed line never blocks a run.** When the collector refuses a batch
   as malformed (HTTP `400` / `413` / `422`, gRPC `InvalidArgument`), the batch
   is split until the offending line is found; that line is dropped (`reason`
-  `rejected`) and the rest delivered. Every other failure — the collector down,
-  throttling, a credential problem — is retried and nothing is dropped.
+  `rejected`) and the rest delivered. A line is dropped only once the
+  collector has accepted another line of the batch (when the first two lines
+  are refused, the batch's last line is tried on its own first), so a
+  collector that refuses every payload drops nothing; one run's refused lines
+  do not stop the other runs from shipping. Every other failure — the
+  collector down, throttling, a credential problem — is retried and nothing is
+  dropped.
 
 ### Was a run's log shipped?
 

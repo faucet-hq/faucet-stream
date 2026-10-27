@@ -742,8 +742,8 @@ mod tests {
         );
         assert_eq!(
             cursor_wrap("SELECT * FROM t", "we`ird", "BYTES"),
-            "SELECT * FROM (SELECT * FROM t\n) AS q WHERE q.`we``ird` >= \
-             FROM_BASE64(@_faucet_bookmark) ORDER BY q.`we``ird`"
+            "SELECT * FROM (SELECT * FROM t\n) AS q WHERE q.`we\\`ird` >= \
+             FROM_BASE64(@_faucet_bookmark) ORDER BY q.`we\\`ird`"
         );
     }
 
@@ -950,8 +950,8 @@ mod tests {
         let ds = descriptors_from_catalog(rows);
         let q = ds[0].config_patch["query"].as_str().unwrap();
         assert_eq!(
-            q, "SELECT * FROM `we``ird`",
-            "interior backtick must be doubled"
+            q, "SELECT * FROM `we\\`ird`",
+            "interior backtick must be backslash-escaped"
         );
     }
 

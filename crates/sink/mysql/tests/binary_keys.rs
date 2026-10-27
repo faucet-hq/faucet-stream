@@ -157,3 +157,72 @@ async fn binary_keys_match_on_delete_cleanup_and_rollback() {
     assert_eq!(v, "a", "the before-image is back");
     pool.close().await;
 }
+
+/// A rollback-enabled scoped cleanup journals the rows it deletes by binary
+/// key, under a binary scope column, so undoing the run restores them (#934):
+/// the journal read renders the key as base64 (not `JSON_OBJECT`'s
+/// `base64:typeNN:` text) and binds the scope the way the delete does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_journaled_cleanup_of_binary_keys_is_undone_by_rollback() {
+    let (_c, url) = start_mysql().await;
+    exec(
+        &url,
+        "CREATE TABLE t (id VARBINARY(32) PRIMARY KEY, tenant VARBINARY(16), v TEXT, \
+         _faucet_run_id VARCHAR(64))",
+    )
+    .await;
+    let seed = MysqlSink::new(config(&url, "t", WriteMode::Upsert, None))
+        .await
+        .unwrap();
+    seed.write_batch(&[
+        json!({"id": A, "tenant": C, "v": "a"}),
+        json!({"id": B, "tenant": C, "v": "b"}),
+    ])
+    .await
+    .unwrap();
+
+    let spec = RollbackWriteSpec {
+        run_id: "r1".into(),
+        run_id_column: "_faucet_run_id".into(),
+        journal: true,
+        keep_previous: false,
+    };
+    let r1 = MysqlSink::new(config(&url, "t", WriteMode::Upsert, Some(spec)))
+        .await
+        .unwrap();
+    r1.write_batch(&[json!({"id": A, "tenant": C, "v": "a2", "_faucet_run_id": "r1"})])
+        .await
+        .unwrap();
+    let mut seen = SeenKeys::new();
+    seen.record_page(&[json!({"id": A})], &["id".to_string()], 1000);
+    let scope = BTreeMap::from([("tenant".to_string(), json!(C))]);
+    assert_eq!(r1.cleanup_scope(&scope, &seen).await.unwrap(), 1);
+    assert_eq!(ids(&url, "t").await, vec![hex(A)], "B cleaned up");
+
+    let out = r1
+        .rollback_run(
+            "r1",
+            &RollbackOptions {
+                run_id_column: "_faucet_run_id".into(),
+                mode: RollbackMode::Upsert,
+                force: false,
+                dry_run: false,
+                later_runs: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(out.applied, "{out:?}");
+    assert_eq!(
+        ids(&url, "t").await,
+        vec![hex(A), hex(B)],
+        "the cleaned-up row is restored"
+    );
+    let pool = sqlx::MySqlPool::connect(&url).await.unwrap();
+    let vs: Vec<String> = sqlx::query_scalar("SELECT v FROM t ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(vs, ["a", "b"]);
+    pool.close().await;
+}

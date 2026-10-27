@@ -1069,7 +1069,11 @@ async fn verify_honours_columns_destination_key_and_limits() {
         .await
         .unwrap();
     assert_eq!(capped.report.differences.len(), 1);
-    assert!(capped.report.truncated, "{capped:?}");
+    // The reporting cap is not an incomplete scan: the count of every
+    // differing key is kept in `differences_found` (#934 R2-010).
+    assert!(!capped.report.truncated, "{capped:?}");
+    assert_eq!(capped.report.differences_found, Some(4), "{capped:?}");
+    assert_eq!(capped.report.differing_keys(), 4);
 
     let budget = faucet_cli::verify::verify(
         &cfg,
@@ -1493,6 +1497,70 @@ async fn a_pending_undo_that_finds_nothing_finishes_the_rewind() {
             .as_deref()
             .unwrap()
             .contains("interrupted"),
+        "{report:?}"
+    );
+}
+
+/// An attempt whose sink undo fails with the run still all in the
+/// destination leaves no pending record, so a retry that finds nothing of the
+/// run still leaves the bookmark alone.
+#[tokio::test]
+async fn a_failed_undo_attempt_does_not_count_as_committed() {
+    let d = fresh().await;
+    exec(&d.dst, "DROP TABLE dst").await;
+    exec(
+        &d.dst,
+        "CREATE TABLE dst (id INTEGER, name TEXT, _faucet_run_id TEXT)",
+    )
+    .await;
+    let cfg = load(&config_yaml(
+        &d.src,
+        &d.dst,
+        &d.state,
+        "append",
+        "rollback: {}",
+    ));
+    let run_id = run(&cfg).await.invocations[0].run_id.clone().unwrap();
+    let inputs = || RollbackInputs {
+        run_id: run_id.clone(),
+        row: None,
+        dry_run: false,
+        force: false,
+        pipeline_name: "mirror".into(),
+        auth: Default::default(),
+    };
+    exec(
+        &d.dst,
+        "CREATE TRIGGER hold BEFORE DELETE ON dst BEGIN SELECT RAISE(ABORT, 'deletes are paused'); END",
+    )
+    .await;
+    faucet_cli::rollback::rollback(&cfg, inputs())
+        .await
+        .expect_err("the undo fails before it commits");
+    exec(&d.dst, "DROP TABLE dst").await;
+    let marker = faucet_cli::rollback::list(&cfg, "mirror", None)
+        .await
+        .unwrap()
+        .remove(0);
+    assert!(marker.undo.is_none(), "{marker:?}");
+
+    exec(
+        &d.dst,
+        "CREATE TABLE dst (id INTEGER, name TEXT, _faucet_run_id TEXT)",
+    )
+    .await;
+    let report = faucet_cli::rollback::rollback(&cfg, inputs())
+        .await
+        .unwrap();
+    assert!(!report.outcome.applied, "{report:?}");
+    assert!(!report.bookmark_rewound, "{report:?}");
+    assert!(
+        report
+            .outcome
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("nothing of this run was found"),
         "{report:?}"
     );
 }

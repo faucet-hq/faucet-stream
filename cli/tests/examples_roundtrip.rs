@@ -15,6 +15,9 @@ use faucet_cli::error::CliError;
 use faucet_cli::expand::expand;
 use std::path::PathBuf;
 
+#[path = "support/example_features.rs"]
+mod example_features;
+
 fn examples_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples")
 }
@@ -55,25 +58,13 @@ fn every_example_loads_and_expands() {
             continue;
         }
         // Skip examples that rely on a feature not compiled into this test
-        // binary.  In CI `--all-features` covers everything; local single-
-        // feature runs must not fail on example YAMLs that need an orthogonal
-        // feature (e.g. `schedule:` requires `--features schedule`).
-        #[cfg(not(feature = "schedule"))]
+        // binary (shared with `cli_end_to_end`). In CI `--all-features`
+        // covers everything.
+        if example_features::missing_feature(&std::fs::read_to_string(&path).unwrap_or_default())
+            .is_some()
         {
-            let yaml_text = std::fs::read_to_string(&path).unwrap_or_default();
-            if yaml_text.contains("\nschedule:") || yaml_text.starts_with("schedule:") {
-                skipped += 1;
-                continue;
-            }
-        }
-        // `masking:` is gated on the `masking` feature (deny_unknown_fields).
-        #[cfg(not(feature = "masking"))]
-        {
-            let yaml_text = std::fs::read_to_string(&path).unwrap_or_default();
-            if yaml_text.contains("\n  masking:") || yaml_text.contains("\nmasking:") {
-                skipped += 1;
-                continue;
-            }
+            skipped += 1;
+            continue;
         }
         count += 1;
         // Load exactly as `faucet validate` does: an example may declare typed

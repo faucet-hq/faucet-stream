@@ -1112,3 +1112,154 @@ fn overwrite_runs_stage_under_their_own_name<D: SqlDialect>(d: D) {
 fn matrix_overwrite_staging_names() {
     every_dialect!(overwrite_runs_stage_under_their_own_name);
 }
+
+/// The cleanup journal read renders a binary key as unwrapped base64 — the
+/// form the writes decode — on MySQL and PostgreSQL; other keys stay raw and
+/// a dialect without the typed override falls back to the untyped query.
+#[test]
+fn cleanup_journal_renders_binary_keys_as_base64() {
+    use faucet_common_sql::dialects::{Mysql, Postgres, Sqlite};
+    let key = ["id".to_string(), "n".to_string()];
+    let types = [Some("VARBINARY(16)"), Some("INT")];
+    let m = Mysql
+        .cleanup_absent_keys_typed_sql(&target(&Mysql, "t"), &[], &[], &key, &types)
+        .unwrap()
+        .unwrap();
+    assert!(
+        m.contains("'id', REPLACE(TO_BASE64(`t`.`id`), CHAR(10 USING ascii), '')"),
+        "{m}"
+    );
+    assert!(m.contains("'n', `t`.`n`"), "{m}");
+    let untyped = Mysql
+        .cleanup_absent_keys_sql(&target(&Mysql, "t"), &[], &[], &key)
+        .unwrap()
+        .unwrap();
+    assert!(!untyped.contains("TO_BASE64"), "{untyped}");
+
+    let p = Postgres
+        .cleanup_absent_keys_typed_sql(
+            &target(&Postgres, "t"),
+            &[],
+            &[],
+            &key,
+            &[Some("bytea"), Some("int4")],
+        )
+        .unwrap()
+        .unwrap();
+    assert!(
+        p.contains("'id', replace(encode(t.\"id\", 'base64'), E'\\n', '')"),
+        "{p}"
+    );
+    assert!(p.contains("'n', t.\"n\""), "{p}");
+
+    let s = Sqlite
+        .cleanup_absent_keys_typed_sql(&target(&Sqlite, "t"), &[], &[], &key, &types)
+        .unwrap();
+    assert_eq!(
+        s,
+        Sqlite
+            .cleanup_absent_keys_sql(&target(&Sqlite, "t"), &[], &[], &key)
+            .unwrap()
+    );
+}
+
+/// Inside a page scope the engine reads a target's live columns once for every
+/// chunk of the page; outside one (or after it closes) every insert reads them.
+fn page_scope_reads_columns_once<D: SqlDialect>(d: D) {
+    let engine = SqlSinkEngine::new(d, WriteSpec::default());
+    let t = target(engine.dialect(), "t");
+    let mut rec = Recorder::new(&[("id", "bigint"), ("v", "text")]);
+    let rows = vec![json!({"id": 1, "v": "a"})];
+    {
+        let _page = engine.page_scope();
+        for _ in 0..3 {
+            futures_lite_block_on(engine.insert(&mut rec, &t, &rows, false)).unwrap();
+        }
+        let other = target(engine.dialect(), "u");
+        futures_lite_block_on(engine.insert(&mut rec, &other, &rows, false)).unwrap();
+    }
+    assert_eq!(
+        rec.catalog_reads,
+        2,
+        "{}: one read per target",
+        engine.dialect().name()
+    );
+    futures_lite_block_on(engine.insert(&mut rec, &t, &rows, false)).unwrap();
+    futures_lite_block_on(engine.insert(&mut rec, &t, &rows, false)).unwrap();
+    assert_eq!(
+        rec.catalog_reads,
+        4,
+        "{}: no cache outside a scope",
+        engine.dialect().name()
+    );
+}
+
+#[test]
+fn page_scope_reads_columns_once_per_target() {
+    every_dialect!(page_scope_reads_columns_once);
+}
+
+/// An integer column widened for fractions never narrows the integer range
+/// an earlier release gave it (28 integer digits: every 64-bit integer and
+/// floats up to 10^28). A backend whose decimals go past 38 digits also keeps
+/// at least 19 fractional digits; one capped at 38 cannot have both.
+fn integer_to_fraction_widening_keeps_its_integer_range<D: SqlDialect>(d: D) {
+    let t = d.widened_type_name(Some(SqlBaseType::Integer), SqlBaseType::Double);
+    let Some((p, s)) = t.split_once('(').and_then(|(_, rest)| {
+        let (p, s) = rest.split_once(',')?;
+        let digits = |x: &str| {
+            x.trim_matches(|c: char| !c.is_ascii_digit())
+                .parse::<u32>()
+                .ok()
+        };
+        Some((digits(p)?, digits(s)?))
+    }) else {
+        return;
+    };
+    assert!(p - s >= 28, "{}: {t} narrows the integer range", d.name());
+    if p > 38 {
+        assert!(s >= 19, "{}: {t}", d.name());
+    }
+}
+
+#[test]
+fn matrix_integer_to_fraction_widening() {
+    every_dialect!(integer_to_fraction_widening_keeps_its_integer_range);
+}
+
+/// The written-key table's alias in a cleanup delete must not shadow a target
+/// table named like it, or the join compares the keys table with itself and
+/// the delete removes nothing.
+fn cleanup_delete_alias_never_shadows_the_target<D: SqlDialect>(d: D) {
+    for name in ["c", "t", "_faucet_seen"] {
+        let target = target(&d, name);
+        let sql = d
+            .cleanup_delete_sql(
+                &target,
+                &["tenant".to_string()],
+                &[None],
+                &["id".to_string()],
+            )
+            .unwrap();
+        let keys = d.cleanup_keys_table();
+        let after = sql
+            .split(&format!("FROM {keys} "))
+            .nth(1)
+            .unwrap_or_else(|| panic!("{}: {sql}", d.name()));
+        let alias = after.split_whitespace().next().unwrap();
+        let outer_named = sql.starts_with(&format!("DELETE FROM {} WHERE", target.reference));
+        if outer_named {
+            assert_ne!(
+                alias.trim_matches(['`', '"', '[', ']']),
+                name,
+                "{}: the keys alias shadows the target: {sql}",
+                d.name()
+            );
+        }
+    }
+}
+
+#[test]
+fn matrix_cleanup_alias() {
+    every_cleanup_dialect!(cleanup_delete_alias_never_shadows_the_target);
+}

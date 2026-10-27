@@ -13,10 +13,9 @@ use std::time::Duration;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
-}
+#[path = "support/ports.rs"]
+mod ports;
+use ports::free_port;
 
 fn args_on(port: u16) -> ServeArgs {
     ServeArgs {

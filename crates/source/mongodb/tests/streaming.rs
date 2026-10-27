@@ -510,3 +510,33 @@ async fn context_placeholder_binds_a_numeric_parent_value_as_a_number() {
     let records = source.fetch_with_context(&ctx).await.expect("fetch");
     assert_eq!(records, vec![serde_json::json!({"id": 3})]);
 }
+
+/// A whole `{key}` placeholder binds the parent value with its JSON type;
+/// `{key:str}` binds it as text, for a field stored as a string.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_text_placeholder_matches_a_string_field_for_a_numeric_parent() {
+    let (_container, uri) = start_mongo().await;
+    let client = Client::with_uri_str(&uri).await.expect("client");
+    let coll = client.database("testdb").collection::<Document>("orders");
+    coll.insert_many(vec![
+        doc! { "order": 1, "customer_id": "7" },
+        doc! { "order": 2, "customer_id": 7 },
+    ])
+    .await
+    .expect("insert_many");
+    let ctx: HashMap<String, serde_json::Value> =
+        [("customers.id".to_string(), serde_json::json!(7))].into();
+    let orders = |placeholder: &str| {
+        MongoSourceConfig::new(uri.clone(), "testdb", "orders")
+            .filter(serde_json::json!({"customer_id": placeholder}))
+            .projection(serde_json::json!({"_id": 0, "order": 1}))
+    };
+    let typed = MongoSource::new(orders("{customers.id}")).await.unwrap();
+    let text = MongoSource::new(orders("{customers.id:str}"))
+        .await
+        .unwrap();
+    let typed = typed.fetch_with_context(&ctx).await.unwrap();
+    let text = text.fetch_with_context(&ctx).await.unwrap();
+    assert_eq!(typed, vec![serde_json::json!({"order": 2})]);
+    assert_eq!(text, vec![serde_json::json!({"order": 1})]);
+}

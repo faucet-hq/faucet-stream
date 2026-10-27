@@ -101,6 +101,125 @@ pub(crate) fn staging_relax_sql(
     )))
 }
 
+/// The database part of a three-part `db.schema.table` name, whose catalog
+/// holds the table's foreign keys (SQL Server has no cross-database keys).
+pub(crate) fn target_database(table: &str) -> Option<&str> {
+    let parts: Vec<&str> = table.split('.').collect();
+    (parts.len() >= 3).then(|| parts[parts.len() - 3])
+}
+
+/// One enabled foreign key of another table that references the overwrite
+/// target, read by [`referencing_keys_sql`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReferencingKey {
+    pub(crate) id: i32,
+    pub(crate) child_schema: String,
+    pub(crate) child_table: String,
+    /// `sys.foreign_keys.delete_referential_action`: 0 `NO ACTION`, 1
+    /// `CASCADE`, 2 `SET NULL`, 3 `SET DEFAULT`.
+    pub(crate) delete_action: i32,
+    pub(crate) columns: Vec<String>,
+}
+
+impl ReferencingKey {
+    /// A key whose `ON DELETE` rewrites the child (`CASCADE` / `SET NULL` /
+    /// `SET DEFAULT`) is refused whatever the child holds; a `NO ACTION` key
+    /// only while some child row references the target (the swap's `DELETE`
+    /// would fail after the whole load).
+    pub(crate) fn rewrites_child(&self) -> bool {
+        self.delete_action != 0
+    }
+
+    /// `schema.table` of the child, prefixed with `db.` for a target in
+    /// another database.
+    pub(crate) fn display(&self, db: Option<&str>) -> String {
+        match db {
+            Some(db) => format!("{db}.{}.{}", self.child_schema, self.child_table),
+            None => format!("{}.{}", self.child_schema, self.child_table),
+        }
+    }
+}
+
+/// The catalog prefix (`[db].`) and `DB_ID(…)` argument for a target in
+/// database `db` (the current database when `None`).
+fn catalog_scope(db: Option<&str>) -> Result<(String, String), FaucetError> {
+    Ok(match db {
+        Some(db) => (
+            format!("{}.", quote_ident_mssql(db)?),
+            format!("DB_ID(N'{}')", db.replace('\'', "''")),
+        ),
+        None => (String::new(), "DB_ID()".to_string()),
+    })
+}
+
+/// The enabled foreign keys of other tables referencing `target` (the
+/// bracket-quoted table, in database `db` when three-part), one row per key
+/// column: key id, child schema, child table, delete action, column name.
+/// Self-references are excluded: the swap replaces every row at once.
+pub(crate) fn referencing_keys_sql(
+    target_quoted: &str,
+    db: Option<&str>,
+) -> Result<String, FaucetError> {
+    let lit = target_quoted.replace('\'', "''");
+    let (p, dbid) = catalog_scope(db)?;
+    Ok(format!(
+        "SELECT fk.object_id, OBJECT_SCHEMA_NAME(fk.parent_object_id, {dbid}), \
+         OBJECT_NAME(fk.parent_object_id, {dbid}), \
+         CAST(fk.delete_referential_action AS INT), c.name \
+         FROM {p}sys.foreign_keys fk \
+         JOIN {p}sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id \
+         JOIN {p}sys.columns c ON c.object_id = fkc.parent_object_id \
+         AND c.column_id = fkc.parent_column_id \
+         WHERE fk.referenced_object_id = OBJECT_ID(N'{lit}', N'U') \
+         AND fk.parent_object_id <> fk.referenced_object_id AND fk.is_disabled = 0 \
+         ORDER BY fk.object_id, fkc.constraint_column_id"
+    ))
+}
+
+/// Fold [`referencing_keys_sql`]'s rows (ordered by key) into one
+/// [`ReferencingKey`] per foreign key.
+pub(crate) fn group_referencing_keys(
+    rows: impl IntoIterator<Item = (i32, String, String, i32, String)>,
+) -> Vec<ReferencingKey> {
+    let mut keys: Vec<ReferencingKey> = Vec::new();
+    for (id, schema, table, action, column) in rows {
+        match keys.last_mut() {
+            Some(k) if k.id == id => k.columns.push(column),
+            _ => keys.push(ReferencingKey {
+                id,
+                child_schema: schema,
+                child_table: table,
+                delete_action: action,
+                columns: vec![column],
+            }),
+        }
+    }
+    keys
+}
+
+/// Whether some child row of `key` references the target: every key column
+/// set (a row with a NULL key column is not checked by SQL Server).
+pub(crate) fn child_references_sql(
+    key: &ReferencingKey,
+    db: Option<&str>,
+) -> Result<String, FaucetError> {
+    let mut table = String::new();
+    if let Some(db) = db {
+        table.push_str(&quote_ident_mssql(db)?);
+        table.push('.');
+    }
+    table.push_str(&quote_ident_mssql(&key.child_schema)?);
+    table.push('.');
+    table.push_str(&quote_ident_mssql(&key.child_table)?);
+    let filter = key
+        .columns
+        .iter()
+        .map(|c| Ok(format!("{} IS NOT NULL", quote_ident_mssql(c)?)))
+        .collect::<Result<Vec<_>, FaucetError>>()?
+        .join(" AND ");
+    Ok(format!("SELECT TOP (1) 1 FROM {table} WHERE {filter}"))
+}
+
 /// The overwrite swap, column lists built from the **target**: computed and
 /// `rowversion` columns are never copied; the IDENTITY column is copied with
 /// `IDENTITY_INSERT` where staging has a value (so identities survive the
@@ -372,6 +491,57 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::time::Duration;
+
+    #[test]
+    fn referencing_keys_probe_skips_self_references_and_disabled_keys() {
+        let sql = referencing_keys_sql("[dbo].[o'k]", None).unwrap();
+        assert!(sql.contains("OBJECT_ID(N'[dbo].[o''k]', N'U')"), "{sql}");
+        assert!(sql.contains("fk.parent_object_id <> fk.referenced_object_id"));
+        assert!(sql.contains("fk.is_disabled = 0"));
+        assert!(sql.contains("FROM sys.foreign_keys fk"));
+        assert!(sql.contains("OBJECT_NAME(fk.parent_object_id, DB_ID())"));
+    }
+
+    #[test]
+    fn referencing_keys_probe_reads_the_target_database_catalog() {
+        assert_eq!(target_database("otherdb.dbo.customers"), Some("otherdb"));
+        assert_eq!(target_database("dbo.customers"), None);
+        assert_eq!(target_database("customers"), None);
+        let sql = referencing_keys_sql("[o'db].[dbo].[c]", Some("o'db")).unwrap();
+        assert!(sql.contains("FROM [o'db].sys.foreign_keys fk"), "{sql}");
+        assert!(
+            sql.contains("JOIN [o'db].sys.foreign_key_columns fkc"),
+            "{sql}"
+        );
+        assert!(sql.contains("JOIN [o'db].sys.columns c"), "{sql}");
+        assert!(sql.contains("OBJECT_SCHEMA_NAME(fk.parent_object_id, DB_ID(N'o''db'))"));
+    }
+
+    #[test]
+    fn referencing_keys_group_per_key_and_classify_the_delete_action() {
+        let row = |id, t: &str, action, c: &str| {
+            (id, "dbo".to_string(), t.to_string(), action, c.to_string())
+        };
+        let keys = group_referencing_keys([
+            row(5, "orders", 0, "a"),
+            row(5, "orders", 0, "b"),
+            row(9, "lines", 1, "x"),
+        ]);
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].columns, vec!["a", "b"]);
+        assert!(!keys[0].rewrites_child());
+        assert!(keys[1].rewrites_child());
+        assert_eq!(keys[0].display(None), "dbo.orders");
+        assert_eq!(keys[0].display(Some("db")), "db.dbo.orders");
+        assert_eq!(
+            child_references_sql(&keys[0], Some("db")).unwrap(),
+            "SELECT TOP (1) 1 FROM [db].[dbo].[orders] WHERE [a] IS NOT NULL AND [b] IS NOT NULL"
+        );
+        assert_eq!(
+            child_references_sql(&keys[1], None).unwrap(),
+            "SELECT TOP (1) 1 FROM [dbo].[lines] WHERE [x] IS NOT NULL"
+        );
+    }
 
     fn info(name: &str, ty: &str, identity: bool) -> ColumnInfo {
         ColumnInfo {

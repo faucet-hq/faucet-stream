@@ -301,7 +301,12 @@ impl faucet_core::Source for BufferingFeed {
                 + 'a,
         >,
     > {
-        let cancel = self.cancel.lock().unwrap().clone().unwrap_or_default();
+        let cancel = self
+            .cancel
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the engine installs the run's cancel token before reading");
         Box::pin(async_stream::stream! {
             cancel.cancelled().await;
             yield Ok(faucet_core::StreamPage {
@@ -326,11 +331,15 @@ async fn a_source_that_drains_on_cancel_has_its_tail_written_then_flushed() {
         canceller.cancel();
     });
 
-    let result = Pipeline::new(&source, &sink)
-        .with_cancel(cancel)
-        .run()
-        .await
-        .expect("a cancelled run stops cleanly");
+    // A bounded wait: if the cancel token stopped reaching the source, the
+    // stream would wait forever; fail with a reason instead of hanging CI.
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        Pipeline::new(&source, &sink).with_cancel(cancel).run(),
+    )
+    .await
+    .expect("the run did not end after cancel: the cancel token never reached the source")
+    .expect("a cancelled run stops cleanly");
 
     assert_eq!(
         result.records_written, 2,

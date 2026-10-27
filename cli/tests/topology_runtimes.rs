@@ -15,6 +15,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+#[path = "support/ports.rs"]
+mod ports;
+
 fn write(path: &Path, body: &str) {
     fs::write(path, body).unwrap();
 }
@@ -77,7 +80,7 @@ pipeline:
 #[tokio::test]
 async fn a_record_budget_stops_every_sink_node() {
     let dir = TempDir::new().unwrap();
-    let (yaml, _, _) = tee_yaml(dir.path(), "budget: { max_records: 2 }");
+    let (yaml, a, b) = tee_yaml(dir.path(), "budget: { max_records: 2 }");
     let cfg = parse(&yaml);
     let auth = build_auth_catalog(None).unwrap();
     let summary = run_topology(
@@ -98,6 +101,105 @@ async fn a_record_budget_stops_every_sink_node() {
     assert!(
         errors.iter().any(|e| e.contains("max_records")),
         "the crossing page is refused: {errors:?}"
+    );
+    // Both tee branches are bounded: a sink node either had its crossing page
+    // refused or was stopped by the run's cancel, and neither output holds
+    // more than the budget allows.
+    for node in ["wa", "wb"] {
+        let inv = summary
+            .invocations
+            .iter()
+            .find(|i| i.row_id == node)
+            .unwrap_or_else(|| panic!("no outcome for {node}: {:?}", summary.invocations));
+        let refused = inv
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("max_records"));
+        assert!(
+            refused || inv.records_written <= 2,
+            "{node} wrote {} records past the budget: {:?}",
+            inv.records_written,
+            inv.error
+        );
+    }
+    assert!(
+        lines(&a).len() <= 2,
+        "sink a wrote {} rows",
+        lines(&a).len()
+    );
+    assert!(
+        lines(&b).len() <= 2,
+        "sink b wrote {} rows",
+        lines(&b).len()
+    );
+}
+
+/// The budget wraps every sink node on its own: here only the second branch
+/// crosses it (the first sees one filtered row), so nothing but that node's
+/// own budget can stop it.
+#[tokio::test]
+async fn a_record_budget_bounds_each_sink_node_on_its_own() {
+    let dir = TempDir::new().unwrap();
+    let csv = orders_csv(dir.path());
+    let a = dir.path().join("a.jsonl");
+    let b = dir.path().join("b.jsonl");
+    let yaml = format!(
+        r#"version: 1
+name: graph
+budget: {{ max_records: 2 }}
+pipeline:
+  sources:
+    orders: {{ type: csv, config: {{ path: {csv} }} }}
+  sinks:
+    a: {{ type: jsonl, config: {{ path: {a} }} }}
+    b: {{ type: jsonl, config: {{ path: {b} }} }}
+  nodes:
+    src: {{ kind: source, ref: orders }}
+    fan: {{ kind: tee, fanout: 2 }}
+    only_de:
+      kind: transform
+      transforms:
+        - {{ type: filter, config: {{ path: country_code, op: eq, value: DE }} }}
+    wa: {{ kind: sink, ref: a }}
+    wb: {{ kind: sink, ref: b }}
+  edges:
+    - {{ from: src, to: fan }}
+    - {{ from: fan, to: only_de }}
+    - {{ from: only_de, to: wa }}
+    - {{ from: fan, to: wb }}
+"#,
+        csv = csv.display(),
+        a = a.display(),
+        b = b.display()
+    );
+    let cfg = parse(&yaml);
+    let auth = build_auth_catalog(None).unwrap();
+    let summary = run_topology(
+        &cfg,
+        &auth,
+        TopologyRunOptions {
+            budget: cfg.budget.clone(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let wb = summary
+        .invocations
+        .iter()
+        .find(|i| i.row_id == "wb")
+        .expect("an outcome for wb");
+    assert!(
+        wb.error
+            .as_deref()
+            .is_some_and(|e| e.contains("max_records")),
+        "wb crossed the budget unrefused: {:?}",
+        summary.invocations
+    );
+    assert!(
+        lines(&b).len() <= 2,
+        "sink b wrote {} rows",
+        lines(&b).len()
     );
 }
 
@@ -381,10 +483,7 @@ mod serve {
     use faucet_cli::serve::ServeConfig;
     use std::time::Duration;
 
-    fn free_port() -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().port()
-    }
+    use super::ports::free_port;
 
     async fn spawn_server(port: u16) {
         let args = ServeArgs {

@@ -149,6 +149,34 @@
       "summary": "a failed write of a batch declared atomic lands no row"
     },
     {
+      "id": "cleanup",
+      "role": "sink",
+      "triggers": [
+        {
+          "kind": "capability",
+          "arg": "cleanup"
+        }
+      ],
+      "assertions": [
+        "assert_cleanup_scoped"
+      ],
+      "summary": "cleanup deletes exactly the unwritten rows of its scope and nothing outside it"
+    },
+    {
+      "id": "rollback",
+      "role": "sink",
+      "triggers": [
+        {
+          "kind": "capability",
+          "arg": "rollback"
+        }
+      ],
+      "assertions": [
+        "assert_rollback_truthful"
+      ],
+      "summary": "rollback deletes exactly the run's rows, and a dry run changes nothing"
+    },
+    {
       "id": "call_deadline",
       "role": "sink",
       "triggers": [
@@ -240,6 +268,20 @@
         "assert_source_call_deadline"
       ],
       "summary": "a read from a hung backend ends at the call deadline and on cancel"
+    },
+    {
+      "id": "streaming",
+      "role": "source",
+      "triggers": [
+        {
+          "kind": "overrides",
+          "arg": "stream_pages"
+        }
+      ],
+      "assertions": [
+        "assert_first_page_before_exhaustion"
+      ],
+      "summary": "the first page arrives before the backend has served the whole result set"
     }
   ],
   "sources": {

@@ -310,8 +310,12 @@ cloud-metadata address, and a host *name* is judged by the addresses it
 resolves to when the connection is made: the client's resolver drops
 link-local / metadata addresses (so `169.254.169.254.nip.io`, or a name
 re-pointed after the submit-time check, is never connected to) unless the
-policy lists that name exactly. Behind an HTTP proxy the proxy resolves the
-target, so this check cannot apply there. A GCS `storage_host` that is not a
+policy lists that name exactly. Behind an HTTP proxy (set in the
+environment, the system settings or the connector) the proxy resolves the
+target, so a caller-submitted run resolves the name itself first and refuses
+it when any address is link-local / metadata; a name the server cannot
+resolve is left to the proxy, and an answer that changes between that check
+and the proxy's own lookup is not covered. A GCS `storage_host` that is not a
 `googleapis.com` endpoint never receives the server's own credentials
 (`application_default` or a key file); a Snowflake `account` must be an
 account identifier, so its request URL always names a Snowflake host.
@@ -1105,7 +1109,11 @@ submitted config before it is merged into the (trusted) template body: its
 path (a `file` state store, a file DLQ sink), every URL (a notification
 webhook, an `http` DLQ sink) and any connector that runs a program are held to
 the [caller reference policy](#reference-policy) — refused with `403` (`422`
-for a subprocess connector without `--allow-subprocess-connectors`). A run for
+for a subprocess connector without `--allow-subprocess-connectors`). It may use
+literal values and the `${now.*}`, `${backfill.*}` and `${partition.*}` tokens
+only: a `${param.*}`, `${vars.*}` or row token is refused (`403`), because its
+value would be bound after the screen. An MCP `run_template` dry run applies the
+same checks. A run for
 a tenant (a tenant-scoped principal, or `POST /v1/tenants/{tenant}/…`) may not
 carry an inline overlay at all (`403`); register the overlay and name it
 instead. Every refusal is audited as a denied `template.run`.

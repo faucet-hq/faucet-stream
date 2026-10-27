@@ -704,10 +704,10 @@ impl GraphqlDriver {
 
                 if !has_next && truncated && key.is_some() {
                     running_max = truncated_bookmark(
-                        start.clone(),
                         running_max,
                         self.config.replication_key_ordered,
-                    );
+                        self.config.replication_bind.is_some(),
+                    )?;
                 }
                 if has_next {
                     // Intermediate page — bookmark stays `None`.
@@ -728,10 +728,10 @@ impl GraphqlDriver {
             // one empty page carrying it so the pipeline persists progress.
             if truncated && !bookmark_emitted && key.is_some() {
                 running_max = truncated_bookmark(
-                    start.clone(),
                     running_max,
                     self.config.replication_key_ordered,
-                );
+                    self.config.replication_bind.is_some(),
+                )?;
             }
             if !bookmark_emitted && running_max.is_some() {
                 yield StreamPage {
@@ -755,26 +755,28 @@ impl GraphqlDriver {
     }
 }
 
-/// The bookmark a run that stopped with pages unread may persist. With results
-/// ordered by the key, the max over the pages read is safe (every unread row
-/// sorts at or after it). Without that, an unread page could hold an older key
-/// the next run would filter out, so the bookmark stays at `start`.
+/// The bookmark a run that stopped with pages unread (`max_pages`, a cursor
+/// loop) may persist. Only results ordered by the key whose bookmark the next
+/// request pushes to the server (`replication_bind`) can resume past the pages
+/// read: every unread row sorts at or after the max, and the server starts
+/// there. Otherwise the bookmark could not advance and every run would re-read
+/// the same pages with a green result, so the pass fails instead.
 fn truncated_bookmark(
-    start: Option<Value>,
     running_max: Option<Value>,
     ordered: bool,
-) -> Option<Value> {
-    if ordered {
-        return running_max;
+    bound: bool,
+) -> Result<Option<Value>, FaucetError> {
+    if ordered && bound {
+        return Ok(running_max);
     }
-    if running_max != start {
-        tracing::warn!(
-            "incremental GraphQL run stopped before the last page; the bookmark is not \
-             advanced because the results are not declared ordered by `replication_key` \
-             (set `replication_key_ordered: true` when the query sorts ascending by it)"
-        );
-    }
-    start
+    Err(FaucetError::Source(
+        "graphql: the incremental pass stopped before the last page (`max_pages` or a \
+         repeated cursor), so its bookmark cannot advance and every run would re-read the \
+         same pages. Raise or remove `max_pages`, or set `replication_key_ordered: true` \
+         together with a `replication_bind` when the query sorts ascending by the \
+         replication key"
+            .into(),
+    ))
 }
 
 #[async_trait]

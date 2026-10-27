@@ -463,7 +463,7 @@ matrix:
 "#,
     );
     let auth = build_auth_catalog(None).unwrap();
-    let err = faucet_cli::topology::preview(&cfg, &auth, 5)
+    let err = faucet_cli::topology::preview(&cfg, &auth, 5, false)
         .await
         .unwrap_err();
     assert!(matches!(err, CliError::MatrixAndNodesBothPresent));
@@ -483,7 +483,7 @@ pipeline:
 "#,
     );
     let auth = build_auth_catalog(None).unwrap();
-    let err = faucet_cli::topology::preview(&cfg, &auth, 5)
+    let err = faucet_cli::topology::preview(&cfg, &auth, 5, false)
         .await
         .unwrap_err();
     assert!(matches!(err, CliError::InvalidTopology { .. }), "{err:?}");

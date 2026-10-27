@@ -274,3 +274,55 @@ async fn concurrent_overwrite_runs_keep_their_own_rows() {
     assert_eq!(names_ordered(&url).await, ["b1"]);
     assert!(!table_exists(&url, &format!("t__faucet_ovw_{b}")).await);
 }
+
+/// A tokened overwrite of a table whose name plus the staging suffix would
+/// pass MySQL's 64-character limit stages under a shortened, hashed name and
+/// swaps (`<staging>_old` fits too); a long-abandoned staging of the same
+/// table is still recognised and swept (#934).
+#[tokio::test(flavor = "multi_thread")]
+async fn overwrite_of_a_long_table_name_fits_the_identifier_limit() {
+    use faucet_core::idempotency::new_overwrite_run_token;
+    let (_container, url) = start_mysql().await;
+    let table = "customer_subscription_invoice_lines_v2_archive_x"; // 48 chars
+    seed(
+        &url,
+        &format!("CREATE TABLE {table} (id INT PRIMARY KEY, name VARCHAR(255))"),
+    )
+    .await;
+    seed(&url, &format!("INSERT INTO {table} VALUES (0, 'old')")).await;
+    let base = faucet_common_sql::bounded_staging_base(table, 60);
+    let abandoned = format!("{base}__faucet_ovw_10000000aaaaaa");
+    seed(&url, &format!("CREATE TABLE {abandoned} LIKE {table}")).await;
+    let token = new_overwrite_run_token();
+    let sink = || async {
+        let mut cfg = overwrite_config(&url);
+        cfg.table_name = table.to_string();
+        MysqlSink::new(cfg)
+            .await
+            .unwrap()
+            .with_overwrite_run(&token)
+            .unwrap()
+    };
+    sink().await.begin_overwrite().await.unwrap();
+    assert!(!table_exists(&url, &abandoned).await, "swept");
+    let w = sink().await;
+    w.write_batch(&[json!({"id": 1, "name": "new"})])
+        .await
+        .unwrap();
+    w.flush().await.unwrap();
+    sink().await.commit_overwrite().await.unwrap();
+    let pool = sqlx::MySqlPool::connect(&url).await.unwrap();
+    let names: Vec<String> = sqlx::query_scalar(&format!("SELECT name FROM {table}"))
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(names, ["new"]);
+    let left: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.tables \
+         WHERE table_schema = DATABASE() AND table_name LIKE '%faucet_ovw%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(left, 0);
+}

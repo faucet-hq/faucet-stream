@@ -22,6 +22,7 @@ pub async fn run(args: RollbackArgs) -> CliResult<()> {
     };
     let cfg = PipelineConfig::from_path_async(&path, args.profile.as_deref()).await?;
     crate::obs::install(&cfg)?;
+    let _otel = crate::obs::flush_on_exit();
     let pipeline_name = cfg.name.clone().unwrap_or_else(|| {
         path.file_stem()
             .and_then(|s| s.to_str())

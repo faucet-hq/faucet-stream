@@ -485,6 +485,16 @@ impl RemoteBackend {
         format!("{}{}/", self.base, self.template.swap_run_dir_name(run))
     }
 
+    /// The key of this output's overwrite commit ledger.
+    fn commit_ledger_key(&self) -> String {
+        format!(
+            "{}{}/{}",
+            self.base,
+            self.template.commit_ledger_dir_name(),
+            super::layout::COMMIT_LEDGER_FILE
+        )
+    }
+
     /// The full key of `name` in `area`.
     pub fn key(&self, area: Area, name: &str) -> String {
         format!("{}{name}", self.prefix(area))
@@ -609,6 +619,79 @@ impl StorageBackend for RemoteBackend {
         self.client
             .remove_empty_dir(prefix.trim_end_matches('/'))
             .await
+    }
+
+    async fn read_swap_run_marker(
+        &self,
+        run: Option<&str>,
+        name: &str,
+    ) -> Result<Option<String>, FaucetError> {
+        let key = format!("{}{name}", self.run_prefix(run));
+        if !self.client.exists(&key).await? {
+            return Ok(None);
+        }
+        let to = self
+            .scratch
+            .path()
+            .join(format!("o-{}", name.replace('/', "_")));
+        self.client.download(&key, &to).await?;
+        let text = std::fs::read_to_string(&to);
+        let _ = std::fs::remove_file(&to);
+        text.map(Some).map_err(|e| {
+            FaucetError::Sink(format!(
+                "remote file sink: reading the overwrite marker: {e}"
+            ))
+        })
+    }
+
+    async fn list_swap_run(&self, run: Option<&str>) -> Result<Vec<String>, FaucetError> {
+        let prefix = self.run_prefix(run);
+        let keys = self.client.list(&prefix).await?;
+        Ok(direct_children(&prefix, keys))
+    }
+
+    async fn promote_from_swap_run(
+        &self,
+        run: Option<&str>,
+        name: &str,
+    ) -> Result<(), FaucetError> {
+        let from = format!("{}{name}", self.run_prefix(run));
+        let to = self.key(Area::Destination, name);
+        match self.client.rename(&from, &to).await {
+            Ok(()) => Ok(()),
+            // Another begin finished this move first.
+            Err(_) if !self.client.exists(&from).await? && self.client.exists(&to).await? => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn read_commit_record(&self) -> Result<Option<String>, FaucetError> {
+        let key = self.commit_ledger_key();
+        if !self.client.exists(&key).await? {
+            return Ok(None);
+        }
+        let to = self.scratch.path().join("o-commit-ledger");
+        self.client.download(&key, &to).await?;
+        let text = std::fs::read_to_string(&to);
+        let _ = std::fs::remove_file(&to);
+        text.map(Some).map_err(|e| {
+            FaucetError::Sink(format!(
+                "remote file sink: reading the overwrite commit ledger: {e}"
+            ))
+        })
+    }
+
+    async fn write_commit_record(&self, text: &str) -> Result<(), FaucetError> {
+        let to = self.scratch.path().join("i-commit-ledger");
+        std::fs::write(&to, text.as_bytes()).map_err(|e| {
+            FaucetError::Sink(format!(
+                "remote file sink: writing the overwrite commit ledger '{}': {e}",
+                to.display()
+            ))
+        })?;
+        let result = self.client.upload(&to, &self.commit_ledger_key()).await;
+        let _ = std::fs::remove_file(&to);
+        result
     }
 
     async fn promote(&self, name: &str) -> Result<(), FaucetError> {

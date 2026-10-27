@@ -191,13 +191,26 @@ pub struct RestStreamConfig {
     /// re-read the same pages forever — unless `assume_ordered` is set.
     #[serde(default = "default_max_pages")]
     pub max_pages: Option<usize>,
+    /// Keep paging when a `PageNumber` / `Offset` / `OffsetInBody` page holds
+    /// the same records as an earlier, non-adjacent page of the pass, instead
+    /// of failing the run. For feeds whose pages can legitimately repeat (a
+    /// sparse report returning `[{"count": 0}]` on several pages). Requires
+    /// `max_pages`, which then bounds a server that cycles pages. A page
+    /// identical to the page just before it still ends paging.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_repeated_pages: bool,
     /// The feed returns records in ascending `replication_key` order, so an
     /// incremental pass that `max_pages` cuts short may persist the largest key
-    /// it read and resume after it next run. Without it such a pass fails the
+    /// it read and resume from it next run. Without it such a pass fails the
     /// run. Requires a `replication_bind` when `max_pages` is set: only a
     /// bookmark the server filters on moves the next run past the pages
-    /// already read. Ignored for windowed passes, with `persist_cursor`, and
-    /// across `requests:` entries (a truncated entry fails the run).
+    /// already read. The bind must compare **inclusively** (`>=`, e.g. a
+    /// `gte|${bookmark}` template): rows sharing the last key read may sit on
+    /// the first unread page, and an exclusive (`>`) server filter would skip
+    /// them; the client-side filter is inclusive, so the re-read rows at that
+    /// key arrive again (pair with an upsert sink). Ignored for windowed
+    /// passes, with `persist_cursor`, and across `requests:` entries (a
+    /// truncated entry fails the run).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub assume_ordered: bool,
     /// Fixed delay between page requests, in seconds — a politeness knob for
@@ -779,6 +792,7 @@ impl Default for RestStreamConfig {
             pagination: PaginationStyle::None,
             records_path: None,
             max_pages: None,
+            allow_repeated_pages: false,
             assume_ordered: false,
             request_delay: None,
             timeout: Some(Duration::from_secs(30)),
@@ -894,6 +908,13 @@ impl RestStreamConfig {
                         .into(),
                 ));
             }
+        }
+        if self.allow_repeated_pages && self.max_pages.is_none() {
+            return Err(faucet_core::FaucetError::Config(
+                "rest: `allow_repeated_pages` needs `max_pages`: with repeated pages allowed, \
+                 only the page cap stops a server that cycles through the same pages"
+                    .into(),
+            ));
         }
         if self.assume_ordered
             && self.max_pages.is_some()
@@ -1325,6 +1346,14 @@ impl RestStreamConfig {
 
     pub fn max_pages(mut self, n: usize) -> Self {
         self.max_pages = Some(n);
+        self
+    }
+
+    /// Keep paging past a page that repeats an earlier, non-adjacent page;
+    /// see [`allow_repeated_pages`](Self::allow_repeated_pages). Needs
+    /// [`max_pages`](Self::max_pages).
+    pub fn allow_repeated_pages(mut self, allow: bool) -> Self {
+        self.allow_repeated_pages = allow;
         self
     }
 

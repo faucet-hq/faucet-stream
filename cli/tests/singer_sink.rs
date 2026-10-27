@@ -123,7 +123,13 @@ pipeline:
     );
     let summary = faucet_cli::run_from_yaml_str(&ok).await.unwrap();
     assert!(!summary.had_failures(), "{:?}", summary.invocations);
-    assert!(read_jsonl(&out).iter().all(|r| r["_stream"] == "people"));
+    // Every record arrived (an empty output would pass the stream check).
+    let records = read_jsonl(&out);
+    assert_eq!(records.len(), 3, "{records:?}");
+    assert!(
+        records.iter().all(|r| r["_stream"] == "people"),
+        "{records:?}"
+    );
 
     let crash = ok.replace(
         "target_config: {",

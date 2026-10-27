@@ -269,7 +269,11 @@ paths:
         Returns 400 when the HTTP method is not in the trigger's configured
         `methods` list. A fire coalesced by the trigger's leading-edge
         `debounce_secs` returns 200 with `{ "status": "coalesced" }` and enqueues
-        no run. Requires the `triggers` Cargo feature.
+        no run. Returns 422 when a value the request sent is refused where the
+        config places it, or one the config uses is missing; 500 when the
+        trigger cannot run whatever is sent (its config does not validate, its
+        template or tenant is gone), which also marks it unhealthy. Requires
+        the `triggers` Cargo feature.
       operationId: fireTrigger
       parameters:
         - { name: name, in: path, required: true, schema: { type: string }, description: "Trigger name from the triggers file." }
@@ -297,7 +301,10 @@ paths:
         "400": { $ref: "#/components/responses/Error" }
         "401": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
         "429": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
     put:
       summary: Fire a named webhook trigger (PUT)
       description: >
@@ -336,7 +343,10 @@ paths:
         "400": { $ref: "#/components/responses/Error" }
         "401": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
         "429": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
   /v1/doctor:
     post:
       summary: Validate and probe a config without running it

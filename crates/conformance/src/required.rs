@@ -189,6 +189,20 @@ pub const REQUIREMENTS: &[Requirement] = &[
         summary: "a failed write of a batch declared atomic lands no row",
     },
     Requirement {
+        id: "cleanup",
+        role: Role::Sink,
+        triggers: &[Trigger::Capability("cleanup")],
+        assertions: &["assert_cleanup_scoped"],
+        summary: "cleanup deletes exactly the unwritten rows of its scope and nothing outside it",
+    },
+    Requirement {
+        id: "rollback",
+        role: Role::Sink,
+        triggers: &[Trigger::Capability("rollback")],
+        assertions: &["assert_rollback_truthful"],
+        summary: "rollback deletes exactly the run's rows, and a dry run changes nothing",
+    },
+    Requirement {
         id: "call_deadline",
         role: Role::Sink,
         triggers: &[Trigger::Always],
@@ -236,6 +250,13 @@ pub const REQUIREMENTS: &[Requirement] = &[
         triggers: &[Trigger::Always],
         assertions: &["assert_source_call_deadline"],
         summary: "a read from a hung backend ends at the call deadline and on cancel",
+    },
+    Requirement {
+        id: "streaming",
+        role: Role::Source,
+        triggers: &[Trigger::Overrides("stream_pages")],
+        assertions: &["assert_first_page_before_exhaustion"],
+        summary: "the first page arrives before the backend has served the whole result set",
     },
 ];
 

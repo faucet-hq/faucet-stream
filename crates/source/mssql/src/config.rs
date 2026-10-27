@@ -35,10 +35,11 @@ pub enum MssqlReplication {
     /// that share a cursor value (ties, late commits, `DATETIME`'s 1/300 s
     /// ticks) are never skipped. Every page carries a bookmark, so a crash
     /// replays at most one page. Write `@bookmark` in the query (with `>=`)
-    /// to apply the cursor further inside it, e.g. in a CTE; a strict `>` is
-    /// refused. The query must not end in a top-level `ORDER BY` (T-SQL
-    /// forbids it in a derived table). Rows whose `column` is NULL are never
-    /// read.
+    /// to apply the cursor further inside it, e.g. in a subquery or join; a
+    /// strict `>` is refused. The query must not have a top-level `ORDER BY` (without
+    /// `TOP` / `OFFSET`) or start with a CTE, and every column must be named:
+    /// T-SQL forbids those in a derived table, and `validate` refuses the
+    /// first two. Rows whose `column` is NULL are never read.
     Incremental {
         /// Column whose value is the replication cursor (e.g. `updated_at`).
         column: String,
@@ -56,6 +57,7 @@ pub struct MssqlSourceConfig {
     pub connection: MssqlConnectionConfig,
     /// SQL query to run. Use `@P1`, `@P2`, … for [`params`](Self::params), and
     /// the literal `@bookmark` token to bind the incremental cursor server-side.
+    #[schemars(extend("x-faucet-sql" = true))]
     pub query: String,
     /// Positional bind parameters for the query (`@P1`…`@Pn`). Defaults to empty.
     #[serde(default)]
@@ -171,6 +173,21 @@ impl MssqlSourceConfig {
                 "MSSQL incremental replication requires a non-null `initial_value`".into(),
             ));
         }
+        if let Some(reason) = derived_table_refusal(&self.query) {
+            return Err(FaucetError::Config(format!(
+                "MSSQL incremental replication wraps the query as \
+                 `SELECT * FROM (<query>) AS q WHERE q.[column] >= @Pn ORDER BY q.[column]`, \
+                 and T-SQL does not accept {reason} inside a derived table; {hint}",
+                hint = match reason {
+                    DerivedTableShape::OrderBy => {
+                        "remove it, the source already orders by the cursor column"
+                    }
+                    DerivedTableShape::Cte => {
+                        "move the CTE into a view or a subquery in the FROM clause"
+                    }
+                },
+            )));
+        }
         if faucet_core::replication::cursor::strict_comparison(&self.query, BOOKMARK_TOKEN) {
             return Err(FaucetError::Config(format!(
                 "MSSQL: compare `{BOOKMARK_TOKEN}` with `>=`, not `>`: the source re-reads the \
@@ -182,6 +199,104 @@ impl MssqlSourceConfig {
     }
 }
 
+/// A query shape SQL Server refuses inside a derived table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DerivedTableShape {
+    /// A top-level `ORDER BY` without `TOP` / `OFFSET` (error 1033).
+    OrderBy,
+    /// A leading `WITH` (a common table expression).
+    Cte,
+}
+
+impl std::fmt::Display for DerivedTableShape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::OrderBy => "a top-level `ORDER BY` (without `TOP` or `OFFSET`)",
+            Self::Cte => "a leading `WITH` (a common table expression)",
+        })
+    }
+}
+
+/// The top-level (outside parentheses, literals, quoted identifiers and
+/// comments) words of a T-SQL text, upper-cased.
+fn top_level_words(sql: &str) -> Vec<String> {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut words = Vec::new();
+    let mut depth = 0usize;
+    let mut word = String::new();
+    let mut i = 0;
+    let flush = |word: &mut String, words: &mut Vec<String>, depth: usize| {
+        if !word.is_empty() {
+            if depth == 0 {
+                words.push(word.to_ascii_uppercase());
+            }
+            word.clear();
+        }
+    };
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        match c {
+            '\'' | '"' | '[' => {
+                flush(&mut word, &mut words, depth);
+                let close = if c == '[' { ']' } else { c };
+                i += 1;
+                while i < chars.len() {
+                    if chars[i] == close {
+                        if chars.get(i + 1) == Some(&close) {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            '-' if next == Some('-') => {
+                flush(&mut word, &mut words, depth);
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '/' if next == Some('*') => {
+                flush(&mut word, &mut words, depth);
+                i += 2;
+                while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+                    i += 1;
+                }
+                i += 1;
+            }
+            '(' => {
+                flush(&mut word, &mut words, depth);
+                depth += 1;
+            }
+            ')' => {
+                flush(&mut word, &mut words, depth);
+                depth = depth.saturating_sub(1);
+            }
+            c if c.is_alphanumeric() || c == '_' || c == '@' || c == '#' || c == '$' => {
+                word.push(c);
+            }
+            _ => flush(&mut word, &mut words, depth),
+        }
+        i += 1;
+    }
+    flush(&mut word, &mut words, depth);
+    words
+}
+
+/// Why `query` cannot be the derived table the incremental cursor wraps, if
+/// it cannot.
+fn derived_table_refusal(query: &str) -> Option<DerivedTableShape> {
+    let words = top_level_words(query);
+    if words.first().map(String::as_str) == Some("WITH") {
+        return Some(DerivedTableShape::Cte);
+    }
+    let order_by = words.windows(2).any(|w| w[0] == "ORDER" && w[1] == "BY");
+    let limited = words.iter().any(|w| w == "TOP" || w == "OFFSET");
+    (order_by && !limited).then_some(DerivedTableShape::OrderBy)
+}
+
 /// The token a query uses to read the incremental bookmark
 /// (`WHERE updated_at >= @bookmark`).
 pub const BOOKMARK_TOKEN: &str = "@bookmark";
@@ -190,6 +305,57 @@ pub const BOOKMARK_TOKEN: &str = "@bookmark";
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn incremental(query: &str) -> MssqlSourceConfig {
+        let mut cfg = MssqlSourceConfig::new("mssql://u:p@h/db", query);
+        cfg.replication = MssqlReplication::Incremental {
+            column: "updated_at".into(),
+            initial_value: json!(0),
+        };
+        cfg
+    }
+
+    #[test]
+    fn incremental_refuses_a_top_level_order_by_and_a_cte() {
+        let err = incremental("SELECT * FROM t WHERE updated_at >= @bookmark ORDER BY updated_at")
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("top-level `ORDER BY`"), "{err}");
+        assert!(err.contains("already orders by the cursor"), "{err}");
+        let err = incremental("with x AS (SELECT * FROM t) SELECT * FROM x")
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("common table expression"), "{err}");
+    }
+
+    #[test]
+    fn incremental_accepts_order_by_that_a_derived_table_allows() {
+        for q in [
+            "SELECT * FROM t",
+            "SELECT TOP 100 * FROM t ORDER BY id",
+            "SELECT * FROM t ORDER BY id OFFSET 0 ROWS",
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS n FROM t",
+            "SELECT * FROM (SELECT TOP 5 * FROM t ORDER BY id) s",
+            "SELECT 'ORDER BY' AS [order by], \"with\" FROM t -- ORDER BY x",
+            "SELECT * FROM t /* ORDER BY x */",
+        ] {
+            incremental(q)
+                .validate()
+                .unwrap_or_else(|e| panic!("{q}: {e}"));
+        }
+    }
+
+    #[test]
+    fn full_replication_keeps_order_by_and_ctes() {
+        MssqlSourceConfig::new(
+            "mssql://u:p@h/db",
+            "WITH x AS (SELECT 1 a) SELECT * FROM x ORDER BY a",
+        )
+        .validate()
+        .unwrap();
+    }
 
     #[test]
     fn replication_full_is_default_and_round_trips() {

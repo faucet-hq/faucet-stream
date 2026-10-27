@@ -37,12 +37,14 @@ async fn start() -> (ContainerAsync<MinIO>, String, Client) {
         .await
         .expect("minio port");
     let endpoint = format!("http://127.0.0.1:{port}");
-    // SAFETY: identical constants across every test in this binary.
-    unsafe {
+    static CREDS: std::sync::Once = std::sync::Once::new();
+    // SAFETY: written once per process, before any client in this binary
+    // reads them; std's own environment reads take the same lock.
+    CREDS.call_once(|| unsafe {
         std::env::set_var("AWS_ACCESS_KEY_ID", ACCESS_KEY);
         std::env::set_var("AWS_SECRET_ACCESS_KEY", SECRET_KEY);
         std::env::set_var("AWS_DEFAULT_REGION", REGION);
-    }
+    });
     let creds = Credentials::new(ACCESS_KEY, SECRET_KEY, None, None, "test");
     let sdk = aws_config::defaults(BehaviorVersion::latest())
         .region(aws_config::Region::new(REGION))

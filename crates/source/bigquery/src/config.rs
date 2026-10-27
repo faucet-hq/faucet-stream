@@ -41,6 +41,7 @@ pub struct BigQuerySourceConfig {
     /// are resolved against the parent-record context at runtime as
     /// positional `?` markers; matched values are appended to
     /// [`params`](Self::params) when the query is sent.
+    #[schemars(extend("x-faucet-sql" = true))]
     pub query: String,
     /// Whether to use BigQuery's legacy SQL dialect. Defaults to `false`
     /// (Standard SQL). Set to `true` only for tables that use legacy

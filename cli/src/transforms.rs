@@ -122,9 +122,18 @@ struct KeysCaseConfig {
     /// Output convention for every key in the record.
     mode: KeyCaseMode,
     /// What to do when two distinct keys re-case to the same name:
-    /// `error` (default — fail loudly) or `suffix` (append `_2`, `_3`, …).
+    /// `error` (default — fail loudly) or `suffix` (write the keys listed in
+    /// `suffix_keys` as the re-cased name plus `_` and a short hash of the
+    /// source key, in every record; a collision between unlisted keys still
+    /// fails).
     #[serde(default)]
     on_collision: KeyCollision,
+    /// With `on_collision: suffix`: the source keys always written under a
+    /// suffixed name (`Account_Id__c` → `account_id_c_<hash>`), so each
+    /// source key keeps one column in every record and run. List every
+    /// spelling but the one that should keep the base name.
+    #[serde(default)]
+    suffix_keys: Vec<String>,
 }
 
 #[cfg(feature = "transforms")]
@@ -386,6 +395,7 @@ fn registry() -> Vec<TransformDef> {
                     Ok(TransformStage::Map(RecordTransform::KeysCase {
                         mode: cfg.mode,
                         on_collision: cfg.on_collision,
+                        suffix_keys: cfg.suffix_keys,
                     }))
                 },
             },
@@ -1093,6 +1103,26 @@ mod tests {
         ];
         let out = compile_transforms(&specs).unwrap();
         assert_eq!(out.len(), 2);
+    }
+
+    #[cfg(feature = "transforms")]
+    #[test]
+    fn keys_case_carries_its_suffix_keys() {
+        let specs = vec![TransformSpec {
+            kind: "keys_case".into(),
+            config: json!({
+                "mode": "snake",
+                "on_collision": "suffix",
+                "suffix_keys": ["Account_Id__c"]
+            }),
+        }];
+        let out = compile_transforms(&specs).unwrap();
+        match &out[0] {
+            TransformStage::Map(RecordTransform::KeysCase { suffix_keys, .. }) => {
+                assert_eq!(suffix_keys, &["Account_Id__c".to_string()]);
+            }
+            other => panic!("expected keys_case, got {other:?}"),
+        }
     }
 
     #[cfg(feature = "transforms")]

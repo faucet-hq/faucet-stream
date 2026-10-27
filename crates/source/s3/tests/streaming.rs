@@ -99,16 +99,7 @@ async fn seed_bucket(endpoint: &str, objects: &[(String, String)]) {
 /// env vars because the source's `build_client` honours the standard AWS
 /// credential chain and has no field for inline credentials.
 async fn build_source(endpoint: &str, config: S3SourceConfig) -> S3Source {
-    // SAFETY: tests are serialised on these env vars because each test
-    // creates its own container/bucket and the credentials are identical
-    // for every MinIO run, so the value is the same across overlapping
-    // tests. The thread-unsafe set is fine here because each test
-    // re-applies the same constants on entry.
-    unsafe {
-        std::env::set_var("AWS_ACCESS_KEY_ID", ACCESS_KEY);
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", SECRET_KEY);
-        std::env::set_var("AWS_DEFAULT_REGION", REGION);
-    }
+    set_test_env();
     let config = config
         .endpoint_url(endpoint.to_string())
         .region(REGION.to_string());
@@ -1037,4 +1028,65 @@ async fn verify_checksum_emits_no_json_lines_record_from_a_mismatched_object() {
     let source = build_source(&endpoint, config).await;
     let records = collect_all(&source, 2).await;
     assert_eq!(records.len(), 5);
+}
+
+/// A streamed JSON Lines object is bounded per line, not as a whole: short
+/// lines read past the cap, a newline-free object fails instead of being
+/// buffered whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_newline_free_jsonl_object_fails_at_max_object_bytes() {
+    let (_container, endpoint) = start_minio().await;
+    let long = format!(
+        "[{}]",
+        (0..200)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    seed_bucket(
+        &endpoint,
+        &[
+            ("ln/short.jsonl".to_string(), jsonl_body(1, 50)),
+            ("ln2/long.jsonl".to_string(), long),
+        ],
+    )
+    .await;
+    let config = |prefix: &str| {
+        let mut c = S3SourceConfig::new(TEST_BUCKET).prefix(prefix);
+        c.max_object_bytes = 64;
+        c
+    };
+    let short = build_source(&endpoint, config("ln/")).await;
+    let ctx: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut pages = short.stream_pages(&ctx, 0);
+    let mut total = 0;
+    while let Some(page) = pages.next().await {
+        total += page.expect("short lines read").records.len();
+    }
+    assert_eq!(total, 50);
+    let long = build_source(&endpoint, config("ln2/")).await;
+    let mut pages = long.stream_pages(&ctx, 0);
+    let err = loop {
+        match pages.next().await {
+            Some(Err(e)) => break e,
+            Some(Ok(_)) => continue,
+            None => panic!("a newline-free object must fail the streamed read"),
+        }
+    };
+    assert!(err.to_string().contains("max_object_bytes"), "{err}");
+}
+
+/// Set the AWS variables every test in this binary shares, once per process:
+/// `setenv` racing another thread's `getenv` is undefined behaviour even when
+/// both sides write the same value.
+fn set_test_env() {
+    static ENV: std::sync::Once = std::sync::Once::new();
+    // SAFETY: the writes run once, before any client in this binary reads the
+    // variables (every caller blocks on the `Once` until they are done), and
+    // std's own environment reads take the same lock as these writes.
+    ENV.call_once(|| unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", ACCESS_KEY);
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", SECRET_KEY);
+        std::env::set_var("AWS_DEFAULT_REGION", REGION);
+    });
 }

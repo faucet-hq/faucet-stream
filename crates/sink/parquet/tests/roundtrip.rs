@@ -525,13 +525,7 @@ async fn s3_destination_builds_without_credentials_for_endpoint_url() {
         endpoint_url: Some("http://localhost:4566".to_string()),
         allow_http: true,
     }));
-    // SAFETY: no other test in this binary reads AWS_* env vars, and the
-    // values are constants — setting them twice from parallel tests would
-    // still result in the same final state, so the data race is benign.
-    unsafe {
-        std::env::set_var("AWS_ACCESS_KEY_ID", "test");
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
-    }
+    set_test_env();
     let result = ParquetSink::new(cfg).await;
     assert!(
         result.is_ok(),
@@ -562,4 +556,18 @@ async fn a_field_null_in_every_record_is_a_nullable_string_column() {
     assert!(note.is_nullable());
     let col = batches[0].column(schema.index_of("note").unwrap());
     assert_eq!(col.null_count(), col.len());
+}
+
+/// Set the AWS variables every test in this binary shares, once per process:
+/// `setenv` racing another thread's `getenv` is undefined behaviour even when
+/// both sides write the same value.
+fn set_test_env() {
+    static ENV: std::sync::Once = std::sync::Once::new();
+    // SAFETY: the writes run once, before any client in this binary reads the
+    // variables (every caller blocks on the `Once` until they are done), and
+    // std's own environment reads take the same lock as these writes.
+    ENV.call_once(|| unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+    });
 }

@@ -53,6 +53,7 @@ pub struct ClickHouseSourceConfig {
     /// the literal `@bookmark` token to push the incremental cursor down into
     /// the `WHERE` clause; use `{key}` tokens to inject parent-context values in
     /// a matrix child.
+    #[schemars(extend("x-faucet-sql" = true))]
     pub query: String,
     /// Records per emitted [`StreamPage`](faucet_core::StreamPage). `0` emits
     /// the whole result set as a single page. Defaults to

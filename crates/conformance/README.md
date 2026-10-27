@@ -44,6 +44,8 @@ Each proves a sink behaves as a capability it declares says it does:
 | 20 | `assert_driver_declarations_truthful` | every lifecycle the sink does not declare is refused by its hook, the declared ones' probes answer (RFC 0014) |
 | 21 | `assert_driver_row_paths_agree` | the plain, reported, per-row and governed writes of a valid page agree (RFC 0014) |
 | 22 | `assert_first_page_before_exhaustion` | given a count of what the backend has served, a source's first page arrives before the whole result set was read (it streams rather than buffers) |
+| 23 | `assert_cleanup_scoped` | scoped cleanup deletes exactly the unwritten rows of its scope and nothing outside it |
+| 24 | `assert_rollback_truthful` | rollback of a run deletes exactly that run's rows; a dry run changes nothing |
 
 Checks 20 and 21 are required for a sink built on a family driver
 (`faucet_core::driver`, `faucet_common_sql::SqlDriver`); they run on any sink.
@@ -142,6 +144,15 @@ cleanup safety, the DLQ boundary, panic isolation, state migration and
 quarantine on every write path (RFC 0013). See the
 [reliability testing guide](../../docs/book/src/operations/reliability-testing.md).
 
+### What the durability helpers count
+
+`EventLog::writes_before_each_bookmark` and `assert_bookmarks_backed_by_writes`
+count a plain `Write` as durable only once the next `Flush` succeeds: a
+buffering sink makes rows durable at flush, and rows pending when a flush
+fails (`FlushFailed`) never count, even after a later successful flush. An
+`IdempotentWrite` commits its page atomically and counts at once. (Before this
+release a plain write counted as soon as it was logged.)
+
 ## Forwarding harnesses (for wrappers)
 
 A wrapper (a source or sink that holds another one) must forward every
@@ -164,7 +175,9 @@ async fn my_wrapper_forwards_every_hook() {
 `HookSource` / `HookSink` answer every hook differently from the trait default
 and record which hooks were reached; `assert_source_forwards_every_hook` /
 `assert_sink_forwards_every_hook` call every hook through the wrapper and name
-the ones that never reached the inner connector. A name in the skip list that
+the ones that never reached the inner connector, or whose answer the wrapper
+changed on the way back (a hook that is reached but answered differently is
+not forwarded either). A name in the skip list that
 is not a hook fails the assertion, so the list cannot go stale. `SOURCE_HOOKS`
 and `SINK_HOOKS` are the canonical hook lists; a test in this crate checks them
 against the trait definitions, so a hook added to either trait without being

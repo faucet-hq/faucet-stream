@@ -30,6 +30,7 @@ use faucet_core::{
 struct Rows {
     rows: Vec<Value>,
     columnar: bool,
+    state_key: Option<String>,
 }
 
 impl Rows {
@@ -37,6 +38,15 @@ impl Rows {
         Self {
             rows,
             columnar: false,
+            state_key: None,
+        }
+    }
+
+    /// The same rows under a state key, so a run persists its bookmark.
+    fn keyed(rows: Vec<Value>, key: &str) -> Self {
+        Self {
+            state_key: Some(key.to_string()),
+            ..Self::new(rows)
         }
     }
 }
@@ -66,6 +76,10 @@ impl Source for Rows {
 
     fn supports_columnar(&self) -> bool {
         self.columnar
+    }
+
+    fn state_key(&self) -> Option<String> {
+        self.state_key.clone()
     }
 
     fn stream_batches<'a>(
@@ -439,8 +453,20 @@ async fn a_transient_dlq_failure_is_retried_under_resilience() {
 /// write path and on the per-row (DLQ) path.
 #[tokio::test]
 async fn a_sink_that_silently_drops_a_row_fails_the_run() {
+    use faucet_core::StateStore;
+    // Control: the same source and store persist the bookmark when every row
+    // is accounted for, so the check below is not vacuous.
+    let source = Rows::keyed(vec![json!({"id": 1}), json!({"id": 2})], "rows");
+    let store = Arc::new(faucet_core::MemoryStateStore::new());
+    Pipeline::new(&source, &Shared(Capture::new(Mode::All)))
+        .with_state_store(store.clone())
+        .run()
+        .await
+        .expect("a balanced run succeeds");
+    assert!(store.get("rows").await.unwrap().is_some());
+
     for with_dlq in [false, true] {
-        let source = Rows::new(vec![json!({"id": 1}), json!({"id": 2})]);
+        let source = Rows::keyed(vec![json!({"id": 1}), json!({"id": 2})], "rows");
         let main = Capture::new(Mode::DropOne);
         let accounts = Arc::new(RowAccounts::new());
         let mut g = Governance::new();
@@ -452,10 +478,14 @@ async fn a_sink_that_silently_drops_a_row_fails_the_run() {
         let err = Pipeline::new(&source, &governed)
             .with_governance(g)
             .with_row_accounts(Arc::clone(&accounts))
-            .with_state_store(store)
+            .with_state_store(store.clone())
             .run()
             .await
             .unwrap_err();
+        assert!(
+            store.get("rows").await.unwrap().is_none(),
+            "the bookmark advanced past a lost row (dlq: {with_dlq})"
+        );
         assert!(
             matches!(
                 err,
@@ -538,8 +568,8 @@ async fn policy_quarantine_is_per_row_on_a_columnar_capable_pair() {
     let mut outcomes = Vec::new();
     for columnar in [true, false] {
         let source = Rows {
-            rows: rows.clone(),
             columnar,
+            ..Rows::new(rows.clone())
         };
         let main = Capture::columnar(Mode::All);
         let dlq = Capture::new(Mode::All);

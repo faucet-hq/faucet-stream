@@ -226,9 +226,22 @@ impl OwnedBind {
 
 /// Derive a stable state key from the database scope and a query fingerprint.
 pub(crate) fn default_state_key(config: &OracleSourceConfig) -> String {
+    key_for_scope(config, &config.connection.scope_label())
+}
+
+/// The keys [`default_state_key`] rendered before the scope named the host
+/// and port, for moving a bookmark stored under one of them.
+pub(crate) fn legacy_state_keys(config: &OracleSourceConfig) -> Vec<String> {
+    config
+        .connection
+        .legacy_scope_label()
+        .map(|scope| vec![key_for_scope(config, &scope)])
+        .unwrap_or_default()
+}
+
+fn key_for_scope(config: &OracleSourceConfig, scope: &str) -> String {
     format!(
-        "oracle:{}:{:016x}",
-        config.connection.scope_label(),
+        "oracle:{scope}:{:016x}",
         faucet_core::shard::shard_hash(&config.query)
     )
 }
@@ -516,7 +529,16 @@ mod tests {
         let c = cfg("SELECT * FROM T");
         let k = default_state_key(&c);
         assert_eq!(k, default_state_key(&c));
-        assert!(k.starts_with("oracle:FREEPDB1:"), "{k}");
+        let scope = c.connection.scope_label();
+        assert!(k.starts_with(&format!("oracle:{scope}:")), "{k}");
+        assert!(scope.contains("FREEPDB1") && scope != "FREEPDB1", "{scope}");
+        let legacy = legacy_state_keys(&c);
+        assert_eq!(legacy.len(), 1);
+        assert!(legacy[0].starts_with("oracle:FREEPDB1:"), "{legacy:?}");
+        assert_eq!(
+            &legacy[0]["oracle:FREEPDB1".len()..],
+            &k[k.rfind(':').unwrap()..]
+        );
         assert!(k.ends_with(&format!(
             "{:016x}",
             faucet_core::shard::shard_hash(&c.query)

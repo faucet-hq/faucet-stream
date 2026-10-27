@@ -716,10 +716,11 @@ async fn object_arrival_enqueues_one_run_per_object_and_dedupes() {
     );
 }
 
+// Compiled only with a queue backend: without one the test is absent, not
+// reported green with nothing run.
+#[cfg(any(feature = "triggers-redis", feature = "triggers-kafka"))]
 #[tokio::test]
 async fn queue_depth_fires_once_on_rising_edge() {
-    // Only run when the queue_depth module is compiled (any backend feature).
-    #[cfg(any(feature = "triggers-redis", feature = "triggers-kafka"))]
     {
         use async_trait::async_trait;
         use faucet_cli::serve::triggers::queue_depth::{DepthProbe, QueueDepthWatcher};
@@ -909,6 +910,58 @@ async fn a_schedule_that_does_not_compile_at_spawn_is_reported_unhealthy() {
     assert!(row.last_error.unwrap_or_default().starts_with("schedule:"));
 }
 
+/// A queue_depth fire whose config cannot be built (here an unknown trigger
+/// token) runs nothing and reports a poll error, so the watcher backs off
+/// instead of reporting healthy.
+#[cfg(any(feature = "triggers-redis", feature = "triggers-kafka"))]
+#[tokio::test]
+async fn queue_depth_fire_that_cannot_start_is_a_poll_error() {
+    use async_trait::async_trait;
+    use faucet_cli::serve::triggers::queue_depth::{DepthProbe, QueueDepthWatcher};
+    use faucet_cli::serve::triggers::watcher::Watcher;
+
+    struct Deep;
+    #[async_trait]
+    impl DepthProbe for Deep {
+        async fn depth(&self) -> Result<u64, String> {
+            Ok(9)
+        }
+        fn queue_label(&self) -> String {
+            "jobs".into()
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let csv = dir.path().join("in.csv");
+    std::fs::write(&csv, "a\n1\n").unwrap();
+    let out = dir.path().join("out.jsonl");
+    let mut inline = inline_pipeline(csv.to_str().unwrap(), out.to_str().unwrap());
+    inline["name"] = serde_json::json!("drain ${trigger.no_such_token}");
+    let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml::from_str(&format!(
+        "version: 1\ntriggers:\n  - name: drain\n    type: queue_depth\n    threshold: 5\n    queue: {{ type: redis, url: \"redis://x\", key: jobs }}\n    config: {}\n",
+        serde_json::to_string(&inline).unwrap()
+    ))
+    .unwrap();
+    let compiled = CompiledTriggers::compile(file).unwrap();
+    let state = build_state(&compiled);
+    let mut w = QueueDepthWatcher::new(
+        Arc::new(compiled.triggers[0].clone()),
+        Box::new(Deep),
+        5,
+        Duration::from_secs(30),
+    );
+    let err = w.poll(&state).await.unwrap_err();
+    assert!(
+        format!("{err:?}").contains("queue_depth run cannot start"),
+        "{err:?}"
+    );
+    let page = state.history().list(&ListFilter::default()).await.unwrap();
+    assert!(
+        page.runs.is_empty(),
+        "a fire that cannot start runs nothing"
+    );
+}
+
 /// SERVE-11: a queue_depth edge ordinal is durable and shared. After a
 /// restart the next crossing gets a new key (it is not swallowed by the old
 /// claim), and two instances watching the same queue fire a crossing once.
@@ -1055,13 +1108,9 @@ async fn queue_depth_edges_survive_a_restart_and_fire_once_across_instances() {
 
 use faucet_cli::cli::ServeArgs;
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+#[path = "support/ports.rs"]
+mod ports;
+use ports::free_port;
 
 /// Spawn a real `faucet serve` instance with the given triggers file and bearer
 /// token, then wait for `/healthz`. Returns the base URL.
@@ -1334,6 +1383,59 @@ async fn webhook_debounce_is_not_consumed_by_a_failed_fire() {
     }
 }
 
+/// A trigger whose own config cannot run answers a server error and turns
+/// unhealthy: the sender did nothing wrong and must not be told it did.
+#[tokio::test(flavor = "multi_thread")]
+async fn webhook_trigger_that_cannot_run_reports_unhealthy_not_the_callers_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let inline = serde_json::json!({
+        "version": 99,
+        "pipeline": {
+            "source": { "type": "csv", "config": { "path": "in.csv" } },
+            "sink": { "type": "stdout", "config": {} }
+        }
+    });
+    let yaml = format!(
+        "version: 1\ntriggers:\n  - name: hook\n    type: webhook\n    methods: [POST]\n    config: {}\n",
+        serde_json::to_string(&inline).unwrap()
+    );
+    let triggers = dir.path().join("triggers.yaml");
+    std::fs::write(&triggers, yaml).unwrap();
+    let token = "test-token";
+    let base = spawn_serve_with_triggers(free_port(), Some(token), &triggers).await;
+    let client = reqwest::Client::new();
+    for attempt in 0..3 {
+        let resp = client
+            .post(format!("{base}/v1/triggers/hook"))
+            .bearer_auth(token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_server_error(),
+            "attempt {attempt}: {}",
+            resp.status()
+        );
+    }
+    let ready: serde_json::Value = client
+        .get(format!("{base}/readyz"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let hook = ready["triggers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "hook")
+        .unwrap()
+        .clone();
+    assert_eq!(hook["healthy"], false, "{ready}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn webhook_query_values_are_percent_decoded() {
     let dir = tempfile::tempdir().unwrap();
@@ -1371,6 +1473,57 @@ async fn webhook_query_values_are_percent_decoded() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert!(target.exists(), "the decoded path was written");
+    // A path the sender chose is held to the caller reference policy: one
+    // outside the allowed roots is refused with 422, and the trigger stays
+    // healthy (the request was at fault, not the trigger).
+    let refused = reqwest::Client::new()
+        .post(format!(
+            "{base}/v1/triggers/hook?out=%2Fopt%2Ffaucet-elsewhere%2Fout.jsonl"
+        ))
+        .bearer_auth(token)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 422);
+    let body = refused.text().await.unwrap();
+    assert!(body.contains("trigger.query.out"), "{body}");
+    // A value the config needs but the request left out is also the
+    // sender's error.
+    let missing = reqwest::Client::new()
+        .post(format!("{base}/v1/triggers/hook"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 422);
+    for _ in 0..3 {
+        let again = reqwest::Client::new()
+            .post(format!("{base}/v1/triggers/hook?out=%2Fopt%2Fx"))
+            .bearer_auth(token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(again.status(), 422);
+    }
+    let ready: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base}/readyz"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        ready["triggers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["healthy"] == true),
+        "{ready}"
+    );
 }
 
 /// #789 SERVE-21: an object whose run cannot start is skipped and reported —
@@ -1536,4 +1689,129 @@ async fn an_object_arrival_trigger_spawns_a_watcher_with_its_lookback() {
             .expect("the watcher stops on shutdown")
             .unwrap();
     }
+}
+
+/// A webhook request abandoned while its fire is still submitting (a client
+/// or proxy timeout) does not cancel the fire or undo its debounce window:
+/// the run is still recorded, and the sender's retry is coalesced instead of
+/// starting a second run.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_abandoned_webhook_request_keeps_its_fire_and_its_debounce_window() {
+    use axum::extract::{Path, RawQuery, State};
+    use axum::http::{HeaderMap, Method, StatusCode};
+    use faucet_cli::serve::triggers::webhook::handle;
+
+    let dir = tempfile::tempdir().unwrap();
+    let csv = dir.path().join("in.csv");
+    std::fs::write(&csv, "a,b\n1,2\n").unwrap();
+    let out = dir.path().join("out.jsonl");
+    // The pipeline config is a FIFO: reading it blocks until the test writes
+    // it, which holds the fire mid-submit while the request is abandoned.
+    let fifo = dir.path().join("pipeline.yaml");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml::from_str(&format!(
+        "version: 1\ntriggers:\n  - name: hook\n    type: webhook\n    methods: [POST]\n    debounce_secs: 60\n    config: {}\n",
+        fifo.display()
+    ))
+    .unwrap();
+    let compiled = CompiledTriggers::compile(file).unwrap();
+    let state = build_state(&compiled);
+    let call = |state: ServerState| {
+        handle(
+            State(state),
+            Path("hook".to_string()),
+            Method::POST,
+            HeaderMap::new(),
+            RawQuery(None),
+            String::new(),
+        )
+    };
+    // The request gives up while the fire waits on its config.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), call(state.clone()))
+            .await
+            .is_err()
+    );
+    let text = serde_yaml::to_string(&inline_pipeline(
+        csv.to_str().unwrap(),
+        out.to_str().unwrap(),
+    ))
+    .unwrap();
+    let fifo_w = fifo.clone();
+    tokio::task::spawn_blocking(move || std::fs::write(fifo_w, text))
+        .await
+        .unwrap()
+        .unwrap();
+    // The abandoned fire still records its run.
+    let mut runs = 0;
+    for _ in 0..200 {
+        runs = state
+            .history()
+            .list(&ListFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .runs
+            .len();
+        if runs > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(runs, 1, "the abandoned request's fire went through");
+    // The retry inside the window is coalesced (it may first be asked to
+    // wait while the fire settles), never fired again.
+    let mut answer = None;
+    for _ in 0..200 {
+        match tokio::time::timeout(Duration::from_secs(2), call(state.clone()))
+            .await
+            .expect("the retry is answered without reading the config again")
+        {
+            Ok((status, body)) => {
+                answer = Some((status, body.0));
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+        }
+    }
+    let (status, body) = answer.expect("the retry was answered");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "coalesced", "{body}");
+}
+
+/// A template trigger's params are held to the same checks as a config
+/// trigger's values: a URL the sender put in a header is refused with 422
+/// before any template is looked up.
+#[cfg(feature = "templates")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_template_trigger_refuses_a_sender_url_its_policy_does_not_allow() {
+    let dir = tempfile::tempdir().unwrap();
+    let triggers = dir.path().join("triggers.yaml");
+    std::fs::write(
+        &triggers,
+        "version: 1\ntriggers:\n  - name: hook\n    type: webhook\n    methods: [POST]\n    template:\n      id: rest-tpl\n      params:\n        api_root: \"${trigger.header.x-host}\"\n",
+    )
+    .unwrap();
+    let token = "test-token";
+    let base = spawn_serve_with_triggers(free_port(), Some(token), &triggers).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/triggers/hook"))
+        .bearer_auth(token)
+        .header("x-host", "http://169.254.169.254/latest")
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 422);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("trigger.header.x-host"), "{body}");
 }

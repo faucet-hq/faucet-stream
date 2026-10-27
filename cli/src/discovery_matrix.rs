@@ -172,16 +172,65 @@ pub fn check_select(select: &str) -> Result<(), String> {
     }
 }
 
-/// The JSONPath `select` names; `None` = the whole record.
+/// The JSONPath `select` names; `None` = the whole record. A bare or
+/// `$.`-prefixed dot path whose segments are not JSONPath shorthand names
+/// (`account-id`, `meta.2fa_id`) keeps its earlier meaning: each segment is a
+/// key looked up verbatim.
 fn select_path(select: &str) -> Option<String> {
     let s = select.trim();
     if s.is_empty() || s == "$" {
-        None
-    } else if s.starts_with('$') {
-        Some(s.to_string())
-    } else {
-        Some(format!("$.{s}"))
+        return None;
     }
+    let path = if s.starts_with('$') {
+        s.to_string()
+    } else {
+        format!("$.{s}")
+    };
+    if parses(&path) {
+        return Some(path);
+    }
+    Some(
+        dot_path_as_brackets(s)
+            .filter(|p| parses(p))
+            .unwrap_or(path),
+    )
+}
+
+fn parses(path: &str) -> bool {
+    faucet_core::util::extract_records(&Value::Null, Some(path)).is_ok()
+}
+
+/// `a.b-c` / `$.a.b-c` / `$id` / `Account Name` as `$['a']['b-c']`, for a
+/// dot path that names no bracket selector; `None` otherwise. Any other text
+/// in a segment (a space, `@`, `*`, `(`, `?`) is part of the key: inside
+/// `['…']` it cannot mean anything else.
+fn dot_path_as_brackets(select: &str) -> Option<String> {
+    let body = select
+        .strip_prefix("$.")
+        .or_else(|| select.strip_prefix('$'))
+        .unwrap_or(select);
+    if body.is_empty() || body.contains(['[', ']']) || body.chars().any(char::is_control) {
+        return None;
+    }
+    let mut out = String::from("$");
+    for seg in body.split('.') {
+        let quote = if !seg.contains('\'') {
+            '\''
+        } else if !seg.contains('"') {
+            '"'
+        } else {
+            return None;
+        };
+        if seg.is_empty() || seg.contains('\\') {
+            return None;
+        }
+        out.push('[');
+        out.push(quote);
+        out.push_str(seg);
+        out.push(quote);
+        out.push(']');
+    }
+    Some(out)
 }
 
 /// Text identity of a value for dedup, with object keys sorted so two
@@ -322,6 +371,30 @@ mod tests {
         );
     }
 
+    /// A dot path with keys JSONPath shorthand cannot spell still projects.
+    #[test]
+    fn legacy_dot_paths_still_project() {
+        let recs = vec![json!({
+            "account-id": 7,
+            "id": 3,
+            "Account Name": "Acme",
+            "meta": {"2fa_id": "q", "o'k": 1, "display name": "d", "@type": "t", "n(1)?*": 5}
+        })];
+        assert_eq!(project_dedup(&recs, "account-id"), vec![json!(7)]);
+        assert_eq!(project_dedup(&recs, "$.account-id"), vec![json!(7)]);
+        assert_eq!(project_dedup(&recs, "meta.2fa_id"), vec![json!("q")]);
+        assert_eq!(project_dedup(&recs, "$id"), vec![json!(3)]);
+        assert_eq!(project_dedup(&recs, "meta.o'k"), vec![json!(1)]);
+        assert_eq!(project_dedup(&recs, "Account Name"), vec![json!("Acme")]);
+        assert_eq!(project_dedup(&recs, "$.Account Name"), vec![json!("Acme")]);
+        assert_eq!(project_dedup(&recs, "meta.display name"), vec![json!("d")]);
+        assert_eq!(project_dedup(&recs, "meta.@type"), vec![json!("t")]);
+        assert_eq!(project_dedup(&recs, "meta.n(1)?*"), vec![json!(5)]);
+        for p in ["Account Name", "meta.display name", "meta.@type"] {
+            assert!(check_select(p).is_ok(), "{p}");
+        }
+    }
+
     #[test]
     fn select_is_jsonpath() {
         let recs = vec![
@@ -350,6 +423,10 @@ mod tests {
     fn an_invalid_select_is_refused() {
         assert!(check_select("$.items[").is_err());
         assert!(check_select("$['account-id']").is_ok());
+        for legacy in ["account-id", "$.account-id", "meta.2fa_id", "$id"] {
+            assert!(check_select(legacy).is_ok(), "{legacy}");
+        }
+        assert!(check_select("$.items[?").is_err());
         assert!(check_select("id").is_ok());
         assert!(check_select("$").is_ok());
     }

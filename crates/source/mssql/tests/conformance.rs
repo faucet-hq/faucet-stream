@@ -244,3 +244,59 @@ async fn conformance_call_deadline() {
     faucet_conformance::calls::assert_source_call_deadline(|| built.lock().unwrap().pop().unwrap())
         .await;
 }
+
+// ── Check 22: the first page arrives before the result set is exhausted ──────
+// `sys.dm_exec_requests.row_count` is the number of rows a running request
+// has returned to its client; once the request has finished it is gone, which
+// counts as the whole result served. CI-only: SQL Server containers do not run
+// on every development host.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_first_page_before_exhaustion() {
+    let _serial = SERIAL.lock().await;
+    let (_container, port) = start_mssql().await;
+    let cfg = conn_cfg(port);
+    let probe = build_pool(&cfg, 2).await.expect("probe pool");
+    let total = 50_000;
+    let batch = 100;
+    let mut scfg = MssqlSourceConfig::new(
+        cfg.connection_url.clone().unwrap(),
+        format!(
+            "SELECT TOP ({total}) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS id, \
+             REPLICATE('x', 200) AS pad \
+             FROM sys.all_objects a CROSS JOIN sys.all_objects b /* faucet-check-22 */"
+        ),
+    );
+    scfg.connection.tls = cfg.tls.clone();
+    scfg.batch_size = batch;
+    let source = MssqlSource::new(scfg).await.expect("source new");
+    let served = faucet_conformance::served_probe(|| async {
+        let mut conn = probe.get().await.expect("checkout");
+        let row = conn
+            .query(
+                "SELECT CAST(COALESCE(SUM(r.row_count), 0) AS BIGINT), CAST(COUNT(*) AS BIGINT) \
+                 FROM sys.dm_exec_requests r CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t \
+                 WHERE r.session_id <> @@SPID AND t.text LIKE '%faucet-check-22%'",
+                &[],
+            )
+            .await
+            .expect("probe query")
+            .into_row()
+            .await
+            .expect("probe row")
+            .expect("one row");
+        let returned: i64 = row.get(0).expect("row_count");
+        let running: i64 = row.get(1).expect("count");
+        if running == 0 {
+            total
+        } else {
+            returned as usize
+        }
+    });
+    faucet_conformance::assert_first_page_before_exhaustion(&source, batch, total, &served).await;
+    // The counter is live: once the stream is drained it has seen every row.
+    assert!(
+        served() >= total,
+        "the served-row counter missed rows: {}",
+        served()
+    );
+}

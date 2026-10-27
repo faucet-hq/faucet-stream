@@ -93,9 +93,11 @@ pub fn encode_to_kind(value: &Value, ty: &SpannerType) -> Result<Kind, String> {
             Value::String(s) => Ok(Kind::StringValue(s.clone())),
             other => Err(mismatch(type_name(ty), other)),
         },
+        // NUMERIC takes a positional decimal; serde_json renders small and large
+        // floats in exponent form (`1e-7`), so expand it.
         SpannerType::Numeric => match value {
-            Value::String(s) => Ok(Kind::StringValue(s.clone())),
-            Value::Number(n) => Ok(Kind::StringValue(n.to_string())),
+            Value::String(s) => positional_decimal(s).map(Kind::StringValue),
+            Value::Number(n) => positional_decimal(&n.to_string()).map(Kind::StringValue),
             other => Err(mismatch("NUMERIC", other)),
         },
         // JSON columns take the value's RFC 7159 serialization verbatim.
@@ -136,10 +138,28 @@ pub fn canonical_kind(kind: Kind, ty: &SpannerType) -> Kind {
     canonical.map_or(kind, Kind::StringValue)
 }
 
+/// `s` with any exponent expanded to positional digits (`"1e-7"` →
+/// `"0.0000001"`); text without an exponent, or that does not parse, is
+/// returned unchanged (Spanner refuses it). An exponent too large to write
+/// out ([`faucet_core::fidelity::MAX_DECIMAL_DIGITS`]) is an error.
+fn positional_decimal(s: &str) -> Result<String, String> {
+    if !s.contains(['e', 'E']) {
+        return Ok(s.to_string());
+    }
+    match faucet_core::fidelity::decimal_text(s) {
+        Ok(Value::String(text)) => Ok(text),
+        Err(e @ faucet_core::fidelity::FidelityError::TooManyDigits(_)) => {
+            Err(format!("NUMERIC: {e}"))
+        }
+        _ => Ok(s.to_string()),
+    }
+}
+
 /// A plain decimal without leading integer zeros or trailing fractional
-/// zeros (`"-0010.500"` → `"-10.5"`, `"-0.0"` → `"0"`).
+/// zeros (`"-0010.500"` → `"-10.5"`, `"-0.0"` → `"0"`, `"1e3"` → `"1000"`).
 fn canonical_decimal(s: &str) -> Option<String> {
-    let t = s.trim();
+    let expanded = positional_decimal(s).ok()?;
+    let t = expanded.trim();
     let (negative, digits) = match t.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, t.strip_prefix('+').unwrap_or(t)),
@@ -238,7 +258,9 @@ mod tests {
         assert_eq!(canon("+3", &SpannerType::Numeric), "3");
         assert_eq!(canon("-0.0", &SpannerType::Numeric), "0");
         assert_eq!(canon(".5", &SpannerType::Numeric), "0.5");
-        assert_eq!(canon("1e3", &SpannerType::Numeric), "1e3", "unparsed kept");
+        assert_eq!(canon("1e3", &SpannerType::Numeric), "1000");
+        assert_eq!(canon("1.50E-2", &SpannerType::Numeric), "0.015");
+        assert_eq!(canon("1e", &SpannerType::Numeric), "1e", "unparsed kept");
         assert_eq!(canon(".", &SpannerType::Numeric), ".");
         assert_eq!(
             canon("2024-01-01T02:00:00.500+02:00", &SpannerType::Timestamp),
@@ -326,6 +348,31 @@ mod tests {
             encode_to_kind(&json!({"a": 1}), &SpannerType::String).unwrap(),
             Kind::StringValue("{\"a\":1}".into())
         );
+    }
+
+    #[test]
+    fn numeric_expands_exponent_form() {
+        assert_eq!(
+            encode_to_kind(&json!(0.0000001), &SpannerType::Numeric).unwrap(),
+            Kind::StringValue("0.0000001".into())
+        );
+        assert_eq!(
+            encode_to_kind(&json!(1.5e21), &SpannerType::Numeric).unwrap(),
+            Kind::StringValue("1500000000000000000000".into())
+        );
+        assert_eq!(
+            encode_to_kind(&json!("2.5E-3"), &SpannerType::Numeric).unwrap(),
+            Kind::StringValue("0.0025".into())
+        );
+        assert_eq!(
+            encode_to_kind(&json!("1.50"), &SpannerType::Numeric).unwrap(),
+            Kind::StringValue("1.50".into())
+        );
+        for huge in ["1e999999999999", "1e-999999999999"] {
+            let err = encode_to_kind(&json!(huge), &SpannerType::Numeric).unwrap_err();
+            assert!(err.contains("too large to write out"), "{err}");
+            assert_eq!(canonical_decimal(huge), None);
+        }
     }
 
     #[test]

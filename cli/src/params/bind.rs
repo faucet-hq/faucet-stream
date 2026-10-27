@@ -13,8 +13,10 @@
 //!    becomes literal text of that string — params are **not** bound as SQL
 //!    parameters. So a caller-supplied free-text value (no `values:` set) that
 //!    is spliced into a longer string may not carry a quote, a backtick, `;`,
-//!    a backslash or a control character; a whole-value reference, or a param
-//!    with a closed `values:` set, is unaffected.
+//!    a backslash or a control character; unquoted in SQL text it takes only
+//!    a number, and in a URL no `?`, `#`, `&`, whitespace or `..`
+//!    segment. A whole-value reference, or a param with a closed `values:`
+//!    set, is unaffected.
 //! 2. **No re-interpolation of caller input.** Env/file/secret directives are
 //!    resolved *before* binding, so a supplied value is never itself scanned for
 //!    directives. Belt and braces, a supplied value containing `${` is rejected
@@ -460,6 +462,7 @@ pub fn bind_document(
         &bound.placeholders,
         inert.as_ref(),
         &guarded,
+        None,
     );
     if let (Some(block), Some(map)) = (stashed, doc.as_object_mut()) {
         map.insert(PARAMS_KEY.to_string(), block);
@@ -514,12 +517,13 @@ fn substitute(
     lenient: &BTreeSet<String>,
     inert: Option<&BTreeMap<String, Value>>,
     guarded: &BTreeSet<String>,
+    field: Option<&str>,
 ) -> CliResult<()> {
     if let Value::String(s) = v {
         let replaced = match whole_token(s, bound, bound, lenient)? {
             Some(typed) => typed,
             None => {
-                refuse_embedded(s, bound, guarded)?;
+                refuse_embedded(s, bound, guarded, field)?;
                 Value::String(rewrite_text(s, bound, bound, lenient)?)
             }
         };
@@ -532,7 +536,7 @@ fn substitute(
     match v {
         Value::Array(items) => {
             for item in items.iter_mut() {
-                substitute(item, bound, lenient, inert, guarded)?;
+                substitute(item, bound, lenient, inert, guarded, field)?;
             }
         }
         Value::Object(map) => {
@@ -540,8 +544,8 @@ fn substitute(
             // map so a rewritten key is honoured — mirrors `interpolate_value`.
             let entries: Vec<(String, Value)> = std::mem::take(map).into_iter().collect();
             for (key, mut val) in entries {
-                substitute(&mut val, bound, lenient, inert, guarded)?;
-                refuse_embedded(&key, bound, guarded)?;
+                substitute(&mut val, bound, lenient, inert, guarded, Some(&key))?;
+                refuse_embedded(&key, bound, guarded, None)?;
                 let new_key = rewrite_text(&key, bound, bound, lenient)?;
                 if let Some(inert) = inert {
                     refuse_new_directives(&key, &new_key, bound, lenient, inert)?;
@@ -573,31 +577,112 @@ fn embedded_value_refusal(value: &Value) -> Option<String> {
         .then(|| "a control character".to_string())
 }
 
+/// What a field holds, by its key, for the stricter splice rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpliceContext {
+    /// SQL text (`query`, `sql`, `statement`, `*_query`).
+    Sql,
+    /// A URL or request path (`url`, `*_url`, `path`, `endpoint`).
+    Url,
+    Other,
+}
+
+fn splice_context(field: Option<&str>) -> SpliceContext {
+    let Some(f) = field.map(str::to_ascii_lowercase) else {
+        return SpliceContext::Other;
+    };
+    if matches!(f.as_str(), "query" | "sql" | "statement") || f.ends_with("_query") {
+        SpliceContext::Sql
+    } else if f == "url" || f.ends_with("_url") || matches!(f.as_str(), "path" | "endpoint") {
+        SpliceContext::Url
+    } else {
+        SpliceContext::Other
+    }
+}
+
+/// Whether every occurrence of `token` in `s` sits between a matching pair of
+/// quotes (`'${param.x}'`, `"${param.x}"`).
+fn always_quoted(s: &str, token: &str) -> bool {
+    let b = s.as_bytes();
+    s.match_indices(token).all(|(i, t)| {
+        let end = i + t.len();
+        i > 0 && end < b.len() && matches!(b[i - 1], b'\'' | b'"') && b[end] == b[i - 1]
+    })
+}
+
+/// Why a value may not stand unquoted in SQL text, if it may not: only a
+/// numeric literal (`-?digits[.digits]`) is kept. Any other text could name a
+/// column (`tenant_id = tenant_id`) or form an expression, and so change
+/// which rows a predicate matches.
+fn unquoted_sql_refusal(value: &Value) -> Option<String> {
+    let Value::String(s) = value else {
+        return None;
+    };
+    let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+    let unsigned = s.strip_prefix('-').unwrap_or(s);
+    let numeric = match unsigned.split_once('.') {
+        Some((int, frac)) => digits(int) && digits(frac),
+        None => digits(unsigned),
+    };
+    (!numeric).then(|| "text other than a number".to_string())
+}
+
+/// Why a value may not be spliced into a URL, if it may not: it may not add
+/// a query, a fragment, another query parameter, whitespace or a `..` segment.
+fn url_refusal(value: &Value) -> Option<String> {
+    let Value::String(s) = value else {
+        return None;
+    };
+    if let Some(c) = s
+        .chars()
+        .find(|c| matches!(c, '?' | '#' | '&') || c.is_whitespace())
+    {
+        return Some(format!("`{}`", c.escape_default()));
+    }
+    s.split(['/', '\\'])
+        .any(|seg| seg == "..")
+        .then(|| "a `..` segment".to_string())
+}
+
 /// Refuse a caller-supplied free-text value embedded in a longer string when
-/// it carries a character that could rewrite the text around it. The value
+/// it carries a character that could rewrite the text around it. In SQL text
+/// a splice not enclosed in quotes takes only a number, and a
+/// splice in a URL may not add a query, fragment or `..` segment. The value
 /// still works as a whole value (`field: ${param.x}`), or with a closed
 /// `values:` set.
 fn refuse_embedded(
     s: &str,
     bound: &BTreeMap<String, Value>,
     guarded: &BTreeSet<String>,
+    field: Option<&str>,
 ) -> CliResult<()> {
     if guarded.is_empty() {
         return Ok(());
     }
-    for (_, dir) in iter_directives(s) {
+    let context = splice_context(field);
+    for (token, dir) in iter_directives(s) {
         let Directive::Deferred { id, path } = dir else {
             continue;
         };
         if id != PARAM_ID || !guarded.contains(path) {
             continue;
         }
-        if let Some(why) = bound.get(path).and_then(embedded_value_refusal) {
+        let Some(value) = bound.get(path) else {
+            continue;
+        };
+        let why = embedded_value_refusal(value).or_else(|| match context {
+            SpliceContext::Sql if !always_quoted(s, token) => unquoted_sql_refusal(value)
+                .map(|c| format!("{c}, and it stands unquoted in SQL text")),
+            SpliceContext::Url => url_refusal(value).map(|c| format!("{c} inside a URL")),
+            _ => None,
+        });
+        if let Some(why) = why {
             return Err(CliError::Config(format!(
-                "param '{path}': the supplied value contains {why}, and the config splices it \
+                "param '{path}': the supplied value contains {why}; the config splices it \
                  into a longer string (a query, a URL, a path), where it could change the \
                  meaning of the text around it. Declare a closed `values:` set for the \
-                 param, or use it as a whole value"
+                 param (or an `int` / `float` type), quote it in SQL text, or use it as a \
+                 whole value"
             )));
         }
     }
@@ -877,6 +962,72 @@ mod tests {
             "s": "say '${param.q}'"
         });
         bind_document(&mut d, &supplied(&[]), BindMode::Strict).unwrap();
+    }
+
+    /// An unquoted SQL splice takes only a number; a URL splice
+    /// may not add a query, fragment or `..` segment.
+    #[test]
+    fn unquoted_sql_and_url_splices_are_narrower() {
+        let doc = || {
+            json!({
+                "params": { "t": { "required": true } },
+                "source": {
+                    "query": "SELECT * FROM orders WHERE tenant_id = ${param.t}",
+                    "base_url": "https://api.example.com/v1/accounts/${param.t}/orders",
+                    "headers": { "x-note": "tenant ${param.t}" }
+                }
+            })
+        };
+        let bind = |v: &str| {
+            let mut d = doc();
+            bind_document(&mut d, &supplied(&[("t", json!(v))]), BindMode::Strict).map(|_| d)
+        };
+        for bad in [
+            "1 OR 1=1",
+            "0=0",
+            "1)--",
+            "tenant_id",
+            "0+tenant_id",
+            "tenant_id-0",
+            "1e9",
+            "t.id",
+            "@@version",
+            "acme-42.eu",
+            "-",
+            "1.",
+            ".5",
+            "x/../../admin",
+            "a?all=1",
+            "a#b",
+            "a&b=c",
+        ] {
+            let err = bind(bad).unwrap_err().to_string();
+            assert!(err.contains("param 't'"), "{bad}: {err}");
+        }
+        for good in ["42", "-7", "3.5"] {
+            let d = bind(good).unwrap();
+            assert_eq!(
+                d["source"]["query"],
+                format!("SELECT * FROM orders WHERE tenant_id = {good}")
+            );
+        }
+        // Quoted in SQL, the earlier quote rule is the guard; other fields
+        // take free text.
+        let mut d = json!({
+            "params": { "t": { "required": true } },
+            "query": "SELECT 1 WHERE n = '${param.t}'",
+            "note": "a b = c (${param.t})"
+        });
+        bind_document(
+            &mut d,
+            &supplied(&[("t", json!("New York = 1"))]),
+            BindMode::Strict,
+        )
+        .unwrap();
+        assert_eq!(d["query"], "SELECT 1 WHERE n = 'New York = 1'");
+        assert!(splice_context(Some("watermark_query")) == SpliceContext::Sql);
+        assert!(splice_context(Some("endpoint")) == SpliceContext::Url);
+        assert!(splice_context(None) == SpliceContext::Other);
     }
 
     #[test]

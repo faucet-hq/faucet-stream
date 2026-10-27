@@ -249,6 +249,8 @@ pub(crate) async fn execute(
     if !live_view_owns_recorder {
         crate::obs::install(&cfg)?;
     }
+    // Flush buffered OTLP telemetry on every exit path, early errors included.
+    let _otel = crate::obs::flush_on_exit();
 
     let pipeline_name = cfg.name.clone().unwrap_or_else(|| {
         resolved_config_path
@@ -652,8 +654,8 @@ pub(crate) async fn execute(
         );
     }
 
-    // Flush any buffered OTLP telemetry before the process exits (no-op without
-    // the `otel` feature). Done on both the success and failure exit paths.
+    // Flush any buffered OTLP telemetry before the summary is returned (no-op
+    // without the `otel` feature); early error returns flush through `_otel`.
     faucet_core::shutdown_otel();
 
     let outcome = if summary.had_failures() {
@@ -1102,6 +1104,22 @@ mod tests {
         // No recorder handle (non-TTY / --quiet) → the future is awaited plainly.
         let out = super::drive_progress_or_plain(async { 7_usize }, "p", None).await;
         assert_eq!(out, 7);
+    }
+
+    /// A run that fails before its summary still flushes OTLP telemetry.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_early_failure_still_flushes_telemetry() {
+        let cfg = crate::config::PipelineConfig::from_text(
+            "version: 1\nname: t\npipeline:\n  sources: { src: { type: csv, config: { path: in.csv } } }\n  sinks: { out: { type: jsonl, config: { path: out.jsonl } } }\n  nodes:\n    s: { kind: source, ref: src }\n    w: { kind: sink, ref: out }\n  edges:\n    - { from: s, to: w }\n",
+            std::path::Path::new("t.yaml"),
+        )
+        .unwrap();
+        let mut args = RunArgs::default();
+        args.selection.only = vec!["a".into()];
+        let before = crate::obs::FLUSHES.with(|n| n.get());
+        let err = execute(cfg, args, None).await.unwrap_err();
+        assert!(err.to_string().contains("topology"), "{err}");
+        assert_eq!(crate::obs::FLUSHES.with(|n| n.get()), before + 1);
     }
 
     #[test]

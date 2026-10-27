@@ -123,6 +123,36 @@ fn read_sample(path: &Path) -> CliResult<Vec<Value>> {
     }
 }
 
+/// Pull a capped, read-only sample (`--live --limit N`) from the selected
+/// row's real source, once: every re-run on save replays the same records.
+/// A source that consumes destructively, or whose read has side effects, is
+/// refused before any read.
+async fn live_sample(args: &DevArgs) -> CliResult<Vec<Value>> {
+    let cfg = crate::config::PipelineConfig::from_path_async(&args.config, args.profile.as_deref())
+        .await?;
+    let auth = crate::auth_catalog::build_auth_catalog(cfg.auth.as_ref())?;
+    let nodes = crate::expand::expand(&cfg)?;
+    let node = crate::commands::plan::select_root(&nodes, args.row.as_deref())?;
+    let mut config = node.source.config.clone();
+    crate::preview_sample::bound_batch_size(&node.source.kind, &mut config, args.limit);
+    let source = crate::registry::build_source(&node.source.kind, config, &auth, None).await?;
+    let sample = crate::preview_sample::sample(
+        source.as_ref(),
+        &[],
+        args.limit,
+        crate::preview_sample::PREVIEW_TIMEOUT,
+    )
+    .await?;
+    if sample.timed_out {
+        println!(
+            "(live sample stopped after {}s with {} record(s))",
+            crate::preview_sample::PREVIEW_TIMEOUT.as_secs(),
+            sample.records.len()
+        );
+    }
+    Ok(sample.records)
+}
+
 /// Run the selected row once through the offline harness and return its output
 /// records (+ any run error string). Reused for the initial run and each save.
 async fn run_once(
@@ -181,9 +211,12 @@ pub async fn run(args: DevArgs) -> CliResult<()> {
 
     let sample = match &args.sample {
         Some(p) => read_sample(p)?,
+        None if args.live => live_sample(&args).await?,
         None => {
             return Err(CliError::Config(
-                "faucet dev needs an offline sample: pass --sample <fixture.jsonl>".to_owned(),
+                "faucet dev needs a sample: pass --sample <fixture.jsonl>, or --live [--limit N] \
+                 to pull one from the real source"
+                    .to_owned(),
             ));
         }
     };
@@ -340,6 +373,34 @@ mod tests {
             now,
             Duration::from_millis(100)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_live_sample_reads_at_most_the_limit_from_the_real_source() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("in.csv"), "id\n1\n2\n3\n4\n").unwrap();
+        let cfg = dir.path().join("p.yaml");
+        std::fs::write(
+            &cfg,
+            format!(
+                "version: 1\npipeline:\n  source:\n    type: csv\n    config:\n      path: {}\n  sink:\n    type: jsonl\n    config:\n      path: out.jsonl\n",
+                dir.path().join("in.csv").display()
+            ),
+        )
+        .unwrap();
+        let args = DevArgs {
+            config: cfg,
+            row: None,
+            sample: None,
+            live: true,
+            limit: 2,
+            once: true,
+            debounce_ms: 300,
+            profile: None,
+        };
+        let records = live_sample(&args).await.unwrap();
+        assert_eq!(records.len(), 2, "{records:?}");
+        run(args).await.expect("faucet dev --live --once");
     }
 
     #[tokio::test]

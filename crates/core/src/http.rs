@@ -15,8 +15,10 @@
 //!   drops link-local / metadata addresses ([`crate::resolve::screen_resolved`])
 //!   unless the reference policy in effect names that host exactly, so a name
 //!   pointing at the metadata service is never connected to, and the address
-//!   checked is the address dialled. (Through a proxy the proxy resolves the
-//!   target, so this rule cannot apply to it.) Under a reference policy
+//!   checked is the address dialled. Through a proxy the proxy resolves the
+//!   target, so under a reference policy the client resolves the name itself
+//!   first and refuses it when any address is link-local / metadata (unless
+//!   [`ClientBuilder::no_proxy`] makes every connection direct). Under a reference policy
 //!   ([`ClientBuilder::reference_policy`], or one scoped over a run with
 //!   [`with_reference_policy`]) the first request and every redirect hop must
 //!   pass [`ReferencePolicy::check_url`](crate::resolve::ReferencePolicy::check_url).
@@ -103,6 +105,7 @@ pub struct ClientBuilder {
     sensitive: Vec<HeaderName>,
     policy: Option<Arc<ReferencePolicy>>,
     lookup: Lookup,
+    direct_only: bool,
     error: Option<FaucetError>,
 }
 
@@ -134,6 +137,7 @@ impl ClientBuilder {
             sensitive: Vec::new(),
             policy: None,
             lookup: system_lookup(),
+            direct_only: false,
             error: None,
         }
     }
@@ -170,8 +174,10 @@ impl ClientBuilder {
     }
 
     /// Route every request through the proxy at `url`. A malformed URL fails
-    /// [`build`](Self::build).
+    /// [`build`](Self::build). Undoes an earlier [`no_proxy`](Self::no_proxy)
+    /// for the reference-policy screening: requests may go through a proxy.
     pub fn proxy(mut self, url: &str) -> Self {
+        self.direct_only = false;
         match reqwest::Proxy::all(url) {
             Ok(p) => self.inner = self.inner.proxy(p),
             Err(e) => {
@@ -187,6 +193,7 @@ impl ClientBuilder {
     /// Ignore proxy environment variables.
     pub fn no_proxy(mut self) -> Self {
         self.inner = self.inner.no_proxy();
+        self.direct_only = true;
         self
     }
 
@@ -239,6 +246,8 @@ impl ClientBuilder {
         mut self,
         f: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
     ) -> Self {
+        // The step may add a proxy; screen as if one could apply.
+        self.direct_only = false;
         self.inner = f(self.inner);
         self
     }
@@ -248,6 +257,7 @@ impl ClientBuilder {
         mut self,
         f: impl FnOnce(reqwest::ClientBuilder) -> Result<reqwest::ClientBuilder, FaucetError>,
     ) -> Result<Self, FaucetError> {
+        self.direct_only = false;
         self.inner = f(self.inner)?;
         Ok(self)
     }
@@ -267,7 +277,7 @@ impl ClientBuilder {
         }
         let resolver = GuardedResolver {
             policy: self.policy.clone(),
-            lookup: self.lookup,
+            lookup: self.lookup.clone(),
         };
         Ok(Client {
             inner: self
@@ -279,6 +289,8 @@ impl ClientBuilder {
             max_redirects: self.max_redirects,
             sensitive: self.sensitive.into(),
             policy: self.policy,
+            lookup: self.lookup,
+            direct_only: self.direct_only,
         })
     }
 }
@@ -377,6 +389,8 @@ pub struct Client {
     max_redirects: usize,
     sensitive: Arc<[HeaderName]>,
     policy: Option<Arc<ReferencePolicy>>,
+    lookup: Lookup,
+    direct_only: bool,
 }
 
 tokio::task_local! {
@@ -436,6 +450,39 @@ fn guard_target(
         ),
         None => Ok(()),
     }
+}
+
+/// Under a reference policy, a request that may go through a proxy (one set
+/// on the builder, in the environment or in the system settings) is checked
+/// here, since the proxy resolves the target and the client's resolver never
+/// sees it: a host name that resolves to any link-local / metadata address is
+/// refused unless the policy lists it exactly. A name this process cannot
+/// resolve is left to the proxy. The address the proxy dials can still differ
+/// from the one checked here (a DNS answer that changes in between).
+async fn screen_through_proxy(
+    lookup: &Lookup,
+    policy: &ReferencePolicy,
+    url: &Url,
+    hop: usize,
+) -> Result<(), FaucetError> {
+    let Some(url::Host::Domain(host)) = url.host() else {
+        return Ok(());
+    };
+    if policy.lists_host_exactly(host) {
+        return Ok(());
+    }
+    let Ok(addrs) = lookup(host.to_string()).await else {
+        return Ok(());
+    };
+    if addrs.iter().any(|a| crate::resolve::is_metadata_ip(a.ip())) {
+        let what = if hop == 0 { "request" } else { "redirect" };
+        return Err(FaucetError::Config(format!(
+            "{what} to {} refused: host `{}` resolves to a link-local / metadata endpoint",
+            crate::util::redact_uri_credentials(url.as_str()),
+            crate::resolve::canonical_host(host)
+        )));
+    }
+    Ok(())
 }
 
 impl fmt::Debug for Client {
@@ -516,6 +563,11 @@ impl Client {
         let mut hops = 0usize;
         loop {
             guard_target(policy.as_deref(), current.url(), hops)?;
+            if !self.direct_only
+                && let Some(p) = policy.as_deref()
+            {
+                screen_through_proxy(&self.lookup, p, current.url(), hops).await?;
+            }
             let template = current.try_clone();
             let method = current.method().clone();
             let url = current.url().clone();
@@ -1053,6 +1105,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn under_a_policy_a_proxied_name_is_resolved_and_screened_first() {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&hits);
+        let proxy = serve(Router::new().fallback(move || {
+            let counted = Arc::clone(&counted);
+            async move {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                "proxied"
+            }
+        }))
+        .await;
+        let lookup: Lookup = Arc::new(|host: String| {
+            let inner = fake_lookup();
+            Box::pin(async move {
+                if host == "nodns.test" {
+                    return Err(std::io::Error::other("no such host"));
+                }
+                inner(host).await
+            })
+        });
+        let build = |policy: ReferencePolicy| {
+            Client::builder()
+                .lookup(lookup.clone())
+                .proxy(&proxy)
+                .reference_policy(Arc::new(policy))
+                .build()
+                .unwrap()
+        };
+        let client = build(ReferencePolicy::open().with_url_hosts(["*"]));
+        for host in ["meta.test", "mixed.test"] {
+            let err = client
+                .send(client.get(format!("http://{host}/x")))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, FaucetError::Config(m) if m.contains("metadata endpoint")),
+                "{host}: {err}"
+            );
+        }
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        for host in ["ok.test", "nodns.test"] {
+            let resp = client
+                .send(client.get(format!("http://{host}/x")))
+                .await
+                .unwrap();
+            assert_eq!(client.text(resp).await.unwrap(), "proxied", "{host}");
+        }
+        let listed = build(ReferencePolicy::open().with_url_hosts(["meta.test"]));
+        let resp = listed.send(listed.get("http://meta.test/x")).await.unwrap();
+        assert_eq!(listed.text(resp).await.unwrap(), "proxied");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
     async fn a_spawned_task_inherits_the_scoped_policy_only_when_asked() {
         let policy = Arc::new(ReferencePolicy::deny_all());
         let (inherited, plain) = with_reference_policy(policy, async {
@@ -1321,6 +1427,23 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_proxy_after_no_proxy_is_screened_again() {
+        let direct = |b: ClientBuilder| b.build().unwrap().direct_only;
+        assert!(direct(Client::builder().no_proxy()));
+        assert!(!direct(Client::builder()));
+        assert!(!direct(
+            Client::builder()
+                .no_proxy()
+                .proxy("http://proxy.example:3128")
+        ));
+        assert!(!direct(Client::builder().no_proxy().configure(|b| b)));
+        assert!(!direct(
+            Client::builder().no_proxy().try_configure(Ok).unwrap()
+        ));
+        assert!(direct(Client::builder().configure(|b| b).no_proxy()));
     }
 
     #[tokio::test]

@@ -14,14 +14,16 @@
 
 use faucet_conformance::{
     assert_bounded_memory, assert_config_schema_valid_value, assert_connector_name_nonempty,
-    assert_errors_not_panics,
+    assert_errors_not_panics, assert_first_page_before_exhaustion,
 };
 use faucet_source_bigquery::{BigQueryCredentials, BigQuerySource, BigQuerySourceConfig};
 use gcp_bigquery_client::client_builder::ClientBuilder;
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use wiremock::matchers::{method, path, query_param};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 const PROJECT_ID: &str = "test-project";
 const AUTH_TOKEN_PATH: &str = "/:o/oauth2/token";
@@ -120,6 +122,86 @@ fn rows(start: i64, count: i64) -> Vec<Value> {
         .collect()
 }
 
+/// Answers with `body` and counts the rows it has served.
+struct Counted {
+    body: Value,
+    rows: usize,
+    served: Arc<AtomicUsize>,
+}
+
+impl Counted {
+    fn new(served: &Arc<AtomicUsize>, rows: usize, body: Value) -> Self {
+        Self {
+            body,
+            rows,
+            served: Arc::clone(served),
+        }
+    }
+}
+
+impl Respond for Counted {
+    fn respond(&self, _req: &Request) -> ResponseTemplate {
+        self.served.fetch_add(self.rows, Ordering::SeqCst);
+        ResponseTemplate::new(200).set_body_json(self.body.clone())
+    }
+}
+
+/// Mount a 6 000-row result over three HTTP pages; returns the served-row count.
+async fn mount_paged_result(server: &MockServer) -> Arc<AtomicUsize> {
+    let served = Arc::new(AtomicUsize::new(0));
+    // jobs.query: first HTTP page (rows 0..2000) + pageToken "tok-1".
+    Mock::given(method("POST"))
+        .and(path(format!("/projects/{PROJECT_ID}/queries")))
+        .respond_with(Counted::new(
+            &served,
+            HTTP_PAGE_ROWS as usize,
+            json!({
+                "jobComplete": true,
+                "schema": schema_one_col(),
+                "jobReference": {"projectId": PROJECT_ID, "jobId": JOB_ID},
+                "rows": rows(0, HTTP_PAGE_ROWS),
+                "pageToken": "tok-1",
+            }),
+        ))
+        .mount(server)
+        .await;
+
+    // getQueryResults page 2 (rows 2000..4000) + pageToken "tok-2".
+    Mock::given(method("GET"))
+        .and(path(results_path(JOB_ID)))
+        .and(query_param("pageToken", "tok-1"))
+        .respond_with(Counted::new(
+            &served,
+            HTTP_PAGE_ROWS as usize,
+            json!({
+                "jobComplete": true,
+                "schema": schema_one_col(),
+                "rows": rows(HTTP_PAGE_ROWS, HTTP_PAGE_ROWS),
+                "pageToken": "tok-2",
+            }),
+        ))
+        .mount(server)
+        .await;
+
+    // getQueryResults page 3 (rows 4000..6000) — final page, no further token.
+    Mock::given(method("GET"))
+        .and(path(results_path(JOB_ID)))
+        .and(query_param("pageToken", "tok-2"))
+        .respond_with(Counted::new(
+            &served,
+            HTTP_PAGE_ROWS as usize,
+            json!({
+                "jobComplete": true,
+                "schema": schema_one_col(),
+                "rows": rows(2 * HTTP_PAGE_ROWS, HTTP_PAGE_ROWS),
+            }),
+        ))
+        .mount(server)
+        .await;
+
+    served
+}
+
 #[test]
 fn conformance_config_schema_valid() {
     let schema = serde_json::to_value(schemars::schema_for!(BigQuerySourceConfig)).unwrap();
@@ -127,47 +209,27 @@ fn conformance_config_schema_valid() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn conformance_first_page_before_exhaustion() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    let served = mount_paged_result(&server).await;
+    let config = BigQuerySourceConfig::new(
+        PROJECT_ID,
+        BigQueryCredentials::ApplicationDefault,
+        "SELECT id FROM events",
+    )
+    .with_batch_size(250);
+    let (source, _sa_file) = build_source(&server, config).await;
+    assert_first_page_before_exhaustion(&source, 250, TOTAL_ROWS, || served.load(Ordering::SeqCst))
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn conformance_bounded_memory() {
     let server = MockServer::start().await;
     mount_token(&server).await;
 
-    // jobs.query: first HTTP page (rows 0..2000) + pageToken "tok-1".
-    Mock::given(method("POST"))
-        .and(path(format!("/projects/{PROJECT_ID}/queries")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "jobComplete": true,
-            "schema": schema_one_col(),
-            "jobReference": {"projectId": PROJECT_ID, "jobId": JOB_ID},
-            "rows": rows(0, HTTP_PAGE_ROWS),
-            "pageToken": "tok-1",
-        })))
-        .mount(&server)
-        .await;
-
-    // getQueryResults page 2 (rows 2000..4000) + pageToken "tok-2".
-    Mock::given(method("GET"))
-        .and(path(results_path(JOB_ID)))
-        .and(query_param("pageToken", "tok-1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "jobComplete": true,
-            "schema": schema_one_col(),
-            "rows": rows(HTTP_PAGE_ROWS, HTTP_PAGE_ROWS),
-            "pageToken": "tok-2",
-        })))
-        .mount(&server)
-        .await;
-
-    // getQueryResults page 3 (rows 4000..6000) — final page, no further token.
-    Mock::given(method("GET"))
-        .and(path(results_path(JOB_ID)))
-        .and(query_param("pageToken", "tok-2"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "jobComplete": true,
-            "schema": schema_one_col(),
-            "rows": rows(2 * HTTP_PAGE_ROWS, HTTP_PAGE_ROWS),
-        })))
-        .mount(&server)
-        .await;
+    mount_paged_result(&server).await;
 
     // Config batch_size must equal the batch passed to the battery — this
     // overriding source treats its config batch_size as authoritative.

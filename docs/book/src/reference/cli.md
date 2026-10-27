@@ -34,7 +34,7 @@ JSON-RPC stream.
 | `faucet install <name>` | Print how to enable/obtain a connector from the registry. |
 | `faucet conformance [name]` | Score each connector against the SDK contract; print its maturity tier + capabilities. `--export` prints the Connector Hub feed. |
 | `faucet plan [config]` | Read-only preview of what a config would do — zero writes. |
-| `faucet dev <config> --sample <f>` | Watch + re-run a sample on save with a live diff (`cli-dev`). |
+| `faucet dev <config> --sample <f>` | Watch + re-run a sample (or `--live --limit N`) on save with a live diff (`cli-dev`). |
 | `faucet doctor [config]` | Probe every connector (auth/network/permissions) and print a checklist. |
 | `faucet test <specs…>` | Run fixture-based offline pipeline tests from one or more spec files. |
 | `faucet mirror [config]` | Bulk-snapshot a table (or every table matching `mirror.tables`), then hand off to CDC for a gap-free mirror. `faucet mirror status` shows per-table progress. |
@@ -272,6 +272,12 @@ faucet preview app.yaml --profile dev --limit 5   # preview with a named profile
 `--profile <name>` / `FAUCET_PROFILE` selects a named overlay from `profiles:` before
 previewing. Same semantics as `run` and `validate`.
 
+A source whose read has side effects — a CDC source (creates or advances its
+replication slot / capture position), `kafka` (joins and rebalances its consumer
+group), `webhook` / `websocket` (opens a listener) — is refused unless you pass
+`--allow-side-effects`. Queue sources that acknowledge what they read are always
+refused (see `plan --live` below).
+
 ## `plan`
 
 A read-only "what would this config change" preview — it runs the sink's
@@ -365,6 +371,11 @@ DLQ count, errors, and a **diff vs the previous run**.
 ```bash
 faucet dev pipeline.yaml --sample fixtures.jsonl
 ```
+
+Instead of a fixture, `--live --limit N` pulls up to `N` records (default 10)
+from the row's real source once at start and replays them on every save. A
+source that removes what it reads (a queue) or whose read has side effects (a
+CDC slot, a consumer group, a listener) is refused; use a fixture for those.
 
 Watches the config file's directory and the directories of any `extends:` /
 `!include` fragments, so editing an included fragment re-triggers a run. In a
@@ -765,9 +776,11 @@ faucet verify pipeline.yaml --row orders --max-differences 50
 | `--json` | Emit the machine-readable report. |
 | `--env-file <path>` / `--no-env-file` / `--profile <name>` | Same config-load handling as `run`. |
 
-A scan that stops early (`max_rows_scanned`, or the report truncated at
-`max_differences`) is not a pass: the command exits non-zero even when no
-difference was found yet. Rows are matched on the sink's `key` or `verify.key`; a keyless table is
+A scan that stops early (`max_rows_scanned`) is not a pass: the command exits
+non-zero even when no difference was found yet. `max_differences` caps only the
+listing: the report's `differences_found` keeps the full count (the exit code),
+a repair covers every difference found, and a post-run repair that re-synced
+all of them leaves the run green. Rows are matched on the sink's `key` or `verify.key`; a keyless table is
 refused. The `verify:` block (see [config](./config.md#verify)) also runs the
 comparison after every successful run. Cookbook: [Content
 verification](../cookbook/verify.md).

@@ -102,6 +102,12 @@ impl SqlDialect for Mssql {
 
     /// `DECIMAL(38,10)` — exact for every `BIGINT` — when an integer column
     /// starts receiving fractions, never `FLOAT`.
+    /// Precision is capped at 38 digits, so no scale keeps both a wide
+    /// integer range and every fractional digit. Scale 10 keeps every value
+    /// with up to 28 integer digits (every 64-bit integer, signed or not, and
+    /// floats up to 10^28); the database rounds a later value with more than
+    /// 10 fractional digits. Declare the column with the scale the data needs
+    /// to keep more.
     fn widened_type_name(&self, from: Option<SqlBaseType>, to: SqlBaseType) -> &'static str {
         match (from, to) {
             (Some(SqlBaseType::Integer), SqlBaseType::Double) => "DECIMAL(38,10)",
