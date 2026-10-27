@@ -2393,12 +2393,29 @@ async fn launches_and_channels_never_point_at_a_missing_version() {
 }
 
 /// `tenant_replace` writes only while the stored tenant still equals the
-/// expected record, in one statement.
+/// expected record: the SQLite backend (one statement), the fallback wrapper
+/// the server always uses, the in-memory backend and the trait default.
 #[tokio::test]
 async fn tenant_replace_is_a_compare_and_set() {
-    use faucet_cli::serve::history::tenants::TenantRecord;
+    use faucet_cli::serve::history::fallback::FallbackHistory;
+    use faucet_cli::serve::history::memory::MemoryHistory;
     let dir = tempfile::tempdir().unwrap();
-    let h = store(&dir, "tenant-cas.db").await;
+    assert_tenant_cas(&store(&dir, "tenant-cas.db").await).await;
+    let wrapped = FallbackHistory::healthy(
+        Box::new(store(&dir, "tenant-cas-fallback.db").await),
+        Duration::from_secs(60),
+        "sqlite",
+    );
+    assert_tenant_cas(&wrapped).await;
+    assert_tenant_cas(&MemoryHistory::new(Duration::from_secs(60))).await;
+    assert_tenant_cas(&DefaultTenantReplace(MemoryHistory::new(
+        Duration::from_secs(60),
+    )))
+    .await;
+}
+
+async fn assert_tenant_cas(h: &dyn RunHistory) {
+    use faucet_cli::serve::history::tenants::TenantRecord;
     let now = Utc::now();
     let t = TenantRecord {
         id: "acme".into(),
@@ -2423,4 +2440,72 @@ async fn tenant_replace_is_a_compare_and_set() {
     assert_eq!(h.tenant_get("acme").await.unwrap().unwrap(), edited);
     assert!(h.tenant_replace(&edited, &reopened).await.unwrap());
     assert_eq!(h.tenant_get("acme").await.unwrap().unwrap(), reopened);
+}
+
+/// A backend that keeps the trait's default `tenant_replace`.
+struct DefaultTenantReplace(faucet_cli::serve::history::memory::MemoryHistory);
+
+#[async_trait::async_trait]
+impl RunHistory for DefaultTenantReplace {
+    async fn claim_idempotency(
+        &self,
+        k: &str,
+        f: &str,
+        r: &str,
+        w: Duration,
+    ) -> Result<Claim, faucet_cli::serve::history::HistoryError> {
+        self.0.claim_idempotency(k, f, r, w).await
+    }
+    async fn upsert(
+        &self,
+        rec: &RunRecord,
+    ) -> Result<(), faucet_cli::serve::history::HistoryError> {
+        self.0.upsert(rec).await
+    }
+    async fn get(
+        &self,
+        id: &str,
+    ) -> Result<Option<RunRecord>, faucet_cli::serve::history::HistoryError> {
+        self.0.get(id).await
+    }
+    async fn list(
+        &self,
+        f: &ListFilter,
+    ) -> Result<faucet_cli::serve::history::ListPage, faucet_cli::serve::history::HistoryError>
+    {
+        self.0.list(f).await
+    }
+    async fn delete(
+        &self,
+        id: &str,
+    ) -> Result<DeleteOutcome, faucet_cli::serve::history::HistoryError> {
+        self.0.delete(id).await
+    }
+    async fn purge_expired(
+        &self,
+        d: Duration,
+    ) -> Result<usize, faucet_cli::serve::history::HistoryError> {
+        self.0.purge_expired(d).await
+    }
+    async fn recover_orphans(&self) -> Result<usize, faucet_cli::serve::history::HistoryError> {
+        Ok(0)
+    }
+    fn degraded(&self) -> bool {
+        false
+    }
+    async fn tenant_upsert(
+        &self,
+        t: &faucet_cli::serve::history::tenants::TenantRecord,
+    ) -> Result<(), faucet_cli::serve::history::HistoryError> {
+        self.0.tenant_upsert(t).await
+    }
+    async fn tenant_get(
+        &self,
+        id: &str,
+    ) -> Result<
+        Option<faucet_cli::serve::history::tenants::TenantRecord>,
+        faucet_cli::serve::history::HistoryError,
+    > {
+        self.0.tenant_get(id).await
+    }
 }

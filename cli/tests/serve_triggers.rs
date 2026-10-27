@@ -910,6 +910,58 @@ async fn a_schedule_that_does_not_compile_at_spawn_is_reported_unhealthy() {
     assert!(row.last_error.unwrap_or_default().starts_with("schedule:"));
 }
 
+/// A queue_depth fire whose config cannot be built (here an unknown trigger
+/// token) runs nothing and reports a poll error, so the watcher backs off
+/// instead of reporting healthy.
+#[cfg(any(feature = "triggers-redis", feature = "triggers-kafka"))]
+#[tokio::test]
+async fn queue_depth_fire_that_cannot_start_is_a_poll_error() {
+    use async_trait::async_trait;
+    use faucet_cli::serve::triggers::queue_depth::{DepthProbe, QueueDepthWatcher};
+    use faucet_cli::serve::triggers::watcher::Watcher;
+
+    struct Deep;
+    #[async_trait]
+    impl DepthProbe for Deep {
+        async fn depth(&self) -> Result<u64, String> {
+            Ok(9)
+        }
+        fn queue_label(&self) -> String {
+            "jobs".into()
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let csv = dir.path().join("in.csv");
+    std::fs::write(&csv, "a\n1\n").unwrap();
+    let out = dir.path().join("out.jsonl");
+    let mut inline = inline_pipeline(csv.to_str().unwrap(), out.to_str().unwrap());
+    inline["name"] = serde_json::json!("drain ${trigger.no_such_token}");
+    let file: faucet_cli::serve::triggers::spec::TriggersFile = serde_yaml::from_str(&format!(
+        "version: 1\ntriggers:\n  - name: drain\n    type: queue_depth\n    threshold: 5\n    queue: {{ type: redis, url: \"redis://x\", key: jobs }}\n    config: {}\n",
+        serde_json::to_string(&inline).unwrap()
+    ))
+    .unwrap();
+    let compiled = CompiledTriggers::compile(file).unwrap();
+    let state = build_state(&compiled);
+    let mut w = QueueDepthWatcher::new(
+        Arc::new(compiled.triggers[0].clone()),
+        Box::new(Deep),
+        5,
+        Duration::from_secs(30),
+    );
+    let err = w.poll(&state).await.unwrap_err();
+    assert!(
+        format!("{err:?}").contains("queue_depth run cannot start"),
+        "{err:?}"
+    );
+    let page = state.history().list(&ListFilter::default()).await.unwrap();
+    assert!(
+        page.runs.is_empty(),
+        "a fire that cannot start runs nothing"
+    );
+}
+
 /// SERVE-11: a queue_depth edge ordinal is durable and shared. After a
 /// restart the next crossing gets a new key (it is not swallowed by the old
 /// claim), and two instances watching the same queue fire a crossing once.
