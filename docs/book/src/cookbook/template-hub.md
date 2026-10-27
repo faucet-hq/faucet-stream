@@ -77,7 +77,7 @@ streams:
 | `sources` | Additional named connectors for streams that read a second endpoint family (a reports API beside the entity API). A stream picks one with `source.ref`. |
 | `transforms` | The pipeline layer — runs before any sink, so every destination receives the same record shape (`keys_case`, `json_encode` for nested fields, `cast`, …). |
 | `contract` | Optional data contract, passed through as `pipeline.contract`. |
-| `streams[]` | One table each: `name`, `source.config` override, per-stream `transforms` (the matrix-row layer), `primary_keys`, `write`, and optionally `parent` / `parent_key` (per-record fan-out) and `inherit_transforms: false`. |
+| `streams[]` | One table each: `name`, `source.config` override, per-stream `transforms` (the matrix-row layer), `primary_keys`, `write`, and optionally `parent` / `parent_key` (per-record fan-out), `inherit_transforms: false`, and `for_each` / `as` / `name_case` ([one row per list item](#repeating-a-stream-over-a-list-param-for_each)). |
 
 `write` is a single mode or an **ordered preference list**: `overwrite` for a
 full refresh, `upsert` (needs `primary_keys`, which become the sink's `key`),
@@ -104,6 +104,104 @@ recorded replay can point it at a local server and a self-hosted variant needs
 no fork; every credential is a `secret: true` param with no default. Shaping
 that every destination needs (`keys_case`, `json_encode` for nested objects)
 goes in the top-level `transforms`.
+
+### Repeating a stream over a list param (`for_each`)
+
+A stream can repeat once per item of a `type: list` param, so one run copies
+a set of tables the caller picks when it triggers the run — every table of a
+connection, say — each as its own row, with its own row id, state key and
+destination:
+
+```yaml
+kind: source-template
+name: pg-tables
+params:
+  pg_url:    { type: string, required: true, secret: true }
+  pg_schema: { type: string, default: public }
+  tables:                          # ["orders", "customers"]
+    type: list
+    required: true
+    items: { type: string }
+    max_items: 500
+  shards: { type: list, required: true, items: { type: int } }   # [1, 2, 3]
+  objects:                         # [{schema: sales, table: Orders}]
+    type: list
+    required: true
+    items:
+      type: object
+      properties:
+        schema: { type: string, required: true }
+        table:  { type: string, required: true }
+source:
+  type: postgres
+  config: { connection_url: "${param.pg_url}" }
+streams:
+  - for_each: ${param.tables}
+    as: t                          # a scalar item is ${t}
+    name: "${param.pg_schema}_${t}"
+    source: { config: { query: 'SELECT * FROM "${param.pg_schema}"."${t}"' } }
+    write: overwrite
+  - for_each: ${param.shards}
+    as: n
+    name: "events_shard_${n}"
+    source: { config: { query: "SELECT * FROM events WHERE shard_id = ${n}" } }
+  - for_each: ${param.objects}
+    as: o                          # an object item's fields are ${o.field}
+    name: "${o.schema}_${o.table}"
+    name_case: snake               # Sales_Orders → sales_orders
+    source: { config: { query: 'SELECT * FROM "${o.schema}"."${o.table}"' } }
+```
+
+Each item becomes one stream before the template composes: `${<as>}` (a
+scalar item) or `${<as>.<field>}` (an object item) is rendered in the stream's
+`name`, `source.config`, `transforms`, `primary_keys` and `write`; a name may
+also use scalar `${param.*}` values. With a sink whose `per_stream` is
+`table_id: "${stream}"` each item lands in its own table
+(`public_orders`, `public_customers`), and its bookmarks live under
+`{id}.{sink id}::{rendered name}` — stable for as long as the item is.
+Dropping an item from the list leaves its state alone; it is not deleted.
+The rows run through the matrix executor like any others, up to the run's
+`execution.max_concurrent`, and one failing row never hides the others:
+`GET /v1/runs/{id}` reports every row's `status` (`succeeded` / `failed` /
+`skipped`) and `error`.
+
+The rules, all checked before anything starts (an HTTP trigger answers `422`):
+
+| Rule | Refused with |
+|---|---|
+| `for_each` is exactly `${param.NAME}` of a declared `type: list` param — never upstream data or `${env:}` | the stream named |
+| `as` is a lower-case identifier that shadows no namespace (`param`, `stream`, `env`, …) | the stream named |
+| every item matches `items:` — its type, its `values:` set, an object's `required` fields (and no other field) | the item's index: `param 'tables[2]': expected an integer, got "abc"` |
+| the list holds `min_items` (default **1** — an empty list is refused rather than run with no rows; set `min_items: 0` to allow it) to `max_items` items | the count |
+| each rendered name matches `^[a-z0-9][a-z0-9_]*$` (≤ 64 chars), after `name_case: snake` when set | the item and the name it rendered |
+| rendered names are unique across the template, static streams included (`1` and `"1"` coerce to the same `int`) | both items |
+| two items do not render the same destination ([below](#a-sink-template)) | the stream |
+| a list of lists, a `parent:` on a repeated stream, or a child of one | at registration |
+| a `secret` item (or field, or param) in a `name` — row names show in run records and logs | at registration |
+
+An item spliced into a longer string is held to exactly the rules a
+`${param.*}` is: in SQL text a text item must sit inside quotes
+(`"${t}"`, `'${t}'`) and may not carry a quote, backtick, `;`, backslash or
+control character; in a URL it may not add a query, fragment or `..`
+segment; it can never form a `${…}` directive with the text around it. An
+`int` / `float` item may stand unquoted (`WHERE shard_id = ${n}`) because it
+is type-checked; a string item in a value position must be quoted. A closed
+`values:` set on the items (or a field) lifts the text rules. `int` items
+render as their exact digits (`9007199254740993` stays exact), `float` items
+through faucet's exact-decimal rendering, `bool` as `true` / `false`.
+
+The list is supplied like any param: a JSON array over HTTP
+(`"tables": ["orders", "customers"]`), `--param tables='["orders","customers"]'`
+on the CLI, or comma-separated text for a list of strings
+(`--param tables=orders,customers`). A `secret: true` list (or a `secret`
+field of an object item) is masked as `***` in run records and responses
+and refused where a run body is persisted, like a scalar secret param.
+`faucet template rows <id> --param tables=…` / `faucet hub rows` (and
+`GET /v1/templates/{id}/rows?params={"tables":[…]}`) list the rows a trigger
+with those items would run, and `--select public_orders` selects by rendered
+name. Without the param a listing shows two placeholder items. `faucet hub
+compose` needs every list param passed, so the composed config it prints
+holds real rows.
 
 ## Importing a template from an OpenAPI description
 
@@ -210,6 +308,18 @@ source template's name) substituted — `table_id: "${stream}"` for a
 warehouse, `path: "${param.out_dir}/${source}/${stream}.jsonl"` for files.
 `write_mode` and `key` are **never** written in a sink template: the composer
 injects them per stream.
+
+A destination can come from a param instead (`table_id: "${param.table}"`),
+for a caller that triggers one run per table of a one-stream source
+template. Whether two streams would land in the same place is decided when
+the pair composes, on the **rendered** values: a pairing where two streams
+(or two items of a [`for_each`](#repeating-a-stream-over-a-list-param-for_each)
+stream) render the same `per_stream` block is refused —
+`sink-template 'X': per_stream renders the same destination for streams a and
+b — use ${stream} (or a per-stream param) so they don't collide` — and
+`faucet hub check` / `faucet hub matrix` report it as incompatible. So
+`table_id: "${param.table}"` composes with a one-stream source and is refused
+with a multi-stream one.
 
 ### Satisfying a mode by construction
 

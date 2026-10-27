@@ -544,6 +544,7 @@ purged between requests. A bare `run_id` is still accepted.
   "records_written": 4096,
   "invocations": [
     {"row_id": "default", "parent_record_key": null, "records_written": 4096, "error": null,
+     "status": "succeeded",
      "batches": {"attempted": 5, "committed": 5, "dlq_partial": 0, "dlq_all": 0, "failed": 0},
      "rows": {"transform_in": 4100, "transform_out": 4098, "offered": 4098, "accepted": 4096,
               "coalesced": 0, "skipped": 0, "failed": 2, "quarantined": 0, "dropped": 0,
@@ -560,7 +561,11 @@ purged between requests. A bare `run_id` is still accepted.
 `elapsed_secs` is filled live for running runs. A run's completion `callback`
 comes back with every header value as `***` and URL credentials stripped, and
 the stored `config_body` (cluster runs) is returned to admins only — it can
-hold inline credentials. Each invocation carries
+hold inline credentials. Each invocation carries its own `status`
+(`succeeded`, `failed` or `skipped`, #952) and `error`, so a run of many rows —
+one per `for_each` item, say — maps each row to its own outcome, and one
+failed row never hides the others; records written before the field existed
+omit it (derive it from `error` / `skipped`). Each invocation also carries
 `batches` — how its sink writes ended (`committed` / `dlq_partial` / `dlq_all` /
 `failed`, #737), `rows` — where every row went (#879): of the `offered` rows,
 how many the sink `accepted`, merged into another row of the same page by a
@@ -1048,6 +1053,28 @@ and the `error` a trigger would return. A topology template returns
 `rows: []`, `selectable: false`. The trigger body takes the same `selection`
 object as `POST /v1/runs`; for a source template only the selected streams are
 composed, so a stream the sink cannot run does not block the others.
+`?params=` (a URL-encoded JSON object of param values) lists a source
+template's `for_each` streams as the rows a trigger with those items would
+run (#952) — `?params={"tables":["orders","customers"]}` — and selectors take
+the rendered names; without it a repeated stream is listed as two placeholder
+items and `notes` says so.
+
+**List params and `for_each` (#952).** A trigger supplies a `type: list`
+param as a JSON array (`"params": {"tables": ["orders", "customers"]}`).
+Every item is checked before the run is queued — a wrong-typed item, one
+outside its `values:`, a list over `max_items` (or under `min_items`, default
+1), a rendered stream name that is invalid or taken twice — and refused with
+`422` naming the item (`tables[2]`). The response's `streams[]` lists every
+expanded row. A `secret` list (or a `secret` field of its items) is shown as
+`***` in `params`.
+
+**New pairs (#951).** Registering one half of a new source + sink pair whose
+`tests:` name each other records a red result for the first (its companion is
+not registered: `missing_companions`); registering the second tests it
+against the first's newest version (`companion_notes`) and re-runs the first's
+tests, returned as `companions_retested` — then both launch. A trigger whose
+`sink` (or `overlay`) names no registered template answers `422` naming the
+kind it looked for (`no sink-template 'x' in the registry`).
 
 ```bash
 curl -s "http://127.0.0.1:8080/v1/templates/crm/rows?sink=files&select=deal_lines&include_parents=eligible" \

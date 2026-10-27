@@ -1109,7 +1109,7 @@ as a pipeline but prints a deprecation notice — add `kind: pipeline`. See the
 | `--reason <text>` | *(deprecate)* Why the template is being retired; surfaced to anyone who triggers it. |
 | `--undo` | *(deprecate)* Revive instead of retire. |
 | `--version <n\|channel>` | *(deprecate)* Retire (or revive) only this version. It still runs when pinned, with a warning; `newest` skips it and `launch` refuses it. |
-| `--param <NAME=VALUE>` | *(run)* Supply a declared param (bare `NAME` reads `$NAME` upper-cased). Repeatable. |
+| `--param <NAME=VALUE>` | *(run / rows)* Supply a declared param (bare `NAME` reads `$NAME` upper-cased). Repeatable. A `type: list` param takes a JSON array (`--param tables='["orders","customers"]'`) or, for a list of strings, comma-separated text (`--param tables=orders,customers`); with `rows`, a source template's `for_each` streams list one row per item (placeholder items without it), and `--select` takes the rendered names. |
 | `--param-env <NAME[=VALUE]>` | *(run)* Override an environment variable for this materialization only. Repeatable. |
 | `--limit <n>` | *(run)* Stop after writing this many records. On a `write_mode: overwrite` row the sample is staged and then discarded — the destination is left unchanged. |
 | `--select` / `--only` / `--skip` / `--tag` / `--status` / `--include-parents` | *(run / rows)* Run — or, with `rows`, preview — only some of the template's rows: a source template's streams, a pipeline's matrix rows. The same selection model as `faucet run`; for a source template only the selected streams are composed, so a stream the sink cannot run does not block the others. A topology template refuses any selection. See [Running a subset of streams](../cookbook/templates.md#running-a-subset-of-streams). |
@@ -1212,6 +1212,7 @@ the generated [source × sink matrix](./template-hub-matrix.md).
 | `--sort name\|stars\|updated` | *(list)* Order by id, by stars (most starred first), or by the newest version's date. Stars, dates and open issues come from the catalog's `index.json` (`trust`) and are shown as columns; `--json` includes each entry's `trust` block. |
 | `--overlay <id\|path>` | *(compose / check, and `run` / `validate`)* A `kind: deployment` overlay applied over the pairing: a path, or an id under `<hub>/deployments/`. `check` also verifies every stream it names exists; `lint` accepts deployment files and flags literal credentials. |
 | `--out <file>` | *(compose / matrix)* Write to a file instead of stdout. |
+| `--param <NAME=VALUE>` | *(compose / rows)* A declared param value. A source template's `for_each` stream repeats once per item of a list param, so `compose` refuses until every such list is passed (`--param tables='["orders"]'`) — the printed config holds real rows; `rows` lists placeholder items without it. |
 | `rows <source\|pipeline.yaml>` | List a catalog source template's streams (with `--sink`, their write resolution and guarantees against that sink) or a pipeline file's matrix rows — the same report as `GET /v1/templates/{id}/rows`. The selection flags preview a run set (exit≠0 when it would be refused); `--state` also reads each row's status from the composed run's state store. |
 | `--format table\|markdown\|json` | *(matrix)* Terminal table, the docs page, or `index.json`. |
 | `import openapi <URL\|PATH>` | Create a draft source template from an OpenAPI 3.x / Swagger 2.0 document: `source-templates/<owner>/<name>.yaml` and `tests/<owner>/<name>/suite.yaml` under `--out` (default `.`). Deterministic; refuses to overwrite a changed file without `--force` and prints the diff. What it maps, and the decision report: [Importing a template](../cookbook/template-hub.md#importing-a-template-from-an-openapi-description). |
@@ -1224,7 +1225,9 @@ the generated [source × sink matrix](./template-hub-matrix.md).
 | `--json` | Machine-readable output. |
 
 `check` and `lint` exit non-zero on any incompatible stream / finding, so both
-gate a catalog in CI.
+gate a catalog in CI. `check` (and the matrix) also refuses a pairing whose
+streams — or the items of a `for_each` stream — render the same `per_stream`
+destination ([Template Hub](../cookbook/template-hub.md#a-sink-template)).
 
 ## `notify`
 

@@ -313,13 +313,33 @@ params:
 
 | Field | Default | Meaning |
 |---|---|---|
-| `type` | `string` | `string` · `int` · `float` · `bool` |
+| `type` | `string` | `string` · `int` · `float` · `bool` · `list` (see **List params** below) |
 | `required` | `false` | The caller must supply a value. Mutually exclusive with `default`. |
 | `default` | — | Value when none is supplied. An ordinary config scalar, so `default: "${env:SINCE}"` resolves. On a typed param it may be text that resolves to the type (`type: int, default: "${env:PORT}"`). |
 | `secret` | `false` | Registered for redaction the instant it is bound — never reaches a log, error, API response, audit record, or the template registry. |
 | `description` | — | Surfaced by `faucet template list`/`show`, `GET /v1/templates`, and the MCP `get_template` tool. |
 | `computed` | — | A **derived** value (see below). Mutually exclusive with `required`, `default`, and `secret`; excluded from the trigger surface. |
 | `values` | — | Closed set of acceptable values. Anything else is rejected at bind time, naming the allowed set. Mutually exclusive with `computed`; a `default` must be one of them. |
+| `items` | — | *(list)* The spec every element is held to: a scalar `type` (with optional `values` and `secret`), or `type: object` with `properties`. |
+| `properties` | — | *(object items)* Each field's spec: a scalar `type`, `required`, `default`, `values`, `secret`. An element may carry no other field. |
+| `min_items` | `1` | *(list)* The fewest elements. An empty list is refused by default rather than running with no rows. |
+| `max_items` | — | *(list)* The most elements. |
+
+**List params.** `type: list` (#952) takes a JSON array over HTTP
+(`"tables": ["orders", "customers"]`), `--param tables='["orders","customers"]'`
+on the CLI, or — for a list of strings — comma-separated text
+(`--param tables=orders,customers`). Every element is coerced against `items`
+before the config binds; a wrong-typed element, one outside `values:`, an
+object missing a `required` field or carrying an unknown one, and a count
+outside `min_items`..`max_items` are refused naming the element
+(`param 'shards[1]': expected an integer, got "abc"`). `int` elements stay
+exact past 2^53; `float` elements are read as exact decimals. A list of lists
+and an `object` param outside `items` are refused. A list is used whole
+(`columns: ${param.cols}` lands as an array) or by a source template's
+[`for_each`](../cookbook/template-hub.md#repeating-a-stream-over-a-list-param-for_each)
+stream; it cannot be spliced into a longer string. `secret: true` (on the
+list or its `items`) masks the whole list as `***`; a `secret` field of an
+object item masks that field in each element.
 
 **Closed value sets.** `values:` turns a param into an enumerable axis. Without
 it a typo'd value — `region: ue` — binds happily and surfaces as a 404 mid-run;

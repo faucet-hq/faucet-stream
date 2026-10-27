@@ -642,7 +642,7 @@ tests:
 | `suite` | Parameter-space cases (`cases`, `combine`, `auto`, `behavioral`), as in a suite file. |
 | `fixtures` | `faucet test` cases. Without `pipeline:` a fixture runs the template's own materialized config (`params:` bind it, `row:` picks a row); with `pipeline:` it runs that inline logic. When no case touches the template — only inline-`pipeline:` fixtures, here and in the shared suites — the run adds an implicit `implicit:auto:defaults` case that materializes it with its defaults, expands it and compiles its transforms. |
 | `requires_suites` | Shared `kind: test-suite` documents, by `name` and semver `version` range over their `release:`. |
-| `sink` / `source` / `overlay` (+ `*_select`) | The companions a hub kind composes with: a source template names its `sink` (and optionally an `overlay`); a sink template names its `source`; a deployment overlay names both. Selectors default to `stable`. A `pipeline` takes none. |
+| `sink` / `source` / `overlay` (+ `*_select`) | The companions a hub kind composes with: a source template names its `sink` (and optionally an `overlay`); a sink template names its `source`; a deployment overlay names both. A `pipeline` takes none. `sink_select` / `source_select` / `overlay_select` pick the companion's version — a number or a channel (`newest`, `prod`, …); `sink: files@newest` is shorthand for `sink: files` + `sink_select: newest` (give the version once). Without a selector the companion's launched (`stable`) version is used, or — while it has none, as for a pair that is new — its `newest`, which the recorded result notes (`companion_notes`). From a hub directory the selector is ignored: the hub holds one file per template. |
 | `retries` (on any case) | Extra attempts, at most 5. A case that passed on a retry says so (`attempts`). |
 
 Everything runs **offline** and repeatably: records are inline (a fixture path is
@@ -676,6 +676,44 @@ who asked. The newest 20 runs per version are kept; deleting a version (or the
 template) deletes its results. No API accepts a result — evidence comes only
 from a test run. Over HTTP: `POST /v1/templates/{id}/versions/{version}/test` and
 `GET …/versions/{version}/tests`; over MCP: `test_template`.
+
+### Bootstrapping a new source + sink pair
+
+Each half of a new pair names the other in its `tests:`, and a launch needs
+passing tests — so neither could be tested against a *launched* companion.
+That is why a companion with no launched version is tested at its `newest`
+version: register both, then launch both, with no selector anywhere.
+
+```yaml
+# billing.yaml                       # files.yaml
+kind: source-template                kind: sink-template
+name: billing                        name: files
+# …                                  # …
+tests:                               tests:
+  sink: files                          source: billing
+  suite:                               suite:
+    auto: { defaults_baseline: true }    auto: { defaults_baseline: true }
+```
+
+```bash
+curl -X POST "$FAUCET/v1/templates" -d '{"config": "<billing.yaml>"}'   # tests: red — `files` is not registered yet
+curl -X POST "$FAUCET/v1/templates" -d '{"config": "<files.yaml>"}'     # tests: green (against billing v1, its newest)
+                                                                       # and billing v1 is re-tested: green
+curl -X POST "$FAUCET/v1/templates/billing/launch" -d '{"version": 1}'
+curl -X POST "$FAUCET/v1/templates/files/launch"   -d '{"version": 1}'
+```
+
+The first registration's result is red only because its companion did not
+exist; it says so (`missing_companions`, and an error naming the
+`sink-template 'files'` and the re-test command). Registering the companion
+re-runs those tests — the response lists them under `companions_retested` —
+so the second launch needs no manual step. To re-run by hand:
+`faucet template test billing@1` or
+`POST /v1/templates/billing/versions/1/test`. Pin a companion explicitly
+(`sink_select: 3`, or `sink: files@prod`) once both are launched and the
+bundle should follow a specific build; a selector that names nothing (an
+unlaunched `stable`, an unset channel) fails the run, naming the companion
+and the fix.
 
 ### Shared suites
 
