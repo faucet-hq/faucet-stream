@@ -345,8 +345,8 @@ fn init_output_is_valid_yaml() {
     // The scaffold itself parses as YAML even before the user fills in the
     // REQUIRED fields — the placeholders are valid YAML values. (Semantic
     // validation via `faucet validate` would still fail because of the empty
-    // `base_url`, but `serde_yaml` should consume the structure.)
-    serde_yaml::from_str::<serde_yaml::Value>(&body).expect("init output should parse as YAML");
+    // `base_url`, but the YAML parser should consume the structure.)
+    faucet_cli::yaml::from_str::<faucet_cli::yaml::Value>(&body).expect("init output should parse as YAML");
 }
 
 #[test]

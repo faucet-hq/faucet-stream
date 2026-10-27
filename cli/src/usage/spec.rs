@@ -225,7 +225,7 @@ impl UsageSpec {
                 serde_json::from_str(&text)
                     .map_err(|e| format!("usage.pricing_file `{}`: {e}", path.display()))?
             } else {
-                serde_yaml::from_str(&text)
+                crate::yaml::from_str(&text)
                     .map_err(|e| format!("usage.pricing_file `{}`: {e}", path.display()))?
             };
             pricing = overrides.apply(pricing);
@@ -247,7 +247,7 @@ mod tests {
         let base = PricingSpec::default();
         base.validate().unwrap();
         assert_eq!(base.currency, "USD");
-        let spec: UsageSpec = serde_yaml::from_str(
+        let spec: UsageSpec = crate::yaml::from_str(
             "pricing:\n  currency: EUR\n  egress_per_gb: 0.09\n  warehouse: { bigquery_per_tib_scanned: 5 }\n",
         )
         .unwrap();
@@ -267,7 +267,7 @@ mod tests {
             "hosted_elt_per_million_rows: 40\nobject_storage: { read_per_1k_requests: 0.001 }\n",
         )
         .unwrap();
-        let spec: UsageSpec = serde_yaml::from_str(
+        let spec: UsageSpec = crate::yaml::from_str(
             "pricing_file: pricing.yaml\npricing: { hosted_elt_per_million_rows: 30 }\n",
         )
         .unwrap();
@@ -276,12 +276,12 @@ mod tests {
         assert_eq!(p.object_storage.read_per_1k_requests, 0.001, "file applied");
 
         std::fs::write(dir.path().join("bad.json"), r#"{"egress_per_gb": -1}"#).unwrap();
-        let spec: UsageSpec = serde_yaml::from_str("pricing_file: bad.json\n").unwrap();
+        let spec: UsageSpec = crate::yaml::from_str("pricing_file: bad.json\n").unwrap();
         let err = spec.resolve_pricing(Some(dir.path())).unwrap_err();
         assert!(err.contains("egress_per_gb"), "{err}");
-        let spec: UsageSpec = serde_yaml::from_str("pricing_file: missing.yaml\n").unwrap();
+        let spec: UsageSpec = crate::yaml::from_str("pricing_file: missing.yaml\n").unwrap();
         assert!(spec.resolve_pricing(Some(dir.path())).is_err());
-        let spec: UsageSpec = serde_yaml::from_str("pricing: { currency: \" \" }\n").unwrap();
+        let spec: UsageSpec = crate::yaml::from_str("pricing: { currency: \" \" }\n").unwrap();
         assert!(spec.resolve_pricing(None).unwrap_err().contains("currency"));
     }
 

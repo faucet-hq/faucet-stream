@@ -96,6 +96,7 @@ pub mod tui;
 pub mod usage;
 pub mod verify;
 pub mod vocabulary;
+pub mod yaml;
 
 pub use error::{CliError, CliResult};
 

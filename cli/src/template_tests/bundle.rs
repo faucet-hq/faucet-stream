@@ -521,7 +521,7 @@ mod tests {
     use super::*;
 
     fn bundle(yaml: &str) -> TestBundle {
-        serde_yaml::from_str(yaml).expect("bundle parses")
+        crate::yaml::from_str(yaml).expect("bundle parses")
     }
 
     #[test]

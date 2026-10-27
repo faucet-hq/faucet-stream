@@ -690,7 +690,7 @@ fn overlay_choice(
     if path.is_file() {
         let text = std::fs::read_to_string(path)
             .map_err(|e| CliError::Config(format!("reading overlay {raw}: {e}")))?;
-        let value: serde_json::Value = serde_yaml::from_str(&text)
+        let value: serde_json::Value = crate::yaml::from_str(&text)
             .map_err(|e| CliError::Config(format!("overlay {raw}: invalid YAML: {e}")))?;
         return Ok(Some(crate::templates::OverlayChoice::Inline(value)));
     }
@@ -984,7 +984,7 @@ async fn test_suite(args: crate::cli::TemplateTestArgs) -> CliResult<()> {
 fn is_template_with_bundle(path: &std::path::Path) -> CliResult<bool> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| CliError::Config(format!("template test: reading {}: {e}", path.display())))?;
-    let doc: serde_json::Value = serde_yaml::from_str(&text).unwrap_or_default();
+    let doc: serde_json::Value = crate::yaml::from_str(&text).unwrap_or_default();
     let is_suite = doc.get("template").is_some() && doc.get("suite").is_some();
     Ok(!is_suite && doc.get("tests").is_some())
 }
@@ -1124,8 +1124,8 @@ pipeline:
             "param token must survive: {out}"
         );
         // round-trips to the same parsed value
-        let before: serde_yaml::Value = serde_yaml::from_str(body).unwrap();
-        let after: serde_yaml::Value = serde_yaml::from_str(&out).unwrap();
+        let before: crate::yaml::Value = crate::yaml::from_str(body).unwrap();
+        let after: crate::yaml::Value = crate::yaml::from_str(&out).unwrap();
         assert_eq!(before, after, "clean output must parse to the same config");
     }
 

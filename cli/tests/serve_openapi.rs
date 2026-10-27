@@ -25,7 +25,7 @@ use serve_routes::canonical_routes;
 fn openapi_routes() -> BTreeSet<(String, String)> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/openapi.yaml");
     let text = std::fs::read_to_string(path).expect("read docs/openapi.yaml");
-    let doc: serde_yaml::Value = serde_yaml::from_str(&text).expect("parse openapi.yaml");
+    let doc: faucet_cli::yaml::Value = faucet_cli::yaml::from_str(&text).expect("parse openapi.yaml");
     let methods = ["get", "post", "put", "delete", "patch", "head", "options"];
     let mut set = BTreeSet::new();
     let paths = doc["paths"].as_mapping().expect("paths mapping");

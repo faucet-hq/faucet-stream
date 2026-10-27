@@ -1077,7 +1077,7 @@ per_stream:
 
     #[test]
     fn parses_and_validates_the_reference_shapes() {
-        let s: SourceTemplate = serde_yaml::from_str(src_yaml()).unwrap();
+        let s: SourceTemplate = crate::yaml::from_str(src_yaml()).unwrap();
         s.validate().unwrap();
         assert_eq!(s.stream_names(), vec!["bills", "users"]);
         assert_eq!(
@@ -1085,14 +1085,14 @@ per_stream:
             vec![WriteMode::Overwrite, WriteMode::Upsert]
         );
         assert_eq!(s.streams[1].write.candidates(), vec![WriteMode::Append]);
-        let k: SinkTemplate = serde_yaml::from_str(sink_yaml()).unwrap();
+        let k: SinkTemplate = crate::yaml::from_str(sink_yaml()).unwrap();
         k.validate().unwrap();
         assert_eq!(k.kind.as_str(), "sink-template");
     }
 
     #[test]
     fn source_validation_names_every_defect() {
-        let base: SourceTemplate = serde_yaml::from_str(src_yaml()).unwrap();
+        let base: SourceTemplate = crate::yaml::from_str(src_yaml()).unwrap();
         let err = |mutate: &dyn Fn(&mut SourceTemplate)| {
             let mut t = base.clone();
             mutate(&mut t);
@@ -1143,7 +1143,7 @@ per_stream:
 
     #[test]
     fn sink_validation_names_every_defect() {
-        let base: SinkTemplate = serde_yaml::from_str(sink_yaml()).unwrap();
+        let base: SinkTemplate = crate::yaml::from_str(sink_yaml()).unwrap();
         let err = |mutate: &dyn Fn(&mut SinkTemplate)| {
             let mut t = base.clone();
             mutate(&mut t);
@@ -1238,20 +1238,20 @@ per_stream:
 
     #[test]
     fn write_choice_round_trips_both_forms() {
-        let one: WriteChoice = serde_yaml::from_str("overwrite").unwrap();
+        let one: WriteChoice = crate::yaml::from_str("overwrite").unwrap();
         assert_eq!(one, WriteChoice::One(WriteMode::Overwrite));
-        let many: WriteChoice = serde_yaml::from_str("[upsert, append]").unwrap();
+        let many: WriteChoice = crate::yaml::from_str("[upsert, append]").unwrap();
         assert_eq!(
             many.candidates(),
             vec![WriteMode::Upsert, WriteMode::Append]
         );
         assert_eq!(WriteChoice::default().candidates(), vec![WriteMode::Append]);
-        assert!(serde_yaml::from_str::<WriteChoice>("truncate").is_err());
+        assert!(crate::yaml::from_str::<WriteChoice>("truncate").is_err());
     }
 
     #[test]
     fn a_deployment_overlay_parses_and_refuses_shape_changing_keys() {
-        let v: Value = serde_yaml::from_str(
+        let v: Value = crate::yaml::from_str(
             "kind: deployment\nname: prod\nstate: { type: memory }\nnotify: []\n",
         )
         .unwrap();
@@ -1269,7 +1269,7 @@ per_stream:
             "transforms: []",
         ] {
             let v: Value =
-                serde_yaml::from_str(&format!("kind: deployment\nname: x\n{bad}\n")).unwrap();
+                crate::yaml::from_str(&format!("kind: deployment\nname: x\n{bad}\n")).unwrap();
             let err = DeploymentTemplate::from_value(v).unwrap_err().to_string();
             assert!(
                 err.contains("cannot be set here") && err.contains("state, dlq"),
@@ -1277,7 +1277,7 @@ per_stream:
             );
         }
         let owned: Value =
-            serde_yaml::from_str("kind: deployment\nname: x\nowner: acme\nsla: {}\n").unwrap();
+            crate::yaml::from_str("kind: deployment\nname: x\nowner: acme\nsla: {}\n").unwrap();
         assert_eq!(
             DeploymentTemplate::from_value(owned).unwrap().id(),
             "acme/x"
@@ -1287,7 +1287,7 @@ per_stream:
     #[test]
     fn deployment_validation_rules() {
         let parse = |y: &str| {
-            DeploymentTemplate::from_value(serde_yaml::from_str::<Value>(y).unwrap())
+            DeploymentTemplate::from_value(crate::yaml::from_str::<Value>(y).unwrap())
                 .map(|_| ())
                 .unwrap_err()
                 .to_string()

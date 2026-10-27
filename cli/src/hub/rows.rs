@@ -1128,10 +1128,10 @@ write_mode_aliases: { overwrite: append }
 "#;
 
     fn src() -> SourceTemplate {
-        serde_yaml::from_str(SRC).unwrap()
+        crate::yaml::from_str(SRC).unwrap()
     }
     fn sink() -> SinkTemplate {
-        serde_yaml::from_str(SINK).unwrap()
+        crate::yaml::from_str(SINK).unwrap()
     }
     fn row<'a>(r: &'a RowsReport, id: &str) -> &'a TemplateRow {
         r.rows.iter().find(|x| x.id == id).unwrap()
@@ -1332,7 +1332,7 @@ matrix:
 "#;
 
     fn pipe(state: &std::path::Path) -> Value {
-        serde_yaml::from_str(&PIPE.replace("STATE", &state.display().to_string())).unwrap()
+        crate::yaml::from_str(&PIPE.replace("STATE", &state.display().to_string())).unwrap()
     }
 
     #[tokio::test]
@@ -1467,7 +1467,7 @@ matrix:
 
     #[tokio::test]
     async fn topology_pipelines_are_not_selectable() {
-        let doc: Value = serde_yaml::from_str(
+        let doc: Value = crate::yaml::from_str(
             r#"
 version: 1
 name: topo

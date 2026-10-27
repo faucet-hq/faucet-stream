@@ -119,8 +119,8 @@ fn only_live_string_literals_define_a_metric() {
 fn artifacts_exist_and_parse() {
     let root = repo_root();
     let alerts = root.join("observability/prometheus/alerts.yml");
-    let parsed: serde_yaml::Value =
-        serde_yaml::from_str(&std::fs::read_to_string(&alerts).expect("alerts.yml exists"))
+    let parsed: faucet_cli::yaml::Value =
+        faucet_cli::yaml::from_str(&std::fs::read_to_string(&alerts).expect("alerts.yml exists"))
             .expect("alerts.yml parses as YAML");
     let groups = parsed["groups"].as_sequence().expect("alert groups");
     assert!(groups.len() >= 3, "alert groups present");

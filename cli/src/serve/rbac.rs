@@ -374,7 +374,7 @@ impl RbacConfig {
         let text = std::fs::read_to_string(path).map_err(|e| {
             CliError::Serve(format!("reading --auth-config {}: {e}", path.display()))
         })?;
-        let mut doc: serde_json::Value = serde_yaml::from_str(&text).map_err(|e| {
+        let mut doc: serde_json::Value = crate::yaml::from_str(&text).map_err(|e| {
             CliError::Serve(format!("parsing --auth-config {}: {e}", path.display()))
         })?;
         crate::serve::load::protect_input(path, &doc);
@@ -1319,10 +1319,10 @@ mod tests {
     #[test]
     fn parses_yaml_and_json() {
         let yaml = "principals:\n  - name: alice\n    token: tok-a\n    role: admin\n";
-        let cfg: AuthConfigFile = serde_yaml::from_str(yaml).unwrap();
+        let cfg: AuthConfigFile = crate::yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.principals.len(), 1);
         let json = r#"{"principals":[{"name":"bob","token":"tok-b","role":"viewer"}]}"#;
-        let cfg: AuthConfigFile = serde_yaml::from_str(json).unwrap();
+        let cfg: AuthConfigFile = crate::yaml::from_str(json).unwrap();
         assert_eq!(cfg.principals[0].role, Role::Viewer);
     }
 

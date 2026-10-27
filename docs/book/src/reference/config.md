@@ -32,6 +32,11 @@ selection:                 # optional; row-selection policy (see Row selection)
 > source <type>` / `faucet schema sink <type>` lists them), so a misspelled
 > connector key is refused too.
 
+> **Repeated keys are rejected.** A mapping that names the same key twice
+> (two `sink:` blocks, a doubled `write_mode:`) fails to load with the key and
+> its line, in YAML and in JSON, in configs, templates, overlays and included
+> files alike. Earlier releases kept the last value silently (#953).
+
 ## `requires_faucet`
 
 An optional semver requirement (Cargo syntax: `">=1.13"`, `"^1.13.2"`,

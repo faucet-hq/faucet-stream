@@ -521,7 +521,7 @@ mod tests {
             active: set.clone(),
             known: set,
             qualifier: None,
-            follow: follow.then(|| serde_yaml::from_str("{}").unwrap()),
+            follow: follow.then(|| crate::yaml::from_str("{}").unwrap()),
         }
     }
 

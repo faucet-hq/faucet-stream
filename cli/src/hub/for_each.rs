@@ -626,7 +626,7 @@ mod tests {
     use serde_json::json;
 
     fn src(yaml: &str) -> SourceTemplate {
-        serde_yaml::from_str(yaml).expect("source template")
+        crate::yaml::from_str(yaml).expect("source template")
     }
 
     const TABLES: &str = r#"

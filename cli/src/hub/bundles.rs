@@ -21,7 +21,7 @@ fn read(path: &Path) -> CliResult<String> {
 }
 
 fn parse(text: &str, path: &Path) -> CliResult<Value> {
-    serde_yaml::from_str(text)
+    crate::yaml::from_str(text)
         .map_err(|e| CliError::Config(format!("{}: invalid YAML: {e}", path.display())))
 }
 

@@ -414,7 +414,7 @@ mod tests {
     use serde_json::json;
 
     fn list(yaml: &str) -> ParamSpec {
-        serde_yaml::from_str(yaml).expect("param spec")
+        crate::yaml::from_str(yaml).expect("param spec")
     }
 
     fn tables() -> ParamSpec {

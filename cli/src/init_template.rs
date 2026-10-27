@@ -7,7 +7,7 @@
 //! values and a `# REQUIRED` comment; optional fields are commented out so
 //! users can opt in by uncommenting and editing.
 //!
-//! The emitter is intentionally a string builder rather than a `serde_yaml`
+//! The emitter is intentionally a string builder rather than a `crate::yaml`
 //! round-trip: comments and required/optional distinctions matter to the
 //! reader and would be lost by any round-trip through a generic YAML value.
 
@@ -490,7 +490,7 @@ mod tests {
     fn string_defaults_round_trip_through_yaml() {
         for s in ["\\d{4}", "C:\\data", "a\tb\nc", "say \"hi\"", "plain"] {
             let rendered = render_default(&Value::String(s.to_string()));
-            let back: String = serde_yaml::from_str(&rendered).expect("valid yaml scalar");
+            let back: String = crate::yaml::from_str(&rendered).expect("valid yaml scalar");
             assert_eq!(back, s, "{rendered}");
         }
     }

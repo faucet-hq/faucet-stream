@@ -2224,7 +2224,7 @@ mod tests {
     use faucet_core::topology::NodeErrorKind;
 
     fn cfg(yaml: &str) -> PipelineConfig {
-        serde_yaml::from_str(yaml).expect("valid config")
+        crate::yaml::from_str(yaml).expect("valid config")
     }
 
     /// #789 CLI-61: a misspelt node key is an error, not a silent no-op.
@@ -2237,10 +2237,10 @@ mod tests {
             "{ kind: merge, extra: 1 }",
         ] {
             let yaml = format!("version: 1\npipeline:\n  nodes:\n    n: {node}\n");
-            let err = serde_yaml::from_str::<PipelineConfig>(&yaml).unwrap_err();
+            let err = crate::yaml::from_str::<PipelineConfig>(&yaml).unwrap_err();
             assert!(err.to_string().contains("unknown field"), "{node}: {err}");
         }
-        serde_yaml::from_str::<PipelineConfig>(
+        crate::yaml::from_str::<PipelineConfig>(
             "version: 1\npipeline:\n  nodes:\n    n: { kind: sink, ref: out, config: { table: eu } }\n",
         )
         .expect("known keys still parse");

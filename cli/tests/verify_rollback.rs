@@ -1020,7 +1020,7 @@ async fn verify_and_rollback_commands_over_a_config_file() {
 // ───────────────────────── verify options ─────────────────────────
 
 fn spec(yaml: &str) -> VerifySpec {
-    serde_yaml::from_str(yaml).unwrap()
+    faucet_cli::yaml::from_str(yaml).unwrap()
 }
 
 fn inputs() -> VerifyInputs {

@@ -188,7 +188,7 @@ pub fn substitute_tracked(
             event_values: Vec::new(),
         });
     }
-    let mut doc: serde_yaml::Value = serde_yaml::from_str(text)
+    let mut doc: crate::yaml::Value = crate::yaml::from_str(text)
         .map_err(|e| SubstituteError::config(format!("pipeline config is not valid YAML: {e}")))?;
     let mut event_values = Vec::new();
     let root = doc.clone();
@@ -200,7 +200,7 @@ pub fn substitute_tracked(
         seen: &mut event_values,
     };
     walk.value(&mut doc, None, &Scope::Unknown)?;
-    let text = serde_yaml::to_string(&doc)
+    let text = crate::yaml::to_string(&doc)
         .map_err(|e| SubstituteError::config(format!("re-rendering pipeline config: {e}")))?;
     Ok(Substitution { text, event_values })
 }
@@ -274,19 +274,19 @@ struct Walk<'a> {
     event: &'a TriggerEvent,
     name: &'a str,
     fired_at: &'a str,
-    root: &'a serde_yaml::Value,
+    root: &'a crate::yaml::Value,
     seen: &'a mut Vec<EventValue>,
 }
 
 impl Walk<'_> {
     fn value(
         &mut self,
-        v: &mut serde_yaml::Value,
+        v: &mut crate::yaml::Value,
         key: Option<&str>,
         scope: &Scope,
     ) -> Result<(), SubstituteError> {
         match v {
-            serde_yaml::Value::String(s) if s.contains("${trigger.") => {
+            crate::yaml::Value::String(s) if s.contains("${trigger.") => {
                 let landing = match scope {
                     Scope::Unknown => Landing::Unknown,
                     Scope::Field(f) => Landing::Known {
@@ -311,12 +311,12 @@ impl Walk<'_> {
                     }),
                 )?;
             }
-            serde_yaml::Value::Sequence(items) => {
+            crate::yaml::Value::Sequence(items) => {
                 for item in items {
                     self.value(item, key, scope)?;
                 }
             }
-            serde_yaml::Value::Mapping(map) => {
+            crate::yaml::Value::Mapping(map) => {
                 let kind = mapping_kind(map, key, self.root);
                 for (k, item) in map.iter_mut() {
                     let child = match (&kind, scope) {
@@ -335,7 +335,7 @@ impl Walk<'_> {
                     self.value(item, k.as_str(), &child)?;
                 }
             }
-            serde_yaml::Value::Tagged(tagged) => {
+            crate::yaml::Value::Tagged(tagged) => {
                 self.value(&mut tagged.value, key, scope)?;
             }
             _ => {}
@@ -348,11 +348,11 @@ impl Walk<'_> {
 /// — for a matrix row's `source:` / `sink:` override — the `type` of the
 /// template its `ref` (else the default template) names.
 fn mapping_kind(
-    map: &serde_yaml::Mapping,
+    map: &crate::yaml::Mapping,
     key: Option<&str>,
-    root: &serde_yaml::Value,
+    root: &crate::yaml::Value,
 ) -> Option<String> {
-    if let Some(t) = map.get("type").and_then(serde_yaml::Value::as_str) {
+    if let Some(t) = map.get("type").and_then(crate::yaml::Value::as_str) {
         return Some(t.to_string());
     }
     let side = match key {
@@ -362,7 +362,7 @@ fn mapping_kind(
     };
     let pipeline = root.get("pipeline")?;
     let named = pipeline.get(format!("{side}s"));
-    let template = match map.get("ref").and_then(serde_yaml::Value::as_str) {
+    let template = match map.get("ref").and_then(crate::yaml::Value::as_str) {
         Some(r) => named.and_then(|n| n.get(r)),
         None => pipeline
             .get(side)
@@ -370,7 +370,7 @@ fn mapping_kind(
     }?;
     template
         .get("type")
-        .and_then(serde_yaml::Value::as_str)
+        .and_then(crate::yaml::Value::as_str)
         .map(str::to_string)
 }
 
@@ -909,7 +909,7 @@ mod tests {
     }
 
     fn parsed(text: &str) -> serde_json::Value {
-        serde_yaml::from_str(text).unwrap()
+        crate::yaml::from_str(text).unwrap()
     }
 
     #[test]

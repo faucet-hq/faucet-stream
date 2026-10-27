@@ -971,7 +971,7 @@ mod tests {
     }
 
     fn spec_of(yaml: &str) -> ParamsSpec {
-        serde_yaml::from_str(yaml).unwrap()
+        crate::yaml::from_str(yaml).unwrap()
     }
 
     fn supplied(pairs: &[(&str, Value)]) -> SuppliedParams {
