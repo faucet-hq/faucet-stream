@@ -96,7 +96,7 @@ async fn start(port: u16, history: Option<String>) -> (reqwest::Client, String) 
 fn pipeline(dir: &std::path::Path, n: u32) -> String {
     std::fs::write(dir.join("in.csv"), "id\n1\n").unwrap();
     format!(
-        "kind: pipeline\nversion: 1\nname: orders\nvars: {{ build: {n} }}\npipeline:\n  source: {{ type: csv, config: {{ path: \"{}\" }} }}\n  sink: {{ type: jsonl, config: {{ path: \"{}\" }} }}\ntests:\n  suite:\n    auto: {{ defaults_baseline: true }}\n",
+        "# build {n}\nkind: pipeline\nversion: 1\nname: orders\nvars: {{ build: {n} }}\npipeline:\n  source: {{ type: csv, config: {{ path: \"{}\" }} }}\n  sink: {{ type: jsonl, config: {{ path: \"{}\" }} }}\ntests:\n  suite:\n    auto: {{ defaults_baseline: true }}\n",
         dir.join("in.csv").display(),
         dir.join(format!("out{n}.jsonl")).display()
     )
@@ -148,6 +148,18 @@ async fn retire_and_revive(dir: &std::path::Path, history: Option<String>) {
         got["deprecated_versions"][0]["reason"], "bad build",
         "{got}"
     );
+
+    let clean: Value = client
+        .get(format!("{base}/v1/templates/orders?version=1&clean=true"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let body = clean["body"].as_str().unwrap();
+    assert!(!body.contains("# build"), "comments stripped: {body}");
+    assert!(body.contains("name: orders"), "{body}");
 
     let run: Value = client
         .post(format!("{base}/v1/templates/orders/runs"))
