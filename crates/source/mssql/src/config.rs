@@ -76,7 +76,7 @@ pub struct MssqlSourceConfig {
     #[serde(default)]
     pub replication: MssqlReplication,
     /// Explicit state-store key for the bookmark. When unset, a key is derived
-    /// from the connection host and a query fingerprint.
+    /// from the server's host, port and database and a query fingerprint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_key: Option<String>,
     /// Optional primary-key range sharding for clustered (Mode B) execution.

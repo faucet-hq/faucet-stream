@@ -356,6 +356,17 @@ where
 /// Derive a default state-store key from the connection host + a query
 /// fingerprint, stable across runs.
 fn default_state_key(config: &MssqlSourceConfig) -> String {
+    // Fixed FNV-1a: the key is durable and `DefaultHasher` is not stable across Rust releases.
+    let fingerprint = faucet_core::shard::shard_hash(&config.query);
+    format!(
+        "mssql:{}:{fingerprint:016x}",
+        config.connection.scope_label()
+    )
+}
+
+/// The derived key before it named the port and database (#930 A39-F011): the
+/// `connection_url` host alone, so two databases on one server shared it.
+fn legacy_state_key(config: &MssqlSourceConfig) -> Option<String> {
     let host = config
         .connection
         .connection_url
@@ -363,10 +374,6 @@ fn default_state_key(config: &MssqlSourceConfig) -> String {
         .and_then(|u| url::Url::parse(u).ok())
         .and_then(|u| u.host_str().map(|h| h.to_string()))
         .unwrap_or_else(|| "mssql".to_string());
-
-    // Fixed FNV-1a: the key is durable and `DefaultHasher` is not stable across Rust releases.
-    let fingerprint = faucet_core::shard::shard_hash(&config.query);
-    // Host may contain dots (allowed mid-key); sanitise anything else.
     let host: String = host
         .chars()
         .map(|c| {
@@ -377,7 +384,9 @@ fn default_state_key(config: &MssqlSourceConfig) -> String {
             }
         })
         .collect();
-    format!("mssql:{host}:{fingerprint:016x}")
+    let fingerprint = faucet_core::shard::shard_hash(&config.query);
+    let old = format!("mssql:{host}:{fingerprint:016x}");
+    (old != default_state_key(config)).then_some(old)
 }
 
 #[async_trait]
@@ -565,6 +574,15 @@ impl Source for MssqlSource {
                     .clone()
                     .unwrap_or_else(|| default_state_key(&self.config)),
             ),
+        }
+    }
+
+    fn legacy_state_keys(&self) -> Vec<String> {
+        match (&self.config.replication, &self.config.state_key) {
+            (MssqlReplication::Incremental { .. }, None) => {
+                legacy_state_key(&self.config).into_iter().collect()
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -1122,9 +1140,41 @@ mod tests {
         let k1 = default_state_key(&cfg);
         let k2 = default_state_key(&cfg);
         assert_eq!(k1, k2);
-        assert!(k1.starts_with("mssql:db.example.com:"));
+        assert!(
+            k1.starts_with(&format!("mssql:{}:", cfg.connection.scope_label())),
+            "{k1}"
+        );
         assert!(k1.contains(&format!("{:x}", faucet_core::shard::shard_hash(&cfg.query))));
         faucet_core::state::validate_state_key(&k1).expect("derived key must be valid");
+    }
+
+    #[test]
+    fn derived_key_separates_databases_and_names_the_old_key() {
+        let mut a = full_cfg();
+        a.connection.connection_url = Some("mssql://sa:pw@db.example.com:1433/a".into());
+        let mut b = a.clone();
+        b.connection.connection_url = Some("mssql://sa:pw@db.example.com:1433/b".into());
+        assert_ne!(default_state_key(&a), default_state_key(&b));
+        let fp = format!("{:016x}", faucet_core::shard::shard_hash(&a.query));
+        assert_eq!(
+            legacy_state_key(&a).as_deref(),
+            Some(format!("mssql:db.example.com:{fp}").as_str())
+        );
+        assert_eq!(default_state_key(&a), format!("mssql:db.example.com_1433_a:{fp}"));
+
+        let mut ado = full_cfg();
+        ado.connection.connection_url = None;
+        ado.connection.connection_string = Some("Server=tcp:h1,1433;Database=x".into());
+        let mut ado2 = ado.clone();
+        ado2.connection.connection_string = Some("Server=tcp:h2,1433;Database=x".into());
+        assert_ne!(default_state_key(&ado), default_state_key(&ado2));
+        assert_eq!(
+            legacy_state_key(&ado).as_deref(),
+            Some(format!("mssql:mssql:{fp}").as_str())
+        );
+        for k in [default_state_key(&ado), legacy_state_key(&ado).unwrap()] {
+            faucet_core::state::validate_state_key(&k).unwrap();
+        }
     }
 
     // dataset_uri is a pure-config method; the source requires a live SQL Server

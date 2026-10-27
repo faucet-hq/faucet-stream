@@ -23016,7 +23016,7 @@
                       }
                     },
                     "state_key": {
-                      "description": "Explicit state-store key for the bookmark. When unset, a key is derived\nfrom the connection host and a query fingerprint.",
+                      "description": "Explicit state-store key for the bookmark. When unset, a key is derived\nfrom the server's host, port and database and a query fingerprint.",
                       "type": [
                         "string",
                         "null"

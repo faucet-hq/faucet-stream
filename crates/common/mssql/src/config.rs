@@ -118,6 +118,73 @@ impl MssqlConnectionConfig {
             _ => Ok(()),
         }
     }
+
+    /// The server and database this config connects to, as a state-key-safe
+    /// label: `<host>_<port>_<database>` (`_` when no database is named), or
+    /// `mssql` when neither form parses.
+    pub fn scope_label(&self) -> String {
+        let (host, port, database) = if let Some(url) = &self.connection_url {
+            match parse_connection_url(url) {
+                Ok(p) => (p.host, p.port, p.database),
+                Err(_) => return "mssql".to_string(),
+            }
+        } else if let Some(cs) = &self.connection_string {
+            match ado_scope(cs) {
+                Some(parts) => parts,
+                None => return "mssql".to_string(),
+            }
+        } else {
+            return "mssql".to_string();
+        };
+        let raw = format!(
+            "{}_{port}_{}",
+            host.trim(),
+            database.as_deref().map(str::trim).unwrap_or("_")
+        );
+        key_safe(&raw)
+    }
+}
+
+/// Server host, port and database named by an ADO.NET connection string.
+fn ado_scope(raw: &str) -> Option<(String, u16, Option<String>)> {
+    let mut server = None;
+    let mut database = None;
+    for pair in raw.split(';') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        let value = value.trim().trim_matches(|c| c == '\'' || c == '"');
+        match key.trim().to_ascii_lowercase().as_str() {
+            "server" | "data source" | "address" | "addr" | "network address" => {
+                server = Some(value.to_string());
+            }
+            "database" | "initial catalog" => database = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    let server = server.filter(|s| !s.is_empty())?;
+    let server = server.strip_prefix("tcp:").unwrap_or(&server);
+    let (host, port) = match server.split_once(',') {
+        Some((host, port)) => (host, port.trim().parse().ok()?),
+        None => (server, 1433),
+    };
+    Some((host.trim().to_string(), port, database.filter(|d| !d.is_empty())))
+}
+
+/// `raw` with every character outside `[A-Za-z0-9_.-]` replaced by `_`, and
+/// leading / trailing `_` trimmed.
+fn key_safe(raw: &str) -> String {
+    let label: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    label.trim_matches('_').to_string()
 }
 
 /// Parse a `mssql://user:password@host:port/database` URL into its parts.
@@ -193,6 +260,66 @@ pub fn quote_ident_mssql(name: &str) -> Result<String, FaucetError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn url_cfg(url: &str) -> MssqlConnectionConfig {
+        MssqlConnectionConfig {
+            connection_url: Some(url.into()),
+            ..Default::default()
+        }
+    }
+
+    fn ado_cfg(cs: &str) -> MssqlConnectionConfig {
+        MssqlConnectionConfig {
+            connection_string: Some(cs.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn scope_label_names_host_port_and_database() {
+        assert_eq!(
+            url_cfg("mssql://sa:pw@db.example.com:1444/sales").scope_label(),
+            "db.example.com_1444_sales"
+        );
+        assert_eq!(
+            url_cfg("mssql://sa:pw@db.example.com/sales").scope_label(),
+            "db.example.com_1433_sales"
+        );
+        assert_eq!(
+            url_cfg("mssql://sa:pw@db.example.com").scope_label(),
+            "db.example.com_1433"
+        );
+        assert_ne!(
+            url_cfg("mssql://sa:pw@h/a").scope_label(),
+            url_cfg("mssql://sa:pw@h/b").scope_label()
+        );
+    }
+
+    #[test]
+    fn scope_label_reads_an_ado_connection_string() {
+        assert_eq!(
+            ado_cfg("Server=tcp:sql.local,1450;Database=Orders;User Id=sa;Password=x;")
+                .scope_label(),
+            "sql.local_1450_Orders"
+        );
+        assert_eq!(
+            ado_cfg("Data Source='sql.local';Initial Catalog=hr").scope_label(),
+            "sql.local_1433_hr"
+        );
+        assert_eq!(ado_cfg("Server=a\\inst;").scope_label(), "a_inst_1433");
+        assert_ne!(
+            ado_cfg("Server=a;Database=x").scope_label(),
+            ado_cfg("Server=b;Database=x").scope_label()
+        );
+    }
+
+    #[test]
+    fn scope_label_falls_back_when_nothing_parses() {
+        assert_eq!(url_cfg("not a url").scope_label(), "mssql");
+        assert_eq!(ado_cfg("User Id=sa;garbage").scope_label(), "mssql");
+        assert_eq!(ado_cfg("Server=h,notaport").scope_label(), "mssql");
+        assert_eq!(MssqlConnectionConfig::default().scope_label(), "mssql");
+    }
 
     #[test]
     fn validate_accepts_exactly_one() {
