@@ -263,7 +263,54 @@ pub fn parse_range(req: &SuiteRequirement) -> CliResult<semver::VersionReq> {
     })
 }
 
+/// A companion named by a bundle: its id and, when one was given, the version
+/// selector — from `tests.<role>_select`, or the `id@selector` shorthand
+/// (`sink: files@newest`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompanionRef<'a> {
+    /// `source`, `sink` or `overlay`.
+    pub role: &'static str,
+    pub id: &'a str,
+    pub select: Option<&'a str>,
+}
+
+/// Split `id@selector`. An id never contains `@`, so the last one separates.
+pub fn split_companion(raw: &str) -> (&str, Option<&str>) {
+    match raw.rsplit_once('@') {
+        Some((id, sel)) => (id, Some(sel)),
+        None => (raw, None),
+    }
+}
+
 impl TestBundle {
+    fn companion_ref<'a>(
+        role: &'static str,
+        id: &'a Option<String>,
+        select: &'a Option<String>,
+    ) -> Option<CompanionRef<'a>> {
+        let (id, inline) = split_companion(id.as_deref()?);
+        Some(CompanionRef {
+            role,
+            id,
+            select: select.as_deref().or(inline),
+        })
+    }
+
+    /// The `source` companion, with its selector.
+    pub fn source_ref(&self) -> Option<CompanionRef<'_>> {
+        Self::companion_ref("source", &self.source, &self.source_select)
+    }
+
+    /// The `sink` companion, with its selector.
+    pub fn sink_ref(&self) -> Option<CompanionRef<'_>> {
+        Self::companion_ref("sink", &self.sink, &self.sink_select)
+    }
+
+    /// The `overlay` companion, with its selector.
+    pub fn overlay_ref(&self) -> Option<CompanionRef<'_>> {
+        Self::companion_ref("overlay", &self.overlay, &self.overlay_select)
+    }
+
     /// True when the bundle declares nothing to run.
     pub fn is_empty(&self) -> bool {
         self.suite.is_empty() && self.fixtures.is_empty() && self.requires_suites.is_empty()
@@ -329,17 +376,32 @@ impl TestBundle {
         companion("source", self.source.is_some(), needs_source, false)?;
         companion("sink", self.sink.is_some(), needs_sink, false)?;
         companion("overlay", self.overlay.is_some(), false, takes_overlay)?;
-        for (sel, base) in [
-            (&self.source_select, &self.source),
-            (&self.sink_select, &self.sink),
-            (&self.overlay_select, &self.overlay),
+        for (role, sel, base) in [
+            ("source", &self.source_select, &self.source),
+            ("sink", &self.sink_select, &self.sink),
+            ("overlay", &self.overlay_select, &self.overlay),
         ] {
-            if let Some(s) = sel {
-                if base.is_none() {
-                    return Err(CliError::Config(format!(
-                        "tests: `{s}` selects a version of a companion the bundle does not name"
-                    )));
-                }
+            if let Some(s) = sel
+                && base.is_none()
+            {
+                return Err(CliError::Config(format!(
+                    "tests: `{s}` selects a version of a companion the bundle does not name"
+                )));
+            }
+            let Some(raw) = base else { continue };
+            let (id, inline) = split_companion(raw);
+            if id.trim().is_empty() {
+                return Err(CliError::Config(format!(
+                    "tests: `{role}: {raw}` names no template"
+                )));
+            }
+            if let (Some(i), Some(s)) = (inline, sel.as_deref()) {
+                return Err(CliError::Config(format!(
+                    "tests: `{role}: {raw}` selects `{i}` and `{role}_select: {s}` selects \
+                     another — give the version once"
+                )));
+            }
+            if let Some(s) = sel.as_deref().or(inline) {
                 crate::template_tests::selector::check(s)?;
             }
         }
@@ -459,7 +521,7 @@ mod tests {
     use super::*;
 
     fn bundle(yaml: &str) -> TestBundle {
-        serde_yaml::from_str(yaml).expect("bundle parses")
+        crate::yaml::from_str(yaml).expect("bundle parses")
     }
 
     #[test]
@@ -531,6 +593,41 @@ requires_suites:
         .validate(TemplateKind::SourceTemplate)
         .expect_err("latest");
         assert!(err.to_string().contains("latest"), "{err}");
+    }
+
+    #[test]
+    fn the_id_at_selector_shorthand_names_the_version() {
+        let base = "suite: { auto: { defaults_baseline: true } }\n";
+        let b = bundle(&format!("sink: acme/files@newest\noverlay: ops\n{base}"));
+        b.validate(TemplateKind::SourceTemplate).unwrap();
+        assert_eq!(
+            b.sink_ref(),
+            Some(CompanionRef {
+                role: "sink",
+                id: "acme/files",
+                select: Some("newest")
+            })
+        );
+        assert_eq!(b.overlay_ref().unwrap().select, None);
+        assert!(b.source_ref().is_none());
+        let b = bundle(&format!("source: erp\nsource_select: \"3\"\n{base}"));
+        assert_eq!(b.source_ref().unwrap().select, Some("3"));
+
+        let err = bundle(&format!("sink: files@newest\nsink_select: stable\n{base}"))
+            .validate(TemplateKind::SourceTemplate)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("give the version once"), "{err}");
+        let err = bundle(&format!("sink: files@latest\n{base}"))
+            .validate(TemplateKind::SourceTemplate)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("latest"), "{err}");
+        let err = bundle(&format!("sink: \"@newest\"\n{base}"))
+            .validate(TemplateKind::SourceTemplate)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("names no template"), "{err}");
     }
 
     #[test]

@@ -725,6 +725,20 @@ pub fn snake_case(key: &str) -> String {
         .join("_")
 }
 
+/// Characters a URL component keeps as-is: RFC 3986 unreserved.
+const COMPONENT: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+/// Percent-encode `s` for one URL path segment or query value: every byte
+/// outside `A-Z a-z 0-9 - . _ ~` becomes `%XX` (UTF-8), so `/`, `?`, `&`, `+`
+/// and space never change how the URL parses.
+pub fn encode_url_component(s: &str) -> String {
+    percent_encoding::utf8_percent_encode(s, COMPONENT).to_string()
+}
+
 /// Compact JSON text for `v` with object keys sorted (byte order) at every
 /// depth; arrays keep their element order.
 ///
@@ -1650,5 +1664,21 @@ mod u64_to_signed_tests {
         assert!(!msg.contains("-9223372036854775808"), "{msg}");
 
         assert!(u64_to_signed(u64::MAX, "c").is_err());
+    }
+}
+
+#[cfg(test)]
+mod encode_tests {
+    use super::encode_url_component;
+
+    #[test]
+    fn encode_url_component_keeps_only_unreserved() {
+        assert_eq!(encode_url_component("Az09-._~"), "Az09-._~");
+        assert_eq!(
+            encode_url_component("a b/c?d&e+f=g%h#i"),
+            "a%20b%2Fc%3Fd%26e%2Bf%3Dg%25h%23i"
+        );
+        assert_eq!(encode_url_component("é"), "%C3%A9");
+        assert_eq!(encode_url_component(""), "");
     }
 }

@@ -79,11 +79,39 @@ async fn pair_sides(p: &crate::cli::HubPairArgs) -> CliResult<hub::HubSides> {
 /// `faucet validate` / `run` / `template register` all take it.
 async fn compose(a: HubComposeArgs) -> CliResult<()> {
     let sides = pair_sides(&a.pair).await?;
-    let c = hub::compose_across(
+    // `for_each` rows (#952) must be the caller's, never placeholders.
+    let params = crate::params::collect_cli_params(&a.param)?;
+    let (source_file, _) =
+        hub::locate_in(&a.pair.source, &sides.source, hub::catalog::SOURCE_DIR).await?;
+    let source = hub::parse_source_file(&source_file)?;
+    let missing = hub::for_each::unsupplied_lists(&source, &params);
+    let names = hub::for_each::unsupplied_name_params(&source, &params);
+    if !missing.is_empty() {
+        return Err(CliError::Config(format!(
+            "'{}' repeats streams over list param(s) {} — pass each with `--param \
+             NAME='[…]'` so the composed config holds the rows a run would have",
+            a.pair.source,
+            missing.join(", ")
+        )));
+    }
+    if !names.is_empty() {
+        return Err(CliError::Config(format!(
+            "'{}' names its repeated streams with param(s) {} — pass each with \
+             `--param NAME=VALUE` so the composed rows have their real names",
+            a.pair.source,
+            names.join(", ")
+        )));
+    }
+    let c = hub::compose_across_with(
         &a.pair.source,
         &a.pair.sink,
         a.pair.overlay.as_deref(),
         &sides,
+        Some(hub::ExpandWith {
+            params: &params,
+            mode: crate::params::BindMode::Placeholder,
+            env: None,
+        }),
     )
     .await?;
     for w in &c.warnings {
@@ -143,7 +171,7 @@ async fn check(a: HubCheckArgs) -> CliResult<()> {
         let c = match &overlaid {
             Some(c) => c,
             None => {
-                composed = hub::compose::compose(&s, &k)?;
+                composed = hub::compose::compose(&hub::for_each::expand_placeholders(&s)?, &k)?;
                 &composed
             }
         };
@@ -196,6 +224,9 @@ async fn check(a: HubCheckArgs) -> CliResult<()> {
         for i in &cell.incompatible {
             out.push_str(&format!("  ✗ {:<32} {}\n", i.stream, i.reason));
         }
+        if let Some(why) = &cell.collision {
+            out.push_str(&format!("  ✗ {why}\n"));
+        }
         if let Some(c) = &overlaid {
             out.push_str(&format!(
                 "  overlay '{}' sets: {}\n",
@@ -246,6 +277,9 @@ async fn check(a: HubCheckArgs) -> CliResult<()> {
             "test bundle failed: {}",
             red.join(", ")
         )));
+    }
+    if let Some(why) = &cell.collision {
+        return Err(CliError::Config(why.clone()));
     }
     if cell.compatible {
         Ok(())
@@ -572,7 +606,7 @@ async fn lint(a: HubLintArgs) -> CliResult<()> {
                 Some(hub::TemplateKind::TestSuite) => {
                     let text = std::fs::read_to_string(f)
                         .map_err(|e| CliError::Config(format!("reading {}: {e}", f.display())))?;
-                    let value: serde_json::Value = serde_yaml::from_str(&text).map_err(|e| {
+                    let value: serde_json::Value = crate::yaml::from_str(&text).map_err(|e| {
                         CliError::Config(format!("{}: invalid YAML: {e}", f.display()))
                     })?;
                     crate::template_tests::bundle::parse_test_suite(value)
@@ -668,11 +702,13 @@ async fn bundle_findings(
 /// streams, or a pipeline file's matrix rows, with their metadata (#741).
 async fn rows(a: crate::cli::HubRowsArgs) -> CliResult<()> {
     let selection = crate::select::SelectionRequest::from_flags(&a.selection)?;
+    let params = crate::params::collect_cli_params(&a.param)?;
     let opts = |state| hub::rows::ListOptions {
         selection: selection.as_ref(),
         state,
         history: Default::default(),
         tenant: None,
+        params: Some(&params),
     };
     let as_path = std::path::Path::new(&a.source);
     let is_pipeline = as_path.is_file()
@@ -689,7 +725,7 @@ async fn rows(a: crate::cli::HubRowsArgs) -> CliResult<()> {
         }
         let text = std::fs::read_to_string(as_path)
             .map_err(|e| CliError::Config(format!("reading {}: {e}", as_path.display())))?;
-        let doc: serde_json::Value = serde_yaml::from_str(&text)
+        let doc: serde_json::Value = crate::yaml::from_str(&text)
             .map_err(|e| CliError::Config(format!("parsing {}: {e}", as_path.display())))?;
         let name = as_path
             .file_stem()
@@ -778,6 +814,7 @@ mod tests {
         let composed = dir.path().join("composed.yaml");
         run(HubArgs {
             command: HubCommand::Compose(HubComposeArgs {
+                param: Vec::new(),
                 pair: with("example-csv", "sqlite"),
                 out: Some(composed.clone()),
                 json: false,
@@ -855,6 +892,7 @@ mod tests {
         let composed = out.path().join("composed.yaml");
         run(HubArgs {
             command: HubCommand::Compose(HubComposeArgs {
+                param: Vec::new(),
                 pair: pair("example-csv", "jsonl"),
                 out: Some(composed.clone()),
                 json: false,
@@ -869,6 +907,7 @@ mod tests {
         );
         run(HubArgs {
             command: HubCommand::Compose(HubComposeArgs {
+                param: Vec::new(),
                 pair: pair("example-csv", "sqlite"),
                 out: None,
                 json: true,

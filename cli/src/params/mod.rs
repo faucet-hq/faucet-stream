@@ -28,6 +28,7 @@
 //! server-side lives in [`crate::templates`] (the `templates` build feature).
 
 pub mod bind;
+pub mod list;
 pub mod spec;
 
 pub use bind::{

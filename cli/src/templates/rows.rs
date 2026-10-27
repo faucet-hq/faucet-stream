@@ -23,6 +23,8 @@ pub struct RowsQuery<'a> {
     /// List for a tenant (#709): read the tenant's own state namespace and
     /// run history, never another tenant's (#789 SERVE-31).
     pub tenant: Option<&'a crate::tenant_tokens::TenantValues>,
+    /// Param values `for_each` streams are listed with (#952).
+    pub params: Option<&'a crate::params::SuppliedParams>,
 }
 
 /// What `${tenant.*}` reads for `tenant`: its record, or just the id when the
@@ -99,6 +101,7 @@ pub async fn list_rows(store: &TemplateStore, q: RowsQuery<'_>) -> CliResult<Row
                     state: q.state,
                     history,
                     tenant: q.tenant,
+                    params: q.params,
                 },
             )
             .await?
@@ -142,6 +145,7 @@ pub async fn list_rows(store: &TemplateStore, q: RowsQuery<'_>) -> CliResult<Row
                     state: q.state,
                     history,
                     tenant: q.tenant,
+                    params: q.params,
                 },
             )
             .await?;

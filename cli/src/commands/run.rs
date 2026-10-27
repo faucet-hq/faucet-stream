@@ -100,8 +100,21 @@ pub async fn run(args: RunArgs) -> CliResult<()> {
         )
         .await?;
         sides.trusted = args.trust.clone();
-        let composition =
-            crate::hub::compose_across(&source, &sink, args.overlay.as_deref(), &sides).await?;
+        let inputs = crate::config::RunInputs {
+            params: crate::params::collect_cli_params(&args.param)?,
+            env: crate::params::collect_env_overrides(&args.param_env)?
+                .into_iter()
+                .collect(),
+            mode: crate::params::BindMode::Strict,
+        };
+        let composition = crate::hub::compose_across_with(
+            &source,
+            &sink,
+            args.overlay.as_deref(),
+            &sides,
+            Some(crate::hub::ExpandWith::inputs(&inputs)),
+        )
+        .await?;
         tracing::info!(
             source = %composition.source,
             source_hub = composition.source_hub.as_deref().unwrap_or("(file)"),
@@ -112,13 +125,6 @@ pub async fn run(args: RunArgs) -> CliResult<()> {
         for w in &composition.warnings {
             eprintln!("warning: {w}");
         }
-        let inputs = crate::config::RunInputs {
-            params: crate::params::collect_cli_params(&args.param)?,
-            env: crate::params::collect_env_overrides(&args.param_env)?
-                .into_iter()
-                .collect(),
-            mode: crate::params::BindMode::Strict,
-        };
         // Heap-pin the secret-resolving load so the hub branch adds no stack
         // to the run future.
         Box::pin(crate::hub::load_composed_async(&composition, &inputs)).await?

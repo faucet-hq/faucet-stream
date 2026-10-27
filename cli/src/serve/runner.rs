@@ -207,7 +207,7 @@ pub(crate) fn apply_request_budget(mut req: SubmitRequest) -> Result<SubmitReque
     };
     extra.validate().map_err(ServeError::BadConfig)?;
     let mut doc: serde_json::Value = match req.config_format {
-        ConfigFormatWire::Yaml => serde_yaml::from_str(&req.config)
+        ConfigFormatWire::Yaml => crate::yaml::from_str(&req.config)
             .map_err(|e| ServeError::BadConfig(format!("invalid YAML: {e}")))?,
         ConfigFormatWire::Json => serde_json::from_str(&req.config)
             .map_err(|e| ServeError::BadConfig(format!("invalid JSON: {e}")))?,
@@ -1591,7 +1591,7 @@ fn submitted_document(
     default_base: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, ServeError> {
     let submitted: serde_json::Value = match req.config_format {
-        ConfigFormatWire::Yaml => serde_yaml::from_str(&req.config)
+        ConfigFormatWire::Yaml => crate::yaml::from_str(&req.config)
             .map_err(|e| ServeError::BadConfig(format!("invalid YAML: {e}")))?,
         ConfigFormatWire::Json => serde_json::from_str(&req.config)
             .map_err(|e| ServeError::BadConfig(format!("invalid JSON: {e}")))?,

@@ -364,3 +364,50 @@ async fn shards_come_from_the_key_bounds() {
     let err = source.enumerate_shards(4).await.unwrap_err().to_string();
     assert!(err.contains("shard-bounds query timed out"), "{err}");
 }
+
+/// #930 A39-F011: the derived key names the server's port and database. The
+/// host-only key earlier releases derived is not migrated: databases on one
+/// server shared it, so its bookmark may be another database's.
+#[tokio::test]
+async fn the_derived_key_names_port_and_database() {
+    let server = TdsServer::start().await.unwrap();
+    let incremental = MssqlReplication::Incremental {
+        column: "id".into(),
+        initial_value: json!(0),
+    };
+    let fp = format!("{:016x}", faucet_core::shard::shard_hash(QUERY));
+
+    let mut c = cfg(&server);
+    c.replication = incremental.clone();
+    let source = started(&server, c).await;
+    let port = server.port();
+    assert_eq!(
+        source.state_key().as_deref(),
+        Some(format!("mssql:127.0.0.1_{port}_db:{fp}").as_str())
+    );
+    assert!(source.legacy_state_keys().is_empty());
+
+    let mut ado = cfg(&server);
+    ado.connection.connection_url = None;
+    ado.connection.connection_string = Some(format!(
+        "Server=tcp:127.0.0.1,{port};Database=db;User Id=sa;Password=pw;TrustServerCertificate=true"
+    ));
+    ado.replication = incremental.clone();
+    let source = started(&server, ado).await;
+    assert_eq!(
+        source.state_key().as_deref(),
+        Some(format!("mssql:127.0.0.1_{port}_db:{fp}").as_str())
+    );
+    assert!(source.legacy_state_keys().is_empty());
+
+    let mut pinned = cfg(&server);
+    pinned.replication = incremental;
+    pinned.state_key = Some("mine".into());
+    let source = started(&server, pinned).await;
+    assert_eq!(source.state_key().as_deref(), Some("mine"));
+    assert!(source.legacy_state_keys().is_empty());
+
+    let source = started(&server, cfg(&server)).await;
+    assert_eq!(source.state_key(), None);
+    assert!(source.legacy_state_keys().is_empty());
+}

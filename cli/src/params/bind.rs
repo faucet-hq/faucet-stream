@@ -72,6 +72,9 @@ pub struct BoundParams {
     /// Required params filled with a type-shaped placeholder (placeholder
     /// mode only). A `${map:}` switching on one falls back to its first case.
     pub placeholders: BTreeSet<String>,
+    /// For a `list` of objects: the item fields marked `secret: true`, by
+    /// param (#952). Only those fields are masked in [`Self::redacted`].
+    pub secret_fields: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl BoundParams {
@@ -84,6 +87,8 @@ impl BoundParams {
             .map(|(k, v)| {
                 if self.secret_names.contains(k) {
                     (k.clone(), Value::String("***".into()))
+                } else if let Some(fields) = self.secret_fields.get(k) {
+                    (k.clone(), super::list::redact_fields(v, fields))
                 } else {
                     (k.clone(), v.clone())
                 }
@@ -94,7 +99,7 @@ impl BoundParams {
     /// Whether any bound param is marked secret (drives the cluster-persistence
     /// guard in the template-trigger path).
     pub fn has_secrets(&self) -> bool {
-        !self.secret_names.is_empty()
+        !self.secret_names.is_empty() || !self.secret_fields.is_empty()
     }
 
     /// Whether a caller-supplied value of a secret param was bound — what a
@@ -155,15 +160,18 @@ pub fn resolve(
         if p.computed.is_some() {
             continue;
         }
+        let secret_fields = super::list::secret_fields(p);
         let value = match supplied.get(name) {
             Some(raw) => {
-                if p.secret {
-                    // Before any error below can echo the raw value.
-                    crate::secrets::registry::register(&value_to_string(raw));
+                // Before any error below can echo the raw value.
+                if p.is_secret() {
+                    register_secret_leaves(raw);
+                } else {
+                    register_secret_fields(raw, &secret_fields);
                 }
                 reject_directives(name, raw)?;
-                let coerced = spec::coerce(name, p.kind, raw).map_err(|e| {
-                    if p.secret {
+                let coerced = spec::coerce_param(name, p, raw).map_err(|e| {
+                    if p.is_secret() {
                         CliError::Config(format!(
                             "param '{name}': the supplied value is not a valid {}",
                             p.kind.as_str()
@@ -198,13 +206,13 @@ pub fn resolve(
                 // A default is authored in the config and already went through
                 // env/file/secret resolution, so it is coerced but not
                 // directive-checked.
-                Some(d) => spec::coerce(name, p.kind, d)?,
+                Some(d) => spec::coerce_param(name, p, d)?,
                 None => match mode {
                     BindMode::Placeholder => match p.values.first() {
                         Some(v) => spec::coerce(name, p.kind, v)?,
                         None => {
                             bound.placeholders.insert(name.clone());
-                            p.kind.placeholder()
+                            p.placeholder()
                         }
                     },
                     BindMode::Strict => {
@@ -219,14 +227,20 @@ pub fn resolve(
         if supplied.contains_key(name) {
             bound.caller_supplied.insert(name.clone());
         }
-        if p.secret {
+        if p.is_secret() {
             // Register before the value can reach any log line, error string, or
             // API body. `register` no-ops below the registry's minimum length.
-            crate::secrets::registry::register(&value_to_string(&value));
+            register_secret_leaves(&value);
             bound.secret_names.insert(name.clone());
             if supplied.contains_key(name) {
                 bound.supplied_secret_names.insert(name.clone());
             }
+        } else if !secret_fields.is_empty() {
+            register_secret_fields(&value, &secret_fields);
+            if supplied.contains_key(name) {
+                bound.supplied_secret_names.insert(name.clone());
+            }
+            bound.secret_fields.insert(name.clone(), secret_fields);
         }
         bound.values.insert(name.clone(), value);
     }
@@ -471,13 +485,44 @@ pub fn bind_document(
     Ok(bound)
 }
 
-/// Reject an interpolation directive inside a caller-supplied value. Supplied
-/// params are data: allowing `${vault:…}` / `${env:…}` through would let a
-/// caller read the *server's* secrets and environment by way of a param.
+/// Register every scalar of a secret value with the redaction registry.
+/// Register only the `fields` of each object item of a list value.
+fn register_secret_fields(v: &Value, fields: &std::collections::BTreeSet<String>) {
+    let Value::Array(items) = v else {
+        return;
+    };
+    for item in items {
+        for f in fields {
+            if let Some(field) = item.get(f) {
+                register_secret_leaves(field);
+            }
+        }
+    }
+}
+
+fn register_secret_leaves(v: &Value) {
+    let mut leaves = Vec::new();
+    super::list::leaves(v, &mut leaves);
+    for l in leaves {
+        crate::secrets::registry::register(&l);
+    }
+}
+
+/// Reject an interpolation directive inside a caller-supplied value — every
+/// string of a list, too. Supplied params are data: allowing `${vault:…}` /
+/// `${env:…}` through would let a caller read the *server's* secrets and
+/// environment by way of a param.
 fn reject_directives(name: &str, raw: &Value) -> CliResult<()> {
-    if let Value::String(s) = raw
-        && s.contains("${")
-    {
+    let found = match raw {
+        Value::String(s) => s.contains("${"),
+        Value::Array(_) | Value::Object(_) => {
+            let mut leaves = Vec::new();
+            super::list::leaves(raw, &mut leaves);
+            leaves.iter().any(|l| l.contains("${"))
+        }
+        _ => false,
+    };
+    if found {
         return Err(CliError::Config(format!(
             "param '{name}': value contains an interpolation directive (`${{`). Param values are \
              literal data — put the directive in the config's `params:` default or in the config \
@@ -670,13 +715,7 @@ fn refuse_embedded(
         let Some(value) = bound.get(path) else {
             continue;
         };
-        let why = embedded_value_refusal(value).or_else(|| match context {
-            SpliceContext::Sql if !always_quoted(s, token) => unquoted_sql_refusal(value)
-                .map(|c| format!("{c}, and it stands unquoted in SQL text")),
-            SpliceContext::Url => url_refusal(value).map(|c| format!("{c} inside a URL")),
-            _ => None,
-        });
-        if let Some(why) = why {
+        if let Some(why) = splice_reason(value, s, token, context) {
             return Err(CliError::Config(format!(
                 "param '{path}': the supplied value contains {why}; the config splices it \
                  into a longer string (a query, a URL, a path), where it could change the \
@@ -687,6 +726,39 @@ fn refuse_embedded(
         }
     }
     Ok(())
+}
+
+fn splice_reason(value: &Value, s: &str, token: &str, context: SpliceContext) -> Option<String> {
+    embedded_value_refusal(value).or_else(|| match context {
+        SpliceContext::Sql if !always_quoted(s, token) => {
+            unquoted_sql_refusal(value).map(|c| format!("{c}, and it stands unquoted in SQL text"))
+        }
+        SpliceContext::Url => url_refusal(value).map(|c| format!("{c} inside a URL")),
+        _ => None,
+    })
+}
+
+/// Why caller-supplied `value`, spliced at `token` into the string `s` of
+/// config field `field`, could change the meaning of the text around it —
+/// the same rule `${param.*}` is held to, shared with a `for_each:` loop
+/// variable (#952).
+pub(crate) fn splice_refusal(
+    value: &Value,
+    s: &str,
+    token: &str,
+    field: Option<&str>,
+) -> Option<String> {
+    splice_reason(value, s, token, splice_context(field))
+}
+
+/// The error for a caller value [`splice_refusal`] refused.
+pub(crate) fn splice_error(what: &str, why: &str) -> CliError {
+    CliError::Config(format!(
+        "{what}: the supplied value contains {why}; the config splices it into a longer \
+         string (a query, a URL, a path), where it could change the meaning of the text around \
+         it. Declare a closed `values:` set for it (or an `int` / `float` type), quote it in \
+         SQL text, or use it as a whole value"
+    ))
 }
 
 /// Compare the directives in `out` with those the same text yields when every
@@ -762,7 +834,14 @@ fn rewrite_text(
     rewrite(s, |body| match classify_directive(body) {
         Directive::Deferred { id, path } if id == PARAM_ID => {
             let token = format!("${{{body}}}");
-            Ok(Some(value_to_string(lookup(path, &token, bound)?)))
+            let v = lookup(path, &token, bound)?;
+            if v.is_array() || v.is_object() {
+                return Err(CliError::Config(format!(
+                    "param '{path}' is a list, so `{token}` cannot be part of a longer string — \
+                     use it as a whole value, or repeat a stream over it with `for_each:`"
+                )));
+            }
+            Ok(Some(value_to_string(v)))
         }
         Directive::LoadTime {
             prefix: "map",
@@ -896,7 +975,7 @@ mod tests {
     }
 
     fn spec_of(yaml: &str) -> ParamsSpec {
-        serde_yaml::from_str(yaml).unwrap()
+        crate::yaml::from_str(yaml).unwrap()
     }
 
     fn supplied(pairs: &[(&str, Value)]) -> SuppliedParams {
@@ -1285,6 +1364,39 @@ mod tests {
             }
             other => panic!("expected UnknownParam, got {other:?}"),
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn only_the_secret_fields_of_a_list_are_redacted() {
+        let spec = spec_of(
+            "tables:\n  type: list\n  items:\n    type: object\n    properties:\n      \
+             table: { type: string, required: true }\n      token: { type: string, secret: true }\n",
+        );
+        let bound = resolve(
+            &spec,
+            &supplied(&[(
+                "tables",
+                json!([{"table": "customers_visible", "token": "tok-list-field-s3cr3t"}]),
+            )]),
+            BindMode::Strict,
+        )
+        .unwrap();
+        assert!(bound.has_supplied_secrets());
+        assert_eq!(
+            crate::secrets::registry::redact("customers_visible tok-list-field-s3cr3t"),
+            "customers_visible ***"
+        );
+        let err = resolve(
+            &spec,
+            &supplied(&[("tables", json!([{"token": "tok-bad-item-s3cr3t"}]))]),
+            BindMode::Strict,
+        );
+        assert!(err.is_err());
+        assert_eq!(
+            crate::secrets::registry::redact("tok-bad-item-s3cr3t orders_visible"),
+            "*** orders_visible"
+        );
     }
 
     #[test]

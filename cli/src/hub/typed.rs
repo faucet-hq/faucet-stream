@@ -98,7 +98,7 @@ fn culprit_params<T: Clone>(
 ) -> Vec<String> {
     params
         .iter()
-        .filter(|(_, p)| p.kind != ParamType::String && p.computed.is_none())
+        .filter(|(_, p)| p.kind != ParamType::String && p.kind.is_scalar() && p.computed.is_none())
         .filter_map(|(name, p)| {
             let mut probe = template.clone();
             with_params(&mut probe, as_string_param(params, name));
@@ -147,11 +147,11 @@ mod tests {
     use super::*;
 
     fn source(yaml: &str) -> SourceTemplate {
-        serde_yaml::from_str(yaml).expect("source template")
+        crate::yaml::from_str(yaml).expect("source template")
     }
 
     fn sink(yaml: &str) -> SinkTemplate {
-        serde_yaml::from_str(yaml).expect("sink template")
+        crate::yaml::from_str(yaml).expect("sink template")
     }
 
     /// The #823 shape: an `int` param as a whole `query_params` value.

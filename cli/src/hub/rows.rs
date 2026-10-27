@@ -245,7 +245,7 @@ fn probe_sink() -> SinkTemplate {
 /// forced to `append` against a stdout sink), so a listing never depends on a
 /// sink the caller has not chosen.
 pub fn source_template_nodes(src: &SourceTemplate) -> CliResult<Vec<ExpandedNode>> {
-    let mut probe = src.clone();
+    let mut probe = super::for_each::expand_placeholders(src)?;
     for s in &mut probe.streams {
         s.write = WriteChoice::One(WriteMode::Append);
     }
@@ -578,8 +578,13 @@ pub fn rows_for_source(
     src: &SourceTemplate,
     sink: Option<&SinkTemplate>,
     overlay: Option<&super::spec::DeploymentTemplate>,
+    params: &SuppliedParams,
 ) -> CliResult<SourceRows> {
     src.validate()?;
+    // `for_each` rows (#952): the caller's items, else placeholders.
+    let placeholder_lists = super::for_each::unsupplied_lists(src, params);
+    let expanded = super::for_each::expand(src, params, BindMode::Placeholder, None)?;
+    let src = &expanded;
     let nodes = source_template_nodes(src)?;
     let streams: HashMap<&str, &super::spec::Stream> =
         src.streams.iter().map(|s| (s.name.as_str(), s)).collect();
@@ -721,6 +726,12 @@ pub fn rows_for_source(
     }
     let mut report = empty_report(src.id(), TemplateKind::SourceTemplate, true);
     report.rows = build_rows(&nodes, meta, "stream");
+    for p in placeholder_lists {
+        report.notes.push(format!(
+            "rows repeated over list param '{p}' are placeholder items — pass `{p}` \
+             (`--param {p}=…`, or `params` over HTTP) to list the rows a run would have"
+        ));
+    }
     if let Some(t) = sink {
         report.sink = Some(t.id());
         report.sink_kind = Some(t.sink.kind.clone());
@@ -887,6 +898,9 @@ pub struct ListOptions<'a> {
     ),
     /// Read the state a tenant's runs keep (#709) instead of the shared one.
     pub tenant: Option<&'a crate::tenant_tokens::TenantValues>,
+    /// Param values a listing expands `for_each` streams with (#952); without
+    /// them, a repeated stream is listed as placeholder items.
+    pub params: Option<&'a SuppliedParams>,
 }
 
 /// The full listing of a source template.
@@ -900,7 +914,12 @@ pub async fn list_source(
         mut report,
         nodes,
         composed,
-    } = rows_for_source(src, sink, overlay)?;
+    } = rows_for_source(
+        src,
+        sink,
+        overlay,
+        opts.params.unwrap_or(&SuppliedParams::new()),
+    )?;
     if let Some(sel) = opts.selection {
         attach_resolve(&mut report, &nodes, sel, None, true);
     }
@@ -1108,10 +1127,10 @@ write_mode_aliases: { overwrite: append }
 "#;
 
     fn src() -> SourceTemplate {
-        serde_yaml::from_str(SRC).unwrap()
+        crate::yaml::from_str(SRC).unwrap()
     }
     fn sink() -> SinkTemplate {
-        serde_yaml::from_str(SINK).unwrap()
+        crate::yaml::from_str(SINK).unwrap()
     }
     fn row<'a>(r: &'a RowsReport, id: &str) -> &'a TemplateRow {
         r.rows.iter().find(|x| x.id == id).unwrap()
@@ -1119,7 +1138,9 @@ write_mode_aliases: { overwrite: append }
 
     #[test]
     fn source_rows_without_sink_describe_every_stream() {
-        let r = rows_for_source(&src(), None, None).unwrap().report;
+        let r = rows_for_source(&src(), None, None, &SuppliedParams::new())
+            .unwrap()
+            .report;
         assert_eq!(r.kind, "source-template");
         assert!(r.selectable);
         assert_eq!(r.rows.len(), 5);
@@ -1153,7 +1174,7 @@ write_mode_aliases: { overwrite: append }
 
     #[test]
     fn source_rows_with_sink_resolve_writes_and_guarantees() {
-        let r = rows_for_source(&src(), Some(&sink()), None).unwrap();
+        let r = rows_for_source(&src(), Some(&sink()), None, &SuppliedParams::new()).unwrap();
         assert!(r.composed.is_some());
         let r = r.report;
         assert_eq!(r.sink.as_deref(), Some("files"));
@@ -1186,7 +1207,7 @@ write_mode_aliases: { overwrite: append }
     fn a_sink_no_stream_can_use_composes_nothing() {
         let mut s = src();
         s.streams.retain(|x| x.name.starts_with("audit"));
-        let r = rows_for_source(&s, Some(&sink()), None).unwrap();
+        let r = rows_for_source(&s, Some(&sink()), None, &SuppliedParams::new()).unwrap();
         assert!(r.composed.is_none());
     }
 
@@ -1310,7 +1331,7 @@ matrix:
 "#;
 
     fn pipe(state: &std::path::Path) -> Value {
-        serde_yaml::from_str(&PIPE.replace("STATE", &state.display().to_string())).unwrap()
+        crate::yaml::from_str(&PIPE.replace("STATE", &state.display().to_string())).unwrap()
     }
 
     #[tokio::test]
@@ -1445,7 +1466,7 @@ matrix:
 
     #[tokio::test]
     async fn topology_pipelines_are_not_selectable() {
-        let doc: Value = serde_yaml::from_str(
+        let doc: Value = crate::yaml::from_str(
             r#"
 version: 1
 name: topo
@@ -1517,14 +1538,18 @@ pipeline:
 
     #[test]
     fn human_render_lists_rows_and_facts() {
-        let r = rows_for_source(&src(), Some(&sink()), None).unwrap().report;
+        let r = rows_for_source(&src(), Some(&sink()), None, &SuppliedParams::new())
+            .unwrap()
+            .report;
         let text = render_human(&r);
         assert!(text.contains("source-template crm"));
         assert!(text.contains("× files"));
         assert!(text.contains("UNSUPPORTED"));
         assert!(text.contains("write overwrite→append"));
         assert!(text.contains("child of deals"));
-        let bare = rows_for_source(&src(), None, None).unwrap().report;
+        let bare = rows_for_source(&src(), None, None, &SuppliedParams::new())
+            .unwrap()
+            .report;
         assert!(render_human(&bare).contains("wants upsert|append"));
     }
 }

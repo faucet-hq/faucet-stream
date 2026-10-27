@@ -127,7 +127,8 @@ pub fn tool_defs(ctx: &McpContext) -> Vec<ToolDef> {
                     "version": { "description": "Version: a number or a channel. Default \"stable\".", "oneOf": [{ "type": "integer" }, { "type": "string" }] },
                     "sink": { "type": "string", "description": "For a source template: the registered sink template to resolve against." },
                     "sink_version": { "oneOf": [{ "type": "integer" }, { "type": "string" }] },
-                    "selection": { "type": "object", "description": "Run only some matrix rows / streams: { select: [ids], only: [globs], skip: [ids|globs], tags: [..], status: [available|draft|archived], include_parents: off|eligible|all }. Omit to run every row." }
+                    "selection": { "type": "object", "description": "Run only some matrix rows / streams: { select: [ids], only: [globs], skip: [ids|globs], tags: [..], status: [available|draft|archived], include_parents: off|eligible|all }. Omit to run every row." },
+                    "params": { "type": "object", "description": "Param values to list with: a source template's `for_each` stream lists one row per item of its list param (`{\"tables\": [\"orders\", \"customers\"]}`); without it, placeholder items." }
                 },
                 "required": ["id"]
             }),
@@ -625,7 +626,7 @@ fn parse_config_with(
     mode: crate::params::BindMode,
     screen: Option<crate::serve::load::BodyOrigin>,
 ) -> Result<PipelineConfig, String> {
-    let mut doc: Value = serde_yaml::from_str(text).map_err(|e| e.to_string())?;
+    let mut doc: Value = crate::yaml::from_str(text).map_err(|e| e.to_string())?;
     crate::interpolate::interpolate_value(&mut doc).map_err(|e| e.to_string())?;
     crate::params::bind_document(&mut doc, &Default::default(), mode).map_err(|e| e.to_string())?;
     if let Some(origin) = screen {
@@ -660,7 +661,7 @@ fn screen_config(ctx: &McpContext, text: &str) -> Result<(), String> {
     let Some(origin) = ctx.submitted else {
         return Ok(());
     };
-    let doc: Value = serde_yaml::from_str(text).map_err(|e| e.to_string())?;
+    let doc: Value = crate::yaml::from_str(text).map_err(|e| e.to_string())?;
     crate::serve::load::screen_document(&doc, origin).map_err(|e| e.api_error().error.message)
 }
 
@@ -1050,6 +1051,7 @@ async fn register_template(ctx: &McpContext, args: &Value) -> Result<String, Str
         "registered": registered.record.summary(),
         "tests": registered.tests,
         "tests_inherited_from": registered.tests_inherited_from,
+        "companions_retested": registered.companions_retested,
     })))
 }
 
@@ -1144,6 +1146,11 @@ async fn list_template_rows(ctx: &McpContext, args: &Value) -> Result<String, St
         None => None,
     };
     let selection = selection_arg(args)?;
+    let params: crate::params::SuppliedParams = match args.get("params") {
+        None | Some(Value::Null) => Default::default(),
+        Some(v) => serde_json::from_value(v.clone())
+            .map_err(|e| format!("`params` must be an object of param values: {e}"))?,
+    };
     let tenant = match ctx.server.as_ref().and_then(|s| s.actor.tenant.as_deref()) {
         Some(t) => Some(crate::templates::rows::tenant_values(store, t).await),
         None => None,
@@ -1158,6 +1165,7 @@ async fn list_template_rows(ctx: &McpContext, args: &Value) -> Result<String, St
             selection: selection.as_ref(),
             state: true,
             tenant: tenant.as_ref(),
+            params: Some(&params),
         },
     )
     .await

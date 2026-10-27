@@ -453,6 +453,40 @@ fn sink_err(context: &'static str) -> impl FnOnce(sqlx::Error) -> FaucetError {
     move |e| FaucetError::Sink(format!("{context}: {e}"))
 }
 
+/// Switching a new file to WAL takes a lock SQLite's busy handler does not wait for,
+/// so concurrent first opens retry here until `deadline`.
+async fn retry_busy<T, E, F, Fut>(
+    deadline: Duration,
+    busy: fn(&E) -> bool,
+    mut open: F,
+) -> Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let start = std::time::Instant::now();
+    let mut pause = Duration::from_millis(10);
+    loop {
+        match open().await {
+            Err(e) if busy(&e) && start.elapsed() < deadline => {
+                #[allow(clippy::disallowed_methods)] // a local file lock, not a backend call
+                tokio::time::sleep(pause).await;
+                pause = (pause * 2).min(Duration::from_millis(500));
+            }
+            other => return other,
+        }
+    }
+}
+
+fn is_busy(e: &sqlx::Error) -> bool {
+    let sqlx::Error::Database(db) = e else {
+        return false;
+    };
+    db.code()
+        .and_then(|c| c.parse::<i32>().ok())
+        .is_some_and(|c| matches!(c & 0xff, 5 | 6))
+}
+
 fn ensure_database_dir(filename: &std::path::Path) -> Result<(), FaucetError> {
     if filename.as_os_str() == ":memory:" {
         return Ok(());
@@ -500,11 +534,17 @@ impl SqliteSink {
             .busy_timeout(Duration::from_secs(config.busy_timeout_secs));
         ensure_database_dir(options.get_filename())?;
 
-        let pool = SqlitePoolOptions::new()
-            .max_connections(config.max_connections)
-            .connect_with(options)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("SQLite connection failed: {e}")))?;
+        let pool = retry_busy(
+            Duration::from_secs(config.busy_timeout_secs),
+            is_busy,
+            || {
+                SqlitePoolOptions::new()
+                    .max_connections(config.max_connections)
+                    .connect_with(options.clone())
+            },
+        )
+        .await
+        .map_err(|e| FaucetError::Sink(format!("SQLite connection failed: {e}")))?;
 
         let engine = SqlSinkEngine::new(Sqlite, config.write.clone())
             .with_options(EngineOptions::new().warn_unmatched_fields(true));
@@ -1037,6 +1077,84 @@ impl RollbackDriver for SqliteDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_busy_open_is_retried_until_it_succeeds_or_the_deadline_passes() {
+        let calls = std::cell::Cell::new(0);
+        let got: Result<u8, &str> = retry_busy(
+            Duration::from_secs(5),
+            |e| *e == "busy",
+            || {
+                calls.set(calls.get() + 1);
+                let n = calls.get();
+                async move { if n < 3 { Err("busy") } else { Ok(7) } }
+            },
+        )
+        .await;
+        assert_eq!((got, calls.get()), (Ok(7), 3));
+
+        calls.set(0);
+        let got: Result<u8, &str> = retry_busy(
+            Duration::from_secs(5),
+            |e| *e == "busy",
+            || {
+                calls.set(calls.get() + 1);
+                async { Err("other") }
+            },
+        )
+        .await;
+        assert_eq!((got, calls.get()), (Err("other"), 1));
+
+        calls.set(0);
+        let got: Result<u8, &str> = retry_busy(
+            Duration::ZERO,
+            |e| *e == "busy",
+            || {
+                calls.set(calls.get() + 1);
+                async { Err("busy") }
+            },
+        )
+        .await;
+        assert_eq!((got, calls.get()), (Err("busy"), 1));
+    }
+
+    #[tokio::test]
+    async fn a_locked_database_is_busy_and_other_errors_are_not() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let url = format!("sqlite:{}?mode=rwc", dir.path().join("b.db").display());
+        let holder = SqlitePool::connect(&url).await.unwrap();
+        let mut held = holder.acquire().await.unwrap();
+        sqlx::query("BEGIN EXCLUSIVE")
+            .execute(&mut *held)
+            .await
+            .unwrap();
+        let opts = SqliteConnectOptions::from_str(&url)
+            .unwrap()
+            .busy_timeout(Duration::ZERO);
+        let other = SqlitePoolOptions::new().connect_with(opts).await.unwrap();
+        let err = sqlx::query("CREATE TABLE t (x INTEGER)")
+            .execute(&other)
+            .await
+            .unwrap_err();
+        assert!(is_busy(&err), "{err}");
+        assert!(!is_busy(&sqlx::Error::PoolTimedOut));
+        let err = sqlx::query("SELEC 1").execute(&other).await.unwrap_err();
+        assert!(!is_busy(&err), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_first_opens_of_a_new_file_all_connect() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let url = format!("sqlite:{}?mode=rwc", dir.path().join("new.db").display());
+        let opens = (0..8).map(|_| {
+            let mut cfg = SqliteSinkConfig::new(url.clone(), "out");
+            cfg.create_table = true;
+            SqliteSink::new(cfg)
+        });
+        for sink in futures::future::join_all(opens).await {
+            sink.unwrap();
+        }
+    }
 
     #[test]
     fn database_dir_is_left_alone_for_memory_bare_and_existing_paths() {

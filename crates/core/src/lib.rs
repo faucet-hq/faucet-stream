@@ -268,7 +268,7 @@ pub use transforming_source::TransformingSource;
 #[cfg(feature = "transform-tree-flatten")]
 pub use tree::{AncestorsSpec, ColumnsSpec, CompiledTreeFlatten, TreeFlattenSpec};
 pub use usage::{CostSignal, UsageMeter, UsageSide, UsageSnapshot, estimate_json_bytes};
-pub use util::{redact_uri_credentials, redacted_uri_authority};
+pub use util::{encode_url_component, redact_uri_credentials, redacted_uri_authority};
 pub use verify::{IntegrityCheck, LengthCheck, VerifyingReader};
 pub use window::{
     WINDOW_END_PLACEHOLDER, WINDOW_PLACEHOLDER, WINDOW_START_PLACEHOLDER, Window, WindowBind,

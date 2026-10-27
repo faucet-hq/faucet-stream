@@ -144,7 +144,7 @@ connector READMEs for full pipeline examples.
 
 | Feature | Default | Adds |
 |---------|---------|------|
-| `schema-registry` | off | The Confluent `KafkaValueFormat` variants, `SchemaRegistryConfig`, `SchemaRegistryClient`, and the `avro`/`protobuf`/`json_schema`/`envelope` codec modules. Pulls in `reqwest`, `lru`, `bytes`, `apache-avro`, `prost-reflect`, `prost`, `jsonschema`, `tokio`, `url`, `urlencoding`. |
+| `schema-registry` | off | The Confluent `KafkaValueFormat` variants, `SchemaRegistryConfig`, `SchemaRegistryClient`, and the `avro`/`protobuf`/`json_schema`/`envelope` codec modules. Pulls in `reqwest`, `lru`, `bytes`, `apache-avro`, `prost-reflect`, `prost`, `jsonschema`, `tokio`, `url`. |
 
 > In the umbrella `faucet-stream` crate and the `faucet-cli`, this is enabled via the
 > `kafka-schema-registry` feature, which forwards to this crate's `schema-registry` feature.

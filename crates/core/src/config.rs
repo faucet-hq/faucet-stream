@@ -33,6 +33,8 @@ use crate::error::FaucetError;
 use serde::de::DeserializeOwned;
 use std::path::Path;
 
+mod env;
+
 /// Load a config struct from a JSON file.
 ///
 /// The file contents are read and deserialized into `T`.
@@ -59,17 +61,17 @@ pub fn load_json<T: DeserializeOwned>(path: impl AsRef<Path>) -> Result<T, Fauce
 /// For example, with prefix `"BQ"` and a field `project_id`, the env
 /// var `BQ_PROJECT_ID` is read.
 ///
-/// Nested structs and enums are supported via `envy`'s deserialization.
+/// The struct is read flat: each field is one variable, holding a number,
+/// boolean, unit enum variant, string, or a comma-separated list.
 pub fn load_env<T: DeserializeOwned>(prefix: &str) -> Result<T, FaucetError> {
-    envy::prefixed(format!("{prefix}_"))
-        .from_env()
+    env::from_vars(&format!("{prefix}_"), std::env::vars_os())
         .map_err(|e| FaucetError::Config(format!("failed to load config from env vars: {e}")))
 }
 
 /// Load a `.env` file into the process environment, then deserialize
 /// a config struct from environment variables with a prefix.
 ///
-/// This combines `dotenvy` (for `.env` file loading) with `envy`
+/// This combines `dotenvy` (for `.env` file loading) with [`load_env`]
 /// (for struct deserialization from env vars).
 ///
 /// The `.env` file is loaded first, setting any variables that aren't

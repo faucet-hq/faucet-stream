@@ -1926,6 +1926,7 @@ paths:
                     properties:
                       tests: { $ref: "#/components/schemas/TemplateTestResult" }
                       tests_inherited_from: { type: integer, description: "The version whose `tests:` block this one inherited (#856)." }
+                      companions_retested: { type: array, items: { $ref: "#/components/schemas/TemplateTestResult" }, description: "Other templates whose newest version last failed its tests because this one was not registered yet as a companion (#951), re-tested now. Absent when none." }
         "401": { $ref: "#/components/responses/Error" }
         "403": { description: Principal's role lacks the required permission }
         "422": { $ref: "#/components/responses/Error" }
@@ -2460,6 +2461,7 @@ paths:
         - { name: status, in: query, required: false, schema: { type: string } }
         - { name: include_parents, in: query, required: false, schema: { type: string, enum: ["off", eligible, all] } }
         - { name: state, in: query, required: false, schema: { type: boolean, default: true }, description: "Read each row's status." }
+        - { name: params, in: query, required: false, schema: { type: string }, description: "Param values as a JSON object (`{\"tables\": [\"orders\"]}`), URL-encoded: a source template's `for_each` stream lists one row per item of its list param (#952). Without it, placeholder items." }
       responses:
         "200":
           description: The rows.
@@ -2925,6 +2927,7 @@ components:
         source_lag: { $ref: "#/components/schemas/SourceLag" }
         rows: { $ref: "#/components/schemas/RowAccounts" }
         skipped: { type: boolean, description: "The invocation never ran because its parent or a `depends_on` row failed or was skipped; `error` names it. Absent when false." }
+        status: { type: string, enum: [succeeded, failed, skipped], description: "What this row's invocation came to (#952), so each row of a run — one per `for_each` item, say — maps to its own outcome; one failed row never hides the others. Absent on records written before it existed (derive it from `error` / `skipped`)." }
       example:
         row_id: orders_to_warehouse
         parent_record_key: example
@@ -3836,6 +3839,7 @@ components:
                     stream: { type: string }
                     write_mode: { type: string }
                     satisfies: { type: string, nullable: true, description: "The requested mode this one stands in for, via an alias." }
+              collision: { type: string, description: "Two streams (or the items of one `for_each` stream) whose `per_stream` renders the same destination (#950); the pairing is then not compatible. Absent otherwise." }
               incompatible:
                 type: array
                 items:
@@ -4063,6 +4067,8 @@ components:
         build_features: { type: array, items: { type: string }, description: "Connectors and transforms compiled into the binary (`source:csv`, `sink:jsonl`, `transform:flatten`, …)." }
         plugins: { type: array, items: { type: string }, description: "Custom connectors registered through a `PluginRegistry`." }
         companions: { type: array, items: { type: string }, description: "Companion templates the bundle ran with (`id@version`)." }
+        companion_notes: { type: array, items: { type: string }, description: "How a companion's version was picked when not by its default (#951) — a companion with no launched version runs at its newest." }
+        missing_companions: { type: array, items: { type: string }, description: "Companions that were not registered when the bundle ran; registering one re-runs these tests (#951)." }
         instance: { type: string, nullable: true, description: "The `faucet serve` instance that ran it; absent for the CLI." }
         error: { type: string, nullable: true, description: "Why the bundle could not run at all (a companion or shared suite that does not resolve)." }
         suites:

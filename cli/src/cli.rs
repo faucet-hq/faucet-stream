@@ -992,6 +992,11 @@ pub struct TemplateRowsArgs {
     /// Version of a registered overlay. Default `stable`.
     #[arg(long, default_value = "stable", requires = "overlay")]
     pub overlay_version: String,
+    /// Param values `for_each` streams are listed with (#952):
+    /// `--param tables='["orders","customers"]'`. Without one, a repeated
+    /// stream is listed as placeholder items. Repeatable.
+    #[arg(long = "param", value_name = "NAME=VALUE")]
+    pub param: Vec<String>,
     /// Skip reading each row's state (last success / failure, bookmark age).
     #[arg(long)]
     pub no_state: bool,
@@ -1259,6 +1264,11 @@ pub struct HubRowsArgs {
     pub sink_hub: Option<String>,
     #[arg(long)]
     pub overlay_hub: Option<String>,
+    /// Param values `for_each` streams are listed with (#952):
+    /// `--param tables='["orders","customers"]'`. Without one, a repeated
+    /// stream is listed as placeholder items. Repeatable.
+    #[arg(long = "param", value_name = "NAME=VALUE")]
+    pub param: Vec<String>,
     /// Also read each row's state from the composed run's state store.
     #[arg(long)]
     pub state: bool,
@@ -1312,6 +1322,11 @@ pub struct HubPairArgs {
 pub struct HubComposeArgs {
     #[command(flatten)]
     pub pair: HubPairArgs,
+    /// Supply a declared param (#952): a `for_each` stream repeats over a
+    /// list param, so composing it needs that list —
+    /// `--param tables='["orders","customers"]'`. Repeatable.
+    #[arg(long = "param", value_name = "NAME=VALUE")]
+    pub param: Vec<String>,
     /// Write the composed config here instead of stdout.
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
     pub out: Option<PathBuf>,

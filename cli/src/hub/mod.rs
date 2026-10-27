@@ -19,6 +19,7 @@
 pub mod bundles;
 pub mod catalog;
 pub mod compose;
+pub mod for_each;
 #[cfg(feature = "source-rest")]
 pub mod import;
 #[cfg(feature = "hub-remote")]
@@ -375,12 +376,51 @@ pub async fn locate_in(
 }
 
 /// Compose a pairing whose sides may come from different hubs (#696),
-/// recording where each came from.
+/// recording where each came from. A `for_each` stream (#952) is expanded
+/// over placeholder items — the structural view; a run passes its params
+/// through [`compose_across_with`].
 pub async fn compose_across(
     source: &str,
     sink: &str,
     overlay: Option<&str>,
     sides: &HubSides,
+) -> CliResult<Composition> {
+    compose_across_with(source, sink, overlay, sides, None).await
+}
+
+/// The values a composition expands `for_each` streams with (#952).
+#[derive(Debug, Clone, Copy)]
+pub struct ExpandWith<'a> {
+    pub params: &'a crate::params::SuppliedParams,
+    pub mode: crate::params::BindMode,
+    /// Resolves `${env:…}` in param defaults first, as the load does.
+    pub env: Option<&'a crate::interpolate::EnvOverlay>,
+}
+
+impl<'a> ExpandWith<'a> {
+    /// From the inputs a composed load binds with.
+    pub fn inputs(inputs: &'a crate::config::RunInputs) -> Self {
+        Self {
+            params: &inputs.params,
+            mode: inputs.mode,
+            env: Some(&inputs.env),
+        }
+    }
+
+    /// Expand `src`.
+    pub fn expand(&self, src: &SourceTemplate) -> CliResult<SourceTemplate> {
+        for_each::expand(src, self.params, self.mode, self.env)
+    }
+}
+
+/// [`compose_across`], expanding `for_each` streams with `with` (placeholder
+/// items when `None`).
+pub async fn compose_across_with(
+    source: &str,
+    sink: &str,
+    overlay: Option<&str>,
+    sides: &HubSides,
+    with: Option<ExpandWith<'_>>,
 ) -> CliResult<Composition> {
     let (source_file, source_hub) = locate_in(source, &sides.source, catalog::SOURCE_DIR).await?;
     let (sink_file, sink_hub) = locate_in(sink, &sides.sink, catalog::SINK_DIR).await?;
@@ -394,6 +434,10 @@ pub async fn compose_across(
         let official = k.is_official() && is_official_file(hub, &sink_file, catalog::SINK_DIR);
         refuse_untrusted_directives(&sink_file, &k.id(), official, &sides.trusted)?;
     }
+    let s = match with {
+        Some(w) => w.expand(&s)?,
+        None => for_each::expand_placeholders(&s)?,
+    };
     let mut c = compose(&s, &k)?;
     c.source_hub = source_hub;
     c.sink_hub = sink_hub;
@@ -548,7 +592,7 @@ fn parse_untyped(text: &str, path: &Path) -> CliResult<Value> {
         serde_json::from_str(text)
             .map_err(|e| CliError::Config(format!("{}: invalid JSON: {e}", path.display())))
     } else {
-        serde_yaml::from_str(text)
+        crate::yaml::from_str(text)
             .map_err(|e| CliError::Config(format!("{}: invalid YAML: {e}", path.display())))
     }
 }
@@ -815,7 +859,7 @@ pub async fn compose_locators_overlaid(
     overlay: Option<&str>,
     hub: &Path,
 ) -> CliResult<Composition> {
-    let s = load_source(source, hub).await?;
+    let s = for_each::expand_placeholders(&load_source(source, hub).await?)?;
     let k = load_sink(sink, hub).await?;
     let c = compose(&s, &k)?;
     match overlay {

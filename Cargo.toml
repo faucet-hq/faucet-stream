@@ -406,7 +406,6 @@ prost-otlp = { package = "prost", version = "0.14" }
 bytes = "1"
 url = "2"
 percent-encoding = "2"
-urlencoding = "2"
 protox = "0.9"
 arrow = "58"
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
@@ -426,7 +425,8 @@ flate2 = "1"
 zstd = "0.13"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 glob = "0.3"
-duckdb = "1.10506.1"
+# Arrow-58 line; duckdb 1.20000 is on arrow 60 (#936).
+duckdb = "~1.10506.1"
 # WebAssembly runtime for the `wasm` transform (issue #124). Lean embedding:
 # JIT via Cranelift + the runtime, on std platforms (native signal traps). We
 # drive core-wasm modules only — no component model, async, cache, or GC.

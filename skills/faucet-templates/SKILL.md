@@ -169,7 +169,11 @@ ordinary config from then on.
    `write` preference list. How to choose them, and the raw-versus-transformed
    key naming trap:
    [A source template](https://faucet-hq.github.io/faucet-stream/cookbook/template-hub.html#a-source-template).
-   Shaping every sink needs goes in the top-level `transforms`.
+   Shaping every sink needs goes in the top-level `transforms`. When the
+   caller picks the tables at trigger time, declare one stream with
+   `for_each:` over a `type: list` param instead of one per table, and list
+   the rows it expands to with `faucet hub rows --param …`:
+   [Repeating a stream over a list param](https://faucet-hq.github.io/faucet-stream/cookbook/template-hub.html#repeating-a-stream-over-a-list-param-for_each).
 
 4. **Make every host and every secret a param.** The API root is a param that
    defaults to the public URL (tests and replays point it at a local server).
@@ -226,7 +230,9 @@ substitution tokens are on the
 [Template Hub](https://faucet-hq.github.io/faucet-stream/cookbook/template-hub.html#a-sink-template)
 page). Declare a `write_mode_aliases` entry only when the destination satisfies
 a mode by construction, and read that page's rules on aliases and child streams
-first. Check it against several sources:
+first. A destination may come from a param, but `hub check` refuses any
+pairing where two streams render the same destination, so check against a
+multi-stream source too. Check it against several sources:
 
 ```bash
 faucet hub lint --hub .
@@ -240,7 +246,10 @@ faucet hub matrix --hub .
    `faucet schema template-test`; walkthrough:
    [Testing the parameter space](https://faucet-hq.github.io/faucet-stream/cookbook/templates.html#testing-the-parameter-space);
    example: [examples/tests/](examples/tests/acme/example-api/suite.yaml)). A
-   suite for a source template names a sink. Turn on the `auto` cases so every
+   suite for a source template names a sink. (A `tests:` bundle of a new
+   source + sink pair names each other: register both, then launch both —
+   [Bootstrapping a new source + sink pair](https://faucet-hq.github.io/faucet-stream/cookbook/templates.html#bootstrapping-a-new-source--sink-pair).)
+   Turn on the `auto` cases so every
    required param, every closed value set and the all-defaults combination is
    covered, add explicit cases for the params that matter, and add
    `behavioral` cases that feed records through the template's transforms and

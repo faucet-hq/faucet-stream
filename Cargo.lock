@@ -4497,15 +4497,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "envy"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f47e0157f2cb54f5ae1bd371b30a2ae4311e1c028f575cd4e81de7353215965"
-dependencies = [
- "serde",
-]
-
-[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5027,7 +5018,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "urlencoding",
  "wiremock",
 ]
 
@@ -5071,7 +5061,6 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "urlencoding",
  "wiremock",
 ]
 
@@ -5329,7 +5318,6 @@ dependencies = [
  "csv",
  "csv-async",
  "dotenvy",
- "envy",
  "flate2",
  "futures",
  "futures-core",
@@ -5347,6 +5335,7 @@ dependencies = [
  "opentelemetry_sdk",
  "orc-rust",
  "parquet 58.3.0",
+ "percent-encoding",
  "quick-xml 0.42.0",
  "regex",
  "reqwest 0.13.3",
@@ -5452,7 +5441,6 @@ dependencies = [
  "testcontainers",
  "testcontainers-modules",
  "tokio",
- "urlencoding",
  "uuid",
  "wiremock",
 ]
@@ -5709,7 +5697,6 @@ dependencies = [
  "tempfile",
  "testcontainers",
  "tokio",
- "urlencoding",
  "wiremock",
 ]
 
@@ -6404,7 +6391,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
- "urlencoding",
  "wiremock",
 ]
 
@@ -6462,7 +6448,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "urlencoding",
 ]
 
 [[package]]
@@ -6965,7 +6950,6 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
- "urlencoding",
  "wiremock",
  "zip",
 ]
@@ -7146,7 +7130,6 @@ dependencies = [
  "subtle",
  "tokio",
  "tracing",
- "urlencoding",
 ]
 
 [[package]]

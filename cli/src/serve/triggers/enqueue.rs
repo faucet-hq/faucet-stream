@@ -88,7 +88,7 @@ pub async fn resolve_config(
         PipelineRef::Path(p) => tokio::fs::read_to_string(p)
             .await
             .map_err(|e| ResolveError::Read(format!("reading pipeline config '{p}': {e}")))?,
-        PipelineRef::Inline(v) => serde_yaml::to_string(v)
+        PipelineRef::Inline(v) => crate::yaml::to_string(v)
             .map_err(|e| ResolveError::Read(format!("serializing inline pipeline: {e}")))?,
     };
     context::substitute_tracked(&raw, event, name, fired_at).map_err(ResolveError::Substitute)

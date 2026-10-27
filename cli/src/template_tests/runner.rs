@@ -315,7 +315,7 @@ pub(crate) fn name_matches(name: &str, filter: Option<&str>) -> bool {
 /// For a source template this is the **composed** declaration (source + sink
 /// params merged), because that is the surface a trigger binds.
 async fn declared_params(target: &Target<'_>) -> CliResult<crate::params::ParamsSpec> {
-    let mut doc = effective_document(target).await?;
+    let mut doc = effective_document(target, None).await?;
     neutralize_secret_defaults(&mut doc);
     super::trust::screen(&doc)?;
     // Defaults like `${env:PORT}` resolve before binding, as a real run does.
@@ -324,14 +324,30 @@ async fn declared_params(target: &Target<'_>) -> CliResult<crate::params::Params
 }
 
 fn parse_template_text(text: &str, what: &str) -> CliResult<Value> {
-    serde_yaml::from_str(text)
+    crate::yaml::from_str(text)
         .map_err(|e| CliError::Config(format!("template test: parsing the {what}: {e}")))
 }
 
 /// The pipeline document the cases run against: a `pipeline` template's body
 /// as-is, or a `source-template` composed with its sink. Composition here is
 /// exactly what a trigger does, so a suite tests the real thing.
-async fn effective_document(target: &Target<'_>) -> CliResult<Value> {
+///
+/// A `for_each` stream (#952) repeats per item of a list param: with
+/// `supplied` (one case's params) it expands over those items, else over
+/// placeholder items — enough to read the declared params.
+async fn effective_document(
+    target: &Target<'_>,
+    supplied: Option<&SuppliedParams>,
+) -> CliResult<Value> {
+    let expand = |source: &crate::hub::SourceTemplate| match supplied {
+        Some(p) => crate::hub::for_each::expand(
+            source,
+            p,
+            crate::params::BindMode::Strict,
+            Some(&Default::default()),
+        ),
+        None => crate::hub::for_each::expand_placeholders(source),
+    };
     match target {
         Target::Document {
             body,
@@ -357,7 +373,7 @@ async fn effective_document(target: &Target<'_>) -> CliResult<Value> {
                             .map_err(|e| {
                                 CliError::Config(format!("template test: sink-template: {e}"))
                             })?;
-                    let c = crate::hub::compose(&source, &sink)?;
+                    let c = crate::hub::compose(&expand(&source)?, &sink)?;
                     Ok(match overlay {
                         Some(v) => {
                             c.apply_overlay(&crate::hub::DeploymentTemplate::from_value(
@@ -427,7 +443,7 @@ async fn effective_document(target: &Target<'_>) -> CliResult<Value> {
                     .map_err(|e| {
                         CliError::Internal(format!("stored sink-template '{sink_id}': {e}"))
                     })?;
-                    let c = crate::hub::compose(&source, &sink_t)?;
+                    let c = crate::hub::compose(&expand(&source)?, &sink_t)?;
                     Ok(match overlay {
                         Some(choice) => {
                             let (t, _, _) =
@@ -687,10 +703,10 @@ async fn materialize_body(supplied: &SuppliedParams, target: &Target<'_>) -> Cli
     // name as a real trigger would). A value the case itself names is used,
     // and recorded as `***` (see `redact_secret_params`).
     let mut owned = supplied.clone();
-    let defaulted = secret_params_with_default(&effective_document(target).await?);
+    let defaulted = secret_params_with_default(&effective_document(target, None).await?);
     for (name, p) in declared_params(target).await? {
         if defaulted.contains(&name) && !owned.contains_key(&name) {
-            owned.insert(name, p.kind.placeholder());
+            owned.insert(name, p.placeholder());
         }
     }
     let supplied = &owned;
@@ -727,7 +743,7 @@ async fn materialize_body(supplied: &SuppliedParams, target: &Target<'_>) -> Cli
             .await?
             .body;
             let mut doc: Value = serde_json::from_str(&body)
-                .or_else(|_| serde_yaml::from_str(&body))
+                .or_else(|_| crate::yaml::from_str(&body))
                 .map_err(|e| CliError::Internal(format!("template test: {e}")))?;
             super::trust::screen(&doc)?;
             crate::interpolate::interpolate_value_with_env(&mut doc, &Default::default())?;
@@ -735,7 +751,7 @@ async fn materialize_body(supplied: &SuppliedParams, target: &Target<'_>) -> Cli
                 .map_err(|e| CliError::Internal(format!("template test: {e}")))
         }
         Target::Document { .. } => {
-            let mut doc = effective_document(target).await?;
+            let mut doc = effective_document(target, Some(supplied)).await?;
             neutralize_secret_defaults(&mut doc);
             super::trust::screen(&doc)?;
             // The env/file/secret pass a local materialization runs first (CLI-121).

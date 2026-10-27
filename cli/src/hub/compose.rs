@@ -91,7 +91,7 @@ impl Composition {
     /// The document as YAML text (what `faucet hub compose` prints), headed by
     /// a comment naming the hub each side came from.
     pub fn to_yaml(&self) -> CliResult<String> {
-        let body = serde_yaml::to_string(&self.document)
+        let body = crate::yaml::to_string(&self.document)
             .map_err(|e| CliError::Internal(format!("hub compose: rendering YAML: {e}")))?;
         let mut head = String::new();
         for (what, id, hub) in [
@@ -299,6 +299,66 @@ pub fn render_per_stream_owned(v: &Value, stream: &str, source: &str, owner: &st
     }
 }
 
+/// The sink config one stream's `per_stream` block renders to.
+fn rendered_destination(
+    sink: &SinkTemplate,
+    stream: &str,
+    source: &SourceTemplate,
+) -> Map<String, Value> {
+    sink.per_stream
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                render_per_stream_owned(
+                    v,
+                    stream,
+                    &source.name,
+                    source.owner.as_deref().unwrap_or(""),
+                ),
+            )
+        })
+        .collect()
+}
+
+/// Two streams whose `per_stream` block renders the same sink config would
+/// write into the same destination (#950). Compared on the rendered values,
+/// so a destination taken only from a param (`table_id: "${param.table}"`) is
+/// fine with a one-stream source and refused with a multi-stream one.
+pub fn destination_collision(source: &SourceTemplate, sink: &SinkTemplate) -> Option<String> {
+    let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+    for s in &source.streams {
+        let dest = Value::Object(rendered_destination(sink, &s.name, source));
+        // An unexpanded `for_each` stream collides unless its destination follows the item.
+        if s.for_each.is_some()
+            && !super::for_each::destination_varies(&dest, s)
+            && source
+                .params
+                .get(super::for_each::list_param(s).unwrap_or_default())
+                .is_none_or(|p| p.max_items != Some(1))
+        {
+            return Some(format!(
+                "sink-template '{}': per_stream renders the same destination for every item \
+                 of stream {} (`for_each: {}`) — use ${{stream}} (or a per-stream param) so \
+                 they don't collide",
+                sink.id(),
+                s.name,
+                s.for_each.as_deref().unwrap_or_default()
+            ));
+        }
+        let rendered = dest.to_string();
+        if let Some(first) = seen.insert(rendered, s.name.as_str()) {
+            return Some(format!(
+                "sink-template '{}': per_stream renders the same destination for streams {first} \
+                 and {} — use ${{stream}} (or a per-stream param) so they don't collide",
+                sink.id(),
+                s.name
+            ));
+        }
+    }
+    None
+}
+
 /// Merge two `params:` (or `auth:`) maps. The same name declared by both
 /// sides must have an identical spec — otherwise the two templates disagree
 /// about what the operator is supplying, and guessing would bind one side
@@ -383,6 +443,13 @@ pub fn compose_with(
 ) -> CliResult<Composition> {
     source.validate()?;
     sink.validate()?;
+    if super::for_each::has_for_each(source) {
+        return Err(CliError::Internal(format!(
+            "source-template '{}' has `for_each` streams: expand them with the run's params \
+             (`hub::for_each::expand`) before composing",
+            source.id()
+        )));
+    }
 
     // Resolve every stream first so the error lists all of them at once.
     let aliases = sink.aliases();
@@ -439,6 +506,10 @@ pub fn compose_with(
         ));
     }
 
+    if let Some(why) = destination_collision(source, sink) {
+        return Err(CliError::Config(why));
+    }
+
     let params = merge_named(
         "param",
         &source.params,
@@ -455,18 +526,7 @@ pub fn compose_with(
 
     let mut rows = Vec::with_capacity(source.streams.len());
     for (s, plan) in source.streams.iter().zip(&plans) {
-        let mut sink_cfg = Map::new();
-        for (k, v) in &sink.per_stream {
-            sink_cfg.insert(
-                k.clone(),
-                render_per_stream_owned(
-                    v,
-                    &s.name,
-                    &source.name,
-                    source.owner.as_deref().unwrap_or(""),
-                ),
-            );
-        }
+        let mut sink_cfg = rendered_destination(sink, &s.name, source);
         if sink_takes_write_mode {
             sink_cfg.insert(
                 "write_mode".into(),
@@ -827,7 +887,7 @@ per_stream:
 "#;
 
     fn src() -> SourceTemplate {
-        serde_yaml::from_str(SRC).unwrap()
+        crate::yaml::from_str(SRC).unwrap()
     }
 
     const ALL: &[WriteMode] = &[
@@ -839,7 +899,7 @@ per_stream:
 
     #[test]
     fn an_overwrite_stream_on_an_incremental_read_is_warned_about() {
-        let sink: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
+        let sink: SinkTemplate = crate::yaml::from_str(BQ).unwrap();
         let mut t = src();
         t.streams[0].source.config["replication_method"] = serde_json::json!("incremental");
         let c = compose_with(&t, &sink, ALL).unwrap();
@@ -857,7 +917,7 @@ per_stream:
 
     #[test]
     fn composes_a_full_pipeline_document_for_a_capable_sink() {
-        let sink: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
+        let sink: SinkTemplate = crate::yaml::from_str(BQ).unwrap();
         let c = compose_with(&src(), &sink, ALL).unwrap();
         assert_eq!(
             c.name, "spend.bigquery",
@@ -900,7 +960,7 @@ per_stream:
 
     #[test]
     fn parent_ref_and_inherit_flow_into_the_matrix_row() {
-        let sink: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
+        let sink: SinkTemplate = crate::yaml::from_str(BQ).unwrap();
         let mut s = src();
         s.sources.insert("reports".into(), s.source.clone());
         s.streams.push(Stream {
@@ -916,6 +976,9 @@ per_stream:
             parent: Some("bills".into()),
             parent_key: Some("id".into()),
             inherit_transforms: false,
+            for_each: None,
+            r#as: None,
+            name_case: None,
         });
         let c = compose_with(&s, &sink, ALL).unwrap();
         let d = &c.document;
@@ -947,6 +1010,9 @@ per_stream:
             parent: Some("bills".into()),
             parent_key: Some("id".into()),
             inherit_transforms: true,
+            for_each: None,
+            r#as: None,
+            name_case: None,
         }
     }
 
@@ -955,7 +1021,7 @@ per_stream:
     /// parent's rows — the composer refuses it and names the stream.
     #[test]
     fn child_streams_never_resolve_to_a_truncating_write() {
-        let mut jsonl: SinkTemplate = serde_yaml::from_str(JSONL).unwrap();
+        let mut jsonl: SinkTemplate = crate::yaml::from_str(JSONL).unwrap();
         jsonl
             .write_mode_aliases
             .insert("overwrite".into(), WriteMode::Append);
@@ -989,7 +1055,7 @@ per_stream:
 
         // A native overwrite is grouped by the executor (#552): allowed, and
         // a refused alias falls through to the next listed mode.
-        let bq: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
+        let bq: SinkTemplate = crate::yaml::from_str(BQ).unwrap();
         let mut s = src();
         s.streams
             .push(child(WriteChoice::One(WriteMode::Overwrite)));
@@ -1011,16 +1077,16 @@ per_stream:
 
     #[test]
     fn truncating_sink_templates_are_recognised() {
-        let jsonl: SinkTemplate = serde_yaml::from_str(JSONL).unwrap();
+        let jsonl: SinkTemplate = crate::yaml::from_str(JSONL).unwrap();
         assert!(jsonl.truncates_per_invocation());
-        let bq: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
+        let bq: SinkTemplate = crate::yaml::from_str(BQ).unwrap();
         assert!(!bq.truncates_per_invocation());
-        let fixed: SinkTemplate = serde_yaml::from_str(
+        let fixed: SinkTemplate = crate::yaml::from_str(
             "kind: sink-template\nname: s3\nsink:\n  type: s3\n  config: { bucket: b }\nper_stream: { path: \"${stream}.jsonl\" }\n",
         )
         .unwrap();
         assert!(fixed.truncates_per_invocation(), "#789 FILE-05");
-        let unique: SinkTemplate = serde_yaml::from_str(
+        let unique: SinkTemplate = crate::yaml::from_str(
             "kind: sink-template\nname: s3\nsink:\n  type: s3\n  config: { bucket: b }\nper_stream: { prefix: \"${stream}/\" }\n",
         )
         .unwrap();
@@ -1032,7 +1098,7 @@ per_stream:
     /// composer runs the stream as append while recording what it satisfies.
     #[test]
     fn aliases_satisfy_a_mode_the_connector_lacks_and_are_validated_against_the_registry() {
-        let mut sink: SinkTemplate = serde_yaml::from_str(JSONL).unwrap();
+        let mut sink: SinkTemplate = crate::yaml::from_str(JSONL).unwrap();
         sink.write_mode_aliases
             .insert("overwrite".into(), WriteMode::Append);
         let c = compose_with(&src(), &sink, &[WriteMode::Append]).unwrap();
@@ -1045,7 +1111,7 @@ per_stream:
                 .get("write_mode")
                 .is_none()
         );
-        let bq: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
+        let bq: SinkTemplate = crate::yaml::from_str(BQ).unwrap();
         let mut bq2 = bq.clone();
         bq2.write_mode_aliases
             .insert("overwrite".into(), WriteMode::Append);
@@ -1064,7 +1130,7 @@ per_stream:
         let mut plugin = bq2.clone();
         plugin.sink.kind = "acme-files".into();
         assert!(compose_with(&src(), &plugin, &[WriteMode::Append]).is_ok());
-        let mut bad: SinkTemplate = serde_yaml::from_str(JSONL).unwrap();
+        let mut bad: SinkTemplate = crate::yaml::from_str(JSONL).unwrap();
         bad.write_mode_aliases
             .insert("overwrite".into(), WriteMode::Append);
         let err = compose_with(&src(), &bad, &[WriteMode::Upsert])
@@ -1074,7 +1140,7 @@ per_stream:
             err.contains("maps to `append`, which sink 'jsonl' does not support"),
             "{err}"
         );
-        let mut keyed: SinkTemplate = serde_yaml::from_str(JSONL).unwrap();
+        let mut keyed: SinkTemplate = crate::yaml::from_str(JSONL).unwrap();
         keyed
             .write_mode_aliases
             .insert("overwrite".into(), WriteMode::Delete);
@@ -1095,7 +1161,7 @@ per_stream:
 
     #[test]
     fn upsert_fallback_carries_the_key() {
-        let sink: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
+        let sink: SinkTemplate = crate::yaml::from_str(BQ).unwrap();
         let c = compose_with(&src(), &sink, &[WriteMode::Append, WriteMode::Upsert]).unwrap();
         assert_eq!(c.streams[0].chosen, WriteMode::Upsert);
         assert_eq!(c.streams[0].key, vec!["id"]);
@@ -1109,7 +1175,7 @@ per_stream:
     /// overwrite|upsert — and the error names both sides, per stream.
     #[test]
     fn incompatible_streams_fail_together_with_both_sides_named() {
-        let sink: SinkTemplate = serde_yaml::from_str(JSONL).unwrap();
+        let sink: SinkTemplate = crate::yaml::from_str(JSONL).unwrap();
         let mut s = src();
         s.streams.push(Stream {
             name: "audit".into(),
@@ -1121,6 +1187,9 @@ per_stream:
             parent: None,
             parent_key: None,
             inherit_transforms: true,
+            for_each: None,
+            r#as: None,
+            name_case: None,
         });
         let err = compose_with(&s, &sink, &[WriteMode::Append])
             .unwrap_err()
@@ -1143,7 +1212,7 @@ per_stream:
 
     #[test]
     fn an_append_only_sink_gets_no_write_mode_key_and_renders_source_and_stream() {
-        let sink: SinkTemplate = serde_yaml::from_str(JSONL).unwrap();
+        let sink: SinkTemplate = crate::yaml::from_str(JSONL).unwrap();
         let mut s = src();
         s.streams[0].write = WriteChoice::One(WriteMode::Append);
         let c = compose_with(&s, &sink, &[WriteMode::Append]).unwrap();
@@ -1157,8 +1226,45 @@ per_stream:
     }
 
     #[test]
+    fn a_param_only_destination_composes_with_one_stream_and_collides_with_two() {
+        let mut sink: SinkTemplate = crate::yaml::from_str(BQ).unwrap();
+        sink.params.insert(
+            "table".into(),
+            crate::params::ParamSpec::string_default("t"),
+        );
+        sink.per_stream
+            .insert("table_id".into(), Value::String("${param.table}".into()));
+        sink.validate().unwrap();
+
+        let mut one = src();
+        one.streams.truncate(1);
+        let c = compose_with(&one, &sink, ALL).unwrap();
+        assert_eq!(
+            c.document["matrix"][0]["sink"]["config"]["table_id"],
+            "${param.table}"
+        );
+
+        let err = compose_with(&src(), &sink, ALL).unwrap_err().to_string();
+        assert!(
+            err.contains(
+                "sink-template 'bigquery': per_stream renders the same destination for streams \
+                 bills and users"
+            ) && err.contains("${stream}"),
+            "{err}"
+        );
+        assert!(destination_collision(&one, &sink).is_none());
+
+        // A per-stream value that differs keeps them apart.
+        sink.per_stream.insert(
+            "table_id".into(),
+            Value::String("${param.table}_${stream}".into()),
+        );
+        compose_with(&src(), &sink, ALL).unwrap();
+    }
+
+    #[test]
     fn upsert_without_primary_keys_is_an_error_not_a_fallthrough() {
-        let sink: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
+        let sink: SinkTemplate = crate::yaml::from_str(BQ).unwrap();
         let mut s = src();
         s.streams[0].primary_keys.clear();
         s.streams[0].write = WriteChoice::Many(vec![WriteMode::Upsert, WriteMode::Append]);
@@ -1171,7 +1277,7 @@ per_stream:
 
     #[test]
     fn conflicting_params_or_auth_are_refused_identical_ones_merge() {
-        let mut sink: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
+        let mut sink: SinkTemplate = crate::yaml::from_str(BQ).unwrap();
         sink.params.get_mut("shared").unwrap().default = Some(json!("b"));
         let err = compose_with(&src(), &sink, ALL).unwrap_err().to_string();
         assert!(
@@ -1179,7 +1285,7 @@ per_stream:
             "{err}"
         );
 
-        let mut sink: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
+        let mut sink: SinkTemplate = crate::yaml::from_str(BQ).unwrap();
         sink.auth = Some(
             [(
                 "spend_oauth".to_string(),
@@ -1191,7 +1297,7 @@ per_stream:
         let err = compose_with(&src(), &sink, ALL).unwrap_err().to_string();
         assert!(err.contains("auth provider 'spend_oauth'"), "{err}");
 
-        let mut sink: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
+        let mut sink: SinkTemplate = crate::yaml::from_str(BQ).unwrap();
         sink.auth = Some(
             [(
                 "bq_sa".to_string(),
@@ -1209,19 +1315,19 @@ per_stream:
 
     #[test]
     fn invalid_templates_are_rejected_before_composition() {
-        let mut sink: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
+        let mut sink: SinkTemplate = crate::yaml::from_str(BQ).unwrap();
         sink.kind = TemplateKind::SourceTemplate;
         assert!(compose_with(&src(), &sink, ALL).is_err());
         let mut s = src();
         s.streams.clear();
-        let sink: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
+        let sink: SinkTemplate = crate::yaml::from_str(BQ).unwrap();
         assert!(compose_with(&s, &sink, ALL).is_err());
     }
 
     #[test]
     fn registry_backed_compose_uses_real_capabilities() {
         // jsonl is append-only in the registry; bills needs overwrite|upsert.
-        let sink: SinkTemplate = serde_yaml::from_str(JSONL).unwrap();
+        let sink: SinkTemplate = crate::yaml::from_str(JSONL).unwrap();
         assert!(compose(&src(), &sink).is_err());
         let mut s = src();
         s.streams[0].write = WriteChoice::One(WriteMode::Append);
@@ -1238,11 +1344,11 @@ per_stream:
     }
 
     fn overlay(yaml: &str) -> DeploymentTemplate {
-        DeploymentTemplate::from_value(serde_yaml::from_str(yaml).unwrap()).unwrap()
+        DeploymentTemplate::from_value(crate::yaml::from_str(yaml).unwrap()).unwrap()
     }
 
     fn jsonl_pair() -> Composition {
-        let k: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
+        let k: SinkTemplate = crate::yaml::from_str(BQ).unwrap();
         compose_with(&src(), &k, ALL).unwrap()
     }
 
@@ -1251,7 +1357,7 @@ per_stream:
         assert!(jsonl_pair().document.get(crate::requires::KEY).is_none());
         let mut source = src();
         source.requires_faucet = Some(">=1.0".into());
-        let mut sink: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
+        let mut sink: SinkTemplate = crate::yaml::from_str(BQ).unwrap();
         sink.requires_faucet = Some("<99".into());
         let c = compose_with(&source, &sink, ALL).unwrap();
         assert_eq!(c.document[crate::requires::KEY], json!(">=1.0, <99"));
@@ -1359,7 +1465,7 @@ streams:
     /// (#789 CLI-67).
     #[test]
     fn an_overlay_skips_a_stream_the_narrowing_dropped() {
-        let k: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
+        let k: SinkTemplate = crate::yaml::from_str(BQ).unwrap();
         let full = src();
         let all: Vec<String> = full.streams.iter().map(|s| s.name.clone()).collect();
         let mut narrowed = full.clone();
@@ -1412,7 +1518,7 @@ streams:
         // warning (#789 CLI-20).
         s.streams[1].source.config =
             json!({ "path": "/users", "replication_method": { "type": "Incremental" } });
-        let k: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
+        let k: SinkTemplate = crate::yaml::from_str(BQ).unwrap();
         let c = compose_with(&s, &k, ALL).unwrap();
         assert!(c.incremental);
         assert!(

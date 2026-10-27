@@ -332,7 +332,7 @@ mod tests {
     use super::*;
 
     fn file(yaml: &str) -> TriggersFile {
-        serde_yaml::from_str(yaml).unwrap()
+        crate::yaml::from_str(yaml).unwrap()
     }
 
     fn compile_err(yaml: &str) -> String {

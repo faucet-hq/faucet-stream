@@ -88,7 +88,7 @@ mod tests {
 
     #[test]
     fn defaults_apply_when_only_cron_given() {
-        let spec: ScheduleSpec = serde_yaml::from_str("cron: \"0 2 * * *\"").unwrap();
+        let spec: ScheduleSpec = crate::yaml::from_str("cron: \"0 2 * * *\"").unwrap();
         assert_eq!(spec.cron, "0 2 * * *");
         assert_eq!(spec.timezone, "UTC");
         assert_eq!(spec.overlap_policy, OverlapPolicy::Skip);
@@ -103,7 +103,7 @@ mod tests {
     #[test]
     fn enums_use_lowercase_wire_form() {
         let spec: ScheduleSpec =
-            serde_yaml::from_str("cron: \"* * * * *\"\noverlap_policy: queue\non_failure: stop\n")
+            crate::yaml::from_str("cron: \"* * * * *\"\noverlap_policy: queue\non_failure: stop\n")
                 .unwrap();
         assert_eq!(spec.overlap_policy, OverlapPolicy::Queue);
         assert_eq!(spec.on_failure, ScheduleOnFailure::Stop);
