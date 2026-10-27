@@ -74,9 +74,13 @@ pub fn document_target(
         let p = resolve_locator(id, hub, DEPLOYMENT_DIR)?;
         parse(&read(&p)?, &p)
     };
-    let need = |field: &Option<String>, what: &str| -> CliResult<String> {
+    // A directory hub holds one file per template, so a companion's version
+    // selector (`files@newest`, `sink_select`) applies to a registry only.
+    let need = |field: Option<crate::template_tests::bundle::CompanionRef<'_>>,
+                what: &str|
+     -> CliResult<String> {
         field
-            .clone()
+            .map(|c| c.id.to_string())
             .ok_or_else(|| CliError::Config(format!("tests: a {kind} bundle needs `{what}:`")))
     };
     Ok(match kind {
@@ -87,17 +91,20 @@ pub fn document_target(
         },
         TemplateKind::SourceTemplate => Target::Document {
             body: text.to_string(),
-            sink_body: Some(companion(hub, &need(&bundle.sink, "sink")?, SINK_DIR)?),
-            overlay: bundle.overlay.as_deref().map(overlay_value).transpose()?,
+            sink_body: Some(companion(hub, &need(bundle.sink_ref(), "sink")?, SINK_DIR)?),
+            overlay: bundle
+                .overlay_ref()
+                .map(|c| overlay_value(c.id))
+                .transpose()?,
         },
         TemplateKind::SinkTemplate => Target::Document {
-            body: companion(hub, &need(&bundle.source, "source")?, SOURCE_DIR)?,
+            body: companion(hub, &need(bundle.source_ref(), "source")?, SOURCE_DIR)?,
             sink_body: Some(text.to_string()),
             overlay: None,
         },
         TemplateKind::Deployment => Target::Document {
-            body: companion(hub, &need(&bundle.source, "source")?, SOURCE_DIR)?,
-            sink_body: Some(companion(hub, &need(&bundle.sink, "sink")?, SINK_DIR)?),
+            body: companion(hub, &need(bundle.source_ref(), "source")?, SOURCE_DIR)?,
+            sink_body: Some(companion(hub, &need(bundle.sink_ref(), "sink")?, SINK_DIR)?),
             overlay: Some(parse(text, Path::new("deployment"))?),
         },
         TemplateKind::TestSuite => {

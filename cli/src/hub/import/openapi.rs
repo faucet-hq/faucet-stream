@@ -1380,6 +1380,7 @@ impl Mapper<'_> {
             description: Some("API root; tests and replays point it at a local server".into()),
             computed: None,
             values: Vec::new(),
+            ..Default::default()
         };
         match chosen {
             Some(u) if !u.contains('{') => {
@@ -1557,6 +1558,7 @@ impl Mapper<'_> {
                     description: Some(format!("{what} (`{name}` in the spec)")),
                     computed: None,
                     values: Vec::new(),
+                    ..Default::default()
                 },
             );
             format!("${{param.{p}}}")
@@ -1875,6 +1877,9 @@ impl Mapper<'_> {
             parent,
             parent_key,
             inherit_transforms: true,
+            for_each: None,
+            r#as: None,
+            name_case: None,
         };
         Ok((stream, cfg, summary))
     }
@@ -3857,6 +3862,7 @@ mod tests {
                     description: None,
                     computed: None,
                     values: Vec::new(),
+                    ..Default::default()
                 }
             )])),
             BTreeMap::from([("plain".to_string(), json!("suite-plain"))])

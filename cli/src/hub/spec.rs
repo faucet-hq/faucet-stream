@@ -227,6 +227,30 @@ pub struct Stream {
     /// (the matrix-row `inherit_transforms` switch).
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub inherit_transforms: bool,
+    /// Repeat this stream once per item of a `type: list` param (#952) —
+    /// exactly `${param.NAME}`. Each item becomes one row, whose `name` (and
+    /// `source.config`, `transforms`, `primary_keys`, `write`) render
+    /// `${<as>}` / `${<as>.<field>}` from the item, at trigger time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub for_each: Option<String>,
+    /// The loop variable of `for_each`: `${t}` for a scalar item,
+    /// `${t.field}` for an object item.
+    #[serde(default, rename = "as", skip_serializing_if = "Option::is_none")]
+    pub r#as: Option<String>,
+    /// `snake`: lower-case each rendered `for_each` name and turn every other
+    /// character into `_` (`Sales-Orders` → `sales_orders`). Without it a
+    /// rendered name outside `^[a-z0-9][a-z0-9_]*$` is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_case: Option<NameCase>,
+}
+
+/// How a `for_each` stream's rendered name is normalised (#952).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NameCase {
+    /// Lower-case; every run of other characters becomes one `_`; leading and
+    /// trailing `_` dropped; a camelCase boundary becomes `_`.
+    Snake,
 }
 
 fn default_true() -> bool {
@@ -239,7 +263,23 @@ fn is_true(b: &bool) -> bool {
 
 impl Stream {
     pub fn validate(&self) -> CliResult<()> {
-        check_slug("stream name", &self.name, false)?;
+        match &self.for_each {
+            None => {
+                for (field, set) in [
+                    ("as", self.r#as.is_some()),
+                    ("name_case", self.name_case.is_some()),
+                ] {
+                    if set {
+                        return Err(CliError::Config(format!(
+                            "stream '{}': `{field}` needs `for_each:`",
+                            self.name
+                        )));
+                    }
+                }
+                check_slug("stream name", &self.name, false)?;
+            }
+            Some(_) => super::for_each::validate_stream(self)?,
+        }
         if !self.source.config.is_object() {
             return Err(CliError::Config(format!(
                 "stream '{}': `source.config` must be a mapping",
@@ -400,6 +440,7 @@ impl SourceTemplate {
                 )));
             }
         }
+        super::for_each::validate_template(self)?;
         for s in &self.streams {
             if let Some(p) = &s.parent
                 && !seen.contains(p.as_str())
@@ -561,21 +602,15 @@ impl SinkTemplate {
         }
         if self.per_stream.is_empty() {
             return Err(CliError::Config(format!(
-                "sink-template '{}': `per_stream` is empty — every stream would land in the same place; \
-                 name the config key that takes `${{stream}}` (e.g. `table_id: \"${{stream}}\"`)",
+                "sink-template '{}': `per_stream` is empty — name the sink config key that \
+                 addresses each stream (e.g. `table_id: \"${{stream}}\"`, or \
+                 `table_id: \"${{param.table}}\"` for a one-stream source)",
                 self.name
             )));
         }
-        let mentions_stream = self
-            .per_stream
-            .values()
-            .any(|v| value_mentions(v, "${stream}"));
-        if !mentions_stream {
-            return Err(CliError::Config(format!(
-                "sink-template '{}': no `per_stream` value uses `${{stream}}`, so streams would collide",
-                self.name
-            )));
-        }
+        // Whether two streams would land in the same place depends on the
+        // source template it is paired with, so that is checked when the two
+        // compose (`compose::destination_collision`), on the rendered values.
         for k in ["write_mode", "key"] {
             if self.per_stream.contains_key(k) {
                 return Err(CliError::Config(format!(
@@ -942,7 +977,7 @@ impl SinkTemplate {
     }
 }
 
-fn value_mentions(v: &Value, needle: &str) -> bool {
+pub(crate) fn value_mentions(v: &Value, needle: &str) -> bool {
     match v {
         Value::String(s) => s.contains(needle),
         Value::Array(a) => a.iter().any(|x| value_mentions(x, needle)),
@@ -1117,13 +1152,14 @@ per_stream:
         assert!(err(&|t| t.kind = TemplateKind::SourceTemplate).contains("not a sink-template"));
         assert!(err(&|t| t.version = 0).contains("version 0"));
         assert!(err(&|t| t.per_stream.clear()).contains("`per_stream` is empty"));
-        assert!(
-            err(&|t| {
-                t.per_stream.clear();
-                t.per_stream.insert("table_id".into(), "fixed".into());
-            })
-            .contains("no `per_stream` value uses")
-        );
+        // #950: a destination taken from a param registers; whether streams
+        // collide is decided when it composes with a source.
+        let mut param_only = base.clone();
+        param_only.per_stream.clear();
+        param_only
+            .per_stream
+            .insert("table_id".into(), "${param.project}".into());
+        param_only.validate().unwrap();
         assert!(
             err(&|t| {
                 t.per_stream.insert("write_mode".into(), "append".into());

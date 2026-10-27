@@ -14,9 +14,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-/// The scalar type a param carries. Params are deliberately scalar-only: a
-/// param substitutes into a config *value* position, and structured overrides
-/// are what named templates / matrix rows are for.
+/// The type a param carries. A param substitutes into a config *value*
+/// position, so it is a scalar — except `list` (#952), a list of scalars or of
+/// flat objects that a source template's stream repeats over (`for_each:`).
+/// `object` is only an `items:` type of a `list`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ParamType {
@@ -25,6 +26,12 @@ pub enum ParamType {
     Int,
     Float,
     Bool,
+    /// A list of `items` (#952): a JSON array over HTTP, `--param x='[...]'`
+    /// on the CLI (a comma-separated `a,b` for a list of strings).
+    List,
+    /// A flat mapping of scalar `properties` — only valid as a `list`'s
+    /// `items`.
+    Object,
 }
 
 impl ParamType {
@@ -34,7 +41,14 @@ impl ParamType {
             Self::Int => "int",
             Self::Float => "float",
             Self::Bool => "bool",
+            Self::List => "list",
+            Self::Object => "object",
         }
+    }
+
+    /// Whether a value of this type is a single scalar.
+    pub fn is_scalar(self) -> bool {
+        !matches!(self, Self::List | Self::Object)
     }
 
     /// A type-shaped stand-in used when validating a config whose required
@@ -47,12 +61,14 @@ impl ParamType {
             Self::Int => Value::from(0i64),
             Self::Float => Value::from(0.0f64),
             Self::Bool => Value::Bool(false),
+            Self::List => Value::Array(Vec::new()),
+            Self::Object => Value::Object(Default::default()),
         }
     }
 }
 
 /// One declared parameter.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ParamSpec {
     /// Value type. Governs coercion of the supplied value and the type
@@ -108,6 +124,27 @@ pub struct ParamSpec {
     /// accepts the string `"1"` from a query string. Empty means unconstrained.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub values: Vec<Value>,
+
+    /// For a `list` param (#952): the spec every item is held to — a scalar
+    /// `type` (with an optional closed `values:` set), or `type: object` with
+    /// `properties`. A list of lists is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub items: Option<Box<ParamSpec>>,
+
+    /// For `type: object` list items: each field's spec (a scalar type,
+    /// `required`, `default`, `values`, `secret`). An element may carry no
+    /// other field.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub properties: BTreeMap<String, ParamSpec>,
+
+    /// For a `list` param: the fewest items a value may hold. Default 1 — an
+    /// empty list is refused rather than running a pipeline with no rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_items: Option<usize>,
+
+    /// For a `list` param: the most items a value may hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_items: Option<usize>,
 }
 
 impl ParamSpec {
@@ -115,14 +152,29 @@ impl ParamSpec {
     #[cfg(test)]
     pub fn string_default(default: &str) -> Self {
         Self {
-            kind: ParamType::String,
-            required: false,
             default: Some(Value::String(default.into())),
-            secret: false,
-            description: None,
-            computed: None,
-            values: Vec::new(),
+            ..Self::default()
         }
+    }
+
+    /// A type-shaped stand-in for a param with no value yet (template
+    /// registration, `faucet validate`, generated test cases): its first
+    /// declared value when it has a closed set, a few distinct items for a
+    /// `list`, else [`ParamType::placeholder`].
+    pub fn placeholder(&self) -> Value {
+        if self.kind == ParamType::List {
+            return super::list::placeholder(self);
+        }
+        match self.values.first() {
+            Some(v) => coerce("_", self.kind, v).unwrap_or_else(|_| v.clone()),
+            None => self.kind.placeholder(),
+        }
+    }
+
+    /// Whether every value of this param is sensitive: `secret: true`, or a
+    /// list whose `items` are.
+    pub fn is_secret(&self) -> bool {
+        self.secret || self.items.as_ref().is_some_and(|i| i.secret)
     }
 }
 
@@ -160,6 +212,7 @@ fn default_matches(kind: ParamType, value: &Value) -> bool {
         ParamType::Int => value.as_i64().is_some(),
         ParamType::Float => value.as_f64().is_some(),
         ParamType::Bool => value.is_boolean(),
+        ParamType::List | ParamType::Object => false,
     }
 }
 
@@ -179,73 +232,127 @@ fn default_ok(kind: ParamType, value: &Value) -> bool {
 pub fn validate(spec: &ParamsSpec) -> CliResult<()> {
     for (name, p) in spec {
         validate_name(name)?;
-        if p.computed.is_some() {
-            if p.required {
+        match p.kind {
+            ParamType::List => super::list::validate(name, p)?,
+            ParamType::Object => {
                 return Err(CliError::Config(format!(
-                    "param '{name}' is `computed` and cannot be `required` — a computed param is \
-                     derived, never supplied"
+                    "param '{name}': `type: object` is only valid as a list's `items` — declare \
+                     `type: list` with `items: {{ type: object, properties: {{ … }} }}`"
                 )));
             }
-            if p.default.is_some() {
-                return Err(CliError::Config(format!(
-                    "param '{name}' is `computed` and cannot have a `default` — its value is the \
-                     computed expression"
-                )));
-            }
-            if p.secret {
-                return Err(CliError::Config(format!(
-                    "param '{name}' is `computed` and cannot be `secret` — a derived value is not \
-                     a secret source; reference the secret directly where it is used"
-                )));
-            }
-        }
-        if p.required && p.default.is_some() {
-            return Err(CliError::Config(format!(
-                "param '{name}' is both `required: true` and has a `default` — a param with a \
-                 default is optional; drop one"
-            )));
-        }
-        if let Some(d) = &p.default {
-            if d.is_null() {
-                return Err(CliError::Config(format!(
-                    "param '{name}': `default: null` is not a value — omit `default` instead"
-                )));
-            }
-            if !default_ok(p.kind, d) {
-                return Err(CliError::Config(format!(
-                    "param '{name}': default {d} is not a valid {} value",
-                    p.kind.as_str()
-                )));
-            }
-        }
-        if !p.values.is_empty() {
-            if p.computed.is_some() {
-                return Err(CliError::Config(format!(
-                    "param '{name}' is `computed` and cannot also declare `values` — its value \
-                     comes from the expression, not from a caller"
-                )));
-            }
-            // Every listed value must be a legal literal for the declared
-            // type, and the default (when there is one) must be in the set —
-            // otherwise the all-defaults case would fail its own constraint.
-            for v in &p.values {
-                if !default_matches(p.kind, v) {
-                    return Err(CliError::Config(format!(
-                        "param '{name}': value {v} in `values` is not a valid {} value",
-                        p.kind.as_str()
-                    )));
-                }
-            }
-            if let Some(d) = &p.default
-                && !p.values.iter().any(|v| values_match(p.kind, v, d))
-            {
-                return Err(CliError::Config(format!(
-                    "param '{name}': default {d} is not one of the declared `values`"
-                )));
+            _ => {
+                refuse_list_fields(name, p)?;
+                validate_scalar(name, p)?;
             }
         }
     }
     Ok(())
+}
+
+/// A scalar param carries none of the `list` / `object` fields.
+pub(crate) fn refuse_list_fields(name: &str, p: &ParamSpec) -> CliResult<()> {
+    for (field, set) in [
+        ("items", p.items.is_some()),
+        ("properties", !p.properties.is_empty()),
+        ("min_items", p.min_items.is_some()),
+        ("max_items", p.max_items.is_some()),
+    ] {
+        if set {
+            return Err(CliError::Config(format!(
+                "param '{name}': `{field}` applies to a `type: list` param (or its object \
+                 `items`), not to a {}",
+                p.kind.as_str()
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_name_of(what: &str, name: &str) -> CliResult<()> {
+    validate_name(name).map_err(|_| {
+        CliError::Config(format!(
+            "invalid {what} name '{name}' — names must match ^[A-Za-z_][A-Za-z0-9_]*$"
+        ))
+    })
+}
+
+/// The checks of one scalar param (or one scalar list item / object field).
+pub(crate) fn validate_scalar(name: &str, p: &ParamSpec) -> CliResult<()> {
+    if p.computed.is_some() {
+        if p.required {
+            return Err(CliError::Config(format!(
+                "param '{name}' is `computed` and cannot be `required` — a computed param is \
+                 derived, never supplied"
+            )));
+        }
+        if p.default.is_some() {
+            return Err(CliError::Config(format!(
+                "param '{name}' is `computed` and cannot have a `default` — its value is the \
+                 computed expression"
+            )));
+        }
+        if p.secret {
+            return Err(CliError::Config(format!(
+                "param '{name}' is `computed` and cannot be `secret` — a derived value is not \
+                 a secret source; reference the secret directly where it is used"
+            )));
+        }
+    }
+    if p.required && p.default.is_some() {
+        return Err(CliError::Config(format!(
+            "param '{name}' is both `required: true` and has a `default` — a param with a \
+             default is optional; drop one"
+        )));
+    }
+    if let Some(d) = &p.default {
+        if d.is_null() {
+            return Err(CliError::Config(format!(
+                "param '{name}': `default: null` is not a value — omit `default` instead"
+            )));
+        }
+        if !default_ok(p.kind, d) {
+            return Err(CliError::Config(format!(
+                "param '{name}': default {d} is not a valid {} value",
+                p.kind.as_str()
+            )));
+        }
+    }
+    if !p.values.is_empty() {
+        if p.computed.is_some() {
+            return Err(CliError::Config(format!(
+                "param '{name}' is `computed` and cannot also declare `values` — its value \
+                 comes from the expression, not from a caller"
+            )));
+        }
+        // Every listed value must be a legal literal for the declared
+        // type, and the default (when there is one) must be in the set —
+        // otherwise the all-defaults case would fail its own constraint.
+        for v in &p.values {
+            if !default_matches(p.kind, v) {
+                return Err(CliError::Config(format!(
+                    "param '{name}': value {v} in `values` is not a valid {} value",
+                    p.kind.as_str()
+                )));
+            }
+        }
+        if let Some(d) = &p.default
+            && !p.values.iter().any(|v| values_match(p.kind, v, d))
+        {
+            return Err(CliError::Config(format!(
+                "param '{name}': default {d} is not one of the declared `values`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Coerce a caller-supplied (or default) value to `p`'s type — a list
+/// against its `items` and size limits, a scalar as [`coerce`].
+pub fn coerce_param(name: &str, p: &ParamSpec, value: &Value) -> CliResult<Value> {
+    match p.kind {
+        ParamType::List => super::list::coerce(name, p, value),
+        _ => coerce(name, p.kind, value),
+    }
 }
 
 /// Whether two literals name the same value for `kind`, after the coercion a
@@ -313,6 +420,8 @@ pub fn coerce(name: &str, kind: ParamType, value: &Value) -> CliResult<Value> {
             },
             _ => Err(bad("a boolean (true/false)")),
         },
+        ParamType::List => Err(bad("a list")),
+        ParamType::Object => Err(bad("an object")),
     }
 }
 
@@ -326,10 +435,7 @@ mod tests {
             kind,
             required,
             default,
-            secret: false,
-            description: None,
-            computed: None,
-            values: Vec::new(),
+            ..ParamSpec::default()
         }
     }
 

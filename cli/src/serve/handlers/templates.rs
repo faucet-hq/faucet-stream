@@ -140,6 +140,10 @@ pub struct RegisterResponse {
     /// block into its stored body.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tests_inherited_from: Option<u32>,
+    /// Other templates re-tested because their newest version last failed
+    /// for want of this one as a companion (#951).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub companions_retested: Vec<crate::serve::history::templates::TemplateTestResult>,
 }
 
 /// `POST /v1/templates` → 201 with the newly registered version's summary.
@@ -239,6 +243,7 @@ pub async fn register_template(
             summary,
             tests: registered.tests,
             tests_inherited_from: registered.tests_inherited_from,
+            companions_retested: registered.companions_retested,
         }),
     ))
 }
@@ -537,6 +542,24 @@ pub struct RowsParams {
     /// Read each row's status (default `true`).
     #[serde(default)]
     pub state: Option<bool>,
+    /// Param values, as a JSON object (`{"tables": ["orders", "customers"]}`),
+    /// that `for_each` streams are listed with (#952).
+    #[serde(default)]
+    pub params: Option<String>,
+}
+
+impl RowsParams {
+    /// The `params` query value, parsed.
+    pub fn supplied_params(&self) -> Result<crate::params::SuppliedParams, ServeError> {
+        match self.params.as_deref().map(str::trim) {
+            None | Some("") => Ok(Default::default()),
+            Some(raw) => serde_json::from_str(raw).map_err(|e| {
+                ServeError::BadConfig(format!(
+                    "`params` must be a JSON object of param values: {e}"
+                ))
+            }),
+        }
+    }
 }
 
 fn csv(v: &Option<String>) -> Vec<String> {
@@ -595,6 +618,7 @@ pub async fn template_rows(
 ) -> Result<Json<crate::hub::rows::RowsReport>, ServeError> {
     let s = store(&state);
     let selection = q.selection()?;
+    let params = q.supplied_params()?;
     let version = crate::templates::resolve_version(&s, &id, q.version.unwrap_or_default())
         .await
         .map_err(map_err)?;
@@ -628,6 +652,7 @@ pub async fn template_rows(
             // A tenant-scoped principal sees its own state and runs, never
             // another tenant's (#789 SERVE-31).
             tenant: tenant.as_ref(),
+            params: Some(&params),
         },
     )
     .await

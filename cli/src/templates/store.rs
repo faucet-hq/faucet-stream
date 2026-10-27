@@ -99,6 +99,9 @@ pub struct Registration {
     pub after: Option<CliError>,
     /// Which step `after` came from.
     pub after_stage: Option<RegistrationStage>,
+    /// Other templates' newest versions re-tested because their last run
+    /// failed for want of this one as a companion (#951).
+    pub companions_retested: Vec<crate::serve::history::templates::TemplateTestResult>,
 }
 
 /// A step a registration runs after the version is stored.
@@ -561,6 +564,12 @@ pub async fn register_staged(
     )
     .await?;
 
+    let companions_retested = Box::pin(crate::templates::bundle::retest_waiting_on(
+        store,
+        &record.id,
+        req.created_by.as_deref(),
+    ))
+    .await;
     let mut out = Registration {
         record,
         tests: None,
@@ -568,6 +577,7 @@ pub async fn register_staged(
         launch: None,
         after: None,
         after_stage: None,
+        companions_retested,
     };
     if bundle.is_some() {
         match Box::pin(crate::templates::bundle::test_version(
@@ -1244,6 +1254,21 @@ pub enum OverlayChoice {
     Inline(Value),
 }
 
+/// A companion that is not in the registry, named by the kind it must be
+/// rather than as a "pipeline template" (#951).
+pub(crate) fn missing_as(e: CliError, kind: TemplateKind) -> CliError {
+    match e {
+        CliError::UnknownPipelineTemplate { id, version } => CliError::Config(format!(
+            "no {kind} '{id}'{} in the registry — list them with `faucet template list --kind \
+             {kind}`",
+            version
+                .map(|v| format!(" at version {v}"))
+                .unwrap_or_default()
+        )),
+        other => other,
+    }
+}
+
 fn not_runnable_suite(id: &str) -> CliError {
     CliError::Config(format!(
         "'{id}' is a test-suite and is not runnable — it runs as part of the test bundle of every \
@@ -1265,7 +1290,9 @@ pub(crate) async fn resolve_overlay(
 ) -> CliResult<(crate::hub::DeploymentTemplate, String, Option<u32>)> {
     match choice {
         OverlayChoice::Registered { id, version } => {
-            let v = resolve_version(store, id, *version).await?;
+            let v = resolve_version(store, id, *version)
+                .await
+                .map_err(|e| missing_as(e, TemplateKind::Deployment))?;
             let rec = fetch_version(store, id, v).await?;
             if rec.kind != TemplateKind::Deployment {
                 return Err(CliError::Config(format!(
@@ -1444,7 +1471,9 @@ async fn materialize_kind(
                      `--sink <id>` (HTTP: `sink`); `faucet template list --kind sink-template` shows them"
                 ))
             })?;
-            let sink_version = resolve_version(store, sink_id, sink.version).await?;
+            let sink_version = resolve_version(store, sink_id, sink.version)
+                .await
+                .map_err(|e| missing_as(e, TemplateKind::SinkTemplate))?;
             materialize_pair_selected(
                 store,
                 (id, version),
@@ -1545,6 +1574,18 @@ async fn materialize_pair_selected(
             "stored sink-template '{sink_id}' v{sink_version}: {e}"
         ))
     })?;
+    // A `for_each` stream becomes one stream per item of its list param
+    // (#952) before anything selects, composes or overlays by stream name.
+    let env_overlay: crate::interpolate::EnvOverlay = env_overrides
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let source = crate::hub::for_each::expand(
+        &source,
+        supplied,
+        BindMode::Strict,
+        (mode == Materialize::Local).then_some(&env_overlay),
+    )?;
     let all_streams: Vec<String> = source.streams.iter().map(|s| s.name.clone()).collect();
     let (source, effective) = match selection {
         Some(sel) => {

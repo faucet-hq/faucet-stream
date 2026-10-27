@@ -8,7 +8,9 @@ use crate::hub::TemplateKind;
 use crate::serve::history::templates::{
     EvidenceClaim, RESULTS_RETAIN, TemplateRecord, TemplateTestResult, VersionSelector,
 };
-use crate::template_tests::bundle::{SuiteRequirement, TestBundle, TestSuiteTemplate, bundle_of};
+use crate::template_tests::bundle::{
+    CompanionRef, SuiteRequirement, TestBundle, TestSuiteTemplate, bundle_of,
+};
 use crate::template_tests::gate::{TestStatus, VersionStatus, status_of};
 use crate::template_tests::result::BundleOutcome;
 use crate::template_tests::run::{SharedSuite, pick, run_bundle};
@@ -99,10 +101,6 @@ pub async fn registered_release(
     Ok(None)
 }
 
-async fn select(store: &TemplateStore, id: &str, sel: Option<&str>) -> CliResult<u32> {
-    crate::template_tests::resolve_target_version(store, id, sel).await
-}
-
 /// Run `id`@`version`'s bundle. `Ok(None)` when the version carries no
 /// `tests:` block. Setup failures (a companion that does not resolve, a shared
 /// suite out of range, a bundle over the size limit) are part of the outcome,
@@ -118,13 +116,24 @@ pub async fn run_version(
         .map(|(rec, outcome, _)| (rec, outcome)))
 }
 
+/// How a bundle's companions were resolved, for the recorded result.
+#[derive(Debug, Default)]
+struct Trace {
+    /// `id@version` of every companion it ran with.
+    companions: Vec<String>,
+    /// A companion picked other than by its default (#951).
+    notes: Vec<String>,
+    /// Companions not registered yet.
+    missing: Vec<String>,
+}
+
 /// [`run_version`], also naming the companions it ran with (`id@version`).
 async fn run_version_traced(
     store: &TemplateStore,
     id: &str,
     version: u32,
     filter: Option<&str>,
-) -> CliResult<Option<(TemplateRecord, BundleOutcome, Vec<String>)>> {
+) -> CliResult<Option<(TemplateRecord, BundleOutcome, Trace)>> {
     let rec = store
         .template_get(id, Some(version))
         .await
@@ -160,13 +169,14 @@ async fn run_version_traced(
                 error: Some(e.to_string()),
                 ..Default::default()
             },
-            Vec::new(),
+            Trace::default(),
         )));
     }
     if bundle.is_structural(rec.kind) {
         bundle.suite = crate::template_tests::bundle::structural_suite();
     }
-    let (outcome, companions) = match prepare(store, &rec, &bundle).await {
+    let mut trace = Trace::default();
+    let outcome = match prepare(store, &rec, &bundle, &mut trace).await {
         Ok((companions, shared)) => {
             let target = companions.target(store, &rec);
             let outcome = Box::pin(crate::template_tests::runner::with_run_limits(
@@ -174,17 +184,15 @@ async fn run_version_traced(
                 run_bundle(&bundle, &target, &shared, filter),
             ))
             .await;
-            (outcome, companions.names())
+            trace.companions = companions.names();
+            outcome
         }
-        Err(e) => (
-            BundleOutcome {
-                error: Some(e.to_string()),
-                ..Default::default()
-            },
-            Vec::new(),
-        ),
+        Err(e) => BundleOutcome {
+            error: Some(e.to_string()),
+            ..Default::default()
+        },
     };
-    Ok(Some((rec, outcome, companions)))
+    Ok(Some((rec, outcome, trace)))
 }
 
 /// The resolved companions of a registered subject.
@@ -243,31 +251,30 @@ impl Companions {
 
 async fn prepare(
     store: &TemplateStore,
-    _rec: &TemplateRecord,
+    rec: &TemplateRecord,
     bundle: &TestBundle,
+    trace: &mut Trace,
 ) -> CliResult<(Companions, Vec<SharedSuite>)> {
-    let mut c = Companions {
-        source: None,
-        sink: None,
-        overlay: None,
+    // Resolve every companion before failing, so the result names each one
+    // that is missing.
+    let mut first_err = None;
+    let mut resolve = async |c: Option<CompanionRef<'_>>, kind: TemplateKind| {
+        let c = c?;
+        match companion(store, rec, c, kind, trace).await {
+            Ok(v) => Some((c.id.to_string(), v)),
+            Err(e) => {
+                first_err.get_or_insert(e);
+                None
+            }
+        }
     };
-    if let Some(s) = &bundle.source {
-        c.source = Some((
-            s.clone(),
-            select(store, s, bundle.source_select.as_deref()).await?,
-        ));
-    }
-    if let Some(s) = &bundle.sink {
-        c.sink = Some((
-            s.clone(),
-            select(store, s, bundle.sink_select.as_deref()).await?,
-        ));
-    }
-    if let Some(s) = &bundle.overlay {
-        c.overlay = Some((
-            s.clone(),
-            select(store, s, bundle.overlay_select.as_deref()).await?,
-        ));
+    let c = Companions {
+        source: resolve(bundle.source_ref(), TemplateKind::SourceTemplate).await,
+        sink: resolve(bundle.sink_ref(), TemplateKind::SinkTemplate).await,
+        overlay: resolve(bundle.overlay_ref(), TemplateKind::Deployment).await,
+    };
+    if let Some(e) = first_err {
+        return Err(e);
     }
     let shared = if bundle.fully_locked() {
         unlock(bundle)?
@@ -275,6 +282,70 @@ async fn prepare(
         resolve_shared(store, &bundle.requires_suites).await?
     };
     Ok((c, shared))
+}
+
+/// The version of companion `c` a bundle runs with (#951): its selector when
+/// one is given, else its launched version — or, while it has none (a new
+/// pair, each side tested against the other before either is launched), its
+/// newest, noted in the result.
+async fn companion(
+    store: &TemplateStore,
+    rec: &TemplateRecord,
+    c: CompanionRef<'_>,
+    kind: TemplateKind,
+    trace: &mut Trace,
+) -> CliResult<u32> {
+    use crate::serve::history::templates::VersionChannel;
+    let retest = format!(
+        "`faucet template test {id}@{v}` or `POST /v1/templates/{id}/versions/{v}/test`",
+        id = rec.id,
+        v = rec.version
+    );
+    let Some(latest) = store.template_get(c.id, None).await.map_err(read_err)? else {
+        trace.missing.push(c.id.to_string());
+        return Err(CliError::Config(format!(
+            "tests: {kind} '{id}' (`tests.{role}`) is not registered — register it; that re-runs \
+             these tests, or re-run them with {retest}",
+            id = c.id,
+            role = c.role,
+        )));
+    };
+    if latest.kind != kind {
+        return Err(CliError::Config(format!(
+            "tests: `{role}: {id}` must name a {kind}, but '{id}' is a {}",
+            latest.kind,
+            role = c.role,
+            id = c.id,
+        )));
+    }
+    let explicit = |e: CliError| {
+        CliError::Config(format!(
+            "tests: {kind} '{}' (`tests.{}`): {e}",
+            c.id, c.role
+        ))
+    };
+    if let Some(sel) = c.select {
+        let selector = VersionSelector::parse(sel).map_err(explicit)?;
+        return crate::templates::resolve_version(store, c.id, selector)
+            .await
+            .map_err(explicit);
+    }
+    let state = crate::templates::template_state(store, c.id).await?;
+    if let Some(v) = state.stable {
+        return Ok(v);
+    }
+    let v = state.derived(VersionChannel::Newest).ok_or_else(|| {
+        explicit(CliError::Config(format!(
+            "it has no launched version and every version is deprecated — revive one, or \
+                 pin one with `{}_select: <n>`",
+            c.role
+        )))
+    })?;
+    trace.notes.push(format!(
+        "{} '{}' has no launched version, so the bundle ran with its newest, v{v}",
+        c.role, c.id
+    ));
+    Ok(v)
 }
 
 /// The shared suites a version locked at registration, as runnable suites.
@@ -323,7 +394,7 @@ pub async fn test_version(
     version: u32,
     recorded_by: Option<&str>,
 ) -> CliResult<TemplateTestResult> {
-    let (rec, outcome, companions) = Box::pin(run_version_traced(store, id, version, None))
+    let (rec, outcome, trace) = Box::pin(run_version_traced(store, id, version, None))
         .await?
         .ok_or_else(|| no_bundle(id, version))?;
     let mut result = TemplateTestResult::new(
@@ -336,7 +407,9 @@ pub async fn test_version(
     result.provenance = crate::template_tests::result::Provenance {
         build_features: crate::template_tests::trust::build_features(),
         plugins: crate::registry::plugin_connectors(),
-        companions,
+        companions: trace.companions,
+        companion_notes: trace.notes,
+        missing_companions: trace.missing,
         instance: crate::template_tests::trust::server_policy().map(|p| p.instance),
     };
     store
@@ -352,6 +425,50 @@ pub async fn test_version(
         "recorded template test run"
     );
     Ok(result)
+}
+
+/// Re-run the tests of every template whose newest version last failed
+/// because `id` was not registered yet (#951): registering one half of a new
+/// source + sink pair after the other leaves the first one's result red for a
+/// reason that registration just removed. Returns the new results; a re-run
+/// that cannot start is logged and skipped, never failing the registration.
+pub async fn retest_waiting_on(
+    store: &TemplateStore,
+    id: &str,
+    by: Option<&str>,
+) -> Vec<TemplateTestResult> {
+    let templates = match store.template_list().await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(template = %id, "listing templates to re-test companions: {e}");
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    for t in templates {
+        if t.id == id || t.kind == TemplateKind::TestSuite {
+            continue;
+        }
+        let waiting = store
+            .template_test_results(&t.id, Some(t.version), 1)
+            .await
+            .ok()
+            .and_then(|r| r.into_iter().next())
+            .is_some_and(|r| r.provenance.missing_companions.iter().any(|m| m == id));
+        if !waiting {
+            continue;
+        }
+        match Box::pin(test_version(store, &t.id, t.version, by)).await {
+            Ok(r) => out.push(r),
+            Err(e) => tracing::warn!(
+                template = %t.id,
+                version = t.version,
+                companion = %id,
+                "re-testing after its companion registered: {e}"
+            ),
+        }
+    }
+    out
 }
 
 fn no_bundle(id: &str, version: u32) -> CliError {

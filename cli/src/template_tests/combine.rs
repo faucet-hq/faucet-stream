@@ -387,7 +387,7 @@ fn placeholder_for(p: &crate::params::ParamSpec) -> Value {
     if let Some(first) = p.values.first() {
         return first.clone();
     }
-    p.kind.placeholder()
+    p.placeholder()
 }
 
 #[cfg(test)]
@@ -450,6 +450,7 @@ mod tests {
                 description: None,
                 computed: None,
                 values: Vec::new(),
+                ..Default::default()
             },
         );
         let cb = combine(&[("region", vec![json!("us"), json!("eu")])], false);
@@ -573,6 +574,7 @@ mod tests {
                 description: None,
                 computed: None,
                 values: Vec::new(),
+                ..Default::default()
             },
         );
         spec.insert(
@@ -585,6 +587,7 @@ mod tests {
                 description: None,
                 computed: None,
                 values: vec![json!("jsonl"), json!("bigquery")],
+                ..Default::default()
             },
         );
         spec
@@ -676,6 +679,7 @@ mod tests {
                 description: None,
                 computed: None,
                 values: vec![json!("us"), json!("eu")],
+                ..Default::default()
             },
         );
         let suite = Suite {
@@ -708,6 +712,7 @@ mod tests {
                 description: None,
                 computed: Some("${map:region|us=com|*=eu}".into()),
                 values: Vec::new(),
+                ..Default::default()
             },
         );
         let suite = Suite {

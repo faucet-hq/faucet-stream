@@ -100,6 +100,14 @@ pub struct Provenance {
     /// The companion templates the bundle ran with (`id@version`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub companions: Vec<String>,
+    /// How a companion's version was picked when it was not the default
+    /// (#951): a companion with no launched version is tested at its newest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub companion_notes: Vec<String>,
+    /// Companions that were not registered when the bundle ran; registering
+    /// one re-runs this version's tests.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_companions: Vec<String>,
     /// The `faucet serve` instance that ran it; `None` for the CLI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance: Option<String>,

@@ -46,6 +46,7 @@ fn record(id: &str, row_id: &str) -> RunRecord {
             source_lag: None,
             rows: None,
             skipped: false,
+            status: None,
         }],
         error: None,
         idempotency_key: None,

@@ -127,6 +127,7 @@ mod tests {
             source_lag: None,
             rows: None,
             skipped: false,
+            status: None,
         }
     }
 

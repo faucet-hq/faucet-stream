@@ -299,6 +299,67 @@ pub fn render_per_stream_owned(v: &Value, stream: &str, source: &str, owner: &st
     }
 }
 
+/// The sink config one stream's `per_stream` block renders to.
+fn rendered_destination(
+    sink: &SinkTemplate,
+    stream: &str,
+    source: &SourceTemplate,
+) -> Map<String, Value> {
+    sink.per_stream
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                render_per_stream_owned(
+                    v,
+                    stream,
+                    &source.name,
+                    source.owner.as_deref().unwrap_or(""),
+                ),
+            )
+        })
+        .collect()
+}
+
+/// Two streams whose `per_stream` block renders the same sink config would
+/// write into the same destination (#950). Compared on the rendered values,
+/// so a destination taken only from a param (`table_id: "${param.table}"`) is
+/// fine with a one-stream source and refused with a multi-stream one.
+pub fn destination_collision(source: &SourceTemplate, sink: &SinkTemplate) -> Option<String> {
+    let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+    for s in &source.streams {
+        let dest = Value::Object(rendered_destination(sink, &s.name, source));
+        // A `for_each` stream (#952) seen before expansion: its items land in
+        // one place unless the destination follows the item.
+        if s.for_each.is_some()
+            && !super::for_each::destination_varies(&dest, s)
+            && source
+                .params
+                .get(super::for_each::list_param(s).unwrap_or_default())
+                .is_none_or(|p| p.max_items != Some(1))
+        {
+            return Some(format!(
+                "sink-template '{}': per_stream renders the same destination for every item \
+                 of stream {} (`for_each: {}`) — use ${{stream}} (or a per-stream param) so \
+                 they don't collide",
+                sink.id(),
+                s.name,
+                s.for_each.as_deref().unwrap_or_default()
+            ));
+        }
+        let rendered = dest.to_string();
+        if let Some(first) = seen.insert(rendered, s.name.as_str()) {
+            return Some(format!(
+                "sink-template '{}': per_stream renders the same destination for streams {first} \
+                 and {} — use ${{stream}} (or a per-stream param) so they don't collide",
+                sink.id(),
+                s.name
+            ));
+        }
+    }
+    None
+}
+
 /// Merge two `params:` (or `auth:`) maps. The same name declared by both
 /// sides must have an identical spec — otherwise the two templates disagree
 /// about what the operator is supplying, and guessing would bind one side
@@ -383,6 +444,13 @@ pub fn compose_with(
 ) -> CliResult<Composition> {
     source.validate()?;
     sink.validate()?;
+    if super::for_each::has_for_each(source) {
+        return Err(CliError::Internal(format!(
+            "source-template '{}' has `for_each` streams: expand them with the run's params \
+             (`hub::for_each::expand`) before composing",
+            source.id()
+        )));
+    }
 
     // Resolve every stream first so the error lists all of them at once.
     let aliases = sink.aliases();
@@ -439,6 +507,10 @@ pub fn compose_with(
         ));
     }
 
+    if let Some(why) = destination_collision(source, sink) {
+        return Err(CliError::Config(why));
+    }
+
     let params = merge_named(
         "param",
         &source.params,
@@ -455,18 +527,7 @@ pub fn compose_with(
 
     let mut rows = Vec::with_capacity(source.streams.len());
     for (s, plan) in source.streams.iter().zip(&plans) {
-        let mut sink_cfg = Map::new();
-        for (k, v) in &sink.per_stream {
-            sink_cfg.insert(
-                k.clone(),
-                render_per_stream_owned(
-                    v,
-                    &s.name,
-                    &source.name,
-                    source.owner.as_deref().unwrap_or(""),
-                ),
-            );
-        }
+        let mut sink_cfg = rendered_destination(sink, &s.name, source);
         if sink_takes_write_mode {
             sink_cfg.insert(
                 "write_mode".into(),
@@ -916,6 +977,9 @@ per_stream:
             parent: Some("bills".into()),
             parent_key: Some("id".into()),
             inherit_transforms: false,
+            for_each: None,
+            r#as: None,
+            name_case: None,
         });
         let c = compose_with(&s, &sink, ALL).unwrap();
         let d = &c.document;
@@ -947,6 +1011,9 @@ per_stream:
             parent: Some("bills".into()),
             parent_key: Some("id".into()),
             inherit_transforms: true,
+            for_each: None,
+            r#as: None,
+            name_case: None,
         }
     }
 
@@ -1121,6 +1188,9 @@ per_stream:
             parent: None,
             parent_key: None,
             inherit_transforms: true,
+            for_each: None,
+            r#as: None,
+            name_case: None,
         });
         let err = compose_with(&s, &sink, &[WriteMode::Append])
             .unwrap_err()
@@ -1154,6 +1224,43 @@ per_stream:
             "jsonl has no WriteSpec; the key would be rejected"
         );
         assert_eq!(c.streams[0].chosen, WriteMode::Append);
+    }
+
+    #[test]
+    fn a_param_only_destination_composes_with_one_stream_and_collides_with_two() {
+        let mut sink: SinkTemplate = serde_yaml::from_str(BQ).unwrap();
+        sink.params.insert(
+            "table".into(),
+            crate::params::ParamSpec::string_default("t"),
+        );
+        sink.per_stream
+            .insert("table_id".into(), Value::String("${param.table}".into()));
+        sink.validate().unwrap();
+
+        let mut one = src();
+        one.streams.truncate(1);
+        let c = compose_with(&one, &sink, ALL).unwrap();
+        assert_eq!(
+            c.document["matrix"][0]["sink"]["config"]["table_id"],
+            "${param.table}"
+        );
+
+        let err = compose_with(&src(), &sink, ALL).unwrap_err().to_string();
+        assert!(
+            err.contains(
+                "sink-template 'bigquery': per_stream renders the same destination for streams \
+                 bills and users"
+            ) && err.contains("${stream}"),
+            "{err}"
+        );
+        assert!(destination_collision(&one, &sink).is_none());
+
+        // A per-stream value that differs keeps them apart.
+        sink.per_stream.insert(
+            "table_id".into(),
+            Value::String("${param.table}_${stream}".into()),
+        );
+        compose_with(&src(), &sink, ALL).unwrap();
     }
 
     #[test]

@@ -32,12 +32,6 @@ pub async fn run(args: ValidateArgs) -> CliResult<()> {
         )
         .await?;
         sides.trusted = args.trust.clone();
-        let composition =
-            crate::hub::compose_across(source, sink, args.overlay.as_deref(), &sides).await?;
-        if args.show_composed {
-            print!("{}", composition.to_yaml()?);
-            return Ok(());
-        }
         let inputs = crate::config::RunInputs {
             params: crate::params::collect_cli_params(&args.param)?,
             env: crate::params::collect_env_overrides(&args.param_env)?
@@ -49,6 +43,18 @@ pub async fn run(args: ValidateArgs) -> CliResult<()> {
                 crate::params::BindMode::Strict
             },
         };
+        let composition = crate::hub::compose_across_with(
+            source,
+            sink,
+            args.overlay.as_deref(),
+            &sides,
+            Some(crate::hub::ExpandWith::inputs(&inputs)),
+        )
+        .await?;
+        if args.show_composed {
+            print!("{}", composition.to_yaml()?);
+            return Ok(());
+        }
         let cfg = crate::hub::load_composed(&composition, &inputs)?;
         if !args.json {
             println!(

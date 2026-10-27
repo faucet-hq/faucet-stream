@@ -118,6 +118,32 @@ pub struct InvocationRecord {
     /// was skipped. `error` says which; it is not a failure of its own.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub skipped: bool,
+    /// What this row's invocation came to (#952): `succeeded`, `failed` or
+    /// `skipped` — so a caller maps each row of a run (one per `for_each`
+    /// item, say) to its own outcome. Absent on records written before it
+    /// existed; derive it from `error` / `skipped` there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<InvocationStatus>,
+}
+
+/// One invocation's outcome in a run record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvocationStatus {
+    Succeeded,
+    Failed,
+    Skipped,
+}
+
+impl InvocationStatus {
+    /// The status `error` / `skipped` describe.
+    pub fn of(error: Option<&str>, skipped: bool) -> Self {
+        match (skipped, error) {
+            (true, _) => Self::Skipped,
+            (false, Some(_)) => Self::Failed,
+            (false, None) => Self::Succeeded,
+        }
+    }
 }
 
 impl From<&InvocationOutcome> for InvocationRecord {
@@ -137,6 +163,10 @@ impl From<&InvocationOutcome> for InvocationRecord {
             source_lag: o.metrics.as_ref().and_then(|m| m.source_lag),
             rows: o.metrics.as_ref().and_then(|m| m.rows),
             skipped: o.error_kind == Some(crate::executor::InvocationErrorKind::Skipped),
+            status: Some(InvocationStatus::of(
+                o.error.as_deref(),
+                o.error_kind == Some(crate::executor::InvocationErrorKind::Skipped),
+            )),
         }
     }
 }

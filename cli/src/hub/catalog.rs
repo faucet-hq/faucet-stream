@@ -268,6 +268,9 @@ pub struct Cell {
     /// Streams with no viable mode.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub incompatible: Vec<StreamIncompatibility>,
+    /// Two streams whose `per_stream` renders the same destination (#950).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collision: Option<String>,
 }
 
 /// Compute one cell without building the document — the matrix over a large
@@ -286,13 +289,15 @@ pub fn cell(source: &SourceTemplate, sink: &SinkTemplate) -> Cell {
             Err(e) => incompatible.push(e),
         }
     }
+    let collision = super::compose::destination_collision(source, sink);
     Cell {
         source: source.id(),
         sink: sink.id(),
         sink_kind: sink.sink.kind.clone(),
-        compatible: incompatible.is_empty(),
+        compatible: incompatible.is_empty() && collision.is_none(),
         streams,
         incompatible,
+        collision,
     }
 }
 
@@ -302,7 +307,11 @@ pub fn compose_all(cat: &Catalog) -> Vec<(String, String, CliResult<super::compo
     let mut out = Vec::new();
     for (_, s) in &cat.sources {
         for (_, k) in &cat.sinks {
-            out.push((s.id(), k.id(), compose(s, k)));
+            out.push((
+                s.id(),
+                k.id(),
+                super::for_each::expand_placeholders(s).and_then(|s| compose(&s, k)),
+            ));
         }
     }
     out
@@ -760,14 +769,20 @@ fn index_json_unsorted(
                 "description": p.description, "default": p.default,
             })).collect::<Vec<_>>(),
         }), k.tests.as_ref())).collect::<Vec<_>>(),
-        "matrix": cells.iter().map(|c| json!({
-            "source": c.source,
-            "sink": c.sink,
-            "compatible": c.compatible,
-            "streams": c.streams.iter().map(|p| json!({"stream": p.stream, "write_mode": p.chosen.as_str(), "satisfies": p.satisfies.map(|m| m.as_str())})).collect::<Vec<_>>(),
-            "incompatible": c.incompatible,
-            "command": cat.source(&c.source).zip(cat.sink(&c.sink)).map(|(s, k)| command(s, k)),
-        })).collect::<Vec<_>>(),
+        "matrix": cells.iter().map(|c| {
+            let mut cell = json!({
+                "source": c.source,
+                "sink": c.sink,
+                "compatible": c.compatible,
+                "streams": c.streams.iter().map(|p| json!({"stream": p.stream, "write_mode": p.chosen.as_str(), "satisfies": p.satisfies.map(|m| m.as_str())})).collect::<Vec<_>>(),
+                "incompatible": c.incompatible,
+                "command": cat.source(&c.source).zip(cat.sink(&c.sink)).map(|(s, k)| command(s, k)),
+            });
+            if let (Some(why), Some(obj)) = (&c.collision, cell.as_object_mut()) {
+                obj.insert("collision".into(), json!(why));
+            }
+            cell
+        }).collect::<Vec<_>>(),
     })
 }
 
@@ -937,6 +952,9 @@ pub fn render_markdown(cat: &Catalog) -> String {
                 md.push_str(&format!("**→ {}** — incompatible:\n\n", k.id()));
                 for i in &c.incompatible {
                     md.push_str(&format!("- `{}`: {}\n", i.stream, i.reason));
+                }
+                if let Some(why) = &c.collision {
+                    md.push_str(&format!("- {why}\n"));
                 }
                 md.push('\n');
             }
@@ -1351,6 +1369,7 @@ per_stream:
                 description: None,
                 values: vec![],
                 computed: None,
+                ..Default::default()
             },
         );
         s.params.get_mut("api_token").unwrap().default = Some(json!("baked"));

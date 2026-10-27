@@ -185,6 +185,12 @@ async fn register(args: TemplateRegisterArgs) -> CliResult<()> {
                 "tests_inherited_from".into(),
                 serde_json::json!(registered.tests_inherited_from),
             );
+            if !registered.companions_retested.is_empty() {
+                obj.insert(
+                    "companions_retested".into(),
+                    serde_json::json!(registered.companions_retested),
+                );
+            }
         }
         println!("{}", to_pretty(&v)?);
         return tests_exit(registered.tests.as_ref());
@@ -200,6 +206,15 @@ async fn register(args: TemplateRegisterArgs) -> CliResult<()> {
     }
     if let Some(from) = registered.tests_inherited_from {
         eprintln!("note: no `tests:` block — inherited v{from}'s tests (stored with this version)");
+    }
+    for r in &registered.companions_retested {
+        eprintln!(
+            "note: re-tested '{}' v{} now that its companion '{}' is registered: {}",
+            r.id,
+            r.version,
+            record.id,
+            if r.passed { "passed" } else { "failed" }
+        );
     }
     println!(
         "registered template '{}' version {}{}",
@@ -794,6 +809,7 @@ async fn rows(args: crate::cli::TemplateRowsArgs) -> CliResult<()> {
         None => None,
     };
     let selection = crate::select::SelectionRequest::from_flags(&args.selection)?;
+    let params = crate::params::collect_cli_params(&args.param)?;
     let report = crate::templates::rows::list_rows(
         &store,
         crate::templates::rows::RowsQuery {
@@ -804,6 +820,7 @@ async fn rows(args: crate::cli::TemplateRowsArgs) -> CliResult<()> {
             selection: selection.as_ref(),
             state: !args.no_state,
             tenant: None,
+            params: Some(&params),
         },
     )
     .await?;
@@ -1694,6 +1711,7 @@ pipeline:
                 description: None,
                 computed: None,
                 values: Vec::new(),
+                ..Default::default()
             },
         );
         params.insert(
@@ -1706,6 +1724,7 @@ pipeline:
                 computed: None,
                 values: Vec::new(),
                 description: None,
+                ..Default::default()
             },
         );
         let summary = TemplateSummary {
