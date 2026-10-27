@@ -406,7 +406,6 @@ prost-otlp = { package = "prost", version = "0.14" }
 bytes = "1"
 url = "2"
 percent-encoding = "2"
-urlencoding = "2"
 protox = "0.9"
 arrow = "58"
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }

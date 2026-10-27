@@ -105,7 +105,7 @@ async fn conformance_call_deadline() {
 async fn visible_records(host: &str, bucket: &str, prefix: &str) -> usize {
     let body: serde_json::Value = reqwest::get(format!(
         "{host}/storage/v1/b/{bucket}/o?prefix={}",
-        urlencoding::encode(prefix)
+        faucet_core::encode_url_component(prefix)
     ))
     .await
     .expect("list")
@@ -120,7 +120,7 @@ async fn visible_records(host: &str, bucket: &str, prefix: &str) -> usize {
         }
         let text = reqwest::get(format!(
             "{host}/storage/v1/b/{bucket}/o/{}?alt=media",
-            urlencoding::encode(name)
+            faucet_core::encode_url_component(name)
         ))
         .await
         .expect("download")

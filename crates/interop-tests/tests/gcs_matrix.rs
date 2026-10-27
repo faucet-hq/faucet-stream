@@ -64,7 +64,7 @@ impl Remote for GcsRemote {
                 .get(format!(
                     "{}/storage/v1/b/{BUCKET}/o?prefix={}",
                     self.host,
-                    urlencoding::encode(&prefix)
+                    faucet_core::encode_url_component(&prefix)
                 ))
                 .send()
                 .await
@@ -80,7 +80,7 @@ impl Remote for GcsRemote {
                     .get(format!(
                         "{}/storage/v1/b/{BUCKET}/o/{}?alt=media",
                         self.host,
-                        urlencoding::encode(&name)
+                        faucet_core::encode_url_component(&name)
                     ))
                     .send()
                     .await

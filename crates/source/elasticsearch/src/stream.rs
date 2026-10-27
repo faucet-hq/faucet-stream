@@ -430,7 +430,7 @@ impl ElasticsearchSource {
         let url = format!(
             "{}/{}/_mapping",
             self.config.base_url,
-            urlencoding::encode(index)
+            faucet_core::encode_url_component(index)
         );
         let resp = self
             .calls
@@ -466,7 +466,7 @@ fn encoded_context(
             };
             (
                 k.clone(),
-                Value::String(urlencoding::encode(&text).into_owned()),
+                Value::String(faucet_core::encode_url_component(&text)),
             )
         })
         .collect()

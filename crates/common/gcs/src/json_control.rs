@@ -46,7 +46,7 @@ impl JsonApiControl {
         let mut url = format!(
             "{}/storage/v1/b/{}/o",
             self.endpoint,
-            urlencoding::encode(bucket)
+            faucet_core::encode_url_component(bucket)
         );
         let query = list_query(req);
         if !query.is_empty() {
@@ -64,8 +64,8 @@ impl JsonApiControl {
         Ok(format!(
             "{}/storage/v1/b/{}/o/{}",
             self.endpoint,
-            urlencoding::encode(bucket),
-            urlencoding::encode(&req.object)
+            faucet_core::encode_url_component(bucket),
+            faucet_core::encode_url_component(&req.object)
         ))
     }
 
@@ -113,8 +113,8 @@ impl google_cloud_storage::stub::StorageControl for JsonApiControl {
         let url = format!(
             "{}/storage/v1/b/{}/o/{}",
             self.endpoint,
-            urlencoding::encode(bucket),
-            urlencoding::encode(&req.object)
+            faucet_core::encode_url_component(bucket),
+            faucet_core::encode_url_component(&req.object)
         );
         let resp = self.http.delete(&url).send().await.map_err(Error::io)?;
         let status = resp.status();
@@ -136,16 +136,16 @@ impl google_cloud_storage::stub::StorageControl for JsonApiControl {
         let mut url = format!(
             "{}/storage/v1/b/{}/o/{}/rewriteTo/b/{}/o/{}",
             self.endpoint,
-            urlencoding::encode(src),
-            urlencoding::encode(&req.source_object),
-            urlencoding::encode(dst),
-            urlencoding::encode(&req.destination_name)
+            faucet_core::encode_url_component(src),
+            faucet_core::encode_url_component(&req.source_object),
+            faucet_core::encode_url_component(dst),
+            faucet_core::encode_url_component(&req.destination_name)
         );
         // A rewrite that did not finish in one call resumes from its token;
         // without it every call would restart the copy from the beginning.
         if !req.rewrite_token.is_empty() {
             url.push_str("?rewriteToken=");
-            url.push_str(&urlencoding::encode(&req.rewrite_token));
+            url.push_str(&faucet_core::encode_url_component(&req.rewrite_token));
         }
         let resp = self.http.post(&url).send().await.map_err(Error::io)?;
         let status = resp.status();
@@ -196,7 +196,7 @@ fn list_query(req: &ListObjectsRequest) -> String {
     }
     pairs
         .into_iter()
-        .map(|(k, v)| format!("{k}={}", urlencoding::encode(&v)))
+        .map(|(k, v)| format!("{k}={}", faucet_core::encode_url_component(&v)))
         .collect::<Vec<_>>()
         .join("&")
 }

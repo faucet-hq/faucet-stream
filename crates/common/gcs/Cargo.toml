@@ -22,7 +22,6 @@ google-cloud-storage.workspace = true
 google-cloud-auth.workspace = true
 google-cloud-gax.workspace = true
 reqwest.workspace = true
-urlencoding.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "time"] }
 crc32c.workspace = true
 

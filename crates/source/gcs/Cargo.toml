@@ -60,7 +60,6 @@ schemars.workspace = true
 futures = { workspace = true }
 testcontainers = "0.27"
 reqwest = { workspace = true }
-urlencoding.workspace = true
 
 [package.metadata.docs.rs]
 all-features = true

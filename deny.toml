@@ -5,16 +5,23 @@
 [advisories]
 version = 2
 # Security advisories from the RustSec database. Yanked crates are denied by
-# default. "unmaintained" covers only workspace crates (transitive helpers are
-# noisy and rarely actionable).
+# default. "unmaintained" covers every crate in the tree (#929), so a newly
+# abandoned dependency fails CI; transitive ones we cannot move are ignored
+# below with a dated reason.
 #
 # The check is a HARD gate in CI (#789 SUPPLY-03): a new advisory fails the
 # build until it is fixed (bump to a fixed version) or triaged here with a
 # dated reason. A scheduled workflow (`advisories.yml`) re-runs it daily and
 # opens an issue, so an advisory published between merges is not missed.
 # Re-triage every entry when its dependency moves; drop it once fixed.
-unmaintained = "workspace"
+unmaintained = "all"
 ignore = [
+    # 2026-10-27 — unmaintained, transitive only, no maintained release of the
+    # parents yet (#929 section 3). Drop each when its parent moves.
+    { id = "RUSTSEC-2024-0436", reason = "paste via parquet 58, oracle, metainfo/volo (iceberg HMS) (2026-10-27)" },
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 via mysql-common-derive and validator_derive (2026-10-27)" },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile 1 via tiberius 0.12; needs tiberius 0.13 (#919) (2026-10-27)" },
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml via serde_yaml; replaced in the YAML move (#929, #935) (2026-10-27)" },
     # 2026-10-16 — no fixed release (Marvin timing side channel). Our own JWT
     # signing moved to aws-lc-rs (#818); `rsa` is left only upstream: opendal's
     # reqsign (Google service-account signing for Iceberg warehouses), russh

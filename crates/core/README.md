@@ -778,7 +778,7 @@ wrapper with `faucet_conformance::forwarding::assert_sink_forwards_every_hook` /
 | `observability` | Pipeline-internal `tracing`/`metrics` decorators; `install_observability` |
 | `compression` | `CompressionConfig`, `compress_buf` (the `compression` feature) |
 | `file_format` | One format vocabulary for every file connector — `FileFormat` (incl. `from_path` extension detection), `decode` / `encode`, `ContainerDecoder` (Avro / ORC across many files, resolved against the first file's schema), `avro` (OCF read + write, explicit logical-type mapping, schema inference), `orc` (read-only, projection, stripe streaming) |
-| `util` | `quote_ident`, `extract_records`, `check_http_response`, `redact_uri_credentials` |
+| `util` | `quote_ident`, `extract_records`, `check_http_response`, `redact_uri_credentials`, `encode_url_component` (percent-encode one URL path segment or query value) |
 
 ## Feature flags
 

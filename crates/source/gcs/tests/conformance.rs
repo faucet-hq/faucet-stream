@@ -84,7 +84,7 @@ async fn seed_object(host: &str, bucket: &str, name: &str, body: &str, content_t
     let client = reqwest::Client::new();
     let url = format!(
         "{host}/upload/storage/v1/b/{bucket}/o?uploadType=media&name={}",
-        urlencoding::encode(name)
+        faucet_core::encode_url_component(name)
     );
     client
         .post(url)

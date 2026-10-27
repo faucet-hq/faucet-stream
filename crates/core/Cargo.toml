@@ -139,6 +139,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 url.workspace = true
+percent-encoding.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
 reqwest.workspace = true
@@ -154,7 +155,6 @@ tokio = { workspace = true, features = ["sync", "fs", "io-util", "net", "time", 
 # `CancellationToken` for cooperative run cancellation (flush-on-cancel, #146 H16).
 tokio-util = { workspace = true }
 dotenvy = "0.15"
-envy = "0.4"
 metrics.workspace = true
 schemars.workspace = true
 uuid.workspace = true

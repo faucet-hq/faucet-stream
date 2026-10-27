@@ -555,7 +555,7 @@ fn substitute_path(template: &str, ctx: &HashMap<String, Value>) -> Result<Strin
         }
         encoded.insert(
             k.clone(),
-            Value::String(urlencoding::encode(&raw).into_owned()),
+            Value::String(faucet_core::encode_url_component(&raw)),
         );
     }
     Ok(faucet_core::util::substitute_context(template, &encoded))

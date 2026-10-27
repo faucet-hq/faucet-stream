@@ -513,7 +513,7 @@ impl WebhookDriver {
                 };
                 (
                     k.clone(),
-                    Value::String(urlencoding::encode(&raw).into_owned()),
+                    Value::String(faucet_core::encode_url_component(&raw)),
                 )
             })
             .collect();

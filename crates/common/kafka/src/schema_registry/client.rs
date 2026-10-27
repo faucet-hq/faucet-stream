@@ -275,7 +275,7 @@ impl SchemaRegistryClient {
         let url = format!(
             "{}/subjects/{}/versions/{version}",
             self.base_url,
-            urlencoding::encode(subject)
+            faucet_core::encode_url_component(subject)
         );
         let schema: RegistrySchema = self
             .calls
@@ -321,7 +321,7 @@ impl SchemaRegistryClient {
         let url = format!(
             "{}/subjects/{}/versions",
             self.base_url,
-            urlencoding::encode(subject)
+            faucet_core::encode_url_component(subject)
         );
         let body = serde_json::json!({
             "schemaType": schema_type,

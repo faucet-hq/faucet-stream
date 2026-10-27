@@ -76,7 +76,7 @@ async fn preflight_check_passes_and_fails_against_the_emulator() {
 async fn object_names(host: &str, bucket: &str, prefix: &str) -> Vec<String> {
     let body: serde_json::Value = reqwest::get(format!(
         "{host}/storage/v1/b/{bucket}/o?prefix={}",
-        urlencoding::encode(prefix)
+        faucet_core::encode_url_component(prefix)
     ))
     .await
     .unwrap()
@@ -99,7 +99,7 @@ async fn object_names(host: &str, bucket: &str, prefix: &str) -> Vec<String> {
 async fn download(host: &str, bucket: &str, name: &str) -> Vec<u8> {
     reqwest::get(format!(
         "{host}/storage/v1/b/{bucket}/o/{}?alt=media",
-        urlencoding::encode(name)
+        faucet_core::encode_url_component(name)
     ))
     .await
     .unwrap()
