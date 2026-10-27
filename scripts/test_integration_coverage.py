@@ -3,7 +3,9 @@
 Run: python3 -m unittest discover -s scripts -p 'test_*.py'
 """
 
+import contextlib
 import importlib.util
+import io
 import os
 import subprocess
 import tempfile
@@ -239,7 +241,8 @@ class MainTests(unittest.TestCase):
         path = write(self.repo, "i.lcov", lcov([(f"{self.repo}/crates/sink/x/src/sink.rs", hits)]))
         summary = Path(self.repo, "summary.md")
         env = {"GITHUB_STEP_SUMMARY": str(summary), "PR_BODY": body or ""}
-        with mock.patch.dict(os.environ, env):
+        quiet = io.StringIO()
+        with mock.patch.dict(os.environ, env), contextlib.redirect_stdout(quiet), contextlib.redirect_stderr(quiet):
             code = ic.main(["--lcov", path, "--base", "base", *extra])
         return code, summary.read_text()
 
@@ -265,7 +268,8 @@ class MainTests(unittest.TestCase):
 
     def test_no_in_scope_change_passes(self):
         path = write(self.repo, "i.lcov", "")
-        with mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": "", "PR_BODY": ""}):
+        quiet = io.StringIO()
+        with mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": "", "PR_BODY": ""}), contextlib.redirect_stdout(quiet):
             self.assertEqual(ic.main(["--lcov", path, "--base", "HEAD"]), 0)
 
 

@@ -3,7 +3,9 @@
 Run: python3 -m unittest discover -s scripts -p 'test_*.py'
 """
 
+import contextlib
 import importlib.util
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -108,8 +110,11 @@ class Main(unittest.TestCase):
             a, b, s = Path(d, "a.log"), Path(d, "b.log"), Path(d, "summary.md")
             a.write_text(LOG)
             b.write_text(LOG + "error: test failed, to rerun pass `-p faucet-cli --lib`\n")
-            self.assertEqual(tf.main(["--summary", str(s), str(a), str(b), str(Path(d, "missing.log"))]), 0)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(tf.main(["--summary", str(s), str(a), str(b), str(Path(d, "missing.log"))]), 0)
             text = s.read_text()
+        self.assertIn("::error title=test failed::widening_scale", out.getvalue())
         self.assertIn("| `widening_scale` | integration (tests/integration.rs) |", text)
         self.assertEqual(text.count("`nested_text`"), 1)
         self.assertIn("- `-p faucet-cli --lib`", text)
