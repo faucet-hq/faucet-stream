@@ -168,7 +168,11 @@ fn ado_scope(raw: &str) -> Option<(String, u16, Option<String>)> {
         Some((host, port)) => (host, port.trim().parse().ok()?),
         None => (server, 1433),
     };
-    Some((host.trim().to_string(), port, database.filter(|d| !d.is_empty())))
+    Some((
+        host.trim().to_string(),
+        port,
+        database.filter(|d| !d.is_empty()),
+    ))
 }
 
 /// `raw` with every character outside `[A-Za-z0-9_.-]` replaced by `_`, and

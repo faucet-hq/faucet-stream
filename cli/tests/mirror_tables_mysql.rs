@@ -153,7 +153,8 @@ pipeline:
         state.join("verify").display()
     );
     let cfg = PipelineConfig::from_text(&yaml, Path::new("v.yaml")).unwrap();
-    let spec: VerifySpec = faucet_cli::yaml::from_str("key: [id]\nranges: 4\nleaf_rows: 16").unwrap();
+    let spec: VerifySpec =
+        faucet_cli::yaml::from_str("key: [id]\nranges: 4\nleaf_rows: 16").unwrap();
     let outcome = faucet_cli::verify::verify(
         &cfg,
         &spec,

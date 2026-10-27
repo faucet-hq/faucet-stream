@@ -374,10 +374,7 @@ async fn the_derived_key_names_port_and_database_and_migrates_the_old_one() {
         column: "id".into(),
         initial_value: json!(0),
     };
-    let fp = format!(
-        "{:016x}",
-        faucet_core::shard::shard_hash(QUERY)
-    );
+    let fp = format!("{:016x}", faucet_core::shard::shard_hash(QUERY));
 
     let mut c = cfg(&server);
     c.replication = incremental.clone();
@@ -403,7 +400,10 @@ async fn the_derived_key_names_port_and_database_and_migrates_the_old_one() {
         source.state_key().as_deref(),
         Some(format!("mssql:127.0.0.1_{port}_db:{fp}").as_str())
     );
-    assert_eq!(source.legacy_state_keys(), vec![format!("mssql:mssql:{fp}")]);
+    assert_eq!(
+        source.legacy_state_keys(),
+        vec![format!("mssql:mssql:{fp}")]
+    );
 
     let mut pinned = cfg(&server);
     pinned.replication = incremental;

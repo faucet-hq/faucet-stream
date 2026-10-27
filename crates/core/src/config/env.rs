@@ -72,7 +72,10 @@ impl<'de, I: Iterator<Item = (String, String)>> de::Deserializer<'de> for Vars<I
 impl<'de, I: Iterator<Item = (String, String)>> MapAccess<'de> for Vars<I> {
     type Error = Error;
 
-    fn next_key_seed<K: DeserializeSeed<'de>>(&mut self, seed: K) -> Result<Option<K::Value>, Error> {
+    fn next_key_seed<K: DeserializeSeed<'de>>(
+        &mut self,
+        seed: K,
+    ) -> Result<Option<K::Value>, Error> {
         match self.entries.next() {
             Some((key, value)) => {
                 self.value = Some(value);
@@ -83,7 +86,10 @@ impl<'de, I: Iterator<Item = (String, String)>> MapAccess<'de> for Vars<I> {
     }
 
     fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, Error> {
-        let value = self.value.take().expect("next_value_seed follows next_key_seed");
+        let value = self
+            .value
+            .take()
+            .expect("next_value_seed follows next_key_seed");
         seed.deserialize(Text(value))
     }
 }
@@ -179,7 +185,10 @@ impl<'de> SeqAccess<'de> for Items {
         &mut self,
         seed: T,
     ) -> Result<Option<T::Value>, Error> {
-        self.0.next().map(|item| seed.deserialize(Text(item))).transpose()
+        self.0
+            .next()
+            .map(|item| seed.deserialize(Text(item)))
+            .transpose()
     }
 }
 

@@ -16,7 +16,11 @@ fn scan(dir: &Path, root: &Path, offenders: &mut Vec<String>) {
         if path.extension().and_then(|e| e.to_str()) != Some("rs") {
             continue;
         }
-        let rel = path.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
+        let rel = path
+            .strip_prefix(root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
         if rel == BOUNDARY || rel == "tests/yaml_boundary.rs" {
             continue;
         }

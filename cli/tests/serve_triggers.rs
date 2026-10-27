@@ -355,11 +355,12 @@ async fn a_webhook_fire_with_quoted_and_embedded_tokens_runs() {
         "version: 1\nname: sync\npipeline:\n  source:\n    type: csv\n    config:\n      path: \"${trigger.query.dir}/in.csv\"\n  sink:\n    type: jsonl\n    config:\n      path: ${trigger.query.dir}/out-${trigger.query.dataset}.jsonl\n",
     )
     .unwrap();
-    let file: faucet_cli::serve::triggers::spec::TriggersFile = faucet_cli::yaml::from_str(&format!(
-        "version: 1\ntriggers:\n  - name: sync-hook\n    type: webhook\n    config: {}\n",
-        pipeline.display()
-    ))
-    .unwrap();
+    let file: faucet_cli::serve::triggers::spec::TriggersFile =
+        faucet_cli::yaml::from_str(&format!(
+            "version: 1\ntriggers:\n  - name: sync-hook\n    type: webhook\n    config: {}\n",
+            pipeline.display()
+        ))
+        .unwrap();
     let compiled = CompiledTriggers::compile(file).unwrap();
     let state = build_state(&compiled);
     let event = webhook_event(&[("dir", dir.path().to_str().unwrap()), ("dataset", "orders")]);

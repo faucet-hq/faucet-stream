@@ -81,7 +81,9 @@ mod tests {
     #[test]
     fn number_forms_are_pinned() {
         assert_eq!(
-            json("a: 1\nb: -7\nc: 1.5\nd: 1e3\ne: 0x1F\nf: 0o17\ng: 010\nh: 1_000\ni: '1'\nj: 18446744073709551615"),
+            json(
+                "a: 1\nb: -7\nc: 1.5\nd: 1e3\ne: 0x1F\nf: 0o17\ng: 010\nh: 1_000\ni: '1'\nj: 18446744073709551615"
+            ),
             json!({"a": 1, "b": -7, "c": 1.5, "d": 1000.0, "e": 31, "f": 15,
                    "g": "010", "h": "1_000", "i": "1", "j": 18446744073709551615u64})
         );
@@ -103,8 +105,12 @@ mod tests {
             from_str::<Json>(text).unwrap_err().to_string(),
             from_str::<Value>(text).unwrap_err().to_string(),
             from_str::<S>(text).unwrap_err().to_string(),
-            from_str::<Json>("x:\n  a: 1\n  a: 2\n").unwrap_err().to_string(),
-            from_str::<Json>(r#"{"a": 1, "a": 2}"#).unwrap_err().to_string(),
+            from_str::<Json>("x:\n  a: 1\n  a: 2\n")
+                .unwrap_err()
+                .to_string(),
+            from_str::<Json>(r#"{"a": 1, "a": 2}"#)
+                .unwrap_err()
+                .to_string(),
         ] {
             assert!(err.contains("duplicate"), "{err}");
         }
@@ -123,7 +129,10 @@ mod tests {
 
     #[test]
     fn json_text_parses_as_yaml() {
-        assert_eq!(json(r#"{"a": [1, "x"], "b": {"c": null}}"#), json!({"a": [1, "x"], "b": {"c": null}}));
+        assert_eq!(
+            json(r#"{"a": [1, "x"], "b": {"c": null}}"#),
+            json!({"a": [1, "x"], "b": {"c": null}})
+        );
     }
 
     #[test]

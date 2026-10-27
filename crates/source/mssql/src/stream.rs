@@ -1160,7 +1160,10 @@ mod tests {
             legacy_state_key(&a).as_deref(),
             Some(format!("mssql:db.example.com:{fp}").as_str())
         );
-        assert_eq!(default_state_key(&a), format!("mssql:db.example.com_1433_a:{fp}"));
+        assert_eq!(
+            default_state_key(&a),
+            format!("mssql:db.example.com_1433_a:{fp}")
+        );
 
         let mut ado = full_cfg();
         ado.connection.connection_url = None;
