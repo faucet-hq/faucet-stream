@@ -340,7 +340,12 @@ async fn effective_document(
     supplied: Option<&SuppliedParams>,
 ) -> CliResult<Value> {
     let expand = |source: &crate::hub::SourceTemplate| match supplied {
-        Some(p) => crate::hub::for_each::expand(source, p, crate::params::BindMode::Strict, None),
+        Some(p) => crate::hub::for_each::expand(
+            source,
+            p,
+            crate::params::BindMode::Strict,
+            Some(&Default::default()),
+        ),
         None => crate::hub::for_each::expand_placeholders(source),
     };
     match target {

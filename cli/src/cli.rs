@@ -992,12 +992,12 @@ pub struct TemplateRowsArgs {
     /// Version of a registered overlay. Default `stable`.
     #[arg(long, default_value = "stable", requires = "overlay")]
     pub overlay_version: String,
-    /// Skip reading each row's state (last success / failure, bookmark age).
     /// Param values `for_each` streams are listed with (#952):
     /// `--param tables='["orders","customers"]'`. Without one, a repeated
     /// stream is listed as placeholder items. Repeatable.
     #[arg(long = "param", value_name = "NAME=VALUE")]
     pub param: Vec<String>,
+    /// Skip reading each row's state (last success / failure, bookmark age).
     #[arg(long)]
     pub no_state: bool,
     /// Preview a selection: which rows would run, which ancestors are pulled
@@ -1264,12 +1264,12 @@ pub struct HubRowsArgs {
     pub sink_hub: Option<String>,
     #[arg(long)]
     pub overlay_hub: Option<String>,
-    /// Also read each row's state from the composed run's state store.
     /// Param values `for_each` streams are listed with (#952):
     /// `--param tables='["orders","customers"]'`. Without one, a repeated
     /// stream is listed as placeholder items. Repeatable.
     #[arg(long = "param", value_name = "NAME=VALUE")]
     pub param: Vec<String>,
+    /// Also read each row's state from the composed run's state store.
     #[arg(long)]
     pub state: bool,
     #[command(flatten)]

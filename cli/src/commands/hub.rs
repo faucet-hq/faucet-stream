@@ -79,19 +79,27 @@ async fn pair_sides(p: &crate::cli::HubPairArgs) -> CliResult<hub::HubSides> {
 /// `faucet validate` / `run` / `template register` all take it.
 async fn compose(a: HubComposeArgs) -> CliResult<()> {
     let sides = pair_sides(&a.pair).await?;
-    // A `for_each` stream (#952) becomes one row per item of its list param,
-    // so the printed config holds the caller's items — never placeholders a
-    // later run would copy.
+    // `for_each` rows (#952) must be the caller's, never placeholders.
     let params = crate::params::collect_cli_params(&a.param)?;
     let (source_file, _) =
         hub::locate_in(&a.pair.source, &sides.source, hub::catalog::SOURCE_DIR).await?;
-    let missing = hub::for_each::unsupplied_lists(&hub::parse_source_file(&source_file)?, &params);
+    let source = hub::parse_source_file(&source_file)?;
+    let missing = hub::for_each::unsupplied_lists(&source, &params);
+    let names = hub::for_each::unsupplied_name_params(&source, &params);
     if !missing.is_empty() {
         return Err(CliError::Config(format!(
             "'{}' repeats streams over list param(s) {} — pass each with `--param \
              NAME='[…]'` so the composed config holds the rows a run would have",
             a.pair.source,
             missing.join(", ")
+        )));
+    }
+    if !names.is_empty() {
+        return Err(CliError::Config(format!(
+            "'{}' names its repeated streams with param(s) {} — pass each with \
+             `--param NAME=VALUE` so the composed rows have their real names",
+            a.pair.source,
+            names.join(", ")
         )));
     }
     let c = hub::compose_across_with(

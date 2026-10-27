@@ -66,6 +66,30 @@ streams:
     )
     .unwrap();
     std::fs::write(
+        hub.join("source-templates/named.yaml"),
+        format!(
+            r#"
+kind: source-template
+name: named
+description: Repeated streams named by a param
+params:
+  prefix: {{ type: string, required: true }}
+  tables: {{ type: list, items: {{ type: string }} }}
+source:
+  type: csv
+  config:
+    path: "{data}/orders.csv"
+streams:
+  - for_each: ${{param.tables}}
+    as: t
+    name: "${{param.prefix}}_${{t}}"
+    source: {{ config: {{ path: "{data}/${{t}}.csv" }} }}
+"#,
+            data = data.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
         hub.join("sink-templates/jsonl.yaml"),
         format!(
             "kind: sink-template\nname: jsonl\ndescription: files\nparams:\n  out_dir: {{ type: string, default: \"{}\" }}\nsink:\n  type: jsonl\n  config: {{}}\nper_stream:\n  path: \"${{param.out_dir}}/${{stream}}.jsonl\"\n",
@@ -111,6 +135,49 @@ fn for_each_streams_through_the_hub_cli() {
         .unwrap_err()
         .to_string();
         assert!(err.contains("pass each with `--param"), "{err}");
+        let err = run(&[
+            "hub",
+            "compose",
+            "--source",
+            "named",
+            "--sink",
+            "jsonl",
+            "--hub",
+            h,
+            "--param",
+            "tables=orders",
+        ])
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("names its repeated streams with param(s) prefix"),
+            "{err}"
+        );
+        let named = root.join("named.yaml");
+        run(&[
+            "hub",
+            "compose",
+            "--source",
+            "named",
+            "--sink",
+            "jsonl",
+            "--hub",
+            h,
+            "--param",
+            "tables=orders",
+            "--param",
+            "prefix=eu",
+            "--out",
+            named.to_str().unwrap(),
+        ])
+        .await
+        .unwrap();
+        let text = std::fs::read_to_string(&named).unwrap();
+        assert!(
+            text.contains("id: eu_orders") && !text.contains("param_"),
+            "{text}"
+        );
         let out = root.join("composed.yaml");
         let o = out.to_str().unwrap();
         run(&[

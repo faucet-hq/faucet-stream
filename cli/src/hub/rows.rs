@@ -581,8 +581,7 @@ pub fn rows_for_source(
     params: &SuppliedParams,
 ) -> CliResult<SourceRows> {
     src.validate()?;
-    // A `for_each` stream lists one row per item (#952): the caller's items
-    // when given, placeholder items otherwise.
+    // `for_each` rows (#952): the caller's items, else placeholders.
     let placeholder_lists = super::for_each::unsupplied_lists(src, params);
     let expanded = super::for_each::expand(src, params, BindMode::Placeholder, None)?;
     let src = &expanded;

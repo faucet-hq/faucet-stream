@@ -1574,8 +1574,7 @@ async fn materialize_pair_selected(
             "stored sink-template '{sink_id}' v{sink_version}: {e}"
         ))
     })?;
-    // A `for_each` stream becomes one stream per item of its list param
-    // (#952) before anything selects, composes or overlays by stream name.
+    // Expand `for_each` streams (#952) before selection, compose and overlay.
     let env_overlay: crate::interpolate::EnvOverlay = env_overrides
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))

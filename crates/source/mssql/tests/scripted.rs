@@ -365,10 +365,11 @@ async fn shards_come_from_the_key_bounds() {
     assert!(err.contains("shard-bounds query timed out"), "{err}");
 }
 
-/// #930 A39-F011: the derived key names the server's port and database, and the
-/// host-only key earlier releases derived is offered for migration.
+/// #930 A39-F011: the derived key names the server's port and database. The
+/// host-only key earlier releases derived is not migrated: databases on one
+/// server shared it, so its bookmark may be another database's.
 #[tokio::test]
-async fn the_derived_key_names_port_and_database_and_migrates_the_old_one() {
+async fn the_derived_key_names_port_and_database() {
     let server = TdsServer::start().await.unwrap();
     let incremental = MssqlReplication::Incremental {
         column: "id".into(),
@@ -384,10 +385,7 @@ async fn the_derived_key_names_port_and_database_and_migrates_the_old_one() {
         source.state_key().as_deref(),
         Some(format!("mssql:127.0.0.1_{port}_db:{fp}").as_str())
     );
-    assert_eq!(
-        source.legacy_state_keys(),
-        vec![format!("mssql:127.0.0.1:{fp}")]
-    );
+    assert!(source.legacy_state_keys().is_empty());
 
     let mut ado = cfg(&server);
     ado.connection.connection_url = None;
@@ -400,10 +398,7 @@ async fn the_derived_key_names_port_and_database_and_migrates_the_old_one() {
         source.state_key().as_deref(),
         Some(format!("mssql:127.0.0.1_{port}_db:{fp}").as_str())
     );
-    assert_eq!(
-        source.legacy_state_keys(),
-        vec![format!("mssql:mssql:{fp}")]
-    );
+    assert!(source.legacy_state_keys().is_empty());
 
     let mut pinned = cfg(&server);
     pinned.replication = incremental;

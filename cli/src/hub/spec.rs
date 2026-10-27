@@ -608,9 +608,7 @@ impl SinkTemplate {
                 self.name
             )));
         }
-        // Whether two streams would land in the same place depends on the
-        // source template it is paired with, so that is checked when the two
-        // compose (`compose::destination_collision`), on the rendered values.
+        // Collisions are checked at compose, on rendered values (#950).
         for k in ["write_mode", "key"] {
             if self.per_stream.contains_key(k) {
                 return Err(CliError::Config(format!(

@@ -74,8 +74,7 @@ pub fn document_target(
         let p = resolve_locator(id, hub, DEPLOYMENT_DIR)?;
         parse(&read(&p)?, &p)
     };
-    // A directory hub holds one file per template, so a companion's version
-    // selector (`files@newest`, `sink_select`) applies to a registry only.
+    // Version selectors apply to registry companions only.
     let need = |field: Option<crate::template_tests::bundle::CompanionRef<'_>>,
                 what: &str|
      -> CliResult<String> {

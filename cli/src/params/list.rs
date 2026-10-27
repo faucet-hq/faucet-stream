@@ -130,8 +130,7 @@ pub fn validate(name: &str, p: &ParamSpec) -> CliResult<()> {
         }
     }
     if let Some(d) = &p.default {
-        // A default may still be a directive (`${env:TABLES}`) resolved before
-        // binding; anything else must already be a valid list.
+        // A `${…}` default resolves before binding; any other must be a valid list.
         let deferred = d.as_str().is_some_and(|s| s.contains("${"));
         if !deferred {
             coerce(name, p, d).map_err(|e| {
@@ -384,13 +383,17 @@ fn distinct_capacity(items: &ParamSpec, want: usize) -> usize {
 }
 
 /// A placeholder list: two distinct items (one when `max_items: 1` or the
-/// items cannot differ), so a structural check sees a stream repeated.
+/// items cannot differ), at least `min_items` long, so a structural check sees
+/// a stream repeated and strict coercion accepts it.
 pub fn placeholder(p: &ParamSpec) -> Value {
     let Some(items) = p.items.as_deref() else {
         return Value::Array(Vec::new());
     };
-    let want = if p.max_items == Some(1) { 1 } else { 2 };
-    let n = distinct_capacity(items, want);
+    let max = p.max_items.unwrap_or(usize::MAX);
+    let want = 2.min(max);
+    let n = distinct_capacity(items, want)
+        .max(p.min_items.unwrap_or(1))
+        .min(max.max(1));
     Value::Array(
         (0..n)
             .map(|i| match items.kind {
@@ -421,6 +424,25 @@ mod tests {
         list(
             "type: list\nmax_items: 3\nitems:\n  type: object\n  properties:\n    schema: { type: string, default: public }\n    table: { type: string, required: true }\n    token: { type: string, secret: true }\n",
         )
+    }
+
+    #[test]
+    fn the_placeholder_meets_min_items_and_coerces() {
+        for (yaml, len) in [
+            ("type: list\nmin_items: 3\nitems: { type: string }\n", 3),
+            (
+                "type: list\nmin_items: 3\nmax_items: 4\nitems: { type: int }\n",
+                3,
+            ),
+            ("type: list\nitems: { type: string }\n", 2),
+            ("type: list\nmax_items: 1\nitems: { type: string }\n", 1),
+            ("type: list\nmin_items: 0\nitems: { type: string }\n", 2),
+        ] {
+            let p = list(yaml);
+            let v = placeholder(&p);
+            assert_eq!(v.as_array().unwrap().len(), len, "{yaml}");
+            coerce("t", &p, &v).unwrap();
+        }
     }
 
     #[test]

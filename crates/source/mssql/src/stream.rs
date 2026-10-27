@@ -364,31 +364,6 @@ fn default_state_key(config: &MssqlSourceConfig) -> String {
     )
 }
 
-/// The derived key before it named the port and database (#930 A39-F011): the
-/// `connection_url` host alone, so two databases on one server shared it.
-fn legacy_state_key(config: &MssqlSourceConfig) -> Option<String> {
-    let host = config
-        .connection
-        .connection_url
-        .as_deref()
-        .and_then(|u| url::Url::parse(u).ok())
-        .and_then(|u| u.host_str().map(|h| h.to_string()))
-        .unwrap_or_else(|| "mssql".to_string());
-    let host: String = host
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let fingerprint = faucet_core::shard::shard_hash(&config.query);
-    let old = format!("mssql:{host}:{fingerprint:016x}");
-    (old != default_state_key(config)).then_some(old)
-}
-
 #[async_trait]
 impl Source for MssqlSource {
     fn set_call_context(&self, ctx: faucet_core::CallContext) {
@@ -574,15 +549,6 @@ impl Source for MssqlSource {
                     .clone()
                     .unwrap_or_else(|| default_state_key(&self.config)),
             ),
-        }
-    }
-
-    fn legacy_state_keys(&self) -> Vec<String> {
-        match (&self.config.replication, &self.config.state_key) {
-            (MssqlReplication::Incremental { .. }, None) => {
-                legacy_state_key(&self.config).into_iter().collect()
-            }
-            _ => Vec::new(),
         }
     }
 
@@ -1149,17 +1115,13 @@ mod tests {
     }
 
     #[test]
-    fn derived_key_separates_databases_and_names_the_old_key() {
+    fn derived_key_separates_databases_and_servers() {
         let mut a = full_cfg();
         a.connection.connection_url = Some("mssql://sa:pw@db.example.com:1433/a".into());
         let mut b = a.clone();
         b.connection.connection_url = Some("mssql://sa:pw@db.example.com:1433/b".into());
         assert_ne!(default_state_key(&a), default_state_key(&b));
         let fp = format!("{:016x}", faucet_core::shard::shard_hash(&a.query));
-        assert_eq!(
-            legacy_state_key(&a).as_deref(),
-            Some(format!("mssql:db.example.com:{fp}").as_str())
-        );
         assert_eq!(
             default_state_key(&a),
             format!("mssql:db.example.com_1433_a:{fp}")
@@ -1171,13 +1133,7 @@ mod tests {
         let mut ado2 = ado.clone();
         ado2.connection.connection_string = Some("Server=tcp:h2,1433;Database=x".into());
         assert_ne!(default_state_key(&ado), default_state_key(&ado2));
-        assert_eq!(
-            legacy_state_key(&ado).as_deref(),
-            Some(format!("mssql:mssql:{fp}").as_str())
-        );
-        for k in [default_state_key(&ado), legacy_state_key(&ado).unwrap()] {
-            faucet_core::state::validate_state_key(&k).unwrap();
-        }
+        faucet_core::state::validate_state_key(&default_state_key(&ado)).unwrap();
     }
 
     // dataset_uri is a pure-config method; the source requires a live SQL Server

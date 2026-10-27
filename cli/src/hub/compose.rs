@@ -329,8 +329,7 @@ pub fn destination_collision(source: &SourceTemplate, sink: &SinkTemplate) -> Op
     let mut seen: BTreeMap<String, &str> = BTreeMap::new();
     for s in &source.streams {
         let dest = Value::Object(rendered_destination(sink, &s.name, source));
-        // A `for_each` stream (#952) seen before expansion: its items land in
-        // one place unless the destination follows the item.
+        // An unexpanded `for_each` stream collides unless its destination follows the item.
         if s.for_each.is_some()
             && !super::for_each::destination_varies(&dest, s)
             && source

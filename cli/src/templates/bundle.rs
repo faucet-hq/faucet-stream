@@ -255,8 +255,7 @@ async fn prepare(
     bundle: &TestBundle,
     trace: &mut Trace,
 ) -> CliResult<(Companions, Vec<SharedSuite>)> {
-    // Resolve every companion before failing, so the result names each one
-    // that is missing.
+    // Resolve every companion first so the error names each missing one.
     let mut first_err = None;
     let mut resolve = async |c: Option<CompanionRef<'_>>, kind: TemplateKind| {
         let c = c?;

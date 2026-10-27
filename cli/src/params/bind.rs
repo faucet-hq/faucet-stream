@@ -163,9 +163,11 @@ pub fn resolve(
         let secret_fields = super::list::secret_fields(p);
         let value = match supplied.get(name) {
             Some(raw) => {
-                if p.is_secret() || !secret_fields.is_empty() {
-                    // Before any error below can echo the raw value.
+                // Before any error below can echo the raw value.
+                if p.is_secret() {
                     register_secret_leaves(raw);
+                } else {
+                    register_secret_fields(raw, &secret_fields);
                 }
                 reject_directives(name, raw)?;
                 let coerced = spec::coerce_param(name, p, raw).map_err(|e| {
@@ -234,19 +236,7 @@ pub fn resolve(
                 bound.supplied_secret_names.insert(name.clone());
             }
         } else if !secret_fields.is_empty() {
-            let mut hidden = Vec::new();
-            if let Value::Array(items) = &value {
-                for item in items {
-                    for f in &secret_fields {
-                        if let Some(v) = item.get(f) {
-                            super::list::leaves(v, &mut hidden);
-                        }
-                    }
-                }
-            }
-            for h in hidden {
-                crate::secrets::registry::register(&h);
-            }
+            register_secret_fields(&value, &secret_fields);
             if supplied.contains_key(name) {
                 bound.supplied_secret_names.insert(name.clone());
             }
@@ -496,6 +486,20 @@ pub fn bind_document(
 }
 
 /// Register every scalar of a secret value with the redaction registry.
+/// Register only the `fields` of each object item of a list value.
+fn register_secret_fields(v: &Value, fields: &std::collections::BTreeSet<String>) {
+    let Value::Array(items) = v else {
+        return;
+    };
+    for item in items {
+        for f in fields {
+            if let Some(field) = item.get(f) {
+                register_secret_leaves(field);
+            }
+        }
+    }
+}
+
 fn register_secret_leaves(v: &Value) {
     let mut leaves = Vec::new();
     super::list::leaves(v, &mut leaves);
@@ -1360,6 +1364,39 @@ mod tests {
             }
             other => panic!("expected UnknownParam, got {other:?}"),
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn only_the_secret_fields_of_a_list_are_redacted() {
+        let spec = spec_of(
+            "tables:\n  type: list\n  items:\n    type: object\n    properties:\n      \
+             table: { type: string, required: true }\n      token: { type: string, secret: true }\n",
+        );
+        let bound = resolve(
+            &spec,
+            &supplied(&[(
+                "tables",
+                json!([{"table": "customers_visible", "token": "tok-list-field-s3cr3t"}]),
+            )]),
+            BindMode::Strict,
+        )
+        .unwrap();
+        assert!(bound.has_supplied_secrets());
+        assert_eq!(
+            crate::secrets::registry::redact("customers_visible tok-list-field-s3cr3t"),
+            "customers_visible ***"
+        );
+        let err = resolve(
+            &spec,
+            &supplied(&[("tables", json!([{"token": "tok-bad-item-s3cr3t"}]))]),
+            BindMode::Strict,
+        );
+        assert!(err.is_err());
+        assert_eq!(
+            crate::secrets::registry::redact("tok-bad-item-s3cr3t orders_visible"),
+            "*** orders_visible"
+        );
     }
 
     #[test]

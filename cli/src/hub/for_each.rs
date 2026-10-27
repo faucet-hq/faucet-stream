@@ -247,8 +247,7 @@ pub fn validate_template(src: &SourceTemplate) -> CliResult<()> {
                 }
             }
         }
-        // A secret item may not become a row id: ids appear in run records,
-        // logs and metrics labels.
+        // A secret item may not become a row id (ids reach logs and metrics).
         for (token, field) in var_refs(&s.name, v) {
             let secret = p.is_secret()
                 || field.is_some_and(|f| items.properties.get(f).is_some_and(|fp| fp.secret));
@@ -522,7 +521,7 @@ pub fn expand(
             serde_json::from_value(v)
                 .map_err(|e| CliError::Config(format!("invalid `params:` block: {e}")))?
         }
-        None => src.params.clone(),
+        None => unresolved_list_defaults(src, src.params.clone(), supplied, mode)?,
     };
     let own: SuppliedParams = supplied
         .iter()
@@ -599,6 +598,43 @@ pub fn expand(
 
 /// [`expand`] with placeholder items — the structural view of a template
 /// (`hub check`, registration, a row listing without params).
+/// Without an env pass a list default that is still an `${…}` directive cannot
+/// be expanded: a placeholder check uses placeholder items, a real run refuses.
+fn unresolved_list_defaults(
+    src: &SourceTemplate,
+    mut spec: ParamsSpec,
+    supplied: &SuppliedParams,
+    mode: BindMode,
+) -> CliResult<ParamsSpec> {
+    for s in src.streams.iter().filter(|s| s.for_each.is_some()) {
+        let pname = list_param(s)?;
+        if supplied.contains_key(pname) {
+            continue;
+        }
+        let Some(p) = spec.get_mut(pname) else {
+            continue;
+        };
+        let directive = p
+            .default
+            .as_ref()
+            .is_some_and(|d| d.to_string().contains("${"));
+        if !directive {
+            continue;
+        }
+        if mode == BindMode::Placeholder {
+            p.default = None;
+        } else {
+            return Err(CliError::Config(format!(
+                "source-template '{}': list param '{pname}' defaults to an `${{…}}` directive, \
+                 which this run cannot resolve before its streams are expanded (a clustered \
+                 server persists the expanded run); pass '{pname}' as a param",
+                src.name
+            )));
+        }
+    }
+    Ok(spec)
+}
+
 pub fn expand_placeholders(src: &SourceTemplate) -> CliResult<SourceTemplate> {
     expand(src, &SuppliedParams::new(), BindMode::Placeholder, None)
 }
@@ -615,6 +651,29 @@ pub fn unsupplied_lists(src: &SourceTemplate, supplied: &SuppliedParams) -> Vec<
         })
         .map(str::to_string)
         .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The scalar params a `for_each` stream's `name` renders that neither
+/// `supplied` nor a default provides; the rendered names are row ids.
+pub fn unsupplied_name_params(src: &SourceTemplate, supplied: &SuppliedParams) -> Vec<String> {
+    let mut out = Vec::new();
+    for s in src.streams.iter().filter(|s| s.for_each.is_some()) {
+        let mut rest = s.name.as_str();
+        while let Some(i) = rest.find("${param.") {
+            rest = &rest[i + "${param.".len()..];
+            let Some(end) = rest.find('}') else { break };
+            let name = &rest[..end];
+            rest = &rest[end..];
+            if !supplied.contains_key(name)
+                && src.params.get(name).is_none_or(|p| p.default.is_none())
+            {
+                out.push(name.to_string());
+            }
+        }
+    }
     out.sort();
     out.dedup();
     out
@@ -679,6 +738,61 @@ streams:
 
     fn params(v: Value) -> SuppliedParams {
         serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn unsupplied_name_params_are_the_ones_a_name_needs() {
+        let t = src(&SCALARS.replace(
+            "pg_schema: { type: string, default: public }",
+            "pg_schema: { type: string }\n  region: { type: string }",
+        ));
+        assert_eq!(
+            unsupplied_name_params(&t, &SuppliedParams::new()),
+            ["pg_schema"]
+        );
+        assert!(unsupplied_name_params(&t, &params(json!({"pg_schema": "s"}))).is_empty());
+        assert!(unsupplied_name_params(&src(SCALARS), &SuppliedParams::new()).is_empty());
+        let mut broken = src(SCALARS);
+        broken.streams[0].name = "x_${param.open".into();
+        assert!(unsupplied_name_params(&broken, &SuppliedParams::new()).is_empty());
+    }
+
+    #[test]
+    fn a_directive_list_default_resolves_with_env_and_is_refused_without() {
+        let t = src(&SCALARS.replace(
+            "tables: { type: list, items: { type: string }, max_items: 500 }",
+            "tables: { type: list, items: { type: string }, default: \"${env:FE_TABLES}\" }",
+        ));
+        let shards = params(json!({"shards": [1]}));
+        let env: EnvOverlay = [("FE_TABLES".to_string(), "orders,users".to_string())].into();
+        let names =
+            |t: &SourceTemplate| t.streams.iter().map(|s| s.name.clone()).collect::<Vec<_>>();
+        let local = expand(&t, &shards, BindMode::Strict, Some(&env)).unwrap();
+        assert_eq!(
+            names(&local),
+            ["public_orders", "public_users", "events_shard_1"]
+        );
+
+        let err = expand(&t, &shards, BindMode::Strict, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("list param 'tables' defaults to an `${…}` directive"),
+            "{err}"
+        );
+        let supplied = params(json!({"shards": [1], "tables": ["a"]}));
+        assert_eq!(
+            names(&expand(&t, &supplied, BindMode::Strict, None).unwrap()),
+            ["public_a", "events_shard_1"]
+        );
+
+        let checked = expand_placeholders(&t).unwrap();
+        assert!(
+            names(&checked).iter().all(|n| !n.contains("env")),
+            "{:?}",
+            names(&checked)
+        );
+        assert!(names(&checked).len() >= 3);
     }
 
     #[test]
