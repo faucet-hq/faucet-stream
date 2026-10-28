@@ -938,9 +938,12 @@ fn template_store(ctx: &McpContext) -> Result<&crate::templates::TemplateStore, 
 #[cfg(feature = "templates")]
 async fn list_templates(ctx: &McpContext) -> Result<String, String> {
     let store = template_store(ctx)?;
-    let templates = crate::templates::list_with_state(store)
+    let mut templates = crate::templates::list_with_state(store)
         .await
         .map_err(|e| e.to_string())?;
+    for t in &mut templates {
+        crate::params::hide_secret_defaults(&mut t.params);
+    }
     Ok(pretty(&json!({
         "count": templates.len(),
         "templates": templates,
@@ -983,6 +986,7 @@ async fn get_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("no pipeline template '{id}'"))?;
+    crate::params::hide_secret_defaults(&mut record.params);
     let body_withheld = !ctx.allow_template_admin;
     if body_withheld {
         record.body.clear();

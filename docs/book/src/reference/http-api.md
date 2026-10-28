@@ -1219,7 +1219,9 @@ target. `GET /v1/templates/{id}` returns `status`, `versions` (newest first),
 second request. Use `?version=newest` to read a `draft` template. The stored
 `body` is returned only to an admin with no tenant scope; anyone else gets an
 empty `body` and `body_withheld: true` (the parameter surface stays in
-`params`), the same rule as a run's `config_body`.
+`params`), the same rule as a run's `config_body`. In `params`, the
+default of a `secret: true` param always reads `"(hidden)"`, here and in
+`GET /v1/templates`; runs still use the real default.
 
 The trigger body's `params` / `env` / `version` / `sink` / `sink_version` /
 `overlay` / `overlay_version` are template-specific; every other field (`name`, `labels`, `timeout_secs`,

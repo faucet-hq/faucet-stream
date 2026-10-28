@@ -2037,7 +2037,8 @@ paths:
       description: >
         One version of a template — the launched (`stable`) one unless `version`
         is given — including the stored config body (admins without a tenant
-        scope only; others get an empty `body` and `body_withheld: true`), the
+        scope only; others get an empty `body` and `body_withheld: true`; a
+        secret param's default always reads `(hidden)`), the
         template's whole release state, and the launch log. Pass `version=newest` to open a `draft`
         template, which has no `stable` version yet. Requires the `TemplateRead`
         permission (viewer).
