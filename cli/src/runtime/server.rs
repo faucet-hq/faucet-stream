@@ -428,6 +428,12 @@ pub async fn submit(
     // proposed, so a change request never waits for approval only to fail
     // when it executes.
     crate::serve::runner::resolve_clock(req.clock.as_deref(), chrono::Utc::now())?;
+    crate::serve::history::labels::check_submitted(&req.labels, req.trusted_config).map_err(
+        |message| ServeError::Unprocessable {
+            message,
+            details: None,
+        },
+    )?;
     // `0` is rejected rather than clamped: it would mean "no connections"
     // (#610).
     if req.concurrency == Some(0) {

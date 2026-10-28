@@ -78,12 +78,39 @@ paths:
         - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 500 } }
         - { name: cursor, in: query, schema: { type: string }, description: "The previous page's `next_cursor` (`<submitted_at>~<run_id>`; a bare run_id is still accepted)." }
         - { name: tenant, in: query, schema: { type: string }, description: "Only runs started for this tenant (#709). A tenant-scoped principal always sees only its own tenant; naming another is a 404." }
+        - name: label
+          in: query
+          style: form
+          explode: true
+          schema: { type: array, items: { type: string }, maxItems: 10 }
+          description: >-
+            Only runs carrying this label (#958): `key:value` is an exact match
+            (split on the first `:`, so a value may contain `:`), a bare `key`
+            means the label is present. Repeatable; every filter must match.
+            At most 10 label filters per query (`label` and `labels` together),
+            else 400. Provenance labels (`template`, `backfill`, …) filter like
+            any other.
+        - name: labels
+          in: query
+          schema: { type: string }
+          description: >-
+            Alias of `label`: comma-separated `key:value` / `key` filters
+            (`labels=team:data,env:prod`). A value containing `,` needs the
+            repeatable `label=` form.
       responses:
         "200":
           description: A page of runs, newest first.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ListResponse" }
+        "400":
+          description: >-
+            An unknown query parameter (a typo such as `lables` is refused
+            rather than returning an unfiltered list), an unknown status, an
+            empty label key, or more than 10 label filters.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "401": { $ref: "#/components/responses/Error" }
   /v1/runs/{id}:
     get:
@@ -2766,7 +2793,15 @@ components:
         config: { type: string, description: "YAML or JSON pipeline body." }
         config_format: { type: string, enum: [yaml, json], default: yaml }
         name: { type: string, description: "Metadata + state-key/metric identity. Reused name = shared bookmarks." }
-        labels: { type: object, additionalProperties: { type: string } }
+        labels:
+          type: object
+          additionalProperties: { type: string, maxLength: 256 }
+          description: >-
+            Free-form run labels, filterable with `GET /v1/runs?label=` (#958).
+            Keys are 1–63 characters, values at most 256, else 422. The
+            provenance keys the server stamps (`template`, `template_version`,
+            `allow_untested`, `sink_template`, `sink_template_version`,
+            `overlay`, `overlay_version`, `selection`) are refused with 422.
         timeout_secs: { type: integer, nullable: true }
         doctor_first: { type: boolean, default: false, description: "Run doctor probes first; 422 with report on failure." }
         idempotency_key: { type: string, nullable: true }

@@ -7,6 +7,7 @@
 pub mod catalog;
 #[cfg(any(feature = "serve-history-postgres", feature = "serve-history-sqlite"))]
 pub mod fallback;
+pub mod labels;
 pub mod memory;
 #[cfg(feature = "serve-history-postgres")]
 pub mod postgres;
@@ -358,6 +359,8 @@ pub struct ListFilter {
     pub cursor: Option<String>,
     /// Only runs started for this tenant (#709).
     pub tenant: Option<String>,
+    /// Only runs carrying every one of these labels (#958).
+    pub labels: Vec<labels::LabelFilter>,
 }
 
 /// The keyset cursor after `rec`: `<submitted_at>~<run_id>`, so the next page

@@ -1926,3 +1926,26 @@ select {
 .le-link:hover { text-decoration: underline; }
 .logs-head { display: flex; align-items: baseline; gap: 14px; }
 .logs-head h2 { margin-right: auto; }
+
+/* Run labels (#958): clickable key/value chips; a click filters the runs list. */
+.label-chip { display: inline-flex; align-items: stretch; max-width: 100%; margin: 0; padding: 0; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-2); font: inherit; font-size: 0.72rem; line-height: 1.5; cursor: pointer; overflow: hidden; vertical-align: middle; }
+.label-chip:hover, .label-chip:focus-visible { border-color: var(--brand); }
+.label-chip-k { padding: 0 6px 0 8px; color: var(--ink-dim); font-weight: 550; white-space: nowrap; }
+.label-chip-v { padding: 0 8px 0 6px; border-left: 1px solid var(--border); color: var(--ink); font-family: var(--font-mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.label-chip-prov { opacity: 0.62; }
+.label-chip-prov:hover, .label-chip-prov:focus-visible { opacity: 1; }
+.run-labels { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-top: 4px; min-width: 0; overflow: hidden; }
+.label-more { font-size: 0.72rem; color: var(--ink-faint); cursor: help; padding: 0 4px; }
+.rs-labels { padding: 12px 18px 14px; border-top: 1px solid var(--border); }
+.rs-labels h3 { margin: 0 0 8px; font-size: 0.68rem; font-weight: 650; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-faint); }
+.rs-labels-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+#f-label { width: 170px; }
+.label-filters { display: flex; flex-wrap: wrap; gap: 6px; flex-basis: 100%; }
+.label-filters[hidden] { display: none; }
+.label-filter { display: inline-flex; align-items: center; max-width: 100%; gap: 2px; padding: 1px 2px 1px 9px; border: 1px solid color-mix(in srgb, var(--brand) 45%, transparent); border-radius: 999px; background: color-mix(in srgb, var(--brand) 10%, transparent); color: var(--ink); font-family: var(--font-mono); font-size: 0.75rem; }
+.label-filter-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.label-filter-x { border: 0; background: transparent; color: var(--ink-dim); font-size: 0.95rem; line-height: 1; padding: 0 6px; cursor: pointer; border-radius: 999px; }
+.label-filter-x:hover { color: var(--ink); background: color-mix(in srgb, var(--brand) 18%, transparent); }
+@media (max-width: 700px) {
+  .runs-table .run-labels { display: none; }
+}

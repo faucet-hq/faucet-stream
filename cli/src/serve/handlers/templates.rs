@@ -1311,16 +1311,7 @@ pub(crate) const LABEL_SINK_TEMPLATE_VERSION: &str = "sink_template_version";
 pub(crate) const LABEL_OVERLAY: &str = "overlay";
 pub(crate) const LABEL_OVERLAY_VERSION: &str = "overlay_version";
 /// Labels only the server stamps on a template-triggered run.
-pub(crate) const RESERVED_LABELS: &[&str] = &[
-    LABEL_TEMPLATE,
-    LABEL_TEMPLATE_VERSION,
-    LABEL_ALLOW_UNTESTED,
-    LABEL_SINK_TEMPLATE,
-    LABEL_SINK_TEMPLATE_VERSION,
-    LABEL_OVERLAY,
-    LABEL_OVERLAY_VERSION,
-    crate::select::LABEL_SELECTION,
-];
+pub(crate) const RESERVED_LABELS: &[&str] = crate::serve::history::labels::RESERVED_LABELS;
 
 /// `POST /v1/templates/{id}/runs` → 202 / 404 / 422 / 429.
 pub async fn trigger_template(
@@ -1366,6 +1357,23 @@ pub async fn trigger_template_outcome(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_provenance_label_is_reserved() {
+        for k in [
+            super::LABEL_TEMPLATE,
+            super::LABEL_TEMPLATE_VERSION,
+            super::LABEL_ALLOW_UNTESTED,
+            super::LABEL_SINK_TEMPLATE,
+            super::LABEL_SINK_TEMPLATE_VERSION,
+            super::LABEL_OVERLAY,
+            super::LABEL_OVERLAY_VERSION,
+            crate::select::LABEL_SELECTION,
+        ] {
+            assert!(super::RESERVED_LABELS.contains(&k), "{k}");
+        }
+        assert_eq!(super::RESERVED_LABELS.len(), 8);
+    }
+
     /// The pre-#703 handler shape the tests were written against: a run, as
     /// `(status, body)`; a pending change request is a test failure.
     async fn trigger_pair(

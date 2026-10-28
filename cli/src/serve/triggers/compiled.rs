@@ -129,6 +129,8 @@ impl CompiledTriggers {
                 }
                 _ => {}
             }
+            crate::serve::history::labels::check_submitted(&t.run.labels, false)
+                .map_err(|e| format!("triggers: '{}' run.labels: {e}", t.name))?;
             if let Some(sel) = &t.tenants {
                 require_feature(&t.name, "tenants")?;
                 sel.validate()
@@ -391,6 +393,15 @@ mod tests {
             CompiledTriggers::compile(file(&format!("{sched}    cron: \"0 * * * *\"\n"))).unwrap();
         assert_eq!(c.triggers[0].kind_label(), "schedule");
         assert!(c.triggers[0].webhook_path.is_none());
+    }
+
+    #[test]
+    fn static_run_labels_are_checked_at_load() {
+        let base = "version: 1\ntriggers:\n  - name: t\n    type: webhook\n    config: ./x.yaml\n    run:\n      labels:\n";
+        assert!(compile_err(&format!("{base}        template: x\n")).contains("set by the server"));
+        let long = "k".repeat(64);
+        assert!(compile_err(&format!("{base}        {long}: v\n")).contains("run.labels"));
+        CompiledTriggers::compile(file(&format!("{base}        team: data\n"))).unwrap();
     }
 
     #[test]

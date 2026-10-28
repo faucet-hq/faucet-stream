@@ -84,7 +84,7 @@ Claude Code: `/plugin marketplace add faucet-hq/faucet-stream`, then
 | `faucet explain [config] [--json\|--rows]` | Plain-English narration of a pipeline (source → transforms → sink, matrix, delivery). Fully offline; never prints secrets. |
 | `faucet status [config] [--row R] [--probe] [--json]` | One screen of per-row health (#732): last success / failure (run-outcome marker, SLA history, `catalog:` run history), bookmark and its age, where the next run resumes, the exactly-once watermark (`--probe` compares it with the sink's), source lag (#733; `--probe` asks the source now), the last run's sink-write outcomes (#737), DLQ backlog, SLA / profiling verdicts, rollback markers, a live or crashed run lease; child rows fold under their parent. Exit `0` healthy, `1` degraded / unknown, `2` failed. Also `GET`/`POST /v1/status` and the console's template Health card. |
 | `faucet state show\|set\|reset\|export\|import <config> …` | Operate on a pipeline's durable state (#735): `show` bookmarks, envelope sequences and markers; `set --row R --bookmark JSON` / `reset --row R [--include-markers] [--rewind-token]` with plan-then-confirm (`--yes` / `--dry-run`), refused while a run lease or the `catalog:` run history says a run is in flight (`--force`), exactly-once envelopes kept sink-safe; `export` the versioned `{version, pipeline, exported_at, keys}` document; `import FILE [--to-state URL] [--overwrite]` to restore or migrate between file / Redis / Postgres stores. Also `GET`/`PUT`/`DELETE /v1/state/{pipeline}/{row}` (admin). |
-| `faucet history [config] [--limit N\|--row R\|--json]` | Terminal view of the run history in the config's `catalog:` store (status/duration/throughput), newest first. Read-only; requires the `catalog` feature. |
+| `faucet history [config] [--limit N\|--row R\|--label K=V\|--json]` | Terminal view of the run history in the config's `catalog:` store (status/duration/throughput), newest first. `--label key=value` (or a bare `key`, repeatable, ANDed) keeps runs carrying those labels. Read-only; requires the `catalog` feature. |
 | `faucet run … --output <text\|json\|ndjson>` | End-of-run summary format. `json`/`ndjson` emit a machine-readable per-row + totals summary (clean stdout, logs on stderr) for CI/cron/Slack. |
 
 Pass `--log-level debug` (or set `FAUCET_LOG=debug`) for verbose tracing. Logs are written to stderr; pipeline records and command output go to stdout.
@@ -294,6 +294,18 @@ faucet serve --history sqlite:/var/lib/faucet/runs.db                  # durable
 faucet serve --default-config defaults.yaml                            # merge workspace defaults under every run
 faucet serve --otel-config otel.yaml                                   # OTLP traces + metrics (+ run logs with `export: [logs]`; `otel` feature)
 ```
+
+**Run labels (#958).** A run's `labels` (`POST /v1/runs`, template triggers,
+backfills, trigger `run.labels`) are filterable: `GET /v1/runs?label=team:data&label=env:prod`
+returns the runs carrying both (exact match, split on the first `:`; a bare
+`label=key` means "has the key"; `labels=k:v,k2:v2` is an alias; at most 10
+per request). The filter composes with `status` / `name` / `since` / `until` /
+`tenant` and the cursor, and runs in SQL on the persistent backends (a
+`faucet_serve_run_labels` side table, backfilled from existing runs on
+connect). An unknown query parameter is a `400`. Label keys are 1–63
+characters and values at most 256 (else `422`); the provenance keys the server
+stamps (`template`, `selection`, …) cannot be set by a caller. The console's
+Runs page has a label filter, and every label chip on a run filters by it.
 
 **Log shipping (#806, `otel` feature).** `export: [logs]` (in a pipeline's
 `observability.otel` block, or in `faucet serve --otel-config`) ships every
