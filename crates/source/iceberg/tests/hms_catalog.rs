@@ -211,7 +211,11 @@ async fn hms_catalog_table_in_s3_is_discovered_and_read() {
     assert_eq!(
         datasets[0].schema.as_ref().expect("schema")["properties"]
             .as_object()
-            .map(|p| p.keys().cloned().collect::<Vec<_>>()),
+            .map(|p| {
+                let mut keys: Vec<String> = p.keys().cloned().collect();
+                keys.sort();
+                keys
+            }),
         Some(vec!["id".to_string(), "name".to_string()])
     );
     assert!(source.fetch_all().await.expect("read").is_empty());

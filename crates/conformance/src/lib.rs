@@ -118,8 +118,6 @@ pub mod calls;
 mod checks;
 #[cfg(feature = "containers")]
 pub mod containers;
-#[cfg(feature = "containers")]
-pub mod stores;
 pub mod counting;
 mod declared;
 pub mod doubles;
@@ -128,6 +126,8 @@ pub mod forwarding;
 pub mod hung;
 pub mod required;
 pub mod scripted;
+#[cfg(feature = "containers")]
+pub mod stores;
 pub mod tds;
 
 /// Stack size [`block_on_large_stack`] gives its thread.

@@ -168,6 +168,20 @@ async fn assert_reads(catalog: Value, location_prefix: &str) {
         "{}",
         table.metadata().location()
     );
+    assert!(read_ids(&catalog, None).await.is_empty(), "no snapshot yet");
+    let source_cfg: IcebergSourceConfig =
+        serde_json::from_value(json!({ "catalog": catalog, "table": "db.events" }))
+            .expect("source config");
+    let datasets = IcebergSource::new(source_cfg)
+        .await
+        .expect("source")
+        .discover()
+        .await
+        .expect("discover");
+    assert_eq!(
+        datasets.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+        vec!["db.events"]
+    );
     let table = append(writer.as_ref(), &table, 0..30).await;
     let first = table.metadata().current_snapshot_id().expect("snapshot");
     let table = append(writer.as_ref(), &table, 30..50).await;
