@@ -2,7 +2,9 @@
 //! read from Azurite (the SAS is a real account SAS signed with the emulator
 //! key, and a wrongly signed one is refused). `managed_identity` reads from a
 //! wiremock fake of IMDS (`IDENTITY_ENDPOINT`) plus the Blob list and get
-//! calls, which only answer the token IMDS issued.
+//! calls, which only answer the token IMDS issued. `service_principal` reads
+//! the same way from a wiremock fake of the Azure AD v2 token endpoint, reached
+//! through `authority_host`.
 
 use base64::Engine as _;
 use faucet_core::Source;
@@ -13,7 +15,7 @@ use object_store::path::Path as ObjPath;
 use object_store::{ObjectStoreExt, PutPayload};
 use serde_json::{Value, json};
 use testcontainers_modules::azurite::{Azurite, BLOB_PORT};
-use wiremock::matchers::{header, method, path, query_param};
+use wiremock::matchers::{body_string_contains, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const ACCOUNT: &str = "devstoreaccount1";
@@ -194,4 +196,39 @@ async fn managed_identity_sends_the_token_imds_issued() {
         read(fake_config(&server, other)).await.is_err(),
         "IMDS issues no token for mi-2"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn service_principal_sends_the_token_the_authority_issued() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/tenant-1/oauth2/v2.0/token"))
+        .and(body_string_contains("grant_type=client_credentials"))
+        .and(body_string_contains("client_id=sp-client"))
+        .and(body_string_contains("client_secret=sp-secret"))
+        .and(body_string_contains(
+            "scope=https%3A%2F%2Fstorage.azure.com%2F.default",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"token_type": "Bearer", "access_token": "sp-token", "expires_in": 3600}),
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    fake_blob(&server, "sp-token").await;
+
+    let principal = |client_secret: &str| AzureCredentials::ServicePrincipal {
+        client_id: "sp-client".into(),
+        client_secret: client_secret.into(),
+        tenant_id: "tenant-1".into(),
+        authority_host: Some(format!("{}/", server.uri())),
+    };
+    assert_eq!(
+        read(fake_config(&server, principal("sp-secret")))
+            .await
+            .unwrap(),
+        rows()
+    );
+    let refused = read(fake_config(&server, principal("wrong-secret"))).await;
+    assert!(refused.is_err(), "no token is issued for a wrong secret");
 }
