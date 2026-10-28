@@ -11,11 +11,12 @@ use std::pin::Pin;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use faucet_common_redshift::data_api::{self, DataColumn, Effect};
+use faucet_common_redshift::{DataApiClient, RedshiftPool};
 use faucet_core::replication::cursor::{CursorBookmark, CursorTracker};
 use faucet_core::util::{quote_ident, substitute_context_bind_params};
 use faucet_core::{FaucetError, Source, Stream, StreamPage};
 use serde_json::Value;
-use sqlx::PgPool;
 
 use crate::config::{BOOKMARK_TOKEN, RedshiftReplication, RedshiftSourceConfig};
 use crate::convert::{bind_params, row_to_json};
@@ -24,12 +25,31 @@ use crate::convert::{bind_params, row_to_json};
 /// as JSON objects.
 pub struct RedshiftSource {
     config: RedshiftSourceConfig,
-    pool: PgPool,
+    backend: Backend,
     /// Bookmark applied via [`Source::apply_start_bookmark`] (incremental only).
     start_bookmark: Mutex<Option<CursorBookmark>>,
     /// Backend-call context (#880): the query and every page of rows run
     /// through it.
     calls: faucet_core::CallSlot,
+}
+
+/// How statements reach Redshift.
+enum Backend {
+    /// The PostgreSQL wire protocol (`password`, `iam`).
+    Wire(RedshiftPool),
+    /// The Redshift Data API over HTTPS (`redshift_data_api`).
+    DataApi(DataApiClient),
+}
+
+/// Where the rows of a running query come from.
+enum Cursor<'a> {
+    Wire(futures::stream::BoxStream<'a, Result<sqlx::postgres::PgRow, sqlx::Error>>),
+    DataApi {
+        id: String,
+        token: Option<String>,
+        columns: Vec<DataColumn>,
+        done: bool,
+    },
 }
 
 /// Incremental-read context (column + starting position).
@@ -44,11 +64,17 @@ impl RedshiftSource {
     /// [`Source::check`]).
     pub fn new(config: RedshiftSourceConfig) -> Result<Self, FaucetError> {
         config.validate()?;
-        let pool =
-            faucet_common_redshift::build_pool_lazy(&config.connection, config.max_connections)?;
+        let backend = match DataApiClient::from_connection(&config.connection, FaucetError::Source)?
+        {
+            Some(api) => Backend::DataApi(api),
+            None => Backend::Wire(faucet_common_redshift::connect_lazy(
+                &config.connection,
+                config.max_connections,
+            )?),
+        };
         Ok(Self {
             config,
-            pool,
+            backend,
             start_bookmark: Mutex::new(None),
             calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
         })
@@ -128,23 +154,16 @@ impl RedshiftSource {
         context: &HashMap<String, Value>,
         column: &str,
     ) -> Result<String, FaucetError> {
-        use sqlx::Executor;
-        let (probe, _) = self.resolve_query(context, None, "");
-        let probe = probe.replace(BOOKMARK_TOKEN, "NULL");
-        let calls = self.calls.get();
-        let described = faucet_common_redshift::calls::once(&calls, "describe", async {
-            (&self.pool).describe(&probe).await.map_err(|e| {
-                FaucetError::Source(format!(
-                    "redshift: could not describe the incremental query: {e}"
-                ))
-            })
-        })
-        .await?;
+        let described = self.describe(context).await.map_err(|e| match e {
+            FaucetError::Source(m) => FaucetError::Source(format!(
+                "redshift: could not describe the incremental query: {m}"
+            )),
+            other => other,
+        })?;
         let name = described
-            .columns()
             .iter()
-            .find(|c| sqlx::Column::name(*c) == column)
-            .map(|c| sqlx::TypeInfo::name(sqlx::Column::type_info(c)).to_string())
+            .find(|(c, _, _)| c == column)
+            .map(|(_, t, _)| t.clone())
             .ok_or_else(|| {
                 FaucetError::Config(format!(
                     "redshift: incremental replication `column` {column:?} is not a column of \
@@ -152,6 +171,136 @@ impl RedshiftSource {
                 ))
             })?;
         cast_type(&name)
+    }
+
+    /// The query's output columns as `(name, type name, nullable)`: a
+    /// describe on the wire, a `LIMIT 0` run of the query through the Data
+    /// API (which has no describe).
+    async fn describe(
+        &self,
+        context: &HashMap<String, Value>,
+    ) -> Result<Vec<(String, String, Option<bool>)>, FaucetError> {
+        use sqlx::Executor;
+        let (probe, binds) = self.resolve_query(context, None, "");
+        let probe = probe.replace(BOOKMARK_TOKEN, "NULL");
+        let calls = self.calls.get();
+        match &self.backend {
+            Backend::Wire(pool) => {
+                let pool = pool.get(&calls).await?;
+                let described = faucet_common_redshift::calls::once(&calls, "describe", async {
+                    (&pool)
+                        .describe(&probe)
+                        .await
+                        .map_err(|e| FaucetError::Source(e.to_string()))
+                })
+                .await?;
+                Ok(described
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        (
+                            sqlx::Column::name(c).to_string(),
+                            sqlx::TypeInfo::name(sqlx::Column::type_info(c)).to_string(),
+                            described.nullable(i),
+                        )
+                    })
+                    .collect())
+            }
+            Backend::DataApi(api) => {
+                let inner = probe.trim_end_matches(|ch: char| ch.is_whitespace() || ch == ';');
+                let sql = format!("SELECT * FROM ({inner}\n) AS q LIMIT 0");
+                let (columns, _) = api
+                    .query(&calls, &data_api::named_parameters(&sql, &binds))
+                    .await?;
+                Ok(columns
+                    .into_iter()
+                    .map(|c| (c.name, c.type_name, c.nullable))
+                    .collect())
+            }
+        }
+    }
+
+    /// Start `sql` and return where its rows come from.
+    async fn open<'a>(
+        &self,
+        calls: &faucet_core::io::CallContext,
+        pool: &'a Option<sqlx::PgPool>,
+        sql: &'a str,
+        binds: &'a [Value],
+    ) -> Result<Cursor<'a>, FaucetError> {
+        use futures::StreamExt;
+        match (&self.backend, pool) {
+            (Backend::DataApi(api), _) => {
+                let done = api
+                    .execute(calls, Effect::Read, &data_api::named_parameters(sql, binds))
+                    .await?;
+                Ok(Cursor::DataApi {
+                    id: done.id,
+                    token: None,
+                    columns: Vec::new(),
+                    done: !done.has_result_set,
+                })
+            }
+            (Backend::Wire(_), Some(pool)) => {
+                let query = bind_params(sqlx::query(sql), binds)?;
+                calls.record("query");
+                Ok(Cursor::Wire(query.fetch(pool).boxed()))
+            }
+            (Backend::Wire(_), None) => Err(FaucetError::Source(
+                "redshift: the wire pool was not acquired".into(),
+            )),
+        }
+    }
+
+    /// Up to `max` more rows of `cursor` as JSON objects, and whether it is
+    /// exhausted. A Data API page is read whole.
+    async fn next_chunk(
+        &self,
+        calls: &faucet_core::io::CallContext,
+        cursor: &mut Cursor<'_>,
+        max: usize,
+    ) -> Result<(Vec<Value>, bool), FaucetError> {
+        match cursor {
+            Cursor::Wire(rows) => {
+                let reads = calls.clone().with_roundtrip_metering(false);
+                let fetched =
+                    faucet_common_redshift::calls::next_rows(&reads, "fetch", rows, max, |e| {
+                        FaucetError::Source(format!("redshift query failed: {e}"))
+                    })
+                    .await?;
+                let exhausted = fetched.len() < max;
+                let rows = fetched.iter().map(row_to_json).collect::<Result<_, _>>()?;
+                Ok((rows, exhausted))
+            }
+            Cursor::DataApi {
+                id,
+                token,
+                columns,
+                done,
+            } => {
+                if *done {
+                    return Ok((Vec::new(), true));
+                }
+                let Backend::DataApi(api) = &self.backend else {
+                    return Err(FaucetError::Source(
+                        "redshift: a Data API cursor needs the Data API".into(),
+                    ));
+                };
+                let page = api.result_page(calls, id, token.as_deref()).await?;
+                if columns.is_empty() {
+                    *columns = page.columns;
+                }
+                let rows = page
+                    .rows
+                    .iter()
+                    .map(|f| data_api::row_to_json(columns, f).map(Value::Object))
+                    .collect::<Result<_, _>>()?;
+                *token = page.next_token;
+                *done = token.is_none();
+                Ok((rows, *done))
+            }
+        }
     }
 }
 
@@ -202,7 +351,10 @@ fn default_state_key(config: &RedshiftSourceConfig) -> String {
     // Fixed FNV-1a: the key is durable and `DefaultHasher` is not stable across Rust releases.
     let material = format!(
         "{}\u{1f}{}\u{1f}{}\u{1f}{}",
-        config.connection.host, config.connection.port, config.connection.database, config.query
+        config.connection.endpoint_label(),
+        config.connection.port,
+        config.connection.database,
+        config.query
     );
     format!(
         "redshift:{:016x}",
@@ -238,27 +390,12 @@ impl Source for RedshiftSource {
         &self,
         context: &HashMap<String, Value>,
     ) -> Result<Option<faucet_core::DeclaredColumns>, FaucetError> {
-        use sqlx::Executor;
-        let (probe, _) = self.resolve_query(context, None, "");
-        let probe = probe.replace(BOOKMARK_TOKEN, "NULL");
-        let calls = self.calls.get();
-        let described = faucet_common_redshift::calls::once(&calls, "describe", async {
-            (&self.pool)
-                .describe(&probe)
-                .await
-                .map_err(|e| FaucetError::Source(e.to_string()))
-        })
-        .await;
-        let Ok(described) = described else {
+        let Ok(described) = self.describe(context).await else {
             return Ok(None);
         };
         Ok(Some(faucet_core::DeclaredColumns::new(
-            described.columns().iter().enumerate().map(|(i, c)| {
-                faucet_core::DeclaredColumn::new(
-                    sqlx::Column::name(c),
-                    declared_type(sqlx::TypeInfo::name(sqlx::Column::type_info(c))),
-                    described.nullable(i) != Some(false),
-                )
+            described.into_iter().map(|(name, ty, nullable)| {
+                faucet_core::DeclaredColumn::new(name, declared_type(&ty), nullable != Some(false))
             }),
         )))
     }
@@ -280,6 +417,15 @@ impl Source for RedshiftSource {
     }
 
     fn dataset_uri(&self) -> String {
+        let conn = &self.config.connection;
+        if conn.uses_data_api() {
+            return format!(
+                "redshift://{}/{}?query={}",
+                conn.endpoint_label(),
+                conn.database,
+                self.config.query
+            );
+        }
         format!(
             "redshift://{}:{}/{}?query={}",
             self.config.connection.host,
@@ -358,29 +504,20 @@ impl Source for RedshiftSource {
             let mut tracker = incr
                 .as_ref()
                 .map(|ic| CursorTracker::new(ic.column.clone(), ic.start.clone()));
-            let query = bind_params(sqlx::query(&query_str), &binds)?;
-
-            let mut rows = query.fetch(&self.pool);
             let calls = self.calls.get();
-            calls.record("query");
-            let reads = calls.with_roundtrip_metering(false);
+            let pool = match &self.backend {
+                Backend::Wire(p) => Some(p.get(&calls).await?),
+                Backend::DataApi(_) => None,
+            };
+            let mut cursor = self.open(&calls, &pool, &query_str, &binds).await?;
             let chunk = if batch_size == 0 { usize::MAX } else { batch_size };
             let cap = if batch_size == 0 { 1024 } else { batch_size };
             let mut buffer: Vec<Value> = Vec::with_capacity(cap);
             let mut total = 0usize;
 
             loop {
-            let fetched = faucet_common_redshift::calls::next_rows(
-                &reads,
-                "fetch",
-                &mut rows,
-                chunk,
-                |e| FaucetError::Source(format!("redshift query failed: {e}")),
-            )
-            .await?;
-            let exhausted = fetched.len() < chunk;
-            for row in fetched {
-                let obj = row_to_json(&row)?;
+            let (fetched, exhausted) = self.next_chunk(&calls, &mut cursor, chunk).await?;
+            for obj in fetched {
                 if tracker.as_mut().is_none_or(|t| t.admit(&obj)) {
                     buffer.push(obj);
                 }
@@ -428,12 +565,25 @@ impl Source for RedshiftSource {
 
         let started = std::time::Instant::now();
         let calls = self.calls.get();
-        let ping = faucet_common_redshift::calls::once(&calls, "query", async {
-            sqlx::query("SELECT 1")
-                .execute(&self.pool)
-                .await
-                .map_err(|e| FaucetError::Source(e.to_string()))
-        });
+        let ping = async {
+            match &self.backend {
+                Backend::Wire(pool) => {
+                    let pool = pool.get(&calls).await?;
+                    faucet_common_redshift::calls::once(&calls, "query", async {
+                        sqlx::query("SELECT 1")
+                            .execute(&pool)
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| FaucetError::Source(e.to_string()))
+                    })
+                    .await
+                }
+                Backend::DataApi(api) => api
+                    .query(&calls, &data_api::Statement::new("SELECT 1"))
+                    .await
+                    .map(|_| ()),
+            }
+        };
         let probe = match tokio::time::timeout(ctx.timeout, ping).await {
             Ok(Ok(_)) => Probe::pass("auth", started.elapsed()),
             Ok(Err(e)) => Probe::fail_hint(
@@ -486,18 +636,36 @@ mod tests {
         }
     }
 
-    #[test]
-    fn new_surfaces_unsupported_credentials() {
+    fn with_credentials(credentials: Value) -> RedshiftSourceConfig {
         let mut c = base_config();
-        c.connection.credentials = faucet_common_redshift::RedshiftCredentials::Iam {
-            region: None,
-            cluster_identifier: None,
-            db_user: None,
-        };
-        assert!(matches!(
-            RedshiftSource::new(c),
-            Err(FaucetError::Config(_))
-        ));
+        c.connection.credentials = serde_json::from_value(credentials).unwrap();
+        c
+    }
+
+    #[tokio::test]
+    async fn new_builds_iam_and_data_api_sources_and_validates_them() {
+        let iam = with_credentials(json!({"type": "iam", "config": {"cluster_identifier": "c"}}));
+        assert!(
+            matches!(RedshiftSource::new(iam).unwrap().backend, Backend::Wire(ref p) if p.is_iam())
+        );
+        let api = with_credentials(
+            json!({"type": "redshift_data_api", "config": {"workgroup_name": "wg"}}),
+        );
+        let s = RedshiftSource::new(api).unwrap();
+        assert!(matches!(s.backend, Backend::DataApi(_)));
+        assert_eq!(
+            s.dataset_uri(),
+            "redshift://workgroup:wg/db?query=SELECT * FROM t"
+        );
+        for bad in [
+            json!({"type": "iam", "config": {}}),
+            json!({"type": "redshift_data_api", "config": {"cluster_identifier": "c"}}),
+        ] {
+            assert!(matches!(
+                RedshiftSource::new(with_credentials(bad)),
+                Err(FaucetError::Config(_))
+            ));
+        }
     }
 
     #[tokio::test]

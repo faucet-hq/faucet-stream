@@ -6,23 +6,31 @@
 //! [`faucet-stream`](https://crates.io/crates/faucet-stream) Amazon Redshift
 //! source and sink connectors.
 //!
-//! Redshift is wire-compatible with PostgreSQL, so both connectors talk to it
-//! through `sqlx`'s Postgres driver.
-//!
-//! - [`RedshiftCredentials`] — `password` (implemented in v1), plus reserved
-//!   `iam` / `redshift_data_api` variants that currently return a typed error.
-//! - [`RedshiftConnection`] — host / port / database / user + a TLS toggle;
-//!   flattened into both end configs so the wire shape matches the other SQL
-//!   connectors.
-//! - [`build_connect_options`] / [`build_pool`] / [`build_pool_lazy`] — the
-//!   single place a `sqlx` [`PgConnectOptions`](sqlx::postgres::PgConnectOptions)
-//!   and a [`PgPool`](sqlx::PgPool) are constructed.
-//! - [`resolve_password`] — extracts the password (and is where an unsupported
-//!   credential variant surfaces its error).
+//! - [`RedshiftCredentials`] — `password`, `iam` (temporary credentials from
+//!   `GetClusterCredentials` / serverless `GetCredentials`, refreshed before
+//!   they expire) and `redshift_data_api` (statements over HTTPS through the
+//!   Redshift Data API).
+//! - [`RedshiftConnection`] — host / port / database / user + TLS; flattened
+//!   into both end configs so the wire shape matches the other SQL connectors.
+//! - [`connect_lazy`] / [`RedshiftPool`] — the PostgreSQL wire pool for
+//!   `password` and `iam` (Redshift is wire-compatible with PostgreSQL, so both
+//!   connectors use `sqlx`'s Postgres driver); [`build_connect_options`] /
+//!   [`build_pool`] / [`build_pool_lazy`] for `password`.
+//! - [`DataApiClient`] — submit, poll and page statements through the Data
+//!   API, with [`data_api::field_to_json`] rendering its typed fields.
 
+mod aws;
 pub mod calls;
 mod config;
+pub mod data_api;
+pub mod iam;
 mod pool;
 
-pub use config::{DEFAULT_PORT, RedshiftConnection, RedshiftCredentials, RedshiftTlsMode};
-pub use pool::{build_connect_options, build_pool, build_pool_lazy, resolve_password};
+pub use config::{
+    DEFAULT_PORT, RedshiftAwsCredentials, RedshiftConnection, RedshiftCredentials, RedshiftTlsMode,
+};
+pub use data_api::DataApiClient;
+pub use pool::{
+    RedshiftPool, build_connect_options, build_pool, build_pool_lazy, connect_lazy,
+    resolve_password,
+};
