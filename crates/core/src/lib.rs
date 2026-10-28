@@ -249,7 +249,7 @@ pub use state_version::{
     ResolvedState, STATE_FORMAT, StateCompat, StoredState, check_compat, peel_versioned,
     resolve_for_source, wrap_versioned,
 };
-pub use tls::{ClientPem, LoadedTls, TlsClientConfig, TlsOptions};
+pub use tls::{ClientPem, LoadedTls, TlsClientConfig, TlsOptions, ensure_crypto_provider};
 pub use topology::{
     Edge, JoinNode, Node, NodeKind, Topology, TopologyBuilder, TopologyOnError, TopologyOptions,
     TopologyResult,

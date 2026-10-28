@@ -32,6 +32,7 @@ use crate::config::{CatalogConfig, CatalogInner};
 /// - The chosen catalog type's Cargo feature is not enabled.
 /// - The catalog client fails to initialise (bad URI, auth failure, etc.).
 pub async fn build_catalog(cfg: &CatalogConfig) -> Result<Arc<dyn Catalog>, FaucetError> {
+    faucet_core::ensure_crypto_provider();
     match cfg {
         CatalogConfig::Rest(inner) => build_rest(inner).await,
         CatalogConfig::Glue(inner) => build_glue(inner).await,

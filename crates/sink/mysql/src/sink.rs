@@ -1103,8 +1103,7 @@ impl MysqlSink {
             ));
         }
 
-        // A build linking two rustls providers has no default; TLS would panic.
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        faucet_core::ensure_crypto_provider();
         let pool = MySqlPoolOptions::new()
             .max_connections(config.max_connections)
             .after_connect(|conn, _meta| Box::pin(async move { strict_session(conn).await }))

@@ -36,7 +36,6 @@ tokio-stream = { version = "0.1", features = ["net"] }
 futures = { workspace = true }
 prost.workspace = true
 tempfile = "3"
-rustls = { workspace = true, features = ["ring"] }
 
 [build-dependencies]
 tonic-build = "0.13"

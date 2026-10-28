@@ -373,7 +373,7 @@ pub async fn connect(cfg: &RabbitMqConnectionConfig) -> Result<lapin::Connection
     let tls = cfg.tls_config()?;
     #[cfg(feature = "tls")]
     if uri.scheme == AMQPScheme::AMQPS {
-        install_crypto_provider();
+        faucet_core::ensure_crypto_provider();
     }
     let retries = cfg.connect_retries as usize;
     let mut props = lapin::ConnectionProperties::default()
@@ -393,15 +393,6 @@ pub async fn connect(cfg: &RabbitMqConnectionConfig) -> Result<lapin::Connection
             "rabbitmq: connect to {address} timed out after {}s",
             cfg.connect_timeout_secs
         ))),
-    }
-}
-
-/// Install ring as rustls' process-wide default provider unless one is already
-/// set; with more than one provider compiled in rustls cannot choose and panics.
-#[cfg(feature = "tls")]
-fn install_crypto_provider() {
-    if rustls::crypto::CryptoProvider::get_default().is_none() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
     }
 }
 

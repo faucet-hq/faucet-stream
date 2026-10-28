@@ -313,6 +313,7 @@ impl ClientBuilder {
 
     /// Build the client.
     pub fn build(self) -> Result<Client, FaucetError> {
+        crate::tls::ensure_crypto_provider();
         if let Some(e) = self.error {
             return Err(e);
         }

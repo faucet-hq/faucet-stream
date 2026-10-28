@@ -445,7 +445,7 @@ pub(crate) fn apply_cdc_tls(
 ) -> PgConnectOptions {
     use crate::config::CdcTls;
     use sqlx::postgres::PgSslMode;
-    ensure_crypto_provider();
+    faucet_core::ensure_crypto_provider();
     match tls {
         CdcTls::FromUrl | CdcTls::Disable => opts.ssl_mode(PgSslMode::Disable),
         CdcTls::Prefer => opts.ssl_mode(PgSslMode::Prefer),
@@ -467,17 +467,11 @@ pub(crate) fn apply_cdc_tls(
     }
 }
 
-/// sqlx and pgwire-replication build TLS configs from the process-wide rustls
-/// provider, which a build linking both `ring` and `aws-lc-rs` lacks (#967).
-fn ensure_crypto_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-}
-
 /// Map the user-facing [`CdcTls`](crate::config::CdcTls) config onto
 /// pgwire-replication's [`TlsConfig`].
 fn tls_config(tls: &crate::config::CdcTls) -> TlsConfig {
     use crate::config::CdcTls;
-    ensure_crypto_provider();
+    faucet_core::ensure_crypto_provider();
     use std::path::PathBuf;
     match tls {
         CdcTls::FromUrl | CdcTls::Disable => TlsConfig::disabled(),

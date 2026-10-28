@@ -258,6 +258,7 @@ impl WebsocketDriver {
                 limit.as_secs()
             ))
         };
+        faucet_core::ensure_crypto_provider();
         let (mut ws, _resp) =
             tokio::time::timeout(limit, connect_async_with_config(request, ws_config, false))
                 .await

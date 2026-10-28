@@ -50,8 +50,7 @@ fn base_connect_options(conn: &RedshiftConnection) -> Result<PgConnectOptions, F
             "redshift: `database` must not be empty".into(),
         ));
     }
-    // A build linking two rustls providers has no default; TLS would panic.
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    faucet_core::ensure_crypto_provider();
     let ssl_mode = match conn.tls_mode {
         Some(RedshiftTlsMode::Disable) => PgSslMode::Disable,
         Some(RedshiftTlsMode::Prefer) => PgSslMode::Prefer,

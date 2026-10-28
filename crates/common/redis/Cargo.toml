@@ -13,8 +13,6 @@ categories.workspace = true
 [dependencies]
 faucet-core.workspace = true
 redis.workspace = true
-# `rediss://` builds a rustls config from the process-wide provider (#967).
-rustls = { workspace = true, features = ["ring"] }
 tracing.workspace = true
 
 [dev-dependencies]
