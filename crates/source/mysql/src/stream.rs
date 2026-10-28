@@ -711,14 +711,14 @@ fn row_to_json(
 
 /// The logical type of a column of sqlx type `name`, as this source renders
 /// it (#955): `BOOLEAN` (`TINYINT(1)`) reads as a number, `TIME` is a
-/// duration (text), and an unknown type is text.
+/// duration (text), `DATETIME` decodes as a UTC instant like `TIMESTAMP`, and
+/// an unknown type is text.
 fn declared_type(name: &str) -> faucet_core::LogicalType {
     use faucet_core::LogicalType as L;
     match name.to_ascii_uppercase().as_str() {
         "BOOLEAN" | "YEAR" => L::Int64,
         "TIME" | "BIT" => L::String,
-        "TIMESTAMP" => L::Timestamp { tz: true },
-        "DATETIME" => L::Timestamp { tz: false },
+        "TIMESTAMP" | "DATETIME" => L::Timestamp { tz: true },
         _ => L::from_sql_type(name, None, None).unwrap_or(L::String),
     }
 }
@@ -1656,7 +1656,7 @@ mod tests {
         assert_eq!(declared_type("TIME"), L::String);
         assert_eq!(declared_type("BIT"), L::String);
         assert_eq!(declared_type("TIMESTAMP"), L::Timestamp { tz: true });
-        assert_eq!(declared_type("DATETIME"), L::Timestamp { tz: false });
+        assert_eq!(declared_type("DATETIME"), L::Timestamp { tz: true });
         assert_eq!(
             declared_type("DECIMAL"),
             L::Decimal {

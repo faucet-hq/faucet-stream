@@ -462,4 +462,4 @@ cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/verify.html).
 
 ## Declared column types
 
-The source declares the query's columns and their types (`Source::declared_columns`, #955) from the describe its read makes, so a sink that creates its table types it from the source rather than from the first page's JSON values. See [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types).
+The source declares the query's columns and their types (`Source::declared_columns`, #955) from the describe its read makes, so a sink that creates its table types it from the source rather than from the first page's JSON values. `DATETIME` is declared as a timestamp with a zone, because this source reads it as a UTC instant (`…+00:00`), the same as `TIMESTAMP`; `DECIMAL` is declared without precision (the describe does not report it). See [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types).
