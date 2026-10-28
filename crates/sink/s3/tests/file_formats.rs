@@ -258,3 +258,28 @@ fn set_test_env() {
         std::env::set_var("AWS_DEFAULT_REGION", REGION);
     });
 }
+
+/// A host-named S3-compatible endpoint only serves path-style requests (#967).
+#[tokio::test]
+async fn writes_through_a_host_named_endpoint() {
+    let (_c, endpoint) = start_minio().await;
+    let client = seed(&endpoint).await;
+    let sink = build_sink(
+        &endpoint.replace("127.0.0.1", "localhost"),
+        S3SinkConfig::new(TEST_BUCKET)
+            .prefix("hosted/")
+            .format(S3SinkFormat::Csv)
+            .file_extension(".csv"),
+    )
+    .await;
+    assert_eq!(sink.write_batch(&records()).await.expect("write"), 2);
+    sink.flush().await.expect("flush");
+    let back = decode(
+        &sole_object(&client, "hosted/").await,
+        FileFormat::Csv,
+        &FormatOptions::default(),
+    )
+    .await
+    .expect("decode");
+    assert_eq!(back, records());
+}
