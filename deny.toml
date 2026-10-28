@@ -72,6 +72,21 @@ ignore = [
     { id = "RUSTSEC-2026-0391", reason = "only zstd 0.13.3 via upstream crates remains; with_context unused (2026-10-26)" },
     { id = "RUSTSEC-2026-0398", reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; Seekable unused (2026-10-26)" },
     { id = "RUSTSEC-2026-0403", reason = "only zstd-safe 7.3.0 via zstd 0.13 remains (upstream pins + faucet-core public type); legacy-frame decode errors only (2026-10-26)" },
+    # 2026-10-28 — the next zstd-safe batch (0395–0406): dictionaries, Seekable,
+    # try_clone, train_from_buffer, multithreaded parameters and raw buffer
+    # positions. Only zstd-safe 7.3.0 via zstd 0.13 remains (same upstream pins as
+    # above); faucet and its dependents use only zstd's streaming Encoder/Decoder,
+    # none of these APIs. Scoped by scripts/advisory-scope.py.
+    { id = "RUSTSEC-2026-0395", reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; affected APIs unused (2026-10-28)" },
+    { id = "RUSTSEC-2026-0396", reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; affected APIs unused (2026-10-28)" },
+    { id = "RUSTSEC-2026-0397", reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; affected APIs unused (2026-10-28)" },
+    { id = "RUSTSEC-2026-0399", reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; affected APIs unused (2026-10-28)" },
+    { id = "RUSTSEC-2026-0400", reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; affected APIs unused (2026-10-28)" },
+    { id = "RUSTSEC-2026-0401", reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; affected APIs unused (2026-10-28)" },
+    { id = "RUSTSEC-2026-0402", reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; affected APIs unused (2026-10-28)" },
+    { id = "RUSTSEC-2026-0404", reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; affected APIs unused (2026-10-28)" },
+    { id = "RUSTSEC-2026-0405", reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; affected APIs unused (2026-10-28)" },
+    { id = "RUSTSEC-2026-0406", reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; affected APIs unused (2026-10-28)" },
 ]
 
 [licenses]
