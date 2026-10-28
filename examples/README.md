@@ -147,6 +147,7 @@ Databricks needs a workspace, a SQL warehouse and a token (`DATABRICKS_TOKEN`):
 | `clickhouse_to_jsonl.yaml` | ClickHouse query source (HTTP `JSONEachRow`) → JSONL |
 | `csv_to_clickhouse.yaml` | CSV → ClickHouse sink (`INSERT … FORMAT JSONEachRow`, optional `async_insert`) |
 | `redshift_to_jsonl.yaml` | Amazon Redshift query source (Postgres wire) → JSONL |
+| `redshift_data_api_to_redshift_iam.yaml` | Amazon Redshift through the Data API (incremental) → Redshift with temporary IAM credentials |
 | `pubsub_to_jsonl.yaml` | Google Cloud Pub/Sub subscription → JSONL (streaming pull, at-least-once ack at page boundaries) |
 | `azure_blob_to_jsonl.yaml` | Azure Blob / ADLS Gen2 object source → JSONL |
 | `mssql_cdc_to_postgres_upsert.yaml` | SQL Server CDC → Postgres upsert mirror (`cdc_unwrap` + `write_mode: upsert`) |

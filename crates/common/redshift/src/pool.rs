@@ -8,34 +8,38 @@ use faucet_core::FaucetError;
 use sqlx::PgPool;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 
+use std::sync::Arc;
+use std::time::{Instant, SystemTime};
+
+use faucet_core::io::CallContext;
+
 use crate::config::{RedshiftConnection, RedshiftCredentials, RedshiftTlsMode};
+use crate::iam::{IamCredentials, refresh_at};
 
 /// Resolve the password for the connection's credentials.
 ///
-/// Returns [`FaucetError::Config`] for the `iam` / `redshift_data_api` variants,
-/// which are reserved but not yet implemented in v1.
+/// Only `password` has a fixed one: `iam` credentials are temporary (build the
+/// pool with [`connect_lazy`], which fetches and refreshes them) and
+/// `redshift_data_api` does not use the PostgreSQL wire protocol (use
+/// [`crate::DataApiClient`]). Both return [`FaucetError::Config`] here.
 pub fn resolve_password(creds: &RedshiftCredentials) -> Result<&str, FaucetError> {
     match creds {
         RedshiftCredentials::Password { password } => Ok(password.as_str()),
         RedshiftCredentials::Iam { .. } => Err(FaucetError::Config(
-            "redshift: IAM authentication is not yet supported (v1 supports password auth only) \
-             — use credentials: { type: password, config: { password: … } }"
+            "redshift: IAM credentials are temporary and have no fixed password; build the pool \
+             with `faucet_common_redshift::connect_lazy`, which fetches and refreshes them"
                 .into(),
         )),
         RedshiftCredentials::RedshiftDataApi { .. } => Err(FaucetError::Config(
-            "redshift: Redshift Data API authentication is not yet supported (v1 supports \
-             password auth only) — use credentials: { type: password, config: { password: … } }"
+            "redshift: `redshift_data_api` runs statements through the Redshift Data API, not a \
+             PostgreSQL wire connection; use `faucet_common_redshift::DataApiClient`"
                 .into(),
         )),
     }
 }
 
-/// Build the `sqlx` [`PgConnectOptions`] for a [`RedshiftConnection`].
-///
-/// Pure (no I/O): validates the required fields, resolves the password (this is
-/// where an unsupported credential variant surfaces its typed error), and maps
-/// the TLS toggle onto an `sslmode`.
-pub fn build_connect_options(conn: &RedshiftConnection) -> Result<PgConnectOptions, FaucetError> {
+/// The wire options without a user or password: validated endpoint and TLS.
+fn base_connect_options(conn: &RedshiftConnection) -> Result<PgConnectOptions, FaucetError> {
     if conn.host.trim().is_empty() {
         return Err(FaucetError::Config(
             "redshift: `host` must not be empty".into(),
@@ -46,12 +50,6 @@ pub fn build_connect_options(conn: &RedshiftConnection) -> Result<PgConnectOptio
             "redshift: `database` must not be empty".into(),
         ));
     }
-    if conn.user.trim().is_empty() {
-        return Err(FaucetError::Config(
-            "redshift: `user` must not be empty".into(),
-        ));
-    }
-    let password = resolve_password(&conn.credentials)?;
     // A build linking two rustls providers has no default; TLS would panic.
     let _ = rustls::crypto::ring::default_provider().install_default();
     let ssl_mode = match conn.tls_mode {
@@ -75,14 +73,28 @@ pub fn build_connect_options(conn: &RedshiftConnection) -> Result<PgConnectOptio
         .host(&conn.host)
         .port(conn.port)
         .database(&conn.database)
-        .username(&conn.user)
-        .password(password)
         .ssl_mode(ssl_mode)
         .application_name("faucet");
     if let Some(cert) = &conn.ssl_root_cert {
         opts = opts.ssl_root_cert(cert.as_str());
     }
     Ok(opts)
+}
+
+/// Build the `sqlx` [`PgConnectOptions`] for a `password` [`RedshiftConnection`].
+///
+/// Pure (no I/O): validates the required fields, resolves the password (an
+/// `iam` or `redshift_data_api` connection returns its typed error here), and
+/// maps the TLS toggle onto an `sslmode`.
+pub fn build_connect_options(conn: &RedshiftConnection) -> Result<PgConnectOptions, FaucetError> {
+    let base = base_connect_options(conn)?;
+    if conn.user.trim().is_empty() {
+        return Err(FaucetError::Config(
+            "redshift: `user` must not be empty".into(),
+        ));
+    }
+    let password = resolve_password(&conn.credentials)?;
+    Ok(base.username(&conn.user).password(password))
 }
 
 /// Build a lazily-connected pool (no I/O at construction). The first query
@@ -111,6 +123,105 @@ pub async fn build_pool(
         .connect_with(opts)
         .await
         .map_err(|e| FaucetError::Config(format!("redshift connection failed: {e}")))
+}
+
+/// A wire-protocol pool whose login credentials may be temporary.
+///
+/// For `password` it is a plain pool. For `iam`, [`get`](Self::get) fetches
+/// temporary credentials on first use and again before they expire, and hands
+/// them to the pool, so every connection the pool opens afterwards logs in
+/// with credentials that are still valid. Call [`get`](Self::get) before each
+/// use of the pool.
+#[derive(Clone)]
+pub struct RedshiftPool {
+    pool: PgPool,
+    iam: Option<Arc<IamState>>,
+}
+
+struct IamState {
+    provider: IamCredentials,
+    base: PgConnectOptions,
+    /// When the current credentials are due for refresh and when they expire.
+    refresh_at: tokio::sync::Mutex<Option<(Instant, SystemTime)>>,
+}
+
+impl std::fmt::Debug for RedshiftPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedshiftPool")
+            .field("iam", &self.iam.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl RedshiftPool {
+    /// The pool, with credentials valid for the connections it opens next.
+    /// For `iam` this may be the call `credentials` through `calls`.
+    pub async fn get(&self, calls: &CallContext) -> Result<PgPool, FaucetError> {
+        if let Some(iam) = &self.iam {
+            let mut due = iam.refresh_at.lock().await;
+            if due.is_none_or(|(at, _)| Instant::now() >= at) {
+                let fetched = Instant::now();
+                match Box::pin(iam.provider.fetch(calls)).await {
+                    Ok(creds) => {
+                        self.pool.set_connect_options(
+                            iam.base
+                                .clone()
+                                .username(&creds.user)
+                                .password(&creds.password),
+                        );
+                        *due = Some((
+                            refresh_at(fetched, SystemTime::now(), creds.expires_at),
+                            creds.expires_at,
+                        ));
+                        tracing::debug!(user = %creds.user, "redshift iam: temporary credentials refreshed");
+                    }
+                    // The current credentials still log in: retry on the next use.
+                    Err(e) if due.is_some_and(|(_, exp)| SystemTime::now() < exp) => {
+                        tracing::warn!(error = %e, "redshift iam: refreshing temporary credentials failed; the current ones are still valid");
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(self.pool.clone())
+    }
+
+    /// The pool as it is, without refreshing credentials.
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// Whether the pool logs in with temporary IAM credentials.
+    pub fn is_iam(&self) -> bool {
+        self.iam.is_some()
+    }
+}
+
+/// Build a lazily-connected [`RedshiftPool`] for a `password` or `iam`
+/// connection (no I/O at construction). A `redshift_data_api` connection is a
+/// [`FaucetError::Config`]: it has no wire connection.
+pub fn connect_lazy(
+    conn: &RedshiftConnection,
+    max_connections: u32,
+) -> Result<RedshiftPool, FaucetError> {
+    let options = PgPoolOptions::new().max_connections(max_connections.max(1));
+    match IamCredentials::from_connection(conn)? {
+        None => Ok(RedshiftPool {
+            pool: options.connect_lazy_with(build_connect_options(conn)?),
+            iam: None,
+        }),
+        Some(provider) => {
+            let base = base_connect_options(conn)?;
+            Ok(RedshiftPool {
+                pool: options.connect_lazy_with(base.clone()),
+                iam: Some(Arc::new(IamState {
+                    provider,
+                    base,
+                    refresh_at: tokio::sync::Mutex::new(None),
+                })),
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -206,11 +317,7 @@ mod tests {
 
     #[test]
     fn resolve_password_rejects_iam_with_typed_error() {
-        let creds = RedshiftCredentials::Iam {
-            region: None,
-            cluster_identifier: None,
-            db_user: None,
-        };
+        let creds = iam_creds();
         match resolve_password(&creds) {
             Err(FaucetError::Config(m)) => assert!(m.contains("IAM"), "got: {m}"),
             other => panic!("expected Config error, got {other:?}"),
@@ -219,13 +326,8 @@ mod tests {
 
     #[test]
     fn resolve_password_rejects_data_api_with_typed_error() {
-        let creds = RedshiftCredentials::RedshiftDataApi {
-            region: None,
-            cluster_identifier: None,
-            workgroup_name: None,
-            secret_arn: None,
-            db_user: None,
-        };
+        let creds: RedshiftCredentials =
+            serde_json::from_str(r#"{"type":"redshift_data_api","config":{}}"#).unwrap();
         match resolve_password(&creds) {
             Err(FaucetError::Config(m)) => assert!(m.contains("Data API"), "got: {m}"),
             other => panic!("expected Config error, got {other:?}"),
@@ -235,12 +337,32 @@ mod tests {
     #[test]
     fn build_connect_options_surfaces_unsupported_credentials() {
         let mut c = conn();
-        c.credentials = RedshiftCredentials::Iam {
-            region: None,
-            cluster_identifier: None,
-            db_user: None,
-        };
+        c.credentials = iam_creds();
         assert!(build_connect_options(&c).is_err());
+    }
+
+    fn iam_creds() -> RedshiftCredentials {
+        serde_json::from_str(r#"{"type":"iam","config":{"cluster_identifier":"c"}}"#).unwrap()
+    }
+
+    #[tokio::test]
+    async fn connect_lazy_builds_password_and_iam_pools_and_refuses_the_data_api() {
+        let p = connect_lazy(&conn(), 2).unwrap();
+        assert!(!p.is_iam());
+        assert_eq!(p.get(&CallContext::new()).await.unwrap().size(), 0);
+        let mut c = conn();
+        c.credentials = iam_creds();
+        let p = connect_lazy(&c, 2).unwrap();
+        assert!(p.is_iam());
+        assert_eq!(p.pool().size(), 0);
+        assert!(format!("{p:?}").contains("iam: true"));
+        c.host = String::new();
+        assert!(connect_lazy(&c, 2).is_err());
+        c.credentials =
+            serde_json::from_str(r#"{"type":"redshift_data_api","config":{}}"#).unwrap();
+        c.host = "h".into();
+        let e = connect_lazy(&c, 2).unwrap_err().to_string();
+        assert!(e.contains("Data API"), "{e}");
     }
 
     #[tokio::test]

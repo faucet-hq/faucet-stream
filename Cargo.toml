@@ -342,6 +342,9 @@ aws-sdk-dynamodbstreams = { version = "1", default-features = false, features = 
 aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
 aws-sdk-sqs = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-secretsmanager = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-redshift = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-redshiftserverless = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-redshiftdata = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 oracle = "0.6"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 # NATS (JetStream-capable async client) for the nats source/sink pair.
