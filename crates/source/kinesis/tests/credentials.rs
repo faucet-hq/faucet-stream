@@ -40,6 +40,13 @@ fn unset(vars: &[&str]) {
     }
 }
 
+/// Bounds one phase so a stalled emulator fails the test with its name instead of hanging CI.
+async fn phase<T>(name: &str, fut: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(std::time::Duration::from_secs(180), fut)
+        .await
+        .unwrap_or_else(|_| panic!("{name} did not finish within 180s"))
+}
+
 fn role(account: &str) -> String {
     format!("arn:aws:iam::{account}:role/faucet-reader")
 }
@@ -119,9 +126,12 @@ async fn read(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn profile_assume_role_and_web_identity_read_string_and_bytes_payloads() {
-    let container = faucet_conformance::containers::start(|| {
-        LocalStack::default().with_env_var("SERVICES", "kinesis,sts")
-    })
+    let container = phase(
+        "starting LocalStack",
+        faucet_conformance::containers::start(|| {
+            LocalStack::default().with_env_var("SERVICES", "kinesis,sts")
+        }),
+    )
     .await;
     let port = container.get_host_port_ipv4(4566).await.unwrap();
     let endpoint = format!("http://127.0.0.1:{port}");
@@ -131,9 +141,21 @@ async fn profile_assume_role_and_web_identity_read_string_and_bytes_payloads() {
         ("AWS_REGION", REGION),
     ]);
     let text: [&[u8]; 2] = [b"plain text", "caf\u{e9}".as_bytes()];
-    seed(&endpoint, "111111111111", "text", &text).await;
-    seed(&endpoint, "222222222222", "binary", &[&[0xff, 0x00, 0x7f]]).await;
-    seed(&endpoint, "333333333333", "text", &text).await;
+    phase(
+        "seeding account 111111111111",
+        seed(&endpoint, "111111111111", "text", &text),
+    )
+    .await;
+    phase(
+        "seeding account 222222222222",
+        seed(&endpoint, "222222222222", "binary", &[&[0xff, 0x00, 0x7f]]),
+    )
+    .await;
+    phase(
+        "seeding account 333333333333",
+        seed(&endpoint, "333333333333", "text", &text),
+    )
+    .await;
     let dir = tempfile::tempdir().unwrap();
 
     // profile: the named profile in the shared files, not the environment.
@@ -154,13 +176,16 @@ async fn profile_assume_role_and_web_identity_read_string_and_bytes_payloads() {
         ("AWS_CONFIG_FILE", config.to_str().unwrap()),
         ("AWS_SHARED_CREDENTIALS_FILE", credentials.to_str().unwrap()),
     ]);
-    let got = read(
-        &endpoint,
-        "text",
-        KinesisCredentials::Profile {
-            name: "faucet-test".into(),
-        },
-        ValueFormat::String,
+    let got = phase(
+        "the profile read",
+        read(
+            &endpoint,
+            "text",
+            KinesisCredentials::Profile {
+                name: "faucet-test".into(),
+            },
+            ValueFormat::String,
+        ),
     )
     .await;
     assert_eq!(
@@ -179,15 +204,18 @@ async fn profile_assume_role_and_web_identity_read_string_and_bytes_payloads() {
         ("AWS_ACCESS_KEY_ID", "test"),
         ("AWS_SECRET_ACCESS_KEY", "test"),
     ]);
-    let got = read(
-        &endpoint,
-        "binary",
-        KinesisCredentials::AssumeRole {
-            role_arn: role("222222222222"),
-            session_name: Some("faucet-it".into()),
-            external_id: Some("ext-1".into()),
-        },
-        ValueFormat::Bytes,
+    let got = phase(
+        "the assume_role read",
+        read(
+            &endpoint,
+            "binary",
+            KinesisCredentials::AssumeRole {
+                role_arn: role("222222222222"),
+                session_name: Some("faucet-it".into()),
+                external_id: Some("ext-1".into()),
+            },
+            ValueFormat::Bytes,
+        ),
     )
     .await;
     let b64 = base64::engine::general_purpose::STANDARD;
@@ -202,11 +230,14 @@ async fn profile_assume_role_and_web_identity_read_string_and_bytes_payloads() {
         ("AWS_ROLE_ARN", role("333333333333").as_str()),
         ("AWS_ROLE_SESSION_NAME", "faucet-web"),
     ]);
-    let got = read(
-        &endpoint,
-        "text",
-        KinesisCredentials::WebIdentity,
-        ValueFormat::String,
+    let got = phase(
+        "the web_identity read",
+        read(
+            &endpoint,
+            "text",
+            KinesisCredentials::WebIdentity,
+            ValueFormat::String,
+        ),
     )
     .await;
     assert_eq!(

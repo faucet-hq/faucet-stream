@@ -124,10 +124,11 @@ async fn writes_over_https_and_refuses_bad_certificates() {
         ],
     )
     .await;
-    let token: serde_json::Value = serde_json::from_str(&token).expect("token json");
-    let token = token["access_token"]
+    let reply: serde_json::Value =
+        serde_json::from_str(&token).unwrap_or_else(|e| panic!("token reply {token:?}: {e}"));
+    let token = reply["access_token"]
         .as_str()
-        .expect("access token")
+        .unwrap_or_else(|| panic!("no access token in {reply}"))
         .to_string();
     assert_eq!(
         write(https.clone(), ElasticsearchAuth::Bearer { token }, 6)
@@ -152,6 +153,19 @@ async fn writes_over_https_and_refuses_bad_certificates() {
         "a wrong password must be refused"
     );
 
+    images::exec(
+        &es,
+        &[
+            "curl",
+            "-sk",
+            "-u",
+            &format!("elastic:{password}"),
+            "-X",
+            "POST",
+            "https://localhost:9200/tls-items/_refresh",
+        ],
+    )
+    .await;
     let count = images::exec(
         &es,
         &[

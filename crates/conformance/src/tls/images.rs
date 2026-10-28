@@ -255,6 +255,8 @@ pub fn elasticsearch(tls: &TlsFixture) -> ContainerRequest<GenericImage> {
         )
         .with_env_var("xpack.security.transport.ssl.enabled", "false")
         .with_env_var("xpack.ml.enabled", "false")
+        // The token service (bearer auth tests) needs more than the basic license.
+        .with_env_var("xpack.license.self_generated.type", "trial")
         .with_env_var("ELASTIC_PASSWORD", ELASTICSEARCH_PASSWORD)
         .with_env_var("ES_JAVA_OPTS", "-Xms512m -Xmx512m")
 }
