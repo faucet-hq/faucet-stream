@@ -3,12 +3,13 @@
 </p>
 
 <p align="center">
-  <a href="https://crates.io/crates/faucet-stream"><img src="https://img.shields.io/crates/v/faucet-stream.svg" alt="Crates.io"></a>
+  <a href="https://github.com/faucet-hq/faucet-stream/releases?q=faucet-cli&expanded=true"><img src="https://img.shields.io/crates/v/faucet-cli.svg?label=faucet" alt="faucet release (CLI, Docker image, binaries)"></a>
+  <a href="https://crates.io/crates/faucet-stream"><img src="https://img.shields.io/crates/v/faucet-stream.svg?label=library" alt="faucet-stream library on crates.io"></a>
   <a href="https://docs.rs/faucet-stream"><img src="https://docs.rs/faucet-stream/badge.svg" alt="Docs.rs"></a>
   <a href="https://faucet-hq.github.io/faucet-stream/"><img src="https://img.shields.io/badge/guide-faucet--hq.github.io-1f6feb" alt="Guide"></a>
   <a href="https://github.com/faucet-hq/faucet-stream/actions/workflows/ci.yml"><img src="https://github.com/faucet-hq/faucet-stream/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://codecov.io/gh/faucet-hq/faucet-stream"><img src="https://codecov.io/gh/faucet-hq/faucet-stream/branch/main/graph/badge.svg" alt="Coverage"></a>
-  <a href="https://crates.io/crates/faucet-stream"><img src="https://img.shields.io/crates/d/faucet-core.svg" alt="Downloads"></a>
+  <a href="https://crates.io/crates/faucet-core"><img src="https://img.shields.io/crates/d/faucet-core.svg?label=downloads" alt="faucet-core downloads"></a>
   <a href="rust-toolchain.toml"><img src="https://img.shields.io/crates/msrv/faucet-stream.svg" alt="MSRV"></a>
   <a href="deny.toml"><img src="https://img.shields.io/badge/deps-cargo--deny-blue" alt="Dependencies"></a>
   <a href="https://scorecard.dev/viewer/?uri=github.com/faucet-hq/faucet-stream"><img src="https://api.scorecard.dev/projects/github.com/faucet-hq/faucet-stream/badge" alt="OpenSSF Scorecard"></a>
