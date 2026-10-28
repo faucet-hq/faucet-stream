@@ -1507,7 +1507,7 @@ mod tests {
             "  page: { type: int, default: 7 }\n",
             "  page: { type: int, default: 7 }\n  api_key: { secret: true, default: s3cr3t-default }\n",
         ).replace("missing-${param.tag}", "missing-${param.tag}-${param.api_key}");
-        register_template(
+        let _registered = register_template(
             State(state.clone()),
             Extension(actor()),
             Json(RegisterBody {
