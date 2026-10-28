@@ -290,7 +290,7 @@ tiberius = { version = "0.12", default-features = false, features = ["rustls", "
 bb8 = "0.9"
 bb8-tiberius = { version = "0.16", default-features = false, features = ["with-tokio", "tds73", "tls"] }
 rust_decimal = "1"
-pgwire-replication = "=0.3.2"
+pgwire-replication = "0.5.0"
 byteorder = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 chrono-tz = "0.10"
