@@ -130,7 +130,7 @@ function tenantTag(r) {
 // The execution pool a run is placed in, shown unless it is `default`.
 function poolTag(r) {
   if (!r.pool || r.pool === "default") return "";
-  return ` <span class="run-tenant run-pool" title="execution pool ${escapeHtml(r.pool)}">${escapeHtml(r.pool)}</span>`;
+  return ` <span class="run-tenant run-pool" title="execution pool ${escapeHtml(r.pool)}">pool ${escapeHtml(r.pool)}</span>`;
 }
 
 function row(r) {
