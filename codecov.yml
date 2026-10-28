@@ -1,8 +1,9 @@
 # Coverage is measured by the CI `coverage` job (unit + integration tests via
-# cargo-llvm-cov). See .github/workflows/ci.yml. Besides the combined report it
-# uploads the unit-only and integration-only halves under the `unit` and
-# `integration` flags (#695), so the PR comment shows how much of a change ran
-# against a real backend.
+# cargo-llvm-cov). See .github/workflows/ci.yml. It uploads the unit-only and
+# integration-only halves under the `unit` and `integration` flags (#695) and
+# Codecov merges them into the total, so the PR comment shows how much of a
+# change ran against a real backend. There is no unflagged combined upload: it
+# was counted inside both flags (#967).
 coverage:
   status:
     project:

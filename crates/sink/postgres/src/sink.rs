@@ -811,6 +811,8 @@ impl PostgresSink {
             )));
         }
 
+        // A build linking two rustls providers has no default; TLS would panic.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let pool = PgPoolOptions::new()
             .max_connections(config.max_connections)
             .connect(&config.connection_url)

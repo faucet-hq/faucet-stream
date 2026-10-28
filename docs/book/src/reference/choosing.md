@@ -158,7 +158,8 @@ Both write columnar Parquet files, but they serve different use cases:
   when you want portable files and don't need schema evolution, time-travel, or
   ACID snapshot isolation.
 - **`sink-iceberg`** — writes Parquet data files and registers them in an Iceberg
-  catalog (REST, AWS Glue, SQL-backed, or Hive Metastore). The catalog tracks
+  catalog (REST, AWS Glue or SQL-backed; the source also reads Hive Metastore
+  tables). The catalog tracks
   schema, partitioning, and snapshot history, enabling time-travel queries,
   schema evolution, and atomic reads across concurrent writers. Requires a
   running catalog service.
@@ -178,7 +179,7 @@ Delta and Iceberg are the two open lakehouse table formats; faucet ships a sink
   `table_uri` on local FS or S3/Azure/GCS is enough. Append-only today;
   time-travel reads via `version`/`timestamp`.
 - **`sink-iceberg` / `source-iceberg`** — the **Iceberg** format, registered in
-  a catalog (REST, Glue, SQL, or HMS). Choose it when your platform is
+  a catalog (REST, Glue or SQL; HMS for reads only). Choose it when your platform is
   Iceberg-native or you need a shared catalog across engines. The source adds
   filter pushdown, snapshot/timestamp time travel, and `mode: incremental`,
   which reads only the snapshots appended since the last run.

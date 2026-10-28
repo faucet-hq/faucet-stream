@@ -400,6 +400,18 @@ impl IcebergSinkConfig {
         // Catalog connection: required URI + a warehouse scheme faucet can serve. (#181)
         faucet_common_iceberg::CatalogConfig::from(&self.catalog).validate_connection()?;
 
+        // iceberg-catalog-hms 0.10's `update_table` returns FeatureUnsupported,
+        // so no snapshot could ever be committed (#967).
+        if matches!(self.catalog, CatalogConfig::Hms(_)) {
+            return Err(FaucetError::Config(
+                "iceberg: the sink cannot write through a Hive Metastore catalog: \
+                 iceberg-rust's HMS client cannot commit a snapshot (it creates the \
+                 table, then every commit fails). Use the rest, glue or sql catalog; \
+                 the Iceberg source still reads HMS tables"
+                    .to_string(),
+            ));
+        }
+
         // Target file size: 0 would make iceberg's rolling writer roll a new
         // (tiny) data file on every batch — almost certainly a misconfiguration.
         if self.target_file_size_mb == 0 {
@@ -653,6 +665,18 @@ mod tests {
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, FaucetError::Config(_)));
         assert!(err.to_string().contains("uri"), "should mention uri: {err}");
+    }
+
+    #[test]
+    fn an_hms_catalog_is_refused_because_it_cannot_commit() {
+        let cfg = parse(serde_json::json!({
+            "catalog": { "type": "hms", "uri": "thrift://hms:9083", "warehouse": "s3://b/w" },
+            "namespace": ["analytics"],
+            "table": "events"
+        }));
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(err, FaucetError::Config(_)));
+        assert!(err.to_string().contains("Hive Metastore"), "{err}");
     }
 
     #[test]

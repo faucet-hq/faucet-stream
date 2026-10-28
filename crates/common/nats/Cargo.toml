@@ -16,6 +16,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 schemars.workspace = true
 async-nats.workspace = true
+rustls = { workspace = true, features = ["ring"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

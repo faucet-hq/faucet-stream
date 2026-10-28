@@ -117,6 +117,8 @@ impl RedisSource {
             .conn
             .get_or_try_init(|| {
                 calls.call_once("connect", async {
+                    // A build linking two rustls providers has no default; TLS would panic.
+                    let _ = rustls::crypto::ring::default_provider().install_default();
                     let client = redis::Client::open(self.config.url.as_str())
                         .map_err(|e| FaucetError::Config(format!("invalid Redis URL: {e}")))?;
                     let manager = redis::aio::ConnectionManagerConfig::new()

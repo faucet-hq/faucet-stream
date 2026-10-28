@@ -140,6 +140,8 @@ pub fn run_main(registry: PluginRegistry) -> std::process::ExitCode {
     use std::process::ExitCode;
 
     set_build_version();
+    // One rustls provider for the process: two linked backends otherwise panic at the first TLS connect (#971).
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     if let Err(err) = registry.install() {
         commands::report(&err);

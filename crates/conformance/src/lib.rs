@@ -111,7 +111,8 @@
 //! With the `containers` feature, the `containers` module is the one way integration
 //! tests start a testcontainers backend: a shared start-up budget, a bounded
 //! retry of start-up failures, an optional readiness probe, and the
-//! `FAUCET_REQUIRE_BACKENDS` skip-or-fail rule.
+//! `FAUCET_REQUIRE_BACKENDS` skip-or-fail rule, and the `stores` module
+//! starts the MinIO, Azurite and fake-gcs-server emulators on pinned images.
 
 pub mod calls;
 mod checks;
@@ -125,7 +126,11 @@ pub mod forwarding;
 pub mod hung;
 pub mod required;
 pub mod scripted;
+#[cfg(feature = "containers")]
+pub mod stores;
 pub mod tds;
+#[cfg(feature = "containers")]
+pub mod tls;
 
 /// Stack size [`block_on_large_stack`] gives its thread.
 pub const LARGE_STACK: usize = 32 << 20;

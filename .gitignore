@@ -84,6 +84,9 @@ docs/superpowers/
 !/scripts/test_fidelity_coverage.py
 !/scripts/decimal-f64.py
 !/scripts/decimal-f64-allow.txt
+!/scripts/variant-coverage.py
+!/scripts/test_variant_coverage.py
+!/scripts/variant-coverage-exempt.txt
 !/scripts/test_decimal_f64.py
 
 # Benchmark generated artifacts (harness + configs are tracked; outputs are not)
