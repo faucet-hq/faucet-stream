@@ -1,5 +1,6 @@
 //! Object-store emulators for connector integration tests: MinIO (S3),
-//! Azurite (Azure Blob) and fake-gcs-server (GCS), started through
+//! Azurite (Azure Blob), fake-gcs-server (GCS) and a Hive 3 metastore over
+//! MinIO (Iceberg's HMS catalog), started through
 //! [`containers::start`](crate::containers::start) with pinned images.
 //!
 //! Each helper returns the running container with the endpoint the host
@@ -44,6 +45,13 @@ pub const FAKE_GCS_XML_IMAGE: (&str, &str) = (
 );
 /// Port fake-gcs-server listens on inside the container.
 pub const FAKE_GCS_PORT: u16 = 4443;
+
+/// Hive image for a standalone metastore. Hive 3: iceberg-rust's HMS client
+/// calls `get_table`, which Hive 4 removed. amd64 only.
+pub const HIVE_IMAGE: (&str, &str) = ("apache/hive", "3.1.3");
+/// Port the metastore serves Thrift on inside the container.
+pub const HIVE_METASTORE_PORT: u16 = 9083;
+const HADOOP_TOOLS: &str = "/opt/hadoop/share/hadoop/tools/lib";
 
 /// A running emulator and the base URL the host reaches it on.
 pub struct Store {
@@ -194,5 +202,140 @@ async fn create_gcs_bucket(port: u16, bucket: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("status {status}: {head}"))
+    }
+}
+
+/// A running Hive metastore and the URI the host reaches it on.
+pub struct Metastore {
+    /// The container; dropping it stops the metastore.
+    pub container: ContainerAsync<GenericImage>,
+    /// `thrift://127.0.0.1:<port>`.
+    pub uri: String,
+}
+
+/// Start a standalone Hive 3 metastore on `network` whose warehouse dir is
+/// `warehouse_dir` (e.g. `s3a://bucket/warehouse`) on the MinIO container
+/// named `minio_host` on the same network. The metastore checks table
+/// locations through Hadoop's S3A client, so it gets the S3A jars, a
+/// `core-site.xml` pointing at MinIO and a `hive-site.xml` naming the
+/// warehouse dir. The bucket must exist before the first namespace is made.
+pub async fn hive_metastore(network: &str, minio_host: &str, warehouse_dir: &str) -> Metastore {
+    let network = network.to_string();
+    let core_site = hive_core_site(minio_host);
+    let hive_site = hive_site(warehouse_dir);
+    let container = start_with(
+        || {
+            GenericImage::new(HIVE_IMAGE.0, HIVE_IMAGE.1)
+                .with_exposed_port(HIVE_METASTORE_PORT.tcp())
+                .with_wait_for(WaitFor::message_on_stdout("Starting Hive Metastore Server"))
+                .with_network(network.clone())
+                .with_env_var("SERVICE_NAME", "metastore")
+                .with_env_var("HIVE_CUSTOM_CONF_DIR", "/hive_custom_conf")
+                .with_env_var(
+                    "HADOOP_CLASSPATH",
+                    format!(
+                        "{HADOOP_TOOLS}/hadoop-aws-3.1.0.jar:{HADOOP_TOOLS}/aws-java-sdk-bundle-1.11.271.jar"
+                    ),
+                )
+                .with_copy_to("/hive_custom_conf/core-site.xml", core_site.clone().into_bytes())
+                .with_copy_to("/hive_custom_conf/hive-site.xml", hive_site.clone().into_bytes())
+        },
+        &StartOptions::default()
+            .ready(ReadyProbe::custom(HIVE_METASTORE_PORT, |ep| {
+                thrift_answers(ep.addr())
+            }))
+            .startup_timeout(std::time::Duration::from_secs(480))
+            .ready_timeout(std::time::Duration::from_secs(480)),
+    )
+    .await;
+    let port = container
+        .get_host_port_ipv4(HIVE_METASTORE_PORT)
+        .await
+        .expect("hive metastore port");
+    Metastore {
+        container,
+        uri: format!("thrift://127.0.0.1:{port}"),
+    }
+}
+
+fn hive_core_site(minio_host: &str) -> String {
+    hadoop_configuration(&[
+        (
+            "fs.s3a.endpoint",
+            format!("http://{minio_host}:{MINIO_PORT}"),
+        ),
+        ("fs.s3a.access.key", MINIO_ACCESS_KEY.to_string()),
+        ("fs.s3a.secret.key", MINIO_SECRET_KEY.to_string()),
+        ("fs.s3a.path.style.access", "true".to_string()),
+        ("fs.s3a.connection.ssl.enabled", "false".to_string()),
+        (
+            "fs.s3a.aws.credentials.provider",
+            "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider".to_string(),
+        ),
+        (
+            "fs.s3.impl",
+            "org.apache.hadoop.fs.s3a.S3AFileSystem".to_string(),
+        ),
+    ])
+}
+
+/// No connection pool: HikariCP over embedded Derby can hang the metastore at
+/// start-up.
+fn hive_site(warehouse_dir: &str) -> String {
+    hadoop_configuration(&[
+        ("hive.metastore.warehouse.dir", warehouse_dir.to_string()),
+        ("datanucleus.connectionPoolingType", "None".to_string()),
+    ])
+}
+
+fn hadoop_configuration(props: &[(&str, String)]) -> String {
+    let body: String = props
+        .iter()
+        .map(|(k, v)| format!("<property><name>{k}</name><value>{v}</value></property>"))
+        .collect();
+    format!("<configuration>{body}</configuration>")
+}
+
+/// One buffered binary-protocol `get_all_databases` call: Docker's port proxy
+/// accepts connections before the metastore listens, so a TCP probe passes early.
+async fn thrift_answers(addr: String) -> Result<(), String> {
+    let name = b"get_all_databases";
+    let mut call = 0x8001_0001u32.to_be_bytes().to_vec();
+    call.extend((name.len() as u32).to_be_bytes());
+    call.extend(name);
+    call.extend(1i32.to_be_bytes());
+    call.push(0);
+    let mut stream = tokio::net::TcpStream::connect(&addr)
+        .await
+        .map_err(|e| e.to_string())?;
+    stream.write_all(&call).await.map_err(|e| e.to_string())?;
+    let mut reply = [0u8; 4];
+    stream
+        .read_exact(&mut reply)
+        .await
+        .map_err(|e| format!("no thrift reply from {addr}: {e}"))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod hive_tests {
+    use super::*;
+
+    #[test]
+    fn hive_configuration_points_s3a_at_minio_and_the_warehouse() {
+        let core = hive_core_site("minio-1");
+        assert!(core.starts_with("<configuration>"), "{core}");
+        assert!(
+            core.contains("<name>fs.s3a.endpoint</name><value>http://minio-1:9000</value>"),
+            "{core}"
+        );
+        assert!(core.contains("<name>fs.s3a.path.style.access</name><value>true</value>"));
+        let site = hive_site("s3a://b/warehouse");
+        assert!(
+            site.contains(
+                "<name>hive.metastore.warehouse.dir</name><value>s3a://b/warehouse</value>"
+            ),
+            "{site}"
+        );
     }
 }
