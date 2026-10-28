@@ -15,8 +15,10 @@ discussions, or pull requests.**
 Report privately through either channel:
 
 1. **GitHub private vulnerability reporting** (preferred) — open the repository's
-   **Security** tab and click **"Report a vulnerability"**. This creates a private
-   advisory visible only to maintainers.
+   [**Security** tab](https://github.com/faucet-hq/faucet-stream/security) and
+   click **"Report a vulnerability"**
+   ([direct link](https://github.com/faucet-hq/faucet-stream/security/advisories/new)).
+   This creates a private advisory visible only to maintainers.
 2. **Email** — **pawanksikawat@gmail.com**.
 
 Please include:
@@ -28,10 +30,35 @@ Please include:
 
 ## What to expect
 
-- We aim to acknowledge a report within a few days.
-- We'll confirm the issue, determine affected versions, and work on a fix.
-- We'll keep you informed of progress and coordinate a disclosure timeline.
+| Step | Timeline |
+|---|---|
+| Acknowledge your report | within **7 days** |
+| Confirm or rule out the issue, and give a severity and affected versions | within **14 days** |
+| Release a fix for a critical or high-severity issue | target **30 days** from confirmation |
+| Release a fix for a medium or low-severity issue | target **90 days** from confirmation |
+| Publish the advisory (GitHub Security Advisory, with a CVE when one applies) | when the fix is released, or at **90 days** from the report if no fix is ready, unless we agree a different date with you |
+
+- We'll keep you informed at each step, and tell you if a timeline slips and why.
+- Fixes ship as a patch release of every affected crate on crates.io, the
+  prebuilt binaries and the container images; the advisory names the fixed
+  versions.
 - With your consent, we'll credit you in the advisory and release notes.
+
+## What counts as a vulnerability
+
+A flaw in faucet-stream's own code or release artifacts that lets someone break
+a guarantee it documents: read or change data, credentials or state they should
+not reach; escape a `faucet serve` trust boundary (authentication, RBAC, tenant
+isolation, the reference policy, sandboxed connectors); run code or reach the
+network or filesystem from a submitted config beyond what the server allows; or
+inject into a query, path or command. The trust boundaries are described in
+[`docs/security/self-assessment.md`](docs/security/self-assessment.md).
+
+Not vulnerabilities (open a normal issue instead): a credential leaked in your
+own config, a misconfiguration the docs warn against, denial of service from a
+config you control, and vulnerabilities in the external systems faucet connects
+to. Dependency advisories are tracked automatically (`cargo-deny`, Dependabot);
+report one privately only if faucet-stream is actually exploitable through it.
 
 ## Scope notes
 

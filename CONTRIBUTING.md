@@ -53,6 +53,16 @@ has a `docker compose` stack and `make demo` for a no-infrastructure smoke test.
   APIs and streaming. Performance and reliability are the project's first
   priority.
 
+The full coding standards are written down: the
+[engineering principles](PRINCIPLES.md) ([detail](docs/engineering-principles.md))
+and the per-topic standards under [`docs/standards/`](docs/standards/) (API
+design, error handling, logging and redaction, performance, state, testing).
+What is planned next is on the [roadmap](docs/roadmap.md) and the
+[roadmap board](https://github.com/orgs/faucet-hq/projects/2). How decisions and
+releases are made, and who can publish, is in [GOVERNANCE.md](GOVERNANCE.md);
+the security self-assessment is
+[`docs/security/self-assessment.md`](docs/security/self-assessment.md).
+
 ## Adding a connector
 
 faucet-stream connectors follow a fixed shape. To add `faucet-source-foo` /
