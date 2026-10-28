@@ -26,8 +26,7 @@ pub type RedisTls = faucet_core::TlsOptions;
 /// settings on a non-`rediss://` URL, or an unreadable certificate file.
 /// Opens no connection.
 pub fn build_client(url: &str, tls: &RedisTls) -> Result<redis::Client, FaucetError> {
-    // A build linking two rustls providers has no default; TLS would panic.
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    faucet_core::ensure_crypto_provider();
     let info = url
         .into_connection_info()
         .map_err(|e| FaucetError::Config(format!("invalid Redis URL: {e}")))?;

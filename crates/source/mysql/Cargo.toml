@@ -18,8 +18,6 @@ serde_json.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 sqlx = { workspace = true, features = ["mysql", "json", "chrono", "bigdecimal"] }
-# sqlx builds its TLS config from the process-wide rustls provider (#967).
-rustls = { workspace = true, features = ["ring"] }
 base64.workspace = true
 async-stream = { workspace = true }
 futures.workspace = true

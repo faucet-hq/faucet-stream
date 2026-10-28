@@ -152,6 +152,8 @@ Route every backend call through a `faucet_core::io::CallSlot` /
 the workspace `clippy.toml` refuses `reqwest::Client::new` / `builder` and
 `tokio::time::sleep` outside sanctioned sites. See
 [Backend calls](../book/src/extending/authoring-connectors.md#backend-calls-callcontext-httpclient-batching).
+Call `faucet_core::ensure_crypto_provider()` before any TLS connect that does
+not go through `faucet_core::http::Client` (#971).
 
 ## Wiring checklist (CI enforces most of this)
 

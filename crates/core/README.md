@@ -282,6 +282,12 @@ let client = faucet_core::http::Client::builder().tls(&tls).build()?;
 `TlsClientConfig` remains the client-identity block of the `rest` / `xml` /
 `graphql` sources.
 
+A connector that opens a TLS connection through anything other than
+`faucet_core::http::Client` (a database driver, a broker client, a WebSocket)
+calls `faucet_core::ensure_crypto_provider()` before connecting. A build that
+links two rustls providers otherwise has no default, and the first TLS connect
+panics (#971). It is idempotent and keeps a provider the application installed.
+
 The workspace `clippy.toml` disallows constructing reqwest clients directly and
 `tokio::time::sleep` / `sleep_until` / `std::thread::sleep`; a sanctioned site
 carries `#[allow(clippy::disallowed_methods)] // <reason>`.
@@ -814,7 +820,7 @@ wrapper with `faucet_conformance::forwarding::assert_sink_forwards_every_hook` /
 | `retry` | `execute_with_retry` (exponential backoff + jitter) |
 | `io` | `CallContext`, `CallSlot`, `DEFAULT_CALL_TIMEOUT` — the backend-call wrapper (#880) |
 | `http` | `Client`, `ClientBuilder`, `status_error`, `is_cross_origin`, `strip_credentials`, `ResponseTooLarge` |
-| `tls` | `TlsOptions`, `LoadedTls`, `ClientPem` (server verification + client certificates), `TlsClientConfig` (HTTP-source mTLS) |
+| `tls` | `TlsOptions`, `LoadedTls`, `ClientPem` (server verification + client certificates), `TlsClientConfig` (HTTP-source mTLS), `ensure_crypto_provider` (the process-wide rustls provider) |
 | `batching` | `chunks`, `into_chunks`, `map_concurrent`, `for_each_concurrent`, `ConcurrencyLimit` |
 | `schema` | `infer_schema` from record samples |
 | `check` | `CheckContext`, `Probe`, `CheckReport` for `faucet doctor` |

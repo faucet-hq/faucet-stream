@@ -23,8 +23,6 @@ pgwire-replication.workspace = true
 byteorder.workspace = true
 bytes.workspace = true
 sqlx = { workspace = true, features = ["postgres"] }
-# sqlx and pgwire-replication take the process-wide rustls provider (#967).
-rustls = { workspace = true, features = ["ring"] }
 url.workspace = true
 percent-encoding.workspace = true
 chrono.workspace = true

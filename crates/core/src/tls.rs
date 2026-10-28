@@ -2,14 +2,40 @@
 //! ([`TlsClientConfig`]) and server verification + client certificates for
 //! connectors that dial a TLS server ([`TlsOptions`]).
 //!
-//! This is a pure data + validation type — it deliberately has **no** dependency
-//! on any TLS or HTTP crate, so `faucet-core` stays lightweight. Each HTTP
-//! source that supports mTLS (`rest` / `xml` / `graphql`) owns the small,
-//! feature-gated code that turns a [`TlsClientConfig`] into a `reqwest::Identity`.
+//! The config types are pure data + validation. Each HTTP source that supports
+//! mTLS (`rest` / `xml` / `graphql`) owns the small, feature-gated code that
+//! turns a [`TlsClientConfig`] into a `reqwest::Identity`.
+//!
+//! [`ensure_crypto_provider`] installs the process-wide rustls provider every
+//! connector that opens a TLS connection must call first (#971).
 
 use crate::FaucetError;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+/// Make sure the process has a default rustls [`CryptoProvider`].
+///
+/// rustls picks its provider from the crate features when exactly one of
+/// `ring` / `aws-lc-rs` is compiled in. A build that links both (one connector's
+/// driver enables `ring`, reqwest enables `aws-lc-rs`) has no default, and any
+/// TLS client built from the process default (`ClientConfig::builder()`,
+/// `WebPkiServerVerifier::builder`) then panics at the first connect.
+///
+/// Call this before opening a TLS connection. It keeps a provider the
+/// application already installed, else installs `aws-lc-rs` (the provider
+/// `faucet-core`'s HTTP client already links, so no new dependency). Cheap and
+/// idempotent; safe to call from any thread, any number of times.
+///
+/// [`CryptoProvider`]: rustls::crypto::CryptoProvider
+pub fn ensure_crypto_provider() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        if rustls::crypto::CryptoProvider::get_default().is_none() {
+            // Losing a race to another installer still leaves a default.
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        }
+    });
+}
 
 /// Client-certificate (mutual TLS) configuration for the HTTP sources.
 ///
@@ -201,6 +227,7 @@ impl TlsOptions {
     /// Validate, then read every configured file. Logs a warning when
     /// `insecure_skip_verify` is on.
     pub fn load(&self, connector: &str) -> Result<LoadedTls, FaucetError> {
+        ensure_crypto_provider();
         self.validate(connector)?;
         let read = |path: &std::path::Path, field: &str| -> Result<Vec<u8>, FaucetError> {
             let bytes = std::fs::read(path).map_err(|e| {
@@ -391,6 +418,14 @@ mod options_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ensure_crypto_provider_installs_a_default_and_is_idempotent() {
+        super::ensure_crypto_provider();
+        super::ensure_crypto_provider();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+        let _ = rustls::ClientConfig::builder();
+    }
+
     use super::TlsClientConfig;
 
     #[test]

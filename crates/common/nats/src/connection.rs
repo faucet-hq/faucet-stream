@@ -191,9 +191,7 @@ pub const MAX_RECONNECTS: usize = 60;
 /// first poll fail cleanly.
 pub async fn connect(cfg: &NatsConnectionConfig) -> Result<async_nats::Client, FaucetError> {
     cfg.validate()?;
-    // async-nats builds its TLS config from the process-wide rustls provider,
-    // which a build linking both `ring` and `aws-lc-rs` lacks (#967).
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    faucet_core::ensure_crypto_provider();
 
     let mut options = async_nats::ConnectOptions::new();
 
@@ -470,7 +468,7 @@ mod tests {
 
     #[test]
     fn rustls_config_reports_bad_material() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        faucet_core::ensure_crypto_provider();
         let empty = LoadedTls {
             ca_pem: Some(
                 b"-----BEGIN PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\n".to_vec(),

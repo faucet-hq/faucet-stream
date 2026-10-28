@@ -180,7 +180,7 @@ pub fn tls_fixture(name: &str) -> PathBuf {
 /// `https://localhost:PORT`.
 #[allow(dead_code)]
 pub async fn start_tls_server() -> ServerHandle {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    faucet_core::ensure_crypto_provider();
     let identity = tonic::transport::Identity::from_pem(
         std::fs::read(tls_fixture("server.pem")).unwrap(),
         std::fs::read(tls_fixture("server.key")).unwrap(),

@@ -25,6 +25,8 @@ base64.workspace = true
 
 [dev-dependencies]
 faucet-conformance.workspace = true
+# Links a second rustls provider beside reqwest's `aws-lc-rs` (#971).
+rustls = { workspace = true, features = ["ring"] }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "net", "signal"] }
 tokio-tungstenite.workspace = true
 futures.workspace = true

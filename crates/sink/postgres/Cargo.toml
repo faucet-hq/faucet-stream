@@ -20,8 +20,6 @@ async-trait.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 sqlx = { workspace = true, features = ["postgres"] }
-# sqlx builds its TLS config from the process-wide rustls provider (#967).
-rustls = { workspace = true, features = ["ring"] }
 base64.workspace = true
 
 [dev-dependencies]

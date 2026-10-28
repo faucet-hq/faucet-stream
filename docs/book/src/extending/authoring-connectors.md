@@ -658,6 +658,11 @@ carry. `client.execute(&ctx, op, || request)` runs a request under a context;
 yourself. reqwest options it does not name (compression, mutual TLS) go
 through `ClientBuilder::configure`.
 
+Any other TLS connection (a database driver, a broker client, a WebSocket)
+starts with `faucet_core::ensure_crypto_provider()`: when two rustls providers
+are linked into one binary, rustls has no default and the first TLS connect
+panics (#971). `http::Client` and `TlsOptions::load` already call it.
+
 ### Batching
 
 `faucet_core::batching::chunks(records, batch_size)` re-chunks a page under the
