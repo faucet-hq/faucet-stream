@@ -322,11 +322,19 @@ database, one template registry, one catalog.
   `422`.
 
 ```yaml
-# pipeline config
 version: 1
 name: invoices_from_private_db
 pool: private
-pipeline: { … }
+pipeline:
+  source:
+    type: postgres
+    config:
+      connection_url: postgres://faucet@10.20.0.5:5432/app
+      query: SELECT id, account_id, amount, updated_at FROM invoices
+  sink:
+    type: file
+    config:
+      path: ./out/invoices.jsonl
 ```
 
 ```bash
