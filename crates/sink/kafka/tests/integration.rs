@@ -219,3 +219,38 @@ async fn batch_size_zero_preserves_legacy_send_path() {
     let payloads = drain_topic(&brokers, topic, 500).await;
     assert_eq!(payloads.len(), 500);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_compression_codec_round_trips() {
+    let (_c, brokers) = start_kafka().await;
+    for codec in [
+        CompressionType::Gzip,
+        CompressionType::Snappy,
+        CompressionType::Lz4,
+        CompressionType::Zstd,
+    ] {
+        let topic = format!("codec-{}", codec.as_str());
+        let mut cfg = sink_config(
+            &brokers,
+            KafkaSinkTopic::Fixed {
+                name: topic.clone(),
+            },
+        );
+        cfg.compression = codec;
+        let sink = KafkaSink::new(cfg)
+            .await
+            .unwrap_or_else(|e| panic!("{codec:?} producer: {e}"));
+        let records: Vec<_> = (0..20)
+            .map(|i| json!({"id": i, "codec": codec.as_str()}))
+            .collect();
+        assert_eq!(sink.write_batch(&records).await.unwrap(), 20, "{codec:?}");
+        sink.flush().await.unwrap();
+        let mut got: Vec<serde_json::Value> = drain_topic(&brokers, &topic, 20)
+            .await
+            .iter()
+            .map(|p| serde_json::from_str(p).unwrap())
+            .collect();
+        got.sort_by_key(|v| v["id"].as_i64());
+        assert_eq!(got, records, "{codec:?}");
+    }
+}

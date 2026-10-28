@@ -615,3 +615,42 @@ async fn an_unbookmarked_partition_starts_at_the_group_committed_offset() {
         .collect();
     assert_eq!(ids, vec![3, 4]);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reads_topics_written_with_every_compression_codec() {
+    let (_container, brokers) = start_kafka().await;
+    for codec in ["gzip", "snappy", "lz4", "zstd"] {
+        let topic = format!("compressed-{codec}");
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", &brokers)
+            .set("compression.codec", codec)
+            .set("linger.ms", "50")
+            .set("message.timeout.ms", "5000")
+            .create()
+            .unwrap_or_else(|e| panic!("{codec} producer: {e}"));
+        for i in 0..10 {
+            let value = format!(r#"{{"id":{i}}}"#);
+            producer
+                .send(
+                    FutureRecord::<str, str>::to(&topic).payload(&value),
+                    Duration::from_secs(5),
+                )
+                .await
+                .unwrap_or_else(|(e, _)| panic!("{codec} send: {e}"));
+        }
+        producer.flush(Duration::from_secs(5)).expect("flush");
+
+        let source = KafkaSource::new(source_config(&brokers, &topic, &format!("g-{codec}"), 10))
+            .await
+            .expect("source");
+        let mut ids: Vec<i64> = source
+            .fetch_all()
+            .await
+            .unwrap_or_else(|e| panic!("{codec} read: {e}"))
+            .iter()
+            .map(|r| r["value"]["id"].as_i64().unwrap())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (0..10).collect::<Vec<_>>(), "{codec}");
+    }
+}
