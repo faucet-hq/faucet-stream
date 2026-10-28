@@ -33,6 +33,7 @@ pub mod contract;
 pub mod create_table;
 #[cfg(feature = "transform-cross-join")]
 pub mod cross_join;
+pub mod declared;
 pub mod diff;
 pub mod discover;
 pub mod dlq;
@@ -126,11 +127,13 @@ pub use columnar::{
     values_to_record_batch, values_to_record_batch_inferred,
 };
 pub use create_table::{
-    PlannedColumn, missing_target_error, plan_columns, plan_keyed_columns, render_column_defs,
-    render_columns, render_primary_key,
+    PlannedColumn, missing_target_error, plan_columns, plan_columns_declared, plan_keyed_columns,
+    plan_keyed_columns_declared, plan_table_declared, render_column_defs, render_columns,
+    render_primary_key,
 };
 #[cfg(feature = "transform-cross-join")]
 pub use cross_join::{CompiledCrossJoin, CrossJoinSpec, OnEmpty as CrossJoinOnEmpty};
+pub use declared::{DeclaredColumn, DeclaredColumns, DeclaredSlot, LogicalType};
 pub use diff::{
     ContentDigest, Difference, DifferenceKind, DigestAccumulator, KeyRange, Normalizer,
     ServerDigest, VerifyReport, diff_rows, plan_ranges, row_hash,

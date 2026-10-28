@@ -424,6 +424,21 @@ macro_rules! forward_source {
                 self.$inner.discover()
             }
         });
+        $crate::__faucet_forward_filter!(declared_columns [$($skip)*] {
+            fn declared_columns<'life0, 'life1, 'async_trait>(
+                &'life0 self,
+                context: &'life1 ::std::collections::HashMap<::std::string::String, $crate::Value>,
+            ) -> $crate::forward::__forward::Fut<'async_trait, $crate::forward::__forward::Res<::core::option::Option<$crate::declared::DeclaredColumns>>>
+            where
+                'life0: 'async_trait,
+                'life1: 'async_trait,
+                Self: 'async_trait,
+            {
+                #[allow(unused_imports)]
+                use $crate::Source as _;
+                self.$inner.declared_columns(context)
+            }
+        });
         $crate::__faucet_forward_filter!(record_table [$($skip)*] {
             fn record_table(
                 &self,
@@ -1102,6 +1117,14 @@ macro_rules! forward_sink {
                 self.$inner.set_roundtrip_recorder(recorder)
             }
         });
+        $crate::__faucet_forward_filter!(set_declared_columns [$($skip)*] {
+            fn set_declared_columns(&self, columns: $crate::declared::DeclaredColumns) -> ()
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.set_declared_columns(columns)
+            }
+        });
         $crate::__faucet_forward_filter!(set_call_context [$($skip)*] {
             fn set_call_context(&self, ctx: $crate::io::CallContext) -> ()
             {
@@ -1182,6 +1205,7 @@ macro_rules! __faucet_forward_filter {
     (range_digest [range_digest $($rest:ident)*] $item:tt) => {};
     (supports_discover [supports_discover $($rest:ident)*] $item:tt) => {};
     (discover [discover $($rest:ident)*] $item:tt) => {};
+    (declared_columns [declared_columns $($rest:ident)*] $item:tt) => {};
     (record_table [record_table $($rest:ident)*] $item:tt) => {};
     (position_le [position_le $($rest:ident)*] $item:tt) => {};
     (record_covered [record_covered $($rest:ident)*] $item:tt) => {};
@@ -1190,6 +1214,7 @@ macro_rules! __faucet_forward_filter {
     (connector_name [connector_name $($rest:ident)*] $item:tt) => {};
     (set_roundtrip_recorder [set_roundtrip_recorder $($rest:ident)*] $item:tt) => {};
     (set_call_context [set_call_context $($rest:ident)*] $item:tt) => {};
+    (set_declared_columns [set_declared_columns $($rest:ident)*] $item:tt) => {};
     (set_run_clock [set_run_clock $($rest:ident)*] $item:tt) => {};
     (set_cancel [set_cancel $($rest:ident)*] $item:tt) => {};
     (dataset_uri [dataset_uri $($rest:ident)*] $item:tt) => {};
@@ -1275,6 +1300,7 @@ macro_rules! __faucet_forward_known {
     (@source [range_digest $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
     (@source [supports_discover $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
     (@source [discover $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
+    (@source [declared_columns $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
     (@source [record_table $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
     (@source [position_le $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
     (@source [record_covered $($rest:ident)*]) => { $crate::__faucet_forward_known!(@source [$($rest)*]); };
@@ -1327,6 +1353,7 @@ macro_rules! __faucet_forward_known {
     (@sink [config_schema $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
     (@sink [connector_name $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
     (@sink [set_roundtrip_recorder $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
+    (@sink [set_declared_columns $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
     (@sink [set_call_context $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
     (@sink [dataset_uri $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
     (@sink [local_outputs $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };

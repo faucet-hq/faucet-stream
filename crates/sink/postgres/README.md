@@ -462,6 +462,10 @@ serialize on a transaction-scoped advisory lock per schema
 (`pg_advisory_xact_lock`), so none fails with a duplicate-key error on the
 catalog. A race lost to a creator outside faucet is retried.
 
+## Declared column types
+
+When the run's source declares its column types (a SQL query source, #955 — see [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types)), a table this sink creates types each declared column from the declaration instead of from the first page: `bigint`, `double precision`, `boolean`, `text`, `numeric(p,s)` (`numeric` without precision), `date`, `time`, `timestamptz` / `timestamp`, `uuid`, `bytea`, `jsonb`. A declared column whose first-page values do not fit its type keeps the inferred type; an existing table is never retyped. With a complete declaration a run that writes nothing creates the empty, typed table.
+
 ## Batch atomicity
 
 What a failed write leaves behind (#737): **atomic** for a JSONB-column append with `batch_size: 0`, or `write_mode: upsert|delete` when journaled for rollback; otherwise **best-effort** — appends commit one transaction per `batch_size` chunk, so a page of several chunks can land in part (the declaration stays best-effort for every configuration it does not list, even where a page happens to fit one transaction). `on_batch_error: dlq_all`

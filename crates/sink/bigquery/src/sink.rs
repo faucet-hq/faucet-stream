@@ -564,6 +564,27 @@ fn json_schema_to_load_schema(schema: &Value) -> Option<Value> {
     Some(serde_json::json!({ "fields": fields }))
 }
 
+/// The load-job schema of a table created from `records` and the source's
+/// declared columns (#955), in the load API's type keywords.
+fn declared_load_schema(
+    records: &[Value],
+    declared: &faucet_core::DeclaredColumns,
+) -> Option<Value> {
+    let fields: Vec<Value> = crate::idempotent::declared_table_columns(records, declared)?
+        .into_iter()
+        .map(|(name, ty)| {
+            let ty = match ty.as_str() {
+                "INT64" => "INTEGER",
+                "FLOAT64" => "FLOAT",
+                "BOOL" => "BOOLEAN",
+                other => other,
+            };
+            serde_json::json!({ "name": name, "type": ty, "mode": "NULLABLE" })
+        })
+        .collect();
+    (!fields.is_empty()).then(|| serde_json::json!({ "fields": fields }))
+}
+
 /// Column names in first-appearance order from the first record of a native batch:
 /// the keys of the first NDJSON object, or the header cells of the first CSV line.
 /// Cheap — reads only up to the first newline. Returns `None` if none can be read.
@@ -987,6 +1008,8 @@ pub(crate) struct BigQueryDriver {
     /// Set once the target table has been confirmed to exist (or been created)
     /// this run, so the existence probe / create runs at most once.
     table_ready: AtomicBool,
+    /// The source's declared columns (#955).
+    declared: faucet_core::DeclaredSlot,
     /// Overwrite-only once-gate: has *this* sink instance ensured the target +
     /// staging clone exist? Set on the first overwrite page. It is per-instance
     /// on purpose — the executor runs `begin_overwrite`, the page writes, and
@@ -1199,6 +1222,7 @@ impl BigQueryDriver {
             schema_cache: RwLock::new(None),
             roundtrips: faucet_core::observability::RecorderSlot::new(),
             table_ready: AtomicBool::new(false),
+            declared: faucet_core::DeclaredSlot::new(),
             overwrite_setup: AtomicBool::new(false),
             stream_appends: AtomicBool::new(false),
             overwrite_rows: AtomicBool::new(false),
@@ -1219,6 +1243,7 @@ impl BigQueryDriver {
             schema_cache: RwLock::new(None),
             roundtrips: faucet_core::observability::RecorderSlot::new(),
             table_ready: AtomicBool::new(false),
+            declared: faucet_core::DeclaredSlot::new(),
             overwrite_setup: AtomicBool::new(false),
             stream_appends: AtomicBool::new(false),
             overwrite_rows: AtomicBool::new(false),
@@ -2112,8 +2137,12 @@ impl BigQueryDriver {
             {
                 Some(explicit) => Some(explicit),
                 None if write_disposition == "WRITE_TRUNCATE" => {
-                    self.truncate_schema(calls, table_id, || {
-                        json_schema_to_load_schema(&faucet_core::schema::infer_schema(records))
+                    let declared = self.declared.get();
+                    self.truncate_schema(calls, table_id, || match declared {
+                        Some(d) => declared_load_schema(records, &d),
+                        None => {
+                            json_schema_to_load_schema(&faucet_core::schema::infer_schema(records))
+                        }
                     })
                     .await?
                 }
@@ -2395,14 +2424,22 @@ impl BigQueryDriver {
     ) -> Result<(), FaucetError> {
         // Prefer an explicit configured schema (authoritative column types, e.g.
         // from OData `$metadata`) over inferring from the first page.
-        let ddl = match &self.config.schema {
-            Some(schema) => idempotent::build_create_table_ddl_from_schema(
+        let declared = self.declared.get();
+        let ddl = match (&self.config.schema, declared) {
+            (Some(schema), _) => idempotent::build_create_table_ddl_from_schema(
                 &self.config.project_id,
                 &self.config.dataset_id,
                 &self.config.table_id,
                 schema,
             ),
-            None => idempotent::build_create_table_ddl(
+            (None, Some(declared)) => idempotent::build_create_table_ddl_declared(
+                &self.config.project_id,
+                &self.config.dataset_id,
+                &self.config.table_id,
+                sample,
+                &declared,
+            ),
+            (None, None) => idempotent::build_create_table_ddl(
                 &self.config.project_id,
                 &self.config.dataset_id,
                 &self.config.table_id,
@@ -3352,7 +3389,24 @@ impl SinkDriver for BigQueryDriver {
             .to_builder()
             .scoped_overwrite(true)
             .direct_overwrite(true)
+            .declared_types(true)
             .build()
+    }
+
+    fn set_declared_columns(&self, columns: faucet_core::DeclaredColumns) {
+        self.declared.set(columns);
+    }
+
+    /// A run that wrote nothing creates the declared table (#955).
+    async fn complete_run(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        if self.config.create_table
+            && self.config.schema.is_none()
+            && !self.table_ready.load(Ordering::Acquire)
+            && self.declared.for_empty_run().is_some()
+        {
+            self.ensure_table_ready(calls, &[]).await?;
+        }
+        Ok(())
     }
 
     fn config_schema(&self) -> serde_json::Value {
@@ -4045,6 +4099,26 @@ mod tests {
         assert_eq!(by["name"], "STRING");
         assert_eq!(by["blob"], "JSON");
         assert!(fields.iter().all(|f| f["mode"] == "NULLABLE"));
+    }
+
+    #[test]
+    fn declared_load_schema_uses_load_keywords() {
+        use faucet_core::{DeclaredColumn, DeclaredColumns, LogicalType};
+        let d = DeclaredColumns::new([
+            DeclaredColumn::new("id", LogicalType::Int64, false),
+            DeclaredColumn::new("ok", LogicalType::Bool, true),
+            DeclaredColumn::new("f", LogicalType::Float64, true),
+            DeclaredColumn::new("at", LogicalType::Timestamp { tz: false }, true),
+        ]);
+        let out = crate::sink::declared_load_schema(&[], &d).unwrap();
+        let types: Vec<&str> = out["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(types, ["INTEGER", "BOOLEAN", "FLOAT", "DATETIME"]);
+        assert!(crate::sink::declared_load_schema(&[], &d.reshaped()).is_none());
     }
 
     #[test]

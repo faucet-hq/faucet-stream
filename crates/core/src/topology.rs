@@ -871,6 +871,12 @@ impl Topology {
         };
         drop(sink_refs);
 
+        // Declared column types (#955) reach a sink node only from the graph's
+        // one source; any transform, merge or join in the graph reshapes them.
+        if let Some(src) = only_source.as_ref() {
+            hand_declared_columns(src.as_ref(), &rest, &governance).await;
+        }
+
         // Every node runs under one cooperative token: a caller's cancel reaches
         // it, and under `Propagate` a node failure cancels it so the siblings stop
         // at their next page boundary — including a node parked on a full or empty
@@ -1943,6 +1949,55 @@ pub fn eo_start_bookmark(ranked: &[(u64, Option<Value>)], source_count: usize) -
         .iter()
         .min_by_key(|(seq, _)| *seq)
         .and_then(|(_, bm)| bm.clone())
+}
+
+/// Give each typing sink node the declaration of the graph's only source.
+async fn hand_declared_columns(
+    source: &dyn Source,
+    nodes: &[Node],
+    governance: &TopologyGovernance,
+) {
+    let typing: Vec<(&String, &dyn Sink)> = nodes
+        .iter()
+        .filter_map(|n| match &n.kind {
+            NodeKind::Sink(s) if s.capabilities().declared_types() => Some((&n.id, s.as_ref())),
+            _ => None,
+        })
+        .collect();
+    if typing.is_empty() {
+        return;
+    }
+    let declared = match source
+        .declared_columns(&std::collections::HashMap::new())
+        .await
+    {
+        Ok(Some(d)) => d,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(error = %e, "the source could not declare its column types");
+            return;
+        }
+    };
+    let reshaping = nodes.iter().any(|n| {
+        matches!(
+            n.kind,
+            NodeKind::Transform(_) | NodeKind::Merge | NodeKind::Join(_)
+        )
+    });
+    for (id, sink) in typing {
+        #[cfg(feature = "masking")]
+        let masked = governance.masking_by_sink.contains_key(id);
+        #[cfg(not(feature = "masking"))]
+        let masked = {
+            let _ = (id, governance);
+            false
+        };
+        sink.set_declared_columns(if reshaping || masked {
+            declared.clone().reshaped()
+        } else {
+            declared.clone()
+        });
+    }
 }
 
 /// Pure resume-point decision: the bookmark every source node is started from,
@@ -3428,6 +3483,83 @@ mod tests {
             *self.0.lock().unwrap() += 1;
             Ok(())
         }
+    }
+
+    struct Declares;
+
+    #[async_trait]
+    impl Source for Declares {
+        async fn fetch_with_context(
+            &self,
+            _ctx: &HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            Ok(vec![json!({"id": 1})])
+        }
+        async fn declared_columns(
+            &self,
+            _ctx: &HashMap<String, Value>,
+        ) -> Result<Option<crate::DeclaredColumns>, FaucetError> {
+            Ok(Some(crate::DeclaredColumns::new([
+                crate::DeclaredColumn::new("id", crate::LogicalType::Int64, false),
+            ])))
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct Typing(Arc<Mutex<Option<crate::DeclaredColumns>>>);
+
+    #[async_trait]
+    impl Sink for Typing {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            Ok(records.len())
+        }
+        fn capabilities(&self) -> crate::Capabilities {
+            crate::Capabilities::of_sink(self)
+                .to_builder()
+                .declared_types(true)
+                .build()
+        }
+        fn set_declared_columns(&self, columns: crate::DeclaredColumns) {
+            *self.0.lock().unwrap() = Some(columns);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_only_source_declares_to_each_typing_sink() {
+        let direct = Typing::default();
+        Topology::builder()
+            .source("s", Box::new(Declares))
+            .sink("k", Box::new(direct.clone()))
+            .edge("s", "k")
+            .build()
+            .unwrap()
+            .run(TopologyOptions::new("p"))
+            .await
+            .unwrap();
+        let got = direct.0.lock().unwrap().clone().expect("declared");
+        assert!(got.is_complete() && got.get("id").is_some());
+
+        let through = Typing::default();
+        Topology::builder()
+            .source("s", Box::new(Declares))
+            .transform("t", vec![])
+            .sink("k", Box::new(through.clone()))
+            .edge("s", "t")
+            .edge("t", "k")
+            .build()
+            .unwrap()
+            .run(TopologyOptions::new("p"))
+            .await
+            .unwrap();
+        assert!(
+            !through
+                .0
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("declared")
+                .is_complete()
+        );
     }
 
     #[tokio::test]

@@ -21,4 +21,12 @@ pub use stream::DuckdbSource;
 
 /// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
 pub const DESCRIPTOR: faucet_core::ConnectorDescriptor =
-    faucet_core::ConnectorDescriptor::new("duckdb", faucet_core::capabilities::plain_source);
+    faucet_core::ConnectorDescriptor::new("duckdb", capabilities);
+
+/// The query's columns are declared from its `DESCRIBE` (#955).
+fn capabilities(_config: &faucet_core::Value) -> faucet_core::Capabilities {
+    faucet_core::Capabilities::plain_source()
+        .to_builder()
+        .declared_columns(true)
+        .build()
+}

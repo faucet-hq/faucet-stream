@@ -125,3 +125,40 @@ async fn conformance_first_page_before_exhaustion() {
         served()
     );
 }
+
+/// Check 25 against a Postgres container standing in for the cluster.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_declared_columns_truthful() {
+    use testcontainers::ImageExt;
+    let container = faucet_conformance::containers::start(|| {
+        testcontainers_modules::postgres::Postgres::default().with_tag("16-alpine")
+    })
+    .await;
+    let port = container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("postgres port");
+    let mut connection = faucet_source_redshift::RedshiftConnection::new(
+        "127.0.0.1",
+        "postgres",
+        "postgres",
+        "postgres",
+    );
+    connection.port = port;
+    connection.tls = false;
+    let source =
+        faucet_source_redshift::RedshiftSource::new(faucet_source_redshift::RedshiftSourceConfig {
+            connection,
+            query:
+                "SELECT 1::int4 AS id, 12.50::numeric(12,2) AS amount, DATE '2024-10-27' AS day, \
+                    TIMESTAMPTZ '2024-02-22 02:00:00+00' AS at, 'x'::text AS note"
+                    .into(),
+            params: Vec::new(),
+            max_connections: 2,
+            batch_size: 100,
+            replication: faucet_source_redshift::RedshiftReplication::Full,
+            state_key: None,
+        })
+        .expect("source");
+    faucet_conformance::assert_declared_columns_truthful(&source).await;
+}

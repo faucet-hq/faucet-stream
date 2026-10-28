@@ -10,6 +10,7 @@ fn capabilities(config: &Value) -> Capabilities {
     Capabilities::append_only_sink()
         .to_builder()
         .staged_load(cfg!(feature = "staging") && (config.is_null() || is_set(config, "staging")))
+        .declared_types(true)
         .build()
 }
 
@@ -21,7 +22,13 @@ mod tests {
     #[test]
     fn staged_load_needs_the_feature_and_a_staging_block() {
         let plain = DESCRIPTOR.capabilities(&json!({"table": "t"}));
-        assert_eq!(plain, Capabilities::append_only_sink());
+        assert_eq!(
+            plain,
+            Capabilities::append_only_sink()
+                .to_builder()
+                .declared_types(true)
+                .build()
+        );
         let staged = DESCRIPTOR.capabilities(&json!({"staging": {"location": "s3://b/p"}}));
         assert_eq!(staged.staged_load(), cfg!(feature = "staging"));
         assert_eq!(

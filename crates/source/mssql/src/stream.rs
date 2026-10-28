@@ -364,6 +364,26 @@ fn default_state_key(config: &MssqlSourceConfig) -> String {
     )
 }
 
+/// The logical type of a column of SQL Server type `ty`, as this source
+/// renders it (#955): `MONEY` is read exactly as `DECIMAL(19,4)`.
+fn declared_type(ty: &str) -> faucet_core::LogicalType {
+    use faucet_core::LogicalType as L;
+    let lower = ty.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "money" => L::Decimal {
+            precision: Some(19),
+            scale: Some(4),
+        },
+        "smallmoney" => L::Decimal {
+            precision: Some(10),
+            scale: Some(4),
+        },
+        "timestamp" | "rowversion" => L::Bytes,
+        _ if lower.starts_with("time") && !lower.starts_with("timestamp") => L::Time,
+        _ => L::from_sql_type(ty, None, None).unwrap_or(L::String),
+    }
+}
+
 #[async_trait]
 impl Source for MssqlSource {
     fn set_call_context(&self, ctx: faucet_core::CallContext) {
@@ -585,7 +605,40 @@ impl Source for MssqlSource {
         faucet_core::Capabilities::of_source(self)
             .to_builder()
             .range_read(true)
+            .declared_columns(true)
             .build()
+    }
+
+    /// The query's columns from `sp_describe_first_result_set` (#955); `None`
+    /// when SQL Server cannot describe it.
+    async fn declared_columns(
+        &self,
+        context: &HashMap<String, Value>,
+    ) -> Result<Option<faucet_core::DeclaredColumns>, FaucetError> {
+        let start = self.current_start();
+        let (query, values, _) = build_query_and_params(&self.config, context, start.as_ref());
+        let decl = money::param_declarations(&values);
+        let mut conn = self.checkout().await?;
+        let (out, cut) = self
+            .bounded(
+                &self.calls.get(),
+                "describe",
+                async { Ok(money::describe(&mut conn, &query, &decl).await) },
+                || FaucetError::Source("MSSQL result-shape probe timed out".into()),
+            )
+            .await;
+        if cut {
+            self.recover(&mut conn).await;
+        }
+        let Ok(columns) = out? else {
+            return Ok(None);
+        };
+        Ok(Some(faucet_core::DeclaredColumns::new(
+            columns.into_iter().filter_map(|c| {
+                let t = declared_type(c.type_name.as_deref().unwrap_or(""));
+                c.name.map(|n| faucet_core::DeclaredColumn::new(n, t, true))
+            }),
+        )))
     }
 
     fn supports_discover(&self) -> bool {
@@ -1263,5 +1316,35 @@ mod tests {
     #[test]
     fn descriptors_empty_catalog_is_empty() {
         assert!(descriptors_from_catalog(Vec::new(), &HashMap::new(), bracket_quote).is_empty());
+    }
+
+    #[test]
+    fn declared_types_follow_the_rendering() {
+        use faucet_core::LogicalType as L;
+        assert_eq!(
+            declared_type("money"),
+            L::Decimal {
+                precision: Some(19),
+                scale: Some(4)
+            }
+        );
+        assert_eq!(
+            declared_type("decimal(12,2)"),
+            L::Decimal {
+                precision: Some(12),
+                scale: Some(2)
+            }
+        );
+        assert_eq!(declared_type("datetime2(7)"), L::Timestamp { tz: false });
+        assert_eq!(
+            declared_type("datetimeoffset(7)"),
+            L::Timestamp { tz: true }
+        );
+        assert_eq!(declared_type("time(7)"), L::Time);
+        assert_eq!(declared_type("uniqueidentifier"), L::Uuid);
+        assert_eq!(declared_type("bit"), L::Bool);
+        assert_eq!(declared_type("nvarchar(50)"), L::String);
+        assert_eq!(declared_type("xml"), L::String);
+        assert_eq!(declared_type("timestamp"), L::Bytes);
     }
 }

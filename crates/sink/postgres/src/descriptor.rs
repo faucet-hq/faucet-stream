@@ -28,6 +28,7 @@ fn capabilities(config: &Value) -> Capabilities {
         .cleanup(column_mapped)
         .rollback(column_mapped)
         .schema_evolution(!jsonb)
+        .declared_types(!jsonb)
         .schema_report(if jsonb {
             SchemaReport::Schemaless
         } else {

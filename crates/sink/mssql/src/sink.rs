@@ -104,6 +104,8 @@ pub(crate) struct MssqlDriver {
     /// Whether the target has been confirmed present for this sink instance
     /// (#580). One check per run, not per page.
     table_ready: std::sync::atomic::AtomicBool,
+    /// The source's declared columns (#955).
+    declared: faucet_core::DeclaredSlot,
     /// Whether the `on_unknown_field: warn` warning has been logged.
     unknown_warned: std::sync::atomic::AtomicBool,
     /// Per-sink run id for staged-object keys (#528).
@@ -159,6 +161,7 @@ impl MssqlDriver {
                 statement_timeout_secs,
             )),
             table_ready: std::sync::atomic::AtomicBool::new(false),
+            declared: faucet_core::DeclaredSlot::new(),
             unknown_warned: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "staging")]
             stage_run_id: crate::staged::new_stage_run_id(),
@@ -278,12 +281,9 @@ impl MssqlDriver {
         } else {
             &[]
         };
-        let planned = if key.is_empty() {
-            faucet_core::plan_columns(records)
-        } else {
-            faucet_core::plan_keyed_columns(records, key)
-        };
-        let Some(columns) = planned else {
+        let declared = self.declared.get();
+        let Some(columns) = faucet_core::plan_table_declared(records, key, declared.as_ref())
+        else {
             return Ok(());
         };
         // An overwrite writes to staging. On a first run (no target) nothing
@@ -302,6 +302,33 @@ impl MssqlDriver {
             .await?;
         self.table_ready.store(true, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// A run that wrote nothing creates the declared target (#955), when the
+    /// declaration is complete and no table is there yet.
+    async fn create_declared_target(&self) -> Result<(), FaucetError> {
+        use std::sync::atomic::Ordering;
+        let Some(declared) = self.declared.for_empty_run() else {
+            return Ok(());
+        };
+        if !self.auto_columns()
+            || !self.config.create_table
+            || self.table_ready.load(Ordering::Relaxed)
+            || self.table_exists(&self.config.table).await?
+        {
+            return Ok(());
+        }
+        let key: &[String] = if self.config.write.dedups_by_key() {
+            &self.config.write.key
+        } else {
+            &[]
+        };
+        let Some(columns) = faucet_core::plan_table_declared(&[], key, Some(&declared)) else {
+            return Ok(());
+        };
+        let sql = build_create_table_sql(&self.config.table, &self.table_quoted, &columns, key)?;
+        self.run_ddl(&tolerate_concurrent_create(&sql), "create_table")
+            .await
     }
 
     async fn table_exists(&self, table_literal: &str) -> Result<bool, FaucetError> {
@@ -2048,6 +2075,14 @@ impl SinkDriver for MssqlDriver {
         self.calls.install(ctx);
     }
 
+    fn set_declared_columns(&self, columns: faucet_core::DeclaredColumns) {
+        self.declared.set(columns);
+    }
+
+    async fn complete_run(&self, _calls: &CallSlot) -> Result<(), FaucetError> {
+        self.create_declared_target().await
+    }
+
     fn set_roundtrip_recorder(
         &self,
         recorder: std::sync::Arc<faucet_core::observability::RoundtripRecorder>,
@@ -2099,7 +2134,7 @@ impl SinkDriver for MssqlDriver {
     /// The JSON-column mode writes whole records, so it reports no schema.
     fn capabilities(&self, derived: faucet_core::Capabilities) -> faucet_core::Capabilities {
         if self.auto_columns() {
-            derived
+            derived.to_builder().declared_types(true).build()
         } else {
             derived
                 .to_builder()

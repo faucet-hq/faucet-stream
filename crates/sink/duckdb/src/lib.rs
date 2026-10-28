@@ -19,4 +19,17 @@ pub use sink::DuckdbSink;
 
 /// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
 pub const DESCRIPTOR: faucet_core::ConnectorDescriptor =
-    faucet_core::ConnectorDescriptor::new("duckdb", faucet_core::capabilities::append_only_sink);
+    faucet_core::ConnectorDescriptor::new("duckdb", capabilities);
+
+/// Append only; a column-mapped config creates its table from declared types.
+fn capabilities(config: &faucet_core::Value) -> faucet_core::Capabilities {
+    let json = !config.is_null()
+        && matches!(
+            faucet_core::capabilities::config::tag(config, "column_mapping"),
+            None | Some("json")
+        );
+    faucet_core::Capabilities::append_only_sink()
+        .to_builder()
+        .declared_types(!json)
+        .build()
+}

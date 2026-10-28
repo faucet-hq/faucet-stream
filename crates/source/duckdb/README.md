@@ -88,3 +88,7 @@ A plain query source: no exactly-once, discovery or sharding. `faucet list --jso
 ## Timeouts, cancellation and retries
 
 Every query runs through the pipeline's `CallContext` (#880): the run's deadline and cancel token end it promptly, and a query cut short is interrupted inside DuckDB so its blocking task stops rather than running on. Each query counts as one `query` round trip in `faucet_source_roundtrips_total`. Reads are not retried.
+
+## Declared column types
+
+The source declares the query's columns and their types (`Source::declared_columns`, #955) from the describe its read makes, so a sink that creates its table types it from the source rather than from the first page's JSON values. See [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types).

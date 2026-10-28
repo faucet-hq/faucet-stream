@@ -12,6 +12,7 @@ fn capabilities(config: &Value) -> Capabilities {
         .shardable(config.is_null() || is_set(config, "shard"))
         .range_read(true)
         .range_digest(true)
+        .declared_columns(true)
         .build()
 }
 
@@ -24,6 +25,7 @@ mod tests {
     fn shardable_follows_the_shard_block() {
         let plain = DESCRIPTOR.capabilities(&json!({"connection_url": "u", "query": "q"}));
         assert!(plain.discover() && plain.range_read() && plain.range_digest());
+        assert!(plain.declared_columns());
         assert!(!plain.shardable() && !plain.exactly_once() && !plain.reports_lag());
         let sharded = DESCRIPTOR.capabilities(&json!({"shard": {"key": "id"}}));
         assert!(sharded.shardable() && sharded.range_digest());

@@ -19,6 +19,7 @@ fn capabilities(config: &Value) -> Capabilities {
         .staged_load(true)
         .schema_evolution(true)
         .schema_report(SchemaReport::Reported)
+        .declared_types(true)
         .build()
 }
 

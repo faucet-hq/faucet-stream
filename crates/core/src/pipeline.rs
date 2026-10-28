@@ -619,6 +619,32 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
         self
     }
 
+    /// Give the sink the source's declared column types (#955). A masking pass
+    /// rewrites values between the two, so its declaration goes over
+    /// reshaped. A source that fails to declare leaves the sink inferring.
+    async fn hand_declared_columns(&self, source: &dyn Source, sink: &dyn Sink) {
+        match source
+            .declared_columns(&std::collections::HashMap::new())
+            .await
+        {
+            Ok(Some(declared)) => {
+                #[cfg(feature = "masking")]
+                let declared = if self.masking.is_some() {
+                    declared.reshaped()
+                } else {
+                    declared
+                };
+                sink.set_declared_columns(declared);
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(
+                error = %e,
+                "the source could not declare its column types; a created destination \
+                 takes the types inferred from the first page"
+            ),
+        }
+    }
+
     /// Run the pipeline in streaming mode.
     ///
     /// 1. Loads the stored bookmark and pushes it to the source (if a state
@@ -868,6 +894,11 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
             {
                 wrapped_source.apply_start_bookmark(bm).await?;
                 start_seq = sink_seq;
+            }
+
+            if wrapped_sink.capabilities().declared_types() {
+                self.hand_declared_columns(&wrapped_source, &wrapped_sink)
+                    .await;
             }
 
             // Native byte-passthrough fast path (#633) — the cheapest mechanism
@@ -9248,5 +9279,129 @@ mod call_context_tests {
         let src = source.seen.0.lock().unwrap().clone().unwrap();
         assert!(src.cancel().is_none());
         assert_eq!(src.timeout(), Some(crate::io::DEFAULT_CALL_TIMEOUT));
+    }
+}
+
+#[cfg(test)]
+mod declared_columns_tests {
+    use super::*;
+    use crate::declared::{DeclaredColumn, DeclaredColumns, LogicalType};
+    use async_trait::async_trait;
+    use serde_json::json;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Declaring {
+        asked: AtomicUsize,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl Source for Declaring {
+        async fn fetch_with_context(
+            &self,
+            _ctx: &std::collections::HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            Ok(vec![json!({"id": 1})])
+        }
+        async fn declared_columns(
+            &self,
+            _ctx: &std::collections::HashMap<String, Value>,
+        ) -> Result<Option<DeclaredColumns>, FaucetError> {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                return Err(FaucetError::Source("describe failed".into()));
+            }
+            Ok(Some(DeclaredColumns::new([DeclaredColumn::new(
+                "id",
+                LogicalType::Int64,
+                false,
+            )])))
+        }
+    }
+
+    #[derive(Default)]
+    struct Typed {
+        declared_types: bool,
+        got: Mutex<Option<DeclaredColumns>>,
+    }
+
+    #[async_trait]
+    impl Sink for Typed {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            Ok(records.len())
+        }
+        fn capabilities(&self) -> crate::Capabilities {
+            crate::Capabilities::of_sink(self)
+                .to_builder()
+                .declared_types(self.declared_types)
+                .build()
+        }
+        fn set_declared_columns(&self, columns: DeclaredColumns) {
+            *self.got.lock().unwrap() = Some(columns);
+        }
+    }
+
+    fn source(fail: bool) -> Declaring {
+        Declaring {
+            asked: AtomicUsize::new(0),
+            fail,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_typing_sink_receives_the_declaration_once() {
+        let src = source(false);
+        let sink = Typed {
+            declared_types: true,
+            ..Default::default()
+        };
+        Pipeline::new(&src, &sink).run().await.unwrap();
+        assert_eq!(src.asked.load(Ordering::SeqCst), 1);
+        let got = sink.got.lock().unwrap().clone().expect("declared");
+        assert!(got.is_complete());
+        assert_eq!(got.get("id").unwrap().logical_type, LogicalType::Int64);
+    }
+
+    #[tokio::test]
+    async fn a_sink_that_does_not_type_is_never_asked_for() {
+        let src = source(false);
+        let sink = Typed::default();
+        Pipeline::new(&src, &sink).run().await.unwrap();
+        assert_eq!(src.asked.load(Ordering::SeqCst), 0);
+        assert!(sink.got.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failed_declaration_leaves_the_run_inferring() {
+        let src = source(true);
+        let sink = Typed {
+            declared_types: true,
+            ..Default::default()
+        };
+        let res = Pipeline::new(&src, &sink).run().await.unwrap();
+        assert_eq!(res.records_written, 1);
+        assert!(sink.got.lock().unwrap().is_none());
+    }
+
+    #[cfg(feature = "masking")]
+    #[tokio::test]
+    async fn masking_reshapes_the_declaration() {
+        use crate::masking::{CompiledMasking, MaskingSpec};
+        let spec: MaskingSpec = serde_json::from_value(json!({
+            "rules": [{ "match": { "fields": ["id"] }, "action": { "type": "hash" } }]
+        }))
+        .unwrap();
+        let src = source(false);
+        let sink = Typed {
+            declared_types: true,
+            ..Default::default()
+        };
+        Pipeline::new(&src, &sink)
+            .with_masking(Arc::new(CompiledMasking::compile(&spec).unwrap()))
+            .run()
+            .await
+            .unwrap();
+        assert!(!sink.got.lock().unwrap().clone().unwrap().is_complete());
     }
 }

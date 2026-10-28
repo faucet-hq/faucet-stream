@@ -385,6 +385,27 @@ fn spanner_keyword(t: faucet_core::SqlBaseType) -> &'static str {
     }
 }
 
+/// The column type a declared column (#955) is created as; `None` keeps
+/// `STRING(MAX)`. `NUMERIC` is fixed at 38 digits, 9 after the point; a
+/// timestamp without a zone has no Spanner counterpart.
+fn spanner_declared_type(t: &faucet_core::LogicalType) -> Option<&'static str> {
+    use faucet_core::LogicalType as L;
+    Some(match *t {
+        L::Int64 => "INT64",
+        L::Float64 => "FLOAT64",
+        L::Bool => "BOOL",
+        L::Decimal {
+            precision: Some(p),
+            scale,
+        } if scale.unwrap_or(0) <= 9 && p.saturating_sub(scale.unwrap_or(0)) <= 29 => "NUMERIC",
+        L::Date => "DATE",
+        L::Timestamp { tz: true } => "TIMESTAMP",
+        L::Bytes => "BYTES(MAX)",
+        L::Json => "JSON",
+        _ => return None,
+    })
+}
+
 /// Render a [`SpannerType`] back to its DDL form, used when re-emitting a
 /// column to relax `NOT NULL`. `Other` (STRUCT/PROTO) cannot be re-emitted.
 fn spanner_type_ddl(ty: &SpannerType) -> Result<String, String> {
@@ -497,6 +518,8 @@ pub(crate) struct SpannerDriver {
     token_table_ready: tokio::sync::OnceCell<()>,
     /// Record fields already warned-about as having no matching column.
     warned_fields: std::sync::Mutex<HashSet<String>>,
+    /// The source's declared columns (#955).
+    declared: faucet_core::DeclaredSlot,
 }
 
 impl SpannerSink {
@@ -524,6 +547,7 @@ impl SpannerDriver {
             meta: tokio::sync::RwLock::new(None),
             token_table_ready: tokio::sync::OnceCell::new(),
             warned_fields: std::sync::Mutex::new(HashSet::new()),
+            declared: faucet_core::DeclaredSlot::new(),
         })
     }
 
@@ -712,7 +736,8 @@ impl SpannerDriver {
                 self.config.table_name
             )));
         }
-        let Some(columns) = faucet_core::plan_columns(records) else {
+        let declared = self.declared.get();
+        let Some(columns) = faucet_core::plan_columns_declared(records, declared.as_ref()) else {
             return Err(FaucetError::Sink(format!(
                 "spanner sink: table `{}` does not exist and the first page carried no \
                  inferable columns to create it from",
@@ -737,7 +762,12 @@ impl SpannerDriver {
                 } else {
                     ""
                 };
-                format!("{} STRING(MAX){null}", quote_ident_spanner(&c.name))
+                let ty = c
+                    .declared
+                    .as_ref()
+                    .and_then(spanner_declared_type)
+                    .unwrap_or("STRING(MAX)");
+                format!("{} {ty}{null}", quote_ident_spanner(&c.name))
             })
             .collect();
         let pk: Vec<String> = key.iter().map(|k| quote_ident_spanner(k)).collect();
@@ -970,6 +1000,26 @@ async fn run_cleanup_txn(
 
 #[async_trait]
 impl SinkDriver for SpannerDriver {
+    fn capabilities(&self, derived: faucet_core::Capabilities) -> faucet_core::Capabilities {
+        derived.to_builder().declared_types(true).build()
+    }
+
+    fn set_declared_columns(&self, columns: faucet_core::DeclaredColumns) {
+        self.declared.set(columns);
+    }
+
+    /// A run that wrote nothing creates the declared table (#955).
+    async fn complete_run(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        if !self.config.create_table
+            || self.config.write.key.is_empty()
+            || self.meta.read().await.is_some()
+            || self.declared.for_empty_run().is_none()
+        {
+            return Ok(());
+        }
+        self.require_meta(calls, &[]).await.map(|_| ())
+    }
+
     /// Every read, commit and DDL operation runs through the call context,
     /// once (#880).
     fn call_context(&self) -> faucet_core::CallContext {
@@ -1728,6 +1778,33 @@ mod tests {
             build_alter_column_sql("t", "name", "STRING(MAX)"),
             "ALTER TABLE `t` ALTER COLUMN `name` STRING(MAX)"
         );
+    }
+
+    #[test]
+    fn declared_columns_map_to_spanner_types() {
+        use faucet_core::LogicalType as L;
+        let dec = |p, sc| L::Decimal {
+            precision: Some(p),
+            scale: Some(sc),
+        };
+        assert_eq!(spanner_declared_type(&dec(12, 2)), Some("NUMERIC"));
+        assert_eq!(spanner_declared_type(&dec(40, 2)), None);
+        assert_eq!(
+            spanner_declared_type(&L::Decimal {
+                precision: None,
+                scale: None
+            }),
+            None
+        );
+        assert_eq!(
+            spanner_declared_type(&L::Timestamp { tz: true }),
+            Some("TIMESTAMP")
+        );
+        assert_eq!(spanner_declared_type(&L::Timestamp { tz: false }), None);
+        assert_eq!(spanner_declared_type(&L::Date), Some("DATE"));
+        assert_eq!(spanner_declared_type(&L::Uuid), None);
+        assert_eq!(spanner_declared_type(&L::Bytes), Some("BYTES(MAX)"));
+        assert_eq!(spanner_declared_type(&L::Int64), Some("INT64"));
     }
 
     #[test]

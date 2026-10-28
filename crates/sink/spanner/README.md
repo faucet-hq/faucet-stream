@@ -130,6 +130,10 @@ the field (narrowing later is the `schema:` drift policy's job). Every auto-crea
 Set `create_table: false` to require a pre-existing target; a missing one then
 fails fast with the same error every table sink raises, naming both ways out.
 
+## Declared column types
+
+When the run's source declares its column types (a SQL query source, #955 — see [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types)), a table this sink creates types each declared column from the declaration instead of from the first page: `INT64`, `FLOAT64`, `BOOL`, `NUMERIC` (at most 29 integer and 9 fractional digits), `DATE`, `TIMESTAMP` (with a zone), `BYTES(MAX)`, `JSON`; anything else stays `STRING(MAX)`. A declared column whose first-page values do not fit its type keeps the inferred type; an existing table is never retyped. With a complete declaration a run that writes nothing creates the empty, typed table.
+
 ## Batch atomicity
 
 What a failed write leaves behind (#737): **best-effort** — mutations commit in 60,000-cell chunks. `on_batch_error: dlq_all`

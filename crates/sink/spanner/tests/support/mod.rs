@@ -153,3 +153,24 @@ pub async fn ids(conn: &SpannerConnection, table: &str) -> Vec<i64> {
     }
     out
 }
+
+/// `(column, SPANNER_TYPE)` of `table`, via a raw client; empty when missing.
+#[allow(dead_code)] // used by the conformance battery only
+pub async fn column_types(conn: &SpannerConnection, table: &str) -> Vec<(String, String)> {
+    let client = conn.connect().await.expect("columns client");
+    let mut tx = client.single().await.expect("single txn");
+    let mut stmt = Statement::new(
+        "SELECT COLUMN_NAME, SPANNER_TYPE FROM INFORMATION_SCHEMA.COLUMNS \
+         WHERE TABLE_SCHEMA = '' AND TABLE_NAME = @t",
+    );
+    stmt.add_param("t", &table);
+    let mut iter = tx.query(stmt).await.expect("columns query");
+    let mut out = Vec::new();
+    while let Some(row) = iter.next().await.expect("columns row") {
+        out.push((
+            row.column_by_name::<String>("COLUMN_NAME").expect("name"),
+            row.column_by_name::<String>("SPANNER_TYPE").expect("type"),
+        ));
+    }
+    out
+}

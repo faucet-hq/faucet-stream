@@ -243,3 +243,78 @@ async fn duckdb_sink_and_duckdb_source_keep_the_corpus() {
     .unwrap();
     fidelity::assert_corpus_read(&source, &sent, typed(Tolerance::exact())).await;
 }
+
+/// The corpus through columns created from a declaration (#955): the DuckDB
+/// sink creates typed columns, the DuckDB source reads the types back and the
+/// values unchanged. A `TIMESTAMPTZ` normalizes the offset it was written
+/// with, so the timestamps are compared as instants.
+#[tokio::test]
+async fn duckdb_typed_columns_keep_the_corpus() {
+    use faucet_core::{DeclaredColumn, DeclaredColumns, LogicalType as L, Source as _};
+    let dir = tempfile::tempdir().unwrap();
+    let db = p(dir.path(), "typed.duckdb");
+    let cfg: faucet_sink_duckdb::DuckdbSinkConfig = serde_json::from_value(json!({
+        "database": db,
+        "table_name": "corpus",
+        "column_mapping": "auto_map",
+    }))
+    .unwrap();
+    let sink = faucet_sink_duckdb::DuckdbSink::new(cfg).await.unwrap();
+    let sent = vec![fidelity::flat_corpus()];
+    let dec = |p, s| L::Decimal {
+        precision: Some(p),
+        scale: Some(s),
+    };
+    let mut columns = vec![
+        DeclaredColumn::new("temporal_date", L::Date, true),
+        DeclaredColumn::new("canonical_decimal", dec(38, 9), true),
+        DeclaredColumn::new("canonical_decimal_scale", dec(10, 2), true),
+        DeclaredColumn::new("canonical_big_integer", dec(38, 0), true),
+    ];
+    for f in ["i64_max", "i64_min", "beyond_f64_exact", "zero", "negative"] {
+        columns.push(DeclaredColumn::new(format!("integers_{f}"), L::Int64, true));
+    }
+    let instants = [
+        "temporal_timestamp_utc",
+        "temporal_timestamp_offset",
+        "temporal_timestamp_micros",
+        "temporal_before_epoch",
+    ];
+    for f in instants {
+        columns.push(DeclaredColumn::new(f, L::Timestamp { tz: true }, true));
+    }
+    sink.set_declared_columns(DeclaredColumns::new(columns).reshaped());
+    write(&sink, &sent).await;
+    drop(sink);
+    let source = faucet_source_duckdb::DuckdbSource::new(
+        faucet_source_duckdb::DuckdbSourceConfig::new(&db, "SELECT * FROM corpus"),
+    )
+    .await
+    .unwrap();
+    let declared = source
+        .declared_columns(&Default::default())
+        .await
+        .unwrap()
+        .expect("the source declares the typed table");
+    let t = |n: &str| declared.get(n).unwrap().logical_type;
+    // 2026-02-29 is no date, so the guard keeps that column text.
+    assert_eq!(t("temporal_date"), L::String);
+    assert_eq!(t("canonical_decimal"), dec(38, 9));
+    assert_eq!(t("canonical_big_integer"), dec(38, 0));
+    assert_eq!(t("integers_i64_max"), L::Int64);
+    assert_eq!(t("temporal_timestamp_offset"), L::Timestamp { tz: true });
+
+    let landed = source.fetch_all().await.unwrap();
+    let instant = |v: &Value| {
+        chrono::DateTime::parse_from_rfc3339(v.as_str().expect("a timestamp string"))
+            .expect("RFC 3339")
+            .timestamp_micros()
+    };
+    for f in instants {
+        assert_eq!(instant(&landed[0][f]), instant(&sent[0][f]), "{f}");
+    }
+    let tol = instants
+        .iter()
+        .fold(typed(Tolerance::exact()), |t, f| t.skipping(f));
+    fidelity::assert_round_trip(&sent, &landed, tol);
+}

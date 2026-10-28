@@ -18,6 +18,7 @@ fn capabilities(config: &Value) -> Capabilities {
         .keyed_dedup(!kind_level && dedups_by_key(config))
         .cleanup(column_mapped)
         .schema_evolution(!json)
+        .declared_types(!json)
         .schema_report(if json {
             SchemaReport::Schemaless
         } else {

@@ -11,6 +11,7 @@ fn capabilities(config: &Value) -> Capabilities {
         .discover(true)
         .shardable(config.is_null() || is_set(config, "shard"))
         .range_read(true)
+        .declared_columns(true)
         .build()
 }
 
