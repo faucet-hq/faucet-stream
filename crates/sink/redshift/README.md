@@ -98,7 +98,7 @@ field (drop or rename it with a transform).
 
 ## Declared column types
 
-When the run's source declares its column types (a SQL query source, #955 — see [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types)), a table this sink creates types each declared column from the declaration instead of from the first page: `BIGINT`, `DOUBLE PRECISION`, `BOOLEAN`, `DECIMAL(p,s)` (up to 38 digits; wider or unbounded stays `VARCHAR`), `DATE`, `TIME`, `TIMESTAMPTZ` / `TIMESTAMP`. A declared column whose first-page values do not fit its type keeps the inferred type; an existing table is never retyped. With a complete declaration a run that writes nothing creates the empty, typed table.
+When the run's source declares its column types (a SQL query source, #955 — see [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types)), a table this sink creates types each declared column from the declaration instead of from the first page: `BIGINT`, `DOUBLE PRECISION`, `BOOLEAN`, `DECIMAL(p,s)` (up to 38 digits; wider or unbounded stays `VARCHAR`), `DATE`, `TIME`, `TIMESTAMPTZ` / `TIMESTAMP`. A declared column whose first-page values do not fit its type keeps the inferred type; an existing table is never retyped. With a complete declaration a run that writes nothing creates the empty, typed table. Row-by-row `INSERT`s bind each decimal, date, time, timestamp and `UUID` value as text cast to its column's type (`$n::date`), so these typed columns — created here or already present — accept the source's string renderings.
 
 ## Commit accumulation (`commit_rows` / `commit_bytes`)
 

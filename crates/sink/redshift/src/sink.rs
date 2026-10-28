@@ -572,19 +572,19 @@ impl RedshiftDriver {
             .into_iter()
             .cloned()
             .collect();
-        // An exact-decimal column binds text cast to its type, so the server
-        // parses the digits the record holds (#885).
-        let decimal_types: Vec<Option<String>> = present
+        // A column whose values arrive as text binds text cast to its type, so
+        // the server parses the exact digits or the instant the record holds.
+        let cast_types: Vec<Option<String>> = present
             .iter()
             .map(|c| {
                 typed
                     .iter()
                     .find(|(n, _)| n == c)
                     .map(|(_, t)| t.clone())
-                    .filter(|t| faucet_core::fidelity::is_exact_decimal_type(t))
+                    .filter(|t| binds_as_cast_text(t))
             })
             .collect();
-        let casts: Vec<Option<&str>> = decimal_types.iter().map(|t| t.as_deref()).collect();
+        let casts: Vec<Option<&str>> = cast_types.iter().map(|t| t.as_deref()).collect();
         if present.is_empty() {
             // Reporting the chunk as written would advance the bookmark past
             // rows that never landed (SQL-19).
@@ -652,6 +652,20 @@ impl RedshiftDriver {
         }
         Ok(total)
     }
+}
+
+/// Whether a column of `sql_type` takes its value as text cast to the type:
+/// exact decimals (#885) and the types the fidelity model renders as strings.
+fn binds_as_cast_text(sql_type: &str) -> bool {
+    if faucet_core::fidelity::is_exact_decimal_type(sql_type) {
+        return true;
+    }
+    let base = sql_type.trim().to_ascii_lowercase();
+    ["date", "time", "timetz", "timestamp", "timestamptz", "uuid"]
+        .iter()
+        .any(|p| {
+            base == *p || base.starts_with(&format!("{p} ")) || base.starts_with(&format!("{p}("))
+        })
 }
 
 /// The records of a COPY chunk that share a column with the table, and how
@@ -1006,6 +1020,29 @@ impl SinkDriver for RedshiftDriver {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn text_rendered_types_bind_as_cast_text() {
+        for t in [
+            "numeric(12,2)",
+            "date",
+            "timestamp without time zone",
+            "timestamp(3) with time zone",
+            "time with time zone",
+            "uuid",
+        ] {
+            assert!(super::binds_as_cast_text(t), "{t}");
+        }
+        for t in [
+            "bigint",
+            "character varying(256)",
+            "boolean",
+            "double precision",
+            "super",
+        ] {
+            assert!(!super::binds_as_cast_text(t), "{t}");
+        }
+    }
 
     #[test]
     fn a_copy_chunk_drops_records_that_share_no_column() {
