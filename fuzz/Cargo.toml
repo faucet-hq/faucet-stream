@@ -21,7 +21,11 @@ serde_json = "1"
 chrono = "0.4"
 faucet-core = { path = "../crates/core" }
 faucet-cli = { path = "../cli", default-features = false }
-faucet-source-postgres-cdc = { path = "../crates/source/postgres-cdc" }
+# The pgoutput decoder is compiled from its source files (fuzz_targets/pgoutput.rs)
+# so the postgres-cdc crate, and the sqlx macros the sanitizer build cannot load, stay out.
+base64 = "0.22"
+byteorder = "1"
+tracing = "0.1"
 
 [[bin]]
 name = "interpolate"
