@@ -208,7 +208,7 @@ jobs:
         with:
           toolchain: "1.96.0"
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: skills/faucet-connector/examples/${{ matrix.crate }}
       # The crates depend on crates.io `faucet-core = "1"` as a third-party
@@ -239,7 +239,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
@@ -256,7 +256,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # Fail on any rustdoc warning (broken intra-doc links, etc.) so the
       # docs.rs render stays clean. The `doc_cfg` feature-badge path itself is
       # nightly-only and exercised by docs.rs, not here.
@@ -350,7 +350,7 @@ jobs:
           dir="$(ls -d /opt/oracle/instantclient_* | sort -V | tail -1)"
           echo "LD_LIBRARY_PATH=$dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
           echo "Oracle Instant Client installed at $dir"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Pull Docker Hub images through a mirror
         # Avoids Docker Hub's anonymous pull rate limit on shared runners.
         env:
@@ -416,7 +416,7 @@ jobs:
         if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
         with:
           toolchain: "1.96.0"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
       - name: Engine guarantee suites (Category A) + state-format gates (Category G)
         # No Docker, no network: the scripted doubles inject failures at exact
@@ -450,7 +450,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Serve-ui + serve-openapi isolation tests
         run: cargo test -p faucet-cli --features serve-ui --test serve_ui --test serve_openapi
 
@@ -480,7 +480,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Tests that read docs
         run: >-
           cargo test --no-fail-fast -p faucet-cli --all-features
@@ -719,7 +719,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.96.0"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.feature }}
       - name: Install librdkafka prerequisites (Ubuntu)
@@ -770,7 +770,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.features }}
       - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
@@ -825,7 +825,7 @@ jobs:
         run: |
           choco install nasm --yes --no-progress
           echo "C:\\Program Files\\NASM" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Build the shipped CLI
         run: cargo build -p faucet-cli --features "$SHIPPED_FEATURES"
       - name: Smoke-test the binary
@@ -854,7 +854,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.96.0"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Install valgrind and gungraun-runner
         run: |
           sudo apt-get update
@@ -900,7 +900,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Pull Docker Hub images through a mirror
         # Avoids Docker Hub's anonymous pull rate limit on shared runners.
         env:
@@ -972,7 +972,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # Excluded: faucet-cli / faucet-stream (see
       # scripts/semver-exclude.py for why) plus any crate not yet on crates.io
       # — computed, so a crate is guarded from its first release on without
@@ -1094,7 +1094,7 @@ jobs:
       - uses: taiki-e/install-action@24b35e792c4eb272ee06051198c72db034fd0be3 # cargo-llvm-cov
         with:
           tool: cargo-llvm-cov
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Pull Docker Hub images through a mirror
         # Avoids Docker Hub's anonymous pull rate limit on shared runners.
         if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
