@@ -237,3 +237,81 @@ async fn oversized_record_fails_per_row_and_rest_deliver() {
     let err = sink.write_batch(&records).await.unwrap_err();
     assert!(err.to_string().contains("2 of 4"), "{err}");
 }
+
+/// Every record's raw payload bytes on `stream`, in order (one shard).
+async fn read_raw(client: &aws_sdk_kinesis::Client, stream: &str) -> Vec<Vec<u8>> {
+    let shards = client
+        .list_shards()
+        .stream_name(stream)
+        .send()
+        .await
+        .unwrap();
+    let shard = shards.shards()[0].shard_id().to_string();
+    let mut it = client
+        .get_shard_iterator()
+        .stream_name(stream)
+        .shard_id(shard)
+        .shard_iterator_type(aws_sdk_kinesis::types::ShardIteratorType::TrimHorizon)
+        .send()
+        .await
+        .unwrap()
+        .shard_iterator()
+        .map(str::to_string);
+    let mut out = Vec::new();
+    for _ in 0..5 {
+        let Some(i) = it else { break };
+        let resp = client
+            .get_records()
+            .shard_iterator(&i)
+            .send()
+            .await
+            .unwrap();
+        out.extend(resp.records().iter().map(|r| r.data().as_ref().to_vec()));
+        it = resp.next_shard_iterator().map(str::to_string);
+    }
+    out
+}
+
+/// `string` writes a JSON string's text and `bytes` a base64 string's bytes
+/// as the raw payload; a record of the wrong shape fails that row (#967).
+#[tokio::test(flavor = "multi_thread")]
+async fn string_and_bytes_value_formats_write_raw_payloads() {
+    use faucet_sink_kinesis::ValueFormat;
+    let (_container, endpoint) = start_localstack().await;
+    let client = raw_client(&endpoint).await;
+    create_stream(&client, "texts", 1).await;
+    create_stream(&client, "blobs", 1).await;
+
+    let mut cfg = sink_config(&endpoint, "texts");
+    cfg.partition_key = PartitionKey::Random;
+    cfg.value_format = ValueFormat::String;
+    let sink = KinesisSink::new(cfg).await.unwrap();
+    let outcomes = sink
+        .write_batch_partial(&[
+            json!("plain text"),
+            json!({"not": "a string"}),
+            json!("caf\u{e9}"),
+        ])
+        .await
+        .unwrap();
+    assert!(outcomes[0].is_ok() && outcomes[2].is_ok(), "{outcomes:?}");
+    assert!(outcomes[1].is_err(), "an object is not a string record");
+    let mut texts = read_raw(&client, "texts").await;
+    texts.sort();
+    assert_eq!(
+        texts,
+        vec!["caf\u{e9}".as_bytes().to_vec(), b"plain text".to_vec()],
+        "random keys give no cross-record order"
+    );
+
+    let mut cfg = sink_config(&endpoint, "blobs");
+    cfg.partition_key = PartitionKey::Random;
+    cfg.value_format = ValueFormat::Bytes;
+    let sink = KinesisSink::new(cfg).await.unwrap();
+    assert_eq!(sink.write_batch(&[json!("/wB/")]).await.unwrap(), 1);
+    assert!(sink.write_batch(&[json!("not base64!")]).await.is_err());
+    assert_eq!(
+        read_raw(&client, "blobs").await,
+        vec![vec![0xff, 0x00, 0x7f]]
+    );
+}
