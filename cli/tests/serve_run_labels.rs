@@ -249,6 +249,49 @@ mod sqlite {
         assert!(ids(&h, f(&["extra"])).await.is_empty());
     }
 
+    /// A row a v6 peer inserted after this instance's backfill carries no
+    /// label rows; the first status write here adds them, once (#975).
+    #[tokio::test]
+    async fn an_update_fills_in_labels_a_peer_never_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peer.db");
+        let h = connect(&path).await;
+        let mut r = rec("peer", &[("team", "data"), ("env", "prod")], 0);
+        r.status = RunStatus::Pending;
+        r.finished_at = None;
+        let mut conn = sqlx::SqliteConnection::connect(&format!("sqlite:{}", path.display()))
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO faucet_serve_runs (run_id, name, status, submitted_at, body) \
+             VALUES (?, 'labelled', 'pending', ?, ?)",
+        )
+        .bind(&r.run_id)
+        .bind(faucet_cli::serve::history::sql::fmt_ts(r.submitted_at))
+        .bind(serde_json::to_string(&r).unwrap())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        let f = |raw: &[&str]| ListFilter {
+            limit: 10,
+            labels: filters(raw),
+            ..Default::default()
+        };
+        assert!(ids(&h, f(&["team:data"])).await.is_empty());
+        r.status = RunStatus::Running;
+        h.upsert(&r).await.unwrap();
+        assert_eq!(ids(&h, f(&["team:data", "env:prod"])).await, ["peer"]);
+        assert_eq!(label_rows(&path).await, 2);
+        r.status = RunStatus::Completed;
+        r.finished_at = Some(Utc::now());
+        h.upsert(&r).await.unwrap();
+        assert_eq!(label_rows(&path).await, 2);
+        assert_eq!(
+            h.get("peer").await.unwrap().unwrap().status,
+            RunStatus::Completed
+        );
+    }
+
     /// The label backfill reads each run once: a reconnect scans only runs
     /// submitted since the previous pass (less its margin).
     #[tokio::test]
@@ -406,4 +449,42 @@ async fn postgres_backend_filters_by_label() {
     .expect("connect postgres history");
     let p = format!("pg{}", Utc::now().timestamp_nanos_opt().unwrap_or(0));
     exercise(&h, &p).await;
+
+    // A row a v6 peer inserted without label rows gets them on its next
+    // status write here (#975).
+    use sqlx::Connection as _;
+    let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+    let peer = format!("{p}-peer");
+    let mut r = rec(&peer, &[("team", "peer"), ("p", &p)], 0);
+    r.status = RunStatus::Pending;
+    r.finished_at = None;
+    sqlx::query(
+        "INSERT INTO faucet_serve_runs (run_id, name, status, submitted_at, body) \
+         VALUES ($1, 'labelled', 'pending', $2, $3)",
+    )
+    .bind(&r.run_id)
+    .bind(faucet_cli::serve::history::sql::fmt_ts(r.submitted_at))
+    .bind(serde_json::to_string(&r).unwrap())
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    let f = ListFilter {
+        limit: 10,
+        labels: filters(&["team:peer", &format!("p:{p}")]),
+        ..Default::default()
+    };
+    assert!(ids(&h, f.clone()).await.is_empty());
+    r.status = RunStatus::Running;
+    h.upsert(&r).await.unwrap();
+    assert_eq!(ids(&h, f.clone()).await, [peer.as_str()]);
+    r.status = RunStatus::Completed;
+    r.finished_at = Some(Utc::now());
+    h.upsert(&r).await.unwrap();
+    let (n,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM faucet_serve_run_labels WHERE run_id=$1")
+            .bind(&peer)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!(n, 2);
 }

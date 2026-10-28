@@ -991,6 +991,10 @@ pub struct Stmts {
     pub purge_orphan_tenant_runs: String,
     /// Insert one `(run_id, key, value)` label row (#958).
     pub run_label_insert: String,
+    /// Insert one label row unless the run already has that key (#975).
+    pub run_label_insert_missing: String,
+    /// `1` when the run has any label row. Param: run id.
+    pub run_labels_exist: String,
     /// Drop every label row of one run.
     pub run_labels_delete: String,
     /// Drop label rows whose run is gone. No params.
@@ -1769,6 +1773,11 @@ impl Stmts {
                 VALUES ($1,$2,$3) \
                 ON CONFLICT (run_id, key) DO UPDATE SET value=excluded.value"
                 .into(),
+            run_label_insert_missing: "INSERT INTO faucet_serve_run_labels (run_id, key, value) \
+                VALUES ($1,$2,$3) ON CONFLICT (run_id, key) DO NOTHING"
+                .into(),
+            run_labels_exist: "SELECT 1 FROM faucet_serve_run_labels WHERE run_id=$1 LIMIT 1"
+                .into(),
             run_labels_delete: "DELETE FROM faucet_serve_run_labels WHERE run_id=$1".into(),
             purge_orphan_run_labels: "DELETE FROM faucet_serve_run_labels \
                 WHERE run_id NOT IN (SELECT run_id FROM faucet_serve_runs)"
@@ -2368,6 +2377,11 @@ impl Stmts {
             run_label_insert: "INSERT INTO faucet_serve_run_labels (run_id, key, value) \
                 VALUES (?,?,?) \
                 ON CONFLICT (run_id, key) DO UPDATE SET value=excluded.value"
+                .into(),
+            run_label_insert_missing: "INSERT INTO faucet_serve_run_labels (run_id, key, value) \
+                VALUES (?,?,?) ON CONFLICT (run_id, key) DO NOTHING"
+                .into(),
+            run_labels_exist: "SELECT 1 FROM faucet_serve_run_labels WHERE run_id=? LIMIT 1"
                 .into(),
             run_labels_delete: "DELETE FROM faucet_serve_run_labels WHERE run_id=?".into(),
             purge_orphan_run_labels: "DELETE FROM faucet_serve_run_labels \
@@ -3049,7 +3063,8 @@ macro_rules! impl_sql_history {
                 let backend = $crate::serve::history::sql::classify_backend_error;
                 let mut tx = self.pool.begin_with($begin_write).await.map_err(backend)?;
                 // Labels never change after submit: they are written with the
-                // row, so a status update is one statement (#975).
+                // row, and a status update only fills them in when the row has
+                // none (#975).
                 let attempts = [
                     &self.stmts.update_run,
                     &self.stmts.insert_new,
@@ -3077,6 +3092,25 @@ macro_rules! impl_sql_history {
                     if i == 1 {
                         for (k, v) in &rec.labels {
                             sqlx::query(&self.stmts.run_label_insert)
+                                .bind(&rec.run_id)
+                                .bind(k)
+                                .bind(v)
+                                .execute(&mut *tx)
+                                .await
+                                .map_err(backend)?;
+                        }
+                    } else if !rec.labels.is_empty()
+                        && sqlx::query(&self.stmts.run_labels_exist)
+                            .bind(&rec.run_id)
+                            .fetch_optional(&mut *tx)
+                            .await
+                            .map_err(backend)?
+                            .is_none()
+                    {
+                        // A row written without its labels (a v6 peer, or a
+                        // concurrent insert) gets them on its next write.
+                        for (k, v) in &rec.labels {
+                            sqlx::query(&self.stmts.run_label_insert_missing)
                                 .bind(&rec.run_id)
                                 .bind(k)
                                 .bind(v)
