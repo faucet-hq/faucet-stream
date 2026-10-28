@@ -1,0 +1,56 @@
+# Amazon Redshift (Data API) -> Amazon Redshift (IAM credentials).
+#
+# The source reads through the Redshift Data API over HTTPS — no network path
+# to the cluster, no database password: the workgroup authenticates as the
+# caller's AWS identity. The sink writes over the PostgreSQL wire protocol
+# with temporary credentials from `redshift:GetClusterCredentials`, which it
+# fetches again before they expire.
+#
+# Run:
+#   faucet run cli/examples/redshift_data_api_to_redshift_iam.yaml
+#
+# Prereqs:
+#   - AWS credentials allowed `redshift-data:*` on the workgroup and
+#     `redshift:GetClusterCredentials` on the cluster (the SDK default chain:
+#     environment, profile, instance or container role).
+#   - An `events` table in the source workgroup's `dev` database.
+version: 1
+name: redshift_data_api_to_redshift_iam
+
+pipeline:
+  source:
+    type: redshift
+    config:
+      database: dev
+      credentials:
+        type: redshift_data_api
+        config:
+          region: us-east-1
+          workgroup_name: analytics
+      query: SELECT id, email, updated_at FROM events WHERE updated_at >= ${bookmark}
+      replication:
+        type: incremental
+        column: updated_at
+        initial_value: "2026-01-01T00:00:00Z"
+      batch_size: 5000
+
+  sink:
+    type: redshift
+    config:
+      host: reporting.abc123.us-east-1.redshift.amazonaws.com
+      database: reporting
+      credentials:
+        type: iam
+        config:
+          region: us-east-1
+          cluster_identifier: reporting
+          db_user: faucet_loader
+          db_groups: [loaders]
+          duration_secs: 3600
+      table_name: events
+      write_strategy: insert
+
+  state:
+    type: file
+    config:
+      path: ./state

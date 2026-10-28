@@ -65,7 +65,7 @@ Legend: ✓ supported · ✗ not applicable. Tier: T1 = passes the faucet-confor
 | Databricks SQL | T1 ✅ᵐ | `source-databricks` | ✓ | ✓⁸ | ✗ | ✗ | ✗ | Statement Execution API; async poll, chunk pagination, typed decode, incremental `${bookmark}` replication in cursor order |
 | Apache Iceberg | T1 ✅ | `source-iceberg` | ✓ | ✓ | ✗ | ✗ | ✓ | REST/Glue/SQL/HMS catalog; Arrow scan with column projection + filter pushdown, snapshot / timestamp time travel, `mode: incremental` reads only snapshots appended since the bookmark; file-task sharding |
 | Amazon DynamoDB | T1 ✅ᵉ | `source-dynamodb` | ✓ | ✓ | ✗ | ✗ | ✓ | `mode: scan` (parallel segments, shardable) / `query` / `streams` (DynamoDB Streams change capture, per-shard sequence bookmarks, `__op` envelope; anchors a [`faucet mirror`](../cookbook/replication.md) handoff) |
-| Amazon Redshift | T1 ✅ | `source-redshift` | ✓ | ✓⁸ | ✗ | ✗ | ✗ | PostgreSQL wire; SQL query, rows as JSON; incremental `${bookmark}` replication in cursor order |
+| Amazon Redshift | T1 ✅ | `source-redshift` | ✓ | ✓⁸ | ✗ | ✗ | ✗ | PostgreSQL wire (password or refreshed IAM credentials) or the Redshift Data API over HTTPS; SQL query, rows as JSON; incremental `${bookmark}` replication in cursor order |
 | ClickHouse | T1 ✅ | `source-clickhouse` | ✓ | ✓⁸ | ✗ | ✗ | ✗ | HTTP interface, `FORMAT JSONEachRow` streaming; incremental `@bookmark` replication in cursor order |
 | BigQuery | T1 ✅ᵐ | `source-bigquery` | ✓ | ✗ | ✗ | ✗ | ✓ | `jobs.query` + pageToken pagination |
 | Snowflake | T1 ✅ᵐ | `source-snowflake` | ✓ | ✗ | ✗ | ✗ | ✓ | SQL REST API, server-side partitions |
@@ -258,7 +258,7 @@ config this project treats as a defect.
 | JSON Lines *(deprecated: use `file`)* | T1 ✅ | `sink-jsonl` | no-op | ✓ | ✗ | ✗ | best-effort | buffered file append |
 | Local files | T1 ✅ | `sink-file` | no-op | ✓ | ✗ | ✗ | atomic (no rollover) | [file sink](../cookbook/file-formats.md#the-local-file-sink): JSONL / JSON / CSV / XML / Excel / Avro / Parquet by extension; temp-then-rename finalisation, record/byte rollover with a `{part}` template, `write_mode: overwrite` swaps the whole output set; Parquet (and Avro) take the columnar path |
 | Snowflake | T2 | `sink-snowflake` | ✓ | ✗ | ✗ | **✓** | atomic (`batch_size: 0`) | SQL REST API; multi-statement `BEGIN;INSERT;MERGE;COMMIT` transaction for effectively-once |
-| Amazon Redshift | T1 ✅ | `sink-redshift` | ✓ | ✗ | ✗ | ✗ | atomic (COPY + `batch_size: 0`) | COPY-from-S3 (staged) or multi-row `INSERT`; append-only; auto-creates the table (`create_table`) |
+| Amazon Redshift | T1 ✅ | `sink-redshift` | ✓ | ✗ | ✗ | ✗ | atomic (COPY + `batch_size: 0`) | COPY-from-S3 (staged) or multi-row `INSERT`, over the PostgreSQL wire (password or refreshed IAM credentials) or the Redshift Data API; append-only; auto-creates the table (`create_table`) |
 | ClickHouse | T1 ✅ | `sink-clickhouse` | ✓ | ✗ | ✗ | ✗ | atomic (`batch_size: 0` or staged) | `INSERT … FORMAT JSONEachRow`; optional `async_insert`; append-only; auto-creates the table (`create_table`) |
 | MySQL | T1 ✅ | `sink-mysql` | ✓ | ✗ | **✓** | **✓** | atomic keyed | multi-row `INSERT` |
 | Microsoft SQL Server | T1 ✅ | `sink-mssql` | ✓ | ✗ | **✓** | **✓** | atomic keyed | multi-row `INSERT` (2100-param auto-split, per-row DLQ) |

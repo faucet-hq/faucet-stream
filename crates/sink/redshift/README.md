@@ -25,7 +25,7 @@ Append-only: Redshift has no `ON CONFLICT`, and `COPY` cannot upsert, so
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `host` / `port` / `database` / `user` / `credentials` / `tls` / `tls_mode` / `ssl_root_cert` | — | Connection block (see `faucet-common-redshift`); `tls_mode: verify_full` + `ssl_root_cert` verifies the server certificate. |
+| `host` / `port` / `database` / `user` / `credentials` / `tls` / `tls_mode` / `ssl_root_cert` | — | Connection block (see [`faucet-common-redshift`](../../common/redshift/README.md)); `credentials` is `password`, `iam` (temporary credentials, refreshed before they expire) or `redshift_data_api` (statements over HTTPS; `host`, `port`, `user` and TLS are then unused). `tls_mode: verify_full` + `ssl_root_cert` verifies the server certificate. |
 | `table_name` | yes | Target table (matched case-insensitively, as Redshift folds identifiers). |
 | `schema` | no | Namespace qualifying the table. Unset = the session's `current_schema()`; same-named tables in other schemas are ignored. |
 | `write_strategy` | no | `copy` (default) or `insert`. |
@@ -74,11 +74,42 @@ capabilities from it. It does not use the SQL family driver
 own transaction, while this sink accumulates pages into commit groups and
 loads them through S3. The public type and config are unchanged.
 
+## Redshift Data API
+
+With `credentials: { type: redshift_data_api }` every statement — the catalog
+lookups, `CREATE TABLE` / `ALTER TABLE`, the `COPY` and the `INSERT`s — runs
+through the Data API (`ExecuteStatement`, polled with `DescribeStatement` until
+it finishes). A write is submitted once and never resubmitted. `insert` binds
+each value as a Data API parameter `:pN` (cast like the wire path,
+`CAST(:p2 AS numeric(38,9))`, so exact decimals and instants land as their
+text; a NULL or empty string is written into the SQL), and splits a commit
+group into statements of at most 60 KB of SQL and parameters. `copy` stages to
+S3 exactly as over the wire and runs the `COPY` as a statement; the staged
+objects are removed whether it finished or failed. Round trips are metered as
+`submit`, `poll` and `fetch`; a run deadline or cancel ends the poll and
+cancels the statement on the service.
+
+```yaml
+database: dev
+credentials:
+  type: redshift_data_api
+  config:
+    region: us-east-1
+    cluster_identifier: my-cluster
+    secret_arn: arn:aws:secretsmanager:us-east-1:123456789012:secret:redshift-loader
+table_name: events
+write_strategy: insert
+```
+
 ## Testing
 
-Redshift has no local container image, and the `copy` path also needs a real S3
-bucket + IAM role, so live load tests live in `tests/integration.rs` and are
-`#[ignore]`d — they run only when `REDSHIFT_*` environment variables are set.
+Redshift has no local container image. `tests/integration.rs` and
+`tests/tls.rs` run the `insert` path against a Postgres container over the
+wire protocol, and `tests/copy.rs` runs `copy` against MinIO through a
+wire-protocol proxy that plays Redshift's `COPY`. `tests/data_api.rs` runs
+the Data API path against a contract fake that executes each statement on a
+Postgres container (and an `iam` write against a fake serverless
+`GetCredentials`); `tests/copy.rs` also runs `copy` through it.
 
 License: MIT OR Apache-2.0
 
@@ -149,7 +180,9 @@ Append only, with a staged load (`write_strategy: copy` bulk-loads through S3). 
 Every statement (`INSERT`, `COPY`, DDL, the catalog lookups) and every S3
 staging request runs through the pipeline's `CallContext` (#880): each is sent
 once, any caller deadline ends it, and each is metered as a round trip
-(`execute`, `query`, `stage`). The pool's connect timeout still applies.
+(`execute`, `query`, `stage`; through the Data API `submit`, `poll`, `fetch`,
+and `credentials` for an `iam` refresh). The pool's connect timeout still
+applies.
 
 ## Shared SQL layer
 

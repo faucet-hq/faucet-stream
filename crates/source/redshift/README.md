@@ -4,19 +4,20 @@ Amazon Redshift query source connector for the
 [`faucet-stream`](https://crates.io/crates/faucet-stream) ecosystem.
 
 Redshift speaks the PostgreSQL wire protocol, so this source connects through
-`sqlx`'s Postgres driver, runs a configurable SQL query, and streams the result
-rows as JSON objects with `O(batch_size)` memory. It supports **full** and
+`sqlx`'s Postgres driver (or, with `credentials: { type: redshift_data_api }`,
+through the Redshift Data API over HTTPS), runs a configurable SQL query, and
+streams the result rows as JSON objects with `O(batch_size)` memory. It supports **full** and
 **incremental** (bookmark-based) replication.
 
 ## Configuration
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `host` | yes | Cluster endpoint host. |
+| `host` | yes¹ | Cluster endpoint host. |
 | `port` | no | Port (default `5439`). |
 | `database` | yes | Database name. |
-| `user` | yes | Database user. |
-| `credentials` | yes | `{ type: password, config: { password: … } }`. `iam` / `redshift_data_api` are reserved (not yet supported). |
+| `user` | yes¹ | Database user (for `iam` on a cluster, the default `db_user`). |
+| `credentials` | yes | `password` (`{ password }`), `iam` (temporary credentials from `GetClusterCredentials` / serverless `GetCredentials`, refreshed before they expire) or `redshift_data_api` (statements over HTTPS). Fields: [`faucet-common-redshift`](../../common/redshift/README.md). |
 | `tls` | no | Require TLS (default `true`, certificate not verified; `false` → `sslmode=prefer`). |
 | `tls_mode` | no | `disable` \| `prefer` \| `require` \| `verify_ca` \| `verify_full`; overrides `tls`. |
 | `ssl_root_cert` | no | CA PEM path for `verify_ca` / `verify_full`. |
@@ -26,6 +27,10 @@ rows as JSON objects with `O(batch_size)` memory. It supports **full** and
 | `batch_size` | no | Rows per emitted page (default `1000`; `0` = one page). |
 | `replication` | no | `{ type: full }` (default) or `{ type: incremental, column, initial_value }`. |
 | `state_key` | no | Explicit bookmark key; otherwise derived from host/database/query. The query fingerprint changed in #839 (a fixed FNV-1a hash replaced Rust's `DefaultHasher`, which is not stable across releases), so a library pipeline relying on the derived key starts once from its initial position after upgrading; set `state_key` to pin it. Runs through the `faucet` CLI are unaffected — the CLI keys state by pipeline and row. |
+
+¹ Not used by `redshift_data_api`, which addresses `cluster_identifier` or
+`workgroup_name` instead (the dataset URI and the derived state key name that
+target: `redshift://workgroup:<name>/<database>`).
 
 ## Incremental replication
 
@@ -79,11 +84,38 @@ replication:
   initial_value: "2026-01-01T00:00:00Z"
 ```
 
+## Redshift Data API
+
+With `credentials: { type: redshift_data_api }` the query is submitted with
+`ExecuteStatement`, polled with `DescribeStatement`, and its rows are read page
+by page with `GetStatementResult`, re-framed into `batch_size` pages (a
+service page is read whole). Bind values (`params`, context tokens, the
+bookmark) travel as Data API parameters `:pN`; a NULL or empty string is
+written into the SQL, since a parameter value can be neither. The typed fields
+render through the shared value-fidelity model: exact `NUMERIC` strings,
+`timestamptz` as RFC 3339 with its offset, `timestamp` / `time` at microsecond
+precision, `VARBYTE` base64. The Data API has no describe, so the incremental
+cursor's type and the declared columns come from a `LIMIT 0` run of the query.
+Its round trips are metered as `submit`, `poll` and `fetch`; a run deadline or
+cancel ends the poll and cancels the statement on the service.
+
+```yaml
+database: dev
+credentials:
+  type: redshift_data_api
+  config:
+    region: us-east-1
+    workgroup_name: analytics
+query: "SELECT * FROM events"
+```
+
 ## Testing
 
 Redshift has no local container image, but it speaks the PostgreSQL wire
 protocol, so `tests/integration.rs` runs the read path against a Postgres
-container (Docker required).
+container (Docker required). `tests/data_api.rs` runs the Data API path
+against a contract fake that executes each statement on that container, and an
+`iam` read against a fake `GetClusterCredentials`.
 
 License: MIT OR Apache-2.0
 
@@ -96,9 +128,11 @@ A plain query source: no exactly-once, discovery or sharding. `faucet list --jso
 The query and every page of rows read from its cursor run through the
 pipeline's `CallContext` (#880): the run's cancel token stops a stalled read,
 any caller deadline ends it, and the query is metered as a `query` round trip.
+The `iam` credentials request (`credentials`) and every Data API request
+(`submit`, `poll`, `fetch`) go through it too.
 Rows are read a page at a time per call, so the per-row cost is unchanged; the
 pool's connect timeout still applies and nothing is retried.
 
 ## Declared column types
 
-The source declares the query's columns and their types (`Source::declared_columns`, #955) from the describe its read makes, so a sink that creates its table types it from the source rather than from the first page's JSON values. See [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types).
+The source declares the query's columns and their types (`Source::declared_columns`, #955) from the describe its read makes (a `LIMIT 0` run through the Data API), so a sink that creates its table types it from the source rather than from the first page's JSON values. See [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types).
