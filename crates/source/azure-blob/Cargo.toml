@@ -59,6 +59,11 @@ object_store = { workspace = true, features = ["azure"] }
 faucet-common-azure = { workspace = true, features = ["testing"] }
 # Writes Parquet fixtures for the `parquet` integration test.
 parquet = { workspace = true }
+# Sign an account SAS and fake IMDS (#967).
+hmac.workspace = true
+sha2.workspace = true
+base64.workspace = true
+wiremock = "0.6"
 
 [package.metadata.docs.rs]
 all-features = true
