@@ -26,6 +26,7 @@ futures.workspace = true
 jsonpath-rust.workspace = true
 
 [dev-dependencies]
+reqwest = { workspace = true, features = ["json"] }
 faucet-conformance = { workspace = true, features = ["containers"] }
 serde_json.workspace = true
 schemars.workspace = true

@@ -25,12 +25,15 @@ base64.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros", "signal"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] }
 serde_json.workspace = true
 futures.workspace = true
 faucet-conformance = { workspace = true, features = ["containers"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["nats"] }
+nkeys = "0.4"
+base64.workspace = true
+tempfile = "3"
 
 [package.metadata.docs.rs]
 all-features = true

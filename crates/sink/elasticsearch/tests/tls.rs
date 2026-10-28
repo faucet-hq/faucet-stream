@@ -2,8 +2,9 @@
 //! with security on (HTTPS only, every request authenticated). Without a
 //! `tls:` block a server signed by an unknown CA and plaintext HTTP are
 //! refused with a typed error; with the fixture CA in `tls.ca_cert_path`
-//! (every OS, no `SSL_CERT_FILE`) `basic` and `api_key` auth write documents a
-//! wrong password cannot, an unrelated CA is still refused, and
+//! (every OS, no `SSL_CERT_FILE`) `basic`, `api_key` and `bearer` (an OAuth2
+//! access token from `_security/oauth2/token`) auth write documents a wrong
+//! credential cannot, an unrelated CA is still refused, and
 //! `insecure_skip_verify` connects without one.
 
 use faucet_conformance::containers;
@@ -106,6 +107,46 @@ async fn writes_over_https_and_refuses_bad_certificates() {
             .expect("api_key"),
         1
     );
+    let token = images::exec(
+        &es,
+        &[
+            "curl",
+            "-sk",
+            "-u",
+            &format!("elastic:{password}"),
+            "-H",
+            "Content-Type: application/json",
+            "-X",
+            "POST",
+            "https://localhost:9200/_security/oauth2/token",
+            "-d",
+            r#"{"grant_type":"client_credentials"}"#,
+        ],
+    )
+    .await;
+    let token: serde_json::Value = serde_json::from_str(&token).expect("token json");
+    let token = token["access_token"]
+        .as_str()
+        .expect("access token")
+        .to_string();
+    assert_eq!(
+        write(https.clone(), ElasticsearchAuth::Bearer { token }, 6)
+            .await
+            .expect("bearer"),
+        1
+    );
+    assert!(
+        write(
+            https.clone(),
+            ElasticsearchAuth::Bearer {
+                token: "not-a-token".into()
+            },
+            7
+        )
+        .await
+        .is_err(),
+        "an unknown bearer token must be refused"
+    );
     assert!(
         write(https.clone(), basic("wrong"), 3).await.is_err(),
         "a wrong password must be refused"
@@ -123,7 +164,7 @@ async fn writes_over_https_and_refuses_bad_certificates() {
     )
     .await;
     let count: serde_json::Value = serde_json::from_str(&count).unwrap();
-    assert_eq!(count["count"], 2, "{count}");
+    assert_eq!(count["count"], 3, "{count}");
 
     let insecure = ElasticsearchTls {
         insecure_skip_verify: true,

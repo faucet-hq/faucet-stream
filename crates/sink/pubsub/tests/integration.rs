@@ -306,3 +306,53 @@ async fn sink_write_batch_surfaces_encode_failure() {
         "aggregate error: {err}"
     );
 }
+
+/// `string` publishes a JSON string's text and `bytes` a base64 string's
+/// decoded bytes as the message data; a record of the wrong shape fails that
+/// row (#967).
+#[tokio::test(flavor = "multi_thread")]
+async fn sink_string_and_bytes_value_formats_publish_raw_data() {
+    let emu = emulator().await;
+    let host = emu.host.as_str();
+    let client = setup_client(host).await;
+
+    let texts = create_topic_sub(&client, "sink-str-t", "sink-str-s").await;
+    let mut cfg = PubsubSinkConfig::new("sink-str-t");
+    cfg.connection = conn(host);
+    cfg.value_format = ValueFormat::String;
+    let sink = PubsubSink::new(cfg).await.expect("sink builds");
+    let outcomes = sink
+        .write_batch_partial(&[
+            json!("plain text"),
+            json!({"not": "a string"}),
+            json!("caf\u{e9}"),
+        ])
+        .await
+        .expect("write");
+    assert!(outcomes[0].is_ok() && outcomes[2].is_ok(), "{outcomes:?}");
+    assert!(outcomes[1].is_err(), "an object is not a string record");
+    let mut got: Vec<Vec<u8>> = drain(&texts, 2)
+        .await
+        .iter()
+        .map(|m| m.message.data.clone())
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec!["caf\u{e9}".as_bytes().to_vec(), b"plain text".to_vec()]
+    );
+
+    let blobs = create_topic_sub(&client, "sink-bytes-t", "sink-bytes-s").await;
+    let mut cfg = PubsubSinkConfig::new("sink-bytes-t");
+    cfg.connection = conn(host);
+    cfg.value_format = ValueFormat::Bytes;
+    let sink = PubsubSink::new(cfg).await.expect("sink builds");
+    assert_eq!(sink.write_batch(&[json!("/wB/")]).await.expect("write"), 1);
+    assert!(sink.write_batch(&[json!("not base64!")]).await.is_err());
+    let got: Vec<Vec<u8>> = drain(&blobs, 1)
+        .await
+        .iter()
+        .map(|m| m.message.data.clone())
+        .collect();
+    assert_eq!(got, vec![vec![0xff, 0x00, 0x7f]]);
+}

@@ -275,6 +275,49 @@ async fn sink_writes_avro_objects() {
     assert_eq!(back, rows.to_vec());
 }
 
+/// XML and Excel objects are written whole on flush and decode back (#967).
+#[cfg(all(feature = "file-format-xml", feature = "file-format-excel"))]
+#[tokio::test]
+async fn sink_writes_xml_and_xlsx_objects() {
+    use faucet_core::file_format::{FileFormat, FormatOptions, decode};
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
+        return;
+    };
+    let rows = vec![
+        json!({"id": "1", "name": "ada"}),
+        json!({"id": "2", "name": "grace"}),
+    ];
+    for (format, shared, ext) in [
+        (faucet_sink_gcs::GcsSinkFormat::Xml, FileFormat::Xml, ".xml"),
+        (
+            faucet_sink_gcs::GcsSinkFormat::Xlsx,
+            FileFormat::Xlsx,
+            ".xlsx",
+        ),
+    ] {
+        let prefix = format!("{}/", &ext[1..]);
+        let sink = GcsSink::new(
+            GcsSinkConfig::new(&bucket)
+                .prefix(&prefix)
+                .format(format)
+                .file_extension(ext)
+                .auth(GcsCredentials::Anonymous)
+                .storage_host(&host),
+        )
+        .await
+        .unwrap();
+        sink.write_batch(&rows).await.unwrap();
+        sink.flush().await.unwrap();
+        let names = object_names(&host, &bucket, &prefix).await;
+        assert_eq!(names.len(), 1, "{names:?}");
+        let body = download(&host, &bucket, &names[0]).await;
+        let back = decode(&body, shared, &FormatOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(back, rows, "{shared:?}");
+    }
+}
+
 /// [`spawn_fake_gcs_inner`], failing instead of skipping when `FAUCET_REQUIRE_BACKENDS`
 /// is set — CI provides Docker, so an unavailable backend is a failure there.
 async fn spawn_fake_gcs() -> Option<(ContainerAsync<GenericImage>, String, String)> {

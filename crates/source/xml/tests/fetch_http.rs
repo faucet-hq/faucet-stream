@@ -48,6 +48,28 @@ async fn basic_auth_header_is_sent() {
 }
 
 #[tokio::test]
+async fn no_auth_sends_no_authorization_header() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/open.xml"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "application/xml")
+                .set_body_string(items_doc(5, 1)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let config = XmlStreamConfig::new(server.uri(), "/open.xml")
+        .records_element_path("root.item")
+        .auth(XmlAuth::None);
+    let records = XmlStream::new(config).fetch_all().await.unwrap();
+    assert_eq!(records, vec![serde_json::json!({"id": "5"})]);
+    let requests = server.received_requests().await.unwrap();
+    assert!(!requests[0].headers.contains_key("authorization"));
+}
+
+#[tokio::test]
 async fn custom_auth_headers_are_sent() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

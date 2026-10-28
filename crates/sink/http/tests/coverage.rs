@@ -121,6 +121,41 @@ async fn basic_auth_is_applied_over_the_wire() {
     );
 }
 
+/// `Bearer` auth sends `Authorization: Bearer <token>` with the JSON body (#967).
+#[tokio::test]
+async fn bearer_auth_is_sent_over_the_wire() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/ingest"))
+        .and(header("authorization", "Bearer tok-123"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/ingest"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+
+    let sink = HttpSink::new(
+        HttpSinkConfig::new(url(&server)).auth(HttpSinkAuth::Bearer {
+            token: "tok-123".into(),
+        }),
+    );
+    assert_eq!(sink.write_batch(&[json!({"id": 7})]).await.unwrap(), 1);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body, json!({"id": 7}));
+
+    let wrong = HttpSink::new(
+        HttpSinkConfig::new(url(&server)).auth(HttpSinkAuth::Bearer {
+            token: "other".into(),
+        }),
+    );
+    assert!(wrong.write_batch(&[json!({"id": 8})]).await.is_err());
+}
+
 // ─── Retry behaviour ─────────────────────────────────────────────────────────
 
 /// A retriable 5xx followed by a 200 succeeds when `max_retries` allows it.
