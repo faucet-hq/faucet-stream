@@ -12,11 +12,11 @@ categories.workspace = true
 
 [dependencies]
 faucet-core.workspace = true
+faucet-common-redis.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 redis.workspace = true
-rustls = { workspace = true, features = ["ring"] }
 tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]

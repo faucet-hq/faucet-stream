@@ -159,11 +159,12 @@ impl EsDriver {
         // Bounded connect and request timeouts: a half-open connection or a
         // wedged node must fail the request, not hang the run (#789 MSG-58).
         let request_timeout = std::time::Duration::from_secs(config.request_timeout_secs);
-        let client = Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(config.connect_timeout_secs))
-            .timeout(request_timeout)
-            .build()
-            .map_err(|e| FaucetError::Config(format!("elasticsearch HTTP client: {e}")))?;
+        let client = faucet_common_elasticsearch::build_client(
+            "elasticsearch sink",
+            std::time::Duration::from_secs(config.connect_timeout_secs),
+            request_timeout,
+            &config.tls,
+        )?;
         Ok(Self {
             config,
             client,

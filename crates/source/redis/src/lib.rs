@@ -11,6 +11,7 @@ pub mod stream;
 pub use faucet_core::{FaucetError, Source};
 
 pub use config::{RedisBinary, RedisJsonParsing, RedisSourceConfig, RedisSourceType};
+pub use faucet_common_redis::RedisTls;
 pub use stream::RedisSource;
 
 /// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.

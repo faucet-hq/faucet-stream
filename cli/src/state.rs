@@ -25,6 +25,8 @@ struct RedisStateConfig {
     url: String,
     #[serde(default = "default_redis_namespace")]
     namespace: String,
+    #[serde(default)]
+    tls: faucet_state_redis::RedisTls,
 }
 
 #[cfg(feature = "state-redis")]
@@ -90,7 +92,12 @@ pub async fn build_state_store(spec: &StateStoreSpec) -> CliResult<Arc<dyn State
         "redis" => {
             let cfg = decode::<RedisStateConfig>("redis", spec.config.clone())?;
             Ok(Arc::new(
-                faucet_state_redis::RedisStateStore::connect(&cfg.url, &cfg.namespace).await?,
+                faucet_state_redis::RedisStateStore::connect_with_tls(
+                    &cfg.url,
+                    &cfg.namespace,
+                    &cfg.tls,
+                )
+                .await?,
             ))
         }
         #[cfg(feature = "state-postgres")]
@@ -183,6 +190,20 @@ mod tests {
             CliError::Config(msg) => assert!(msg.contains("max_connections"), "{msg}"),
             other => panic!("expected Config error, got {other:?}"),
         }
+    }
+
+    #[cfg(feature = "state-redis")]
+    #[tokio::test]
+    async fn redis_state_applies_its_tls_block() {
+        let spec = StateStoreSpec {
+            kind: "redis".into(),
+            config: json!({
+                "url": "redis://127.0.0.1:1/0",
+                "tls": {"insecure_skip_verify": true},
+            }),
+        };
+        let err = build_state_store(&spec).await.err().expect("should fail");
+        assert!(err.to_string().contains("rediss://"), "{err}");
     }
 
     #[cfg(feature = "encryption")]

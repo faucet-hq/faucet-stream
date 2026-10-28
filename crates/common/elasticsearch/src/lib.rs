@@ -6,6 +6,8 @@
 //! Elasticsearch source and sink connectors.
 //!
 //! - [`ElasticsearchAuth`] — authentication modes (None, Basic, Bearer, ApiKey)
+//! - [`ElasticsearchTls`] — the `tls:` block (private CA, client certificate,
+//!   `insecure_skip_verify`) and [`build_client`], which applies it
 //!
 //! The enum derives `Serialize`, `Deserialize`, and `JsonSchema` so it round-trips
 //! through YAML/JSON configs and CLI introspection. Its `Debug` impl masks
@@ -15,6 +17,32 @@
 use faucet_core::{Credential, FaucetError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+/// The `tls:` block of the Elasticsearch source and sink: a CA that signed
+/// the cluster's certificate (`ca_cert_path` / `ca_cert_pem`, used in place
+/// of the platform roots — self-managed Elasticsearch 8 ships a self-signed
+/// CA), a client certificate for mutual TLS, and `insecure_skip_verify`.
+pub type ElasticsearchTls = faucet_core::TlsOptions;
+
+/// Build the HTTP client both connectors use: bounded connect and request
+/// timeouts plus `tls`. `connector` prefixes errors (`"elasticsearch source"`).
+pub fn build_client(
+    connector: &str,
+    connect_timeout: std::time::Duration,
+    request_timeout: std::time::Duration,
+    tls: &ElasticsearchTls,
+) -> Result<faucet_core::http::Client, FaucetError> {
+    let loaded = tls.load(connector)?;
+    faucet_core::http::Client::builder()
+        .connect_timeout(connect_timeout)
+        .timeout(request_timeout)
+        .tls(&loaded)
+        .build()
+        .map_err(|e| match e {
+            FaucetError::Config(m) => FaucetError::Config(format!("{connector}: {m}")),
+            other => FaucetError::Config(format!("{connector} HTTP client: {other}")),
+        })
+}
 
 /// Authentication method for Elasticsearch.
 ///
@@ -148,5 +176,29 @@ mod tests {
         assert_eq!(json, r#"{"type":"api_key","config":{"key":"k"}}"#);
         let parsed: ElasticsearchAuth = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed, ElasticsearchAuth::ApiKey { .. }));
+    }
+
+    #[test]
+    fn build_client_applies_and_reports_tls() {
+        let d = std::time::Duration::from_secs(1);
+        assert!(build_client("elasticsearch source", d, d, &ElasticsearchTls::default()).is_ok());
+        let missing = ElasticsearchTls {
+            ca_cert_path: Some("/nonexistent/ca.pem".into()),
+            ..Default::default()
+        };
+        let e = build_client("elasticsearch source", d, d, &missing)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("elasticsearch source: cannot read"), "{e}");
+        let bad = ElasticsearchTls {
+            ca_cert_pem: Some(
+                "-----BEGIN CERTIFICATE-----\n!!\n-----END CERTIFICATE-----\n".into(),
+            ),
+            ..Default::default()
+        };
+        let e = build_client("elasticsearch sink", d, d, &bad)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("elasticsearch sink: tls:"), "{e}");
     }
 }

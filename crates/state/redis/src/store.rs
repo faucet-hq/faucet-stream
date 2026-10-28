@@ -92,13 +92,19 @@ impl RedisStateStore {
         url: impl AsRef<str>,
         namespace: impl Into<String>,
     ) -> Result<Self, FaucetError> {
+        Self::connect_with_tls(url, namespace, &faucet_common_redis::RedisTls::default()).await
+    }
+
+    /// [`connect`](Self::connect) with a `tls:` block for a `rediss://`
+    /// URL: a private CA, a client certificate, or `insecure_skip_verify`.
+    pub async fn connect_with_tls(
+        url: impl AsRef<str>,
+        namespace: impl Into<String>,
+        tls: &faucet_common_redis::RedisTls,
+    ) -> Result<Self, FaucetError> {
         let namespace = namespace.into();
         validate_namespace(&namespace)?;
-        // `rediss://` builds a rustls config from the process-wide provider; a
-        // build that links two providers has no default, so pick one.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = redis::Client::open(url.as_ref())
-            .map_err(|e| FaucetError::Config(format!("invalid Redis URL: {e}")))?;
+        let client = faucet_common_redis::build_client(url.as_ref(), tls)?;
         let config = redis::aio::ConnectionManagerConfig::new()
             .set_connection_timeout(Some(CONNECT_TIMEOUT))
             .set_response_timeout(Some(RESPONSE_TIMEOUT))

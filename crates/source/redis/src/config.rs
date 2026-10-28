@@ -45,6 +45,13 @@ pub struct RedisSourceConfig {
     pub url: String,
     /// The type of Redis data structure to read from.
     pub source_type: RedisSourceType,
+    /// TLS settings for a `rediss://` URL: a private CA, a client
+    /// certificate for mutual TLS, or `insecure_skip_verify`.
+    #[serde(
+        default,
+        skip_serializing_if = "faucet_common_redis::RedisTls::is_default"
+    )]
+    pub tls: faucet_common_redis::RedisTls,
     /// Optional maximum number of records to return.
     pub max_records: Option<usize>,
     /// Records per emitted [`StreamPage`](faucet_core::StreamPage). Each mode
@@ -130,6 +137,7 @@ impl std::fmt::Debug for RedisSourceConfig {
         f.debug_struct("RedisSourceConfig")
             .field("url", &"***")
             .field("source_type", &self.source_type)
+            .field("tls", &self.tls)
             .field("max_records", &self.max_records)
             .field("batch_size", &self.batch_size)
             .field("parse_json", &self.parse_json)
@@ -145,12 +153,19 @@ impl RedisSourceConfig {
         Self {
             url: url.into(),
             source_type,
+            tls: faucet_common_redis::RedisTls::default(),
             max_records: None,
             batch_size: DEFAULT_BATCH_SIZE,
             parse_json: RedisJsonParsing::default(),
             binary: RedisBinary::default(),
             max_tracked_keys: DEFAULT_MAX_TRACKED_KEYS,
         }
+    }
+
+    /// Set the [`tls`](Self::tls) block.
+    pub fn with_tls(mut self, tls: faucet_common_redis::RedisTls) -> Self {
+        self.tls = tls;
+        self
     }
 
     /// Set [`max_tracked_keys`](Self::max_tracked_keys).

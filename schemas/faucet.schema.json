@@ -9379,6 +9379,68 @@
         }
       ]
     },
+    "source_nats__TlsWire": {
+      "description": "`tls:` on the wire: a flag or a settings block.",
+      "anyOf": [
+        {
+          "description": "`true` requires TLS and trusts the platform roots.",
+          "type": [
+            "boolean",
+            "string"
+          ]
+        },
+        {
+          "description": "Require TLS with these settings.",
+          "$ref": "#/$defs/source_nats__TlsOptions"
+        }
+      ]
+    },
+    "source_nats__TlsOptions": {
+      "description": "Server verification and client-certificate settings for a connector that\ndials a TLS server itself (Redis, NATS, Elasticsearch).\n\nPure data: [`TlsOptions::load`] reads the files and each connector hands the\nPEM bytes to its own client library. A configured CA is the **only** trust\nanchor (the platform and bundled roots are not consulted), so a server\nsigned by any other CA is refused.",
+      "type": "object",
+      "properties": {
+        "ca_cert_path": {
+          "description": "PEM file of the CA certificate(s) that signed the server certificate,\nfor a server with a private CA. Mutually exclusive with `ca_cert_pem`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-faucet-resource": "path"
+        },
+        "ca_cert_pem": {
+          "description": "The same CA certificate(s) inline as PEM (e.g. from `${secret:…}`).\nMutually exclusive with `ca_cert_path`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_cert_path": {
+          "description": "PEM client certificate (chain) for mutual TLS. Set together with\n`client_key_path`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-faucet-resource": "path"
+        },
+        "client_key_path": {
+          "description": "PEM private key (PKCS#8, PKCS#1 or SEC1) for `client_cert_path`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-faucet-resource": "path"
+        },
+        "insecure_skip_verify": {
+          "description": "Accept any server certificate without verification. Defaults to\n`false`; a run with it on logs a warning. Never use it in production.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
+        }
+      },
+      "additionalProperties": true
+    },
     "source_nats__NatsValueFormat": {
       "description": "How [`NatsSourceConfig::value_format`] decodes a payload.",
       "oneOf": [
@@ -11548,6 +11610,52 @@
         }
       ]
     },
+    "source_redis__TlsOptions": {
+      "description": "Server verification and client-certificate settings for a connector that\ndials a TLS server itself (Redis, NATS, Elasticsearch).\n\nPure data: [`TlsOptions::load`] reads the files and each connector hands the\nPEM bytes to its own client library. A configured CA is the **only** trust\nanchor (the platform and bundled roots are not consulted), so a server\nsigned by any other CA is refused.",
+      "type": "object",
+      "properties": {
+        "ca_cert_path": {
+          "description": "PEM file of the CA certificate(s) that signed the server certificate,\nfor a server with a private CA. Mutually exclusive with `ca_cert_pem`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-faucet-resource": "path"
+        },
+        "ca_cert_pem": {
+          "description": "The same CA certificate(s) inline as PEM (e.g. from `${secret:…}`).\nMutually exclusive with `ca_cert_path`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_cert_path": {
+          "description": "PEM client certificate (chain) for mutual TLS. Set together with\n`client_key_path`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-faucet-resource": "path"
+        },
+        "client_key_path": {
+          "description": "PEM private key (PKCS#8, PKCS#1 or SEC1) for `client_cert_path`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-faucet-resource": "path"
+        },
+        "insecure_skip_verify": {
+          "description": "Accept any server certificate without verification. Defaults to\n`false`; a run with it on logs a warning. Never use it in production.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
+        }
+      },
+      "additionalProperties": true
+    },
     "source_redis__RedisJsonParsing": {
       "description": "Which Redis values the source parses as JSON.",
       "oneOf": [
@@ -11924,6 +12032,52 @@
         "ref": {
           "description": "Name of the provider in the top-level `auth:` catalog.",
           "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_elasticsearch__TlsOptions": {
+      "description": "Server verification and client-certificate settings for a connector that\ndials a TLS server itself (Redis, NATS, Elasticsearch).\n\nPure data: [`TlsOptions::load`] reads the files and each connector hands the\nPEM bytes to its own client library. A configured CA is the **only** trust\nanchor (the platform and bundled roots are not consulted), so a server\nsigned by any other CA is refused.",
+      "type": "object",
+      "properties": {
+        "ca_cert_path": {
+          "description": "PEM file of the CA certificate(s) that signed the server certificate,\nfor a server with a private CA. Mutually exclusive with `ca_cert_pem`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-faucet-resource": "path"
+        },
+        "ca_cert_pem": {
+          "description": "The same CA certificate(s) inline as PEM (e.g. from `${secret:…}`).\nMutually exclusive with `ca_cert_path`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_cert_path": {
+          "description": "PEM client certificate (chain) for mutual TLS. Set together with\n`client_key_path`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-faucet-resource": "path"
+        },
+        "client_key_path": {
+          "description": "PEM private key (PKCS#8, PKCS#1 or SEC1) for `client_cert_path`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-faucet-resource": "path"
+        },
+        "insecure_skip_verify": {
+          "description": "Accept any server certificate without verification. Defaults to\n`false`; a run with it on logs a warning. Never use it in production.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
         }
       },
       "additionalProperties": true
@@ -15641,6 +15795,68 @@
         }
       ]
     },
+    "sink_nats__TlsWire": {
+      "description": "`tls:` on the wire: a flag or a settings block.",
+      "anyOf": [
+        {
+          "description": "`true` requires TLS and trusts the platform roots.",
+          "type": [
+            "boolean",
+            "string"
+          ]
+        },
+        {
+          "description": "Require TLS with these settings.",
+          "$ref": "#/$defs/sink_nats__TlsOptions"
+        }
+      ]
+    },
+    "sink_nats__TlsOptions": {
+      "description": "Server verification and client-certificate settings for a connector that\ndials a TLS server itself (Redis, NATS, Elasticsearch).\n\nPure data: [`TlsOptions::load`] reads the files and each connector hands the\nPEM bytes to its own client library. A configured CA is the **only** trust\nanchor (the platform and bundled roots are not consulted), so a server\nsigned by any other CA is refused.",
+      "type": "object",
+      "properties": {
+        "ca_cert_path": {
+          "description": "PEM file of the CA certificate(s) that signed the server certificate,\nfor a server with a private CA. Mutually exclusive with `ca_cert_pem`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-faucet-resource": "path"
+        },
+        "ca_cert_pem": {
+          "description": "The same CA certificate(s) inline as PEM (e.g. from `${secret:…}`).\nMutually exclusive with `ca_cert_path`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_cert_path": {
+          "description": "PEM client certificate (chain) for mutual TLS. Set together with\n`client_key_path`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-faucet-resource": "path"
+        },
+        "client_key_path": {
+          "description": "PEM private key (PKCS#8, PKCS#1 or SEC1) for `client_cert_path`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-faucet-resource": "path"
+        },
+        "insecure_skip_verify": {
+          "description": "Accept any server certificate without verification. Defaults to\n`false`; a run with it on logs a warning. Never use it in production.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
+        }
+      },
+      "additionalProperties": true
+    },
     "sink_rabbitmq__RabbitMqAuth": {
       "description": "RabbitMQ authentication.\n\nSerializes with an adjacent `{ \"type\": <method>, \"config\": { … } }` tag in\nsnake_case, matching every other faucet connector's auth shape. The\nhand-written [`std::fmt::Debug`] never prints the password.",
       "oneOf": [
@@ -17010,6 +17226,52 @@
         }
       ]
     },
+    "sink_redis__TlsOptions": {
+      "description": "Server verification and client-certificate settings for a connector that\ndials a TLS server itself (Redis, NATS, Elasticsearch).\n\nPure data: [`TlsOptions::load`] reads the files and each connector hands the\nPEM bytes to its own client library. A configured CA is the **only** trust\nanchor (the platform and bundled roots are not consulted), so a server\nsigned by any other CA is refused.",
+      "type": "object",
+      "properties": {
+        "ca_cert_path": {
+          "description": "PEM file of the CA certificate(s) that signed the server certificate,\nfor a server with a private CA. Mutually exclusive with `ca_cert_pem`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-faucet-resource": "path"
+        },
+        "ca_cert_pem": {
+          "description": "The same CA certificate(s) inline as PEM (e.g. from `${secret:…}`).\nMutually exclusive with `ca_cert_path`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_cert_path": {
+          "description": "PEM client certificate (chain) for mutual TLS. Set together with\n`client_key_path`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-faucet-resource": "path"
+        },
+        "client_key_path": {
+          "description": "PEM private key (PKCS#8, PKCS#1 or SEC1) for `client_cert_path`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-faucet-resource": "path"
+        },
+        "insecure_skip_verify": {
+          "description": "Accept any server certificate without verification. Defaults to\n`false`; a run with it on logs a warning. Never use it in production.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
+        }
+      },
+      "additionalProperties": true
+    },
     "sink_csv__OnUnknownField": {
       "description": "Policy for a record key that is not in the sink's frozen column set.\n\nThe CSV header is fixed from the first non-empty batch and cannot be\nrewritten in place. A field that first appears after the header is written\n(in a later batch, or a later record of the first batch once the header is\ndetermined) therefore cannot become a column, so its value would be lost.",
       "oneOf": [
@@ -17204,6 +17466,52 @@
         },
         "keep_previous": {
           "description": "Keep the replaced table of an overwrite as `<table>__faucet_prev`.",
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "default": false
+        }
+      },
+      "additionalProperties": true
+    },
+    "sink_elasticsearch__TlsOptions": {
+      "description": "Server verification and client-certificate settings for a connector that\ndials a TLS server itself (Redis, NATS, Elasticsearch).\n\nPure data: [`TlsOptions::load`] reads the files and each connector hands the\nPEM bytes to its own client library. A configured CA is the **only** trust\nanchor (the platform and bundled roots are not consulted), so a server\nsigned by any other CA is refused.",
+      "type": "object",
+      "properties": {
+        "ca_cert_path": {
+          "description": "PEM file of the CA certificate(s) that signed the server certificate,\nfor a server with a private CA. Mutually exclusive with `ca_cert_pem`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-faucet-resource": "path"
+        },
+        "ca_cert_pem": {
+          "description": "The same CA certificate(s) inline as PEM (e.g. from `${secret:…}`).\nMutually exclusive with `ca_cert_path`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_cert_path": {
+          "description": "PEM client certificate (chain) for mutual TLS. Set together with\n`client_key_path`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-faucet-resource": "path"
+        },
+        "client_key_path": {
+          "description": "PEM private key (PKCS#8, PKCS#1 or SEC1) for `client_cert_path`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-faucet-resource": "path"
+        },
+        "insecure_skip_verify": {
+          "description": "Accept any server certificate without verification. Defaults to\n`false`; a run with it on logs a warning. Never use it in production.",
           "type": [
             "boolean",
             "string"
@@ -23582,18 +23890,15 @@
                       "x-faucet-resource": "url"
                     },
                     "auth": {
-                      "description": "Authentication mode. Defaults to [`NatsAuth::None`] (anonymous).",
+                      "description": "Authentication mode. Defaults to `none` (anonymous).",
                       "$ref": "#/$defs/source_nats__NatsAuth",
                       "default": {
                         "type": "none"
                       }
                     },
                     "tls": {
-                      "description": "Require a TLS connection to the server. Defaults to `false`.",
-                      "type": [
-                        "boolean",
-                        "string"
-                      ],
+                      "description": "TLS: `true` to require it with the platform roots, or a block with\n`ca_cert_path` / `ca_cert_pem`, `client_cert_path` + `client_key_path`\nand `insecure_skip_verify` (which also requires TLS). Defaults to\n`false`.",
+                      "$ref": "#/$defs/source_nats__TlsWire",
                       "default": false
                     },
                     "name": {
@@ -26234,6 +26539,10 @@
                       "description": "The type of Redis data structure to read from.",
                       "$ref": "#/$defs/source_redis__RedisSourceType"
                     },
+                    "tls": {
+                      "description": "TLS settings for a `rediss://` URL: a private CA, a client\ncertificate for mutual TLS, or `insecure_skip_verify`.",
+                      "$ref": "#/$defs/source_redis__TlsOptions"
+                    },
                     "max_records": {
                       "description": "Optional maximum number of records to return.",
                       "type": [
@@ -27076,6 +27385,10 @@
                       "format": "uint64",
                       "minimum": 0,
                       "default": 300
+                    },
+                    "tls": {
+                      "description": "TLS settings for an `https://` cluster: a private CA, a client\ncertificate for mutual TLS, or `insecure_skip_verify`.",
+                      "$ref": "#/$defs/source_elasticsearch__TlsOptions"
                     }
                   }
                 },
@@ -31223,18 +31536,15 @@
                       "x-faucet-resource": "url"
                     },
                     "auth": {
-                      "description": "Authentication mode. Defaults to [`NatsAuth::None`] (anonymous).",
+                      "description": "Authentication mode. Defaults to `none` (anonymous).",
                       "$ref": "#/$defs/sink_nats__NatsAuth",
                       "default": {
                         "type": "none"
                       }
                     },
                     "tls": {
-                      "description": "Require a TLS connection to the server. Defaults to `false`.",
-                      "type": [
-                        "boolean",
-                        "string"
-                      ],
+                      "description": "TLS: `true` to require it with the platform roots, or a block with\n`ca_cert_path` / `ca_cert_pem`, `client_cert_path` + `client_key_path`\nand `insecure_skip_verify` (which also requires TLS). Defaults to\n`false`.",
+                      "$ref": "#/$defs/sink_nats__TlsWire",
                       "default": false
                     },
                     "name": {
@@ -32418,6 +32728,10 @@
                       "description": "The type of Redis data structure to write to.",
                       "$ref": "#/$defs/sink_redis__RedisSinkType"
                     },
+                    "tls": {
+                      "description": "TLS settings for a `rediss://` URL: a private CA, a client\ncertificate for mutual TLS, or `insecure_skip_verify`.",
+                      "$ref": "#/$defs/sink_redis__TlsOptions"
+                    },
                     "batch_size": {
                       "description": "Maximum number of commands packed into a single Redis pipeline.\nDefaults to [`DEFAULT_BATCH_SIZE`] (1000), which is a comfortable\nper-pipeline working set for Redis: pipelined commands are cheap,\nso bigger windows amortise the round-trip but very large pipelines\ncan stall other clients sharing the server.\n\nWhen `write_batch` receives a slice larger than `batch_size`, the\nsink re-chunks it into `batch_size` slices and issues one Redis\npipeline per chunk. `batch_size = 0` is the **\"no batching\"\nsentinel**: the entire records slice is packed into a single\nRedis pipeline, no matter how large, preserving upstream\n[`StreamPage`](faucet_core::StreamPage) framing.",
                       "type": [
@@ -32705,6 +33019,10 @@
                       "format": "uint64",
                       "minimum": 0,
                       "default": 300
+                    },
+                    "tls": {
+                      "description": "TLS settings for an `https://` cluster: a private CA, a client\ncertificate for mutual TLS, or `insecure_skip_verify`.",
+                      "$ref": "#/$defs/sink_elasticsearch__TlsOptions"
                     },
                     "op_type": {
                       "description": "The `_bulk` action for `append` writes: `index` (default; overwrites a\ndocument with the same `_id`) or `create` (required by data streams,\nwhich reject `index`; a document whose `_id` already exists is left as\nit is and counted as written, so a replayed page stays idempotent).\n`upsert` / `delete` / `overwrite` always use `index`.",

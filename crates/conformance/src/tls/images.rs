@@ -154,6 +154,15 @@ pub fn mysql(tls: &TlsFixture) -> ContainerRequest<GenericImage> {
 
 /// Redis listening only on its TLS port; client certificates are optional.
 pub fn redis(tls: &TlsFixture) -> ContainerRequest<GenericImage> {
+    redis_with(tls, "optional")
+}
+
+/// [`redis`] that requires a client certificate signed by the fixture CA.
+pub fn redis_mutual(tls: &TlsFixture) -> ContainerRequest<GenericImage> {
+    redis_with(tls, "yes")
+}
+
+fn redis_with(tls: &TlsFixture, auth_clients: &str) -> ContainerRequest<GenericImage> {
     let (name, tag) = REDIS_IMAGE;
     let image = GenericImage::new(name, tag)
         .with_exposed_port(REDIS_PORT.tcp())
@@ -171,7 +180,7 @@ pub fn redis(tls: &TlsFixture) -> ContainerRequest<GenericImage> {
         "--tls-ca-cert-file".to_string(),
         cert(files::CA),
         "--tls-auth-clients".to_string(),
-        "optional".to_string(),
+        auth_clients.to_string(),
     ])
 }
 
@@ -195,18 +204,35 @@ pub fn mongo(tls: &TlsFixture) -> ContainerRequest<GenericImage> {
 
 /// NATS with JetStream that requires TLS on its client port.
 pub fn nats(tls: &TlsFixture) -> ContainerRequest<GenericImage> {
+    nats_with(tls, false)
+}
+
+/// [`nats`] that also requires a client certificate signed by the fixture CA.
+pub fn nats_mutual(tls: &TlsFixture) -> ContainerRequest<GenericImage> {
+    nats_with(tls, true)
+}
+
+fn nats_with(tls: &TlsFixture, verify_clients: bool) -> ContainerRequest<GenericImage> {
     let (name, tag) = NATS_IMAGE;
     let image = GenericImage::new(name, tag)
         .with_exposed_port(NATS_PORT.tcp())
         .with_wait_for(WaitFor::message_on_stderr("Server is ready"));
-    tls.mount(image, CERT_DIR).with_cmd([
+    let mut cmd = vec![
         "--tls".to_string(),
         "--tlscert".to_string(),
         cert(files::SERVER_CERT),
         "--tlskey".to_string(),
         cert(files::SERVER_KEY),
-        "-js".to_string(),
-    ])
+    ];
+    if verify_clients {
+        cmd.extend([
+            "--tlsverify".to_string(),
+            "--tlscacert".to_string(),
+            cert(files::CA),
+        ]);
+    }
+    cmd.push("-js".to_string());
+    tls.mount(image, CERT_DIR).with_cmd(cmd)
 }
 
 /// A single-node Elasticsearch with security on: HTTPS only, and every
@@ -465,6 +491,8 @@ mod tests {
         assert_eq!(copies(&postgres(&tls)), files + 1);
         assert_eq!(copies(&mysql(&tls)), files);
         assert_eq!(copies(&redis(&tls)), files);
+        assert_eq!(copies(&redis_mutual(&tls)), files);
+        assert_eq!(copies(&nats_mutual(&tls)), files);
         assert_eq!(copies(&mongo(&tls)), files);
         assert_eq!(copies(&nats(&tls)), files);
         assert_eq!(copies(&elasticsearch(&tls)), files);

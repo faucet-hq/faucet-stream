@@ -29,7 +29,7 @@ pub use config::{NatsOnDecodeError, NatsSourceConfig, NatsValueFormat};
 pub use stream::NatsSource;
 
 // Re-export shared config types so downstream users import from one place.
-pub use faucet_common_nats::{NatsAuth, NatsConnectionConfig};
+pub use faucet_common_nats::{NatsAuth, NatsConnectionConfig, NatsTls};
 pub use faucet_core::{FaucetError, Source};
 
 /// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
