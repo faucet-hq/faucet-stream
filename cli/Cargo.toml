@@ -557,6 +557,7 @@ templates-sync = ["templates", "dep:base64"]
 templates-sync-object-store = ["templates-sync", "dep:object_store"]
 
 [dependencies]
+rustls = { workspace = true, features = ["ring"] }
 regex = { workspace = true, optional = true }
 faucet-core.workspace = true
 faucet-auth.workspace = true
