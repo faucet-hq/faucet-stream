@@ -206,7 +206,10 @@ pub const REQUIREMENTS: &[Requirement] = &[
         id: "declared_types",
         role: Role::Sink,
         triggers: &[Trigger::Capability("declared_types")],
-        assertions: &["assert_declared_types_create"],
+        assertions: &[
+            "assert_declared_types_create",
+            "assert_declared_instants_exact",
+        ],
         summary: "a declaration types the created destination, which a write never retypes",
     },
     Requirement {

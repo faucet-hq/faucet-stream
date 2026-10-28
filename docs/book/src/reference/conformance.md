@@ -160,7 +160,7 @@ the assertions that prove it:
 | `atomic_batches` | declares `BatchAtomicity::Atomic` for some config | `assert_batch_atomicity_truthful` |
 | `cleanup` | declares `cleanup` | `assert_cleanup_scoped` |
 | `rollback` | declares `rollback` | `assert_rollback_truthful` |
-| `declared_types` | declares `declared_types` | `assert_declared_types_create` |
+| `declared_types` | declares `declared_types` | `assert_declared_types_create` or `assert_declared_instants_exact` |
 | `driver_declarations` | is built on a family driver (holds a `DriverSink<`, or implements `SinkDriver`, `SqlDriver`, `MessageDriver` or `HttpDriver`) | `assert_driver_declarations_truthful` |
 | `driver_row_paths` | is built on a family driver | `assert_driver_row_paths_agree` |
 | `call_deadline` | (every source and sink) | `assert_source_call_deadline` / `assert_sink_call_deadline` |
