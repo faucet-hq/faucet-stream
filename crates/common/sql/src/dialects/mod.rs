@@ -31,49 +31,58 @@ pub use redshift::Redshift;
 pub use sqlite::Sqlite;
 pub use warehouse::{BigQuery, Databricks, Snowflake};
 
-/// [`SqlDialect::declared_fits`](crate::SqlDialect::declared_fits) for a
-/// dialect that creates an unbounded declared decimal as `unbounded`
-/// `(precision, scale)` (`scale: None` = that many significant digits at any
-/// scale) and keeps time values to `fraction` fractional-second digits.
+/// [`SqlDialect::declared_fits`](crate::SqlDialect::declared_fits): `value`
+/// is a rendering of `t` and, for a time or timestamp, carries at most
+/// `fraction` fractional-second digits (`None`: any). An unbounded declared
+/// decimal is checked against `unbounded` `(precision, scale)` when the
+/// dialect creates it as a bounded type (`scale: None` = that many
+/// significant digits at any scale); `None` leaves it unbounded.
 pub(crate) fn fits_bounded(
     t: &faucet_core::LogicalType,
     value: &faucet_core::Value,
-    unbounded: (u32, Option<u32>),
+    unbounded: Option<(u32, Option<u32>)>,
     fraction: Option<usize>,
 ) -> bool {
     use faucet_core::LogicalType;
-    match *t {
-        LogicalType::Decimal {
-            precision: None,
-            scale: None,
-        } => LogicalType::Decimal {
-            precision: Some(unbounded.0),
-            scale: unbounded.1,
+    if !t.accepts(value) || !fraction.is_none_or(|max| t.fits_fraction(value, max)) {
+        return false;
+    }
+    match (t, unbounded) {
+        (
+            LogicalType::Decimal {
+                precision: None,
+                scale: None,
+            },
+            Some((p, Some(s))),
+        ) => LogicalType::Decimal {
+            precision: Some(p),
+            scale: Some(s),
         }
         .accepts(value),
-        LogicalType::Decimal {
-            precision: Some(p),
-            scale,
-        } => LogicalType::Decimal {
-            precision: Some(p),
-            scale: Some(scale.unwrap_or(0)),
-        }
-        .accepts(value),
-        LogicalType::Time | LogicalType::Timestamp { .. } => {
-            t.accepts(value)
-                && fraction
-                    .is_none_or(|max| value.as_str().is_none_or(|s| fraction_digits(s) <= max))
-        }
-        _ => t.accepts(value),
+        (
+            LogicalType::Decimal {
+                precision: None,
+                scale: None,
+            },
+            Some((p, None)),
+        ) => significant_digits(value) <= p as usize,
+        _ => true,
     }
 }
 
-/// The fractional-second digits of a time or timestamp rendering.
-fn fraction_digits(s: &str) -> usize {
-    let time = s.rsplit(['T', ' ']).next().unwrap_or(s);
-    time.split_once('.').map_or(0, |(_, rest)| {
-        rest.bytes().take_while(u8::is_ascii_digit).count()
-    })
+/// The significant digits of an accepted decimal rendering (leading and
+/// trailing zeros change no value).
+fn significant_digits(value: &faucet_core::Value) -> usize {
+    let text = match value {
+        faucet_core::Value::String(s) => s.clone(),
+        faucet_core::Value::Number(n) => n.to_string(),
+        _ => return 0,
+    };
+    let body = text.trim_start_matches(['-', '+']);
+    let (int, frac) = body.split_once('.').unwrap_or((body, ""));
+    format!("{int}{}", frac.trim_end_matches('0'))
+        .trim_start_matches('0')
+        .len()
 }
 
 /// `keyword(p,s)` for a declared decimal of at most `max` digits whose scale

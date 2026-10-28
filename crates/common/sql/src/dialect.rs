@@ -110,24 +110,22 @@ pub trait SqlDialect: Send + Sync {
         None
     }
 
-    /// Whether `value` fits the column a declared `t` creates here (#955):
-    /// a decimal is checked against the bounds of the type the dialect
-    /// renders, so an unbounded declaration mapped to a fixed-scale type
-    /// refuses values that type would round. The default reads a declared
-    /// precision without a scale as scale 0, as the decimal keywords render
-    /// it, and leaves an unbounded decimal unbounded.
+    /// The fractional-second digits the time and timestamp types
+    /// [`declared_type_name`](Self::declared_type_name) creates keep, or
+    /// `None` when they keep any. Default: `None` (no time type is created).
+    fn time_fraction_digits(&self) -> Option<usize> {
+        None
+    }
+
+    /// Whether `value` fits the column a declared `t` creates here (#955),
+    /// so creating that column loses nothing the inferred (text) column
+    /// would keep: a time or timestamp may carry at most
+    /// [`time_fraction_digits`](Self::time_fraction_digits) fractional-second
+    /// digits, and a decimal must fit its declared bounds (an unbounded one
+    /// stays unbounded). A dialect that creates an unbounded decimal as a
+    /// bounded type overrides this to check those bounds.
     fn declared_fits(&self, t: &LogicalType, value: &faucet_core::Value) -> bool {
-        match *t {
-            LogicalType::Decimal {
-                precision: Some(p),
-                scale,
-            } => LogicalType::Decimal {
-                precision: Some(p),
-                scale: Some(scale.unwrap_or(0)),
-            }
-            .accepts(value),
-            _ => t.accepts(value),
-        }
+        crate::dialects::fits_bounded(t, value, None, self.time_fraction_digits())
     }
 
     /// [`declared_type_name`](Self::declared_type_name) for a primary-key

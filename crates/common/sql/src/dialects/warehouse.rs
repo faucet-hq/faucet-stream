@@ -45,6 +45,10 @@ impl SqlDialect for Snowflake {
         "STRING"
     }
 
+    fn time_fraction_digits(&self) -> Option<usize> {
+        Some(9)
+    }
+
     /// Declared columns (#955) take their type: the row writer's `::string`
     /// projection is coerced into it on `INSERT`. Binary and JSON stay
     /// `STRING` (a `::string` value is neither hex nor parsed JSON).
@@ -125,6 +129,10 @@ impl SqlDialect for Databricks {
             SqlBaseType::Boolean => "BOOLEAN",
             SqlBaseType::Text | SqlBaseType::Json => "STRING",
         }
+    }
+
+    fn time_fraction_digits(&self) -> Option<usize> {
+        Some(6)
     }
 
     fn declared_type_name(&self, t: &LogicalType) -> Option<String> {
@@ -248,13 +256,24 @@ impl SqlDialect for BigQuery {
                     _ => (76, 38),
                 }
             }
-            _ => return super::fits_bounded(t, value, (76, Some(38)), Some(6)),
+            _ => {
+                return super::fits_bounded(
+                    t,
+                    value,
+                    Some((76, Some(38))),
+                    self.time_fraction_digits(),
+                );
+            }
         };
         LogicalType::Decimal {
             precision: Some(created.0),
             scale: Some(created.1),
         }
         .accepts(value)
+    }
+
+    fn time_fraction_digits(&self) -> Option<usize> {
+        Some(6)
     }
 
     /// `NUMERIC` holds 29 integer and 9 fractional digits, `BIGNUMERIC` 38

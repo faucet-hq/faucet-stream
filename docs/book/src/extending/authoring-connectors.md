@@ -774,7 +774,8 @@ renders a type) and set `declared_columns` in its descriptor and
 from `set_declared_columns` in a `faucet_core::DeclaredSlot`, plan with
 `faucet_core::plan_table_declared_with` and your dialect's `declared_fits`
 (implement it when a declared type maps to a column with other bounds than the
-declared ones, so a value that would be rounded keeps the inferred type),
+declared ones, so a value that would be rounded keeps the inferred type; set
+`time_fraction_digits` to the sub-second digits your time types keep),
 render with `planned_type_name` (implement `declared_type_name`), create the
 empty typed table in `complete_run` — the staging table under
 `write_mode: overwrite`, which the commit publishes — and declare

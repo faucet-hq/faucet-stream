@@ -1560,5 +1560,103 @@ fn declared_time_fractions_fit_the_created_column() {
     assert!(Mysql.declared_fits(&L::Time, &json!("10:11:12.5")));
     assert!(!Mysql.declared_fits(&L::Time, &json!("10:11:12.1234567")));
     assert!(Oracle.declared_fits(&ts, &nanos));
-    assert!(Postgres.declared_fits(&ts, &nanos));
+    assert!(
+        !Postgres.declared_fits(&ts, &nanos),
+        "postgres keeps microseconds"
+    );
+}
+
+/// A time or timestamp value with more fractional-second digits than the
+/// column a dialect creates keeps falls back to the inferred (text) column,
+/// which keeps every digit (#975).
+fn declared_time_fractions_follow_the_dialect<D: SqlDialect>(d: D) {
+    use faucet_core::{DeclaredColumn, LogicalType as L};
+    let name = d.name();
+    let expected = match name {
+        "postgres" | "redshift" | "duckdb" | "mysql" | "clickhouse" | "databricks" | "bigquery" => {
+            Some(6)
+        }
+        "mssql" => Some(7),
+        "oracle" | "snowflake" => Some(9),
+        _ => None,
+    };
+    assert_eq!(d.time_fraction_digits(), expected, "{name}");
+    let frac = |n: usize| "1".repeat(n);
+    let types = [
+        (L::Timestamp { tz: true }, "2024-02-22T02:00:00.{}Z"),
+        (L::Timestamp { tz: true }, "2024-02-22T02:00:00.{}+05:30"),
+        (L::Timestamp { tz: false }, "2024-02-22T02:00:00.{}"),
+        (L::Timestamp { tz: false }, "2024-02-22 02:00:00.{}"),
+        (L::Time, "02:00:00.{}"),
+    ];
+    for (t, shape) in types {
+        let at = |n: usize| json!(shape.replace("{}", &frac(n)));
+        match expected {
+            Some(max) => {
+                assert!(d.declared_fits(&t, &at(max)), "{name}: {t:?} keeps {max}");
+                assert!(
+                    !d.declared_fits(&t, &at(max + 1)),
+                    "{name}: {t:?} rounds {} digits",
+                    max + 1
+                );
+            }
+            None => assert!(d.declared_fits(&t, &at(12)), "{name}: {t:?}"),
+        }
+        assert!(d.declared_fits(&t, &json!(null)), "{name}");
+    }
+
+    let ts = L::Timestamp { tz: true };
+    let decl = faucet_core::DeclaredColumns::new([DeclaredColumn::new("at", ts, true)]);
+    let page = [json!({"at": "2024-01-01T00:00:00.1234567891Z"})];
+    let engine = SqlSinkEngine::new(d, spec(WriteMode::Append, &[]));
+    let t = target(engine.dialect(), "t");
+    let sql = engine
+        .create_table_sql_declared(&t, &page, None, Some(&decl))
+        .unwrap()
+        .expect("a page");
+    let dialect = engine.dialect();
+    let text = dialect.type_name(SqlBaseType::Text);
+    let col = dialect.quote_ident("at");
+    if expected.is_some() {
+        assert!(
+            sql.contains(&format!("{col} {text}")),
+            "{name}: ten digits fall back to text: {sql}"
+        );
+    }
+}
+
+#[test]
+fn matrix_declared_time_fractions() {
+    every_dialect!(declared_time_fractions_follow_the_dialect);
+}
+
+/// A declared precision without a scale has scale 0 on every dialect, as
+/// SQL reads `numeric(p)` and as each dialect creates it (#975).
+fn declared_precision_without_scale_is_an_integer<D: SqlDialect>(d: D) {
+    use faucet_core::LogicalType as L;
+    let name = d.name();
+    let t = L::Decimal {
+        precision: Some(10),
+        scale: None,
+    };
+    let Some(created) = d.declared_type_name(&t) else {
+        return;
+    };
+    assert!(
+        d.declared_fits(&t, &json!("1234567890")),
+        "{name}: {created}"
+    );
+    assert!(d.declared_fits(&t, &json!(12)), "{name}: {created}");
+    if name != "bigquery" {
+        assert!(
+            !d.declared_fits(&t, &json!("12.3")),
+            "{name}: {created} would round 12.3"
+        );
+    }
+    assert!(!t.accepts(&json!("12.3")), "{name}");
+}
+
+#[test]
+fn matrix_declared_precision_without_scale() {
+    every_dialect!(declared_precision_without_scale_is_an_integer);
 }
