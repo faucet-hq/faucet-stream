@@ -1,0 +1,5 @@
+interface:
+  display_name: "faucet API"
+  short_description: "Drive faucet serve from another service over HTTP"
+  brand_color: "#14B8A6"
+  default_prompt: "Use $faucet-api to build a client that registers faucet templates, triggers runs with idempotency keys and labels, and polls them to completion."

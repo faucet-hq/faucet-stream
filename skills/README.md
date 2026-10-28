@@ -15,6 +15,11 @@ Install: see [Agent skills](https://faucet-hq.github.io/faucet-stream/getting-st
 | [`faucet-connector`](faucet-connector/SKILL.md) | Build a `faucet-source-*` or `faucet-sink-*` crate on `faucet-core`. |
 | [`faucet-migrate`](faucet-migrate/SKILL.md) | Move a Singer-protocol or other ELT setup to faucet and cut over safely. |
 | [`faucet-deploy`](faucet-deploy/SKILL.md) | Run faucet in production with `run`, `schedule` or `serve`. |
+| [`faucet-api`](faucet-api/SKILL.md) | Drive `faucet serve` from another service: templates, runs, polling and errors over HTTP. |
+| [`faucet-secrets`](faucet-secrets/SKILL.md) | Keep credentials out of run responses, run history and logs, and pick the right mechanism for each. |
+| [`faucet-verify`](faucet-verify/SKILL.md) | Prove a copy matches its source, table by table, before sign-off or cutover. |
+| [`faucet-tune`](faucet-tune/SKILL.md) | Find the bottleneck and make a pipeline fast enough, one measured change at a time. |
+| [`faucet-operate`](faucet-operate/SKILL.md) | Keep a running `faucet serve` or cluster healthy: health, stuck runs, members, upgrades, history. |
 
 ## Rules for skill content
 

@@ -1,0 +1,5 @@
+interface:
+  display_name: "faucet Verify"
+  short_description: "Prove a faucet copy matches its source"
+  brand_color: "#14B8A6"
+  default_prompt: "Use $faucet-verify to prove that every table this faucet pipeline copied matches its source, with a rerunnable pass/fail report."

@@ -1,0 +1,5 @@
+interface:
+  display_name: "faucet Tune"
+  short_description: "Measure and tune faucet pipeline throughput"
+  brand_color: "#14B8A6"
+  default_prompt: "Use $faucet-tune to find the bottleneck in this faucet pipeline and make it fast enough for its window, one measured change at a time."
