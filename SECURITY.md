@@ -42,6 +42,15 @@ Please include:
 - Fixes ship as a patch release of every affected crate on crates.io, the
   prebuilt binaries and the container images; the advisory names the fixed
   versions.
+
+## Verifying releases
+
+Prebuilt binaries carry build-provenance attestations (also attached to each
+release as `<asset>.sigstore.json`), are built with `cargo-auditable` so
+`cargo audit bin` can check them, and each release has a CycloneDX SBOM
+(`faucet-cli.cdx.json`). Container images are keyless-signed with SLSA
+provenance and an SBOM. Commands:
+[installation guide](https://faucet-hq.github.io/faucet-stream/getting-started/installation.html).
 - With your consent, we'll credit you in the advisory and release notes.
 
 ## What counts as a vulnerability

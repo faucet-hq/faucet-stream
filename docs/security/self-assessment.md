@@ -13,7 +13,7 @@ architecture and hardening checklist) and the disclosure policy in
 | **Software** | <https://github.com/faucet-hq/faucet-stream> |
 | **Security provider** | No. faucet-stream moves data; it is not a security tool, but it holds credentials and handles sensitive records, so its security features are part of its core. |
 | **Languages** | Rust (engine, connectors, CLI, server); JavaScript, HTML and CSS (the embedded web console) |
-| **Software bill of materials** | Every container image ships an SBOM attestation; `Cargo.lock` pins the full dependency tree. |
+| **Software bill of materials** | Each `faucet-cli` release attaches a CycloneDX SBOM (`faucet-cli.cdx.json`); prebuilt binaries embed their dependency list (`cargo-auditable`); every container image ships an SBOM attestation; `Cargo.lock` pins the full dependency tree. |
 | **Security links** | [`SECURITY.md`](../../SECURITY.md) · [security model](../architecture/security.md) · [reference policy](../book/src/reference/http-api.md#reference-policy) · [secrets](../book/src/cookbook/secrets.md) · [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/faucet-hq/faucet-stream) |
 
 ## Overview
@@ -153,15 +153,18 @@ software, not a hosted service). It tracks the
   assertions; a chaos suite injects failures at named pipeline boundaries.
 - Supply chain: `cargo-deny` (licenses, advisories, sources) as a required
   check, a daily advisories scan, Dependabot for Cargo, GitHub Actions and the
-  container base images, every GitHub Action pinned by commit SHA, base images
+  container base images, dependency review on pull requests, every GitHub
+  Action pinned by commit SHA, zizmor analysis of the workflows,
+  StepSecurity harden-runner egress auditing on CI jobs, base images
   pinned by digest, OSV-Scanner triage in `osv-scanner.toml`.
 - Repository security: secret scanning with push protection, private
   vulnerability reporting, `CODEOWNERS` on workflows and release configuration,
   least-privilege workflow tokens (`permissions: read-all` by default).
 - Releases: automated by release-plz; publishing jobs wait for approval in a
-  protected environment that alone holds the publishing secrets. Binaries carry
-  build-provenance attestations, also attached to each GitHub release as
-  `<asset>.sigstore.json`; container images are keyless-signed with SLSA
+  protected environment that alone holds the publishing secrets. Binaries are built
+  with `cargo-auditable` and carry build-provenance attestations, also
+  attached to each GitHub release as `<asset>.sigstore.json`, plus a
+  CycloneDX SBOM (`faucet-cli.cdx.json`); container images are keyless-signed with SLSA
   provenance and an SBOM.
 
 ### Communication channels
