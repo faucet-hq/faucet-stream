@@ -420,3 +420,42 @@ async fn typed_partition_values_follow_the_value_renderings() {
         })]
     );
 }
+
+/// A data file whose add action records no usable size is still read (its
+/// footer located from the end of the object) rather than refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_add_action_without_a_size_still_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    write_parquet(&dir.path().join("part-0.parquet"), &ids(3), 1_000);
+    write_log(
+        dir.path(),
+        json!([{"name": "id", "type": "long", "nullable": true, "metadata": {}}]),
+        &[],
+        json!({}),
+        &[("part-0.parquet".into(), json!({}))],
+        plain_protocol(),
+    );
+    let log = dir.path().join("_delta_log/00000000000000000000.json");
+    let body: String = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut action: Value = serde_json::from_str(line).unwrap();
+            if let Some(add) = action.get_mut("add") {
+                add["size"] = json!(0);
+            }
+            format!("{action}\n")
+        })
+        .collect();
+    std::fs::write(&log, body).unwrap();
+    let rows = DeltaSource::new(source(dir.path()))
+        .await
+        .unwrap()
+        .fetch_all()
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![json!({"id": 0}), json!({"id": 1}), json!({"id": 2})]
+    );
+}

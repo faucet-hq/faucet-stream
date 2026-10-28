@@ -36,9 +36,22 @@ pub struct DeltaSource {
 /// One active data file plus its partition values from the log.
 struct DataFile {
     path: ObjPath,
+    /// Byte size from the add action. Without it the footer read is a suffix
+    /// range request, which Azure Blob Storage refuses.
+    size: Option<u64>,
     /// `col -> JSON value` for every partition column, typed against the table
     /// schema. `null` for the Hive default-partition sentinel.
     partitions: HashMap<String, Value>,
+}
+
+impl DataFile {
+    fn reader(&self, store: std::sync::Arc<dyn object_store::ObjectStore>) -> ParquetObjectReader {
+        let reader = ParquetObjectReader::new(store, self.path.clone());
+        match self.size {
+            Some(size) => reader.with_file_size(size),
+            None => reader,
+        }
+    }
 }
 
 impl DeltaSource {
@@ -103,6 +116,7 @@ impl DeltaSource {
             .iter()
             .map(|v| DataFile {
                 path: v.object_store_path(),
+                size: u64::try_from(v.size()).ok().filter(|s| *s > 0),
                 partitions: typed_partition_values(
                     &v.partition_values_map(),
                     &partition_cols,
@@ -302,7 +316,7 @@ impl faucet_core::Source for DeltaSource {
 
             let mut whole_file: Vec<Value> = Vec::new();
             for file in &files {
-                let reader = ParquetObjectReader::new(store.clone(), file.path.clone());
+                let reader = file.reader(store.clone());
                 let mut builder = ParquetRecordBatchStreamBuilder::new(reader)
                     .within(&self.calls, "get")
                     .await?
@@ -380,7 +394,7 @@ impl faucet_core::Source for DeltaSource {
 
             let mut file_batches: Vec<arrow::array::RecordBatch> = Vec::new();
             for file in &files {
-                let reader = ParquetObjectReader::new(store.clone(), file.path.clone());
+                let reader = file.reader(store.clone());
                 let mut builder = ParquetRecordBatchStreamBuilder::new(reader)
                     .within(&self.calls, "get")
                     .await?
