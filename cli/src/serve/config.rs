@@ -144,7 +144,8 @@ pub struct ServeConfig {
     pub require_approval: Vec<crate::serve::changes::ChangeKind>,
     /// Fallback expiry of a pending change request.
     pub approval_expiry: Duration,
-    /// The tenant connection vault key and its rotation predecessors (#709).
+    /// The vault key and its rotation predecessors: seals tenant connections
+    /// (#709) and a clustered run's `secret: true` param values (#956).
     pub vault: Option<VaultKeys>,
     /// Path to a `--connect-providers` file (#709).
     pub connect_providers_path: Option<PathBuf>,

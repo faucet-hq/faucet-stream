@@ -1,6 +1,7 @@
-//! The connection vault key (#709): seals tenant credentials with AES-256-GCM
-//! before they reach the run-history store, and opens them on the instance
-//! that runs the pipeline.
+//! The server's vault key: seals tenant credentials (#709) and the
+//! `secret: true` param values of a clustered template run (#956) with
+//! AES-256-GCM before they reach the run-history store, and opens them on the
+//! instance that runs the pipeline.
 
 use base64::Engine as _;
 use faucet_core::encryption::{CompiledEncryption, EncryptionSpec};

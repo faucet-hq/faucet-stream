@@ -107,6 +107,39 @@ impl BoundParams {
     pub fn has_supplied_secrets(&self) -> bool {
         !self.supplied_secret_names.is_empty()
     }
+
+    /// The text of every bound secret value (each leaf of a secret param, and
+    /// each secret field of a list of objects), in param order.
+    pub fn secret_texts(&self) -> SecretTexts {
+        let mut out = Vec::new();
+        for name in &self.secret_names {
+            if let Some(v) = self.values.get(name) {
+                super::list::leaves(v, &mut out);
+            }
+        }
+        for (name, fields) in &self.secret_fields {
+            if let Some(Value::Array(items)) = self.values.get(name) {
+                for item in items {
+                    for f in fields {
+                        if let Some(field) = item.get(f) {
+                            super::list::leaves(field, &mut out);
+                        }
+                    }
+                }
+            }
+        }
+        SecretTexts(out)
+    }
+}
+
+/// Bound secret values as text. `Debug` never prints them.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct SecretTexts(pub Vec<String>);
+
+impl std::fmt::Debug for SecretTexts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SecretTexts([{} redacted])", self.0.len())
+    }
 }
 
 /// Read the `params:` block out of an untyped config document, validating it.
@@ -1705,6 +1738,31 @@ mod tests {
             crate::secrets::registry::redact("token=s3cret-value-long-enough"),
             "token=***"
         );
+    }
+
+    #[test]
+    fn secret_texts_list_every_secret_leaf_and_hide_them_from_debug() {
+        let spec = spec_of(
+            "token: { required: true, secret: true }\npin: { type: int, required: true, secret: true }\nuser: { default: bob }\ntables:\n  type: list\n  items:\n    type: object\n    properties:\n      table: { type: string, required: true }\n      key: { type: string, secret: true }\n",
+        );
+        let bound = resolve(
+            &spec,
+            &supplied(&[
+                ("token", json!("texts-token-value")),
+                ("pin", json!(4242)),
+                (
+                    "tables",
+                    json!([{ "table": "a", "key": "texts-key-a" }, { "table": "b" }]),
+                ),
+            ]),
+            BindMode::Strict,
+        )
+        .unwrap();
+        let texts = bound.secret_texts();
+        let mut got = texts.0.clone();
+        got.sort();
+        assert_eq!(got, vec!["4242", "texts-key-a", "texts-token-value"]);
+        assert_eq!(format!("{texts:?}"), "SecretTexts([3 redacted])");
     }
 
     #[test]

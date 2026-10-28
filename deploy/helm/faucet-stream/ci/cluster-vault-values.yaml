@@ -1,0 +1,19 @@
+# A clustered server with a vault key (#956): template triggers that supply
+# `secret: true` params are sealed in the shared history.
+# expect: name: FAUCET_VAULT_KEY
+# expect: name: faucet-cluster-vault
+# expect: name: FAUCET_VAULT_PREVIOUS_KEY_0
+# expect: name: faucet-cluster-vault-old
+# expect: name: FAUCET_VAULT_PREVIOUS_KEYS
+# expect-not: --vault-key
+serve:
+  replicaCount: 2
+  history:
+    backend: postgres
+    existingSecret: faucet-history
+  cluster:
+    enabled: true
+    vaultKey:
+      existingSecret: faucet-cluster-vault
+    previousKeys:
+      - existingSecret: faucet-cluster-vault-old

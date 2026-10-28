@@ -82,6 +82,50 @@ mod shard_tests {
     }
 
     #[tokio::test]
+    async fn run_secrets_are_kept_apart_and_purged_once_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = backend(&url_in(dir.path()), "a", Duration::from_secs(30)).await;
+        seed_run(&h, "live").await;
+        seed_run(&h, "done").await;
+        for id in ["live", "done", "fresh-orphan", "old-orphan"] {
+            h.run_secrets_put(id, &format!("sealed-{id}"))
+                .await
+                .unwrap();
+        }
+        h.run_secrets_put("live", "sealed-live-2").await.unwrap();
+        let mut done = h.get("done").await.unwrap().unwrap();
+        done.status = RunStatus::Completed;
+        done.finished_at = Some(chrono::Utc::now());
+        h.upsert(&done).await.unwrap();
+        let old = crate::serve::history::sql::fmt_ts(
+            chrono::Utc::now() - crate::serve::history::RUN_SECRETS_ORPHAN_GRACE * 2,
+        );
+        sqlx::query(
+            "UPDATE faucet_serve_run_secrets SET stored_at = ? WHERE run_id = 'old-orphan'",
+        )
+        .bind(old)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+        let body: String =
+            sqlx::query_scalar("SELECT body FROM faucet_serve_runs WHERE run_id = 'live'")
+                .fetch_one(&h.pool)
+                .await
+                .unwrap();
+        assert!(!body.contains("sealed-live"), "kept out of the record body");
+        assert_eq!(h.run_secrets_purge_terminal().await.unwrap(), 2);
+        assert_eq!(
+            h.run_secrets_get("live").await.unwrap().as_deref(),
+            Some("sealed-live-2")
+        );
+        assert!(h.run_secrets_get("fresh-orphan").await.unwrap().is_some());
+        assert!(h.run_secrets_get("done").await.unwrap().is_none());
+        assert!(h.run_secrets_get("old-orphan").await.unwrap().is_none());
+        h.run_secrets_delete("live").await.unwrap();
+        assert!(h.run_secrets_get("live").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn connect_failures_carry_a_typed_permanent_verdict() {
         use crate::serve::history::Transience;
         // An unknown query parameter fails `SqliteConnectOptions::from_str`

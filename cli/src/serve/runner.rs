@@ -97,6 +97,12 @@ pub struct SubmitRequest {
     /// keep host access (#862 H-04). Implies `trusted_config`.
     #[serde(skip)]
     pub server_file: bool,
+    /// Set in-process by a clustered template trigger, never accepted from a
+    /// client (#956): the persisted form of `config` (its `secret: true`
+    /// values replaced by tokens) and the values, sealed under the vault key
+    /// when the run is stored.
+    #[serde(skip)]
+    pub sealed_params: Option<crate::serve::sealed::SealedParams>,
 }
 
 impl SubmitRequest {
@@ -1034,7 +1040,7 @@ pub(crate) async fn enqueue(
             }
         };
         let mut outcome = claim(fp).await?;
-        if matches!(outcome, Claim::Conflict) {
+        if matches!(outcome, Claim::Conflict) && req.sealed_params.is_none() {
             // A claim stored by an earlier release (or by an older peer during
             // a rolling upgrade) holds the fingerprint of the resolved config.
             // Accept it for one release so a retry spanning the upgrade
@@ -1098,7 +1104,15 @@ pub(crate) async fn enqueue(
         // run it, mark the run Pending, and wake the local claim loop. No local
         // queue slot / spawn — the claim loop owns execution.
         rec.status = RunStatus::Pending;
-        rec.config_body = Some(req.config.clone());
+        rec.config_body = Some(match &req.sealed_params {
+            Some(sp) => sp.body().to_string(),
+            None => req.config.clone(),
+        });
+        if let Some(sp) = &req.sealed_params {
+            for v in rec.labels.values_mut() {
+                *v = sp.redact_text(v);
+            }
+        }
         rec.config_format = Some(req.config_format.into());
         rec.timeout_secs = req.timeout_secs;
         rec.clock = req.clock.clone();
@@ -1109,7 +1123,17 @@ pub(crate) async fn enqueue(
             release_orphaned_claim(&state, &req, &run_id).await;
             return Err(e);
         }
+        // The sealed values go before the record a peer would claim (#956).
+        if let Some(sp) = &req.sealed_params
+            && let Err(e) = crate::serve::sealed::store(&state, &run_id, sp).await
+        {
+            release_orphaned_claim(&state, &req, &run_id).await;
+            return Err(e);
+        }
         if let Err(e) = state.history().upsert_coordinated(&rec).await {
+            if req.sealed_params.is_some() {
+                crate::serve::sealed::forget(&state, &run_id).await;
+            }
             // The record write that should follow a `Fresh` claim failed — release
             // the orphaned claim so a replay starts fresh instead of 404-ing for
             // the whole retention window (F21). Best-effort.
@@ -1590,10 +1614,15 @@ fn submitted_document(
     req: &SubmitRequest,
     default_base: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, ServeError> {
+    // A sealed run is identified by its persisted body, which names no secret.
+    let text = req
+        .sealed_params
+        .as_ref()
+        .map_or(req.config.as_str(), |sp| sp.body());
     let submitted: serde_json::Value = match req.config_format {
-        ConfigFormatWire::Yaml => crate::yaml::from_str(&req.config)
+        ConfigFormatWire::Yaml => crate::yaml::from_str(text)
             .map_err(|e| ServeError::BadConfig(format!("invalid YAML: {e}")))?,
-        ConfigFormatWire::Json => serde_json::from_str(&req.config)
+        ConfigFormatWire::Json => serde_json::from_str(text)
             .map_err(|e| ServeError::BadConfig(format!("invalid JSON: {e}")))?,
     };
     Ok(match default_base {
@@ -2117,6 +2146,7 @@ async fn finalize_owned(
     // our write is a no-op and we discard our result — the reclaimer is now
     // authoritative (#197).
     if state.history().finalize_owned(rec).await? {
+        crate::serve::sealed::forget(state, &rec.run_id).await;
         metrics::record_run_finished(rec.status, reason);
         record_tenant_run(rec);
         // Only the instance that won the owner-fenced write fires the
@@ -2834,6 +2864,7 @@ mod tests {
             selection: None,
             trusted_config: false,
             server_file: false,
+            sealed_params: None,
         };
 
         let err = submit(state.clone(), req, admin_actor()).await.unwrap_err();
@@ -2943,6 +2974,7 @@ mod tests {
             selection: None,
             trusted_config: false,
             server_file: false,
+            sealed_params: None,
         };
         let resp = submit(state.clone(), req, admin_actor()).await.unwrap();
         assert_eq!(resp.status, RunStatus::Pending);
@@ -3166,6 +3198,7 @@ mod tests {
             selection: None,
             trusted_config: false,
             server_file: false,
+            sealed_params: None,
         };
         let err = submit(state.clone(), req, admin_actor()).await.unwrap_err();
         assert!(

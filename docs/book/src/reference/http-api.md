@@ -1191,11 +1191,16 @@ and `selection` for a row selection). Only the server sets these: a caller's
 
 Status codes: `404` for an unknown id or pinned version; `422` for a missing
 `required` param or a type mismatch, naming the param; `429` when the queue is
-full. On a **clustered** server a template declaring `secret: true` params is
-refused with `422` — the materialized config is persisted for peer execution, and
-the shared history database is not a secret store. Reference the secret from the
-template body (`${env:…}` / `${vault:…}`, resolved on the executing instance)
-instead.
+full. On a **clustered** server the materialized config is persisted for peer
+execution, so a trigger that supplies a `secret: true` param is sealed under the
+server's vault key (`--vault-key` / `FAUCET_VAULT_KEY`): the stored config — and
+`config_body` in `GET /v1/runs/{id}` — carries `${sealed:N}` tokens, the values
+are stored encrypted (bound to the run id) apart from the record, opened only by
+the member that runs it, and deleted once the run is terminal. Without a vault
+key, or with `env` overrides, the trigger is refused with `422`; reference the
+secret from the template body (`${env:…}` / `${vault:…}`, resolved on the
+executing instance) instead. See
+[clustered execution](../cookbook/cluster.md#3-per-run-secret-template-params-need-a-vault-key).
 
 ### `POST /v1/backfill`
 

@@ -362,6 +362,43 @@ mod tests {
         AuthContext::system("test")
     }
 
+    /// #956: a finished run's stored body has only tokens left, so a rollback
+    /// asks for the config rather than loading it.
+    #[tokio::test]
+    async fn a_rollback_of_a_sealed_run_asks_for_its_config() {
+        let state = crate::serve::test_support::test_state();
+        let mut rec = RunRecord::queued(
+            "r-sealed".into(),
+            None,
+            Default::default(),
+            None,
+            chrono::Utc::now(),
+        );
+        rec.status = RunStatus::Completed;
+        rec.config_body =
+            Some(r#"{"version":1,"pipeline":{"source":{"config":{"p":"${sealed:0}"}}}}"#.into());
+        state.history().upsert(&rec).await.unwrap();
+        let err = rollback_run(
+            State(state),
+            Extension(global()),
+            Path("r-sealed".into()),
+            Some(Json(RollbackRequest {
+                invocation_id: Some("inv-1".into()),
+                dry_run: true,
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap_err();
+        let ServeError::Unprocessable { message, .. } = &err else {
+            panic!("{err:?}");
+        };
+        assert!(
+            message.contains("sealed `secret: true`") && message.contains("pass `config`"),
+            "{message}"
+        );
+    }
+
     #[tokio::test]
     async fn a_rollback_is_disabled_under_require_approval_run_but_a_dry_run_answers() {
         let mut cfg = crate::serve::test_support::test_config();

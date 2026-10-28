@@ -2406,10 +2406,14 @@ paths:
         unpinned request with a `422`; a `deprecated` one still runs but the
         response carries a `deprecated` field. A missing required param or a type
         mismatch is a `422` naming the param; an unknown template or pinned
-        version is a `404`. On a clustered server a
-        template declaring `secret: true` params is refused (`422`) because the
-        materialized config is persisted for peer execution — reference the
-        secret from the template body instead.
+        version is a `404`. On a clustered server a trigger that supplies a
+        `secret: true` param is sealed under the server's vault key
+        (`--vault-key` / `FAUCET_VAULT_KEY`): the persisted config carries
+        `${sealed:N}` tokens, the values are stored encrypted (bound to the run
+        id) apart from the run record, opened by the member that runs it, and
+        deleted once the run is terminal. Without a vault key, with `env`
+        overrides, or when the trigger needs an approved change request, it is
+        refused (`422`) — reference the secret from the template body instead.
       operationId: triggerTemplate
       security: [{ bearerAuth: [] }]
       parameters:

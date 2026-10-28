@@ -108,9 +108,14 @@ pub struct MemoryHistory {
     tenants: Mutex<TenantState>,
     /// queue_depth trigger edges: trigger → (last ordinal, armed).
     trigger_edges: Mutex<std::collections::HashMap<String, (u64, bool)>>,
+    /// Sealed secret params of clustered runs (#956): run id → sealed text.
+    run_secrets: Mutex<RunSecrets>,
     /// Retention window for idempotency claims (separate from run retention).
     idem_retention: Duration,
 }
+
+/// Run id → (sealed secret params, when they were stored).
+type RunSecrets = std::collections::HashMap<String, (String, DateTime<Utc>)>;
 
 /// Run id → (persisted watermark, when it was last advanced).
 type LogWriters = std::collections::HashMap<String, (u64, DateTime<Utc>)>;
@@ -144,6 +149,12 @@ impl MemoryHistory {
         Ok(())
     }
 
+    fn secrets(&self) -> Result<std::sync::MutexGuard<'_, RunSecrets>, HistoryError> {
+        self.run_secrets
+            .lock()
+            .map_err(|_| HistoryError::Backend("run secrets lock poisoned".into()))
+    }
+
     fn tenant_state(&self) -> Result<std::sync::MutexGuard<'_, TenantState>, HistoryError> {
         self.tenants
             .lock()
@@ -173,6 +184,7 @@ impl MemoryHistory {
             changes: Mutex::new(BTreeMap::new()),
             tenants: Mutex::new(TenantState::default()),
             trigger_edges: Mutex::new(std::collections::HashMap::new()),
+            run_secrets: Mutex::new(std::collections::HashMap::new()),
             idem_retention,
         }
     }
@@ -1308,6 +1320,32 @@ impl RunHistory for MemoryHistory {
             .and_then(|(ordinal, armed)| (!*armed).then_some(*ordinal)))
     }
 
+    async fn run_secrets_put(&self, run_id: &str, sealed: &str) -> Result<(), HistoryError> {
+        self.secrets()?
+            .insert(run_id.to_string(), (sealed.to_string(), Utc::now()));
+        Ok(())
+    }
+
+    async fn run_secrets_get(&self, run_id: &str) -> Result<Option<String>, HistoryError> {
+        Ok(self.secrets()?.get(run_id).map(|(s, _)| s.clone()))
+    }
+
+    async fn run_secrets_delete(&self, run_id: &str) -> Result<(), HistoryError> {
+        self.secrets()?.remove(run_id);
+        Ok(())
+    }
+
+    async fn run_secrets_purge_terminal(&self) -> Result<usize, HistoryError> {
+        let mut secrets = self.secrets()?;
+        let before = secrets.len();
+        let orphaned_before = Utc::now() - super::RUN_SECRETS_ORPHAN_GRACE;
+        secrets.retain(|id, (_, stored_at)| match self.runs.get(id) {
+            Some(r) => !r.status.is_terminal(),
+            None => *stored_at >= orphaned_before,
+        });
+        Ok(before - secrets.len())
+    }
+
     async fn trigger_edge_retract(&self, trigger: &str, ordinal: u64) -> Result<(), HistoryError> {
         let mut edges = self
             .trigger_edges
@@ -1987,6 +2025,35 @@ mod tests {
             r.finished_at = Some(submitted);
         }
         r
+    }
+
+    #[tokio::test]
+    async fn run_secrets_outlive_no_terminal_run() {
+        let h = MemoryHistory::new(Duration::from_secs(60));
+        h.upsert(&rec("live", RunStatus::Pending, Utc::now()))
+            .await
+            .unwrap();
+        h.upsert(&rec("done", RunStatus::Completed, Utc::now()))
+            .await
+            .unwrap();
+        for id in ["live", "done", "fresh-orphan", "old-orphan"] {
+            h.run_secrets_put(id, &format!("sealed-{id}"))
+                .await
+                .unwrap();
+        }
+        h.secrets().unwrap().get_mut("old-orphan").unwrap().1 =
+            Utc::now() - crate::serve::history::RUN_SECRETS_ORPHAN_GRACE * 2;
+        assert_eq!(h.run_secrets_purge_terminal().await.unwrap(), 2);
+        assert_eq!(
+            h.run_secrets_get("live").await.unwrap().as_deref(),
+            Some("sealed-live")
+        );
+        assert!(h.run_secrets_get("fresh-orphan").await.unwrap().is_some());
+        for gone in ["done", "old-orphan"] {
+            assert!(h.run_secrets_get(gone).await.unwrap().is_none(), "{gone}");
+        }
+        h.run_secrets_delete("live").await.unwrap();
+        assert!(h.run_secrets_get("live").await.unwrap().is_none());
     }
 
     #[tokio::test]

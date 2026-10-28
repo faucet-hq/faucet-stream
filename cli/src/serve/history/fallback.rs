@@ -679,6 +679,18 @@ impl RunHistory for FallbackHistory {
     ) -> Result<Option<super::tenants::ConnectSession>, HistoryError> {
         strict!(self, p => p.connect_session_take(state), f => f.connect_session_take(state))
     }
+    async fn run_secrets_put(&self, run_id: &str, sealed: &str) -> Result<(), HistoryError> {
+        strict!(self, p => p.run_secrets_put(run_id, sealed), f => f.run_secrets_put(run_id, sealed))
+    }
+    async fn run_secrets_get(&self, run_id: &str) -> Result<Option<String>, HistoryError> {
+        strict!(self, p => p.run_secrets_get(run_id), f => f.run_secrets_get(run_id))
+    }
+    async fn run_secrets_delete(&self, run_id: &str) -> Result<(), HistoryError> {
+        strict!(self, p => p.run_secrets_delete(run_id), f => f.run_secrets_delete(run_id))
+    }
+    async fn run_secrets_purge_terminal(&self) -> Result<usize, HistoryError> {
+        strict!(self, p => p.run_secrets_purge_terminal(), f => f.run_secrets_purge_terminal())
+    }
     async fn tenant_run_link(&self, run_id: &str, tenant: &str) -> Result<(), HistoryError> {
         strict!(self, p => p.tenant_run_link(run_id, tenant), f => f.tenant_run_link(run_id, tenant))
     }
@@ -1198,6 +1210,28 @@ mod tests {
         let startup = FallbackHistory::degraded_at_startup(Duration::from_secs(60), "test");
         assert!(!startup.try_recover().await, "no primary to recover to");
         assert!(startup.trigger_edge_rise("q").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn run_secrets_reach_the_primary_and_wait_for_a_degraded_one() {
+        let healthy = FallbackHistory::healthy(
+            Box::new(MemoryHistory::new(Duration::from_secs(60))),
+            Duration::from_secs(60),
+            "test",
+        );
+        healthy.run_secrets_put("r", "sealed").await.unwrap();
+        assert_eq!(
+            healthy.run_secrets_get("r").await.unwrap().as_deref(),
+            Some("sealed")
+        );
+        healthy.run_secrets_delete("r").await.unwrap();
+        assert!(healthy.run_secrets_get("r").await.unwrap().is_none());
+        assert_eq!(healthy.run_secrets_purge_terminal().await.unwrap(), 0);
+        healthy.degraded.store(true, Ordering::Release);
+        assert!(matches!(
+            healthy.run_secrets_put("r", "sealed").await,
+            Err(HistoryError::Degraded(_))
+        ));
     }
 
     /// #862 M-004: a primary unreachable at startup is reconnected from the

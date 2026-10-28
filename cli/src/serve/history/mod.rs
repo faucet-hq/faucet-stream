@@ -171,6 +171,11 @@ impl From<&InvocationOutcome> for InvocationRecord {
     }
 }
 
+/// How long sealed secret params may outlive a missing run record before the
+/// purge treats them as orphaned (#956): longer than any submit takes between
+/// storing them and writing the record.
+pub const RUN_SECRETS_ORPHAN_GRACE: chrono::TimeDelta = chrono::TimeDelta::hours(1);
+
 /// One run's full record — the GET / list element (spec §6).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRecord {
@@ -1033,6 +1038,38 @@ pub trait RunHistory: Send + Sync {
         Err(HistoryError::Backend(
             "this run-history backend does not support queue_depth trigger edges".into(),
         ))
+    }
+
+    // ── Sealed secret params of a clustered run (#956) ───────────────────────
+
+    /// Store the vault-sealed `secret: true` param values of `run_id`, outside
+    /// its record body. Default: unsupported, so a backend that cannot keep
+    /// them refuses the run instead of dropping them.
+    async fn run_secrets_put(&self, run_id: &str, sealed: &str) -> Result<(), HistoryError> {
+        let _ = (run_id, sealed);
+        Err(HistoryError::Backend(
+            "this run-history backend does not store sealed secret params".into(),
+        ))
+    }
+
+    /// The sealed secret params of `run_id`, if still stored. Default: none.
+    async fn run_secrets_get(&self, run_id: &str) -> Result<Option<String>, HistoryError> {
+        let _ = run_id;
+        Ok(None)
+    }
+
+    /// Delete the sealed secret params of `run_id`. Default: inert.
+    async fn run_secrets_delete(&self, run_id: &str) -> Result<(), HistoryError> {
+        let _ = run_id;
+        Ok(())
+    }
+
+    /// Delete the sealed secret params of every terminal run, and of any run
+    /// with no record [`RUN_SECRETS_ORPHAN_GRACE`] after they were stored (a
+    /// submit that failed between the two writes). Returns how many were
+    /// deleted. Default: inert.
+    async fn run_secrets_purge_terminal(&self) -> Result<usize, HistoryError> {
+        Ok(0)
     }
 
     // ── Audit log (RBAC, #205) ───────────────────────────────────────────────
@@ -2399,6 +2436,16 @@ mod tests {
             ..Default::default()
         };
         assert!(!row.has_pending());
+    }
+
+    #[tokio::test]
+    async fn run_secret_defaults_refuse_to_store_and_read_empty() {
+        let h = Bare;
+        let err = h.run_secrets_put("r", "s").await.unwrap_err();
+        assert!(err.to_string().contains("sealed secret params"), "{err}");
+        assert!(h.run_secrets_get("r").await.unwrap().is_none());
+        h.run_secrets_delete("r").await.unwrap();
+        assert_eq!(h.run_secrets_purge_terminal().await.unwrap(), 0);
     }
 
     #[tokio::test]

@@ -57,6 +57,39 @@ the same `.env` file, the same IAM role, etc. An instance that cannot resolve a
 directive will fail the run with a config error rather than silently producing
 wrong results.
 
+### 3. Per-run secret template params need a vault key
+
+A template trigger can supply `secret: true` params — a per-tenant database
+password, a service-account key passed per run. The materialized config is
+persisted for the claiming member, so a clustered server seals those values:
+
+- every occurrence of a supplied secret value in the stored config is replaced
+  by a `${sealed:N}` token, so the run record, `GET /v1/runs/{id}`, logs and
+  audit never carry it;
+- the values are encrypted with AES-256-GCM under the vault key
+  (`--vault-key` / `FAUCET_VAULT_KEY`), bound to the run id, and stored apart
+  from the run record;
+- the member that claims the run opens them in memory, registers them for log
+  redaction and restores the config just before loading it;
+- they are deleted once the run is terminal (completed, failed or cancelled),
+  so retries and re-claims after a failover still find them, and a finished
+  run's stored config holds tokens only. Rolling back such a run therefore
+  needs `config` in the request.
+
+**Every member needs the same vault key.** A member without one (or with a
+different one) fails a claimed run with a `422`-class error naming the key; it
+never runs the tokens. To rotate, start every member with the new
+`--vault-key` and the old one as `--vault-previous-key` (or
+`FAUCET_VAULT_PREVIOUS_KEYS`) until every run sealed under the old key has
+finished. Without a vault key such triggers are refused with a `422` naming
+`--vault-key`. A trigger with `env` overrides, and one that needs an approved
+change request (`--require-approval run`), stay refused: the change request
+stores the config for its reviewers.
+
+An idempotent replay (same `idempotency_key`) answers with the original run
+and does not re-seal; the fingerprint is taken over the tokenized config, so
+the secret values themselves are not part of it.
+
 ## Flags
 
 | Flag | Default | Description |

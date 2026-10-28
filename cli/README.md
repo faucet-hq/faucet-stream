@@ -430,6 +430,12 @@ faucet serve --cluster \
              --listen 0.0.0.0:8081
 ```
 
+A template trigger that supplies a `secret: true` param is accepted on a cluster only when
+every member is started with the same vault key (`--vault-key` / `FAUCET_VAULT_KEY`): the
+values are sealed with it (AES-256-GCM, bound to the run id) apart from the run record, opened
+by the member that runs the job, and deleted once the run finishes. Rotate with
+`--vault-previous-key`. Without a key such triggers are refused with a `422` naming it.
+
 See the [cluster cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/cluster.html)
 for the full lifecycle, delivery guarantees, and Kubernetes deployment notes.
 

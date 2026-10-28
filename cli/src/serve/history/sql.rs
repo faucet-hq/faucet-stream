@@ -24,7 +24,7 @@ use std::time::Duration;
 /// in `faucet_serve_schema`. A database stamped with a newer version is
 /// refused at startup instead of being written by code that does not know
 /// its columns.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// The oldest binary schema version that can still read a database this
 /// binary writes, kept as the `min_readable` row of `faucet_serve_schema`.
@@ -629,6 +629,12 @@ pub const DDL: &[&str] = &[
         trigger_name TEXT PRIMARY KEY,\
         ordinal TEXT NOT NULL,\
         armed TEXT NOT NULL)",
+    // A clustered run's vault-sealed `secret: true` param values (#956), kept
+    // out of the run's body and deleted once the run is terminal (v7).
+    "CREATE TABLE IF NOT EXISTS faucet_serve_run_secrets (\
+        run_id TEXT PRIMARY KEY,\
+        stored_at TEXT NOT NULL,\
+        sealed TEXT NOT NULL)",
 ];
 
 /// The usage-listing cap for `filter`.
@@ -882,6 +888,13 @@ pub struct Stmts {
     pub session_purge: String,
     pub session_take: String,
     pub tenant_run_link: String,
+    /// Store a run's sealed secret params (#956). Params: run_id, stored_at, sealed.
+    pub run_secrets_put: String,
+    pub run_secrets_get: String,
+    pub run_secrets_delete: String,
+    /// Delete the sealed params of terminal runs and of runs with no record
+    /// stored before the param (an orphan threshold).
+    pub run_secrets_purge: String,
     pub tenant_run_delete: String,
     pub purge_orphan_tenant_runs: String,
     pub state_ref_insert: String,
@@ -1588,6 +1601,17 @@ impl Stmts {
             tenant_run_link: "INSERT INTO faucet_tenant_runs (run_id, tenant) VALUES ($1,$2) \
                 ON CONFLICT (run_id) DO UPDATE SET tenant=excluded.tenant"
                 .into(),
+            run_secrets_put: "INSERT INTO faucet_serve_run_secrets (run_id, stored_at, sealed) \
+                VALUES ($1,$2,$3) ON CONFLICT (run_id) DO UPDATE \
+                SET stored_at=excluded.stored_at, sealed=excluded.sealed"
+                .into(),
+            run_secrets_get: "SELECT sealed FROM faucet_serve_run_secrets WHERE run_id=$1".into(),
+            run_secrets_delete: "DELETE FROM faucet_serve_run_secrets WHERE run_id=$1".into(),
+            run_secrets_purge: "DELETE FROM faucet_serve_run_secrets WHERE run_id IN \
+                (SELECT run_id FROM faucet_serve_runs \
+                    WHERE status IN ('completed','failed','cancelled')) \
+                OR (stored_at < $1 AND run_id NOT IN (SELECT run_id FROM faucet_serve_runs))"
+                .into(),
             tenant_run_delete: "DELETE FROM faucet_tenant_runs WHERE run_id=$1".into(),
             purge_orphan_tenant_runs: "DELETE FROM faucet_tenant_runs \
                 WHERE run_id NOT IN (SELECT run_id FROM faucet_serve_runs)"
@@ -2150,6 +2174,17 @@ impl Stmts {
                 .into(),
             tenant_run_link: "INSERT INTO faucet_tenant_runs (run_id, tenant) VALUES (?,?) \
                 ON CONFLICT (run_id) DO UPDATE SET tenant=excluded.tenant"
+                .into(),
+            run_secrets_put: "INSERT INTO faucet_serve_run_secrets (run_id, stored_at, sealed) \
+                VALUES (?,?,?) ON CONFLICT (run_id) DO UPDATE \
+                SET stored_at=excluded.stored_at, sealed=excluded.sealed"
+                .into(),
+            run_secrets_get: "SELECT sealed FROM faucet_serve_run_secrets WHERE run_id=?".into(),
+            run_secrets_delete: "DELETE FROM faucet_serve_run_secrets WHERE run_id=?".into(),
+            run_secrets_purge: "DELETE FROM faucet_serve_run_secrets WHERE run_id IN \
+                (SELECT run_id FROM faucet_serve_runs \
+                    WHERE status IN ('completed','failed','cancelled')) \
+                OR (stored_at < ? AND run_id NOT IN (SELECT run_id FROM faucet_serve_runs))"
                 .into(),
             tenant_run_delete: "DELETE FROM faucet_tenant_runs WHERE run_id=?".into(),
             purge_orphan_tenant_runs: "DELETE FROM faucet_tenant_runs \
@@ -5268,6 +5303,64 @@ macro_rules! impl_sql_history {
             ) -> Result<Option<$crate::serve::history::tenants::ConnectSession>, $crate::serve::history::HistoryError> {
                 self.select_one_body(&self.stmts.session_take, &[state], "connect session")
                     .await
+            }
+
+            async fn run_secrets_put(
+                &self,
+                run_id: &str,
+                sealed: &str,
+            ) -> Result<(), $crate::serve::history::HistoryError> {
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                sqlx::query(&self.stmts.run_secrets_put)
+                    .bind(run_id)
+                    .bind($crate::serve::history::sql::fmt_ts(chrono::Utc::now()))
+                    .bind(sealed)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                Ok(())
+            }
+
+            async fn run_secrets_get(
+                &self,
+                run_id: &str,
+            ) -> Result<Option<String>, $crate::serve::history::HistoryError> {
+                use sqlx::Row as _;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let row = sqlx::query(&self.stmts.run_secrets_get)
+                    .bind(run_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                row.map(|r| r.try_get::<String, _>("sealed").map_err(backend))
+                    .transpose()
+            }
+
+            async fn run_secrets_delete(
+                &self,
+                run_id: &str,
+            ) -> Result<(), $crate::serve::history::HistoryError> {
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                sqlx::query(&self.stmts.run_secrets_delete)
+                    .bind(run_id)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                Ok(())
+            }
+
+            async fn run_secrets_purge_terminal(
+                &self,
+            ) -> Result<usize, $crate::serve::history::HistoryError> {
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let orphaned_before =
+                    chrono::Utc::now() - $crate::serve::history::RUN_SECRETS_ORPHAN_GRACE;
+                Ok(sqlx::query(&self.stmts.run_secrets_purge)
+                    .bind($crate::serve::history::sql::fmt_ts(orphaned_before))
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?
+                    .rows_affected() as usize)
             }
 
             async fn tenant_run_link(&self, run_id: &str, tenant: &str) -> Result<(), $crate::serve::history::HistoryError> {

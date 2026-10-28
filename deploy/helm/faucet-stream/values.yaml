@@ -263,6 +263,19 @@ serve:
   # Multi-instance clustered execution (requires history.backend != memory).
   cluster:
     enabled: false
+    # The vault key that lets a clustered server accept template triggers
+    # supplying `secret: true` params (#956): the values are sealed with it in
+    # the shared history and opened by the replica that runs the job. Every
+    # replica reads the same key (at least 32 bytes of random key material)
+    # from your Secret as FAUCET_VAULT_KEY. Without it such triggers are
+    # refused. With serve.tenants enabled, serve.tenants.vaultKey is used.
+    vaultKey:
+      existingSecret: ""
+      existingSecretKey: FAUCET_VAULT_KEY
+    # Keys from before a rotation, tried when opening sealed values.
+    previousKeys: []
+    #  - existingSecret: faucet-vault-old
+    #    existingSecretKey: FAUCET_VAULT_KEY
 
   # ---------------------------------------------------------------------------
   # File-backed serve features. Each block takes the file from exactly one of:

@@ -176,6 +176,7 @@ pub fn build_submit_request(
         selection: compiled.spec.run.selection.clone(),
         trusted_config: true,
         server_file: true,
+        sealed_params: None,
     }
 }
 

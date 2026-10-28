@@ -2397,10 +2397,13 @@ pub struct ServeArgs {
     /// `--auth-config` `approvals.expire_secs` does not say. Default 24h.
     #[arg(long, default_value_t = 86_400)]
     pub approval_expiry_secs: u64,
-    /// Key that seals tenant connection credentials at rest (#709,
-    /// AES-256-GCM). At least 32 bytes of random key material. Prefer the env
+    /// Key that seals secrets at rest (AES-256-GCM): tenant connection
+    /// credentials (#709) and, on a `--cluster` server, the `secret: true`
+    /// param values of a template trigger (#956). At least 32 bytes of random
+    /// key material; every cluster member needs the same key. Prefer the env
     /// var (avoids `ps` leakage). Without it the server refuses to store or
-    /// open tenant connections.
+    /// open tenant connections, and a clustered server refuses template
+    /// triggers that supply a `secret: true` param.
     #[arg(long, env = "FAUCET_VAULT_KEY", hide_env_values = true)]
     pub vault_key: Option<String>,
     /// A previous vault key, tried when opening credentials sealed before a

@@ -67,6 +67,14 @@
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- range $i, $k := .Values.serve.cluster.previousKeys -}}
+{{- if not (and (kindIs "map" $k) $k.existingSecret) -}}
+{{- fail (printf "serve.cluster.previousKeys[%d] needs existingSecret (and optionally existingSecretKey, default FAUCET_VAULT_KEY)." $i) -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.serve.cluster.previousKeys (not .Values.serve.cluster.vaultKey.existingSecret) -}}
+{{- fail "serve.cluster.previousKeys needs serve.cluster.vaultKey.existingSecret: previous keys only open values sealed under an earlier key." -}}
+{{- end -}}
 {{- if and .Values.serve.connectProviders.enabled (not .Values.serve.tenants.enabled) -}}
 {{- fail "serve.connectProviders.enabled=true requires serve.tenants.enabled=true: a hosted OAuth connect stores the grant as a tenant connection sealed with the vault key." -}}
 {{- end -}}
