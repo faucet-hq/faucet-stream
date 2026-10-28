@@ -146,7 +146,7 @@ let rows = source.fetch_all().await?;
 
 The catalog features forward to [`faucet-common-iceberg`](https://crates.io/crates/faucet-common-iceberg), the same crate the sink uses, so both connectors gate catalogs identically.
 
-**Hive Metastore:** `uri` is `thrift://host:port` (or bare `host:port`). iceberg-rust's HMS client calls `get_table`, which Hive 4 removed, so it needs a **Hive 3.x** metastore. A table's location follows its database's, so tables created through faucet land under the metastore's `hive.metastore.warehouse.dir` (point it at the bucket, e.g. `s3a://lake/warehouse`); `catalog.warehouse` only selects the storage scheme. The sink cannot write through HMS (iceberg-rust cannot commit there), so HMS tables are written by another engine and read here.
+**Hive Metastore:** `uri` is `thrift://host:port` (or bare `host:port`). iceberg-rust's HMS client calls `get_table`, which Hive 4 removed, so it needs a **Hive 3.x** metastore. A table's location follows its database's, so tables created through faucet land under the metastore's `hive.metastore.warehouse.dir` (point it at the bucket, e.g. `s3a://lake/warehouse`); `catalog.warehouse` only selects the storage scheme. The sink writes HMS tables too.
 
 ## Capabilities
 

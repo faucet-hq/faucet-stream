@@ -823,6 +823,31 @@ pub async fn partition_roots_on(
         .collect())
 }
 
+/// The pgwire-replication client settings for one fetch cycle.
+fn replication_config(coords: PgCoords, params: &ReplicationParams<'_>) -> ReplicationConfig {
+    let start_lsn = Lsn::from_u64(params.start_lsn.unwrap_or(0));
+
+    // ack_lsn stays unset: the reported flush position starts at start_lsn,
+    // which is always a durable bookmark or the slot's own confirmed_flush_lsn.
+    ReplicationConfig::new(
+        coords.host,
+        coords.user,
+        coords.password,
+        coords.dbname,
+        params.slot_name,
+        params.publication_name,
+    )
+    .with_port(coords.port)
+    .with_tls(tls_config(params.tls))
+    .with_start_lsn(start_lsn)
+    // Use the dedicated status-update interval (not tcp_keepalive) so that
+    // Standby Status Updates fire on their own cadence.
+    .with_status_interval(params.status_update_interval)
+    // Wake up the worker at least as often as we send status updates.
+    .with_wakeup_interval(params.status_update_interval)
+    .with_buffer_size(8192)
+}
+
 /// Open a logical replication stream and return a [`Duplex`] handle.
 ///
 /// Internally this calls `pgwire_replication::ReplicationClient::connect`
@@ -834,34 +859,13 @@ pub async fn start_replication(
 ) -> Result<Duplex, FaucetError> {
     if params.proto_version != 1 {
         return Err(FaucetError::Config(format!(
-            "postgres-cdc: pgwire-replication 0.3.2 supports proto_version = 1 only; \
+            "postgres-cdc: pgwire-replication supports proto_version = 1 only; \
              got {}",
             params.proto_version
         )));
     }
 
-    let coords = parse_url(params.connection_url)?;
-
-    let start_lsn = Lsn::from_u64(params.start_lsn.unwrap_or(0));
-
-    let cfg = ReplicationConfig {
-        host: coords.host,
-        port: coords.port,
-        user: coords.user,
-        password: coords.password,
-        database: coords.dbname,
-        tls: tls_config(params.tls),
-        slot: params.slot_name.to_owned(),
-        publication: params.publication_name.to_owned(),
-        start_lsn,
-        stop_at_lsn: None,
-        // Use the dedicated status-update interval (not tcp_keepalive) so that
-        // Standby Status Updates fire on their own cadence.
-        status_interval: params.status_update_interval,
-        // Wake up the worker at least as often as we send status updates.
-        idle_wakeup_interval: params.status_update_interval,
-        buffer_events: 8192,
-    };
+    let cfg = replication_config(parse_url(params.connection_url)?, params);
 
     let inner = ReplicationClient::connect(cfg)
         .await
@@ -1421,6 +1425,50 @@ mod tests {
     #[test]
     fn escape_simple_doubles_quotes() {
         assert_eq!(escape_simple("foo'bar"), "foo''bar");
+    }
+
+    #[test]
+    fn replication_config_starts_and_acknowledges_at_the_resume_lsn() {
+        let tls = crate::config::CdcTls::Require;
+        let params = ReplicationParams {
+            connection_url: "postgres://alice:secret@db.example.com:5544/analytics",
+            slot_name: "slot_a",
+            publication_name: "pub_a",
+            proto_version: 1,
+            create_slot_if_missing: false,
+            start_lsn: Some(0x16B_3748),
+            status_update_interval: Duration::from_secs(3),
+            tcp_keepalive: Duration::from_secs(30),
+            slot_type: crate::config::SlotType::Permanent,
+            tls: &tls,
+            max_buffered_events: 10,
+            max_buffered_bytes: 1024,
+        };
+        let cfg = replication_config(parse_url(params.connection_url).unwrap(), &params);
+        assert_eq!(cfg.host, "db.example.com");
+        assert_eq!(cfg.port, 5544);
+        assert_eq!(cfg.user, "alice");
+        assert_eq!(cfg.password, "secret");
+        assert_eq!(cfg.database, "analytics");
+        assert_eq!(cfg.slot, "slot_a");
+        assert_eq!(cfg.start_lsn, Lsn::from_u64(0x16B_3748));
+        assert_eq!(
+            cfg.ack_lsn, None,
+            "the acknowledged LSN starts at start_lsn"
+        );
+        assert_eq!(cfg.stop_at_lsn, None);
+        assert_eq!(cfg.status_interval, Duration::from_secs(3));
+        assert_eq!(cfg.idle_wakeup_interval, Duration::from_secs(3));
+        assert_eq!(cfg.buffer_events, 8192);
+        assert!(!cfg.binary);
+        assert_eq!(cfg.tls.mode, pgwire_replication::SslMode::Require);
+
+        let from_slot = ReplicationParams {
+            start_lsn: None,
+            ..params
+        };
+        let cfg = replication_config(parse_url(from_slot.connection_url).unwrap(), &from_slot);
+        assert_eq!(cfg.start_lsn, Lsn::from_u64(0));
     }
 
     #[test]

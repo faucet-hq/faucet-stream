@@ -10,7 +10,7 @@
 //! | REST    | `catalog-rest`    | `iceberg-catalog-rest`  |
 //! | Glue    | `catalog-glue`    | `iceberg-catalog-glue`  |
 //! | SQL     | `catalog-sql`     | `iceberg-catalog-sql`   |
-//! | HMS     | `catalog-hms`     | `iceberg-catalog-hms`   |
+//! | HMS     | `catalog-hms`     | `iceberg-catalog-hms` + [`crate::hms`] for commits |
 
 #[cfg(any(
     feature = "catalog-rest",
@@ -191,10 +191,7 @@ fn hms_address(uri: &str) -> &str {
 
 #[cfg(feature = "catalog-hms")]
 async fn build_hms(inner: &CatalogInner) -> Result<Arc<dyn Catalog>, FaucetError> {
-    use iceberg::CatalogBuilder;
-    use iceberg_catalog_hms::{
-        HMS_CATALOG_PROP_URI, HMS_CATALOG_PROP_WAREHOUSE, HmsCatalogBuilder,
-    };
+    use iceberg_catalog_hms::{HMS_CATALOG_PROP_URI, HMS_CATALOG_PROP_WAREHOUSE};
 
     let mut props: HashMap<String, String> = inner.properties.clone();
 
@@ -210,11 +207,8 @@ async fn build_hms(inner: &CatalogInner) -> Result<Arc<dyn Catalog>, FaucetError
 
     let storage_factory = crate::storage_factory::select_storage_factory(inner)?;
 
-    let catalog = HmsCatalogBuilder::default()
-        .with_storage_factory(storage_factory)
-        .load(crate::CATALOG_NAME, props)
-        .await
-        .map_err(|e| FaucetError::Config(format!("iceberg: HMS catalog init failed: {e}")))?;
+    let catalog =
+        crate::hms::HmsCommitCatalog::load(crate::CATALOG_NAME, props, storage_factory).await?;
 
     Ok(Arc::new(catalog))
 }
