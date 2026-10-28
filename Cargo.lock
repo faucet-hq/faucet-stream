@@ -6263,6 +6263,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "testcontainers",
  "tokio",
  "tracing",
  "uuid",

@@ -151,6 +151,11 @@ pub struct BigQuerySourceConfig {
     #[serde(skip)]
     #[schemars(skip)]
     pub api_host: Option<String>,
+    /// Plaintext Storage Read API endpoint (`host:port`) of an emulator, used
+    /// without credentials. Test-only like [`api_host`](Self::api_host).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub storage_host: Option<String>,
 }
 
 fn default_stream_concurrency() -> usize {
@@ -208,6 +213,7 @@ impl BigQuerySourceConfig {
             selected_fields: Vec::new(),
             max_streams: default_max_streams(),
             api_host: None,
+            storage_host: None,
             stream_concurrency: default_stream_concurrency(),
         }
     }
