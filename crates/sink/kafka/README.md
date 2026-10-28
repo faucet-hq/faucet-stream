@@ -264,7 +264,7 @@ It does **not** apply to `from_path` topic failures (including a path resolving 
 | `lz4` | Fast encode/decode — recommended for throughput-sensitive pipelines. |
 | `zstd` | Best ratio at moderate CPU. Requires broker ≥ 2.1. |
 
-All four codecs are compiled into the bundled librdkafka (zlib and zstd statically), so the Kafka source also reads topics other producers compressed with any of them. Before 1.16 the build left out zlib and zstd, so `gzip` and `zstd` failed at producer creation (#968).
+All four codecs are compiled into the bundled librdkafka (zlib and zstd statically), so the Kafka source also reads topics other producers compressed with any of them. Earlier releases built it without zlib and zstd, so `gzip` and `zstd` failed at producer creation (#968).
 
 ## Examples
 
