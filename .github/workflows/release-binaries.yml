@@ -150,13 +150,10 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
-      - name: Install Rust non-interactively if not already installed
-        if: ${{ matrix.container }}
-        run: |
-          if ! command -v cargo > /dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-          fi
+      # Hand edit (#978): dist's "install Rust in the container" step (curl | sh
+      # of rustup) is removed. Every target builds on a native runner that has
+      # Rust, so no matrix entry sets `container`; restore a checksum-verified
+      # rustup-init if one ever does.
       - name: Install dist
         shell: bash
         env:
@@ -326,9 +323,23 @@ jobs:
           # Remove the granular manifests
           rm -f artifacts/*-dist-manifest.json
       - name: Attest build provenance
+        id: attest
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: "artifacts/*"
+      # Hand edit (#978): attach the Sigstore bundle beside each asset so the
+      # provenance is verifiable offline with
+      # `gh attestation verify <asset> --bundle <asset>.sigstore.json`. One bundle
+      # covers every subject; a copy per asset keeps the pairing obvious.
+      - name: Attach provenance bundles
+        env:
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          for asset in artifacts/*; do
+            case "$asset" in *.sigstore.json) continue ;; esac
+            cp "$BUNDLE" "$asset.sigstore.json"
+          done
       - name: Create GitHub Release
         env:
           PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"

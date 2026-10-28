@@ -824,10 +824,11 @@ jobs:
         with:
           toolchain: "1.99.1"
       # aws-lc-sys and the vendored OpenSSL (librdkafka) assemble with NASM;
-      # Strawberry Perl, CMake and MSVC are already on the image.
+      # Strawberry Perl, CMake and MSVC are already on the image. The version is
+      # pinned and choco must verify the package's checksum.
       - name: Install NASM
         run: |
-          choco install nasm --yes --no-progress
+          choco install nasm --version=3.2.0 --require-checksums --yes --no-progress
           echo "C:\\Program Files\\NASM" >> "$GITHUB_PATH"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Build the shipped CLI

@@ -9,3 +9,10 @@ updates:
         patterns: ["*"]
     commit-message:
       prefix: ci
+  # Keeps the Dockerfile's digest-pinned base images current.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: build
