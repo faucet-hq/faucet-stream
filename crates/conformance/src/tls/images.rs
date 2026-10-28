@@ -284,6 +284,27 @@ pub async fn mysql_exec<I: Image>(container: &ContainerAsync<I>, sql: &str) -> S
     .await
 }
 
+/// Evaluate JavaScript with `mongosh` in a [`mongo`] container, over TLS
+/// with the mounted CA, and return what it prints.
+pub async fn mongosh<I: Image>(container: &ContainerAsync<I>, script: &str) -> String {
+    let ca = cert(files::CA);
+    exec(
+        container,
+        &[
+            "mongosh",
+            "--quiet",
+            "--tls",
+            "--tlsCAFile",
+            &ca,
+            "--host",
+            "localhost",
+            "--eval",
+            script,
+        ],
+    )
+    .await
+}
+
 const KAFKA_START_SCRIPT: &str = "/tmp/faucet_kafka_start.sh";
 
 /// A single KRaft Kafka node with three client listeners: [`KAFKA_SSL_PORT`]
