@@ -361,7 +361,11 @@ impl RedshiftDriver {
             loader = loader.endpoint_url(endpoint);
         }
         let sdk_config = loader.load().await;
-        S3Client::new(&sdk_config)
+        // S3-compatible stores (MinIO) do not serve virtual-hosted bucket names.
+        let s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
+            .force_path_style(copy_cfg.endpoint_url.is_some())
+            .build();
+        S3Client::from_conf(s3_config)
     }
 
     fn table_ref(&self) -> String {

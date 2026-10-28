@@ -5174,6 +5174,7 @@ version = "1.2.1"
 dependencies = [
  "faucet-core",
  "futures",
+ "rustls 0.23.46",
  "schemars 1.2.1",
  "serde",
  "serde_json",

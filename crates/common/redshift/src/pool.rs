@@ -52,6 +52,8 @@ pub fn build_connect_options(conn: &RedshiftConnection) -> Result<PgConnectOptio
         ));
     }
     let password = resolve_password(&conn.credentials)?;
+    // A build linking two rustls providers has no default; TLS would panic.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let ssl_mode = match conn.tls_mode {
         Some(RedshiftTlsMode::Disable) => PgSslMode::Disable,
         Some(RedshiftTlsMode::Prefer) => PgSslMode::Prefer,
