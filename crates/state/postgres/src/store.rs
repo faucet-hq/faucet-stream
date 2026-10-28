@@ -44,6 +44,8 @@ impl PostgresStateStore {
         table: &str,
     ) -> Result<Self, FaucetError> {
         validate_table_name(table)?;
+        // A build linking two rustls providers has no default; TLS would panic.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
             .connect(connection_url)

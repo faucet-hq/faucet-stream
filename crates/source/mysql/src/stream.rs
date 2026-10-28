@@ -53,6 +53,8 @@ impl MysqlSource {
         config.validate()?;
 
         let net_write_timeout = config.net_write_timeout_secs;
+        // A build linking two rustls providers has no default; TLS would panic.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let pool = MySqlPoolOptions::new()
             .max_connections(config.max_connections)
             .after_connect(move |conn, _meta| {
