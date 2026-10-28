@@ -327,12 +327,7 @@ pub async fn forget(state: &ServerState, run_id: &str) {
 
 #[cfg(feature = "encryption")]
 fn open_stored(state: &ServerState, run_id: &str, stored: &str) -> Result<Value, String> {
-    let vault = state
-        .vault()
-        .ok_or_else(|| format!("this instance was started without a vault key: {NO_VAULT_HINT}"))?;
-    vault
-        .open_for(stored, &context(run_id))
-        .map_err(|e| format!("this instance cannot open them: {e}"))
+    open_with(state.vault().as_deref(), run_id, stored)
 }
 
 #[cfg(not(feature = "encryption"))]
@@ -351,6 +346,23 @@ pub async fn unseal<'a>(
     run_id: &str,
     body: &'a str,
 ) -> Result<Cow<'a, str>, ServeError> {
+    unseal_with(
+        state.history().as_ref(),
+        |stored| open_stored(state, run_id, stored),
+        run_id,
+        body,
+    )
+    .await
+}
+
+/// [`unseal`] over a history store and an `open` that decrypts the stored
+/// payload (for a component that holds the vault key but no server state).
+pub async fn unseal_with<'a>(
+    history: &dyn crate::serve::history::RunHistory,
+    open: impl FnOnce(&str) -> Result<Value, String>,
+    run_id: &str,
+    body: &'a str,
+) -> Result<Cow<'a, str>, ServeError> {
     if !is_sealed(body) {
         return Ok(Cow::Borrowed(body));
     }
@@ -358,8 +370,7 @@ pub async fn unseal<'a>(
         message: format!("this run's `secret: true` param values are sealed, and {m}"),
         details: None,
     };
-    let stored = state
-        .history()
+    let stored = history
         .run_secrets_get(run_id)
         .await
         .map_err(history_error)?
@@ -370,7 +381,7 @@ pub async fn unseal<'a>(
                     .into(),
             )
         })?;
-    let opened = open_stored(state, run_id, &stored).map_err(refuse)?;
+    let opened = open(&stored).map_err(refuse)?;
     let values: Vec<String> = serde_json::from_value(opened["values"].clone())
         .map_err(|e| refuse(format!("their sealed payload is malformed: {e}")))?;
     for v in &values {
@@ -379,6 +390,19 @@ pub async fn unseal<'a>(
     restore(body, &values)
         .map(Cow::Owned)
         .map_err(|e| refuse(format!("the stored config does not match them: {e}")))
+}
+
+/// Decrypt a run's stored payload with `vault` (`None`: no key here).
+#[cfg(feature = "encryption")]
+pub fn open_with(
+    vault: Option<&crate::serve::vault::Vault>,
+    run_id: &str,
+    stored: &str,
+) -> Result<Value, String> {
+    vault
+        .ok_or_else(|| format!("this instance was started without a vault key: {NO_VAULT_HINT}"))?
+        .open_for(stored, &context(run_id))
+        .map_err(|e| format!("this instance cannot open them: {e}"))
 }
 
 #[cfg(test)]

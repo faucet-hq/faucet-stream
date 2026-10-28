@@ -241,6 +241,11 @@ pub(crate) fn apply_request_budget(mut req: SubmitRequest) -> Result<SubmitReque
     );
     req.config = serde_json::to_string(&doc).map_err(|e| ServeError::Internal(e.to_string()))?;
     req.config_format = ConfigFormatWire::Json;
+    // The persisted sealed body is what a peer runs, so it carries the ceilings too.
+    if let Some(sp) = req.sealed_params.take() {
+        req.sealed_params = crate::serve::sealed::tokenize(&req.config, sp.values())
+            .map_err(ServeError::Internal)?;
+    }
     Ok(req)
 }
 
@@ -4225,5 +4230,26 @@ mod tests {
                 "{e:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_sealed_body_carries_the_request_budget() {
+        let plain = r#"{"pipeline":{"tok":"s3cr3t-value"}}"#;
+        let sealed = crate::serve::sealed::tokenize(plain, &["s3cr3t-value".to_string()]).unwrap();
+        let mut req: SubmitRequest = serde_json::from_value(serde_json::json!({
+            "config": plain, "config_format": "json", "budget": {"max_records": 1}
+        }))
+        .unwrap();
+        req.sealed_params = sealed;
+        let out = apply_request_budget(req).unwrap();
+        let sp = out.sealed_params.expect("still sealed");
+        let body: serde_json::Value = serde_json::from_str(sp.body()).unwrap();
+        assert_eq!(body["budget"]["max_records"], 1);
+        assert_eq!(body["pipeline"]["tok"], "${sealed:0}");
+        assert!(!sp.body().contains("s3cr3t-value"));
+        assert_eq!(
+            crate::serve::sealed::restore(sp.body(), sp.values()).unwrap(),
+            out.config
+        );
     }
 }

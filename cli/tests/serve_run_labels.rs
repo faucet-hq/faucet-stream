@@ -1,7 +1,7 @@
 //! `GET /v1/runs?label=` storage (#958): every run-history backend filters by
-//! label with the same semantics, paginates the filtered set, drops a run's
-//! label rows with it, and a database written before the label table existed
-//! is filterable once migrated.
+//! label with the same semantics, paginates the filtered set, writes a run's
+//! label rows once and drops them with it, and a database written before the
+//! label table existed is filterable once migrated.
 #![cfg(feature = "serve")]
 
 use chrono::{Duration as ChronoDuration, Utc};
@@ -116,17 +116,19 @@ async fn exercise(h: &dyn RunHistory, p: &str) {
     f.name = Some("other".into());
     assert!(ids(h, f).await.is_empty());
 
-    // Rewriting a run replaces its labels; deleting it drops them.
-    let mut a = rec_at(&id("a"), &[("team", "ops")], at("a"));
+    // A status update keeps the run filterable; deleting it drops its labels.
+    let mut a = rec_at(&id("a"), &[("team", "data"), ("env", "prod")], at("a"));
     a.labels.insert("p".into(), p.into());
+    a.status = RunStatus::Failed;
     h.upsert(&a).await.unwrap();
+    let mut f = base(&["team:data", "env:prod"], 50);
+    f.status = vec![RunStatus::Failed];
+    assert_eq!(ids(h, f).await, [id("a")]);
+    h.delete(&id("a")).await.unwrap();
     assert_eq!(
         ids(h, base(&["team:data", "env:prod"], 50)).await,
         [id("e"), id("d")]
     );
-    assert_eq!(ids(h, base(&["team:ops"], 50)).await, [id("a")]);
-    h.delete(&id("a")).await.unwrap();
-    assert!(ids(h, base(&["team:ops"], 50)).await.is_empty());
 
     // insert_new writes labels only for the run it actually inserts.
     let mut fresh = rec(&id("g"), &[("team", "new")], 1);
@@ -203,6 +205,102 @@ mod sqlite {
         )
         .await;
         assert_eq!(got, ["new"]);
+    }
+
+    /// A status update leaves the run's label rows alone: they are written
+    /// once, with the row (#975).
+    #[tokio::test]
+    async fn a_later_upsert_does_not_rewrite_label_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("u.db");
+        let h = connect(&path).await;
+        let mut r = rec("u", &[("team", "data")], 10);
+        r.status = RunStatus::Running;
+        r.finished_at = None;
+        h.upsert(&r).await.unwrap();
+        let mut conn = sqlx::SqliteConnection::connect(&format!("sqlite:{}", path.display()))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE faucet_serve_run_labels SET value='marked' WHERE run_id='u'")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        r.status = RunStatus::Completed;
+        r.finished_at = Some(Utc::now());
+        r.labels.insert("extra".into(), "x".into());
+        h.upsert(&r).await.unwrap();
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT key, value FROM faucet_serve_run_labels WHERE run_id='u' ORDER BY key",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(rows, [("team".to_string(), "marked".to_string())]);
+        assert_eq!(
+            h.get("u").await.unwrap().unwrap().status,
+            RunStatus::Completed
+        );
+        let f = |raw: &[&str]| ListFilter {
+            limit: 10,
+            labels: filters(raw),
+            ..Default::default()
+        };
+        assert_eq!(ids(&h, f(&["team:marked"])).await, ["u"]);
+        assert!(ids(&h, f(&["extra"])).await.is_empty());
+    }
+
+    /// The label backfill reads each run once: a reconnect scans only runs
+    /// submitted since the previous pass (less its margin).
+    #[tokio::test]
+    async fn the_label_backfill_does_not_rescan_old_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.db");
+        drop(connect(&path).await);
+        let mut conn = sqlx::SqliteConnection::connect(&format!("sqlite:{}", path.display()))
+            .await
+            .unwrap();
+        let (mark,): (String,) = sqlx::query_as(
+            "SELECT version FROM faucet_serve_schema WHERE id='run_labels_backfill_from'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        for (r, at) in [
+            (
+                rec("old", &[("team", "data")], 0),
+                "2026-01-01T00:00:00.000000000Z".to_string(),
+            ),
+            (
+                rec("peer", &[("team", "data")], 0),
+                faucet_cli::serve::history::sql::fmt_ts(Utc::now()),
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO faucet_serve_runs (run_id, name, status, submitted_at, body) \
+                 VALUES (?, 'labelled', 'completed', ?, ?)",
+            )
+            .bind(&r.run_id)
+            .bind(at)
+            .bind(serde_json::to_string(&r).unwrap())
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+        let h = connect(&path).await;
+        let got: Vec<(String,)> =
+            sqlx::query_as("SELECT run_id FROM faucet_serve_run_labels ORDER BY run_id")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(got, [("peer".to_string(),)], "only the recent run is read");
+        let (later,): (String,) = sqlx::query_as(
+            "SELECT version FROM faucet_serve_schema WHERE id='run_labels_backfill_from'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert!(later >= mark, "{later} < {mark}");
+        drop(h);
     }
 
     /// A database at schema v6 (runs, no label table) is migrated: every run

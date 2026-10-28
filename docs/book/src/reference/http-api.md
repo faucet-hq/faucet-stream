@@ -475,7 +475,10 @@ Request body:
   replication bookmarks.
 - **`labels`** — string key/value metadata stored on the run record and
   filterable with `GET /v1/runs?label=key:value` (#958). Keys are 1–63
-  characters and values at most 256; a longer one is a `422`. The provenance
+  characters without `:` and values at most 256; anything else is a `422`
+  (the filter splits on the first `:`, so a key holding one could never
+  match). A value may hold `:` and `,`; filter on a `,` value with the
+  repeatable `label=` form. The provenance
   keys the server stamps (`template`, `template_version`, `allow_untested`,
   `sink_template`, `sink_template_version`, `overlay`, `overlay_version`,
   `selection`) are refused with a `422`; they stay filterable.

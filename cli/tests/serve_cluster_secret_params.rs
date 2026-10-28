@@ -284,3 +284,66 @@ async fn one_instance_triggers_and_a_peer_executes_with_the_secret_sealed() {
         "the secret reached the history database"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_enforces_the_request_budget_of_a_sealed_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let history = format!("sqlite:{}", dir.path().join("history.db").display());
+    let (client, base) = start_b(free_port(), &history).await;
+    let registered = client
+        .post(format!("{base}/v1/templates"))
+        .json(&json!({ "config": template(dir.path()), "config_format": "yaml", "launch": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(registered.status(), 201);
+
+    let a = instance_a(&history).await;
+    let outcome = trigger_template(
+        a.clone(),
+        Principal::new(AuthContext::system("embedder"), Origin::Trusted),
+        "sealed-e2e".into(),
+        TriggerBody {
+            params: [("token".to_string(), json!(SECRET))].into(),
+            budget: Some(serde_json::from_value(json!({ "max_records": 1 })).unwrap()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let TriggerOutcome::Run(resp) = outcome else {
+        panic!("unexpected pending change");
+    };
+    let run_id = resp.run.run_id.clone();
+
+    let stored = a.history().get(&run_id).await.unwrap().unwrap();
+    let body: Value = serde_json::from_str(stored.config_body.as_deref().unwrap()).unwrap();
+    assert_eq!(body["budget"]["max_records"], 1, "{body}");
+    assert!(!body.to_string().contains(SECRET));
+
+    let mut detail = Value::Null;
+    for _ in 0..240 {
+        detail = client
+            .get(format!("{base}/v1/runs/{run_id}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if matches!(
+            detail["status"].as_str(),
+            Some("completed" | "failed" | "cancelled")
+        ) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert_eq!(detail["status"], "failed", "{detail}");
+    assert!(
+        detail.to_string().contains("budget"),
+        "the peer refused on the budget: {detail}"
+    );
+    let out = std::fs::read_to_string(dir.path().join("out.jsonl")).unwrap_or_default();
+    assert_eq!(out.lines().count(), 0, "{out}");
+}

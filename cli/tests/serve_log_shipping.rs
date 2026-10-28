@@ -963,3 +963,95 @@ where
     }
     false
 }
+
+#[cfg(all(feature = "notify", feature = "encryption"))]
+#[tokio::test]
+async fn a_sealed_runs_stored_notifications_are_unsealed_or_skipped() {
+    use faucet_cli::serve::sealed;
+    use faucet_cli::serve::vault::Vault;
+    use std::sync::Arc;
+    let hook = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .mount(&hook)
+        .await;
+    let (col, ep) = start_grpc().await;
+    col.set_down(true);
+    let mut cfg = export_config(Some(otel(&ep, faucet_core::OtelProtocol::Grpc)));
+    cfg.log_buffer.notify_after = Duration::ZERO;
+    let vault = Arc::new(Vault::new("log-export-vault-key-0123456789abcdef0123", &[]).unwrap());
+    let url = format!("{}/sealed-hook", hook.uri());
+    let plain = serde_json::json!({
+        "version": 1,
+        "notifications": [{
+            "name": "hook", "on": ["log_export_failed"],
+            "channel": { "type": "webhook", "config": { "url": url } }
+        }]
+    })
+    .to_string();
+    let sp = sealed::tokenize(&plain, std::slice::from_ref(&url))
+        .unwrap()
+        .unwrap();
+    assert!(!sp.body().contains("sealed-hook"));
+
+    let h = MemoryHistory::new(Duration::from_secs(60));
+    for id in ["s-open", "s-nokey"] {
+        let mut rec = RunRecord::queued(
+            id.into(),
+            Some("p".into()),
+            Default::default(),
+            None,
+            chrono::Utc::now(),
+        );
+        rec.config_body = Some(sp.body().to_string());
+        h.upsert(&rec).await.unwrap();
+        h.run_secrets_put(
+            id,
+            &vault.seal_for(
+                &serde_json::json!({ "values": sp.values() }),
+                &sealed::context(id),
+            ),
+        )
+        .await
+        .unwrap();
+        h.record_run_logs(id, &lines_at(Duration::from_secs(10), 1, "a"))
+            .await
+            .unwrap();
+    }
+
+    let without_key = LogExport::from_config(&cfg);
+    without_key.ship_once(&h).await.unwrap();
+    assert!(
+        hook.received_requests().await.unwrap().is_empty(),
+        "no key: the fallback is skipped, never sent to a token"
+    );
+
+    let h2 = MemoryHistory::new(Duration::from_secs(60));
+    let mut rec = RunRecord::queued(
+        "s-open".into(),
+        Some("p".into()),
+        Default::default(),
+        None,
+        chrono::Utc::now(),
+    );
+    rec.config_body = Some(sp.body().to_string());
+    h2.upsert(&rec).await.unwrap();
+    h2.run_secrets_put(
+        "s-open",
+        &vault.seal_for(
+            &serde_json::json!({ "values": sp.values() }),
+            &sealed::context("s-open"),
+        ),
+    )
+    .await
+    .unwrap();
+    h2.record_run_logs("s-open", &lines_at(Duration::from_secs(10), 1, "a"))
+        .await
+        .unwrap();
+    let with_key = LogExport::from_config(&cfg);
+    with_key.set_vault(Some(vault));
+    with_key.ship_once(&h2).await.unwrap();
+    let sent = hook.received_requests().await.unwrap();
+    assert_eq!(sent.len(), 1, "the unsealed channel is notified");
+    assert_eq!(sent[0].url.path(), "/sealed-hook");
+}
