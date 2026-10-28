@@ -3,8 +3,8 @@
 //! no CA setting: it trusts the platform store. Everywhere, a server signed by
 //! an unknown CA and plaintext HTTP are refused with a typed error. On Linux,
 //! where the platform verifier honours `SSL_CERT_FILE`, the fixture CA is then
-//! trusted and `basic` and `api_key` auth write documents a wrong password
-//! cannot.
+//! trusted and `basic`, `api_key` and `bearer` (an OAuth2 access token from
+//! `_security/oauth2/token`) auth write documents a wrong credential cannot.
 
 use faucet_conformance::containers;
 use faucet_conformance::tls::{TlsFixture, images};
@@ -80,6 +80,46 @@ async fn writes_over_https_and_refuses_bad_certificates() {
             .expect("api_key"),
         1
     );
+    let token = images::exec(
+        &es,
+        &[
+            "curl",
+            "-sk",
+            "-u",
+            &format!("elastic:{password}"),
+            "-H",
+            "Content-Type: application/json",
+            "-X",
+            "POST",
+            "https://localhost:9200/_security/oauth2/token",
+            "-d",
+            r#"{"grant_type":"client_credentials"}"#,
+        ],
+    )
+    .await;
+    let token: serde_json::Value = serde_json::from_str(&token).expect("token json");
+    let token = token["access_token"]
+        .as_str()
+        .expect("access token")
+        .to_string();
+    assert_eq!(
+        write(&https, ElasticsearchAuth::Bearer { token }, 4)
+            .await
+            .expect("bearer"),
+        1
+    );
+    assert!(
+        write(
+            &https,
+            ElasticsearchAuth::Bearer {
+                token: "not-a-token".into()
+            },
+            5
+        )
+        .await
+        .is_err(),
+        "an unknown bearer token must be refused"
+    );
     assert!(
         write(&https, basic("wrong"), 3).await.is_err(),
         "a wrong password must be refused"
@@ -97,5 +137,5 @@ async fn writes_over_https_and_refuses_bad_certificates() {
     )
     .await;
     let count: serde_json::Value = serde_json::from_str(&count).unwrap();
-    assert_eq!(count["count"], 2, "{count}");
+    assert_eq!(count["count"], 3, "{count}");
 }
