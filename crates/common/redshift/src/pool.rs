@@ -14,7 +14,7 @@ use std::time::{Instant, SystemTime};
 use faucet_core::io::CallContext;
 
 use crate::config::{RedshiftConnection, RedshiftCredentials, RedshiftTlsMode};
-use crate::iam::{IamCredentials, refresh_at};
+use crate::iam::{IamCredentials, refresh_at, retry_at};
 
 /// Resolve the password for the connection's credentials.
 ///
@@ -175,11 +175,20 @@ impl RedshiftPool {
                         ));
                         tracing::debug!(user = %creds.user, "redshift iam: temporary credentials refreshed");
                     }
-                    // The current credentials still log in: retry on the next use.
-                    Err(e) if due.is_some_and(|(_, exp)| SystemTime::now() < exp) => {
-                        tracing::warn!(error = %e, "redshift iam: refreshing temporary credentials failed; the current ones are still valid");
-                    }
-                    Err(e) => return Err(e),
+                    Err(e) => match *due {
+                        // The current credentials still log in: retry after a
+                        // backoff, not on every use.
+                        Some((_, exp)) if SystemTime::now() < exp => {
+                            let next = retry_at(Instant::now(), SystemTime::now(), exp);
+                            *due = Some((next, exp));
+                            tracing::warn!(
+                                error = %e,
+                                retry_in_ms = next.saturating_duration_since(Instant::now()).as_millis() as u64,
+                                "redshift iam: refreshing temporary credentials failed; the current ones are still valid"
+                            );
+                        }
+                        _ => return Err(e),
+                    },
                 }
             }
         }

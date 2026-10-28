@@ -43,12 +43,31 @@ impl std::fmt::Debug for TempCredentials {
     }
 }
 
+/// The shortest and longest wait before retrying a failed refresh while the
+/// current credentials are still valid; also the shortest time between two
+/// fetches.
+pub const RETRY_RANGE: std::ops::RangeInclusive<Duration> =
+    Duration::from_secs(1)..=Duration::from_secs(60);
+
 /// When credentials fetched at `fetched` and valid until `expires_at` should
 /// be replaced: [`REFRESH_MARGIN`] before expiry, or halfway through a
-/// lifetime shorter than twice the margin.
+/// lifetime shorter than twice the margin, but never sooner than the start of
+/// [`RETRY_RANGE`] after `fetched` (credentials that look expired already, as
+/// with a skewed clock, are not refetched on every use).
 pub fn refresh_at(fetched: Instant, now: SystemTime, expires_at: SystemTime) -> Instant {
     let lifetime = expires_at.duration_since(now).unwrap_or_default();
-    fetched + lifetime - REFRESH_MARGIN.min(lifetime / 2)
+    (fetched + lifetime - REFRESH_MARGIN.min(lifetime / 2)).max(fetched + *RETRY_RANGE.start())
+}
+
+/// When to retry after a refresh failed at `failed` while the current
+/// credentials are valid until `expires_at`: a quarter of the remaining
+/// lifetime, within [`RETRY_RANGE`], and no later than expiry.
+pub fn retry_at(failed: Instant, now: SystemTime, expires_at: SystemTime) -> Instant {
+    let remaining = expires_at.duration_since(now).unwrap_or_default();
+    let wait = (remaining / 4)
+        .clamp(*RETRY_RANGE.start(), *RETRY_RANGE.end())
+        .min(remaining);
+    failed + wait
 }
 
 #[derive(Debug, Clone)]
@@ -362,8 +381,28 @@ mod tests {
         );
         assert_eq!(
             refresh_at(fetched, now, now - Duration::from_secs(1)),
-            fetched
+            fetched + Duration::from_secs(1),
+            "already expired by the local clock: not refetched on every use"
         );
+        assert_eq!(
+            refresh_at(fetched, now, now + Duration::from_secs(1)),
+            fetched + Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn a_failed_refresh_backs_off_within_the_remaining_lifetime() {
+        let failed = Instant::now();
+        let now = SystemTime::now();
+        let at = |secs: u64| retry_at(failed, now, now + Duration::from_secs(secs)) - failed;
+        assert_eq!(at(60), Duration::from_secs(15));
+        assert_eq!(at(3600), Duration::from_secs(60));
+        assert_eq!(at(2), Duration::from_secs(1));
+        assert_eq!(
+            retry_at(failed, now, now + Duration::from_millis(400)) - failed,
+            Duration::from_millis(400)
+        );
+        assert_eq!(retry_at(failed, now, now - Duration::from_secs(1)), failed);
     }
 
     #[test]

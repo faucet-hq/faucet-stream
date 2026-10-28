@@ -287,3 +287,75 @@ async fn a_failed_refresh_keeps_credentials_that_are_still_valid() {
     let err = pool.get(&ctx).await.unwrap_err().to_string();
     assert!(err.contains("GetClusterCredentials failed"), "{err}");
 }
+
+/// Succeeds on the calls listed in `ok`, refuses every other one.
+#[derive(Clone)]
+struct Flaky {
+    ok: &'static [usize],
+    lifetime: Duration,
+    calls: Arc<AtomicUsize>,
+}
+
+impl Respond for Flaky {
+    fn respond(&self, _req: &Request) -> ResponseTemplate {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.ok.contains(&n) {
+            credentials_response("IAM:flaky", "pw", self.lifetime)
+        } else {
+            ResponseTemplate::new(400)
+                .insert_header("content-type", "text/xml")
+                .set_body_string(
+                    "<ErrorResponse><Error><Type>Sender</Type><Code>ClusterNotFound</Code>\
+                     <Message>degraded</Message></Error><RequestId>r</RequestId></ErrorResponse>",
+                )
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failing_refresh_backs_off_while_the_credentials_are_valid() {
+    let server = MockServer::start().await;
+    let fake = Flaky {
+        ok: &[0, 2],
+        lifetime: Duration::from_secs(8),
+        calls: Arc::default(),
+    };
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(fake.clone())
+        .mount(&server)
+        .await;
+    let conn = iam_connection(
+        1,
+        json!({
+            "region": REGION,
+            "cluster_identifier": "c",
+            "db_user": "flaky",
+            "aws_credentials": access_key(),
+            "endpoint_url": server.uri(),
+        }),
+    );
+    let pool = connect_lazy(&conn, 1).unwrap();
+    let ctx = CallContext::new().without_retry();
+    pool.get(&ctx).await.unwrap();
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+
+    // Due at ~4 s; the refresh fails, and every later use reuses the
+    // still-valid credentials instead of calling the API again.
+    tokio::time::sleep(Duration::from_millis(4200)).await;
+    for _ in 0..50 {
+        pool.get(&ctx).await.unwrap();
+    }
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 2, "one failed refresh");
+
+    // After the backoff (a quarter of the ~3.8 s left, at least 1 s) it
+    // tries again, succeeds, and stops.
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    for _ in 0..50 {
+        pool.get(&ctx).await.unwrap();
+    }
+    assert_eq!(
+        fake.calls.load(Ordering::SeqCst),
+        3,
+        "retried once after the backoff"
+    );
+}
