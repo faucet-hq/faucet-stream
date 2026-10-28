@@ -119,7 +119,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: "1.96.0"
+          toolchain: "1.99.1"
           components: rustfmt
       - run: cargo fmt --all --check
 
@@ -206,7 +206,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: "1.96.0"
+          toolchain: "1.99.1"
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
@@ -233,7 +233,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: "1.96.0"
+          toolchain: "1.99.1"
           components: clippy
       - name: Install librdkafka prerequisites
         run: |
@@ -251,7 +251,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: "1.96.0"
+          toolchain: "1.99.1"
       - name: Install librdkafka prerequisites
         run: |
           sudo apt-get update
@@ -317,7 +317,7 @@ jobs:
           df -h /
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: "1.96.0"
+          toolchain: "1.99.1"
       - name: Install librdkafka prerequisites
         run: |
           sudo apt-get update
@@ -415,7 +415,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
         with:
-          toolchain: "1.96.0"
+          toolchain: "1.99.1"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
       - name: Engine guarantee suites (Category A) + state-format gates (Category G)
@@ -445,7 +445,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: "1.96.0"
+          toolchain: "1.99.1"
       - name: Install librdkafka prerequisites
         run: |
           sudo apt-get update
@@ -475,7 +475,7 @@ jobs:
           df -h /
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: "1.96.0"
+          toolchain: "1.99.1"
       - name: Install librdkafka prerequisites
         run: |
           sudo apt-get update
@@ -718,7 +718,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: "1.96.0"
+          toolchain: "1.99.1"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.feature }}
@@ -764,7 +764,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: "1.96.0"
+          toolchain: "1.99.1"
       - name: Install librdkafka prerequisites
         if: contains(matrix.features, 'full') || contains(matrix.features, 'kafka')
         run: |
@@ -818,7 +818,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: "1.96.0"
+          toolchain: "1.99.1"
       # aws-lc-sys and the vendored OpenSSL (librdkafka) assemble with NASM;
       # Strawberry Perl, CMake and MSVC are already on the image.
       - name: Install NASM
@@ -853,7 +853,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: "1.96.0"
+          toolchain: "1.99.1"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Install valgrind and gungraun-runner
         run: |
@@ -895,7 +895,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: "1.96.0"
+          toolchain: "1.99.1"
       - name: Install librdkafka prerequisites
         run: |
           sudo apt-get update
@@ -962,7 +962,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: "1.96.0"
+          toolchain: "1.99.1"
       # This job builds rustdoc for every publishable crate, which reaches
       # rdkafka's `sasl2-sys` and its bundled C build. Every other build job
       # already installs these; this one did not, and a warm `rust-cache`
@@ -992,7 +992,7 @@ jobs:
           # (#654 H10). Every published crate now also declares the additive-is-
           # minor lint contract in its own `[package.metadata.cargo-semver-checks.lints]`,
           # so this gate fails only on real breaks.
-          # Use the 1.96.0 toolchain installed above, not the action's default.
+          # Use the 1.99.1 toolchain installed above, not the action's default.
           rust-toolchain: manual
       # #918: crates whose optional Excel support needs a yanked zip cannot
       # resolve with every feature on; check them with default features.
@@ -1057,7 +1057,7 @@ jobs:
           df -h /
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: "1.96.0"
+          toolchain: "1.99.1"
           components: llvm-tools-preview
       - name: Install librdkafka prerequisites
         run: |

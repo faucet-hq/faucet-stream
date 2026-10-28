@@ -192,31 +192,33 @@ impl GrpcStream {
         path: tonic::codegen::http::uri::PathAndQuery,
         output_desc: MessageDescriptor,
         request_bytes: Vec<u8>,
-    ) -> Result<(tonic::Streaming<DynamicMessage>, Option<Credential>), Failure> {
+    ) -> Result<(tonic::Streaming<DynamicMessage>, Option<Credential>), Box<Failure>> {
         let channel = self
             .connect_channel(endpoint)
             .await
-            .map_err(Failure::from_connect)?;
+            .map_err(|e| Box::new(Failure::from_connect(e)))?;
         let mut grpc_client = self.configure_client(tonic::client::Grpc::new(channel));
         grpc_client.ready().await.map_err(|e| {
-            Failure::Retry(FaucetError::Source(format!("gRPC channel not ready: {e}")))
+            Box::new(Failure::Retry(FaucetError::Source(format!(
+                "gRPC channel not ready: {e}"
+            ))))
         })?;
         let (request, sent) = self
             .build_grpc_request(request_bytes)
             .await
-            .map_err(Failure::Fatal)?;
+            .map_err(|e| Box::new(Failure::Fatal(e)))?;
         let call = grpc_client.server_streaming(request, path, DynamicCodec::new(output_desc));
         match with_timeout(self.config.timeout, call).await {
             Some(Ok(response)) => Ok((response.into_inner(), sent)),
-            Some(Err(status)) => Err(Failure::from_status(
+            Some(Err(status)) => Err(Box::new(Failure::from_status(
                 "gRPC server-streaming start failed",
                 status,
                 sent,
-            )),
-            None => Err(Failure::Retry(FaucetError::Source(format!(
+            ))),
+            None => Err(Box::new(Failure::Retry(FaucetError::Source(format!(
                 "gRPC server-streaming start timed out after {}s",
                 secs(self.config.timeout)
-            )))),
+            ))))),
         }
     }
 
@@ -256,7 +258,7 @@ impl GrpcStream {
                         .await;
                     let (mut streaming, sent) = match opened {
                         Ok(Ok(opened)) => opened,
-                        Ok(Err(failure)) => break 'attempt failure,
+                        Ok(Err(failure)) => break 'attempt *failure,
                         Err(spent) => break 'attempt Failure::Fatal(spent),
                     };
                     let skip = if self.config.reconnect_replay_from_start { emitted } else { 0 };

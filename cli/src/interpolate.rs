@@ -648,10 +648,10 @@ pub fn resolve_config_refs(cfg: &mut crate::config::PipelineConfig) -> CliResult
 
     // Phase 2: substitute vars inside template bodies so the snapshot taken
     // next sees fully-resolved values.
-    for (_name, spec) in cfg.pipeline.sources.iter_mut() {
+    for spec in cfg.pipeline.sources.values_mut() {
         resolve_vars_only(&mut spec.config, vars_ref)?;
     }
-    for (_name, spec) in cfg.pipeline.sinks.iter_mut() {
+    for spec in cfg.pipeline.sinks.values_mut() {
         resolve_vars_only(&mut spec.config, vars_ref)?;
     }
     if let Some(spec) = cfg.pipeline.source.as_mut() {
@@ -666,10 +666,10 @@ pub fn resolve_config_refs(cfg: &mut crate::config::PipelineConfig) -> CliResult
 
     // Phase 3: walk everything — including the template bodies again for
     // ${sources/sinks.X.PATH} refs (Phase 2 only resolved ${vars.X} there).
-    for (_name, spec) in cfg.pipeline.sources.iter_mut() {
+    for spec in cfg.pipeline.sources.values_mut() {
         resolve_value_full(&mut spec.config, vars_ref, &snapshot)?;
     }
-    for (_name, spec) in cfg.pipeline.sinks.iter_mut() {
+    for spec in cfg.pipeline.sinks.values_mut() {
         resolve_value_full(&mut spec.config, vars_ref, &snapshot)?;
     }
     if let Some(spec) = cfg.pipeline.source.as_mut() {
@@ -690,7 +690,7 @@ pub fn resolve_config_refs(cfg: &mut crate::config::PipelineConfig) -> CliResult
     // The shared `auth:` catalog is a first-class config location: provider
     // specs may reference `${vars.X}` / `${sources.X.PATH}` like any other (#134).
     if let Some(auth) = cfg.auth.as_mut() {
-        for (_name, spec) in auth.iter_mut() {
+        for spec in auth.values_mut() {
             resolve_value_full(spec, vars_ref, &snapshot)?;
         }
     }

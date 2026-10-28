@@ -50,6 +50,6 @@ body:
     attributes:
       label: Environment
       description: OS, architecture, Rust toolchain.
-      placeholder: "macOS 14 arm64, rustc 1.96"
+      placeholder: "macOS 14 arm64, rustc 1.99"
     validations:
       required: false

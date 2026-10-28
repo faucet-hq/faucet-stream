@@ -2,7 +2,7 @@
 name = "faucet-sink-acme"
 version = "1.0.0"
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.99"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/your-org/faucet-sink-acme"
 description = "acme sink connector for the faucet-stream ecosystem"

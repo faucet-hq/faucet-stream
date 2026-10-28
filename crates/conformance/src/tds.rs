@@ -322,8 +322,10 @@ fn pick(rules: &mut Vec<Rule>, text: &str) -> Reply {
 fn request_text(payload: &[u8]) -> String {
     let decode = |bytes: &[u8]| {
         let units: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .collect();
         String::from_utf16_lossy(&units)
     };

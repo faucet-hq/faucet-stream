@@ -122,8 +122,10 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
         _ => None,
     };
     s.as_bytes()
-        .chunks_exact(2)
-        .map(|p| Some(nibble(p[0])? << 4 | nibble(p[1])?))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|[hi, lo]| Some(nibble(*hi)? << 4 | nibble(*lo)?))
         .collect()
 }
 

@@ -131,7 +131,7 @@ exclude = [
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.99"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/faucet-hq/faucet-stream"
 # Shared crates.io discovery metadata, inherited by connector/state crates via

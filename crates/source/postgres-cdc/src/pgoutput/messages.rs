@@ -217,7 +217,7 @@ mod tests {
 
     #[test]
     fn message_kind_byte_round_trip() {
-        for byte in [b'B', b'C', b'O', b'R', b'Y', b'I', b'U', b'D', b'T'] {
+        for byte in *b"BCORYIUDT" {
             let kind = MessageKind::from_byte(byte).expect("known kind");
             assert_eq!(kind.as_byte(), byte);
         }
@@ -230,7 +230,7 @@ mod tests {
 
     #[test]
     fn relation_replica_identity_round_trip() {
-        for byte in [b'd', b'n', b'f', b'i'] {
+        for byte in *b"dnfi" {
             let id = ReplicaIdentity::from_byte(byte).expect("known");
             assert_eq!(id.as_byte(), byte);
         }

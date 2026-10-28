@@ -968,7 +968,7 @@ mod tests {
         assert_eq!(decimal_key("0.000"), Some((false, String::new(), 0)));
         assert_eq!(decimal_key("-00"), Some((false, String::new(), 0)));
         let f = datum_for("x", &Literal::Str(" 0.5 ".into()), &PrimitiveType::Float).unwrap();
-        assert_eq!(f, Datum::float(0.5));
+        assert_eq!(f, Datum::float(0.5_f32));
         for bad in ["abc", "inf", "NaN"] {
             let e = datum_for("x", &Literal::Str(bad.into()), &PrimitiveType::Float).unwrap_err();
             assert!(e.to_string().contains(&format!("'{bad}'")), "{e}");

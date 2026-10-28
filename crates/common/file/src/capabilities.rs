@@ -37,12 +37,9 @@ pub fn resolved_format(config: &Value, shape: SinkShape) -> Option<FileFormat> {
     }
     let name = match config.get(shape.path_field) {
         Some(Value::String(p)) => p.replace(PART_TOKEN, "00001"),
-        Some(Value::Null) | None => match shape.default_extension {
-            Some(default) => str_field(config, "file_extension")
-                .unwrap_or(default)
-                .to_string(),
-            None => return None,
-        },
+        Some(Value::Null) | None => str_field(config, "file_extension")
+            .unwrap_or(shape.default_extension?)
+            .to_string(),
         Some(_) => return None,
     };
     FileFormatChoice::Auto.resolve_writable(&name).ok()
