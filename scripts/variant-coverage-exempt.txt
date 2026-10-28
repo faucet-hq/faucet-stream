@@ -6,4 +6,3 @@ common/pubsub::PubsubCredentials::ServiceAccountJsonFile -- with emulator_host s
 common/pubsub::PubsubCredentials::ServiceAccountJsonInline -- with emulator_host set the client skips authentication entirely (use_auth is false), so the key is only read against real Pub/Sub
 common/spanner::SpannerCredentials::ServiceAccountKey -- under emulator_host the client uses the emulator environment and credential application is a no-op, so the key only runs against real Spanner
 common/spanner::SpannerCredentials::ServiceAccountKeyPath -- under emulator_host the client uses the emulator environment and credential application is a no-op, so the key only runs against real Spanner
-sink/iceberg::CatalogConfig::Hms -- the Iceberg sink refuses the HMS catalog at config load until #977
