@@ -30,6 +30,8 @@ pub(crate) struct SnowflakeDriver {
     /// Whether the target has been confirmed present for this sink instance
     /// (#580). One check per run, not per page.
     table_ready: std::sync::atomic::AtomicBool,
+    /// The source's declared columns (#955).
+    declared: faucet_core::DeclaredSlot,
     /// The target's columns, loaded once (`None` until then).
     columns: std::sync::Mutex<Option<TableColumns>>,
     /// Records accumulated across `write_batch` calls (#617). Without this,
@@ -273,7 +275,8 @@ impl SnowflakeDriver {
         }
         // A page with nothing inferable leaves the table uncreated so the next
         // page can try, rather than emitting a zero-column CREATE.
-        let Some(columns) = faucet_core::plan_columns(records) else {
+        let declared = self.declared.get();
+        let Some(columns) = faucet_core::plan_columns_declared(records, declared.as_ref()) else {
             return Ok(());
         };
         let sql = build_create_table_sql(
@@ -423,6 +426,7 @@ impl SnowflakeDriver {
         }
         Ok(Self {
             table_ready: std::sync::atomic::AtomicBool::new(false),
+            declared: faucet_core::DeclaredSlot::new(),
             pending: tokio::sync::Mutex::new(faucet_core::PageAccumulator::bounded(
                 config.commit_rows,
                 config.commit_bytes,
@@ -928,10 +932,9 @@ fn utc_wall_time(s: &str) -> Option<String> {
 
 /// `CREATE TABLE IF NOT EXISTS` for an auto-created target (#580).
 ///
-/// Every column is a nullable `STRING`, matching what `build_insert` actually
-/// writes — it projects each value with `::string`, so a typed column would
-/// reject its own writer's cast. An operator who wants typed columns defines
-/// the table and sets `create_table: false`.
+/// An inferred column is a nullable `STRING`. A column the source declared
+/// (#955) takes its declared type: `build_insert` projects each value with
+/// `::string`, which Snowflake coerces into the column's type on `INSERT`.
 fn build_create_table_sql(
     database: &str,
     schema: &str,
@@ -1121,6 +1124,25 @@ impl SnowflakeDriver {
 
 #[async_trait]
 impl SinkDriver for SnowflakeDriver {
+    fn capabilities(&self, derived: faucet_core::Capabilities) -> faucet_core::Capabilities {
+        derived.to_builder().declared_types(true).build()
+    }
+
+    fn set_declared_columns(&self, columns: faucet_core::DeclaredColumns) {
+        self.declared.set(columns);
+    }
+
+    /// A run that wrote nothing creates the declared table (#955).
+    async fn complete_run(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        if self.config.create_table
+            && !self.table_ready.load(std::sync::atomic::Ordering::Relaxed)
+            && self.declared.for_empty_run().is_some()
+        {
+            self.ensure_table_ready(calls, &[]).await?;
+        }
+        Ok(())
+    }
+
     fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
         self.config.batch_atomicity()
     }

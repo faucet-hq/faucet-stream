@@ -139,3 +139,43 @@ async fn conformance_call_deadline() {
     release_tx.send(()).unwrap();
     holder.await.unwrap();
 }
+
+/// Check 26: a declaration creates the table, typed, for an empty run.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_declared_types_create() {
+    let Some((_container, conn)) = common::start_oracle().await else {
+        return;
+    };
+    let sink = OracleSink::new(OracleSinkConfig::new(conn.clone(), "typed"))
+        .await
+        .expect("sink");
+    let types = || {
+        let conn = conn.clone();
+        async move {
+            common::query_strings(
+                &conn,
+                "SELECT COLUMN_NAME || '|' || DATA_TYPE FROM USER_TAB_COLUMNS \
+                 WHERE UPPER(TABLE_NAME) = 'TYPED'",
+            )
+            .await
+            .into_iter()
+            .flatten()
+            .filter_map(|s| {
+                s.split_once('|')
+                    .map(|(n, t)| (n.to_string(), t.to_string()))
+            })
+            .collect::<Vec<_>>()
+        }
+    };
+    faucet_conformance::assert_declared_types_create(
+        &sink,
+        &[
+            ("id", "number"),
+            ("amount", "number"),
+            ("day", "date"),
+            ("at", "with time zone"),
+        ],
+        types,
+    )
+    .await;
+}

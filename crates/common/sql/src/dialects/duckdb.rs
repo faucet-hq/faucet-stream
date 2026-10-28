@@ -2,7 +2,7 @@
 
 use crate::dialect::{SqlDialect, TableTarget};
 use crate::mapping::ColumnMatching;
-use faucet_core::{FaucetError, SqlBaseType};
+use faucet_core::{FaucetError, LogicalType, SqlBaseType};
 
 /// DuckDB: double-quoted identifiers (each segment of a qualified name quoted
 /// on its own), `?` placeholders with no practical parameter cap (a page is
@@ -52,6 +52,21 @@ impl SqlDialect for Duckdb {
             SqlBaseType::Boolean => "BOOLEAN",
             SqlBaseType::Text | SqlBaseType::Json => "TEXT",
         }
+    }
+
+    fn declared_type_name(&self, t: &LogicalType) -> Option<String> {
+        Some(match t {
+            LogicalType::Int64 => "BIGINT".into(),
+            LogicalType::Float64 => "DOUBLE".into(),
+            LogicalType::Bool => "BOOLEAN".into(),
+            LogicalType::Decimal { .. } => super::declared_decimal(t, 38, None, "DECIMAL")?,
+            LogicalType::Date => "DATE".into(),
+            LogicalType::Time => "TIME".into(),
+            LogicalType::Timestamp { tz: true } => "TIMESTAMPTZ".into(),
+            LogicalType::Timestamp { tz: false } => "TIMESTAMP".into(),
+            LogicalType::Uuid => "UUID".into(),
+            _ => return None,
+        })
     }
 
     /// Precision is capped at 38 digits, so no scale keeps both a wide

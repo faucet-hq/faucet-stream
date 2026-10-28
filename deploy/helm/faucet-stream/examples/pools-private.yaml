@@ -1,0 +1,29 @@
+# Execution pools on two node groups (#957), release 1 of 2: replicas on the
+# private-subnet nodes, serving the `private` pool. Install with
+#
+#   helm install faucet-private deploy/helm/faucet-stream -f examples/pools-private.yaml
+#   helm install faucet-public  deploy/helm/faucet-stream -f examples/pools-public.yaml
+#
+# Both releases share one postgres run history (the same Secret) and the same
+# auth Secret, so they form one cluster: one run list, one template registry,
+# one catalog. A run whose config says `pool: private` (or that is submitted
+# with `"pool": "private"`) is claimed only here; everything else goes to the
+# public release, which serves `default`. Submit to either release's Service.
+serve:
+  enabled: true
+  replicaCount: 2
+  history:
+    backend: postgres
+    existingSecret: faucet-history
+  auth:
+    existingSecret: faucet-serve-auth
+  cluster:
+    enabled: true
+    pools: [private]
+    poolWaitTimeoutSecs: 900
+  nodeSelector:
+    node.kubernetes.io/subnet: private
+  tolerations:
+    - key: subnet
+      value: private
+      effect: NoSchedule

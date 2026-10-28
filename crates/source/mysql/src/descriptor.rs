@@ -12,6 +12,7 @@ fn capabilities(config: &Value) -> Capabilities {
         .shardable(config.is_null() || is_set(config, "shard"))
         .range_read(true)
         .range_digest(true)
+        .declared_columns(true)
         .build()
 }
 

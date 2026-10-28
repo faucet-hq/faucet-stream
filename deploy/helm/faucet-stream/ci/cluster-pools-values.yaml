@@ -1,0 +1,20 @@
+# One release of a pooled fleet: this one runs on private-subnet nodes and
+# serves `private`; a second release (examples/pools-public.yaml) shares the
+# same postgres history and serves `default`.
+# expect: - --cluster
+# expect: - --pool=private
+# expect: - --pool=gpu
+# expect: - --pool-wait-timeout-secs=600
+# expect: subnet: private
+serve:
+  enabled: true
+  replicaCount: 2
+  history:
+    backend: postgres
+    existingSecret: faucet-history
+  cluster:
+    enabled: true
+    pools: [private, gpu]
+    poolWaitTimeoutSecs: 600
+  nodeSelector:
+    subnet: private

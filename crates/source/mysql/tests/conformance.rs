@@ -218,3 +218,25 @@ async fn conformance_first_page_before_exhaustion() {
         served()
     );
 }
+
+/// Check 25: the declaration names every emitted column with its type.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_declared_columns_truthful() {
+    let (_container, url) = start_mysql().await;
+    let pool = sqlx::MySqlPool::connect(&url).await.expect("pool connect");
+    for sql in [
+        "CREATE TABLE typed (id INT NOT NULL, amount DECIMAL(12,2), day DATE, \
+         at TIMESTAMP NULL, local DATETIME(3), t TIME, note VARCHAR(20), flag BOOLEAN, \
+         f DOUBLE, j JSON, b VARBINARY(4))",
+        "INSERT INTO typed VALUES (1, 12.50, '2024-10-27', '2024-02-22 02:00:00', \
+         '2024-02-22 02:00:00.5', '10:11:12', 'x', true, 1.5, '{\"a\": 1}', 0x0102), \
+         (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
+    ] {
+        sqlx::query(sql).execute(&pool).await.expect("seed");
+    }
+    pool.close().await;
+    let source = MysqlSource::new(MysqlSourceConfig::new(&url, "SELECT * FROM typed"))
+        .await
+        .expect("source");
+    faucet_conformance::assert_declared_columns_truthful(&source).await;
+}

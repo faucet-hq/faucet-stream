@@ -302,10 +302,11 @@ pub async fn reload(
     body: &str,
 ) -> Result<LoadedSubmission, ServeError> {
     let principal = Principal::stored(AuthContext::runtime(), rec);
+    let body = crate::serve::sealed::unseal(state, &rec.run_id, body).await?;
     load(
         state,
         &principal,
-        Submission::new(body, rec.config_format.unwrap_or_default())
+        Submission::new(&body, rec.config_format.unwrap_or_default())
             .selected(rec.selection.as_ref()),
     )
     .await
@@ -428,6 +429,12 @@ pub async fn submit(
     // proposed, so a change request never waits for approval only to fail
     // when it executes.
     crate::serve::runner::resolve_clock(req.clock.as_deref(), chrono::Utc::now())?;
+    crate::serve::history::labels::check_submitted(&req.labels, req.trusted_config).map_err(
+        |message| ServeError::Unprocessable {
+            message,
+            details: None,
+        },
+    )?;
     // `0` is rejected rather than clamped: it would mean "no connections"
     // (#610).
     if req.concurrency == Some(0) {
@@ -436,6 +443,9 @@ pub async fn submit(
                 .into(),
             details: None,
         });
+    }
+    if let Some(p) = req.pool.as_deref() {
+        crate::serve::pools::resolve(Some(p), None)?;
     }
     let gated = req.approved_change.is_none()
         && (req.require_approval
@@ -489,6 +499,12 @@ pub async fn submit(
         },
     )
     .await?;
+    // The execution pool (#957): the request's, else the config's, else
+    // `default` — refused when no replica would run it.
+    let pool =
+        crate::serve::pools::resolve(req.pool.as_deref(), admitted.loaded.cfg.pool.as_deref())?;
+    crate::serve::pools::admit(state, &pool).await?;
+    req.pool = Some(pool);
     // The stored body (what a cluster peer re-runs) carries the ceilings too.
     req.budget = admitted.budget.clone();
     let req = runner::apply_request_budget(req)?;
@@ -841,6 +857,16 @@ pub async fn rollback(
             req.config_format.into(),
             Principal::caller(state, actor).on_behalf_of(rec.tenant.clone()),
         ),
+        (None, Some(stored)) if crate::serve::sealed::is_sealed(stored) => {
+            return Err(ServeError::Unprocessable {
+                message: format!(
+                    "run {id}'s stored config held sealed `secret: true` param values, which are \
+                     deleted once a run finishes; pass `config` (the pipeline config the run was \
+                     made with) in the request body"
+                ),
+                details: None,
+            });
+        }
         (None, Some(stored)) => (
             stored.to_string(),
             rec.config_format.unwrap_or_default(),
@@ -1446,8 +1472,14 @@ mod templates {
         .map_err(map_err)?;
 
         // Caller-supplied values that would land in the persisted body (a
-        // `secret: true` param, an `env:` override) are refused (#456 M4).
-        if (clustered || gated) && (materialized.used_secret_params || !body.env.is_empty()) {
+        // `secret: true` param, an `env:` override) are refused (#456 M4) —
+        // except secret params on a clustered server with a vault key, which
+        // are sealed out of the body (#956).
+        let seal = clustered && !gated && materialized.used_secret_params && body.env.is_empty();
+        if (clustered || gated)
+            && (materialized.used_secret_params || !body.env.is_empty())
+            && !(seal && crate::serve::sealed::vault_configured(&state))
+        {
             let what = if materialized.used_secret_params {
                 "declares `secret: true` param(s)"
             } else {
@@ -1461,9 +1493,14 @@ mod templates {
                  which would store the value in the shared run-history database"
             };
             let alternative = if gated {
-                "trigger it on a server that does not require approval for runs"
+                "trigger it on a server that does not require approval for runs".to_string()
+            } else if seal {
+                format!(
+                    "trigger it on a non-clustered server, or {}",
+                    crate::serve::sealed::NO_VAULT_HINT
+                )
             } else {
-                "trigger it on a non-clustered server"
+                "trigger it on a non-clustered server".to_string()
             };
             return Err(ServeError::Unprocessable {
                 message: format!(
@@ -1474,6 +1511,17 @@ mod templates {
                 details: None,
             });
         }
+        let sealed_params = if seal {
+            crate::serve::sealed::tokenize(&materialized.body, &materialized.secret_texts.0)
+                .map_err(|e| ServeError::Unprocessable {
+                    message: crate::secrets::registry::redact_message(&format!(
+                        "sealing the `secret: true` params: {e}"
+                    )),
+                    details: None,
+                })?
+        } else {
+            None
+        };
 
         let mut labels = body.labels;
         // Provenance labels are the server's to set.
@@ -1516,7 +1564,13 @@ mod templates {
         let req = SubmitRequest {
             config: materialized.body.clone(),
             config_format: ConfigFormatWire::Json,
-            name: body.name.or_else(|| materialized.name.clone()),
+            name: body
+                .name
+                .or_else(|| materialized.name.clone())
+                .map(|n| match &sealed_params {
+                    Some(sp) => sp.redact_text(&n),
+                    None => n,
+                }),
             labels,
             timeout_secs: body.timeout_secs,
             doctor_first: body.doctor_first,
@@ -1529,8 +1583,10 @@ mod templates {
             budget: body.budget,
             approved_change: None,
             selection: materialized.selection.clone(),
+            pool: body.pool,
             trusted_config: true,
             server_file: false,
+            sealed_params,
         };
         // The template is the operator's: the run loads it trusted.
         let run_as = Principal::new(actor.clone(), Origin::Trusted).on_behalf_of(tenant);

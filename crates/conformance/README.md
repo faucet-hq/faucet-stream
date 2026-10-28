@@ -46,6 +46,8 @@ Each proves a sink behaves as a capability it declares says it does:
 | 22 | `assert_first_page_before_exhaustion` | given a count of what the backend has served, a source's first page arrives before the whole result set was read (it streams rather than buffers) |
 | 23 | `assert_cleanup_scoped` | scoped cleanup deletes exactly the unwritten rows of its scope and nothing outside it |
 | 24 | `assert_rollback_truthful` | rollback of a run deletes exactly that run's rows; a dry run changes nothing |
+| 25 | `assert_declared_columns_truthful` | a source's column declaration (#955) is complete and every emitted value fits its declared type |
+| 26 | `assert_declared_types_create` | a sink handed a declaration creates the destination with typed columns, and a write never retypes them |
 
 Checks 20 and 21 are required for a sink built on a family driver
 (`faucet_core::driver`, `faucet_common_sql::SqlDriver`); they run on any sink.

@@ -19,6 +19,11 @@ pub struct ClusterConfig {
     pub poll: Duration,
     /// Max failover re-runs before an orphan is marked Failed (poison).
     pub max_attempts: u32,
+    /// The execution pools this replica serves (#957), sorted; `[default]`
+    /// without `--pool`. Applies to a non-clustered server too.
+    pub pools: Vec<String>,
+    /// Fail a pending run whose pool no live member has served this long.
+    pub pool_wait_timeout: Option<Duration>,
 }
 
 impl ClusterConfig {
@@ -28,6 +33,8 @@ impl ClusterConfig {
             enabled: false,
             poll: Duration::from_secs(2),
             max_attempts: 3,
+            pools: crate::serve::pools::default_only(),
+            pool_wait_timeout: None,
         }
     }
 }
@@ -45,11 +52,22 @@ struct ClusterInner {
     cfg: ClusterConfig,
     listen: String,
     max_concurrent: u32,
+    /// How long a member stays live without a heartbeat.
+    member_ttl: Duration,
     started_at: chrono::DateTime<chrono::Utc>,
     kick: Notify,
     members: AtomicUsize,
     /// The state format every live member reads (#736).
     state_format: std::sync::atomic::AtomicU32,
+    /// The live members last seen by the lease loop, with their pools (#957).
+    live: std::sync::RwLock<Vec<crate::serve::history::InstanceRecord>>,
+    /// Pools the `faucet_serve_runs_pending` gauge has reported, so a pool
+    /// whose last pending run went is reset to 0.
+    gauged_pools: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// When this replica first saw each pool with pending runs and no live
+    /// member serving it (`--pool-wait-timeout-secs`).
+    unserved_since:
+        std::sync::Mutex<std::collections::BTreeMap<String, chrono::DateTime<chrono::Utc>>>,
     /// Whether the last lease renewal reached the run-history backend (#905).
     history_reachable: AtomicBool,
     /// While fenced (leases not renewed), how long a cancelled run may take
@@ -66,12 +84,17 @@ impl ClusterHandle {
                 cfg: config.cluster.clone(),
                 listen: config.listen.to_string(),
                 max_concurrent: config.max_concurrent_runs as u32,
+                member_ttl: crate::serve::server::lease_interval(config.lease_ttl)
+                    .saturating_mul(3),
                 started_at: chrono::Utc::now(),
                 kick: Notify::new(),
                 members: AtomicUsize::new(0),
                 state_format: std::sync::atomic::AtomicU32::new(
                     faucet_core::state_version::STATE_FORMAT,
                 ),
+                live: std::sync::RwLock::new(Vec::new()),
+                gauged_pools: std::sync::Mutex::new(Default::default()),
+                unserved_since: std::sync::Mutex::new(Default::default()),
                 history_reachable: AtomicBool::new(true),
                 fence_grace_ms: AtomicU64::new(0),
             }),
@@ -95,6 +118,68 @@ impl ClusterHandle {
     }
     pub fn started_at(&self) -> chrono::DateTime<chrono::Utc> {
         self.inner.started_at
+    }
+    /// How long a member stays live without a heartbeat (three lease beats).
+    pub fn member_ttl(&self) -> Duration {
+        self.inner.member_ttl
+    }
+    /// The execution pools this replica serves (#957).
+    pub fn pools(&self) -> &[String] {
+        &self.inner.cfg.pools
+    }
+    pub fn pool_wait_timeout(&self) -> Option<Duration> {
+        self.inner.cfg.pool_wait_timeout
+    }
+
+    /// The live members the lease loop saw last (#957).
+    pub fn live_members(&self) -> Vec<crate::serve::history::InstanceRecord> {
+        self.inner
+            .live
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+    pub fn set_live_members(&self, members: Vec<crate::serve::history::InstanceRecord>) {
+        *self.inner.live.write().unwrap_or_else(|e| e.into_inner()) = members;
+    }
+
+    /// Record which pools have pending runs and no live member now: a pool
+    /// keeps the time it was first seen, and one served again is forgotten. Returns each unserved pool's first-seen time.
+    pub fn note_unserved(
+        &self,
+        unserved: &[String],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> std::collections::BTreeMap<String, chrono::DateTime<chrono::Utc>> {
+        let mut since = self
+            .inner
+            .unserved_since
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        since.retain(|p, _| unserved.contains(p));
+        for p in unserved {
+            since.entry(p.clone()).or_insert(now);
+        }
+        since.clone()
+    }
+
+    /// Set `faucet_serve_runs_pending{pool}` from per-pool counts; a pool
+    /// reported before and absent now drops to 0.
+    pub fn report_pending(&self, counts: &[(String, usize)]) {
+        let mut seen = self
+            .inner
+            .gauged_pools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for pool in seen.iter() {
+            if !counts.iter().any(|(p, _)| p == pool) {
+                crate::serve::metrics::set_runs_pending(pool, 0);
+            }
+        }
+        seen.clear();
+        for (pool, n) in counts {
+            crate::serve::metrics::set_runs_pending(pool, *n);
+            seen.insert(pool.clone());
+        }
     }
 
     /// Wake the local claim loop now (called by `submit` after writing Pending).
@@ -224,7 +309,7 @@ pub async fn claim_loop(state: ServerState, shutdown: CancellationToken) {
             continue;
         };
         let mut claimed_count = 0usize;
-        match state.history().claim_pending(free).await {
+        match state.history().claim_pending(free, handle.pools()).await {
             Ok(claimed) => {
                 if !claimed.is_empty() {
                     crate::serve::metrics::record_runs_claimed(claimed.len());
@@ -251,7 +336,11 @@ pub async fn claim_loop(state: ServerState, shutdown: CancellationToken) {
         //    permits it simply queues on the semaphore, like a claimed run.
         let shard_budget = free.saturating_sub(claimed_count);
         if shard_budget > 0 {
-            match state.history().claim_shards(shard_budget).await {
+            match state
+                .history()
+                .claim_shards(shard_budget, handle.pools())
+                .await
+            {
                 Ok(shards) => {
                     if !shards.is_empty() {
                         crate::serve::metrics::record_shards_claimed(shards.len());
@@ -326,7 +415,10 @@ mod tests {
             no_env_file: false,
             log_level: "info".into(),
             ui_enabled: true,
-            cluster: ClusterConfig::disabled(),
+            cluster: ClusterConfig {
+                pools: vec!["a".into(), "b".into()],
+                ..ClusterConfig::disabled()
+            },
             triggers_path: None,
             templates_sync_path: None,
             policy_path: None,
@@ -346,5 +438,36 @@ mod tests {
             .expect("kick must wake the waiter");
         h.set_members(2);
         assert_eq!(h.members(), 2);
+        assert_eq!(h.pools(), ["a", "b"]);
+        assert_eq!(h.member_ttl(), Duration::from_secs(30));
+        assert!(h.pool_wait_timeout().is_none());
+        assert!(h.live_members().is_empty());
+        let m = crate::serve::history::InstanceRecord {
+            instance_id: "i".into(),
+            started_at: chrono::Utc::now(),
+            last_heartbeat: chrono::Utc::now(),
+            listen: None,
+            max_concurrent: 1,
+            in_flight: 0,
+            state_format: 0,
+            pools: Some(vec!["a".into()]),
+        };
+        h.set_live_members(vec![m]);
+        assert_eq!(
+            h.live_members()[0].pools.as_deref(),
+            Some(&["a".to_string()][..])
+        );
+        let t0 = chrono::Utc::now();
+        let first = h.note_unserved(&["x".into()], t0);
+        let later = h.note_unserved(&["x".into(), "y".into()], t0 + chrono::Duration::seconds(5));
+        assert_eq!(first["x"], t0);
+        assert_eq!(later["x"], t0, "a pool keeps its first-seen time");
+        assert!(
+            h.note_unserved(&[], t0).is_empty(),
+            "a served pool is forgotten"
+        );
+        h.report_pending(&[("a".into(), 2)]);
+        h.report_pending(&[]);
+        assert!(h.inner.gauged_pools.lock().unwrap().is_empty());
     }
 }

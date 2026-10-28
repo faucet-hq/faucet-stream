@@ -666,7 +666,10 @@ pub fn labels(name: &str, event: &TriggerEvent) -> BTreeMap<String, String> {
     match event {
         TriggerEvent::Object { bucket, key, .. } => {
             m.insert("faucet.trigger.bucket".into(), bucket.clone());
-            m.insert("faucet.trigger.object_key".into(), key.clone());
+            m.insert(
+                "faucet.trigger.object_key".into(),
+                crate::serve::history::labels::clamp_value(key),
+            );
         }
         TriggerEvent::ObjectBatch { bucket, count, .. } => {
             m.insert("faucet.trigger.bucket".into(), bucket.clone());
@@ -897,6 +900,22 @@ mod tests {
             labels("n", &e)["faucet.trigger.tick"],
             "2026-09-26T02:00:00Z"
         );
+    }
+
+    #[test]
+    fn a_long_object_key_label_is_clamped() {
+        let e = TriggerEvent::Object {
+            bucket: "b".into(),
+            key: "k".repeat(1000),
+            size: 1,
+            last_modified: "2026-06-12T10:00:00Z".into(),
+        };
+        let l = labels("n", &e);
+        assert_eq!(
+            l["faucet.trigger.object_key"].len(),
+            crate::serve::history::labels::MAX_LABEL_VALUE_LEN
+        );
+        assert!(crate::serve::history::labels::validate(&l, &[]).is_ok());
     }
 
     fn obj() -> TriggerEvent {

@@ -183,7 +183,10 @@ curl -s -X POST http://127.0.0.1:8080/v1/backfill \
 ```
 
 Unit runs are named `{name}-backfill-{range_hash}-{unit}` and labelled
-`backfill=<range-hash>` + `backfill_unit=<unit>`; the pipeline `name` is
+`backfill=<range-hash>` + `backfill_unit=<unit>` (the response's `backfill`
+field is the hash). Follow one backfill's units with
+`GET /v1/runs?label=backfill:<range-hash>`, which lists only that backfill's
+runs; add `&label=backfill_unit:<unit>` for one unit. The pipeline `name` is
 rewritten per unit so state keys stay namespaced, and delivery is forced to
 at-least-once. Deterministic idempotency keys (`backfill:{hash}:{unit}`) make
 re-POSTing the same body replay-safe: already-submitted units replay,

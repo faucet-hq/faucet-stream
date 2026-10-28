@@ -20,11 +20,13 @@ pub mod logs;
 pub mod mcp_route;
 pub mod metrics;
 pub mod observability;
+pub mod pools;
 pub mod preview;
 pub mod rbac;
 pub mod references;
 pub mod registry;
 pub mod runner;
+pub mod sealed;
 pub mod server;
 pub mod state;
 #[cfg(feature = "tenants")]
@@ -35,6 +37,8 @@ pub mod test_support;
 pub mod triggers;
 #[cfg(feature = "serve-ui")]
 pub mod ui_assets;
+#[cfg(feature = "encryption")]
+pub mod vault;
 
 pub use config::ServeConfig;
 

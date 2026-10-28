@@ -917,6 +917,7 @@ impl Mapper<'_> {
             sources: BTreeMap::new(),
             transforms,
             contract: None,
+            pool: None,
             streams,
             tests: None,
         };

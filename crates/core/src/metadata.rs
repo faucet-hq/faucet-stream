@@ -304,8 +304,25 @@ impl Sink for MetadataSink {
     crate::forward_sink!(inner; except
         admit_page, write_batch, write_batch_reported, write_governed, write_batch_partial,
         write_batch_idempotent, write_batch_idempotent_reported,
-        begin_overwrite,
+        begin_overwrite, set_declared_columns,
         supports_columnar, write_batch_columnar, native_load_capabilities, load_native);
+
+    // The stamped columns are part of every written row, so a table created
+    // from the declaration carries them too.
+    fn set_declared_columns(&self, columns: crate::declared::DeclaredColumns) {
+        use crate::declared::{DeclaredColumn, LogicalType};
+        let declared = self.meta.columns.iter().fold(columns, |d, &col| {
+            let t = match col {
+                MetadataColumn::ExtractedAt | MetadataColumn::LoadedAt => {
+                    LogicalType::Timestamp { tz: true }
+                }
+                MetadataColumn::RunId | MetadataColumn::Source => LogicalType::String,
+                MetadataColumn::Sequence => LogicalType::Int64,
+            };
+            d.with_column(DeclaredColumn::new(self.meta.column_name(col), t, true))
+        });
+        self.inner.set_declared_columns(declared);
+    }
 
     async fn admit_page(&self, records: &[Value]) -> Result<(), FaucetError> {
         self.inner.admit_page(&self.preview(records)).await
@@ -734,5 +751,73 @@ mod tests {
         let out = sink.stamp(&[json!({"a": 1})]);
         assert_eq!(out[0]["_dt_run_id"], "run-42");
         assert!(out[0].get("_dt_loaded_at").is_none());
+    }
+
+    #[test]
+    fn the_declaration_gains_the_stamped_columns() {
+        struct Keeps(std::sync::Mutex<Option<crate::DeclaredColumns>>);
+        #[async_trait::async_trait]
+        impl Sink for Keeps {
+            async fn write_batch(&self, r: &[Value]) -> Result<usize, FaucetError> {
+                Ok(r.len())
+            }
+            fn set_declared_columns(&self, c: crate::DeclaredColumns) {
+                *self.0.lock().unwrap() = Some(c);
+            }
+        }
+        let keeps = std::sync::Arc::new(Keeps(std::sync::Mutex::new(None)));
+        struct Shared(std::sync::Arc<Keeps>);
+        #[async_trait::async_trait]
+        impl Sink for Shared {
+            async fn write_batch(&self, r: &[Value]) -> Result<usize, FaucetError> {
+                self.0.write_batch(r).await
+            }
+            fn set_declared_columns(&self, c: crate::DeclaredColumns) {
+                self.0.set_declared_columns(c)
+            }
+        }
+        let meta = CompiledMetadata::compile(&MetadataColumnsSpec {
+            columns: vec![
+                MetadataColumn::LoadedAt,
+                MetadataColumn::RunId,
+                MetadataColumn::Sequence,
+            ],
+            ..Default::default()
+        })
+        .unwrap()
+        .unwrap();
+        let sink = MetadataSink::new(
+            Box::new(Shared(keeps.clone())),
+            meta,
+            MetadataContext {
+                run_id: "r".into(),
+                source: "s".into(),
+            },
+        );
+        sink.set_declared_columns(crate::DeclaredColumns::new([crate::DeclaredColumn::new(
+            "id",
+            crate::LogicalType::Int64,
+            false,
+        )]));
+        let got = keeps.0.lock().unwrap().clone().unwrap();
+        let names: Vec<&str> = got.columns().iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "id",
+                "_faucet_loaded_at",
+                "_faucet_run_id",
+                "_faucet_sequence"
+            ]
+        );
+        assert_eq!(
+            got.get("_faucet_loaded_at").unwrap().logical_type,
+            crate::LogicalType::Timestamp { tz: true }
+        );
+        assert_eq!(
+            got.get("_faucet_sequence").unwrap().logical_type,
+            crate::LogicalType::Int64
+        );
+        assert!(got.is_complete());
     }
 }

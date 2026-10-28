@@ -9,6 +9,7 @@ fn capabilities(_config: &Value) -> Capabilities {
     Capabilities::append_only_sink()
         .to_builder()
         .staged_load(true)
+        .declared_types(true)
         .build()
 }
 

@@ -381,8 +381,25 @@ impl RunHistory for FallbackHistory {
         strict!(self, p => p.renew_leases(), f => f.renew_leases())
     }
 
-    async fn claim_pending(&self, limit: usize) -> Result<Vec<RunRecord>, HistoryError> {
-        strict!(self, p => p.claim_pending(limit), f => f.claim_pending(limit))
+    async fn claim_pending(
+        &self,
+        limit: usize,
+        pools: &[String],
+    ) -> Result<Vec<RunRecord>, HistoryError> {
+        strict!(self, p => p.claim_pending(limit, pools), f => f.claim_pending(limit, pools))
+    }
+    async fn pending_by_pool(&self) -> Result<Vec<(String, usize)>, HistoryError> {
+        strict!(self, p => p.pending_by_pool(), f => f.pending_by_pool())
+    }
+    async fn stranded_pending(
+        &self,
+        served: &[String],
+        before: DateTime<Utc>,
+    ) -> Result<Vec<RunRecord>, HistoryError> {
+        strict!(self, p => p.stranded_pending(served, before), f => f.stranded_pending(served, before))
+    }
+    async fn fail_pending(&self, rec: &RunRecord) -> Result<bool, HistoryError> {
+        strict!(self, p => p.fail_pending(rec), f => f.fail_pending(rec))
     }
     async fn reclaim_orphans(&self, max_attempts: u32) -> Result<ReclaimReport, HistoryError> {
         strict!(self, p => p.reclaim_orphans(max_attempts), f => f.reclaim_orphans(max_attempts))
@@ -434,8 +451,9 @@ impl RunHistory for FallbackHistory {
     async fn claim_shards(
         &self,
         limit: usize,
+        pools: &[String],
     ) -> Result<Vec<crate::serve::history::ClaimedShard>, HistoryError> {
-        strict!(self, p => p.claim_shards(limit), f => f.claim_shards(limit))
+        strict!(self, p => p.claim_shards(limit, pools), f => f.claim_shards(limit, pools))
     }
     async fn renew_shard_leases(&self) -> Result<usize, HistoryError> {
         strict!(self, p => p.renew_shard_leases(), f => f.renew_shard_leases())
@@ -678,6 +696,18 @@ impl RunHistory for FallbackHistory {
         state: &str,
     ) -> Result<Option<super::tenants::ConnectSession>, HistoryError> {
         strict!(self, p => p.connect_session_take(state), f => f.connect_session_take(state))
+    }
+    async fn run_secrets_put(&self, run_id: &str, sealed: &str) -> Result<(), HistoryError> {
+        strict!(self, p => p.run_secrets_put(run_id, sealed), f => f.run_secrets_put(run_id, sealed))
+    }
+    async fn run_secrets_get(&self, run_id: &str) -> Result<Option<String>, HistoryError> {
+        strict!(self, p => p.run_secrets_get(run_id), f => f.run_secrets_get(run_id))
+    }
+    async fn run_secrets_delete(&self, run_id: &str) -> Result<(), HistoryError> {
+        strict!(self, p => p.run_secrets_delete(run_id), f => f.run_secrets_delete(run_id))
+    }
+    async fn run_secrets_purge_terminal(&self) -> Result<usize, HistoryError> {
+        strict!(self, p => p.run_secrets_purge_terminal(), f => f.run_secrets_purge_terminal())
     }
     async fn tenant_run_link(&self, run_id: &str, tenant: &str) -> Result<(), HistoryError> {
         strict!(self, p => p.tenant_run_link(run_id, tenant), f => f.tenant_run_link(run_id, tenant))
@@ -1200,6 +1230,28 @@ mod tests {
         assert!(startup.trigger_edge_rise("q").await.unwrap().is_some());
     }
 
+    #[tokio::test]
+    async fn run_secrets_reach_the_primary_and_wait_for_a_degraded_one() {
+        let healthy = FallbackHistory::healthy(
+            Box::new(MemoryHistory::new(Duration::from_secs(60))),
+            Duration::from_secs(60),
+            "test",
+        );
+        healthy.run_secrets_put("r", "sealed").await.unwrap();
+        assert_eq!(
+            healthy.run_secrets_get("r").await.unwrap().as_deref(),
+            Some("sealed")
+        );
+        healthy.run_secrets_delete("r").await.unwrap();
+        assert!(healthy.run_secrets_get("r").await.unwrap().is_none());
+        assert_eq!(healthy.run_secrets_purge_terminal().await.unwrap(), 0);
+        healthy.degraded.store(true, Ordering::Release);
+        assert!(matches!(
+            healthy.run_secrets_put("r", "sealed").await,
+            Err(HistoryError::Degraded(_))
+        ));
+    }
+
     /// #862 M-004: a primary unreachable at startup is reconnected from the
     /// lease tick, and until then shared state and idempotency fail with 503
     /// instead of being served from the empty memory store.
@@ -1397,11 +1449,22 @@ mod tests {
             fb.finalize_owned(&rec).await,
             Err(HistoryError::Degraded(_))
         ));
-        assert!(fb.claim_pending(4).await.is_err());
+        assert!(
+            fb.claim_pending(4, &crate::serve::pools::default_only())
+                .await
+                .is_err()
+        );
         assert!(fb.reclaim_orphans(3).await.is_err());
         assert!(fb.cancel_pending("r1").await.is_err());
         assert!(fb.request_cancel("r1").await.is_err());
-        assert!(fb.claim_shards(4).await.is_err());
+        assert!(
+            fb.claim_shards(4, &crate::serve::pools::default_only())
+                .await
+                .is_err()
+        );
+        assert!(fb.pending_by_pool().await.is_err());
+        assert!(fb.stranded_pending(&[], chrono::Utc::now()).await.is_err());
+        assert!(fb.fail_pending(&rec).await.is_err());
         assert!(
             fb.finalize_sharded_parent("r1", RunStatus::Completed, chrono::Utc::now(), None)
                 .await
@@ -1501,7 +1564,21 @@ mod tests {
             "test",
         );
         assert_eq!(fb.insert_shards("r", &[]).await.unwrap(), 0);
-        assert!(fb.claim_shards(4).await.unwrap().is_empty());
+        assert!(
+            fb.claim_shards(4, &crate::serve::pools::default_only())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(fb.pending_by_pool().await.unwrap().is_empty());
+        assert!(
+            fb.stranded_pending(&[], Utc::now())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let rec = RunRecord::queued("r".into(), None, Default::default(), None, Utc::now());
+        assert!(!fb.fail_pending(&rec).await.unwrap());
         assert_eq!(fb.renew_shard_leases().await.unwrap(), 0);
         assert_eq!(
             fb.reclaim_shards(3).await.unwrap(),

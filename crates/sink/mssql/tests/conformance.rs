@@ -283,3 +283,58 @@ async fn conformance_cleanup_scoped() {
     })
     .await;
 }
+
+/// Check 26: a declaration creates the table, typed, for an empty run.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_declared_types_create() {
+    let container =
+        faucet_conformance::containers::start(|| MssqlServer::default().with_accept_eula()).await;
+    let port = container
+        .get_host_port_ipv4(1433)
+        .await
+        .expect("mssql host port");
+    let cfg = conn_cfg(port);
+    let pool = build_pool(&cfg, 4).await.expect("pool");
+    let mut scfg = MssqlSinkConfig::new(cfg.connection_url.clone().unwrap(), "dbo.typed");
+    scfg.connection.tls = cfg.tls.clone();
+    scfg.column_mapping = MssqlColumnMapping::AutoColumns {
+        on_unknown_field: OnUnknownField::Warn,
+    };
+    let sink = MssqlSink::new(scfg).await.expect("sink");
+    let types = || {
+        let pool = pool.clone();
+        async move {
+            let mut conn = pool.get().await.expect("checkout");
+            let rows = conn
+                .query(
+                    "SELECT COLUMN_NAME AS n, DATA_TYPE AS t FROM INFORMATION_SCHEMA.COLUMNS \
+                     WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME = 'typed'",
+                    &[],
+                )
+                .await
+                .expect("columns query")
+                .into_first_result()
+                .await
+                .expect("columns result");
+            rows.iter()
+                .map(|r| {
+                    (
+                        r.get::<&str, _>("n").unwrap_or_default().to_string(),
+                        r.get::<&str, _>("t").unwrap_or_default().to_string(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+    faucet_conformance::assert_declared_types_create(
+        &sink,
+        &[
+            ("id", "bigint"),
+            ("amount", "decimal"),
+            ("day", "date"),
+            ("at", "datetimeoffset"),
+        ],
+        types,
+    )
+    .await;
+}

@@ -212,6 +212,33 @@ groups:
             fail, this instance cancels its own runs before their leases
             expire, and /readyz is reporting 503 until the database answers.
 
+      - alert: FaucetServePoolStarved
+        expr: min by (pool) (faucet_serve_runs_pending) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "runs in execution pool {{ $labels.pool }} have been pending for 15m"
+          description: >
+            Cluster runs in this pool have stayed unclaimed for 15 minutes:
+            no live replica serves the pool (its last replica drained or
+            crashed), or every replica serving it is at its concurrency
+            limit. Runs of a pool are never claimed by another pool's
+            replicas. Start or scale a replica with `--pool {{ $labels.pool }}`,
+            or set `--pool-wait-timeout-secs` to fail such runs instead.
+
+      - alert: FaucetServePoolRunsFailed
+        expr: increase(faucet_serve_runs_total{reason="pool_unavailable"}[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "runs failed because no replica served their execution pool"
+          description: >
+            `--pool-wait-timeout-secs` failed pending runs whose pool no live
+            cluster member served for the whole timeout. Their error starts
+            with `pool_unavailable`; resubmit them once a replica of the pool
+            is running.
+
       - alert: FaucetServeScheduleTicksMissed
         expr: increase(faucet_serve_trigger_missed_ticks_total[1h]) > 0
         labels:

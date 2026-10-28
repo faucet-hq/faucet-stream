@@ -82,6 +82,50 @@ mod shard_tests {
     }
 
     #[tokio::test]
+    async fn run_secrets_are_kept_apart_and_purged_once_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = backend(&url_in(dir.path()), "a", Duration::from_secs(30)).await;
+        seed_run(&h, "live").await;
+        seed_run(&h, "done").await;
+        for id in ["live", "done", "fresh-orphan", "old-orphan"] {
+            h.run_secrets_put(id, &format!("sealed-{id}"))
+                .await
+                .unwrap();
+        }
+        h.run_secrets_put("live", "sealed-live-2").await.unwrap();
+        let mut done = h.get("done").await.unwrap().unwrap();
+        done.status = RunStatus::Completed;
+        done.finished_at = Some(chrono::Utc::now());
+        h.upsert(&done).await.unwrap();
+        let old = crate::serve::history::sql::fmt_ts(
+            chrono::Utc::now() - crate::serve::history::RUN_SECRETS_ORPHAN_GRACE * 2,
+        );
+        sqlx::query(
+            "UPDATE faucet_serve_run_secrets SET stored_at = ? WHERE run_id = 'old-orphan'",
+        )
+        .bind(old)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+        let body: String =
+            sqlx::query_scalar("SELECT body FROM faucet_serve_runs WHERE run_id = 'live'")
+                .fetch_one(&h.pool)
+                .await
+                .unwrap();
+        assert!(!body.contains("sealed-live"), "kept out of the record body");
+        assert_eq!(h.run_secrets_purge_terminal().await.unwrap(), 2);
+        assert_eq!(
+            h.run_secrets_get("live").await.unwrap().as_deref(),
+            Some("sealed-live-2")
+        );
+        assert!(h.run_secrets_get("fresh-orphan").await.unwrap().is_some());
+        assert!(h.run_secrets_get("done").await.unwrap().is_none());
+        assert!(h.run_secrets_get("old-orphan").await.unwrap().is_none());
+        h.run_secrets_delete("live").await.unwrap();
+        assert!(h.run_secrets_get("live").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn connect_failures_carry_a_typed_permanent_verdict() {
         use crate::serve::history::Transience;
         // An unknown query parameter fails `SqliteConnectOptions::from_str`
@@ -147,7 +191,10 @@ mod shard_tests {
             .await
             .unwrap();
 
-        let claimed = h.claim_shards(10).await.unwrap();
+        let claimed = h
+            .claim_shards(10, &crate::serve::pools::default_only())
+            .await
+            .unwrap();
         assert_eq!(claimed.len(), 3);
         // Largest estimated size first.
         assert_eq!(claimed[0].shard_id, "1");
@@ -161,7 +208,12 @@ mod shard_tests {
         assert_eq!(p.running, 3);
 
         // Everything is claimed → a second claim returns nothing.
-        assert!(h.claim_shards(10).await.unwrap().is_empty());
+        assert!(
+            h.claim_shards(10, &crate::serve::pools::default_only())
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -174,7 +226,10 @@ mod shard_tests {
         a.insert_shards("run1", &[shard("0", 1)]).await.unwrap();
 
         // A claims the only shard.
-        let claimed = a.claim_shards(10).await.unwrap();
+        let claimed = a
+            .claim_shards(10, &crate::serve::pools::default_only())
+            .await
+            .unwrap();
         assert_eq!(claimed.len(), 1);
 
         // B does not own it → cannot finalize.
@@ -205,7 +260,9 @@ mod shard_tests {
         let h = backend(&url, "inst-a", Duration::ZERO).await;
         seed_run(&h, "run1").await;
         h.insert_shards("run1", &[shard("0", 1)]).await.unwrap();
-        h.claim_shards(10).await.unwrap();
+        h.claim_shards(10, &crate::serve::pools::default_only())
+            .await
+            .unwrap();
 
         // First reclaim: attempt 0 < 2 → requeued back to pending.
         let r1 = h.reclaim_shards(2).await.unwrap();
@@ -214,10 +271,14 @@ mod shard_tests {
         assert_eq!(h.shard_progress("run1").await.unwrap().pending, 1);
 
         // Re-claim and reclaim until the attempt cap poisons it.
-        h.claim_shards(10).await.unwrap();
+        h.claim_shards(10, &crate::serve::pools::default_only())
+            .await
+            .unwrap();
         let r2 = h.reclaim_shards(2).await.unwrap();
         assert_eq!(r2.requeued, 1, "attempt 1 < 2 → still requeued");
-        h.claim_shards(10).await.unwrap();
+        h.claim_shards(10, &crate::serve::pools::default_only())
+            .await
+            .unwrap();
         let r3 = h.reclaim_shards(2).await.unwrap();
         assert_eq!(r3.failed, 1, "attempt 2 >= 2 → poisoned (failed)");
         assert_eq!(h.shard_progress("run1").await.unwrap().failed, 1);

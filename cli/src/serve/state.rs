@@ -64,6 +64,10 @@ struct Inner {
     /// admission locks. Replaced once at startup.
     #[cfg(feature = "tenants")]
     tenants: RwLock<Arc<crate::serve::tenants::TenantsRuntime>>,
+    /// The vault key (`--vault-key`): seals a clustered run's `secret: true`
+    /// param values (#956). Set once at startup.
+    #[cfg(feature = "encryption")]
+    vault: RwLock<Option<Arc<crate::serve::vault::Vault>>>,
     /// Change kinds that need an approved request (`--require-approval`, #703).
     require_approval: Vec<crate::serve::changes::ChangeKind>,
     /// Fallback expiry of a pending change request when the approval policy
@@ -126,6 +130,8 @@ impl ServerState {
                 policy: RwLock::new(None),
                 #[cfg(feature = "tenants")]
                 tenants: RwLock::new(Arc::new(Default::default())),
+                #[cfg(feature = "encryption")]
+                vault: RwLock::new(None),
                 require_approval: config.require_approval.clone(),
                 approval_expiry: config.approval_expiry,
                 allow_subprocess_connectors: config.allow_subprocess_connectors,
@@ -195,6 +201,22 @@ impl ServerState {
             .tenants
             .write()
             .unwrap_or_else(|e| e.into_inner()) = Arc::new(rt);
+    }
+
+    /// Attach the vault key (server startup, #956).
+    #[cfg(feature = "encryption")]
+    pub fn set_vault(&self, vault: Option<Arc<crate::serve::vault::Vault>>) {
+        *self.inner.vault.write().unwrap_or_else(|e| e.into_inner()) = vault;
+    }
+
+    /// The vault key, when the server was started with one.
+    #[cfg(feature = "encryption")]
+    pub fn vault(&self) -> Option<Arc<crate::serve::vault::Vault>> {
+        self.inner
+            .vault
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// The tenant runtime.

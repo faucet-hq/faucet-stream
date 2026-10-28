@@ -402,6 +402,7 @@ pub struct SqlSinkDriver<D> {
     driver: D,
     table_ready: AtomicBool,
     token_table_ready: AtomicBool,
+    declared: faucet_core::DeclaredSlot,
 }
 
 impl<D: SqlDriver> SqlSinkDriver<D> {
@@ -411,7 +412,40 @@ impl<D: SqlDriver> SqlSinkDriver<D> {
             driver,
             table_ready: AtomicBool::new(false),
             token_table_ready: AtomicBool::new(false),
+            declared: faucet_core::DeclaredSlot::new(),
         }
+    }
+
+    /// A run that wrote nothing creates the declared destination (#955): only
+    /// with a complete declaration, column mapping, `create_table` on, and no
+    /// table there yet (an overwrite's commit already published its staging).
+    fn declared_target(&self) -> Option<faucet_core::DeclaredColumns> {
+        let layout = self.layout();
+        if !layout.create_table
+            || layout.json_column.is_some()
+            || self.table_ready.load(Ordering::Relaxed)
+        {
+            return None;
+        }
+        self.declared.for_empty_run()
+    }
+
+    async fn create_declared_target(
+        &self,
+        declared: faucet_core::DeclaredColumns,
+    ) -> Result<(), FaucetError> {
+        let layout = self.layout();
+        if self.driver.table_exists(&layout.table).await? {
+            return Ok(());
+        }
+        let target = self.driver.target(&layout.table);
+        if let Some(sql) =
+            self.engine()
+                .create_table_sql_declared(&target, &[], None, Some(&declared))?
+        {
+            self.driver.ddl(&sql, label::CREATE_TABLE).await?;
+        }
+        Ok(())
     }
 
     /// The SQL driver.
@@ -521,9 +555,13 @@ impl<D: SqlDriver> SqlSinkDriver<D> {
             return Ok(());
         }
         let target = self.driver.target(&self.effective_table());
-        let Some(sql) =
-            self.engine()
-                .create_table_sql(&target, records, layout.json_column.as_deref())?
+        let declared = self.declared.get();
+        let Some(sql) = self.engine().create_table_sql_declared(
+            &target,
+            records,
+            layout.json_column.as_deref(),
+            declared.as_ref(),
+        )?
         else {
             return Ok(());
         };
@@ -693,7 +731,26 @@ impl<D: SqlDriver> SinkDriver for SqlSinkDriver<D> {
     }
 
     fn capabilities(&self, derived: Capabilities) -> Capabilities {
-        self.driver.capabilities(derived)
+        self.driver.capabilities(
+            derived
+                .to_builder()
+                .declared_types(self.layout().json_column.is_none())
+                .build(),
+        )
+    }
+
+    fn set_declared_columns(&self, columns: faucet_core::DeclaredColumns) {
+        self.declared.set(columns);
+    }
+
+    async fn complete_run(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        match self.declared_target() {
+            Some(declared) => {
+                self.op(calls, "complete_run", self.create_declared_target(declared))
+                    .await
+            }
+            None => Ok(()),
+        }
     }
 
     fn staging(&self) -> Option<&dyn StagingDriver> {
@@ -1294,5 +1351,70 @@ mod tests {
             .filter(|q| q.contains("_faucet_commit_token") && q.starts_with("CREATE"))
             .count();
         assert_eq!(creates, 1, "{ddl:?}");
+    }
+
+    fn declared(complete: bool) -> faucet_core::DeclaredColumns {
+        use faucet_core::{DeclaredColumn, DeclaredColumns, LogicalType};
+        let d = DeclaredColumns::new([
+            DeclaredColumn::new("id", LogicalType::Int64, false),
+            DeclaredColumn::new("day", LogicalType::Date, true),
+        ]);
+        if complete { d } else { d.reshaped() }
+    }
+
+    fn creates(log: &[String]) -> Vec<&String> {
+        log.iter()
+            .filter(|s| s.starts_with("CREATE TABLE"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_empty_run_creates_the_declared_table() {
+        let sink = DriverSink::new(SqlSinkDriver::new(Mem::new(SqlLayout::new("t"), false)));
+        assert!(sink.capabilities().declared_types());
+        sink.set_declared_columns(declared(true));
+        sink.complete_run().await.unwrap();
+        let log = sink.driver().driver().log();
+        let created = creates(&log);
+        assert_eq!(created.len(), 1, "{log:?}");
+        assert!(created[0].contains("`id` INTEGER, `day` TEXT"), "{log:?}");
+    }
+
+    #[tokio::test]
+    async fn a_run_that_wrote_or_was_reshaped_creates_nothing_more() {
+        let sink = DriverSink::new(SqlSinkDriver::new(Mem::new(SqlLayout::new("t"), false)));
+        sink.set_declared_columns(declared(true));
+        sink.write_batch(&[json!({"day": "2024-01-02", "id": 1})])
+            .await
+            .unwrap();
+        sink.complete_run().await.unwrap();
+        let log = sink.driver().driver().log();
+        let created = creates(&log);
+        assert_eq!(created.len(), 1, "{log:?}");
+        assert!(
+            created[0].contains("`id` INTEGER, `day` TEXT"),
+            "declared order: {log:?}"
+        );
+
+        let reshaped = DriverSink::new(SqlSinkDriver::new(Mem::new(SqlLayout::new("t"), false)));
+        reshaped.set_declared_columns(declared(false));
+        reshaped.complete_run().await.unwrap();
+        assert!(creates(&reshaped.driver().driver().log()).is_empty());
+
+        let exists = DriverSink::new(SqlSinkDriver::new(Mem::new(SqlLayout::new("t"), true)));
+        exists.set_declared_columns(declared(true));
+        exists.complete_run().await.unwrap();
+        assert!(creates(&exists.driver().driver().log()).is_empty());
+
+        let mut off = SqlLayout::new("t");
+        off.create_table = false;
+        let off = DriverSink::new(SqlSinkDriver::new(Mem::new(off, false)));
+        off.set_declared_columns(declared(true));
+        off.complete_run().await.unwrap();
+        assert!(creates(&off.driver().driver().log()).is_empty());
+
+        let undeclared = DriverSink::new(SqlSinkDriver::new(Mem::new(SqlLayout::new("t"), false)));
+        undeclared.complete_run().await.unwrap();
+        assert!(undeclared.driver().driver().log().is_empty());
     }
 }

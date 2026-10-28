@@ -103,3 +103,24 @@ async fn conformance_driver_declarations_and_row_paths() {
     faucet_conformance::assert_driver_declarations_truthful(&json).await;
     faucet_conformance::assert_driver_row_paths_agree(&json).await;
 }
+
+/// Check 26: a declaration creates the table, typed, for an empty run.
+#[tokio::test]
+async fn conformance_declared_types_create() {
+    let sink = DuckdbSink::new(
+        DuckdbSinkConfig::new(":memory:", "typed").column_mapping(DuckdbColumnMapping::AutoMap),
+    )
+    .await
+    .expect("sink");
+    faucet_conformance::assert_declared_types_create(
+        &sink,
+        &[
+            ("id", "bigint"),
+            ("amount", "decimal(12,2)"),
+            ("day", "date"),
+            ("at", "timestamp with time zone"),
+        ],
+        || async { sink.column_types("typed").await.expect("columns") },
+    )
+    .await;
+}

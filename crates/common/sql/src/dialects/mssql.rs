@@ -2,7 +2,7 @@
 
 use crate::dialect::{SqlDialect, TableTarget};
 use crate::mapping::ColumnMatching;
-use faucet_core::{FaucetError, SqlBaseType};
+use faucet_core::{FaucetError, LogicalType, SqlBaseType};
 
 /// SQL Server: `[bracket]` identifiers (NUL refused), `@Pn` placeholders
 /// wrapped in `CAST(… AS type)` so a multi-row `VALUES` column has one type,
@@ -89,6 +89,21 @@ impl SqlDialect for Mssql {
             SqlBaseType::Text => "NVARCHAR(MAX)",
             SqlBaseType::Json => "NVARCHAR(MAX)",
         }
+    }
+
+    fn declared_type_name(&self, t: &LogicalType) -> Option<String> {
+        Some(match t {
+            LogicalType::Int64 => "BIGINT".into(),
+            LogicalType::Float64 => "FLOAT".into(),
+            LogicalType::Bool => "BIT".into(),
+            LogicalType::Decimal { .. } => super::declared_decimal(t, 38, None, "DECIMAL")?,
+            LogicalType::Date => "DATE".into(),
+            LogicalType::Time => "TIME(7)".into(),
+            LogicalType::Timestamp { tz: true } => "DATETIMEOFFSET(7)".into(),
+            LogicalType::Timestamp { tz: false } => "DATETIME2(7)".into(),
+            LogicalType::Uuid => "UNIQUEIDENTIFIER".into(),
+            _ => return None,
+        })
     }
 
     /// `NVARCHAR(MAX)` cannot be indexed; 450 characters is the 900-byte key
@@ -190,11 +205,7 @@ impl SqlDialect for Mssql {
     ) -> Result<String, FaucetError> {
         let mut rendered: Vec<String> = Vec::with_capacity(columns.len() + 1);
         for c in columns {
-            let ty = if key.contains(&c.name) {
-                self.key_type_name(c.base_type)
-            } else {
-                self.type_name(c.base_type)
-            };
+            let ty = self.planned_type_name(c, key.contains(&c.name));
             rendered.push(format!("{} {ty}", quote_ident(&c.name)?));
         }
         if !key.is_empty() {

@@ -300,3 +300,34 @@ async fn conformance_first_page_before_exhaustion() {
         served()
     );
 }
+
+/// Check 25: the declaration names every emitted column with its type.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_declared_columns_truthful() {
+    let _serial = SERIAL.lock().await;
+    let (_container, port) = start_mssql().await;
+    let cfg = conn_cfg(port);
+    let pool = build_pool(&cfg, 4).await.expect("pool");
+    exec(
+        &pool,
+        "CREATE TABLE dbo.typed (id INT NOT NULL, amount DECIMAL(12,2), day DATE, \
+         at DATETIMEOFFSET, local DATETIME2, t TIME, note NVARCHAR(20), flag BIT, \
+         f FLOAT, uid UNIQUEIDENTIFIER, m MONEY, b VARBINARY(4))",
+    )
+    .await;
+    exec(
+        &pool,
+        "INSERT INTO dbo.typed VALUES (1, 12.50, '2024-10-27', '2024-02-22T02:00:00+00:00', \
+         '2024-02-22T02:00:00.5', '10:11:12', N'x', 1, 1.5, \
+         '123E4567-E89B-12D3-A456-426614174000', 3.25, 0x0102), \
+         (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
+    )
+    .await;
+    let mut scfg = MssqlSourceConfig::new(
+        cfg.connection_url.clone().unwrap(),
+        "SELECT * FROM dbo.typed",
+    );
+    scfg.connection.tls = cfg.tls.clone();
+    let source = MssqlSource::new(scfg).await.expect("source new");
+    faucet_conformance::assert_declared_columns_truthful(&source).await;
+}

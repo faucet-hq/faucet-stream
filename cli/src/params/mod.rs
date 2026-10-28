@@ -32,7 +32,7 @@ pub mod list;
 pub mod spec;
 
 pub use bind::{
-    BindMode, BoundParams, PARAM_ID, PARAMS_KEY, SuppliedParams, bind_document, collect_cli_params,
-    collect_env_overrides, declared, parse_cli_param, resolve,
+    BindMode, BoundParams, PARAM_ID, PARAMS_KEY, SecretTexts, SuppliedParams, bind_document,
+    collect_cli_params, collect_env_overrides, declared, parse_cli_param, resolve,
 };
 pub use spec::{ParamSpec, ParamType, ParamsSpec};

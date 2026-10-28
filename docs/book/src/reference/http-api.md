@@ -473,7 +473,12 @@ Request body:
 - **`name`** — metadata; also drives the **state-key and metric identity** (see
   the cookbook's cardinality note). Two submissions sharing a `name` share
   replication bookmarks.
-- **`labels`** — arbitrary string metadata, stored on the run record only.
+- **`labels`** — string key/value metadata stored on the run record and
+  filterable with `GET /v1/runs?label=key:value` (#958). Keys are 1–63
+  characters and values at most 256; a longer one is a `422`. The provenance
+  keys the server stamps (`template`, `template_version`, `allow_untested`,
+  `sink_template`, `sink_template_version`, `overlay`, `overlay_version`,
+  `selection`) are refused with a `422`; they stay filterable.
 - **`timeout_secs`** — wall-clock cap; on expiry the run is marked failed.
 - **`doctor_first`** — run preflight probes before executing; on any failure the
   submit returns `422` with the doctor report in `error.details`.
@@ -509,6 +514,16 @@ Request body:
   selection is stored with it, so a clustered or sharded run applies the same
   subset. The same field is accepted by every run-starting endpoint
   (template triggers, tenant runs, fan-out).
+- **`pool`** — the execution pool to run in (#957). Wins over the config's
+  `pool:`; with neither the run goes to `default`. Only a replica serving the
+  pool (`faucet serve --pool`) claims the run and its shards. A pool no live
+  cluster member serves — or, on a non-clustered server, one it does not serve
+  — is a `422` naming the pool; so is a pool other than `default` while a
+  member running a release without pools is live. Part of the idempotency
+  fingerprint when it is not `default`. The same field is accepted by
+  `POST /v1/templates/{id}/runs` (and tenant runs and fan-out) and
+  `POST /v1/backfill`; the run record carries the resolved `pool`. See
+  [Execution pools](../cookbook/cluster.md#execution-pools).
 
 Response (`202`):
 
@@ -522,10 +537,33 @@ submitted config (submitted values win).
 ### `GET /v1/runs`
 
 Query parameters: `status`, `name`, `since`, `until` (RFC3339), `limit` (default
-50, max 500), `cursor`. Ordering is `(submitted_at DESC, run_id DESC)`; `cursor`
-is the previous page's `next_cursor` — the last row's sort key
-(`<submitted_at>~<run_id>`), so paging stays correct when that run is deleted or
-purged between requests. A bare `run_id` is still accepted.
+50, max 500), `cursor`, `tenant`, `label`, `labels`. Ordering is
+`(submitted_at DESC, run_id DESC)`; `cursor` is the previous page's
+`next_cursor` — the last row's sort key (`<submitted_at>~<run_id>`), so paging
+stays correct when that run is deleted or purged between requests. A bare
+`run_id` is still accepted. Every filter composes with the others and with the
+cursor.
+
+**Filtering by label (#958).** `label=key:value` keeps runs whose label `key`
+is exactly `value`; `label=key` keeps runs that carry `key` at all. Repeat it
+to require several (they are ANDed):
+
+```bash
+curl -s -G http://127.0.0.1:8080/v1/runs -H "Authorization: Bearer $TOKEN" \
+  --data-urlencode label=team:data --data-urlencode label=env:prod
+```
+
+The value is split from the key on the **first** `:`, so `label=url:https://x`
+matches the value `https://x`; URL-encode values as usual. `labels=team:data,env:prod`
+is a comma-separated alias (a value containing `,` needs the repeatable form).
+At most 10 label filters per request. Provenance labels filter like any other —
+`label=template:orders`, `label=backfill:<range-hash>` (one backfill's units),
+`label=pipeline:<name>`. A sharded run is listed once, as its parent, with the
+labels it was submitted with.
+
+**Unknown parameters are a `400`.** A typo such as `?lables=team:data` is
+refused rather than silently returning every run. So are an unknown `status`
+token, an empty label key and more than 10 label filters.
 
 ```json
 { "runs": [ { "run_id": "…", "status": "completed", … } ], "next_cursor": "2026-10-01T12:00:00.000000000Z~0192…" }
@@ -542,6 +580,7 @@ purged between requests. A bare `run_id` is still accepted.
   "submitted_at": "…", "started_at": "…", "finished_at": "…",
   "elapsed_secs": 12.4,
   "records_written": 4096,
+  "pool": "default",
   "invocations": [
     {"row_id": "default", "parent_record_key": null, "records_written": 4096, "error": null,
      "status": "succeeded",
@@ -1187,15 +1226,21 @@ labelled `template` and `template_version` (plus `sink_template` /
 `sink_template_version` for a composed run, `overlay` / `overlay_version`
 when an overlay applied, `allow_untested` for a run of a non-`passing` version
 and `selection` for a row selection). Only the server sets these: a caller's
-`labels` entry under any of those keys is dropped.
+`labels` entry under any of those keys is dropped (on `POST /v1/runs`,
+`POST /v1/backfill` and `POST /v1/changes` it is a `422`).
 
 Status codes: `404` for an unknown id or pinned version; `422` for a missing
 `required` param or a type mismatch, naming the param; `429` when the queue is
-full. On a **clustered** server a template declaring `secret: true` params is
-refused with `422` — the materialized config is persisted for peer execution, and
-the shared history database is not a secret store. Reference the secret from the
-template body (`${env:…}` / `${vault:…}`, resolved on the executing instance)
-instead.
+full. On a **clustered** server the materialized config is persisted for peer
+execution, so a trigger that supplies a `secret: true` param is sealed under the
+server's vault key (`--vault-key` / `FAUCET_VAULT_KEY`): the stored config — and
+`config_body` in `GET /v1/runs/{id}` — carries `${sealed:N}` tokens, the values
+are stored encrypted (bound to the run id) apart from the record, opened only by
+the member that runs it, and deleted once the run is terminal. Without a vault
+key, or with `env` overrides, the trigger is refused with `422`; reference the
+secret from the template body (`${env:…}` / `${vault:…}`, resolved on the
+executing instance) instead. See
+[clustered execution](../cookbook/cluster.md#3-per-run-secret-template-params-need-a-vault-key).
 
 ### `POST /v1/backfill`
 
@@ -1437,7 +1482,10 @@ after it stopped renewing.
 `/metrics` serves the standard `faucet_*` pipeline metrics plus serve-specific
 series: `faucet_serve_requests_total{method,path,status}`,
 `faucet_serve_request_duration_seconds{method,path}`, `faucet_serve_runs_queued`,
-`faucet_serve_runs_in_flight`, `faucet_serve_runs_total{status,reason}`,
+`faucet_serve_runs_in_flight`, `faucet_serve_runs_total{status,reason}`
+(`reason="pool_unavailable"` for a run `--pool-wait-timeout-secs` failed),
+`faucet_serve_runs_pending{pool}` (cluster mode: unclaimed runs per execution
+pool),
 `faucet_serve_idempotency_hits_total`, `faucet_serve_history_degraded` (the
 backend fell back to memory) and `faucet_serve_history_unreachable` (the last
 lease heartbeat did not reach the history database; `/readyz` is `503` while

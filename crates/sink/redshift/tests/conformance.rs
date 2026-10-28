@@ -156,3 +156,57 @@ async fn conformance_driver_declarations() {
         faucet_conformance::assert_driver_declarations_truthful(&sink).await;
     }
 }
+
+/// Check 26 against a Postgres container standing in for the cluster: a
+/// declaration types the created table.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_declared_types_create() {
+    use testcontainers::ImageExt;
+    use testcontainers_modules::postgres::Postgres;
+
+    let Some(container) = faucet_conformance::containers::start_or_skip(
+        || Postgres::default().with_tag("16-alpine"),
+        &faucet_conformance::containers::StartOptions::default(),
+    )
+    .await
+    else {
+        return;
+    };
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+    let pool = sqlx::PgPool::connect(&url).await.expect("pool");
+    let v = serde_json::json!({
+        "host": "127.0.0.1",
+        "port": port,
+        "database": "postgres",
+        "user": "postgres",
+        "credentials": {"type": "password", "config": {"password": "postgres"}},
+        "tls": false,
+        "table_name": "typed",
+        "write_strategy": "insert",
+    });
+    let cfg: faucet_sink_redshift::RedshiftSinkConfig = serde_json::from_value(v).unwrap();
+    let sink = faucet_sink_redshift::RedshiftSink::new(cfg)
+        .await
+        .expect("sink");
+    let pool = &pool;
+    faucet_conformance::assert_declared_types_create(
+        &sink,
+        &[
+            ("id", "bigint"),
+            ("amount", "numeric(12,2)"),
+            ("day", "date"),
+            ("at", "timestamp with time zone"),
+        ],
+        move || async move {
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a \
+                 WHERE a.attrelid = to_regclass('typed') AND a.attnum > 0 AND NOT a.attisdropped",
+            )
+            .fetch_all(pool)
+            .await
+            .expect("columns")
+        },
+    )
+    .await;
+}

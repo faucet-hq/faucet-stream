@@ -3,7 +3,7 @@
 use crate::dialect::{SqlDialect, TableTarget};
 use crate::mapping::ColumnMatching;
 use faucet_core::rollback::JournalSql;
-use faucet_core::{FaucetError, SqlBaseType};
+use faucet_core::{FaucetError, LogicalType, SqlBaseType};
 
 /// MySQL: backtick-quoted identifiers, `?` placeholders, 65535 parameters,
 /// case-insensitive column names, `ON DUPLICATE KEY UPDATE … = VALUES(…)`,
@@ -77,6 +77,24 @@ impl SqlDialect for Mysql {
             SqlBaseType::Text => "LONGTEXT",
             SqlBaseType::Json => "JSON",
         }
+    }
+
+    fn declared_type_name(&self, t: &LogicalType) -> Option<String> {
+        Some(match t {
+            LogicalType::Int64 => "BIGINT".into(),
+            LogicalType::Float64 => "DOUBLE".into(),
+            LogicalType::Bool => "TINYINT(1)".into(),
+            LogicalType::Decimal { .. } => {
+                super::declared_decimal(t, 65, Some("DECIMAL(65,30)"), "DECIMAL")?
+            }
+            LogicalType::Date => "DATE".into(),
+            LogicalType::Time => "TIME(6)".into(),
+            LogicalType::Timestamp { .. } => "DATETIME(6)".into(),
+            LogicalType::Uuid => "CHAR(36)".into(),
+            LogicalType::Bytes => "LONGBLOB".into(),
+            LogicalType::Json => "JSON".into(),
+            _ => return None,
+        })
     }
 
     /// 191 characters keeps even a four-column utf8mb4 key under InnoDB's

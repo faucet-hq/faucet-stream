@@ -179,3 +179,53 @@ async fn conformance_first_page_before_exhaustion() {
         served()
     );
 }
+
+/// Check 25: the declaration names every emitted column with its type, and a
+/// `numeric` read from a table column carries its precision.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_declared_columns_truthful() {
+    let (_container, url) = start_postgres().await;
+    let pool = sqlx::PgPool::connect(&url).await.expect("pool connect");
+    for sql in [
+        "CREATE TABLE typed (id integer NOT NULL, amount numeric(12,2), total numeric, \
+         day date, at timestamptz, local timestamp, t time, uid uuid, b bytea, j jsonb, \
+         note text, flag boolean, f double precision, span interval, tags int[])",
+        "INSERT INTO typed VALUES (1, 12.50, 1.000000000001, '2024-10-27', \
+         '2024-02-22 02:00:00+00', '2024-02-22 02:00:00.5', '10:11:12', \
+         '123e4567-e89b-12d3-a456-426614174000', '\\x0102', '{\"a\": 1}', 'x', true, 1.5, \
+         '1 day', '{1,2}'), (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
+         NULL, NULL, NULL, NULL)",
+    ] {
+        sqlx::query(sql).execute(&pool).await.expect("seed");
+    }
+    pool.close().await;
+    let source = PostgresSource::new(PostgresSourceConfig::new(&url, "SELECT * FROM typed"))
+        .await
+        .expect("source");
+    faucet_conformance::assert_declared_columns_truthful(&source).await;
+    let declared = source
+        .declared_columns(&Default::default())
+        .await
+        .unwrap()
+        .unwrap();
+    use faucet_core::LogicalType as L;
+    let t = |n: &str| declared.get(n).unwrap().logical_type;
+    assert_eq!(
+        t("amount"),
+        L::Decimal {
+            precision: Some(12),
+            scale: Some(2)
+        }
+    );
+    assert_eq!(
+        t("total"),
+        L::Decimal {
+            precision: None,
+            scale: None
+        }
+    );
+    assert_eq!(t("at"), L::Timestamp { tz: true });
+    assert_eq!(t("local"), L::Timestamp { tz: false });
+    assert_eq!(t("span"), L::String);
+    assert!(!declared.get("id").unwrap().nullable);
+}

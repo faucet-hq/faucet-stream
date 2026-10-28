@@ -56,6 +56,7 @@ fn test_config(listen: &str) -> ServeConfig {
         connect_providers: None,
         allow_subprocess_connectors: false,
         references: Default::default(),
+        pools: Default::default(),
     };
     ServeConfig::from_args(args).unwrap()
 }

@@ -70,6 +70,7 @@ fn args(port: u16, sync: Option<std::path::PathBuf>) -> ServeArgs {
         connect_providers: None,
         allow_subprocess_connectors: false,
         references: Default::default(),
+        pools: Default::default(),
     }
 }
 

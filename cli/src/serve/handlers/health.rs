@@ -38,6 +38,14 @@ pub async fn readyz(State(state): State<ServerState>) -> impl IntoResponse {
         "cluster": {
             "enabled": state.cluster().enabled(),
             "instances": state.cluster().members(),
+            "pools": state.cluster().pools(),
+            "members": state.cluster().live_members().iter().map(|m| json!({
+                "instance_id": m.instance_id,
+                "listen": m.listen,
+                "pools": m.pools,
+                "in_flight": m.in_flight,
+                "max_concurrent": m.max_concurrent,
+            })).collect::<Vec<_>>(),
         },
         "triggers": triggers,
     });
@@ -132,6 +140,17 @@ mod tests {
     async fn readyz_reports_cluster_membership() {
         let st = state(true);
         st.cluster().set_members(3);
+        st.cluster()
+            .set_live_members(vec![crate::serve::history::InstanceRecord {
+                instance_id: "peer".into(),
+                started_at: chrono::Utc::now(),
+                last_heartbeat: chrono::Utc::now(),
+                listen: Some("10.0.0.2:8080".into()),
+                max_concurrent: 4,
+                in_flight: 1,
+                state_format: 1,
+                pools: Some(vec!["private".into()]),
+            }]);
         let resp = readyz(axum::extract::State(st)).await.into_response();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
@@ -140,6 +159,12 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["cluster"]["enabled"], true);
         assert_eq!(v["cluster"]["instances"], 3);
+        assert_eq!(v["cluster"]["pools"], serde_json::json!(["default"]));
+        assert_eq!(
+            v["cluster"]["members"][0]["pools"],
+            serde_json::json!(["private"])
+        );
+        assert_eq!(v["cluster"]["members"][0]["listen"], "10.0.0.2:8080");
         assert_eq!(v["status"], "ready");
         assert_eq!(v["history_ok"], true);
         assert_eq!(v["queue_ok"], true);

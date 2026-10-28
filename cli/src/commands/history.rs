@@ -19,29 +19,10 @@ use crate::serve::history::{ListFilter, RunRecord};
 
 /// Execute the `history` subcommand.
 pub async fn run(args: HistoryArgs) -> CliResult<()> {
-    let (handle, pipeline_name) = connect(&args).await?;
+    let json = args.json;
+    let runs = load(args).await?;
 
-    // Over-fetch when filtering by row so the post-filter still returns a full
-    // page; otherwise fetch exactly the requested limit. Newest-first ordering
-    // is guaranteed by the backend.
-    let fetch = if args.row.is_some() {
-        args.limit.max(200)
-    } else {
-        args.limit.max(1)
-    };
-    let page = handle
-        .store
-        .list(&ListFilter {
-            name: pipeline_name,
-            limit: fetch,
-            ..Default::default()
-        })
-        .await
-        .map_err(|e| CliError::Internal(format!("catalog run-history read: {e}")))?;
-
-    let runs = select_runs(page.runs, args.row.as_deref(), args.limit);
-
-    if args.json {
+    if json {
         // The RunRecord's `Serialize` already omits secret-bearing fields
         // (config bodies are only present for cluster runs); scrub as a backstop.
         let json = serde_json::to_string_pretty(&runs)
@@ -60,6 +41,34 @@ pub async fn run(args: HistoryArgs) -> CliResult<()> {
 
     print!("{}", render_table(&runs));
     Ok(())
+}
+
+/// The runs `faucet history` shows for `args`, newest first.
+pub async fn load(args: HistoryArgs) -> CliResult<Vec<RunRecord>> {
+    let labels =
+        crate::serve::history::labels::parse_cli_filters(&args.label).map_err(CliError::Config)?;
+    let (handle, pipeline_name) = connect(&args).await?;
+
+    // Over-fetch when filtering by row so the post-filter still returns a full
+    // page; otherwise fetch exactly the requested limit. Newest-first ordering
+    // is guaranteed by the backend.
+    let fetch = if args.row.is_some() {
+        args.limit.max(200)
+    } else {
+        args.limit.max(1)
+    };
+    let page = handle
+        .store
+        .list(&ListFilter {
+            name: pipeline_name,
+            limit: fetch,
+            labels,
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| CliError::Internal(format!("catalog run-history read: {e}")))?;
+
+    Ok(select_runs(page.runs, args.row.as_deref(), args.limit))
 }
 
 /// Load the config named by the flags and connect its `catalog:` store,
@@ -224,6 +233,7 @@ mod tests {
             selection: None,
             host_access: false,
             caller_config: false,
+            pool: "default".into(),
         }
     }
 
@@ -314,6 +324,7 @@ mod tests {
             profile: None,
             limit: 20,
             row: None,
+            label: Vec::new(),
             json: false,
         })
         .await;
@@ -321,5 +332,18 @@ mod tests {
             Err(CliError::Config(m)) => assert!(m.contains("catalog"), "got: {m}"),
             other => panic!("expected a no-catalog Config error, got {other:?}"),
         }
+        let err = super::load(HistoryArgs {
+            config: None,
+            env_file: None,
+            no_env_file: true,
+            profile: None,
+            limit: 20,
+            row: None,
+            label: vec![":x".into()],
+            json: false,
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("empty key"), "{err}");
     }
 }

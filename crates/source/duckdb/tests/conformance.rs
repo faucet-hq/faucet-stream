@@ -115,3 +115,17 @@ async fn conformance_call_deadline() {
     faucet_conformance::calls::assert_source_call_deadline(|| built.lock().unwrap().pop().unwrap())
         .await;
 }
+
+/// Check 25: the declaration names every emitted column with its type.
+#[tokio::test]
+async fn conformance_declared_columns_truthful() {
+    let source = DuckdbSource::new(DuckdbSourceConfig::new(
+        ":memory:",
+        "SELECT i::INTEGER AS id, (i * 1.25)::DECIMAL(10,2) AS amount, \
+         DATE '2024-01-01' + i::INTEGER AS day, TIMESTAMPTZ '2024-01-01 00:00:00+00' AS at, \
+         'n' || i AS note, [i] AS list FROM range(0, 5) t(i)",
+    ))
+    .await
+    .expect("source");
+    faucet_conformance::assert_declared_columns_truthful(&source).await;
+}

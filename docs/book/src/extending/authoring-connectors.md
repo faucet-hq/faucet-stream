@@ -764,6 +764,21 @@ Which built-in sinks use how much of it:
 | oracle | the dialect; blocking array DML on the core `SinkDriver` with staging, commit-token and schema groups |
 | redshift, clickhouse, snowflake, databricks, bigquery | the dialect for quoting, escaping, types and DDL; the family-neutral `SinkDriver` and its lifecycle groups (staging, commit tokens, cleanup, schema) over their own row handling (`COPY`/`JSONEachRow` bodies, JSON-payload statement APIs), because their commit unit — a cross-page commit group, a statement-API request, a load job — is not the per-page client transaction `SqlSinkDriver` opens and commits (RFC 0014) |
 
+### Declared column types
+
+A SQL source that describes its statement anyway should declare the columns:
+override `Source::declared_columns` (map type names with
+`faucet_core::LogicalType::from_sql_type`, adjusting for how your source
+renders a type) and set `declared_columns` in its descriptor and
+`capabilities()`. A sink that creates its table should accept them: keep them
+from `set_declared_columns` in a `faucet_core::DeclaredSlot`, plan with
+`faucet_core::plan_table_declared`, render with your dialect's
+`planned_type_name` (implement `declared_type_name`), create the empty typed
+table in `complete_run`, and declare `declared_types`. `SqlSinkDriver` does all
+of the sink side. Prove each with `assert_declared_columns_truthful` /
+`assert_declared_types_create`. See
+[Declared column types](../reference/value-fidelity.md#declared-column-types).
+
 ## Make it fast
 
 Performance is the project's first principle, and none of this may trade away

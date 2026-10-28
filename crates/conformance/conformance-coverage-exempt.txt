@@ -88,3 +88,8 @@ faucet-source-singer streaming: records come from a child process's stdout, whic
 # Scoped cleanup (check 23, #930). BigQuery has no emulator; the single-statement
 # delete is pinned against a statement fake.
 faucet-sink-bigquery cleanup: no emulator; the single-statement delete is pinned by tests/cleanup.rs against a statement fake
+
+# Declared column types (check 26, #955). BigQuery has no emulator to read the
+# created table's column types back; the typed DDL is pinned by
+# tests/declared_types.rs against a tables.get / jobs.query fake.
+faucet-sink-bigquery declared_types: no emulator; the typed CREATE TABLE is pinned by tests/declared_types.rs against a statement fake

@@ -6,13 +6,13 @@
 
 use crate::dialect::{SqlDialect, TableTarget};
 use crate::mapping::ColumnMatching;
-use faucet_core::{FaucetError, PlannedColumn, SqlBaseType};
+use faucet_core::{FaucetError, LogicalType, PlannedColumn, SqlBaseType};
 
 /// Snowflake: ANSI double-quoted identifiers, single-quoted literals with
 /// `''` doubling and backslash escapes, `?` bind placeholders, fields folded
-/// to the one column equal ignoring case. Created columns are all `STRING`:
-/// the row writer projects every value with `::string`, so a typed column
-/// would reject its own writer's cast.
+/// to the one column equal ignoring case. An inferred column is `STRING`
+/// (the row writer projects every value with `::string`); a declared one
+/// (#955) takes its type, into which Snowflake coerces that text on `INSERT`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Snowflake;
 
@@ -43,6 +43,23 @@ impl SqlDialect for Snowflake {
 
     fn type_name(&self, _t: SqlBaseType) -> &'static str {
         "STRING"
+    }
+
+    /// Declared columns (#955) take their type: the row writer's `::string`
+    /// projection is coerced into it on `INSERT`. Binary and JSON stay
+    /// `STRING` (a `::string` value is neither hex nor parsed JSON).
+    fn declared_type_name(&self, t: &LogicalType) -> Option<String> {
+        Some(match t {
+            LogicalType::Int64 => "NUMBER(38,0)".into(),
+            LogicalType::Float64 => "FLOAT".into(),
+            LogicalType::Bool => "BOOLEAN".into(),
+            LogicalType::Decimal { .. } => super::declared_decimal(t, 38, None, "NUMBER")?,
+            LogicalType::Date => "DATE".into(),
+            LogicalType::Time => "TIME(9)".into(),
+            LogicalType::Timestamp { tz: true } => "TIMESTAMP_TZ(9)".into(),
+            LogicalType::Timestamp { tz: false } => "TIMESTAMP_NTZ(9)".into(),
+            _ => return None,
+        })
     }
 
     /// Precision is capped at 38 digits, so no scale keeps both a wide
@@ -110,6 +127,20 @@ impl SqlDialect for Databricks {
         }
     }
 
+    fn declared_type_name(&self, t: &LogicalType) -> Option<String> {
+        Some(match t {
+            LogicalType::Int64 => "BIGINT".into(),
+            LogicalType::Float64 => "DOUBLE".into(),
+            LogicalType::Bool => "BOOLEAN".into(),
+            LogicalType::Decimal { .. } => super::declared_decimal(t, 38, None, "DECIMAL")?,
+            LogicalType::Date => "DATE".into(),
+            LogicalType::Timestamp { tz: true } => "TIMESTAMP".into(),
+            LogicalType::Timestamp { tz: false } => "TIMESTAMP_NTZ".into(),
+            LogicalType::Bytes => "BINARY".into(),
+            _ => return None,
+        })
+    }
+
     /// Delta type widening reaches `DOUBLE` in place only from the narrow
     /// integer types (exact: a 32-bit value fits a double's mantissa); the
     /// sink refuses to widen a `BIGINT` column rather than round it.
@@ -129,7 +160,7 @@ impl SqlDialect for Databricks {
                 format!(
                     "{} {}",
                     self.quote_ident(&c.name),
-                    self.type_name(c.base_type)
+                    self.planned_type_name(c, false)
                 )
             })
             .collect();
@@ -196,6 +227,35 @@ impl SqlDialect for BigQuery {
             SqlBaseType::Text => "STRING",
             SqlBaseType::Json => "JSON",
         }
+    }
+
+    /// `NUMERIC` holds 29 integer and 9 fractional digits, `BIGNUMERIC` 38
+    /// and 38; a decimal without precision, or wider than `NUMERIC`, is
+    /// `BIGNUMERIC`, and one wider than that stays `STRING` (exact). A
+    /// timestamp without a zone is a `DATETIME`; a UUID is `STRING`.
+    fn declared_type_name(&self, t: &LogicalType) -> Option<String> {
+        Some(match *t {
+            LogicalType::Int64 => "INT64".into(),
+            LogicalType::Float64 => "FLOAT64".into(),
+            LogicalType::Bool => "BOOL".into(),
+            LogicalType::String | LogicalType::Uuid => "STRING".into(),
+            LogicalType::Decimal { precision, scale } => {
+                let s = scale.unwrap_or(0);
+                match precision {
+                    None => "BIGNUMERIC".into(),
+                    Some(p) if s <= 9 && p.saturating_sub(s) <= 29 => "NUMERIC".into(),
+                    Some(p) if s <= 38 && p.saturating_sub(s) <= 38 => "BIGNUMERIC".into(),
+                    Some(_) => return None,
+                }
+            }
+            LogicalType::Date => "DATE".into(),
+            LogicalType::Time => "TIME".into(),
+            LogicalType::Timestamp { tz: true } => "TIMESTAMP".into(),
+            LogicalType::Timestamp { tz: false } => "DATETIME".into(),
+            LogicalType::Bytes => "BYTES".into(),
+            LogicalType::Json => "JSON".into(),
+            _ => return None,
+        })
     }
 
     /// `BIGNUMERIC` is exact for every `INT64` and for the fraction; BigQuery

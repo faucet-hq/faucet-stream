@@ -1033,10 +1033,17 @@ redaction, and echoed back as `"***"`.
 
 One consequence is worth stating plainly: a **clustered** server persists the
 materialized config so a peer can execute the run, which would put a secret param
-value in the shared history database. A clustered trigger that *supplies* a value
-for a `secret: true` param is therefore refused with a `422` explaining the two
-safe alternatives (reference the secret from the body, or trigger on a
-non-clustered server). A secret param left at a `default: "${env:VAR}"` is not
+value in the shared history database. A clustered server started with a vault
+key (`--vault-key` / `FAUCET_VAULT_KEY`, the same on every member) seals those
+values instead: the stored config carries `${sealed:N}` tokens, the values are
+stored encrypted and bound to the run id, opened only by the member that runs
+it, and deleted once the run finishes (see
+[clustered execution](cluster.md#3-per-run-secret-template-params-need-a-vault-key)).
+Without a vault key, a clustered trigger that *supplies* a value for a
+`secret: true` param is refused with a `422` naming the key and the safe
+alternatives (reference the secret from the body, or trigger on a
+non-clustered server). A trigger that needs an approved change request is
+refused either way. A secret param left at a `default: "${env:VAR}"` is not
 refused: the reference stays unresolved in the persisted body and resolves on
 the executing instance. Non-clustered servers store no config body and are
 unaffected.

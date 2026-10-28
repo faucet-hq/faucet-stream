@@ -56,6 +56,10 @@ With `create_table: true` a missing table is created from the first page: intege
 
 Oracle stores `''` as `NULL`; an empty string is written as `NULL`.
 
+## Declared column types
+
+When the run's source declares its column types (a SQL query source, #955 — see [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types)), a table this sink creates types each declared column from the declaration instead of from the first page: `NUMBER(19)`, `BINARY_DOUBLE`, `NUMBER(1)`, `NUMBER(p,s)` (`NUMBER` without precision), `DATE`, `TIMESTAMP(9) WITH TIME ZONE` / `TIMESTAMP(9)`, `VARCHAR2(36 CHAR)` for a UUID, `BLOB` — in `auto_columns` mode. A declared column whose first-page values do not fit its type keeps the inferred type; an existing table is never retyped. With a complete declaration a run that writes nothing creates the empty, typed table.
+
 ## Write modes (upsert / delete)
 
 `write_mode: upsert` / `delete` require `auto_columns` and a non-empty `key`. Each page is partitioned by the shared planner (last write wins per key; rows missing a key are rejected), then applied in one transaction with array-bound `MERGE INTO … USING (SELECT :1 AS … FROM DUAL) … WHEN MATCHED THEN UPDATE … WHEN NOT MATCHED THEN INSERT` and `DELETE … WHERE key = :n`. Only the columns present in the page are written. Two writers merging the same new key at once can both take the insert branch; the one that loses fails with ORA-00001, which only rolls back that statement, so the sink runs the `MERGE` once more and it updates the row the other writer committed. Pair with the `cdc_unwrap` transform to mirror a CDC source.

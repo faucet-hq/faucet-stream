@@ -118,6 +118,7 @@ mod checks;
 #[cfg(feature = "containers")]
 pub mod containers;
 pub mod counting;
+mod declared;
 pub mod doubles;
 pub mod fidelity;
 pub mod forwarding;
@@ -159,6 +160,9 @@ pub use checks::{
     assert_batch_atomicity_truthful, assert_cleanup_scoped, assert_driver_declarations_truthful,
     assert_driver_row_paths_agree, assert_overwrite_lifecycle, assert_partial_outcomes_truthful,
     assert_replay_safe, assert_reported_rows_truthful, assert_rollback_truthful,
+};
+pub use declared::{
+    assert_declared_columns_truthful, assert_declared_types_create, declared_corpus,
 };
 
 use std::collections::HashMap;

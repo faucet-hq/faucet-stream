@@ -373,7 +373,7 @@ futures = "0.3"
 async-stream = "0.3"
 # `sasl` (Cyrus SASL, for GSSAPI) is added per crate on unix only: sasl2-sys
 # cannot build on Windows. PLAIN / SCRAM / OAUTHBEARER are built into librdkafka.
-rdkafka = { version = "0.39", default-features = false, features = ["tokio", "cmake-build", "ssl-vendored"] }
+rdkafka = { version = "0.39", default-features = false, features = ["tokio", "cmake-build", "ssl-vendored", "libz-static", "zstd"] }
 apache-avro = { version = "0.22", default-features = false, features = ["snappy", "zstandard"] }
 # ORC reader (#719). Arrow-native; pinned to the arrow-58 line like parquet.
 orc-rust = { version = "0.8", default-features = false }

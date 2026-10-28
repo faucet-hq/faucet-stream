@@ -611,6 +611,9 @@ pub fn compose_with(
     }
     let name = pairing_name(&source.id(), &sink.id());
     doc.insert("name".into(), Value::String(name.clone()));
+    if let Some(pool) = &source.pool {
+        doc.insert("pool".into(), Value::String(pool.clone()));
+    }
     if !params.is_empty() {
         doc.insert(
             "params".into(),
@@ -913,6 +916,24 @@ per_stream:
         );
         let plain = compose_with(&src(), &sink, ALL).unwrap();
         assert!(plain.warnings.iter().all(|w| !w.contains("overwrite")));
+    }
+
+    #[test]
+    fn a_source_template_pool_becomes_the_composed_pool() {
+        let sink: SinkTemplate = crate::yaml::from_str(BQ).unwrap();
+        assert!(
+            compose_with(&src(), &sink, ALL)
+                .unwrap()
+                .document
+                .get("pool")
+                .is_none()
+        );
+        let mut s = src();
+        s.pool = Some("private".into());
+        let c = compose_with(&s, &sink, ALL).unwrap();
+        assert_eq!(c.document["pool"], "private");
+        let cfg: crate::config::PipelineConfig = serde_json::from_value(c.document).unwrap();
+        assert_eq!(cfg.pool.as_deref(), Some("private"));
     }
 
     #[test]

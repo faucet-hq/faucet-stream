@@ -27,6 +27,8 @@ pub(crate) struct ClickHouseDriver {
     /// Whether the target has been confirmed present for this sink instance
     /// (#580). One check per run, not per page.
     pub(crate) table_ready: std::sync::atomic::AtomicBool,
+    /// The source's declared columns (#955).
+    declared: faucet_core::DeclaredSlot,
     /// Records accumulated across `write_batch` calls (#617).
     ///
     /// ClickHouse creates one MergeTree part per insert, so an insert per
@@ -301,7 +303,8 @@ impl ClickHouseDriver {
         }
         // A page with nothing inferable leaves the table uncreated so the next
         // page can try, rather than emitting a zero-column CREATE.
-        let Some(columns) = faucet_core::plan_columns(records) else {
+        let declared = self.declared.get();
+        let Some(columns) = faucet_core::plan_columns_declared(records, declared.as_ref()) else {
             return Ok(());
         };
         let sql = build_create_table_sql(&self.config.table, &columns);
@@ -392,6 +395,7 @@ impl ClickHouseDriver {
         let client = faucet_common_clickhouse::http_client(&config.connection)?;
         Ok(Self {
             table_ready: std::sync::atomic::AtomicBool::new(false),
+            declared: faucet_core::DeclaredSlot::new(),
             known_columns: tokio::sync::Mutex::new(None),
             pending: tokio::sync::Mutex::new(faucet_core::PageAccumulator::bounded(
                 config.commit_rows,
@@ -605,6 +609,25 @@ impl ClickHouseDriver {
 
 #[async_trait]
 impl SinkDriver for ClickHouseDriver {
+    fn capabilities(&self, derived: faucet_core::Capabilities) -> faucet_core::Capabilities {
+        derived.to_builder().declared_types(true).build()
+    }
+
+    fn set_declared_columns(&self, columns: faucet_core::DeclaredColumns) {
+        self.declared.set(columns);
+    }
+
+    /// A run that wrote nothing creates the declared table (#955).
+    async fn complete_run(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        if self.config.create_table
+            && !self.table_ready.load(std::sync::atomic::Ordering::Relaxed)
+            && self.declared.for_empty_run().is_some()
+        {
+            self.ensure_table_ready(calls, &[]).await?;
+        }
+        Ok(())
+    }
+
     fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
         self.config.batch_atomicity()
     }

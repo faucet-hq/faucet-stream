@@ -103,6 +103,11 @@ pub fn set_cluster_instances(n: usize) {
     metrics::gauge!("faucet_serve_cluster_instances").set(n as f64);
 }
 
+/// Pending (unclaimed) cluster runs in one execution pool (#957).
+pub fn set_runs_pending(pool: &str, n: usize) {
+    metrics::gauge!("faucet_serve_runs_pending", "pool" => pool.to_string()).set(n as f64);
+}
+
 /// Count failover reclaims, split by outcome.
 pub fn record_runs_reclaimed(requeued: usize, failed: usize) {
     // Emit both label series unconditionally (increment(0) is a no-op that still

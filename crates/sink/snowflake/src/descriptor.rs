@@ -12,6 +12,7 @@ fn capabilities(config: &Value) -> Capabilities {
         .idempotent_writes(true)
         .staged_load(true)
         .columnar(cfg!(feature = "arrow") && bulk_load)
+        .declared_types(true)
         .build()
 }
 

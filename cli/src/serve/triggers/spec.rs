@@ -243,6 +243,10 @@ pub struct RunTemplate {
     /// triggers over one template.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<crate::select::SelectionRequest>,
+    /// The execution pool the fired runs go to (#957); wins over the
+    /// pipeline's or template's `pool:`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
 }
 
 /// Detect fields in the raw triggers document that the typed parse silently

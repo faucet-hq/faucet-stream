@@ -1,7 +1,10 @@
-//! Iceberg `StorageFactory` selection for the non-REST catalogs.
+//! Iceberg `StorageFactory` selection.
 //!
-//! REST catalogs resolve `FileIO` server-side. The SQL / Glue / HMS catalogs
-//! build `FileIO` in-process and need an explicit `StorageFactory`:
+//! Every catalog builds its `FileIO` in-process and needs a `StorageFactory`.
+//! The REST catalog gets [`rest_storage_factory`]: its warehouse is usually a
+//! logical name, and the table locations (and any vended credentials) come
+//! from the server, so the backend is picked per path. The SQL / Glue / HMS
+//! catalogs pick one from the warehouse URI:
 //!
 //! - Local (`file://` / bare path) warehouses → `iceberg::io::LocalFsStorageFactory`.
 //! - Cloud (`s3://` / `s3a://` / `gs://`) warehouses → an `OpendalPropInjector`
@@ -18,7 +21,7 @@ use std::sync::Arc;
 
 use faucet_core::FaucetError;
 use iceberg::io::{LocalFsStorageFactory, Storage, StorageConfig, StorageFactory};
-use iceberg_storage_opendal::OpenDalStorageFactory;
+use iceberg_storage_opendal::{OpenDalResolvingStorageFactory, OpenDalStorageFactory};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{CatalogInner, WarehouseScheme, warehouse_scheme};
@@ -89,6 +92,13 @@ fn cloud_factory_gcs(props: &HashMap<String, String>) -> Arc<dyn StorageFactory>
         OpenDalStorageFactory::Gcs,
         props.clone(),
     ))
+}
+
+/// The REST catalog's `StorageFactory`: OpenDAL storage chosen from each
+/// file path's scheme, configured from the catalog properties merged with the
+/// server's config and the table's (vended) config.
+pub fn rest_storage_factory() -> Arc<dyn StorageFactory> {
+    Arc::new(OpenDalResolvingStorageFactory::new())
 }
 
 /// Select an Iceberg `StorageFactory` from a catalog's warehouse URI scheme.

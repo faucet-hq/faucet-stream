@@ -35,6 +35,7 @@ triggers:
       labels: {}            # static labels merged with the auto-derived trigger labels
       timeout_secs: null    # per-run timeout in seconds
       selection: null       # optional: run only some rows / streams (see below)
+      pool: null            # optional: execution pool for the fired runs (#957); wins over the config's `pool:`
     type: <trigger type>    # required; one of object_arrival, webhook, queue_depth, schedule
     # … type-specific fields below
 ```

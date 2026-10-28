@@ -57,6 +57,7 @@ fn test_config_with(listen: &str, concurrent: usize, queued: usize) -> ServeConf
         connect_providers: None,
         allow_subprocess_connectors: false,
         references: Default::default(),
+        pools: Default::default(),
     };
     ServeConfig::from_args(args).unwrap()
 }
@@ -571,5 +572,175 @@ async fn a_restart_that_submits_nothing_still_starts_a_new_generation() {
         first_run.as_str(),
         "resume after the restart runs the unit again: {resumed}"
     );
+    server.abort();
+}
+
+/// #958: the poll URL the backfill API advertises lists exactly that
+/// backfill's unit runs, not every run on the server.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_advertised_label_poll_lists_only_that_backfills_units() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.db").display().to_string();
+    seed_sqlite(&src).await;
+    let out_dir = dir.path().join("out").display().to_string();
+    let (url, client, server) = boot().await;
+    let post = |from: &str, to: &str| {
+        client
+            .post(format!("{url}/v1/backfill"))
+            .json(&json!({
+                "config": scoped_config(&src, &out_dir),
+                "from": from,
+                "to": to,
+                "window": "1d",
+                "labels": { "team": "data" },
+            }))
+            .send()
+    };
+    let first: Value = post("2026-06-01", "2026-06-03")
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let second: Value = post("2026-06-03", "2026-06-04")
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_ne!(first["backfill"], second["backfill"]);
+    let plain = client
+        .post(format!("{url}/v1/runs"))
+        .json(&json!({ "config": scoped_config(&src, &out_dir).replace("${backfill.start_date}", "2026-06-01").replace("${backfill.end_date}", "2026-06-02").replace("${backfill.unit}", "plain"), "labels": { "team": "data" } }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(plain.status(), 202, "{}", plain.text().await.unwrap());
+    wait_completed(&client, &url, 4).await;
+
+    let list = |q: String| {
+        let client = client.clone();
+        let url = url.clone();
+        async move {
+            let resp = client
+                .get(format!("{url}/v1/runs?{q}"))
+                .send()
+                .await
+                .unwrap();
+            let status = resp.status();
+            (status, resp.json::<Value>().await.unwrap())
+        }
+    };
+    let unit_ids = |v: &Value| {
+        let mut ids: Vec<String> = v["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["run_id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    };
+    let mut want: Vec<String> = first["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["run_id"].as_str().unwrap().to_string())
+        .collect();
+    want.sort();
+    let hash = first["backfill"].as_str().unwrap();
+
+    let (code, page) = list(format!("label=backfill:{hash}")).await;
+    assert_eq!(code, 200);
+    assert_eq!(unit_ids(&page), want, "{page}");
+    let (_, page) = list(format!("labels=backfill:{hash},team:data")).await;
+    assert_eq!(unit_ids(&page), want, "the comma alias");
+    let (_, page) = list(format!(
+        "label=backfill:{hash}&label=backfill_unit:20260602T000000Z"
+    ))
+    .await;
+    assert_eq!(page["runs"].as_array().unwrap().len(), 1);
+    let (_, page) = list("label=team:data&limit=500".into()).await;
+    assert_eq!(
+        page["runs"].as_array().unwrap().len(),
+        4,
+        "units + the plain run"
+    );
+    let (_, page) = list("label=backfill&limit=500".into()).await;
+    assert_eq!(page["runs"].as_array().unwrap().len(), 3, "key present");
+
+    // A typo is refused instead of returning an unfiltered list.
+    let (code, body) = list(format!("lables=backfill:{hash}")).await;
+    assert_eq!(code, 400, "{body}");
+    assert!(body.to_string().contains("lables"), "{body}");
+    let too_many: Vec<String> = (0..11).map(|i| format!("label=k{i}")).collect();
+    let (code, body) = list(too_many.join("&")).await;
+    assert_eq!(code, 400);
+    assert!(body.to_string().contains("at most 10"), "{body}");
+    let (code, _) = list("label=:v".into()).await;
+    assert_eq!(code, 400);
+
+    // The callback refusal names the working poll.
+    let resp = client
+        .post(format!("{url}/v1/backfill"))
+        .json(&json!({
+            "config": scoped_config(&src, &out_dir),
+            "from": "2026-06-01",
+            "to": "2026-06-02",
+            "window": "1d",
+            "callback": { "url": "https://example.com/hook" },
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 422);
+    assert!(
+        resp.text()
+            .await
+            .unwrap()
+            .contains("GET /v1/runs?label=backfill:<hash>")
+    );
+
+    server.abort();
+}
+
+/// #958: label keys/values are capped and provenance keys refused, on runs
+/// and backfills alike.
+#[tokio::test(flavor = "multi_thread")]
+async fn submitted_labels_are_checked() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.db").display().to_string();
+    seed_sqlite(&src).await;
+    let out_dir = dir.path().join("out").display().to_string();
+    let (url, client, server) = boot().await;
+    let run = |labels: Value| {
+        client
+            .post(format!("{url}/v1/runs"))
+            .json(&json!({ "config": scoped_config(&src, &out_dir), "labels": labels }))
+            .send()
+    };
+    for (labels, needle) in [
+        (json!({ ("k".repeat(64)): "v" }), "longer than 63"),
+        (json!({ "k": ("v".repeat(257)) }), "longer than 256"),
+        (json!({ "template": "fake" }), "set by the server"),
+    ] {
+        let resp = run(labels).await.unwrap();
+        assert_eq!(resp.status(), 422);
+        assert!(resp.text().await.unwrap().contains(needle), "{needle}");
+    }
+    let resp = client
+        .post(format!("{url}/v1/backfill"))
+        .json(&json!({
+            "config": scoped_config(&src, &out_dir),
+            "from": "2026-06-01",
+            "to": "2026-06-02",
+            "window": "1d",
+            "labels": { "selection": "x" },
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 422);
+    assert!(resp.text().await.unwrap().contains("set by the server"));
     server.abort();
 }

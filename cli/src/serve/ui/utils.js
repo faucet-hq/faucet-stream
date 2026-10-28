@@ -73,3 +73,29 @@ export function mdInline(s) {
 
 /** Run statuses that never change again (mirrors `RunStatus::is_terminal`). */
 export const TERMINAL_RUN_STATUSES = ["completed", "failed", "cancelled"];
+
+// Labels the server stamps on a run (provenance): shown after the caller's
+// own labels and muted. Mirrors RESERVED_LABELS plus the other server labels.
+const PROVENANCE_LABELS = new Set([
+  "template", "template_version", "allow_untested", "sink_template",
+  "sink_template_version", "overlay", "overlay_version", "selection",
+  "pipeline", "backfill", "backfill_unit", "dlq_replay",
+]);
+
+export function isProvenanceLabel(key) {
+  return PROVENANCE_LABELS.has(key) || key.startsWith("faucet.");
+}
+
+/** A run's labels as `[key, value, provenance]`, caller labels first. */
+export function sortedLabels(labels) {
+  return Object.entries(labels || {})
+    .map(([k, v]) => [k, String(v), isProvenanceLabel(k)])
+    .sort((a, b) => (a[2] - b[2]) || a[0].localeCompare(b[0]));
+}
+
+/** One clickable `key: value` chip; long values are cut with a tooltip. */
+export function labelChip(key, value, provenance) {
+  const shown = value.length > 40 ? `${value.slice(0, 39)}…` : value;
+  const filter = `${key}:${value}`;
+  return `<button type="button" class="label-chip${provenance ? " label-chip-prov" : ""}" data-label="${escapeHtml(filter)}" title="Filter runs by ${escapeHtml(filter)}"><span class="label-chip-k">${escapeHtml(key)}</span><span class="label-chip-v">${escapeHtml(shown)}</span></button>`;
+}

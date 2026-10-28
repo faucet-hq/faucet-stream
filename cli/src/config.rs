@@ -205,6 +205,13 @@ pub struct PipelineConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollback: Option<crate::rollback::RollbackSpec>,
 
+    /// The execution pool `faucet serve` runs this config in (#957): only a
+    /// replica started with `--pool <name>` claims it. A run request's own
+    /// `pool` wins; absent, the run goes to `default`. Ignored by
+    /// `faucet run` and the other one-shot runtimes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
+
     /// Optional source-shard distribution for clustered (Mode B) execution.
     /// Only consumed by `faucet serve --cluster`: a run whose source
     /// [is shardable](faucet_core::Source::is_shardable) is split into

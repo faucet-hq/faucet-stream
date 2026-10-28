@@ -123,6 +123,10 @@ The HTTP client uses a 30 s connect and a 300 s idle-read timeout, so a
 half-open connection fails the request instead of hanging the run.
 
 
+## Declared column types
+
+When the run's source declares its column types (a SQL query source, #955 — see [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types)), a table this sink creates types each declared column from the declaration instead of from the first page: `Nullable(Int64)`, `Nullable(Float64)`, `Nullable(Bool)`, `Nullable(Decimal(p, s))` (`Decimal(76, 38)` without precision), `Nullable(Date32)`, `Nullable(DateTime64(6, 'UTC'))` / `Nullable(DateTime64(6))`, `Nullable(UUID)`. A declared column whose first-page values do not fit its type keeps the inferred type; an existing table is never retyped. With a complete declaration a run that writes nothing creates the empty, typed table.
+
 ## Commit accumulation (`commit_rows` / `commit_bytes`)
 
 Records **accumulate across `write_batch` calls** and commit once per

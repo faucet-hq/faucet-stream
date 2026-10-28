@@ -446,6 +446,7 @@ async fn server_with_sqlite_history_persists_runs() {
         connect_providers: None,
         allow_subprocess_connectors: false,
         references: Default::default(),
+        pools: Default::default(),
     };
     let mut config = ServeConfig::from_args(args).unwrap();
     config.log_level = "warn".into();
@@ -682,7 +683,8 @@ async fn claim_pending_is_exclusive_across_instances() {
     // exercised (both select the same pending candidate, then race the guarded
     // UPDATE; SQLite's single writer + the `WHERE status='pending'` guard mean only
     // one's UPDATE affects the row).
-    let (ra, rb) = tokio::join!(a.claim_pending(8), b.claim_pending(8));
+    let pools = faucet_cli::serve::pools::default_only();
+    let (ra, rb) = tokio::join!(a.claim_pending(8, &pools), b.claim_pending(8, &pools));
     let got_a = ra.unwrap();
     let got_b = rb.unwrap();
     assert_eq!(
@@ -723,7 +725,10 @@ async fn an_unreadable_record_does_not_block_claims() {
             .await
             .unwrap();
     }
-    let claimed = h.claim_pending(1).await.unwrap();
+    let claimed = h
+        .claim_pending(1, &faucet_cli::serve::pools::default_only())
+        .await
+        .unwrap();
     assert_eq!(
         claimed
             .iter()
@@ -797,6 +802,7 @@ async fn membership_heartbeat_and_liveness() {
         max_concurrent: 4,
         in_flight: n,
         state_format: faucet_core::state_version::STATE_FORMAT,
+        pools: faucet_cli::serve::pools::default_only(),
     };
     a.heartbeat_instance(&beat(1)).await.unwrap();
     b.heartbeat_instance(&beat(0)).await.unwrap();
@@ -1973,7 +1979,10 @@ async fn release_owned_requeues_only_the_owners_running_run() {
     assert_eq!(back.status, RunStatus::Pending);
     assert!(back.started_at.is_none());
     assert!(!a.release_owned(&rec).await.unwrap(), "already released");
-    let claimed = b.claim_pending(5).await.unwrap();
+    let claimed = b
+        .claim_pending(5, &faucet_cli::serve::pools::default_only())
+        .await
+        .unwrap();
     assert_eq!(claimed.len(), 1, "a peer claims it");
 }
 
@@ -2240,7 +2249,13 @@ async fn release_shard_is_owner_fenced_and_requeues() {
         size_estimate: None,
     };
     a.insert_shards("r", &[shard]).await.unwrap();
-    assert_eq!(a.claim_shards(1).await.unwrap().len(), 1);
+    assert_eq!(
+        a.claim_shards(1, &faucet_cli::serve::pools::default_only())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     assert!(!b.release_shard("r", "0").await.unwrap(), "not b's shard");
     assert!(a.release_shard("r", "0").await.unwrap());
     assert!(
@@ -2250,7 +2265,10 @@ async fn release_shard_is_owner_fenced_and_requeues() {
     let progress = a.shard_progress("r").await.unwrap();
     assert_eq!((progress.pending, progress.running), (1, 0));
     assert_eq!(
-        b.claim_shards(1).await.unwrap().len(),
+        b.claim_shards(1, &faucet_cli::serve::pools::default_only())
+            .await
+            .unwrap()
+            .len(),
         1,
         "a peer resumes it"
     );

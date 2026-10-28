@@ -11,7 +11,7 @@
 
 pub mod connect;
 pub mod metrics;
-pub mod vault;
+pub use crate::serve::vault;
 
 use crate::auth_catalog::AuthCatalog;
 use crate::serve::error::ServeError;

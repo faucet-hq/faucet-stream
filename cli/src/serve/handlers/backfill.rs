@@ -71,6 +71,10 @@ pub struct BackfillSubmitRequest {
     /// would leave them waiting forever.
     #[serde(default)]
     pub callback: Option<crate::serve::callback::CallbackSpec>,
+    /// The execution pool every unit run goes to (#957); wins over the
+    /// config's `pool:`.
+    #[serde(default)]
+    pub pool: Option<String>,
     /// Continue a backfill of this exact range that was submitted before:
     /// already-submitted units replay, the rest are submitted.
     #[serde(default)]
@@ -151,13 +155,20 @@ pub async fn submit_backfill(
         return Err(ServeError::Unprocessable {
             message: "`callback` is not supported on /v1/backfill: this submits one run \
                       per window unit, so there is no single run for a completion callback \
-                      to describe. Poll `GET /v1/runs?labels=backfill:<hash>` for unit \
+                      to describe. Poll `GET /v1/runs?label=backfill:<hash>` for unit \
                       status, or submit the units individually via `POST /v1/runs` with a \
                       callback on each"
                 .to_string(),
             details: None,
         });
     }
+
+    crate::serve::history::labels::check_submitted(&req.labels, false).map_err(|message| {
+        ServeError::Unprocessable {
+            message,
+            details: None,
+        }
+    })?;
 
     if req.resume && req.restart {
         return Err(ServeError::Unprocessable {
@@ -308,8 +319,10 @@ pub async fn submit_backfill(
             budget: None,
             approved_change: None,
             selection: None,
+            pool: req.pool.clone(),
             trusted_config: false,
             server_file: false,
+            sealed_params: None,
         };
         let outcome = crate::runtime::server::submit(
             &state,

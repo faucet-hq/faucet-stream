@@ -1,0 +1,17 @@
+# Execution pools on two node groups (#957), release 2 of 2: replicas on the
+# public-subnet nodes, serving the `default` pool (egress without a NAT
+# gateway). See examples/pools-private.yaml for the other release; both share
+# the history and auth Secrets.
+serve:
+  enabled: true
+  replicaCount: 2
+  history:
+    backend: postgres
+    existingSecret: faucet-history
+  auth:
+    existingSecret: faucet-serve-auth
+  cluster:
+    enabled: true
+    pools: [default]
+  nodeSelector:
+    node.kubernetes.io/subnet: public

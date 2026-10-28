@@ -274,3 +274,38 @@ async fn conformance_cleanup_scoped_and_rollback_truthful() {
     })
     .await;
 }
+
+/// Check 26: a declaration creates the table, typed, for an empty run.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_declared_types_create() {
+    let (_container, _permit, url, _sink) = fresh_sink().await;
+    let cfg = MysqlSinkConfig::new(&url, "typed").column_mapping(MysqlColumnMapping::AutoMap);
+    let sink = MysqlSink::new(cfg).await.expect("sink");
+    let types = || {
+        let url = url.clone();
+        async move {
+            let pool = sqlx::MySqlPool::connect(&url).await.expect("pool connect");
+            let rows: Vec<(String, String)> = sqlx::query_as(
+                "SELECT CAST(COLUMN_NAME AS CHAR), CAST(COLUMN_TYPE AS CHAR) \
+                 FROM INFORMATION_SCHEMA.COLUMNS \
+                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'typed'",
+            )
+            .fetch_all(&pool)
+            .await
+            .expect("columns");
+            pool.close().await;
+            rows
+        }
+    };
+    faucet_conformance::assert_declared_types_create(
+        &sink,
+        &[
+            ("id", "bigint"),
+            ("amount", "decimal(12,2)"),
+            ("day", "date"),
+            ("at", "datetime(6)"),
+        ],
+        types,
+    )
+    .await;
+}

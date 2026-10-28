@@ -98,6 +98,8 @@ pub struct Capabilities {
     table_routing: bool,
     read_side_effects: bool,
     complete_reads: bool,
+    declared_columns: bool,
+    declared_types: bool,
 }
 
 const MODE_ORDER: [WriteMode; 4] = [
@@ -196,6 +198,7 @@ impl Capabilities {
             .table_routing(inner.table_routing)
             .read_side_effects(inner.read_side_effects)
             .complete_reads(inner.complete_reads)
+            .declared_columns(inner.declared_columns)
             .build()
     }
 
@@ -206,6 +209,7 @@ impl Capabilities {
             .schema_report(inner.schema_report)
             .scoped_overwrite(inner.scoped_overwrite)
             .direct_overwrite(inner.direct_overwrite)
+            .declared_types(inner.declared_types)
             .build()
     }
 
@@ -337,6 +341,17 @@ impl Capabilities {
         self.complete_reads
     }
 
+    /// Declares its columns' types (`Source::declared_columns`, #955).
+    pub fn declared_columns(&self) -> bool {
+        self.declared_columns
+    }
+
+    /// Creates its destination from a source's declared column types
+    /// (`Sink::set_declared_columns`, #955).
+    pub fn declared_types(&self) -> bool {
+        self.declared_types
+    }
+
     /// The source's typed replay guarantee.
     pub fn replay_guarantee(&self) -> ReplayGuarantee {
         if self.exactly_once {
@@ -418,6 +433,8 @@ impl CapabilitiesBuilder {
         table_routing,
         read_side_effects,
         complete_reads,
+        declared_columns,
+        declared_types,
     );
 
     /// Finish.
@@ -674,6 +691,8 @@ mod tests {
             .table_routing(true)
             .read_side_effects(true)
             .complete_reads(true)
+            .declared_columns(true)
+            .declared_types(true)
             .schema_report(SchemaReport::DropsUnknownFields)
             .scoped_overwrite(true)
             .direct_overwrite(true)
@@ -682,10 +701,12 @@ mod tests {
         let src = Capabilities::decorated_source(&Plain, &inner);
         assert!(src.range_read() && src.range_digest() && src.reports_lag());
         assert!(src.table_routing() && src.read_side_effects() && src.complete_reads());
+        assert!(src.declared_columns() && !src.declared_types());
         assert!(!src.discover(), "derived from the outer connector");
         let sink = Capabilities::decorated_sink(&Plain, &inner);
         assert_eq!(sink.schema_report(), SchemaReport::DropsUnknownFields);
         assert!(sink.scoped_overwrite() && sink.direct_overwrite());
+        assert!(sink.declared_types() && !sink.declared_columns());
         assert_eq!(sink.write_modes(), &[WriteMode::Append]);
     }
 

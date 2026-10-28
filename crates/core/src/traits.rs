@@ -415,6 +415,25 @@ pub trait Source: Send + Sync {
         )))
     }
 
+    /// The columns this stream emits, with their exact types (#955), so a sink
+    /// that creates its destination types it from the source rather than from
+    /// the first page's JSON values. See [`crate::declared`].
+    ///
+    /// Called once by [`Pipeline::run`](crate::Pipeline::run), before the first
+    /// page, with the same `context` as [`stream_pages`](Self::stream_pages).
+    /// A SQL source answers it from the describe of the statement it is about
+    /// to run. Must be read-only; `Ok(None)` (the default) declares nothing and
+    /// leaves the sink inferring types. A source that overrides it declares
+    /// `declared_columns` in its capabilities. A wrapper that reshapes records
+    /// returns the inner declaration [`reshaped`](crate::DeclaredColumns::reshaped)
+    /// or `None`.
+    async fn declared_columns(
+        &self,
+        _context: &std::collections::HashMap<String, Value>,
+    ) -> Result<Option<crate::declared::DeclaredColumns>, FaucetError> {
+        Ok(None)
+    }
+
     /// The dataset (table / collection) a change record belongs to, for a
     /// change stream that carries several tables (#731). A multi-table
     /// `faucet mirror` runs one stream and routes each record to its table's
@@ -1183,6 +1202,16 @@ pub trait Sink: Send + Sync {
         _recorder: std::sync::Arc<crate::observability::RoundtripRecorder>,
     ) {
     }
+
+    /// Receive the columns the run's source declared (#955), before the first
+    /// write. A sink that creates its destination types the created columns
+    /// from them (see [`crate::declared`]) and, when the declaration is
+    /// complete and the run wrote nothing, creates the empty typed destination
+    /// in [`complete_run`](Self::complete_run). An existing destination is
+    /// never retyped. Such a sink declares `declared_types` in its
+    /// capabilities. Defaulted to a no-op; a wrapping sink forwards it (one
+    /// that adds columns declares them).
+    fn set_declared_columns(&self, _columns: crate::declared::DeclaredColumns) {}
 
     /// Receive the run's [`CallContext`](crate::io::CallContext) (#880). See
     /// [`Source::set_call_context`]. A sink's context never carries the run's

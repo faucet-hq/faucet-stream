@@ -1,6 +1,6 @@
 import { api, toast } from "../api.js";
 import { navigate } from "../router.js";
-import { escapeHtml, fmtInt, fmtDuration, fmtCompact, TERMINAL_RUN_STATUSES as TERMINAL } from "../utils.js";
+import { escapeHtml, fmtInt, fmtDuration, fmtCompact, labelChip, sortedLabels, TERMINAL_RUN_STATUSES as TERMINAL } from "../utils.js";
 import { attachDatePicker } from "./date-picker.js";
 import { formatTs } from "../tz.js";
 import { currentTenant, tenantList, withTenant } from "../tenant.js";
@@ -8,9 +8,19 @@ import { currentTenant, tenantList, withTenant } from "../tenant.js";
 // Every RunStatus the API accepts — pending/sharded appear in cluster mode.
 const STATUSES = ["queued", "pending", "running", "sharded", "completed", "failed", "cancelled"];
 
-export async function renderRuns(container) {
+// Label chips shown per row before the rest collapse into "+N".
+const ROW_LABELS = 3;
+// The API's cap on label filters per query.
+const MAX_LABEL_FILTERS = 10;
+
+export async function renderRuns(container, params = {}) {
   let cursor = null;
   let filters = { status: "", name: "", since: "", until: "" };
+  // `key:value` / `key` label filters, kept in the URL hash (`#/runs?label=…`).
+  const labelFilters = [];
+  for (const l of params.query?.getAll("label") || []) {
+    if (l && !labelFilters.includes(l)) labelFilters.push(l);
+  }
   const statusSel = new Set(); // selected statuses (empty = all)
   let pollTimer = null;
 
@@ -30,8 +40,10 @@ export async function renderRuns(container) {
         <input id="f-name" placeholder="name" />
         <input id="f-since" class="date-input" type="text" readonly placeholder="from…" />
         <input id="f-until" class="date-input" type="text" readonly placeholder="to…" />
+        <input id="f-label" placeholder="label key:value" title="Filter by label: key:value for an exact value, key for any value. Enter adds it." />
         <button class="btn-ghost" id="f-apply">Apply</button>
         <button class="btn-ghost" id="f-refresh">↻</button>
+        <div class="label-filters" id="f-labels" hidden></div>
       </div>
       <table class="ds-table runs-table">
         <thead><tr>
@@ -43,6 +55,68 @@ export async function renderRuns(container) {
     </div>`;
 
   const list = container.querySelector("#runs-list");
+  const labelBox = container.querySelector("#f-labels");
+  const labelInput = container.querySelector("#f-label");
+
+  // Mirror the label filters into the hash without re-rendering the view.
+  function syncHash() {
+    const p = new URLSearchParams();
+    for (const l of labelFilters) p.append("label", l);
+    const qs = p.toString();
+    history.replaceState(null, "", qs ? `#/runs?${qs}` : "#/runs");
+  }
+
+  function renderLabelFilters() {
+    labelBox.hidden = !labelFilters.length;
+    labelBox.innerHTML = labelFilters
+      .map((l, i) => `<span class="label-filter" title="${escapeHtml(l)}"><span class="label-filter-text">${escapeHtml(l)}</span><button type="button" class="label-filter-x" data-i="${i}" aria-label="Remove label filter ${escapeHtml(l)}">×</button></span>`)
+      .join("");
+    labelBox.querySelectorAll(".label-filter-x").forEach((b) => {
+      b.onclick = () => {
+        labelFilters.splice(Number(b.dataset.i), 1);
+        renderLabelFilters();
+        syncHash();
+        load(true);
+      };
+    });
+  }
+
+  // Returns false (with a toast) for an entry the API would refuse.
+  function addLabelFilter(raw) {
+    const l = raw.trim();
+    if (!l) return true;
+    if (l.startsWith(":")) {
+      toast("a label filter needs a key: key:value or key", "error");
+      return false;
+    }
+    if (labelFilters.includes(l)) return true;
+    if (labelFilters.length >= MAX_LABEL_FILTERS) {
+      toast(`at most ${MAX_LABEL_FILTERS} label filters`, "error");
+      return false;
+    }
+    labelFilters.push(l);
+    renderLabelFilters();
+    syncHash();
+    return true;
+  }
+
+  labelInput.onkeydown = (e) => {
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    if (addLabelFilter(labelInput.value)) {
+      labelInput.value = "";
+      load(true);
+    }
+  };
+
+  // A label chip in a row filters by it instead of opening the run.
+  list.addEventListener("click", (e) => {
+    const chip = e.target.closest(".label-chip");
+    if (!chip) return;
+    e.stopPropagation();
+    if (addLabelFilter(chip.dataset.label)) load(true);
+  });
+  renderLabelFilters();
   container.querySelector("#r-submit").onclick = () => navigate("#/submit");
   attachDatePicker(container.querySelector("#f-since"));
   attachDatePicker(container.querySelector("#f-until"));
@@ -74,6 +148,7 @@ export async function renderRuns(container) {
     if (filters.until) p.set("until", new Date(filters.until).toISOString());
     p.set("limit", "50");
     if (cursor) p.set("cursor", cursor);
+    for (const l of labelFilters) p.append("label", l);
     withTenant(p);
     return p.toString();
   }
@@ -84,7 +159,7 @@ export async function renderRuns(container) {
       const data = await api(`/v1/runs?${query(reset)}`);
       if (reset) list.innerHTML = "";
       if (!data.runs.length && reset)
-        list.innerHTML = `<tr><td colspan="5" class="empty">No runs yet.</td></tr>`;
+        list.innerHTML = `<tr><td colspan="5" class="empty">${labelFilters.length ? "No runs carry these labels." : "No runs yet."}</td></tr>`;
       for (const r of data.runs) list.appendChild(row(r));
       cursor = data.next_cursor || null;
       container.querySelector("#r-more").hidden = !cursor;
@@ -101,6 +176,8 @@ export async function renderRuns(container) {
   }
 
   container.querySelector("#f-apply").onclick = () => {
+    if (!addLabelFilter(labelInput.value)) return;
+    labelInput.value = "";
     filters = {
       status: [...statusSel].join(","),
       name: container.querySelector("#f-name").value.trim(),
@@ -127,6 +204,24 @@ function tenantTag(r) {
   return ` <span class="run-tenant" title="tenant ${escapeHtml(r.tenant)}">${escapeHtml(label)}</span>`;
 }
 
+// The execution pool a run is placed in, shown unless it is `default`.
+function poolTag(r) {
+  if (!r.pool || r.pool === "default") return "";
+  return ` <span class="run-tenant run-pool" title="execution pool ${escapeHtml(r.pool)}">pool ${escapeHtml(r.pool)}</span>`;
+}
+
+// Up to ROW_LABELS chips, caller labels first; the rest fold into "+N".
+function rowLabels(r) {
+  const all = sortedLabels(r.labels);
+  if (!all.length) return "";
+  const shown = all.slice(0, ROW_LABELS).map(([k, v, p]) => labelChip(k, v, p)).join("");
+  const rest = all.slice(ROW_LABELS);
+  const more = rest.length
+    ? `<span class="label-more" title="${escapeHtml(rest.map(([k, v]) => `${k}: ${v}`).join("\n"))}">+${rest.length}</span>`
+    : "";
+  return `<div class="run-labels">${shown}${more}</div>`;
+}
+
 function row(r) {
   const el = document.createElement("tr");
   el.className = "ds-tr";
@@ -137,7 +232,7 @@ function row(r) {
   const recs = r.records_written ?? 0;
   el.innerHTML = `
     <td><span class="pill pill-${r.status}">${r.status}</span></td>
-    <td class="ds-uri"><div class="ds-uri-in">${escapeHtml(r.name || r.run_id)}${tenantTag(r)}</div></td>
+    <td class="ds-uri"><div class="ds-uri-in">${escapeHtml(r.name || r.run_id)}${tenantTag(r)}${poolTag(r)}</div>${rowLabels(r)}</td>
     <td class="ds-meta ds-num" title="${elapsedExact}">${elapsed}</td>
     <td class="ds-meta ds-num" title="${fmtInt(recs)}">${fmtCompact(recs)}</td>
     <td class="ds-meta ds-time">${fmtTime(r.submitted_at)}</td>`;

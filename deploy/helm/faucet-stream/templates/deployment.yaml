@@ -100,6 +100,12 @@ spec:
             {{- if .Values.serve.cluster.enabled }}
             - --cluster
             {{- end }}
+            {{- range .Values.serve.cluster.pools }}
+            - --pool={{ . }}
+            {{- end }}
+            {{- with .Values.serve.cluster.poolWaitTimeoutSecs }}
+            - --pool-wait-timeout-secs={{ . }}
+            {{- end }}
             {{- if .Values.pipelineConfig.create }}
             - --default-config={{ include "faucet-stream.configFilePath" . }}
             {{- end }}
@@ -181,20 +187,26 @@ spec:
               value: {{ . | quote }}
             {{- end }}
             {{- end }}
+            {{- $vault := dict }}
             {{- if .Values.serve.tenants.enabled }}
+            {{- $vault = dict "key" .Values.serve.tenants.vaultKey "previous" .Values.serve.tenants.previousKeys }}
+            {{- else if and .Values.serve.cluster.enabled .Values.serve.cluster.vaultKey.existingSecret }}
+            {{- $vault = dict "key" .Values.serve.cluster.vaultKey "previous" .Values.serve.cluster.previousKeys }}
+            {{- end }}
+            {{- with $vault }}
             - name: FAUCET_VAULT_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.serve.tenants.vaultKey.existingSecret }}
-                  key: {{ .Values.serve.tenants.vaultKey.existingSecretKey }}
-            {{- range $i, $k := .Values.serve.tenants.previousKeys }}
+                  name: {{ .key.existingSecret }}
+                  key: {{ .key.existingSecretKey | default "FAUCET_VAULT_KEY" }}
+            {{- range $i, $k := .previous }}
             - name: FAUCET_VAULT_PREVIOUS_KEY_{{ $i }}
               valueFrom:
                 secretKeyRef:
                   name: {{ $k.existingSecret }}
                   key: {{ $k.existingSecretKey | default "FAUCET_VAULT_KEY" }}
             {{- end }}
-            {{- with .Values.serve.tenants.previousKeys }}
+            {{- with .previous }}
             - name: FAUCET_VAULT_PREVIOUS_KEYS
               value: {{ $refs := list }}{{ range $i, $_ := . }}{{ $refs = append $refs (printf "$(FAUCET_VAULT_PREVIOUS_KEY_%d)" $i) }}{{ end }}{{ join "," $refs | quote }}
             {{- end }}

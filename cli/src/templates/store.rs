@@ -143,6 +143,9 @@ pub struct MaterializedConfig {
     /// True when the caller supplied the value of a `secret: true` param (a
     /// secret bound from its default does not count — it can be deferred).
     pub used_secret_params: bool,
+    /// The text of every bound secret value: what a clustered server seals
+    /// out of the persisted body (#956).
+    pub secret_texts: params::SecretTexts,
     /// The sink template composed in (a source-template run), with its version.
     pub sink_id: Option<String>,
     pub sink_version: Option<u32>,
@@ -1215,6 +1218,7 @@ pub async fn materialize(
         body,
         params_redacted: bound.redacted(),
         used_secret_params: bound.has_supplied_secrets(),
+        secret_texts: bound.secret_texts(),
         sink_id: None,
         sink_version: None,
         streams: Vec::new(),
@@ -1611,6 +1615,7 @@ async fn materialize_pair_selected(
         body,
         params_redacted: bound.redacted(),
         used_secret_params: bound.has_supplied_secrets(),
+        secret_texts: bound.secret_texts(),
         sink_id: Some(sink_rec.id.clone()),
         sink_version: Some(sink_rec.version),
         streams: composition.streams,

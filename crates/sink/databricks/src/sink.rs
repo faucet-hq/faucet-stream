@@ -62,6 +62,8 @@ pub(crate) struct DatabricksDriver {
     stage_seq: AtomicU64,
     columns: tokio::sync::Mutex<Option<Vec<TableColumn>>>,
     token_table_ready: AtomicBool,
+    /// The source's declared columns (#955).
+    declared: faucet_core::DeclaredSlot,
     /// The overwrite run this instance belongs to: staging is then
     /// `<table>__faucet_ovw_<token>`, apart from any concurrent run's.
     overwrite_run: Option<String>,
@@ -173,6 +175,7 @@ impl DatabricksDriver {
             stage_seq: AtomicU64::new(0),
             columns: tokio::sync::Mutex::new(None),
             token_table_ready: AtomicBool::new(false),
+            declared: faucet_core::DeclaredSlot::new(),
             overwrite_run: None,
         })
     }
@@ -210,6 +213,41 @@ impl DatabricksDriver {
 
     /// Where this instance's writes land: the overwrite staging table during
     /// an overwrite run, else the target.
+    /// The key a created table plans its columns around.
+    fn created_key(&self) -> &[String] {
+        if self.config.write.dedups_by_key() {
+            &self.config.write.key
+        } else {
+            &[]
+        }
+    }
+
+    /// A run that wrote nothing creates the declared destination (#955).
+    async fn create_declared_target(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        let Some(declared) = self.declared.for_empty_run() else {
+            return Ok(());
+        };
+        if !self.config.create_table || self.columns.lock().await.is_some() {
+            return Ok(());
+        }
+        let target = self.final_target();
+        if !self.describe(calls, &target).await?.is_empty() {
+            return Ok(());
+        }
+        let Some(planned) =
+            faucet_core::plan_table_declared(&[], self.created_key(), Some(&declared))
+        else {
+            return Ok(());
+        };
+        self.exec(
+            calls,
+            sql::create_table_sql(&target, &planned, false),
+            Replay::Safe,
+        )
+        .await
+        .map(|_| ())
+    }
+
     fn target(&self) -> TableRef {
         if self.config.write.is_overwrite() {
             self.staging_ref(self.overwrite_run.as_deref())
@@ -382,12 +420,10 @@ impl DatabricksDriver {
                     &target.display(),
                 ));
             }
-            let planned = if self.config.write.dedups_by_key() {
-                faucet_core::plan_keyed_columns(records, &self.config.write.key)
-            } else {
-                faucet_core::plan_columns(records)
-            };
-            let Some(planned) = planned else {
+            let declared = self.declared.get();
+            let Some(planned) =
+                faucet_core::plan_table_declared(records, self.created_key(), declared.as_ref())
+            else {
                 return Ok(None);
             };
             self.exec(
@@ -730,6 +766,18 @@ impl DatabricksDriver {
 
 #[async_trait]
 impl SinkDriver for DatabricksDriver {
+    fn capabilities(&self, derived: faucet_core::Capabilities) -> faucet_core::Capabilities {
+        derived.to_builder().declared_types(true).build()
+    }
+
+    fn set_declared_columns(&self, columns: faucet_core::DeclaredColumns) {
+        self.declared.set(columns);
+    }
+
+    async fn complete_run(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        self.create_declared_target(calls).await
+    }
+
     fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
         self.config.batch_atomicity()
     }

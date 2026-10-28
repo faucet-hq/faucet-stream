@@ -474,7 +474,7 @@ pub(crate) async fn local_output_gc_loop(
 
 /// The lease heartbeat / orphan-recovery cadence: one third of the lease TTL
 /// (so a run sees ≥2 renewals before its lease could expire), floored at 1s.
-fn lease_interval(lease_ttl: Duration) -> Duration {
+pub(crate) fn lease_interval(lease_ttl: Duration) -> Duration {
     (lease_ttl / 3).max(Duration::from_secs(1))
 }
 
@@ -503,6 +503,7 @@ pub(crate) async fn refresh_membership(state: &ServerState, member_ttl: Duration
         max_concurrent: cluster.max_concurrent(),
         in_flight: state.registry().in_flight() as u32,
         state_format: faucet_core::state_version::STATE_FORMAT,
+        pools: cluster.pools().to_vec(),
     };
     if let Err(e) = state.history().heartbeat_instance(&beat).await {
         tracing::warn!(error = %e, "cluster: heartbeat_instance failed");
@@ -512,9 +513,11 @@ pub(crate) async fn refresh_membership(state: &ServerState, member_ttl: Duration
             cluster.set_members(members.len());
             cluster.set_state_format(crate::serve::history::cluster_state_format(&members));
             crate::serve::metrics::set_cluster_instances(members.len());
+            cluster.set_live_members(members);
         }
         Err(e) => tracing::warn!(error = %e, "cluster: live_instances failed"),
     }
+    crate::serve::pools::upkeep(state).await;
 }
 
 /// How long ago this instance last renewed its leases, and whether it has
@@ -688,6 +691,15 @@ pub(crate) async fn lease_loop(state: ServerState, period: Duration, shutdown: C
                     // completed on another instance). Status-fenced + metric
                     // recorded inside the backend, so a parent already finalized by
                     // `maybe_finalize_parent` is not re-finalized or double-counted.
+                    // Sealed secret params outlive no terminal run (#956).
+                    match state.history().run_secrets_purge_terminal().await {
+                        Ok(n) if n > 0 => tracing::debug!(
+                            purged = n,
+                            "cluster: deleted the sealed secret params of finished runs"
+                        ),
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "cluster: purging sealed secret params failed"),
+                    }
                     match crate::serve::runner::sweep_sharded_parents(&state).await {
                         Ok(n) if n > 0 => tracing::info!(
                             finalized = n,
@@ -872,17 +884,23 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         ));
     }
 
-    // Tenants (#709): the vault key and the hosted-OAuth providers, both
-    // validated before the listener opens.
+    // The vault key (#709, #956), validated before the listener opens.
+    #[cfg(feature = "encryption")]
+    let vault = match &config.vault {
+        Some(v) => Some(std::sync::Arc::new(
+            crate::serve::vault::Vault::new(&v.key, &v.previous).map_err(CliError::Serve)?,
+        )),
+        None => None,
+    };
+    #[cfg(not(feature = "encryption"))]
+    if config.vault.is_some() {
+        return Err(CliError::Serve(
+            "--vault-key requires a build with the `encryption` feature".into(),
+        ));
+    }
+    // Tenants (#709): the hosted-OAuth providers.
     #[cfg(feature = "tenants")]
     let tenants_runtime = {
-        let vault = match &config.vault {
-            Some(v) => Some(
-                crate::serve::tenants::vault::Vault::new(&v.key, &v.previous)
-                    .map_err(CliError::Serve)?,
-            ),
-            None => None,
-        };
         let providers = match &config.connect_providers_path {
             Some(path) => crate::serve::tenants::connect::ConnectProviders::load(path)
                 .map_err(CliError::Serve)?,
@@ -895,12 +913,14 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
                     .into(),
             ));
         }
-        crate::serve::tenants::TenantsRuntime::new(vault, providers)
+        let mut rt = crate::serve::tenants::TenantsRuntime::new(None, providers);
+        rt.vault = vault.clone();
+        rt
     };
     #[cfg(not(feature = "tenants"))]
-    if config.vault.is_some() || config.connect_providers_path.is_some() {
+    if config.connect_providers_path.is_some() {
         return Err(CliError::Serve(
-            "--vault-key / --connect-providers require a build with the `tenants` feature".into(),
+            "--connect-providers requires a build with the `tenants` feature".into(),
         ));
     }
 
@@ -929,6 +949,8 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         tracing::info!(rules = p.rules.len(), "data-flow policy loaded");
         state.set_policy(p);
     }
+    #[cfg(feature = "encryption")]
+    state.set_vault(vault);
     #[cfg(feature = "tenants")]
     {
         crate::serve::tenants::metrics::describe();

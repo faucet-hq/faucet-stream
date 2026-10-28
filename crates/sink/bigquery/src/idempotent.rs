@@ -664,6 +664,56 @@ pub fn bq_column_type(field_spec: &serde_json::Value) -> &'static str {
     }
 }
 
+/// The `(column, GoogleSQL type)` list of a table created from `sample` and a
+/// source's `declared` columns (#955): a declared column that fits every
+/// sample value takes [`BigQuery`]'s mapping of its declared type, any other
+/// column [`bq_column_type`] of its inferred fragment. `None` when there is
+/// nothing to create.
+pub fn declared_table_columns(
+    sample: &[serde_json::Value],
+    declared: &faucet_core::DeclaredColumns,
+) -> Option<Vec<(String, String)>> {
+    let planned = faucet_core::plan_columns_declared(sample, Some(declared))?;
+    let schema = faucet_core::schema::infer_schema(sample);
+    let props = schema.get("properties").and_then(|p| p.as_object());
+    Some(
+        planned
+            .into_iter()
+            .map(|c| {
+                let ty = c
+                    .declared
+                    .and_then(|t| BigQuery.declared_type_name(&t))
+                    .unwrap_or_else(|| {
+                        props
+                            .and_then(|p| p.get(&c.name))
+                            .map_or("STRING", bq_column_type)
+                            .to_string()
+                    });
+                (c.name, ty)
+            })
+            .collect(),
+    )
+}
+
+/// [`build_create_table_ddl`] typed from a source's declared columns (#955).
+pub fn build_create_table_ddl_declared(
+    project: &str,
+    dataset: &str,
+    table: &str,
+    sample: &[serde_json::Value],
+    declared: &faucet_core::DeclaredColumns,
+) -> Option<String> {
+    let cols = declared_table_columns(sample, declared)?;
+    Some(format!(
+        "CREATE OR REPLACE TABLE {} ({})",
+        table_ref(project, dataset, table),
+        cols.iter()
+            .map(|(n, t)| format!("{} {t}", quote_ident(n)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
 /// Turn a [`build_create_table_ddl`] statement into `CREATE TABLE IF NOT
 /// EXISTS`, for a table that does not exist (REPLACE is only for a verified
 /// schemaless one).
@@ -1269,5 +1319,48 @@ mod tests {
             build_ensure_dataset_ddl("a.b", "c"),
             "CREATE SCHEMA IF NOT EXISTS `a.b`.`c`"
         );
+    }
+
+    #[test]
+    fn declared_columns_type_the_created_table() {
+        use faucet_core::{DeclaredColumn, DeclaredColumns, LogicalType};
+        use serde_json::json;
+        let declared = DeclaredColumns::new([
+            DeclaredColumn::new("id", LogicalType::Int64, false),
+            DeclaredColumn::new(
+                "amount",
+                LogicalType::Decimal {
+                    precision: Some(12),
+                    scale: Some(2),
+                },
+                true,
+            ),
+            DeclaredColumn::new(
+                "total",
+                LogicalType::Decimal {
+                    precision: None,
+                    scale: None,
+                },
+                true,
+            ),
+            DeclaredColumn::new("day", LogicalType::Date, true),
+            DeclaredColumn::new("at", LogicalType::Timestamp { tz: true }, true),
+            DeclaredColumn::new("local", LogicalType::Timestamp { tz: false }, true),
+            DeclaredColumn::new("uid", LogicalType::Uuid, true),
+        ]);
+        let ddl = build_create_table_ddl_declared("p", "d", "t", &[], &declared).unwrap();
+        assert_eq!(
+            ddl,
+            "CREATE OR REPLACE TABLE `p.d.t` (`id` INT64, `amount` NUMERIC, `total` BIGNUMERIC, \
+             `day` DATE, `at` TIMESTAMP, `local` DATETIME, `uid` STRING)"
+        );
+        let page = [json!({"id": 1, "amount": "1.50", "day": "bad", "extra": 2.5})];
+        let cols = declared_table_columns(&page, &declared).unwrap();
+        let by: std::collections::HashMap<_, _> = cols.into_iter().collect();
+        assert_eq!(by["amount"], "NUMERIC");
+        assert_eq!(by["day"], "STRING");
+        assert_eq!(by["extra"], "FLOAT64");
+        assert!(!by.contains_key("at"));
+        assert!(declared_table_columns(&[], &declared.clone().reshaped()).is_none());
     }
 }

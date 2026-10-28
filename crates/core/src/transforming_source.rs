@@ -261,9 +261,34 @@ impl Source for TransformingSource {
     // take the trait default so they run through the transforms above; the
     // native byte path and server-side range digests stay at the default
     // (off) because both would bypass the transforms.
+    // A stage other than a filter may rename, add, drop or rewrite columns, so
+    // the inner declaration no longer describes the records exactly.
+    async fn declared_columns(
+        &self,
+        context: &HashMap<String, Value>,
+    ) -> Result<Option<crate::declared::DeclaredColumns>, FaucetError> {
+        let declared = self.inner.declared_columns(context).await?;
+        Ok(declared.map(|d| {
+            if self.stages.iter().all(is_filter) {
+                d
+            } else {
+                d.reshaped()
+            }
+        }))
+    }
+
     crate::forward_source!(inner; except fetch_with_context, fetch_with_context_incremental,
         stream_pages, supports_columnar, stream_batches, fetch_all, fetch_all_incremental,
-        native_output_formats, stream_native, range_digest);
+        native_output_formats, stream_native, range_digest, declared_columns);
+}
+
+fn is_filter(stage: &CompiledStage) -> bool {
+    #[cfg(feature = "transform-filter")]
+    if matches!(stage, CompiledStage::Filter(_)) {
+        return true;
+    }
+    let _ = stage;
+    false
 }
 
 #[cfg(test)]
@@ -271,7 +296,7 @@ impl Source for TransformingSource {
 mod tests {
     use super::*;
 
-    struct OnePage;
+    pub(super) struct OnePage;
 
     #[async_trait::async_trait]
     impl crate::Source for OnePage {
@@ -1352,5 +1377,48 @@ mod columnar_tests {
         )
         .unwrap();
         assert!(!wrapped.supports_columnar(), "inner is not columnar");
+    }
+
+    #[tokio::test]
+    async fn a_reshaping_stage_marks_the_declaration_reshaped() {
+        struct Declares;
+        #[async_trait::async_trait]
+        impl crate::Source for Declares {
+            async fn fetch_with_context(
+                &self,
+                _ctx: &HashMap<String, Value>,
+            ) -> Result<Vec<Value>, FaucetError> {
+                Ok(vec![])
+            }
+            async fn declared_columns(
+                &self,
+                _ctx: &HashMap<String, Value>,
+            ) -> Result<Option<crate::DeclaredColumns>, FaucetError> {
+                Ok(Some(crate::DeclaredColumns::new([
+                    crate::DeclaredColumn::new("a", crate::LogicalType::Int64, true),
+                ])))
+            }
+        }
+        let ctx = HashMap::new();
+        let none =
+            TransformingSource::new(Box::new(Declares), vec![], Labels::for_named("t")).unwrap();
+        let d = none.declared_columns(&ctx).await.unwrap().unwrap();
+        assert!(d.is_complete());
+        let mapped = TransformingSource::new(
+            Box::new(Declares),
+            vec![TransformStage::Custom(std::sync::Arc::new(|v| vec![v]))],
+            Labels::for_named("t"),
+        )
+        .unwrap();
+        let d = mapped.declared_columns(&ctx).await.unwrap().unwrap();
+        assert!(!d.is_complete());
+        assert!(d.get("a").is_some());
+        let plain = TransformingSource::new(
+            Box::new(super::tests::OnePage),
+            vec![],
+            Labels::for_named("t"),
+        )
+        .unwrap();
+        assert!(plain.declared_columns(&ctx).await.unwrap().is_none());
     }
 }

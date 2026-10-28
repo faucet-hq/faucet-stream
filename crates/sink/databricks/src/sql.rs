@@ -187,7 +187,13 @@ pub fn base_type_sql(t: SqlBaseType) -> &'static str {
 pub fn create_table_sql(table: &TableRef, cols: &[PlannedColumn], eo: bool) -> String {
     let mut defs: Vec<String> = cols
         .iter()
-        .map(|c| format!("{} {}", quote_ident(&c.name), base_type_sql(c.base_type)))
+        .map(|c| {
+            format!(
+                "{} {}",
+                quote_ident(&c.name),
+                Databricks.planned_type_name(c, false)
+            )
+        })
         .collect();
     if eo {
         defs.push(format!("{} STRING", quote_ident(EO_SCOPE_COL)));
@@ -204,7 +210,12 @@ pub fn create_table_sql(table: &TableRef, cols: &[PlannedColumn], eo: bool) -> S
 pub fn planned_table_columns(cols: &[PlannedColumn], eo: bool) -> Vec<TableColumn> {
     let mut out: Vec<TableColumn> = cols
         .iter()
-        .map(|c| TableColumn::new(&c.name, base_type_sql(c.base_type).to_ascii_lowercase()))
+        .map(|c| {
+            TableColumn::new(
+                &c.name,
+                Databricks.planned_type_name(c, false).to_ascii_lowercase(),
+            )
+        })
         .collect();
     if eo {
         out.extend(eo_columns());

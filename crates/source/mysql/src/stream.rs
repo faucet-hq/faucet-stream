@@ -709,6 +709,20 @@ fn row_to_json(
     Ok(Value::Object(map))
 }
 
+/// The logical type of a column of sqlx type `name`, as this source renders
+/// it (#955): `BOOLEAN` (`TINYINT(1)`) reads as a number, `TIME` is a
+/// duration (text), `DATETIME` decodes as a UTC instant like `TIMESTAMP`, and
+/// an unknown type is text.
+fn declared_type(name: &str) -> faucet_core::LogicalType {
+    use faucet_core::LogicalType as L;
+    match name.to_ascii_uppercase().as_str() {
+        "BOOLEAN" | "YEAR" => L::Int64,
+        "TIME" | "BIT" => L::String,
+        "TIMESTAMP" | "DATETIME" => L::Timestamp { tz: true },
+        _ => L::from_sql_type(name, None, None).unwrap_or(L::String),
+    }
+}
+
 /// sqlx type names of columns MySQL flags BINARY: real binary types, but also
 /// text with a `_bin` collation.
 const BINARY_FLAGGED: &[&str] = &[
@@ -904,7 +918,51 @@ impl faucet_core::Source for MysqlSource {
             .to_builder()
             .range_read(true)
             .range_digest(true)
+            .declared_columns(true)
             .build()
+    }
+
+    /// The query's columns from a describe of the statement the read runs
+    /// (#955). MySQL reports no decimal precision, so a `DECIMAL` is declared
+    /// unbounded.
+    async fn declared_columns(
+        &self,
+        context: &std::collections::HashMap<String, Value>,
+    ) -> Result<Option<faucet_core::DeclaredColumns>, FaucetError> {
+        use sqlx::{Executor, TypeInfo};
+        let (query, binds, _) = self.plan_fetch(context)?;
+        let described = self
+            .calls
+            .call_once("describe", async {
+                (&self.pool)
+                    .describe(query.as_str())
+                    .await
+                    .map_err(|e| FaucetError::Source(e.to_string()))
+            })
+            .await;
+        let Ok(described) = described else {
+            return Ok(None);
+        };
+        let flagged = described
+            .columns()
+            .iter()
+            .any(|c| BINARY_FLAGGED.contains(&c.type_info().name()));
+        let text = if flagged {
+            self.text_columns(&query, &binds).await
+        } else {
+            Default::default()
+        };
+        Ok(Some(faucet_core::DeclaredColumns::new(
+            described.columns().iter().enumerate().map(|(i, c)| {
+                let name = c.name();
+                let t = if text.contains(name) {
+                    faucet_core::LogicalType::String
+                } else {
+                    declared_type(c.type_info().name())
+                };
+                faucet_core::DeclaredColumn::new(name, t, described.nullable(i) != Some(false))
+            }),
+        )))
     }
 
     fn supports_discover(&self) -> bool {
@@ -1589,5 +1647,34 @@ mod tests {
             hi: Some(10),
         };
         assert!(src.range_digest(&range, "ts", &[]).await.is_err());
+    }
+
+    #[test]
+    fn declared_types_follow_the_rendering() {
+        use faucet_core::LogicalType as L;
+        assert_eq!(declared_type("BOOLEAN"), L::Int64);
+        assert_eq!(declared_type("TIME"), L::String);
+        assert_eq!(declared_type("BIT"), L::String);
+        assert_eq!(declared_type("TIMESTAMP"), L::Timestamp { tz: true });
+        assert_eq!(declared_type("DATETIME"), L::Timestamp { tz: true });
+        assert_eq!(
+            declared_type("DECIMAL"),
+            L::Decimal {
+                precision: None,
+                scale: None
+            }
+        );
+        assert_eq!(
+            declared_type("BIGINT UNSIGNED"),
+            L::Decimal {
+                precision: Some(20),
+                scale: Some(0)
+            }
+        );
+        assert_eq!(declared_type("INT"), L::Int64);
+        assert_eq!(declared_type("DATE"), L::Date);
+        assert_eq!(declared_type("JSON"), L::Json);
+        assert_eq!(declared_type("VARBINARY"), L::Bytes);
+        assert_eq!(declared_type("GEOMETRY"), L::String);
     }
 }

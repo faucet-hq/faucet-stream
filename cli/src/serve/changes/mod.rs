@@ -928,6 +928,19 @@ pub async fn create(
             obj.remove("require_approval");
             obj.remove("reason");
         }
+        let labels: std::collections::BTreeMap<String, String> = payload
+            .get("labels")
+            .filter(|l| !l.is_null())
+            .map(|l| serde_json::from_value(l.clone()))
+            .transpose()
+            .map_err(|e| ServeError::BadConfig(format!("labels: {e}")))?
+            .unwrap_or_default();
+        crate::serve::history::labels::check_submitted(&labels, new.trusted_config).map_err(
+            |message| ServeError::Unprocessable {
+                message,
+                details: None,
+            },
+        )?;
     }
     let plan = plan_for(state, actor, new.kind, &payload, new.trusted_config).await?;
     let policy = state.approvals();
@@ -2057,6 +2070,34 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, ServeError::BadConfig(_)));
+        let run = |labels: serde_json::Value, trusted_config| NewChange {
+            kind: ChangeKind::Run,
+            payload: json!({"config": "x", "labels": labels}),
+            reason: None,
+            budget: None,
+            trusted_config,
+        };
+        let err = create(&state, &actor("bob"), run(json!({"template": "t"}), false))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ServeError::Unprocessable { ref message, .. } if message.contains("set by the server")),
+            "{err:?}"
+        );
+        let err = create(&state, &actor("bob"), run(json!({"k": 1}), false))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ServeError::BadConfig(ref m) if m.starts_with("labels:")),
+            "{err:?}"
+        );
+        let err = create(&state, &actor("bob"), run(json!({"template": "t"}), true))
+            .await
+            .unwrap_err();
+        assert!(
+            !format!("{err:?}").contains("set by the server"),
+            "a server-written request may carry provenance labels: {err:?}"
+        );
 
         // A stored request whose payload no longer plans fails on approval.
         let c = stored(ChangeKind::Run, json!({"nope": 1}), "m", 1);

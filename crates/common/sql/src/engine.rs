@@ -326,19 +326,27 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
         records: &[Value],
         json_column: Option<&str>,
     ) -> Result<Option<String>, FaucetError> {
+        self.create_table_sql_declared(target, records, json_column, None)
+    }
+
+    /// [`create_table_sql`](Self::create_table_sql), typing the columns from
+    /// the source's `declared` columns (#955, [`faucet_core::plan_columns_declared`]);
+    /// with a complete declaration an empty `records` creates the declared
+    /// columns.
+    pub fn create_table_sql_declared(
+        &self,
+        target: &TableTarget,
+        records: &[Value],
+        json_column: Option<&str>,
+        declared: Option<&faucet_core::DeclaredColumns>,
+    ) -> Result<Option<String>, FaucetError> {
         if let Some(column) = json_column {
             return self.dialect.create_json_table_sql(target, column).map(Some);
         }
-        let key = self.table_key();
-        let planned = if key.is_empty() {
-            faucet_core::plan_columns(records)
-        } else {
-            faucet_core::plan_keyed_columns(records, key)
-        };
-        match planned {
+        match faucet_core::plan_table_declared(records, self.table_key(), declared) {
             Some(columns) => self
                 .dialect
-                .create_table_sql(target, &columns, key)
+                .create_table_sql(target, &columns, self.table_key())
                 .map(Some),
             None => Ok(None),
         }

@@ -139,6 +139,22 @@ serve:
   never on the command line: a postgres `url` is stored in a chart-managed
   Secret, or point `history.existingSecret` / `history.existingSecretKey` at
   your own Secret so the password never sits in Helm values.
+- **Secret template params on a cluster** (#956): a clustered server refuses a
+  template trigger that supplies a `secret: true` param unless it has a vault
+  key. Set `cluster.vaultKey.existingSecret` (key `FAUCET_VAULT_KEY`, at least
+  32 bytes, e.g. `openssl rand -base64 48`) and, after a rotation,
+  `cluster.previousKeys`; every replica reads the same key, and the values are
+  sealed in the shared history until the run finishes. With `tenants.enabled`
+  the tenants vault key is used instead.
+- **Execution pools** (#957): `cluster.pools: [private]` renders `--pool` per
+  entry, so these replicas claim only runs (and shards) in those pools; empty =
+  `default` only. `cluster.poolWaitTimeoutSecs` fails a pending run whose pool
+  no live replica has served that long (needs `cluster.enabled`). To place
+  pools on different nodes, install one release per node group — its own
+  `nodeSelector` / `tolerations` and `cluster.pools` — all pointing at the same
+  postgres `history.existingSecret` and `auth.existingSecret`; the releases form
+  one cluster. See [`examples/pools-private.yaml`](./examples/pools-private.yaml)
+  and [`examples/pools-public.yaml`](./examples/pools-public.yaml).
 - **Replicas**: `replicaCount > 1` or `autoscaling.enabled` is refused at
   render time unless `history.backend: postgres` and `cluster.enabled: true` —
   with per-pod history each replica has its own runs and idempotency keys, so
@@ -438,6 +454,7 @@ See [`values.yaml`](./values.yaml) — every key is commented. Common ones:
 | `serve.preview.rows` | `500` | rows a preview loads when the request omits `row_count_to_load` (soft cap); `0` = the whole dataset |
 | `serve.preview.maxRows` | `5000` | ceiling on one preview's rows (hard cap); a larger request — including `row_count_to_load=all` — is clamped to it. `0` lifts the ceiling, letting one request read an entire output file (still bounded by a 64 MiB response budget and a 30s deadline) |
 | `serve.triggers` / `.templatesSync` / `.policy` / `.connectProviders` / `.otel` | disabled | file-backed serve features: `enabled` + one of `content` / `existingConfigMap` / `existingSecret`, and `fileName` (see [Serve features](#serve-features)) |
+| `serve.cluster.vaultKey.existingSecret` | `""` | vault key (`FAUCET_VAULT_KEY`) that seals clustered template runs' `secret: true` params; `cluster.previousKeys` open values sealed under an earlier key |
 | `serve.tenants.enabled` | `false` | tenants; needs `vaultKey.existingSecret` (+ `existingSecretKey`, default `FAUCET_VAULT_KEY`) and persistent history |
 | `serve.tenants.previousKeys` | `[]` | `{existingSecret, existingSecretKey}` entries → `FAUCET_VAULT_PREVIOUS_KEYS` |
 | `serve.approvals.require` | `[]` | change kinds needing approval: `run`, `template_register`, `template_launch` |

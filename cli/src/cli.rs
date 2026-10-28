@@ -200,7 +200,7 @@ pub enum Command {
     Schedule(ScheduleArgs),
     /// Run a long-running HTTP control plane (submit / poll / cancel pipeline runs).
     #[cfg(feature = "serve")]
-    Serve(ServeArgs),
+    Serve(Box<ServeArgs>),
     /// Run an MCP (Model Context Protocol) server over stdio, exposing faucet's
     /// introspection surfaces as agent tool calls (for Claude Desktop / Code).
     #[cfg(feature = "mcp")]
@@ -436,6 +436,10 @@ pub struct HistoryArgs {
     /// Show only runs that contain an invocation for this matrix row id.
     #[arg(long)]
     pub row: Option<String>,
+    /// Show only runs carrying this label: `key=value` (or `key:value`), or a
+    /// bare `key` for "has the label". Repeatable; every one must match.
+    #[arg(long = "label", value_name = "KEY=VALUE")]
+    pub label: Vec<String>,
     /// Emit the history as JSON instead of a table.
     #[arg(long)]
     pub json: bool,
@@ -2108,6 +2112,29 @@ impl Default for LogBufferArgs {
     }
 }
 
+/// Execution pools (#957): which runs this replica executes.
+#[cfg(feature = "serve")]
+#[derive(Debug, Clone, Default, clap::Args)]
+pub struct PoolArgs {
+    /// An execution pool this replica serves. Repeatable or comma-separated.
+    /// A run carries one pool (the request's `pool`, else the config's
+    /// `pool:`, else `default`); a clustered replica claims only runs in its
+    /// pools, and a submission to a pool no live member serves is refused.
+    /// Default: `default` only.
+    #[arg(
+        long = "pool",
+        value_name = "NAME",
+        value_delimiter = ',',
+        env = "FAUCET_SERVE_POOLS"
+    )]
+    pub pool: Vec<String>,
+    /// Fail a pending run whose pool no live cluster member has served for
+    /// this many seconds (error `pool_unavailable`). Unset: such runs stay
+    /// pending until a replica of their pool returns. Must be > 0.
+    #[arg(long, value_name = "SECS")]
+    pub pool_wait_timeout_secs: Option<u64>,
+}
+
 /// The reference policy for configs a client submits to `faucet serve`
 /// (#881). Anything not listed is refused; templates and the triggers file
 /// are not restricted.
@@ -2397,10 +2424,13 @@ pub struct ServeArgs {
     /// `--auth-config` `approvals.expire_secs` does not say. Default 24h.
     #[arg(long, default_value_t = 86_400)]
     pub approval_expiry_secs: u64,
-    /// Key that seals tenant connection credentials at rest (#709,
-    /// AES-256-GCM). At least 32 bytes of random key material. Prefer the env
+    /// Key that seals secrets at rest (AES-256-GCM): tenant connection
+    /// credentials (#709) and, on a `--cluster` server, the `secret: true`
+    /// param values of a template trigger (#956). At least 32 bytes of random
+    /// key material; every cluster member needs the same key. Prefer the env
     /// var (avoids `ps` leakage). Without it the server refuses to store or
-    /// open tenant connections.
+    /// open tenant connections, and a clustered server refuses template
+    /// triggers that supply a `secret: true` param.
     #[arg(long, env = "FAUCET_VAULT_KEY", hide_env_values = true)]
     pub vault_key: Option<String>,
     /// A previous vault key, tried when opening credentials sealed before a
@@ -2428,6 +2458,9 @@ pub struct ServeArgs {
     /// `--allow-*` reference-policy flags.
     #[command(flatten)]
     pub references: ReferenceArgs,
+    /// Execution pools (`--pool`, `--pool-wait-timeout-secs`, #957).
+    #[command(flatten)]
+    pub pools: PoolArgs,
     /// Restrict per-run completion callbacks (`callback` on a submit) to these
     /// hosts. Repeatable. When unset, any host is permitted **except**
     /// link-local / cloud-metadata addresses, which are always refused unless

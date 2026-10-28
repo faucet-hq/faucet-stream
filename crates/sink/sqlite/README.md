@@ -430,6 +430,10 @@ the field (narrowing later is the `schema:` drift policy's job).
 Set `create_table: false` to require a pre-existing target; a missing one then
 fails fast with the same error every table sink raises, naming both ways out.
 
+## Declared column types
+
+When the run's source declares its column types (a SQL query source, #955 — see [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types)), a table this sink creates types each declared column from the declaration instead of from the first page: SQLite keeps decimals, dates and timestamps as text, so only the integer, real and boolean affinities come from the declaration (a column that is all `null` on the first page still gets its declared affinity). A declared column whose first-page values do not fit its type keeps the inferred type; an existing table is never retyped. With a complete declaration a run that writes nothing creates the empty, typed table.
+
 ## Batch atomicity
 
 What a failed write leaves behind (#737): **atomic** with `batch_size: 0` or `write_mode: upsert|delete`, otherwise **best-effort** — each chunk is one transaction; keyed writes are one transaction. `on_batch_error: dlq_all`

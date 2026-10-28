@@ -63,6 +63,7 @@ async fn build_rest(inner: &CatalogInner) -> Result<Arc<dyn Catalog>, FaucetErro
     }
 
     let catalog = RestCatalogBuilder::default()
+        .with_storage_factory(crate::storage_factory::rest_storage_factory())
         .load(crate::CATALOG_NAME, props)
         .await
         .map_err(|e| FaucetError::Config(format!("iceberg: REST catalog init failed: {e}")))?;

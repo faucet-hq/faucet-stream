@@ -1234,6 +1234,9 @@ pub struct TriggerBody {
     /// lists them and previews what a selection resolves to.
     #[serde(default)]
     pub selection: Option<crate::select::SelectionRequest>,
+    /// The execution pool to run in (#957); wins over the template's `pool:`.
+    #[serde(default)]
+    pub pool: Option<String>,
     /// Set (never from the wire) by a fire of a trigger declared in the
     /// server's `--triggers` file: the declaration is a standing approval,
     /// so the fire runs without a change request.
@@ -1311,16 +1314,7 @@ pub(crate) const LABEL_SINK_TEMPLATE_VERSION: &str = "sink_template_version";
 pub(crate) const LABEL_OVERLAY: &str = "overlay";
 pub(crate) const LABEL_OVERLAY_VERSION: &str = "overlay_version";
 /// Labels only the server stamps on a template-triggered run.
-pub(crate) const RESERVED_LABELS: &[&str] = &[
-    LABEL_TEMPLATE,
-    LABEL_TEMPLATE_VERSION,
-    LABEL_ALLOW_UNTESTED,
-    LABEL_SINK_TEMPLATE,
-    LABEL_SINK_TEMPLATE_VERSION,
-    LABEL_OVERLAY,
-    LABEL_OVERLAY_VERSION,
-    crate::select::LABEL_SELECTION,
-];
+pub(crate) const RESERVED_LABELS: &[&str] = crate::serve::history::labels::RESERVED_LABELS;
 
 /// `POST /v1/templates/{id}/runs` → 202 / 404 / 422 / 429.
 pub async fn trigger_template(
@@ -1366,6 +1360,23 @@ pub async fn trigger_template_outcome(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_provenance_label_is_reserved() {
+        for k in [
+            super::LABEL_TEMPLATE,
+            super::LABEL_TEMPLATE_VERSION,
+            super::LABEL_ALLOW_UNTESTED,
+            super::LABEL_SINK_TEMPLATE,
+            super::LABEL_SINK_TEMPLATE_VERSION,
+            super::LABEL_OVERLAY,
+            super::LABEL_OVERLAY_VERSION,
+            crate::select::LABEL_SELECTION,
+        ] {
+            assert!(super::RESERVED_LABELS.contains(&k), "{k}");
+        }
+        assert_eq!(super::RESERVED_LABELS.len(), 8);
+    }
+
     /// The pre-#703 handler shape the tests were written against: a run, as
     /// `(status, body)`; a pending change request is a test failure.
     async fn trigger_pair(
@@ -2716,6 +2727,201 @@ tests:
             }
             other => panic!("expected 422, got {other:?}"),
         }
+    }
+
+    #[cfg(feature = "encryption")]
+    const VAULT_A: &str = "0000000000000000000000000000000000000000000000000000000000000a01";
+    #[cfg(feature = "encryption")]
+    const VAULT_B: &str = "0000000000000000000000000000000000000000000000000000000000000b02";
+
+    #[cfg(feature = "encryption")]
+    fn vault(key: &str, previous: &[&str]) -> Option<std::sync::Arc<crate::serve::vault::Vault>> {
+        let previous: Vec<String> = previous.iter().map(|k| k.to_string()).collect();
+        Some(std::sync::Arc::new(
+            crate::serve::vault::Vault::new(key, &previous).unwrap(),
+        ))
+    }
+
+    #[cfg(feature = "encryption")]
+    async fn register_secret_template(state: &ServerState, dir: &std::path::Path, id: &str) {
+        let body = format!(
+            "version: 1\nname: {id}\nparams:\n  token: {{ required: true, secret: true }}\n  pin: {{ type: int, required: true, secret: true }}\npipeline:\n  source:\n    type: csv\n    config:\n      path: ./x-${{param.token}}.csv\n  sink:\n    type: jsonl\n    config:\n      path: {}\n      batch_size: ${{param.pin}}\n",
+            dir.join("o.jsonl").display()
+        );
+        let _registered = register_template(
+            State(state.clone()),
+            Extension(actor()),
+            Json(RegisterBody {
+                id: None,
+                config: crate::templates::bundle::smoke(&body),
+                config_format: ConfigFormatWire::Yaml,
+                description: None,
+                tags: vec![],
+                launch: true,
+            }),
+        )
+        .await
+        .expect("register");
+    }
+
+    #[cfg(feature = "encryption")]
+    fn secret_trigger(token: &str) -> TriggerBody {
+        TriggerBody {
+            params: [
+                ("token".to_string(), json!(token)),
+                ("pin".to_string(), json!(48_271)),
+            ]
+            .into(),
+            idempotency_key: Some("seal-key".into()),
+            ..Default::default()
+        }
+    }
+
+    /// #956: with a vault key a clustered server seals the values instead of
+    /// refusing, stores only tokens in the run record, and the claiming member
+    /// restores them — under the current key or a previous one, never without.
+    #[cfg(feature = "encryption")]
+    #[tokio::test]
+    async fn a_clustered_server_with_a_vault_key_seals_secret_params() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::serve::test_support::test_state_clustered();
+        state.set_vault(vault(VAULT_A, &[]));
+        register_secret_template(&state, dir.path(), "tpl-sealed").await;
+        let (code, resp) = trigger_pair(
+            State(state.clone()),
+            Extension(actor()),
+            Path("tpl-sealed".into()),
+            Json(secret_trigger("sealed-token-value")),
+        )
+        .await
+        .expect("a sealed trigger runs");
+        assert_eq!(code, StatusCode::ACCEPTED);
+        assert_eq!(resp.0.params["token"], json!("***"));
+        let run_id = resp.0.run.run_id.clone();
+
+        let rec = state.history().get(&run_id).await.unwrap().unwrap();
+        let stored = serde_json::to_string(&rec).unwrap();
+        assert!(!stored.contains("sealed-token-value"), "{stored}");
+        assert!(!stored.contains("48271"), "{stored}");
+        let body = rec.config_body.clone().unwrap();
+        assert!(body.contains("${sealed:"), "{body}");
+        let sealed = state
+            .history()
+            .run_secrets_get(&run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!sealed.contains("sealed-token-value"));
+
+        // The executing member registers the opened values for redaction.
+        crate::secrets::registry::unregister("sealed-token-value");
+        let loaded = crate::runtime::server::reload(&state, &rec, &body)
+            .await
+            .expect("the vault key opens them");
+        assert_eq!(
+            crate::secrets::registry::redact("got sealed-token-value"),
+            "got ***"
+        );
+        let cfg = serde_json::to_string(&loaded.cfg).unwrap();
+        assert!(cfg.contains("x-sealed-token-value.csv"), "{cfg}");
+        assert!(cfg.contains("48271"), "{cfg}");
+
+        // A replay with the same key answers with the same run.
+        let (_, again) = trigger_pair(
+            State(state.clone()),
+            Extension(actor()),
+            Path("tpl-sealed".into()),
+            Json(secret_trigger("sealed-token-value")),
+        )
+        .await
+        .expect("replay");
+        assert_eq!(again.0.run.run_id, run_id);
+
+        // Rotation: the new key opens values sealed under the previous one.
+        state.set_vault(vault(VAULT_B, &[VAULT_A]));
+        crate::runtime::server::reload(&state, &rec, &body)
+            .await
+            .expect("a previous key still opens them");
+
+        let refusal = |e: ServeError| match e {
+            ServeError::Unprocessable { message, .. } => message,
+            other => panic!("expected 422, got {other:?}"),
+        };
+        state.set_vault(vault(VAULT_B, &[]));
+        let m = refusal(
+            crate::runtime::server::reload(&state, &rec, &body)
+                .await
+                .unwrap_err(),
+        );
+        assert!(m.contains("cannot open them"), "{m}");
+        state.set_vault(None);
+        let m = refusal(
+            crate::runtime::server::reload(&state, &rec, &body)
+                .await
+                .unwrap_err(),
+        );
+        assert!(
+            m.contains("without a vault key") && m.contains("--vault-key"),
+            "{m}"
+        );
+
+        // Purged once the run is terminal; a later load explains why.
+        let mut done = rec.clone();
+        done.status = crate::serve::history::RunStatus::Completed;
+        done.finished_at = Some(chrono::Utc::now());
+        state.history().upsert(&done).await.unwrap();
+        assert_eq!(
+            state.history().run_secrets_purge_terminal().await.unwrap(),
+            1
+        );
+        state.set_vault(vault(VAULT_A, &[]));
+        let m = refusal(
+            crate::runtime::server::reload(&state, &rec, &body)
+                .await
+                .unwrap_err(),
+        );
+        assert!(m.contains("no longer stored"), "{m}");
+    }
+
+    /// #956: without a vault key the clustered refusal stays and names the
+    /// option; an approval-gated trigger is refused even with one.
+    #[cfg(feature = "encryption")]
+    #[tokio::test]
+    async fn secret_params_without_a_vault_key_or_behind_approval_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::serve::test_support::test_state_clustered();
+        register_secret_template(&state, dir.path(), "tpl-unsealed").await;
+        let message = |e: ServeError| match e {
+            ServeError::Unprocessable { message, .. } => message,
+            other => panic!("expected 422, got {other:?}"),
+        };
+        let m = message(
+            trigger_pair(
+                State(state.clone()),
+                Extension(actor()),
+                Path("tpl-unsealed".into()),
+                Json(secret_trigger("refused-token-value")),
+            )
+            .await
+            .unwrap_err(),
+        );
+        assert!(
+            m.contains("--vault-key") && m.contains("FAUCET_VAULT_KEY"),
+            "{m}"
+        );
+        assert!(!m.contains("refused-token-value"), "{m}");
+
+        state.set_vault(vault(VAULT_A, &[]));
+        let mut gated = secret_trigger("refused-token-value");
+        gated.require_approval = true;
+        let m = message(
+            trigger_template_outcome(state, actor(), "tpl-unsealed".into(), gated)
+                .await
+                .map(|_| ())
+                .unwrap_err(),
+        );
+        assert!(m.contains("approved change request"), "{m}");
+        assert!(!m.contains("--vault-key"), "{m}");
     }
 
     /// #789 CLI-118: a secret param bound from its deferred `${env:…}` default

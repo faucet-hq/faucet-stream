@@ -57,6 +57,39 @@ the same `.env` file, the same IAM role, etc. An instance that cannot resolve a
 directive will fail the run with a config error rather than silently producing
 wrong results.
 
+### 3. Per-run secret template params need a vault key
+
+A template trigger can supply `secret: true` params — a per-tenant database
+password, a service-account key passed per run. The materialized config is
+persisted for the claiming member, so a clustered server seals those values:
+
+- every occurrence of a supplied secret value in the stored config is replaced
+  by a `${sealed:N}` token, so the run record, `GET /v1/runs/{id}`, logs and
+  audit never carry it;
+- the values are encrypted with AES-256-GCM under the vault key
+  (`--vault-key` / `FAUCET_VAULT_KEY`), bound to the run id, and stored apart
+  from the run record;
+- the member that claims the run opens them in memory, registers them for log
+  redaction and restores the config just before loading it;
+- they are deleted once the run is terminal (completed, failed or cancelled),
+  so retries and re-claims after a failover still find them, and a finished
+  run's stored config holds tokens only. Rolling back such a run therefore
+  needs `config` in the request.
+
+**Every member needs the same vault key.** A member without one (or with a
+different one) fails a claimed run with a `422`-class error naming the key; it
+never runs the tokens. To rotate, start every member with the new
+`--vault-key` and the old one as `--vault-previous-key` (or
+`FAUCET_VAULT_PREVIOUS_KEYS`) until every run sealed under the old key has
+finished. Without a vault key such triggers are refused with a `422` naming
+`--vault-key`. A trigger with `env` overrides, and one that needs an approved
+change request (`--require-approval run`), stay refused: the change request
+stores the config for its reviewers.
+
+An idempotent replay (same `idempotency_key`) answers with the original run
+and does not re-seal; the fingerprint is taken over the tokenized config, so
+the secret values themselves are not part of it.
+
 ## Flags
 
 | Flag | Default | Description |
@@ -64,6 +97,8 @@ wrong results.
 | `--cluster` | (disabled) | Enable cluster mode. Requires a persistent `--history` backend. |
 | `--cluster-poll-secs` | `2` | How often (seconds) each instance polls for pending runs and propagates cross-instance cancels. Also the maximum cancel-propagation lag between instances. |
 | `--cluster-max-attempts` | `3` | Maximum number of times a run will be attempted across all instances. After `max-attempts` failures (including crash-failovers) the run is marked `failed` (poisoned). |
+| `--pool <name>` | `default` | An [execution pool](#execution-pools) this replica serves. Repeatable or comma-separated; also `FAUCET_SERVE_POOLS`. Without it the replica serves only `default`. |
+| `--pool-wait-timeout-secs` | (unset) | Fail a pending run whose pool no live member has served for this long (error `pool_unavailable`). Unset: such runs wait. Needs `--cluster`. |
 | `--lease-ttl-secs` | `30` | Run-ownership lease TTL. An instance heartbeats its own in-flight runs at ~⅓ of this interval. A run whose owner's lease expires is eligible for reclaim. Tune this above your worst-case GC/IO stall — a longer TTL is safer but increases the time before a dead node's runs are requeued. |
 
 ## Run lifecycle in cluster mode
@@ -125,10 +160,18 @@ populated:
   "draining": false,
   "cluster": {
     "enabled": true,
-    "instances": 3
+    "instances": 3,
+    "pools": ["default"],
+    "members": [
+      { "instance_id": "8c1…", "listen": "10.0.1.4:8080", "pools": ["default"], "in_flight": 1, "max_concurrent": 4 },
+      { "instance_id": "f02…", "listen": "10.0.2.7:8080", "pools": ["private"], "in_flight": 0, "max_concurrent": 4 }
+    ]
   }
 }
 ```
+
+`pools` is what this replica serves; `members` lists every live member with
+its pools (`null` for a member running a release without execution pools).
 
 A member that received `SIGTERM` reports `"draining": true` (and `503`),
 refuses new submissions, and hands any run still unfinished at the end of its
@@ -148,6 +191,8 @@ a node that loses its DB connection may report stale counts.
 | `faucet_serve_runs_claimed_total` | counter | Total runs claimed (transitioned from `pending` to `running`) by this instance. |
 | `faucet_serve_runs_reclaimed_total{outcome="requeued"}` | counter | Orphaned runs requeued by this instance after a peer's lease expired. |
 | `faucet_serve_runs_reclaimed_total{outcome="failed"}` | counter | Orphaned runs poisoned after reaching `--cluster-max-attempts`. |
+| `faucet_serve_runs_pending{pool}` | gauge | Unclaimed cluster runs per execution pool, from the shared history (every member reports the same value). |
+| `faucet_serve_runs_total{status="failed",reason="pool_unavailable"}` | counter | Runs failed by `--pool-wait-timeout-secs`. |
 
 Useful alert expressions:
 
@@ -245,6 +290,76 @@ curl http://node-a:8080/readyz | jq .cluster
 # { "enabled": true, "instances": 2 }
 ```
 
+## Execution pools
+
+Some runs must execute on a particular placement: a source inside a private
+network needs replicas on private-subnet nodes, while public endpoints are
+cheaper to reach from public-subnet nodes (no NAT-gateway egress). Other
+placements work the same way: GPU or high-memory nodes, a data-residency
+region, a dedicated egress IP on an allowlist. **Execution pools** route each
+run to the replicas that can serve it, inside one cluster — one history
+database, one template registry, one catalog.
+
+- **A replica** serves the pools it is started with:
+  `faucet serve --cluster --pool private` (repeatable, or
+  `FAUCET_SERVE_POOLS=private,gpu`). Without `--pool` it serves `default`.
+- **A run** carries one pool, from the first of:
+  1. `pool` on the request — `POST /v1/runs`, `POST /v1/templates/{id}/runs`
+     (and tenant template runs and fan-out), `POST /v1/backfill`, a trigger's
+     `run.pool` (schedule triggers included), the MCP `run_pipeline` /
+     `run_template` / `propose_run` tools; a change request keeps the pool it
+     was proposed with;
+  2. `pool:` in the pipeline config, or in the source template a composed run
+     comes from;
+  3. `default`.
+- **Claiming** — a replica claims only pending runs, and shards of sharded
+  runs, in its pools. Shards inherit their run's pool; a run re-queued after
+  its owner's lease expired, or released at shutdown, keeps its pool; an
+  idempotent replay returns the original run.
+- **Admission** — a submission to a pool that no live member serves is
+  refused with `422` naming the pool, so nothing queues forever. A
+  non-clustered server serves only its own pools and refuses any other with
+  `422`.
+
+```yaml
+version: 1
+name: invoices_from_private_db
+pool: private
+pipeline:
+  source:
+    type: postgres
+    config:
+      connection_url: postgres://faucet@10.20.0.5:5432/app
+      query: SELECT id, account_id, amount, updated_at FROM invoices
+  sink:
+    type: file
+    config:
+      path: ./out/invoices.jsonl
+```
+
+```bash
+curl -X POST localhost:8080/v1/runs -H 'content-type: application/json' \
+  -d '{"config": "…", "pool": "gpu"}'
+# {"error": {"message": "no live cluster member serves pool `gpu` (live members serve: default, private); start a replica with `--pool gpu`"}}
+```
+
+**When a pool's last replica goes away** its pending runs stay pending — they
+are never claimed by another pool. `faucet_serve_runs_pending{pool}` keeps
+rising and the shipped `FaucetServePoolStarved` alert fires after 15 minutes.
+Start a replica of the pool and the runs are claimed; or set
+`--pool-wait-timeout-secs` so any member fails them (error
+`pool_unavailable: …`, metric reason `pool_unavailable`, completion callback
+fired) once no live member has served the pool for that long.
+
+**Rolling upgrades** — a member running a release without execution pools
+claims any pending run, whatever its pool. Every member advertises its pools
+in the `faucet_serve_instance_caps` row it heartbeats; while a member that
+advertises none is live, a submission to a pool other than `default` is
+refused with `422` naming that member, and runs in `default` behave as
+before. Finish upgrading every replica, then use pools. Runs recorded before
+the upgrade belong to `default`. Do not roll a replica back below the
+execution-pools release while runs in other pools are pending.
+
 ## Kubernetes / Helm deployment
 
 Deploy N replicas behind a Service; all replicas share the same `--history`
@@ -252,7 +367,18 @@ connection string and the same environment (ConfigMap + Secret). The Service
 load-balances submissions across replicas; each replica independently claims
 from the shared DB.
 
-See the operator/Helm chart for faucet — TBD (#197).
+With the Helm chart, `serve.cluster.pools` renders a `--pool` per entry and
+`serve.cluster.poolWaitTimeoutSecs` the timeout. To put pools on different
+node groups, install one release per group, each with its own
+`serve.nodeSelector` / `tolerations` and `serve.cluster.pools`, all pointing at
+the same postgres history Secret and auth Secret:
+
+```bash
+helm install faucet-private deploy/helm/faucet-stream -f deploy/helm/faucet-stream/examples/pools-private.yaml
+helm install faucet-public  deploy/helm/faucet-stream -f deploy/helm/faucet-stream/examples/pools-public.yaml
+```
+
+The two releases form one cluster: submit to either Service.
 
 ## Distributing one big source across workers (Mode B)
 

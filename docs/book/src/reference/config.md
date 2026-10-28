@@ -1404,6 +1404,22 @@ each ceiling, the intersection of the sink lists). Applies to `run`,
 `schedule` and `serve`; a backfill is bounded by its window instead. See the
 [usage cookbook](../cookbook/usage.md#run-budgets). Schema: `faucet schema budget`.
 
+## `pool`
+
+The execution pool `faucet serve` runs the config in (#957):
+
+```yaml
+pool: private   # lowercase letters, digits, `-`, `_`; at most 63 characters
+```
+
+Only a replica started with `--pool private` claims the run, its shards and
+its re-claims. A request's own `pool` (`POST /v1/runs`, a template run, a
+trigger's `run.pool`, …) wins; with neither, the run goes to `default`. A
+source template may carry `pool:` too, and the composed config inherits it.
+A pool no live replica serves is refused at submit time with `422`. Ignored
+by `faucet run`, `schedule`, `mirror` and `backfill`. See
+[Execution pools](../cookbook/cluster.md#execution-pools).
+
 ## `notifications`
 
 *(requires the `notify` build feature)*

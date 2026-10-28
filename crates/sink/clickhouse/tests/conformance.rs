@@ -192,3 +192,47 @@ async fn conformance_call_deadline() {
     )
     .await;
 }
+
+// ── Check 26: a declaration types the created table ────────────────────────
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_declared_types_create() {
+    let Some((_c, base)) = start_clickhouse().await else {
+        return;
+    };
+    let sink = ClickHouseSink::new(ClickHouseSinkConfig::new(&base, "typed")).expect("sink");
+    let base_ref = base.as_str();
+    faucet_conformance::assert_declared_types_create(
+        &sink,
+        &[
+            ("id", "nullable(int64)"),
+            ("amount", "decimal(12, 2)"),
+            ("day", "date32"),
+            ("at", "datetime64(6, 'utc')"),
+        ],
+        move || async move {
+            let body = reqwest::Client::new()
+                .post(base_ref)
+                .body(
+                    "SELECT name, type FROM system.columns WHERE database = currentDatabase() \
+                     AND table = 'typed' FORMAT JSONEachRow"
+                        .to_string(),
+                )
+                .send()
+                .await
+                .expect("columns send")
+                .text()
+                .await
+                .expect("columns body");
+            body.lines()
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .map(|v| {
+                    (
+                        v["name"].as_str().unwrap_or_default().to_string(),
+                        v["type"].as_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        },
+    )
+    .await;
+}

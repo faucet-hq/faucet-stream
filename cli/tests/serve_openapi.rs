@@ -158,6 +158,7 @@ async fn every_documented_route_is_wired_on_the_live_server() {
         connect_providers: None,
         allow_subprocess_connectors: false,
         references: Default::default(),
+        pools: Default::default(),
     };
     let mut config = ServeConfig::from_args(args).unwrap();
     config.log_level = "warn".into();
@@ -240,4 +241,24 @@ async fn every_documented_route_is_wired_on_the_live_server() {
             );
         }
     }
+}
+
+#[test]
+fn list_runs_documents_every_query_parameter() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/openapi.yaml");
+    let doc: faucet_cli::yaml::Value =
+        faucet_cli::yaml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let params: BTreeSet<String> = doc["paths"]["/v1/runs"]["get"]["parameters"]
+        .as_sequence()
+        .expect("listRuns parameters")
+        .iter()
+        .map(|p| p["name"].as_str().unwrap().to_string())
+        .collect();
+    let expected: BTreeSet<String> = [
+        "status", "name", "since", "until", "limit", "cursor", "tenant", "label", "labels",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    assert_eq!(params, expected);
 }
