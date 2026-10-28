@@ -236,3 +236,54 @@ async fn a_refused_credentials_call_is_an_auth_error() {
         other => panic!("expected an auth error, got {other:?}"),
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_refresh_keeps_credentials_that_are_still_valid() {
+    let (_pg, port) = support::start_postgres().await;
+    let admin = sqlx::PgPool::connect(&admin_url(port)).await.unwrap();
+    sqlx::query(r#"CREATE ROLE "IAM:steady" LOGIN PASSWORD 'pw-s'"#)
+        .execute(&admin)
+        .await
+        .unwrap();
+    let server = MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(credentials_response(
+            "IAM:steady",
+            "pw-s",
+            Duration::from_secs(5),
+        ))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .insert_header("content-type", "text/xml")
+                .set_body_string(
+                    "<ErrorResponse><Error><Type>Sender</Type><Code>AccessDenied</Code>\
+                     <Message>revoked</Message></Error><RequestId>r</RequestId></ErrorResponse>",
+                ),
+        )
+        .mount(&server)
+        .await;
+    let conn = iam_connection(
+        port,
+        json!({
+            "region": REGION,
+            "cluster_identifier": "c",
+            "db_user": "steady",
+            "aws_credentials": access_key(),
+            "endpoint_url": server.uri(),
+        }),
+    );
+    let pool = connect_lazy(&conn, 2).unwrap();
+    let ctx = CallContext::new();
+    pool.get(&ctx).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+    // Due for refresh, the refresh fails, the current password still logs in.
+    let still = pool.get(&ctx).await.unwrap();
+    assert_eq!(current_user(&still).await, "IAM:steady");
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let err = pool.get(&ctx).await.unwrap_err().to_string();
+    assert!(err.contains("GetClusterCredentials failed"), "{err}");
+}

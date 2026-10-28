@@ -25,7 +25,10 @@ on both sides.
     `aws_credentials` and `endpoint_url` select how AWS is called. The pool
     fetches credentials on first use and again 60 s before they expire (half
     way through a shorter lifetime), so every connection it opens afterwards
-    logs in with valid ones; open connections are unaffected.
+    logs in with valid ones; open connections are unaffected. A refresh that
+    fails while the current credentials are still valid is logged and retried
+    on the next use; once they have expired it fails the operation as
+    `FaucetError::Auth`.
   - `redshift_data_api` — every statement goes through the Data API
     (`ExecuteStatement`, polled with `DescribeStatement` until `FINISHED` /
     `FAILED` / `ABORTED`, rows paged with `GetStatementResult`). Set exactly

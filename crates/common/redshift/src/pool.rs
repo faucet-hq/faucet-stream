@@ -141,7 +141,8 @@ pub struct RedshiftPool {
 struct IamState {
     provider: IamCredentials,
     base: PgConnectOptions,
-    refresh_at: tokio::sync::Mutex<Option<Instant>>,
+    /// When the current credentials are due for refresh and when they expire.
+    refresh_at: tokio::sync::Mutex<Option<(Instant, SystemTime)>>,
 }
 
 impl std::fmt::Debug for RedshiftPool {
@@ -158,17 +159,28 @@ impl RedshiftPool {
     pub async fn get(&self, calls: &CallContext) -> Result<PgPool, FaucetError> {
         if let Some(iam) = &self.iam {
             let mut due = iam.refresh_at.lock().await;
-            if due.is_none_or(|at| Instant::now() >= at) {
+            if due.is_none_or(|(at, _)| Instant::now() >= at) {
                 let fetched = Instant::now();
-                let creds = Box::pin(iam.provider.fetch(calls)).await?;
-                self.pool.set_connect_options(
-                    iam.base
-                        .clone()
-                        .username(&creds.user)
-                        .password(&creds.password),
-                );
-                *due = Some(refresh_at(fetched, SystemTime::now(), creds.expires_at));
-                tracing::debug!(user = %creds.user, "redshift iam: temporary credentials refreshed");
+                match Box::pin(iam.provider.fetch(calls)).await {
+                    Ok(creds) => {
+                        self.pool.set_connect_options(
+                            iam.base
+                                .clone()
+                                .username(&creds.user)
+                                .password(&creds.password),
+                        );
+                        *due = Some((
+                            refresh_at(fetched, SystemTime::now(), creds.expires_at),
+                            creds.expires_at,
+                        ));
+                        tracing::debug!(user = %creds.user, "redshift iam: temporary credentials refreshed");
+                    }
+                    // The current credentials still log in: retry on the next use.
+                    Err(e) if due.is_some_and(|(_, exp)| SystemTime::now() < exp) => {
+                        tracing::warn!(error = %e, "redshift iam: refreshing temporary credentials failed; the current ones are still valid");
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         }
         Ok(self.pool.clone())

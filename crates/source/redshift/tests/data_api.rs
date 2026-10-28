@@ -229,6 +229,17 @@ async fn failures_columns_and_the_preflight_go_through_the_data_api() {
     assert!(err.contains("statement failed"), "{err}");
     assert!(err.contains("\"missing\" does not exist"), "{err}");
 
+    let incremental = source(
+        &env,
+        "SELECT * FROM missing",
+        json!({"replication": {"type": "incremental", "column": "id", "initial_value": 0}}),
+    );
+    let err = incremental.fetch_all().await.unwrap_err().to_string();
+    assert!(
+        err.contains("could not describe the incremental query") && err.contains("\"missing\""),
+        "{err}"
+    );
+
     let s = source(&env, "SELECT * FROM t", json!({}));
     assert_eq!(
         s.dataset_uri(),

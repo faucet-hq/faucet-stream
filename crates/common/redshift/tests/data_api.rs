@@ -172,6 +172,17 @@ async fn a_failed_statement_carries_the_server_error() {
     );
     assert!(body.get("DbUser").is_none() && body.get("ClusterIdentifier").is_none());
 
+    let aborted = api
+        .execute(
+            &CallContext::new(),
+            Effect::Read,
+            &Statement::new("SELECT 1 /* abort */"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(aborted.contains("statement was aborted"), "{aborted}");
+
     // A request the service rejects outright.
     let bad = api
         .execute(

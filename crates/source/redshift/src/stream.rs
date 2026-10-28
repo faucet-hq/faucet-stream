@@ -41,10 +41,18 @@ enum Backend {
     DataApi(Box<DataApiClient>),
 }
 
+/// A backend ready to run a query: the wire pool with fresh credentials, or
+/// the Data API client.
+enum Conn<'a> {
+    Wire(sqlx::PgPool),
+    DataApi(&'a DataApiClient),
+}
+
 /// Where the rows of a running query come from.
 enum Cursor<'a> {
     Wire(futures::stream::BoxStream<'a, Result<sqlx::postgres::PgRow, sqlx::Error>>),
     DataApi {
+        api: &'a DataApiClient,
         id: String,
         token: Option<String>,
         columns: Vec<DataColumn>,
@@ -223,40 +231,36 @@ impl RedshiftSource {
 
     /// Start `sql` and return where its rows come from.
     async fn open<'a>(
-        &self,
         calls: &faucet_core::io::CallContext,
-        pool: &'a Option<sqlx::PgPool>,
+        conn: &'a Conn<'a>,
         sql: &'a str,
         binds: &'a [Value],
     ) -> Result<Cursor<'a>, FaucetError> {
         use futures::StreamExt;
-        match (&self.backend, pool) {
-            (Backend::DataApi(api), _) => {
+        match conn {
+            Conn::DataApi(api) => {
                 let done = api
                     .execute(calls, Effect::Read, &data_api::named_parameters(sql, binds))
                     .await?;
                 Ok(Cursor::DataApi {
+                    api,
                     id: done.id,
                     token: None,
                     columns: Vec::new(),
                     done: !done.has_result_set,
                 })
             }
-            (Backend::Wire(_), Some(pool)) => {
+            Conn::Wire(pool) => {
                 let query = bind_params(sqlx::query(sql), binds)?;
                 calls.record("query");
                 Ok(Cursor::Wire(query.fetch(pool).boxed()))
             }
-            (Backend::Wire(_), None) => Err(FaucetError::Source(
-                "redshift: the wire pool was not acquired".into(),
-            )),
         }
     }
 
     /// Up to `max` more rows of `cursor` as JSON objects, and whether it is
     /// exhausted. A Data API page is read whole.
     async fn next_chunk(
-        &self,
         calls: &faucet_core::io::CallContext,
         cursor: &mut Cursor<'_>,
         max: usize,
@@ -274,6 +278,7 @@ impl RedshiftSource {
                 Ok((rows, exhausted))
             }
             Cursor::DataApi {
+                api,
                 id,
                 token,
                 columns,
@@ -282,11 +287,6 @@ impl RedshiftSource {
                 if *done {
                     return Ok((Vec::new(), true));
                 }
-                let Backend::DataApi(api) = &self.backend else {
-                    return Err(FaucetError::Source(
-                        "redshift: a Data API cursor needs the Data API".into(),
-                    ));
-                };
                 let page = api.result_page(calls, id, token.as_deref()).await?;
                 if columns.is_empty() {
                     *columns = page.columns;
@@ -505,18 +505,18 @@ impl Source for RedshiftSource {
                 .as_ref()
                 .map(|ic| CursorTracker::new(ic.column.clone(), ic.start.clone()));
             let calls = self.calls.get();
-            let pool = match &self.backend {
-                Backend::Wire(p) => Some(p.get(&calls).await?),
-                Backend::DataApi(_) => None,
+            let conn = match &self.backend {
+                Backend::Wire(p) => Conn::Wire(p.get(&calls).await?),
+                Backend::DataApi(api) => Conn::DataApi(api),
             };
-            let mut cursor = self.open(&calls, &pool, &query_str, &binds).await?;
+            let mut cursor = Self::open(&calls, &conn, &query_str, &binds).await?;
             let chunk = if batch_size == 0 { usize::MAX } else { batch_size };
             let cap = if batch_size == 0 { 1024 } else { batch_size };
             let mut buffer: Vec<Value> = Vec::with_capacity(cap);
             let mut total = 0usize;
 
             loop {
-            let (fetched, exhausted) = self.next_chunk(&calls, &mut cursor, chunk).await?;
+            let (fetched, exhausted) = Self::next_chunk(&calls, &mut cursor, chunk).await?;
             for obj in fetched {
                 if tracker.as_mut().is_none_or(|t| t.admit(&obj)) {
                     buffer.push(obj);

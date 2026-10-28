@@ -335,6 +335,12 @@ impl Respond for DataApiFake {
                 };
                 let mut st = self.state.lock().unwrap();
                 let statement = match outcome {
+                    // A statement someone cancels while it runs.
+                    Ok(_) if bound_sql.contains("/* abort */") => Statement {
+                        statuses: VecDeque::from(["SUBMITTED", "ABORTED"]),
+                        error: None,
+                        result: None,
+                    },
                     Ok(result) => Statement {
                         statuses: if self.stall {
                             VecDeque::from(["SUBMITTED", "STARTED"])
