@@ -27,8 +27,10 @@ on both sides.
     way through a shorter lifetime), so every connection it opens afterwards
     logs in with valid ones; open connections are unaffected. A refresh that
     fails while the current credentials are still valid is logged and retried
-    on the next use; once they have expired it fails the operation as
-    `FaucetError::Auth`.
+    after a backoff (a quarter of the remaining lifetime, 1–60 s), not on
+    every use; once they have expired it fails the operation as
+    `FaucetError::Auth`. Credentials are never refetched sooner than 1 s after
+    the last fetch, even when they look expired already (a skewed clock).
   - `redshift_data_api` — every statement goes through the Data API
     (`ExecuteStatement`, polled with `DescribeStatement` until `FINISHED` /
     `FAILED` / `ABORTED`, rows paged with `GetStatementResult`). Set exactly
@@ -68,7 +70,10 @@ on both sides.
   (the call `submit`; a `Effect::Write` is a single attempt, never resubmitted)
   and polls (`poll`, waiting through `CallContext::wait`, 50 ms doubling to
   1 s); a run deadline or cancel ends the wait and cancels the statement on the
-  service, best effort. `result_page` (`fetch`) pages the result; `query` reads
+  service, best effort. A failed poll is retried up to 4 times (250 ms
+  doubling); when polling gives up the statement is cancelled as well, and for
+  an `Effect::Write` the error names the statement id and says whether it
+  committed is unknown (check the destination before re-running). `result_page` (`fetch`) pages the result; `query` reads
   a small one whole. `data_api::named_parameters` turns `$n` placeholders into
   `:pN` parameters (NULL and empty strings are written into the SQL, since a
   parameter value can be neither), and `data_api::field_to_json` renders the

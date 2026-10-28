@@ -213,6 +213,7 @@ pub struct DataApiFake {
     page_size: usize,
     stall: bool,
     copy: Option<Result<(), String>>,
+    failing_polls: usize,
 }
 
 impl DataApiFake {
@@ -225,7 +226,14 @@ impl DataApiFake {
             page_size,
             stall: false,
             copy: None,
+            failing_polls: 0,
         }
+    }
+
+    /// The first `n` `DescribeStatement` calls fail (`usize::MAX`: all).
+    pub fn failing_polls(mut self, n: usize) -> Self {
+        self.failing_polls = n;
+        self
     }
 
     /// `COPY … FROM 's3://…'` statements are not run (PostgreSQL cannot read
@@ -360,6 +368,14 @@ impl Respond for DataApiFake {
                 amz_json(json!({"Id": id, "Database": body["Database"]}))
             }
             "RedshiftData.DescribeStatement" => {
+                let polls = st
+                    .targets
+                    .iter()
+                    .filter(|t| *t == "RedshiftData.DescribeStatement")
+                    .count();
+                if polls <= self.failing_polls {
+                    return amz_error("ValidationException", "describe is unavailable");
+                }
                 let id = body["Id"].as_str().unwrap_or_default().to_string();
                 let Some(s) = st.statements.get_mut(&id) else {
                     return amz_error("ResourceNotFoundException", "no such statement");

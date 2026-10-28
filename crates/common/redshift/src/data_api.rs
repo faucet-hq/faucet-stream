@@ -7,7 +7,9 @@
 //! call through the caller's [`CallContext`]: submitting a write is a single
 //! attempt (`call_once`), polling waits through [`CallContext::wait`], so the
 //! run's deadline and cancel end a long statement (which is then cancelled
-//! on the service, best effort).
+//! on the service, best effort). A failed poll is retried
+//! ([`POLL_FAILURE_RETRIES`]); when polling gives up, the statement is
+//! cancelled too, and for a write the error says its outcome is unknown.
 //!
 //! Data API parameters are named strings and cannot be NULL or empty, so
 //! [`named_parameters`] turns the `$n` placeholders the connectors write into
@@ -29,6 +31,13 @@ pub const POLL_START: Duration = Duration::from_millis(50);
 
 /// The longest wait between two polls.
 pub const POLL_MAX: Duration = Duration::from_secs(1);
+
+/// How many consecutive failed `DescribeStatement` calls are retried before
+/// polling gives up on a submitted statement.
+pub const POLL_FAILURE_RETRIES: u32 = 4;
+
+/// The first wait after a failed poll; it doubles on each further failure.
+pub const POLL_FAILURE_WAIT: Duration = Duration::from_millis(250);
 
 /// How long the best-effort `CancelStatement` of an abandoned statement may
 /// take.
@@ -229,7 +238,10 @@ impl DataApiClient {
     }
 
     /// Submit `statement` and wait until it finishes. A failed or aborted
-    /// statement is an error carrying the service's message.
+    /// statement is an error carrying the service's message. When waiting
+    /// stops before the statement finishes, it is cancelled (best effort); a
+    /// write whose polling failed is an error naming the statement and saying
+    /// its outcome is unknown.
     pub async fn execute(
         &self,
         calls: &CallContext,
@@ -279,11 +291,21 @@ impl DataApiClient {
             Effect::Read => calls.call("submit", submit).await?,
         };
         match Box::pin(self.wait(calls, client, &id)).await {
-            Err(e @ (FaucetError::Timeout { .. } | FaucetError::Cancelled { .. })) => {
-                cancel_detached(client.clone(), id);
-                Err(e)
+            Ok(done) => Ok(done),
+            Err(Waited::Finished(e)) => Err(e),
+            // The statement may still run: ask the service to cancel it.
+            Err(Waited::Abandoned(e)) => {
+                cancel_detached(client.clone(), id.clone());
+                match e {
+                    FaucetError::Timeout { .. } | FaucetError::Cancelled { .. } => Err(e),
+                    e if effect == Effect::Write => Err((self.error)(format!(
+                        "redshift data api: statement {id} was submitted but polling it failed \
+                         ({e}); a cancel was requested, but whether it committed is unknown, so \
+                         check the destination before re-running"
+                    ))),
+                    e => Err(e),
+                }
             }
-            other => other,
         }
     }
 
@@ -292,10 +314,11 @@ impl DataApiClient {
         calls: &CallContext,
         client: &aws_sdk_redshiftdata::Client,
         id: &str,
-    ) -> Result<Executed, FaucetError> {
+    ) -> Result<Executed, Waited> {
         let mut delay = POLL_START;
+        let mut failures = 0;
         loop {
-            let d = calls
+            let polled = calls
                 .call("poll", || async {
                     client
                         .describe_statement()
@@ -304,7 +327,26 @@ impl DataApiClient {
                         .await
                         .map_err(|e| self.fail("DescribeStatement", e))
                 })
-                .await?;
+                .await;
+            let d = match polled {
+                Ok(d) => d,
+                Err(e @ (FaucetError::Timeout { .. } | FaucetError::Cancelled { .. })) => {
+                    return Err(Waited::Abandoned(e));
+                }
+                // Polling is read-only: keep trying before giving up on a
+                // statement that may still finish.
+                Err(e) if failures < POLL_FAILURE_RETRIES => {
+                    tracing::warn!(statement = %id, error = %e, "redshift data api: polling a statement failed; retrying");
+                    calls
+                        .wait(POLL_FAILURE_WAIT * 2u32.pow(failures))
+                        .await
+                        .map_err(Waited::Abandoned)?;
+                    failures += 1;
+                    continue;
+                }
+                Err(e) => return Err(Waited::Abandoned(e)),
+            };
+            failures = 0;
             match d.status() {
                 Some(StatusString::Finished) => {
                     return Ok(Executed {
@@ -314,19 +356,19 @@ impl DataApiClient {
                     });
                 }
                 Some(StatusString::Failed) => {
-                    return Err((self.error)(format!(
+                    return Err(Waited::Finished((self.error)(format!(
                         "redshift data api: statement failed: {}",
                         d.error().unwrap_or("the service gave no reason")
-                    )));
+                    ))));
                 }
                 Some(StatusString::Aborted) => {
-                    return Err((self.error)(
+                    return Err(Waited::Finished((self.error)(
                         "redshift data api: statement was aborted".into(),
-                    ));
+                    )));
                 }
                 _ => {}
             }
-            calls.wait(delay).await?;
+            calls.wait(delay).await.map_err(Waited::Abandoned)?;
             delay = (delay * 2).min(POLL_MAX);
         }
     }
@@ -400,6 +442,15 @@ impl DataApiClient {
             }
         }
     }
+}
+
+/// How waiting for a submitted statement ended, when it did not finish.
+enum Waited {
+    /// The service reported it failed or was aborted: nothing is left running.
+    Finished(FaucetError),
+    /// Waiting stopped (deadline, cancel, polling failed) while the statement
+    /// may still be running.
+    Abandoned(FaucetError),
 }
 
 /// Cancel an abandoned statement on a spawned task, best effort.

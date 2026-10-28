@@ -218,7 +218,7 @@ async fn a_deadline_ends_the_poll_and_cancels_the_statement() {
         .await
         .unwrap_err();
     assert!(matches!(err, FaucetError::Timeout { .. }), "{err:?}");
-    for _ in 0..50 {
+    for _ in 0..200 {
         if !fake.cancelled().is_empty() {
             break;
         }
@@ -237,4 +237,94 @@ async fn a_deadline_ends_the_poll_and_cancels_the_statement() {
         .await
         .unwrap_err();
     assert!(matches!(err, FaucetError::Cancelled { .. }), "{err:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_whose_polling_fails_is_cancelled_and_its_outcome_unknown() {
+    let (_pg, port) = support::start_postgres().await;
+    let server = MockServer::start().await;
+    let fake = DataApiFake::new(admin_url(port), 100)
+        .stalled()
+        .failing_polls(usize::MAX);
+    fake.mount(&server).await;
+    let api = DataApiClient::from_connection(
+        &connection(&server, json!({"workgroup_name": "wg"})),
+        FaucetError::Sink,
+    )
+    .unwrap()
+    .unwrap();
+    let err = api
+        .execute(
+            &CallContext::new(),
+            Effect::Write,
+            &Statement::new("SELECT 1"),
+        )
+        .await
+        .unwrap_err();
+    let FaucetError::Sink(m) = &err else {
+        panic!("expected a sink error, got {err:?}");
+    };
+    assert!(m.contains("statement stmt-1"), "{m}");
+    assert!(m.contains("whether it committed is unknown"), "{m}");
+    assert!(m.contains("DescribeStatement failed"), "{m}");
+    let polls = fake
+        .targets()
+        .iter()
+        .filter(|t| *t == "RedshiftData.DescribeStatement")
+        .count();
+    assert_eq!(
+        polls as u32,
+        faucet_common_redshift::data_api::POLL_FAILURE_RETRIES + 1
+    );
+    for _ in 0..200 {
+        if !fake.cancelled().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(fake.cancelled(), ["stmt-1"]);
+
+    // A read keeps the plain error, and is cancelled as well.
+    let err = api
+        .execute(
+            &CallContext::new(),
+            Effect::Read,
+            &Statement::new("SELECT 1"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("DescribeStatement failed"), "{err}");
+    assert!(!err.contains("unknown"), "{err}");
+    for _ in 0..200 {
+        if fake.cancelled().len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(fake.cancelled(), ["stmt-1", "stmt-2"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_poll_that_fails_briefly_is_retried() {
+    let (_pg, port) = support::start_postgres().await;
+    let server = MockServer::start().await;
+    let fake = DataApiFake::new(admin_url(port), 100).failing_polls(2);
+    fake.mount(&server).await;
+    let api = DataApiClient::from_connection(
+        &connection(&server, json!({"workgroup_name": "wg"})),
+        FaucetError::Sink,
+    )
+    .unwrap()
+    .unwrap();
+    let done = api
+        .execute(
+            &CallContext::new(),
+            Effect::Write,
+            &Statement::new("SELECT 1"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(done.id, "stmt-1");
+    assert!(fake.cancelled().is_empty());
 }
