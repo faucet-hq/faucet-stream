@@ -12,7 +12,7 @@ Reach for it when you want a database query, a CDC stream, a CSV dump, or an API
 ## Feature highlights
 
 - **Four catalog backends, one config shape** — REST (Polaris, Nessie, Tabular, …), AWS Glue, SQL-backed (Postgres/SQLite/…), and Hive Metastore, each selected by a Cargo feature and a single `catalog.type` discriminator.
-- **Local & cloud warehouses** — REST resolves FileIO server-side; the SQL/Glue/HMS catalogs pick an OpenDAL-backed storage factory from the `warehouse` URI scheme (`file://`, `s3://`/`s3a://`, `gs://`).
+- **Local & cloud warehouses** — the REST catalog opens each table file with OpenDAL storage chosen from the file's scheme (`file://`, `s3://`/`s3a://`, `gs://`), configured from `catalog.properties` plus the server's config and any credentials it vends; the SQL/Glue/HMS catalogs pick the storage from the `warehouse` URI scheme.
 - **Atomic snapshot commits** — each `flush()` writes the Parquet footer and registers the new data files in a single `fast_append` transaction. One `StreamPage` becomes exactly one snapshot.
 - **Schema inference on create** — when `create_if_missing` is set and the table is new, the Iceberg schema is inferred from the first Arrow batch (every field becomes a nullable column typed by its first non-null value; a field null in every sampled record becomes a nullable `string`).
 - **Partitioned tables** — writes to a partitioned table (new or existing) are split by the table's default partition spec, one data file per partition; on create, `identity`, `year`, `month`, `day`, `hour`, `void`, plus parameterized `bucket[N]` / `truncate[N]`.
@@ -36,7 +36,7 @@ cargo install faucet-cli --features sink-iceberg                    # REST only
 cargo install faucet-cli --features sink-iceberg,sink-iceberg-glue  # REST + Glue
 ```
 
-The umbrella crate mirrors the same shape — `sink-iceberg` enables the REST catalog; `sink-iceberg-glue` / `sink-iceberg-sql` / `sink-iceberg-hms` forward the catalog features onto the sink. Enabling any non-REST catalog automatically pulls in `storage-opendal` (S3/GCS/local warehouse support).
+The umbrella crate mirrors the same shape — `sink-iceberg` enables the REST catalog; `sink-iceberg-glue` / `sink-iceberg-sql` / `sink-iceberg-hms` forward the catalog features onto the sink. Every catalog feature pulls in `storage-opendal` (S3/GCS/local warehouse support).
 
 ## Quick start
 
@@ -127,7 +127,7 @@ Configuring a catalog type whose feature is not compiled in returns `FaucetError
 
 ### Warehouse storage
 
-All catalogs support both cloud object stores and local filesystems. The **REST** catalog resolves FileIO server-side from the catalog config + `s3.*` properties. The **SQL / Glue / HMS** catalogs select an OpenDAL-backed storage factory from the `warehouse` URI scheme:
+All catalogs support both cloud object stores and local filesystems. Table files are read and written by faucet itself through OpenDAL. The **REST** catalog picks the storage from each file's scheme (`file://`, `s3://`/`s3a://`, `gs://`) and configures it from `catalog.properties`, the server's `/v1/config`, and the per-table config — so credentials the catalog vends (`s3.access-key-id`, `s3.session-token`, …) are used as-is. Java-only properties such as `io-impl` are ignored, and S3 remote signing is not supported (use credential vending or static keys). The **SQL / Glue / HMS** catalogs select an OpenDAL-backed storage factory from the `warehouse` URI scheme:
 
 | Warehouse scheme | Storage |
 |---|---|
@@ -135,12 +135,12 @@ All catalogs support both cloud object stores and local filesystems. The **REST*
 | `s3://…` / `s3a://…` | Amazon S3 / S3-compatible (MinIO, …) |
 | `gs://…` | Google Cloud Storage |
 
-Cloud storage is enabled automatically when you enable a non-REST catalog feature (each of `catalog-glue` / `catalog-sql` / `catalog-hms` also enables `storage-opendal`). Pass storage credentials/options through `catalog.properties`:
+Cloud storage is enabled automatically by every catalog feature (each `catalog-*` feature also enables `storage-opendal`). Pass storage credentials/options through `catalog.properties`:
 
 - **S3:** `s3.region`, `s3.endpoint` (for S3-compatible stores), `s3.access-key-id`, `s3.secret-access-key`, `s3.path-style-access`, `s3.disable-config-load`.
 - **GCS:** `gcs.credentials-json`, `gcs.no-auth`, `gcs.service.path`.
 
-Schemes without a built-in factory (e.g. `oss://`, `abfss://`) are rejected at config-load time for the non-REST catalogs; use the REST catalog for those object stores.
+Schemes without a built-in factory (e.g. `oss://`, `abfss://`) are rejected at config-load time for the non-REST catalogs, and fail at the first table access under the REST catalog.
 
 ## Examples
 
@@ -357,7 +357,7 @@ sink.flush().await?;
 | `catalog-glue` | no | AWS Glue catalog (also enables `storage-opendal`). |
 | `catalog-sql` | no | SQL-backed catalog (also enables `storage-opendal`). |
 | `catalog-hms` | no | Hive Metastore catalog (also enables `storage-opendal`). |
-| `storage-opendal` | no (auto) | OpenDAL S3/GCS/local warehouse storage factory for the non-REST catalogs. Auto-enabled by each non-REST catalog feature. |
+| `storage-opendal` | no (auto) | OpenDAL S3/GCS/local warehouse storage. Auto-enabled by every catalog feature. |
 
 Each feature forwards to the same-named feature of `faucet-common-iceberg`, so the sink and `faucet-source-iceberg` gate catalogs identically.
 
@@ -368,7 +368,7 @@ In the CLI/umbrella, the corresponding feature is `sink-iceberg` (REST), with `s
 | Symptom | Likely cause & fix |
 |---------|--------------------|
 | `FaucetError::Config: catalog '…' requires a non-empty uri` | `rest` / `sql` / `hms` catalogs need a `uri`. Set it (Glue is the only catalog that resolves its endpoint from AWS config). |
-| `FaucetError::Config: warehouse scheme '…://' is not supported` | A non-REST catalog got an unsupported warehouse scheme. Use `file://`, `s3://`, `s3a://`, or `gs://` — or switch to the REST catalog, which accepts any scheme (it resolves FileIO server-side). |
+| `FaucetError::Config: warehouse scheme '…://' is not supported` | A non-REST catalog got an unsupported warehouse scheme. Use `file://`, `s3://`, `s3a://`, or `gs://`. |
 | `unknown variant 'overwrite'` / `write_mode … rejected` | Only `append` is supported. `upsert`/`delete` parse but are rejected at `new()`; `overwrite` is not a variant. See [Write mode](#write-mode-append-only). |
 | Catalog type fails at startup despite a valid config | The catalog's Cargo feature isn't compiled in. Rebuild with `--features catalog-glue` (or `-sql` / `-hms`) — `catalog-rest` is the only one in the default build. |
 | `faucet doctor` catalog probe times out / fails | Verify the catalog URI, credentials, and network reachability. The probe calls `table_exists` and is bounded by `--timeout-secs`. |

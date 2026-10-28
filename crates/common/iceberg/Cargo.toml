@@ -14,7 +14,7 @@ categories.workspace = true
 # No default catalog: each connector's `catalog-*` features forward here, so the
 # source and sink gate catalogs identically.
 default = []
-catalog-rest = ["dep:iceberg-catalog-rest"]
+catalog-rest = ["dep:iceberg-catalog-rest", "storage-opendal"]
 catalog-glue = ["dep:iceberg-catalog-glue", "storage-opendal"]
 catalog-sql  = ["dep:iceberg-catalog-sql",  "storage-opendal"]
 catalog-hms  = ["dep:iceberg-catalog-hms",  "storage-opendal"]
