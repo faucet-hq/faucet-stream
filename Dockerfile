@@ -35,7 +35,7 @@
 # selected features can contain one (`full` or a name with `oracle`); `true` /
 # `false` force it.
 
-ARG RUST_VERSION=1.96.0
+ARG RUST_VERSION=1.99.1
 ARG DEBIAN_RELEASE=bookworm
 ARG ORACLE_CLIENT=auto
 

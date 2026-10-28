@@ -97,7 +97,7 @@ impl Registry {
     fn dec_queued(&self) {
         let _ = self
             .queued
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |q| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |q| {
                 Some(q.saturating_sub(1))
             });
     }
@@ -106,7 +106,7 @@ impl Registry {
     fn dec_in_flight(&self) {
         let _ = self
             .in_flight
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 Some(n.saturating_sub(1))
             });
     }

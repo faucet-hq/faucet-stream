@@ -16,6 +16,7 @@ use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, transport::Server};
 
+#[allow(clippy::result_large_err)] // tonic-generated: `Status` is large by design
 pub mod pb {
     tonic::include_proto!("faucet.test.echo");
 }

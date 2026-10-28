@@ -382,7 +382,7 @@ cargo add faucet-stream                                         # as a library
 
 Prebuilt archives with SHA-256 checksums are on the
 [releases page](https://github.com/faucet-hq/faucet-stream/releases). The minimum supported
-Rust version is 1.96. See the [installation guide](https://faucet-hq.github.io/faucet-stream/getting-started/installation.html)
+Rust version is 1.99. See the [installation guide](https://faucet-hq.github.io/faucet-stream/getting-started/installation.html)
 for container images and slim builds. Prebuilt binaries cover macOS and Linux.
 
 Pin the version a project uses in its `mise.toml` (`faucet init` writes it) and
