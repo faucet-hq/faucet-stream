@@ -250,3 +250,94 @@ async fn sql_catalog_table_in_s3_reads_back() {
     });
     assert_reads(catalog, &warehouse).await;
 }
+
+/// Drain `mode: incremental` from `bookmark`, returning the ids read and the
+/// last page's bookmark.
+async fn read_incremental(catalog: &Value, bookmark: Option<Value>) -> (Vec<i64>, Option<Value>) {
+    use futures::StreamExt;
+    let cfg: IcebergSourceConfig = serde_json::from_value(json!({
+        "catalog": catalog,
+        "table": "db.events",
+        "mode": "incremental",
+    }))
+    .expect("source config");
+    let source = IcebergSource::new(cfg).await.expect("source");
+    if let Some(b) = bookmark {
+        source.apply_start_bookmark(b).await.expect("bookmark");
+    }
+    let ctx = std::collections::HashMap::new();
+    let mut pages = source.stream_pages(&ctx, 0);
+    let (mut ids, mut last) = (Vec::new(), None);
+    while let Some(page) = pages.next().await {
+        let page = page.expect("page");
+        ids.extend(page.records.iter().map(|r| r["id"].as_i64().unwrap()));
+        if page.bookmark.is_some() {
+            last = page.bookmark;
+        }
+    }
+    ids.sort_unstable();
+    (ids, last)
+}
+
+/// `mode: incremental` reads only the snapshots appended since its bookmark
+/// (#967), over the SQL catalog with the table in MinIO.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incremental_mode_reads_only_snapshots_appended_since_the_bookmark() {
+    let minio = stores::minio().await;
+    create_bucket(&minio.endpoint).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let catalog = json!({
+        "type": "sql",
+        "uri": format!("sqlite:{}?mode=rwc", dir.path().join("catalog.db").display()),
+        "warehouse": format!("s3://{BUCKET}/incremental"),
+        "properties": s3_props(&minio.endpoint)
+    });
+    let cfg: CatalogConfig = serde_json::from_value(catalog.clone()).expect("catalog config");
+    let writer = build_catalog(&cfg).await.expect("catalog");
+    let ns = NamespaceIdent::from_strs(["db"]).unwrap();
+    writer
+        .create_namespace(&ns, Default::default())
+        .await
+        .expect("create namespace");
+    let schema = Schema::builder()
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()
+        .expect("schema");
+    let table = writer
+        .create_table(
+            &ns,
+            TableCreation::builder()
+                .name("events".to_string())
+                .schema(schema)
+                .build(),
+        )
+        .await
+        .expect("create table");
+
+    let table = append(writer.as_ref(), &table, 0..10).await;
+    let (ids, first) = read_incremental(&catalog, None).await;
+    assert_eq!(ids, (0..10).collect::<Vec<_>>());
+    let first = first.expect("a bookmark");
+    assert_eq!(
+        first["snapshot_id"].as_i64(),
+        table.metadata().current_snapshot_id(),
+        "{first}"
+    );
+
+    let table = append(writer.as_ref(), &table, 10..14).await;
+    append(writer.as_ref(), &table, 14..15).await;
+    let (ids, second) = read_incremental(&catalog, Some(first)).await;
+    assert_eq!(
+        ids,
+        (10..15).collect::<Vec<_>>(),
+        "only the two new snapshots"
+    );
+    let (ids, _) = read_incremental(&catalog, second).await;
+    assert!(
+        ids.is_empty(),
+        "nothing new since the last bookmark: {ids:?}"
+    );
+}
