@@ -1442,10 +1442,10 @@ select {
 .tpl-body-wrap[hidden] { display: none; }
 .tpl-body {
   margin: 0;
-  padding-right: 52px;
   max-height: 340px;
   overflow: auto;
-  padding: 13px 15px;
+  /* The right side clears the copy button. */
+  padding: 13px 52px 13px 15px;
   background: var(--term-bg);
   color: var(--term-ink);
   border: 1px solid var(--border-strong);

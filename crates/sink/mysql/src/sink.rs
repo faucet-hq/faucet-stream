@@ -698,8 +698,6 @@ fn split_writable(
     (split.outcomes, split.writable, split.positions)
 }
 
-/// Whether a MySQL `DATA_TYPE` (or a full `COLUMN_TYPE` such as
-/// `varbinary(32)`) stores raw bytes.
 /// An RFC 3339 instant bound for a `DATETIME` or `TIMESTAMP` column, as text
 /// MySQL stores as that instant (#975), or `None` for any other value or
 /// column. MySQL refuses a `Z` suffix and shifts an offset into the session
@@ -723,6 +721,8 @@ pub(crate) fn instant_text(value: &str, data_type: &str) -> Option<String> {
     Some(format!("{}{suffix}", utc.format("%Y-%m-%d %H:%M:%S%.f")))
 }
 
+/// Whether a MySQL `DATA_TYPE` (or a full `COLUMN_TYPE` such as
+/// `varbinary(32)`) stores raw bytes.
 pub(crate) fn is_binary_type(data_type: &str) -> bool {
     let base = data_type
         .trim()
