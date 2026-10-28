@@ -141,7 +141,7 @@ let rows = source.fetch_all().await?;
 | `catalog-glue` | no | AWS Glue catalog (+ `storage-opendal`) |
 | `catalog-sql` | no | SQL-backed catalog (+ `storage-opendal`) |
 | `catalog-hms` | no | Hive Metastore catalog (+ `storage-opendal`) |
-| `storage-opendal` | no (auto) | OpenDAL S3 / GCS / local warehouse storage for the non-REST catalogs |
+| `storage-opendal` | no (auto) | OpenDAL S3 / GCS / local warehouse storage (auto-enabled by every catalog feature) |
 | `arrow` | no | Columnar fast path (`supports_columnar` / `stream_batches`) |
 
 The catalog features forward to [`faucet-common-iceberg`](https://crates.io/crates/faucet-common-iceberg), the same crate the sink uses, so both connectors gate catalogs identically.

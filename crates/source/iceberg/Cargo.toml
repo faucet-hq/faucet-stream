@@ -14,7 +14,7 @@ categories.workspace = true
 default = ["catalog-rest"]
 # Catalog clients are shared with the sink through faucet-common-iceberg, so
 # both connectors gate catalogs identically.
-catalog-rest = ["faucet-common-iceberg/catalog-rest"]
+catalog-rest = ["faucet-common-iceberg/catalog-rest", "storage-opendal"]
 catalog-glue = ["faucet-common-iceberg/catalog-glue", "storage-opendal"]
 catalog-sql  = ["faucet-common-iceberg/catalog-sql",  "storage-opendal"]
 catalog-hms  = ["faucet-common-iceberg/catalog-hms",  "storage-opendal"]
