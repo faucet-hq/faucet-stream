@@ -43,6 +43,8 @@ impl PostgresSource {
     /// Create a new PostgreSQL source. Establishes a connection pool.
     pub async fn new(config: PostgresSourceConfig) -> Result<Self, FaucetError> {
         config.validate()?;
+        // A build linking two rustls providers has no default; TLS would panic.
+        let _ = rustls::crypto::ring::default_provider().install_default();
 
         let pool = PgPoolOptions::new()
             .max_connections(config.max_connections)

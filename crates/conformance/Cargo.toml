@@ -23,11 +23,14 @@ futures-core.workspace = true
 # place this crate builds a runtime of its own.
 tokio = { workspace = true, features = ["time", "net", "rt", "rt-multi-thread", "io-util", "sync"] }
 testcontainers = { version = "0.27", optional = true }
+# Throwaway CA / server / client certificates for the TLS integration tests (#967).
+rcgen = { version = "0.14", optional = true }
+tempfile = { workspace = true, optional = true }
 
 [features]
 # The shared container start helper (#841) for connector integration tests;
 # off by default so the conformance battery pulls no Docker client.
-containers = ["dep:testcontainers", "tokio/net", "tokio/io-util"]
+containers = ["dep:testcontainers", "dep:rcgen", "dep:tempfile", "tokio/net", "tokio/io-util"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "test-util", "io-util"] }
