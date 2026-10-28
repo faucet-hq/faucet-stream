@@ -84,3 +84,41 @@ async fn reads_over_every_ssl_mode_and_refuses_bad_certificates() {
         }
     }
 }
+
+/// `ssl-mode=VERIFY_CA` must trust the CA without checking the hostname. With
+/// sqlx 0.8.6 and rustls 0.23.46 it checks the hostname too (#974).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "sqlx 0.8.6 verify-ca hostname bug (#974); re-enable when sqlx is fixed"]
+async fn verify_ca_ignores_a_name_off_the_certificate() {
+    let tls = TlsFixture::for_names(&["localhost"]);
+    let db = containers::start(|| images::mysql(&tls)).await;
+    let port = db.get_host_port_ipv4(images::MYSQL_PORT).await.unwrap();
+    images::mysql_exec(
+        &db,
+        "CREATE TABLE items (id INT PRIMARY KEY, v TEXT); INSERT INTO items VALUES (1, 'a');",
+    )
+    .await;
+    let rows = read(url("127.0.0.1", port, &verify("VERIFY_CA", &tls.ca_path())))
+        .await
+        .expect("VERIFY_CA by an IP the certificate does not name");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+}
+
+/// Today's behaviour, pinned until #974 is fixed upstream: `VERIFY_CA` by a
+/// name the certificate does not cover is refused like `VERIFY_IDENTITY`,
+/// with a typed error.
+#[tokio::test(flavor = "multi_thread")]
+async fn verify_ca_and_verify_identity_refuse_a_name_off_the_certificate_today() {
+    let tls = TlsFixture::for_names(&["localhost"]);
+    let db = containers::start(|| images::mysql(&tls)).await;
+    let port = db.get_host_port_ipv4(images::MYSQL_PORT).await.unwrap();
+    for mode in ["VERIFY_CA", "VERIFY_IDENTITY"] {
+        match read(url("127.0.0.1", port, &verify(mode, &tls.ca_path()))).await {
+            Err(FaucetError::Config(msg)) => assert!(
+                msg.contains("MySQL connection failed") && msg.contains("not valid for name"),
+                "{mode}: {msg}"
+            ),
+            other => panic!("{mode} by 127.0.0.1 must be refused today, got {other:?}"),
+        }
+    }
+}
