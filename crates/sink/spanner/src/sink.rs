@@ -408,7 +408,7 @@ fn spanner_declared_type(t: &faucet_core::LogicalType) -> Option<&'static str> {
 
 /// Whether `value` fits the column a declared `t` creates (#975): a declared
 /// decimal created as `NUMERIC` holds 29 integer and 9 fractional digits; one
-/// created as `STRING(MAX)` holds any digits.
+/// created as `STRING(MAX)` holds any digits; a `TIMESTAMP` keeps nanoseconds.
 fn spanner_fits(t: &faucet_core::LogicalType, value: &Value) -> bool {
     use faucet_core::LogicalType as L;
     match *t {
@@ -422,7 +422,7 @@ fn spanner_fits(t: &faucet_core::LogicalType, value: &Value) -> bool {
             scale: None,
         }
         .accepts(value),
-        _ => t.accepts(value),
+        _ => t.accepts(value) && t.fits_fraction(value, 9),
     }
 }
 
@@ -1830,6 +1830,17 @@ mod tests {
         assert_eq!(spanner_declared_type(&L::Uuid), None);
         assert_eq!(spanner_declared_type(&L::Bytes), Some("BYTES(MAX)"));
         assert_eq!(spanner_declared_type(&L::Int64), Some("INT64"));
+    }
+
+    #[test]
+    fn a_timestamp_beyond_nanoseconds_keeps_the_inferred_type() {
+        use faucet_core::LogicalType as L;
+        let ts = L::Timestamp { tz: true };
+        assert!(spanner_fits(&ts, &json!("2024-01-01T00:00:00.123456789Z")));
+        assert!(!spanner_fits(
+            &ts,
+            &json!("2024-01-01T00:00:00.1234567891Z")
+        ));
     }
 
     #[test]

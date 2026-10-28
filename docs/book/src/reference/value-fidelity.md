@@ -141,9 +141,12 @@ The rules every sink follows:
   column the dialect creates** — a decimal within its precision and scale (an
   unbounded decimal checked against the fixed type it becomes: MySQL
   `DECIMAL(65,30)`, ClickHouse `Decimal(76, 38)`, Oracle `NUMBER`'s 38
-  significant digits, BigQuery `NUMERIC` / `BIGNUMERIC`), a timestamp within
-  the sub-second digits the column keeps (microseconds in MySQL, ClickHouse
-  and BigQuery). A value that would be rounded keeps the inferred column. A transform or a
+  significant digits, BigQuery `NUMERIC` / `BIGNUMERIC`; a precision without
+  a scale, `numeric(p)`, is scale 0), a time or timestamp within the
+  sub-second digits the column keeps (microseconds in PostgreSQL, Redshift,
+  DuckDB, MySQL, ClickHouse, Databricks and BigQuery; 7 digits in SQL Server;
+  nanoseconds in Oracle, Snowflake and Spanner). A value that would be rounded
+  keeps the inferred column. A transform or a
   masking rule that rewrote a column (a hashed date, a renamed field) therefore
   keeps today's inferred type for that column. A column the page does not
   carry is not created, and an undeclared one (a transform's output, the

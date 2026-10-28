@@ -73,8 +73,12 @@ to the dialect's column type (`None` keeps the base type), and
 with. `SqlDialect::declared_fits` says whether a value fits the column a
 declared type creates (an unbounded decimal against the fixed type it becomes:
 MySQL `DECIMAL(65,30)`, ClickHouse `Decimal(76, 38)`, Oracle `NUMBER`,
-BigQuery `NUMERIC`/`BIGNUMERIC`; sub-second digits where a column keeps only
-microseconds), so a value that would be rounded keeps the inferred type.
+BigQuery `NUMERIC`/`BIGNUMERIC`; a declared precision without a scale is
+scale 0, as SQL reads `numeric(p)`; a time or timestamp within the
+fractional-second digits `SqlDialect::time_fraction_digits` says the created
+type keeps — 6 for Postgres, Redshift, DuckDB, MySQL, ClickHouse, Databricks
+and BigQuery, 7 for SQL Server, 9 for Oracle and Snowflake), so a value that
+would be rounded keeps the inferred type.
 `SqlSinkEngine::create_table_sql_declared` plans from the page and the
 declaration; `SqlSinkDriver` keeps the declaration a sink is handed
 (`SinkDriver::set_declared_columns`), creates from it, and in `complete_run`

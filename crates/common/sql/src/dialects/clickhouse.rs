@@ -68,7 +68,11 @@ impl SqlDialect for ClickHouse {
     /// An unbounded decimal is created as `Decimal(76, 38)`; timestamps keep
     /// microseconds.
     fn declared_fits(&self, t: &LogicalType, value: &faucet_core::Value) -> bool {
-        super::fits_bounded(t, value, (76, Some(38)), Some(6))
+        super::fits_bounded(t, value, Some((76, Some(38))), self.time_fraction_digits())
+    }
+
+    fn time_fraction_digits(&self) -> Option<usize> {
+        Some(6)
     }
 
     fn declared_type_name(&self, t: &LogicalType) -> Option<String> {
