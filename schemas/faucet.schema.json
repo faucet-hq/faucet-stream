@@ -11260,6 +11260,14 @@
             "config": {
               "type": "object",
               "properties": {
+                "authority_host": {
+                  "description": "Azure AD authority host the token request goes to, for a sovereign\nor private cloud (`https://login.microsoftonline.us`,\n`https://login.chinacloudapi.cn`). Unset uses `AZURE_AUTHORITY_HOST`\nfrom the environment, else the public cloud\n(`https://login.microsoftonline.com`). Must be `https://`; plain\n`http://` is accepted only for a loopback host.",
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "x-faucet-resource": "url"
+                },
                 "client_id": {
                   "description": "Application (client) id.",
                   "type": "string"
@@ -20409,6 +20417,14 @@
             "config": {
               "type": "object",
               "properties": {
+                "authority_host": {
+                  "description": "Azure AD authority host the token request goes to, for a sovereign\nor private cloud (`https://login.microsoftonline.us`,\n`https://login.chinacloudapi.cn`). Unset uses `AZURE_AUTHORITY_HOST`\nfrom the environment, else the public cloud\n(`https://login.microsoftonline.com`). Must be `https://`; plain\n`http://` is accepted only for a loopback host.",
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "x-faucet-resource": "url"
+                },
                 "client_id": {
                   "description": "Application (client) id.",
                   "type": "string"

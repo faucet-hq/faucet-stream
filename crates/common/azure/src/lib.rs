@@ -69,6 +69,15 @@ pub enum AzureCredentials {
         client_secret: String,
         /// Directory (tenant) id.
         tenant_id: String,
+        /// Azure AD authority host the token request goes to, for a sovereign
+        /// or private cloud (`https://login.microsoftonline.us`,
+        /// `https://login.chinacloudapi.cn`). Unset uses `AZURE_AUTHORITY_HOST`
+        /// from the environment, else the public cloud
+        /// (`https://login.microsoftonline.com`). Must be `https://`; plain
+        /// `http://` is accepted only for a loopback host.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(extend("x-faucet-resource" = "url"))]
+        authority_host: Option<String>,
     },
     /// `DefaultAzureCredential`-style resolution: the object-store builder's
     /// default chain (environment variables, workload identity, managed
@@ -127,14 +136,71 @@ impl AzureCredentials {
                 client_id,
                 client_secret,
                 tenant_id,
-            } => vec![
-                ("azure_storage_client_id", client_id.clone()),
-                ("azure_storage_client_secret", client_secret.clone()),
-                ("azure_storage_tenant_id", tenant_id.clone()),
-            ],
+                authority_host,
+            } => {
+                let mut entries = vec![
+                    ("azure_storage_client_id", client_id.clone()),
+                    ("azure_storage_client_secret", client_secret.clone()),
+                    ("azure_storage_tenant_id", tenant_id.clone()),
+                ];
+                if let Some(host) = authority_host {
+                    entries.push((
+                        "azure_storage_authority_host",
+                        host.trim().trim_end_matches('/').to_string(),
+                    ));
+                }
+                entries
+            }
             AzureCredentials::Default => Vec::new(),
         }
     }
+
+    /// Check the parts of this credential that can be wrong before any
+    /// request: a service principal's `authority_host` must be an `https://`
+    /// URL (or `http://` to a loopback host) with no credentials, query or
+    /// fragment.
+    pub fn validate(&self) -> Result<(), FaucetError> {
+        if let AzureCredentials::ServicePrincipal {
+            authority_host: Some(host),
+            ..
+        } = self
+        {
+            validate_authority_host(host)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_authority_host(raw: &str) -> Result<(), FaucetError> {
+    let bad = |why: &str| {
+        FaucetError::Config(format!(
+            "azure: service_principal authority_host '{raw}' {why}"
+        ))
+    };
+    let url = url::Url::parse(raw.trim()).map_err(|e| bad(&format!("is not a URL: {e}")))?;
+    let loopback = match url.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => return Err(bad("has no host")),
+    };
+    match url.scheme() {
+        "https" => {}
+        "http" if loopback => {}
+        "http" => {
+            return Err(bad(
+                "must use https:// (http:// is allowed only for a loopback host)",
+            ));
+        }
+        other => return Err(bad(&format!("must use https://, not {other}://"))),
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(bad("must not carry credentials"));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(bad("must not have a query or fragment"));
+    }
+    Ok(())
 }
 
 /// Parse an Azure storage connection string into the `object_store` config
@@ -202,7 +268,8 @@ fn parse_connection_string(cs: &str) -> Vec<(&'static str, String)> {
 
 /// The `AZURE_*` environment settings an explicitly configured credential
 /// still takes: the account, endpoint and HTTP-client options, plus the
-/// identity endpoint for a managed identity — never another credential, so
+/// identity endpoint for a managed identity and the authority host for a
+/// service principal — never another credential, so
 /// a key, secret or workload identity in the environment cannot replace the
 /// one the config names.
 fn env_fallback(
@@ -210,6 +277,7 @@ fn env_fallback(
     vars: impl IntoIterator<Item = (String, String)>,
 ) -> Vec<(AzureConfigKey, String)> {
     let managed = matches!(auth, AzureCredentials::ManagedIdentity { .. });
+    let principal = matches!(auth, AzureCredentials::ServicePrincipal { .. });
     let mut out = Vec::new();
     for (name, value) in vars {
         if name == "IDENTITY_ENDPOINT" {
@@ -234,6 +302,7 @@ fn env_fallback(
             AzureConfigKey::MsiEndpoint
             | AzureConfigKey::ObjectId
             | AzureConfigKey::MsiResourceId => managed,
+            AzureConfigKey::AuthorityHost => principal,
             _ => false,
         };
         if keep {
@@ -384,6 +453,14 @@ pub fn build_store(conn: &AzureConnection) -> Result<Arc<dyn ObjectStore>, Fauce
 pub fn build_azure(
     conn: &AzureConnection,
 ) -> Result<Arc<object_store::azure::MicrosoftAzure>, FaucetError> {
+    let store = configured_builder(conn)?
+        .build()
+        .map_err(|e| FaucetError::Config(format!("azure: failed to build client: {e}")))?;
+    Ok(Arc::new(store))
+}
+
+fn configured_builder(conn: &AzureConnection) -> Result<MicrosoftAzureBuilder, FaucetError> {
+    conn.auth.validate()?;
     if conn.container.trim().is_empty() {
         return Err(FaucetError::Config(
             "azure: container name must not be empty".into(),
@@ -423,11 +500,7 @@ pub fn build_azure(
             .map_err(|e| FaucetError::Config(format!("azure: unknown config key '{key}': {e}")))?;
         builder = builder.with_config(config_key, value);
     }
-
-    let store = builder
-        .build()
-        .map_err(|e| FaucetError::Config(format!("azure: failed to build client: {e}")))?;
-    Ok(Arc::new(store))
+    Ok(builder)
 }
 
 #[cfg(test)]
@@ -603,11 +676,113 @@ mod tests {
             client_id: "cid".into(),
             client_secret: "secret".into(),
             tenant_id: "tid".into(),
+            authority_host: None,
         };
         let entries = creds.config_entries();
         assert!(entries.contains(&("azure_storage_client_id", "cid".to_string())));
         assert!(entries.contains(&("azure_storage_client_secret", "secret".to_string())));
         assert!(entries.contains(&("azure_storage_tenant_id", "tid".to_string())));
+    }
+
+    fn principal(authority_host: Option<&str>) -> AzureCredentials {
+        AzureCredentials::ServicePrincipal {
+            client_id: "cid".into(),
+            client_secret: "sec".into(),
+            tenant_id: "tid".into(),
+            authority_host: authority_host.map(str::to_string),
+        }
+    }
+
+    fn resolved_authority_host(auth: AzureCredentials) -> Option<String> {
+        let conn = AzureConnection::new("c").account("acct").auth(auth);
+        configured_builder(&conn)
+            .unwrap()
+            .get_config_value(&AzureConfigKey::AuthorityHost)
+    }
+
+    #[test]
+    fn service_principal_defaults_to_the_public_cloud_authority() {
+        let creds = principal(None);
+        assert!(
+            !creds
+                .config_entries()
+                .iter()
+                .any(|(k, _)| *k == "azure_storage_authority_host")
+        );
+        assert_eq!(resolved_authority_host(creds), None);
+        let v: AzureCredentials = serde_json::from_value(json!({
+            "type": "service_principal",
+            "config": {"client_id": "c", "client_secret": "s", "tenant_id": "t"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            v,
+            AzureCredentials::ServicePrincipal {
+                authority_host: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn service_principal_authority_host_reaches_the_builder() {
+        assert_eq!(
+            resolved_authority_host(principal(Some("https://login.microsoftonline.us/"))),
+            Some("https://login.microsoftonline.us".to_string())
+        );
+        assert_eq!(
+            resolved_authority_host(principal(Some("http://127.0.0.1:8080"))),
+            Some("http://127.0.0.1:8080".to_string())
+        );
+        assert_eq!(
+            resolved_authority_host(principal(Some("http://[::1]:8080"))),
+            Some("http://[::1]:8080".to_string())
+        );
+        assert_eq!(
+            resolved_authority_host(principal(Some("http://localhost:8080"))),
+            Some("http://localhost:8080".to_string())
+        );
+    }
+
+    #[test]
+    fn service_principal_rejects_a_bad_authority_host() {
+        for (host, why) in [
+            ("login.microsoftonline.us", "is not a URL"),
+            ("http://login.microsoftonline.us", "must use https://"),
+            ("ftp://login.microsoftonline.us", "not ftp://"),
+            ("https://user:pw@login.microsoftonline.us", "credentials"),
+            ("https://login.microsoftonline.us/?x=1", "query or fragment"),
+            ("https://login.microsoftonline.us/#f", "query or fragment"),
+            ("unix:/run/sock", "has no host"),
+        ] {
+            let conn = AzureConnection::new("c")
+                .account("acct")
+                .auth(principal(Some(host)));
+            match build_store(&conn) {
+                Err(FaucetError::Config(msg)) => {
+                    assert!(msg.contains(why) && msg.contains(host), "{host}: {msg}")
+                }
+                other => panic!("{host}: expected a Config error, got {:?}", other.err()),
+            }
+        }
+        assert!(AzureCredentials::Default.validate().is_ok());
+    }
+
+    #[test]
+    fn service_principal_keeps_the_authority_host_from_the_environment() {
+        let env = vec![(
+            "AZURE_AUTHORITY_HOST".to_string(),
+            "https://login.chinacloudapi.cn".to_string(),
+        )];
+        let kept: Vec<_> = env_fallback(&principal(None), env.clone())
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(kept, vec![AzureConfigKey::AuthorityHost]);
+        let sas = AzureCredentials::SasToken {
+            sas_token: "sv=1".into(),
+        };
+        assert!(env_fallback(&sas, env).is_empty());
     }
 
     #[test]
@@ -634,13 +809,13 @@ mod tests {
 
     #[test]
     fn credentials_serde_service_principal_round_trip() {
-        let creds = AzureCredentials::ServicePrincipal {
-            client_id: "cid".into(),
-            client_secret: "sec".into(),
-            tenant_id: "tid".into(),
-        };
+        let creds = principal(Some("https://login.microsoftonline.us"));
         let v = serde_json::to_value(&creds).unwrap();
         assert_eq!(v["type"], "service_principal");
+        assert_eq!(
+            v["config"]["authority_host"],
+            "https://login.microsoftonline.us"
+        );
         let back: AzureCredentials = serde_json::from_value(v).unwrap();
         assert_eq!(back, creds);
     }
@@ -704,6 +879,7 @@ mod tests {
                     client_id: "cid".into(),
                     client_secret: "sec".into(),
                     tenant_id: "tid".into(),
+                    authority_host: None,
                 });
         assert!(build_store(&conn).is_ok());
     }

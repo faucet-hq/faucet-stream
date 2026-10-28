@@ -1,6 +1,5 @@
 # Connector config variants with no integration test, and why (#967).
 # Format: <crate dir>::<Enum>::<Variant> -- <reason>
-common/azure::AzureCredentials::ServicePrincipal -- the client-secret token request always goes to login.microsoftonline.com: an explicit credential drops AZURE_AUTHORITY_HOST from the environment and the config has no authority host, so no fake can answer it
 common/gcs::GcsCredentials::ServiceAccountJsonFile -- a key file is refused for any storage_host that is not googleapis.com (refuse_held_credentials_off_google), so it only runs against real GCS
 common/gcs::GcsCredentials::ServiceAccountJsonInline -- fake-gcs-server is plaintext http and refuse_credentials_over_plaintext refuses every non-anonymous credential there; the key is only sent to an https Google endpoint
 common/pubsub::PubsubCredentials::ServiceAccountJsonFile -- with emulator_host set the client skips authentication entirely (use_auth is false), so the key is only read against real Pub/Sub

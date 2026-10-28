@@ -17,7 +17,7 @@ Connection fields come from `faucet-common-azure` and are set at the top level:
 |---|---|---|
 | `container` | string | **Required.** Blob container / ADLS filesystem. |
 | `account` | string | Storage-account name (optional with a connection string / emulator). |
-| `auth` | `{ type, config }` | `account_key` / `sas_token` / `connection_string` / `managed_identity` / `service_principal` / `default`. With any explicit `auth`, `AZURE_*` credential variables in the environment are ignored (only `default` uses the environment's credential chain). A `connection_string` honours `EndpointSuffix`, `DefaultEndpointsProtocol` and `UseDevelopmentStorage=true`. |
+| `auth` | `{ type, config }` | `account_key` / `sas_token` / `connection_string` / `managed_identity` / `service_principal` / `default`. With any explicit `auth`, `AZURE_*` credential variables in the environment are ignored (only `default` uses the environment's credential chain). A `connection_string` honours `EndpointSuffix`, `DefaultEndpointsProtocol` and `UseDevelopmentStorage=true`. A `service_principal` (`client_id`, `client_secret`, `tenant_id`) takes an optional `authority_host` for a sovereign or private cloud (`https://login.microsoftonline.us`); unset, `AZURE_AUTHORITY_HOST` applies, else the public cloud. |
 | `endpoint` | string | Custom blob endpoint (emulator / sovereign cloud). |
 | `allow_http` | bool | Permit plaintext HTTP (Azurite). |
 | `use_emulator` | bool | Target the Azurite emulator. |
