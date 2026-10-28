@@ -113,6 +113,42 @@ async fn binary_frames_base64_encoded() {
     assert_eq!(records[0], serde_json::json!("aGVsbG8="));
 }
 
+/// `raw_string` keeps text frames as written (JSON stays text) and decodes a
+/// binary frame as UTF-8 (#967).
+#[tokio::test]
+async fn raw_string_frames_are_kept_as_text() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await {
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = ws.send(Message::Text(r#"{"id":1}"#.into())).await;
+            let _ = ws.send(Message::Text("not json".into())).await;
+            let _ = ws
+                .send(Message::Binary("caf\u{e9}".as_bytes().to_vec().into()))
+                .await;
+            while ws.next().await.is_some() {}
+        }
+    });
+    let mut cfg = base_config(&format!("ws://{addr}"));
+    cfg.message_format = WsMessageFormat::RawString;
+    cfg.max_messages = Some(3);
+    cfg.idle_timeout = Some(Duration::from_secs(5));
+    let records = WebsocketSource::new(cfg)
+        .unwrap()
+        .fetch_all()
+        .await
+        .unwrap();
+    assert_eq!(
+        records,
+        vec![
+            serde_json::json!("{\"id\":1}"),
+            serde_json::json!("not json"),
+            serde_json::json!("caf\u{e9}"),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn envelope_mode_wraps_record() {
     let url = spawn_pushing_server(vec![r#"{"id":1}"#.into()]).await;
