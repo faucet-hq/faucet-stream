@@ -54,7 +54,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1  # zizmor: ignore[artipacked] -- this job pushes the release commit and tags
         with:
           fetch-depth: 0
           # Check out (and thus push commits/tags) with an admin PAT, not the
@@ -250,7 +250,7 @@ jobs:
           SCOPE: ${{ inputs.scope }}
           BUMP: ${{ inputs.bump }}
           CUSTOM_CRATES: ${{ inputs.custom_crates }}
-        run: |
+        run: | # zizmor: ignore[use-trusted-publishing] -- manual fallback; trusted publishing needs crates.io setup for every crate
           set -uo pipefail
 
           read -ra all_crates <<< "$ordered_all"

@@ -289,8 +289,10 @@ jobs:
           merge-multiple: true
       - id: cargo-dist
         shell: bash
+        env:
+          TAG_FLAG: ${{ needs.plan.outputs.tag-flag }}
         run: |
-          dist build ${{ needs.plan.outputs.tag-flag }} --output-format=json "--artifacts=global" > dist-manifest.json
+          dist build ${TAG_FLAG} --output-format=json "--artifacts=global" > dist-manifest.json
           echo "dist ran successfully"
 
           # Parse out what we just built and upload it to scratch storage
@@ -358,8 +360,10 @@ jobs:
           merge-multiple: true
       - id: host
         shell: bash
+        env:
+          TAG_FLAG: ${{ needs.plan.outputs.tag-flag }}
         run: |
-          dist host ${{ needs.plan.outputs.tag-flag }} --steps=upload --steps=release --output-format=json > dist-manifest.json
+          dist host ${TAG_FLAG} --steps=upload --steps=release --output-format=json > dist-manifest.json
           echo "artifacts uploaded and released successfully"
           cat dist-manifest.json
           echo "manifest=$(jq -c "." dist-manifest.json)" >> "$GITHUB_OUTPUT"
@@ -402,19 +406,20 @@ jobs:
         env:
           PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
           RELEASE_COMMIT: "${{ github.sha }}"
+          TAG: ${{ needs.plan.outputs.tag }}
         run: |
           # If we're editing a release in place, we need to upload things ahead of time.
           # release-plz creates the GitHub release for this tag (create-release = false
           # in dist-workspace.toml); tolerate the small window where the tag exists but
           # the release record does not yet.
           for i in 1 2 3 4 5 6; do
-            if gh release view "${{ needs.plan.outputs.tag }}" >/dev/null 2>&1; then break; fi
-            echo "release for ${{ needs.plan.outputs.tag }} not visible yet (attempt $i); waiting 30s"
+            if gh release view "${TAG}" >/dev/null 2>&1; then break; fi
+            echo "release for ${TAG} not visible yet (attempt $i); waiting 30s"
             sleep 30
           done
-          gh release upload "${{ needs.plan.outputs.tag }}" artifacts/* --clobber
+          gh release upload "${TAG}" artifacts/* --clobber
 
-          gh release edit "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --draft=false
+          gh release edit "${TAG}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --draft=false
 
   # The Connector Hub feed (#572): attached to the release so the website
   # picks up every released connector without a manual snapshot.
@@ -448,10 +453,12 @@ jobs:
         with: # zizmor: ignore[cache-poisoning]
           key: connector-export
       - name: Export and upload connectors.json
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
         run: |
           cargo build -p faucet-cli --no-default-features --features full
           ./target/debug/faucet conformance --export --require-all > connectors.json
-          gh release upload "${{ needs.plan.outputs.tag }}" connectors.json --clobber
+          gh release upload "${TAG}" connectors.json --clobber
       # notify-site fires minutes after the release burst, long before this
       # job finishes, so that rebuild still reads the previous feed. Rebuild
       # the site again now that the feed is attached.
