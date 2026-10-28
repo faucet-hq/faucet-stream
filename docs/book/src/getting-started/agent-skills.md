@@ -11,6 +11,11 @@ faucet ships [Agent Skills](https://agentskills.io/) that teach coding agents
 | `faucet-connector` | Build a `faucet-source-*` or `faucet-sink-*` crate on `faucet-core`. |
 | `faucet-migrate` | Move a Singer-protocol or other ELT setup to faucet and cut over safely. |
 | `faucet-deploy` | Run faucet in production with `run`, `schedule` or `serve`. |
+| `faucet-api` | Drive `faucet serve` from another service: templates, runs, polling and errors over HTTP. |
+| `faucet-secrets` | Keep credentials out of run responses, run history and logs, and pick the right mechanism for each. |
+| `faucet-verify` | Prove a copy matches its source, table by table, before sign-off or cutover. |
+| `faucet-tune` | Find the bottleneck and make a pipeline fast enough, one measured change at a time. |
+| `faucet-operate` | Keep a running `faucet serve` or cluster healthy: health, stuck runs, members, upgrades, history. |
 
 The skills live in the faucet-stream repository under
 [`skills/`](https://github.com/faucet-hq/faucet-stream/tree/main/skills) and

@@ -9,7 +9,7 @@
     {
       "name": "faucet",
       "source": "./skills",
-      "description": "Write and validate faucet pipeline configs, debug runs, deploy faucet, migrate to it, use and publish Template Hub templates, and build connector crates.",
+      "description": "Write and validate faucet pipeline configs, debug, verify and tune runs, deploy and operate faucet, drive its HTTP API, handle credentials safely, migrate to it, use and publish Template Hub templates, and build connector crates.",
       "category": "Developer Tools"
     }
   ]
