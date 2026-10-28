@@ -127,6 +127,7 @@ members = [
 # `[patch]`, and they are never published.
 exclude = [
     "examples/wasm-transforms/rust",
+    "fuzz",
     "skills/faucet-connector/examples",
 ]
 

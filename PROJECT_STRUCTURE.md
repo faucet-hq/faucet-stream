@@ -35,6 +35,9 @@ skills/                       — agent skills (Claude Code / Codex plugin), ver
 schemas/                      — committed JSON Schema for pipeline configs (editor validation)
 examples/                     — repo-level examples: docker-compose infra stack + run index
   orchestration/              — ELT recipe: faucet (EL) + dbt (T) + Airflow/Dagster
+  wasm-transforms/            — reference `wasm` transform modules (hand-written .wat, Rust, AssemblyScript)
+fuzz/                         — cargo-fuzz targets (own workspace, nightly, never published)
+.clusterfuzzlite/             — ClusterFuzzLite build for fuzz/ (run on PRs by cflite_pr.yml)
 benchmarks/                   — benchmark harness and configs
 observability/                — Prometheus alert rules and Grafana dashboards
 Dockerfile                    — multi-stage image build (name-based connector selection)
@@ -47,6 +50,6 @@ deploy/                       — container + Kubernetes assets
 scripts/                      — helper and CI-check scripts (try-local.sh, build-image.sh, chaos/run.sh, …)
 docs/book/                    — mdBook documentation site (source under docs/book/src)
 rfcs/                         — design RFCs
-.github/workflows/            — ci.yml, release-plz.yml, docs.yml, docker-images.yml, chaos.yml, …
+.github/workflows/            — ci.yml, release-plz.yml, docs.yml, docker-images.yml, chaos.yml, codeql.yml, scorecard.yml, …
 .github/assets/               — brand assets: logo, wordmark, social-preview banner, favicon
 ```
