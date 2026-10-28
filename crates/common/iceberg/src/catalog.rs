@@ -180,6 +180,15 @@ async fn build_sql(_inner: &CatalogInner) -> Result<Arc<dyn Catalog>, FaucetErro
 
 // ── HMS ───────────────────────────────────────────────────────────────────────
 
+/// The `host:port` the HMS client dials: it resolves the address as a socket
+/// address, so the documented `thrift://host:port` form loses its scheme.
+#[cfg_attr(not(feature = "catalog-hms"), allow(dead_code))]
+fn hms_address(uri: &str) -> &str {
+    uri.strip_prefix("thrift://")
+        .unwrap_or(uri)
+        .trim_end_matches('/')
+}
+
 #[cfg(feature = "catalog-hms")]
 async fn build_hms(inner: &CatalogInner) -> Result<Arc<dyn Catalog>, FaucetError> {
     use iceberg::CatalogBuilder;
@@ -190,7 +199,10 @@ async fn build_hms(inner: &CatalogInner) -> Result<Arc<dyn Catalog>, FaucetError
     let mut props: HashMap<String, String> = inner.properties.clone();
 
     if let Some(uri) = &inner.uri {
-        props.insert(HMS_CATALOG_PROP_URI.to_string(), uri.clone());
+        props.insert(
+            HMS_CATALOG_PROP_URI.to_string(),
+            hms_address(uri).to_string(),
+        );
     }
     if let Some(warehouse) = &inner.warehouse {
         props.insert(HMS_CATALOG_PROP_WAREHOUSE.to_string(), warehouse.clone());
@@ -233,6 +245,13 @@ mod tests {
         for uri in ["postgres://h/m", "postgresql://h/m", "", "other://h"] {
             assert!(!uses_qmark(uri), "{uri}");
         }
+    }
+
+    #[test]
+    fn hms_address_drops_the_thrift_scheme() {
+        assert_eq!(hms_address("thrift://hms:9083"), "hms:9083");
+        assert_eq!(hms_address("thrift://hms:9083/"), "hms:9083");
+        assert_eq!(hms_address("127.0.0.1:9083"), "127.0.0.1:9083");
     }
 
     #[allow(dead_code)]

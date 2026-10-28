@@ -39,7 +39,9 @@ object_store.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 tempfile = "3"
-faucet-conformance.workspace = true
+faucet-conformance = { workspace = true, features = ["containers"] }
+faucet-common-azure = { workspace = true, features = ["testing"] }
+aws-sdk-s3.workspace = true
 serde_json.workspace = true
 schemars.workspace = true
 
