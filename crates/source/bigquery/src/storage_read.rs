@@ -81,24 +81,35 @@ fn check_row_count(sent: i64, decoded: usize) -> Result<(), FaucetError> {
 /// The Arrow IPC end-of-stream marker (continuation token, zero length).
 const IPC_EOS: [u8; 8] = [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
 
+/// Whether `buf` starts with an IPC schema message, i.e. is a whole IPC
+/// stream rather than a bare record-batch message.
+fn starts_with_schema(buf: &[u8]) -> bool {
+    let body = buf.strip_prefix(&IPC_EOS[..4]).unwrap_or(buf);
+    let Some(len) = body
+        .get(..4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+    else {
+        return false;
+    };
+    body.get(4..4 + len)
+        .and_then(|meta| arrow::ipc::root_as_message(meta).ok())
+        .is_some_and(|m| m.header_type() == arrow::ipc::MessageHeader::Schema)
+}
+
 /// Decode one Storage Read API Arrow message. The API sends the IPC schema
 /// once (first response) and each batch as a standalone IPC record-batch
-/// message; concatenating schema + batch bytes yields a decodable IPC stream.
+/// message; reading schema then batch yields a decodable IPC stream.
 fn decode_arrow(schema: &[u8], batch: &[u8]) -> Result<Vec<RecordBatch>, FaucetError> {
     use arrow::ipc::reader::StreamReader;
+    use std::io::Read as _;
     // Some servers send each message as a whole IPC stream (schema, batch, end marker).
-    let reader = match StreamReader::try_new(std::io::Cursor::new(batch.to_vec()), None) {
-        Ok(whole) => whole,
-        Err(_) => {
-            let schema = schema.strip_suffix(&IPC_EOS).unwrap_or(schema);
-            let mut buf = Vec::with_capacity(schema.len() + batch.len());
-            buf.extend_from_slice(schema);
-            buf.extend_from_slice(batch);
-            StreamReader::try_new(std::io::Cursor::new(buf), None).map_err(|e| {
-                FaucetError::Source(format!("BigQuery Storage Read arrow decode: {e}"))
-            })?
-        }
+    let schema: &[u8] = if starts_with_schema(batch) {
+        &[]
+    } else {
+        schema.strip_suffix(&IPC_EOS).unwrap_or(schema)
     };
+    let reader = StreamReader::try_new(schema.chain(batch), None)
+        .map_err(|e| FaucetError::Source(format!("BigQuery Storage Read arrow decode: {e}")))?;
     let mut out = Vec::new();
     for b in reader {
         out.push(
@@ -502,6 +513,14 @@ mod tests {
             2
         );
         assert!(super::decode_arrow(b"junk", batch_msg).is_err());
+        assert!(super::starts_with_schema(&stream));
+        assert!(super::starts_with_schema(schema_msg));
+        assert!(!super::starts_with_schema(batch_msg));
+        assert!(!super::starts_with_schema(b"junk"));
+        assert!(!super::starts_with_schema(&[]));
+        // The pre-0.15 framing (no continuation marker) is a whole stream too.
+        let legacy = &stream[4..];
+        assert!(super::starts_with_schema(legacy));
     }
 
     #[test]
