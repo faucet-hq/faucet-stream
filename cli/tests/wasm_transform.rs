@@ -1,21 +1,20 @@
 //! End-to-end: a real `faucet run` pipeline with a WASM transform, driving the
-//! precompiled reference module at `examples/wasm-transforms/add_field.wasm`
-//! (built from `examples/wasm-transforms/rust/`). Gated on `transform-wasm`.
+//! hand-written reference module `examples/wasm-transforms/add_field.wat`
+//! (WebAssembly text; no compiled binary is committed). Gated on `transform-wasm`.
 #![cfg(feature = "transform-wasm")]
 
 use assert_cmd::Command;
 use std::fs;
 use tempfile::TempDir;
 
-/// The committed reference module (Rust → wasm): uppercases `name` and stamps
-/// `wasm_processed: true`.
-const ADD_FIELD_WASM: &[u8] = include_bytes!("../../examples/wasm-transforms/add_field.wasm");
+/// The reference module: uppercases `name` and stamps `wasm_processed: true`.
+const ADD_FIELD_WAT: &str = include_str!("../../examples/wasm-transforms/add_field.wat");
 
 #[test]
 fn run_pipeline_with_wasm_transform() {
     let dir = TempDir::new().unwrap();
-    let module = dir.path().join("add_field.wasm");
-    fs::write(&module, ADD_FIELD_WASM).unwrap();
+    let module = dir.path().join("add_field.wat");
+    fs::write(&module, ADD_FIELD_WAT).unwrap();
 
     let csv = dir.path().join("in.csv");
     fs::write(&csv, "name,id\nalice,1\nbob,2\n").unwrap();
