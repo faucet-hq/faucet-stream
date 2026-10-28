@@ -269,32 +269,41 @@ fn required_param_hint(summary: &TemplateSummary) -> String {
 }
 
 fn print_params(summary: &TemplateSummary) {
-    if summary.params.is_empty() {
-        println!("params: (none — this template takes no overrides)");
-        return;
+    for line in param_lines(summary) {
+        println!("{line}");
     }
-    println!("\nparams:");
+}
+
+/// The `params:` block of `template show` / `register`. A secret param's
+/// default is never rendered.
+fn param_lines(summary: &TemplateSummary) -> Vec<String> {
+    if summary.params.is_empty() {
+        return vec!["params: (none — this template takes no overrides)".to_string()];
+    }
+    let mut lines = vec!["\nparams:".to_string()];
     for (name, p) in &summary.params {
         let requirement = if p.required {
             "required".to_string()
         } else {
             match &p.default {
+                Some(_) if p.is_secret() => "default (hidden)".to_string(),
                 Some(d) => format!("default {d}"),
                 None => "optional".to_string(),
             }
         };
-        println!(
+        lines.push(format!(
             "  {:<20} {:<7} {}{}{}",
             name,
             p.kind.as_str(),
             requirement,
-            if p.secret { "  [secret]" } else { "" },
+            if p.is_secret() { "  [secret]" } else { "" },
             match &p.description {
                 Some(d) => format!("  — {d}"),
                 None => String::new(),
             }
-        );
+        ));
     }
+    lines
 }
 
 async fn revalidate(args: TemplateRevalidateArgs) -> CliResult<()> {
@@ -1743,6 +1752,49 @@ pipeline:
         assert_eq!(hint, " --param tag=<string>");
         // `print_params` renders both without panicking.
         print_params(&summary);
+    }
+
+    #[test]
+    fn param_lines_never_render_a_secret_default() {
+        let mut params = crate::params::ParamsSpec::new();
+        params.insert(
+            "api_token".into(),
+            crate::params::ParamSpec {
+                kind: crate::params::ParamType::String,
+                default: Some(serde_json::json!("hunter2-literal")),
+                secret: true,
+                ..Default::default()
+            },
+        );
+        params.insert(
+            "page".into(),
+            crate::params::ParamSpec {
+                kind: crate::params::ParamType::Int,
+                default: Some(serde_json::json!(5)),
+                ..Default::default()
+            },
+        );
+        let summary = TemplateSummary {
+            kind: crate::hub::TemplateKind::Pipeline,
+            state: None,
+            id: "t".into(),
+            version: 1,
+            name: None,
+            description: None,
+            params,
+            created_at: chrono::Utc::now(),
+            created_by: None,
+            warnings: Vec::new(),
+        };
+        let out = param_lines(&summary).join("\n");
+        assert!(!out.contains("hunter2-literal"), "{out}");
+        let token = out.lines().find(|l| l.contains("api_token")).unwrap();
+        assert!(
+            token.contains("default (hidden)") && token.contains("[secret]"),
+            "{token}"
+        );
+        let page = out.lines().find(|l| l.contains("page")).unwrap();
+        assert!(page.contains("default 5"), "{page}");
     }
 
     #[tokio::test]
