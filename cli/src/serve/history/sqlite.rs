@@ -147,7 +147,10 @@ mod shard_tests {
             .await
             .unwrap();
 
-        let claimed = h.claim_shards(10).await.unwrap();
+        let claimed = h
+            .claim_shards(10, &crate::serve::pools::default_only())
+            .await
+            .unwrap();
         assert_eq!(claimed.len(), 3);
         // Largest estimated size first.
         assert_eq!(claimed[0].shard_id, "1");
@@ -161,7 +164,12 @@ mod shard_tests {
         assert_eq!(p.running, 3);
 
         // Everything is claimed → a second claim returns nothing.
-        assert!(h.claim_shards(10).await.unwrap().is_empty());
+        assert!(
+            h.claim_shards(10, &crate::serve::pools::default_only())
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -174,7 +182,10 @@ mod shard_tests {
         a.insert_shards("run1", &[shard("0", 1)]).await.unwrap();
 
         // A claims the only shard.
-        let claimed = a.claim_shards(10).await.unwrap();
+        let claimed = a
+            .claim_shards(10, &crate::serve::pools::default_only())
+            .await
+            .unwrap();
         assert_eq!(claimed.len(), 1);
 
         // B does not own it → cannot finalize.
@@ -205,7 +216,9 @@ mod shard_tests {
         let h = backend(&url, "inst-a", Duration::ZERO).await;
         seed_run(&h, "run1").await;
         h.insert_shards("run1", &[shard("0", 1)]).await.unwrap();
-        h.claim_shards(10).await.unwrap();
+        h.claim_shards(10, &crate::serve::pools::default_only())
+            .await
+            .unwrap();
 
         // First reclaim: attempt 0 < 2 → requeued back to pending.
         let r1 = h.reclaim_shards(2).await.unwrap();
@@ -214,10 +227,14 @@ mod shard_tests {
         assert_eq!(h.shard_progress("run1").await.unwrap().pending, 1);
 
         // Re-claim and reclaim until the attempt cap poisons it.
-        h.claim_shards(10).await.unwrap();
+        h.claim_shards(10, &crate::serve::pools::default_only())
+            .await
+            .unwrap();
         let r2 = h.reclaim_shards(2).await.unwrap();
         assert_eq!(r2.requeued, 1, "attempt 1 < 2 → still requeued");
-        h.claim_shards(10).await.unwrap();
+        h.claim_shards(10, &crate::serve::pools::default_only())
+            .await
+            .unwrap();
         let r3 = h.reclaim_shards(2).await.unwrap();
         assert_eq!(r3.failed, 1, "attempt 2 >= 2 → poisoned (failed)");
         assert_eq!(h.shard_progress("run1").await.unwrap().failed, 1);

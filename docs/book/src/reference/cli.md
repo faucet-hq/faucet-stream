@@ -1430,6 +1430,8 @@ Selected flags (`faucet serve --help` for the full list):
 | `--cluster` | Enable cluster mode: instances pull-balance `pending` runs from the shared `--history` DB and provide crash-failover. Requires a persistent `--history` backend (postgres or sqlite). See [Running a cluster](../cookbook/cluster.md). |
 | `--cluster-poll-secs <n>` | Claim-loop poll interval in seconds (default `2`). Also the maximum lag before a cross-instance cancel is propagated to the executing instance. |
 | `--cluster-max-attempts <n>` | Maximum total attempts (including crash-failovers) before a run is poisoned and marked `failed` (default `3`). |
+| `--pool <name>` | An execution pool this replica serves (#957). Repeatable or comma-separated; env `FAUCET_SERVE_POOLS`. Default: `default` only. A clustered replica claims only runs (and shards) in its pools; a submission to a pool no live member serves — or, unclustered, one this server does not serve — is a `422`. See [Execution pools](../cookbook/cluster.md#execution-pools). |
+| `--pool-wait-timeout-secs <n>` | With `--cluster`: fail a pending run whose pool no live member has served for `n` seconds (error `pool_unavailable`). Unset: such runs stay pending. Must be > 0. |
 | `--body-limit-bytes` / `--shutdown-grace-secs` / `--retain-terminal-runs-secs` / `--idempotency-retention-secs` | Tuning knobs. |
 | `--no-ui` | Disable the embedded web console at runtime even when the binary was built with `serve-ui`. |
 | `--local-output-retention-days <n>` | How long the local files a run's sinks wrote (jsonl/csv/parquet) are kept before the retention GC reclaims them (default `7`; env `FAUCET_LOCAL_SINK_OUTPUT_RETENTION_DAYS`). `0` disables the automatic sweep. See [Local output retention](#local-output-retention). |

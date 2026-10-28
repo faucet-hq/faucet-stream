@@ -71,6 +71,10 @@ pub struct BackfillSubmitRequest {
     /// would leave them waiting forever.
     #[serde(default)]
     pub callback: Option<crate::serve::callback::CallbackSpec>,
+    /// The execution pool every unit run goes to (#957); wins over the
+    /// config's `pool:`.
+    #[serde(default)]
+    pub pool: Option<String>,
     /// Continue a backfill of this exact range that was submitted before:
     /// already-submitted units replay, the rest are submitted.
     #[serde(default)]
@@ -308,6 +312,7 @@ pub async fn submit_backfill(
             budget: None,
             approved_change: None,
             selection: None,
+            pool: req.pool.clone(),
             trusted_config: false,
             server_file: false,
         };

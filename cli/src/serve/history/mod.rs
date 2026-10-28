@@ -240,6 +240,11 @@ pub struct RunRecord {
     /// caller reference policy wherever it runs (#881).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub caller_config: bool,
+    /// The execution pool the run belongs to (#957): only a replica serving
+    /// it claims the run, its shards and its re-claims. Records written before
+    /// pools existed read as `default`.
+    #[serde(default = "crate::serve::pools::default_pool")]
+    pub pool: String,
 }
 
 impl RunRecord {
@@ -277,6 +282,7 @@ impl RunRecord {
             selection: None,
             host_access: false,
             caller_config: false,
+            pool: crate::serve::pools::default_pool(),
         }
     }
 }
@@ -320,6 +326,8 @@ pub struct InstanceHeartbeat {
     pub in_flight: u32,
     /// The newest state format this instance reads (#736).
     pub state_format: u32,
+    /// The execution pools this instance serves (#957).
+    pub pools: Vec<String>,
 }
 
 /// One live cluster member (for `/readyz` + metrics).
@@ -334,6 +342,9 @@ pub struct InstanceRecord {
     /// The newest state format the member reads (#736); `0` for a member that
     /// predates versioned state (it never advertised one).
     pub state_format: u32,
+    /// The execution pools the member serves (#957); `None` for a member that
+    /// predates pools — it claims every pending run.
+    pub pools: Option<Vec<String>>,
 }
 
 /// The state format every live member reads (#736): the lowest any of them
@@ -793,9 +804,38 @@ pub trait RunHistory: Send + Sync {
     /// claimed records (with `config_body`) for the caller to execute. Exclusive:
     /// a run claimed by one caller is never returned to another. Default: none
     /// (memory is single-process and never writes `Pending`).
-    async fn claim_pending(&self, limit: usize) -> Result<Vec<RunRecord>, HistoryError> {
-        let _ = limit;
+    /// Only runs whose pool is in `pools` are claimed (#957).
+    async fn claim_pending(
+        &self,
+        limit: usize,
+        pools: &[String],
+    ) -> Result<Vec<RunRecord>, HistoryError> {
+        let _ = (limit, pools);
         Ok(Vec::new())
+    }
+
+    /// Pending runs per pool (#957), for the `faucet_serve_runs_pending`
+    /// gauge. Default: none.
+    async fn pending_by_pool(&self) -> Result<Vec<(String, usize)>, HistoryError> {
+        Ok(Vec::new())
+    }
+
+    /// Pending runs submitted before `before` whose pool is not in `served`
+    /// (#957): the candidates `--pool-wait-timeout-secs` fails. Default: none.
+    async fn stranded_pending(
+        &self,
+        served: &[String],
+        before: DateTime<Utc>,
+    ) -> Result<Vec<RunRecord>, HistoryError> {
+        let _ = (served, before);
+        Ok(Vec::new())
+    }
+
+    /// Write `rec` (already terminal) over a run that is still `Pending`.
+    /// `true` = this call made the transition. Default: `false`.
+    async fn fail_pending(&self, rec: &RunRecord) -> Result<bool, HistoryError> {
+        let _ = rec;
+        Ok(false)
     }
 
     /// Cluster failover: expired-lease `Running` runs whose `attempt < max_attempts`
@@ -910,8 +950,13 @@ pub trait RunHistory: Send + Sync {
     /// (`pending` → `running` with a fresh lease), largest-estimated-size first
     /// for skew-aware balancing, returning each with its parent run record.
     /// Exclusive, like [`claim_pending`](Self::claim_pending). Default: none.
-    async fn claim_shards(&self, limit: usize) -> Result<Vec<ClaimedShard>, HistoryError> {
-        let _ = limit;
+    /// Only shards of runs whose pool is in `pools` are claimed (#957).
+    async fn claim_shards(
+        &self,
+        limit: usize,
+        pools: &[String],
+    ) -> Result<Vec<ClaimedShard>, HistoryError> {
+        let _ = (limit, pools);
         Ok(Vec::new())
     }
 
@@ -2639,7 +2684,12 @@ mod tests {
         use crate::serve::history::memory::MemoryHistory;
         let h = MemoryHistory::new(Duration::from_secs(60));
         assert_eq!(h.insert_shards("r", &[]).await.unwrap(), 0);
-        assert!(h.claim_shards(8).await.unwrap().is_empty());
+        assert!(
+            h.claim_shards(8, &crate::serve::pools::default_only())
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(h.renew_shard_leases().await.unwrap(), 0);
         assert!(
             !h.finalize_shard("r", "0", ShardOutcome::Completed)
@@ -2656,7 +2706,12 @@ mod tests {
     async fn memory_backend_cluster_methods_are_inert() {
         use crate::serve::history::memory::MemoryHistory;
         let h = MemoryHistory::new(Duration::from_secs(60));
-        assert!(h.claim_pending(8).await.unwrap().is_empty());
+        assert!(
+            h.claim_pending(8, &crate::serve::pools::default_only())
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             h.reclaim_orphans(3).await.unwrap(),
             ReclaimReport::default()

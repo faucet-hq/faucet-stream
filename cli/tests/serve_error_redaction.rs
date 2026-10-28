@@ -40,7 +40,7 @@ async fn spawn(db: &std::path::Path) -> String {
     let Command::Serve(args) = cli.command else {
         panic!("serve args");
     };
-    let mut config = faucet_cli::serve::ServeConfig::from_args(args).unwrap();
+    let mut config = faucet_cli::serve::ServeConfig::from_args(*args).unwrap();
     config.log_level = "warn".into();
     tokio::spawn(async move {
         let _ = faucet_cli::serve::run_server(config, Default::default()).await;

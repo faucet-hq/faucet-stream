@@ -57,6 +57,7 @@ fn test_config_with(listen: &str, concurrent: usize, queued: usize) -> ServeConf
         connect_providers: None,
         allow_subprocess_connectors: false,
         references: Default::default(),
+        pools: Default::default(),
     };
     ServeConfig::from_args(args).unwrap()
 }

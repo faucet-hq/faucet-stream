@@ -60,6 +60,7 @@ fn args(port: u16, history: String) -> faucet_cli::cli::ServeArgs {
         connect_providers: None,
         allow_subprocess_connectors: false,
         references: Default::default(),
+        pools: Default::default(),
     }
 }
 
@@ -116,7 +117,14 @@ async fn cancel_stops_unstarted_shards_and_the_run_ends_cancelled() {
         })
         .collect();
     ghost.insert_shards("big", &shards).await.unwrap();
-    assert_eq!(ghost.claim_shards(1).await.unwrap().len(), 1);
+    assert_eq!(
+        ghost
+            .claim_shards(1, &faucet_cli::serve::pools::default_only())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     assert!(
         ghost
             .finalize_shard("big", "0", ShardOutcome::Completed)

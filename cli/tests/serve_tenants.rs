@@ -85,6 +85,7 @@ fn serve_args(
         connect_providers: Some(providers),
         allow_subprocess_connectors: false,
         references: Default::default(),
+        pools: Default::default(),
     }
 }
 

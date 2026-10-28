@@ -67,6 +67,7 @@ fn args(port: u16, triggers: Option<PathBuf>) -> faucet_cli::cli::ServeArgs {
         connect_providers: None,
         allow_subprocess_connectors: false,
         references: Default::default(),
+        pools: Default::default(),
     }
 }
 

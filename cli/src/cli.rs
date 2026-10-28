@@ -200,7 +200,7 @@ pub enum Command {
     Schedule(ScheduleArgs),
     /// Run a long-running HTTP control plane (submit / poll / cancel pipeline runs).
     #[cfg(feature = "serve")]
-    Serve(ServeArgs),
+    Serve(Box<ServeArgs>),
     /// Run an MCP (Model Context Protocol) server over stdio, exposing faucet's
     /// introspection surfaces as agent tool calls (for Claude Desktop / Code).
     #[cfg(feature = "mcp")]
@@ -2108,6 +2108,29 @@ impl Default for LogBufferArgs {
     }
 }
 
+/// Execution pools (#957): which runs this replica executes.
+#[cfg(feature = "serve")]
+#[derive(Debug, Clone, Default, clap::Args)]
+pub struct PoolArgs {
+    /// An execution pool this replica serves. Repeatable or comma-separated.
+    /// A run carries one pool (the request's `pool`, else the config's
+    /// `pool:`, else `default`); a clustered replica claims only runs in its
+    /// pools, and a submission to a pool no live member serves is refused.
+    /// Default: `default` only.
+    #[arg(
+        long = "pool",
+        value_name = "NAME",
+        value_delimiter = ',',
+        env = "FAUCET_SERVE_POOLS"
+    )]
+    pub pool: Vec<String>,
+    /// Fail a pending run whose pool no live cluster member has served for
+    /// this many seconds (error `pool_unavailable`). Unset: such runs stay
+    /// pending until a replica of their pool returns. Must be > 0.
+    #[arg(long, value_name = "SECS")]
+    pub pool_wait_timeout_secs: Option<u64>,
+}
+
 /// The reference policy for configs a client submits to `faucet serve`
 /// (#881). Anything not listed is refused; templates and the triggers file
 /// are not restricted.
@@ -2428,6 +2451,9 @@ pub struct ServeArgs {
     /// `--allow-*` reference-policy flags.
     #[command(flatten)]
     pub references: ReferenceArgs,
+    /// Execution pools (`--pool`, `--pool-wait-timeout-secs`, #957).
+    #[command(flatten)]
+    pub pools: PoolArgs,
     /// Restrict per-run completion callbacks (`callback` on a submit) to these
     /// hosts. Repeatable. When unset, any host is permitted **except**
     /// link-local / cloud-metadata addresses, which are always refused unless

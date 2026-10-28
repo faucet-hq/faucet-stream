@@ -237,6 +237,7 @@ button { font-family: inherit; }
   .nav { order: 1; flex-basis: 100%; overflow-x: auto; }
 }
 .run-tenant { display: inline-block; margin-left: 8px; padding: 0 7px; border: 1px solid var(--border); border-radius: 999px; font-size: 0.72rem; font-weight: 550; color: var(--ink-dim); background: var(--surface-2); vertical-align: 1px; white-space: nowrap; }
+.run-pool { font-family: var(--font-mono); }
 
 .icon-btn {
   appearance: none;

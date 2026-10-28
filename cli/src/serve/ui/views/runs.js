@@ -127,6 +127,12 @@ function tenantTag(r) {
   return ` <span class="run-tenant" title="tenant ${escapeHtml(r.tenant)}">${escapeHtml(label)}</span>`;
 }
 
+// The execution pool a run is placed in, shown unless it is `default`.
+function poolTag(r) {
+  if (!r.pool || r.pool === "default") return "";
+  return ` <span class="run-tenant run-pool" title="execution pool ${escapeHtml(r.pool)}">${escapeHtml(r.pool)}</span>`;
+}
+
 function row(r) {
   const el = document.createElement("tr");
   el.className = "ds-tr";
@@ -137,7 +143,7 @@ function row(r) {
   const recs = r.records_written ?? 0;
   el.innerHTML = `
     <td><span class="pill pill-${r.status}">${r.status}</span></td>
-    <td class="ds-uri"><div class="ds-uri-in">${escapeHtml(r.name || r.run_id)}${tenantTag(r)}</div></td>
+    <td class="ds-uri"><div class="ds-uri-in">${escapeHtml(r.name || r.run_id)}${tenantTag(r)}${poolTag(r)}</div></td>
     <td class="ds-meta ds-num" title="${elapsedExact}">${elapsed}</td>
     <td class="ds-meta ds-num" title="${fmtInt(recs)}">${fmtCompact(recs)}</td>
     <td class="ds-meta ds-time">${fmtTime(r.submitted_at)}</td>`;

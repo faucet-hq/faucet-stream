@@ -474,7 +474,7 @@ pub(crate) async fn local_output_gc_loop(
 
 /// The lease heartbeat / orphan-recovery cadence: one third of the lease TTL
 /// (so a run sees ≥2 renewals before its lease could expire), floored at 1s.
-fn lease_interval(lease_ttl: Duration) -> Duration {
+pub(crate) fn lease_interval(lease_ttl: Duration) -> Duration {
     (lease_ttl / 3).max(Duration::from_secs(1))
 }
 
@@ -503,6 +503,7 @@ pub(crate) async fn refresh_membership(state: &ServerState, member_ttl: Duration
         max_concurrent: cluster.max_concurrent(),
         in_flight: state.registry().in_flight() as u32,
         state_format: faucet_core::state_version::STATE_FORMAT,
+        pools: cluster.pools().to_vec(),
     };
     if let Err(e) = state.history().heartbeat_instance(&beat).await {
         tracing::warn!(error = %e, "cluster: heartbeat_instance failed");
@@ -512,9 +513,11 @@ pub(crate) async fn refresh_membership(state: &ServerState, member_ttl: Duration
             cluster.set_members(members.len());
             cluster.set_state_format(crate::serve::history::cluster_state_format(&members));
             crate::serve::metrics::set_cluster_instances(members.len());
+            cluster.set_live_members(members);
         }
         Err(e) => tracing::warn!(error = %e, "cluster: live_instances failed"),
     }
+    crate::serve::pools::upkeep(state).await;
 }
 
 /// How long ago this instance last renewed its leases, and whether it has

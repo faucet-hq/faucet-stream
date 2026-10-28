@@ -88,6 +88,7 @@ fn serve_args(
             allow_env: vec!["FAUCET_789_*".into()],
             ..Default::default()
         },
+        pools: Default::default(),
     }
 }
 

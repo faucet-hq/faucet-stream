@@ -290,6 +290,7 @@ export async function renderDetail(container, { id }) {
     };
     const provenance = [
       templateLink(rec) && `<dt>Template</dt><dd>${templateLink(rec)}</dd>`,
+      rec.pool && `<dt title="execution pool">Pool</dt><dd class="mono">${escapeHtml(rec.pool)}</dd>`,
       rec.idempotency_key && `<dt>Idempotency key</dt><dd class="mono">${escapeHtml(rec.idempotency_key)}</dd>`,
     ].filter(Boolean).join("");
     container.querySelector("#detail-head").innerHTML = `

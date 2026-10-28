@@ -91,6 +91,7 @@ fn serve_args_with_retention(
         connect_providers: None,
         allow_subprocess_connectors: false,
         references: Default::default(),
+        pools: Default::default(),
     }
 }
 

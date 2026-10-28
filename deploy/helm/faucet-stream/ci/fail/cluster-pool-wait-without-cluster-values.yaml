@@ -1,0 +1,4 @@
+# expect-error: serve.cluster.poolWaitTimeoutSecs requires serve.cluster.enabled=true
+serve:
+  cluster:
+    poolWaitTimeoutSecs: 300

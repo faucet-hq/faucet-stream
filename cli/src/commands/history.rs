@@ -224,6 +224,7 @@ mod tests {
             selection: None,
             host_access: false,
             caller_config: false,
+            pool: "default".into(),
         }
     }
 

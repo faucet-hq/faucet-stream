@@ -224,6 +224,13 @@
         }
       ]
     },
+    "pool": {
+      "description": "The execution pool `faucet serve` runs this config in (#957): only a\nreplica started with `--pool <name>` claims it. A run request's own\n`pool` wins; absent, the run goes to `default`. Ignored by\n`faucet run` and the other one-shot runtimes.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "shard": {
       "description": "Optional source-shard distribution for clustered (Mode B) execution.\nOnly consumed by `faucet serve --cluster`: a run whose source\n[is shardable](faucet_core::Source::is_shardable) is split into\n`shard.count` shards processed concurrently across cluster workers.\nIgnored by `faucet run` and by a non-cluster `serve`, so it is fully\nbackward compatible.",
       "anyOf": [

@@ -174,6 +174,7 @@ pub fn build_submit_request(
         budget: None,
         approved_change: None,
         selection: compiled.spec.run.selection.clone(),
+        pool: compiled.spec.run.pool.clone(),
         trusted_config: true,
         server_file: true,
     }
@@ -571,6 +572,7 @@ pub fn template_body_tracked(
         timeout_secs: compiled.spec.run.timeout_secs,
         idempotency_key: Some(context::idempotency_key(name, event)),
         selection: compiled.spec.run.selection.clone(),
+        pool: compiled.spec.run.pool.clone(),
         standing_approval: true,
         allow_untested: tpl.allow_untested,
         ..Default::default()
@@ -848,6 +850,7 @@ mod tests {
                     labels: Default::default(),
                     timeout_secs: Some(60),
                     selection: None,
+                    pool: None,
                 },
                 kind: TriggerKind::Webhook {
                     methods: vec!["POST".into()],
