@@ -110,6 +110,26 @@ pub trait SqlDialect: Send + Sync {
         None
     }
 
+    /// Whether `value` fits the column a declared `t` creates here (#955):
+    /// a decimal is checked against the bounds of the type the dialect
+    /// renders, so an unbounded declaration mapped to a fixed-scale type
+    /// refuses values that type would round. The default reads a declared
+    /// precision without a scale as scale 0, as the decimal keywords render
+    /// it, and leaves an unbounded decimal unbounded.
+    fn declared_fits(&self, t: &LogicalType, value: &faucet_core::Value) -> bool {
+        match *t {
+            LogicalType::Decimal {
+                precision: Some(p),
+                scale,
+            } => LogicalType::Decimal {
+                precision: Some(p),
+                scale: Some(scale.unwrap_or(0)),
+            }
+            .accepts(value),
+            _ => t.accepts(value),
+        }
+    }
+
     /// [`declared_type_name`](Self::declared_type_name) for a primary-key
     /// column. Defaults to it, except for text, JSON and binary, which take
     /// [`key_type_name`](Self::key_type_name) (a dialect that cannot index

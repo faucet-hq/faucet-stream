@@ -673,7 +673,8 @@ pub fn declared_table_columns(
     sample: &[serde_json::Value],
     declared: &faucet_core::DeclaredColumns,
 ) -> Option<Vec<(String, String)>> {
-    let planned = faucet_core::plan_columns_declared(sample, Some(declared))?;
+    let fits = |t: &faucet_core::LogicalType, v: &serde_json::Value| BigQuery.declared_fits(t, v);
+    let planned = faucet_core::plan_columns_declared_with(sample, Some(declared), &fits)?;
     let schema = faucet_core::schema::infer_schema(sample);
     let props = schema.get("properties").and_then(|p| p.as_object());
     Some(

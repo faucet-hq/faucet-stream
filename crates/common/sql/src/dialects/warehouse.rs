@@ -229,6 +229,34 @@ impl SqlDialect for BigQuery {
         }
     }
 
+    /// A value fits the column created: `NUMERIC` (29 integer, 9 fractional
+    /// digits) or `BIGNUMERIC` (38 and 38); timestamps keep microseconds.
+    fn declared_fits(&self, t: &LogicalType, value: &faucet_core::Value) -> bool {
+        let created = match *t {
+            LogicalType::Decimal { precision, scale } => {
+                let s = scale.unwrap_or(0);
+                match precision {
+                    Some(p) if s <= 9 && p.saturating_sub(s) <= 29 => (38, 9),
+                    // Created as STRING, which holds any digits exactly.
+                    Some(p) if s > 38 || p.saturating_sub(s) > 38 => {
+                        return LogicalType::Decimal {
+                            precision: None,
+                            scale: None,
+                        }
+                        .accepts(value);
+                    }
+                    _ => (76, 38),
+                }
+            }
+            _ => return super::fits_bounded(t, value, (76, Some(38)), Some(6)),
+        };
+        LogicalType::Decimal {
+            precision: Some(created.0),
+            scale: Some(created.1),
+        }
+        .accepts(value)
+    }
+
     /// `NUMERIC` holds 29 integer and 9 fractional digits, `BIGNUMERIC` 38
     /// and 38; a decimal without precision, or wider than `NUMERIC`, is
     /// `BIGNUMERIC`, and one wider than that stays `STRING` (exact). A

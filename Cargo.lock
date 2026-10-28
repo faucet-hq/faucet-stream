@@ -5299,6 +5299,7 @@ dependencies = [
  "arrow 58.3.0",
  "async-stream",
  "async-trait",
+ "chrono",
  "faucet-core",
  "futures",
  "futures-core",
@@ -5875,6 +5876,7 @@ version = "1.9.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "chrono",
  "faucet-common-sql",
  "faucet-conformance",
  "faucet-core",

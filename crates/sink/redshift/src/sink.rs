@@ -224,7 +224,16 @@ impl RedshiftDriver {
         // A page with nothing inferable leaves the table uncreated so the next
         // page can try, rather than emitting a zero-column CREATE.
         let declared = self.declared.get();
-        let Some(columns) = faucet_core::plan_columns_declared(records, declared.as_ref()) else {
+        let fits = |t: &faucet_core::LogicalType, v: &Value| {
+            faucet_common_sql::SqlDialect::declared_fits(
+                &faucet_common_sql::dialects::Redshift,
+                t,
+                v,
+            )
+        };
+        let Some(columns) =
+            faucet_core::plan_columns_declared_with(records, declared.as_ref(), &fits)
+        else {
             return Ok(());
         };
         if let Some(schema) = self.config.schema.as_deref() {
@@ -902,7 +911,10 @@ impl RedshiftDriver {
 #[async_trait]
 impl SinkDriver for RedshiftDriver {
     fn capabilities(&self, derived: faucet_core::Capabilities) -> faucet_core::Capabilities {
-        derived.to_builder().declared_types(true).build()
+        derived
+            .to_builder()
+            .declared_types(self.config.create_table)
+            .build()
     }
 
     fn set_declared_columns(&self, columns: faucet_core::DeclaredColumns) {

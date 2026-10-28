@@ -156,6 +156,22 @@ pub fn plan_columns_declared(
     page: &[Value],
     declared: Option<&crate::declared::DeclaredColumns>,
 ) -> Option<Vec<PlannedColumn>> {
+    plan_columns_declared_with(page, declared, &crate::declared::LogicalType::accepts)
+}
+
+/// The declared-type fit test the planners take: whether a value fits the
+/// column a dialect creates for a declared type (its bounds may differ from
+/// the declared ones, an unbounded decimal's in particular).
+pub type DeclaredFit<'a> = &'a dyn Fn(&crate::declared::LogicalType, &Value) -> bool;
+
+/// [`plan_columns_declared`] with the fit test of the dialect that creates the
+/// table, so a declared type is used only when every first-page value fits
+/// the column it would actually create.
+pub fn plan_columns_declared_with(
+    page: &[Value],
+    declared: Option<&crate::declared::DeclaredColumns>,
+    fits: DeclaredFit<'_>,
+) -> Option<Vec<PlannedColumn>> {
     let Some(declared) = declared.filter(|d| !d.is_empty()) else {
         return plan_columns(page);
     };
@@ -180,10 +196,9 @@ pub fn plan_columns_declared(
         let Some(d) = declared.get(&column.name) else {
             continue;
         };
-        let fits = page.iter().all(|r| {
-            r.get(&column.name)
-                .is_none_or(|v| d.logical_type.accepts(v))
-        });
+        let fits = page
+            .iter()
+            .all(|r| r.get(&column.name).is_none_or(|v| fits(&d.logical_type, v)));
         if fits {
             column.base_type = d.logical_type.base_type();
             column.declared = Some(d.logical_type);
@@ -214,7 +229,18 @@ pub fn plan_keyed_columns_declared(
     key: &[String],
     declared: Option<&crate::declared::DeclaredColumns>,
 ) -> Option<Vec<PlannedColumn>> {
-    let mut columns = plan_columns_declared(page, declared)?;
+    plan_keyed_columns_declared_with(page, key, declared, &crate::declared::LogicalType::accepts)
+}
+
+/// [`plan_keyed_columns_declared`] with a dialect's fit test (see
+/// [`plan_columns_declared_with`]).
+pub fn plan_keyed_columns_declared_with(
+    page: &[Value],
+    key: &[String],
+    declared: Option<&crate::declared::DeclaredColumns>,
+    fits: DeclaredFit<'_>,
+) -> Option<Vec<PlannedColumn>> {
+    let mut columns = plan_columns_declared_with(page, declared, fits)?;
     for k in key {
         match columns.iter_mut().find(|c| &c.name == k) {
             Some(c) => c.nullable = false,
@@ -239,10 +265,21 @@ pub fn plan_table_declared(
     key: &[String],
     declared: Option<&crate::declared::DeclaredColumns>,
 ) -> Option<Vec<PlannedColumn>> {
+    plan_table_declared_with(page, key, declared, &crate::declared::LogicalType::accepts)
+}
+
+/// [`plan_table_declared`] with a dialect's fit test (see
+/// [`plan_columns_declared_with`]).
+pub fn plan_table_declared_with(
+    page: &[Value],
+    key: &[String],
+    declared: Option<&crate::declared::DeclaredColumns>,
+    fits: DeclaredFit<'_>,
+) -> Option<Vec<PlannedColumn>> {
     if key.is_empty() {
-        plan_columns_declared(page, declared)
+        plan_columns_declared_with(page, declared, fits)
     } else {
-        plan_keyed_columns_declared(page, key, declared)
+        plan_keyed_columns_declared_with(page, key, declared, fits)
     }
 }
 
@@ -513,6 +550,20 @@ mod tests {
                 DeclaredColumn::new("day", LogicalType::Date, true),
                 DeclaredColumn::new("at", LogicalType::Timestamp { tz: true }, true),
             ])
+        }
+
+        #[test]
+        fn a_value_outside_the_bounds_keeps_the_inferred_type() {
+            let page = [json!({"id": 1, "amount": "1.125"})];
+            let cols = plan_table_declared(&page, &[], Some(&decl())).expect("plan");
+            let amount = cols.iter().find(|c| c.name == "amount").unwrap();
+            assert_eq!(amount.declared, None);
+            assert_eq!(amount.base_type, SqlBaseType::Text);
+            let refuse_all = |_: &LogicalType, _: &Value| false;
+            let keyed = plan_table_declared_with(&page, &["id".into()], Some(&decl()), &refuse_all)
+                .expect("plan");
+            assert!(keyed.iter().all(|c| c.declared.is_none()));
+            assert!(!keyed.iter().find(|c| c.name == "id").unwrap().nullable);
         }
 
         #[test]

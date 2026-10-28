@@ -167,7 +167,8 @@ pub use checks::{
     assert_replay_safe, assert_reported_rows_truthful, assert_rollback_truthful,
 };
 pub use declared::{
-    assert_declared_columns_truthful, assert_declared_types_create, declared_corpus,
+    DECLARED_INSTANT, assert_declared_columns_truthful, assert_declared_instants_exact,
+    assert_declared_overwrite_empty_run, assert_declared_types_create, declared_corpus,
 };
 
 use std::collections::HashMap;

@@ -127,9 +127,10 @@ pub use columnar::{
     values_to_record_batch, values_to_record_batch_inferred,
 };
 pub use create_table::{
-    PlannedColumn, missing_target_error, plan_columns, plan_columns_declared, plan_keyed_columns,
-    plan_keyed_columns_declared, plan_table_declared, render_column_defs, render_columns,
-    render_primary_key,
+    DeclaredFit, PlannedColumn, missing_target_error, plan_columns, plan_columns_declared,
+    plan_columns_declared_with, plan_keyed_columns, plan_keyed_columns_declared,
+    plan_keyed_columns_declared_with, plan_table_declared, plan_table_declared_with,
+    render_column_defs, render_columns, render_primary_key,
 };
 #[cfg(feature = "transform-cross-join")]
 pub use cross_join::{CompiledCrossJoin, CrossJoinSpec, OnEmpty as CrossJoinOnEmpty};
