@@ -1082,6 +1082,9 @@ fn build_opts(config: &MysqlCdcSourceConfig) -> Result<Opts, FaucetError> {
     let base = Opts::from_url(&config.connection_url)
         .map_err(|e| FaucetError::Config(format!("mysql-cdc: invalid connection URL: {e}")))?;
 
+    // mysql_async builds its TLS config from the process-wide rustls
+    // provider, which a build linking both `ring` and `aws-lc-rs` lacks.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let ssl = match &config.tls {
         CdcTls::Disable => return Ok(base),
         CdcTls::Require => SslOpts::default()

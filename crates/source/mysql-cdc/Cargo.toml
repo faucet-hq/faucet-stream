@@ -18,6 +18,8 @@ schemars.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 mysql_async = { workspace = true }
+# mysql_async takes the process-wide rustls provider (#967).
+rustls = { workspace = true, features = ["ring"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 futures.workspace = true
 async-stream = { workspace = true }
