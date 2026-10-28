@@ -410,6 +410,17 @@ Declares `discover`, `range_read` and `range_digest` (`faucet verify` reads and 
 
 Every query runs through the pipeline's `CallContext` (#880): the run's deadline and cancel token end an in-flight query, or a stalled row read, promptly; `read_timeout_secs` still bounds each server read. Each query counts as one `query` round trip in `faucet_source_roundtrips_total` (`describe` for type probes, `discover` for catalog reads). Reads are not retried.
 
+## TLS
+
+TLS is configured in the connection URL: `sslmode=disable|prefer|require|verify-ca|verify-full`,
+`sslrootcert=<CA PEM>`, and `sslcert=` / `sslkey=` for a client certificate.
+
+**Known issue (#974):** with sqlx 0.8.6, `sslmode=verify-ca` also verifies the
+hostname, so it behaves like `verify-full`: connecting by an IP address or a
+name the certificate does not list fails with `certificate not valid for
+name`. Connect by a name on the certificate, or use `verify-full`, until a
+fixed sqlx release is in use.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

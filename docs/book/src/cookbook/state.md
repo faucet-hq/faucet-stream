@@ -229,6 +229,8 @@ state:
   config:
     url: redis://localhost:6379
     namespace: faucet
+    # tls:                          # rediss:// with a private CA / client cert
+    #   ca_cert_path: /etc/faucet/redis-ca.pem
 
 # Postgres
 state:

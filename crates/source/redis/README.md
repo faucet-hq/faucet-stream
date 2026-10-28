@@ -65,6 +65,7 @@ faucet run pipeline.yaml
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `url` | string | — *(required)* | Redis connection URL, e.g. `redis://127.0.0.1:6379` or `redis://user:pass@host:6379/0`. Masked in `Debug` output. |
+| `tls` | object | — | TLS settings for a `rediss://` URL: private CA, client certificate, `insecure_skip_verify` — see [TLS](#tls-rediss-private-ca-client-certificates). |
 | `source_type` | `RedisSourceType` | — *(required)* | The Redis data structure to read from — `List`, `Stream`, or `Keys` (see below). |
 | `max_records` | int | *(unbounded)* | Optional cap on the total number of records returned. Honored by both `fetch_all` and streaming. |
 | `batch_size` | int | `1000` | Records per emitted `StreamPage`, mapped onto each mode's native paging primitive. **`0` = no batching** (drain into one page). See [Streaming & batching](#streaming--batching). |
@@ -123,6 +124,36 @@ Each key-value pair is returned as:
 ```
 
 Stream field values and key values are decoded per `parse_json` / `binary`.
+
+## TLS (`rediss://`, private CA, client certificates)
+
+`rediss://` URLs negotiate TLS. Without a `tls:` block the server certificate
+is verified against the bundled Mozilla (web PKI) roots. A `tls:` block
+(shared with the other Redis connectors through
+[`faucet-common-redis`](https://crates.io/crates/faucet-common-redis), #972)
+adds a private CA, mutual TLS, or turns verification off:
+
+| field | type | default | description |
+|-------|------|---------|-------------|
+| `ca_cert_path` | path | — | PEM CA certificate(s) that signed the server certificate. When set it is the only trust anchor. |
+| `ca_cert_pem` | string | — | The same CA inline (e.g. `${secret:…}`); mutually exclusive with `ca_cert_path`. |
+| `client_cert_path` | path | — | PEM client certificate for mutual TLS; set with `client_key_path`. |
+| `client_key_path` | path | — | PEM private key (PKCS#8, PKCS#1 or SEC1) for the client certificate. |
+| `insecure_skip_verify` | bool | `false` | Accept any server certificate. Logs a warning; never use in production. |
+
+The hostname is always checked unless `insecure_skip_verify` is on (the URL
+fragment `#insecure` does the same and also logs a warning). `tls` settings on
+a `redis://` URL, an unreadable file or a file that is not PEM is a
+`FaucetError::Config`; a certificate the server presents that does not verify
+fails the connection with a typed error (`FaucetError::Source`, `Redis connection failed`).
+
+```yaml
+url: rediss://redis.internal:6380/0
+tls:
+  ca_cert_path: /etc/faucet/redis-ca.pem
+  client_cert_path: /etc/faucet/client.pem
+  client_key_path: /etc/faucet/client.key
+```
 
 ## Examples
 

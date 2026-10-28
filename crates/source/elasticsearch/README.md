@@ -68,6 +68,7 @@ faucet run pipeline.yaml
 | `scroll_timeout` | string | `"5m"` | Scroll-context keep-alive sent on the initial and every follow-up scroll request (e.g. `"1m"`, `"5m"`). Must exceed the time taken to process one page downstream. |
 | `connect_timeout_secs` | int | `10` | Seconds to wait for a connection to the cluster. |
 | `request_timeout_secs` | int | `300` | Seconds one search or scroll request may take; a half-open connection or wedged node fails the run (the request is not retried) instead of hanging it. |
+| `tls` | object | — | TLS settings for an `https://` cluster: private CA, client certificate, `insecure_skip_verify` — see [TLS](#tls-private-ca-client-certificates). |
 | `auth` | `ElasticsearchAuth` | `{ type: none }` | Authentication — inline `{ type, config }` or `{ ref: <name> }`. See [Authentication](#authentication). |
 | `max_pages` | int | *(unset = no limit)* | Maximum number of scroll responses to emit. The cap applies *after* a page is yielded. |
 | `batch_size` | int | `1000` | Docs per emitted `StreamPage`, also the scroll API `size` parameter. **`0` = no batching**: the whole result set is drained through the scroll API (10 000 docs per request) and emitted as one page. Validated against `MAX_BATCH_SIZE` (1,000,000) at construction (an empty `base_url` / `index` is likewise rejected with `FaucetError::Config`). |
@@ -132,6 +133,32 @@ pipeline:
 ```
 
 A shared provider may only yield a `bearer` or `basic` credential — header- and token-style credentials have no Elasticsearch equivalent and surface as an auth error.
+
+## TLS (private CA, client certificates)
+
+An `https://` `base_url` is verified against the platform trust store. Self-managed
+Elasticsearch 8 ships a self-signed CA, so give its CA in a `tls:` block
+(shared with the other Elasticsearch connector through
+[`faucet-common-elasticsearch`](https://crates.io/crates/faucet-common-elasticsearch), #973).
+It works the same on every OS; `SSL_CERT_FILE` is not needed.
+
+| field | type | default | description |
+|-------|------|---------|-------------|
+| `ca_cert_path` | path | — | PEM CA certificate(s) that signed the server certificate. When set it is the only trust anchor. |
+| `ca_cert_pem` | string | — | The same CA inline (e.g. `${secret:…}`); mutually exclusive with `ca_cert_path`. |
+| `client_cert_path` | path | — | PEM client certificate for mutual TLS; set with `client_key_path`. |
+| `client_key_path` | path | — | PEM private key (PKCS#8, PKCS#1 or SEC1) for the client certificate. |
+| `insecure_skip_verify` | bool | `false` | Accept any server certificate. Logs a warning; never use in production. |
+
+The hostname is always checked unless `insecure_skip_verify` is on. An
+unreadable file, a file that is not PEM or a malformed certificate or key is a
+`FaucetError::Config` when the connector is built.
+
+```yaml
+base_url: https://es.internal:9200
+tls:
+  ca_cert_path: /etc/faucet/elastic-ca.pem   # e.g. config/certs/http_ca.crt
+```
 
 ## Examples
 

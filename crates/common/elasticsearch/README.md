@@ -23,6 +23,15 @@ you never touch this crate directly; it's pulled in (and re-exported) by the con
   `faucet_core::AuthProvider` onto an `ElasticsearchAuth` variant (used when a connector references a
   provider from the top-level `auth:` catalog).
 
+- **`ElasticsearchTls`** — the `tls:` block (an alias of `faucet_core::TlsOptions`):
+  `ca_cert_path` / `ca_cert_pem` (the only trust anchor when set),
+  `client_cert_path` + `client_key_path` (mutual TLS) and
+  `insecure_skip_verify` (default `false`, logs a warning).
+- **`build_client(connector, connect_timeout, request_timeout, &ElasticsearchTls)`** —
+  the HTTP client both connectors use, built through
+  `faucet_core::http::ClientBuilder::tls`. A bad certificate file is a
+  `FaucetError::Config` prefixed with `connector`.
+
 ### `ElasticsearchAuth` variants
 
 Serializes as `{ type: <method>, config: { … } }` (adjacent tagging, snake_case discriminators) —

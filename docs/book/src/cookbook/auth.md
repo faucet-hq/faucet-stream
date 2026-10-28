@@ -161,6 +161,61 @@ never written to logs or error messages.
 > shared `auth: { ref }` provider uses that provider's own client and does not
 > present the source's certificate — use inline auth for mTLS endpoints.
 
+## Private CAs and client certificates (Redis, NATS, Elasticsearch)
+
+Servers with an internal CA — a managed Redis with a per-instance CA, a
+self-managed Elasticsearch 8 (it ships a self-signed CA by default), a NATS
+cluster on internal PKI — need the CA in the config. The Redis source, sink
+and state store, the NATS source and sink, and the Elasticsearch source and
+sink all take the same `tls:` block:
+
+```yaml
+source:
+  type: redis
+  config:
+    url: rediss://redis.internal:6380/0     # TLS needs rediss://
+    source_type: { type: List, key: events }
+    tls:
+      ca_cert_path: /etc/faucet/ca.pem        # or ca_cert_pem: ${secret:REDIS_CA}
+      client_cert_path: /etc/faucet/client.pem   # mutual TLS (optional)
+      client_key_path: /etc/faucet/client.key
+      # insecure_skip_verify: false          # true accepts any certificate; logs a warning
+```
+
+| Field | Meaning |
+|-------|---------|
+| `ca_cert_path` / `ca_cert_pem` | The CA certificate(s) that signed the server certificate, as a PEM file or inline PEM (one of the two). When set it is the **only** trust anchor: the platform / bundled roots are not consulted. |
+| `client_cert_path` + `client_key_path` | A PEM client certificate and its key, for servers that require mutual TLS. Set both or neither. |
+| `insecure_skip_verify` | Accept any server certificate (default `false`). It logs a warning; use it only to diagnose a test setup. |
+
+The hostname is always checked against the certificate unless
+`insecure_skip_verify` is on. A file that cannot be read, a file that is not
+PEM, or a CA and a client pair given half-way is a config error before the
+run connects.
+
+- **Redis:** the block applies to `rediss://` URLs only; on a `redis://` URL it
+  is a config error. Without a CA the server is verified against the bundled
+  Mozilla roots. The same block goes under `state.config.tls` for the Redis
+  state store.
+- **NATS:** `tls: true` still means "require TLS and trust the platform roots";
+  a `tls:` block also requires TLS.
+- **Elasticsearch:** the block works the same on every OS (it no longer depends
+  on `SSL_CERT_FILE`, which only Linux honoured).
+
+Paths in the block are declared resources, so `faucet serve` checks them
+against its reference policy like any other path in a submitted config.
+
+### PostgreSQL and MySQL: `verify-ca` checks the hostname (#974)
+
+The PostgreSQL source, sink and state store and the MySQL source and sink take
+TLS settings in the URL (`sslmode=` / `ssl-mode=`, `sslrootcert=` / `ssl-ca=`).
+With the sqlx release they are built on (0.8.6), `sslmode=verify-ca` and
+`ssl-mode=VERIFY_CA` **also verify the hostname**, so they behave like
+`verify-full` / `VERIFY_IDENTITY`: connecting by an IP address or a name the
+certificate does not list fails with `certificate not valid for name`. Until a
+fixed sqlx release is in use, connect by a name on the certificate, or use
+`verify-full` / `VERIFY_IDENTITY` (which is the stronger setting anyway).
+
 ## Google service accounts (JWT-bearer)
 
 Google APIs (Sheets, Drive, BigQuery, …) accept a
