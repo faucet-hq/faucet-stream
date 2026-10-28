@@ -11,7 +11,7 @@ pub mod stream;
 
 pub use faucet_core::{AuthSpec, FaucetError, SharedAuthProvider, Source};
 
-pub use config::{ElasticsearchAuth, ElasticsearchSourceConfig};
+pub use config::{ElasticsearchAuth, ElasticsearchSourceConfig, ElasticsearchTls};
 pub use stream::ElasticsearchSource;
 
 mod descriptor;

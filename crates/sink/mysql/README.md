@@ -477,6 +477,17 @@ lifecycle and schema evolution from it. `MysqlSink` wraps it in a
 chunk is written in its own transaction. The public type and config are
 unchanged.
 
+## TLS
+
+TLS is configured in the connection URL: `ssl-mode=DISABLED|PREFERRED|REQUIRED|VERIFY_CA|VERIFY_IDENTITY`,
+`ssl-ca=<CA PEM>`, and `ssl-cert=` / `ssl-key=` for a client certificate.
+
+**Known issue (#974):** with sqlx 0.8.6, `ssl-mode=VERIFY_CA` also verifies
+the hostname, so it behaves like `VERIFY_IDENTITY`: connecting by an IP
+address or a name the certificate does not list fails with `certificate not
+valid for name`. Connect by a name on the certificate, or use
+`VERIFY_IDENTITY`, until a fixed sqlx release is in use.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

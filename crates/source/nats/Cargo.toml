@@ -25,7 +25,7 @@ base64.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros", "signal"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }
 serde_json.workspace = true
 futures.workspace = true
 faucet-conformance = { workspace = true, features = ["containers"] }

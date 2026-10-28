@@ -5112,8 +5112,10 @@ name = "faucet-common-nats"
 version = "1.2.1"
 dependencies = [
  "async-nats",
+ "faucet-conformance",
  "faucet-core",
  "rustls 0.23.46",
+ "rustls-native-certs 0.8.3",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -5166,6 +5168,18 @@ dependencies = [
  "serde_json",
  "testcontainers",
  "tokio",
+]
+
+[[package]]
+name = "faucet-common-redis"
+version = "1.0.0"
+dependencies = [
+ "faucet-conformance",
+ "faucet-core",
+ "redis",
+ "rustls 0.23.46",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -6022,11 +6036,11 @@ name = "faucet-sink-redis"
 version = "1.5.0"
 dependencies = [
  "async-trait",
+ "faucet-common-redis",
  "faucet-conformance",
  "faucet-core",
  "futures",
  "redis",
- "rustls 0.23.46",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -6913,11 +6927,11 @@ dependencies = [
  "async-stream",
  "async-trait",
  "base64 0.22.1",
+ "faucet-common-redis",
  "faucet-conformance",
  "faucet-core",
  "futures",
  "redis",
- "rustls 0.23.46",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -7228,10 +7242,10 @@ name = "faucet-state-redis"
 version = "1.2.0"
 dependencies = [
  "async-trait",
+ "faucet-common-redis",
  "faucet-conformance",
  "faucet-core",
  "redis",
- "rustls 0.23.46",
  "serde_json",
  "testcontainers",
  "testcontainers-modules",

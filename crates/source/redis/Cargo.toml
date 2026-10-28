@@ -12,14 +12,13 @@ categories.workspace = true
 
 [dependencies]
 faucet-core.workspace = true
+faucet-common-redis.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 redis = { workspace = true, features = ["connection-manager"] }
-# `rediss://` builds a rustls config from the process-wide provider (#967).
-rustls = { workspace = true, features = ["ring"] }
 tokio = { workspace = true, features = ["sync"] }
 async-stream = { workspace = true }
 futures.workspace = true

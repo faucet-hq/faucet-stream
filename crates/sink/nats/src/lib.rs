@@ -26,7 +26,7 @@ pub use config::NatsSinkConfig;
 pub use sink::NatsSink;
 
 // Re-export shared config types so downstream users import from one place.
-pub use faucet_common_nats::{NatsAuth, NatsConnectionConfig};
+pub use faucet_common_nats::{NatsAuth, NatsConnectionConfig, NatsTls};
 pub use faucet_core::{FaucetError, Sink};
 
 /// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.

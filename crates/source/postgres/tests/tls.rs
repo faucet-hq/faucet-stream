@@ -81,3 +81,41 @@ async fn reads_over_every_sslmode_and_refuses_bad_certificates() {
         }
     }
 }
+
+/// `sslmode=verify-ca` must trust the CA without checking the hostname. With
+/// sqlx 0.8.6 and rustls 0.23.46 it checks the hostname too (#974).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "sqlx 0.8.6 verify-ca hostname bug (#974); re-enable when sqlx is fixed"]
+async fn verify_ca_ignores_a_name_off_the_certificate() {
+    let tls = TlsFixture::for_names(&["localhost"]);
+    let pg = containers::start(|| images::postgres(&tls)).await;
+    let port = pg.get_host_port_ipv4(images::POSTGRES_PORT).await.unwrap();
+    images::psql(
+        &pg,
+        "CREATE TABLE items (id INT PRIMARY KEY, v TEXT); INSERT INTO items VALUES (1, 'a');",
+    )
+    .await;
+    let rows = read(url("127.0.0.1", port, &verify("verify-ca", &tls.ca_path())))
+        .await
+        .expect("verify-ca by an IP the certificate does not name");
+    assert_eq!(rows, vec![json!({"ssl": true, "id": 1, "v": "a"})]);
+}
+
+/// Today's behaviour, pinned until #974 is fixed upstream: `verify-ca` by a
+/// name the certificate does not cover is refused like `verify-full`, with a
+/// typed error.
+#[tokio::test(flavor = "multi_thread")]
+async fn verify_ca_and_verify_full_refuse_a_name_off_the_certificate_today() {
+    let tls = TlsFixture::for_names(&["localhost"]);
+    let pg = containers::start(|| images::postgres(&tls)).await;
+    let port = pg.get_host_port_ipv4(images::POSTGRES_PORT).await.unwrap();
+    for mode in ["verify-ca", "verify-full"] {
+        match read(url("127.0.0.1", port, &verify(mode, &tls.ca_path()))).await {
+            Err(FaucetError::Config(msg)) => assert!(
+                msg.contains("PostgreSQL connection failed") && msg.contains("not valid for name"),
+                "{mode}: {msg}"
+            ),
+            other => panic!("{mode} by 127.0.0.1 must be refused today, got {other:?}"),
+        }
+    }
+}

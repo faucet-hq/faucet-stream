@@ -93,6 +93,7 @@ members = [
     "crates/source/sqs",
     "crates/sink/sqs",
     "crates/common/nats",
+    "crates/common/redis",
     "crates/source/nats",
     "crates/sink/nats",
     "crates/common/sftp",
@@ -250,6 +251,7 @@ faucet-sink-databricks = { path = "crates/sink/databricks", version = "1" }
 faucet-source-sqs = { path = "crates/source/sqs", version = "1" }
 faucet-sink-sqs = { path = "crates/sink/sqs", version = "1" }
 faucet-common-nats = { path = "crates/common/nats", version = "1" }
+faucet-common-redis = { path = "crates/common/redis", version = "1" }
 faucet-source-nats = { path = "crates/source/nats", version = "1" }
 faucet-sink-nats = { path = "crates/sink/nats", version = "1" }
 faucet-common-sftp = { path = "crates/common/sftp", version = "1" }
@@ -363,7 +365,7 @@ csv = "1.3"
 csv-async = { version = "1.3", features = ["tokio"] }
 calamine = { version = "0.37", features = ["dates"] }
 rust_xlsxwriter = "0.100"
-redis = { version = "1.7.1", features = ["tokio-comp", "aio", "connection-manager", "tokio-rustls-comp", "tls-rustls-webpki-roots"] }
+redis = { version = "1.7.1", features = ["tokio-comp", "aio", "connection-manager", "tokio-rustls-comp", "tls-rustls-webpki-roots", "tls-rustls-insecure"] }
 axum = "0.8"
 subtle = "2"
 tower-http = { version = "0.6", features = ["limit", "cors", "trace", "request-id", "util"] }

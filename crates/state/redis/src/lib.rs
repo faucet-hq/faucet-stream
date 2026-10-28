@@ -8,4 +8,5 @@
 
 pub mod store;
 
+pub use faucet_common_redis::RedisTls;
 pub use store::RedisStateStore;

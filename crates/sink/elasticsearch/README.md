@@ -69,6 +69,7 @@ faucet run pipeline.yaml
 | `op_type` | `index` \| `create` | `index` | The `_bulk` action for `append` writes. Data streams accept only `create`; with `create`, a document whose `_id` already exists is left as it is and counted as written (`409 version_conflict_engine_exception` is "already there"), so an at-least-once replay of a page with `id_field` is idempotent instead of failing every later run. Refused with any other `write_mode`. |
 | `connect_timeout_secs` | int | `10` | Seconds to wait for a connection to the cluster. |
 | `request_timeout_secs` | int | `300` | Seconds one HTTP request may take end to end; a half-open connection or wedged node fails the request (retriable) instead of hanging the run. |
+| `tls` | object | — | TLS settings for an `https://` cluster: private CA, client certificate, `insecure_skip_verify` — see [TLS](#tls-private-ca-client-certificates). |
 
 ### Batching
 
@@ -157,6 +158,32 @@ auth:
 ```
 
 The `Debug` impl masks passwords, tokens, and keys with `***` to prevent credential leakage in logs.
+
+## TLS (private CA, client certificates)
+
+An `https://` `base_url` is verified against the platform trust store. Self-managed
+Elasticsearch 8 ships a self-signed CA, so give its CA in a `tls:` block
+(shared with the other Elasticsearch connector through
+[`faucet-common-elasticsearch`](https://crates.io/crates/faucet-common-elasticsearch), #973).
+It works the same on every OS; `SSL_CERT_FILE` is not needed.
+
+| field | type | default | description |
+|-------|------|---------|-------------|
+| `ca_cert_path` | path | — | PEM CA certificate(s) that signed the server certificate. When set it is the only trust anchor. |
+| `ca_cert_pem` | string | — | The same CA inline (e.g. `${secret:…}`); mutually exclusive with `ca_cert_path`. |
+| `client_cert_path` | path | — | PEM client certificate for mutual TLS; set with `client_key_path`. |
+| `client_key_path` | path | — | PEM private key (PKCS#8, PKCS#1 or SEC1) for the client certificate. |
+| `insecure_skip_verify` | bool | `false` | Accept any server certificate. Logs a warning; never use in production. |
+
+The hostname is always checked unless `insecure_skip_verify` is on. An
+unreadable file, a file that is not PEM or a malformed certificate or key is a
+`FaucetError::Config` when the connector is built.
+
+```yaml
+base_url: https://es.internal:9200
+tls:
+  ca_cert_path: /etc/faucet/elastic-ca.pem   # e.g. config/certs/http_ca.crt
+```
 
 ## Examples
 

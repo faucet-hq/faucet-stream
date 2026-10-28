@@ -19,6 +19,7 @@ pub mod connection;
 
 pub use auth::NatsAuth;
 pub use connection::{NatsConnectionConfig, connect};
+pub use faucet_core::TlsOptions as NatsTls;
 
 /// The lineage dataset URI for a subject on the first configured server:
 /// `nats://host:port?subject=…`, with any credentials in the server URL

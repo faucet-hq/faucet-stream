@@ -1,24 +1,34 @@
-//! The Elasticsearch source over HTTPS (#967) against an Elasticsearch 8 with
-//! security on (HTTPS only, every request authenticated). The connector has
-//! no CA setting: it trusts the platform store. Everywhere, a server signed by
-//! an unknown CA and plaintext HTTP are refused with a typed error. On Linux,
-//! where the platform verifier honours `SSL_CERT_FILE`, the fixture CA is then
-//! trusted and `basic` auth reads documents a wrong password cannot.
+//! The Elasticsearch source over HTTPS (#967, #973) against an Elasticsearch 8
+//! with security on (HTTPS only, every request authenticated). Without a
+//! `tls:` block a server signed by an unknown CA and plaintext HTTP are
+//! refused with a typed error; with the fixture CA from config (path or
+//! inline PEM, every OS) `basic` and `api_key` auth read documents a wrong
+//! password cannot.
 
 use faucet_conformance::containers;
 use faucet_conformance::tls::{TlsFixture, images};
 use faucet_core::{FaucetError, Source};
 use faucet_source_elasticsearch::{
-    ElasticsearchAuth, ElasticsearchSource, ElasticsearchSourceConfig,
+    ElasticsearchAuth, ElasticsearchSource, ElasticsearchSourceConfig, ElasticsearchTls,
 };
 use serde_json::Value;
 
-async fn read(base: &str, password: &str) -> Result<Vec<Value>, FaucetError> {
-    let config = ElasticsearchSourceConfig::new(base, "tls-items").auth(ElasticsearchAuth::Basic {
+async fn read_as(
+    base: &str,
+    auth: ElasticsearchAuth,
+    tls: ElasticsearchTls,
+) -> Result<Vec<Value>, FaucetError> {
+    let config = ElasticsearchSourceConfig::new(base, "tls-items")
+        .auth(auth)
+        .with_tls(tls);
+    ElasticsearchSource::new(config)?.fetch_all().await
+}
+
+fn basic(password: &str) -> ElasticsearchAuth {
+    ElasticsearchAuth::Basic {
         username: "elastic".into(),
         password: password.into(),
-    });
-    ElasticsearchSource::new(config)?.fetch_all().await
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -48,28 +58,64 @@ async fn reads_over_https_and_refuses_bad_certificates() {
     )
     .await;
     let https = format!("https://localhost:{port}");
+    let ca = ElasticsearchTls {
+        ca_cert_path: Some(tls.ca_path()),
+        ..Default::default()
+    };
 
-    let untrusted = read(&https, password).await;
+    let untrusted = read_as(&https, basic(password), ElasticsearchTls::default()).await;
     assert!(
         untrusted.is_err(),
         "an unknown CA must be refused: {untrusted:?}"
     );
-    let plaintext = read(&format!("http://localhost:{port}"), password).await;
+    let plaintext = read_as(
+        &format!("http://localhost:{port}"),
+        basic(password),
+        ca.clone(),
+    )
+    .await;
     assert!(
         plaintext.is_err(),
         "plaintext must be refused: {plaintext:?}"
     );
 
-    if !cfg!(target_os = "linux") {
-        return;
-    }
-    // SAFETY: this binary runs one test; nothing else reads the environment concurrently.
-    unsafe { std::env::set_var("SSL_CERT_FILE", tls.ca_path()) };
-    let docs = read(&https, password).await.expect("verified HTTPS read");
+    let docs = read_as(&https, basic(password), ca.clone())
+        .await
+        .expect("verified HTTPS read");
     assert_eq!(docs.len(), 1, "{docs:?}");
     assert_eq!(docs[0]["v"], "a", "{docs:?}");
     assert!(
-        read(&https, "wrong").await.is_err(),
+        read_as(&https, basic("wrong"), ca.clone()).await.is_err(),
         "a wrong password must be refused"
     );
+
+    let key = images::exec(
+        &es,
+        &[
+            "curl",
+            "-sk",
+            "-u",
+            &format!("elastic:{password}"),
+            "-H",
+            "Content-Type: application/json",
+            "-X",
+            "POST",
+            "https://localhost:9200/_security/api_key",
+            "-d",
+            r#"{"name":"faucet-source"}"#,
+        ],
+    )
+    .await;
+    let key: Value = serde_json::from_str(&key).expect("api key json");
+    let inline = ElasticsearchTls {
+        ca_cert_pem: Some(tls.ca_pem().to_string()),
+        ..Default::default()
+    };
+    let api_key = ElasticsearchAuth::ApiKey {
+        key: key["encoded"].as_str().expect("encoded key").to_string(),
+    };
+    let docs = read_as(&https, api_key, inline)
+        .await
+        .expect("api_key read");
+    assert_eq!(docs.len(), 1, "{docs:?}");
 }

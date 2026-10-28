@@ -34,6 +34,13 @@ pub struct RedisSinkConfig {
     pub url: String,
     /// The type of Redis data structure to write to.
     pub sink_type: RedisSinkType,
+    /// TLS settings for a `rediss://` URL: a private CA, a client
+    /// certificate for mutual TLS, or `insecure_skip_verify`.
+    #[serde(
+        default,
+        skip_serializing_if = "faucet_common_redis::RedisTls::is_default"
+    )]
+    pub tls: faucet_common_redis::RedisTls,
     /// Maximum number of commands packed into a single Redis pipeline.
     /// Defaults to [`DEFAULT_BATCH_SIZE`] (1000), which is a comfortable
     /// per-pipeline working set for Redis: pipelined commands are cheap,
@@ -67,6 +74,7 @@ impl std::fmt::Debug for RedisSinkConfig {
         f.debug_struct("RedisSinkConfig")
             .field("url", &"***")
             .field("sink_type", &self.sink_type)
+            .field("tls", &self.tls)
             .field("batch_size", &self.batch_size)
             .field("ttl_secs", &self.ttl_secs)
             .field("stream_max_len", &self.stream_max_len)
@@ -80,16 +88,24 @@ impl RedisSinkConfig {
         Self {
             url: url.into(),
             sink_type,
+            tls: faucet_common_redis::RedisTls::default(),
             batch_size: DEFAULT_BATCH_SIZE,
             ttl_secs: None,
             stream_max_len: None,
         }
     }
 
+    /// Set the [`tls`](Self::tls) block.
+    pub fn with_tls(mut self, tls: faucet_common_redis::RedisTls) -> Self {
+        self.tls = tls;
+        self
+    }
+
     /// Refuse options that do not apply to the configured `sink_type`, or a
     /// zero TTL / length (which Redis rejects or would empty the stream).
     pub fn validate(&self) -> Result<(), faucet_core::FaucetError> {
         faucet_core::validate_batch_size(self.batch_size)?;
+        self.tls.validate("redis sink")?;
         let err = |m: &str| Err(faucet_core::FaucetError::Config(format!("redis sink: {m}")));
         match (&self.sink_type, self.ttl_secs, self.stream_max_len) {
             (_, Some(0), _) => err("ttl_secs must be greater than 0"),

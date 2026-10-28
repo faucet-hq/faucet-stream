@@ -4,7 +4,7 @@ use faucet_core::{AuthSpec, DEFAULT_BATCH_SIZE};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-pub use faucet_common_elasticsearch::ElasticsearchAuth;
+pub use faucet_common_elasticsearch::{ElasticsearchAuth, ElasticsearchTls};
 
 /// Deprecated alias retained for one minor release. Removed in `0.4.0`.
 #[deprecated(since = "0.3.0", note = "renamed to `ElasticsearchAuth`")]
@@ -69,6 +69,10 @@ pub struct ElasticsearchSinkConfig {
     /// half-open connection or wedged node cannot hang a run forever.
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
+    /// TLS settings for an `https://` cluster: a private CA, a client
+    /// certificate for mutual TLS, or `insecure_skip_verify`.
+    #[serde(default, skip_serializing_if = "ElasticsearchTls::is_default")]
+    pub tls: ElasticsearchTls,
     /// The `_bulk` action for `append` writes: `index` (default; overwrites a
     /// document with the same `_id`) or `create` (required by data streams,
     /// which reject `index`; a document whose `_id` already exists is left as
@@ -124,11 +128,14 @@ impl ElasticsearchSinkConfig {
             connect_timeout_secs: default_connect_timeout_secs(),
             request_timeout_secs: default_request_timeout_secs(),
             op_type: ElasticsearchOpType::default(),
+            tls: ElasticsearchTls::default(),
         }
     }
 
-    /// Refuse a zero timeout and `op_type: create` outside `append`.
+    /// Refuse a zero timeout, `op_type: create` outside `append` and a
+    /// malformed `tls` block.
     pub fn validate(&self) -> Result<(), faucet_core::FaucetError> {
+        self.tls.validate("elasticsearch sink")?;
         if self.connect_timeout_secs == 0 || self.request_timeout_secs == 0 {
             return Err(faucet_core::FaucetError::Config(
                 "elasticsearch sink: connect_timeout_secs and request_timeout_secs must be > 0"
@@ -144,6 +151,12 @@ impl ElasticsearchSinkConfig {
             )));
         }
         Ok(())
+    }
+
+    /// Set the [`tls`](Self::tls) block.
+    pub fn with_tls(mut self, tls: ElasticsearchTls) -> Self {
+        self.tls = tls;
+        self
     }
 
     /// Set the authentication method.
