@@ -494,16 +494,14 @@ async fn two_process_pools_keep_runs_on_their_replicas() {
                 .map_or(usize::MAX, Vec::len)
         }
     };
-    let wait_members = |port: u16, n: usize| {
-        async move {
-            for _ in 0..400 {
-                if members(port).await == n {
-                    return true;
-                }
-                sleep(Duration::from_millis(100)).await;
+    let wait_members = |port: u16, n: usize| async move {
+        for _ in 0..400 {
+            if members(port).await == n {
+                return true;
             }
-            false
+            sleep(Duration::from_millis(100)).await;
         }
+        false
     };
     let submit = |port: u16, tag: String, pool: &'static str| {
         let client = client.clone();
