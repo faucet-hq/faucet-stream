@@ -51,5 +51,6 @@ scripts/                      — helper and CI-check scripts (try-local.sh, bui
 docs/book/                    — mdBook documentation site (source under docs/book/src)
 rfcs/                         — design RFCs
 .github/workflows/            — ci.yml, release-plz.yml, docs.yml, docker-images.yml, chaos.yml, codeql.yml, scorecard.yml, …
+.github/codeql/               — codeql-config.yml (CodeQL scan scope: test code excluded)
 .github/assets/               — brand assets: logo, wordmark, social-preview banner, favicon
 ```
