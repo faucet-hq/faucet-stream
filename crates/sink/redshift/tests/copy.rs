@@ -9,6 +9,9 @@
 //! reads RFC-4180 cells with the unquoted marker as NULL. Every other message
 //! passes through untouched.
 
+#[path = "../../../common/redshift/tests/support/mod.rs"]
+mod support;
+
 use std::sync::{Arc, Mutex};
 
 use aws_sdk_s3::Client as S3Client;
@@ -315,6 +318,7 @@ struct Env {
     s3: S3Client,
     minio: String,
     proxy: u16,
+    pg_port: u16,
     seen: Arc<Mutex<Seen>>,
 }
 
@@ -345,6 +349,7 @@ async fn env() -> Env {
         minio: minio.endpoint.clone(),
         _minio: minio,
         proxy,
+        pg_port,
         seen,
     }
 }
@@ -537,37 +542,23 @@ async fn a_failed_copy_surfaces_the_error_and_removes_its_staged_objects() {
     assert_eq!(staged_keys(&env).await, Vec::<String>::new());
 }
 
-/// `iam` and `redshift_data_api` are reserved in v1: the sink refuses them at
-/// build time, before any connection or S3 call.
+/// An `iam` or `redshift_data_api` config missing its target is refused at
+/// build time, before any connection, AWS or S3 call.
 #[tokio::test]
-async fn reserved_credential_variants_are_refused_before_any_io() {
-    let base = || {
-        let mut conn = RedshiftConnection::new("127.0.0.1", "dev", "admin", "unused");
-        conn.port = 1;
-        conn
-    };
+async fn incomplete_iam_and_data_api_credentials_are_refused_before_any_io() {
     for (creds, want) in [
         (
-            RedshiftCredentials::Iam {
-                region: Some("us-east-1".into()),
-                cluster_identifier: Some("c".into()),
-                db_user: Some("admin".into()),
-            },
-            "IAM authentication is not yet supported",
+            json!({"type": "iam", "config": {"region": "us-east-1", "db_user": "admin"}}),
+            "set exactly one of `cluster_identifier` (provisioned) or `workgroup_name`",
         ),
         (
-            RedshiftCredentials::RedshiftDataApi {
-                region: Some("us-east-1".into()),
-                cluster_identifier: None,
-                workgroup_name: Some("wg".into()),
-                secret_arn: None,
-                db_user: None,
-            },
-            "Redshift Data API authentication is not yet supported",
+            json!({"type": "redshift_data_api", "config": {"region": "us-east-1", "cluster_identifier": "c"}}),
+            "a cluster needs exactly one of `db_user`",
         ),
     ] {
-        let mut conn = base();
-        conn.credentials = creds;
+        let mut conn = RedshiftConnection::new("127.0.0.1", "dev", "admin", "unused");
+        conn.port = 1;
+        conn.credentials = serde_json::from_value::<RedshiftCredentials>(creds).unwrap();
         let cfg = RedshiftSinkConfig {
             connection: conn,
             table_name: "t".into(),
@@ -591,5 +582,71 @@ async fn reserved_credential_variants_are_refused_before_any_io() {
             Err(other) => panic!("unexpected error {other:?}"),
             Ok(_) => panic!("{want}: must be refused"),
         }
+    }
+}
+
+/// `copy` through the Data API: the chunk is staged to S3, the `COPY` runs as
+/// a Data API statement, and the staged object is removed whether the load
+/// finished or failed.
+#[tokio::test(flavor = "multi_thread")]
+async fn copy_through_the_data_api_runs_copy_as_a_statement_and_cleans_up() {
+    let env = env().await;
+    sqlx::query("CREATE TABLE events (id BIGINT, name TEXT)")
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    for (outcome, want) in [
+        (Ok(()), None),
+        (
+            Err("S3ServiceException: Access Denied".to_string()),
+            Some("Access Denied"),
+        ),
+    ] {
+        let server = wiremock::MockServer::start().await;
+        let fake = support::DataApiFake::new(support::admin_url(env.pg_port), 100).copying(outcome);
+        fake.mount(&server).await;
+        let mut cfg = config(&env, "events", RedshiftCopyFormat::Jsonl, 0);
+        cfg.connection.credentials = serde_json::from_value(json!({
+            "type": "redshift_data_api",
+            "config": {"workgroup_name": "wg", "region": stores::MINIO_REGION,
+                       "aws_credentials": support::access_key(), "endpoint_url": server.uri()}
+        }))
+        .unwrap();
+        let sink = RedshiftSink::new(cfg).await.unwrap();
+        sink.write_batch(&[json!({"id": 1, "name": "a"}), json!({"id": 2})])
+            .await
+            .unwrap();
+        let flushed = sink.flush().await;
+        let copy = fake
+            .submitted()
+            .into_iter()
+            .map(|s| s.body)
+            .find(|b| b["Sql"].as_str().is_some_and(|s| s.starts_with("COPY ")))
+            .expect("a COPY statement");
+        let sql = copy["Sql"].as_str().unwrap();
+        assert!(
+            sql.starts_with(&format!("COPY \"events\" FROM 's3://{BUCKET}/loads/")),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(&format!(
+                "IAM_ROLE '{ROLE}' FORMAT AS JSON 'auto ignorecase'"
+            )),
+            "{sql}"
+        );
+        assert_eq!(copy["WorkgroupName"], "wg");
+        match want {
+            None => flushed.unwrap(),
+            Some(needle) => {
+                let err = flushed.unwrap_err().to_string();
+                assert!(err.contains("redshift: COPY failed"), "{err}");
+                assert!(err.contains(needle), "{err}");
+            }
+        }
+        assert_eq!(staged_keys(&env).await, Vec::<String>::new());
+        assert!(
+            env.seen.lock().unwrap().copies.is_empty(),
+            "nothing went over the wire"
+        );
     }
 }

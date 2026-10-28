@@ -45,13 +45,16 @@ type ResultSet = (Vec<(String, String)>, Vec<Vec<Value>>);
 
 /// Runs SQL on its own thread and runtime, so a synchronous wiremock
 /// responder can wait for it.
+/// A statement and where its outcome goes.
+type Job = (String, mpsc::Sender<Result<ResultSet, String>>);
+
 struct PgExec {
-    tx: Mutex<mpsc::Sender<(String, mpsc::Sender<Result<ResultSet, String>>)>>,
+    tx: Mutex<mpsc::Sender<Job>>,
 }
 
 impl PgExec {
     fn new(url: String) -> Self {
-        let (tx, rx) = mpsc::channel::<(String, mpsc::Sender<Result<ResultSet, String>>)>();
+        let (tx, rx) = mpsc::channel::<Job>();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -209,6 +212,7 @@ pub struct DataApiFake {
     pg: Arc<PgExec>,
     page_size: usize,
     stall: bool,
+    copy: Option<Result<(), String>>,
 }
 
 impl DataApiFake {
@@ -220,7 +224,15 @@ impl DataApiFake {
             pg: Arc::new(PgExec::new(url)),
             page_size,
             stall: false,
+            copy: None,
         }
+    }
+
+    /// `COPY … FROM 's3://…'` statements are not run (PostgreSQL cannot read
+    /// S3); each finishes, or fails with the given message.
+    pub fn copying(mut self, outcome: Result<(), String>) -> Self {
+        self.copy = Some(outcome);
+        self
     }
 
     /// Statements never leave STARTED (deadline and cancel tests).
@@ -315,7 +327,12 @@ impl Respond for DataApiFake {
                     bound_sql: bound_sql.clone(),
                 });
                 drop(st);
-                let outcome = self.pg.run(&bound_sql);
+                let outcome = match &self.copy {
+                    Some(result) if bound_sql.trim_start().starts_with("COPY ") => {
+                        result.clone().map(|()| (Vec::new(), Vec::new()))
+                    }
+                    _ => self.pg.run(&bound_sql),
+                };
                 let mut st = self.state.lock().unwrap();
                 let statement = match outcome {
                     Ok(result) => Statement {

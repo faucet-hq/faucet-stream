@@ -23,22 +23,68 @@ fn conformance_config_schema_valid() {
 
 #[tokio::test]
 async fn descriptor_matches_the_built_source() {
-    let v = serde_json::json!({
-        "host": "localhost",
-        "database": "db",
-        "user": "u",
-        "credentials": {"type": "password", "config": {"password": "pw"}},
-        "query": "SELECT 1"
+    for credentials in [
+        serde_json::json!({"type": "password", "config": {"password": "pw"}}),
+        serde_json::json!({"type": "iam", "config": {"cluster_identifier": "c"}}),
+        serde_json::json!({"type": "redshift_data_api", "config": {"workgroup_name": "wg"}}),
+    ] {
+        let v = serde_json::json!({
+            "host": "localhost",
+            "database": "db",
+            "user": "u",
+            "credentials": credentials,
+            "query": "SELECT 1"
+        });
+        let cfg: faucet_source_redshift::RedshiftSourceConfig =
+            serde_json::from_value(v.clone()).unwrap();
+        let built = faucet_source_redshift::RedshiftSource::new(cfg).expect("source");
+        faucet_conformance::assert_descriptor_matches_source(
+            &faucet_source_redshift::DESCRIPTOR,
+            "redshift",
+            &v,
+            &built,
+        );
+    }
+}
+
+/// The `iam` credentials call and every Data API request end at the run's
+/// deadline too, against an endpoint that never answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_call_deadline_over_aws_apis() {
+    let hung = faucet_conformance::hung::SilentListener::start()
+        .await
+        .expect("listener");
+    let aws = serde_json::json!({
+        "region": "us-east-1",
+        "endpoint_url": format!("http://127.0.0.1:{}", hung.port()),
+        "aws_credentials": {"type": "access_key", "config": {"access_key_id": "AKID", "secret_access_key": "s"}},
     });
-    let cfg: faucet_source_redshift::RedshiftSourceConfig =
-        serde_json::from_value(v.clone()).unwrap();
-    let built = faucet_source_redshift::RedshiftSource::new(cfg).expect("source");
-    faucet_conformance::assert_descriptor_matches_source(
-        &faucet_source_redshift::DESCRIPTOR,
-        "redshift",
-        &v,
-        &built,
-    );
+    for (kind, target) in [
+        ("iam", serde_json::json!({"cluster_identifier": "c"})),
+        (
+            "redshift_data_api",
+            serde_json::json!({"workgroup_name": "wg"}),
+        ),
+    ] {
+        let mut config = aws.clone();
+        for (k, val) in target.as_object().unwrap() {
+            config[k] = val.clone();
+        }
+        let v = serde_json::json!({
+            "host": "127.0.0.1",
+            "port": 1,
+            "database": "db",
+            "user": "u",
+            "credentials": {"type": kind, "config": config},
+            "tls_mode": "disable",
+            "query": "SELECT 1"
+        });
+        faucet_conformance::calls::assert_source_call_deadline(|| {
+            faucet_source_redshift::RedshiftSource::new(serde_json::from_value(v.clone()).unwrap())
+                .unwrap()
+        })
+        .await;
+    }
 }
 
 // ── Check: backend calls honour the call deadline and cancel (#880) ──────────

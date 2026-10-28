@@ -10859,10 +10859,10 @@
       ]
     },
     "source_redshift__RedshiftCredentials": {
-      "description": "How to authenticate with Amazon Redshift.\n\nSerializes as `{ type: <method>, config: { … } }` (adjacent tagging,\nsnake_case discriminators) — the consistent auth wire shape shared by every\nfaucet connector.\n\nv1 implements only [`RedshiftCredentials::Password`]. The [`Iam`] and\n[`RedshiftDataApi`] variants are accepted by the config parser (so a future\nversion can add them without a breaking change) but currently return a typed\n[`FaucetError::Config`](faucet_core::FaucetError::Config) at client-build\ntime.\n\n[`Iam`]: RedshiftCredentials::Iam\n[`RedshiftDataApi`]: RedshiftCredentials::RedshiftDataApi",
+      "description": "How to authenticate with Amazon Redshift.\n\nSerializes as `{ type: <method>, config: { … } }` (adjacent tagging,\nsnake_case discriminators) — the consistent auth wire shape shared by every\nfaucet connector.\n\n- [`Password`](Self::Password) — a database user and password over the\n  PostgreSQL wire protocol.\n- [`Iam`](Self::Iam) — temporary database credentials from\n  `redshift:GetClusterCredentials` (provisioned cluster) or\n  `redshift-serverless:GetCredentials` (workgroup), refreshed before they\n  expire, over the PostgreSQL wire protocol.\n- [`RedshiftDataApi`](Self::RedshiftDataApi) — every statement runs through\n  the Redshift Data API over HTTPS; no network path to the cluster is\n  needed.",
       "oneOf": [
         {
-          "description": "Username/password authentication (the user comes from\n[`RedshiftConnection::user`]). The only mechanism supported in v1.",
+          "description": "Username/password authentication (the user comes from\n[`RedshiftConnection::user`]).",
           "type": "object",
           "properties": {
             "type": {
@@ -10881,7 +10881,7 @@
           }
         },
         {
-          "description": "IAM authentication via temporary cluster credentials\n(`GetClusterCredentials`). **Not yet supported** — reserved for a future\nversion; building a client with this variant returns a typed error.",
+          "description": "IAM authentication with temporary database credentials. Set exactly\none of `cluster_identifier` (provisioned, `GetClusterCredentials`) or\n`workgroup_name` (serverless, `GetCredentials`). The connection then\nuses the returned user and password over the PostgreSQL wire protocol\n(`host`, `port`, `database` and TLS as configured), and new pool\nconnections get fresh credentials before the old ones expire.",
           "type": "object",
           "properties": {
             "type": {
@@ -10892,32 +10892,75 @@
               "type": "object",
               "properties": {
                 "region": {
-                  "description": "AWS region of the cluster.",
+                  "description": "AWS region of the cluster or workgroup. `None` uses the SDK\ndefault chain (`AWS_REGION`, profile).",
                   "type": [
                     "string",
                     "null"
                   ]
                 },
                 "cluster_identifier": {
-                  "description": "Provisioned cluster identifier used to request temporary credentials.",
+                  "description": "Provisioned cluster identifier (`GetClusterCredentials`).",
                   "type": [
                     "string",
                     "null"
                   ]
                 },
                 "db_user": {
-                  "description": "Database user to authenticate as.",
+                  "description": "Database user to request credentials for (provisioned only).\nDefaults to [`RedshiftConnection::user`].",
                   "type": [
                     "string",
                     "null"
                   ]
+                },
+                "workgroup_name": {
+                  "description": "Serverless workgroup name (`redshift-serverless:GetCredentials`);\nthe database user is derived from the IAM identity.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "auto_create": {
+                  "description": "Create `db_user` when it does not exist (provisioned only).",
+                  "type": [
+                    "boolean",
+                    "string"
+                  ]
+                },
+                "db_groups": {
+                  "description": "Database groups the user joins for the session (provisioned only).",
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "duration_secs": {
+                  "description": "Lifetime of the temporary credentials, 900–3600 seconds. `None`\nuses the service default (900).",
+                  "type": [
+                    "integer",
+                    "null",
+                    "string"
+                  ],
+                  "format": "uint32",
+                  "minimum": 0
+                },
+                "aws_credentials": {
+                  "description": "AWS credentials used to call the credentials API. Defaults to the\nSDK default chain.",
+                  "$ref": "#/$defs/source_redshift__RedshiftAwsCredentials"
+                },
+                "endpoint_url": {
+                  "description": "Endpoint override for the credentials API (VPC endpoints, tests).",
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "x-faucet-resource": "url"
                 }
               }
             }
           }
         },
         {
-          "description": "Authentication through the Redshift Data API (HTTP, not the PG wire).\n**Not yet supported** — reserved for a future version; building a client\nwith this variant returns a typed error.",
+          "description": "Every statement runs through the Redshift Data API over HTTPS\n(`ExecuteStatement`, `DescribeStatement`, `GetStatementResult`), not the\nPostgreSQL wire protocol, so `host`, `port`, `user` and the TLS settings\nare not used. Set exactly one of `cluster_identifier` or\n`workgroup_name`; a cluster also needs `db_user` (temporary\ncredentials) or `secret_arn`.",
           "type": "object",
           "properties": {
             "type": {
@@ -10928,7 +10971,7 @@
               "type": "object",
               "properties": {
                 "region": {
-                  "description": "AWS region.",
+                  "description": "AWS region. `None` uses the SDK default chain.",
                   "type": [
                     "string",
                     "null"
@@ -10956,13 +10999,132 @@
                   ]
                 },
                 "db_user": {
-                  "description": "Database user to authenticate as.",
+                  "description": "Database user to authenticate as with temporary credentials\n(provisioned clusters only).",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "aws_credentials": {
+                  "description": "AWS credentials used to call the Data API. Defaults to the SDK\ndefault chain.",
+                  "$ref": "#/$defs/source_redshift__RedshiftAwsCredentials"
+                },
+                "endpoint_url": {
+                  "description": "Endpoint override for the Data API (VPC endpoints, tests).",
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "x-faucet-resource": "url"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "source_redshift__RedshiftAwsCredentials": {
+      "description": "The AWS credentials the `iam` and `redshift_data_api` methods call AWS\nwith. The same shape as the other AWS connectors' `credentials`.",
+      "oneOf": [
+        {
+          "description": "The AWS SDK default provider chain: environment variables, shared\nconfig/credentials files, container credentials, web-identity tokens\nand instance profiles, refreshed automatically.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "default"
+            }
+          }
+        },
+        {
+          "description": "A named profile from the shared AWS config/credentials files.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "profile"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "description": "Profile name.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Static access keys. Prefer `${env:…}` / secrets-manager interpolation\nover literals.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "access_key"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "access_key_id": {
+                  "description": "AWS access key id.",
+                  "type": "string"
+                },
+                "secret_access_key": {
+                  "description": "AWS secret access key.",
+                  "type": "string"
+                },
+                "session_token": {
+                  "description": "Optional session token (temporary credentials).",
                   "type": [
                     "string",
                     "null"
                   ]
                 }
               }
+            }
+          }
+        },
+        {
+          "description": "Assume an IAM role via STS on top of the default provider chain.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "assume_role"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "role_arn": {
+                  "description": "ARN of the role to assume.",
+                  "type": "string"
+                },
+                "session_name": {
+                  "description": "Session name recorded in CloudTrail. Defaults to `faucet-stream`.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "external_id": {
+                  "description": "Optional external id for cross-account trust policies.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Web-identity federation (`AWS_WEB_IDENTITY_TOKEN_FILE` +\n`AWS_ROLE_ARN`, e.g. EKS IRSA), through the default chain.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "web_identity"
             }
           }
         }
@@ -19850,10 +20012,10 @@
       ]
     },
     "sink_redshift__RedshiftCredentials": {
-      "description": "How to authenticate with Amazon Redshift.\n\nSerializes as `{ type: <method>, config: { … } }` (adjacent tagging,\nsnake_case discriminators) — the consistent auth wire shape shared by every\nfaucet connector.\n\nv1 implements only [`RedshiftCredentials::Password`]. The [`Iam`] and\n[`RedshiftDataApi`] variants are accepted by the config parser (so a future\nversion can add them without a breaking change) but currently return a typed\n[`FaucetError::Config`](faucet_core::FaucetError::Config) at client-build\ntime.\n\n[`Iam`]: RedshiftCredentials::Iam\n[`RedshiftDataApi`]: RedshiftCredentials::RedshiftDataApi",
+      "description": "How to authenticate with Amazon Redshift.\n\nSerializes as `{ type: <method>, config: { … } }` (adjacent tagging,\nsnake_case discriminators) — the consistent auth wire shape shared by every\nfaucet connector.\n\n- [`Password`](Self::Password) — a database user and password over the\n  PostgreSQL wire protocol.\n- [`Iam`](Self::Iam) — temporary database credentials from\n  `redshift:GetClusterCredentials` (provisioned cluster) or\n  `redshift-serverless:GetCredentials` (workgroup), refreshed before they\n  expire, over the PostgreSQL wire protocol.\n- [`RedshiftDataApi`](Self::RedshiftDataApi) — every statement runs through\n  the Redshift Data API over HTTPS; no network path to the cluster is\n  needed.",
       "oneOf": [
         {
-          "description": "Username/password authentication (the user comes from\n[`RedshiftConnection::user`]). The only mechanism supported in v1.",
+          "description": "Username/password authentication (the user comes from\n[`RedshiftConnection::user`]).",
           "type": "object",
           "properties": {
             "type": {
@@ -19872,7 +20034,7 @@
           }
         },
         {
-          "description": "IAM authentication via temporary cluster credentials\n(`GetClusterCredentials`). **Not yet supported** — reserved for a future\nversion; building a client with this variant returns a typed error.",
+          "description": "IAM authentication with temporary database credentials. Set exactly\none of `cluster_identifier` (provisioned, `GetClusterCredentials`) or\n`workgroup_name` (serverless, `GetCredentials`). The connection then\nuses the returned user and password over the PostgreSQL wire protocol\n(`host`, `port`, `database` and TLS as configured), and new pool\nconnections get fresh credentials before the old ones expire.",
           "type": "object",
           "properties": {
             "type": {
@@ -19883,32 +20045,75 @@
               "type": "object",
               "properties": {
                 "region": {
-                  "description": "AWS region of the cluster.",
+                  "description": "AWS region of the cluster or workgroup. `None` uses the SDK\ndefault chain (`AWS_REGION`, profile).",
                   "type": [
                     "string",
                     "null"
                   ]
                 },
                 "cluster_identifier": {
-                  "description": "Provisioned cluster identifier used to request temporary credentials.",
+                  "description": "Provisioned cluster identifier (`GetClusterCredentials`).",
                   "type": [
                     "string",
                     "null"
                   ]
                 },
                 "db_user": {
-                  "description": "Database user to authenticate as.",
+                  "description": "Database user to request credentials for (provisioned only).\nDefaults to [`RedshiftConnection::user`].",
                   "type": [
                     "string",
                     "null"
                   ]
+                },
+                "workgroup_name": {
+                  "description": "Serverless workgroup name (`redshift-serverless:GetCredentials`);\nthe database user is derived from the IAM identity.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "auto_create": {
+                  "description": "Create `db_user` when it does not exist (provisioned only).",
+                  "type": [
+                    "boolean",
+                    "string"
+                  ]
+                },
+                "db_groups": {
+                  "description": "Database groups the user joins for the session (provisioned only).",
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "duration_secs": {
+                  "description": "Lifetime of the temporary credentials, 900–3600 seconds. `None`\nuses the service default (900).",
+                  "type": [
+                    "integer",
+                    "null",
+                    "string"
+                  ],
+                  "format": "uint32",
+                  "minimum": 0
+                },
+                "aws_credentials": {
+                  "description": "AWS credentials used to call the credentials API. Defaults to the\nSDK default chain.",
+                  "$ref": "#/$defs/sink_redshift__RedshiftAwsCredentials"
+                },
+                "endpoint_url": {
+                  "description": "Endpoint override for the credentials API (VPC endpoints, tests).",
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "x-faucet-resource": "url"
                 }
               }
             }
           }
         },
         {
-          "description": "Authentication through the Redshift Data API (HTTP, not the PG wire).\n**Not yet supported** — reserved for a future version; building a client\nwith this variant returns a typed error.",
+          "description": "Every statement runs through the Redshift Data API over HTTPS\n(`ExecuteStatement`, `DescribeStatement`, `GetStatementResult`), not the\nPostgreSQL wire protocol, so `host`, `port`, `user` and the TLS settings\nare not used. Set exactly one of `cluster_identifier` or\n`workgroup_name`; a cluster also needs `db_user` (temporary\ncredentials) or `secret_arn`.",
           "type": "object",
           "properties": {
             "type": {
@@ -19919,7 +20124,7 @@
               "type": "object",
               "properties": {
                 "region": {
-                  "description": "AWS region.",
+                  "description": "AWS region. `None` uses the SDK default chain.",
                   "type": [
                     "string",
                     "null"
@@ -19947,13 +20152,132 @@
                   ]
                 },
                 "db_user": {
-                  "description": "Database user to authenticate as.",
+                  "description": "Database user to authenticate as with temporary credentials\n(provisioned clusters only).",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "aws_credentials": {
+                  "description": "AWS credentials used to call the Data API. Defaults to the SDK\ndefault chain.",
+                  "$ref": "#/$defs/sink_redshift__RedshiftAwsCredentials"
+                },
+                "endpoint_url": {
+                  "description": "Endpoint override for the Data API (VPC endpoints, tests).",
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "x-faucet-resource": "url"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "sink_redshift__RedshiftAwsCredentials": {
+      "description": "The AWS credentials the `iam` and `redshift_data_api` methods call AWS\nwith. The same shape as the other AWS connectors' `credentials`.",
+      "oneOf": [
+        {
+          "description": "The AWS SDK default provider chain: environment variables, shared\nconfig/credentials files, container credentials, web-identity tokens\nand instance profiles, refreshed automatically.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "default"
+            }
+          }
+        },
+        {
+          "description": "A named profile from the shared AWS config/credentials files.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "profile"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "description": "Profile name.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Static access keys. Prefer `${env:…}` / secrets-manager interpolation\nover literals.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "access_key"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "access_key_id": {
+                  "description": "AWS access key id.",
+                  "type": "string"
+                },
+                "secret_access_key": {
+                  "description": "AWS secret access key.",
+                  "type": "string"
+                },
+                "session_token": {
+                  "description": "Optional session token (temporary credentials).",
                   "type": [
                     "string",
                     "null"
                   ]
                 }
               }
+            }
+          }
+        },
+        {
+          "description": "Assume an IAM role via STS on top of the default provider chain.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "assume_role"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "role_arn": {
+                  "description": "ARN of the role to assume.",
+                  "type": "string"
+                },
+                "session_name": {
+                  "description": "Session name recorded in CloudTrail. Defaults to `faucet-stream`.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "external_id": {
+                  "description": "Optional external id for cross-account trust policies.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Web-identity federation (`AWS_WEB_IDENTITY_TOKEN_FILE` +\n`AWS_ROLE_ARN`, e.g. EKS IRSA), through the default chain.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "web_identity"
             }
           }
         }
@@ -25722,8 +26046,9 @@
                 {
                   "properties": {
                     "host": {
-                      "description": "Cluster / endpoint host (e.g. `my-cluster.abc123.us-east-1.redshift.amazonaws.com`).",
+                      "description": "Cluster / endpoint host (e.g. `my-cluster.abc123.us-east-1.redshift.amazonaws.com`).\nRequired except with `credentials: { type: redshift_data_api }`.",
                       "type": "string",
+                      "default": "",
                       "x-faucet-resource": "url"
                     },
                     "port": {
@@ -25742,8 +26067,9 @@
                       "type": "string"
                     },
                     "user": {
-                      "description": "Database user.",
-                      "type": "string"
+                      "description": "Database user. Required for `password`; for a provisioned `iam`\ncluster it is the default `db_user`; unused by `redshift_data_api`.",
+                      "type": "string",
+                      "default": ""
                     },
                     "credentials": {
                       "description": "Authentication credentials.",
@@ -34627,8 +34953,9 @@
                 {
                   "properties": {
                     "host": {
-                      "description": "Cluster / endpoint host (e.g. `my-cluster.abc123.us-east-1.redshift.amazonaws.com`).",
+                      "description": "Cluster / endpoint host (e.g. `my-cluster.abc123.us-east-1.redshift.amazonaws.com`).\nRequired except with `credentials: { type: redshift_data_api }`.",
                       "type": "string",
+                      "default": "",
                       "x-faucet-resource": "url"
                     },
                     "port": {
@@ -34647,8 +34974,9 @@
                       "type": "string"
                     },
                     "user": {
-                      "description": "Database user.",
-                      "type": "string"
+                      "description": "Database user. Required for `password`; for a provisioned `iam`\ncluster it is the default `db_user`; unused by `redshift_data_api`.",
+                      "type": "string",
+                      "default": ""
                     },
                     "credentials": {
                       "description": "Authentication credentials.",

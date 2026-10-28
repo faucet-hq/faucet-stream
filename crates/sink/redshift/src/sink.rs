@@ -118,7 +118,7 @@ enum Backend {
     /// The PostgreSQL wire protocol (`password`, `iam`).
     Wire(RedshiftPool),
     /// The Redshift Data API over HTTPS (`redshift_data_api`).
-    DataApi(DataApiClient),
+    DataApi(Box<DataApiClient>),
 }
 
 /// How many bytes of SQL and parameter text one Data API `INSERT` carries
@@ -398,7 +398,7 @@ impl RedshiftDriver {
     async fn new(config: RedshiftSinkConfig) -> Result<Self, FaucetError> {
         config.validate()?;
         let backend = match DataApiClient::from_connection(&config.connection, FaucetError::Sink)? {
-            Some(api) => Backend::DataApi(api),
+            Some(api) => Backend::DataApi(Box::new(api)),
             None => Backend::Wire(faucet_common_redshift::connect_lazy(
                 &config.connection,
                 config.max_connections,
@@ -835,6 +835,9 @@ fn data_api_inserts(
     Ok(out)
 }
 
+/// A `VALUES` tuple, its parameters, and its size in bytes.
+type InsertTuple = (String, Vec<(String, String)>, usize);
+
 /// One `VALUES` tuple whose parameters are numbered after `first`, its
 /// parameters, and its size in bytes.
 fn insert_tuple(
@@ -842,7 +845,7 @@ fn insert_tuple(
     columns: &[String],
     casts: &[Option<&str>],
     first: usize,
-) -> Result<(String, Vec<(String, String)>, usize), FaucetError> {
+) -> Result<InsertTuple, FaucetError> {
     let mut tuple = String::from("(");
     let mut params: Vec<(String, String)> = Vec::new();
     for (i, (col, cast)) in columns.iter().zip(casts).enumerate() {

@@ -631,7 +631,7 @@ fn float_text(ty: &str, s: &str) -> Result<Value, String> {
 /// Hex text (`0aff`, or `\x0aff` as PostgreSQL writes `bytea`) as bytes.
 fn hex_bytes(s: &str) -> Option<Vec<u8>> {
     let s = s.strip_prefix("\\x").unwrap_or(s);
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())

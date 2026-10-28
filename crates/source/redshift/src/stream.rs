@@ -38,7 +38,7 @@ enum Backend {
     /// The PostgreSQL wire protocol (`password`, `iam`).
     Wire(RedshiftPool),
     /// The Redshift Data API over HTTPS (`redshift_data_api`).
-    DataApi(DataApiClient),
+    DataApi(Box<DataApiClient>),
 }
 
 /// Where the rows of a running query come from.
@@ -66,7 +66,7 @@ impl RedshiftSource {
         config.validate()?;
         let backend = match DataApiClient::from_connection(&config.connection, FaucetError::Source)?
         {
-            Some(api) => Backend::DataApi(api),
+            Some(api) => Backend::DataApi(Box::new(api)),
             None => Backend::Wire(faucet_common_redshift::connect_lazy(
                 &config.connection,
                 config.max_connections,

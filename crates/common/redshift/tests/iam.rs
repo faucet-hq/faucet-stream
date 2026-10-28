@@ -19,6 +19,9 @@ use serde_json::json;
 use support::{ACCESS_KEY, REGION, access_key, admin_url, credentials_response, form};
 use wiremock::{MockServer, Request, Respond, ResponseTemplate};
 
+/// One request: its form fields and `Authorization` header.
+type Seen = (std::collections::HashMap<String, String>, String);
+
 /// Hands out `passwords` in turn, each valid for `lifetime`, and keeps every
 /// request's form fields and `Authorization` header.
 #[derive(Clone)]
@@ -27,7 +30,7 @@ struct ClusterCredentials {
     passwords: Vec<&'static str>,
     lifetime: Duration,
     calls: Arc<AtomicUsize>,
-    seen: Arc<Mutex<Vec<(std::collections::HashMap<String, String>, String)>>>,
+    seen: Arc<Mutex<Vec<Seen>>>,
 }
 
 impl Respond for ClusterCredentials {
