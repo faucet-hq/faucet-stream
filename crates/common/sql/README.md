@@ -65,6 +65,16 @@ lifecycle; every default reproduces the generic behaviour:
 | `table_display(table)` | as configured | postgres: the schema-qualified name |
 | `capabilities(derived)` | unchanged | postgres: scoped overwrite |
 
+### Declared column types
+
+`SqlDialect::declared_type_name` maps a source's declared `LogicalType` (#955)
+to the dialect's column type (`None` keeps the base type), and
+`planned_type_name` is what every `create_table_sql` renders a planned column
+with. `SqlSinkEngine::create_table_sql_declared` plans from the page and the
+declaration; `SqlSinkDriver` keeps the declaration a sink is handed
+(`SinkDriver::set_declared_columns`), creates from it, and in `complete_run`
+creates the empty typed table for a run that wrote nothing.
+
 ## Using the engine directly
 
 ```rust,ignore

@@ -10,7 +10,7 @@
 
 use crate::mapping::ColumnMatching;
 use faucet_core::rollback::JournalSql;
-use faucet_core::{FaucetError, PlannedColumn, SqlBaseType};
+use faucet_core::{FaucetError, LogicalType, PlannedColumn, SqlBaseType};
 
 /// The table a statement targets: its bare name and its quoted reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +101,45 @@ pub trait SqlDialect: Send + Sync {
 
     /// The column type a created or added column of base type `t` gets.
     fn type_name(&self, t: SqlBaseType) -> &'static str;
+
+    /// The column type a created column declared as `t` (#955) gets, or
+    /// `None` when the dialect has no exact counterpart and the column falls
+    /// back to [`type_name`](Self::type_name) of its base type. Default: none.
+    fn declared_type_name(&self, t: &LogicalType) -> Option<String> {
+        let _ = t;
+        None
+    }
+
+    /// [`declared_type_name`](Self::declared_type_name) for a primary-key
+    /// column. Defaults to it, except for text, JSON and binary, which take
+    /// [`key_type_name`](Self::key_type_name) (a dialect that cannot index
+    /// its unbounded types bounds them there).
+    fn declared_key_type_name(&self, t: &LogicalType) -> Option<String> {
+        match t {
+            LogicalType::String | LogicalType::Json | LogicalType::Bytes => None,
+            other => self.declared_type_name(other),
+        }
+    }
+
+    /// The type keyword of planned column `c` in a created table: its
+    /// declared type when the dialect maps it, else its base type's.
+    fn planned_type_name(&self, c: &PlannedColumn, key: bool) -> String {
+        let declared = c.declared.as_ref().and_then(|t| {
+            if key {
+                self.declared_key_type_name(t)
+            } else {
+                self.declared_type_name(t)
+            }
+        });
+        declared.unwrap_or_else(|| {
+            if key {
+                self.key_type_name(c.base_type)
+            } else {
+                self.type_name(c.base_type)
+            }
+            .to_string()
+        })
+    }
 
     /// The column type of a primary-key column of a created table. Defaults
     /// to [`type_name`](Self::type_name); a dialect that cannot index its
@@ -213,11 +252,7 @@ pub trait SqlDialect: Send + Sync {
     ) -> Result<String, FaucetError> {
         let mut defs: Vec<String> = Vec::with_capacity(columns.len() + 1);
         for c in columns {
-            let ty = if key.contains(&c.name) {
-                self.key_type_name(c.base_type)
-            } else {
-                self.type_name(c.base_type)
-            };
+            let ty = self.planned_type_name(c, key.contains(&c.name));
             defs.push(format!("{} {ty}", self.quote(&c.name)?));
         }
         if !key.is_empty() {

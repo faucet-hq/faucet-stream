@@ -546,8 +546,69 @@ fn stream_blocking(
     Ok(())
 }
 
+/// The logical type of a column of DuckDB type `ty`, as this source renders
+/// it (#955): nested types are JSON, the types read through text are text.
+fn declared_type(ty: &str) -> faucet_core::LogicalType {
+    use faucet_core::LogicalType as L;
+    let upper = ty.trim().to_ascii_uppercase();
+    if upper.ends_with(']')
+        || ["STRUCT", "MAP", "UNION", "LIST"]
+            .iter()
+            .any(|p| upper.starts_with(p))
+    {
+        return L::Json;
+    }
+    match upper.as_str() {
+        "UHUGEINT" | "BIT" | "BIGNUM" | "VARINT" | "TIMETZ" | "TIME WITH TIME ZONE" => L::String,
+        "TIMESTAMP_S" | "TIMESTAMP_MS" | "TIMESTAMP_NS" => L::Timestamp { tz: false },
+        _ => L::from_sql_type(ty, None, None).unwrap_or(L::String),
+    }
+}
+
 #[async_trait]
 impl faucet_core::Source for DuckdbSource {
+    fn capabilities(&self) -> faucet_core::Capabilities {
+        faucet_core::Capabilities::of_source(self)
+            .to_builder()
+            .declared_columns(true)
+            .build()
+    }
+
+    /// The query's columns from its `DESCRIBE` (#955); `None` for a statement
+    /// DuckDB cannot describe.
+    async fn declared_columns(
+        &self,
+        context: &HashMap<String, Value>,
+    ) -> Result<Option<faucet_core::DeclaredColumns>, FaucetError> {
+        let conn = self.conn.clone();
+        let (query, binds) = resolve_query(&self.config, context);
+        let task = tokio::task::spawn_blocking(move || {
+            let guard = conn
+                .lock()
+                .map_err(|_| FaucetError::Source("duckdb connection mutex poisoned".into()))?;
+            let params: Vec<DuckValue> = binds.iter().map(json_to_duck).collect();
+            Ok::<_, FaucetError>(
+                describe(&guard, &query, &params)
+                    .or_else(|| describe_by_typeof(&guard, &query, &params)),
+            )
+        });
+        let described = self
+            .calls
+            .call_once("describe", async {
+                task.await.map_err(|e| {
+                    FaucetError::Source(format!("duckdb describe task panicked: {e}"))
+                })?
+            })
+            .await?;
+        Ok(described.map(|cols| {
+            faucet_core::DeclaredColumns::new(
+                cols.iter().map(|(name, ty)| {
+                    faucet_core::DeclaredColumn::new(name, declared_type(ty), true)
+                }),
+            )
+        }))
+    }
+
     fn set_call_context(&self, ctx: faucet_core::CallContext) {
         self.calls.install(ctx);
     }
@@ -1220,5 +1281,65 @@ mod tests {
         )
         .unwrap();
         assert!(c.sandbox);
+    }
+
+    #[test]
+    fn declared_types_follow_the_rendering() {
+        use faucet_core::LogicalType as L;
+        assert_eq!(declared_type("INTEGER"), L::Int64);
+        assert_eq!(
+            declared_type("DECIMAL(18,3)"),
+            L::Decimal {
+                precision: Some(18),
+                scale: Some(3)
+            }
+        );
+        assert_eq!(
+            declared_type("TIMESTAMP WITH TIME ZONE"),
+            L::Timestamp { tz: true }
+        );
+        assert_eq!(declared_type("TIMESTAMP_NS"), L::Timestamp { tz: false });
+        assert_eq!(declared_type("INTEGER[]"), L::Json);
+        assert_eq!(declared_type("STRUCT(a INTEGER)"), L::Json);
+        assert_eq!(declared_type("UHUGEINT"), L::String);
+        assert_eq!(declared_type("INTERVAL"), L::String);
+        assert_eq!(declared_type("BLOB"), L::Bytes);
+        assert_eq!(declared_type("UUID"), L::Uuid);
+    }
+
+    #[tokio::test]
+    async fn declares_the_described_columns() {
+        use faucet_core::Source as _;
+        let src = DuckdbSource::new(crate::DuckdbSourceConfig::new(
+            ":memory:",
+            "SELECT 1::INTEGER AS id, 2.50::DECIMAL(10,2) AS amount, DATE '2024-01-02' AS day",
+        ))
+        .await
+        .unwrap();
+        let d = src
+            .declared_columns(&HashMap::new())
+            .await
+            .unwrap()
+            .expect("declared");
+        let types: Vec<_> = d
+            .columns()
+            .iter()
+            .map(|c| (c.name.as_str(), c.logical_type))
+            .collect();
+        assert_eq!(
+            types,
+            [
+                ("id", faucet_core::LogicalType::Int64),
+                (
+                    "amount",
+                    faucet_core::LogicalType::Decimal {
+                        precision: Some(10),
+                        scale: Some(2)
+                    }
+                ),
+                ("day", faucet_core::LogicalType::Date),
+            ]
+        );
+        assert!(src.capabilities().declared_columns());
     }
 }

@@ -31,6 +31,9 @@ pub struct PostgresSource {
     decimal_columns: Mutex<std::collections::HashSet<String>>,
     /// Bookmark loaded via [`Source::apply_start_bookmark`](faucet_core::Source::apply_start_bookmark).
     start_bookmark: Mutex<Option<Value>>,
+    /// The last statement described and its columns, so the declaration
+    /// (#955) and the read share one describe round trip.
+    described: Mutex<Option<(String, Vec<DescribedColumn>)>>,
     /// Backend-call context (#880): the run's deadline, cancel token and
     /// recorder. `read_timeout_secs` stays the per-read bound.
     calls: CallSlot,
@@ -61,6 +64,7 @@ impl PostgresSource {
             json_warned: Mutex::new(Default::default()),
             decimal_columns: Mutex::new(Default::default()),
             start_bookmark: Mutex::new(None),
+            described: Mutex::new(None),
             calls: CallSlot::new(CallContext::new().without_timeout()),
         })
     }
@@ -108,26 +112,21 @@ impl PostgresSource {
         start: &Value,
         sharded: bool,
     ) -> Result<(String, Vec<Value>), FaucetError> {
-        use sqlx::Executor;
         let probe = resolve_query_text(
             &self.config.query.replace(BOOKMARK_TOKEN, "NULL"),
             self.config.params.len(),
             context,
         )
         .0;
-        let described = self
-            .read("describe", (&self.pool).describe(&probe))
-            .await?
-            .map_err(|e| {
-                FaucetError::Source(format!(
-                    "postgres: could not describe the incremental query: {e}"
-                ))
-            })?;
+        let described = self.describe(&probe).await?.map_err(|e| {
+            FaucetError::Source(format!(
+                "postgres: could not describe the incremental query: {e}"
+            ))
+        })?;
         let type_name = described
-            .columns()
             .iter()
-            .find(|c| c.name() == column)
-            .map(|c| c.type_info().name().to_string())
+            .find(|c| c.name == column)
+            .map(|c| c.type_name.clone())
             .ok_or_else(|| {
                 FaucetError::Config(format!(
                     "postgres: incremental replication `column` {column:?} is not a column of \
@@ -187,13 +186,11 @@ impl PostgresSource {
     /// has no exact mapping for. A query the server cannot describe is
     /// returned unchanged, so its own error surfaces when it runs.
     async fn typed_query(&self, query: String) -> String {
-        use sqlx::Executor;
-        match self.read("describe", (&self.pool).describe(&query)).await {
+        match self.describe(&query).await {
             Ok(Ok(described)) => {
                 let columns: Vec<(String, String)> = described
-                    .columns()
                     .iter()
-                    .map(|c| (c.name().to_string(), c.type_info().name().to_string()))
+                    .map(|c| (c.name.clone(), c.type_name.clone()))
                     .collect();
                 *self.decimal_columns.lock().expect("decimal columns") = columns
                     .iter()
@@ -203,6 +200,94 @@ impl PostgresSource {
                 text_cast_query(&query, &columns).unwrap_or(query)
             }
             _ => query,
+        }
+    }
+
+    /// Describe `query` (one `describe` round trip), reusing the last result
+    /// for the same text.
+    async fn describe(
+        &self,
+        query: &str,
+    ) -> Result<Result<Vec<DescribedColumn>, sqlx::Error>, FaucetError> {
+        use sqlx::Executor;
+        if let Some((q, cols)) = &*self.described.lock().expect("described mutex")
+            && q == query
+        {
+            return Ok(Ok(cols.clone()));
+        }
+        let described = match self.read("describe", (&self.pool).describe(query)).await? {
+            Ok(d) => d,
+            Err(e) => return Ok(Err(e)),
+        };
+        let cols: Vec<DescribedColumn> = described
+            .columns()
+            .iter()
+            .enumerate()
+            .map(|(i, c)| DescribedColumn {
+                name: c.name().to_string(),
+                type_name: c.type_info().name().to_string(),
+                nullable: described.nullable(i) != Some(false),
+                relation: c
+                    .relation_id()
+                    .zip(c.relation_attribute_no())
+                    .map(|(r, a)| (r.0, a)),
+            })
+            .collect();
+        *self.described.lock().expect("described mutex") = Some((query.to_string(), cols.clone()));
+        Ok(Ok(cols))
+    }
+
+    /// The `(precision, scale)` of each `NUMERIC` column read straight from a
+    /// table column, from `pg_attribute.atttypmod` (one more `describe` round
+    /// trip, only when such a column exists).
+    async fn numeric_precision(
+        &self,
+        cols: &[DescribedColumn],
+    ) -> Result<std::collections::HashMap<(u32, i16), (u32, u32)>, FaucetError> {
+        let wanted: Vec<(u32, i16)> = cols
+            .iter()
+            .filter(|c| c.type_name.eq_ignore_ascii_case("NUMERIC"))
+            .filter_map(|c| c.relation)
+            .collect();
+        if wanted.is_empty() {
+            return Ok(Default::default());
+        }
+        let rels: Vec<i64> = wanted.iter().map(|(r, _)| i64::from(*r)).collect();
+        let atts: Vec<i32> = wanted.iter().map(|(_, a)| i32::from(*a)).collect();
+        let rows: Vec<(i64, i32, i32)> = self
+            .read(
+                "describe",
+                sqlx::query_as(
+                    "SELECT a.attrelid::int8, a.attnum::int4, a.atttypmod FROM pg_attribute a \
+                     JOIN unnest($1::int8[], $2::int4[]) AS w(rel, att) \
+                     ON a.attrelid = w.rel::oid AND a.attnum = w.att",
+                )
+                .bind(rels)
+                .bind(atts)
+                .fetch_all(&self.pool),
+            )
+            .await?
+            .map_err(|e| FaucetError::Source(format!("postgres: numeric precision lookup: {e}")))?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(rel, att, typmod)| {
+                numeric_typmod(typmod).map(|ps| ((rel as u32, att as i16), ps))
+            })
+            .collect())
+    }
+
+    /// The statement [`plan_fetch`](Self::plan_fetch) describes first.
+    fn declared_statement(&self, context: &std::collections::HashMap<String, Value>) -> String {
+        match &self.config.replication {
+            PostgresReplication::Full => self.shard_wrap(resolve_query(&self.config, context).0),
+            PostgresReplication::Incremental { .. } => {
+                resolve_query_text(
+                    &self.config.query.replace(BOOKMARK_TOKEN, "NULL"),
+                    self.config.params.len(),
+                    context,
+                )
+                .0
+            }
         }
     }
 
@@ -232,6 +317,48 @@ impl PostgresSource {
             Some(bounds) => bounds.wrap(&for_subquery(&query), quote_ident),
             None => query,
         }
+    }
+}
+
+/// One column of a described statement.
+#[derive(Debug, Clone)]
+struct DescribedColumn {
+    name: String,
+    type_name: String,
+    nullable: bool,
+    /// The table column it reads, as `(relation oid, attribute number)`.
+    relation: Option<(u32, i16)>,
+}
+
+/// `(precision, scale)` of a `numeric(p,s)` type modifier; `None` for an
+/// unconstrained `numeric` (`-1`).
+fn numeric_typmod(typmod: i32) -> Option<(u32, u32)> {
+    if typmod < 4 {
+        return None;
+    }
+    let t = (typmod - 4) as u32;
+    Some(((t >> 16) & 0xffff, t & 0xffff))
+}
+
+/// The logical type of a described column as this source renders it (#955):
+/// every type the decoder does not map exactly is read as text.
+fn declared_type(type_name: &str, precision: Option<(u32, u32)>) -> faucet_core::LogicalType {
+    use faucet_core::LogicalType as L;
+    let native = NATIVE_TYPES
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case(type_name));
+    match type_name.to_ascii_uppercase().as_str() {
+        "NUMERIC" => L::Decimal {
+            precision: precision.map(|p| p.0),
+            scale: precision.map(|p| p.1),
+        },
+        "MONEY" => L::Decimal {
+            precision: None,
+            scale: None,
+        },
+        "TIME" => L::Time,
+        _ if native => L::from_sql_type(type_name, None, None).unwrap_or(L::String),
+        _ => L::String,
     }
 }
 
@@ -1094,7 +1221,30 @@ impl faucet_core::Source for PostgresSource {
             .to_builder()
             .range_read(true)
             .range_digest(true)
+            .declared_columns(true)
             .build()
+    }
+
+    /// The query's columns from the describe its read makes anyway (#955); a
+    /// `numeric` column read from a table column carries its precision.
+    async fn declared_columns(
+        &self,
+        context: &std::collections::HashMap<String, Value>,
+    ) -> Result<Option<faucet_core::DeclaredColumns>, FaucetError> {
+        let Ok(cols) = self.describe(&self.declared_statement(context)).await? else {
+            return Ok(None);
+        };
+        let precision = self.numeric_precision(&cols).await?;
+        Ok(Some(faucet_core::DeclaredColumns::new(cols.iter().map(
+            |c| {
+                let p = c.relation.and_then(|r| precision.get(&r).copied());
+                faucet_core::DeclaredColumn::new(
+                    &c.name,
+                    declared_type(&c.type_name, p),
+                    c.nullable,
+                )
+            },
+        ))))
     }
 
     fn supports_discover(&self) -> bool {
@@ -1929,6 +2079,7 @@ mod tests {
             applied_shard: Mutex::new(None),
             json_warned: Mutex::new(Default::default()),
             decimal_columns: Mutex::new(Default::default()),
+            described: Mutex::new(None),
             start_bookmark: Mutex::new(None),
             calls: CallSlot::new(CallContext::new().without_timeout()),
         }
@@ -2113,5 +2264,54 @@ mod bind_overflow_tests {
             hi: Some(10),
         };
         assert!(src.range_digest(&range, "ts", &[]).await.is_err());
+    }
+
+    #[test]
+    fn numeric_typmods_decode_precision_and_scale() {
+        assert_eq!(numeric_typmod(-1), None);
+        assert_eq!(numeric_typmod(((12 << 16) | 2) + 4), Some((12, 2)));
+        assert_eq!(numeric_typmod((38 << 16) + 4), Some((38, 0)));
+    }
+
+    #[test]
+    fn declared_types_follow_the_rendering() {
+        use faucet_core::LogicalType as L;
+        assert_eq!(
+            declared_type("NUMERIC", Some((12, 2))),
+            L::Decimal {
+                precision: Some(12),
+                scale: Some(2)
+            }
+        );
+        assert_eq!(
+            declared_type("NUMERIC", None),
+            L::Decimal {
+                precision: None,
+                scale: None
+            }
+        );
+        assert_eq!(
+            declared_type("MONEY", None),
+            L::Decimal {
+                precision: None,
+                scale: None
+            }
+        );
+        assert_eq!(
+            declared_type("TIMESTAMPTZ", None),
+            L::Timestamp { tz: true }
+        );
+        assert_eq!(declared_type("TIMESTAMP", None), L::Timestamp { tz: false });
+        assert_eq!(declared_type("DATE", None), L::Date);
+        assert_eq!(declared_type("TIME", None), L::Time);
+        assert_eq!(declared_type("INT4", None), L::Int64);
+        assert_eq!(declared_type("FLOAT4", None), L::Float64);
+        assert_eq!(declared_type("UUID", None), L::Uuid);
+        assert_eq!(declared_type("BYTEA", None), L::Bytes);
+        assert_eq!(declared_type("JSONB", None), L::Json);
+        assert_eq!(declared_type("BPCHAR", None), L::String);
+        assert_eq!(declared_type("INTERVAL", None), L::String);
+        assert_eq!(declared_type("TIMETZ", None), L::String);
+        assert_eq!(declared_type("_INT4", None), L::String);
     }
 }

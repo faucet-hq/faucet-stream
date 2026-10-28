@@ -210,10 +210,57 @@ fn default_state_key(config: &RedshiftSourceConfig) -> String {
     )
 }
 
+/// The logical type of a described column as this source renders it (#955).
+fn declared_type(type_name: &str) -> faucet_core::LogicalType {
+    use faucet_core::LogicalType as L;
+    match type_name.to_ascii_uppercase().as_str() {
+        "TIMETZ" | "INTERVAL" | "OID" => L::String,
+        _ => L::from_sql_type(type_name, None, None).unwrap_or(L::String),
+    }
+}
+
 #[async_trait]
 impl Source for RedshiftSource {
     fn connector_name(&self) -> &'static str {
         "redshift"
+    }
+
+    fn capabilities(&self) -> faucet_core::Capabilities {
+        faucet_core::Capabilities::of_source(self)
+            .to_builder()
+            .declared_columns(true)
+            .build()
+    }
+
+    /// The query's columns from a describe of it (#955). The server reports
+    /// no decimal precision, so a `NUMERIC` is declared unbounded.
+    async fn declared_columns(
+        &self,
+        context: &HashMap<String, Value>,
+    ) -> Result<Option<faucet_core::DeclaredColumns>, FaucetError> {
+        use sqlx::Executor;
+        let (probe, _) = self.resolve_query(context, None, "");
+        let probe = probe.replace(BOOKMARK_TOKEN, "NULL");
+        let calls = self.calls.get();
+        let described = faucet_common_redshift::calls::once(&calls, "describe", async {
+            (&self.pool)
+                .describe(&probe)
+                .await
+                .map_err(|e| FaucetError::Source(e.to_string()))
+        })
+        .await;
+        let Ok(described) = described else {
+            return Ok(None);
+        };
+        Ok(Some(faucet_core::DeclaredColumns::new(
+            described.columns().iter().enumerate().map(|(i, c)| {
+                faucet_core::DeclaredColumn::new(
+                    sqlx::Column::name(c),
+                    declared_type(sqlx::TypeInfo::name(sqlx::Column::type_info(c))),
+                    described.nullable(i) != Some(false),
+                )
+            }),
+        )))
     }
 
     fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
@@ -610,5 +657,23 @@ mod tests {
         assert_eq!(cast_type("character varying").unwrap(), "character varying");
         assert!(cast_type("INT4); DROP TABLE t; --").is_err());
         assert!(cast_type("").is_err());
+    }
+
+    #[test]
+    fn declared_types_follow_the_rendering() {
+        use faucet_core::LogicalType as L;
+        assert_eq!(
+            declared_type("NUMERIC"),
+            L::Decimal {
+                precision: None,
+                scale: None
+            }
+        );
+        assert_eq!(declared_type("TIMESTAMPTZ"), L::Timestamp { tz: true });
+        assert_eq!(declared_type("TIMESTAMP"), L::Timestamp { tz: false });
+        assert_eq!(declared_type("INT4"), L::Int64);
+        assert_eq!(declared_type("TIMETZ"), L::String);
+        assert_eq!(declared_type("INTERVAL"), L::String);
+        assert_eq!(declared_type("SUPER"), L::String);
     }
 }

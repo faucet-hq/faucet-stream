@@ -186,6 +186,8 @@ pub(crate) struct DuckdbDriver {
     /// Whether the target has been confirmed present for this sink instance
     /// (#580). One check per run, not per page.
     table_ready: std::sync::atomic::AtomicBool,
+    /// The source's declared columns (#955).
+    declared: faucet_core::DeclaredSlot,
     /// Interrupts a write the call context cuts short, so the blocking task
     /// stops (and its transaction rolls back) instead of running on.
     interrupt: Arc<duckdb::InterruptHandle>,
@@ -510,6 +512,7 @@ fn prepare_table_blocking(
     conn: &Connection,
     config: &DuckdbSinkConfig,
     records: &[Value],
+    declared: Option<&faucet_core::DeclaredColumns>,
 ) -> Result<bool, FaucetError> {
     let json_column = match &config.column_mapping {
         DuckdbColumnMapping::AutoMap => None,
@@ -524,7 +527,10 @@ fn prepare_table_blocking(
         }
         return Ok(true);
     }
-    let mut columns = match (json_column, faucet_core::plan_columns(records)) {
+    let mut columns = match (
+        json_column,
+        faucet_core::plan_columns_declared(records, declared),
+    ) {
         (Some(_), _) => Vec::new(),
         (None, Some(c)) => c,
         (None, None) => return Ok(false),
@@ -552,9 +558,10 @@ impl DuckdbDriver {
         }
         let config = self.config.clone();
         let owned = records.to_vec();
+        let declared = self.declared.get();
         let ready = self
             .blocking(calls, "ddl", move |conn| {
-                prepare_table_blocking(conn, &config, &owned)
+                prepare_table_blocking(conn, &config, &owned, declared.as_ref())
             })
             .await?;
         if ready {
@@ -690,6 +697,7 @@ impl DuckdbSink {
                 conn,
                 _instance: instance,
                 table_ready: std::sync::atomic::AtomicBool::new(false),
+                declared: faucet_core::DeclaredSlot::new(),
                 interrupt,
             }),
         })
@@ -728,6 +736,34 @@ impl DuckdbSink {
             guard
                 .query_row(&sql, [], |r| r.get::<_, i64>(0))
                 .map_err(|e| FaucetError::Sink(format!("DuckDB count failed: {e}")))
+        })
+        .await
+        .map_err(|e| FaucetError::Sink(format!("duckdb task panicked: {e}")))?
+    }
+
+    /// `(column, type)` of `table` on the sink's connection; empty when it
+    /// does not exist.
+    #[doc(hidden)]
+    pub async fn column_types(&self, table: &str) -> Result<Vec<(String, String)>, FaucetError> {
+        let conn = self.conn.clone();
+        let table = table.to_string();
+        tokio::task::spawn_blocking(move || {
+            let guard = conn
+                .lock()
+                .map_err(|_| FaucetError::Sink("duckdb connection mutex poisoned".into()))?;
+            let mut stmt = guard
+                .prepare(
+                    "SELECT column_name, data_type FROM information_schema.columns \
+                     WHERE table_name = ? ORDER BY ordinal_position",
+                )
+                .map_err(|e| FaucetError::Sink(format!("DuckDB column read failed: {e}")))?;
+            let rows = stmt
+                .query_map([table], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(|e| FaucetError::Sink(format!("DuckDB column read failed: {e}")))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| FaucetError::Sink(format!("DuckDB column read failed: {e}")))
         })
         .await
         .map_err(|e| FaucetError::Sink(format!("duckdb task panicked: {e}")))?
@@ -774,6 +810,31 @@ impl SinkDriver for DuckdbDriver {
             )),
             _ => Ok(PageWrite::accepted(self.write_all(calls, rows).await?)),
         }
+    }
+
+    fn capabilities(&self, derived: faucet_core::Capabilities) -> faucet_core::Capabilities {
+        derived
+            .to_builder()
+            .declared_types(matches!(
+                self.config.column_mapping,
+                DuckdbColumnMapping::AutoMap
+            ))
+            .build()
+    }
+
+    fn set_declared_columns(&self, columns: faucet_core::DeclaredColumns) {
+        self.declared.set(columns);
+    }
+
+    /// A run that wrote nothing creates the declared table (#955).
+    async fn complete_run(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        if self.config.create_table
+            && matches!(self.config.column_mapping, DuckdbColumnMapping::AutoMap)
+            && self.declared.for_empty_run().is_some()
+        {
+            self.ensure_table_ready(calls, &[]).await?;
+        }
+        Ok(())
     }
 }
 

@@ -253,3 +253,8 @@ table exists.
 This sink takes its identifier quoting, literal escaping and column types from the `Databricks` dialect of
 [`faucet-common-sql`](../../common/sql/README.md) (RFC 0013, #884), the same
 place every SQL sink gets them. Rows travel inline (`FROM VALUES` of literals with per-column casts) or from a staged file, upserts use a presence-flag `MERGE` over nested types, and exactly-once uses idempotent page writes — none of which is the engine's bind-per-cell model.
+
+## Declared column types
+
+When the run's source declares its column types (a SQL query source, #955 — see [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types)), a table this sink creates types each declared column from the declaration instead of from the first page: `BIGINT`, `DOUBLE`, `BOOLEAN`, `DECIMAL(p,s)` (up to 38 digits), `DATE`, `TIMESTAMP` / `TIMESTAMP_NTZ`, `BINARY`; the insert casts each value to its column type. A declared column whose first-page values do not fit its type keeps the inferred type; an existing table is never retyped. With a complete declaration a run that writes nothing creates the empty, typed table.
+

@@ -74,6 +74,80 @@ counted `null` only where a batch is turned into JSON rows.
   carries — is kept as a string of its digits. A 17-digit rendering of a double
   (`0.10000000000000001`) still names that double.
 
+## Declared column types
+
+An exact decimal, a date, a timestamp and a UUID all render as JSON strings,
+so a sink that creates its destination from the first page's values
+(`create_table: true`) would create them as text columns. A source that knows
+its column types declares them instead (`Source::declared_columns`), and the
+pipeline hands the declaration to the sink (`Sink::set_declared_columns`)
+before the first write. The declared types are portable:
+
+| Logical type | Rendering it describes |
+|---|---|
+| `int64` | a JSON integer |
+| `float64` | a JSON number (`NaN` / `±Inf` arrive as `null`) |
+| `bool` | a JSON boolean |
+| `string` | a JSON string |
+| `decimal { precision, scale }` | an exact decimal string; no precision is unbounded |
+| `date` | `YYYY-MM-DD` |
+| `time` | `HH:MM:SS[.f]` |
+| `timestamp { tz }` | RFC 3339 with an offset (`tz: true`), or a date-time without a zone |
+| `uuid` | the 36-character hyphenated text |
+| `bytes` | standard base64 |
+| `json` | any JSON value |
+
+The SQL query sources declare them from the describe of the statement they are
+about to run: `postgres` (a `numeric` column read straight from a table column
+carries its precision and scale), `mysql`, `mssql`, `redshift` and `duckdb`.
+MySQL and Redshift report no decimal precision, so their decimals are declared
+unbounded. SQLite is not among them: its columns have affinities, not types,
+so no declared type would hold for every row.
+
+Each SQL and warehouse sink maps the declaration through its dialect when it
+creates the table — `postgres`, `mysql`, `sqlite`, `mssql`, `duckdb`,
+`oracle`, `redshift`, `clickhouse`, `snowflake`, `databricks`, `bigquery` and
+`spanner`. BigQuery, for example:
+
+| Declared | BigQuery column |
+|---|---|
+| `decimal` of at most 29 integer and 9 fractional digits | `NUMERIC` |
+| `decimal` up to 38 and 38, or without precision | `BIGNUMERIC` |
+| `date` / `time` | `DATE` / `TIME` |
+| `timestamp { tz: true }` / `{ tz: false }` | `TIMESTAMP` / `DATETIME` |
+| `uuid` | `STRING` |
+| `bytes` / `json` | `BYTES` / `JSON` |
+
+A type a dialect cannot hold exactly — a decimal wider than its widest exact
+type, a time of day where there is no time type — keeps the inferred column
+(text), never a rounding one. The renderings load into the typed columns as
+they are: each sink already binds, casts or coerces them per column type.
+
+The rules every sink follows:
+
+- **Only a created table is typed.** An existing table is never retyped; a
+  declared type that differs from an existing column is the
+  [`schema:` drift policy](../cookbook/schema-drift.md)'s business.
+- **The first page decides, column by column.** A declared type is used only
+  when every value of the first page is a rendering of it. A transform or a
+  masking rule that rewrote a column (a hashed date, a renamed field) therefore
+  keeps today's inferred type for that column. A column the page does not
+  carry is not created, and an undeclared one (a transform's output, the
+  `_faucet_*` metadata columns when no declaration covers them) is inferred.
+  Declared columns come first, in the source's order; the rest follow sorted.
+- **An empty source creates the empty, typed table** when the declaration is
+  complete: nothing between source and sink renamed, added, removed or
+  rewrote a column (no transform stage other than a filter, no masking rule).
+  The `metadata_columns` decorator adds its own columns to the declaration.
+  Under `write_mode: overwrite` the table appears after the commit. Without a
+  complete declaration an empty source still creates nothing.
+- **Without a declaration nothing changes**: a source that declares nothing, a
+  sink that does not type, or a declaration the source could not produce (the
+  run logs a warning and infers).
+
+A topology hands the declaration of its one source to each sink node; a
+transform, merge or join node anywhere in the graph makes it incomplete.
+
 ## The fidelity corpus
 
 `faucet_conformance::fidelity` holds a corpus of the values that have broken a

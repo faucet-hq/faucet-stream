@@ -1,6 +1,6 @@
 //! The connector's static descriptor (RFC 0013).
 
-use faucet_core::capabilities::config::dedups_by_key;
+use faucet_core::capabilities::config::{dedups_by_key, tag};
 use faucet_core::{Capabilities, ConnectorDescriptor, SchemaReport, Value, WriteMode};
 
 /// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
@@ -19,6 +19,7 @@ fn capabilities(config: &Value) -> Capabilities {
         .keyed_dedup(!config.is_null() && dedups_by_key(config))
         .schema_evolution(true)
         .schema_report(SchemaReport::Reported)
+        .declared_types(config.is_null() || tag(config, "column_mapping") != Some("json_column"))
         .build()
 }
 

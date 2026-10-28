@@ -3,7 +3,7 @@
 use crate::dialect::{SqlDialect, TableTarget};
 use crate::mapping::ColumnMatching;
 use faucet_core::rollback::JournalSql;
-use faucet_core::{FaucetError, SqlBaseType};
+use faucet_core::{FaucetError, LogicalType, SqlBaseType};
 
 /// PostgreSQL: double-quoted identifiers, `$n::type` placeholders (the bound
 /// text goes through the column type's input function), 65535 parameters,
@@ -54,6 +54,30 @@ impl SqlDialect for Postgres {
             SqlBaseType::Text => "text",
             SqlBaseType::Json => "jsonb",
         }
+    }
+
+    fn declared_type_name(&self, t: &LogicalType) -> Option<String> {
+        Some(match t {
+            LogicalType::Int64 => "bigint".into(),
+            LogicalType::Float64 => "double precision".into(),
+            LogicalType::Bool => "boolean".into(),
+            LogicalType::String => "text".into(),
+            LogicalType::Decimal { .. } => {
+                super::declared_decimal(t, 1000, Some("numeric"), "numeric")?
+            }
+            LogicalType::Date => "date".into(),
+            LogicalType::Time => "time".into(),
+            LogicalType::Timestamp { tz: true } => "timestamptz".into(),
+            LogicalType::Timestamp { tz: false } => "timestamp".into(),
+            LogicalType::Uuid => "uuid".into(),
+            LogicalType::Bytes => "bytea".into(),
+            LogicalType::Json => "jsonb".into(),
+            _ => return None,
+        })
+    }
+
+    fn declared_key_type_name(&self, t: &LogicalType) -> Option<String> {
+        self.declared_type_name(t)
     }
 
     /// An integer column that starts receiving fractions becomes exact

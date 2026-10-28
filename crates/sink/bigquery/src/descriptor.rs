@@ -20,7 +20,8 @@ fn capabilities(config: &Value) -> Capabilities {
         .schema_report(SchemaReport::Reported)
         .staged_load(true)
         .scoped_overwrite(true)
-        .direct_overwrite(true);
+        .direct_overwrite(true)
+        .declared_types(true);
     if config.is_null() {
         return base.columnar(cfg!(feature = "arrow")).native(true).build();
     }

@@ -1263,3 +1263,208 @@ fn cleanup_delete_alias_never_shadows_the_target<D: SqlDialect>(d: D) {
 fn matrix_cleanup_alias() {
     every_cleanup_dialect!(cleanup_delete_alias_never_shadows_the_target);
 }
+
+fn declared() -> faucet_core::DeclaredColumns {
+    use faucet_core::{DeclaredColumn, LogicalType};
+    faucet_core::DeclaredColumns::new([
+        DeclaredColumn::new("id", LogicalType::Int64, false),
+        DeclaredColumn::new(
+            "amount",
+            LogicalType::Decimal {
+                precision: Some(12),
+                scale: Some(2),
+            },
+            true,
+        ),
+        DeclaredColumn::new("day", LogicalType::Date, true),
+        DeclaredColumn::new("at", LogicalType::Timestamp { tz: true }, true),
+        DeclaredColumn::new("note", LogicalType::String, true),
+    ])
+}
+
+/// What each dialect creates a declared column as, else its base type.
+fn expected_type<D: SqlDialect>(d: &D, c: &faucet_core::DeclaredColumn, key: bool) -> String {
+    let declared = if key {
+        d.declared_key_type_name(&c.logical_type)
+    } else {
+        d.declared_type_name(&c.logical_type)
+    };
+    declared.unwrap_or_else(|| {
+        if key {
+            d.key_type_name(c.logical_type.base_type())
+        } else {
+            d.type_name(c.logical_type.base_type())
+        }
+        .to_string()
+    })
+}
+
+fn declared_create_table_types_each_column<D: SqlDialect>(d: D) {
+    let name = d.name();
+    let keyed = matches!(name, "postgres" | "mysql" | "sqlite" | "mssql" | "oracle");
+    let key: &[&str] = if keyed { &["id"] } else { &[] };
+    let mode = if keyed {
+        WriteMode::Upsert
+    } else {
+        WriteMode::Append
+    };
+    let engine = SqlSinkEngine::new(d, spec(mode, key));
+    let t = target(engine.dialect(), "t");
+    let decl = declared();
+    let empty = engine
+        .create_table_sql_declared(&t, &[], None, Some(&decl))
+        .unwrap()
+        .expect("a complete declaration creates an empty table");
+    for c in decl.columns() {
+        let ty = expected_type(engine.dialect(), c, key.contains(&c.name.as_str()));
+        let col = engine.dialect().quote_ident(&c.name);
+        assert!(
+            empty.contains(&format!("{col} {ty}")),
+            "{name}: {} typed {ty}: {empty}",
+            c.name
+        );
+    }
+    let pos = |n: &str| empty.find(&engine.dialect().quote_ident(n)).unwrap();
+    assert!(
+        pos("id") < pos("amount") && pos("day") < pos("at"),
+        "{name}: source order: {empty}"
+    );
+    assert!(
+        engine
+            .create_table_sql_declared(&t, &[], None, Some(&decl.clone().reshaped()))
+            .unwrap()
+            .is_none(),
+        "{name}: a reshaped declaration creates nothing for an empty page"
+    );
+    let page = [json!({"id": 1, "amount": "1.50", "day": "not a date", "extra": true})];
+    let sql = engine
+        .create_table_sql_declared(&t, &page, None, Some(&decl))
+        .unwrap()
+        .expect("a page");
+    let day = engine.dialect().quote_ident("day");
+    let text = engine.dialect().type_name(SqlBaseType::Text);
+    assert!(
+        sql.contains(&format!("{day} {text}")),
+        "{name}: refused values keep text: {sql}"
+    );
+    assert!(
+        !sql.contains(&engine.dialect().quote_ident("at")),
+        "{name}: {sql}"
+    );
+    assert_eq!(
+        engine
+            .create_table_sql_declared(&t, &page, None, None)
+            .unwrap(),
+        engine.create_table_sql(&t, &page, None).unwrap(),
+        "{name}: no declaration is today's inference"
+    );
+}
+
+#[test]
+fn matrix_declared_create_table() {
+    every_dialect!(declared_create_table_types_each_column);
+}
+
+#[test]
+fn declared_types_per_dialect() {
+    use faucet_core::LogicalType as L;
+    let dec = |p, s| L::Decimal {
+        precision: Some(p),
+        scale: Some(s),
+    };
+    let unbounded = L::Decimal {
+        precision: None,
+        scale: None,
+    };
+    let bq = BigQuery;
+    assert_eq!(
+        bq.declared_type_name(&dec(12, 2)).as_deref(),
+        Some("NUMERIC")
+    );
+    assert_eq!(
+        bq.declared_type_name(&dec(38, 9)).as_deref(),
+        Some("NUMERIC")
+    );
+    assert_eq!(
+        bq.declared_type_name(&dec(40, 2)).as_deref(),
+        Some("BIGNUMERIC")
+    );
+    assert_eq!(
+        bq.declared_type_name(&dec(20, 12)).as_deref(),
+        Some("BIGNUMERIC")
+    );
+    assert_eq!(
+        bq.declared_type_name(&unbounded).as_deref(),
+        Some("BIGNUMERIC")
+    );
+    assert_eq!(bq.declared_type_name(&dec(100, 50)), None);
+    assert_eq!(bq.declared_type_name(&L::Date).as_deref(), Some("DATE"));
+    assert_eq!(
+        bq.declared_type_name(&L::Timestamp { tz: true }).as_deref(),
+        Some("TIMESTAMP")
+    );
+    assert_eq!(
+        bq.declared_type_name(&L::Timestamp { tz: false })
+            .as_deref(),
+        Some("DATETIME")
+    );
+    assert_eq!(bq.declared_type_name(&L::Uuid).as_deref(), Some("STRING"));
+    assert_eq!(bq.declared_type_name(&L::Bytes).as_deref(), Some("BYTES"));
+    assert_eq!(
+        Postgres.declared_type_name(&dec(12, 2)).as_deref(),
+        Some("numeric(12,2)")
+    );
+    assert_eq!(
+        Postgres.declared_type_name(&unbounded).as_deref(),
+        Some("numeric")
+    );
+    assert_eq!(
+        Postgres.declared_key_type_name(&L::Uuid).as_deref(),
+        Some("uuid")
+    );
+    assert_eq!(
+        Mysql.declared_type_name(&unbounded).as_deref(),
+        Some("DECIMAL(65,30)")
+    );
+    assert_eq!(Mysql.declared_key_type_name(&L::String), None);
+    assert_eq!(Mssql.declared_type_name(&unbounded), None);
+    assert_eq!(Mssql.declared_type_name(&dec(40, 2)), None);
+    assert_eq!(
+        Duckdb.declared_type_name(&dec(18, 4)).as_deref(),
+        Some("DECIMAL(18,4)")
+    );
+    assert_eq!(Redshift.declared_type_name(&L::Uuid), None);
+    assert_eq!(
+        ClickHouse.declared_type_name(&unbounded).as_deref(),
+        Some("Nullable(Decimal(76, 38))")
+    );
+    assert_eq!(ClickHouse.declared_type_name(&L::Time), None);
+    assert_eq!(
+        Oracle.declared_type_name(&unbounded).as_deref(),
+        Some("NUMBER")
+    );
+    assert_eq!(Oracle.declared_type_name(&L::Time), None);
+    assert_eq!(Snowflake.declared_type_name(&L::Bytes), None);
+    assert_eq!(
+        Snowflake
+            .declared_type_name(&L::Timestamp { tz: true })
+            .as_deref(),
+        Some("TIMESTAMP_TZ(9)")
+    );
+    assert_eq!(Databricks.declared_type_name(&L::Time), None);
+    assert_eq!(
+        Databricks
+            .declared_type_name(&L::Timestamp { tz: false })
+            .as_deref(),
+        Some("TIMESTAMP_NTZ")
+    );
+    assert_eq!(Sqlite.declared_type_name(&L::Date), None);
+    let planned = faucet_core::PlannedColumn {
+        name: "k".into(),
+        base_type: SqlBaseType::Text,
+        nullable: false,
+        declared: Some(L::String),
+    };
+    assert_eq!(Mysql.planned_type_name(&planned, true), "VARCHAR(191)");
+    assert_eq!(Mysql.planned_type_name(&planned, false), "LONGTEXT");
+}

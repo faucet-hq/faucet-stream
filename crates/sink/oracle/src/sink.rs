@@ -58,6 +58,8 @@ struct Inner {
     token_table: String,
     columns: Mutex<Option<Vec<ColumnInfo>>>,
     ready: AtomicBool,
+    /// The source's declared columns (#955), cased like the records.
+    declared: faucet_core::DeclaredSlot,
 }
 
 fn sink_err(context: &str, e: &oracle::Error) -> FaucetError {
@@ -407,12 +409,9 @@ impl Inner {
                 } else {
                     &[]
                 };
-                let cols = if key.is_empty() {
-                    faucet_core::plan_columns(records)
-                } else {
-                    faucet_core::plan_keyed_columns(records, key)
-                };
-                cols.map(|c| create_table_sql(quoted, &c, key))
+                let declared = self.declared.get();
+                faucet_core::plan_table_declared(records, key, declared.as_ref())
+                    .map(|c| create_table_sql(quoted, &c, key))
                     .transpose()?
             }
         };
@@ -735,6 +734,7 @@ impl OracleSink {
             config,
             columns: Mutex::new(None),
             ready: AtomicBool::new(false),
+            declared: faucet_core::DeclaredSlot::new(),
         };
         let driver = OracleDriver {
             inner: Arc::new(inner),
@@ -980,6 +980,60 @@ impl SinkDriver for OracleDriver {
 
     fn schema(&self) -> Option<&dyn SchemaDriver> {
         Some(self)
+    }
+
+    fn capabilities(&self, derived: faucet_core::Capabilities) -> faucet_core::Capabilities {
+        derived
+            .to_builder()
+            .declared_types(matches!(
+                self.inner.config.column_mapping,
+                OracleColumnMapping::AutoColumns { .. }
+            ))
+            .build()
+    }
+
+    fn set_declared_columns(&self, columns: faucet_core::DeclaredColumns) {
+        let cfg = &self.inner.config;
+        let upper = cfg.identifier_case == IdentifierCase::Upper
+            && matches!(cfg.column_mapping, OracleColumnMapping::AutoColumns { .. });
+        let columns = if upper {
+            columns.renamed(str::to_uppercase)
+        } else {
+            columns
+        };
+        self.inner.declared.set(columns);
+    }
+
+    /// A run that wrote nothing creates the declared target (#955).
+    async fn complete_run(&self, calls: &CallSlot) -> Result<(), FaucetError> {
+        let cfg = &self.inner.config;
+        if !cfg.create_table
+            || !matches!(cfg.column_mapping, OracleColumnMapping::AutoColumns { .. })
+            || self.inner.ready.load(Ordering::Relaxed)
+            || self.inner.declared.for_empty_run().is_none()
+        {
+            return Ok(());
+        }
+        self.run(calls, "complete_run", |i| {
+            let conn = i.conn()?;
+            if i.table_exists(&conn, &i.target)? {
+                return Ok(());
+            }
+            let key: &[String] = if i.config.write.dedups_by_key() {
+                &i.config.write.key
+            } else {
+                &[]
+            };
+            let declared = i.declared.for_empty_run();
+            let Some(cols) = faucet_core::plan_table_declared(&[], key, declared.as_ref()) else {
+                return Ok(());
+            };
+            let ddl = create_table_sql(&i.target_quoted, &cols, key)?;
+            exec(&conn, &ignoring(&ddl, &[ORA_NAME_IN_USE]), "create table")?;
+            i.forget_columns();
+            Ok(())
+        })
+        .await
     }
 }
 

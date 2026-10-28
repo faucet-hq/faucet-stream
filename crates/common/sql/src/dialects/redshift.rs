@@ -2,7 +2,7 @@
 
 use crate::dialect::SqlDialect;
 use crate::mapping::ColumnMatching;
-use faucet_core::SqlBaseType;
+use faucet_core::{LogicalType, SqlBaseType};
 
 /// Redshift: PostgreSQL-style double-quoted identifiers and `$n`
 /// placeholders, 32767 parameters, identifiers folded to lower case (fields
@@ -49,6 +49,20 @@ impl SqlDialect for Redshift {
             SqlBaseType::Boolean => "BOOLEAN",
             SqlBaseType::Text | SqlBaseType::Json => "VARCHAR(65535)",
         }
+    }
+
+    fn declared_type_name(&self, t: &LogicalType) -> Option<String> {
+        Some(match t {
+            LogicalType::Int64 => "BIGINT".into(),
+            LogicalType::Float64 => "DOUBLE PRECISION".into(),
+            LogicalType::Bool => "BOOLEAN".into(),
+            LogicalType::Decimal { .. } => super::declared_decimal(t, 38, None, "DECIMAL")?,
+            LogicalType::Date => "DATE".into(),
+            LogicalType::Time => "TIME".into(),
+            LogicalType::Timestamp { tz: true } => "TIMESTAMPTZ".into(),
+            LogicalType::Timestamp { tz: false } => "TIMESTAMP".into(),
+            _ => return None,
+        })
     }
 
     /// Precision is capped at 38 digits, so no scale keeps both a wide

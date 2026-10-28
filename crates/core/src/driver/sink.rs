@@ -408,6 +408,13 @@ pub trait SinkDriver: Send + Sync {
         Vec::new()
     }
 
+    /// The columns the run's source declared (#955), before the first write;
+    /// a driver that creates its destination types it from them. Default:
+    /// ignored.
+    fn set_declared_columns(&self, columns: crate::declared::DeclaredColumns) {
+        let _ = columns;
+    }
+
     /// The run's call context, for a driver whose clients hold their own
     /// (a storage backend). Most drivers use the slot they are handed.
     fn set_call_context(&self, ctx: CallContext) {
@@ -790,6 +797,10 @@ impl<D: SinkDriver> Sink for DriverSink<D> {
     fn set_roundtrip_recorder(&self, recorder: Arc<RoundtripRecorder>) {
         self.calls.install_recorder(Arc::clone(&recorder));
         self.driver.set_roundtrip_recorder(recorder);
+    }
+
+    fn set_declared_columns(&self, columns: crate::declared::DeclaredColumns) {
+        self.driver.set_declared_columns(columns);
     }
 
     fn set_call_context(&self, ctx: CallContext) {

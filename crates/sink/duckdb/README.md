@@ -75,6 +75,10 @@ With `auto_map`, an ISO 8601 string carrying an offset (`…-08:00`, `…Z`) bou
 for a tz-less `TIMESTAMP` column is converted to UTC first; DuckDB's text cast
 would otherwise drop the offset. Offset-less strings are stored as given.
 
+## Declared column types
+
+When the run's source declares its column types (a SQL query source, #955 — see [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types)), a table this sink creates types each declared column from the declaration instead of from the first page: `BIGINT`, `DOUBLE`, `BOOLEAN`, `DECIMAL(p,s)` (up to 38 digits; wider or unbounded stays `TEXT`), `DATE`, `TIME`, `TIMESTAMPTZ` / `TIMESTAMP`, `UUID` — in `auto_map` mode. A declared column whose first-page values do not fit its type keeps the inferred type; an existing table is never retyped. With a complete declaration a run that writes nothing creates the empty, typed table.
+
 ## Batch atomicity
 
 What a failed write leaves behind (#737): **atomic** — every chunk of a batch runs in one transaction. `on_batch_error: dlq_all`

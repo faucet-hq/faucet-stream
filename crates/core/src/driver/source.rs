@@ -206,6 +206,17 @@ pub trait SourceDriver: Send + Sync {
     }
 
     /// Enumerate the datasets behind the connection (read-only, cheap).
+    /// The columns the read declares (#955), from the backend's describe of
+    /// it. Default: none.
+    async fn declared_columns(
+        &self,
+        calls: &CallSlot,
+        context: &HashMap<String, Value>,
+    ) -> Result<Option<crate::declared::DeclaredColumns>, FaucetError> {
+        let _ = (calls, context);
+        Ok(None)
+    }
+
     async fn discover(
         &self,
         calls: &CallSlot,
@@ -427,6 +438,13 @@ impl<D: SourceDriver> Source for DriverSource<D> {
 
     fn supports_discover(&self) -> bool {
         self.driver.supports_discover()
+    }
+
+    async fn declared_columns(
+        &self,
+        context: &HashMap<String, Value>,
+    ) -> Result<Option<crate::declared::DeclaredColumns>, FaucetError> {
+        self.driver.declared_columns(&self.calls, context).await
     }
 
     async fn discover(&self) -> Result<Vec<crate::discover::DatasetDescriptor>, FaucetError> {

@@ -275,3 +275,38 @@ async fn conformance_cleanup_scoped_and_rollback_truthful() {
     })
     .await;
 }
+
+/// Check 26: a declaration creates the table, typed, for an empty run.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_declared_types_create() {
+    let (_container, url, _sink) = fresh_sink().await;
+    let cfg = PostgresSinkConfig::new(&url, "typed").column_mapping(PostgresColumnMapping::AutoMap);
+    let sink = PostgresSink::new(cfg).await.expect("sink");
+    let types = || {
+        let url = url.clone();
+        async move {
+            let pool = sqlx::PgPool::connect(&url).await.expect("pool connect");
+            let rows: Vec<(String, String)> = sqlx::query_as(
+                "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a \
+                 WHERE a.attrelid = to_regclass('typed') AND a.attnum > 0 AND NOT a.attisdropped",
+            )
+            .fetch_all(&pool)
+            .await
+            .expect("columns");
+            pool.close().await;
+            rows
+        }
+    };
+    faucet_conformance::assert_declared_types_create(
+        &sink,
+        &[
+            ("id", "bigint"),
+            ("amount", "numeric(12,2)"),
+            ("day", "date"),
+            ("at", "timestamp with time zone"),
+            ("note", "text"),
+        ],
+        types,
+    )
+    .await;
+}

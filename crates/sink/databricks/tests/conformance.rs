@@ -2,6 +2,8 @@
 //! connector name, preflight shape, and an *effective* schema evolution
 //! against a stateful fake warehouse that applies `ALTER TABLE ADD COLUMNS`.
 
+mod common;
+
 use std::sync::{Arc, Mutex};
 
 use faucet_conformance::{
@@ -298,4 +300,52 @@ async fn conformance_declared_capabilities() {
     faucet_conformance::assert_partial_outcomes_truthful(&sink, count).await;
     faucet_conformance::assert_driver_declarations_truthful(&sink).await;
     faucet_conformance::assert_driver_row_paths_agree(&sink).await;
+}
+
+/// The `(column, type)` pairs of the newest `CREATE TABLE` the fake received.
+fn created_columns(wh: &common::Warehouse) -> Vec<(String, String)> {
+    let Some(ddl) = wh
+        .statements()
+        .into_iter()
+        .rev()
+        .find(|s| s.starts_with("CREATE TABLE"))
+    else {
+        return Vec::new();
+    };
+    let start = ddl.find(" (").map(|i| i + 2).unwrap_or(0);
+    let end = ddl.rfind(") USING DELTA").unwrap_or(ddl.len());
+    ddl[start..end]
+        .split(", `")
+        .filter_map(|c| {
+            let c = c.trim_start_matches('`');
+            c.split_once("` ")
+                .map(|(n, t)| (n.to_string(), t.to_string()))
+        })
+        .collect()
+}
+
+/// Check 26: a declaration types the created table (against the scripted
+/// warehouse, which reports no table, so the typed DDL is what is read back).
+#[tokio::test]
+async fn conformance_declared_types_create() {
+    let wh = common::Warehouse::start().await;
+    let s = common::sink(&wh, |_| {});
+    faucet_conformance::assert_declared_types_create(
+        &s,
+        &[
+            ("id", "bigint"),
+            ("amount", "decimal(12,2)"),
+            ("day", "date"),
+            ("at", "timestamp"),
+        ],
+        || std::future::ready(created_columns(&wh)),
+    )
+    .await;
+    let insert = wh
+        .statements()
+        .into_iter()
+        .find(|s| s.starts_with("INSERT"))
+        .expect("an insert");
+    assert!(insert.contains("AS decimal(12,2))"), "{insert}");
+    assert!(insert.contains("AS date)"), "{insert}");
 }

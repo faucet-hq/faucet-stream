@@ -211,3 +211,83 @@ async fn conformance_declared_capabilities() {
     )
     .await;
 }
+
+/// A warehouse that keeps the one `CREATE TABLE` it receives and lists its
+/// columns back.
+#[derive(Clone, Default)]
+struct Creates(std::sync::Arc<std::sync::Mutex<Option<String>>>);
+
+impl Creates {
+    fn columns(&self) -> Vec<(String, String)> {
+        let Some(ddl) = self.0.lock().unwrap().clone() else {
+            return Vec::new();
+        };
+        let start = ddl.find(" (").map(|i| i + 2).unwrap_or(0);
+        ddl[start..ddl.len() - 1]
+            .split(", \"")
+            .filter_map(|c| {
+                let c = c.trim_start_matches('"');
+                c.split_once("\" ")
+                    .map(|(n, t)| (n.to_string(), t.to_string()))
+            })
+            .collect()
+    }
+}
+
+impl wiremock::Respond for Creates {
+    fn respond(&self, req: &wiremock::Request) -> wiremock::ResponseTemplate {
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        let sql = body["statement"].as_str().unwrap_or_default();
+        if sql.starts_with("CREATE TABLE") && self.0.lock().unwrap().is_none() {
+            *self.0.lock().unwrap() = Some(sql.to_string());
+        }
+        let data = if sql.contains("information_schema.columns") {
+            serde_json::json!(
+                self.columns()
+                    .into_iter()
+                    .map(|(n, t)| vec![n, t])
+                    .collect::<Vec<_>>()
+            )
+        } else {
+            serde_json::json!([])
+        };
+        wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "090001", "message": "ok", "data": data
+        }))
+    }
+}
+
+/// Check 26: a declaration types the created table.
+#[tokio::test]
+async fn conformance_declared_types_create() {
+    let server = wiremock::MockServer::start().await;
+    let wh = Creates::default();
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/api/v2/statements"))
+        .respond_with(wh.clone())
+        .mount(&server)
+        .await;
+    let cfg = SnowflakeSinkConfig::new(
+        "xy12345",
+        "WH",
+        "DB",
+        "PUBLIC",
+        "t",
+        SnowflakeAuth::OAuth { token: "t".into() },
+    );
+    let sink = SnowflakeSink::new(cfg)
+        .unwrap()
+        .with_endpoint(format!("{}/api/v2/statements", server.uri()));
+    faucet_conformance::assert_declared_types_create(
+        &sink,
+        &[
+            ("id", "number(38,0)"),
+            ("amount", "number(12,2)"),
+            ("day", "date"),
+            ("at", "timestamp_tz"),
+            ("note", "string"),
+        ],
+        || std::future::ready(wh.columns()),
+    )
+    .await;
+}

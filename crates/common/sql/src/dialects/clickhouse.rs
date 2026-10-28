@@ -2,7 +2,7 @@
 
 use crate::dialect::{SqlDialect, TableTarget};
 use crate::mapping::ColumnMatching;
-use faucet_core::{FaucetError, PlannedColumn, SqlBaseType};
+use faucet_core::{FaucetError, LogicalType, PlannedColumn, SqlBaseType};
 
 /// ClickHouse: double-quoted identifiers and single-quoted literals that both
 /// take C-style escapes (so `\` and the quote are backslash-escaped — doubling
@@ -65,6 +65,23 @@ impl SqlDialect for ClickHouse {
         }
     }
 
+    fn declared_type_name(&self, t: &LogicalType) -> Option<String> {
+        let inner = match t {
+            LogicalType::Int64 => "Int64".into(),
+            LogicalType::Float64 => "Float64".into(),
+            LogicalType::Bool => "Bool".into(),
+            LogicalType::Decimal { .. } => {
+                super::declared_decimal(t, 76, Some("Decimal(76, 38)"), "Decimal")?
+            }
+            LogicalType::Date => "Date32".into(),
+            LogicalType::Timestamp { tz: true } => "DateTime64(6, 'UTC')".into(),
+            LogicalType::Timestamp { tz: false } => "DateTime64(6)".into(),
+            LogicalType::Uuid => "UUID".into(),
+            _ => return None,
+        };
+        Some(format!("Nullable({inner})"))
+    }
+
     /// `Decimal(76, 38)` (a 256-bit decimal): 38 integer and 38 fractional
     /// digits, so every 64-bit integer, every float up to 10^38 and every
     /// fraction a double carries stay exact.
@@ -83,7 +100,17 @@ impl SqlDialect for ClickHouse {
         columns: &[PlannedColumn],
         _key: &[String],
     ) -> Result<String, FaucetError> {
-        let cols = faucet_core::render_columns(columns, quote_ident, |t| self.type_name(t));
+        let cols = columns
+            .iter()
+            .map(|c| {
+                format!(
+                    "{} {}",
+                    quote_ident(&c.name),
+                    self.planned_type_name(c, false)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         Ok(format!(
             "CREATE TABLE IF NOT EXISTS {} ({cols}) ENGINE = MergeTree ORDER BY tuple()",
             target.reference

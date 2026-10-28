@@ -203,6 +203,13 @@ pub const REQUIREMENTS: &[Requirement] = &[
         summary: "rollback deletes exactly the run's rows, and a dry run changes nothing",
     },
     Requirement {
+        id: "declared_types",
+        role: Role::Sink,
+        triggers: &[Trigger::Capability("declared_types")],
+        assertions: &["assert_declared_types_create"],
+        summary: "a declaration types the created destination, which a write never retypes",
+    },
+    Requirement {
         id: "call_deadline",
         role: Role::Sink,
         triggers: &[Trigger::Always],
@@ -245,6 +252,13 @@ pub const REQUIREMENTS: &[Requirement] = &[
         summary: "every discovered dataset can be selected and read",
     },
     Requirement {
+        id: "declared_columns",
+        role: Role::Source,
+        triggers: &[Trigger::Capability("declared_columns")],
+        assertions: &["assert_declared_columns_truthful"],
+        summary: "every emitted column is declared and its values fit the declared type",
+    },
+    Requirement {
         id: "call_deadline",
         role: Role::Source,
         triggers: &[Trigger::Always],
@@ -277,6 +291,7 @@ mod tests {
     const LIB: &str = include_str!("lib.rs");
     const CHECKS: &str = include_str!("checks.rs");
     const CALLS: &str = include_str!("calls.rs");
+    const DECLARED: &str = include_str!("declared.rs");
 
     #[test]
     fn every_named_assertion_exists() {
@@ -285,7 +300,7 @@ mod tests {
                 let def = format!("pub async fn {a}");
                 let def_sync = format!("pub fn {a}");
                 assert!(
-                    [LIB, CHECKS, CALLS]
+                    [LIB, CHECKS, CALLS, DECLARED]
                         .iter()
                         .any(|src| src.contains(&def) || src.contains(&def_sync)),
                     "requirement `{}` names `{a}`, which faucet-conformance does not define",

@@ -98,3 +98,7 @@ pipeline's `CallContext` (#880): the run's cancel token stops a stalled read,
 any caller deadline ends it, and the query is metered as a `query` round trip.
 Rows are read a page at a time per call, so the per-row cost is unchanged; the
 pool's connect timeout still applies and nothing is retried.
+
+## Declared column types
+
+The source declares the query's columns and their types (`Source::declared_columns`, #955) from the describe its read makes, so a sink that creates its table types it from the source rather than from the first page's JSON values. See [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types).

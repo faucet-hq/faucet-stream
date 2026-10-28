@@ -459,3 +459,7 @@ computed by one aggregate query over the range-wrapped `query`. Algorithm id
 pair of these sources verifies without shipping any rows for the ranges that
 match (other pairings stream and hash client-side). See the [verification
 cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/verify.html).
+
+## Declared column types
+
+The source declares the query's columns and their types (`Source::declared_columns`, #955) from the describe its read makes, so a sink that creates its table types it from the source rather than from the first page's JSON values. See [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types).

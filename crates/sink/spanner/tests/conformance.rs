@@ -250,3 +250,34 @@ async fn conformance_cleanup_scoped() {
     let sink = SpannerSink::new(cfg).await.expect("sink");
     faucet_conformance::assert_cleanup_scoped(&sink, "tenant", || support::ids(&conn, "c")).await;
 }
+
+/// Check 26: a declaration creates the table, typed, for an empty run.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_declared_types_create() {
+    let conn = support::create_database("declared", Vec::new()).await;
+    let mut cfg = SpannerSinkConfig::new(
+        conn.project_id.clone(),
+        conn.instance.clone(),
+        conn.database.clone(),
+        "typed",
+    );
+    cfg.connection.emulator_host = conn.emulator_host.clone();
+    cfg.write = WriteSpec {
+        write_mode: WriteMode::Upsert,
+        key: vec!["id".to_string()],
+        delete_marker: None,
+        rollback: None,
+    };
+    let sink = SpannerSink::new(cfg).await.expect("sink");
+    faucet_conformance::assert_declared_types_create(
+        &sink,
+        &[
+            ("id", "int64"),
+            ("amount", "numeric"),
+            ("day", "date"),
+            ("at", "timestamp"),
+        ],
+        || support::column_types(&conn, "typed"),
+    )
+    .await;
+}

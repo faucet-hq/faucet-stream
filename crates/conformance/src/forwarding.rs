@@ -90,6 +90,7 @@ pub const SOURCE_HOOKS: &[&str] = &[
     "range_digest",
     "supports_discover",
     "discover",
+    "declared_columns",
     "record_table",
     "position_le",
     "record_covered",
@@ -146,6 +147,7 @@ pub const SINK_HOOKS: &[&str] = &[
     "config_schema",
     "connector_name",
     "set_roundtrip_recorder",
+    "set_declared_columns",
     "set_call_context",
     "dataset_uri",
     "local_outputs",
@@ -438,6 +440,9 @@ impl Sink for HookSink {
     fn set_roundtrip_recorder(&self, _recorder: Arc<RoundtripRecorder>) {
         self.hit("set_roundtrip_recorder");
     }
+    fn set_declared_columns(&self, _columns: faucet_core::DeclaredColumns) {
+        self.hit("set_declared_columns");
+    }
     fn set_call_context(&self, _ctx: faucet_core::io::CallContext) {
         self.hit("set_call_context");
     }
@@ -582,6 +587,7 @@ pub async fn assert_sink_forwards_every_hook(sink: &dyn Sink, probe: &HookSink, 
     let _ = sink.config_schema();
     let _ = sink.connector_name();
     sink.set_roundtrip_recorder(recorder(RoundtripSide::Sink));
+    sink.set_declared_columns(faucet_core::DeclaredColumns::new([]));
     sink.set_call_context(faucet_core::io::CallContext::new());
     answer(
         &mut wrong,
@@ -781,6 +787,15 @@ impl Source for HookSource {
         self.hit("discover");
         Ok(vec![DatasetDescriptor::new("hook", "table", json!({}))])
     }
+    async fn declared_columns(
+        &self,
+        _context: &HashMap<String, Value>,
+    ) -> Result<Option<faucet_core::DeclaredColumns>, FaucetError> {
+        self.hit("declared_columns");
+        Ok(Some(faucet_core::DeclaredColumns::new([
+            faucet_core::DeclaredColumn::new("hook", faucet_core::LogicalType::Int64, true),
+        ])))
+    }
     fn record_table(&self, _record: &Value) -> Option<String> {
         self.hit("record_table");
         Some("hook".into())
@@ -907,6 +922,11 @@ pub async fn assert_source_forwards_every_hook(
         .await;
     answer(&mut wrong, "supports_discover", source.supports_discover());
     let _ = source.discover().await;
+    answer(
+        &mut wrong,
+        "declared_columns",
+        matches!(source.declared_columns(&ctx).await, Ok(Some(d)) if d.get("hook").is_some()),
+    );
     answer(
         &mut wrong,
         "record_table",

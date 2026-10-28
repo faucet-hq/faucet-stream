@@ -479,6 +479,23 @@ assert_eq!(v["id"], serde_json::json!("18446744073709551616"));
 (`RowAccountsSnapshot::non_finite`, `faucet_fidelity_non_finite_total`). See
 the [value fidelity reference](https://faucet-hq.github.io/faucet-stream/reference/value-fidelity.html).
 
+## Declared column types
+
+A source that knows its column types implements `Source::declared_columns`,
+returning a `DeclaredColumns` of `DeclaredColumn { name, logical_type,
+nullable }` (`LogicalType`: `Int64`, `Float64`, `Bool`, `String`,
+`Decimal { precision, scale }`, `Date`, `Time`, `Timestamp { tz }`, `Uuid`,
+`Bytes`, `Json`; `LogicalType::from_sql_type` maps SQL type names) and declares
+`declared_columns` in its capabilities. `Pipeline::run` hands it to a sink that
+declares `declared_types` through `Sink::set_declared_columns` before the first
+write (reshaped when a masking pass sits in between; `TransformingSource`
+reshapes it for any stage but a filter). A creating sink keeps it in a
+`DeclaredSlot` and plans with `plan_columns_declared` /
+`plan_keyed_columns_declared` / `plan_table_declared`, which set
+`PlannedColumn::declared`; its `complete_run` creates the empty typed table when
+nothing was written and the declaration is complete. See
+`docs/book/src/reference/value-fidelity.md#declared-column-types`.
+
 ## Effectively-once delivery
 
 `DeliveryMode` (`AtLeastOnce` default, or `ExactlyOnce`) controls run semantics. Under `ExactlyOnce` the pipeline assigns a monotonic fixed-width commit token (`format_token(seq)`) to each bookmark-carrying page and calls `write_batch_idempotent(records, scope, token)`; the sink commits records **and** token atomically. On resume, `last_committed_token(scope)` is consulted to skip already-committed pages.

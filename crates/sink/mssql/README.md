@@ -410,6 +410,10 @@ Concurrent first writes are safe (#828): when two writers create the same table
 (or the commit-token table) at once, the loser's "object already exists"
 (error 2714) is treated as success.
 
+## Declared column types
+
+When the run's source declares its column types (a SQL query source, #955 — see [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types)), a table this sink creates types each declared column from the declaration instead of from the first page: `BIGINT`, `FLOAT`, `BIT`, `DECIMAL(p,s)` (up to 38 digits; wider or unbounded stays `NVARCHAR(MAX)`), `DATE`, `TIME(7)`, `DATETIMEOFFSET(7)` / `DATETIME2(7)`, `UNIQUEIDENTIFIER` — in `auto_columns` mode. A declared column whose first-page values do not fit its type keeps the inferred type; an existing table is never retyped. With a complete declaration a run that writes nothing creates the empty, typed table.
+
 ## Batch atomicity
 
 What a failed write leaves behind (#737): **atomic** for `write_mode: upsert|delete`, otherwise **best-effort** — keyed writes run in one transaction; appends commit per chunk and isolate failing rows. `on_batch_error: dlq_all`

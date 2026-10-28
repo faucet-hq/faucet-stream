@@ -310,3 +310,37 @@ async fn conformance_rollback_truthful() {
     })
     .await;
 }
+
+/// Check 26: a declaration creates the table for an empty run (SQLite keeps
+/// temporal and decimal values as text, so only the integer is typed).
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_declared_types_create() {
+    let dir = TempDir::new().expect("tempdir");
+    let url = format!("sqlite://{}?mode=rwc", dir.path().join("d.db").display());
+    let cfg = SqliteSinkConfig::new(&url, "d").column_mapping(SqliteColumnMapping::AutoMap);
+    let sink = SqliteSink::new(cfg).await.expect("sink");
+    let types = || {
+        let url = url.clone();
+        async move {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(&url)
+                .await
+                .expect("connect");
+            let rows = sqlx::query("SELECT name, type FROM pragma_table_info('d')")
+                .fetch_all(&pool)
+                .await
+                .expect("pragma");
+            pool.close().await;
+            rows.iter()
+                .map(|r| (r.get::<String, _>("name"), r.get::<String, _>("type")))
+                .collect::<Vec<_>>()
+        }
+    };
+    faucet_conformance::assert_declared_types_create(
+        &sink,
+        &[("id", "integer"), ("amount", "text"), ("day", "text")],
+        types,
+    )
+    .await;
+}

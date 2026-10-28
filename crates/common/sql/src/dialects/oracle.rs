@@ -5,7 +5,7 @@ use crate::mapping::ColumnMatching;
 use faucet_core::idempotency::{
     COMMIT_TOKEN_SCOPE_COL, COMMIT_TOKEN_TABLE, COMMIT_TOKEN_TOKEN_COL,
 };
-use faucet_core::{FaucetError, PlannedColumn, SqlBaseType};
+use faucet_core::{FaucetError, LogicalType, PlannedColumn, SqlBaseType};
 
 /// Oracle: double-quoted, case-sensitive identifiers (no escape exists for
 /// `"` inside one, so it is refused, as are NUL, empty names and names over
@@ -160,6 +160,23 @@ impl SqlDialect for Oracle {
         column_type(t, false)
     }
 
+    fn declared_type_name(&self, t: &LogicalType) -> Option<String> {
+        Some(match t {
+            LogicalType::Int64 => "NUMBER(19)".into(),
+            LogicalType::Float64 => "BINARY_DOUBLE".into(),
+            LogicalType::Bool => "NUMBER(1)".into(),
+            LogicalType::Decimal { .. } => {
+                super::declared_decimal(t, 38, Some("NUMBER"), "NUMBER")?
+            }
+            LogicalType::Date => "DATE".into(),
+            LogicalType::Timestamp { tz: true } => "TIMESTAMP(9) WITH TIME ZONE".into(),
+            LogicalType::Timestamp { tz: false } => "TIMESTAMP(9)".into(),
+            LogicalType::Uuid => "VARCHAR2(36 CHAR)".into(),
+            LogicalType::Bytes => "BLOB".into(),
+            _ => return None,
+        })
+    }
+
     fn key_type_name(&self, t: SqlBaseType) -> &'static str {
         column_type(t, true)
     }
@@ -250,10 +267,16 @@ impl SqlDialect for Oracle {
         columns: &[PlannedColumn],
         key: &[String],
     ) -> Result<String, FaucetError> {
+        let declared_key = |c: &PlannedColumn| {
+            c.declared
+                .as_ref()
+                .and_then(|t| self.declared_key_type_name(t))
+        };
         let text_keys = columns
             .iter()
             .filter(|c| {
                 key.contains(&c.name)
+                    && declared_key(c).is_none()
                     && matches!(c.base_type, SqlBaseType::Text | SqlBaseType::Json)
             })
             .count();
@@ -261,10 +284,11 @@ impl SqlDialect for Oracle {
         for c in columns {
             let is_key = key.contains(&c.name);
             let ty = match c.base_type {
+                _ if is_key && declared_key(c).is_some() => declared_key(c).unwrap_or_default(),
                 SqlBaseType::Text | SqlBaseType::Json if is_key => {
                     format!("VARCHAR2({} CHAR)", key_text_width(text_keys))
                 }
-                t => column_type(t, is_key).to_string(),
+                _ => self.planned_type_name(c, is_key),
             };
             defs.push(format!("{} {ty}", quote_ident(&c.name)?));
         }
