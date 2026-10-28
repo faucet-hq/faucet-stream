@@ -76,6 +76,12 @@ the next refused call makes the console re-read it and redraw.
 Lists all runs with live status badges. You can:
 
 - Filter by name, status, or time range.
+- Filter by label: type `key:value` (or a bare `key`) into the label box and
+  press Enter. Each filter becomes a removable chip, every chip must match,
+  and the filters live in the URL (`#/runs?label=team:data`), so a filtered
+  view is a shareable link. Clicking a label chip on a run row adds it.
+- See each run's labels as chips under its name (the first three, the rest
+  behind a `+N` with a tooltip).
 - Page through history.
 - Click any row to open the run detail view.
 - Click **+ Submit run** to go directly to the Submit view.
@@ -85,7 +91,10 @@ Lists all runs with live status badges. You can:
 ### Run detail
 
 Shows the full run record (status, timestamps, labels, config) plus every
-invocation in the matrix. For in-flight runs it streams structured log events
+invocation in the matrix. The **Labels** strip lists every label as a
+`key: value` chip — the caller's own first, then the provenance labels faucet
+stamps (`template`, `pipeline`, `backfill`, …) muted; clicking one opens the
+Runs list filtered by it. For in-flight runs it streams structured log events
 live via SSE (the same `GET /v1/runs/{id}/logs` endpoint). You can cancel or
 delete a run from this view.
 

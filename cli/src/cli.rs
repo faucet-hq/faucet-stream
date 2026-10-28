@@ -436,6 +436,10 @@ pub struct HistoryArgs {
     /// Show only runs that contain an invocation for this matrix row id.
     #[arg(long)]
     pub row: Option<String>,
+    /// Show only runs carrying this label: `key=value` (or `key:value`), or a
+    /// bare `key` for "has the label". Repeatable; every one must match.
+    #[arg(long = "label", value_name = "KEY=VALUE")]
+    pub label: Vec<String>,
     /// Emit the history as JSON instead of a table.
     #[arg(long)]
     pub json: bool,

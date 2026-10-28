@@ -17,6 +17,7 @@ fn args(config: PathBuf, row: Option<String>, json: bool) -> HistoryArgs {
         profile: None,
         limit: 20,
         row,
+        label: Vec::new(),
         json,
     }
 }
@@ -101,4 +102,49 @@ async fn history_reads_seeded_sqlite_catalog() {
     faucet_cli::commands::history::run(args(cfg.clone(), Some("eu".into()), false))
         .await
         .expect("row filter");
+}
+
+#[tokio::test]
+async fn history_label_flag_keeps_only_matching_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("cat.db");
+    let cfg = dir.path().join("faucet.yaml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "version: 1\nname: demo\ncatalog:\n  url: \"sqlite:{db}\"\npipeline:\n  source: {{ type: rest, config: {{ path: /x }} }}\n  sink: {{ type: jsonl, config: {{ path: o }} }}\n",
+            db = db.display(),
+        ),
+    )
+    .unwrap();
+    let handle = faucet_cli::catalog::connect_from_spec(&faucet_cli::catalog::CatalogSpec {
+        url: format!("sqlite:{}", db.display()),
+        sample_records: 10,
+        datasets: Vec::new(),
+    })
+    .await
+    .unwrap();
+    let mut a = record("run-a", "us");
+    a.labels.insert("team".into(), "data".into());
+    let mut b = record("run-b", "us");
+    b.labels.insert("team".into(), "web".into());
+    handle.store.upsert(&a).await.unwrap();
+    handle.store.upsert(&b).await.unwrap();
+
+    let mut with = args(cfg.clone(), None, false);
+    with.label = vec!["team=data".into()];
+    let runs = faucet_cli::commands::history::load(with).await.unwrap();
+    assert_eq!(
+        runs.iter().map(|r| r.run_id.as_str()).collect::<Vec<_>>(),
+        ["run-a"]
+    );
+    let mut any = args(cfg, None, false);
+    any.label = vec!["team".into()];
+    assert_eq!(
+        faucet_cli::commands::history::load(any)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
 }

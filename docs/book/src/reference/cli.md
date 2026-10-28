@@ -45,7 +45,7 @@ JSON-RPC stream.
 | `faucet doctor --offline [config]` | Static, credential-free config lints (no network; secret-manager directives stay unresolved, an unsupplied required param gets a placeholder) — dangling/unused auth, unused vars, no-op sink `batch_size`. `faucet doctor` takes `--param NAME=VALUE` / `--param-env NAME[=VALUE]` like `run`. |
 | `faucet fmt [config] [--check]` | Canonicalize a config (stable key order); `--check` is a CI gate. |
 | `faucet explain [config]` | Plain-English narration of what a pipeline does (offline, zero I/O). |
-| `faucet history [config]` | Terminal view of the run history in a config's `catalog:` store. |
+| `faucet history [config]` | Terminal view of the run history in a config's `catalog:` store. `--label key=value` (repeatable; a bare `key` = has the label) keeps runs carrying every given label. |
 | `faucet status [config]` | One screen of per-row health: last success / failure, bookmark, resume point, DLQ backlog, SLA verdicts. Exit 0 / 1 / 2. |
 | `faucet state show\|set\|reset\|export\|import` | Inspect, move, reset, back up, and restore a pipeline's durable state. |
 | `faucet run … --output json\|ndjson` | Machine-readable end-of-run summary (per-row + totals) for scripting. |

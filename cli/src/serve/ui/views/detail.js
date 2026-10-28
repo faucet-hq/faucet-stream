@@ -2,7 +2,7 @@ import { api, toast } from "../api.js";
 import { streamLogs } from "../sse.js";
 import { navigate } from "../router.js";
 import { formatTsSplit } from "../tz.js";
-import { escapeHtml, fmtInt, fmtCompact, TERMINAL_RUN_STATUSES as TERMINAL } from "../utils.js";
+import { escapeHtml, fmtInt, fmtCompact, labelChip, sortedLabels, TERMINAL_RUN_STATUSES as TERMINAL } from "../utils.js";
 
 /** Human duration between two RFC3339 timestamps; "—" if either is missing. */
 function fmtDur(fromISO, toISO) {
@@ -55,6 +55,14 @@ function templateLink(rec) {
   if (!l.template) return "";
   const ver = l.template_version ? ` <b>v${escapeHtml(String(l.template_version))}</b>` : "";
   return `<a href="#/templates/${encodeURIComponent(l.template)}">${escapeHtml(l.template)}</a>${ver}`;
+}
+
+/** Every label as a chip (caller labels first, provenance muted); a click
+ *  lists the runs carrying it. */
+function labelsBlock(rec) {
+  const all = sortedLabels(rec.labels);
+  if (!all.length) return "";
+  return `<div class="rs-labels"><h3>Labels</h3><div class="rs-labels-chips">${all.map(([k, v, p]) => labelChip(k, v, p)).join("")}</div></div>`;
 }
 
 /** Render a rollback report: what changed (or would), and why it was blocked. */
@@ -322,7 +330,11 @@ export async function renderDetail(container, { id }) {
           ${provenance ? `<div class="rs-seg"><h3>Provenance</h3><dl>${provenance}</dl></div>` : ""}
           ${logExportSegment(rec.log_export)}
         </div>
+        ${labelsBlock(rec)}
       </section>${errors}`;
+    container.querySelectorAll("#detail-head .label-chip").forEach((chip) => {
+      chip.onclick = () => navigate(`#/runs?${new URLSearchParams({ label: chip.dataset.label })}`);
+    });
     const inv = container.querySelector("#invocations");
     // Per-row timing (#645): sort slowest-first so the object dominating the
     // run's makespan is obvious, and draw a proportional bar next to each.

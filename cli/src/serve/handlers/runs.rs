@@ -7,7 +7,7 @@ use crate::serve::rbac::AuthContext;
 use crate::serve::runner::{self, ConfigFormatWire, SubmitOutcome, SubmitRequest};
 use crate::serve::state::ServerState;
 use axum::Json;
-use axum::extract::{Extension, Path, Query, State};
+use axum::extract::{Extension, Path, Query, RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use chrono::{DateTime, Utc};
@@ -211,8 +211,10 @@ impl<'de> Deserialize<'de> for DateTimeUtcParam {
     }
 }
 
-/// `GET /v1/runs` query string.
-#[derive(Debug, Deserialize)]
+/// `GET /v1/runs` query string. An unknown parameter is a 400 (#958): a
+/// dropped one would hand back an unfiltered list.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListQuery {
     /// Comma-separated status names to include (e.g. `running,completed`); empty
     /// / absent = every status. An unknown token is a 400 — silently ignoring it
@@ -225,6 +227,40 @@ pub struct ListQuery {
     pub cursor: Option<String>,
     /// Only runs started for this tenant (#709).
     pub tenant: Option<String>,
+    /// Repeatable `label=key:value` / `label=key` filters, ANDed (#958).
+    #[serde(skip)]
+    pub label: Vec<String>,
+    /// The comma-separated `labels=k:v,k2:v2` alias of `label`.
+    #[serde(skip)]
+    pub labels: Vec<String>,
+}
+
+impl ListQuery {
+    /// Parse a raw query string: the repeatable `label` / `labels` pairs by
+    /// hand (the form decoder takes one value per key), the rest by serde.
+    pub fn from_raw(raw: Option<&str>) -> Result<Self, ServeError> {
+        let raw = raw.unwrap_or_default();
+        let mut label = Vec::new();
+        let mut labels = Vec::new();
+        let mut rest = url::form_urlencoded::Serializer::new(String::new());
+        for (k, v) in url::form_urlencoded::parse(raw.as_bytes()) {
+            match k.as_ref() {
+                "label" => label.push(v.into_owned()),
+                "labels" => labels.push(v.into_owned()),
+                _ => {
+                    rest.append_pair(&k, &v);
+                }
+            }
+        }
+        let uri: axum::http::Uri = format!("/?{}", rest.finish())
+            .parse()
+            .map_err(|e: axum::http::uri::InvalidUri| ServeError::BadConfig(e.to_string()))?;
+        let Query(mut q) = Query::<ListQuery>::try_from_uri(&uri)
+            .map_err(|e| ServeError::BadConfig(e.body_text()))?;
+        q.label = label;
+        q.labels = labels;
+        Ok(q)
+    }
 }
 
 /// `GET /v1/runs` response body.
@@ -268,6 +304,8 @@ impl ListQuery {
             limit: self.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT),
             cursor: self.cursor,
             tenant: actor.tenant_filter(self.tenant)?,
+            labels: crate::serve::history::labels::parse_filters(&self.label, &self.labels)
+                .map_err(ServeError::BadConfig)?,
         })
     }
 }
@@ -276,8 +314,9 @@ impl ListQuery {
 pub async fn list_runs(
     State(state): State<ServerState>,
     Extension(actor): Extension<AuthContext>,
-    Query(query): Query<ListQuery>,
+    RawQuery(raw): RawQuery,
 ) -> Result<Json<ListResponse>, ServeError> {
+    let query = ListQuery::from_raw(raw.as_deref())?;
     let page = state
         .history()
         .list(&query.into_filter(&actor)?)
@@ -470,6 +509,7 @@ mod tests {
             limit: None,
             cursor: None,
             tenant: tenant.map(str::to_string),
+            ..Default::default()
         };
         let mut scoped = global();
         scoped.tenant = Some("acme".into());
@@ -489,6 +529,41 @@ mod tests {
     }
 
     #[test]
+    fn from_raw_collects_label_filters_and_refuses_unknown_keys() {
+        let q = ListQuery::from_raw(Some(
+            "label=team%3Adata&label=env:prod&labels=a:1,b&status=failed&limit=5&since=2026-10-01T00:00:00%2B05:30",
+        ))
+        .unwrap();
+        assert_eq!(q.label, ["team:data", "env:prod"]);
+        assert_eq!(q.labels, ["a:1,b"]);
+        assert_eq!(q.limit, Some(5));
+        let f = q.into_filter(&global()).unwrap();
+        assert_eq!(f.labels.len(), 4);
+        assert_eq!(f.labels[3].value, None);
+        assert_eq!(f.status, vec![RunStatus::Failed]);
+        assert_eq!(
+            f.since.unwrap().to_rfc3339(),
+            "2026-09-30T18:30:00+00:00",
+            "an encoded '+' offset survives the re-encode"
+        );
+        assert!(ListQuery::from_raw(None).unwrap().label.is_empty());
+        let err = ListQuery::from_raw(Some("lables=x")).unwrap_err();
+        assert!(
+            matches!(err, ServeError::BadConfig(ref m) if m.contains("lables")),
+            "{err:?}"
+        );
+        let many = (0..11)
+            .map(|i| format!("label=k{i}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let err = ListQuery::from_raw(Some(&many))
+            .unwrap()
+            .into_filter(&global())
+            .unwrap_err();
+        assert!(matches!(err, ServeError::BadConfig(ref m) if m.contains("at most 10")));
+    }
+
+    #[test]
     fn list_query_clamps_limit() {
         let q = ListQuery {
             status: None,
@@ -498,6 +573,7 @@ mod tests {
             limit: Some(99999),
             cursor: None,
             tenant: None,
+            ..Default::default()
         };
         assert_eq!(q.into_filter(&global()).unwrap().limit, MAX_LIMIT);
         let q = ListQuery {
@@ -508,6 +584,7 @@ mod tests {
             limit: None,
             cursor: None,
             tenant: None,
+            ..Default::default()
         };
         let f = q.into_filter(&global()).unwrap();
         assert_eq!(f.limit, DEFAULT_LIMIT);
@@ -526,6 +603,7 @@ mod tests {
             limit: None,
             cursor: None,
             tenant: None,
+            ..Default::default()
         };
         let err = q.into_filter(&global()).unwrap_err();
         assert!(matches!(err, ServeError::BadConfig(ref m) if m.contains("faild")));
@@ -538,6 +616,7 @@ mod tests {
             limit: None,
             cursor: None,
             tenant: None,
+            ..Default::default()
         };
         assert!(q.into_filter(&global()).is_err(), "case-sensitive tokens");
         // A trailing comma (empty token) is tolerated.
@@ -549,6 +628,7 @@ mod tests {
             limit: None,
             cursor: None,
             tenant: None,
+            ..Default::default()
         };
         assert_eq!(
             q.into_filter(&global()).unwrap().status,

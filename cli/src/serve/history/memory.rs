@@ -280,6 +280,7 @@ impl RunHistory for MemoryHistory {
                     .as_deref()
                     .is_none_or(|t| r.tenant.as_deref() == Some(t))
             })
+            .filter(|r| crate::serve::history::labels::matches_all(&filter.labels, &r.labels))
             .collect();
         // (submitted_at DESC, run_id DESC)
         rows.sort_by(|a, b| {

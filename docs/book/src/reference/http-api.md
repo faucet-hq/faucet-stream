@@ -473,7 +473,12 @@ Request body:
 - **`name`** — metadata; also drives the **state-key and metric identity** (see
   the cookbook's cardinality note). Two submissions sharing a `name` share
   replication bookmarks.
-- **`labels`** — arbitrary string metadata, stored on the run record only.
+- **`labels`** — string key/value metadata stored on the run record and
+  filterable with `GET /v1/runs?label=key:value` (#958). Keys are 1–63
+  characters and values at most 256; a longer one is a `422`. The provenance
+  keys the server stamps (`template`, `template_version`, `allow_untested`,
+  `sink_template`, `sink_template_version`, `overlay`, `overlay_version`,
+  `selection`) are refused with a `422`; they stay filterable.
 - **`timeout_secs`** — wall-clock cap; on expiry the run is marked failed.
 - **`doctor_first`** — run preflight probes before executing; on any failure the
   submit returns `422` with the doctor report in `error.details`.
@@ -532,10 +537,33 @@ submitted config (submitted values win).
 ### `GET /v1/runs`
 
 Query parameters: `status`, `name`, `since`, `until` (RFC3339), `limit` (default
-50, max 500), `cursor`. Ordering is `(submitted_at DESC, run_id DESC)`; `cursor`
-is the previous page's `next_cursor` — the last row's sort key
-(`<submitted_at>~<run_id>`), so paging stays correct when that run is deleted or
-purged between requests. A bare `run_id` is still accepted.
+50, max 500), `cursor`, `tenant`, `label`, `labels`. Ordering is
+`(submitted_at DESC, run_id DESC)`; `cursor` is the previous page's
+`next_cursor` — the last row's sort key (`<submitted_at>~<run_id>`), so paging
+stays correct when that run is deleted or purged between requests. A bare
+`run_id` is still accepted. Every filter composes with the others and with the
+cursor.
+
+**Filtering by label (#958).** `label=key:value` keeps runs whose label `key`
+is exactly `value`; `label=key` keeps runs that carry `key` at all. Repeat it
+to require several (they are ANDed):
+
+```bash
+curl -s -G http://127.0.0.1:8080/v1/runs -H "Authorization: Bearer $TOKEN" \
+  --data-urlencode label=team:data --data-urlencode label=env:prod
+```
+
+The value is split from the key on the **first** `:`, so `label=url:https://x`
+matches the value `https://x`; URL-encode values as usual. `labels=team:data,env:prod`
+is a comma-separated alias (a value containing `,` needs the repeatable form).
+At most 10 label filters per request. Provenance labels filter like any other —
+`label=template:orders`, `label=backfill:<range-hash>` (one backfill's units),
+`label=pipeline:<name>`. A sharded run is listed once, as its parent, with the
+labels it was submitted with.
+
+**Unknown parameters are a `400`.** A typo such as `?lables=team:data` is
+refused rather than silently returning every run. So are an unknown `status`
+token, an empty label key and more than 10 label filters.
 
 ```json
 { "runs": [ { "run_id": "…", "status": "completed", … } ], "next_cursor": "2026-10-01T12:00:00.000000000Z~0192…" }
@@ -1198,7 +1226,8 @@ labelled `template` and `template_version` (plus `sink_template` /
 `sink_template_version` for a composed run, `overlay` / `overlay_version`
 when an overlay applied, `allow_untested` for a run of a non-`passing` version
 and `selection` for a row selection). Only the server sets these: a caller's
-`labels` entry under any of those keys is dropped.
+`labels` entry under any of those keys is dropped (on `POST /v1/runs`,
+`POST /v1/backfill` and `POST /v1/changes` it is a `422`).
 
 Status codes: `404` for an unknown id or pinned version; `422` for a missing
 `required` param or a type mismatch, naming the param; `429` when the queue is

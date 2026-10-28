@@ -245,6 +245,34 @@ macro_rules! migrate {
                     .map_err(|e| ctx("backfilling change tenants", e))?;
                 }
             }
+            // Every run without label rows (written before v7, or by an older
+            // peer since) gets them from its body (#958). Idempotent.
+            let rows = sqlx::query(
+                "SELECT r.run_id, r.body FROM faucet_serve_runs r WHERE NOT EXISTS \
+                 (SELECT 1 FROM faucet_serve_run_labels l WHERE l.run_id = r.run_id)",
+            )
+            .fetch_all($pool)
+            .await
+            .map_err(|e| ctx("backfilling run labels", e))?;
+            for row in rows {
+                let body: String = row.try_get("body").unwrap_or_default();
+                let run_id: String = row.try_get("run_id").unwrap_or_default();
+                for (k, v) in $crate::serve::history::sql::body_labels(&body) {
+                    sqlx::query(&format!(
+                        "INSERT INTO faucet_serve_run_labels (run_id, key, value) \
+                         VALUES ({}, {}, {}) ON CONFLICT (run_id, key) DO NOTHING",
+                        $crate::serve::history::sql::bind_mark(&*$pool, 1),
+                        $crate::serve::history::sql::bind_mark(&*$pool, 2),
+                        $crate::serve::history::sql::bind_mark(&*$pool, 3),
+                    ))
+                    .bind(&run_id)
+                    .bind(k)
+                    .bind(v)
+                    .execute($pool)
+                    .await
+                    .map_err(|e| ctx("backfilling run labels", e))?;
+                }
+            }
             for stmt in POST_MIGRATION_DDL {
                 sqlx::query(stmt)
                     .execute($pool)
@@ -282,6 +310,19 @@ pub fn body_tenant(body: &str) -> Option<String> {
         .get("tenant")?
         .as_str()
         .map(str::to_string)
+}
+
+/// The `labels` a stored JSON run body carries (empty when unreadable).
+pub fn body_labels(body: &str) -> Vec<(String, String)> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("labels").and_then(|l| l.as_object()).cloned())
+        .map(|m| {
+            m.into_iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The positional placeholder of a pool's dialect.
@@ -624,6 +665,15 @@ pub const DDL: &[&str] = &[
         tenant TEXT NOT NULL)",
     "CREATE INDEX IF NOT EXISTS faucet_tenant_runs_tenant_idx \
         ON faucet_tenant_runs (tenant)",
+    // A run's labels, one row per key, so `GET /v1/runs?label=` filters in
+    // SQL (#958). Written with the run, dropped with it.
+    "CREATE TABLE IF NOT EXISTS faucet_serve_run_labels (\
+        run_id TEXT NOT NULL,\
+        key TEXT NOT NULL,\
+        value TEXT NOT NULL,\
+        PRIMARY KEY (run_id, key))",
+    "CREATE INDEX IF NOT EXISTS faucet_serve_run_labels_kv_idx \
+        ON faucet_serve_run_labels (key, value, run_id)",
     "CREATE TABLE IF NOT EXISTS faucet_tenant_state_refs (\
         tenant TEXT NOT NULL,\
         state_key TEXT NOT NULL,\
@@ -908,6 +958,12 @@ pub struct Stmts {
     pub run_secrets_purge: String,
     pub tenant_run_delete: String,
     pub purge_orphan_tenant_runs: String,
+    /// Insert one `(run_id, key, value)` label row (#958).
+    pub run_label_insert: String,
+    /// Drop every label row of one run.
+    pub run_labels_delete: String,
+    /// Drop label rows whose run is gone. No params.
+    pub purge_orphan_run_labels: String,
     pub state_ref_insert: String,
     pub state_ref_select: String,
     pub catalog_upsert_dataset: String,
@@ -1221,6 +1277,39 @@ impl Stmts {
         (sql, binds)
     }
 
+    /// The run-listing query: [`Stmts::list`]'s fourteen binds, then one
+    /// clause per label filter, then the `LIMIT` bind. Returns the SQL and the
+    /// label binds, in bind order (#958).
+    pub fn list_query(
+        &self,
+        labels: &[crate::serve::history::labels::LabelFilter],
+    ) -> (String, Vec<String>) {
+        let mut sql = self.list.clone();
+        let mut binds = Vec::new();
+        for f in labels {
+            binds.push(f.key.clone());
+            let key = self.placeholder(14 + binds.len());
+            match &f.value {
+                Some(v) => {
+                    binds.push(v.clone());
+                    let value = self.placeholder(14 + binds.len());
+                    sql.push_str(&format!(
+                        " AND run_id IN (SELECT run_id FROM faucet_serve_run_labels \
+                         WHERE key = {key} AND value = {value})"
+                    ));
+                }
+                None => sql.push_str(&format!(
+                    " AND run_id IN (SELECT run_id FROM faucet_serve_run_labels WHERE key = {key})"
+                )),
+            }
+        }
+        sql.push_str(&format!(
+            " ORDER BY submitted_at DESC, run_id DESC LIMIT {}",
+            self.placeholder(15 + binds.len())
+        ));
+        (sql, binds)
+    }
+
     /// The dialect's positional placeholder for the `n`-th (1-based) bind.
     fn placeholder(&self, n: usize) -> String {
         match self.dialect {
@@ -1262,8 +1351,7 @@ impl Stmts {
                 AND ($9::text IS NULL OR (submitted_at < $10::text \
                     OR (submitted_at = $11::text AND run_id < $12::text))) \
                 AND ($13::text IS NULL OR run_id IN \
-                    (SELECT run_id FROM faucet_tenant_runs WHERE tenant = $14::text)) \
-                ORDER BY submitted_at DESC, run_id DESC LIMIT $15"
+                    (SELECT run_id FROM faucet_tenant_runs WHERE tenant = $14::text))"
                 .into(),
             purge_runs: "DELETE FROM faucet_serve_runs \
                 WHERE status IN ('completed','failed','cancelled') \
@@ -1642,6 +1730,14 @@ impl Stmts {
             purge_orphan_tenant_runs: "DELETE FROM faucet_tenant_runs \
                 WHERE run_id NOT IN (SELECT run_id FROM faucet_serve_runs)"
                 .into(),
+            run_label_insert: "INSERT INTO faucet_serve_run_labels (run_id, key, value) \
+                VALUES ($1,$2,$3) \
+                ON CONFLICT (run_id, key) DO UPDATE SET value=excluded.value"
+                .into(),
+            run_labels_delete: "DELETE FROM faucet_serve_run_labels WHERE run_id=$1".into(),
+            purge_orphan_run_labels: "DELETE FROM faucet_serve_run_labels \
+                WHERE run_id NOT IN (SELECT run_id FROM faucet_serve_runs)"
+                .into(),
             state_ref_insert: "INSERT INTO faucet_tenant_state_refs (tenant, state_key, body) \
                 VALUES ($1,$2,$3) ON CONFLICT (tenant, state_key) DO NOTHING"
                 .into(),
@@ -1857,8 +1953,7 @@ impl Stmts {
                 AND (? IS NULL OR (submitted_at < ? \
                     OR (submitted_at = ? AND run_id < ?))) \
                 AND (? IS NULL OR run_id IN \
-                    (SELECT run_id FROM faucet_tenant_runs WHERE tenant = ?)) \
-                ORDER BY submitted_at DESC, run_id DESC LIMIT ?"
+                    (SELECT run_id FROM faucet_tenant_runs WHERE tenant = ?))"
                 .into(),
             purge_runs: "DELETE FROM faucet_serve_runs \
                 WHERE status IN ('completed','failed','cancelled') \
@@ -2229,6 +2324,14 @@ impl Stmts {
                 .into(),
             tenant_run_delete: "DELETE FROM faucet_tenant_runs WHERE run_id=?".into(),
             purge_orphan_tenant_runs: "DELETE FROM faucet_tenant_runs \
+                WHERE run_id NOT IN (SELECT run_id FROM faucet_serve_runs)"
+                .into(),
+            run_label_insert: "INSERT INTO faucet_serve_run_labels (run_id, key, value) \
+                VALUES (?,?,?) \
+                ON CONFLICT (run_id, key) DO UPDATE SET value=excluded.value"
+                .into(),
+            run_labels_delete: "DELETE FROM faucet_serve_run_labels WHERE run_id=?".into(),
+            purge_orphan_run_labels: "DELETE FROM faucet_serve_run_labels \
                 WHERE run_id NOT IN (SELECT run_id FROM faucet_serve_runs)"
                 .into(),
             state_ref_insert: "INSERT INTO faucet_tenant_state_refs (tenant, state_key, body) \
@@ -2894,6 +2997,8 @@ macro_rules! impl_sql_history {
                 // so the heartbeat can extend a lease without a body read-modify-
                 // write race (#146 H7).
                 let lease = sql::fmt_ts(chrono::Utc::now() + self.lease_ttl);
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let mut tx = self.pool.begin_with($begin_write).await.map_err(backend)?;
                 sqlx::query(&self.stmts.upsert)
                     .bind(&rec.run_id)
                     .bind(rec.name.as_deref())
@@ -2905,9 +3010,24 @@ macro_rules! impl_sql_history {
                     .bind(&lease)
                     .bind(&body)
                     .bind(&rec.pool)
-                    .execute(&self.pool)
+                    .execute(&mut *tx)
                     .await
-                    .map_err($crate::serve::history::sql::classify_backend_error)?;
+                    .map_err(backend)?;
+                sqlx::query(&self.stmts.run_labels_delete)
+                    .bind(&rec.run_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(backend)?;
+                for (k, v) in &rec.labels {
+                    sqlx::query(&self.stmts.run_label_insert)
+                        .bind(&rec.run_id)
+                        .bind(k)
+                        .bind(v)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(backend)?;
+                }
+                tx.commit().await.map_err(backend)?;
                 Ok(())
             }
 
@@ -2920,6 +3040,8 @@ macro_rules! impl_sql_history {
                 let submitted = sql::fmt_ts(rec.submitted_at);
                 let finished = rec.finished_at.map(sql::fmt_ts);
                 let lease = sql::fmt_ts(chrono::Utc::now() + self.lease_ttl);
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let mut tx = self.pool.begin_with($begin_write).await.map_err(backend)?;
                 let done = sqlx::query(&self.stmts.insert_new)
                     .bind(&rec.run_id)
                     .bind(rec.name.as_deref())
@@ -2931,10 +3053,23 @@ macro_rules! impl_sql_history {
                     .bind(&lease)
                     .bind(&body)
                     .bind(&rec.pool)
-                    .execute(&self.pool)
+                    .execute(&mut *tx)
                     .await
-                    .map_err($crate::serve::history::sql::classify_backend_error)?;
-                Ok(done.rows_affected() == 1)
+                    .map_err(backend)?;
+                let inserted = done.rows_affected() == 1;
+                if inserted {
+                    for (k, v) in &rec.labels {
+                        sqlx::query(&self.stmts.run_label_insert)
+                            .bind(&rec.run_id)
+                            .bind(k)
+                            .bind(v)
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(backend)?;
+                    }
+                }
+                tx.commit().await.map_err(backend)?;
+                Ok(inserted)
             }
 
             async fn get(
@@ -3020,7 +3155,8 @@ macro_rules! impl_sql_history {
                 let limit = filter.limit.max(1);
                 let fetch_n = limit as i64 + 1; // +1 to detect a next page
 
-                let rows = sqlx::query(&self.stmts.list)
+                let (list_sql, label_binds) = self.stmts.list_query(&filter.labels);
+                let mut q = sqlx::query(&list_sql)
                     .bind(status_s)
                     .bind(status_s)
                     .bind(name_s)
@@ -3034,7 +3170,11 @@ macro_rules! impl_sql_history {
                     .bind(cursor_ts.as_deref())
                     .bind(cur_id)
                     .bind(filter.tenant.as_deref())
-                    .bind(filter.tenant.as_deref())
+                    .bind(filter.tenant.as_deref());
+                for b in &label_binds {
+                    q = q.bind(b.as_str());
+                }
+                let rows = q
                     .bind(fetch_n)
                     .fetch_all(&self.pool)
                     .await
@@ -3077,11 +3217,18 @@ macro_rules! impl_sql_history {
                         Ok(DeleteOutcome::StillRunning)
                     }
                     Some(_) => {
+                        let mut tx = self.pool.begin_with($begin_write).await.map_err(backend)?;
                         sqlx::query(&self.stmts.delete)
                             .bind(id)
-                            .execute(&self.pool)
+                            .execute(&mut *tx)
                             .await
                             .map_err(backend)?;
+                        sqlx::query(&self.stmts.run_labels_delete)
+                            .bind(id)
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(backend)?;
+                        tx.commit().await.map_err(backend)?;
                         sqlx::query(&self.stmts.tenant_run_delete)
                             .bind(id)
                             .execute(&self.pool)
@@ -3129,12 +3276,18 @@ macro_rules! impl_sql_history {
                 use $crate::serve::history::sql;
                 let backend = $crate::serve::history::sql::classify_backend_error;
                 let now = chrono::Utc::now();
+                let mut tx = self.pool.begin_with($begin_write).await.map_err(backend)?;
                 let removed = sqlx::query(&self.stmts.purge_runs)
                     .bind(sql::threshold(now, retain_for))
-                    .execute(&self.pool)
+                    .execute(&mut *tx)
                     .await
                     .map_err(backend)?
                     .rows_affected() as usize;
+                sqlx::query(&self.stmts.purge_orphan_run_labels)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(backend)?;
+                tx.commit().await.map_err(backend)?;
                 // Drop expired idempotency claims too (best-effort).
                 let _ = sqlx::query(&self.stmts.purge_idem)
                     .bind(sql::threshold(now, self.idem_retention))
@@ -7041,11 +7194,44 @@ mod tests {
         let lite = Stmts::new(Dialect::Sqlite);
         assert!(pg.upsert.contains("$1") && lite.upsert.contains('?'));
         assert!(pg.list.contains("$13") && lite.list.contains('?'));
+        let (q, _) = pg.list_query(&[]);
+        assert!(q.ends_with("LIMIT $15"), "{q}");
         // Both target the same tables / conflict targets.
         assert!(pg.insert_idem.contains("ON CONFLICT (key) DO NOTHING"));
         assert!(lite.insert_idem.contains("ON CONFLICT (key) DO NOTHING"));
         assert!(pg.claim_one.contains("$3") && lite.claim_one.contains('?'));
         assert!(pg.heartbeat_instance.contains("faucet_serve_instances"));
         assert!(lite.heartbeat_instance.contains("faucet_serve_instances"));
+    }
+
+    #[test]
+    fn list_query_adds_one_clause_per_label_filter_before_the_limit() {
+        use crate::serve::history::labels::LabelFilter;
+        let f = [
+            LabelFilter::parse("team:data").unwrap(),
+            LabelFilter::parse("env").unwrap(),
+        ];
+        let (q, binds) = Stmts::new(Dialect::Postgres).list_query(&f);
+        assert_eq!(binds, ["team", "data", "env"]);
+        assert!(q.contains("WHERE key = $15 AND value = $16)"), "{q}");
+        assert!(q.contains("WHERE key = $17)"), "{q}");
+        assert!(
+            q.ends_with("ORDER BY submitted_at DESC, run_id DESC LIMIT $18"),
+            "{q}"
+        );
+        let (q, binds) = Stmts::new(Dialect::Sqlite).list_query(&f);
+        assert_eq!(binds.len(), 3);
+        assert_eq!(q.matches("faucet_serve_run_labels").count(), 2);
+        assert!(q.ends_with("LIMIT ?"), "{q}");
+    }
+
+    #[test]
+    fn body_labels_reads_string_labels_only() {
+        assert_eq!(
+            body_labels(r#"{"labels":{"a":"1","b":2}}"#),
+            vec![("a".to_string(), "1".to_string())]
+        );
+        assert!(body_labels("not json").is_empty());
+        assert!(body_labels(r#"{"run_id":"x"}"#).is_empty());
     }
 }

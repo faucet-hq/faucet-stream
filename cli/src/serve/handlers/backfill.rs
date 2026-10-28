@@ -155,13 +155,20 @@ pub async fn submit_backfill(
         return Err(ServeError::Unprocessable {
             message: "`callback` is not supported on /v1/backfill: this submits one run \
                       per window unit, so there is no single run for a completion callback \
-                      to describe. Poll `GET /v1/runs?labels=backfill:<hash>` for unit \
+                      to describe. Poll `GET /v1/runs?label=backfill:<hash>` for unit \
                       status, or submit the units individually via `POST /v1/runs` with a \
                       callback on each"
                 .to_string(),
             details: None,
         });
     }
+
+    crate::serve::history::labels::check_submitted(&req.labels, false).map_err(|message| {
+        ServeError::Unprocessable {
+            message,
+            details: None,
+        }
+    })?;
 
     if req.resume && req.restart {
         return Err(ServeError::Unprocessable {
