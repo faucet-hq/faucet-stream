@@ -164,6 +164,10 @@ jobs:
         run: |
           python3 scripts/test_decimal_f64.py
           python3 scripts/decimal-f64.py
+      - name: Check every selecting connector config variant has an integration test (#967)
+        run: |
+          python3 scripts/test_variant_coverage.py
+          python3 scripts/variant-coverage.py
 
   # The agent skills ship with the engine (#853): they link to docs pages and
   # cli/examples files that must exist, carry no version facts, and their
@@ -1247,22 +1251,17 @@ jobs:
             --unit-lcov unit.lcov \
             --base "origin/${{ github.base_ref }}" \
             --min 60
-      - name: Upload to Codecov
+      - name: Upload unit coverage to Codecov
         if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+        # Codecov merges the two flagged uploads into the total, so no unflagged
+        # combined upload: one counted inside every flag and made `integration`
+        # report the overall number (#967).
         # `continue-on-error` keeps a Codecov outage from failing the build — the
         # merge gate is the patch-coverage step above, which needs no third party.
         # But `fail_ci_if_error: true` makes the step itself go red and log the
-        # reason, so a broken upload is visible instead of silently doing nothing.
-        # That combination was the actual defect: with both set to "ignore", the
-        # one upload that failed (PR #482) looked identical to a healthy run.
-        continue-on-error: true
-        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: lcov.info
-          fail_ci_if_error: true
-      - name: Upload unit coverage to Codecov
-        if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+        # reason, so a broken upload is visible instead of silently doing nothing
+        # (with both set to "ignore", the upload that failed on PR #482 looked
+        # identical to a healthy run).
         continue-on-error: true
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
