@@ -36,7 +36,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.96.0"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Run the ignored SQL Server CDC suites
         run: >-
           scripts/retry-on-image-pull.sh cargo test -p faucet-source-mssql-cdc --all-features
@@ -77,7 +77,7 @@ jobs:
           sudo unzip -qo "$zip" -d /opt/oracle
           dir="$(ls -d /opt/oracle/instantclient_* | sort -V | tail -1)"
           echo "LD_LIBRARY_PATH=$dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Pull Docker Hub images through a mirror
         # Avoids Docker Hub's anonymous pull rate limit on shared runners.
         env:
@@ -124,7 +124,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Seed the secrets
         run: |
           set -euo pipefail
@@ -158,7 +158,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Run the ignored scaffold build tests
         run: cargo test -p faucet-cli --test scaffold_build -- --ignored
 
