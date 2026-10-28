@@ -198,11 +198,10 @@ impl GrpcStream {
             .await
             .map_err(|e| Box::new(Failure::from_connect(e)))?;
         let mut grpc_client = self.configure_client(tonic::client::Grpc::new(channel));
-        grpc_client.ready().await.map_err(|e| {
-            Box::new(Failure::Retry(FaucetError::Source(format!(
-                "gRPC channel not ready: {e}"
-            ))))
-        })?;
+        grpc_client
+            .ready()
+            .await
+            .map_err(|e| Box::new(Failure::not_ready(e)))?;
         let (request, sent) = self
             .build_grpc_request(request_bytes)
             .await
@@ -840,6 +839,13 @@ enum Failure {
 }
 
 impl Failure {
+    /// Unreachable from a real server: tonic reports a dropped connection from the call instead.
+    fn not_ready(error: impl std::fmt::Display) -> Self {
+        Failure::Retry(FaucetError::Source(format!(
+            "gRPC channel not ready: {error}"
+        )))
+    }
+
     fn from_connect(error: FaucetError) -> Self {
         match error {
             FaucetError::Source(_) => Failure::Retry(error),
@@ -1297,6 +1303,12 @@ mod tests {
             Failure::from_connect(FaucetError::Url("bad".into())),
             Failure::Fatal(_)
         ));
+        match Failure::not_ready("buffer closed") {
+            Failure::Retry(FaucetError::Source(m)) => {
+                assert_eq!(m, "gRPC channel not ready: buffer closed")
+            }
+            _ => panic!("not ready must retry"),
+        }
         assert_eq!(secs(None), 0);
         assert_eq!(secs(Some(Duration::from_secs(7))), 7);
     }
