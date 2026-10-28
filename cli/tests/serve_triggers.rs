@@ -1168,6 +1168,7 @@ async fn spawn_serve_with_triggers(
         connect_providers: None,
         allow_subprocess_connectors: false,
         references: Default::default(),
+        pools: Default::default(),
     };
     let mut config = ServeConfig::from_args(args).unwrap();
     config.log_level = "warn".into();

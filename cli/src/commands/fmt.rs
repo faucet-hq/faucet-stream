@@ -179,6 +179,7 @@ const KEY_ORDER: &[&str] = &[
     "rollback",
     "usage",
     "budget",
+    "pool",
     "backfill",
     "mirror",
     "replication",

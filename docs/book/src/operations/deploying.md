@@ -144,6 +144,7 @@ Every `faucet serve` feature has a values block, so nothing needs raw
 | `serve.tenants` | tenants; the vault key comes from a Secret as `FAUCET_VAULT_KEY` |
 | `serve.approvals` | change requests (`--require-approval`, `--approval-expiry-secs`) |
 | `serve.mcp` | the `/mcp` endpoint (`--mcp`, `--mcp-allow-mutations`) |
+| `serve.cluster.pools` | execution pools this release serves (`--pool`, `--pool-wait-timeout-secs`) |
 | `extraVolumes` / `extraVolumeMounts` | extra volumes on the serve, Job and CronJob pods |
 
 The file-backed blocks take the file inline (`content`, rendered to a
@@ -154,6 +155,12 @@ sync, and similar). Behind an Ingress, the run-log stream
 (`/v1/runs/{id}/logs`, Server-Sent Events) needs proxy buffering off and a long
 read timeout (the chart sets both for ingress-nginx), and
 `/v1/connect/callback` must be publicly reachable for hosted OAuth connect.
+
+To run [execution pools](../cookbook/cluster.md#execution-pools) on separate
+node groups, install one release per group — each with its own
+`serve.nodeSelector` / `tolerations` and `serve.cluster.pools` — all pointing at
+the same postgres history Secret and auth Secret; together they form one
+cluster (`examples/pools-private.yaml` and `examples/pools-public.yaml`).
 
 The chart's `examples/everything.yaml` turns every feature on; its
 [README](https://github.com/faucet-hq/faucet-stream/tree/main/deploy/helm/faucet-stream)

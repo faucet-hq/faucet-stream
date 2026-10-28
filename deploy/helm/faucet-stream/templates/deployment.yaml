@@ -100,6 +100,12 @@ spec:
             {{- if .Values.serve.cluster.enabled }}
             - --cluster
             {{- end }}
+            {{- range .Values.serve.cluster.pools }}
+            - --pool={{ . }}
+            {{- end }}
+            {{- with .Values.serve.cluster.poolWaitTimeoutSecs }}
+            - --pool-wait-timeout-secs={{ . }}
+            {{- end }}
             {{- if .Values.pipelineConfig.create }}
             - --default-config={{ include "faucet-stream.configFilePath" . }}
             {{- end }}

@@ -438,6 +438,9 @@ pub async fn submit(
             details: None,
         });
     }
+    if let Some(p) = req.pool.as_deref() {
+        crate::serve::pools::resolve(Some(p), None)?;
+    }
     let gated = req.approved_change.is_none()
         && (req.require_approval
             || (approval == Approval::Required
@@ -490,6 +493,12 @@ pub async fn submit(
         },
     )
     .await?;
+    // The execution pool (#957): the request's, else the config's, else
+    // `default` — refused when no replica would run it.
+    let pool =
+        crate::serve::pools::resolve(req.pool.as_deref(), admitted.loaded.cfg.pool.as_deref())?;
+    crate::serve::pools::admit(state, &pool).await?;
+    req.pool = Some(pool);
     // The stored body (what a cluster peer re-runs) carries the ceilings too.
     req.budget = admitted.budget.clone();
     let req = runner::apply_request_budget(req)?;
@@ -1568,6 +1577,7 @@ mod templates {
             budget: body.budget,
             approved_change: None,
             selection: materialized.selection.clone(),
+            pool: body.pool,
             trusted_config: true,
             server_file: false,
             sealed_params,

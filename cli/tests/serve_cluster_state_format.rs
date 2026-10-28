@@ -27,6 +27,7 @@ fn beat(state_format: u32) -> InstanceHeartbeat {
         max_concurrent: 4,
         in_flight: 0,
         state_format,
+        pools: faucet_cli::serve::pools::default_only(),
     }
 }
 

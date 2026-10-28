@@ -15,6 +15,21 @@
 {{- if and .Values.serve.enabled .Values.serve.cluster.enabled (not (include "faucet-stream.durableHistory" .)) -}}
 {{- fail "serve.cluster.enabled=true requires a persistent history backend: set serve.history.backend to postgres, or sqlite with serve.persistence.enabled (or serve.persistence.existingClaim) — without a volume the sqlite file is on an emptyDir and is lost on every restart." -}}
 {{- end -}}
+{{- if .Values.serve.enabled -}}
+{{- range .Values.serve.cluster.pools -}}
+{{- if not (regexMatch "^[a-z0-9][a-z0-9_-]{0,62}$" (toString .)) -}}
+{{- fail (printf "serve.cluster.pools: invalid pool name %q — use 1-63 lowercase letters, digits, `-` or `_`, starting with a letter or digit." (toString .)) -}}
+{{- end -}}
+{{- end -}}
+{{- with .Values.serve.cluster.poolWaitTimeoutSecs -}}
+{{- if not $.Values.serve.cluster.enabled -}}
+{{- fail "serve.cluster.poolWaitTimeoutSecs requires serve.cluster.enabled=true." -}}
+{{- end -}}
+{{- if le (int .) 0 -}}
+{{- fail (printf "serve.cluster.poolWaitTimeoutSecs must be a positive number of seconds (got %v)." .) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- if and .Values.serve.enabled (lt (int .Values.serve.localOutputs.retentionDays) 0) -}}
 {{- fail (printf "serve.localOutputs.retentionDays must be 0 (never expire) or a positive number of days (got %v)." .Values.serve.localOutputs.retentionDays) -}}
 {{- end -}}

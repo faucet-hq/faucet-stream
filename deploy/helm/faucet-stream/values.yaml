@@ -276,6 +276,17 @@ serve:
     previousKeys: []
     #  - existingSecret: faucet-vault-old
     #    existingSecretKey: FAUCET_VAULT_KEY
+    # Execution pools this release's replicas serve (#957): `--pool` per entry.
+    # A run carries one pool (the request's `pool`, else the config's `pool:`,
+    # else `default`) and only a replica serving it claims the run. Empty =
+    # `default` only. To place pools on different nodes, install one release
+    # per node group — each with its own `serve.nodeSelector` / `tolerations`
+    # and `pools` — all pointing at the same postgres history (same
+    # `serve.history.existingSecret`) and the same auth secret.
+    pools: []
+    # Fail a pending run whose pool no live replica has served for this many
+    # seconds (`--pool-wait-timeout-secs`). null = such runs wait.
+    poolWaitTimeoutSecs: null
 
   # ---------------------------------------------------------------------------
   # File-backed serve features. Each block takes the file from exactly one of:

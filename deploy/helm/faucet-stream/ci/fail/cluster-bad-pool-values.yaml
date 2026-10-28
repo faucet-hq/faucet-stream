@@ -1,0 +1,4 @@
+# expect-error: serve.cluster.pools: invalid pool name "Private"
+serve:
+  cluster:
+    pools: [Private]

@@ -5241,6 +5241,7 @@ mod tests {
             rollback: None,
             usage: None,
             budget: None,
+            pool: None,
             shard: None,
             replication: None,
             backfill: None,

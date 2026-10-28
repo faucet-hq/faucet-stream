@@ -161,6 +161,8 @@ fn config() -> ServeConfig {
             enabled: true,
             poll: Duration::from_secs(3600),
             max_attempts: 3,
+            pools: faucet_cli::serve::pools::default_only(),
+            pool_wait_timeout: None,
         },
         triggers_path: None,
         templates_sync_path: None,

@@ -1234,6 +1234,9 @@ pub struct TriggerBody {
     /// lists them and previews what a selection resolves to.
     #[serde(default)]
     pub selection: Option<crate::select::SelectionRequest>,
+    /// The execution pool to run in (#957); wins over the template's `pool:`.
+    #[serde(default)]
+    pub pool: Option<String>,
     /// Set (never from the wire) by a fire of a trigger declared in the
     /// server's `--triggers` file: the declaration is a standing approval,
     /// so the fire runs without a change request.

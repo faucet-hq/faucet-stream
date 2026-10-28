@@ -158,6 +158,7 @@ async fn every_documented_route_is_wired_on_the_live_server() {
         connect_providers: None,
         allow_subprocess_connectors: false,
         references: Default::default(),
+        pools: Default::default(),
     };
     let mut config = ServeConfig::from_args(args).unwrap();
     config.log_level = "warn".into();

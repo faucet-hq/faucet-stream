@@ -20,6 +20,7 @@ pub mod logs;
 pub mod mcp_route;
 pub mod metrics;
 pub mod observability;
+pub mod pools;
 pub mod preview;
 pub mod rbac;
 pub mod references;

@@ -92,7 +92,8 @@ pub fn tool_defs(ctx: &McpContext) -> Vec<ToolDef> {
                 "properties": {
                     "config": { "type": "string" },
                     "dry_run": { "type": "boolean", "description": "If true, validate + preview only; do not write to any sink." },
-                    "selection": { "type": "object", "description": "Run only some matrix rows / streams: { select: [ids], only: [globs], skip: [ids|globs], tags: [..], status: [available|draft|archived], include_parents: off|eligible|all }. Omit to run every row." }
+                    "selection": { "type": "object", "description": "Run only some matrix rows / streams: { select: [ids], only: [globs], skip: [ids|globs], tags: [..], status: [available|draft|archived], include_parents: off|eligible|all }. Omit to run every row." },
+                    "pool": { "type": "string", "description": "Execution pool to run in (faucet serve): wins over the config's `pool:`; default `default`. A pool no live replica serves is refused." }
                 },
                 "required": ["config"]
             }),
@@ -215,7 +216,8 @@ pub fn tool_defs(ctx: &McpContext) -> Vec<ToolDef> {
                         "env": { "type": "object", "description": "Per-run overrides for ${env:VAR} resolution." },
                         "dry_run": { "type": "boolean", "description": "If true, materialize + validate only; do not write to any sink." },
                         "selection": { "type": "object", "description": "Run only some matrix rows / streams: { select: [ids], only: [globs], skip: [ids|globs], tags: [..], status: [available|draft|archived], include_parents: off|eligible|all }. Omit to run every row." },
-                        "allow_untested": { "type": "boolean", "description": "Run a version whose tests are not `passing`. Once the template has been launched such a run is refused without it; with it the run is labelled `allow_untested=true` and audited. Default false." }
+                        "allow_untested": { "type": "boolean", "description": "Run a version whose tests are not `passing`. Once the template has been launched such a run is refused without it; with it the run is labelled `allow_untested=true` and audited. Default false." },
+                        "pool": { "type": "string", "description": "Execution pool to run in (faucet serve): wins over the config's `pool:`; default `default`. A pool no live replica serves is refused." }
                     },
                     "required": ["id"]
                 }),
@@ -239,7 +241,8 @@ pub fn tool_defs(ctx: &McpContext) -> Vec<ToolDef> {
                     "labels": { "type": "object", "additionalProperties": { "type": "string" } },
                     "timeout_secs": { "type": "integer" },
                     "clock": { "type": "string", "description": "RFC 3339 / YYYY-MM-DD run clock for ${now.*}." },
-                    "selection": { "type": "object", "description": "Run only some matrix rows / streams: { select: [ids], only: [globs], skip: [ids|globs], tags: [..], status: [available|draft|archived], include_parents: off|eligible|all }. Omit to run every row." }
+                    "selection": { "type": "object", "description": "Run only some matrix rows / streams: { select: [ids], only: [globs], skip: [ids|globs], tags: [..], status: [available|draft|archived], include_parents: off|eligible|all }. Omit to run every row." },
+                    "pool": { "type": "string", "description": "Execution pool to run in (faucet serve): wins over the config's `pool:`; default `default`. A pool no live replica serves is refused." }
                 },
                 "required": ["config", "reason"]
             }),
@@ -460,7 +463,14 @@ async fn propose_run(p: &crate::mcp::ChangeProposer, args: &Value) -> Result<Str
         "config": config,
         "config_format": args.get("config_format").cloned().unwrap_or(json!("yaml")),
     });
-    for key in ["name", "labels", "timeout_secs", "clock", "selection"] {
+    for key in [
+        "name",
+        "labels",
+        "timeout_secs",
+        "clock",
+        "selection",
+        "pool",
+    ] {
         if let Some(v) = args.get(key).filter(|v| !v.is_null()) {
             payload[key] = v.clone();
         }
@@ -830,7 +840,14 @@ async fn run_pipeline(ctx: &McpContext, args: &Value) -> Result<String, String> 
             "config": text,
             "config_format": args.get("config_format").cloned().unwrap_or(json!("yaml")),
         });
-        for key in ["name", "labels", "timeout_secs", "clock", "selection"] {
+        for key in [
+            "name",
+            "labels",
+            "timeout_secs",
+            "clock",
+            "selection",
+            "pool",
+        ] {
             if let Some(v) = args.get(key).filter(|v| !v.is_null()) {
                 req[key] = v.clone();
             }
@@ -1229,8 +1246,11 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
     let selection = selection_arg(args)?;
     if let Some(server) = &ctx.server {
         if !dry_run {
-            return run_template_on_server(server, id, version, supplied, env, sink, selection)
-                .await;
+            let pool = args.get("pool").and_then(Value::as_str).map(str::to_string);
+            return run_template_on_server(
+                server, id, version, supplied, env, sink, selection, pool,
+            )
+            .await;
         }
         // A dry run on a server checks the request's own inputs exactly as a
         // real run does before materializing anything with them.
@@ -1339,6 +1359,7 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
 /// `run_template` on `faucet serve --mcp`: the same path as
 /// `POST /v1/templates/{id}/runs`, as the calling principal.
 #[cfg(feature = "templates")]
+#[allow(clippy::too_many_arguments)]
 async fn run_template_on_server(
     server: &crate::mcp::ChangeProposer,
     id: &str,
@@ -1347,6 +1368,7 @@ async fn run_template_on_server(
     env: std::collections::BTreeMap<String, String>,
     sink: crate::templates::SinkChoice,
     selection: Option<crate::select::SelectionRequest>,
+    pool: Option<String>,
 ) -> Result<String, String> {
     use crate::runtime::server::{TriggerOutcome, trigger_template};
     use crate::serve::handlers::templates::{OverlayRef, TriggerBody};
@@ -1368,6 +1390,7 @@ async fn run_template_on_server(
         overlay_version,
         selection,
         allow_untested: sink.allow_untested,
+        pool,
         ..Default::default()
     };
     let outcome = trigger_template(

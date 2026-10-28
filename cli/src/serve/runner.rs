@@ -88,6 +88,11 @@ pub struct SubmitRequest {
     /// sharded run applies the same subset. Omitted: every row runs.
     #[serde(default)]
     pub selection: Option<crate::select::SelectionRequest>,
+    /// The execution pool to run in (#957). Wins over the config's `pool:`;
+    /// omitted with no `pool:` = `default`. A pool no live replica serves is
+    /// refused (422).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
     /// Set in-process when the server's operator wrote the config (a
     /// registered template, the triggers file), never accepted from a client.
     #[serde(skip)]
@@ -1020,6 +1025,7 @@ pub(crate) async fn enqueue(
             req.concurrency,
             &req.labels,
         );
+        let fp = crate::serve::pools::fold_fingerprint(fp, req.pool.as_deref());
         let key = idempotency_scope(principal.tenant(), key);
         let claim = |fp: String| {
             let state = state.clone();
@@ -1087,6 +1093,10 @@ pub(crate) async fn enqueue(
     rec.selection = req.selection.clone();
     rec.host_access = req.server_file;
     rec.caller_config = principal.caller_body();
+    rec.pool = req
+        .pool
+        .clone()
+        .unwrap_or_else(crate::serve::pools::default_pool);
 
     if state.cluster().enabled() {
         // A degraded (DB-unreachable) backend can't coordinate a cluster: the
@@ -2862,6 +2872,7 @@ mod tests {
             budget: None,
             approved_change: None,
             selection: None,
+            pool: None,
             trusted_config: false,
             server_file: false,
             sealed_params: None,
@@ -2972,6 +2983,7 @@ mod tests {
             budget: None,
             approved_change: None,
             selection: None,
+            pool: None,
             trusted_config: false,
             server_file: false,
             sealed_params: None,
@@ -3196,6 +3208,7 @@ mod tests {
             budget: None,
             approved_change: None,
             selection: None,
+            pool: None,
             trusted_config: false,
             server_file: false,
             sealed_params: None,
@@ -3434,7 +3447,11 @@ mod tests {
                 .await
                 .unwrap();
             // Claim them so they are 'running' and finalizable by this instance.
-            let claimed = state.history().claim_shards(n).await.unwrap();
+            let claimed = state
+                .history()
+                .claim_shards(n, &crate::serve::pools::default_only())
+                .await
+                .unwrap();
             assert_eq!(claimed.len(), n);
         }
 
@@ -3618,7 +3635,11 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let claimed = state.history().claim_shards(1).await.unwrap();
+            let claimed = state
+                .history()
+                .claim_shards(1, &crate::serve::pools::default_only())
+                .await
+                .unwrap();
             assert_eq!(claimed.len(), 1);
 
             resume_claimed_shard(state.clone(), claimed.into_iter().next().unwrap());
@@ -3715,7 +3736,11 @@ mod tests {
                 size_estimate: None,
             });
             state.history().insert_shards("r", &shards).await.unwrap();
-            let claimed = state.history().claim_shards(1).await.unwrap();
+            let claimed = state
+                .history()
+                .claim_shards(1, &crate::serve::pools::default_only())
+                .await
+                .unwrap();
             assert_eq!(claimed.len(), 1);
             resume_claimed_shard(state.clone(), claimed.into_iter().next().unwrap());
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -3732,7 +3757,15 @@ mod tests {
             assert_eq!(progress.failed, 0, "{progress:?}");
             let parent = state.history().get("r").await.unwrap().unwrap();
             assert_eq!(parent.status, RunStatus::Sharded, "the parent stays open");
-            assert_eq!(state.history().claim_shards(2).await.unwrap().len(), 2);
+            assert_eq!(
+                state
+                    .history()
+                    .claim_shards(2, &crate::serve::pools::default_only())
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
             assert!(!state.history().release_shard("r", "nope").await.unwrap());
         }
 
@@ -3747,7 +3780,11 @@ mod tests {
             rec.status = RunStatus::Pending;
             rec.config_body = Some(waiting_yaml(dir.path()));
             state.history().upsert(&rec).await.unwrap();
-            let claimed = state.history().claim_pending(1).await.unwrap();
+            let claimed = state
+                .history()
+                .claim_pending(1, &crate::serve::pools::default_only())
+                .await
+                .unwrap();
             assert_eq!(claimed.len(), 1);
             resume_claimed_run(state.clone(), claimed.into_iter().next().unwrap());
             let mut status = RunStatus::Pending;
@@ -3793,7 +3830,11 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let claimed = state.history().claim_shards(1).await.unwrap();
+            let claimed = state
+                .history()
+                .claim_shards(1, &crate::serve::pools::default_only())
+                .await
+                .unwrap();
             resume_claimed_shard(state.clone(), claimed.into_iter().next().unwrap());
 
             let mut status = RunStatus::Sharded;
@@ -3883,7 +3924,11 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let claimed = state.history().claim_shards(1).await.unwrap();
+            let claimed = state
+                .history()
+                .claim_shards(1, &crate::serve::pools::default_only())
+                .await
+                .unwrap();
             resume_claimed_shard(state.clone(), claimed.into_iter().next().unwrap());
 
             let mut status = RunStatus::Sharded;
@@ -3926,7 +3971,11 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let claimed = state.history().claim_shards(1).await.unwrap();
+            let claimed = state
+                .history()
+                .claim_shards(1, &crate::serve::pools::default_only())
+                .await
+                .unwrap();
             assert_eq!(claimed.len(), 1, "shard claimed (running, owned)");
             state.history().request_cancel("r").await.unwrap();
 
@@ -3957,7 +4006,11 @@ mod tests {
             state.history().insert_shards("A", &one("0")).await.unwrap();
             seed_run(&state, "C", RunStatus::Sharded).await;
             state.history().insert_shards("C", &one("0")).await.unwrap();
-            let claimed = state.history().claim_shards(8).await.unwrap();
+            let claimed = state
+                .history()
+                .claim_shards(8, &crate::serve::pools::default_only())
+                .await
+                .unwrap();
             assert_eq!(claimed.len(), 2, "A and C shards claimed (running)");
             state.history().request_cancel("A").await.unwrap();
 

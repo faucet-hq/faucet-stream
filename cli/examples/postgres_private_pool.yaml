@@ -1,0 +1,31 @@
+# Run a pipeline only on the replicas that can reach its source. The
+# warehouse below sits in a private network, so the config names the
+# `private` execution pool: in a `faucet serve --cluster` fleet only a
+# replica started with `--pool private` (for example one on private-subnet
+# nodes) claims the run, its shards and its re-claims. Every other run keeps
+# going to `default`.
+#
+#   faucet validate cli/examples/postgres_private_pool.yaml
+#   # replicas: faucet serve --cluster --history postgres://… --pool private
+#   jq -Rs '{config: .}' cli/examples/postgres_private_pool.yaml |
+#     curl -X POST localhost:8080/v1/runs -H 'content-type: application/json' \
+#       -H "Authorization: Bearer $TOKEN" -d @-
+#
+# A request's own `pool` wins over this one; a pool no live replica serves is
+# refused with 422. `faucet run` ignores `pool:`.
+version: 1
+name: postgres_private_pool
+
+pool: private
+
+pipeline:
+  source:
+    type: postgres
+    config:
+      connection_url: postgres://faucet@10.20.0.5:5432/app
+      query: SELECT id, account_id, amount, updated_at FROM invoices
+
+  sink:
+    type: file
+    config:
+      path: ./out/invoices.jsonl

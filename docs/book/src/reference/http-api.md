@@ -509,6 +509,16 @@ Request body:
   selection is stored with it, so a clustered or sharded run applies the same
   subset. The same field is accepted by every run-starting endpoint
   (template triggers, tenant runs, fan-out).
+- **`pool`** — the execution pool to run in (#957). Wins over the config's
+  `pool:`; with neither the run goes to `default`. Only a replica serving the
+  pool (`faucet serve --pool`) claims the run and its shards. A pool no live
+  cluster member serves — or, on a non-clustered server, one it does not serve
+  — is a `422` naming the pool; so is a pool other than `default` while a
+  member running a release without pools is live. Part of the idempotency
+  fingerprint when it is not `default`. The same field is accepted by
+  `POST /v1/templates/{id}/runs` (and tenant runs and fan-out) and
+  `POST /v1/backfill`; the run record carries the resolved `pool`. See
+  [Execution pools](../cookbook/cluster.md#execution-pools).
 
 Response (`202`):
 
@@ -542,6 +552,7 @@ purged between requests. A bare `run_id` is still accepted.
   "submitted_at": "…", "started_at": "…", "finished_at": "…",
   "elapsed_secs": 12.4,
   "records_written": 4096,
+  "pool": "default",
   "invocations": [
     {"row_id": "default", "parent_record_key": null, "records_written": 4096, "error": null,
      "status": "succeeded",
@@ -1442,7 +1453,10 @@ after it stopped renewing.
 `/metrics` serves the standard `faucet_*` pipeline metrics plus serve-specific
 series: `faucet_serve_requests_total{method,path,status}`,
 `faucet_serve_request_duration_seconds{method,path}`, `faucet_serve_runs_queued`,
-`faucet_serve_runs_in_flight`, `faucet_serve_runs_total{status,reason}`,
+`faucet_serve_runs_in_flight`, `faucet_serve_runs_total{status,reason}`
+(`reason="pool_unavailable"` for a run `--pool-wait-timeout-secs` failed),
+`faucet_serve_runs_pending{pool}` (cluster mode: unclaimed runs per execution
+pool),
 `faucet_serve_idempotency_hits_total`, `faucet_serve_history_degraded` (the
 backend fell back to memory) and `faucet_serve_history_unreachable` (the last
 lease heartbeat did not reach the history database; `/readyz` is `503` while

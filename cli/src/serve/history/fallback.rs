@@ -381,8 +381,25 @@ impl RunHistory for FallbackHistory {
         strict!(self, p => p.renew_leases(), f => f.renew_leases())
     }
 
-    async fn claim_pending(&self, limit: usize) -> Result<Vec<RunRecord>, HistoryError> {
-        strict!(self, p => p.claim_pending(limit), f => f.claim_pending(limit))
+    async fn claim_pending(
+        &self,
+        limit: usize,
+        pools: &[String],
+    ) -> Result<Vec<RunRecord>, HistoryError> {
+        strict!(self, p => p.claim_pending(limit, pools), f => f.claim_pending(limit, pools))
+    }
+    async fn pending_by_pool(&self) -> Result<Vec<(String, usize)>, HistoryError> {
+        strict!(self, p => p.pending_by_pool(), f => f.pending_by_pool())
+    }
+    async fn stranded_pending(
+        &self,
+        served: &[String],
+        before: DateTime<Utc>,
+    ) -> Result<Vec<RunRecord>, HistoryError> {
+        strict!(self, p => p.stranded_pending(served, before), f => f.stranded_pending(served, before))
+    }
+    async fn fail_pending(&self, rec: &RunRecord) -> Result<bool, HistoryError> {
+        strict!(self, p => p.fail_pending(rec), f => f.fail_pending(rec))
     }
     async fn reclaim_orphans(&self, max_attempts: u32) -> Result<ReclaimReport, HistoryError> {
         strict!(self, p => p.reclaim_orphans(max_attempts), f => f.reclaim_orphans(max_attempts))
@@ -434,8 +451,9 @@ impl RunHistory for FallbackHistory {
     async fn claim_shards(
         &self,
         limit: usize,
+        pools: &[String],
     ) -> Result<Vec<crate::serve::history::ClaimedShard>, HistoryError> {
-        strict!(self, p => p.claim_shards(limit), f => f.claim_shards(limit))
+        strict!(self, p => p.claim_shards(limit, pools), f => f.claim_shards(limit, pools))
     }
     async fn renew_shard_leases(&self) -> Result<usize, HistoryError> {
         strict!(self, p => p.renew_shard_leases(), f => f.renew_shard_leases())
@@ -1431,11 +1449,22 @@ mod tests {
             fb.finalize_owned(&rec).await,
             Err(HistoryError::Degraded(_))
         ));
-        assert!(fb.claim_pending(4).await.is_err());
+        assert!(
+            fb.claim_pending(4, &crate::serve::pools::default_only())
+                .await
+                .is_err()
+        );
         assert!(fb.reclaim_orphans(3).await.is_err());
         assert!(fb.cancel_pending("r1").await.is_err());
         assert!(fb.request_cancel("r1").await.is_err());
-        assert!(fb.claim_shards(4).await.is_err());
+        assert!(
+            fb.claim_shards(4, &crate::serve::pools::default_only())
+                .await
+                .is_err()
+        );
+        assert!(fb.pending_by_pool().await.is_err());
+        assert!(fb.stranded_pending(&[], chrono::Utc::now()).await.is_err());
+        assert!(fb.fail_pending(&rec).await.is_err());
         assert!(
             fb.finalize_sharded_parent("r1", RunStatus::Completed, chrono::Utc::now(), None)
                 .await
@@ -1535,7 +1564,21 @@ mod tests {
             "test",
         );
         assert_eq!(fb.insert_shards("r", &[]).await.unwrap(), 0);
-        assert!(fb.claim_shards(4).await.unwrap().is_empty());
+        assert!(
+            fb.claim_shards(4, &crate::serve::pools::default_only())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(fb.pending_by_pool().await.unwrap().is_empty());
+        assert!(
+            fb.stranded_pending(&[], Utc::now())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let rec = RunRecord::queued("r".into(), None, Default::default(), None, Utc::now());
+        assert!(!fb.fail_pending(&rec).await.unwrap());
         assert_eq!(fb.renew_shard_leases().await.unwrap(), 0);
         assert_eq!(
             fb.reclaim_shards(3).await.unwrap(),

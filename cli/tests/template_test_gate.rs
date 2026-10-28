@@ -622,6 +622,7 @@ async fn serve_with_history(
             connect_providers: None,
             allow_subprocess_connectors: false,
             references: Default::default(),
+            pools: Default::default(),
         };
     let mut config = faucet_cli::serve::ServeConfig::from_args(args).unwrap();
     config.log_level = "warn".into();

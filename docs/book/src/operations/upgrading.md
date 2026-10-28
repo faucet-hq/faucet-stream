@@ -112,6 +112,15 @@ writing bare values it can read, and refuse to run a pipeline whose source
 bookmark shape is past schema 0 (an old member would misread it). Once the
 last old member is gone, the envelope is written again. Nothing to configure.
 
+Execution pools (#957) follow the same rule: every member advertises the pools
+it serves, and a member that advertises none (a release without pools) would
+claim any pending run. While one is live, a submission to a pool other than
+`default` is refused with `422` naming that member; `default` runs are
+unaffected. Finish the upgrade before starting replicas with `--pool`, and do
+not roll a replica back below that release while runs in other pools are
+pending. The run-history schema moves to version 7 (an added `pool` column);
+the previous release still reads it.
+
 ## Guarantee and how it is tested
 
 - A golden fixture of every source's released bookmark shapes — bare, in the

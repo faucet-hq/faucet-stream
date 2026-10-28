@@ -275,6 +275,7 @@ async fn submit(
                         labels: Default::default(),
                         timeout_secs: None,
                         selection: None,
+                        pool: None,
                     },
                     kind: TriggerKind::Webhook {
                         methods: vec!["POST".into()],

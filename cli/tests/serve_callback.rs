@@ -66,6 +66,7 @@ fn args_on(port: u16) -> ServeArgs {
         connect_providers: None,
         allow_subprocess_connectors: false,
         references: Default::default(),
+        pools: Default::default(),
     }
 }
 

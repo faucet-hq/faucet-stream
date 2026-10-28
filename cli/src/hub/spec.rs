@@ -384,6 +384,11 @@ pub struct SourceTemplate {
     /// Optional data contract, passed through as `pipeline.contract`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contract: Option<Value>,
+    /// The execution pool `faucet serve` runs this source in (#957), passed
+    /// through as the composed config's `pool:` — e.g. replicas on a private
+    /// network for a source only reachable there. A run request's `pool` wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
     /// The tables this source produces; one matrix row each.
     pub streams: Vec<Stream>,
     /// The version's test bundle (#856): cases run against this template

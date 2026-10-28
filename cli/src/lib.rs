@@ -293,7 +293,7 @@ async fn dispatch(cli: Cli) -> CliResult<()> {
         #[cfg(feature = "schedule")]
         Command::Schedule(args) => commands::schedule::run(args).await,
         #[cfg(feature = "serve")]
-        Command::Serve(args) => commands::serve::run(args, serve_log_level, log_format).await,
+        Command::Serve(args) => commands::serve::run(*args, serve_log_level, log_format).await,
         #[cfg(feature = "mcp")]
         Command::Mcp(args) => commands::mcp::run(args).await,
         #[cfg(feature = "notify")]

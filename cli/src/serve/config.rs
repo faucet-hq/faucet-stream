@@ -361,6 +361,22 @@ impl ServeConfig {
             ));
         }
 
+        let pools = crate::serve::pools::replica_pools(&args.pools.pool)
+            .map_err(|m| CliError::Serve(format!("--pool: {m}")))?;
+        if args.pools.pool_wait_timeout_secs == Some(0) {
+            return Err(CliError::Serve(
+                "--pool-wait-timeout-secs must be > 0 (omit it to keep runs pending until a \
+                 replica of their pool returns)"
+                    .into(),
+            ));
+        }
+        if args.pools.pool_wait_timeout_secs.is_some() && !args.cluster {
+            return Err(CliError::Serve(
+                "--pool-wait-timeout-secs requires --cluster (a single server refuses a pool it \
+                 does not serve at submit time, so no run waits for one)"
+                    .into(),
+            ));
+        }
         let cluster = if args.cluster {
             if matches!(history, HistoryBackendSpec::Memory) {
                 return Err(CliError::Serve(
@@ -387,9 +403,14 @@ impl ServeConfig {
                 enabled: true,
                 poll: Duration::from_secs(args.cluster_poll_secs),
                 max_attempts: args.cluster_max_attempts,
+                pools,
+                pool_wait_timeout: args.pools.pool_wait_timeout_secs.map(Duration::from_secs),
             }
         } else {
-            ClusterConfig::disabled()
+            ClusterConfig {
+                pools,
+                ..ClusterConfig::disabled()
+            }
         };
 
         // `0` on either preview cap means "no limit" — the same convention as
@@ -653,6 +674,7 @@ mod tests {
             connect_providers: None,
             allow_subprocess_connectors: false,
             references: Default::default(),
+            pools: Default::default(),
         }
     }
 
@@ -974,6 +996,52 @@ mod tests {
     }
 
     #[test]
+    fn pools_reach_the_cluster_config_and_are_validated() {
+        let mut a = base_args();
+        a.no_auth = true;
+        let cfg = ServeConfig::from_args(a.clone()).unwrap();
+        assert_eq!(cfg.cluster.pools, ["default"]);
+        assert!(cfg.cluster.pool_wait_timeout.is_none());
+
+        let mut single = a.clone();
+        single.pools.pool = vec!["b".into(), "a".into()];
+        let cfg = ServeConfig::from_args(single).unwrap();
+        assert!(!cfg.cluster.enabled);
+        assert_eq!(
+            cfg.cluster.pools,
+            ["a", "b"],
+            "an unclustered server keeps its pools"
+        );
+
+        let mut clustered = a.clone();
+        clustered.cluster = true;
+        clustered.history = Some("sqlite:runs.db".into());
+        clustered.pools.pool = vec!["gpu".into()];
+        clustered.pools.pool_wait_timeout_secs = Some(90);
+        let cfg = ServeConfig::from_args(clustered.clone()).unwrap();
+        assert_eq!(cfg.cluster.pools, ["gpu"]);
+        assert_eq!(cfg.cluster.pool_wait_timeout, Some(Duration::from_secs(90)));
+
+        let mut bad = a.clone();
+        bad.pools.pool = vec!["GPU".into()];
+        let err = ServeConfig::from_args(bad).unwrap_err().to_string();
+        assert!(err.contains("--pool: invalid pool name `GPU`"), "{err}");
+
+        let mut zero = clustered.clone();
+        zero.pools.pool_wait_timeout_secs = Some(0);
+        let err = ServeConfig::from_args(zero).unwrap_err().to_string();
+        assert!(
+            err.contains("--pool-wait-timeout-secs must be > 0"),
+            "{err}"
+        );
+
+        let mut unclustered = a;
+        unclustered.pools.pool_wait_timeout_secs = Some(5);
+        let err = ServeConfig::from_args(unclustered).unwrap_err().to_string();
+        assert!(err.contains("requires --cluster"), "{err}");
+    }
+
+    #[test]
     fn preview_is_off_by_default_with_the_documented_caps() {
         let mut a = base_args();
         a.no_auth = true;
@@ -1073,6 +1141,22 @@ mod tests {
         let args = crate::cli::ServeArgs::try_parse_from(["serve", "--no-auth"]).unwrap();
         unsafe { std::env::remove_var("FAUCET_SERVE_HISTORY") };
         assert_eq!(args.history.as_deref(), Some("sqlite:/tmp/from-env.db"));
+    }
+
+    #[test]
+    #[serial_test::serial(env)]
+    fn pools_come_from_repeated_flags_commas_or_the_environment() {
+        use clap::Parser;
+        let args = crate::cli::ServeArgs::try_parse_from(["serve", "--pool", "a,b", "--pool", "c"])
+            .unwrap();
+        assert_eq!(args.pools.pool, ["a", "b", "c"]);
+        unsafe { std::env::set_var("FAUCET_SERVE_POOLS", "private,gpu") };
+        let args =
+            crate::cli::ServeArgs::try_parse_from(["serve", "--pool-wait-timeout-secs", "60"]);
+        unsafe { std::env::remove_var("FAUCET_SERVE_POOLS") };
+        let args = args.unwrap();
+        assert_eq!(args.pools.pool, ["private", "gpu"]);
+        assert_eq!(args.pools.pool_wait_timeout_secs, Some(60));
     }
 
     #[test]

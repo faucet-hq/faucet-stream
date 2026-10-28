@@ -371,6 +371,7 @@ pub fn build_pipeline_config(env: &HashMap<String, String>) -> CliResult<Pipelin
         rollback: None,
         usage: None,
         budget: None,
+        pool: None,
         shard: None,
         replication: None,
         backfill: None,

@@ -146,6 +146,15 @@ serve:
   `cluster.previousKeys`; every replica reads the same key, and the values are
   sealed in the shared history until the run finishes. With `tenants.enabled`
   the tenants vault key is used instead.
+- **Execution pools** (#957): `cluster.pools: [private]` renders `--pool` per
+  entry, so these replicas claim only runs (and shards) in those pools; empty =
+  `default` only. `cluster.poolWaitTimeoutSecs` fails a pending run whose pool
+  no live replica has served that long (needs `cluster.enabled`). To place
+  pools on different nodes, install one release per node group — its own
+  `nodeSelector` / `tolerations` and `cluster.pools` — all pointing at the same
+  postgres `history.existingSecret` and `auth.existingSecret`; the releases form
+  one cluster. See [`examples/pools-private.yaml`](./examples/pools-private.yaml)
+  and [`examples/pools-public.yaml`](./examples/pools-public.yaml).
 - **Replicas**: `replicaCount > 1` or `autoscaling.enabled` is refused at
   render time unless `history.backend: postgres` and `cluster.enabled: true` —
   with per-pod history each replica has its own runs and idempotency keys, so

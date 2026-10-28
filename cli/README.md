@@ -330,6 +330,8 @@ Auth is mandatory: without `--auth-token`/`FAUCET_SERVE_AUTH_TOKEN` **and** with
 | `--cluster` | Enable clustered execution: all instances sharing the same `--history` DB pull-balance `pending` runs and provide crash-failover. Requires a persistent `--history` backend. See the [cluster cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/cluster.html). |
 | `--cluster-poll-secs <n>` | Claim-loop poll interval in seconds (default `2`). Also the maximum cross-instance cancel propagation lag. |
 | `--cluster-max-attempts <n>` | Maximum attempts per run (including crash-failovers) before it is poisoned as `failed` (default `3`). |
+| `--pool <name>` | Execution pool this replica serves (repeatable, comma-separated, or `FAUCET_SERVE_POOLS`; default `default`). A run's pool is its request's `pool`, else its config's `pool:`, else `default`; only replicas serving it claim it, and a pool nobody serves is a `422`. |
+| `--pool-wait-timeout-secs <n>` | Fail a pending run whose pool no live cluster member has served for `n` seconds (`pool_unavailable`). |
 | `--triggers <path>` | Path to a triggers file (YAML) defining event-driven watchers. Requires the `triggers` Cargo feature. See [Event-driven triggers](#event-driven-triggers-triggers). |
 | `--local-output-retention-days <n>` / `--local-output-in-flight-grace-secs <n>` | Retention GC for the local files a run's sinks wrote (jsonl/csv/parquet): the window (default `7`; `0` disables the sweep) and the mid-write guard (default `60`). Only files faucet recorded as its own sink outputs are ever deleted. Requires the `catalog` feature. |
 | `--preview-local-outputs` | Serve **dataset previews** of those local files — the console reads a tracked output's first N rows back (`FAUCET_SERVE_PREVIEW_LOCAL_OUTPUTS`). **Off by default**: it returns file contents over HTTP, so it is a local-testing convenience. Caps: `--preview-default-rows` (soft, default `500`) and `--preview-max-rows` (hard, default `5000`; a larger `row_count_to_load` — including `all` — is clamped to it). `--preview-max-rows 0` lifts the ceiling so `row_count_to_load=all` reads a whole dataset; the read is still bounded by a response-size budget and a deadline, and a partial answer names the bound that stopped it. |
@@ -436,8 +438,13 @@ values are sealed with it (AES-256-GCM, bound to the run id) apart from the run 
 by the member that runs the job, and deleted once the run finishes. Rotate with
 `--vault-previous-key`. Without a key such triggers are refused with a `422` naming it.
 
+To place runs on particular replicas (a private network, GPU nodes, a region),
+start each replica with `--pool <name>` and put `pool: <name>` in the config —
+or `"pool"` in the request. A replica claims only the runs, and shards, in its
+pools; a pool no live member serves is refused with `422`.
+
 See the [cluster cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/cluster.html)
-for the full lifecycle, delivery guarantees, and Kubernetes deployment notes.
+for the full lifecycle, execution pools, delivery guarantees, and Kubernetes deployment notes.
 
 Submit a run:
 

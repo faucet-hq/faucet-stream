@@ -727,6 +727,7 @@ paths:
                 name: { type: string }
                 labels: { type: object, additionalProperties: { type: string } }
                 timeout_secs: { type: integer, description: "Per-unit run timeout" }
+                pool: { type: string, description: "Execution pool every unit run goes to (#957); wins over the config's `pool:`. A pool no replica serves is a 422." }
                 resume: { type: boolean, default: false, description: "Continue a range submitted before (stateful configs)" }
                 restart: { type: boolean, default: false, description: "Clear each unit's scoped state and run a range submitted before again" }
       responses:
@@ -2604,7 +2605,8 @@ paths:
         lease heartbeat, the run queue is full, or the server is shutting down
         (`draining`). Always returns a JSON body with
         `status`, `history_ok`, `queue_ok`, `draining`, and a `cluster` object
-        (`enabled` bool + `instances` live-member count).
+        (`enabled` bool, `instances` live-member count, this replica's
+        `pools`, and the live `members` with the pools each serves).
       operationId: readyz
       security: []
       responses:
@@ -2624,6 +2626,18 @@ paths:
                     properties:
                       enabled: { type: boolean, description: "true when --cluster was set." }
                       instances: { type: integer, description: "Live cluster member count (from last membership heartbeat)." }
+                      pools: { type: array, items: { type: string }, description: "The execution pools this replica serves (#957); `[default]` without --pool." }
+                      members:
+                        type: array
+                        description: "Live members from the last membership refresh (cluster mode), with the pools each serves (#957)."
+                        items:
+                          type: object
+                          properties:
+                            instance_id: { type: string }
+                            listen: { type: string, nullable: true }
+                            pools: { type: array, nullable: true, items: { type: string }, description: "null for a member that predates execution pools: it claims any pending run, so a non-default pool is refused while it is live." }
+                            in_flight: { type: integer }
+                            max_concurrent: { type: integer }
                   triggers:
                     type: array
                     description: "Per-watcher health; present only when --triggers is active."
@@ -2648,6 +2662,8 @@ paths:
                     properties:
                       enabled: { type: boolean }
                       instances: { type: integer }
+                      pools: { type: array, items: { type: string } }
+                      members: { type: array, items: { type: object } }
                   triggers:
                     type: array
                     description: "Per-watcher health; present only when --triggers is active."
@@ -2781,6 +2797,7 @@ components:
         reason: { type: string, description: "Why, for the approvers (with require_approval)." }
         budget: { $ref: "#/components/schemas/BudgetSpec" }
         selection: { $ref: "#/components/schemas/RowSelection" }
+        pool: { type: string, pattern: "^[a-z0-9][a-z0-9_-]{0,62}$", description: "Execution pool to run in (#957). Wins over the config's `pool:`; omitted with no `pool:` = `default`. A clustered replica claims only runs in the pools it serves (`--pool`); a pool no live member serves (or, on a single server, one it does not serve) is a 422 naming the pool." }
       example:
         name: orders_to_warehouse
         config_format: yaml
@@ -2990,6 +3007,7 @@ components:
         selection: { $ref: "#/components/schemas/RowSelection" }
         host_access: { type: boolean, description: "The config came from the server's --triggers file, so its SQL connectors are not sandboxed (#862). Absent otherwise." }
         caller_config: { type: boolean, description: "The request carried the config, so its HTTP requests and redirect hops are checked against the caller reference policy wherever the run executes (#881). Absent otherwise." }
+        pool: { type: string, default: default, description: "The execution pool the run belongs to (#957): only a replica serving it claims the run, its shards and its re-claims. Runs recorded before pools existed read as `default`." }
         invocations:
           type: array
           items: { $ref: "#/components/schemas/InvocationRecord" }
@@ -4334,6 +4352,7 @@ components:
         concurrency: { type: integer, minimum: 1, nullable: true, description: "Override this run's connector concurrency (source + sink connections/fetches), whatever the config says. Maps onto whichever knob the connector declares (max_connections / request_concurrency / partition_concurrency / shard_concurrency / concurrency); a connector with none ignores it. Does not change matrix parallelism or the server's --max-concurrent slots. Per-shard for a sharded run. 0 is rejected." }
         budget: { $ref: "#/components/schemas/BudgetSpec" }
         selection: { $ref: "#/components/schemas/RowSelection" }
+        pool: { type: string, pattern: "^[a-z0-9][a-z0-9_-]{0,62}$", description: "Execution pool to run in (#957). Wins over the template's `pool:`; omitted with no `pool:` = `default`. A clustered replica claims only runs in the pools it serves (`--pool`); a pool no live member serves (or, on a single server, one it does not serve) is a 422 naming the pool." }
       example:
         params:
           region: us-east-1
