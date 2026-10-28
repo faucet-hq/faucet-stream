@@ -948,3 +948,23 @@ async fn http_fetcher_get_and_head_without_a_call_context() {
         2
     );
 }
+
+/// `format: xml` reads an XML file whose extension `auto` would skip (#967).
+#[tokio::test]
+async fn an_explicit_xml_format_reads_a_file_auto_would_skip() {
+    let dir = tempfile::tempdir().unwrap();
+    let rows = vec![
+        json!({"id": "1", "name": "ada"}),
+        json!({"id": "2", "name": "grace"}),
+    ];
+    let body = encode(&rows, FileFormat::Xml, &FormatOptions::default()).unwrap();
+    let path = write(dir.path(), "export.data", &body);
+    let auto = FileSource::new(FileSourceConfig::new(dir_str(dir.path()))).unwrap();
+    assert!(read_all(&auto).await.unwrap().is_empty());
+    let cfg: FileSourceConfig =
+        serde_json::from_value(json!({"path": path, "format": "xml"})).unwrap();
+    assert_eq!(
+        read_all(&FileSource::new(cfg).unwrap()).await.unwrap(),
+        rows
+    );
+}
