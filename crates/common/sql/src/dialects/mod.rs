@@ -31,6 +31,51 @@ pub use redshift::Redshift;
 pub use sqlite::Sqlite;
 pub use warehouse::{BigQuery, Databricks, Snowflake};
 
+/// [`SqlDialect::declared_fits`](crate::SqlDialect::declared_fits) for a
+/// dialect that creates an unbounded declared decimal as `unbounded`
+/// `(precision, scale)` (`scale: None` = that many significant digits at any
+/// scale) and keeps time values to `fraction` fractional-second digits.
+pub(crate) fn fits_bounded(
+    t: &faucet_core::LogicalType,
+    value: &faucet_core::Value,
+    unbounded: (u32, Option<u32>),
+    fraction: Option<usize>,
+) -> bool {
+    use faucet_core::LogicalType;
+    match *t {
+        LogicalType::Decimal {
+            precision: None,
+            scale: None,
+        } => LogicalType::Decimal {
+            precision: Some(unbounded.0),
+            scale: unbounded.1,
+        }
+        .accepts(value),
+        LogicalType::Decimal {
+            precision: Some(p),
+            scale,
+        } => LogicalType::Decimal {
+            precision: Some(p),
+            scale: Some(scale.unwrap_or(0)),
+        }
+        .accepts(value),
+        LogicalType::Time | LogicalType::Timestamp { .. } => {
+            t.accepts(value)
+                && fraction
+                    .is_none_or(|max| value.as_str().is_none_or(|s| fraction_digits(s) <= max))
+        }
+        _ => t.accepts(value),
+    }
+}
+
+/// The fractional-second digits of a time or timestamp rendering.
+fn fraction_digits(s: &str) -> usize {
+    let time = s.rsplit(['T', ' ']).next().unwrap_or(s);
+    time.split_once('.').map_or(0, |(_, rest)| {
+        rest.bytes().take_while(u8::is_ascii_digit).count()
+    })
+}
+
 /// `keyword(p,s)` for a declared decimal of at most `max` digits whose scale
 /// fits it; `unbounded` for one without precision; `None` (text) for anything
 /// the dialect cannot hold exactly.

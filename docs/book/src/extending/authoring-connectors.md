@@ -772,11 +772,17 @@ override `Source::declared_columns` (map type names with
 renders a type) and set `declared_columns` in its descriptor and
 `capabilities()`. A sink that creates its table should accept them: keep them
 from `set_declared_columns` in a `faucet_core::DeclaredSlot`, plan with
-`faucet_core::plan_table_declared`, render with your dialect's
-`planned_type_name` (implement `declared_type_name`), create the empty typed
-table in `complete_run`, and declare `declared_types`. `SqlSinkDriver` does all
-of the sink side. Prove each with `assert_declared_columns_truthful` /
-`assert_declared_types_create`. See
+`faucet_core::plan_table_declared_with` and your dialect's `declared_fits`
+(implement it when a declared type maps to a column with other bounds than the
+declared ones, so a value that would be rounded keeps the inferred type),
+render with `planned_type_name` (implement `declared_type_name`), create the
+empty typed table in `complete_run` — the staging table under
+`write_mode: overwrite`, which the commit publishes — and declare
+`declared_types` only when the sink may create the table (`create_table` on).
+`SqlSinkDriver` does all of the sink side. Prove each with
+`assert_declared_columns_truthful` / `assert_declared_types_create`
+(`assert_declared_instants_exact` with a real backend) and, for an overwrite
+sink, `assert_declared_overwrite_empty_run`. See
 [Declared column types](../reference/value-fidelity.md#declared-column-types).
 
 ## Make it fast

@@ -406,6 +406,26 @@ fn spanner_declared_type(t: &faucet_core::LogicalType) -> Option<&'static str> {
     })
 }
 
+/// Whether `value` fits the column a declared `t` creates (#975): a declared
+/// decimal created as `NUMERIC` holds 29 integer and 9 fractional digits; one
+/// created as `STRING(MAX)` holds any digits.
+fn spanner_fits(t: &faucet_core::LogicalType, value: &Value) -> bool {
+    use faucet_core::LogicalType as L;
+    match *t {
+        L::Decimal { .. } if spanner_declared_type(t) == Some("NUMERIC") => L::Decimal {
+            precision: Some(38),
+            scale: Some(9),
+        }
+        .accepts(value),
+        L::Decimal { .. } => L::Decimal {
+            precision: None,
+            scale: None,
+        }
+        .accepts(value),
+        _ => t.accepts(value),
+    }
+}
+
 /// Render a [`SpannerType`] back to its DDL form, used when re-emitting a
 /// column to relax `NOT NULL`. `Other` (STRUCT/PROTO) cannot be re-emitted.
 fn spanner_type_ddl(ty: &SpannerType) -> Result<String, String> {
@@ -737,7 +757,9 @@ impl SpannerDriver {
             )));
         }
         let declared = self.declared.get();
-        let Some(columns) = faucet_core::plan_columns_declared(records, declared.as_ref()) else {
+        let Some(columns) =
+            faucet_core::plan_columns_declared_with(records, declared.as_ref(), &spanner_fits)
+        else {
             return Err(FaucetError::Sink(format!(
                 "spanner sink: table `{}` does not exist and the first page carried no \
                  inferable columns to create it from",
@@ -1001,7 +1023,10 @@ async fn run_cleanup_txn(
 #[async_trait]
 impl SinkDriver for SpannerDriver {
     fn capabilities(&self, derived: faucet_core::Capabilities) -> faucet_core::Capabilities {
-        derived.to_builder().declared_types(true).build()
+        derived
+            .to_builder()
+            .declared_types(self.config.create_table)
+            .build()
     }
 
     fn set_declared_columns(&self, columns: faucet_core::DeclaredColumns) {

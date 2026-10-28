@@ -3389,7 +3389,7 @@ impl SinkDriver for BigQueryDriver {
             .to_builder()
             .scoped_overwrite(true)
             .direct_overwrite(true)
-            .declared_types(true)
+            .declared_types(self.config.create_table)
             .build()
     }
 

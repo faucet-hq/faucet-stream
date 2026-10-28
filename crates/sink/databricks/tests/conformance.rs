@@ -349,3 +349,31 @@ async fn conformance_declared_types_create() {
     assert!(insert.contains("AS decimal(12,2))"), "{insert}");
     assert!(insert.contains("AS date)"), "{insert}");
 }
+
+/// #975: a zero-row first overwrite creates the declared *staging* table — on
+/// the writer (CLI) and at a single instance's commit — so the commit
+/// publishes an empty typed table instead of finding a target and no staging.
+#[tokio::test]
+#[allow(deprecated)] // drives the 1.x lifecycle hooks until faucet-core 2.0 (RFC 0014)
+async fn a_zero_row_overwrite_creates_the_declared_staging() {
+    let wh = common::Warehouse::start().await;
+    let overwrite = |c: &mut faucet_sink_databricks::DatabricksSinkConfig| {
+        c.write.write_mode = faucet_core::WriteMode::Overwrite;
+    };
+    let writer = common::sink(&wh, overwrite);
+    writer.set_declared_columns(faucet_conformance::declared_corpus());
+    writer.complete_run().await.expect("complete_run");
+    let one = common::sink(&wh, overwrite);
+    one.set_declared_columns(faucet_conformance::declared_corpus());
+    one.commit_overwrite().await.expect("commit");
+    let creates: Vec<String> = wh
+        .statements()
+        .into_iter()
+        .filter(|s| s.starts_with("CREATE TABLE"))
+        .collect();
+    assert_eq!(creates.len(), 2, "{creates:?}");
+    for ddl in &creates {
+        assert!(ddl.contains("`orders__faucet_ovw`"), "{ddl}");
+        assert!(ddl.contains("DECIMAL(12,2)"), "{ddl}");
+    }
+}

@@ -282,7 +282,9 @@ impl MssqlDriver {
             &[]
         };
         let declared = self.declared.get();
-        let Some(columns) = faucet_core::plan_table_declared(records, key, declared.as_ref())
+        let fits = |t: &faucet_core::LogicalType, v: &Value| Mssql.declared_fits(t, v);
+        let Some(columns) =
+            faucet_core::plan_table_declared_with(records, key, declared.as_ref(), &fits)
         else {
             return Ok(());
         };
@@ -305,7 +307,8 @@ impl MssqlDriver {
     }
 
     /// A run that wrote nothing creates the declared target (#955), when the
-    /// declaration is complete and no table is there yet.
+    /// declaration is complete and no table is there yet. An overwrite creates
+    /// its staging instead, which the commit publishes (#975).
     async fn create_declared_target(&self) -> Result<(), FaucetError> {
         use std::sync::atomic::Ordering;
         let Some(declared) = self.declared.for_empty_run() else {
@@ -326,7 +329,19 @@ impl MssqlDriver {
         let Some(columns) = faucet_core::plan_table_declared(&[], key, Some(&declared)) else {
             return Ok(());
         };
-        let sql = build_create_table_sql(&self.config.table, &self.table_quoted, &columns, key)?;
+        let sql = if self.config.write.is_overwrite() {
+            if self.table_exists(&self.staging_literal()).await? {
+                return Ok(());
+            }
+            build_create_table_sql(
+                &self.staging_literal(),
+                &self.staging_table_quoted,
+                &columns,
+                key,
+            )?
+        } else {
+            build_create_table_sql(&self.config.table, &self.table_quoted, &columns, key)?
+        };
         self.run_ddl(&tolerate_concurrent_create(&sql), "create_table")
             .await
     }
@@ -1755,7 +1770,11 @@ impl MssqlDriver {
     async fn publish_impl(&self) -> Result<(), FaucetError> {
         if !self.table_exists(&self.config.table).await? {
             // First run: staging holds everything; publish it as the target.
-            // A run that wrote nothing has no staging either, and leaves no table.
+            // A run that wrote nothing has no staging either, and leaves no
+            // table — unless it holds a complete declaration (#975).
+            if !self.table_exists(&self.staging_literal()).await? {
+                self.create_declared_target().await?;
+            }
             if self.table_exists(&self.staging_literal()).await? {
                 let mut conn = self.checkout().await?;
                 self.control(
@@ -2134,7 +2153,10 @@ impl SinkDriver for MssqlDriver {
     /// The JSON-column mode writes whole records, so it reports no schema.
     fn capabilities(&self, derived: faucet_core::Capabilities) -> faucet_core::Capabilities {
         if self.auto_columns() {
-            derived.to_builder().declared_types(true).build()
+            derived
+                .to_builder()
+                .declared_types(self.config.create_table)
+                .build()
         } else {
             derived
                 .to_builder()

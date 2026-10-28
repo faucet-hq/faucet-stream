@@ -222,7 +222,8 @@ impl DatabricksDriver {
         }
     }
 
-    /// A run that wrote nothing creates the declared destination (#955).
+    /// A run that wrote nothing creates the declared destination (#955); an
+    /// overwrite creates its staging, which the commit publishes (#975).
     async fn create_declared_target(&self, calls: &CallSlot) -> Result<(), FaucetError> {
         let Some(declared) = self.declared.for_empty_run() else {
             return Ok(());
@@ -230,8 +231,11 @@ impl DatabricksDriver {
         if !self.config.create_table || self.columns.lock().await.is_some() {
             return Ok(());
         }
-        let target = self.final_target();
-        if !self.describe(calls, &target).await?.is_empty() {
+        if !self.describe(calls, &self.final_target()).await?.is_empty() {
+            return Ok(());
+        }
+        let target = self.target();
+        if self.config.write.is_overwrite() && !self.describe(calls, &target).await?.is_empty() {
             return Ok(());
         }
         let Some(planned) =
@@ -421,9 +425,18 @@ impl DatabricksDriver {
                 ));
             }
             let declared = self.declared.get();
-            let Some(planned) =
-                faucet_core::plan_table_declared(records, self.created_key(), declared.as_ref())
-            else {
+            let Some(planned) = faucet_core::plan_table_declared_with(
+                records,
+                self.created_key(),
+                declared.as_ref(),
+                &|t, v| {
+                    faucet_common_sql::SqlDialect::declared_fits(
+                        &faucet_common_sql::dialects::Databricks,
+                        t,
+                        v,
+                    )
+                },
+            ) else {
                 return Ok(None);
             };
             self.exec(
@@ -767,7 +780,10 @@ impl DatabricksDriver {
 #[async_trait]
 impl SinkDriver for DatabricksDriver {
     fn capabilities(&self, derived: faucet_core::Capabilities) -> faucet_core::Capabilities {
-        derived.to_builder().declared_types(true).build()
+        derived
+            .to_builder()
+            .declared_types(self.config.create_table)
+            .build()
     }
 
     fn set_declared_columns(&self, columns: faucet_core::DeclaredColumns) {
@@ -1111,7 +1127,11 @@ impl StagingDriver for DatabricksDriver {
         let target = self.final_target();
         let staging = self.target();
         let target_exists = !self.describe(calls, &target).await?.is_empty();
-        let staging_exists = !self.describe(calls, &staging).await?.is_empty();
+        let mut staging_exists = !self.describe(calls, &staging).await?.is_empty();
+        if !target_exists && !staging_exists && self.declared.for_empty_run().is_some() {
+            self.create_declared_target(calls).await?;
+            staging_exists = !self.describe(calls, &staging).await?.is_empty();
+        }
         match (target_exists, staging_exists) {
             (true, true) => {
                 let target_cols = self.describe(calls, &target).await?;

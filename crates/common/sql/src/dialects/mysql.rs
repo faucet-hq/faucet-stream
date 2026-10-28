@@ -79,6 +79,12 @@ impl SqlDialect for Mysql {
         }
     }
 
+    /// An unbounded decimal is created as `DECIMAL(65,30)`; times keep
+    /// microseconds.
+    fn declared_fits(&self, t: &LogicalType, value: &faucet_core::Value) -> bool {
+        super::fits_bounded(t, value, (65, Some(30)), Some(6))
+    }
+
     fn declared_type_name(&self, t: &LogicalType) -> Option<String> {
         Some(match t {
             LogicalType::Int64 => "BIGINT".into(),

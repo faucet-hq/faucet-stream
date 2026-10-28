@@ -275,37 +275,72 @@ async fn conformance_cleanup_scoped_and_rollback_truthful() {
     .await;
 }
 
-/// Check 26: a declaration creates the table, typed, for an empty run.
+async fn mysql_types(url: String, table: &'static str) -> Vec<(String, String)> {
+    let pool = sqlx::MySqlPool::connect(&url).await.expect("pool connect");
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT CAST(COLUMN_NAME AS CHAR), CAST(COLUMN_TYPE AS CHAR) \
+         FROM INFORMATION_SCHEMA.COLUMNS \
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?",
+    )
+    .bind(table)
+    .fetch_all(&pool)
+    .await
+    .expect("columns");
+    pool.close().await;
+    rows
+}
+
+const MYSQL_DECLARED: &[(&str, &str)] = &[
+    ("id", "bigint"),
+    ("amount", "decimal(12,2)"),
+    ("day", "date"),
+    ("at", "datetime(6)"),
+];
+
+/// Check 26: a declaration creates the table, typed, for an empty run; the
+/// sink's session runs at `+05:30` and every rendering of the instant (`Z`,
+/// `+00:00`, `+05:30`) lands as the same UTC wall-clock time (#975).
 #[tokio::test(flavor = "multi_thread")]
 async fn conformance_declared_types_create() {
     let (_container, _permit, url, _sink) = fresh_sink().await;
-    let cfg = MysqlSinkConfig::new(&url, "typed").column_mapping(MysqlColumnMapping::AutoMap);
+    let session = format!("{url}?timezone=%2B05:30");
+    let cfg = MysqlSinkConfig::new(&session, "typed").column_mapping(MysqlColumnMapping::AutoMap);
     let sink = MysqlSink::new(cfg).await.expect("sink");
-    let types = || {
+    let read_at = || async {
+        let pool = sqlx::MySqlPool::connect(&url).await.expect("pool connect");
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT CAST(DATE_FORMAT(at, '%Y-%m-%dT%H:%i:%s.%fZ') AS CHAR) FROM typed ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("select");
+        pool.close().await;
+        rows.into_iter().map(|(at,)| at).collect()
+    };
+    faucet_conformance::assert_declared_instants_exact(
+        &sink,
+        MYSQL_DECLARED,
+        || mysql_types(url.clone(), "typed"),
+        read_at,
+    )
+    .await;
+}
+
+/// Check 27 (#975): a zero-row first overwrite leaves the empty typed table.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_declared_overwrite_empty_run() {
+    let (_container, _permit, url, _sink) = fresh_sink().await;
+    let make = |n: usize| {
         let url = url.clone();
         async move {
-            let pool = sqlx::MySqlPool::connect(&url).await.expect("pool connect");
-            let rows: Vec<(String, String)> = sqlx::query_as(
-                "SELECT CAST(COLUMN_NAME AS CHAR), CAST(COLUMN_TYPE AS CHAR) \
-                 FROM INFORMATION_SCHEMA.COLUMNS \
-                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'typed'",
-            )
-            .fetch_all(&pool)
-            .await
-            .expect("columns");
-            pool.close().await;
-            rows
+            let mut cfg = MysqlSinkConfig::new(&url, format!("o{n}"))
+                .column_mapping(MysqlColumnMapping::AutoMap);
+            cfg.write.write_mode = WriteMode::Overwrite;
+            Box::new(MysqlSink::new(cfg).await.expect("sink")) as Box<dyn Sink>
         }
     };
-    faucet_conformance::assert_declared_types_create(
-        &sink,
-        &[
-            ("id", "bigint"),
-            ("amount", "decimal(12,2)"),
-            ("day", "date"),
-            ("at", "datetime(6)"),
-        ],
-        types,
-    )
+    faucet_conformance::assert_declared_overwrite_empty_run(make, MYSQL_DECLARED, |n| {
+        mysql_types(url.clone(), if n == 0 { "o0" } else { "o1" })
+    })
     .await;
 }

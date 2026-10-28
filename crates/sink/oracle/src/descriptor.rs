@@ -19,7 +19,10 @@ fn capabilities(config: &Value) -> Capabilities {
         .keyed_dedup(!config.is_null() && dedups_by_key(config))
         .schema_evolution(true)
         .schema_report(SchemaReport::Reported)
-        .declared_types(config.is_null() || tag(config, "column_mapping") != Some("json_column"))
+        .declared_types(
+            (config.is_null() || tag(config, "column_mapping") != Some("json_column"))
+                && faucet_core::capabilities::config::bool_field(config, "create_table", true),
+        )
         .build()
 }
 

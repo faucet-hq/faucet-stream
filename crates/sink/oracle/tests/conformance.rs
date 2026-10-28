@@ -179,3 +179,42 @@ async fn conformance_declared_types_create() {
     )
     .await;
 }
+
+/// Check 27 (#975): a zero-row first overwrite leaves the empty typed table.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_declared_overwrite_empty_run() {
+    let Some((_container, conn)) = common::start_oracle().await else {
+        return;
+    };
+    let make = |n: usize| {
+        let mut cfg = OracleSinkConfig::new(conn.clone(), format!("o{n}"));
+        cfg.write.write_mode = faucet_core::WriteMode::Overwrite;
+        async move { Box::new(OracleSink::new(cfg).await.expect("sink")) as Box<dyn faucet_core::Sink> }
+    };
+    let types = |n: usize| {
+        let conn = conn.clone();
+        async move {
+            common::query_strings(
+                &conn,
+                &format!(
+                    "SELECT COLUMN_NAME || '|' || DATA_TYPE FROM USER_TAB_COLUMNS \
+                     WHERE UPPER(TABLE_NAME) = 'O{n}'"
+                ),
+            )
+            .await
+            .into_iter()
+            .flatten()
+            .filter_map(|s| {
+                s.split_once('|')
+                    .map(|(n, t)| (n.to_string(), t.to_string()))
+            })
+            .collect::<Vec<_>>()
+        }
+    };
+    faucet_conformance::assert_declared_overwrite_empty_run(
+        make,
+        &[("id", "number"), ("day", "date"), ("at", "with time zone")],
+        types,
+    )
+    .await;
+}

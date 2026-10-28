@@ -418,7 +418,8 @@ impl<D: SqlDriver> SqlSinkDriver<D> {
 
     /// A run that wrote nothing creates the declared destination (#955): only
     /// with a complete declaration, column mapping, `create_table` on, and no
-    /// table there yet (an overwrite's commit already published its staging).
+    /// table there yet. An overwrite creates its staging instead, which the
+    /// commit publishes (#975).
     fn declared_target(&self) -> Option<faucet_core::DeclaredColumns> {
         let layout = self.layout();
         if !layout.create_table
@@ -438,7 +439,11 @@ impl<D: SqlDriver> SqlSinkDriver<D> {
         if self.driver.table_exists(&layout.table).await? {
             return Ok(());
         }
-        let target = self.driver.target(&layout.table);
+        let table = self.effective_table();
+        if table != layout.table && self.driver.table_exists(&table).await? {
+            return Ok(());
+        }
+        let target = self.driver.target(&table);
         if let Some(sql) =
             self.engine()
                 .create_table_sql_declared(&target, &[], None, Some(&declared))?
@@ -734,7 +739,7 @@ impl<D: SqlDriver> SinkDriver for SqlSinkDriver<D> {
         self.driver.capabilities(
             derived
                 .to_builder()
-                .declared_types(self.layout().json_column.is_none())
+                .declared_types(self.layout().json_column.is_none() && self.layout().create_table)
                 .build(),
         )
     }
@@ -818,17 +823,20 @@ impl<D: SqlDriver> StagingDriver for SqlSinkDriver<D> {
     }
 
     /// Swap staging into place; on a first run (no destination) publish the
-    /// staging table as the destination — and a run that wrote nothing
-    /// leaves no table at all.
+    /// staging table as the destination. A run that wrote nothing leaves no
+    /// table, unless it holds a complete declaration: then it publishes the
+    /// empty typed table.
     async fn publish(&self, calls: &CallSlot) -> Result<(), FaucetError> {
         self.op(calls, label::COMMIT_OVERWRITE, async {
             let layout = self.layout();
             if !self.driver.table_exists(&layout.table).await? {
-                if self
-                    .driver
-                    .table_exists(&self.driver.staging_table())
-                    .await?
+                let staging = self.driver.staging_table();
+                if !self.driver.table_exists(&staging).await?
+                    && let Some(declared) = self.declared_target()
                 {
+                    self.create_declared_target(declared).await?;
+                }
+                if self.driver.table_exists(&staging).await? {
                     self.driver.publish_staging().await?;
                 }
                 return Ok(());
@@ -1409,6 +1417,7 @@ mod tests {
         let mut off = SqlLayout::new("t");
         off.create_table = false;
         let off = DriverSink::new(SqlSinkDriver::new(Mem::new(off, false)));
+        assert!(!off.capabilities().declared_types());
         off.set_declared_columns(declared(true));
         off.complete_run().await.unwrap();
         assert!(creates(&off.driver().driver().log()).is_empty());

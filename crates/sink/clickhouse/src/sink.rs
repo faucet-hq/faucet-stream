@@ -304,7 +304,10 @@ impl ClickHouseDriver {
         // A page with nothing inferable leaves the table uncreated so the next
         // page can try, rather than emitting a zero-column CREATE.
         let declared = self.declared.get();
-        let Some(columns) = faucet_core::plan_columns_declared(records, declared.as_ref()) else {
+        let fits = |t: &faucet_core::LogicalType, v: &Value| ClickHouse.declared_fits(t, v);
+        let Some(columns) =
+            faucet_core::plan_columns_declared_with(records, declared.as_ref(), &fits)
+        else {
             return Ok(());
         };
         let sql = build_create_table_sql(&self.config.table, &columns);
@@ -610,7 +613,10 @@ impl ClickHouseDriver {
 #[async_trait]
 impl SinkDriver for ClickHouseDriver {
     fn capabilities(&self, derived: faucet_core::Capabilities) -> faucet_core::Capabilities {
-        derived.to_builder().declared_types(true).build()
+        derived
+            .to_builder()
+            .declared_types(self.config.create_table)
+            .build()
     }
 
     fn set_declared_columns(&self, columns: faucet_core::DeclaredColumns) {

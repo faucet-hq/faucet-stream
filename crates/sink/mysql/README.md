@@ -427,7 +427,11 @@ fails fast with the same error every table sink raises, naming both ways out.
 
 ## Declared column types
 
-When the run's source declares its column types (a SQL query source, #955 — see [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types)), a table this sink creates types each declared column from the declaration instead of from the first page: `BIGINT`, `DOUBLE`, `TINYINT(1)`, `DECIMAL(p,s)` (`DECIMAL(65,30)` without precision), `DATE`, `TIME(6)`, `DATETIME(6)`, `CHAR(36)` for a UUID, `LONGBLOB`, `JSON`. A declared column whose first-page values do not fit its type keeps the inferred type; an existing table is never retyped. With a complete declaration a run that writes nothing creates the empty, typed table.
+When the run's source declares its column types (a SQL query source, #955 — see [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types)), a table this sink creates types each declared column from the declaration instead of from the first page: `BIGINT`, `DOUBLE`, `TINYINT(1)`, `DECIMAL(p,s)` (`DECIMAL(65,30)` without precision), `DATE`, `TIME(6)`, `DATETIME(6)`, `CHAR(36)` for a UUID, `LONGBLOB`, `JSON`. A declared column whose first-page values do not fit the column created keeps the inferred type — a decimal with more than 30 fractional or 35 integer digits for `DECIMAL(65,30)`, a time with more than microseconds; an existing table is never retyped. With a complete declaration a run that writes nothing creates the empty, typed table (under `write_mode: overwrite`, the empty staging table the commit publishes).
+
+### Zoned timestamps
+
+MySQL has no zoned date-time type, so a declared instant (`timestamp { tz: true }`) is a `DATETIME(6)` holding **UTC wall-clock time**. The sink converts every RFC 3339 string it binds for a `DATETIME` column to UTC before binding (`2024-02-22T07:30:00+05:30` → `2024-02-22 02:00:00`), and one for a `TIMESTAMP` column to its instant at `+00:00`, because MySQL refuses a `Z` suffix and shifts an offset into the session time zone. The stored instant is the same whatever the connection's `timezone`, and the `mysql` source reads a `DATETIME` back at `+00:00`. A string without an offset is bound as it is.
 
 ## Batch atomicity
 

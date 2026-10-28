@@ -18,7 +18,9 @@ fn capabilities(config: &Value) -> Capabilities {
         .cleanup(column_mapped)
         .rollback(column_mapped)
         .schema_evolution(!json)
-        .declared_types(!json)
+        .declared_types(
+            !json && faucet_core::capabilities::config::bool_field(config, "create_table", true),
+        )
         .schema_report(if json {
             SchemaReport::Schemaless
         } else {

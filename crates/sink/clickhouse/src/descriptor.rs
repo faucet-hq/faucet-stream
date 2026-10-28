@@ -10,7 +10,11 @@ fn capabilities(config: &Value) -> Capabilities {
     Capabilities::append_only_sink()
         .to_builder()
         .staged_load(cfg!(feature = "staging") && (config.is_null() || is_set(config, "staging")))
-        .declared_types(true)
+        .declared_types(faucet_core::capabilities::config::bool_field(
+            config,
+            "create_table",
+            true,
+        ))
         .build()
 }
 
