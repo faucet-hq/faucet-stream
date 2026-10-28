@@ -11,11 +11,8 @@ cargo build --release --target wasm32-unknown-unknown
 # → target/wasm32-unknown-unknown/release/faucet_wasm_example_add_field.wasm
 ```
 
-Copy it next to the other reference modules (this is the committed `add_field.wasm`):
-
-```bash
-cp target/wasm32-unknown-unknown/release/faucet_wasm_example_add_field.wasm ../add_field.wasm
-```
+Point a `wasm` transform's `module:` at that file. (The runnable example uses
+the hand-written `../add_field.wat`, so no compiled binary is committed.)
 
 This crate is intentionally **excluded from the host workspace** (it targets
 `wasm32-unknown-unknown` with its own release profile), so a normal

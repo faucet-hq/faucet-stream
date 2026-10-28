@@ -1,0 +1,48 @@
+# ClusterFuzzLite (#978): runs the cargo-fuzz targets in fuzz/ for a few
+# minutes on pull requests that touch the code they exercise.
+name: ClusterFuzzLite PR fuzzing
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "fuzz/**"
+      - ".clusterfuzzlite/**"
+      - ".github/workflows/cflite_pr.yml"
+      - "crates/core/**"
+      - "crates/source/postgres-cdc/**"
+      - "cli/src/interpolate.rs"
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  pr:
+    name: Fuzz (${{ matrix.sanitizer }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency:
+      group: ${{ github.workflow }}-${{ matrix.sanitizer }}-${{ github.ref }}
+      cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address]
+    steps:
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
+      - name: Build fuzzers
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: rust
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          sanitizer: ${{ matrix.sanitizer }}
+      - name: Run fuzzers
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: rust
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 300
+          mode: code-change
+          sanitizer: ${{ matrix.sanitizer }}

@@ -99,6 +99,9 @@ jobs:
             oracle: "false"
             cargo_profile: release-lto
     steps:
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -265,6 +268,9 @@ jobs:
       matrix:
         profile: [full, core, analytics, cdc]
     steps:
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -389,6 +395,9 @@ jobs:
     env:
       RELEASE: ${{ inputs.release }}
     steps:
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -425,10 +434,14 @@ jobs:
 
       - name: Push chart to GHCR (OCI)
         if: github.event_name == 'release' || inputs.push
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          CHART_VERSION: ${{ steps.v.outputs.v }}
         run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" \
-            | helm registry login "${REGISTRY}" -u "${{ github.actor }}" --password-stdin
-          helm push "faucet-stream-${{ steps.v.outputs.v }}.tgz" \
+          echo "$REGISTRY_TOKEN" \
+            | helm registry login "${REGISTRY}" -u "$ACTOR" --password-stdin
+          helm push "faucet-stream-${CHART_VERSION}.tgz" \
             "oci://${REGISTRY}/${GITHUB_REPOSITORY_OWNER}/charts"
 
       - name: Build deploy bundle (Dockerfile + chart + README)

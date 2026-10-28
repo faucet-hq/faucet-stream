@@ -21,6 +21,9 @@ jobs:
       security-events: write
       id-token: write
     steps:
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -28,6 +31,9 @@ jobs:
         with:
           results_file: results.sarif
           results_format: sarif
+          # A fine-grained read-only PAT lets the Branch-Protection check read
+          # the protection settings; without the secret it uses the job token.
+          repo_token: ${{ secrets.SCORECARD_TOKEN || github.token }}
           publish_results: true
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

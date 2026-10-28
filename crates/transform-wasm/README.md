@@ -3,7 +3,7 @@
 WebAssembly-as-transform for [`faucet-stream`](https://crates.io/crates/faucet-stream) —
 run a user-provided, sandboxed `.wasm` module over each record.
 
-It loads a precompiled WebAssembly module through [`wasmtime`](https://wasmtime.dev/)
+It loads a WebAssembly module (a compiled `.wasm` binary or `.wat` text) through [`wasmtime`](https://wasmtime.dev/)
 and invokes an exported function once per record. Any language that compiles to
 core wasm (Rust, TinyGo, AssemblyScript, Zig, C/C++, …) can express arbitrary
 per-record logic in a faucet pipeline — no forking, single-binary deploy.

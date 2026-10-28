@@ -1,11 +1,13 @@
 # Transform each record with a user-provided WebAssembly module.
 #
-# The `wasm` transform loads a precompiled `.wasm` module and invokes its
+# The `wasm` transform loads a WebAssembly module (a compiled `.wasm` binary or
+# `.wat` text) and invokes its
 # exported `transform` function once per record, in a sandbox bounded by fuel
 # (CPU) and a linear-memory cap. Any language that compiles to core wasm can
 # express the per-record logic.
 #
-# The reference module here (built from examples/wasm-transforms/rust/)
+# The reference module here (hand-written WebAssembly text; the Rust and
+# AssemblyScript sources beside it build equivalent `.wasm` binaries)
 # uppercases `name` and stamps `wasm_processed: true`.
 #
 #   faucet validate cli/examples/csv_to_jsonl_wasm.yaml
@@ -25,7 +27,7 @@ pipeline:
   transforms:
     - type: wasm
       config:
-        module: examples/wasm-transforms/add_field.wasm
+        module: examples/wasm-transforms/add_field.wat
         function: transform      # default; the exported entry point
         memory_limit_mb: 16       # linear-memory cap per record
         fuel_limit: 10000000      # deterministic CPU bound per record

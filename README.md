@@ -12,6 +12,8 @@
   <a href="rust-toolchain.toml"><img src="https://img.shields.io/crates/msrv/faucet-stream.svg" alt="MSRV"></a>
   <a href="deny.toml"><img src="https://img.shields.io/badge/deps-cargo--deny-blue" alt="Dependencies"></a>
   <a href="https://scorecard.dev/viewer/?uri=github.com/faucet-hq/faucet-stream"><img src="https://api.scorecard.dev/projects/github.com/faucet-hq/faucet-stream/badge" alt="OpenSSF Scorecard"></a>
+  <!-- OpenSSF Best Practices badge: add once the bestpractices.dev entry exists (#978):
+  <a href="https://www.bestpractices.dev/projects/PROJECT_ID"><img src="https://www.bestpractices.dev/projects/PROJECT_ID/badge" alt="OpenSSF Best Practices"></a> -->
   <a href="#license"><img src="https://img.shields.io/crates/l/faucet-stream.svg" alt="License"></a>
   <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/changelog-keep%20a%20changelog-orange" alt="Changelog"></a>
   <a href="https://www.linkedin.com/company/faucet-stream"><img src="https://img.shields.io/badge/LinkedIn-follow-0A66C2?logo=linkedin" alt="LinkedIn"></a>

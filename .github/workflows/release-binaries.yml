@@ -76,6 +76,9 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -95,6 +98,21 @@ jobs:
             echo "${DIST_INSTALLER_SHA256}  dist-installer.sh" | shasum -a 256 -c -
           fi
           sh dist-installer.sh
+      # Hand edit (#978): dist generates `curl | sh` of the latest
+      # cargo-auditable installer here; pin a release and verify it first.
+      - name: Install cargo-auditable
+        shell: bash
+        env:
+          AUDITABLE_INSTALLER_SHA256: 232904f2a30ecaf9027903f6327f08c8232917f8fa985540dce0ad9813e4dd92
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -LsSf -o cargo-auditable-installer.sh https://github.com/rust-secure-code/cargo-auditable/releases/download/v0.7.7/cargo-auditable-installer.sh
+          if command -v sha256sum >/dev/null; then
+            echo "${AUDITABLE_INSTALLER_SHA256}  cargo-auditable-installer.sh" | sha256sum -c -
+          else
+            echo "${AUDITABLE_INSTALLER_SHA256}  cargo-auditable-installer.sh" | shasum -a 256 -c -
+          fi
+          sh cargo-auditable-installer.sh
       - name: Cache dist
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -106,8 +124,12 @@ jobs:
       # (PRs run on the *source* but secrets are usually on the *target* -- that's *good*
       # but also really annoying to build CI around when it needs secrets to work right.)
       - id: plan
+        # Hand edit (#978): the dist arguments reach the shell through env.
+        env:
+          DIST_ARGS: ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }}
         run: |
-          dist ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }} --output-format=json > plan-dist-manifest.json
+          # shellcheck disable=SC2086 # DIST_ARGS is several words
+          dist $DIST_ARGS --output-format=json > plan-dist-manifest.json
           echo "dist ran successfully"
           cat plan-dist-manifest.json
           echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
@@ -138,11 +160,13 @@ jobs:
       # - N "local" tasks that build each platform's binaries and platform-specific installers
       matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
     runs-on: ${{ matrix.runner }}
-    container: ${{ matrix.container && matrix.container.image || null }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
     steps:
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
       - name: enable windows longpaths
         run: |
           git config --global core.longpaths true
@@ -150,13 +174,10 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
-      - name: Install Rust non-interactively if not already installed
-        if: ${{ matrix.container }}
-        run: |
-          if ! command -v cargo > /dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-          fi
+      # Hand edit (#978): dist's "install Rust in the container" step (curl | sh
+      # of rustup) is removed. Every target builds on a native runner that has
+      # Rust, so no matrix entry sets `container`; restore a checksum-verified
+      # rustup-init if one ever does.
       - name: Install dist
         shell: bash
         env:
@@ -180,7 +201,9 @@ jobs:
           path: target/distrib/
           merge-multiple: true
       - name: Install dependencies
-        run: |
+        # The command comes from the dist plan (dist-workspace.toml), not from
+        # an event payload.
+        run: | # zizmor: ignore[template-injection]
           ${{ matrix.packages_install }}
       # Hand edit: the chocolatey NASM package does not put nasm.exe on PATH,
       # and aws-lc-sys / openssl-src look it up there.
@@ -194,9 +217,13 @@ jobs:
         shell: bash
         run: echo "OPENSSL_SRC_PERL=C:/Strawberry/perl/bin/perl.exe" >> "$GITHUB_ENV"
       - name: Build artifacts
+        env:
+          TAG_FLAG: ${{ needs.plan.outputs.tag-flag }}
+          DIST_ARGS: ${{ matrix.dist_args }}
         run: |
           # Actually do builds and make zips and whatnot
-          dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
+          # shellcheck disable=SC2086 # the flags are word lists
+          dist build $TAG_FLAG --print=linkage --output-format=json $DIST_ARGS > dist-manifest.json
           echo "dist ran successfully"
       - id: cargo-dist
         name: Post-build
@@ -229,6 +256,9 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
     steps:
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -239,6 +269,17 @@ jobs:
           name: cargo-dist-cache
           path: ~/.cargo/bin/
       - run: chmod +x ~/.cargo/bin/dist
+      # Hand edit (#978): dist generates `curl | sh` of a cargo-cyclonedx
+      # installer here; download a pinned release binary and verify it.
+      - name: Install cargo-cyclonedx
+        env:
+          CYCLONEDX_SHA256: fb8dbee9f182173e062a64a387b21a0badc6fab8b2abf9294973f012972bf6d8
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -LsSf -o cargo-cyclonedx.tar.xz https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-0.5.9/cargo-cyclonedx-x86_64-unknown-linux-gnu.tar.xz
+          echo "${CYCLONEDX_SHA256}  cargo-cyclonedx.tar.xz" | sha256sum -c -
+          tar -xJf cargo-cyclonedx.tar.xz
+          install -m 0755 cargo-cyclonedx-x86_64-unknown-linux-gnu/cargo-cyclonedx ~/.cargo/bin/
       # Get all the local artifacts for the global tasks to use (for e.g. checksums)
       - name: Fetch local artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -258,12 +299,23 @@ jobs:
           echo "EOF" >> "$GITHUB_OUTPUT"
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
+      # Hand edit (#978): one SBOM for the shipped binary (the CLI's `full`
+      # build, dependencies of every target) rather than dist's one per
+      # workspace crate.
+      - id: cargo-cyclonedx
+        run: |
+          set -euo pipefail
+          cargo cyclonedx --manifest-path cli/Cargo.toml --features full --target all \
+            --format json --spec-version 1.5 --override-filename faucet-cli
+          mv cli/faucet-cli.cdx.json target/distrib/faucet-cli.cdx.json
+          echo "path=target/distrib/faucet-cli.cdx.json" >> "$GITHUB_OUTPUT"
       - name: "Upload artifacts"
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: artifacts-build-global
           path: |
             ${{ steps.cargo-dist.outputs.paths }}
+            ${{ steps.cargo-cyclonedx.outputs.path }}
             ${{ env.BUILD_MANIFEST_NAME }}
   # Determines if we should publish/announce
   host:
@@ -284,6 +336,9 @@ jobs:
     outputs:
       val: ${{ steps.host.outputs.manifest }}
     steps:
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -326,9 +381,23 @@ jobs:
           # Remove the granular manifests
           rm -f artifacts/*-dist-manifest.json
       - name: Attest build provenance
+        id: attest
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: "artifacts/*"
+      # Hand edit (#978): attach the Sigstore bundle beside each asset so the
+      # provenance is verifiable offline with
+      # `gh attestation verify <asset> --bundle <asset>.sigstore.json`. One bundle
+      # covers every subject; a copy per asset keeps the pairing obvious.
+      - name: Attach provenance bundles
+        env:
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          for asset in artifacts/*; do
+            case "$asset" in *.sigstore.json) continue ;; esac
+            cp "$BUNDLE" "$asset.sigstore.json"
+          done
       - name: Create GitHub Release
         env:
           PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
@@ -360,6 +429,9 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -370,8 +442,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
+      # This job builds only connectors.json (connector metadata for the
+      # website), not a shipped artifact; uncached it takes over 30 minutes.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
+        with: # zizmor: ignore[cache-poisoning]
           key: connector-export
       - name: Export and upload connectors.json
         run: |
@@ -407,6 +481,9 @@ jobs:
       GITHUB_EMAIL: "admin+bot@axo.dev"
     if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
     steps:
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: true
@@ -456,6 +533,9 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false

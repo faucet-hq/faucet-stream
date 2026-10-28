@@ -27,6 +27,12 @@ features = ["full"]
 allow-dirty = ["ci"]
 # Whether to install an updater program
 install-updater = false
+# Build with cargo-auditable, which embeds the dependency list in each binary
+# (`cargo audit bin` reads it), and attach a CycloneDX SBOM to each release
+# (#978). release-binaries.yml installs both tools at pinned, checksum-verified
+# versions instead of the generated curl | sh steps.
+cargo-auditable = true
+cargo-cyclonedx = true
 
 # System packages for the Linux build runners (mirrors the Dockerfile builder,
 # which builds the same `full` set): sasl2-sys needs libsasl2-dev, rdkafka and

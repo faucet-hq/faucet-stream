@@ -1,10 +1,10 @@
 # WASM transform (custom code)
 
-The `wasm` transform runs a **user-provided, precompiled WebAssembly module**
-once per record. It is the escape hatch for arbitrary per-record logic in a YAML
+The `wasm` transform runs a **user-provided WebAssembly module** once per
+record. It is the escape hatch for arbitrary per-record logic in a YAML
 pipeline: write the transform in any language that compiles to core wasm — Rust,
-TinyGo, AssemblyScript, Zig, C/C++ — compile it to a `.wasm` file, and point the
-transform at it. faucet stays a single-binary deploy; you never fork it.
+TinyGo, AssemblyScript, Zig, C/C++ — compile it to a `.wasm` file (or write
+WebAssembly text, `.wat`), and point the transform at it. faucet stays a single-binary deploy; you never fork it.
 
 > Needs the `transform-wasm` feature: `cargo install faucet-cli --features transform-wasm`
 > (included in `full`). It is **not** in the default build.
@@ -32,20 +32,22 @@ pipeline:
   transforms:
     - type: wasm
       config:
-        module: examples/wasm-transforms/add_field.wasm
+        module: examples/wasm-transforms/add_field.wat
   sink:
     type: file
     config: { path: /tmp/out.jsonl }
 ```
 
-The runnable example is `cli/examples/csv_to_jsonl_wasm.yaml`; the reference
-module sources live under `examples/wasm-transforms/`.
+The runnable example is `cli/examples/csv_to_jsonl_wasm.yaml`. Its module,
+`add_field.wat`, is hand-written WebAssembly text; the Rust and AssemblyScript
+reference sources under `examples/wasm-transforms/` build equivalent `.wasm`
+binaries.
 
 ## Config fields
 
 | Field | Default | Meaning |
 |---|---|---|
-| `module` | *(required)* | Filesystem path to the precompiled `.wasm` (absolute, or relative to the working directory). URLs are out of scope in v1. |
+| `module` | *(required)* | Filesystem path to the module, a compiled `.wasm` binary or WebAssembly text (`.wat`), absolute or relative to the working directory. URLs are out of scope in v1. |
 | `function` | `"transform"` | Exported entry-point function name. |
 | `memory_limit_mb` | `16` | Linear-memory cap. A record that grows memory past this fails (see `on_error`). ~8 MB is the practical floor for ~1 KB JSON records. |
 | `fuel_limit` | `10_000_000` | wasmtime fuel per record — a deterministic CPU bound. A record that exhausts fuel fails. |
@@ -183,7 +185,8 @@ tagged record your downstream can route.
   planned once wasmtime's component support and demand are clear.
 - **Network access** from modules — deliberately disallowed (sandbox + secret
   leakage). A module only ever sees the record it is handed.
-- **Module-from-URL** and **inline WASM source** — path to a precompiled `.wasm`
-  only. Files are easier to audit; faucet does not bundle a wasm compiler.
+- **Module-from-URL** and **inline WASM source** — a path to a `.wasm` or
+  `.wat` file only. Files are easier to audit; faucet compiles no source
+  language, it only assembles WebAssembly text.
 - A **wall-clock `timeout`** — `fuel_limit` is the deterministic CPU bound;
   since v1 has no blocking host calls, a separate timeout would be redundant.
