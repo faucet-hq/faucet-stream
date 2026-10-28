@@ -1209,9 +1209,11 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
       - name: Test the coverage gate scripts
-        if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.code == 'true' }}
+        if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.changes.outputs.code == 'true' }}
         run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - name: Enforce >=95% patch coverage
+        # Runs after failing tests too (the reports are written either way), so
+        # one red run reports test failures and coverage gaps together.
         # The project standard is >=95% coverage of changed lines. `codecov/patch`
         # reports the same number but posts unreliably — of the eight PRs merged
         # before this gate landed, only one carried a codecov status on its head
@@ -1219,7 +1221,7 @@ jobs:
         # required check without blocking PRs on "Expected — waiting for status".
         # This runs inside the already-required Coverage job instead, where the
         # result is deterministic.
-        if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.code == 'true' }}
+        if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.changes.outputs.code == 'true' }}
         run: |
           # `--depth=0` is not a valid depth; this printed a red "fatal:"
           # on every coverage run and made real failures look like tooling
@@ -1236,7 +1238,7 @@ jobs:
         # an integration test, not only a unit test (#695). A PR description
         # line `no-integration-test: <reason>` downgrades a failure to a
         # warning; the job summary shows the per-file table either way.
-        if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.code == 'true' }}
+        if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.changes.outputs.code == 'true' }}
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
