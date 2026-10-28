@@ -1,5 +1,5 @@
 //! Container requests for servers that only accept TLS, built on a
-//! [`TlsFixture`](super::TlsFixture).
+//! [`TlsFixture`].
 //!
 //! Each builder mounts the fixture at [`CERT_DIR`] and configures the server
 //! so a plaintext client is refused, which is how a test proves the connector
