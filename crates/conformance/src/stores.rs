@@ -26,8 +26,9 @@ pub const MINIO_REGION: &str = "us-east-1";
 /// Port MinIO serves S3 on inside the container.
 pub const MINIO_PORT: u16 = 9000;
 
-/// Azurite image.
-pub const AZURITE_IMAGE: (&str, &str) = ("mcr.microsoft.com/azure-storage/azurite", "3.35.0");
+/// Azurite image. 3.37.0 is the first release that honours the `startFrom`
+/// listing parameter Delta's log listing sends (#984).
+pub const AZURITE_IMAGE: (&str, &str) = ("mcr.microsoft.com/azure-storage/azurite", "3.37.0");
 /// Azurite's well-known development account.
 pub const AZURITE_ACCOUNT: &str = "devstoreaccount1";
 /// Azurite's well-known development account key.
@@ -93,22 +94,30 @@ pub async fn minio() -> Store {
 }
 
 /// Start Azurite (Blob only, in memory). The endpoint names the account.
+///
+/// Ready once the mapped port answers HTTP: the log line comes before a host
+/// port forward (Docker VMs) passes connections through.
 pub async fn azurite() -> Store {
-    let container = start(|| {
-        GenericImage::new(AZURITE_IMAGE.0, AZURITE_IMAGE.1)
-            .with_exposed_port(AZURITE_BLOB_PORT.tcp())
-            .with_wait_for(WaitFor::message_on_stdout(
-                "Azurite Blob service successfully listens on",
-            ))
-            .with_cmd([
-                "azurite-blob",
-                "--blobHost",
-                "0.0.0.0",
-                "--inMemoryPersistence",
-                "--skipApiVersionCheck",
-                "--loose",
-            ])
-    })
+    let container = start_with(
+        || {
+            GenericImage::new(AZURITE_IMAGE.0, AZURITE_IMAGE.1)
+                .with_exposed_port(AZURITE_BLOB_PORT.tcp())
+                .with_wait_for(WaitFor::message_on_stdout(
+                    "Azurite Blob service successfully listens on",
+                ))
+                .with_cmd([
+                    "azurite-blob",
+                    "--blobHost",
+                    "0.0.0.0",
+                    "--inMemoryPersistence",
+                    "--skipApiVersionCheck",
+                    "--loose",
+                ])
+        },
+        &StartOptions::default().ready(ReadyProbe::custom(AZURITE_BLOB_PORT, |ep| async move {
+            answers_http(&ep.addr()).await
+        })),
+    )
     .await;
     let port = container
         .get_host_port_ipv4(AZURITE_BLOB_PORT)
@@ -117,6 +126,28 @@ pub async fn azurite() -> Store {
     Store {
         container,
         endpoint: format!("http://127.0.0.1:{port}/{AZURITE_ACCOUNT}"),
+    }
+}
+
+/// Whether `addr` answers an HTTP request with any status line (Azurite
+/// refuses an unsigned request, so a 2xx probe cannot be used).
+async fn answers_http(addr: &str) -> Result<(), String> {
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .map_err(|e| format!("connect {addr}: {e}"))?;
+    stream
+        .write_all(b"GET / HTTP/1.0\r\nConnection: close\r\n\r\n")
+        .await
+        .map_err(|e| format!("write to {addr}: {e}"))?;
+    let mut head = [0u8; 12];
+    let n = stream
+        .read(&mut head)
+        .await
+        .map_err(|e| format!("read from {addr}: {e}"))?;
+    if head[..n].starts_with(b"HTTP/") {
+        Ok(())
+    } else {
+        Err(format!("no HTTP answer from {addr}"))
     }
 }
 

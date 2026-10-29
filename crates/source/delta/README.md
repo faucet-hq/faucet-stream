@@ -48,9 +48,9 @@ Cloud backends require the matching crate feature: `s3`, `azure`, `gcs`.
 `s3://` commits use S3 conditional writes (no locking provider), so an
 S3-compatible store must support `If-None-Match` (MinIO does). For an S3-alike,
 set `endpoint_url` (and `allow_http` for plain HTTP) in the `aws` credentials;
-against Azurite set `storage_options.azure_storage_use_emulator: "true"` and the
-`AZURITE_BLOB_STORAGE_URL` environment variable, since Azurite ignores the
-listing offset the Delta log relies on outside emulator mode.
+against Azurite (3.37.0 or later, which honours the `startFrom` listing offset
+the Delta log relies on) set `storage_options.azure_storage_endpoint` to
+`http://<host>:<port>/devstoreaccount1` and `azure_allow_http: "true"`.
 Data files are opened with the size their add action records, so the Parquet
 footer is read with a bounded range request; Azure Blob Storage refuses the
 suffix range a size-less read sends (#967).
