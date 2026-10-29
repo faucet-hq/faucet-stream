@@ -1368,6 +1368,7 @@ params:
   page_size: { type: int, default: 500 }
   api_token: { required: true, secret: true } # redacted everywhere, never persisted
   region:    { default: us, values: [us, eu, apac] }  # closed set: anything else is rejected
+  out_dir:   { default: ./out, trusted: true }  # on `faucet serve`: the caller's value skips the caller reference policy
   tables:    { type: list, items: { type: string }, max_items: 50 }  # a JSON array; min_items defaults to 1
 pipeline:
   source:

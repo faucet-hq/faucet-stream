@@ -22,6 +22,9 @@ pub struct Submission<'a> {
     pub format: ConfigFormat,
     /// Run only some of the config's rows (#741).
     pub selection: Option<&'a crate::select::SelectionRequest>,
+    /// Where a trusted template body holds values a caller supplied for its
+    /// params (#989): held to the caller reference policy.
+    pub caller_fields: Option<&'a crate::params::CallerFields>,
 }
 
 impl<'a> Submission<'a> {
@@ -31,12 +34,19 @@ impl<'a> Submission<'a> {
             body,
             format,
             selection: None,
+            caller_fields: None,
         }
     }
 
     /// Narrowed to `selection`'s rows.
     pub fn selected(mut self, selection: Option<&'a crate::select::SelectionRequest>) -> Self {
         self.selection = selection;
+        self
+    }
+
+    /// With the values a caller supplied for the template's params (#989).
+    pub fn with_caller_fields(mut self, fields: &'a crate::params::CallerFields) -> Self {
+        self.caller_fields = (!fields.is_empty()).then_some(fields);
         self
     }
 }
@@ -110,7 +120,16 @@ pub async fn load(
         None => None,
         Some(t) => Some(tenant_scope(state, t).await?),
     };
-    let mut loaded = crate::serve::load::load_submission_with(
+    // A body from the server's own triggers file carries the operator's
+    // params, not a caller's.
+    let caller = sub
+        .caller_fields
+        .filter(|_| principal.origin() != Origin::ServerFile)
+        .map(|fields| crate::serve::load::CallerParams {
+            fields,
+            origin: state.caller_origin(),
+        });
+    let loaded = crate::serve::load::load_submission_inputs(
         sub.body,
         sub.format,
         state.default_base().as_ref(),
@@ -118,8 +137,26 @@ pub async fn load(
         principal.body_origin(),
         scope,
         &state.references(),
+        caller,
     )
-    .await?;
+    .await;
+    let mut loaded = match loaded {
+        Err(ServeError::Forbidden(m))
+            if caller.is_some() && m.starts_with(crate::serve::load::CALLER_PARAM_REFUSAL) =>
+        {
+            crate::serve::audit::write_target_detail(
+                state,
+                &principal.actor(),
+                "policy.denied",
+                "template params".into(),
+                crate::secrets::registry::redact_message(&m),
+                "denied",
+            )
+            .await;
+            return Err(ServeError::Forbidden(m));
+        }
+        other => other?,
+    };
     if let Some(sel) = sub.selection {
         let nodes = std::mem::take(&mut loaded.nodes);
         let bad = |e: crate::error::CliError| {
@@ -307,7 +344,8 @@ pub async fn reload(
         state,
         &principal,
         Submission::new(&body, rec.config_format.unwrap_or_default())
-            .selected(rec.selection.as_ref()),
+            .selected(rec.selection.as_ref())
+            .with_caller_fields(&rec.caller_params),
     )
     .await
 }
@@ -472,6 +510,7 @@ pub async fn submit(
                 reason,
                 budget,
                 trusted_config: req.trusted_config,
+                caller_params: req.caller_fields.clone(),
             },
         )
         .await?;
@@ -491,7 +530,9 @@ pub async fn submit(
     let admitted = admit(
         state,
         principal,
-        Submission::new(&req.config, req.config_format.into()).selected(req.selection.as_ref()),
+        Submission::new(&req.config, req.config_format.into())
+            .selected(req.selection.as_ref())
+            .with_caller_fields(&req.caller_fields),
         Gates {
             policy: true,
             budget: req.budget.take(),
@@ -851,6 +892,7 @@ pub async fn rollback(
     // The caller's config, else the stored one (cluster mode), loaded under
     // the run's tenant (#789 SERVE-27).
     let actor = principal.actor();
+    let stored_params = rec.config_body.is_some() && req.config.is_none();
     let (config, format, run_as) = match (req.config, rec.config_body.as_deref()) {
         (Some(c), _) => (
             c,
@@ -885,10 +927,17 @@ pub async fn rollback(
     if !req.dry_run {
         runner::refuse_unapproved_write(state, "run rollback")?;
     }
+    // The stored body of a template run keeps its caller's param values
+    // under the caller policy (#989).
+    let no_params = crate::params::CallerFields::default();
     let admitted = admit(
         state,
         &run_as,
-        Submission::new(&config, format),
+        Submission::new(&config, format).with_caller_fields(if stored_params {
+            &rec.caller_params
+        } else {
+            &no_params
+        }),
         if req.dry_run {
             Gates::default()
         } else {
@@ -1587,6 +1636,13 @@ mod templates {
             trusted_config: true,
             server_file: false,
             sealed_params,
+            // A trigger declared in the server's triggers file passes the
+            // operator's params, not a caller's.
+            caller_fields: if body.standing_approval {
+                Default::default()
+            } else {
+                materialized.caller_fields.clone()
+            },
         };
         // The template is the operator's: the run loads it trusted.
         let run_as = Principal::new(actor.clone(), Origin::Trusted).on_behalf_of(tenant);

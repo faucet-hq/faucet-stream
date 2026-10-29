@@ -2459,7 +2459,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/TriggerTemplateResponse" }
         "401": { $ref: "#/components/responses/Error" }
-        "403": { description: Principal's role lacks the required permission }
+        "403": { description: "Principal's role lacks the required permission, or a param value the caller supplied reaches a path, URL or command the caller reference policy does not allow (#989; names the param and the field, audited `policy.denied`)" }
         "404": { $ref: "#/components/responses/Error" }
         "422": { $ref: "#/components/responses/Error" }
         "429": { $ref: "#/components/responses/Error" }
@@ -3780,6 +3780,7 @@ components:
         required: { type: boolean, default: false, description: "Caller must supply a value. Mutually exclusive with `default`." }
         default: { description: "Value used when the caller supplies none. Resolved like any other config scalar, so `${env:X}` works." }
         secret: { type: boolean, default: false, description: "Registered for log/response redaction the moment it is bound; never persisted." }
+        trusted: { type: boolean, default: false, description: "A caller's value reaches path, URL and command fields without the caller reference policy (#989). Without it such a value is refused with 403 when the policy does not allow it." }
         description: { type: string }
       example:
         type: string

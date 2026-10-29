@@ -292,11 +292,14 @@ fn param_lines(summary: &TemplateSummary) -> Vec<String> {
             }
         };
         lines.push(format!(
-            "  {:<20} {:<7} {}{}{}",
+            "  {:<20} {:<7} {}{}{}{}",
             name,
             p.kind.as_str(),
             requirement,
             if p.is_secret() { "  [secret]" } else { "" },
+            // #989: a server does not hold this param's caller value to its
+            // reference policy.
+            if p.trusted { "  [trusted]" } else { "" },
             match &p.description {
                 Some(d) => format!("  — {d}"),
                 None => String::new(),
@@ -1795,6 +1798,34 @@ pipeline:
         );
         let page = out.lines().find(|l| l.contains("page")).unwrap();
         assert!(page.contains("default 5"), "{page}");
+        assert!(!out.contains("[trusted]"), "{out}");
+    }
+
+    #[test]
+    fn param_lines_mark_a_trusted_param() {
+        let mut params = crate::params::ParamsSpec::new();
+        params.insert(
+            "out_dir".into(),
+            crate::params::ParamSpec {
+                trusted: true,
+                ..Default::default()
+            },
+        );
+        let summary = TemplateSummary {
+            kind: crate::hub::TemplateKind::Pipeline,
+            state: None,
+            id: "t".into(),
+            version: 1,
+            name: None,
+            description: None,
+            params,
+            created_at: chrono::Utc::now(),
+            created_by: None,
+            warnings: Vec::new(),
+        };
+        let out = param_lines(&summary).join("\n");
+        let line = out.lines().find(|l| l.contains("out_dir")).unwrap();
+        assert!(line.contains("[trusted]"), "{line}");
     }
 
     #[tokio::test]

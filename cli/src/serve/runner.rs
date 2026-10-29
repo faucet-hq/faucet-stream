@@ -108,6 +108,11 @@ pub struct SubmitRequest {
     /// when the run is stored.
     #[serde(skip)]
     pub sealed_params: Option<crate::serve::sealed::SealedParams>,
+    /// Set in-process by a template trigger, never accepted from a client
+    /// (#989): where the trusted `config` holds values the caller supplied
+    /// for the template's params, held to the caller reference policy.
+    #[serde(skip)]
+    pub caller_fields: crate::params::CallerFields,
 }
 
 impl SubmitRequest {
@@ -1098,6 +1103,7 @@ pub(crate) async fn enqueue(
     rec.selection = req.selection.clone();
     rec.host_access = req.server_file;
     rec.caller_config = principal.caller_body();
+    rec.caller_params = req.caller_fields.clone();
     rec.pool = req
         .pool
         .clone()
@@ -2881,6 +2887,7 @@ mod tests {
             trusted_config: false,
             server_file: false,
             sealed_params: None,
+            caller_fields: Default::default(),
         };
 
         let err = submit(state.clone(), req, admin_actor()).await.unwrap_err();
@@ -2992,6 +2999,7 @@ mod tests {
             trusted_config: false,
             server_file: false,
             sealed_params: None,
+            caller_fields: Default::default(),
         };
         let resp = submit(state.clone(), req, admin_actor()).await.unwrap();
         assert_eq!(resp.status, RunStatus::Pending);
@@ -3217,6 +3225,7 @@ mod tests {
             trusted_config: false,
             server_file: false,
             sealed_params: None,
+            caller_fields: Default::default(),
         };
         let err = submit(state.clone(), req, admin_actor()).await.unwrap_err();
         assert!(

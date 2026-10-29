@@ -246,6 +246,12 @@ pub struct RunRecord {
     /// caller reference policy wherever it runs (#881).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub caller_config: bool,
+    /// Where a template run's trusted config holds values its caller supplied
+    /// for the template's params (#989): a claim, a shard or a rollback
+    /// re-checks them against the caller reference policy of the instance
+    /// that loads the body.
+    #[serde(default, skip_serializing_if = "crate::params::CallerFields::is_empty")]
+    pub caller_params: crate::params::CallerFields,
     /// The execution pool the run belongs to (#957): only a replica serving
     /// it claims the run, its shards and its re-claims. Records written before
     /// pools existed read as `default`.
@@ -288,6 +294,7 @@ impl RunRecord {
             selection: None,
             host_access: false,
             caller_config: false,
+            caller_params: Default::default(),
             pool: crate::serve::pools::default_pool(),
         }
     }
