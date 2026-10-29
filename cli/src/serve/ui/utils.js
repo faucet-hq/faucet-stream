@@ -25,6 +25,18 @@ export function fmtDuration(secs) {
   return `${sec}s`;
 }
 
+/** How long ago an RFC 3339 instant was, compactly: `12s`, `14m`, `3h`, `2d`, `5w`. */
+export function fmtAge(iso, now = Date.now()) {
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return "";
+  const s = Math.max(0, Math.round((now - t) / 1000));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h`;
+  if (s < 86400 * 14) return `${Math.floor(s / 86400)}d`;
+  return `${Math.floor(s / (86400 * 7))}w`;
+}
+
 /** Format a count compactly with a K/M/B suffix (e.g. 4801657 → "4.8M",
  * 3_883_982 → "3.88M", 1234 → "1.23K", 999 → "999"). Trims trailing zeros;
  * under 1000 shows the exact integer. Non-numbers pass through. */

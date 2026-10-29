@@ -2,7 +2,6 @@ import { token, onUnauthorized, authOk } from "./api.js";
 import { startRouter, refresh } from "./router.js";
 import { getTz, setTz, TZ_OPTIONS } from "./tz.js";
 import { renderRuns } from "./views/runs.js";
-import { renderDetail } from "./views/detail.js";
 import { renderSubmit } from "./views/submit.js";
 import { renderSchemas } from "./views/schemas.js";
 import { renderTemplates, renderTemplateDetail } from "./views/templates.js";
@@ -73,8 +72,8 @@ function wireChrome() {
 }
 
 function registerRoutes() {
-  route("#/runs", renderRuns);
-  route("#/runs/:id", renderDetail);
+  route("#/runs", renderRuns, { group: "runs" });
+  route("#/runs/:id", renderRuns, { group: "runs" });
   route("#/submit", renderSubmit);
   route("#/schemas", renderSchemas);
   route("#/templates", renderTemplates);
@@ -84,8 +83,8 @@ function registerRoutes() {
   route("#/lineage", renderLineage);
   route("#/lineage/:root", renderLineage);
   route("#/usage", renderUsage);
-  route("#/changes", renderChanges);
-  route("#/changes/:id", renderChanges);
+  route("#/changes", renderChanges, { group: "changes" });
+  route("#/changes/:id", renderChanges, { group: "changes" });
   route("#/tenants", renderTenants);
   route("#/tenants/:id", renderTenants);
 }

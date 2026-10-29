@@ -71,42 +71,65 @@ the next refused call makes the console re-read it and redraw.
 
 ## Views
 
-### Runs dashboard
+### Runs
 
-Lists all runs with live status badges. You can:
+Runs is a split pane: the run list on the left, the selected run's detail on
+the right. `#/runs` opens the list; `#/runs/<id>` selects a run, so a run is a
+shareable link, and choosing another run keeps the list where it was (filters,
+scroll position, collapsed sections). Below about 1100 px wide the detail
+replaces the list, with a **← Runs** link back.
 
-- Filter by name, status, or time range.
-- Filter by label: type `key:value` (or a bare `key`) into the label box and
-  press Enter. Each filter becomes a removable chip, every chip must match,
-  and the filters live in the URL (`#/runs?label=team:data`), so a filtered
-  view is a shareable link. Clicking a label chip on a run row adds it.
-- See each run's labels as chips under its name (the first three, the rest
-  behind a `+N` with a tooltip).
-- Page through history.
-- Click any row to open the run detail view.
-- Click **+ Submit run** to go directly to the Submit view.
+The list pane has:
+
+- Tabs for **All runs**, **Active** (queued, pending, running, sharded) and
+  **Failed**.
+- A stat strip — running, succeeded and failed counts plus the records written
+  — over the runs loaded (a `+` means more pages exist).
+- Sections for **Running**, **Queued**, **Failed**, **Succeeded** and
+  **Cancelled**, each collapsible. Every row shows a status ring, the run's name
+  (its pipeline when it has none), how long ago it was submitted, and one line
+  of facts: the first invocation's error for a failed run, else the template,
+  backfill unit or `source → sink`, then records, invocations, duration, pool
+  and tenant. Long names are cut with an ellipsis; hover for the full text.
+- The filter button opens name, status, time-range and label filters. A label
+  filter is `key:value` (or a bare `key`), entered with Enter; each becomes a
+  removable chip, every chip must match, and the filters live in the URL
+  (`#/runs?label=team:data`), so a filtered list is a shareable link too.
+- **+** goes to the Submit view.
+
+While any listed run is still going, the list and the stat strip refresh every
+few seconds in place, without moving the selection or the scroll position.
 
 ![The Runs dashboard, listing completed runs with status badges, record counts, and timestamps](../assets/console/runs.png)
 
-### Run detail
+The detail pane has four tabs, with **Cancel run** (while it runs), **Roll
+back…** and **Delete** (once it has finished) on the right:
 
-Shows the full run record (status, timestamps, labels, config) plus every
-invocation in the matrix. The **Labels** strip lists every label as a
-`key: value` chip — the caller's own first, then the provenance labels faucet
-stamps (`template`, `pipeline`, `backfill`, …) muted; clicking one opens the
-Runs list filtered by it. For in-flight runs it streams structured log events
-live via SSE (the same `GET /v1/runs/{id}/logs` endpoint). You can cancel or
-delete a run from this view.
+- **Overview**: the name, status, `source → sink` and run id; any error, with
+  each failed invocation's own error; a card with the records written, the
+  submitted / started / finished times and the duration, and the
+  [row accounting](../reference/http-api.md#get-v1runsid--runrecord) of every
+  invocation summed into one bar (written, merged, skipped, to the DLQ,
+  quarantined, dropped, and `unaccounted` in red when a sink lost rows); the
+  slowest invocations; provenance (template and version, pool, tenant,
+  `depends_on` edges, the DLQ it replayed, idempotency key, clock, timeout);
+  the labels; and the last lines of the log. Clicking a label adds it to the
+  list's filters.
+- **Invocations**: every invocation, slowest first, with its own run id,
+  records, rows, batches, source lag, duration bar and error.
+- **Logs**: the full log, streamed live over SSE for an in-flight run (the
+  same `GET /v1/runs/{id}/logs` endpoint).
+- **Dead-letter queue**: the DLQ tools described below.
 
 With [log shipping](../operations/observability.md#shipping-logs) on, a **Log
 export** panel shows whether the run's lines reached the log service —
 `exported`, `pending`, `failed` (with the last error), or `partially_dropped`
 (with the dropped count) — and how many lines are still buffered locally. With
 `--log-link-template` set, **View logs ↗** (and the link beside the *Logs*
-heading) opens the run in the log service; once the local copy has aged out, the
+tab) opens the run in the log service; once the local copy has aged out, the
 log pane says so and points there.
 
-It also embeds a **dead-letter-queue panel** — enter a server-local DLQ location
+The **Dead-letter queue** tab holds the DLQ tools (not tied to the run) — enter a server-local DLQ location
 (a `.jsonl` file, a directory, or a glob), then **Inspect** it (grouped by
 reason), **Discard** envelopes (optionally archiving first), or **Replay
 through a config** — paste a pipeline config and re-feed the quarantined
@@ -114,22 +137,45 @@ payloads through its transforms / quality / contract / sink, with a dry-run
 toggle. This is the [DLQ replay](./dlq.md) workflow, in the browser (backed by
 `POST /v1/dlq/{inspect,replay,discard}`).
 
-The invocations table's **rows** column says where each invocation's rows went
+The **Invocations** tab's **rows** column says where each invocation's rows went
 — `98 ok · 2 dlq`, plus any rows merged by a keyed write, skipped by the sink,
 quarantined, dropped or `unaccounted` (red: a sink lost them and the run
 failed); hovering it shows how many rows were offered and how many the
 transforms filtered out ([row accounting](../reference/http-api.md#get-v1runsid--runrecord)).
 
-The invocations table carries each invocation's own **run id** — the value of
+The same table carries each invocation's own **run id** — the value of
 the `_faucet_run_id` column and what a rollback undoes — and a finished run
 made with a `rollback:` block gets a **Roll back…** button (admin-only) that
-opens a panel with an invocation picker, a dry-run toggle, a *force* toggle for
+opens a panel on the Overview tab with an invocation picker, a dry-run toggle, a *force* toggle for
 keys a later run changed, and a config editor for servers that did not store the
 run's config. The result renders inline: what was deleted / restored, any
 conflicts, and whether the bookmark was rewound (backed by
 `POST /v1/runs/{id}/rollback`; see [Undoing a run](./rollback.md)).
 
 ![A run's detail view showing the status summary, the Roll back… and Delete actions, the invocations table with a run id column, the log panel, and the dead-letter-queue inspect/replay/discard panel](../assets/console/run-detail.png)
+
+### Changes
+
+Change requests ([plan → approve → run](./approvals.md)) use the same split
+pane: `#/changes` lists them, `#/changes/<id>` selects one. The list has a
+**Needs me** tab (pending requests you may approve: not your own, not already
+approved by you; shown to principals with the `change_approve` permission) and
+**All**, a stat strip (pending, executed, rejected, failed), and sections for
+**Pending**, **Approved, executing** and **Decided**. Each row shows the
+proposal, its age, and its kind and approvals, or its outcome.
+
+The detail pane's **Plan** tab shows the requester's reason, then the stored
+plan as a diff: one block per pipeline row (`source → sink`, write mode,
+delivery guarantee, transforms, schema drift, governance passes) and the
+budget, or for a template change the version being launched, registered,
+deleted or retired. Its footnote gives the verdict of the impact and policy
+analysis. Below it are the approvals so far, the budget, and, for a pending
+request, the comment and rejection-reason fields behind **Reject** and
+**Approve** (hidden without `change_approve`; the server's approval policy
+still decides, and its refusal names the rule). **Impact** lists each row's
+schema delta, affected downstream datasets and owners, and policy violations;
+**History** is the timeline of the request, its approvals and its outcome, with
+a link to the run it started.
 
 ### Submit
 

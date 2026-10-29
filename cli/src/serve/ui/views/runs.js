@@ -1,36 +1,74 @@
+// Runs (#998): the run list beside the selected run's detail. `#/runs` and
+// `#/runs/<id>` are one view, so selecting a run keeps the list, its filters
+// and its scroll position.
 import { api, toast } from "../api.js";
 import { navigate } from "../router.js";
-import { escapeHtml, fmtInt, fmtDuration, fmtCompact, labelChip, sortedLabels, TERMINAL_RUN_STATUSES as TERMINAL } from "../utils.js";
+import { escapeHtml, fmtInt, fmtDuration, fmtCompact, fmtAge, TERMINAL_RUN_STATUSES as TERMINAL } from "../utils.js";
 import { attachDatePicker } from "./date-picker.js";
 import { formatTs } from "../tz.js";
 import { currentTenant, tenantList, withTenant } from "../tenant.js";
+import { icon, statStrip, listRow, tabs } from "../components.js";
+import { splitPane, sectionList } from "./split.js";
+import { mountRunDetail } from "./detail.js";
 
 // Every RunStatus the API accepts — pending/sharded appear in cluster mode.
 const STATUSES = ["queued", "pending", "running", "sharded", "completed", "failed", "cancelled"];
-
-// Label chips shown per row before the rest collapse into "+N".
-const ROW_LABELS = 3;
 // The API's cap on label filters per query.
 const MAX_LABEL_FILTERS = 10;
+const PAGE = 100;
+
+const TABS = [
+  { id: "all", label: "All runs", statuses: [] },
+  { id: "active", label: "Active", statuses: ["queued", "pending", "running", "sharded"] },
+  { id: "failed", label: "Failed", statuses: ["failed"] },
+];
+
+const SECTIONS = [
+  ["running", "Running", ["running", "sharded"]],
+  ["queued", "Queued", ["queued", "pending"]],
+  ["failed", "Failed", ["failed"]],
+  ["completed", "Succeeded", ["completed"]],
+  ["cancelled", "Cancelled", ["cancelled"]],
+];
+
+const RING = {
+  running: ["info", "half"],
+  sharded: ["info", "half"],
+  queued: ["warn", "hollow"],
+  pending: ["warn", "hollow"],
+  completed: ["ok", "full"],
+  failed: ["bad", "full"],
+  cancelled: ["muted", "hollow"],
+};
 
 export async function renderRuns(container, params = {}) {
   let cursor = null;
+  let runs = [];
   let filters = { status: "", name: "", since: "", until: "" };
   // `key:value` / `key` label filters, kept in the URL hash (`#/runs?label=…`).
   const labelFilters = [];
   for (const l of params.query?.getAll("label") || []) {
     if (l && !labelFilters.includes(l)) labelFilters.push(l);
   }
-  const statusSel = new Set(); // selected statuses (empty = all)
+  const statusSel = new Set();
+  let tab = "all";
   let pollTimer = null;
+  let selected = params.id || null;
+  let detailStop = null;
+  let alive = true;
 
-  container.innerHTML = `
-    <div class="page">
-      <div class="page-head">
-        <h1>Runs</h1>
-        <button class="btn-primary" id="r-submit" data-perm="config_submit">+ Submit run</button>
+  const pane = splitPane(container, {
+    name: "Runs",
+    listHead: `
+      <div class="sp-tabs">
+        ${tabs(TABS, tab)}
+        <span class="sp-tools">
+          <button type="button" class="icon-btn" id="f-toggle" title="Filters" aria-label="Filters" aria-expanded="false">${icon("filter")}<span class="sp-dot" hidden></span></button>
+          <button type="button" class="icon-btn" id="f-refresh" title="Refresh" aria-label="Refresh">${icon("refresh")}</button>
+          <a class="icon-btn" id="r-submit" href="#/submit" data-perm="config_submit" title="Submit a run" aria-label="Submit a run">${icon("plus")}</a>
+        </span>
       </div>
-      <div class="filters">
+      <div class="sp-filters" id="f-panel" hidden>
         <details class="dd" id="f-status-dd">
           <summary id="f-status-sum">status ▾</summary>
           <div class="dd-menu">
@@ -42,28 +80,28 @@ export async function renderRuns(container, params = {}) {
         <input id="f-until" class="date-input" type="text" readonly placeholder="to…" />
         <input id="f-label" placeholder="label key:value" title="Filter by label: key:value for an exact value, key for any value. Enter adds it." />
         <button class="btn-ghost" id="f-apply">Apply</button>
-        <button class="btn-ghost" id="f-refresh">↻</button>
-        <div class="label-filters" id="f-labels" hidden></div>
+        <button class="btn-ghost" id="f-clear">Clear</button>
       </div>
-      <table class="ds-table runs-table">
-        <thead><tr>
-          <th>status</th><th>name</th><th>duration</th><th>rows</th><th>submitted</th>
-        </tr></thead>
-        <tbody id="runs-list"></tbody>
-      </table>
-      <button class="btn-ghost load-more" id="r-more" hidden>Load more</button>
-    </div>`;
+      <div class="label-filters" id="f-labels" hidden></div>
+      <div id="r-stats"></div>`,
+  });
+  const $ = (sel) => pane.head.querySelector(sel);
+  const labelBox = $("#f-labels");
+  const labelInput = $("#f-label");
+  const list = sectionList(pane.body, "faucet.runs.sections");
 
-  const list = container.querySelector("#runs-list");
-  const labelBox = container.querySelector("#f-labels");
-  const labelInput = container.querySelector("#f-label");
-
-  // Mirror the label filters into the hash without re-rendering the view.
-  function syncHash() {
+  function queryString() {
     const p = new URLSearchParams();
     for (const l of labelFilters) p.append("label", l);
     const qs = p.toString();
-    history.replaceState(null, "", qs ? `#/runs?${qs}` : "#/runs");
+    return qs ? `?${qs}` : "";
+  }
+  function hrefFor(id) {
+    return `#/runs/${encodeURIComponent(id)}${queryString()}`;
+  }
+  // Mirror the label filters into the hash without re-rendering the view.
+  function syncHash() {
+    history.replaceState(null, "", selected ? hrefFor(selected) : `#/runs${queryString()}`);
   }
 
   function renderLabelFilters() {
@@ -76,9 +114,10 @@ export async function renderRuns(container, params = {}) {
         labelFilters.splice(Number(b.dataset.i), 1);
         renderLabelFilters();
         syncHash();
-        load(true);
+        load("fresh");
       };
     });
+    markFiltered();
   }
 
   // Returns false (with a toast) for an entry the API would refuse.
@@ -100,31 +139,37 @@ export async function renderRuns(container, params = {}) {
     return true;
   }
 
+  function markFiltered() {
+    const on = !!(filters.name || filters.since || filters.until || labelFilters.length || (statusSel.size && !TABS.some((t) => t.id === tab && t.statuses.length)));
+    $("#f-toggle .sp-dot").hidden = !on;
+  }
+
   labelInput.onkeydown = (e) => {
     if (e.key !== "Enter") return;
     e.preventDefault();
     if (addLabelFilter(labelInput.value)) {
       labelInput.value = "";
-      load(true);
+      load("fresh");
     }
   };
-
-  // A label chip in a row filters by it instead of opening the run.
-  list.addEventListener("click", (e) => {
-    const chip = e.target.closest(".label-chip");
-    if (!chip) return;
-    e.stopPropagation();
-    if (addLabelFilter(chip.dataset.label)) load(true);
-  });
   renderLabelFilters();
-  container.querySelector("#r-submit").onclick = () => navigate("#/submit");
-  attachDatePicker(container.querySelector("#f-since"));
-  attachDatePicker(container.querySelector("#f-until"));
+  attachDatePicker($("#f-since"));
+  attachDatePicker($("#f-until"));
 
-  // Multi-select status filter: check any combination (empty = all). Applied on
-  // the Apply button, alongside name/date, so one round-trip covers every filter.
-  const statusDd = container.querySelector("#f-status-dd");
-  const statusSum = container.querySelector("#f-status-sum");
+  const toggle = $("#f-toggle");
+  toggle.onclick = () => {
+    const panel = $("#f-panel");
+    panel.hidden = !panel.hidden;
+    toggle.setAttribute("aria-expanded", String(!panel.hidden));
+    toggle.classList.toggle("on", !panel.hidden);
+  };
+
+  const statusDd = $("#f-status-dd");
+  const statusSum = $("#f-status-sum");
+  function syncStatusBoxes() {
+    statusDd.querySelectorAll("input[type=checkbox]").forEach((cb) => (cb.checked = statusSel.has(cb.value)));
+    statusSum.textContent = statusSel.size ? `status (${statusSel.size}) ▾` : "status ▾";
+  }
   statusDd.querySelectorAll("input[type=checkbox]").forEach((cb) => {
     cb.onchange = () => {
       if (cb.checked) statusSel.add(cb.value);
@@ -132,111 +177,249 @@ export async function renderRuns(container, params = {}) {
       statusSum.textContent = statusSel.size ? `status (${statusSel.size}) ▾` : "status ▾";
     };
   });
-  // Named handler so the view teardown can remove it — a per-render anonymous
-  // listener would accumulate on `document` across navigations.
   const closeStatusDd = (e) => {
     if (statusDd.open && !statusDd.contains(e.target)) statusDd.open = false;
   };
   document.addEventListener("click", closeStatusDd);
 
-  function query(reset) {
-    if (reset) cursor = null;
+  function setTab(id) {
+    tab = id;
+    pane.head.querySelectorAll(".c-tab").forEach((b) => {
+      const on = b.dataset.tab === id;
+      b.classList.toggle("on", on);
+      b.setAttribute("aria-selected", String(on));
+    });
+  }
+  pane.head.querySelectorAll(".c-tab").forEach((b) => {
+    b.onclick = () => {
+      const t = TABS.find((x) => x.id === b.dataset.tab);
+      setTab(t.id);
+      statusSel.clear();
+      t.statuses.forEach((s) => statusSel.add(s));
+      syncStatusBoxes();
+      filters.status = [...statusSel].join(",");
+      markFiltered();
+      load("fresh");
+    };
+  });
+  function tabForStatuses() {
+    const key = [...statusSel].sort().join(",");
+    const t = TABS.find((x) => [...x.statuses].sort().join(",") === key);
+    setTab(t ? t.id : "");
+  }
+
+  // `fresh` starts over at one page; a refresh re-reads every row already
+  // shown, so rows don't vanish; `more` appends the next page.
+  function query(mode) {
     const p = new URLSearchParams();
     if (filters.status) p.set("status", filters.status);
     if (filters.name) p.set("name", filters.name);
     if (filters.since) p.set("since", new Date(filters.since).toISOString());
     if (filters.until) p.set("until", new Date(filters.until).toISOString());
-    p.set("limit", "50");
-    if (cursor) p.set("cursor", cursor);
+    p.set("limit", String(mode === "refresh" ? Math.min(500, Math.max(PAGE, runs.length)) : PAGE));
+    if (mode === "more" && cursor) p.set("cursor", cursor);
     for (const l of labelFilters) p.append("label", l);
     withTenant(p);
     return p.toString();
   }
 
-  async function load(reset) {
-    if (!reset && !cursor) return; // no next page — don't re-fetch page 1 into the list
+  let seq = 0;
+  async function load(mode) {
+    if (mode === "more" && !cursor) return;
+    const mine = ++seq;
     try {
-      const data = await api(`/v1/runs?${query(reset)}`);
-      if (reset) list.innerHTML = "";
-      if (!data.runs.length && reset)
-        list.innerHTML = `<tr><td colspan="5" class="empty">${labelFilters.length ? "No runs carry these labels." : "No runs yet."}</td></tr>`;
-      for (const r of data.runs) list.appendChild(row(r));
+      const data = await api(`/v1/runs?${query(mode)}`);
+      if (!alive || mine !== seq) return;
+      runs = mode === "more" ? runs.concat(data.runs) : data.runs;
       cursor = data.next_cursor || null;
-      container.querySelector("#r-more").hidden = !cursor;
-      maybePoll(data.runs);
+      paint();
+      maybePoll();
     } catch (e) {
+      if (!alive || mine !== seq) return;
       toast(e.message, "error");
+      maybePoll(true);
     }
   }
 
-  function maybePoll(runs) {
-    const active = runs.some((r) => !TERMINAL.includes(r.status));
+  function maybePoll(retry = false) {
     clearTimeout(pollTimer);
-    if (active) pollTimer = setTimeout(() => load(true), 3000);
+    if (!alive) return;
+    if (retry || runs.some((r) => !TERMINAL.includes(r.status))) pollTimer = setTimeout(() => load("refresh"), 3000);
+    else pollTimer = setTimeout(() => load("refresh"), 15000);
   }
 
-  container.querySelector("#f-apply").onclick = () => {
+  function paint() {
+    const more = cursor ? "+" : "";
+    const count = (sts) => runs.filter((r) => sts.includes(r.status)).length;
+    const records = runs.reduce((n, r) => n + (r.records_written || 0), 0);
+    $("#r-stats").innerHTML = statStrip([
+      { label: "Running", value: `${fmtInt(count(["running", "sharded"]))}${more}`, tone: "info" },
+      { label: "Succeeded", value: `${fmtInt(count(["completed"]))}${more}`, tone: "ok" },
+      { label: "Failed", value: `${fmtInt(count(["failed"]))}${more}`, tone: count(["failed"]) ? "bad" : "" },
+      { label: "Records", value: `${fmtCompact(records)}${more}` },
+    ]);
+    const now = Date.now();
+    const filtered = !!(filters.status || filters.name || filters.since || filters.until || labelFilters.length);
+    const empty = filtered
+      ? `<div class="sp-empty"><b>No runs match these filters.</b><span>Clear the filters, or widen the date range.</span></div>`
+      : `<div class="sp-empty"><b>No runs yet.</b><span>Submit a pipeline config on the <a href="#/submit">Submit</a> page, trigger a template, or <code>POST /v1/runs</code>.</span></div>`;
+    list.render(
+      SECTIONS.map(([id, label, sts]) => {
+        const rows = runs.filter((r) => sts.includes(r.status));
+        return { id, label, count: rows.length, rows: rows.map((r) => runRow(r, now)) };
+      }),
+      {
+        empty,
+        footer: cursor ? `<button type="button" class="btn-ghost load-more" id="r-more">Load more</button>` : "",
+      },
+    );
+  }
+
+  function runRow(r, now) {
+    const [tone, shape] = RING[r.status] || ["muted", "full"];
+    const facts = rowFacts(r);
+    return listRow({
+      id: r.run_id,
+      href: hrefFor(r.run_id),
+      tone,
+      shape,
+      title: runTitle(r),
+      tooltip: runTitle(r) !== r.run_id ? `${runTitle(r)}\n${r.run_id}` : r.run_id,
+      age: fmtAge(r.submitted_at, now),
+      ageTitle: `submitted ${fmtTime(r.submitted_at)}`,
+      metaLead: facts[0],
+      meta: facts.slice(1).join(" · "),
+      selected: r.run_id === selected,
+    });
+  }
+
+  pane.body.addEventListener("click", (e) => {
+    if (e.target.closest("#r-more")) load("more");
+  });
+
+  $("#f-apply").onclick = () => {
     if (!addLabelFilter(labelInput.value)) return;
     labelInput.value = "";
     filters = {
       status: [...statusSel].join(","),
-      name: container.querySelector("#f-name").value.trim(),
-      since: container.querySelector("#f-since").dataset.value || "",
-      until: container.querySelector("#f-until").dataset.value || "",
+      name: $("#f-name").value.trim(),
+      since: $("#f-since").dataset.value || "",
+      until: $("#f-until").dataset.value || "",
     };
-    load(true);
+    tabForStatuses();
+    markFiltered();
+    load("fresh");
   };
-  container.querySelector("#f-refresh").onclick = () => load(true);
-  container.querySelector("#r-more").onclick = () => load(false);
+  $("#f-clear").onclick = () => {
+    statusSel.clear();
+    syncStatusBoxes();
+    $("#f-name").value = "";
+    for (const id of ["#f-since", "#f-until"]) {
+      const el = $(id);
+      el.value = "";
+      delete el.dataset.value;
+    }
+    labelFilters.length = 0;
+    labelInput.value = "";
+    filters = { status: "", name: "", since: "", until: "" };
+    setTab("all");
+    renderLabelFilters();
+    syncHash();
+    load("fresh");
+  };
+  $("#f-refresh").onclick = () => load("refresh");
 
-  await load(true);
-  return () => {
-    clearTimeout(pollTimer);
-    document.removeEventListener("click", closeStatusDd);
-  }; // teardown
+  function showDetail(id) {
+    detailStop?.();
+    detailStop = null;
+    selected = id;
+    pane.setSelected(!!id);
+    list.select(id);
+    if (!id) {
+      pane.detail.innerHTML = runs.length
+        ? `<div class="sp-none"><b>Select a run</b><span>Pick a run on the left to see its invocations, row accounting and live logs.</span></div>`
+        : `<div class="sp-none"><b>Nothing to show yet</b><span>Runs appear here as soon as one is submitted.</span></div>`;
+      return;
+    }
+    detailStop = mountRunDetail(pane.detail, id, {
+      backHref: `#/runs${queryString()}`,
+      onLabel: (l) => {
+        if (addLabelFilter(l)) load("fresh");
+      },
+      onChange: () => load("refresh"),
+      onDeleted: () => {
+        runs = runs.filter((r) => r.run_id !== id);
+        navigate(`#/runs${queryString()}`);
+        load("refresh");
+      },
+    });
+  }
+
+  await load("fresh");
+  if (!alive) return;
+  showDetail(selected);
+
+  return {
+    teardown() {
+      alive = false;
+      clearTimeout(pollTimer);
+      detailStop?.();
+      document.removeEventListener("click", closeStatusDd);
+    },
+    update(p) {
+      const ls = [...new Set((p.query?.getAll("label") || []).filter(Boolean))];
+      if (ls.join("\n") !== labelFilters.join("\n")) {
+        labelFilters.splice(0, labelFilters.length, ...ls);
+        renderLabelFilters();
+        load("fresh");
+      }
+      const id = p.id || null;
+      if (id === selected) return;
+      showDetail(id);
+      if (!id) paint();
+    },
+  };
 }
 
-// Which tenant a run belongs to, shown while the list is not scoped to one.
-function tenantTag(r) {
-  if (!r.tenant || currentTenant()) return "";
-  const t = (tenantList() || []).find((x) => x.id === r.tenant);
-  const label = t?.name || r.tenant;
-  return ` <span class="run-tenant" title="tenant ${escapeHtml(r.tenant)}">${escapeHtml(label)}</span>`;
+/** A run's display name: its name, else the pipeline it ran, else its id. */
+export function runTitle(r) {
+  return r.name || (r.labels || {}).pipeline || r.run_id;
 }
 
-// The execution pool a run is placed in, shown unless it is `default`.
-function poolTag(r) {
-  if (!r.pool || r.pool === "default") return "";
-  return ` <span class="run-tenant run-pool" title="execution pool ${escapeHtml(r.pool)}">pool ${escapeHtml(r.pool)}</span>`;
+/** `rest → file` from the first invocation's usage record, when it has one. */
+export function runKinds(r) {
+  const u = (r.invocations || []).find((i) => i.usage && i.usage.source_kind)?.usage;
+  return u ? `${u.source_kind} → ${u.sink_kind}` : "";
 }
 
-// Up to ROW_LABELS chips, caller labels first; the rest fold into "+N".
-function rowLabels(r) {
-  const all = sortedLabels(r.labels);
-  if (!all.length) return "";
-  const shown = all.slice(0, ROW_LABELS).map(([k, v, p]) => labelChip(k, v, p)).join("");
-  const rest = all.slice(ROW_LABELS);
-  const more = rest.length
-    ? `<span class="label-more" title="${escapeHtml(rest.map(([k, v]) => `${k}: ${v}`).join("\n"))}">+${rest.length}</span>`
-    : "";
-  return `<div class="run-labels">${shown}${more}</div>`;
+// The facts a row's meta line shows, most telling first.
+function rowFacts(r) {
+  const l = r.labels || {};
+  const facts = [];
+  const recs = `${fmtInt(r.records_written ?? 0)} records`;
+  const invErr = (r.invocations || []).find((i) => i.error && !i.skipped)?.error;
+  if (r.status === "failed") facts.push(firstLine(invErr || r.error) || "failed");
+  else if (l.template) facts.push(`template ${l.template}${l.template_version ? `@v${l.template_version}` : ""}`);
+  else if (l.backfill_unit) facts.push(`backfill ${l.backfill_unit}`);
+  else if (l.dlq_replay) facts.push("DLQ replay");
+  else if (runKinds(r)) facts.push(runKinds(r));
+  else facts.push(recs);
+  if (r.status !== "failed" && runKinds(r) && !facts.includes(runKinds(r))) facts.push(runKinds(r));
+  if (facts[0] !== recs) facts.push(recs);
+  const inv = (r.invocations || []).length;
+  if (inv > 1) facts.push(`${fmtInt(inv)} invocations`);
+  if (r.elapsed_secs != null) facts.push(r.elapsed_secs < 1 ? "<1s" : fmtDuration(r.elapsed_secs));
+  if (r.pool && r.pool !== "default") facts.push(`pool ${r.pool}`);
+  if (r.tenant && !currentTenant()) {
+    const t = (tenantList() || []).find((x) => x.id === r.tenant);
+    facts.push(t?.name || r.tenant);
+  }
+  if (r.attempt) facts.push(`attempt ${r.attempt + 1}`);
+  return facts;
 }
 
-function row(r) {
-  const el = document.createElement("tr");
-  el.className = "ds-tr";
-  el.onclick = () => navigate(`#/runs/${r.run_id}`);
-  const secs = r.elapsed_secs;
-  const elapsed = secs != null ? fmtDuration(secs) : "—";
-  const elapsedExact = secs != null ? `${secs.toFixed(1)}s` : "";
-  const recs = r.records_written ?? 0;
-  el.innerHTML = `
-    <td><span class="pill pill-${r.status}">${r.status}</span></td>
-    <td class="ds-uri"><div class="ds-uri-in">${escapeHtml(r.name || r.run_id)}${tenantTag(r)}${poolTag(r)}</div>${rowLabels(r)}</td>
-    <td class="ds-meta ds-num" title="${elapsedExact}">${elapsed}</td>
-    <td class="ds-meta ds-num" title="${fmtInt(recs)}">${fmtCompact(recs)}</td>
-    <td class="ds-meta ds-time">${fmtTime(r.submitted_at)}</td>`;
-  return el;
+function firstLine(s) {
+  return String(s || "").split("\n")[0].trim();
 }
 
 export function fmtTime(s) {

@@ -28,6 +28,12 @@ const PATHS = {
   check: '<path d="M20 6L9 17l-5-5"/>',
   x: '<path d="M18 6L6 18M6 6l12 12"/>',
   play: '<path d="M6 4l14 8-14 8z"/>',
+  filter: '<path d="M3 5h18M6 12h12M10 19h4"/>',
+  refresh: '<path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/>',
+  back: '<path d="M15 6l-6 6 6 6"/>',
+  undo: '<path d="M9 14L4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 0 12h-3"/>',
+  trash: '<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
 };
 
 /** An inline stroke icon by name (see `PATHS`); unknown names render nothing. */
@@ -67,12 +73,24 @@ export function statusRing(tone = "muted", shape = "full") {
 
 /** One list item: ring, title, age, and a muted meta line whose `metaLead`
  *  is shown in bold. `href` makes the row a link. */
-export function listRow({ tone, shape, title, age, metaLead, meta, href, selected, tooltip }) {
+export function listRow({ tone, shape, title, age, metaLead, meta, href, selected, tooltip, id, ageTitle }) {
   const tag = href ? "a" : "div";
-  const attrs = href ? ` href="${esc(href)}"` : "";
+  const attrs = (href ? ` href="${esc(href)}"` : "") + (id ? ` data-id="${esc(id)}"` : "");
   const lead = metaLead ? `<b>${esc(metaLead)}</b>` : "";
   const rest = meta ? `${lead ? " · " : ""}${esc(meta)}` : "";
-  return `<${tag} class="${cls("c-row", selected && "on")}"${attrs}${selected ? ' aria-current="true"' : ""}>${statusRing(tone, shape)}<span class="c-row-t" title="${esc(tooltip || title)}">${esc(title)}</span><span class="c-row-age">${esc(age || "")}</span><span class="c-row-meta">${lead}${rest}</span></${tag}>`;
+  return `<${tag} class="${cls("c-row", selected && "on")}"${attrs}${selected ? ' aria-current="true"' : ""}>${statusRing(tone, shape)}<span class="c-row-t" title="${esc(tooltip || title)}">${esc(title)}</span><span class="c-row-age"${ageTitle ? ` title="${esc(ageTitle)}"` : ""}>${esc(age || "")}</span><span class="c-row-meta" title="${esc([metaLead, meta].filter(Boolean).join(" · "))}">${lead}${rest}</span></${tag}>`;
+}
+
+/** A row of tabs: `[{ id, label, count? }]`; `on` is the active id. */
+export function tabs(items, on, { cls: extra = "" } = {}) {
+  return `<div class="${cls("c-tabs", extra)}" role="tablist">${items
+    .map(
+      (t) =>
+        `<button type="button" role="tab" class="${cls("c-tab", t.id === on && "on")}" data-tab="${esc(t.id)}" aria-selected="${t.id === on}"${
+          t.hidden ? " hidden" : ""
+        }${t.perm ? ` data-perm="${esc(t.perm)}"` : ""}>${esc(t.label)}${t.count == null ? "" : `<span class="c-tab-n">${num(t.count)}</span>`}</button>`,
+    )
+    .join("")}</div>`;
 }
 
 /** A rounded status pill: tone ok|warn|bad|info or none. `iconName` is optional. */

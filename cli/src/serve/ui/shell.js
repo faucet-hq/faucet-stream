@@ -135,6 +135,17 @@ function shortId(id) {
   return id.length > 14 ? `${id.slice(0, 6)}…${id.slice(-4)}` : id;
 }
 
+/** Show a view's own name for the item the route selects (a run's name,
+ *  not its id) as the last breadcrumb. */
+export function setCrumbTitle(text) {
+  const last = document.querySelector("#crumb > b:last-child");
+  if (!last || !text) return;
+  last.textContent = text;
+  last.title = text;
+  const entry = entryFor(currentPath());
+  if (entry) document.title = `${text} · ${entry.label} — faucet stream`;
+}
+
 /** Fill the top bar's context chip slot (trusted markup; "" clears it). */
 export function setContext(html) {
   const el = document.getElementById("ctx-chip");
