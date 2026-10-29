@@ -63,11 +63,12 @@ impl RunDependencies {
         if self.is_empty() {
             return Ok(false);
         }
-        if doc
-            .pointer("/pipeline/nodes")
-            .and_then(Value::as_array)
-            .is_some_and(|n| !n.is_empty())
-        {
+        let topology = match doc.pointer("/pipeline/nodes") {
+            Some(Value::Object(n)) => !n.is_empty(),
+            Some(Value::Array(n)) => !n.is_empty(),
+            _ => false,
+        };
+        if topology {
             return Err(CliError::Config(
                 "run request `depends_on`: this pipeline is a topology (`pipeline.nodes`) — it \
                  has no matrix rows to order; express the order with its `edges:`"
@@ -398,6 +399,26 @@ mod tests {
             .apply_to_document(&mut json!({"pipeline": {"nodes": [{"id": "a"}]}}))
             .unwrap_err();
         assert!(e.to_string().contains("topology"), "{e}");
+        assert!(is_run_dependency_error(&e));
+    }
+
+    #[test]
+    fn a_topology_config_is_told_to_use_its_edges() {
+        let mut d = json!({
+            "pipeline": {
+                "nodes": {
+                    "src": {"type": "source"},
+                    "out": {"type": "sink"}
+                },
+                "edges": [{"from": "src", "to": "out"}]
+            }
+        });
+        let e = deps(json!({"out": ["src"]}))
+            .apply_to_document(&mut d)
+            .unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("topology"), "{msg}");
+        assert!(msg.contains("`edges:`"), "{msg}");
         assert!(is_run_dependency_error(&e));
     }
 
