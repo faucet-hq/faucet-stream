@@ -45,7 +45,7 @@ const P = {
   play: '<path d="M6 4l14 8-14 8z"/>',
   undo: '<path d="M9 14L4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 0 10h-3"/>',
   flask: '<path d="M9 3h6M10 3v6L4 19a1.5 1.5 0 0 0 1.3 2h13.4A1.5 1.5 0 0 0 20 19l-6-10V3"/>',
-  rocket: '<path d="M5 15c-1.5 1.3-2 5-2 5s3.7-.5 5-2c.7-.8.7-2.1-.1-2.9a2.1 2.1 0 0 0-2.9-.1z"/><path d="M12 15l-3-3a22 22 0 0 1 2-4A12.9 12.9 0 0 1 22 2c0 2.7-.8 7.5-6 11a22.4 22.4 0 0 1-4 2z"/>'
+  rocket: '<path d="M12 15l-3-3a22 22 0 0 1 2-4A12.9 12.9 0 0 1 22 2c0 2.7-.8 7.5-6 11a22.4 22.4 0 0 1-4 2z"/><path d="M9 12H5s.6-3 2-4c1.6-1.1 4 0 4 0"/><path d="M12 15v4s3-.6 4-2c1.1-1.6 0-4 0-4"/><circle cx="15.5" cy="8.5" r="1.5"/><path d="M7 17l-3 3M5 14.5l-1.5 1.5M9.5 19.5L8 21"/>'
 };
 const ic = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${P[n]}</svg>`;
 const params = new URLSearchParams(location.search);
