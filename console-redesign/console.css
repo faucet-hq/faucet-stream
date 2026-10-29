@@ -54,8 +54,7 @@ svg.i { width: 15px; height: 15px; stroke: currentColor; fill: none; stroke-widt
 /* sidebar */
 .side { display: flex; flex-direction: column; padding: 6px 4px; min-height: 0; }
 .ws { display: flex; align-items: center; gap: 10px; padding: 6px 8px 12px; }
-.ws .logo { width: 28px; height: 28px; border-radius: 7px; background: var(--accent); display: grid; place-items: center; color: var(--accent-ink); }
-.ws .logo svg { stroke: var(--accent-ink); stroke-width: 2; width: 16px; height: 16px; fill: none; }
+.ws .logo { flex: none; display: block; }
 .ws b { display: block; font-size: 13.5px; }
 .ws span { color: var(--muted); font-size: 12px; }
 .ws .chev { margin-left: auto; color: var(--muted); }

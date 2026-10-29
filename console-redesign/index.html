@@ -61,7 +61,7 @@ const NAV = [
 ];
 const active = { runs: 'runs', templates: 'tpl', changes: 'changes', datasets: 'db' }[view];
 document.getElementById('side').innerHTML = `
-  <div class="ws"><div class="logo"><svg viewBox="0 0 24 24"><path d="M12 3c3 4.5 6 7.6 6 11a6 6 0 0 1-12 0c0-3.4 3-6.5 6-11z"/></svg></div>
+  <div class="ws"><svg class="logo" viewBox="6 6 116 116" width="30" height="30" aria-label="faucet-stream logo"><rect x="6" y="6" width="116" height="116" rx="28" fill="#14B8A6"/><g fill="none" stroke="#fff" stroke-width="11" stroke-linecap="round" stroke-linejoin="round" transform="translate(-2,2)"><path d="M55 40 V26"/><path d="M44 26 H66"/><path d="M34 40 H76 a14 14 0 0 1 14 14 V64"/></g><g fill="#fff" transform="translate(-2,2)"><circle cx="90" cy="79" r="5.5"/><circle cx="90" cy="95" r="4.6" opacity="0.85"/><circle cx="90" cy="108" r="3.6" opacity="0.6"/></g></svg>
     <div><b>faucet</b><span>prod-eu · 3 replicas</span></div>${ic('updown', 'i chev')}</div>
   <div class="quick"><div class="on">${ic('home')}</div><div>${ic('search')}</div><div>${ic('logs')}</div><div>${ic('bell')} 4</div></div>
   ${NAV.map(([g, items]) => `<div class="grp"><h6>${g} ${ic('chev')}</h6>${items.map(([k, l, n, hot]) =>
