@@ -71,6 +71,7 @@ pub mod registry_index;
 pub mod replication;
 pub mod requires;
 pub mod rollback;
+pub mod run_deps;
 pub mod runtime;
 pub mod scaffold;
 #[cfg(feature = "schedule")]

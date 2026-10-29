@@ -515,7 +515,7 @@ Request body:
   repeatable `label=` form. The provenance
   keys the server stamps (`template`, `template_version`, `allow_untested`,
   `sink_template`, `sink_template_version`, `overlay`, `overlay_version`,
-  `selection`) are refused with a `422`; they stay filterable.
+  `selection`, `depends_on`) are refused with a `422`; they stay filterable.
 - **`timeout_secs`** — wall-clock cap; on expiry the run is marked failed.
 - **`doctor_first`** — run preflight probes before executing; on any failure the
   submit returns `422` with the doctor report in `error.details`.
@@ -551,6 +551,25 @@ Request body:
   selection is stored with it, so a clustered or sharded run applies the same
   subset. The same field is accepted by every run-starting endpoint
   (template triggers, tenant runs, fan-out).
+- **`depends_on`** — completion dependencies between the run's rows (#960):
+  `{ "orders": ["customers"], "payments": ["orders"] }` starts `orders` only
+  after `customers` completes. Ordering only, with no record hand-off (that
+  is `parent:`); a failed or skipped prerequisite skips its dependents, as a
+  config's own `depends_on:` does. The edges are **added** to the config's
+  `depends_on:` — a request never removes one. Every name must be a matrix
+  row of the run (a row without an `id` is `row-<n>`), and the combined
+  `parent:` + `depends_on:` graph must stay acyclic; otherwise a `400` naming
+  the edge (`b → ghost`, `a → c` for a cycle). A topology or a config without
+  `matrix:` has nothing to order (`400`). With a `selection`, a prerequisite
+  the selection leaves out follows `include_parents` like a declared one. The
+  edges are folded into the stored config, so a clustered, claimed or sharded
+  run applies them and they are part of the idempotency fingerprint (the same
+  key with different edges is a `409`); the run record keeps them as
+  `depends_on`, the run is labelled `depends_on=<row>:<prerequisites>;…`, and
+  a change request shows them in its plan summary (different edges are a
+  different change). Accepted by every run-starting endpoint (template
+  triggers, tenant runs, fan-out, MCP `run_pipeline` / `run_template` /
+  `propose_run`, a trigger's `run.depends_on`).
 - **`pool`** — the execution pool to run in (#957). Wins over the config's
   `pool:`; with neither the run goes to `default`. Only a replica serving the
   pool (`faucet serve --pool`) claims the run and its shards. A pool no live
@@ -1128,7 +1147,12 @@ parameter (`select`, `only`, `skip`, `tags`, `status` comma-joined;
 and the `error` a trigger would return. A topology template returns
 `rows: []`, `selectable: false`. The trigger body takes the same `selection`
 object as `POST /v1/runs`; for a source template only the selected streams are
-composed, so a stream the sink cannot run does not block the others.
+composed, so a stream the sink cannot run does not block the others. It also
+takes `depends_on` (#960) over the template's rows or streams — for a source
+template the edges join the streams' own `depends_on:` before the selection
+resolves (so `include_parents` follows them), an edge on a stream the
+selection leaves out is dropped with it, and a `for_each` stream is named by
+its rendered row name. The response echoes the edges the run applies.
 `?params=` (a URL-encoded JSON object of param values) lists a source
 template's `for_each` streams as the rows a trigger with those items would
 run (#952) — `?params={"tables":["orders","customers"]}` — and selectors take
@@ -1263,8 +1287,9 @@ The trigger body's `params` / `env` / `version` / `sink` / `sink_version` /
 `POST /v1/runs`, because the run is submitted through the same path. The run is
 labelled `template` and `template_version` (plus `sink_template` /
 `sink_template_version` for a composed run, `overlay` / `overlay_version`
-when an overlay applied, `allow_untested` for a run of a non-`passing` version
-and `selection` for a row selection). Only the server sets these: a caller's
+when an overlay applied, `allow_untested` for a run of a non-`passing` version,
+`selection` for a row selection and `depends_on` for request-supplied
+dependencies). Only the server sets these: a caller's
 `labels` entry under any of those keys is dropped (on `POST /v1/runs`,
 `POST /v1/backfill` and `POST /v1/changes` it is a `422`).
 

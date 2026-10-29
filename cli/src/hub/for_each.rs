@@ -188,6 +188,14 @@ pub fn validate_template(src: &SourceTemplate) -> CliResult<()> {
                 src.name, s.name
             )));
         }
+        if let Some(d) = s.depends_on.iter().find(|d| repeated.contains(d.as_str())) {
+            return Err(CliError::Config(format!(
+                "source-template '{}': stream '{}' depends on the `for_each` stream '{d}' — its \
+                 rows are named only at trigger time; name one in the run request's \
+                 `depends_on` instead",
+                src.name, s.name
+            )));
+        }
         if s.for_each.is_none() {
             continue;
         }
@@ -1182,6 +1190,13 @@ streams:
         .unwrap_err()
         .to_string();
         assert!(err.contains("cannot have children"), "{err}");
+        let err = src(&format!(
+            "{TABLES}  - name: after\n    depends_on: [\"${{t.schema}}_${{t.table}}\"]\n"
+        ))
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("run request's"), "{err}");
         let err = src(&SCALARS.replace("name: \"events_shard_${n}\"", "name: \"events_${n.id}\""))
             .validate()
             .unwrap_err()

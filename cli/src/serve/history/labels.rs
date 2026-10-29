@@ -21,6 +21,7 @@ pub const RESERVED_LABELS: &[&str] = &[
     "overlay",
     "overlay_version",
     crate::select::LABEL_SELECTION,
+    crate::run_deps::LABEL_DEPENDS_ON,
 ];
 
 /// Refuse a caller-supplied label set: a reserved provenance key (unless the

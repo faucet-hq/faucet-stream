@@ -34,7 +34,10 @@ pub(crate) fn map_err(e: crate::error::CliError) -> ServeError {
         CliError::Internal(m) => ServeError::Internal(m),
         CliError::HistoryUnavailable(m) => ServeError::Unavailable(m),
         refused @ CliError::VersionNotPassing { .. } => not_passing(refused),
-        other if crate::select::is_selection_error(&other) => {
+        other
+            if crate::select::is_selection_error(&other)
+                || crate::run_deps::is_run_dependency_error(&other) =>
+        {
             ServeError::BadConfig(other.to_string())
         }
         other => ServeError::Unprocessable {
@@ -1238,6 +1241,11 @@ pub struct TriggerBody {
     /// lists them and previews what a selection resolves to.
     #[serde(default)]
     pub selection: Option<crate::select::SelectionRequest>,
+    /// Completion dependencies between the template's rows / streams (#960),
+    /// added to the template's own: `{"orders": ["customers"]}` starts
+    /// `orders` after `customers` completes.
+    #[serde(default)]
+    pub depends_on: Option<crate::run_deps::RunDependencies>,
     /// The execution pool to run in (#957); wins over the template's `pool:`.
     #[serde(default)]
     pub pool: Option<String>,
@@ -1305,6 +1313,9 @@ pub struct TriggerResponse {
     /// The selection the run applies, as the caller sent it (#741).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selection: Option<crate::select::SelectionRequest>,
+    /// The request's completion dependencies the run applies (#960).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depends_on: Option<crate::run_deps::RunDependencies>,
 }
 
 /// Label keys stamped on a template-triggered run, so `GET /v1/runs` can filter
@@ -1375,10 +1386,11 @@ mod tests {
             super::LABEL_OVERLAY,
             super::LABEL_OVERLAY_VERSION,
             crate::select::LABEL_SELECTION,
+            crate::run_deps::LABEL_DEPENDS_ON,
         ] {
             assert!(super::RESERVED_LABELS.contains(&k), "{k}");
         }
-        assert_eq!(super::RESERVED_LABELS.len(), 8);
+        assert_eq!(super::RESERVED_LABELS.len(), 9);
     }
 
     /// The pre-#703 handler shape the tests were written against: a run, as

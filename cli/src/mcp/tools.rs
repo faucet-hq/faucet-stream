@@ -93,6 +93,7 @@ pub fn tool_defs(ctx: &McpContext) -> Vec<ToolDef> {
                     "config": { "type": "string" },
                     "dry_run": { "type": "boolean", "description": "If true, validate + preview only; do not write to any sink." },
                     "selection": { "type": "object", "description": "Run only some matrix rows / streams: { select: [ids], only: [globs], skip: [ids|globs], tags: [..], status: [available|draft|archived], include_parents: off|eligible|all }. Omit to run every row." },
+                    "depends_on": { "type": "object", "additionalProperties": { "type": "array", "items": { "type": "string" } }, "description": "Completion dependencies between the run's rows / streams, added to the config's own `depends_on:`: { \"orders\": [\"customers\"] } starts orders only after customers completes. Every name must be a row / stream of the run; a cycle is refused." },
                     "pool": { "type": "string", "description": "Execution pool to run in (faucet serve): wins over the config's `pool:`; default `default`. A pool no live replica serves is refused." }
                 },
                 "required": ["config"]
@@ -216,6 +217,7 @@ pub fn tool_defs(ctx: &McpContext) -> Vec<ToolDef> {
                         "env": { "type": "object", "description": "Per-run overrides for ${env:VAR} resolution." },
                         "dry_run": { "type": "boolean", "description": "If true, materialize + validate only; do not write to any sink." },
                         "selection": { "type": "object", "description": "Run only some matrix rows / streams: { select: [ids], only: [globs], skip: [ids|globs], tags: [..], status: [available|draft|archived], include_parents: off|eligible|all }. Omit to run every row." },
+                        "depends_on": { "type": "object", "additionalProperties": { "type": "array", "items": { "type": "string" } }, "description": "Completion dependencies between the run's rows / streams, added to the config's own `depends_on:`: { \"orders\": [\"customers\"] } starts orders only after customers completes. Every name must be a row / stream of the run; a cycle is refused." },
                         "allow_untested": { "type": "boolean", "description": "Run a version whose tests are not `passing`. Once the template has been launched such a run is refused without it; with it the run is labelled `allow_untested=true` and audited. Default false." },
                         "pool": { "type": "string", "description": "Execution pool to run in (faucet serve): wins over the config's `pool:`; default `default`. A pool no live replica serves is refused." }
                     },
@@ -242,6 +244,7 @@ pub fn tool_defs(ctx: &McpContext) -> Vec<ToolDef> {
                     "timeout_secs": { "type": "integer" },
                     "clock": { "type": "string", "description": "RFC 3339 / YYYY-MM-DD run clock for ${now.*}." },
                     "selection": { "type": "object", "description": "Run only some matrix rows / streams: { select: [ids], only: [globs], skip: [ids|globs], tags: [..], status: [available|draft|archived], include_parents: off|eligible|all }. Omit to run every row." },
+                    "depends_on": { "type": "object", "additionalProperties": { "type": "array", "items": { "type": "string" } }, "description": "Completion dependencies between the run's rows / streams, added to the config's own `depends_on:`: { \"orders\": [\"customers\"] } starts orders only after customers completes. Every name must be a row / stream of the run; a cycle is refused." },
                     "pool": { "type": "string", "description": "Execution pool to run in (faucet serve): wins over the config's `pool:`; default `default`. A pool no live replica serves is refused." }
                 },
                 "required": ["config", "reason"]
@@ -469,6 +472,7 @@ async fn propose_run(p: &crate::mcp::ChangeProposer, args: &Value) -> Result<Str
         "timeout_secs",
         "clock",
         "selection",
+        "depends_on",
         "pool",
     ] {
         if let Some(v) = args.get(key).filter(|v| !v.is_null()) {
@@ -807,6 +811,16 @@ async fn preview_unscoped(ctx: &McpContext, args: &Value) -> Result<String, Stri
     Ok(pretty(&doc))
 }
 
+/// The optional `depends_on` argument (#960).
+fn depends_on_arg(args: &Value) -> Result<Option<crate::run_deps::RunDependencies>, String> {
+    match args.get("depends_on") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => serde_json::from_value(v.clone())
+            .map(Some)
+            .map_err(|e| format!("depends_on: {e}")),
+    }
+}
+
 /// The optional `selection` argument (#741).
 fn selection_arg(args: &Value) -> Result<Option<crate::select::SelectionRequest>, String> {
     match args.get("selection") {
@@ -848,6 +862,7 @@ async fn run_pipeline(ctx: &McpContext, args: &Value) -> Result<String, String> 
             "timeout_secs",
             "clock",
             "selection",
+            "depends_on",
             "pool",
         ] {
             if let Some(v) = args.get(key).filter(|v| !v.is_null()) {
@@ -873,6 +888,14 @@ async fn run_pipeline(ctx: &McpContext, args: &Value) -> Result<String, String> 
         }));
     }
 
+    let depended = match depends_on_arg(args)? {
+        Some(deps) => deps
+            .apply_to_text(text, false)
+            .map_err(|e| e.to_string())?
+            .map(|t| (t, deps)),
+        None => None,
+    };
+    let text = depended.as_ref().map_or(text, |(t, _)| t.as_str());
     let summary = crate::run_from_yaml_str_selected(text, selection.as_ref())
         .await
         .map_err(|e| e.to_string())?;
@@ -880,6 +903,7 @@ async fn run_pipeline(ctx: &McpContext, args: &Value) -> Result<String, String> 
     let total: usize = summary.invocations.iter().map(|i| i.records_written).sum();
     let doc = json!({
         "selection": selection.as_ref().map(|s| s.canonical()),
+        "depends_on": depended.as_ref().map(|(_, d)| d.canonical()),
         "invocations": summary.invocations.len(),
         "ok": summary.invocations.len() - failed,
         "failed": failed,
@@ -1250,11 +1274,12 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
             .unwrap_or(false),
     };
     let selection = selection_arg(args)?;
+    let depends_on = depends_on_arg(args)?;
     if let Some(server) = &ctx.server {
         if !dry_run {
             let pool = args.get("pool").and_then(Value::as_str).map(str::to_string);
             return run_template_on_server(
-                server, id, version, supplied, env, sink, selection, pool,
+                server, id, version, supplied, env, sink, selection, depends_on, pool,
             )
             .await;
         }
@@ -1281,6 +1306,7 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
         // The MCP tool runs the pipeline in this process; nothing is persisted.
         crate::templates::Materialize::Local,
         selection.as_ref(),
+        depends_on.as_ref(),
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -1352,6 +1378,7 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
             "rows": rows,
             "run_set": run_set,
             "selection": selection.as_ref().map(|s| s.canonical()),
+            "depends_on": materialized.depends_on.as_ref().map(|d| d.canonical()),
             "dry_run": true,
             "deprecated": deprecated,
             "allow_untested": untested,
@@ -1375,6 +1402,7 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
         "overlay_version": materialized.overlay_version,
         "params": materialized.params_redacted,
         "selection": selection.as_ref().map(|s| s.canonical()),
+        "depends_on": materialized.depends_on.as_ref().map(|d| d.canonical()),
         "invocations": summary.invocations.len(),
         "ok": summary.invocations.len() - failed,
         "failed": failed,
@@ -1403,6 +1431,7 @@ async fn run_template_on_server(
     env: std::collections::BTreeMap<String, String>,
     sink: crate::templates::SinkChoice,
     selection: Option<crate::select::SelectionRequest>,
+    depends_on: Option<crate::run_deps::RunDependencies>,
     pool: Option<String>,
 ) -> Result<String, String> {
     use crate::runtime::server::{TriggerOutcome, trigger_template};
@@ -1424,6 +1453,7 @@ async fn run_template_on_server(
         overlay,
         overlay_version,
         selection,
+        depends_on,
         allow_untested: sink.allow_untested,
         pool,
         ..Default::default()
@@ -2089,6 +2119,42 @@ mod tests {
             )
             .await;
             assert_eq!(out["isError"], true);
+        }
+
+        #[tokio::test]
+        async fn run_pipeline_honours_request_depends_on() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("in.csv"), "id\n1\n").unwrap();
+            let config = format!(
+                "version: 1\nname: m\nexecution: {{ on_error: continue }}\npipeline:\n  source: {{ type: csv, config: {{ path: {d}/in.csv }} }}\n  sink: {{ type: jsonl, config: {{ path: {d}/x.jsonl }} }}\nmatrix:\n  - {{ id: a, source: {{ config: {{ path: {d}/missing.csv }} }}, sink: {{ config: {{ path: {d}/a.jsonl }} }} }}\n  - {{ id: b, sink: {{ config: {{ path: {d}/b.jsonl }} }} }}\n",
+                d = dir.path().display()
+            );
+            let out = call_tool(
+                &ctx(true),
+                "run_pipeline",
+                &json!({"config": config, "depends_on": {"b": ["a"]}}),
+            )
+            .await;
+            assert_eq!(out["isError"], true, "{out}");
+            assert!(out.to_string().contains("b:a"), "{out}");
+            assert!(!dir.path().join("b.jsonl").exists());
+            let out = call_tool(
+                &ctx(true),
+                "run_pipeline",
+                &json!({"config": config, "depends_on": {"b": ["ghost"]}}),
+            )
+            .await;
+            assert_eq!(out["isError"], true);
+            assert!(out.to_string().contains("ghost"), "{out}");
+            let out = call_tool(
+                &ctx(true),
+                "run_pipeline",
+                &json!({"config": config, "depends_on": ["a"]}),
+            )
+            .await;
+            assert_eq!(out["isError"], true);
+            assert!(out.to_string().contains("depends_on"), "{out}");
+            assert!(!dir.path().join("b.jsonl").exists());
         }
 
         #[tokio::test]

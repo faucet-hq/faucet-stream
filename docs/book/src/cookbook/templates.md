@@ -921,6 +921,30 @@ needs `upsert` on a file sink) no longer blocks the others.
 | `eligible` | runnable (`mandatory` / `active`) ancestors are pulled in; a parked (`available` / `draft` / `archived`) one is refused |
 | `all` | every ancestor is pulled in (parked ones with a warning) |
 
+**Ordering rows from the request.** A source template's stream (like a
+matrix row) can declare `depends_on: [other_stream]` — it starts only after
+that stream completes, with no record hand-off. A caller who knows of an
+order the template does not encode adds it to the trigger instead:
+
+```bash
+curl -sX POST localhost:8080/v1/templates/crm/runs -H "Authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"sink":"files","depends_on":{"deals":["accounts"]}}'
+```
+
+The request's edges are **added** to the template's own (never removing
+one), checked like them — every name must be a stream or row of the run (a
+`for_each` stream by its rendered name), and the combined `parent:` +
+`depends_on:` graph must stay acyclic, else a `400` naming the edge — and
+applied before the selection resolves, so a prerequisite the selection
+leaves out follows `include_parents` exactly as in the table above. An edge
+on a stream the selection leaves out is dropped with it. A failed
+prerequisite skips its dependents under the run's `on_error`. The run record
+keeps the edges (`depends_on`), the run is labelled
+`depends_on=deals:accounts`, and they are part of the idempotency fingerprint
+and of a change request's plan. `POST /v1/runs` takes the same field for a
+config's matrix rows.
+
 **What a selection does not change.** State keys are per row
 (`{pipeline}::{row}`), so running a subset never touches another row's
 bookmark. The run is labelled `selection=<canonical form>` (for example

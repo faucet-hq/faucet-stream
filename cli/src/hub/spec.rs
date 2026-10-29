@@ -223,6 +223,11 @@ pub struct Stream {
     /// Default `id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_key: Option<String>,
+    /// Streams this one starts after (completion ordering only — no record
+    /// hand-off, unlike `parent`): the composed row's `depends_on:`. A failed
+    /// prerequisite skips this stream. A run request can add more (#960).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
     /// Set `false` to drop the template's shared `transforms` for this stream
     /// (the matrix-row `inherit_transforms` switch).
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
@@ -314,6 +319,12 @@ impl Stream {
         if self.parent.as_deref() == Some(self.name.as_str()) {
             return Err(CliError::Config(format!(
                 "stream '{}': cannot be its own parent",
+                self.name
+            )));
+        }
+        if self.depends_on.iter().any(|d| d == &self.name) {
+            return Err(CliError::Config(format!(
+                "stream '{}': cannot depend on itself",
                 self.name
             )));
         }
@@ -454,6 +465,14 @@ impl SourceTemplate {
                     "source-template '{}': stream '{}' names unknown parent stream '{p}'",
                     self.name, s.name
                 )));
+            }
+            for d in &s.depends_on {
+                if !seen.contains(d.as_str()) {
+                    return Err(CliError::Config(format!(
+                        "source-template '{}': stream '{}' depends on unknown stream '{d}'",
+                        self.name, s.name
+                    )));
+                }
             }
             if let Some(r) = &s.source.r#ref
                 && r != DEFAULT_SOURCE
@@ -1122,6 +1141,14 @@ per_stream:
                 .contains("unknown parent stream 'nope'")
         );
         assert!(err(&|t| t.streams[1].parent = Some("users".into())).contains("its own parent"));
+        assert!(
+            err(&|t| t.streams[1].depends_on = vec!["nope".into()])
+                .contains("depends on unknown stream 'nope'")
+        );
+        assert!(
+            err(&|t| t.streams[1].depends_on = vec![t.streams[1].name.clone()])
+                .contains("cannot depend on itself")
+        );
         assert!(
             err(&|t| t.streams[1].parent_key = Some("id".into()))
                 .contains("`parent_key` needs a `parent`")

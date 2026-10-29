@@ -275,6 +275,7 @@ async fn submit(
                         labels: Default::default(),
                         timeout_secs: None,
                         selection: None,
+                        depends_on: None,
                         pool: None,
                     },
                     kind: TriggerKind::Webhook {
@@ -901,6 +902,7 @@ async fn trigger_params(adapter: ParamAdapter, state: &ServerState, out: &str) -
                         labels: Default::default(),
                         timeout_secs: None,
                         selection: None,
+                        depends_on: None,
                         pool: None,
                     },
                     kind: TriggerKind::Webhook {

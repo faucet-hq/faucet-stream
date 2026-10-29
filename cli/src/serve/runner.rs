@@ -88,6 +88,12 @@ pub struct SubmitRequest {
     /// sharded run applies the same subset. Omitted: every row runs.
     #[serde(default)]
     pub selection: Option<crate::select::SelectionRequest>,
+    /// Completion dependencies between the run's rows / streams (#960):
+    /// `{"orders": ["customers"]}` starts `orders` only after `customers`
+    /// completes. Added to the config's own `depends_on:` edges (never
+    /// removing one), validated like them, and stored with the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depends_on: Option<crate::run_deps::RunDependencies>,
     /// The execution pool to run in (#957). Wins over the config's `pool:`;
     /// omitted with no `pool:` = `default`. A pool no live replica serves is
     /// refused (422).
@@ -1101,6 +1107,7 @@ pub(crate) async fn enqueue(
     rec.callback = req.callback.clone();
     rec.tenant = principal.tenant().map(str::to_string);
     rec.selection = req.selection.clone();
+    rec.depends_on = req.depends_on.clone().filter(|d| !d.is_empty());
     rec.host_access = req.server_file;
     rec.caller_config = principal.caller_body();
     rec.caller_params = req.caller_fields.clone();
@@ -2883,6 +2890,7 @@ mod tests {
             budget: None,
             approved_change: None,
             selection: None,
+            depends_on: None,
             pool: None,
             trusted_config: false,
             server_file: false,
@@ -2995,6 +3003,7 @@ mod tests {
             budget: None,
             approved_change: None,
             selection: None,
+            depends_on: None,
             pool: None,
             trusted_config: false,
             server_file: false,
@@ -3221,6 +3230,7 @@ mod tests {
             budget: None,
             approved_change: None,
             selection: None,
+            depends_on: None,
             pool: None,
             trusted_config: false,
             server_file: false,

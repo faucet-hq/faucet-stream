@@ -174,6 +174,7 @@ pub fn build_submit_request(
         budget: None,
         approved_change: None,
         selection: compiled.spec.run.selection.clone(),
+        depends_on: compiled.spec.run.depends_on.clone(),
         pool: compiled.spec.run.pool.clone(),
         trusted_config: true,
         server_file: true,
@@ -574,6 +575,7 @@ pub fn template_body_tracked(
         timeout_secs: compiled.spec.run.timeout_secs,
         idempotency_key: Some(context::idempotency_key(name, event)),
         selection: compiled.spec.run.selection.clone(),
+        depends_on: compiled.spec.run.depends_on.clone(),
         pool: compiled.spec.run.pool.clone(),
         standing_approval: true,
         allow_untested: tpl.allow_untested,
@@ -852,6 +854,7 @@ mod tests {
                     labels: Default::default(),
                     timeout_secs: Some(60),
                     selection: None,
+                    depends_on: None,
                     pool: None,
                 },
                 kind: TriggerKind::Webhook {
@@ -884,5 +887,12 @@ mod tests {
             Some("hook")
         );
         assert!(!req.doctor_first);
+        assert!(req.depends_on.is_none());
+        // The trigger's `run.depends_on` (#960) rides on every fired run.
+        let mut c = compiled_webhook();
+        c.spec.run.depends_on =
+            Some(serde_json::from_value(serde_json::json!({ "orders": ["customers"] })).unwrap());
+        let req = build_submit_request(&c, &event, "version: 1".into(), "now");
+        assert_eq!(req.depends_on.unwrap().canonical(), "orders:customers");
     }
 }

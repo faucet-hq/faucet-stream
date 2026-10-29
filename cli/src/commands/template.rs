@@ -739,6 +739,7 @@ async fn run_template(args: TemplateRunArgs) -> CliResult<()> {
         // `faucet template run` executes locally; nothing is persisted.
         crate::templates::Materialize::Local,
         selection.as_ref(),
+        None,
     )
     .await?;
     if let Some(status) = materialized.untested {

@@ -237,6 +237,12 @@ pub struct RunRecord {
     /// column; defaulted for records written before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<crate::select::SelectionRequest>,
+    /// The completion dependencies the run request added between its rows /
+    /// streams (#960), as the caller sent them. Already folded into the
+    /// stored config, so a claim or shard applies them; kept here to show
+    /// which edges were request-supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depends_on: Option<crate::run_deps::RunDependencies>,
     /// The run's config came from a file on the server (the triggers file),
     /// so a claim or resume keeps its SQL connectors' host access (#862 H-04).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -292,6 +298,7 @@ impl RunRecord {
             callback: None,
             tenant: None,
             selection: None,
+            depends_on: None,
             host_access: false,
             caller_config: false,
             caller_params: Default::default(),
