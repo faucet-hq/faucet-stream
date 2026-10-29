@@ -6690,6 +6690,7 @@ dependencies = [
  "testcontainers-modules",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "wiremock",
  "yaml_serde",
 ]

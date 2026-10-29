@@ -126,6 +126,12 @@ async fn read(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn profile_assume_role_and_web_identity_read_string_and_bytes_payloads() {
+    // Printed only when the test fails: where a stalled credentials or
+    // Kinesis call was waiting.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("aws_config=debug,aws_smithy_runtime=debug,aws_sdk_sts=debug,faucet_source_kinesis=debug")
+        .with_test_writer()
+        .try_init();
     let container = phase(
         "starting LocalStack",
         faucet_conformance::containers::start(|| {
@@ -199,9 +205,10 @@ async fn profile_assume_role_and_web_identity_read_string_and_bytes_payloads() {
         ("AWS_SHARED_CREDENTIALS_FILE", none.to_str().unwrap()),
     ]);
 
-    // assume_role: STS trades the base credentials for a role session.
+    // assume_role: STS trades the base credentials for a role session. The
+    // base key is a 12-digit account id, as LocalStack scopes by account.
     set(&[
-        ("AWS_ACCESS_KEY_ID", "test"),
+        ("AWS_ACCESS_KEY_ID", "000000000000"),
         ("AWS_SECRET_ACCESS_KEY", "test"),
     ]);
     let got = phase(
