@@ -1,4 +1,5 @@
-//! Connection / pool construction over `tiberius` + `bb8-tiberius`.
+//! Connection / pool construction over `tiberius` and a `bb8` connection
+//! manager of our own ([`ConnectionManager`]).
 //!
 //! This is the only module in the workspace that builds a `tiberius`
 //! [`tiberius::Config`] or an MSSQL connection pool — both the source and the
@@ -8,11 +9,88 @@ use std::future::Future;
 use std::time::Duration;
 
 use bb8::{Pool, PooledConnection};
-use bb8_tiberius::ConnectionManager;
 use faucet_core::FaucetError;
 use tiberius::{AuthMethod, Config, EncryptionLevel};
+use tokio::net::TcpStream;
+use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 use crate::config::{MssqlConnectionConfig, MssqlTls, MssqlTlsMode, parse_connection_url};
+
+/// A `tiberius` client over a tokio TCP socket: what [`MssqlPool`] hands out.
+pub type MssqlClient = tiberius::Client<Compat<TcpStream>>;
+
+/// The `bb8` connection manager behind [`MssqlPool`].
+///
+/// Each connection is a TCP connect (keepalive + `TCP_NODELAY`, see
+/// [`KEEPALIVE_TIME`]) followed by the TDS handshake. A server that answers
+/// with a routing redirect (Azure SQL gateway) is followed once. `is_valid`
+/// runs `SELECT 1`; `has_broken` is always `false` — a desynced connection is
+/// replaced by the caller through [`replace_connection`].
+pub struct ConnectionManager {
+    config: Config,
+}
+
+impl std::fmt::Debug for ConnectionManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionManager")
+            .field("addr", &self.config.get_addr())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ConnectionManager {
+    /// A manager connecting with `config`.
+    pub fn new(config: Config) -> Self {
+        Self { config }
+    }
+
+    async fn open(config: &Config) -> Result<TcpStream, tiberius::error::Error> {
+        let tcp = TcpStream::connect(config.get_addr()).await?;
+        configure_tcp(&tcp)?;
+        Ok(tcp)
+    }
+
+    async fn connect_client(&self) -> Result<MssqlClient, tiberius::error::Error> {
+        faucet_core::ensure_crypto_provider();
+        let tcp = Self::open(&self.config).await?;
+        match tiberius::Client::connect(self.config.clone(), tcp.compat_write()).await {
+            Ok(client) => Ok(client),
+            Err(tiberius::error::Error::Routing { host, port }) => {
+                let config = routed(&self.config, &host, port);
+                let tcp = Self::open(&config).await?;
+                // One redirect at most: a second one is an error.
+                tiberius::Client::connect(config, tcp.compat_write()).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// `config` pointed at the address a routing redirect named.
+fn routed(config: &Config, host: &str, port: u16) -> Config {
+    let mut config = config.clone();
+    config.host(host);
+    config.port(port);
+    config
+}
+
+impl bb8::ManageConnection for ConnectionManager {
+    type Connection = MssqlClient;
+    type Error = tiberius::error::Error;
+
+    async fn connect(&self) -> Result<Self::Connection, Self::Error> {
+        self.connect_client().await
+    }
+
+    async fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Self::Error> {
+        conn.simple_query("SELECT 1").await?.into_results().await?;
+        Ok(())
+    }
+
+    fn has_broken(&self, _conn: &mut Self::Connection) -> bool {
+        false
+    }
+}
 
 /// A `bb8` pool of `tiberius` clients.
 pub type MssqlPool = Pool<ConnectionManager>;
@@ -42,13 +120,56 @@ pub fn build_config(cfg: &MssqlConnectionConfig) -> Result<Config, FaucetError> 
             .connection_string
             .as_ref()
             .expect("validate() guarantees one of url/string is set");
+        check_ado_trust(s, &cfg.tls)?;
         Config::from_ado_string(s)
             .map_err(|e| FaucetError::Config(format!("invalid MSSQL connection_string: {e}")))?
     };
 
     apply_tls(&mut config, &cfg.tls)?;
     config.application_name("faucet");
+    // tiberius 0.13 bounds each server round trip at 30 s by default; the
+    // connectors' `statement_timeout_secs` owns that bound, so turn it off.
+    config.command_timeout(None);
     Ok(config)
+}
+
+/// Refuse a `connection_string` whose trust keys conflict with the `tls`
+/// block: tiberius panics when certificate bypass and a trusted CA are both
+/// set, whichever side sets them.
+fn check_ado_trust(ado: &str, tls: &MssqlTls) -> Result<(), FaucetError> {
+    let (bypass, ca) = ado_trust_keys(ado);
+    let bypass_wanted = tls.mode == MssqlTlsMode::TrustServerCertificate;
+    let ca_wanted = tls.mode != MssqlTlsMode::Disable && tls.ca_cert_path.is_some();
+    if (bypass && (ca || ca_wanted)) || (ca && bypass_wanted) {
+        return Err(FaucetError::Config(
+            "MSSQL connection_string: `TrustServerCertificate=true` skips certificate \
+             validation, so a trusted CA (`TrustServerCertificateCA` or `tls.ca_cert_path`) \
+             cannot apply; set only one"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether an ADO.NET string sets `TrustServerCertificate` to true and whether
+/// it names a `TrustServerCertificateCA`.
+fn ado_trust_keys(ado: &str) -> (bool, bool) {
+    let mut bypass = false;
+    let mut ca = false;
+    for pair in ado.split(';') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        let value = value.trim().trim_matches(|c| c == '\'' || c == '"');
+        match key.trim().to_ascii_lowercase().as_str() {
+            "trustservercertificate" => {
+                bypass = matches!(value.to_ascii_lowercase().as_str(), "true" | "yes")
+            }
+            "trustservercertificateca" => ca = !value.is_empty(),
+            _ => {}
+        }
+    }
+    (bypass, ca)
 }
 
 fn apply_tls(config: &mut Config, tls: &MssqlTls) -> Result<(), FaucetError> {
@@ -93,10 +214,10 @@ pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// vanished without a reset (failover, NAT idle eviction) fails the read
 /// instead of hanging a row stream or a control statement forever.
 fn manager(config: Config) -> ConnectionManager {
-    ConnectionManager::new(config).with_modify_tcp_stream(configure_tcp)
+    ConnectionManager::new(config)
 }
 
-fn configure_tcp(tcp: &tokio::net::TcpStream) -> std::io::Result<()> {
+fn configure_tcp(tcp: &TcpStream) -> std::io::Result<()> {
     tcp.set_nodelay(true)?;
     let keepalive = socket2::TcpKeepalive::new()
         .with_time(KEEPALIVE_TIME)
@@ -131,7 +252,7 @@ pub async fn build_pool(
 ///
 /// A statement abandoned on timeout can leave its connection mid-request with a
 /// transaction open, and the pool would hand that connection to the next
-/// caller (`bb8-tiberius` never reports a connection broken). Replacing the
+/// caller ([`ConnectionManager`] never reports a connection broken). Replacing the
 /// client drops — and so closes — the stale one, which makes the server roll
 /// its transaction back, and leaves a clean connection in the pool slot.
 ///
@@ -181,7 +302,7 @@ fn reconnect_context(ctx: &faucet_core::CallContext) -> faucet_core::CallContext
 async fn reconnect(
     cfg: &MssqlConnectionConfig,
     ctx: &faucet_core::CallContext,
-) -> Result<<ConnectionManager as bb8::ManageConnection>::Connection, FaucetError> {
+) -> Result<MssqlClient, FaucetError> {
     use bb8::ManageConnection;
     use faucet_core::CallExt as _;
     let manager = manager(build_config(cfg)?);
@@ -251,6 +372,128 @@ where
 #[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
+
+    #[test]
+    fn ado_trust_keys_are_read_case_insensitively() {
+        assert_eq!(
+            ado_trust_keys("Server=h;TrustServerCertificate=true"),
+            (true, false)
+        );
+        assert_eq!(
+            ado_trust_keys("server=h;trustservercertificate = Yes ;"),
+            (true, false)
+        );
+        assert_eq!(
+            ado_trust_keys("Server=h;TrustServerCertificate=false"),
+            (false, false)
+        );
+        assert_eq!(
+            ado_trust_keys("Server=h;TrustServerCertificateCA='/ca.pem'"),
+            (false, true)
+        );
+        assert_eq!(
+            ado_trust_keys("Server=h;junk;TrustServerCertificateCA="),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn conflicting_ado_trust_is_a_config_error_not_a_panic() {
+        let with = |s: &str, mode, ca: Option<&str>| MssqlConnectionConfig {
+            connection_string: Some(format!("Server=tcp:h,1433;User Id=sa;Password=p;{s}")),
+            tls: MssqlTls {
+                mode,
+                ca_cert_path: ca.map(Into::into),
+            },
+            ..Default::default()
+        };
+        for cfg in [
+            with(
+                "TrustServerCertificateCA=/ca.pem",
+                MssqlTlsMode::TrustServerCertificate,
+                None,
+            ),
+            with(
+                "TrustServerCertificate=true",
+                MssqlTlsMode::Require,
+                Some("/ca.pem"),
+            ),
+        ] {
+            let err = build_config(&cfg).unwrap_err();
+            assert!(err.to_string().contains("TrustServerCertificate"), "{err}");
+        }
+        assert!(
+            build_config(&with(
+                "TrustServerCertificate=true",
+                MssqlTlsMode::Disable,
+                Some("/ca.pem")
+            ))
+            .is_ok()
+        );
+        assert!(
+            build_config(&with(
+                "TrustServerCertificateCA=/ca.pem",
+                MssqlTlsMode::Require,
+                None
+            ))
+            .is_ok()
+        );
+        assert!(
+            build_config(&with(
+                "TrustServerCertificate=true",
+                MssqlTlsMode::TrustServerCertificate,
+                None
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_routing_redirect_keeps_everything_but_the_address() {
+        let cfg = MssqlConnectionConfig {
+            connection_url: Some("mssql://sa:pw@gateway:1433/sales".into()),
+            ..Default::default()
+        };
+        let base = build_config(&cfg).unwrap();
+        let routed = routed(&base, "replica.internal", 11000);
+        assert_eq!(routed.get_addr(), "replica.internal:11000");
+        assert_eq!(base.get_addr(), "gateway:1433");
+        let manager = ConnectionManager::new(base);
+        assert!(format!("{manager:?}").contains("gateway:1433"));
+    }
+
+    #[tokio::test]
+    async fn the_manager_reports_an_unreachable_server() {
+        use bb8::ManageConnection;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let cfg = MssqlConnectionConfig {
+            connection_url: Some(format!("mssql://sa:p@127.0.0.1:{port}/db")),
+            ..Default::default()
+        };
+        let manager = ConnectionManager::new(build_config(&cfg).unwrap());
+        let err = manager.connect().await.unwrap_err();
+        assert!(matches!(err, tiberius::error::Error::Io { .. }), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_server_that_closes_mid_handshake_fails_the_connect() {
+        use bb8::ManageConnection;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _closer = tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                drop(sock);
+            }
+        });
+        let cfg = MssqlConnectionConfig {
+            connection_url: Some(format!("mssql://sa:p@127.0.0.1:{port}/db")),
+            ..Default::default()
+        };
+        let manager = ConnectionManager::new(build_config(&cfg).unwrap());
+        assert!(manager.connect().await.is_err());
+    }
 
     #[tokio::test]
     async fn a_reconnect_ends_at_the_call_timeout_and_cancel() {

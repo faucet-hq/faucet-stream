@@ -20,7 +20,6 @@ ignore = [
     # parents yet (#929 section 3). Drop each when its parent moves.
     { id = "RUSTSEC-2024-0436", reason = "paste via parquet 58, oracle, metainfo/volo (iceberg HMS) (2026-10-27)" },
     { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 via mysql-common-derive and validator_derive (2026-10-27)" },
-    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile 1 via tiberius 0.12; needs tiberius 0.13 (#919) (2026-10-27)" },
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml via serde_yaml; replaced in the YAML move (#929, #935) (2026-10-27)" },
     # 2026-10-16 — no fixed release (Marvin timing side channel). Our own JWT
     # signing moved to aws-lc-rs (#818); `rsa` is left only upstream: opendal's
@@ -29,19 +28,6 @@ ignore = [
     # encryption (not a private-key operation). An attacker needs precise
     # timing of many signatures on the signing host.
     { id = "RUSTSEC-2023-0071", reason = "no fix; upstream signers only (reqsign, russh) (2026-10-16)" },
-    # 2026-10-16 — rustls 0.21 / rustls-webpki 0.101 come only from tiberius
-    # 0.12 (the MSSQL connectors' TLS). The AWS SDK's legacy connector that also
-    # carried them is no longer compiled. No 0.101.x fix exists; clearing these
-    # needs tiberius 0.13, a public-dependency change of faucet-common-mssql.
-    { id = "RUSTSEC-2026-0098", reason = "tiberius 0.12 TLS; needs tiberius 0.13 (2026-10-16)" },
-    { id = "RUSTSEC-2026-0099", reason = "tiberius 0.12 TLS; needs tiberius 0.13 (2026-10-16)" },
-    { id = "RUSTSEC-2026-0104", reason = "tiberius 0.12 TLS; needs tiberius 0.13 (2026-10-16)" },
-    { id = "RUSTSEC-2026-0346", reason = "tiberius 0.12 TLS; needs tiberius 0.13 (2026-10-16)" },
-    # 2026-10-21: emSign distrust (RUSTSEC-2026-0382). rustls-webpki 0.103 is on
-    # the patched 0.103.16; only tiberius 0.12's 0.101.7 remains, with no fixed
-    # 0.101.x release. Drop with the tiberius 0.13 move (#919).
-    { id = "RUSTSEC-2026-0382", reason = "only tiberius 0.12's rustls-webpki 0.101.7 remains; needs tiberius 0.13 (2026-10-21)" },
-    { id = "RUSTSEC-2026-0349", reason = "tiberius 0.12 TLS; needs tiberius 0.13 (2026-10-16)" },
     # 2026-10-24 — crypto-bigint timing branches (RUSTSEC-2026-0387). The 0.7
     # line is on the patched 0.7.6; only 0.5.5 remains, via aws-sigv4 (SigV4a
     # request signing) -> ecdsa 0.16 -> elliptic-curve 0.13, with no fixed 0.5.x.

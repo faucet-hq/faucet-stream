@@ -5,7 +5,7 @@
 //! Microsoft SQL Server query source for the
 //! [`faucet-stream`](https://crates.io/crates/faucet-stream) ecosystem, built on
 //! [`tiberius`](https://crates.io/crates/tiberius) +
-//! [`bb8-tiberius`](https://crates.io/crates/bb8-tiberius).
+//! [`bb8`](https://crates.io/crates/bb8).
 //!
 //! Runs parameterized SQL, streams rows as JSON [`StreamPage`](faucet_core::StreamPage)s
 //! through a connection pool, and supports incremental replication via a tracking
