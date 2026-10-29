@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/faucet-source-snowflake.svg)](https://crates.io/crates/faucet-source-snowflake)
 [![Docs.rs](https://docs.rs/faucet-source-snowflake/badge.svg)](https://docs.rs/faucet-source-snowflake)
-[![MSRV](https://img.shields.io/crates/msrv/faucet-source-snowflake.svg)](https://github.com/faucet-hq/faucet-stream/blob/main/rust-toolchain.toml)
+[![MSRV](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Ffaucet-hq%2Ffaucet-stream%2Fmain%2FCargo.toml&query=%24.workspace.package%5B%27rust-version%27%5D&label=MSRV&color=blue)](../../../Cargo.toml)
 [![License](https://img.shields.io/crates/l/faucet-source-snowflake.svg)](https://github.com/faucet-hq/faucet-stream#license)
 
 **Snowflake** query source for the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem. Executes a SQL statement against Snowflake's [SQL REST API](https://docs.snowflake.com/en/developer-guide/sql-api/intro) (`POST /api/v2/statements`), decodes each row into a typed `serde_json::Value`, and streams the result set back partition-by-partition so peak memory stays bounded no matter how large the result is.

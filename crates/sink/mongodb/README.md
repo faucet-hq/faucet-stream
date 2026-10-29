@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/faucet-sink-mongodb.svg)](https://crates.io/crates/faucet-sink-mongodb)
 [![Docs.rs](https://docs.rs/faucet-sink-mongodb/badge.svg)](https://docs.rs/faucet-sink-mongodb)
-[![MSRV](https://img.shields.io/crates/msrv/faucet-sink-mongodb.svg)](https://github.com/faucet-hq/faucet-stream/blob/main/rust-toolchain.toml)
+[![MSRV](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Ffaucet-hq%2Ffaucet-stream%2Fmain%2FCargo.toml&query=%24.workspace.package%5B%27rust-version%27%5D&label=MSRV&color=blue)](../../../Cargo.toml)
 [![License](https://img.shields.io/crates/l/faucet-sink-mongodb.svg)](https://github.com/faucet-hq/faucet-stream#license)
 
 **MongoDB** sink for the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem. Writes JSON records into a MongoDB collection — appending with batched `insert_many`, or keeping a collection in sync with a changing source via `upsert` / `delete`. With `delivery: exactly_once` (replica set required) it commits each page and a watermark in one multi-document transaction.

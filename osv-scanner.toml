@@ -1,7 +1,9 @@
 # Advisories accepted for OpenSSF Scorecard's Vulnerabilities check (osv-scanner).
 # Mirrors deny.toml's [advisories] ignore list (the CI gate) plus GHSA-only
 # advisories RustSec does not carry. Every entry needs a dated reason; drop it
-# when the dependency moves. Keep in sync with deny.toml.
+# when the dependency moves. Keep in sync with deny.toml. Entries for crates
+# the fuzz lockfile shares must also be in fuzz/osv-scanner.toml
+# (scripts/advisory-scope.py checks every fuzz entry is listed here).
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2024-0436"

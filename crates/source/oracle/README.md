@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/faucet-source-oracle.svg)](https://crates.io/crates/faucet-source-oracle)
 [![Docs.rs](https://docs.rs/faucet-source-oracle/badge.svg)](https://docs.rs/faucet-source-oracle)
-[![MSRV](https://img.shields.io/crates/msrv/faucet-source-oracle.svg)](https://github.com/faucet-hq/faucet-stream/blob/main/rust-toolchain.toml)
+[![MSRV](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Ffaucet-hq%2Ffaucet-stream%2Fmain%2FCargo.toml&query=%24.workspace.package%5B%27rust-version%27%5D&label=MSRV&color=blue)](../../../Cargo.toml)
 [![License](https://img.shields.io/crates/l/faucet-source-oracle.svg)](https://github.com/faucet-hq/faucet-stream#license)
 
 Oracle Database **query source** for the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem. Runs parameterized SQL and streams rows as JSON pages, with incremental replication, PK-range sharding for clustered runs and catalog discovery. Built on the [`oracle`](https://crates.io/crates/oracle) driver (ODPI-C).

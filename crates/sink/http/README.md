@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/faucet-sink-http.svg)](https://crates.io/crates/faucet-sink-http)
 [![Docs.rs](https://docs.rs/faucet-sink-http/badge.svg)](https://docs.rs/faucet-sink-http)
-[![MSRV](https://img.shields.io/crates/msrv/faucet-sink-http.svg)](https://github.com/faucet-hq/faucet-stream/blob/main/rust-toolchain.toml)
+[![MSRV](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Ffaucet-hq%2Ffaucet-stream%2Fmain%2FCargo.toml&query=%24.workspace.package%5B%27rust-version%27%5D&label=MSRV&color=blue)](../../../Cargo.toml)
 [![License](https://img.shields.io/crates/l/faucet-sink-http.svg)](https://github.com/faucet-hq/faucet-stream#license)
 
 HTTP POST sink connector for the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem. Sends JSON records to any HTTP(S) endpoint — a webhook, an ingest API, a serverless function, another faucet pipeline's webhook source.

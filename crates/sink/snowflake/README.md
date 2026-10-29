@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/faucet-sink-snowflake.svg)](https://crates.io/crates/faucet-sink-snowflake)
 [![Docs.rs](https://docs.rs/faucet-sink-snowflake/badge.svg)](https://docs.rs/faucet-sink-snowflake)
-[![MSRV](https://img.shields.io/crates/msrv/faucet-sink-snowflake.svg)](https://github.com/faucet-hq/faucet-stream/blob/main/rust-toolchain.toml)
+[![MSRV](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Ffaucet-hq%2Ffaucet-stream%2Fmain%2FCargo.toml&query=%24.workspace.package%5B%27rust-version%27%5D&label=MSRV&color=blue)](../../../Cargo.toml)
 [![License](https://img.shields.io/crates/l/faucet-sink-snowflake.svg)](https://github.com/faucet-hq/faucet-stream#license)
 
 **Snowflake** sink for the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem. Writes JSON records to a Snowflake table over the [Snowflake SQL REST API](https://docs.snowflake.com/en/developer-guide/sql-api/index) — no driver, no ODBC, no client library, just HTTPS.

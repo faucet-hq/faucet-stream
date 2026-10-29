@@ -25,7 +25,7 @@ tracing.workspace = true
 [dev-dependencies]
 faucet-conformance = { workspace = true, features = ["containers"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-yaml_serde = "0.10"
+yaml_serde.workspace = true
 testcontainers = "0.27"
 wiremock = "0.6"
 

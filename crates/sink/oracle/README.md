@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/faucet-sink-oracle.svg)](https://crates.io/crates/faucet-sink-oracle)
 [![Docs.rs](https://docs.rs/faucet-sink-oracle/badge.svg)](https://docs.rs/faucet-sink-oracle)
-[![MSRV](https://img.shields.io/crates/msrv/faucet-sink-oracle.svg)](https://github.com/faucet-hq/faucet-stream/blob/main/rust-toolchain.toml)
+[![MSRV](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Ffaucet-hq%2Ffaucet-stream%2Fmain%2FCargo.toml&query=%24.workspace.package%5B%27rust-version%27%5D&label=MSRV&color=blue)](../../../Cargo.toml)
 [![License](https://img.shields.io/crates/l/faucet-sink-oracle.svg)](https://github.com/faucet-hq/faucet-stream#license)
 
 Oracle Database **sink** for the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem. Writes pages with array DML, supports keyed `upsert` / `delete` through `MERGE`, atomic `overwrite`, exactly-once delivery, schema-drift evolution and table auto-creation. Built on the [`oracle`](https://crates.io/crates/oracle) driver (ODPI-C).

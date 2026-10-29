@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/faucet-sink-s3.svg)](https://crates.io/crates/faucet-sink-s3)
 [![Docs.rs](https://docs.rs/faucet-sink-s3/badge.svg)](https://docs.rs/faucet-sink-s3)
-[![MSRV](https://img.shields.io/crates/msrv/faucet-sink-s3.svg)](https://github.com/faucet-hq/faucet-stream/blob/main/rust-toolchain.toml)
+[![MSRV](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Ffaucet-hq%2Ffaucet-stream%2Fmain%2FCargo.toml&query=%24.workspace.package%5B%27rust-version%27%5D&label=MSRV&color=blue)](../../../Cargo.toml)
 [![License](https://img.shields.io/crates/l/faucet-sink-s3.svg)](https://github.com/faucet-hq/faucet-stream#license)
 
 AWS **S3** sink for the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem. Writes JSON records to S3 (or any S3-compatible store) as JSON Lines (NDJSON) objects, one UUID-keyed object per chunk, uploaded concurrently via `buffer_unordered`.

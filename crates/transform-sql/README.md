@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/faucet-transform-sql.svg)](https://crates.io/crates/faucet-transform-sql)
 [![Docs.rs](https://docs.rs/faucet-transform-sql/badge.svg)](https://docs.rs/faucet-transform-sql)
-[![MSRV](https://img.shields.io/crates/msrv/faucet-transform-sql.svg)](https://github.com/faucet-hq/faucet-stream/blob/main/rust-toolchain.toml)
+[![MSRV](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Ffaucet-hq%2Ffaucet-stream%2Fmain%2FCargo.toml&query=%24.workspace.package%5B%27rust-version%27%5D&label=MSRV&color=blue)](../../Cargo.toml)
 [![License](https://img.shields.io/crates/l/faucet-transform-sql.svg)](https://github.com/faucet-hq/faucet-stream#license)
 
 SQL-as-transform for the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem — run [DuckDB](https://duckdb.org/) SQL over each pipeline page. The page's records are exposed as the relation `batch`; the query's result set replaces the page.

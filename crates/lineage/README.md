@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/faucet-lineage.svg)](https://crates.io/crates/faucet-lineage)
 [![Docs.rs](https://docs.rs/faucet-lineage/badge.svg)](https://docs.rs/faucet-lineage)
-[![MSRV](https://img.shields.io/crates/msrv/faucet-lineage.svg)](https://github.com/faucet-hq/faucet-stream/blob/main/rust-toolchain.toml)
+[![MSRV](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Ffaucet-hq%2Ffaucet-stream%2Fmain%2FCargo.toml&query=%24.workspace.package%5B%27rust-version%27%5D&label=MSRV&color=blue)](../../Cargo.toml)
 [![License](https://img.shields.io/crates/l/faucet-lineage.svg)](https://github.com/faucet-hq/faucet-stream#license)
 
 [OpenLineage](https://openlineage.io/) event emission for the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem. Every pipeline run emits OpenLineage `RunEvent`s describing the job, the run, its input/output datasets, their inferred schemas, and column-level lineage — to an HTTP endpoint (e.g. [Marquez](https://marquezproject.ai/)), a local JSON Lines file, or a Kafka topic.
