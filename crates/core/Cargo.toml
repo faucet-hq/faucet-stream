@@ -74,7 +74,7 @@ transforms = [
 ]
 observability-install = ["dep:metrics-exporter-prometheus", "dep:tracing-subscriber"]
 # OTLP (OpenTelemetry) export of traces + metrics (#201). Opt-in; pulls the
-# 0.31-line OTel stack. The wiring inside `install_observability` is additionally
+# 0.33-line OTel stack. The wiring inside `install_observability` is additionally
 # gated on `observability-install` (see otel.rs); enabling `otel` alone just makes
 # the provider builders available to library callers.
 otel = [
@@ -82,7 +82,7 @@ otel = [
     "dep:opentelemetry_sdk",
     "dep:opentelemetry-otlp",
     "dep:tracing-opentelemetry",
-    "dep:metrics-exporter-opentelemetry",
+    "dep:metrics-opentelemetry",
     "dep:metrics-util",
     "dep:tracing-subscriber",
     "tokio/rt",
@@ -169,7 +169,7 @@ opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
-metrics-exporter-opentelemetry = { workspace = true, optional = true }
+metrics-opentelemetry = { workspace = true, optional = true }
 async-compression = { workspace = true, optional = true }
 # Staged bulk load (#528, feature `staging`): S3/GCS/Azure uploader.
 object_store = { workspace = true, optional = true, features = ["aws", "gcp", "azure"] }

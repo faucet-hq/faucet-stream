@@ -393,20 +393,20 @@ lru = "0.18"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 metrics-util = "0.20"
-# OpenTelemetry (OTLP) export — issue #201. PINNED TO THE 0.31 LINE: the metrics
-# bridge `metrics-exporter-opentelemetry` 0.2.1 requires `opentelemetry`/`opentelemetry_sdk`
-# ^0.31, so the whole stack is locked to 0.31 (tracing-opentelemetry 0.32.1 is the
-# 0.31-compatible release — 0.33 targets opentelemetry 0.32). Before bumping any of
-# these, confirm metrics-exporter-opentelemetry supports the newer line first.
-opentelemetry = "0.31"
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "grpc-tonic", "http-proto", "reqwest-blocking-client"] }
-tracing-opentelemetry = "0.32.1"
-metrics-exporter-opentelemetry = "0.2.1"
+# OpenTelemetry (OTLP) export — issue #201. The 0.33 line (#980). The `metrics`
+# facade bridge `metrics-opentelemetry` is pinned exactly: its version encodes the
+# `metrics` + OpenTelemetry lines it targets (0.24033 = metrics 0.24 + otel 0.33),
+# and a semantic change must arrive as a reviewed bump. It is used only in
+# `faucet-core`'s `observability/otel.rs` (`build_meter_provider`).
+opentelemetry = "0.33"
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "metrics", "grpc-tonic", "http-proto", "reqwest-blocking-client"] }
+tracing-opentelemetry = "0.34"
+metrics-opentelemetry = "=0.24033.1"
 # OTLP log shipping from the durable local buffer (#806): requests are built from
 # the generated protobuf types and sent with the tonic/prost lines that
-# opentelemetry-proto 0.31 itself uses (the workspace's own tonic/prost are 0.13).
-opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic", "logs"] }
+# opentelemetry-proto 0.33 itself uses (the workspace's own tonic/prost are 0.13).
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic", "logs"] }
 tonic-otlp = { package = "tonic", version = "0.14", default-features = false, features = ["channel"] }
 prost-otlp = { package = "prost", version = "0.14" }
 bytes = "1"
