@@ -1,6 +1,7 @@
 //! #975: a fan-out child row describes its source query with the parent's
 //! values bound, so a sink that creates tables from declared column types
-//! (#955) creates them typed for child rows too.
+//! (#955) creates them typed for child rows too. The two child invocations
+//! run concurrently and create the same table (#990).
 #![cfg(all(feature = "source-duckdb", feature = "sink-duckdb"))]
 
 use clap::Parser as _;
@@ -66,7 +67,6 @@ fn a_child_row_creates_its_table_from_the_bound_query_types() {
                  \x20 sink:\n\
                  \x20   type: duckdb\n\
                  \x20   config: {{ database: \"{out}\", table_name: parents, column_mapping: auto_map }}\n\
-                 execution: {{ max_concurrent: 1 }}\n\
                  matrix:\n\
                  \x20 - id: bills\n\
                  \x20 - id: prices\n\
