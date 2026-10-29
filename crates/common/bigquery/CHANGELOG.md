@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.3.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-common-bigquery-v1.2.1...faucet-common-bigquery-v1.3.0) - 2026-10-29
+
+### Bug Fixes
+
+- *(deps)* Zip 9.0.5, OSV config for the fuzz lockfile, MSRV badge, SPDX-named license file ([#992](https://github.com/faucet-hq/faucet-stream/pull/992))
+- Resolve 310 low-severity audit findings across CLI, serve, core, connectors and tooling (#930 low) ([#947](https://github.com/faucet-hq/faucet-stream/pull/947))
+
+### Features
+
+- *(registry)* Faucet-registry crate for embedders, and review fixes for template param checks ([#996](https://github.com/faucet-hq/faucet-stream/pull/996))
+
 ## [1.2.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-common-bigquery-v1.2.0...faucet-common-bigquery-v1.2.1) - 2026-10-22
 
 ### Bug Fixes

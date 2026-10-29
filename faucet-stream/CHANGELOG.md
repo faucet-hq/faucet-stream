@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.11.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-stream-v1.10.0...faucet-stream-v1.11.0) - 2026-10-29
+
+### Bug Fixes
+
+- *(deps)* Zip 9.0.5, OSV config for the fuzz lockfile, MSRV badge, SPDX-named license file ([#992](https://github.com/faucet-hq/faucet-stream/pull/992))
+- #966 review findings, integration tests, TLS everywhere, Iceberg HMS commits, Redshift IAM and Data API, Scorecard hardening ([#986](https://github.com/faucet-hq/faucet-stream/pull/986))
+- Resolve the #931/#933 review findings, Oracle pool flake and held #930 low packages ([#934](https://github.com/faucet-hq/faucet-stream/pull/934)) ([#949](https://github.com/faucet-hq/faucet-stream/pull/949))
+- Resolve 310 low-severity audit findings across CLI, serve, core, connectors and tooling (#930 low) ([#947](https://github.com/faucet-hq/faucet-stream/pull/947))
+
+### Documentation
+
+- *(bench)* Refresh published benchmark figures (Oct 2026) and pin Meltano in the harness ([#913](https://github.com/faucet-hq/faucet-stream/pull/913))
+
+### Features
+
+- *(registry)* Faucet-registry crate for embedders, and review fixes for template param checks ([#996](https://github.com/faucet-hq/faucet-stream/pull/996))
+
+### Miscellaneous
+
+- Upgrade the Rust toolchain to 1.99.1 (MSRV 1.99, async-trait 0.1.92) ([#969](https://github.com/faucet-hq/faucet-stream/pull/969))
+
 ## [1.10.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-stream-v1.9.3...faucet-stream-v1.10.0) - 2026-10-15
 
 ### Bug Fixes

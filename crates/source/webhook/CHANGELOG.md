@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.4.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-webhook-v1.3.0...faucet-source-webhook-v1.4.0) - 2026-10-29
+
+### Bug Fixes
+
+- Fresh-resolve pin, last #930 finding, dependency cleanup, YAML module, template for_each and pair bootstrap ([#954](https://github.com/faucet-hq/faucet-stream/pull/954))
+- Resolve 310 low-severity audit findings across CLI, serve, core, connectors and tooling (#930 low) ([#947](https://github.com/faucet-hq/faucet-stream/pull/947))
+
+### Features
+
+- *(registry)* Faucet-registry crate for embedders, and review fixes for template param checks ([#996](https://github.com/faucet-hq/faucet-stream/pull/996))
+
 ## [1.3.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-webhook-v1.2.1...faucet-source-webhook-v1.3.0) - 2026-10-15
 
 ### Bug Fixes

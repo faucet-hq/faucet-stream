@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.9.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-mysql-v1.8.0...faucet-source-mysql-v1.9.0) - 2026-10-29
+
+### Bug Fixes
+
+- #966 review findings, integration tests, TLS everywhere, Iceberg HMS commits, Redshift IAM and Data API, Scorecard hardening ([#986](https://github.com/faucet-hq/faucet-stream/pull/986))
+- Resolve the #931/#933 review findings, Oracle pool flake and held #930 low packages ([#934](https://github.com/faucet-hq/faucet-stream/pull/934)) ([#949](https://github.com/faucet-hq/faucet-stream/pull/949))
+
+### Features
+
+- *(registry)* Faucet-registry crate for embedders, and review fixes for template param checks ([#996](https://github.com/faucet-hq/faucet-stream/pull/996))
+- Typed warehouse tables, sealed cluster secret params, execution pools, run label filter, Iceberg REST + Kafka codec fixes ([#966](https://github.com/faucet-hq/faucet-stream/pull/966))
+
+### Miscellaneous
+
+- Enable database features only in the respective connectors ([#901](https://github.com/faucet-hq/faucet-stream/pull/901))
+
 ## [1.8.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-mysql-v1.7.1...faucet-source-mysql-v1.8.0) - 2026-10-15
 
 ### Bug Fixes
