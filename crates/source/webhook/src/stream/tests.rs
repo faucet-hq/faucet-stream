@@ -1,4 +1,3 @@
-
 fn state(max_payloads: Option<usize>, closed: bool) -> std::sync::Arc<super::AppState> {
     std::sync::Arc::new(super::AppState {
         inbox: tokio::sync::Mutex::new(super::Inbox {

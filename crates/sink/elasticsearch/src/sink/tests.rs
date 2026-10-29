@@ -1,4 +1,3 @@
-
 use super::*;
 use faucet_core::Sink as _;
 

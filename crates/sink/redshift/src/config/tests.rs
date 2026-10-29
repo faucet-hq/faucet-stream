@@ -1,4 +1,3 @@
-
 use super::*;
 use faucet_common_redshift::RedshiftConnection;
 

@@ -54,7 +54,9 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
         let path = entry.unwrap().path();
         if path.is_dir() {
             rust_files(&path, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
+        } else if path.extension().is_some_and(|e| e == "rs")
+            && path.file_name().is_none_or(|n| n != "tests.rs")
+        {
             out.push(path);
         }
     }

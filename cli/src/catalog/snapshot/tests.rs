@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::serve::history::catalog::ConnectorSnapshot;
 use serde_json::json;

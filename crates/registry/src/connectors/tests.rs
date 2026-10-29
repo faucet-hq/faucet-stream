@@ -1,4 +1,3 @@
-
 #[cfg(all(feature = "sink-bigquery", feature = "arrow"))]
 #[test]
 fn validate_refuses_a_truncating_bigquery_bulk_load() {

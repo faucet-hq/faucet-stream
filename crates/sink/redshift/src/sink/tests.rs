@@ -1,4 +1,3 @@
-
 #[test]
 fn text_rendered_types_bind_as_cast_text() {
     for t in [

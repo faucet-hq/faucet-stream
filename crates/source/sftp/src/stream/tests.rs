@@ -1,4 +1,3 @@
-
 use super::*;
 use faucet_common_sftp::SftpConnectionConfig;
 use faucet_core::Source;

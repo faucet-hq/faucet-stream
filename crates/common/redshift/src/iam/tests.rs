@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn conn(config: serde_json::Value) -> RedshiftConnection {

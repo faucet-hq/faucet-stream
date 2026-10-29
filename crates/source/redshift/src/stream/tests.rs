@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::config::RedshiftReplication;
 use faucet_common_redshift::RedshiftConnection;

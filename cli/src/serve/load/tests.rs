@@ -1,4 +1,3 @@
-
 use super::*;
 
 /// A caller-supplied fragment (an inline overlay) is screened like a

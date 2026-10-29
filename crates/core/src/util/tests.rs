@@ -1,4 +1,3 @@
-
 #[test]
 fn redacted_uri_authority_keeps_only_scheme_and_hosts() {
     assert_eq!(

@@ -1,4 +1,3 @@
-
 #[test]
 fn glob_wildcards_match_names_holding_wildcard_characters() {
     assert!(glob_match("*.jsonl", "*daily.jsonl"));

@@ -1,4 +1,3 @@
-
 use super::*;
 
 /// The table output redacts error text like `--json` does (#789 CLI-162).

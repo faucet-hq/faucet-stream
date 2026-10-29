@@ -1,4 +1,3 @@
-
 use super::*;
 use aws_sdk_redshiftdata::primitives::Blob;
 use serde_json::json;
