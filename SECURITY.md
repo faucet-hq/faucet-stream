@@ -12,14 +12,12 @@ latest release before reporting.
 **Please do not report security vulnerabilities through public GitHub issues,
 discussions, or pull requests.**
 
-Report privately through either channel:
-
-1. **GitHub private vulnerability reporting** (preferred) — open the repository's
-   [**Security** tab](https://github.com/faucet-hq/faucet-stream/security) and
-   click **"Report a vulnerability"**
-   ([direct link](https://github.com/faucet-hq/faucet-stream/security/advisories/new)).
-   This creates a private advisory visible only to maintainers.
-2. **Email** — **pawanksikawat@gmail.com**.
+Report privately through **GitHub private vulnerability reporting**: open the
+repository's [**Security** tab](https://github.com/faucet-hq/faucet-stream/security)
+and click **"Report a vulnerability"**
+([direct link](https://github.com/faucet-hq/faucet-stream/security/advisories/new)).
+This creates a private advisory visible only to maintainers, where we can
+discuss the report, prepare a fix and coordinate disclosure with you.
 
 Please include:
 
