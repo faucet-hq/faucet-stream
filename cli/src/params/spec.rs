@@ -145,6 +145,16 @@ pub struct ParamSpec {
     /// For a `list` param: the most items a value may hold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_items: Option<usize>,
+
+    /// The template author means the caller's value to reach a path, URL or
+    /// command field as given (#989). Without it, `faucet serve` holds a
+    /// caller-supplied value that lands in such a field to the caller
+    /// reference policy (`--allow-path-root`, `--allow-url-host`, …), like a
+    /// config the caller submitted. A default, a closed `values:` set and a
+    /// computed value built only from those are the author's and never
+    /// checked.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub trusted: bool,
 }
 
 impl ParamSpec {
@@ -245,6 +255,31 @@ fn default_ok(kind: ParamType, value: &Value) -> bool {
 pub fn validate(spec: &ParamsSpec) -> CliResult<()> {
     for (name, p) in spec {
         validate_name(name)?;
+        if p.trusted && p.computed.is_some() {
+            return Err(CliError::Config(format!(
+                "param '{name}' is `computed` and cannot be `trusted` — a computed value is \
+                 checked through the params it reads; mark those `trusted` instead"
+            )));
+        }
+        for (what, nested) in p
+            .items
+            .iter()
+            .map(|i| ("items".to_string(), i.as_ref()))
+            .chain(
+                p.items
+                    .iter()
+                    .flat_map(|i| i.properties.iter())
+                    .chain(p.properties.iter())
+                    .map(|(f, s)| (format!("field '{f}'"), s)),
+            )
+        {
+            if nested.trusted {
+                return Err(CliError::Config(format!(
+                    "param '{name}': `trusted` applies to the whole param, not to its {what} — \
+                     set `trusted: true` on '{name}'"
+                )));
+            }
+        }
         match p.kind {
             ParamType::List => super::list::validate(name, p)?,
             ParamType::Object => {
@@ -735,5 +770,35 @@ mod tests {
         assert_eq!(params["token"].default, Some(Value::from(HIDDEN_DEFAULT)));
         assert_eq!(params["plain"].default, Some(Value::from(5)));
         assert_eq!(params["none"].default, None);
+    }
+
+    #[test]
+    fn trusted_applies_to_a_whole_supplied_param() {
+        let spec = |v: Value| -> ParamsSpec { serde_json::from_value(v).unwrap() };
+        validate(&spec(serde_json::json!({ "dir": { "trusted": true } }))).unwrap();
+        let err = validate(&spec(serde_json::json!({
+            "dir": { "computed": "${param.x}", "trusted": true }, "x": {}
+        })))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("cannot be `trusted`"), "{err}");
+        let err = validate(&spec(serde_json::json!({
+            "files": { "type": "list", "items": { "type": "string", "trusted": true } }
+        })))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("whole param"), "{err}");
+        let err = validate(&spec(serde_json::json!({
+            "rows": { "type": "list", "items": { "type": "object",
+                "properties": { "p": { "trusted": true } } } }
+        })))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("field 'p'"), "{err}");
+        // Round-trips, and is omitted when false.
+        let s = spec(serde_json::json!({ "a": { "trusted": true }, "b": {} }));
+        let back = serde_json::to_value(&s).unwrap();
+        assert_eq!(back["a"]["trusted"], true);
+        assert!(back["b"].get("trusted").is_none());
     }
 }

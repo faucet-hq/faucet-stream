@@ -178,6 +178,7 @@ pub fn build_submit_request(
         trusted_config: true,
         server_file: true,
         sealed_params: None,
+        caller_fields: Default::default(),
     }
 }
 

@@ -168,6 +168,10 @@ pub struct MaterializedConfig {
     /// the caller's for a `pipeline`; for a composed run, the streams the
     /// caller's selection resolved to (the composition carries only those).
     pub selection: Option<crate::select::SelectionRequest>,
+    /// Where [`Self::body`] holds text the caller chose through a param
+    /// (#989): `faucet serve` holds those values to the caller reference
+    /// policy although the body loads trusted.
+    pub caller_fields: params::CallerFields,
 }
 
 impl MaterializedConfig {
@@ -1228,6 +1232,7 @@ pub async fn materialize(
         warnings: Vec::new(),
         selection: None,
         untested: None,
+        caller_fields: bound.fields,
     })
 }
 
@@ -1583,12 +1588,13 @@ async fn materialize_pair_selected(
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    let source = crate::hub::for_each::expand(
+    let expanded = crate::hub::for_each::expand_traced(
         &source,
         supplied,
         BindMode::Strict,
         (mode == Materialize::Local).then_some(&env_overlay),
     )?;
+    let source = expanded.template.clone();
     let all_streams: Vec<String> = source.streams.iter().map(|s| s.name.clone()).collect();
     let (source, effective) = match selection {
         Some(sel) => {
@@ -1607,7 +1613,9 @@ async fn materialize_pair_selected(
     }
     let overlay_contributes = std::mem::take(&mut composition.overlay_contributes);
     let warnings = std::mem::take(&mut composition.warnings);
+    let mut caller_fields = expanded.composed_fields(&composition.document);
     let (body, bound) = bind_document_for_run(composition.document, supplied, env_overrides, mode)?;
+    caller_fields.extend(&bound.fields);
     Ok(MaterializedConfig {
         template_id: src_rec.id.clone(),
         version: src_rec.version,
@@ -1625,6 +1633,7 @@ async fn materialize_pair_selected(
         warnings,
         selection: effective,
         untested: None,
+        caller_fields,
     })
 }
 

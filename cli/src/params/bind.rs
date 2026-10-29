@@ -75,6 +75,12 @@ pub struct BoundParams {
     /// For a `list` of objects: the item fields marked `secret: true`, by
     /// param (#952). Only those fields are masked in [`Self::redacted`].
     pub secret_fields: BTreeMap<String, BTreeSet<String>>,
+    /// Params whose value is caller free text (#989): supplied with no
+    /// closed set, not `trusted`, holding a string — or computed by splicing
+    /// one. See [`super::caller`].
+    pub free_text: BTreeSet<String>,
+    /// Where [`bind_document`] wrote [`Self::free_text`] values.
+    pub fields: super::caller::CallerFields,
 }
 
 impl BoundParams {
@@ -279,6 +285,7 @@ pub fn resolve(
     }
 
     resolve_computed(spec, &mut bound)?;
+    bound.free_text = super::caller::free_text_params(spec, &bound.values, &bound.caller_supplied);
     Ok(bound)
 }
 
@@ -488,7 +495,7 @@ pub fn bind_document(
     mode: BindMode,
 ) -> CliResult<BoundParams> {
     let spec = declared(doc)?;
-    let bound = resolve(&spec, supplied, mode)?;
+    let mut bound = resolve(&spec, supplied, mode)?;
 
     // Lift the declaration block out so defaults are never rewritten, then put
     // it back byte-identical — the block is part of the config and is persisted
@@ -503,18 +510,25 @@ pub fn bind_document(
         .filter(|n| spec.get(*n).is_none_or(|p| p.values.is_empty()))
         .cloned()
         .collect();
+    let mut fields = super::caller::CallerFields::default();
     let result = substitute(
         doc,
-        &bound.values,
-        &bound.placeholders,
-        inert.as_ref(),
-        &guarded,
+        &Subst {
+            bound: &bound.values,
+            lenient: &bound.placeholders,
+            inert: inert.as_ref(),
+            guarded: &guarded,
+            free: &bound.free_text,
+        },
         None,
+        "",
+        &mut fields,
     );
     if let (Some(block), Some(map)) = (stashed, doc.as_object_mut()) {
         map.insert(PARAMS_KEY.to_string(), block);
     }
     result?;
+    bound.fields = fields;
     Ok(bound)
 }
 
@@ -587,17 +601,45 @@ fn inert_values(bound: &BoundParams) -> Option<BTreeMap<String, Value>> {
     )
 }
 
-/// Substitute `${param.NAME}` throughout `v`. With `inert` set, refuse any
-/// directive that exists only because of caller-supplied text (CLI-37).
+/// What [`substitute`] binds with.
+struct Subst<'a> {
+    bound: &'a BTreeMap<String, Value>,
+    lenient: &'a BTreeSet<String>,
+    inert: Option<&'a BTreeMap<String, Value>>,
+    guarded: &'a BTreeSet<String>,
+    /// Params whose text is recorded where it lands (#989).
+    free: &'a BTreeSet<String>,
+}
+
+/// The free-text params `s` references (`${param.NAME}`).
+fn free_refs(s: &str, free: &BTreeSet<String>) -> BTreeSet<String> {
+    if free.is_empty() {
+        return BTreeSet::new();
+    }
+    iter_directives(s)
+        .filter_map(|(_, d)| match d {
+            Directive::Deferred { id, path } if id == PARAM_ID && free.contains(path) => {
+                Some(path.to_string())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Substitute `${param.NAME}` throughout `v` (at JSON pointer `ptr`),
+/// recording in `fields` where caller free text lands. With `inert` set,
+/// refuse any directive that exists only because of caller-supplied text
+/// (CLI-37).
 fn substitute(
     v: &mut Value,
-    bound: &BTreeMap<String, Value>,
-    lenient: &BTreeSet<String>,
-    inert: Option<&BTreeMap<String, Value>>,
-    guarded: &BTreeSet<String>,
+    cx: &Subst<'_>,
     field: Option<&str>,
+    ptr: &str,
+    fields: &mut super::caller::CallerFields,
 ) -> CliResult<()> {
+    let (bound, lenient, inert, guarded) = (cx.bound, cx.lenient, cx.inert, cx.guarded);
     if let Value::String(s) = v {
+        fields.insert_all(ptr, &free_refs(s, cx.free));
         let replaced = match whole_token(s, bound, bound, lenient)? {
             Some(typed) => typed,
             None => {
@@ -613,8 +655,8 @@ fn substitute(
     }
     match v {
         Value::Array(items) => {
-            for item in items.iter_mut() {
-                substitute(item, bound, lenient, inert, guarded, field)?;
+            for (i, item) in items.iter_mut().enumerate() {
+                substitute(item, cx, field, &format!("{ptr}/{i}"), fields)?;
             }
         }
         Value::Object(map) => {
@@ -622,12 +664,18 @@ fn substitute(
             // map so a rewritten key is honoured — mirrors `interpolate_value`.
             let entries: Vec<(String, Value)> = std::mem::take(map).into_iter().collect();
             for (key, mut val) in entries {
-                substitute(&mut val, bound, lenient, inert, guarded, Some(&key))?;
+                // Where the value lands: under its rewritten key.
+                let at = super::caller::child(
+                    ptr,
+                    &rewrite_text(&key, bound, bound, lenient).unwrap_or_else(|_| key.clone()),
+                );
+                substitute(&mut val, cx, Some(&key), &at, fields)?;
                 refuse_embedded(&key, bound, guarded, None)?;
                 let new_key = rewrite_text(&key, bound, bound, lenient)?;
                 if let Some(inert) = inert {
                     refuse_new_directives(&key, &new_key, bound, lenient, inert)?;
                 }
+                fields.insert_all(&at, &free_refs(&key, cx.free));
                 map.insert(new_key, val);
             }
         }
@@ -1884,5 +1932,78 @@ mod tests {
         let mut doc = json!(7);
         bind_document(&mut doc, &SuppliedParams::new(), BindMode::Strict).unwrap();
         assert_eq!(doc, json!(7));
+    }
+
+    /// #989: binding records where a caller's free text lands — whole,
+    /// spliced, in a key or as a whole list — and nothing a default, a
+    /// closed set, a typed value, a `trusted` param or a `${map:}` wrote.
+    #[test]
+    fn binding_records_where_caller_free_text_lands() {
+        let mut doc = json!({
+            "params": {
+                "dlq": {},
+                "name": {},
+                "port": { "type": "int" },
+                "pick": { "values": ["a", "b"] },
+                "root": { "trusted": true },
+                "files": { "type": "list", "items": { "type": "string" } },
+                "header": {},
+                "defaulted": { "default": "/srv/x" },
+                "joined": { "computed": "/data/${param.name}" },
+                "mapped": { "computed": "${map:pick|a=/one|*=/two}" },
+            },
+            "pipeline": {
+                "dlq": { "sink": { "type": "file", "config": { "path": "${param.dlq}" } } },
+                "sink": { "type": "file", "config": {
+                    "path": "/out/${param.name}.jsonl",
+                    "port": "${param.port}",
+                    "mode": "${param.pick}",
+                    "root": "${param.root}",
+                    "other": "${param.defaulted}",
+                    "joined": "${param.joined}",
+                    "mapped": "${param.mapped}",
+                    "headers": { "${param.header}": "v" },
+                } },
+                "source": { "type": "file", "config": { "paths": "${param.files}" } },
+            },
+        });
+        let supplied: SuppliedParams = [
+            ("dlq", json!("/etc/x")),
+            ("name", json!("n")),
+            ("port", json!(5)),
+            ("pick", json!("a")),
+            ("root", json!("/etc")),
+            ("files", json!(["/a", "/b"])),
+            ("header", json!("X-H")),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let bound = bind_document(&mut doc, &supplied, BindMode::Strict).unwrap();
+        let got: Vec<(String, Vec<String>)> = bound
+            .fields
+            .iter()
+            .map(|(p, n)| (p.clone(), n.iter().cloned().collect()))
+            .collect();
+        let want: Vec<(String, Vec<String>)> = [
+            ("/pipeline/dlq/sink/config/path", "dlq"),
+            ("/pipeline/sink/config/headers/X-H", "header"),
+            ("/pipeline/sink/config/joined", "joined"),
+            ("/pipeline/sink/config/path", "name"),
+            ("/pipeline/source/config/paths", "files"),
+        ]
+        .into_iter()
+        .map(|(p, n)| (p.to_string(), vec![n.to_string()]))
+        .collect();
+        assert_eq!(got, want);
+        assert_eq!(
+            doc["pipeline"]["source"]["config"]["paths"],
+            json!(["/a", "/b"])
+        );
+
+        // Nothing supplied: nothing recorded.
+        let mut doc = json!({ "params": { "d": { "default": "/x" } }, "p": "${param.d}" });
+        let bound = bind_document(&mut doc, &SuppliedParams::new(), BindMode::Strict).unwrap();
+        assert!(bound.fields.is_empty());
     }
 }

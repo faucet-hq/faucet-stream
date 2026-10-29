@@ -488,6 +488,7 @@ async fn propose_run(p: &crate::mcp::ChangeProposer, args: &Value) -> Result<Str
             reason: Some(reason.to_string()),
             budget,
             trusted_config: false,
+            caller_params: Default::default(),
         },
     )
     .await
@@ -535,6 +536,7 @@ async fn propose_template(p: &crate::mcp::ChangeProposer, args: &Value) -> Resul
             reason: Some(reason.to_string()),
             budget: None,
             trusted_config: false,
+            caller_params: Default::default(),
         },
     )
     .await
@@ -1296,6 +1298,35 @@ async fn run_template(ctx: &McpContext, args: &Value) -> Result<String, String> 
         // Validate the materialized config without touching a sink, and never
         // echo the body — a secret param value would be in it.
         let cfg = parse_config_with(&materialized.body, crate::params::BindMode::Strict, None)?;
+        // On a server, the caller's param values meet the caller reference
+        // policy before a dry run resolves a selection against the source.
+        if let Some(server) = &ctx.server {
+            let doc: Value = serde_json::from_str(&materialized.body).map_err(|e| e.to_string())?;
+            let tenant = server.actor.tenant.as_deref();
+            let policy = server
+                .state
+                .references()
+                .for_origin(server.state.caller_origin(), tenant);
+            if let Err(e) = crate::serve::load::refuse_caller_params(
+                &doc,
+                &cfg,
+                &materialized.caller_fields,
+                &policy,
+                tenant.is_some(),
+            ) {
+                let message = e.api_error().error.message;
+                crate::serve::audit::write_target_detail(
+                    &server.state,
+                    &server.actor,
+                    "policy.denied",
+                    "template params".into(),
+                    crate::secrets::registry::redact_message(&message),
+                    "denied",
+                )
+                .await;
+                return Err(message);
+            }
+        }
         let mut nodes = crate::expand::expand(&cfg).map_err(|e| e.to_string())?;
         if let Some(sel) = &materialized.selection {
             let auth = crate::auth_catalog::build_auth_catalog(cfg.auth.as_ref())

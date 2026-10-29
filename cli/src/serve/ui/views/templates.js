@@ -1504,6 +1504,7 @@ function paramField(name, p) {
       <span class="pill">${escapeHtml(type)}</span>
       ${p.required ? `<span class="pill pill-failed">required</span>` : ""}
       ${p.secret ? `<span class="pill pill-cancelled">secret</span>` : ""}
+      ${p.trusted ? `<span class="pill pill-queued" title="the template's author lets this value reach paths, URLs and commands without the server's caller reference policy">trusted</span>` : ""}
       ${p.fromSink ? `<span class="pill tpl-kind tpl-kind-sink-template" title="declared by sink template ${escapeHtml(p.fromSink)}">sink</span>` : ""}
       ${p.fromOverlay ? `<span class="pill tpl-kind tpl-kind-deployment" title="declared by deployment ${escapeHtml(p.fromOverlay)}">deployment</span>` : ""}
     </span>

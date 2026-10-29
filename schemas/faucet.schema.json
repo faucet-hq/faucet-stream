@@ -426,6 +426,11 @@
           ],
           "format": "uint",
           "minimum": 0
+        },
+        "trusted": {
+          "description": "The template author means the caller's value to reach a path, URL or\ncommand field as given (#989). Without it, `faucet serve` holds a\ncaller-supplied value that lands in such a field to the caller\nreference policy (`--allow-path-root`, `--allow-url-host`, …), like a\nconfig the caller submitted. A default, a closed `values:` set and a\ncomputed value built only from those are the author's and never\nchecked.",
+          "type": "boolean",
+          "default": false
         }
       },
       "additionalProperties": false

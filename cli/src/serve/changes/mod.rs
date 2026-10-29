@@ -266,6 +266,11 @@ pub struct ChangeRequest {
     /// registered template), not by the requester. Set by the server only.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub trusted_config: bool,
+    /// Where that trusted config holds values the requester supplied for the
+    /// template's params (#989): planned and executed under the caller
+    /// reference policy. Set by the server only.
+    #[serde(default, skip_serializing_if = "crate::params::CallerFields::is_empty")]
+    pub caller_params: crate::params::CallerFields,
 }
 
 impl ChangeRequest {
@@ -359,6 +364,10 @@ pub struct NewChange {
     /// accepted from a client.
     #[serde(skip)]
     pub trusted_config: bool,
+    /// Set in-process with `trusted_config`: where the config holds values
+    /// the requester supplied for the template's params (#989).
+    #[serde(skip)]
+    pub caller_params: crate::params::CallerFields,
 }
 
 /// Executing a `template_launch` request needs this much of the launch body.
@@ -499,7 +508,8 @@ async fn plan_run(
         state,
         &principal,
         crate::runtime::server::Submission::new(&req.config, req.config_format.into())
-            .selected(req.selection.as_ref()),
+            .selected(req.selection.as_ref())
+            .with_caller_fields(&req.caller_fields),
         crate::runtime::server::Gates {
             policy: true,
             budget: None,
@@ -776,12 +786,14 @@ async fn plan_for(
     kind: ChangeKind,
     payload: &Value,
     trusted: bool,
+    caller_params: &crate::params::CallerFields,
 ) -> Result<ChangePlan, ServeError> {
     match kind {
         ChangeKind::Run => {
             let mut req: SubmitRequest = serde_json::from_value(payload.clone())
                 .map_err(|e| ServeError::BadConfig(format!("run payload: {e}")))?;
             req.trusted_config = trusted;
+            req.caller_fields = caller_params.clone();
             plan_run(state, actor, &req).await
         }
         #[cfg(feature = "templates")]
@@ -942,7 +954,15 @@ pub async fn create(
             },
         )?;
     }
-    let plan = plan_for(state, actor, new.kind, &payload, new.trusted_config).await?;
+    let plan = plan_for(
+        state,
+        actor,
+        new.kind,
+        &payload,
+        new.trusted_config,
+        &new.caller_params,
+    )
+    .await?;
     let policy = state.approvals();
     let rule = policy.effective(new.kind);
     let now = Utc::now();
@@ -967,6 +987,7 @@ pub async fn create(
         error: None,
         tenant: actor.tenant.clone(),
         trusted_config: new.trusted_config,
+        caller_params: new.caller_params,
     };
     save(state, &change).await?;
     record_metric(change.kind, "requested");
@@ -1005,7 +1026,8 @@ async fn notify_requested(state: &ServerState, change: &ChangeRequest) {
         state,
         &principal,
         crate::runtime::server::Submission::new(&req.config, req.config_format.into())
-            .selected(req.selection.as_ref()),
+            .selected(req.selection.as_ref())
+            .with_caller_fields(&change.caller_params),
     )
     .await
     {
@@ -1217,6 +1239,7 @@ async fn execute(
         change.kind,
         &change.payload,
         change.trusted_config,
+        &change.caller_params,
     )
     .await
     {
@@ -1263,6 +1286,7 @@ async fn execute(
             req.reason = None;
             req.approved_change = Some(change.id.clone());
             req.trusted_config = change.trusted_config;
+            req.caller_fields = change.caller_params.clone();
             req.budget = match (req.budget.take(), change.budget.clone()) {
                 (Some(a), Some(b)) => Some(a.merge(&b)),
                 (a, b) => a.or(b),
@@ -1762,6 +1786,7 @@ mod tests {
             error: None,
             tenant: Some("acme".into()),
             trusted_config: false,
+            caller_params: Default::default(),
         };
         assert!(ChangeListFilter::default().matches(&c));
         assert!(
@@ -1850,6 +1875,7 @@ mod tests {
             error: None,
             tenant: None,
             trusted_config: false,
+            caller_params: Default::default(),
         }
     }
 
@@ -2048,6 +2074,7 @@ mod tests {
                 reason: None,
                 budget: None,
                 trusted_config: false,
+                caller_params: Default::default(),
             },
         )
         .await
@@ -2065,6 +2092,7 @@ mod tests {
                     ..Default::default()
                 }),
                 trusted_config: false,
+                caller_params: Default::default(),
             },
         )
         .await
@@ -2076,6 +2104,7 @@ mod tests {
             reason: None,
             budget: None,
             trusted_config,
+            caller_params: Default::default(),
         };
         let err = create(&state, &actor("bob"), run(json!({"template": "t"}), false))
             .await
@@ -2134,6 +2163,7 @@ mod tests {
                     ..Default::default()
                 }),
                 trusted_config: false,
+                caller_params: Default::default(),
             },
         )
         .await
@@ -2161,10 +2191,17 @@ mod tests {
         c = stored(ChangeKind::Run, payload, "stale", 1);
         c.plan.as_mut().unwrap().rows.clear();
         save(&state, &c).await.unwrap();
-        let fresh_rows = plan_for(&state, &actor("bob"), ChangeKind::Run, &c.payload, false)
-            .await
-            .unwrap()
-            .rows;
+        let fresh_rows = plan_for(
+            &state,
+            &actor("bob"),
+            ChangeKind::Run,
+            &c.payload,
+            false,
+            &Default::default(),
+        )
+        .await
+        .unwrap()
+        .rows;
         c.plan.as_mut().unwrap().rows = fresh_rows;
         save(&state, &c).await.unwrap();
         let inv = approve(&state, &actor("alice"), &c.id, None).await.unwrap();
@@ -2186,6 +2223,7 @@ mod tests {
                     reason: Some("x".into()),
                     budget: None,
                     trusted_config: false,
+                    caller_params: Default::default(),
                 },
             )
             .await
@@ -2266,6 +2304,7 @@ mod tests {
             error: None,
             tenant: None,
             trusted_config: false,
+            caller_params: Default::default(),
         };
         store.change_upsert(&c).await.unwrap();
         let read = c.clone();
@@ -2303,6 +2342,7 @@ mod tests {
                 reason: None,
                 budget: None,
                 trusted_config: false,
+                caller_params: Default::default(),
             },
         )
         .await
@@ -2366,6 +2406,7 @@ mod tests {
             reason: None,
             budget: None,
             trusted_config: false,
+            caller_params: Default::default(),
         };
         for (kind, needle) in [
             (ChangeKind::TemplateRegister, "template_register payload"),
