@@ -7,6 +7,17 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
 
+## [1.3.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-sqs-v1.2.1...faucet-sink-sqs-v1.3.0) - 2026-10-29
+
+### Bug Fixes
+
+- Template param path checks, run-request depends_on, YAML on yaml_serde, DuckDB writers, OpenTelemetry 0.33, MSSQL on tiberius 0.13 ([#993](https://github.com/faucet-hq/faucet-stream/pull/993))
+- Resolve 310 low-severity audit findings across CLI, serve, core, connectors and tooling (#930 low) ([#947](https://github.com/faucet-hq/faucet-stream/pull/947))
+
+### Features
+
+- *(registry)* Faucet-registry crate for embedders, and review fixes for template param checks ([#996](https://github.com/faucet-hq/faucet-stream/pull/996))
+
 ## [1.2.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-sqs-v1.2.0...faucet-sink-sqs-v1.2.1) - 2026-10-22
 
 ### Bug Fixes

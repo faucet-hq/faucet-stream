@@ -7,6 +7,13 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
 
+## [1.2.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-sftp-v1.2.1...faucet-sink-sftp-v1.2.2) - 2026-10-29
+
+### Bug Fixes
+
+- Resolve the #931/#933 review findings, Oracle pool flake and held #930 low packages ([#934](https://github.com/faucet-hq/faucet-stream/pull/934)) ([#949](https://github.com/faucet-hq/faucet-stream/pull/949))
+- Resolve 310 low-severity audit findings across CLI, serve, core, connectors and tooling (#930 low) ([#947](https://github.com/faucet-hq/faucet-stream/pull/947))
+
 ## [1.2.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-sftp-v1.2.0...faucet-sink-sftp-v1.2.1) - 2026-10-22
 
 ### Bug Fixes

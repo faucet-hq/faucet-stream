@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.6.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-jsonl-v1.5.0...faucet-sink-jsonl-v1.6.0) - 2026-10-29
+
+### Bug Fixes
+
+- Resolve 310 low-severity audit findings across CLI, serve, core, connectors and tooling (#930 low) ([#947](https://github.com/faucet-hq/faucet-stream/pull/947))
+
+### Features
+
+- *(registry)* Faucet-registry crate for embedders, and review fixes for template param checks ([#996](https://github.com/faucet-hq/faucet-stream/pull/996))
+
 ## [1.5.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-jsonl-v1.4.2...faucet-sink-jsonl-v1.5.0) - 2026-10-15
 
 ### Bug Fixes

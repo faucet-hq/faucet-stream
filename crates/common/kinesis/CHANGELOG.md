@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.2.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-common-kinesis-v1.1.0...faucet-common-kinesis-v1.2.0) - 2026-10-29
+
+### Bug Fixes
+
+- Template param path checks, run-request depends_on, YAML on yaml_serde, DuckDB writers, OpenTelemetry 0.33, MSSQL on tiberius 0.13 ([#993](https://github.com/faucet-hq/faucet-stream/pull/993))
+
+### Features
+
+- *(registry)* Faucet-registry crate for embedders, and review fixes for template param checks ([#996](https://github.com/faucet-hq/faucet-stream/pull/996))
+
 ## [1.1.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-common-kinesis-v1.0.6...faucet-common-kinesis-v1.1.0) - 2026-09-29
 
 ### Features

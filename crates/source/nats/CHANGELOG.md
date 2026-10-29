@@ -7,6 +7,12 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
 
+## [1.2.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-nats-v1.2.0...faucet-source-nats-v1.2.1) - 2026-10-29
+
+### Bug Fixes
+
+- #966 review findings, integration tests, TLS everywhere, Iceberg HMS commits, Redshift IAM and Data API, Scorecard hardening ([#986](https://github.com/faucet-hq/faucet-stream/pull/986))
+
 ## [1.2.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-nats-v1.1.1...faucet-source-nats-v1.2.0) - 2026-10-15
 
 ### Bug Fixes
