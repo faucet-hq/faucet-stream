@@ -9,7 +9,7 @@ see the top-level [`CONTRIBUTING.md`](../../CONTRIBUTING.md).
 
 ## Workspace shape
 
-faucet-stream is a Cargo workspace of <!--COUNT:crates-->114<!--/COUNT--> crates. They fall into four layers,
+faucet-stream is a Cargo workspace of <!--COUNT:crates-->115<!--/COUNT--> crates. They fall into four layers,
 and the dependency direction only ever flows downward:
 
 ```mermaid
@@ -51,7 +51,7 @@ umbrella, or on the CLI. This is what lets a third party publish a
 | A connector's config shape | `crates/{source,sink}/<name>/src/config.rs` |
 | Shared config for a source+sink pair | `crates/common/<name>/` (e.g. `faucet-common-kafka`) |
 | Config parsing, matrix expansion, execution | `cli/src/{config,expand,executor}.rs` |
-| Connector dispatch + plugin registry | `cli/src/registry.rs` |
+| Connector dispatch + plugin registry | `crates/registry/src/connectors.rs` (`faucet-registry`; the CLI re-exports it as `cli/src/registry.rs`) |
 | The CLI verbs (`run`, `validate`, `doctor`, `test`, …) | `cli/src/commands/` |
 | The HTTP control plane | `cli/src/serve/` |
 | The connector inventory used by the CLI's `registry_index` test | [`cli/connectors/registry.json`](../../cli/connectors/registry.json) |
@@ -88,7 +88,7 @@ flowchart LR
    write-mode, quarantine-requires-DLQ). This is where a bad config is rejected
    *before* any I/O.
 3. **Execution** — `cli/src/executor.rs` builds the concrete source/sink via
-   `cli/src/registry.rs`, wires the `RunStreamOptions`, and drives each node
+   `cli/src/registry.rs` (over `faucet-registry`), wires the `RunStreamOptions`, and drives each node
    under a bounded semaphore.
 4. **Core pipeline** — `Pipeline::run` (in [`pipeline.rs`](../../crates/core/src/pipeline.rs))
    resolves the bookmark, then calls `run_stream`. This is the heart of the

@@ -9,7 +9,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/faucet-source-parquet.svg)](https://crates.io/crates/faucet-source-parquet)
 [![Docs.rs](https://docs.rs/faucet-source-parquet/badge.svg)](https://docs.rs/faucet-source-parquet)
-[![MSRV](https://img.shields.io/crates/msrv/faucet-source-parquet.svg)](https://github.com/faucet-hq/faucet-stream/blob/main/rust-toolchain.toml)
+[![MSRV](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Ffaucet-hq%2Ffaucet-stream%2Fmain%2FCargo.toml&query=%24.workspace.package%5B%27rust-version%27%5D&label=MSRV&color=blue)](../../../Cargo.toml)
 [![License](https://img.shields.io/crates/l/faucet-source-parquet.svg)](https://github.com/faucet-hq/faucet-stream#license)
 
 Apache **Parquet** file source for the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem. Reads one or more Parquet files from a **local path**, a **local glob pattern**, or **Amazon S3** (single object or prefix) and yields each row as a `serde_json::Value` object.

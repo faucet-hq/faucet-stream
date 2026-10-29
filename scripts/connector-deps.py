@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Fail when a published crate depends on a connector crate (#784).
 
-Every published workspace crate except the two aggregators (`faucet-stream`,
-`faucet-cli`, which depend on every connector by design) must not depend on a
+Every published workspace crate except the aggregators (`faucet-stream`,
+`faucet-cli` and `faucet-registry`, which depend on every connector by design)
+must not depend on a
 `faucet-source-*` / `faucet-sink-*` crate other than itself, in every
 dependency section including `[dev-dependencies]` and target-specific tables.
 A versioned edge to another connector makes `cargo publish` need that connector
@@ -17,7 +18,7 @@ import sys
 import tomllib
 
 CONNECTOR_PREFIXES = ("faucet-source-", "faucet-sink-")
-AGGREGATORS = {"faucet-stream", "faucet-cli"}
+AGGREGATORS = {"faucet-stream", "faucet-cli", "faucet-registry"}
 SECTIONS = ("dependencies", "dev-dependencies", "build-dependencies")
 
 

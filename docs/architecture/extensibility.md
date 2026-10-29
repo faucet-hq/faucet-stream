@@ -36,10 +36,16 @@ through "does this keep the barrier to a third-party connector low?"
   own error types without extending the core enum.
 - **Naming convention** `faucet-source-<name>` / `faucet-sink-<name>`; shared
   source/sink config lives in a `faucet-common-<name>` crate.
-- **`PluginRegistry`** (`cli/src/registry.rs`) — a custom-CLI author calls
+- **`PluginRegistry`** (`faucet-registry`, re-exported as `faucet_cli::registry`) — a custom-CLI author calls
   `faucet_cli::run_main(PluginRegistry::with_builtins().register_source(...).register_sink(...))`;
   the registry is consulted before built-ins by `build_source`/`build_sink`/
   `source_schema`/`sink_schema`. Example: `cli/examples/custom-cli/`.
+- **`faucet-registry`** (`crates/registry/`, #995) — the by-name registry and the
+  shared `auth:` catalog as a semver-checked library, so a tool embedding
+  faucet builds any connector from `type:` + JSON config without the CLI. It
+  uses configs as given (no reference resolution) and refuses connectors that
+  run programs unless the caller passes `BuildPolicy::allow_subprocess`. See
+  `docs/book/src/extending/embedding.md`.
 - **Declared capabilities** (`crates/core/src/capabilities.rs`, RFC 0013) — a
   connector declares what it can do as a `Capabilities` value: through
   `Source::capabilities` / `Sink::capabilities` on a built connector (defaulted,

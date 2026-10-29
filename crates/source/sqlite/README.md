@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/faucet-source-sqlite.svg)](https://crates.io/crates/faucet-source-sqlite)
 [![Docs.rs](https://docs.rs/faucet-source-sqlite/badge.svg)](https://docs.rs/faucet-source-sqlite)
-[![MSRV](https://img.shields.io/crates/msrv/faucet-source-sqlite.svg)](https://github.com/faucet-hq/faucet-stream/blob/main/rust-toolchain.toml)
+[![MSRV](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Ffaucet-hq%2Ffaucet-stream%2Fmain%2FCargo.toml&query=%24.workspace.package%5B%27rust-version%27%5D&label=MSRV&color=blue)](../../../Cargo.toml)
 [![License](https://img.shields.io/crates/l/faucet-source-sqlite.svg)](https://github.com/faucet-hq/faucet-stream#license)
 
 A **SQLite** query source for the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem. Executes a SQL statement against a SQLite database (a file or an in-memory database), decodes each row into a typed `serde_json::Value`, and streams the result set back page-by-page via a sqlx row cursor so memory stays bounded no matter how large the table is.

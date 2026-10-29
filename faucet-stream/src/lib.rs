@@ -97,6 +97,7 @@
 //! | `delta-s3`, `delta-azure`, `delta-gcs` | Cloud warehouses for the Delta Lake source and sink |
 //! | `state`, `state-redis`, `state-postgres` | Redis / PostgreSQL bookmark state stores (`state` = both) |
 //! | `auth`, `oauth1`, `google-sa` | Shared single-flight auth providers (OAuth 1.0a, Google service accounts) |
+//! | `registry` | Build any enabled connector from its `type:` name and a JSON config ([`registry`], from `faucet-registry`) |
 //! | `mtls`, `rabbitmq-tls` | Client-certificate TLS for the HTTP sources / TLS for RabbitMQ |
 //! | `compression` | gzip / zstd for the file and object-store connectors |
 //! | `arrow` | Columnar (Arrow) transfer paths |
@@ -130,6 +131,12 @@ pub use faucet_core::observability::Labels;
 pub mod auth {
     pub use faucet_auth::*;
 }
+
+// ── By-name connector registry ───────────────────────────────────────────────
+/// Build any enabled connector from its `type:` name and a JSON config, as the
+/// `faucet` CLI does (enable the `registry` feature). See [`faucet_registry`].
+#[cfg(feature = "registry")]
+pub use faucet_registry as registry;
 
 // ── Source connectors ────────────────────────────────────────────────────────
 

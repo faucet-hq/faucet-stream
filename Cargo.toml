@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/core",
     "crates/auth",
+    "crates/registry",
     "crates/lineage",
     "crates/transform-sql",
     "crates/transform-wasm",
@@ -146,6 +147,7 @@ categories = ["database", "asynchronous"]
 # Internal crates
 faucet-core = { path = "crates/core", version = "1" }
 faucet-auth = { path = "crates/auth", version = "1" }
+faucet-registry = { path = "crates/registry", version = "1.0.0" }
 faucet-lineage = { path = "crates/lineage", version = "2" }
 faucet-common-bigquery = { path = "crates/common/bigquery", version = "1" }
 faucet-common-elasticsearch = { path = "crates/common/elasticsearch", version = "1" }
@@ -266,11 +268,13 @@ faucet-source-mssql-cdc = { path = "crates/source/mssql-cdc", version = "1" }
 # Shared external deps
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_path_to_error = "0.1.20"
+yaml_serde = "0.10"
 tokio = { version = "1", features = ["time"] }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
-async-trait = "0.1.89"
+async-trait = "0.1.92"
 aho-corasick = "1"
 regex = "1"
 reqwest = { version = "0.13", features = ["json", "form", "query"] }
@@ -428,7 +432,7 @@ deltalake = { version = "1.1.0", default-features = false, features = ["rustls"]
 async-compression = { version = "0.4", features = ["tokio", "gzip", "zstd"] }
 flate2 = "1"
 zstd = "0.13"
-zip = { version = "9", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 glob = "0.3"
 # Arrow-58 line; duckdb 1.20000 is on arrow 60 (#936).
 duckdb = "~1.10506.1"

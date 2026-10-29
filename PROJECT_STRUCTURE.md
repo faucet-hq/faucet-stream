@@ -4,7 +4,7 @@ Where everything lives in the faucet-stream repository. For how the pieces fit
 together at run time, see the [architecture guide](docs/architecture/README.md);
 to start contributing, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-The workspace has <!--COUNT:crates-->114<!--/COUNT--> crates: <!--COUNT:sources-->43<!--/COUNT-->
+The workspace has <!--COUNT:crates-->115<!--/COUNT--> crates: <!--COUNT:sources-->43<!--/COUNT-->
 source connectors, <!--COUNT:sinks-->35<!--/COUNT--> sink connectors and
 <!--COUNT:common-->26<!--/COUNT--> shared connector libraries, plus the core, auth, state,
 lineage, transform and test crates below.
@@ -14,6 +14,7 @@ Cargo.toml                    — workspace manifest
 crates/
   core/                       — faucet-core: shared types, traits, pipeline, transforms, config
   auth/                       — faucet-auth: shared OAuth2 / token-endpoint providers
+  registry/                   — faucet-registry: build any connector from its `type:` name + JSON config, and the shared auth catalog (for embedders; the CLI re-exports it)
   source/                     — source connectors (rest, graphql, xml, grpc, *-cdc, kafka, s3, azure-blob, redshift, clickhouse, pubsub, delta, databricks, iceberg, dynamodb, oracle, oracle-cdc, singer, duckdb, sqs, nats, rabbitmq, sftp, file, …)
   sink/                       — sink connectors (bigquery, iceberg, delta, databricks, dynamodb, oracle, postgres, parquet, kafka, redshift, clickhouse, pubsub, azure-blob, duckdb, sqs, nats, rabbitmq, sftp, singer, …)
   common/                     — shared connector libraries (bigquery, elasticsearch, gcs, kafka, snowflake, mssql, kinesis, spanner, delta, redshift, pubsub, clickhouse, azure, s3, sqs, nats, rabbitmq, sftp, iceberg, dynamodb, databricks, oracle, singer, redis, file, sql — the shared SQL dialects and sink engine)

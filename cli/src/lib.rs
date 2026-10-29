@@ -144,7 +144,7 @@ pub fn run_main(registry: PluginRegistry) -> std::process::ExitCode {
     faucet_core::ensure_crypto_provider();
 
     if let Err(err) = registry.install() {
-        commands::report(&err);
+        commands::report(&CliError::from(err));
         return ExitCode::from(1);
     }
 
@@ -156,6 +156,8 @@ pub fn run_main(registry: PluginRegistry) -> std::process::ExitCode {
     faucet_core::redact::install(Box::new(|s: &str| {
         secrets::registry::redact(s).into_owned()
     }));
+    // And the registry the secrets it finds while building connectors (#995).
+    registry::install_secret_registrar();
 
     // Dynamic shell completion (#383): when the shell invokes us with the
     // `COMPLETE` env var set, compute and print candidates, then exit — before

@@ -12,6 +12,9 @@
 //! function so it is fully unit-testable without touching the filesystem; the
 //! [`crate::commands::new`] command writes the returned files to disk.
 
+/// The minimum Rust version a generated crate declares: faucet's own.
+const MSRV: &str = env!("CARGO_PKG_RUST_VERSION");
+
 /// Which half of a connector pair to scaffold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectorKind {
@@ -169,7 +172,7 @@ impl ConnectorScaffold {
 name = "{crate_name}"
 version = "1.0.0"
 edition = "2024"
-rust-version = "1.99"
+rust-version = "{MSRV}"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/your-org/{crate_name}"
 description = "{name} {role} connector for the faucet-stream ecosystem"
@@ -537,7 +540,7 @@ To use it from the `faucet` CLI, build a custom binary that registers it — see
 name = "{common}"
 version = "1.0.0"
 edition = "2024"
-rust-version = "1.99"
+rust-version = "{MSRV}"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/your-org/{common}"
 description = "Shared config types for the {name} faucet-stream source/sink pair"
@@ -671,6 +674,22 @@ mod tests {
         let long = validate_name("acme-enterprise-widgets").unwrap_err();
         assert!(long.contains("20 characters"), "{long}");
         assert!(validate_name("acme--x").is_err());
+    }
+
+    #[test]
+    fn generated_crates_declare_faucets_msrv() {
+        let s = ConnectorScaffold::new("acme", ConnectorKind::Sink, true).unwrap();
+        let line = format!("rust-version = \"{}\"", env!("CARGO_PKG_RUST_VERSION"));
+        assert!(!env!("CARGO_PKG_RUST_VERSION").is_empty());
+        let manifests: Vec<_> = s
+            .files()
+            .into_iter()
+            .filter(|f| f.path.ends_with("Cargo.toml"))
+            .collect();
+        assert_eq!(manifests.len(), 2);
+        for f in manifests {
+            assert!(f.contents.contains(&line), "{}: {}", f.path, f.contents);
+        }
     }
 
     #[test]

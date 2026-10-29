@@ -1038,6 +1038,84 @@ async fn a_trusted_param_passes_unchecked_and_others_get_a_403() {
     assert_eq!(finished(&state, &id).await.status, RunStatus::Completed);
 }
 
+/// #989: a caller's `env` override is caller text like a param: one that
+/// lands in a path outside the caller roots is refused naming the variable
+/// (and the 403 shows none of the operator's own text around it); inside a
+/// root it runs; a `${env:}` the server's own environment fills is the
+/// operator's and is not checked.
+#[tokio::test]
+#[serial_test::serial(env)]
+async fn an_env_override_is_held_to_the_caller_policy() {
+    let root = tempfile::tempdir().unwrap();
+    let state = fresh_rooted(root.path()).await;
+    let input = root.path().join("in.csv");
+    std::fs::write(&input, "id\n1\n").unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    // SAFETY: serialised on `env` with every other test that sets variables.
+    unsafe {
+        std::env::set_var("FAUCET_989_DIR", elsewhere.path());
+        std::env::set_var("FAUCET_989_KEY", "operator-only-key-989");
+    }
+    register(
+        &state,
+        &format!(
+            "version: 1\nname: pe\npipeline:\n  source: {{ type: csv, config: {{ path: \"{}\" }} }}\n  sink: {{ type: jsonl, config: {{ path: \"${{env:FAUCET_989_DIR}}/${{env:FAUCET_989_KEY}}.jsonl\" }} }}\n",
+            input.display(),
+        ),
+    )
+    .await;
+    let trigger = |env: Value| -> crate::serve::handlers::templates::TriggerBody {
+        serde_json::from_value(json!({ "version": "newest", "env": env })).unwrap()
+    };
+    let run = |env: Value| {
+        crate::serve::handlers::templates::trigger_template(
+            State(state.clone()),
+            Extension(AuthContext {
+                role: Role::Operator,
+                ..alice(None)
+            }),
+            Path("tpl".to_string()),
+            Json(trigger(env)),
+        )
+    };
+    // An override is registered for redaction like any `${env:}` value, so
+    // the refusal shows it masked; the operator's text around it is elided.
+    let err = run(json!({ "FAUCET_989_DIR": "/etc/faucet-989-override" }))
+        .await
+        .map(|_| ())
+        .unwrap_err();
+    let msg = error_text(err);
+    assert!(
+        msg.contains("env override 'FAUCET_989_DIR'") && msg.contains("pipeline.sink.config.path"),
+        "{msg}"
+    );
+    assert!(msg.contains("…"), "{msg}");
+    assert!(!msg.contains("operator-only-key-989"), "{msg}");
+    assert!(
+        !msg.contains(&elsewhere.path().display().to_string()),
+        "{msg}"
+    );
+
+    // Inside a root the override goes ahead.
+    let resp = run(json!({ "FAUCET_989_DIR": root.path().display().to_string() }))
+        .await
+        .unwrap();
+    let id = response_run_id(resp).await.unwrap().unwrap();
+    assert_eq!(finished(&state, &id).await.status, RunStatus::Completed);
+    assert!(root.path().join("operator-only-key-989.jsonl").exists());
+
+    // The server's own environment is the operator's: not checked.
+    let resp = run(json!({})).await.unwrap();
+    let id = response_run_id(resp).await.unwrap().unwrap();
+    assert_eq!(finished(&state, &id).await.status, RunStatus::Completed);
+    assert!(
+        elsewhere
+            .path()
+            .join("operator-only-key-989.jsonl")
+            .exists()
+    );
+}
+
 /// A clustered run re-checks its caller's param values on the instance
 /// that claims it: the stored record carries where they are.
 #[tokio::test]

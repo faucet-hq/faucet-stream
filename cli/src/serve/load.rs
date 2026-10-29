@@ -631,12 +631,110 @@ fn local_path(value: &str) -> Option<&str> {
 /// values come from the clock or the config itself, never from records.
 const STATIC_PATH_TOKENS: &[&str] = &["now", "backfill", "partition"];
 
+/// Why a screening pass refused a value.
+#[derive(Debug, Clone)]
+enum Why {
+    /// A local path that takes a value from records.
+    RecordPath,
+    /// A system tree or a file holding the server's own credentials.
+    Protected,
+    /// A URL host that takes a value from records.
+    RecordHost,
+    /// A URL host taken from a token.
+    TokenHost,
+    /// A connector type that runs a program.
+    Program,
+    /// A local file an auth provider a caller configures names.
+    ProviderFile,
+    /// The reference policy's reason.
+    Policy(String),
+}
+
+/// One refused value. `text` is how a refusal of a whole submitted config
+/// lists it; `caller` is set when only a caller's template params were
+/// screened (#989).
+#[derive(Debug, Clone)]
+struct Finding {
+    why: Why,
+    text: String,
+    caller: Option<CallerFinding>,
+}
+
+/// What a refusal of a caller's template param may say about a finding:
+/// which names wrote the value, where, and only the caller's own text.
+#[derive(Debug, Clone)]
+struct CallerFinding {
+    names: std::collections::BTreeSet<String>,
+    field: String,
+    shown: Option<String>,
+    reason: Option<String>,
+}
+
 /// What a screening pass refused: paths that reach the server's credentials
 /// or a system tree, and resources the reference policy does not allow.
 #[derive(Default)]
 struct Findings {
     protected: Vec<String>,
     policy: Vec<String>,
+    items: Vec<Finding>,
+}
+
+impl Findings {
+    /// Record a refusal of `value` at `ptr` (relative to `base`).
+    fn add(
+        &mut self,
+        scope: &Scope<'_>,
+        base: &str,
+        ptr: &str,
+        value: &str,
+        why: Why,
+        text: String,
+    ) {
+        match why {
+            Why::RecordPath | Why::Protected => self.protected.push(text.clone()),
+            Why::RecordHost | Why::TokenHost | Why::Policy(_) => self.policy.push(text.clone()),
+            Why::Program | Why::ProviderFile => {}
+        }
+        let caller = scope.only.map(|f| CallerFinding {
+            names: f.params_at(ptr),
+            field: format!("{base}{ptr}"),
+            shown: f.shown(ptr, value),
+            reason: match &why {
+                Why::Policy(r) => Some(f.shown_reason(ptr, r)),
+                _ => None,
+            },
+        });
+        self.items.push(Finding { why, text, caller });
+    }
+}
+
+/// What one screening pass checks: a whole caller config (`caller`), a
+/// trusted one, or — with `only` — just the values a caller's template
+/// params wrote (#989), as pointers relative to the value being checked.
+#[derive(Clone, Copy)]
+struct Scope<'a> {
+    caller: bool,
+    policy: Option<&'a ReferencePolicy>,
+    only: Option<&'a crate::params::CallerFields>,
+}
+
+impl<'a> Scope<'a> {
+    /// Whether the value at `ptr` is screened.
+    fn wants(&self, ptr: &str) -> bool {
+        self.only.is_none_or(|f| f.covers(ptr))
+    }
+
+    /// This scope over a value whose own caller fields are `only`.
+    fn within<'b>(&self, only: Option<&'b crate::params::CallerFields>) -> Scope<'b>
+    where
+        'a: 'b,
+    {
+        Scope {
+            caller: self.caller,
+            policy: self.policy,
+            only,
+        }
+    }
 }
 
 /// Whether a local path a caller supplied takes a value from records.
@@ -650,100 +748,144 @@ fn takes_record_value(path: &str) -> bool {
 
 const RECORD_PATH: &str = "(a local path in a submitted config may not take a value from records)";
 
+/// The access a read of `config` implies (a `recursive: true` directory
+/// read reaches every file below it).
+fn read_access(config: &Value, access: Access) -> Access {
+    match access {
+        Access::Read { .. } => Access::Read {
+            recursive: config.get("recursive").and_then(Value::as_bool) == Some(true),
+        },
+        Access::Write => Access::Write,
+    }
+}
+
+/// Check one local path `s` at `ptr` (relative to `base`).
+fn check_path_value(
+    s: &str,
+    base: &str,
+    ptr: &str,
+    access: Access,
+    scope: &Scope<'_>,
+    found: &mut Findings,
+) {
+    let Some(path) = local_path(s) else {
+        return;
+    };
+    if scope.caller && takes_record_value(path) {
+        found.add(
+            scope,
+            base,
+            ptr,
+            s,
+            Why::RecordPath,
+            format!("{s} {RECORD_PATH}"),
+        );
+    } else if data_path_is_protected(path, access) {
+        found.add(scope, base, ptr, s, Why::Protected, s.to_string());
+    } else if let Some(Err(e)) = scope.policy.map(|p| p.check_path(path)) {
+        let text = format!("{s} ({})", e.reason);
+        found.add(scope, base, ptr, s, Why::Policy(e.reason), text);
+    }
+}
+
 fn check_local_paths(
     config: &Value,
+    base: &str,
     access: Access,
-    caller: bool,
-    policy: Option<&ReferencePolicy>,
+    scope: &Scope<'_>,
     found: &mut Findings,
 ) {
     fn walk(
         v: &Value,
+        ptr: &str,
         under_path_key: bool,
-        access: Access,
-        caller: bool,
-        policy: Option<&ReferencePolicy>,
+        cx: (&str, Access, &Scope<'_>),
         found: &mut Findings,
     ) {
+        let (base, access, scope) = cx;
         match v {
             Value::String(s) if under_path_key => {
-                let Some(path) = local_path(s) else {
-                    return;
-                };
-                if caller && takes_record_value(path) {
-                    found.protected.push(format!("{s} {RECORD_PATH}"));
-                    return;
-                }
-                if data_path_is_protected(path, access) {
-                    found.protected.push(s.clone());
-                } else if let Some(Err(e)) = policy.map(|p| p.check_path(path)) {
-                    found.policy.push(format!("{s} ({})", e.reason));
+                if scope.wants(ptr) {
+                    check_path_value(s, base, ptr, access, scope, found);
                 }
             }
             Value::Array(items) => items
                 .iter()
-                .for_each(|i| walk(i, under_path_key, access, caller, policy, found)),
+                .enumerate()
+                .for_each(|(i, x)| walk(x, &format!("{ptr}/{i}"), under_path_key, cx, found)),
             Value::Object(map) => {
                 for (k, child) in map {
-                    walk(child, is_path_key(k), access, caller, policy, found);
+                    let at = crate::params::caller::child(ptr, k);
+                    walk(child, &at, is_path_key(k), cx, found);
                 }
             }
             _ => {}
         }
     }
-    let access = match access {
-        Access::Read { .. } => Access::Read {
-            recursive: config.get("recursive").and_then(Value::as_bool) == Some(true),
-        },
-        Access::Write => Access::Write,
-    };
-    walk(config, false, access, caller, policy, found);
+    walk(
+        config,
+        "",
+        false,
+        (base, read_access(config, access), scope),
+        found,
+    );
 }
 
-/// Check every resource a `kind` connector's `config` names through its
-/// schema's `x-faucet-resource` annotations (#881): a local path against the
-/// server's credential files and system trees, and every resource against the
-/// reference policy.
+/// Check every resource a `kind` connector's `config` (at `base`) names
+/// through its schema's `x-faucet-resource` annotations (#881): a local path
+/// against the server's credential files and system trees, and every
+/// resource against the reference policy.
 fn check_connector(
     kind: &str,
     config: &Value,
+    base: &str,
     access: Access,
-    caller: bool,
-    policy: Option<&ReferencePolicy>,
+    scope: &Scope<'_>,
     found: &mut Findings,
 ) {
-    if LOCAL_PATH_KINDS.contains(&kind) {
-        check_local_paths(config, access, caller, policy, found);
+    if scope.only.is_some_and(|f| f.is_empty()) {
+        return;
     }
+    if LOCAL_PATH_KINDS.contains(&kind) {
+        check_local_paths(config, base, access, scope, found);
+    }
+    let access = read_access(config, access);
     for r in crate::serve::references::connector_resources(kind, config) {
+        if !scope.wants(&r.pointer) {
+            continue;
+        }
+        let ptr = r.pointer.as_str();
         if r.kind == ResourceKind::Path
             && let Some(path) = local_path(&r.value)
         {
-            if caller && takes_record_value(path) {
-                found.protected.push(format!("{} {RECORD_PATH}", r.value));
+            if scope.caller && takes_record_value(path) {
+                let text = format!("{} {RECORD_PATH}", r.value);
+                found.add(scope, base, ptr, &r.value, Why::RecordPath, text);
                 continue;
             }
             if data_path_is_protected(path, access) {
-                found.protected.push(r.value.clone());
+                found.add(scope, base, ptr, &r.value, Why::Protected, r.value.clone());
                 continue;
             }
         }
-        if caller
+        if scope.caller
             && (r.kind == ResourceKind::Url
                 || (r.kind == ResourceKind::Path && local_path(&r.value).is_none()))
             && faucet_core::resolve::url_hosts(&r.value)
                 .iter()
                 .any(|h| takes_record_value(h))
         {
-            found.policy.push(format!(
+            let text = format!(
                 "{kind}{}: {} (a URL host in a submitted config may not take a value from \
                  records — it cannot be checked)",
                 r.pointer, r.value
-            ));
+            );
+            found.add(scope, base, ptr, &r.value, Why::RecordHost, text);
             continue;
         }
-        if let Some(Err(e)) = policy.map(|p| p.check(&r)) {
-            found.policy.push(format!("{} ({})", r.value, e.reason));
+        if let Some(Err(e)) = scope.policy.map(|p| p.check(&r)) {
+            let text = format!("{} ({})", r.value, e.reason);
+            found.add(scope, base, ptr, &r.value, Why::Policy(e.reason), text);
         }
     }
 }
@@ -765,17 +907,18 @@ fn access_under(key: &str, inherited: Access) -> Access {
 /// and the file-backed relations of a `sql` transform — that would read or
 /// write a system tree or a server credential file.
 pub fn server_data_paths(doc: &Value, caller: bool) -> Vec<String> {
-    data_path_findings(doc, caller, None).protected
+    let scope = Scope {
+        caller,
+        policy: None,
+        only: None,
+    };
+    data_path_findings(doc, &scope).protected
 }
 
-fn data_path_findings(doc: &Value, caller: bool, policy: Option<&ReferencePolicy>) -> Findings {
-    fn walk(
-        v: &Value,
-        access: Access,
-        caller: bool,
-        policy: Option<&ReferencePolicy>,
-        found: &mut Findings,
-    ) {
+/// Every `{type, config}` in `doc` (pointers from its root) checked under
+/// `scope`.
+fn data_path_findings(doc: &Value, scope: &Scope<'_>) -> Findings {
+    fn walk(v: &Value, ptr: &str, access: Access, scope: &Scope<'_>, found: &mut Findings) {
         match v {
             Value::Object(map) => {
                 let access = match map.get("kind").and_then(Value::as_str) {
@@ -783,32 +926,53 @@ fn data_path_findings(doc: &Value, caller: bool, policy: Option<&ReferencePolicy
                     Some("source") => Access::Read { recursive: false },
                     _ => access,
                 };
-                match (map.get("type").and_then(Value::as_str), map.get("config")) {
-                    (Some(t), Some(cfg)) => check_connector(t, cfg, access, caller, policy, found),
-                    (Some("csv" | "jsonl"), None) => {
-                        if let Some(path) = map.get("path") {
-                            let wrapped = serde_json::json!({ "path": path });
-                            check_local_paths(&wrapped, access, caller, policy, found);
+                if let Some(t) = map.get("type").and_then(Value::as_str) {
+                    // A caller's template param naming a connector that runs
+                    // a program (a whole caller config is screened for that
+                    // before it is parsed).
+                    let at = format!("{ptr}/type");
+                    if scope.only.is_some_and(|f| f.covers(&at))
+                        && crate::serve::references::runs_program(t)
+                        && scope.policy.is_some_and(|p| !p.allows_subprocess())
+                    {
+                        found.add(scope, "", &at, t, Why::Program, t.to_string());
+                    }
+                    let (base, config) = match map.get("config") {
+                        Some(cfg) => (format!("{ptr}/config"), Some(cfg.clone())),
+                        None if matches!(t, "csv" | "jsonl") => (
+                            ptr.to_string(),
+                            map.get("path").map(|p| serde_json::json!({ "path": p })),
+                        ),
+                        None => (String::new(), None),
+                    };
+                    if let Some(config) = config {
+                        let rel = scope.only.map(|f| f.under(&base));
+                        let inner = scope.within(rel.as_ref());
+                        if map.contains_key("config") {
+                            check_connector(t, &config, &base, access, &inner, found);
+                        } else if !inner.only.is_some_and(|f| f.is_empty()) {
+                            check_local_paths(&config, &base, access, &inner, found);
                         }
                     }
-                    _ => {}
                 }
                 for (k, c) in map {
-                    walk(c, access_under(k, access), caller, policy, found);
+                    let at = crate::params::caller::child(ptr, k);
+                    walk(c, &at, access_under(k, access), scope, found);
                 }
             }
             Value::Array(items) => items
                 .iter()
-                .for_each(|c| walk(c, access, caller, policy, found)),
+                .enumerate()
+                .for_each(|(i, c)| walk(c, &format!("{ptr}/{i}"), access, scope, found)),
             _ => {}
         }
     }
     let mut found = Findings::default();
     walk(
         doc,
+        "",
         Access::Read { recursive: false },
-        caller,
-        policy,
+        scope,
         &mut found,
     );
     for list in [&mut found.protected, &mut found.policy] {
@@ -818,47 +982,82 @@ fn data_path_findings(doc: &Value, caller: bool, policy: Option<&ReferencePolicy
     found
 }
 
+/// A connector template and the pointer it is declared at.
 fn template_spec<'a>(
     templates: &'a std::collections::HashMap<String, crate::config::ConnectorSpec>,
     legacy: &'a Option<crate::config::ConnectorSpec>,
+    plural: &str,
     name: Option<&str>,
-) -> Option<&'a crate::config::ConnectorSpec> {
+) -> Option<(&'a crate::config::ConnectorSpec, String)> {
     let name = name.unwrap_or("default");
-    templates.get(name).or(if name == "default" {
-        legacy.as_ref()
-    } else {
-        None
-    })
+    if let Some(t) = templates.get(name) {
+        return Some((
+            t,
+            format!("/pipeline/{plural}/{}", crate::params::caller::escape(name)),
+        ));
+    }
+    let singular = plural.trim_end_matches('s');
+    legacy
+        .as_ref()
+        .filter(|_| name == "default")
+        .map(|t| (t, format!("/pipeline/{singular}")))
 }
 
-/// The connector a template override builds: its kind (the override's, else
-/// the template's) and the template config with the override merged over it.
+/// A connector a config builds from a template override (a matrix-row
+/// `source` / `sink` / `fan_out.source`, a topology `source` / `sink` node):
+/// its kind, the template config with the override merged over it, and
+/// where both are.
+struct OverrideConnector {
+    kind: String,
+    config: Value,
+    access: Access,
+    /// Where the override is (its config is at `{at}/config`).
+    at: String,
+    /// The template's config and where it is declared.
+    template: Option<(Value, String)>,
+    over: Value,
+}
+
 fn resolve_override(
     templates: &std::collections::HashMap<String, crate::config::ConnectorSpec>,
     legacy: &Option<crate::config::ConnectorSpec>,
-    name: Option<&str>,
-    kind: Option<&str>,
-    config: Option<&Value>,
-) -> Option<(String, Value)> {
-    let template = template_spec(templates, legacy, name);
-    let kind = kind.or(template.map(|t| t.kind.as_str()))?.to_string();
-    let mut merged = template
-        .map(|t| t.config.clone())
+    plural: &str,
+    over: (Option<&str>, Option<&str>, Option<&Value>),
+    at: String,
+    access: Access,
+) -> Option<OverrideConnector> {
+    let (name, kind, config) = over;
+    let template = template_spec(templates, legacy, plural, name);
+    let kind = kind
+        .or(template.as_ref().map(|(t, _)| t.kind.as_str()))?
+        .to_string();
+    let template = template.map(|(t, tat)| (t.config.clone(), format!("{tat}/config")));
+    let over = config
+        .cloned()
         .unwrap_or_else(|| Value::Object(Default::default()));
-    if let Some(over) = config {
-        crate::merge::merge_value(&mut merged, over.clone());
-    }
-    Some((kind, merged))
+    let mut merged = template
+        .as_ref()
+        .map(|(c, _)| c.clone())
+        .unwrap_or_else(|| Value::Object(Default::default()));
+    crate::merge::merge_value(&mut merged, over.clone());
+    Some(OverrideConnector {
+        kind,
+        config: merged,
+        access,
+        at,
+        template,
+        over,
+    })
 }
 
-/// The connectors a config builds from a template override — matrix-row
-/// `source` / `sink` / `fan_out.source` and topology `source` / `sink`
-/// nodes — resolved against their template, with the access each implies.
-fn override_connectors(cfg: &PipelineConfig) -> Vec<(String, Value, Access)> {
+/// The connectors a config builds from a template override, resolved
+/// against their template, with the access each implies.
+fn override_connectors(cfg: &PipelineConfig) -> Vec<OverrideConnector> {
     let p = &cfg.pipeline;
     let read = Access::Read { recursive: false };
     let mut out = Vec::new();
-    for node in p.nodes.values() {
+    for (id, node) in &p.nodes {
+        let at = format!("/pipeline/nodes/{}", crate::params::caller::escape(id));
         let resolved = match node {
             crate::config::NodeSpec::Source {
                 template,
@@ -867,11 +1066,11 @@ fn override_connectors(cfg: &PipelineConfig) -> Vec<(String, Value, Access)> {
             } => resolve_override(
                 &p.sources,
                 &p.source,
-                template.as_deref(),
-                kind.as_deref(),
-                config.as_ref(),
-            )
-            .map(|(k, c)| (k, c, read)),
+                "sources",
+                (template.as_deref(), kind.as_deref(), config.as_ref()),
+                at,
+                read,
+            ),
             crate::config::NodeSpec::Sink {
                 template,
                 kind,
@@ -879,42 +1078,84 @@ fn override_connectors(cfg: &PipelineConfig) -> Vec<(String, Value, Access)> {
             } => resolve_override(
                 &p.sinks,
                 &p.sink,
-                template.as_deref(),
-                kind.as_deref(),
-                config.as_ref(),
-            )
-            .map(|(k, c)| (k, c, Access::Write)),
+                "sinks",
+                (template.as_deref(), kind.as_deref(), config.as_ref()),
+                at,
+                Access::Write,
+            ),
             _ => None,
         };
         out.extend(resolved);
     }
-    for row in &cfg.matrix {
-        let no_templates = Default::default();
+    let no_templates = Default::default();
+    for (i, row) in cfg.matrix.iter().enumerate() {
         let discover = row.discover.as_ref().map(|d| &d.source);
         let discover_templates = match discover {
             Some(d) if d.r#ref.is_none() => &no_templates,
             _ => &p.sources,
         };
         let overrides = [
-            (row.source.as_ref(), &p.sources, &p.source, read),
-            (discover, discover_templates, &None, read),
-            (row.sink.as_ref(), &p.sinks, &p.sink, Access::Write),
+            (
+                row.source.as_ref(),
+                &p.sources,
+                &p.source,
+                "sources",
+                "source",
+                read,
+            ),
+            (
+                discover,
+                discover_templates,
+                &None,
+                "sources",
+                "fan_out/source",
+                read,
+            ),
+            (
+                row.sink.as_ref(),
+                &p.sinks,
+                &p.sink,
+                "sinks",
+                "sink",
+                Access::Write,
+            ),
         ];
-        for (over, templates, legacy, access) in overrides {
+        for (over, templates, legacy, plural, part, access) in overrides {
             let Some(over) = over else { continue };
-            out.extend(
-                resolve_override(
-                    templates,
-                    legacy,
+            out.extend(resolve_override(
+                templates,
+                legacy,
+                plural,
+                (
                     over.r#ref.as_deref(),
                     over.kind.as_deref(),
                     over.config.as_ref(),
-                )
-                .map(|(k, c)| (k, c, access)),
-            );
+                ),
+                format!("/matrix/{i}/{part}"),
+                access,
+            ));
         }
     }
     out
+}
+
+/// Check every template-override connector of `cfg` under `scope`; with
+/// `scope.only`, a value the override inherits from its template is the
+/// caller's where the template's was.
+fn override_findings(cfg: &PipelineConfig, scope: &Scope<'_>, found: &mut Findings) {
+    for o in override_connectors(cfg) {
+        let base = format!("{}/config", o.at);
+        let merged = scope.only.map(|f| {
+            let empty = Value::Object(Default::default());
+            let (tpl_cfg, tpl_fields) = match &o.template {
+                Some((c, tat)) => (c, f.under(tat)),
+                None => (&empty, f.empty_like()),
+            };
+            merged_caller_fields(tpl_cfg, &tpl_fields, &o.over, &f.under(&base))
+        });
+        let inner = scope.within(merged.as_ref());
+        check_connector(&o.kind, &o.config, &base, o.access, &inner, found);
+    }
 }
 
 // ── Caller-supplied template params (#989) ─────────────────────────────────
@@ -931,13 +1172,6 @@ pub struct CallerParams<'a> {
 
 /// How a refusal of a caller-supplied param value starts.
 pub const CALLER_PARAM_REFUSAL: &str = "a value a caller supplied for a template param";
-
-struct ParamFinding {
-    params: std::collections::BTreeSet<String>,
-    field: String,
-    value: String,
-    reason: String,
-}
 
 /// `fields` extended through the config's own references: a string holding
 /// `${vars.X}` / `${sources.N.PATH}` / `${sinks.N.PATH}` that names a
@@ -1044,122 +1278,22 @@ fn merged_caller_fields(
         false
     };
     let mut out = over_fields.clone();
-    for (ptr, params) in template_fields.iter() {
-        if !replaced(ptr) {
-            out.insert_all(ptr, params);
+    for ptr in template_fields.iter().map(|(p, _)| p.clone()) {
+        if !replaced(&ptr) {
+            out.copy_entry(template_fields, &ptr, &ptr);
         }
     }
     out
 }
 
-/// Check the resources connector `kind`'s `config` names where `fields`
-/// (relative to the config) says a caller chose the value.
-#[allow(clippy::too_many_arguments)]
-fn check_param_connector(
-    kind: &str,
-    config: &Value,
-    fields: &crate::params::CallerFields,
-    base: &str,
-    access: Access,
-    policy: &ReferencePolicy,
-    out: &mut Vec<ParamFinding>,
-) {
-    if fields.is_empty() {
-        return;
-    }
-    let mut push = |ptr: &str, value: &str, reason: String| {
-        out.push(ParamFinding {
-            params: fields.params_at(ptr),
-            field: format!("{base}{ptr}"),
-            value: value.to_string(),
-            reason,
-        });
-    };
-    let path_reason = |path: &str, access: Access| -> Option<String> {
-        if takes_record_value(path) {
-            Some("a path a caller chooses may not also take a value from records".into())
-        } else if data_path_is_protected(path, access) {
-            Some(format!(
-                "it reaches a system tree ({}) or a file holding the server's own credentials",
-                SYSTEM_DIRS.join(", ")
-            ))
-        } else {
-            policy.check_path(path).err().map(|e| e.reason)
-        }
-    };
-    let access = match access {
-        Access::Read { .. } => Access::Read {
-            recursive: config.get("recursive").and_then(Value::as_bool) == Some(true),
-        },
-        Access::Write => Access::Write,
-    };
-    if LOCAL_PATH_KINDS.contains(&kind) {
-        fn walk(v: &Value, ptr: &str, under: bool, out: &mut Vec<(String, String)>) {
-            match v {
-                Value::String(s) if under => out.push((ptr.to_string(), s.clone())),
-                Value::Array(a) => a
-                    .iter()
-                    .enumerate()
-                    .for_each(|(i, x)| walk(x, &format!("{ptr}/{i}"), under, out)),
-                Value::Object(o) => o.iter().for_each(|(k, x)| {
-                    walk(
-                        x,
-                        &crate::params::caller::child(ptr, k),
-                        is_path_key(k),
-                        out,
-                    )
-                }),
-                _ => {}
-            }
-        }
-        let mut paths = Vec::new();
-        walk(config, "", false, &mut paths);
-        for (ptr, s) in paths {
-            if !fields.covers(&ptr) {
-                continue;
-            }
-            if let Some(path) = local_path(&s)
-                && let Some(reason) = path_reason(path, access)
-            {
-                push(&ptr, &s, reason);
-            }
-        }
-    }
-    for r in crate::serve::references::connector_resources(kind, config) {
-        if !fields.covers(&r.pointer) {
-            continue;
-        }
-        if r.kind == ResourceKind::Path
-            && let Some(path) = local_path(&r.value)
-        {
-            if let Some(reason) = path_reason(path, access) {
-                push(&r.pointer, &r.value, reason);
-            }
-            continue;
-        }
-        if faucet_core::resolve::url_hosts(&r.value)
-            .iter()
-            .any(|h| takes_record_value(h))
-        {
-            push(
-                &r.pointer,
-                &r.value,
-                "a URL host a caller chooses may not also take a value from records".into(),
-            );
-            continue;
-        }
-        if let Err(e) = policy.check(&r) {
-            push(&r.pointer, &r.value, e.reason);
-        }
-    }
-}
-
 /// Refuse a trusted template body (#989) in which a value a caller supplied
-/// for a param reaches a path, URL or command the caller reference `policy`
-/// does not allow: every connector field annotated `x-faucet-resource` (and
+/// for a param (or an `env` override) reaches a path, URL or command the
+/// caller reference `policy` does not allow: the screening a caller's own
+/// config gets — every connector field annotated `x-faucet-resource` (and
 /// every path of a local-file connector, state store, DLQ or lineage
-/// transport), every absolute URL, and a connector type that runs a
-/// program. `doc` is the body as loaded, before it was parsed into `cfg`.
+/// transport), every auth provider, every absolute URL, and a connector type
+/// that runs a program — over just the values `fields` names. `doc` is the
+/// body as loaded, before it was parsed into `cfg`.
 pub fn refuse_caller_params(
     doc: &Value,
     cfg: &PipelineConfig,
@@ -1173,335 +1307,87 @@ pub fn refuse_caller_params(
     let fields = propagate_caller_fields(doc, fields);
     let view = serde_json::to_value(cfg)
         .map_err(|e| ServeError::Internal(format!("serializing config: {e}")))?;
-    let mut found = Vec::new();
-
-    // Every `{type, config}` in the config, as the screening walk reads it.
-    fn walk(
-        v: &Value,
-        ptr: &str,
-        access: Access,
-        fields: &crate::params::CallerFields,
-        policy: &ReferencePolicy,
-        found: &mut Vec<ParamFinding>,
-    ) {
-        match v {
-            Value::Object(map) => {
-                let access = match map.get("kind").and_then(Value::as_str) {
-                    Some("sink") => Access::Write,
-                    Some("source") => Access::Read { recursive: false },
-                    _ => access,
-                };
-                if let Some(t) = map.get("type").and_then(Value::as_str) {
-                    let at = format!("{ptr}/type");
-                    if fields.covers(&at)
-                        && crate::serve::references::runs_program(t)
-                        && !policy.allows_subprocess()
-                    {
-                        found.push(ParamFinding {
-                            params: fields.params_at(&at),
-                            field: at,
-                            value: t.to_string(),
-                            reason: "connectors that run a program are not allowed".into(),
-                        });
-                    }
-                    match map.get("config") {
-                        Some(cfg) => {
-                            let base = format!("{ptr}/config");
-                            check_param_connector(
-                                t,
-                                cfg,
-                                &fields.under(&base),
-                                &base,
-                                access,
-                                policy,
-                                found,
-                            );
-                        }
-                        None if matches!(t, "csv" | "jsonl") => {
-                            if let Some(path) = map.get("path") {
-                                let wrapped = serde_json::json!({ "path": path });
-                                check_param_connector(
-                                    t,
-                                    &wrapped,
-                                    &fields.under(ptr),
-                                    ptr,
-                                    access,
-                                    policy,
-                                    found,
-                                );
-                            }
-                        }
-                        None => {}
-                    }
-                }
-                for (k, c) in map {
-                    walk(
-                        c,
-                        &crate::params::caller::child(ptr, k),
-                        access_under(k, access),
-                        fields,
-                        policy,
-                        found,
-                    );
-                }
-            }
-            Value::Array(items) => items
-                .iter()
-                .enumerate()
-                .for_each(|(i, c)| walk(c, &format!("{ptr}/{i}"), access, fields, policy, found)),
-            _ => {}
-        }
-    }
-    walk(
-        &view,
-        "",
-        Access::Read { recursive: false },
-        &fields,
-        policy,
-        &mut found,
-    );
-
-    // Template overrides (matrix rows, topology nodes), merged over their
-    // template like the run builds them.
-    let p = &cfg.pipeline;
-    let template_at =
-        |templates: &std::collections::HashMap<String, crate::config::ConnectorSpec>,
-         legacy: &Option<crate::config::ConnectorSpec>,
-         plural: &str,
-         singular: &str,
-         name: Option<&str>|
-         -> Option<(String, String, Value)> {
-            let name = name.unwrap_or("default");
-            if let Some(t) = templates.get(name) {
-                return Some((
-                    t.kind.clone(),
-                    format!("/pipeline/{plural}/{}", crate::params::caller::escape(name)),
-                    t.config.clone(),
-                ));
-            }
-            legacy.as_ref().filter(|_| name == "default").map(|t| {
-                (
-                    t.kind.clone(),
-                    format!("/pipeline/{singular}"),
-                    t.config.clone(),
-                )
-            })
-        };
-    struct Override<'c> {
-        at: String,
-        name: Option<&'c str>,
-        kind: Option<&'c str>,
-        config: Option<&'c Value>,
-        is_source: bool,
-        /// A fan-out source without `ref` builds from its own config only.
-        templated: bool,
-        access: Access,
-    }
-    let read = Access::Read { recursive: false };
-    let mut overrides: Vec<Override<'_>> = Vec::new();
-    for (id, node) in &p.nodes {
-        let at = format!("/pipeline/nodes/{}", crate::params::caller::escape(id));
-        match node {
-            crate::config::NodeSpec::Source {
-                template,
-                kind,
-                config,
-            } => overrides.push(Override {
-                at,
-                name: template.as_deref(),
-                kind: kind.as_deref(),
-                config: config.as_ref(),
-                is_source: true,
-                templated: true,
-                access: read,
-            }),
-            crate::config::NodeSpec::Sink {
-                template,
-                kind,
-                config,
-            } => overrides.push(Override {
-                at,
-                name: template.as_deref(),
-                kind: kind.as_deref(),
-                config: config.as_ref(),
-                is_source: false,
-                templated: true,
-                access: Access::Write,
-            }),
-            _ => {}
-        }
-    }
-    for (i, row) in cfg.matrix.iter().enumerate() {
-        let parts = [
-            ("source", row.source.as_ref(), true, read),
-            ("sink", row.sink.as_ref(), false, Access::Write),
-            (
-                "fan_out/source",
-                row.discover.as_ref().map(|d| &d.source),
-                true,
-                read,
-            ),
-        ];
-        for (part, over, is_source, access) in parts {
-            if let Some(o) = over {
-                overrides.push(Override {
-                    at: format!("/matrix/{i}/{part}"),
-                    name: o.r#ref.as_deref(),
-                    kind: o.kind.as_deref(),
-                    config: o.config.as_ref(),
-                    is_source,
-                    templated: part != "fan_out/source" || o.r#ref.is_some(),
-                    access,
-                });
-            }
-        }
-    }
-    let empty = Value::Object(Default::default());
-    for Override {
-        at,
-        name,
-        kind,
-        config,
-        is_source,
-        templated,
-        access,
-    } in overrides
-    {
-        let template = match (templated, is_source) {
-            (false, _) => None,
-            (true, true) => template_at(&p.sources, &p.source, "sources", "source", name),
-            (true, false) => template_at(&p.sinks, &p.sink, "sinks", "sink", name),
-        };
-        let Some(kind) = kind
-            .map(str::to_string)
-            .or_else(|| template.as_ref().map(|t| t.0.clone()))
-        else {
-            continue;
-        };
-        let (tpl_cfg, tpl_fields) = match &template {
-            Some((_, tat, c)) => (c.clone(), fields.under(&format!("{tat}/config"))),
-            None => (empty.clone(), Default::default()),
-        };
-        let over = config.cloned().unwrap_or_else(|| empty.clone());
-        let base = format!("{at}/config");
-        let merged_fields =
-            merged_caller_fields(&tpl_cfg, &tpl_fields, &over, &fields.under(&base));
-        let mut merged = tpl_cfg;
-        crate::merge::merge_value(&mut merged, over);
-        check_param_connector(
-            &kind,
-            &merged,
-            &merged_fields,
-            &base,
-            access,
-            policy,
-            &mut found,
-        );
-    }
-
-    // The `auth:` catalog's providers: a token endpoint is held to the
-    // policy; a local file a caller chose is refused outright, as in a
-    // caller's own provider.
+    let scope = Scope {
+        caller: true,
+        policy: Some(policy),
+        only: Some(&fields),
+    };
+    let mut found = data_path_findings(&view, &scope);
+    override_findings(cfg, &scope, &mut found);
+    url_findings(&view, &scope, &mut found);
     for (name, spec) in cfg.auth.iter().flatten() {
         let base = format!("/auth/{}/config", crate::params::caller::escape(name));
         let here = fields.under(&base);
-        if here.is_empty() {
-            continue;
-        }
-        for r in faucet_auth::provider_resources(spec) {
-            if !here.covers(&r.pointer) {
-                continue;
-            }
-            let reason = match r.kind {
-                ResourceKind::Path => Some(
-                    "a provider a caller configures may not name a local file — pass a key \
-                     inline as `key_json`"
-                        .to_string(),
-                ),
-                _ => policy.check(&r.to_resource_ref()).err().map(|e| e.reason),
-            };
-            if let Some(reason) = reason {
-                found.push(ParamFinding {
-                    params: here.params_at(&r.pointer),
-                    field: format!("{base}{}", r.pointer),
-                    value: r.value.clone(),
-                    reason,
-                });
-            }
-        }
+        provider_findings(
+            spec,
+            (&format!("auth.{name}"), &base),
+            &scope.within(Some(&here)),
+            &mut found,
+        );
     }
+    caller_params_error(found, for_tenant)
+}
 
-    // Every absolute URL a caller wrote, wherever it is.
-    fn urls(v: &Value, ptr: &str, out: &mut Vec<(String, String)>) {
-        match v {
-            Value::String(s) if is_absolute_url(s) => out.push((ptr.to_string(), s.clone())),
-            Value::Array(a) => a
-                .iter()
-                .enumerate()
-                .for_each(|(i, x)| urls(x, &format!("{ptr}/{i}"), out)),
-            Value::Object(o) => o
-                .iter()
-                .for_each(|(k, x)| urls(x, &crate::params::caller::child(ptr, k), out)),
-            _ => {}
-        }
-    }
-    let mut all = Vec::new();
-    urls(&view, "", &mut all);
-    for (ptr, url) in all {
-        if !fields.covers(&ptr) {
-            continue;
-        }
-        let reason = if faucet_core::resolve::url_hosts(&url)
-            .iter()
-            .any(|h| h.contains("${"))
-        {
-            Some("a URL host a caller chooses may not also come from a token".to_string())
-        } else {
-            policy.check_url(&url).err().map(|e| e.reason)
-        };
-        if let Some(reason) = reason {
-            found.push(ParamFinding {
-                params: fields.params_at(&ptr),
-                field: ptr,
-                value: url,
-                reason,
-            });
-        }
-    }
-
-    if found.is_empty() {
-        return Ok(());
-    }
+/// The refusal [`refuse_caller_params`]'s findings amount to, if any: each
+/// names the params (and `env` overrides) that wrote the value, the field,
+/// and only the text the caller sent.
+fn caller_params_error(found: Findings, for_tenant: bool) -> Result<(), ServeError> {
     let mut lines: Vec<String> = found
+        .items
         .into_iter()
-        .map(|f| {
-            let params = f
-                .params
+        .filter_map(|f| {
+            let c = f.caller?;
+            let reason = match f.why {
+                Why::RecordPath => {
+                    "a path a caller chooses may not also take a value from records".to_string()
+                }
+                Why::Protected => format!(
+                    "it reaches a system tree ({}) or a file holding the server's own credentials",
+                    SYSTEM_DIRS.join(", ")
+                ),
+                Why::RecordHost => {
+                    "a URL host a caller chooses may not also take a value from records".into()
+                }
+                Why::TokenHost => {
+                    "a URL host a caller chooses may not also come from a token".into()
+                }
+                Why::Program => "connectors that run a program are not allowed".into(),
+                Why::ProviderFile => "a provider a caller configures may not name a local file \
+                                      — pass a key inline as `key_json`"
+                    .into(),
+                Why::Policy(r) => c.reason.unwrap_or(r),
+            };
+            let names = c
+                .names
                 .iter()
-                .map(|p| format!("'{p}'"))
+                .map(|n| crate::params::caller::describe(n))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!(
-                "param {params} sets `{}` to {} ({})",
-                crate::params::caller::display(&f.field),
-                f.value,
-                f.reason
-            )
+            let to = c.shown.map(|v| format!(" to {v}")).unwrap_or_default();
+            Some(format!(
+                "{names} sets `{}`{to} ({reason})",
+                crate::params::caller::display(&c.field),
+            ))
         })
         .collect();
+    if lines.is_empty() {
+        return Ok(());
+    }
     lines.sort();
     lines.dedup();
-    Err(ServeError::Forbidden(format!(
-        "{CALLER_PARAM_REFUSAL} reaches what the server's reference policy does not allow a \
-         caller: {}; the operator can allow it with --allow-path-root / --allow-url-host / \
-         --allow-url-scheme{}, or the template's author can declare the param `trusted: true`",
-        lines.join("; "),
-        if for_tenant {
-            " (a tenant is confined to --tenant-path-root/<tenant>)"
-        } else {
-            ""
-        }
-    )))
+    Err(ServeError::Forbidden(
+        crate::secrets::registry::redact_message(&format!(
+            "{CALLER_PARAM_REFUSAL} reaches what the server's reference policy does not allow a \
+             caller: {}; the operator can allow it with --allow-path-root / --allow-url-host / \
+             --allow-url-scheme{}, or the template's author can declare the param `trusted: true`",
+            lines.join("; "),
+            if for_tenant {
+                " (a tenant is confined to --tenant-path-root/<tenant>)"
+            } else {
+                ""
+            }
+        )),
+    ))
 }
 
 /// Refuse a server-local path a request names outside a config (a DLQ
@@ -1578,20 +1464,21 @@ pub fn refuse_server_paths_with(
     origin: BodyOrigin,
     policy: &ReferencePolicy,
 ) -> Result<(), ServeError> {
-    let caller = matches!(origin, BodyOrigin::Caller { .. });
-    let policy = Some(policy);
+    let scope = Scope {
+        caller: matches!(origin, BodyOrigin::Caller { .. }),
+        policy: Some(policy),
+        only: None,
+    };
     let mut found = match serde_json::to_value(cfg) {
-        Ok(doc) => data_path_findings(&doc, caller, policy),
+        Ok(doc) => data_path_findings(&doc, &scope),
         Err(e) => return Err(ServeError::Internal(format!("serializing config: {e}"))),
     };
-    let mut check = |kind: &str, config: &Value, access: Access| {
-        check_connector(kind, config, access, caller, policy, &mut found);
-    };
+    override_findings(cfg, &scope, &mut found);
     let read = Access::Read { recursive: false };
-    for (kind, config, access) in override_connectors(cfg) {
-        check(&kind, &config, access);
-    }
     for n in nodes {
+        let mut check = |kind: &str, config: &Value, access: Access| {
+            check_connector(kind, config, "", access, &scope, &mut found);
+        };
         check(&n.source.kind, &n.source.config, read);
         check(&n.sink.kind, &n.sink.config, Access::Write);
         if let Some(st) = &n.state {
@@ -1640,25 +1527,46 @@ fn is_absolute_url(value: &str) -> bool {
     })
 }
 
-/// Every absolute URL anywhere in `doc` checked against `policy`; a URL whose
-/// host comes from a `${…}` token cannot be checked and is refused.
-fn url_findings(doc: &Value, policy: &ReferencePolicy, found: &mut Findings) {
-    for_each_string(doc, &mut |s| {
-        if !is_absolute_url(s) {
-            return;
+/// Every absolute URL anywhere in `doc` (the ones `scope` wants) checked
+/// against its policy; a URL whose host comes from a `${…}` token cannot be
+/// checked and is refused.
+fn url_findings(doc: &Value, scope: &Scope<'_>, found: &mut Findings) {
+    fn urls(v: &Value, ptr: &str, out: &mut Vec<(String, String)>) {
+        match v {
+            Value::String(s) if is_absolute_url(s) => out.push((ptr.to_string(), s.clone())),
+            Value::Array(a) => a
+                .iter()
+                .enumerate()
+                .for_each(|(i, x)| urls(x, &format!("{ptr}/{i}"), out)),
+            Value::Object(o) => o
+                .iter()
+                .for_each(|(k, x)| urls(x, &crate::params::caller::child(ptr, k), out)),
+            _ => {}
         }
-        if faucet_core::resolve::url_hosts(s)
+    }
+    let Some(policy) = scope.policy else {
+        return;
+    };
+    let mut all = Vec::new();
+    urls(doc, "", &mut all);
+    for (ptr, s) in all {
+        if !scope.wants(&ptr) {
+            continue;
+        }
+        if faucet_core::resolve::url_hosts(&s)
             .iter()
             .any(|h| h.contains("${"))
         {
-            found.policy.push(format!(
+            let text = format!(
                 "{s} (a URL host in a submitted document may not come from a token — it cannot \
                  be checked)"
-            ));
-        } else if let Err(e) = policy.check_url(s) {
-            found.policy.push(format!("{s} ({})", e.reason));
+            );
+            found.add(scope, "", &ptr, &s, Why::TokenHost, text);
+        } else if let Err(e) = policy.check_url(&s) {
+            let text = format!("{s} ({})", e.reason);
+            found.add(scope, "", &ptr, &s, Why::Policy(e.reason), text);
         }
-    });
+    }
 }
 
 /// Screen a document fragment a request supplied for a run whose body is
@@ -1672,8 +1580,13 @@ pub fn screen_caller_fragment(doc: &Value, policy: &ReferencePolicy) -> Result<(
     refuse_bound_tokens(doc)?;
     screen_subprocess(doc, policy, false)?;
     screen_references(doc, policy)?;
-    let mut found = data_path_findings(doc, true, Some(policy));
-    url_findings(doc, policy, &mut found);
+    let scope = Scope {
+        caller: true,
+        policy: Some(policy),
+        only: None,
+    };
+    let mut found = data_path_findings(doc, &scope);
+    url_findings(doc, &scope, &mut found);
     findings_error(found)
 }
 
@@ -1837,6 +1750,50 @@ pub fn screen_auth_catalog(
     )
 }
 
+/// Check every endpoint and file an auth provider `spec` names
+/// ([`faucet_auth::provider_resources`]); `at` is how a message names it
+/// and the pointer of its `config`. With `scope.caller` the provider came
+/// from a caller and may not name a local file at all.
+fn provider_findings(spec: &Value, at: (&str, &str), scope: &Scope<'_>, found: &mut Findings) {
+    let (name, base) = at;
+    if scope.only.is_some_and(|f| f.is_empty()) {
+        return;
+    }
+    for r in faucet_auth::provider_resources(spec) {
+        if !scope.wants(&r.pointer) {
+            continue;
+        }
+        let at = format!("{name}.config{}", r.pointer.replace('/', "."));
+        let ptr = r.pointer.as_str();
+        match r.kind {
+            ResourceKind::Path => {
+                let path = local_path(&r.value).unwrap_or(&r.value);
+                let access = if r.writes {
+                    Access::Write
+                } else {
+                    Access::Read { recursive: false }
+                };
+                if scope.caller {
+                    let text = format!("{at}: {}", r.value);
+                    found.add(scope, base, ptr, &r.value, Why::ProviderFile, text);
+                } else if data_path_is_protected(path, access) {
+                    let text = format!(
+                        "{at}: {} (a system tree or a server credential file)",
+                        r.value
+                    );
+                    found.add(scope, base, ptr, &r.value, Why::Protected, text);
+                }
+            }
+            _ => {
+                if let Some(Err(e)) = scope.policy.map(|p| p.check(&r.to_resource_ref())) {
+                    let text = format!("{at}: {} ({})", r.value, e.reason);
+                    found.add(scope, base, ptr, &r.value, Why::Policy(e.reason), text);
+                }
+            }
+        }
+    }
+}
+
 /// [`screen_auth_catalog`] over any named provider specs (a config's `auth:`
 /// catalog, a tenant's connections). With `caller`, the specs came from a
 /// request: a provider may not name a local file at all — a key file is
@@ -1848,34 +1805,20 @@ pub fn screen_auth_providers<'a>(
     policy: &ReferencePolicy,
     caller: bool,
 ) -> Result<(), ServeError> {
-    let mut refused = Vec::new();
-    let mut files = Vec::new();
+    let scope = Scope {
+        caller,
+        policy: Some(policy),
+        only: None,
+    };
+    let mut found = Findings::default();
     for (name, spec) in providers {
-        for r in faucet_auth::provider_resources(spec) {
-            let at = format!("{name}.config{}", r.pointer.replace('/', "."));
-            match r.kind {
-                ResourceKind::Path => {
-                    let path = local_path(&r.value).unwrap_or(&r.value);
-                    let access = if r.writes {
-                        Access::Write
-                    } else {
-                        Access::Read { recursive: false }
-                    };
-                    if caller {
-                        files.push(format!("{at}: {}", r.value));
-                    } else if data_path_is_protected(path, access) {
-                        files.push(format!(
-                            "{at}: {} (a system tree or a server credential file)",
-                            r.value
-                        ));
-                    }
-                }
-                _ => {
-                    if let Err(e) = policy.check(&r.to_resource_ref()) {
-                        refused.push(format!("{at}: {} ({})", r.value, e.reason));
-                    }
-                }
-            }
+        provider_findings(spec, (&name, ""), &scope, &mut found);
+    }
+    let (mut files, mut refused) = (Vec::new(), Vec::new());
+    for f in found.items {
+        match f.why {
+            Why::Policy(_) => refused.push(f.text),
+            _ => files.push(f.text),
         }
     }
     if !files.is_empty() {
@@ -3925,5 +3868,60 @@ schedule:
         );
         assert!(aliased.covers("/mirror/snapshot/source/config/x"));
         assert!(aliased.covers("/matrix/0/fan_out/source/config"));
+    }
+
+    /// #989: a refusal shows only what the caller sent — never the
+    /// operator's `${env:}` / `${file:}` text resolved around it, in the
+    /// value or in the policy's reason — and is redacted.
+    #[cfg(all(feature = "source-rest", feature = "sink-file"))]
+    #[test]
+    fn a_refusal_shows_only_the_callers_own_text() {
+        let root = tempfile::tempdir().unwrap();
+        let policy = ReferencePolicy::deny_all()
+            .with_path_roots([root.path().to_path_buf()])
+            .any_url_scheme()
+            .with_url_hosts(["api.example.com".to_string()]);
+        let out = root.path().join("o.jsonl").display().to_string();
+        let doc = json!({
+            "version": 1,
+            "pipeline": {
+                "source": { "type": "rest", "config": {
+                    "base_url": "https://evil.example.net/v1?key=svc-key-from-operator-env" } },
+                "sink": { "type": "file", "config": { "path": out } }
+            }
+        });
+        let cfg = PipelineConfig::from_value(doc.clone()).unwrap();
+        let mut f = crate::params::CallerFields::default();
+        f.insert_as(
+            "/pipeline/source/config/base_url",
+            "host",
+            crate::params::caller::Wrote::Part,
+        );
+        f.add_text("host", "evil.example.net");
+        let err = refuse_caller_params(&doc, &cfg, &f, &policy, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("param 'host' sets `pipeline.source.config.base_url`"),
+            "{err}"
+        );
+        assert!(err.contains("to …evil.example.net…"), "{err}");
+        assert!(!err.contains("svc-key-from-operator-env"), "{err}");
+        // Without the caller's texts (a stored record), no value is shown.
+        let mut bare = crate::params::CallerFields::default();
+        bare.insert_as(
+            "/pipeline/source/config/base_url",
+            "host",
+            crate::params::caller::Wrote::Part,
+        );
+        let err = refuse_caller_params(&doc, &cfg, &bare, &policy, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("sets `pipeline.source.config.base_url` ("),
+            "{err}"
+        );
+        assert!(!err.contains("evil.example.net"), "{err}");
+        assert!(!err.contains("svc-key-from-operator-env"), "{err}");
     }
 }

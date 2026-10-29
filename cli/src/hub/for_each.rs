@@ -433,46 +433,59 @@ fn splices_free_text(s: &str, item: &Item<'_>) -> bool {
             .any(|(_, f)| crate::params::caller::item_field_text(item.items, item.value, *f))
 }
 
-/// Render every reference to `item` in `v` (at JSON pointer `ptr`),
-/// recording in `traced` where caller free text lands.
+/// The caller texts of `item` that `s` splices (#989).
+fn spliced_texts(s: &str, item: &Item<'_>) -> Vec<String> {
+    if !item.traced {
+        return Vec::new();
+    }
+    var_refs(s, item.var)
+        .iter()
+        .filter(|(_, f)| crate::params::caller::item_field_text(item.items, item.value, *f))
+        .filter_map(|(token, f)| item.text(token, *f).ok())
+        .collect()
+}
+
+/// Render every reference to `item` in `v` (at `cur`), recording in `traced`
+/// where caller free text lands and in `texts` what it is.
 fn render_tree(
     v: &mut Value,
     item: &Item<'_>,
     field: Option<&str>,
-    ptr: &str,
+    cur: &crate::params::caller::Cursor,
     traced: &mut Vec<String>,
+    texts: &mut Vec<String>,
 ) -> CliResult<()> {
     match v {
         Value::String(s) => {
             if splices_free_text(s, item) {
-                traced.push(ptr.to_string());
+                traced.push(cur.at.clone());
+                texts.extend(spliced_texts(s, item));
             }
             *v = render_string(s, item, field)?;
         }
         Value::Array(a) => {
             for (i, x) in a.iter_mut().enumerate() {
-                render_tree(x, item, field, &format!("{ptr}/{i}"), traced)?;
+                render_tree(x, item, field, &cur.index(i), traced, texts)?;
             }
         }
         Value::Object(o) => {
             let entries: Vec<(String, Value)> = std::mem::take(o).into_iter().collect();
             for (key, mut val) in entries {
-                let rendered = render_string(&key, item, None)
-                    .map(|k| match k {
-                        Value::String(k) => k,
-                        other => value_to_string(&other),
-                    })
-                    .unwrap_or_else(|_| key.clone());
-                let at = crate::params::caller::child(ptr, &rendered);
-                render_tree(&mut val, item, Some(&key), &at, traced)?;
-                let key = match render_string(&key, item, None)? {
+                // Rendered once: the value lands under this text.
+                let rendered = match render_string(&key, item, None)? {
                     Value::String(k) => k,
                     other => value_to_string(&other),
                 };
+                let secret = rendered != key && crate::params::caller::key_is_secret(&rendered);
+                let next = cur.key(&key, &rendered, secret);
+                render_tree(&mut val, item, Some(&key), &next, traced, texts)?;
                 if splices_free_text(&key, item) {
-                    traced.push(at);
+                    traced.push(next.at.clone());
+                    if !secret {
+                        texts.extend(spliced_texts(&key, item));
+                    }
                 }
-                o.insert(key, val);
+                o.insert(rendered, val);
             }
         }
         _ => {}
@@ -561,6 +574,9 @@ pub struct Expanded {
     /// a JSON pointer into the stream (`/source/config/…`,
     /// `/transforms/0/config/…`) and the list param.
     pub caller_fields: Vec<(String, String, String)>,
+    /// The caller texts each traced name wrote (never a secret field's), so
+    /// a refusal can show them.
+    pub caller_texts: BTreeMap<String, Vec<String>>,
 }
 
 impl Expanded {
@@ -579,7 +595,16 @@ impl Expanded {
                 .iter()
                 .position(|r| r.get("id").and_then(Value::as_str) == Some(stream.as_str()))
             {
-                out.insert(format!("/matrix/{i}{ptr}"), param.clone());
+                out.insert_as(
+                    format!("/matrix/{i}{ptr}"),
+                    param.clone(),
+                    crate::params::caller::Wrote::Part,
+                );
+            }
+        }
+        for (name, texts) in &self.caller_texts {
+            for t in texts {
+                out.add_text(name.clone(), t.clone());
             }
         }
         out
@@ -597,9 +622,33 @@ pub fn expand_traced(
         return Ok(Expanded {
             template: src.clone(),
             caller_fields: Vec::new(),
+            caller_texts: BTreeMap::new(),
         });
     }
     src.validate()?;
+    // A list default an `env` override wrote is the caller's text too.
+    let mut via_env: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    if let Some(env) = env {
+        for (name, p) in &src.params {
+            let Some(d) = &p.default else { continue };
+            let mut strings = Vec::new();
+            crate::params::list::leaves(d, &mut strings);
+            let vars: Vec<String> = strings
+                .iter()
+                .flat_map(|s| iter_directives(s).map(|(_, d)| d).collect::<Vec<_>>())
+                .filter_map(|d| match d {
+                    Directive::LoadTime {
+                        prefix: "env" | "secret",
+                        body,
+                    } if env.contains_key(body) => Some(crate::params::caller::env_name(body)),
+                    _ => None,
+                })
+                .collect();
+            if !vars.is_empty() && !supplied.contains_key(name) {
+                via_env.insert(name.clone(), vars);
+            }
+        }
+    }
     let spec: ParamsSpec = match env {
         Some(env) => {
             let mut v = serde_json::to_value(&src.params)
@@ -619,6 +668,7 @@ pub fn expand_traced(
 
     let mut streams = Vec::with_capacity(src.streams.len());
     let mut caller_fields = Vec::new();
+    let mut caller_texts: BTreeMap<String, Vec<String>> = BTreeMap::new();
     // Rendered name → where it came from, for the duplicate error.
     let mut origin: BTreeMap<String, String> = src
         .streams
@@ -648,7 +698,12 @@ pub fn expand_traced(
                 label: format!("{pname}[{i}]"),
                 guarded: bound.caller_supplied.contains(pname),
                 items: &items_spec,
-                traced: bound.caller_supplied.contains(pname) && !p.trusted,
+                traced: (bound.caller_supplied.contains(pname) || via_env.contains_key(pname))
+                    && !p.trusted,
+            };
+            let names: Vec<String> = match via_env.get(pname) {
+                Some(vars) => vars.clone(),
+                None => vec![pname.to_string()],
             };
             let name = render_name(s, &item, &bound, &what)?;
             if let Some(prev) = origin.insert(name.clone(), format!("item {}", item.label)) {
@@ -660,18 +715,38 @@ pub fn expand_traced(
             }
             let mut parts = rendered_parts(s);
             let mut traced = Vec::new();
-            render_tree(&mut parts, &item, None, "", &mut traced).map_err(|e| match e {
+            let mut texts = Vec::new();
+            render_tree(
+                &mut parts,
+                &item,
+                None,
+                &crate::params::caller::Cursor::default(),
+                &mut traced,
+                &mut texts,
+            )
+            .map_err(|e| match e {
                 CliError::Config(m) => CliError::Config(format!("{what}: {m}")),
                 other => other,
             })?;
             // A row's source config and transforms reach connectors; its
             // keys, write modes and name are checked as stream data.
-            caller_fields.extend(
-                traced
-                    .into_iter()
-                    .filter(|p| p.starts_with("/source/config") || p.starts_with("/transforms/"))
-                    .map(|p| (name.clone(), p, pname.to_string())),
-            );
+            let traced: Vec<String> = traced
+                .into_iter()
+                .filter(|p| p.starts_with("/source/config") || p.starts_with("/transforms/"))
+                .collect();
+            if !traced.is_empty() {
+                for n in &names {
+                    caller_texts
+                        .entry(n.clone())
+                        .or_default()
+                        .extend(texts.iter().cloned());
+                }
+            }
+            for p in traced {
+                for n in &names {
+                    caller_fields.push((name.clone(), p.clone(), n.clone()));
+                }
+            }
             let mut out = s.clone();
             out.name = name;
             out.for_each = None;
@@ -694,6 +769,7 @@ pub fn expand_traced(
     Ok(Expanded {
         template: expanded,
         caller_fields,
+        caller_texts,
     })
 }
 

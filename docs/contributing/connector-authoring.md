@@ -160,13 +160,20 @@ not go through `faucet_core::http::Client` (#971).
 Implementing the trait is half the job. A connector isn't shipped until it's
 wired into every surface. Miss one and a CI job — or a downstream user — breaks:
 
-- [ ] **Umbrella feature** — add `source-foo` / `sink-foo` to `faucet-stream/Cargo.toml`.
-- [ ] **CLI feature** — add the matching feature to `cli/Cargo.toml`.
-- [ ] **CLI dispatch** — add the arm to `build_source`/`build_sink` (and the
-      `*_schema` / `*_descriptions` helpers) in [`cli/src/registry.rs`](../../cli/src/registry.rs).
+- [ ] **Registry feature** — add `source-foo` / `sink-foo` (`dep:faucet-source-foo`)
+      to `crates/registry/Cargo.toml` and to its `source` / `sink` aggregate.
+- [ ] **Umbrella feature** — add `source-foo` / `sink-foo` to `faucet-stream/Cargo.toml`,
+      forwarding `faucet-registry?/source-foo`.
+- [ ] **CLI feature** — add the matching feature to `cli/Cargo.toml`, forwarding
+      `faucet-registry/source-foo`.
+- [ ] **Dispatch** — add the arm to `build_source`/`build_sink` (and the
+      `*_schema` / `*_descriptions` / `validate_*` / descriptor helpers) in
+      [`crates/registry/src/connectors.rs`](../../crates/registry/src/connectors.rs),
+      and the kind to its `FIRST_PARTY_SOURCES` / `FIRST_PARTY_SINKS`.
 - [ ] **Registry index** — add a verified entry to
       [`cli/connectors/registry.json`](../../cli/connectors/registry.json), or the CLI
-      `registry_index` test panics under `--all-features`.
+      `registry_index` test panics under `--all-features` (and
+      `first_party_kinds_match_the_verified_index` fails).
 - [ ] **CI matrix** — add the connector to the `feature-check` matrix in
       `.github/workflows/ci.yml` (feature-isolation builds each connector alone).
 - [ ] **Own dep-features** — the crate must enable in *its own* `Cargo.toml`

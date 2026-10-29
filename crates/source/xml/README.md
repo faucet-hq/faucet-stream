@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/faucet-source-xml.svg)](https://crates.io/crates/faucet-source-xml)
 [![Docs.rs](https://docs.rs/faucet-source-xml/badge.svg)](https://docs.rs/faucet-source-xml)
-[![MSRV](https://img.shields.io/crates/msrv/faucet-source-xml.svg)](https://github.com/faucet-hq/faucet-stream/blob/main/rust-toolchain.toml)
+[![MSRV](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Ffaucet-hq%2Ffaucet-stream%2Fmain%2FCargo.toml&query=%24.workspace.package%5B%27rust-version%27%5D&label=MSRV&color=blue)](../../../Cargo.toml)
 [![License](https://img.shields.io/crates/l/faucet-source-xml.svg)](https://github.com/faucet-hq/faucet-stream#license)
 
 A config-driven **XML / SOAP API source** for the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem. It fetches an XML (or SOAP) HTTP endpoint, converts the response to JSON, pulls the repeating record element out by a dot-separated element path, and streams the records page-by-page into any faucet-stream sink — a file, a database, a warehouse, a queue — with one declarative config and no glue code.

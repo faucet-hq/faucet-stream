@@ -382,6 +382,7 @@ brew install faucet-hq/faucet-stream/faucet-cli                  # macOS / Linux
 curl -LsSf https://github.com/faucet-hq/faucet-stream/releases/latest/download/faucet-cli-installer.sh | sh
 cargo install faucet-cli                                        # from source
 cargo add faucet-stream                                         # as a library
+cargo add faucet-registry --features source-postgres,sink-jsonl # connectors by `type:` name, for embedders
 ```
 
 Prebuilt archives with SHA-256 checksums are on the

@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/faucet-source-kafka.svg)](https://crates.io/crates/faucet-source-kafka)
 [![Docs.rs](https://docs.rs/faucet-source-kafka/badge.svg)](https://docs.rs/faucet-source-kafka)
-[![MSRV](https://img.shields.io/crates/msrv/faucet-source-kafka.svg)](https://github.com/faucet-hq/faucet-stream/blob/main/rust-toolchain.toml)
+[![MSRV](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Ffaucet-hq%2Ffaucet-stream%2Fmain%2FCargo.toml&query=%24.workspace.package%5B%27rust-version%27%5D&label=MSRV&color=blue)](../../../Cargo.toml)
 [![License](https://img.shields.io/crates/l/faucet-source-kafka.svg)](https://github.com/faucet-hq/faucet-stream#license)
 
 Apache **Kafka** consumer source for the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem. Subscribes to one or more topics, drains messages until a `max_messages` count or an `idle_timeout` window fires, and emits each Kafka message as a structured JSON record. Built on [`rdkafka`](https://crates.io/crates/rdkafka) (librdkafka bindings) — one of the fastest Kafka clients available.

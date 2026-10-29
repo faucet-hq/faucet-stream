@@ -121,3 +121,4 @@
 - [Authoring a connector](./extending/authoring-connectors.md)
 - [Connector protocol (FCP v0)](./spec/faucet-connector-spec-v0.md)
 - [Connector marketplace](./extending/marketplace.md)
+- [Embedding faucet in another tool](./extending/embedding.md)

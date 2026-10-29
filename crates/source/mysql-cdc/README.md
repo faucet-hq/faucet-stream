@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/faucet-source-mysql-cdc.svg)](https://crates.io/crates/faucet-source-mysql-cdc)
 [![Docs.rs](https://docs.rs/faucet-source-mysql-cdc/badge.svg)](https://docs.rs/faucet-source-mysql-cdc)
-[![MSRV](https://img.shields.io/crates/msrv/faucet-source-mysql-cdc.svg)](https://github.com/faucet-hq/faucet-stream/blob/main/rust-toolchain.toml)
+[![MSRV](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Ffaucet-hq%2Ffaucet-stream%2Fmain%2FCargo.toml&query=%24.workspace.package%5B%27rust-version%27%5D&label=MSRV&color=blue)](../../../Cargo.toml)
 [![License](https://img.shields.io/crates/l/faucet-source-mysql-cdc.svg)](https://github.com/faucet-hq/faucet-stream#license)
 
 MySQL **Change Data Capture (CDC)** source for the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem. Tails the MySQL binary log via row-based replication and emits every `INSERT` / `UPDATE` / `DELETE` (and optionally DDL) as a structured JSON change event.

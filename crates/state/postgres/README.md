@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/faucet-state-postgres.svg)](https://crates.io/crates/faucet-state-postgres)
 [![Docs.rs](https://docs.rs/faucet-state-postgres/badge.svg)](https://docs.rs/faucet-state-postgres)
-[![MSRV](https://img.shields.io/crates/msrv/faucet-state-postgres.svg)](https://github.com/faucet-hq/faucet-stream/blob/main/rust-toolchain.toml)
+[![MSRV](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Ffaucet-hq%2Ffaucet-stream%2Fmain%2FCargo.toml&query=%24.workspace.package%5B%27rust-version%27%5D&label=MSRV&color=blue)](../../../Cargo.toml)
 [![License](https://img.shields.io/crates/l/faucet-state-postgres.svg)](https://github.com/faucet-hq/faucet-stream#license)
 
 PostgreSQL-backed [`StateStore`](https://docs.rs/faucet-core/latest/faucet_core/state/trait.StateStore.html) for the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem. Persists incremental-replication bookmarks in a single JSONB-backed table so sources can resume exactly where they left off after a crash, restart, or scheduled invocation.

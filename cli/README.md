@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/faucet-cli.svg)](https://crates.io/crates/faucet-cli)
 [![Docs.rs](https://docs.rs/faucet-cli/badge.svg)](https://docs.rs/faucet-cli)
-[![MSRV](https://img.shields.io/crates/msrv/faucet-cli.svg)](https://github.com/faucet-hq/faucet-stream/blob/main/rust-toolchain.toml)
+[![MSRV](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Ffaucet-hq%2Ffaucet-stream%2Fmain%2FCargo.toml&query=%24.workspace.package%5B%27rust-version%27%5D&label=MSRV&color=blue)](../Cargo.toml)
 [![License](https://img.shields.io/crates/l/faucet-cli.svg)](https://github.com/faucet-hq/faucet-stream#license)
 
 `faucet` — config-driven runner for [`faucet-stream`](https://crates.io/crates/faucet-stream) pipelines.
@@ -1743,7 +1743,14 @@ A complete, runnable example lives in
 [`cli/examples/custom-cli/`](examples/custom-cli/main.rs) (build it with
 `cargo run --example custom-cli -- list`).
 
-[`PluginRegistry`]: https://docs.rs/faucet-cli/latest/faucet_cli/registry/struct.PluginRegistry.html
+To use faucet's connectors from **another tool** rather than a `faucet`
+binary — build any connector from its `type:` name and a JSON config — depend
+on [`faucet-registry`](https://crates.io/crates/faucet-registry) instead of `faucet-cli`:
+it is the same registry (`faucet_cli::registry` and `faucet_cli::auth_catalog`
+re-export it), without the CLI's dependencies, and it follows semver. See
+[Embedding faucet in another tool](https://faucet-hq.github.io/faucet-stream/extending/embedding.html).
+
+[`PluginRegistry`]: https://docs.rs/faucet-registry/latest/faucet_registry/struct.PluginRegistry.html
 
 ## Troubleshooting / FAQ
 

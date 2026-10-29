@@ -34,7 +34,8 @@ pub mod spec;
 
 pub use bind::{
     BindMode, BoundParams, PARAM_ID, PARAMS_KEY, SecretTexts, SuppliedParams, bind_document,
-    collect_cli_params, collect_env_overrides, declared, parse_cli_param, resolve,
+    bind_document_traced, collect_cli_params, collect_env_overrides, declared, parse_cli_param,
+    resolve,
 };
 pub use caller::CallerFields;
 pub use spec::{HIDDEN_DEFAULT, ParamSpec, ParamType, ParamsSpec, hide_secret_defaults};

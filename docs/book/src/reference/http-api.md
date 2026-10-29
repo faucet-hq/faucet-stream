@@ -303,7 +303,9 @@ checked, so it is refused; register the pipeline as a template instead.
 
 A registered template is the operator's, so the server loads its body under
 the open policy. The values a caller supplies for the template's `params:`
-are not: wherever one lands in the materialized config — whole
+are not, and neither is an `env` override (`"env": {"OUT_DIR": "…"}`), which
+replaces the value of a `${env:VAR}` / `${secret:VAR}` the template reads:
+wherever one lands in the materialized config — whole
 (`path: ${param.out}`), spliced into longer text (`path: /data/${param.name}.jsonl`),
 reached through `${vars.*}` / `${sources.*}`, carried by a `for_each` list
 item, or composed in from a source × sink × overlay pairing — the field is
@@ -311,8 +313,10 @@ checked against the caller policy above after the trusted load and before
 anything in the config runs: every annotated connector path, URL and
 command, the state, DLQ and lineage paths, `auth:` provider endpoints and
 files, every absolute URL, and a connector `type` that runs a program. A
-tenant run is confined to `--tenant-path-root/<tenant>`. A refusal is a `403`
-naming the param and the field, and is audited as `policy.denied`:
+tenant run is confined to `--tenant-path-root/<tenant>` (and may not send
+`env` overrides at all). A param's `default` that an `env` override filled counts as the override's.
+A refusal is a `403` naming the param (or `env override 'VAR'`) and the
+field, and is audited as `policy.denied`:
 
 ```
 403 a value a caller supplied for a template param reaches what the server's
@@ -320,12 +324,24 @@ reference policy does not allow a caller: param 'x' sets
 `pipeline.dlq.sink.config.path` to /etc/faucet-x (outside the allowed path roots …)
 ```
 
+The refusal shows only what the caller sent: a value the caller's text fills
+whole is shown as is; in a value that also holds the template's own text
+(including what the server's `${env:}` / `${file:}` resolved), everything but
+the caller's text reads `…`, in the value and in the reason. It is redacted
+like any server message, so an `env` override (registered as a possible
+secret) shows as `***`, and a `secret: true` param's value is never shown. A
+clustered run re-checked on the instance that claims it shows no value: the
+stored record keeps where the caller's text is, never the text. A key that
+holds a secret is not stored either: a value under such a key is recorded at
+the key's object.
+
 This applies to `POST /v1/templates/{id}/runs`, tenant template runs,
 `POST /v1/templates/{id}/fanout`, MCP `run_template` (including a dry run),
 an approval-gated template run (checked when it is proposed and again when it
 executes), `/v1/status` and `/v1/mirror` with `template:` + `params`, and a
 clustered run on the instance that claims it (after its sealed `secret: true`
-values are unsealed). Not checked: a param's `default`, a closed `values:`
+values are unsealed). Not checked: a param's `default` (unless an `env` override wrote it), a
+`${env:}` the server's own environment fills, a closed `values:`
 set, an `int` / `float` / `bool` value, a `computed` param built only from
 those (a `${map:…}` switch), a param the template declares `trusted: true`,
 and a template trigger in the server's own `--triggers` file (the operator

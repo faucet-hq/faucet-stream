@@ -121,6 +121,79 @@ pub fn interpolate_value_with_env(value: &mut Value, overlay: &EnvOverlay) -> Cl
     Ok(())
 }
 
+/// [`interpolate_value_with_env`], tracing caller text (#989): returns
+/// where a value of `overlay` (a caller's `env` overrides) lands, as
+/// `env:NAME`, with `carried` (caller text already in `value`) moved to where
+/// it reads once keys are resolved. A key holding a load-time directive is
+/// never part of a recorded pointer (its value may be secret).
+pub fn interpolate_value_traced(
+    value: &mut Value,
+    overlay: &EnvOverlay,
+    carried: &crate::params::CallerFields,
+) -> CliResult<crate::params::CallerFields> {
+    use crate::params::caller::{Cursor, Wrote, env_name};
+    fn overridden(s: &str, overlay: &EnvOverlay) -> Vec<String> {
+        iter_directives(s)
+            .filter_map(|(_, d)| match d {
+                Directive::LoadTime {
+                    prefix: "env" | "secret",
+                    body,
+                } if overlay.contains_key(body) => Some(body.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+    fn walk(
+        v: &mut Value,
+        overlay: &EnvOverlay,
+        carried: &crate::params::CallerFields,
+        cur: &Cursor,
+        out: &mut crate::params::CallerFields,
+    ) -> CliResult<()> {
+        cur.carry(carried, out);
+        match v {
+            Value::String(s) => {
+                let vars = overridden(s, overlay);
+                let whole =
+                    vars.len() == 1 && iter_directives(s).next().is_some_and(|(t, _)| t == s);
+                for var in vars {
+                    out.add_text(env_name(&var), overlay[&var].clone());
+                    out.insert_as(
+                        cur.at.clone(),
+                        env_name(&var),
+                        if whole { Wrote::Whole } else { Wrote::Part },
+                    );
+                }
+                *s = interpolate_with_env(s, overlay)?;
+            }
+            Value::Array(items) => {
+                for (i, item) in items.iter_mut().enumerate() {
+                    walk(item, overlay, carried, &cur.index(i), out)?;
+                }
+            }
+            Value::Object(map) => {
+                let entries: Vec<(String, Value)> = std::mem::take(map).into_iter().collect();
+                for (key, mut val) in entries {
+                    let resolved_key = interpolate_with_env(&key, overlay)?;
+                    let secret =
+                        iter_directives(&key).any(|(_, d)| matches!(d, Directive::LoadTime { .. }));
+                    let next = cur.key(&key, &resolved_key, secret);
+                    walk(&mut val, overlay, carried, &next, out)?;
+                    for var in overridden(&key, overlay) {
+                        out.insert_as(next.at.clone(), env_name(&var), Wrote::Part);
+                    }
+                    map.insert(resolved_key, val);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    let mut out = carried.empty_like();
+    walk(value, overlay, carried, &Cursor::default(), &mut out)?;
+    Ok(out)
+}
+
 /// Resolve `${id.dotted.path}` tokens against `ctx`. Tokens that look like
 /// load-time directives (`${env:...}`, `${file:...}`, `${secret:...}`) are
 /// left untouched — they should already have been resolved by [`interpolate`].

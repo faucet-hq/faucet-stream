@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/faucet-source-mongodb.svg)](https://crates.io/crates/faucet-source-mongodb)
 [![Docs.rs](https://docs.rs/faucet-source-mongodb/badge.svg)](https://docs.rs/faucet-source-mongodb)
-[![MSRV](https://img.shields.io/crates/msrv/faucet-source-mongodb.svg)](https://github.com/faucet-hq/faucet-stream/blob/main/rust-toolchain.toml)
+[![MSRV](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Ffaucet-hq%2Ffaucet-stream%2Fmain%2FCargo.toml&query=%24.workspace.package%5B%27rust-version%27%5D&label=MSRV&color=blue)](../../../Cargo.toml)
 [![License](https://img.shields.io/crates/l/faucet-source-mongodb.svg)](https://github.com/faucet-hq/faucet-stream#license)
 
 A **MongoDB** source for the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem. Runs a single `find()` query against a collection — with optional filter, projection, sort, and limit — and yields each matching document as a `serde_json::Value` object.

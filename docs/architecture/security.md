@@ -65,7 +65,7 @@ Every connector's credentials serialize as one adjacently-tagged shape,
 `{ type, config }` (e.g. `auth: { type: bearer, config: { token: … } }`).
 Credentials may be inline **or** referenced from the top-level `auth:` catalog
 via `auth: { ref: <name> }`. The CLI builds each named provider **once**
-(`cli/src/auth_catalog.rs`) and shares one `Arc<dyn AuthProvider>` across every
+(`faucet_registry::auth_catalog`, re-exported by `cli/src/auth_catalog.rs`) and shares one `Arc<dyn AuthProvider>` across every
 connector that references it, so N matrix rows hitting one IdP share a single
 token with single-flight refresh rather than each caching a copy.
 
