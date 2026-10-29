@@ -424,4 +424,4 @@ best signal for the next person deciding whether to bet a pipeline on it.
 
 ## License
 
-Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.
+Licensed under either of [Apache License 2.0](LICENSE-Apache-2.0) or [MIT](LICENSE-MIT), at your option.

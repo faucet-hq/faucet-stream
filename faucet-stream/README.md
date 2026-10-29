@@ -268,4 +268,4 @@ If you are **building your own connector**, depend only on `faucet-core` — it 
 
 ## License
 
-Licensed under either of [MIT](../LICENSE-MIT) or [Apache-2.0](../LICENSE-APACHE) at your option.
+Licensed under either of [MIT](../LICENSE-MIT) or [Apache-2.0](../LICENSE-Apache-2.0) at your option.
