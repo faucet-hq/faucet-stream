@@ -34,27 +34,6 @@
   --muted: #6b7179;
   --faint: #9aa0a7;
   --accent: #0f9488;
-  --accent-ink: #e6f7f5;
-  --ok: #1f9a5d;
-  --warn: #b7791f;
-  --bad: #d64545;
-  --info: #2f6fd6;
-  --pill: #f1f1ef;
-  color-scheme: light;
-}
-:root[data-theme="teal"] {
-  --bg: #f4f4f2;
-  --chrome: #fafaf9;
-  --panel: #ffffff;
-  --panel-2: #fafaf9;
-  --hover: #f1f1ef;
-  --line: #e4e4e0;
-  --line-soft: #eeeeeb;
-  --text: #16181b;
-  --text-2: #3d4248;
-  --muted: #6b7179;
-  --faint: #9aa0a7;
-  --accent: #0f9488;
   --accent-ink: #ffffff;
   --ok: #1f9a5d;
   --warn: #b7791f;
@@ -66,24 +45,24 @@
   --teal-line: #bfe3dc;
   --teal-ink: #0b5d56;
 }
-:root[data-theme="teal"] .avatar { background: #dfe2e6; color: #3a3f47; }
-:root[data-theme="teal"] .nav.on { background: var(--teal-fill); color: var(--teal-ink); box-shadow: inset 0 0 0 1px var(--teal-line); }
-:root[data-theme="teal"] .nav.on .n { background: #ffffff; color: var(--teal-ink); }
-:root[data-theme="teal"] .row.on { background: var(--teal-fill); box-shadow: inset 0 0 0 1px var(--teal-line), inset 3px 0 0 var(--accent); }
-:root[data-theme="teal"] .tab.on,
-:root[data-theme="teal"] .quick div.on { background: var(--teal-fill); color: var(--teal-ink); border-color: var(--teal-line); }
-:root[data-theme="teal"] .ch.stable { background: var(--teal-fill); border-color: var(--teal-line); color: var(--teal-ink); }
-:root[data-theme="teal-dark"] {
+:root[data-theme="light"] .avatar { background: #dfe2e6; color: #3a3f47; }
+:root[data-theme="light"] .nav.on { background: var(--teal-fill); color: var(--teal-ink); box-shadow: inset 0 0 0 1px var(--teal-line); }
+:root[data-theme="light"] .nav.on .n { background: #ffffff; color: var(--teal-ink); }
+:root[data-theme="light"] .row.on { background: var(--teal-fill); box-shadow: inset 0 0 0 1px var(--teal-line), inset 3px 0 0 var(--accent); }
+:root[data-theme="light"] .tab.on,
+:root[data-theme="light"] .quick div.on { background: var(--teal-fill); color: var(--teal-ink); border-color: var(--teal-line); }
+:root[data-theme="light"] .ch.stable { background: var(--teal-fill); border-color: var(--teal-line); color: var(--teal-ink); }
+:root {
   --teal-fill: rgba(45, 212, 191, .10);
   --teal-line: rgba(45, 212, 191, .26);
   --teal-ink: #5eead4;
 }
-:root[data-theme="teal-dark"] .nav.on { background: var(--teal-fill); color: var(--teal-ink); box-shadow: inset 0 0 0 1px var(--teal-line); }
-:root[data-theme="teal-dark"] .nav.on .n { background: rgba(45, 212, 191, .16); color: var(--teal-ink); }
-:root[data-theme="teal-dark"] .row.on { background: var(--teal-fill); box-shadow: inset 0 0 0 1px var(--teal-line), inset 3px 0 0 var(--accent); }
-:root[data-theme="teal-dark"] .tab.on,
-:root[data-theme="teal-dark"] .quick div.on { background: var(--teal-fill); color: var(--teal-ink); border-color: var(--teal-line); }
-:root[data-theme="teal-dark"] .ch.stable { background: var(--teal-fill); border-color: var(--teal-line); color: var(--teal-ink); }
+:root .nav.on { background: var(--teal-fill); color: var(--teal-ink); box-shadow: inset 0 0 0 1px var(--teal-line); }
+:root .nav.on .n { background: rgba(45, 212, 191, .16); color: var(--teal-ink); }
+:root .row.on { background: var(--teal-fill); box-shadow: inset 0 0 0 1px var(--teal-line), inset 3px 0 0 var(--accent); }
+:root .tab.on,
+:root .quick div.on { background: var(--teal-fill); color: var(--teal-ink); border-color: var(--teal-line); }
+:root .ch.stable { background: var(--teal-fill); border-color: var(--teal-line); color: var(--teal-ink); }
 * { box-sizing: border-box; margin: 0; }
 html, body { height: 100%; }
 body { background: var(--bg); color: var(--text); font: 13px/1.45 var(--sans); -webkit-font-smoothing: antialiased; }
@@ -112,7 +91,6 @@ svg.i { width: 15px; height: 15px; stroke: currentColor; fill: none; stroke-widt
 .side .foot { margin-top: auto; padding: 10px 12px; display: flex; align-items: center; justify-content: space-between; color: var(--muted); font-size: 12px; border-top: 1px solid var(--line-soft); }
 .who { display: flex; gap: 8px; align-items: center; }
 .avatar { width: 22px; height: 22px; border-radius: 50%; background: #3a3f47; color: #dfe2e6; font-size: 10.5px; display: grid; place-items: center; font-weight: 600; }
-:root[data-theme="light"] .avatar { background: #dfe2e6; color: #3a3f47; }
 
 /* main shell */
 .main { background: var(--chrome); border: 1px solid var(--line-soft); border-radius: 12px; display: grid; grid-template-rows: 50px 1fr 28px; min-height: 0; overflow: hidden; }
