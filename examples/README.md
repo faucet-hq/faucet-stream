@@ -82,7 +82,7 @@ The stack also provisions the shipped observability artifacts (issue #200):
 docker compose -f examples/docker-compose.yml up -d prometheus grafana
 ```
 
-Grafana at <http://localhost:3000> (admin / admin) pre-loads the four
+Grafana at <http://localhost:3000> (admin / admin) pre-loads the six
 `observability/grafana/` dashboards; Prometheus at <http://localhost:9095>
 evaluates `observability/prometheus/alerts.yml` and scrapes a faucet process
 on the host (enable the exporter with

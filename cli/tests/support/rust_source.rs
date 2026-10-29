@@ -80,9 +80,15 @@ pub fn non_test(src: &str) -> &str {
     while let Some(k) = src[from..].find(ATTR) {
         let at = from + k;
         let mut rest = src[at + ATTR.len()..].trim_start();
-        // Further attributes may sit between `#[cfg(test)]` and `mod`.
-        while rest.starts_with("#[") {
-            rest = rest.find(']').map_or("", |e| rest[e + 1..].trim_start());
+        // Further attributes and line comments may sit between `#[cfg(test)]` and `mod`.
+        loop {
+            if rest.starts_with("#[") {
+                rest = rest.find(']').map_or("", |e| rest[e + 1..].trim_start());
+            } else if rest.starts_with("//") {
+                rest = rest.find('\n').map_or("", |e| rest[e + 1..].trim_start());
+            } else {
+                break;
+            }
         }
         if rest.starts_with("mod ") {
             return &src[..at];

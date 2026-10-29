@@ -136,6 +136,19 @@ A one-shot `faucet run` exits when it finishes, so a Prometheus scrape can miss
 it entirely; use `faucet run --output json` and the logs for one-shot runs, and
 metrics for `faucet schedule` and `faucet serve`.
 
+## Dashboards for these metrics
+
+The six Grafana dashboards under `observability/grafana/` chart every metric
+on this page; [Dashboards & alerts](../cookbook/dashboards.md) lists what each
+one shows and the alert rules that go with them. Row accounting, verify
+results, policy violations and the other governance signals are on
+`faucet-governance`. Estimated cost, bytes moved and backend round trips are
+on `faucet-cost`. Log shipping, lineage and notification delivery are on
+`faucet-reliability`. A CI check fails when the code emits a metric that no
+dashboard shows and that `observability/metrics-not-charted.txt` does not list
+with a reason. So a new metric needs a panel, or a line in that file saying why
+it has none.
+
 ## Reliability properties
 
 - **Drop-guard timers** sample durations even when a task is cancelled.
