@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/faucet-source-webhook.svg)](https://crates.io/crates/faucet-source-webhook)
 [![Docs.rs](https://docs.rs/faucet-source-webhook/badge.svg)](https://docs.rs/faucet-source-webhook)
-[![MSRV](https://img.shields.io/crates/msrv/faucet-source-webhook.svg)](https://github.com/faucet-hq/faucet-stream/blob/main/rust-toolchain.toml)
+[![MSRV](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Ffaucet-hq%2Ffaucet-stream%2Fmain%2FCargo.toml&query=%24.workspace.package%5B%27rust-version%27%5D&label=MSRV&color=blue)](../../../Cargo.toml)
 [![License](https://img.shields.io/crates/l/faucet-source-webhook.svg)](https://github.com/faucet-hq/faucet-stream#license)
 
 A **webhook receiver** source that starts a temporary HTTP server, collects incoming `POST` payloads as JSON records, and then hands them to the pipeline. Part of the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem.

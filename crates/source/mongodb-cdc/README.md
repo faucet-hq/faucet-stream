@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/faucet-source-mongodb-cdc.svg)](https://crates.io/crates/faucet-source-mongodb-cdc)
 [![Docs.rs](https://docs.rs/faucet-source-mongodb-cdc/badge.svg)](https://docs.rs/faucet-source-mongodb-cdc)
-[![MSRV](https://img.shields.io/crates/msrv/faucet-source-mongodb-cdc.svg)](https://github.com/faucet-hq/faucet-stream/blob/main/rust-toolchain.toml)
+[![MSRV](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Ffaucet-hq%2Ffaucet-stream%2Fmain%2FCargo.toml&query=%24.workspace.package%5B%27rust-version%27%5D&label=MSRV&color=blue)](../../../Cargo.toml)
 [![License](https://img.shields.io/crates/l/faucet-source-mongodb-cdc.svg)](https://github.com/faucet-hq/faucet-stream#license)
 
 MongoDB **Change Data Capture (CDC)** source for the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem. Tails a MongoDB [Change Stream](https://www.mongodb.com/docs/manual/changeStreams/) — at collection, database, or whole-cluster scope — and emits each per-document change event (insert, update, replace, delete, DDL) as a flat JSON CDC envelope.

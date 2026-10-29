@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/faucet-common-oracle.svg)](https://crates.io/crates/faucet-common-oracle)
 [![Docs.rs](https://docs.rs/faucet-common-oracle/badge.svg)](https://docs.rs/faucet-common-oracle)
-[![MSRV](https://img.shields.io/crates/msrv/faucet-common-oracle.svg)](https://github.com/faucet-hq/faucet-stream/blob/main/rust-toolchain.toml)
+[![MSRV](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Ffaucet-hq%2Ffaucet-stream%2Fmain%2FCargo.toml&query=%24.workspace.package%5B%27rust-version%27%5D&label=MSRV&color=blue)](../../../Cargo.toml)
 [![License](https://img.shields.io/crates/l/faucet-common-oracle.svg)](https://github.com/faucet-hq/faucet-stream#license)
 
 Shared connection, TLS and type-mapping code for the [faucet-stream](https://github.com/faucet-hq/faucet-stream) Oracle connectors — [`faucet-source-oracle`](https://crates.io/crates/faucet-source-oracle), [`faucet-source-oracle-cdc`](https://crates.io/crates/faucet-source-oracle-cdc) and [`faucet-sink-oracle`](https://crates.io/crates/faucet-sink-oracle). You normally configure it through one of those crates; they re-export the connection types.

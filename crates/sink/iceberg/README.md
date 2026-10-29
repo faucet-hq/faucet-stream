@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/faucet-sink-iceberg.svg)](https://crates.io/crates/faucet-sink-iceberg)
 [![Docs.rs](https://docs.rs/faucet-sink-iceberg/badge.svg)](https://docs.rs/faucet-sink-iceberg)
-[![MSRV](https://img.shields.io/crates/msrv/faucet-sink-iceberg.svg)](https://github.com/faucet-hq/faucet-stream/blob/main/rust-toolchain.toml)
+[![MSRV](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Ffaucet-hq%2Ffaucet-stream%2Fmain%2FCargo.toml&query=%24.workspace.package%5B%27rust-version%27%5D&label=MSRV&color=blue)](../../../Cargo.toml)
 [![License](https://img.shields.io/crates/l/faucet-sink-iceberg.svg)](https://github.com/faucet-hq/faucet-stream#license)
 
 Apache **Iceberg** sink for the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem. Buffers JSON records into Arrow batches, writes them as Parquet data files, and commits each batch as a new Iceberg snapshot via `Transaction::fast_append` — so any faucet-stream source can land directly in an Iceberg lakehouse.

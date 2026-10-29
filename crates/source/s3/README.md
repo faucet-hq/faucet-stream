@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/faucet-source-s3.svg)](https://crates.io/crates/faucet-source-s3)
 [![Docs.rs](https://docs.rs/faucet-source-s3/badge.svg)](https://docs.rs/faucet-source-s3)
-[![MSRV](https://img.shields.io/crates/msrv/faucet-source-s3.svg)](https://github.com/faucet-hq/faucet-stream/blob/main/rust-toolchain.toml)
+[![MSRV](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Ffaucet-hq%2Ffaucet-stream%2Fmain%2FCargo.toml&query=%24.workspace.package%5B%27rust-version%27%5D&label=MSRV&color=blue)](../../../Cargo.toml)
 [![License](https://img.shields.io/crates/l/faucet-source-s3.svg)](https://github.com/faucet-hq/faucet-stream#license)
 
 An **AWS S3** source that lists objects under a prefix and parses them as JSON Lines, a JSON array, or raw text. Part of the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem.
