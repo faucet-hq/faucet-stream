@@ -1,10 +1,10 @@
 //! The Delta sink on Azurite through `az://` and `abfss://` table URIs with
 //! `DeltaCredentials::Azure` (account name + access key), #967.
 //!
-//! Azurite ignores the `startFrom` listing parameter, which Delta's log
-//! listing relies on; `object_store` filters client-side only in emulator
-//! mode, whose blob URL comes from `AZURITE_BLOB_STORAGE_URL`. That variable
-//! is process-wide, so this binary holds a single test.
+//! Each test starts its own Azurite and reaches it through
+//! `azure_storage_endpoint`, as a real account would be, so Delta's log
+//! listing sends `startFrom` to the server (Azurite honours it since 3.37.0,
+//! #984).
 //!
 //! Requires Docker:
 //!   cargo test -p faucet-sink-delta --all-features --test azure_store
@@ -24,34 +24,39 @@ fn credentials() -> Value {
     }})
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn az_and_abfss_tables_on_azurite_with_azure_credentials() {
+/// Start Azurite, create `container`, and return the store with the
+/// `storage_options` that point Delta at it.
+async fn azurite_with(container: &str) -> (stores::Store, Value) {
     let azurite = stores::azurite().await;
-    let blob_url = azurite
-        .endpoint
-        .strip_suffix(&format!("/{}", stores::AZURITE_ACCOUNT))
-        .expect("account-qualified endpoint")
-        .to_string();
-    // SAFETY: the only test in this binary; set before any Azure client is built.
-    unsafe { std::env::set_var("AZURITE_BLOB_STORAGE_URL", &blob_url) };
-    for container in ["delta-az", "delta-abfss"] {
-        faucet_common_azure::testing::create_container(
-            &azurite.endpoint,
-            stores::AZURITE_ACCOUNT,
-            stores::AZURITE_KEY,
-            container,
-        )
-        .await
-        .expect("create azurite container");
-    }
-    let options = json!({ "azure_storage_use_emulator": "true" });
+    faucet_common_azure::testing::create_container(
+        &azurite.endpoint,
+        stores::AZURITE_ACCOUNT,
+        stores::AZURITE_KEY,
+        container,
+    )
+    .await
+    .expect("create azurite container");
+    let options = json!({
+        "azure_storage_endpoint": azurite.endpoint,
+        "azure_allow_http": "true",
+    });
+    (azurite, options)
+}
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn az_table_on_azurite_with_azure_credentials() {
+    let (_azurite, options) = azurite_with("delta-az").await;
     assert_round_trip(sink_config(
         "az://delta-az/tables/events",
         credentials(),
-        options.clone(),
+        options,
     ))
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abfss_table_on_azurite_with_azure_credentials() {
+    let (_azurite, options) = azurite_with("delta-abfss").await;
     assert_round_trip(sink_config(
         &format!(
             "abfss://delta-abfss@{}.dfs.core.windows.net/tables/events",
