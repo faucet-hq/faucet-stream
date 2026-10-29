@@ -78,7 +78,8 @@ async fn seed(endpoint: &str, account: &str, stream: &str, payloads: &[&[u8]]) {
     }
 }
 
-/// Read `stream` (owned by `account`) through the connector with `credentials`.
+/// Read `stream` (owned by `account`) through the connector with `credentials`,
+/// stopping after `expected` records.
 ///
 /// The connector retries a failed `GetRecords` forever, so a bounded
 /// `GetRecords` with the owner's key runs first: a stalled emulator then fails
@@ -89,6 +90,7 @@ async fn read(
     stream: &str,
     credentials: KinesisCredentials,
     format: ValueFormat,
+    expected: usize,
 ) -> Vec<Value> {
     support::probe_reads(&admin(endpoint, account).await, stream).await;
     let label = format!("{credentials:?}");
@@ -99,6 +101,7 @@ async fn read(
     cfg.value_format = format;
     cfg.poll_interval_ms = 200;
     cfg.idle_termination_secs = Some(2);
+    cfg.max_messages = Some(expected);
     let source = KinesisSource::new(cfg).await.unwrap();
     let records = source
         .fetch_all()
@@ -169,6 +172,7 @@ async fn profile_assume_role_and_web_identity_read_string_and_bytes_payloads() {
                 name: "faucet-test".into(),
             },
             ValueFormat::String,
+            2,
         ),
     )
     .await;
@@ -201,6 +205,7 @@ async fn profile_assume_role_and_web_identity_read_string_and_bytes_payloads() {
                 external_id: Some("ext-1".into()),
             },
             ValueFormat::Bytes,
+            1,
         ),
     )
     .await;
@@ -224,6 +229,7 @@ async fn profile_assume_role_and_web_identity_read_string_and_bytes_payloads() {
             "text",
             KinesisCredentials::WebIdentity,
             ValueFormat::String,
+            2,
         ),
     )
     .await;
