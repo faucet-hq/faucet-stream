@@ -4,8 +4,8 @@ import { getTz, setTz, TZ_OPTIONS } from "./tz.js";
 import { renderRuns } from "./views/runs.js";
 import { renderSubmit } from "./views/submit.js";
 import { renderSchemas } from "./views/schemas.js";
-import { renderTemplates, renderTemplateDetail } from "./views/templates.js";
-import { renderDatasets, renderDatasetDetail } from "./views/datasets.js";
+import { renderTemplates } from "./views/templates.js";
+import { renderDatasets } from "./views/datasets.js";
 import { renderLineage } from "./views/lineage.js";
 import { renderUsage } from "./views/usage.js";
 import { renderChanges } from "./views/changes.js";
@@ -76,17 +76,17 @@ function registerRoutes() {
   route("#/runs/:id", renderRuns, { group: "runs" });
   route("#/submit", renderSubmit);
   route("#/schemas", renderSchemas);
-  route("#/templates", renderTemplates);
-  route("#/templates/:id", renderTemplateDetail);
-  route("#/catalog", renderDatasets);
-  route("#/catalog/:id", renderDatasetDetail);
+  route("#/templates", renderTemplates, { group: "templates" });
+  route("#/templates/:id", renderTemplates, { group: "templates" });
+  route("#/catalog", renderDatasets, { group: "catalog" });
+  route("#/catalog/:id", renderDatasets, { group: "catalog" });
   route("#/lineage", renderLineage);
   route("#/lineage/:root", renderLineage);
   route("#/usage", renderUsage);
   route("#/changes", renderChanges, { group: "changes" });
   route("#/changes/:id", renderChanges, { group: "changes" });
-  route("#/tenants", renderTenants);
-  route("#/tenants/:id", renderTenants);
+  route("#/tenants", renderTenants, { group: "tenants" });
+  route("#/tenants/:id", renderTenants, { group: "tenants" });
 }
 
 async function main() {

@@ -1,7 +1,9 @@
-// Pipeline template registry (#444): the Templates browser and the per-template
-// **versions page** — one row per registered version showing which channels point
-// at it, with the release controls (assign a channel, launch, roll back,
-// deprecate) and a typed trigger form built from the template's `params:` block.
+// Pipeline template registry (#444): the templates, by kind, beside the
+// selected template's versions page — one row per registered version showing
+// which channels point at it, with the release controls (assign a channel,
+// launch, roll back, deprecate) and a typed trigger form built from the
+// template's `params:` block. With nothing selected the detail pane holds the
+// registry-wide tools: the compatibility matrix, the register editor and sync.
 //
 // The lifecycle model this view renders:
 //   • registering a version never moves callers — it only extends the build list
@@ -9,8 +11,12 @@
 //   • `stable` / `previous` / `newest` are derived; `dev`…`prod` are assignable
 import { api, toast } from "../api.js";
 import { navigate } from "../router.js";
-import { copyButton, escapeHtml, mdInline } from "../utils.js";
+import { copyButton, escapeHtml, mdInline, fmtInt, fmtAge } from "../utils.js";
 import { fmtTime } from "./runs.js";
+import { setCrumbTitle } from "../shell.js";
+import { can } from "../access.js";
+import { icon, statStrip, listRow, tabs, pill, chip, card, kvGrid } from "../components.js";
+import { splitPane, sectionList } from "./split.js";
 
 const TEMPLATES_MISSING =
   "The pipeline template endpoints are not available on this server " +
@@ -24,233 +30,312 @@ export function templatesUnavailable(e) {
   return e && e.status === 404 && !e.code;
 }
 
-/** Template kind → pill. Old rows without a stored kind are pipelines. */
+/** Template kind → label. Old rows without a stored kind are pipelines. */
 const KINDS = ["source-template", "sink-template", "deployment", "pipeline"];
 const KIND_LABEL = { "source-template": "source", "sink-template": "sink", deployment: "deployment", pipeline: "pipeline" };
+const KIND_TITLE = {
+  "source-template": "source template — a system and its streams; runs composed with a sink template",
+  "sink-template": "sink template — a destination; composed into a source template's run",
+  deployment: "deployment overlay — state, DLQ, notifications and SLA applied over a composed run",
+  pipeline: "complete pipeline config",
+};
 function kindOf(t) {
   return KINDS.includes(t.kind) ? t.kind : "pipeline";
 }
-function kindPill(kind) {
-  const k = KINDS.includes(kind) ? kind : "pipeline";
-  const title = {
-    "source-template": "source template — a system and its streams; runs composed with a sink template",
-    "sink-template": "sink template — a destination; composed into a source template's run",
-    deployment: "deployment overlay — state, DLQ, notifications and SLA applied over a composed run",
-    pipeline: "complete pipeline config",
-  }[k];
-  return `<span class="pill tpl-kind tpl-kind-${escapeHtml(k)}" title="${escapeHtml(title)}"><span class="pill-label">${KIND_LABEL[k]}</span></span>`;
+
+const SECTIONS = [
+  ["source-template", "Source templates"],
+  ["sink-template", "Sink templates"],
+  ["deployment", "Deployments"],
+  ["pipeline", "Pipelines"],
+];
+
+const LIST_TABS = [
+  { id: "all", label: "All", statuses: ["launched", "draft"] },
+  { id: "launched", label: "Launched", statuses: ["launched"] },
+  { id: "draft", label: "Draft", statuses: ["draft"] },
+];
+
+/** The newest version's test status, from the list summary. */
+function newestTests(st) {
+  const ts = st.test_status || {};
+  return st.newest != null ? ts[st.newest] || ts[String(st.newest)] || null : null;
 }
 
-function statusPill(status) {
-  const cls = { launched: "pill-completed", draft: "pill-queued", deprecated: "pill-cancelled" };
-  return `<span class="pill ${cls[status] || ""}">${escapeHtml(status)}</span>`;
+/** Ring tone + shape and the lead fact a template's list row shows. */
+function rowState(t) {
+  const st = t.state || {};
+  const status = st.status || "draft";
+  const nt = newestTests(st);
+  if (status === "deprecated") return { tone: "muted", shape: "hollow", lead: "deprecated" };
+  if (nt === "failing" || nt === "unknown") return { tone: "bad", shape: "full", lead: `v${st.newest} tests ${nt}` };
+  if (status === "draft") return { tone: "warn", shape: "hollow", lead: "draft" };
+  return { tone: "ok", shape: "full", lead: `stable v${st.stable}` };
+}
+
+function rowMeta(t) {
+  const st = t.state || {};
+  const parts = [];
+  if ((st.status || "draft") === "draft") parts.push("never launched");
+  for (const [tag, v] of Object.entries(st.tags || {})) parts.push(`${tag} v${v}`);
+  if (st.newest != null && st.stable != null && st.newest !== st.stable) parts.push(`newest v${st.newest}`);
+  const nt = newestTests(st);
+  if (nt === "passing") parts.push("tests passed");
+  else if (nt === "untested") parts.push("tests not run");
+  else if (nt === "no_tests" || (!st.has_tests && !nt)) parts.push("no tests");
+  const n = Object.keys(t.params || {}).length;
+  if (n) parts.push(`${fmtInt(n)} param${n === 1 ? "" : "s"}`);
+  return parts.join(" · ");
 }
 
 // ── list ────────────────────────────────────────────────────────────────────
 
-export async function renderTemplates(container) {
-  container.innerHTML = `
-    <div class="page">
-      <div class="page-head">
-        <h1>Templates</h1>
-        <button class="btn-ghost" id="t-refresh">↻</button>
-        <button class="btn-ghost" id="t-sync" data-perm="template_admin" hidden title="Pull templates from the configured remote origins">Sync from origins</button>
-        <button class="btn-primary" id="t-new" data-perm="template_admin">Register a template</button>
-      </div>
-      <div id="t-register" hidden></div>
-      <div id="t-sync-panel" hidden></div>
-      <div id="t-matrix" hidden></div>
-      <div class="filters" id="t-filters" hidden>
-        <input id="t-search" type="search" autocomplete="off"
-          placeholder="search templates by id or description…" />
-        <div class="tpl-status-filter" id="t-status-filter" role="group" aria-label="Filter by status">
-          <span class="tpl-filter-label">status</span>
-          <button type="button" class="tpl-chip is-on" data-status="launched">launched</button>
-          <button type="button" class="tpl-chip is-on" data-status="draft">draft</button>
-          <button type="button" class="tpl-chip" data-status="deprecated">deprecated</button>
-        </div>
-        <div class="tpl-status-filter" id="t-kind-filter" role="group" aria-label="Filter by kind">
-          <span class="tpl-filter-label">kind</span>
-          <button type="button" class="tpl-chip is-on" data-kind="source-template">source</button>
-          <button type="button" class="tpl-chip is-on" data-kind="sink-template">sink</button>
-          <button type="button" class="tpl-chip" data-kind="deployment">deployment</button>
-          <button type="button" class="tpl-chip" data-kind="pipeline">pipeline</button>
-        </div>
-      </div>
-      <div class="tpl-list-head" id="t-list-head" hidden>
-        <span>status</span>
-        <button type="button" class="tpl-sort" data-sort="name">name<span class="tpl-sort-caret"></span></button>
-        <span>kind</span>
-        <button type="button" class="tpl-sort tpl-col-r" data-sort="updated">last updated<span class="tpl-sort-caret"></span></button>
-        <span class="tpl-col-r">live</span>
-        <span class="tpl-col-r">newest</span>
-        <span class="tpl-col-r">params</span>
-      </div>
-      <div id="t-list" class="runs-list"></div>
-    </div>`;
-
-  const list = container.querySelector("#t-list");
-  const registerHost = container.querySelector("#t-register");
-  const filters = container.querySelector("#t-filters");
-  const listHead = container.querySelector("#t-list-head");
-  const search = container.querySelector("#t-search");
+export async function renderTemplates(container, params = {}) {
   let all = [];
-
-  // Column sort — alphabetical by name is the default; clicking a sortable header
-  // sets the column and toggles asc/desc on repeat clicks. Status is a filter
-  // (below), not a sort column.
-  const sort = { col: "name", dir: 1 };
-  const sortKey = {
-    name: (t) => (t.id || "").toLowerCase(),
-    updated: (t) => new Date(t.created_at || 0).getTime() || 0,
-  };
-  listHead.querySelectorAll(".tpl-sort").forEach((btn) => {
-    btn.onclick = () => {
-      const col = btn.dataset.sort;
-      if (sort.col === col) sort.dir *= -1;
-      else { sort.col = col; sort.dir = 1; }
-      render();
-    };
-  });
-
-  // Status filter — launched + draft on by default; deprecated hidden until its
-  // chip is toggled on.
-  const statusFilter = new Set(["launched", "draft"]);
-  container.querySelectorAll("#t-status-filter .tpl-chip").forEach((chip) => {
-    chip.onclick = () => {
-      const s = chip.dataset.status;
-      if (statusFilter.has(s)) statusFilter.delete(s);
-      else statusFilter.add(s);
-      chip.classList.toggle("is-on", statusFilter.has(s));
-      render();
-    };
-  });
-
-  // Kind filter — source and sink templates on by default; deployments and
-  // pipelines are one chip away.
-  const kindFilter = new Set(["source-template", "sink-template"]);
-  container.querySelectorAll("#t-kind-filter .tpl-chip").forEach((chip) => {
-    chip.onclick = () => {
-      const k = chip.dataset.kind;
-      if (kindFilter.has(k)) kindFilter.delete(k);
-      else kindFilter.add(k);
-      chip.classList.toggle("is-on", kindFilter.has(k));
-      render();
-    };
-  });
-
-  container.querySelector("#t-new").onclick = () => {
-    registerHost.hidden = !registerHost.hidden;
-    if (!registerHost.hidden && !registerHost.childElementCount) {
-      registerHost.appendChild(registerPanel(() => load()));
-    }
-  };
-  container.querySelector("#t-refresh").onclick = () => load();
-  search.oninput = () => render();
-
-  // Client-side filter over the loaded set — match id or description,
-  // case-insensitive. The registry is small, so there's no server round-trip.
-  function render() {
-    const q = search.value.trim().toLowerCase();
-    const rows = all.filter((t) => {
-      const status = (t.state || {}).status || "draft";
-      if (!statusFilter.has(status)) return false;
-      if (!kindFilter.has(kindOf(t))) return false;
-      if (q && !((t.id || "").toLowerCase().includes(q) || (t.description || "").toLowerCase().includes(q))) return false;
-      return true;
-    });
-    const key = sortKey[sort.col];
-    if (key) {
-      rows.sort((a, b) => {
-        const av = key(a), bv = key(b);
-        return (av < bv ? -1 : av > bv ? 1 : 0) * sort.dir;
-      });
-    }
-    updateSortCarets();
-    list.innerHTML = "";
-    listHead.hidden = !rows.length; // only show the column header when rows are shown
-    if (!rows.length) {
-      const why = q
-        ? `No templates match “${escapeHtml(search.value.trim())}”.`
-        : "No templates match the selected status / kind filters.";
-      list.innerHTML = `<div class="empty">${why}</div>`;
-      return;
-    }
-    for (const t of rows) list.appendChild(listRow(t));
-  }
-
-  // Reflect the active sort on the header: ▲/▼ on the sorted column, a faint ↕
-  // hint on the other sortable columns.
-  function updateSortCarets() {
-    listHead.querySelectorAll(".tpl-sort").forEach((btn) => {
-      const active = sort.col === btn.dataset.sort;
-      btn.classList.toggle("is-active", active);
-      btn.setAttribute("aria-sort", active ? (sort.dir > 0 ? "ascending" : "descending") : "none");
-      btn.querySelector(".tpl-sort-caret").textContent = active ? (sort.dir > 0 ? " ▲" : " ▼") : " ↕";
-    });
-  }
-
-  const syncBtn = container.querySelector("#t-sync");
-  const syncPanel = container.querySelector("#t-sync-panel");
-  syncBtn.onclick = () => {
-    if (!syncPanel.hidden) {
-      syncPanel.hidden = true;
-      return;
-    }
-    syncPanel.innerHTML = "";
-    syncPanel.appendChild(syncControls(syncOrigins, load));
-    syncPanel.hidden = false;
-  };
   let syncOrigins = [];
+  let unavailable = "";
+  let selected = params.id || null;
+  let query = params.query || new URLSearchParams();
+  let tab = "all";
+  let search = "";
+  let sortBy = "name";
+  let showRetired = false;
+  let overviewTab = "matrix";
+  let overviewForced = false;
+  let detailStop = null;
+  let alive = true;
 
-  const matrixHost = container.querySelector("#t-matrix");
-  // The source × sink compatibility matrix — shown as soon as the registry
-  // holds at least one of each kind, fetched separately so the list never
-  // waits on composition.
-  async function loadMatrix() {
-    const hasSources = all.some((t) => kindOf(t) === "source-template");
-    const hasSinks = all.some((t) => kindOf(t) === "sink-template");
-    if (!hasSources || !hasSinks) {
-      matrixHost.hidden = true;
-      matrixHost.innerHTML = "";
-      return;
-    }
-    try {
-      const idx = await api("/v1/templates/matrix");
-      matrixHost.innerHTML = "";
-      matrixHost.appendChild(renderMatrix(idx));
-      matrixHost.hidden = false;
-    } catch (e) {
-      matrixHost.hidden = true;
-      toast(`matrix: ${e.message}`, "error");
-    }
-  }
+  const pane = splitPane(container, {
+    name: "Templates",
+    listHead: `
+      <div class="sp-tabs">
+        ${tabs(LIST_TABS, tab)}
+        <span class="sp-tools">
+          <button type="button" class="icon-btn" id="t-filter" title="Search and sort" aria-label="Search and sort" aria-expanded="false">${icon("filter")}<span class="sp-dot" hidden></span></button>
+          <button type="button" class="icon-btn" id="t-refresh" title="Refresh" aria-label="Refresh">${icon("refresh")}</button>
+          <button type="button" class="icon-btn" id="t-matrix" title="Compatibility matrix" aria-label="Compatibility matrix">${icon("matrix")}</button>
+          <button type="button" class="icon-btn" id="t-new" data-perm="template_admin" title="Register a template" aria-label="Register a template">${icon("plus")}</button>
+        </span>
+      </div>
+      <div class="sp-filters sp-filters-1" id="t-filters" hidden>
+        <input id="t-search" type="search" autocomplete="off" placeholder="search by id or description" />
+        <label class="sp-sort">sort
+          <select id="t-sort"><option value="name">name</option><option value="updated">last updated</option></select>
+        </label>
+        <label class="sp-check"><input type="checkbox" id="t-retired" /> include deprecated templates</label>
+      </div>
+      <div id="t-stats"></div>`,
+  });
+  const $ = (sel) => pane.head.querySelector(sel);
+  const list = sectionList(pane.body, "faucet.templates.sections");
+
+  pane.head.querySelectorAll(".c-tab").forEach((b) => {
+    b.onclick = () => {
+      tab = b.dataset.tab;
+      pane.head.querySelectorAll(".c-tab").forEach((x) => {
+        x.classList.toggle("on", x === b);
+        x.setAttribute("aria-selected", String(x === b));
+      });
+      paint();
+    };
+  });
+  const filterBtn = $("#t-filter");
+  filterBtn.onclick = () => {
+    const panel = $("#t-filters");
+    panel.hidden = !panel.hidden;
+    filterBtn.setAttribute("aria-expanded", String(!panel.hidden));
+    filterBtn.classList.toggle("on", !panel.hidden);
+    if (!panel.hidden) $("#t-search").focus();
+  };
+  $("#t-search").oninput = (e) => {
+    search = e.target.value.trim().toLowerCase();
+    markFiltered();
+    paint();
+  };
+  $("#t-retired").onchange = (e) => {
+    showRetired = e.target.checked;
+    markFiltered();
+    paint();
+  };
+  const markFiltered = () => ($("#t-filter .sp-dot").hidden = !(search || showRetired));
+  $("#t-sort").onchange = (e) => {
+    sortBy = e.target.value;
+    paint();
+  };
+  $("#t-refresh").onclick = () => {
+    load();
+    if (selected) showDetail(selected);
+  };
+  const openOverview = (t) => {
+    overviewTab = t;
+    overviewForced = true;
+    if (selected) navigate("#/templates");
+    else showDetail(null);
+  };
+  $("#t-matrix").onclick = () => openOverview("matrix");
+  $("#t-new").onclick = () => openOverview("register");
 
   async function load() {
     try {
       const data = await api("/v1/templates");
+      if (!alive) return;
       all = data.templates || [];
       syncOrigins = (data.sync && data.sync.origins) || [];
-      syncBtn.hidden = syncOrigins.length === 0;
-      loadMatrix();
-      list.innerHTML = "";
-      if (!all.length) {
-        filters.hidden = true;
-        listHead.hidden = true;
-        list.innerHTML = `<div class="empty">No templates registered yet — register a <b>source template</b> (a system and its streams), a <b>sink template</b> (a destination), or a complete pipeline to give operators something versioned to trigger.</div>`;
-        return;
-      }
-      filters.hidden = false;
-      render(); // keeps any active search term across a refresh
+      unavailable = "";
     } catch (e) {
-      filters.hidden = true;
-      listHead.hidden = true;
-      if (templatesUnavailable(e)) list.innerHTML = `<div class="empty">${TEMPLATES_MISSING}</div>`;
-      else toast(e.message, "error");
+      if (!alive) return;
+      all = [];
+      unavailable = templatesUnavailable(e) ? TEMPLATES_MISSING : e.message;
+      if (!templatesUnavailable(e)) toast(e.message, "error");
+    }
+    paint();
+  }
+
+  function paint() {
+    const status = (t) => (t.state || {}).status || "draft";
+    const failing = all.filter((t) => ["failing", "unknown"].includes(newestTests(t.state || {}))).length;
+    $("#t-stats").innerHTML = statStrip([
+      { label: "Templates", value: all.length },
+      { label: "Launched", value: all.filter((t) => status(t) === "launched").length, tone: "ok" },
+      { label: "Draft", value: all.filter((t) => status(t) === "draft").length, tone: "warn" },
+      { label: "Failing", value: failing, tone: failing ? "bad" : "" },
+    ]);
+    const want = [...(LIST_TABS.find((x) => x.id === tab) || LIST_TABS[0]).statuses, ...(showRetired ? ["deprecated"] : [])];
+    const rows = all.filter(
+      (t) =>
+        want.includes(status(t)) &&
+        (!search || (t.id || "").toLowerCase().includes(search) || (t.description || "").toLowerCase().includes(search)),
+    );
+    const key = sortBy === "updated" ? (t) => -(Date.parse(t.created_at) || 0) : (t) => (t.id || "").toLowerCase();
+    rows.sort((a, b) => (key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0));
+    const now = Date.now();
+    const empty = unavailable
+      ? `<div class="sp-empty"><b>Templates are not available.</b><span>${escapeHtml(unavailable)}</span></div>`
+      : all.length
+        ? `<div class="sp-empty"><b>No templates match.</b><span>${search ? `Nothing matches “${escapeHtml(search)}”.` : "Nothing in this tab."} Try the All tab or clear the search.</span></div>`
+        : `<div class="sp-empty"><b>No templates registered yet.</b><span>Register a <b>source template</b> (a system and its streams), a <b>sink template</b> (a destination), or a complete pipeline to give operators something versioned to trigger.</span></div>`;
+    list.render(
+      SECTIONS.map(([kind, label]) => ({
+        id: kind,
+        label,
+        rows: rows.filter((t) => kindOf(t) === kind).map((t) => templateRow(t, now)),
+      })),
+      { empty },
+    );
+  }
+
+  function templateRow(t, now) {
+    const s = rowState(t);
+    const st = t.state || {};
+    return listRow({
+      id: t.id,
+      href: `#/templates/${encodeURIComponent(t.id)}`,
+      tone: s.tone,
+      shape: s.shape,
+      title: t.id,
+      tooltip: `${t.id}${t.description ? `\n${t.description}` : ""}\nregistered ${fmtAge(t.created_at, now)} ago`,
+      age: `v${st.newest ?? t.version}`,
+      ageTitle: "newest registered version",
+      metaLead: s.lead,
+      meta: rowMeta(t),
+      selected: t.id === selected,
+    });
+  }
+
+  function showOverview() {
+    pane.setSelected(overviewForced);
+    const host = pane.detail;
+    const tabsList = [
+      { id: "matrix", label: "Compatibility" },
+      { id: "register", label: "Register", perm: "template_admin" },
+      { id: "sync", label: "Sync", perm: "template_admin", hidden: !syncOrigins.length },
+    ];
+    if (overviewTab === "sync" && !syncOrigins.length) overviewTab = "matrix";
+    host.innerHTML = `
+      <div class="c-dhead">
+        <a class="sp-back" href="#/templates" id="t-ov-back">${icon("back")}Templates</a>
+        ${tabs(tabsList, overviewTab)}
+      </div>
+      <div><h1 class="c-title">Template registry</h1>
+        <div class="c-sub"><span>${fmtInt(all.length)} template${all.length === 1 ? "" : "s"}</span><span class="c-sub-sep">·</span><span>pick one on the left for its versions, tests and trigger form</span></div></div>
+      <div class="d-pane" data-pane="matrix"><div id="t-ov-matrix"><div class="sp-loading">loading…</div></div></div>
+      <div class="d-pane" data-pane="register" hidden><section class="c-card"><div class="c-card-h">${icon("plus")}<b>Register a template</b><span class="c-card-aside">registering never moves stable</span></div><div class="c-card-pad" id="t-ov-register"></div></section></div>
+      <div class="d-pane" data-pane="sync" hidden><section class="c-card"><div class="c-card-h">${icon("sync")}<b>Sync from origins</b><span class="c-card-aside">pull templates from the configured remote origins</span></div><div class="c-card-pad" id="t-ov-sync"></div></section></div>`;
+    host.querySelector("#t-ov-back").onclick = (e) => {
+      e.preventDefault();
+      overviewForced = false;
+      pane.setSelected(false);
+    };
+    const show = (t) => {
+      overviewTab = t;
+      host.querySelectorAll(".c-dhead .c-tab").forEach((b) => {
+        b.classList.toggle("on", b.dataset.tab === t);
+        b.setAttribute("aria-selected", String(b.dataset.tab === t));
+      });
+      host.querySelectorAll(".d-pane").forEach((p) => (p.hidden = p.dataset.pane !== t));
+    };
+    host.querySelectorAll(".c-dhead .c-tab").forEach((b) => (b.onclick = () => show(b.dataset.tab)));
+    show(overviewTab);
+    host.querySelector("#t-ov-register").appendChild(registerPanel(() => load()));
+    if (syncOrigins.length) host.querySelector("#t-ov-sync").appendChild(syncControls(syncOrigins, load));
+    loadMatrix(host.querySelector("#t-ov-matrix"));
+  }
+
+  async function loadMatrix(el) {
+    const hasSources = all.some((t) => kindOf(t) === "source-template");
+    const hasSinks = all.some((t) => kindOf(t) === "sink-template");
+    if (!hasSources || !hasSinks) {
+      el.innerHTML = `<div class="sp-none"><b>No pairings to show</b><span>The compatibility matrix appears once the registry holds at least one source template and one sink template.</span></div>`;
+      return;
+    }
+    try {
+      const idx = await api("/v1/templates/matrix");
+      if (!el.isConnected) return;
+      el.innerHTML = "";
+      el.appendChild(renderMatrix(idx));
+    } catch (e) {
+      el.innerHTML = `<div class="sp-none"><b>Could not compose the matrix</b><span>${escapeHtml(e.message)}</span></div>`;
     }
   }
 
+  function showDetail(id) {
+    detailStop?.();
+    detailStop = null;
+    selected = id;
+    list.select(id);
+    if (!id) {
+      showOverview();
+      return;
+    }
+    overviewForced = false;
+    pane.setSelected(true);
+    detailStop = mountTemplateDetail(pane.detail, id, {
+      query,
+      onChanged: () => load(),
+      onDeleted: () => {
+        navigate("#/templates");
+        load();
+      },
+    });
+  }
+
   await load();
+  if (!alive) return;
+  showDetail(selected);
+
+  return {
+    teardown() {
+      alive = false;
+      detailStop?.();
+    },
+    update(p) {
+      const id = p.id || null;
+      const q = p.query || new URLSearchParams();
+      if (id === selected && q.toString() === query.toString()) return;
+      query = q;
+      showDetail(id);
+    },
+  };
 }
 
 /** Source × sink compatibility grid (RFC 0008 / #677). A ✓ cell opens the
@@ -401,27 +486,6 @@ function renderMatrix(idx) {
   document.addEventListener("click", close);
   document.addEventListener("keydown", close);
   draw();
-  return el;
-}
-
-function listRow(t) {
-  const st = t.state || {};
-  const el = document.createElement("div");
-  el.className = "run-row tpl-row";
-  el.onclick = () => navigate(`#/templates/${encodeURIComponent(t.id)}`);
-  const params = Object.keys(t.params || {}).length;
-  const live = st.stable == null ? "—" : `v${st.stable}`;
-  el.innerHTML = `
-    ${statusPill(st.status || "draft")}
-    <span class="tpl-row-id">
-      <span class="tpl-row-title"><b class="mono">${escapeHtml(t.id)}</b>${st.stable != null && st.stable_tests ? testPill(st.stable_tests, `v${st.stable} `) : st.has_tests ? "" : testPill("no_tests")}</span>
-      ${t.description ? `<span class="tpl-row-desc">${escapeHtml(t.description)}</span>` : ""}
-    </span>
-    <span class="tpl-row-kind">${kindPill(kindOf(t))}</span>
-    <span class="run-meta" data-l="updated" title="last registered / updated">${fmtTime(t.created_at)}</span>
-    <span class="run-meta" data-l="live" title="live version — what an unpinned run uses">${live}</span>
-    <span class="run-meta" data-l="newest" title="newest registered build">v${st.newest ?? t.version}</span>
-    <span class="run-meta" data-l="params" title="declared params">${params}</span>`;
   return el;
 }
 
@@ -588,131 +652,585 @@ streams:
 
 // ── detail / versions page ──────────────────────────────────────────────────
 
-export async function renderTemplateDetail(container, { id, query }) {
-  const preselectSink = query && query.get("sink");
-  container.innerHTML = `<div class="page"><div class="empty">loading…</div></div>`;
+/** Version options for the template's own trigger form: newest first, each
+ *  labelled with the channels that point at it; the live version selected. */
+function ownVersionOptions(st) {
+  const pick = st.stable ?? st.newest;
+  return [...st.versions]
+    .sort((a, b) => b - a)
+    .map((v) => {
+      const ch = channelsFor(v, st);
+      const retired = (st.deprecated_versions || []).some((x) => x.version === v);
+      const note = [...ch, retired ? "deprecated" : ""].filter(Boolean).join(", ");
+      return `<option value="${v}"${v === pick ? " selected" : ""}>v${v}${note ? ` · ${escapeHtml(note)}` : ""}</option>`;
+    })
+    .join("");
+}
 
-  // The detail response carries the whole release state, so one request is
-  // enough to render every version row and every control.
-  let d;
-  try {
-    // `newest` (not the default `stable`) so a draft template — which has no
-    // stable version at all — still opens.
-    d = await api(`/v1/templates/${encodeURIComponent(id)}?version=newest`);
-  } catch (e) {
-    const msg = templatesUnavailable(e) ? TEMPLATES_MISSING : e.message;
-    container.innerHTML = `<div class="page"><div class="empty">${escapeHtml(msg)}</div></div>`;
-    return;
+const TEST_TONE = { passing: "ok", failing: "bad", untested: "warn", no_tests: "", unknown: "bad" };
+const TEST_WORD = { passing: "passed", failing: "failing", untested: "not run", no_tests: "no tests", unknown: "unreadable" };
+
+function testCell(t) {
+  if (!t) return `<span class="c-muted">—</span>`;
+  const tone = TEST_TONE[t.status] || "";
+  return `<span class="c-nowrap"><span class="c-dot ${tone}"></span>${escapeHtml(TEST_WORD[t.status] || t.status)}</span>`;
+}
+
+/** Mount one template's page into `el`; returns a stop function. */
+export function mountTemplateDetail(el, id, hooks = {}) {
+  let alive = true;
+  let gen = 0;
+  let detailTab = "versions";
+  const preselectSink = hooks.query && hooks.query.get("sink");
+  if (preselectSink) detailTab = "run";
+
+  async function load() {
+    const mine = ++gen;
+    if (!el.querySelector(".c-dhead")) el.innerHTML = `<div class="sp-loading">loading…</div>`;
+    let d;
+    try {
+      // `newest` (not the default `stable`) so a draft template — which has no
+      // stable version at all — still opens.
+      d = await api(`/v1/templates/${encodeURIComponent(id)}?version=newest`);
+    } catch (e) {
+      if (!alive || mine !== gen) return;
+      const msg = templatesUnavailable(e) ? TEMPLATES_MISSING : e.message;
+      el.innerHTML = `<div class="c-dhead"><a class="sp-back" href="#/templates">${icon("back")}Templates</a></div><div class="sp-none"><b>${e.status === 404 && !templatesUnavailable(e) ? "Template not found" : "Could not load this template"}</b><span>${escapeHtml(msg)}</span></div>`;
+      return;
+    }
+    if (!alive || mine !== gen) return;
+    render(d);
   }
 
-  const reload = () => renderTemplateDetail(container, { id, query });
-  const st = { status: d.status, versions: d.versions, stable: d.stable, previous: d.previous, newest: d.newest, tags: d.tags || {}, deprecation: d.deprecation, deprecated_versions: d.deprecated_versions || [] };
-  // A pipeline or source template runs from this page; the sink/deployment
-  // panels in the same slot are read-only information, visible to everyone.
-  const runnable = !["sink-template", "deployment"].includes(kindOf(d));
+  const reload = () => {
+    load();
+    hooks.onChanged?.();
+  };
 
-  container.innerHTML = `
-    <div class="page">
-      <div class="page-head">
-        <button class="btn-ghost" id="t-back">← Templates</button>
-        <h1 class="dataset-title mono">${escapeHtml(d.id)}</h1>
-        ${kindPill(kindOf(d))}
-        ${statusPill(st.status)}
-        <div class="detail-actions">
-          <button class="btn-primary" id="t-newver" data-perm="template_admin" title="register a new version of this template">+ New version</button>
-          <button class="btn-ghost" id="t-rollback" data-perm="template_admin" ${st.previous == null ? "disabled" : ""}
-            title="${st.previous == null ? "no earlier launch to roll back to" : `re-launch v${st.previous}`}">Roll back</button>
-          <button class="${st.status === "deprecated" ? "btn-ghost" : "btn-warn"}" id="t-deprecate" data-perm="template_admin">${st.status === "deprecated" ? "Revive" : "Deprecate"}</button>
-        </div>
+  function render(d) {
+    const kind = kindOf(d);
+    const st = {
+      status: d.status,
+      versions: d.versions,
+      stable: d.stable,
+      previous: d.previous,
+      newest: d.newest,
+      tags: d.tags || {},
+      deprecation: d.deprecation,
+      deprecated_versions: d.deprecated_versions || [],
+    };
+    setCrumbTitle(d.id);
+    const runnable = !["sink-template", "deployment"].includes(kind);
+    const runLabel = { "sink-template": "Pairings", deployment: "Use" }[kind] || "Run";
+    const cand = st.newest;
+    const candTests = cand != null ? testsFor(d, cand) : null;
+    const candRetired = (st.deprecated_versions || []).some((x) => x.version === cand);
+    const canLaunch = cand != null && cand !== st.stable && !candRetired && st.status !== "deprecated" && canTakeLabel(candTests);
+    const statusTone = { launched: "ok", draft: "warn", deprecated: "" }[st.status] || "";
+    const nParams = Object.keys(d.params || {}).length;
+    const sub = [
+      pill(st.status === "launched" ? `Launched · v${st.stable}` : st.status === "draft" ? "Draft · never launched" : "Deprecated", statusTone, st.status === "launched" ? "check" : ""),
+      `<span title="${escapeHtml(KIND_TITLE[kind])}">${escapeHtml(KIND_LABEL[kind])}${kind === "pipeline" ? "" : " template"}</span>`,
+      `<span>${fmtInt(st.versions.length)} version${st.versions.length === 1 ? "" : "s"} · ${fmtInt(nParams)} param${nParams === 1 ? "" : "s"}</span>`,
+      d.created_by ? `<span>v${d.version} registered by <b>${escapeHtml(d.created_by)}</b></span>` : `<span title="${escapeHtml(fmtTime(d.created_at))}">v${d.version} registered ${escapeHtml(fmtAge(d.created_at))} ago</span>`,
+      d.name && d.name !== d.id ? `<span>config name <b>${escapeHtml(d.name)}</b></span>` : "",
+    ].filter(Boolean);
+    const showHealth = kind === "pipeline" && st.stable != null;
+
+    el.innerHTML = `
+      <div class="c-dhead">
+        <a class="sp-back" href="#/templates">${icon("back")}Templates</a>
+        ${tabs(
+          [
+            { id: "versions", label: "Versions", count: st.versions.length },
+            { id: "run", label: runLabel, perm: runnable ? "run_write" : "" },
+            { id: "health", label: "Health", hidden: !showHealth, perm: "status_read" },
+          ],
+          detailTab,
+        )}
+        <span class="c-dhead-r">
+          <button class="c-btn" id="t-newver" data-perm="template_admin" title="register a new version of this template">${icon("plus")}New version</button>
+          <button class="c-btn" id="t-rollback" data-perm="template_admin" ${st.previous == null ? "disabled" : ""}
+            title="${st.previous == null ? "no earlier launch to roll back to" : `re-launch v${st.previous}`}">${icon("undo")}Roll back</button>
+          <button class="c-btn${st.status === "deprecated" ? "" : " danger"}" id="t-deprecate" data-perm="template_admin">${st.status === "deprecated" ? "Revive" : "Deprecate"}</button>
+          ${canLaunch ? `<button class="c-btn primary" id="t-launch" data-perm="template_admin" title="make v${cand} live for unpinned runs">${icon("play")}Launch v${cand}</button>` : ""}
+        </span>
       </div>
-
+      <div><h1 class="c-title" title="${escapeHtml(d.id)}">${escapeHtml(d.id)}</h1><div class="c-sub">${sub.join('<span class="c-sub-sep">·</span>')}</div></div>
+      ${d.description ? `<div class="c-quote">${escapeHtml(d.description)}</div>` : ""}
+      ${st.status === "draft" ? `<div class="c-alert warn">This template is a <b>draft</b> — nothing has been launched, so a run without an explicit version is refused. Launch a version to make it live.</div>` : ""}
+      ${st.status === "deprecated" ? `<div class="c-alert warn"><b>Deprecated</b>${d.deprecation && d.deprecation.reason ? ` — ${escapeHtml(d.deprecation.reason)}` : ""}. Existing callers still resolve <code>stable</code>, but every trigger warns.</div>` : ""}
       <div id="t-newver-host" hidden></div>
-
-      ${st.status === "draft" ? `<div class="tpl-notice">This template is a <b>draft</b> — nothing has been launched, so a run without an explicit version is refused. Launch a version to make it live.</div>` : ""}
-      ${st.status === "deprecated" ? `<div class="tpl-notice tpl-notice-warn">Deprecated${d.deprecation && d.deprecation.reason ? ` — ${escapeHtml(d.deprecation.reason)}` : ""}. Existing callers still resolve <code>stable</code>, but every trigger warns.</div>` : ""}
-
-      <div class="detail-grid">
-        <div><label>kind</label><b>${escapeHtml(KIND_LABEL[kindOf(d)])}</b></div>
-        <div><label>status</label><b>${escapeHtml(st.status)}</b></div>
-        <div><label>live (stable)</label><b>${st.stable == null ? "—" : `v${st.stable}`}</b></div>
-        <div><label>previous</label><b>${st.previous == null ? "—" : `v${st.previous}`}</b></div>
-        <div><label>newest</label><b>${st.newest == null ? "—" : `v${st.newest}`}</b></div>
-        <div><label>versions</label><b>${st.versions.length}</b></div>
-        ${d.name && d.name !== d.id ? `<div><label>config name</label><b>${escapeHtml(d.name)}</b></div>` : ""}
+      <div class="d-pane" data-pane="versions">
+        ${gateCard(d, st, cand, candTests)}
+        <section class="c-card">
+          <div class="c-card-h"><b>Versions</b><span class="c-card-aside">${runnable ? (can("run_write") ? "Run opens the trigger form with that version" : "") : "a sink or deployment runs through a source template"}</span><span class="c-card-r">runs: last 7 days</span></div>
+          <div class="d-scroll-x"><table class="c-tbl tpl-vtbl">
+            <colgroup><col style="width:72px" /><col /><col style="width:104px" /><col style="width:112px" /><col style="width:78px" /><col style="width:208px" /></colgroup>
+            <thead><tr><th>Version</th><th>Channels</th><th>Tests</th><th>Last tested</th><th class="num" title="runs submitted from this version in the last 7 days">Runs</th><th></th></tr></thead>
+            <tbody id="t-vrows"></tbody>
+          </table></div>
+        </section>
+        ${launchCard(d.launches || [])}
       </div>
-      ${d.description ? `<p class="tpl-desc">${escapeHtml(d.description)}</p>` : ""}
+      <div class="d-pane" data-pane="run" hidden><div id="t-trigger"></div></div>
+      <div class="d-pane" data-pane="health" hidden>${showHealth ? `<section class="c-card" data-perm="status_read"><div id="t-health" class="c-card-pad"></div></section>` : ""}</div>`;
 
-      ${kindOf(d) === "pipeline" && st.stable != null ? `<div id="t-health" class="health-card" data-perm="status_read"></div>` : ""}
+    const showTab = (t) => {
+      detailTab = t;
+      el.querySelectorAll(".c-dhead .c-tab").forEach((b) => {
+        b.classList.toggle("on", b.dataset.tab === t);
+        b.setAttribute("aria-selected", String(b.dataset.tab === t));
+      });
+      el.querySelectorAll(".d-pane").forEach((p) => (p.hidden = p.dataset.pane !== t));
+    };
+    el.querySelectorAll(".c-dhead .c-tab").forEach((b) => (b.onclick = () => showTab(b.dataset.tab)));
+    if (detailTab === "health" && !showHealth) detailTab = "versions";
+    showTab(detailTab);
 
-      <h2 class="tpl-h2">Versions</h2>
-      <p class="tpl-desc tpl-versions-hint"${runnable ? ' data-perm="run_write"' : ""}>Click a version to run it below.</p>
-      <div id="t-versions" class="tpl-versions"></div>
-
-      <div${runnable ? ' data-perm="run_write"' : ""}>
-        <h2 class="tpl-h2">${{ "sink-template": "Compose with a source template", deployment: "Apply to a run" }[kindOf(d)] || "Trigger a run"}</h2>
-        <div id="t-trigger"></div>
-      </div>
-
-      <h2 class="tpl-h2">Launch history</h2>
-      <div id="t-launches"></div>
-    </div>`;
-
-  container.querySelector("#t-back").onclick = () => navigate("#/templates");
-
-  // "+ New version" — open the same register panel, but pinned to this id and
-  // seeded with the newest version's config so a new build is an edit of the
-  // current one rather than a blank slate.
-  const newverHost = container.querySelector("#t-newver-host");
-  container.querySelector("#t-newver").onclick = async () => {
-    if (!newverHost.hidden) { newverHost.hidden = true; newverHost.innerHTML = ""; return; }
-    let seed = "";
-    try {
-      const rec = await api(`/v1/templates/${encodeURIComponent(id)}?version=${st.newest}`);
-      if (rec.body_withheld) {
-        toast(`v${st.newest} config is withheld: only an unscoped admin can read stored template configs`, "error");
+    // "New version" — the register panel pinned to this id and seeded with the
+    // newest version's config, so a new build is an edit of the current one.
+    const newverHost = el.querySelector("#t-newver-host");
+    el.querySelector("#t-newver").onclick = async () => {
+      if (!newverHost.hidden) {
+        newverHost.hidden = true;
+        newverHost.innerHTML = "";
         return;
       }
-      seed = rec.body || "";
-    } catch (e) { toast(`could not load v${st.newest} config: ${e.message}`, "error"); }
-    newverHost.innerHTML = "";
-    newverHost.appendChild(
-      registerPanel(reload, { presetId: id, presetBody: seed, presetDesc: d.description || "", lockId: true, newVersion: true }),
-    );
-    newverHost.hidden = false;
-  };
+      let seed = "";
+      try {
+        const rec = await api(`/v1/templates/${encodeURIComponent(id)}?version=${st.newest}`);
+        if (rec.body_withheld) {
+          toast(`v${st.newest} config is withheld: only an unscoped admin can read stored template configs`, "error");
+          return;
+        }
+        seed = rec.body || "";
+      } catch (e) {
+        toast(`could not load v${st.newest} config: ${e.message}`, "error");
+      }
+      newverHost.innerHTML = `<section class="c-card"><div class="c-card-h">${icon("plus")}<b>New version of ${escapeHtml(id)}</b><button type="button" class="c-btn c-card-r" id="t-newver-x">${icon("x")}Close</button></div><div class="c-card-pad"></div></section>`;
+      newverHost.querySelector(".c-card-pad").appendChild(
+        registerPanel(reload, { presetId: id, presetBody: seed, presetDesc: d.description || "", lockId: true, newVersion: true }),
+      );
+      newverHost.querySelector("#t-newver-x").onclick = () => el.querySelector("#t-newver").click();
+      newverHost.hidden = false;
+    };
 
-  container.querySelector("#t-rollback").onclick = async () => {
-    if (st.previous == null) return;
-    try {
-      const r = await api(`/v1/templates/${encodeURIComponent(id)}/rollback`, { method: "POST", body: {} });
-      toast(`rolled back to v${r.version}`);
-      reload();
-    } catch (e) { toast(e.message, "error"); }
-  };
+    el.querySelector("#t-rollback").onclick = async () => {
+      if (st.previous == null) return;
+      try {
+        const r = await api(`/v1/templates/${encodeURIComponent(id)}/rollback`, { method: "POST", body: {} });
+        toast(`rolled back to v${r.version}`);
+        reload();
+      } catch (e) {
+        toast(e.message, "error");
+      }
+    };
 
-  container.querySelector("#t-deprecate").onclick = async () => {
-    const undo = st.status === "deprecated";
-    const body = { undo };
-    if (!undo) {
-      const reason = prompt("Why is this template being retired? (optional)");
-      if (reason === null) return;
-      if (reason.trim()) body.reason = reason.trim();
+    el.querySelector("#t-deprecate").onclick = async () => {
+      const undo = st.status === "deprecated";
+      const body = { undo };
+      if (!undo) {
+        const reason = prompt("Why is this template being retired? (optional)");
+        if (reason === null) return;
+        if (reason.trim()) body.reason = reason.trim();
+      }
+      try {
+        const r = await api(`/v1/templates/${encodeURIComponent(id)}/deprecate`, { method: "POST", body });
+        toast(`${id} is now ${r.status}`);
+        reload();
+      } catch (e) {
+        toast(e.message, "error");
+      }
+    };
+
+    const launch = el.querySelector("#t-launch");
+    if (launch) launch.onclick = () => launchVersion(cand);
+
+    let trigger = null;
+    const pickToRun = (v) => {
+      showTab("run");
+      trigger?.pick(v);
+    };
+    renderVersions(el.querySelector("#t-vrows"), id, st, d, { reload, launchVersion, onRun: runnable ? pickToRun : null, onDeleted: hooks.onDeleted });
+    loadRuns7d(el.querySelector("#t-vrows"), id);
+    const trig = el.querySelector("#t-trigger");
+    if (kind === "sink-template") renderSinkPairings(trig, id);
+    else if (kind === "deployment") renderDeploymentUse(trig, id);
+    else {
+      Promise.resolve(renderTrigger(trig, id, st, d, kind === "source-template", preselectSink)).then((t) => {
+        trigger = t || null;
+      });
     }
-    try {
-      const r = await api(`/v1/templates/${encodeURIComponent(id)}/deprecate`, { method: "POST", body });
-      toast(`${id} is now ${r.status}`);
-      reload();
-    } catch (e) { toast(e.message, "error"); }
-  };
+    const healthHost = el.querySelector("#t-health");
+    if (healthHost) renderHealth(healthHost, id);
+  }
 
-  renderVersions(container.querySelector("#t-versions"), id, st, d, reload);
-  const kind = kindOf(d);
-  if (kind === "sink-template") renderSinkPairings(container.querySelector("#t-trigger"), id);
-  else if (kind === "deployment") renderDeploymentUse(container.querySelector("#t-trigger"), id);
-  else renderTrigger(container.querySelector("#t-trigger"), id, st, d, kind === "source-template", preselectSink);
-  renderLaunches(container.querySelector("#t-launches"), d.launches || []);
-  const healthHost = container.querySelector("#t-health");
-  if (healthHost) renderHealth(healthHost, id);
+  async function launchVersion(v) {
+    try {
+      const r = await api(`/v1/templates/${encodeURIComponent(id)}/launch`, { method: "POST", body: { version: v } });
+      toast(r.already_launched ? `v${r.version} was already live` : `v${r.version} is live${r.replaced != null ? ` (was v${r.replaced})` : ""}`);
+      reload();
+    } catch (e) {
+      toast(e.message, "error");
+    }
+  }
+
+  load();
+  return () => {
+    alive = false;
+  };
+}
+
+/** The launch-gate card: the candidate version's latest test result and what
+ *  launching it would do. */
+function gateCard(d, st, cand, t) {
+  if (cand == null) return "";
+  const r = t && t.results && t.results[0];
+  const passed = r ? r.cases.filter((c) => c.passed).length : 0;
+  const head = r
+    ? `v${cand} ${r.passed ? "passed" : "failed"} ${fmtInt(passed)} of ${fmtInt(r.cases.length)} case${r.cases.length === 1 ? "" : "s"}`
+    : t && t.status === "no_tests"
+      ? `v${cand} has no test bundle`
+      : `v${cand} · no test result yet`;
+  const items = [];
+  if (r) {
+    const byOrigin = new Map();
+    for (const c of r.cases) {
+      const k = c.origin || c.source || "case";
+      const e = byOrigin.get(k) || [0, 0];
+      e[0] += c.passed ? 1 : 0;
+      e[1] += 1;
+      byOrigin.set(k, e);
+    }
+    for (const [k, [p, n]] of byOrigin) items.push({ k: `${k[0].toUpperCase()}${k.slice(1)} cases`, v: `${fmtInt(p)} / ${fmtInt(n)}` });
+    const retried = r.cases.filter((c) => c.attempts > 1).length;
+    if (retried) items.push({ k: "Retried", v: retried });
+    if ((r.suites || []).length) items.push({ k: "Shared suites", v: r.suites.map((s) => `${s.name}${s.release ? `@${s.release}` : s.version != null ? ` v${s.version}` : ""}`).join(", ") });
+    items.push({ k: "Faucet", v: r.faucet_version, s: r.recorded_by ? `by ${r.recorded_by}` : "" });
+  }
+  let note = "";
+  let tone = "";
+  const stable = st.stable;
+  if (cand === stable) {
+    note = `v${cand} is stable · unpinned triggers resolve it`;
+    tone = "ok";
+  } else if (t && t.status === "passing") {
+    note = stable != null
+      ? `Launch gate open · v${cand} can become stable. Unpinned triggers keep resolving v${stable} until it does.`
+      : `Launch gate open · v${cand} can be launched. Until a version is, unpinned triggers are refused.`;
+    tone = "ok";
+  } else if (t && t.status === "untested") {
+    note = `No result for v${cand} under this faucet version · launching it runs its tests first.`;
+    tone = "warn";
+  } else {
+    note = `Launch blocked · v${cand} ${t && t.status === "no_tests" ? "carries no tests: block, and only a version whose tests pass can be launched or take a channel" : t && t.status === "failing" ? "fails its tests" : "has unreadable tests"}`;
+    tone = "bad";
+  }
+  const failing = t && (t.failing || []).length
+    ? `<ul class="tpl-fail-list">${t.failing.map((f) => `<li class="mono">${escapeHtml(f)}</li>`).join("")}</ul>`
+    : "";
+  return card({
+    title: head,
+    iconName: r && r.passed ? "check" : r || (t && t.status === "no_tests") ? "x" : "",
+    tag: r ? `${r.body_sha256.slice(0, 8)}` : "",
+    right: r ? `tested ${fmtAge(r.recorded_at)} ago` : "",
+    html: (items.length ? kvGrid(items, 4) : `<div class="c-card-empty">${t && t.reason ? mdInline(t.reason) : `No test result recorded for v${cand}.`}</div>`) + failing,
+    footnote: note,
+    footTone: tone,
+  });
+}
+
+function launchCard(launches) {
+  if (!launches.length) {
+    return `<section class="c-card"><div class="c-card-h"><b>Launch history</b></div><div class="c-card-empty">Never launched.</div></section>`;
+  }
+  return `<section class="c-card"><div class="c-card-h"><b>Launch history</b><span class="c-card-r">${fmtInt(launches.length)} launch${launches.length === 1 ? "" : "es"}</span></div><div class="c-log c-timeline">${launches
+    .map(
+      (l) =>
+        `<div><span class="c-log-ts" title="${escapeHtml(fmtTime(l.launched_at))}">${escapeHtml(fmtAge(l.launched_at))} ago</span>&nbsp; #${fmtInt(l.seq)} <b>v${l.version}</b> launched by <b>${escapeHtml(l.launched_by || "cli")}</b>${l.tests_skipped ? ` · <span class="c-warn-t">tests skipped: ${escapeHtml(l.tests_skipped)}</span>` : l.evidence ? " · tests passed" : ""}</div>`,
+    )
+    .join("")}</div></section>`;
+}
+
+/** Fill the "Runs 7d" column: runs submitted from each version in a week. */
+async function loadRuns7d(tbody, id) {
+  const since = new Date(Date.now() - 7 * 86400e3).toISOString();
+  const p = new URLSearchParams({ label: `template:${id}`, since, limit: "500" });
+  let runs = [];
+  try {
+    runs = (await api(`/v1/runs?${p}`)).runs || [];
+  } catch {
+    return;
+  }
+  const by = new Map();
+  for (const r of runs) {
+    const v = (r.labels || {}).template_version;
+    if (v != null) by.set(String(v), (by.get(String(v)) || 0) + 1);
+  }
+  tbody.querySelectorAll("tr[data-version] .tpl-runs7").forEach((td) => {
+    const n = by.get(td.closest("tr").dataset.version) || 0;
+    td.textContent = `${fmtInt(n)}${runs.length >= 500 ? "+" : ""}`;
+  });
+}
+
+function renderVersions(tbody, id, st, d, { reload, launchVersion, onRun, onDeleted }) {
+  if (!st.versions.length) {
+    tbody.innerHTML = `<tr><td colspan="6" class="c-muted">No versions stored.</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = "";
+  for (const v of [...st.versions].sort((a, b) => b - a)) {
+    const retired = (st.deprecated_versions || []).find((x) => x.version === v);
+    const t = testsFor(d, v);
+    const tb = testsBlock(t);
+    const blocked = !canTakeLabel(t);
+    const launchTitle = st.stable === v ? "already live" : retired ? `v${v} is deprecated — revive it to launch it` : blocked ? `only a version whose tests pass can be launched (v${v} is ${t ? t.status : "unknown"})` : `make v${v} live for unpinned runs`;
+    const chips = channelChips(v, st) + (retired ? chip("deprecated", "", retired.reason ? `deprecated: ${retired.reason}` : "deprecated") : "");
+    const when = t && (t.result_at || (t.results && t.results[0] && t.results[0].recorded_at));
+    const row = document.createElement("tr");
+    row.dataset.version = String(v);
+    row.className = "tpl-vrow" + (st.stable === v ? " is-live" : "") + (retired ? " is-retired" : "");
+    row.innerHTML = `
+      <td class="mono">v${v}</td>
+      <td><span class="tpl-chips">${chips || `<span class="c-muted">no channel</span>`}</span></td>
+      <td title="${escapeHtml((t && t.reason) || "")}">${testCell(t)}</td>
+      <td class="c-muted c-nowrap" title="${when ? escapeHtml(fmtTime(when)) : ""}">${when ? `${escapeHtml(fmtAge(when))} ago` : "—"}</td>
+      <td class="num tpl-runs7 c-muted">—</td>
+      <td class="tpl-vact">
+        ${onRun ? `<button class="c-btn tpl-run" data-perm="run_write" title="open the trigger form with v${v}">${icon("play")}Run</button>` : ""}
+        <button class="c-btn tpl-launch" data-perm="template_admin" ${st.stable === v || retired || blocked ? "disabled" : ""} title="${escapeHtml(launchTitle)}">Launch</button>
+        <details class="dd tpl-more"${(t && (t.results || []).length) || can("template_admin") ? "" : " hidden"}>
+          <summary class="c-btn" title="more actions for v${v}">More</summary>
+          <div class="dd-menu dd-menu-r">
+            <label class="tpl-assign-l" data-perm="template_admin">channel
+              <select class="tpl-assign" ${blocked ? "disabled" : ""} title="${blocked ? `only a version whose tests pass can take a channel` : `point a channel at v${v}`}">
+                <option value="">assign…</option>
+                ${ASSIGNABLE.map((c) => `<option value="${c}">${c}</option>`).join("")}
+              </select>
+            </label>
+            ${t && (t.results || []).length ? `<button class="dd-item tpl-history">Test history</button>` : ""}
+            ${t && t.has_tests ? `<button class="dd-item tpl-runtests" data-perm="template_admin" title="run v${v}'s tests: bundle and record the result">Run tests</button>` : ""}
+            <button class="dd-item tpl-view" data-perm="template_admin">Show config</button>
+            <button class="dd-item tpl-view-clean" data-perm="template_admin" title="comments stripped, canonical YAML">Show clean config</button>
+            <button class="dd-item tpl-vdeprecate" data-perm="template_admin" title="${retired ? `make v${v} usable again` : `retire v${v}: pinned runs still work but warn, newest skips it, launch refuses it`}">${retired ? "Revive" : "Deprecate"}</button>
+            <button class="dd-item danger tpl-del" data-perm="template_admin">Delete v${v}</button>
+          </div>
+        </details>
+      </td>`;
+    const extra = document.createElement("tr");
+    extra.className = "tpl-vextra";
+    extra.innerHTML = `<td colspan="6">${tb.body}<div class="tpl-body-wrap" hidden><pre class="tpl-body"></pre></div></td>`;
+    const history = extra.querySelector(".tpl-tests-runs");
+    const hasWhy = !!extra.querySelector(".tpl-tests-why");
+    const syncExtra = () => {
+      extra.hidden = !hasWhy && (!history || history.hidden) && extra.querySelector(".tpl-body-wrap").hidden;
+    };
+    if (history) history.hidden = true;
+    syncExtra();
+    const histBtn = row.querySelector(".tpl-history");
+    if (histBtn) {
+      histBtn.onclick = () => {
+        more.open = false;
+        history.hidden = !history.hidden;
+        history.open = !history.hidden;
+        histBtn.textContent = history.hidden ? "Test history" : "Hide test history";
+        syncExtra();
+      };
+    }
+
+    const more = row.querySelector(".tpl-more");
+    const closeMore = (e) => {
+      if (!more.isConnected) {
+        document.removeEventListener("click", closeMore);
+        return;
+      }
+      if (more.open && !more.contains(e.target)) more.open = false;
+    };
+    document.addEventListener("click", closeMore);
+    // The table scrolls sideways, which would clip the menu: pin it to the viewport.
+    more.addEventListener("toggle", () => {
+      const menu = more.querySelector(".dd-menu");
+      if (!more.open) return;
+      const r = more.querySelector("summary").getBoundingClientRect();
+      menu.style.position = "fixed";
+      menu.style.right = `${Math.max(8, window.innerWidth - r.right)}px`;
+      const below = window.innerHeight - r.bottom;
+      const h = menu.offsetHeight;
+      if (below < h + 12 && r.top > h + 12) {
+        menu.style.top = "auto";
+        menu.style.bottom = `${window.innerHeight - r.top + 4}px`;
+      } else {
+        menu.style.bottom = "auto";
+        menu.style.top = `${r.bottom + 4}px`;
+      }
+      const scroller = more.closest(".sp-detail");
+      const shut = () => {
+        more.open = false;
+        scroller?.removeEventListener("scroll", shut);
+      };
+      scroller?.addEventListener("scroll", shut, { once: true });
+    });
+
+    const runBtn = row.querySelector(".tpl-run");
+    if (runBtn) runBtn.onclick = () => onRun(v);
+
+    const runTests = row.querySelector(".tpl-runtests");
+    if (runTests) {
+      runTests.onclick = async () => {
+        runTests.disabled = true;
+        runTests.textContent = "Running…";
+        try {
+          const r = await api(`/v1/templates/${encodeURIComponent(id)}/versions/${v}/test`, { method: "POST", body: {} });
+          const failed = r.cases.filter((c) => !c.passed).length;
+          if (r.passed) toast(`v${v}: ${r.cases.length} case(s) passed`);
+          else toast(`v${v}: ${failed} of ${r.cases.length} case(s) failed`, "error");
+          reload();
+        } catch (e) {
+          toast(e.message, "error");
+          runTests.disabled = false;
+          runTests.textContent = "Run tests";
+        }
+      };
+    }
+
+    row.querySelector(".tpl-assign").onchange = async (ev) => {
+      const tag = ev.target.value;
+      if (!tag) return;
+      try {
+        await api(`/v1/templates/${encodeURIComponent(id)}/tags`, { method: "POST", body: { tag, version: v } });
+        toast(`${tag} → v${v}`);
+        reload();
+      } catch (e) {
+        toast(e.message, "error");
+        ev.target.value = "";
+      }
+    };
+
+    row.querySelector(".tpl-vdeprecate").onclick = async () => {
+      more.open = false;
+      const body = { undo: !!retired };
+      if (!retired) {
+        const reason = prompt(`Why is v${v} being retired? (optional)`);
+        if (reason === null) return;
+        if (reason.trim()) body.reason = reason.trim();
+      }
+      try {
+        await api(`/v1/templates/${encodeURIComponent(id)}/versions/${v}/deprecate`, { method: "POST", body });
+        toast(retired ? `v${v} is live again` : `v${v} is deprecated`);
+        reload();
+      } catch (e) {
+        toast(e.message, "error");
+      }
+    };
+
+    row.querySelector(".tpl-launch").onclick = () => launchVersion(v);
+
+    const body = extra.querySelector(".tpl-body");
+    const wrap = extra.querySelector(".tpl-body-wrap");
+    const copy = copyButton(() => body.textContent, "Copy config");
+    copy.addEventListener("copy-failed", (ev) => toast(ev.detail.message, "error"));
+    wrap.appendChild(copy);
+    // Config = raw stored body; Clean = comments stripped, canonical YAML (the
+    // server renders it via ?clean=true, sharing the CLI's clean_config_yaml).
+    const showConfig = async (clean) => {
+      more.open = false;
+      const mode = clean ? "clean" : "raw";
+      if (!wrap.hidden && body.dataset.mode === mode) {
+        wrap.hidden = true;
+        syncExtra();
+        return;
+      }
+      try {
+        const q = clean ? `?version=${v}&clean=true` : `?version=${v}`;
+        const rec = await api(`/v1/templates/${encodeURIComponent(id)}${q}`);
+        body.textContent = rec.body_withheld
+          ? "Config withheld: only an unscoped admin can read a template's stored config."
+          : rec.body;
+        body.classList.toggle("tpl-body-withheld", !!rec.body_withheld);
+        copy.hidden = !!rec.body_withheld;
+        copy.title = clean ? "Copy clean config" : "Copy config";
+        copy.setAttribute("aria-label", copy.title);
+        body.dataset.mode = mode;
+        wrap.hidden = false;
+        syncExtra();
+      } catch (e) {
+        toast(e.message, "error");
+      }
+    };
+    row.querySelector(".tpl-view").onclick = () => showConfig(false);
+    row.querySelector(".tpl-view-clean").onclick = () => showConfig(true);
+
+    row.querySelector(".tpl-del").onclick = async () => {
+      more.open = false;
+      if (!confirm(`Delete ${id} v${v}? Channels pointing at it are dropped too.`)) return;
+      try {
+        await api(`/v1/templates/${encodeURIComponent(id)}?version=${v}`, { method: "DELETE" });
+        toast(`v${v} deleted`);
+        if (st.versions.length === 1) onDeleted?.();
+        else reload();
+      } catch (e) {
+        toast(e.message, "error");
+      }
+    };
+
+    tbody.appendChild(row);
+    tbody.appendChild(extra);
+  }
+}
+
+/** A source template the selected sink or deployment can be used with, as a
+ *  list row that opens it. */
+function sourceRows(sources, sinkId) {
+  const now = Date.now();
+  return sources
+    .map((s) => {
+      const r = rowState(s);
+      return listRow({
+        id: s.id,
+        href: `#/templates/${encodeURIComponent(s.id)}${sinkId ? `?sink=${encodeURIComponent(sinkId)}` : ""}`,
+        tone: r.tone,
+        shape: r.shape,
+        title: s.id,
+        tooltip: s.description || s.id,
+        age: fmtAge(s.created_at, now),
+        metaLead: r.lead,
+        meta: s.description || rowMeta(s),
+      });
+    })
+    .join("");
+}
+
+/** A deployment overlay is never run on its own: it is picked in a source
+ *  template's trigger form, alongside the sink. */
+async function renderDeploymentUse(host, id) {
+  host.innerHTML = `<div class="sp-loading">loading…</div>`;
+  let sources = [];
+  try {
+    const data = await api("/v1/templates?kind=source-template");
+    sources = data.templates || [];
+  } catch (e) {
+    host.innerHTML = `<div class="c-alert bad">${escapeHtml(e.message)}</div>`;
+    return;
+  }
+  const how = `A deployment overlay adds the operational blocks — state, DLQ, notifications, SLA — to a <b>source × sink</b> run: open a source template, pick a sink, and choose <b class="mono">${escapeHtml(id)}</b> as its deployment.`;
+  host.innerHTML = `<section class="c-card"><div class="c-card-h"><b>Apply to a run</b><span class="c-card-r">${fmtInt(sources.length)} source template${sources.length === 1 ? "" : "s"}</span></div><div class="c-card-note c-card-note-top">${how}</div><div class="tpl-src-rows">${sources.length ? sourceRows(sources) : `<div class="c-card-empty">No source templates are registered yet.</div>`}</div></section>`;
+}
+
+/** A sink template has no streams of its own: instead of a trigger form, list
+ *  the registered source templates it can be composed with. */
+async function renderSinkPairings(host, id) {
+  host.innerHTML = `<div class="sp-loading">loading…</div>`;
+  let sources = [];
+  try {
+    const data = await api("/v1/templates?kind=source-template");
+    sources = data.templates || [];
+  } catch (e) {
+    host.innerHTML = `<div class="c-alert bad">${escapeHtml(e.message)}</div>`;
+    return;
+  }
+  const how = `A sink template is run <b>through a source template</b>: open one below — <b class="mono">${escapeHtml(id)}</b> is preselected as its sink — and trigger.`;
+  host.innerHTML = `<section class="c-card"><div class="c-card-h"><b>Compose with a source template</b><span class="c-card-r">${fmtInt(sources.length)} source template${sources.length === 1 ? "" : "s"}</span></div><div class="c-card-note c-card-note-top">${how}</div><div class="tpl-src-rows">${sources.length ? sourceRows(sources, id) : `<div class="c-card-empty">No source templates are registered yet.</div>`}</div></section>`;
 }
 
 const HEALTH_PILL = {
@@ -789,13 +1307,20 @@ async function renderHealth(host, id) {
 /** Which channels — derived and assigned — currently point at `v`. */
 function channelsFor(v, st) {
   const out = [];
-  if (st.stable === v) out.push(["stable", "pill-completed"]);
-  if (st.previous === v) out.push(["previous", "pill-cancelled"]);
-  if (st.newest === v) out.push(["newest", "pill-running"]);
+  if (st.stable === v) out.push("stable");
+  if (st.previous === v) out.push("previous");
+  if (st.newest === v) out.push("newest");
   for (const [tag, target] of Object.entries(st.tags)) {
-    if (target === v) out.push([tag, "pill-queued"]);
+    if (target === v) out.push(tag);
   }
   return out;
+}
+
+/** The channel chips for `v`; `stable` is the only highlighted one. */
+function channelChips(v, st) {
+  return channelsFor(v, st)
+    .map((c) => chip(c, c === "stable" ? "stable" : ""))
+    .join("");
 }
 
 /** One vocabulary for a version's test status (#856). */
@@ -832,8 +1357,6 @@ function testsBlock(t) {
   if (t.status === "failing") {
     const cases = (t.failing || []).map((f) => `<li class="mono">${escapeHtml(f)}</li>`).join("");
     lines.push(`<div class="tpl-tests-why"><b>Can't be launched or take a channel</b> — its tests fail.${cases ? `<ul>${cases}</ul>` : ""}</div>`);
-  } else if (t.status === "no_tests") {
-    lines.push(`<div class="tpl-tests-why"><b>Can't be launched or take a channel</b> — ${mdInline(t.reason || "it has no `tests:` block.")}</div>`);
   } else if (t.status === "unknown") {
     lines.push(`<div class="tpl-tests-why"><b>Can't be launched or take a channel</b> — ${mdInline(t.reason || "its tests or results cannot be read.")}</div>`);
   } else if (t.status === "untested") {
@@ -847,194 +1370,9 @@ function testsBlock(t) {
         return `<tr><td class="tpl-launch-when">${fmtTime(r.recorded_at)}</td><td><span class="pill ${r.passed ? "pill-completed" : "pill-failed"}">${r.passed ? "pass" : "fail"}</span></td><td class="tpl-tests-cases">${r.cases.length - failed}/${r.cases.length}${retried ? ` · ${retried} retried` : ""}${r.error ? ` · ${escapeHtml(r.error)}` : ""}</td><td class="mono">${escapeHtml(r.faucet_version)}</td><td>${escapeHtml(r.recorded_by || "cli")}</td></tr>`;
       })
       .join("");
-    lines.push(`<div class="tpl-launch-wrap"><table class="tbl tpl-tests-tbl"><thead><tr><th>run</th><th>result</th><th>cases</th><th>faucet</th><th>by</th></tr></thead><tbody>${rows}</tbody></table></div>`);
+    lines.push(`<details class="tpl-tests-runs"><summary>${t.results.length} recorded test run${t.results.length === 1 ? "" : "s"}</summary><div class="tpl-launch-wrap"><table class="tbl tpl-tests-tbl"><thead><tr><th>run</th><th>result</th><th>cases</th><th>faucet</th><th>by</th></tr></thead><tbody>${rows}</tbody></table></div></details>`);
   }
   return { pill, body: lines.length ? `<div class="tpl-tests">${lines.join("")}</div>` : "" };
-}
-
-function renderVersions(host, id, st, d, reload) {
-  host.innerHTML = "";
-  if (!st.versions.length) {
-    host.innerHTML = `<div class="empty">No versions stored.</div>`;
-    return;
-  }
-  for (const v of st.versions) {
-    const retired = (st.deprecated_versions || []).find((x) => x.version === v);
-    const row = document.createElement("div");
-    row.className = "tpl-version" + (st.stable === v ? " tpl-version-live" : "") + (retired ? " tpl-version-retired" : "");
-    row.dataset.version = String(v);
-    const pills =
-      (retired
-        ? `<span class="pill pill-cancelled" title="${escapeHtml(retired.reason ? `deprecated: ${retired.reason}` : "deprecated")}">deprecated</span>`
-        : "") +
-      channelsFor(v, st)
-        .map(([name, cls]) => `<span class="pill ${cls}">${escapeHtml(name)}</span>`)
-        .join("");
-    const t = testsFor(d, v);
-    const tb = testsBlock(t);
-    const blocked = !canTakeLabel(t);
-    const launchTitle = st.stable === v ? "already live" : retired ? `v${v} is deprecated — revive it to launch it` : blocked ? `only a version whose tests pass can be launched (v${v} is ${t ? t.status : "unknown"})` : `make v${v} live for unpinned runs`;
-    row.innerHTML = `
-      <span class="tpl-vnum mono">v${v}</span>
-      <span class="tpl-vchannels">${pills || `<span class="run-meta">no channel</span>`}${tb.pill}</span>
-      <select class="tpl-assign" data-perm="template_admin" ${blocked ? "disabled" : ""} title="${blocked ? `only a version whose tests pass can take a channel` : `point a channel at v${v}`}">
-        <option value="">assign channel</option>
-        ${ASSIGNABLE.map((c) => `<option value="${c}">${c}</option>`).join("")}
-      </select>
-      <button class="btn-ghost tpl-launch" data-perm="template_admin" ${st.stable === v || retired || blocked ? "disabled" : ""}
-        title="${escapeHtml(launchTitle)}">Launch</button>
-      ${t && t.has_tests ? `<button class="btn-ghost tpl-runtests" data-perm="template_admin" title="run v${v}'s tests: bundle and record the result">Run tests</button>` : ""}
-      <button class="btn-ghost tpl-view" data-perm="template_admin">Config</button>
-      <button class="btn-ghost tpl-view-clean" data-perm="template_admin" title="comments stripped, canonical YAML">Clean</button>
-      <button class="${retired ? "btn-ghost" : "btn-warn"} tpl-vdeprecate" data-perm="template_admin"
-        title="${retired ? `make v${v} usable again` : `retire v${v}: pinned runs still work but warn, newest skips it, launch refuses it`}">${retired ? "Revive" : "Deprecate"}</button>
-      <button class="btn-danger tpl-del" data-perm="template_admin">Delete</button>
-      ${tb.body}
-      <div class="tpl-body-wrap" hidden><pre class="tpl-body"></pre></div>`;
-
-    const runTests = row.querySelector(".tpl-runtests");
-    if (runTests) {
-      runTests.onclick = async (ev) => {
-        ev.stopPropagation();
-        runTests.disabled = true;
-        runTests.textContent = "Running…";
-        try {
-          const r = await api(`/v1/templates/${encodeURIComponent(id)}/versions/${v}/test`, { method: "POST", body: {} });
-          const failed = r.cases.filter((c) => !c.passed).length;
-          if (r.passed) toast(`v${v}: ${r.cases.length} case(s) passed`);
-          else toast(`v${v}: ${failed} of ${r.cases.length} case(s) failed`, "error");
-          reload();
-        } catch (e) {
-          toast(e.message, "error");
-          runTests.disabled = false;
-          runTests.textContent = "Run tests";
-        }
-      };
-    }
-
-    row.querySelector(".tpl-assign").onchange = async (ev) => {
-      const tag = ev.target.value;
-      if (!tag) return;
-      try {
-        await api(`/v1/templates/${encodeURIComponent(id)}/tags`, { method: "POST", body: { tag, version: v } });
-        toast(`${tag} → v${v}`);
-        reload();
-      } catch (e) { toast(e.message, "error"); ev.target.value = ""; }
-    };
-
-    row.querySelector(".tpl-vdeprecate").onclick = async () => {
-      const body = { undo: !!retired };
-      if (!retired) {
-        const reason = prompt(`Why is v${v} being retired? (optional)`);
-        if (reason === null) return;
-        if (reason.trim()) body.reason = reason.trim();
-      }
-      try {
-        await api(`/v1/templates/${encodeURIComponent(id)}/versions/${v}/deprecate`, { method: "POST", body });
-        toast(retired ? `v${v} is live again` : `v${v} is deprecated`);
-        reload();
-      } catch (e) { toast(e.message, "error"); }
-    };
-
-    row.querySelector(".tpl-launch").onclick = async () => {
-      try {
-        const r = await api(`/v1/templates/${encodeURIComponent(id)}/launch`, { method: "POST", body: { version: v } });
-        toast(r.already_launched ? `v${r.version} was already live` : `v${r.version} is live${r.replaced != null ? ` (was v${r.replaced})` : ""}`);
-        reload();
-      } catch (e) { toast(e.message, "error"); }
-    };
-
-    const body = row.querySelector(".tpl-body");
-    const wrap = row.querySelector(".tpl-body-wrap");
-    const copy = copyButton(() => body.textContent, "Copy config");
-    copy.addEventListener("copy-failed", (ev) => toast(ev.detail.message, "error"));
-    wrap.appendChild(copy);
-    // Config = raw stored body; Clean = comments stripped, canonical YAML (the
-    // server renders it via ?clean=true, sharing the CLI's clean_config_yaml).
-    // Each toggles the shared <pre>; switching modes refetches so the two views
-    // never collide.
-    const showConfig = async (clean) => {
-      const mode = clean ? "clean" : "raw";
-      if (!wrap.hidden && body.dataset.mode === mode) {
-        wrap.hidden = true;
-        return;
-      }
-      try {
-        const q = clean ? `?version=${v}&clean=true` : `?version=${v}`;
-        const rec = await api(`/v1/templates/${encodeURIComponent(id)}${q}`);
-        body.textContent = rec.body_withheld
-          ? "Config withheld: only an unscoped admin can read a template's stored config."
-          : rec.body;
-        body.classList.toggle("tpl-body-withheld", !!rec.body_withheld);
-        copy.hidden = !!rec.body_withheld;
-        copy.title = clean ? "Copy clean config" : "Copy config";
-        copy.setAttribute("aria-label", copy.title);
-        body.dataset.mode = mode;
-        wrap.hidden = false;
-      } catch (e) {
-        toast(e.message, "error");
-      }
-    };
-    row.querySelector(".tpl-view").onclick = () => showConfig(false);
-    row.querySelector(".tpl-view-clean").onclick = () => showConfig(true);
-
-    row.querySelector(".tpl-del").onclick = async () => {
-      if (!confirm(`Delete ${id} v${v}? Channels pointing at it are dropped too.`)) return;
-      try {
-        await api(`/v1/templates/${encodeURIComponent(id)}?version=${v}`, { method: "DELETE" });
-        toast(`v${v} deleted`);
-        if (st.versions.length === 1) navigate("#/templates");
-        else reload();
-      } catch (e) { toast(e.message, "error"); }
-    };
-
-    host.appendChild(row);
-  }
-}
-
-/** A sink template has no streams of its own: instead of a trigger form, list
- *  the registered source templates it can be composed with. */
-/** A deployment overlay is never run on its own: it is picked in a source
- *  template's trigger form, alongside the sink. */
-async function renderDeploymentUse(host, id) {
-  host.innerHTML = `<div class="empty">loading…</div>`;
-  let sources = [];
-  try {
-    const data = await api("/v1/templates?kind=source-template");
-    sources = data.templates || [];
-  } catch (e) {
-    host.innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;
-    return;
-  }
-  const how = `A deployment overlay adds the operational blocks — state, DLQ, notifications, SLA — to a <b>source × sink</b> run: open a source template, pick a sink, and choose <b class="mono">${escapeHtml(id)}</b> as its deployment.`;
-  if (!sources.length) {
-    host.innerHTML = `<div class="tpl-notice">${how} No source templates are registered yet.</div>`;
-    return;
-  }
-  host.innerHTML = `<p class="tpl-desc">${how}</p><div class="runs-list" id="td-list"></div>`;
-  const list = host.querySelector("#td-list");
-  for (const s of sources) list.appendChild(listRow(s));
-}
-
-async function renderSinkPairings(host, id) {
-  host.innerHTML = `<div class="empty">loading…</div>`;
-  let sources = [];
-  try {
-    const data = await api("/v1/templates?kind=source-template");
-    sources = data.templates || [];
-  } catch (e) {
-    host.innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;
-    return;
-  }
-  if (!sources.length) {
-    host.innerHTML = `<div class="tpl-notice">A sink template is run <b>through a source template</b>: open one, pick <b class="mono">${escapeHtml(id)}</b> as its sink, and trigger. No source templates are registered yet.</div>`;
-    return;
-  }
-  host.innerHTML = `
-    <p class="tpl-desc">A sink template is run <b>through a source template</b>: open one below, pick <b class="mono">${escapeHtml(id)}</b> as its sink, and trigger.</p>
-    <div class="runs-list" id="tp-list"></div>`;
-  const list = host.querySelector("#tp-list");
-  for (const s of sources) list.appendChild(listRow(s));
 }
 
 /** A typed form over the template's declared `params:`, plus a version selector.
@@ -1079,11 +1417,9 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
         "source",
         withSink ? "Source" : "Template",
         `<label class="tpl-field-wide">template <span class="tpl-picked"><b class="mono">${escapeHtml(id)}</b></span></label>
-         <label>version
-           <input type="hidden" id="tg-version" value="${st.stable ?? st.newest}" />
-           <span id="tg-version-show" class="tpl-picked"></span>
-         </label>`,
-        "pick the version in the list above",
+         <label>version <select id="tg-version">${ownVersionOptions(st)}</select></label>
+         <span id="tg-version-show" class="tpl-picked"></span>`,
+        "defaults to the live version",
       )}
       ${withSink ? segment(
         "sink",
@@ -1216,16 +1552,9 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
       }
     }
   };
-  // The version rows above the form pick the source version to run: clicking
-  // one selects it here, and the row that matches the selection stays marked.
-  const rows = [...(host.closest(".page") || document).querySelectorAll(".tpl-version[data-version]")];
   const markPicked = () => {
     const picked = Number(versionSel.value);
-    const pills = channelsFor(picked, st)
-      .map(([name, cls]) => `<span class="pill ${cls}">${escapeHtml(name)}</span>`)
-      .join("");
-    host.querySelector("#tg-version-show").innerHTML = `<b class="mono">v${picked}</b>${pills}`;
-    for (const r of rows) r.classList.toggle("tpl-version-picked", Number(r.dataset.version) === picked);
+    host.querySelector("#tg-version-show").innerHTML = channelChips(picked, st);
     // After a launch, an unlabelled version whose tests do not pass runs only
     // with allow_untested (the server refuses it otherwise).
     const t = testsFor(d, picked);
@@ -1238,15 +1567,6 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
       ? `v${picked} holds no label and its tests are ${testPill(t.status)}.`
       : "";
   };
-  for (const r of rows) {
-    r.title = `run v${r.dataset.version}`;
-    r.onclick = (ev) => {
-      if (ev.target.closest("button, select, a, pre, .tpl-tests")) return;
-      versionSel.value = r.dataset.version;
-      markPicked();
-      renderParams();
-    };
-  }
   // The row picker (#741): the template's rows from the rows API, checked by
   // default the way a bare run would pick them, with a live preview of the
   // run set the server resolves for the current choice.
@@ -1373,10 +1693,7 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
   parentsSel.onchange = refreshPreview;
   for (const b of host.querySelectorAll("[data-pick]")) b.onclick = () => pick(b.dataset.pick);
   const reloadForm = () => { renderParams(); loadRows(); };
-  for (const r of rows) {
-    const choose = r.onclick;
-    r.onclick = (ev) => { const before = versionSel.value; choose(ev); if (versionSel.value !== before) loadRows(); };
-  }
+  versionSel.onchange = () => { markPicked(); reloadForm(); };
 
   markPicked();
   reloadForm();
@@ -1450,6 +1767,12 @@ async function renderTrigger(host, id, st, d, withSink = false, preselectSink = 
       out.textContent = `✗ ${e.message}\n\n` + (e.details ? JSON.stringify(e.details, null, 2) : "");
       toast(e.message, "error");
     }
+  };
+  return {
+    pick(v) {
+      versionSel.value = String(v);
+      versionSel.onchange();
+    },
   };
 }
 
@@ -1551,23 +1874,4 @@ function coerce(raw, type) {
   if (type === "int" || type === "float") return raw.trim();
   if (type === "bool") return raw === "true";
   return raw;
-}
-
-function renderLaunches(host, launches) {
-  if (!launches.length) {
-    host.innerHTML = `<div class="empty">Never launched.</div>`;
-    return;
-  }
-  host.innerHTML = `
-    <div class="tpl-launch-wrap"><table class="tbl tpl-launch-tbl">
-      <thead><tr><th>#</th><th>version</th><th>when</th><th>by</th></tr></thead>
-      <tbody>
-        ${launches
-          .map(
-            (l) => `<tr><td class="mono">${l.seq}</td><td class="mono">v${l.version}</td>
-              <td class="tpl-launch-when">${fmtTime(l.launched_at)}</td><td>${escapeHtml(l.launched_by || "cli")}</td></tr>`,
-          )
-          .join("")}
-      </tbody>
-    </table></div>`;
 }

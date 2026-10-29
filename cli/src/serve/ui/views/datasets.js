@@ -1,6 +1,8 @@
-// Data Movement Catalog (#279): the Datasets browser — a filterable list of
-// every dataset the server's pipelines have touched, plus a per-dataset
-// detail view (schema timeline with diffs, recent volume, lineage edges).
+// Data Movement Catalog (#279): every dataset the server's pipelines have
+// touched, beside the selected dataset's detail — volume and null-rate trends,
+// the latest column profile, the schema timeline with diffs, owners and
+// consumers, and its lineage edges. With nothing selected the detail pane
+// holds the server's local outputs.
 //
 // Also the control surface for local-output retention (#587/#588) and the
 // dataset **preview** of those outputs (#586) — the rows a run actually wrote,
@@ -12,9 +14,12 @@
 // as `expired`, never as a broken row.
 import { api, toast } from "../api.js";
 import { navigate } from "../router.js";
-import { escapeHtml, fmtCompact, fmtInt } from "../utils.js";
+import { escapeHtml, fmtCompact, fmtInt, fmtAge as ageOf } from "../utils.js";
 import { attachDatePicker } from "./date-picker.js";
 import { fmtTime } from "./runs.js";
+import { setCrumbTitle } from "../shell.js";
+import { icon, statStrip, listRow, tabs, pill, sparkline as trend } from "../components.js";
+import { splitPane, sectionList } from "./split.js";
 
 const CATALOG_MISSING =
   "The Data Movement Catalog endpoints are not available on this server " +
@@ -25,53 +30,106 @@ export function catalogUnavailable(e) {
   return e && e.status === 404 && !e.code;
 }
 
-export async function renderDatasets(container) {
-  container.innerHTML = `
-    <div class="page page-wide">
-      <div class="page-head">
-        <h1>Datasets</h1>
-        <button class="btn-ghost" id="d-lineage">Lineage graph →</button>
+const DAY = 86400e3;
+const LIST_TABS = [
+  { id: "", label: "All" },
+  { id: "sink", label: "Destinations" },
+  { id: "source", label: "Sources" },
+];
+// The catalog is a bounded set; walk the cursor once and filter client-side.
+const MAX_FETCH_PAGES = 100;
+// Rows per section before a "show more" footer.
+const SECTION_CAP = 200;
+
+/** A URI without its scheme and credentials-free authority noise, for titles. */
+function shortUri(uri) {
+  return String(uri || "").replace(/^[a-z][a-z0-9+.-]*:\/\//i, "") || String(uri || "");
+}
+
+export async function renderDatasets(container, params = {}) {
+  let all = [];
+  let unavailable = "";
+  let role = "";
+  let selected = params.id || null;
+  let alive = true;
+  let detailStop = null;
+  let overviewForced = false;
+  let cap = SECTION_CAP;
+  const kinds = new Set();
+
+  const pane = splitPane(container, {
+    name: "Datasets",
+    listHead: `
+      <div class="sp-tabs">
+        ${tabs(LIST_TABS.map((t) => ({ ...t, id: t.id || "all" })), "all")}
+        <span class="sp-tools">
+          <button type="button" class="icon-btn" id="f-toggle" title="Filters" aria-label="Filters" aria-expanded="false">${icon("filter")}<span class="sp-dot" hidden></span></button>
+          <button type="button" class="icon-btn" id="f-refresh" title="Refresh" aria-label="Refresh">${icon("refresh")}</button>
+          <a class="icon-btn" href="#/lineage" title="Lineage graph" aria-label="Lineage graph">${icon("lineage")}</a>
+          <button type="button" class="icon-btn" id="f-outputs" title="Local outputs" aria-label="Local outputs">${icon("logs")}</button>
+        </span>
       </div>
-      <div class="filters filters-1line">
+      <div class="sp-filters" id="f-panel" hidden>
+        <input id="f-q" placeholder="search URI" />
         <details class="dd" id="f-kind-dd">
           <summary id="f-kind-sum">kind ▾</summary>
           <div class="dd-menu" id="f-kind-menu"><span class="dd-empty">run a pipeline first</span></div>
         </details>
-        <input id="f-q" placeholder="search URI" />
-        <button class="btn-ghost" id="f-refresh" title="refresh">↻</button>
-        <span class="filter-chips" id="f-roles">
-          <button class="chip chip-on" data-role="">all</button>
-          <button class="chip" data-role="source">source</button>
-          <button class="chip" data-role="sink">sink</button>
-        </span>
-        <input id="f-from" class="date-input" type="text" readonly placeholder="from…" />
+        <input id="f-from" class="date-input" type="text" readonly placeholder="last success from…" />
         <input id="f-to" class="date-input" type="text" readonly placeholder="to…" />
       </div>
-      <table class="ds-table">
-        <thead><tr>
-          <th>kind</th><th>dataset</th><th>roles</th><th>runs</th><th>rows</th><th>last seen</th>
-        </tr></thead>
-        <tbody id="ds-list"></tbody>
-      </table>
-      <nav id="ds-pager" class="pager" aria-label="Dataset pages"></nav>
-      <div id="lo-section"></div>
-    </div>`;
+      <div id="d-stats"></div>`,
+  });
+  const $ = (sel) => pane.head.querySelector(sel);
+  const list = sectionList(pane.body, "faucet.datasets.sections");
 
-  const list = container.querySelector("#ds-list");
-  const pager = container.querySelector("#ds-pager");
-  container.querySelector("#d-lineage").onclick = () => navigate("#/lineage");
-  const PAGE_SIZE = 50;
-  let page = 1; // 1-based current page over the *filtered* set
-  let all = []; // the whole catalog, fetched once; filtered + paginated client-side
-  let role = ""; // "", "source", or "sink"
-  const kinds = new Set(); // selected kinds (empty = all)
+  pane.head.querySelectorAll(".c-tab").forEach((b) => {
+    b.onclick = () => {
+      role = b.dataset.tab === "all" ? "" : b.dataset.tab;
+      pane.head.querySelectorAll(".c-tab").forEach((x) => {
+        x.classList.toggle("on", x === b);
+        x.setAttribute("aria-selected", String(x === b));
+      });
+      cap = SECTION_CAP;
+      paint();
+    };
+  });
+  const toggle = $("#f-toggle");
+  toggle.onclick = () => {
+    const panel = $("#f-panel");
+    panel.hidden = !panel.hidden;
+    toggle.setAttribute("aria-expanded", String(!panel.hidden));
+    toggle.classList.toggle("on", !panel.hidden);
+  };
+  const refilter = () => {
+    cap = SECTION_CAP;
+    paint();
+  };
+  $("#f-q").oninput = refilter;
+  attachDatePicker($("#f-from"));
+  attachDatePicker($("#f-to"));
+  $("#f-from").addEventListener("change", refilter);
+  $("#f-to").addEventListener("change", refilter);
+  $("#f-refresh").onclick = () => {
+    loadAll();
+    if (selected) showDetail(selected);
+  };
+  $("#f-outputs").onclick = () => {
+    overviewForced = true;
+    if (selected) navigate("#/catalog");
+    else showDetail(null);
+  };
+  const kindDd = $("#f-kind-dd");
+  const closeKindDd = (e) => {
+    if (kindDd.open && !kindDd.contains(e.target)) kindDd.open = false;
+  };
+  document.addEventListener("click", closeKindDd);
 
-  // Datasets matching every filter EXCEPT kind — the base the kind facet and
-  // the final table are both computed from, so the kind options only ever list
-  // kinds still reachable given the active role/date filters (faceted).
+  // Datasets matching every filter except kind — the base the kind facet is
+  // computed from, so it lists only kinds the other filters still reach.
   function baseFiltered() {
-    const from = container.querySelector("#f-from").dataset.value || ""; // ISO or ""
-    const to = container.querySelector("#f-to").dataset.value || "";
+    const from = $("#f-from").dataset.value || "";
+    const to = $("#f-to").dataset.value || "";
     return all.filter((d) => {
       if (role && !(d.roles || []).includes(role)) return false;
       const ts = d.last_success || "";
@@ -80,161 +138,370 @@ export async function renderDatasets(container) {
       return true;
     });
   }
-
-  // The fully-filtered set (role/date + kind + URI search), sorted as the server
-  // returned it. Pagination slices this — so the page count always reflects the
-  // active filters.
   function filtered() {
-    const q = container.querySelector("#f-q").value.trim().toLowerCase();
+    const q = $("#f-q").value.trim().toLowerCase();
     return baseFiltered()
       .filter((d) => !kinds.size || kinds.has(d.kind))
       .filter((d) => !q || (d.uri || "").toLowerCase().includes(q));
   }
-
-  function render() {
-    populateKinds(); // keep the kind facet in sync with role/date
-    const rows = filtered();
-    const pageCount = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
-    if (page > pageCount) page = pageCount;
-    if (page < 1) page = 1;
-    list.innerHTML = "";
-    if (!rows.length) {
-      list.innerHTML = `<tr><td colspan="6" class="empty">${
-        all.length ? "No datasets match the filters." : "No datasets catalogued yet — run a pipeline first."
-      }</td></tr>`;
-      renderPager(0, 0);
-      return;
-    }
-    const start = (page - 1) * PAGE_SIZE;
-    for (const d of rows.slice(start, start + PAGE_SIZE)) list.appendChild(row(d));
-    renderPager(pageCount, rows.length);
-  }
-
-  // « ‹ 1 … 4 [5] 6 … 20 › » — numbered pages with ellipses; a single page hides
-  // the pager entirely. A count summary ("51–58 of 58") sits alongside.
-  function renderPager(pageCount, total) {
-    pager.innerHTML = "";
-    if (pageCount <= 1) return;
-    const go = (p) => { page = Math.min(Math.max(1, p), pageCount); render(); };
-    const btn = (label, target, opts = {}) => {
-      const b = document.createElement("button");
-      b.className = "pager-btn" + (opts.current ? " is-current" : "");
-      b.textContent = label;
-      if (opts.disabled) b.disabled = true;
-      else b.onclick = () => go(target);
-      return b;
-    };
-    const gap = () => {
-      const s = document.createElement("span");
-      s.className = "pager-gap";
-      s.textContent = "…";
-      return s;
-    };
-    // window of page numbers around the current page
-    const nums = new Set([1, pageCount, page, page - 1, page + 1]);
-    const shown = [...nums].filter((n) => n >= 1 && n <= pageCount).sort((a, b) => a - b);
-    pager.appendChild(btn("‹", page - 1, { disabled: page === 1 }));
-    let prev = 0;
-    for (const n of shown) {
-      if (n - prev > 1) pager.appendChild(gap());
-      pager.appendChild(btn(String(n), n, { current: n === page }));
-      prev = n;
-    }
-    pager.appendChild(btn("›", page + 1, { disabled: page === pageCount }));
-    const info = document.createElement("span");
-    info.className = "pager-info";
-    const from = (page - 1) * PAGE_SIZE + 1;
-    const to = Math.min(page * PAGE_SIZE, total);
-    info.textContent = `${from}–${to} of ${total}`;
-    pager.appendChild(info);
-  }
-
-  // Populate the kind multi-select from the kinds reachable under the *other*
-  // active filters (role/date), and drop any selected kind that no longer fits.
   function populateKinds() {
-    const menu = container.querySelector("#f-kind-menu");
+    const menu = $("#f-kind-menu");
     const distinct = [...new Set(baseFiltered().map((d) => d.kind))].sort();
     for (const k of [...kinds]) if (!distinct.includes(k)) kinds.delete(k);
     if (!distinct.length) return;
     menu.innerHTML = distinct
-      .map(
-        (k) =>
-          `<label class="dd-opt"><input type="checkbox" value="${escapeHtml(k)}"${
-            kinds.has(k) ? " checked" : ""
-          } /> ${escapeHtml(k)}</label>`,
-      )
+      .map((k) => `<label class="dd-opt"><input type="checkbox" value="${escapeHtml(k)}"${kinds.has(k) ? " checked" : ""} /> ${escapeHtml(k)}</label>`)
       .join("");
     menu.querySelectorAll("input").forEach((cb) => {
       cb.onchange = () => {
         if (cb.checked) kinds.add(cb.value);
         else kinds.delete(cb.value);
-        container.querySelector("#f-kind-sum").textContent = kinds.size ? `kind (${kinds.size}) ▾` : "kind ▾";
-        page = 1;
-        render();
+        $("#f-kind-sum").textContent = kinds.size ? `kind (${kinds.size}) ▾` : "kind ▾";
+        refilter();
       };
     });
   }
 
-  // The catalog is a bounded set (the datasets a pipeline touches), so we fetch
-  // it all once by walking the server's cursor, then filter + paginate in the
-  // client — which is what makes true numbered pages (jump to any page, a page
-  // count that tracks the filters) possible. Deduped by id in case a concurrent
-  // write shifts the server sort between cursor pages.
-  const MAX_FETCH_PAGES = 100; // safety backstop (~5000 datasets)
   async function loadAll() {
     try {
       const acc = [];
       const seen = new Set();
       let cursor = null;
       for (let i = 0; i < MAX_FETCH_PAGES; i++) {
-        const p = new URLSearchParams();
-        p.set("limit", "200");
+        const p = new URLSearchParams({ limit: "200" });
         if (cursor) p.set("cursor", cursor);
         const data = await api(`/v1/catalog/datasets?${p}`);
         for (const d of data.datasets) if (!seen.has(d.id)) { seen.add(d.id); acc.push(d); }
         cursor = data.next_cursor || null;
         if (!cursor) break;
       }
+      if (!alive) return;
       all = acc;
-      page = 1;
-      populateKinds();
-      render();
+      unavailable = "";
     } catch (e) {
-      if (catalogUnavailable(e)) list.innerHTML = `<tr><td colspan="6" class="empty">${CATALOG_MISSING}</td></tr>`;
-      else toast(e.message, "error");
+      if (!alive) return;
+      all = [];
+      unavailable = catalogUnavailable(e) ? CATALOG_MISSING : e.message;
+      if (!catalogUnavailable(e)) toast(e.message, "error");
     }
+    paint();
   }
 
-  // Any filter change re-filters the already-fetched set and jumps back to page 1.
-  const refilter = () => { page = 1; render(); };
-  container.querySelector("#f-refresh").onclick = () => loadAll();
-  container.querySelector("#f-q").oninput = refilter;
-  attachDatePicker(container.querySelector("#f-from"));
-  attachDatePicker(container.querySelector("#f-to"));
-  container.querySelector("#f-from").addEventListener("change", refilter);
-  container.querySelector("#f-to").addEventListener("change", refilter);
-  container.querySelectorAll("#f-roles .chip").forEach((c) => {
-    c.onclick = () => {
-      role = c.dataset.role;
-      container.querySelectorAll("#f-roles .chip").forEach((x) => x.classList.toggle("chip-on", x === c));
-      refilter();
-    };
+  function paint() {
+    populateKinds();
+    const now = Date.now();
+    const recent = all.filter((d) => now - Date.parse(d.last_success) < DAY).length;
+    const changed = all.filter((d) => (d.schema_versions || 0) > 1).length;
+    const owned = all.filter((d) => (d.owners || []).length).length;
+    $("#d-stats").innerHTML = statStrip([
+      { label: "Datasets", value: all.length },
+      { label: "Last 24h", value: recent, tone: "ok" },
+      { label: "Evolved", value: changed, tone: changed ? "warn" : "" },
+      { label: "Owned", value: owned },
+    ]);
+    const filters = !!($("#f-q").value.trim() || kinds.size || $("#f-from").dataset.value || $("#f-to").dataset.value);
+    $("#f-toggle .sp-dot").hidden = !filters;
+    const rows = filtered();
+    const sinks = rows.filter((d) => (d.roles || []).includes("sink"));
+    const sources = rows.filter((d) => !(d.roles || []).includes("sink"));
+    const more = (n) => (n > cap ? `<button type="button" class="btn-ghost load-more" data-more>Show ${fmtInt(n - cap)} more</button>` : "");
+    const empty = unavailable
+      ? `<div class="sp-empty"><b>The catalog is not available.</b><span>${escapeHtml(unavailable)}</span></div>`
+      : all.length
+        ? `<div class="sp-empty"><b>No datasets match the filters.</b><span>Clear the filters or pick another tab.</span></div>`
+        : `<div class="sp-empty"><b>No datasets catalogued yet.</b><span>Every dataset a run reads or writes is recorded here — submit a run on the <a href="#/submit">Submit</a> page.</span></div>`;
+    list.render(
+      [
+        { id: "sink", label: "Destinations", count: sinks.length, rows: sinks.slice(0, cap).map((d) => datasetRow(d, now)) },
+        { id: "source", label: "Sources", count: sources.length, rows: sources.slice(0, cap).map((d) => datasetRow(d, now)) },
+      ],
+      { empty, footer: more(Math.max(sinks.length, sources.length)) },
+    );
+    if (!selected) showOverviewCounts();
+  }
+  pane.body.addEventListener("click", (e) => {
+    if (e.target.closest("[data-more]")) {
+      cap += SECTION_CAP;
+      paint();
+    }
   });
-  // Collapse the kind dropdown when clicking anywhere outside it. Named so the
-  // teardown can remove it — a per-render anonymous listener would accumulate
-  // on `document` across navigations, each closure pinning its detached DOM.
-  const kindDd = container.querySelector("#f-kind-dd");
-  const closeKindDd = (e) => {
-    if (kindDd.open && !kindDd.contains(e.target)) kindDd.open = false;
-  };
-  document.addEventListener("click", closeKindDd);
+
+  function datasetRow(d, now) {
+    const fresh = now - Date.parse(d.last_success) < DAY;
+    const meta = [
+      `${fmtCompact(d.last_records)} rows`,
+      d.schema_versions ? `schema v${d.schema_versions}` : "",
+      (d.consumers || []).length ? `${fmtInt(d.consumers.length)} consumer${d.consumers.length === 1 ? "" : "s"}` : "",
+      (d.owners || []).length ? `owner ${d.owners[0]}` : "",
+      d.pipeline ? `by ${d.pipeline}` : "",
+    ].filter(Boolean);
+    return listRow({
+      id: d.id,
+      href: `#/catalog/${encodeURIComponent(d.id)}`,
+      tone: fresh ? "ok" : "muted",
+      shape: fresh ? "full" : "hollow",
+      title: shortUri(d.uri),
+      tooltip: `${d.uri}\nlast success ${fmtTime(d.last_success)}`,
+      age: ageOf(d.last_success, now),
+      ageTitle: `last success ${fmtTime(d.last_success)}`,
+      metaLead: d.kind,
+      meta: meta.join(" · "),
+      selected: d.id === selected,
+    });
+  }
+
+  let loTeardown = null;
+  function showOverviewCounts() {
+    const n = pane.detail.querySelector("#d-ov-count");
+    if (n) n.textContent = `${fmtInt(all.length)} dataset${all.length === 1 ? "" : "s"} catalogued`;
+  }
+  async function showOverview() {
+    pane.setSelected(overviewForced);
+    pane.detail.innerHTML = `
+      <div class="c-dhead"><a class="sp-back" href="#/catalog" id="d-ov-back">${icon("back")}Datasets</a></div>
+      <div><h1 class="c-title">Data movement catalog</h1>
+        <div class="c-sub"><span id="d-ov-count"></span><span class="c-sub-sep">·</span><span>pick a dataset on the left for its volume, profile, schema timeline and lineage</span><span class="c-sub-sep">·</span><a href="#/lineage">Open the lineage graph</a></div></div>
+      <section class="c-card"><div class="c-card-h">${icon("logs")}<b>Local outputs</b><span class="c-card-aside">files the server's runs wrote to its own disk</span></div><div class="c-card-pad" id="d-ov-lo"></div></section>`;
+    showOverviewCounts();
+    pane.detail.querySelector("#d-ov-back").onclick = (e) => {
+      e.preventDefault();
+      overviewForced = false;
+      pane.setSelected(false);
+    };
+    loTeardown = await renderLocalOutputs(pane.detail.querySelector("#d-ov-lo"), { bare: true });
+  }
+
+  function showDetail(id) {
+    detailStop?.();
+    detailStop = null;
+    loTeardown?.();
+    loTeardown = null;
+    selected = id;
+    list.select(id);
+    if (!id) {
+      showOverview();
+      return;
+    }
+    overviewForced = false;
+    pane.setSelected(true);
+    detailStop = mountDatasetDetail(pane.detail, id, { onChanged: () => loadAll() });
+  }
+
   await loadAll();
-  const loCleanup = await renderLocalOutputs(container.querySelector("#lo-section"), {});
-  return () => {
-    document.removeEventListener("click", closeKindDd);
-    if (loCleanup) loCleanup();
+  if (!alive) return;
+  showDetail(selected);
+
+  return {
+    teardown() {
+      alive = false;
+      detailStop?.();
+      loTeardown?.();
+      document.removeEventListener("click", closeKindDd);
+    },
+    update(p) {
+      const id = p.id || null;
+      if (id === selected) return;
+      showDetail(id);
+    },
   };
 }
+
+/** Mount one dataset's page into `el`; returns a stop function. */
+export function mountDatasetDetail(el, id, hooks = {}) {
+  let alive = true;
+  let tab = "overview";
+  let loStop = null;
+  let gen = 0;
+
+  async function load() {
+    const mine = ++gen;
+    if (!el.querySelector(".c-dhead")) el.innerHTML = `<div class="sp-loading">loading…</div>`;
+    let d;
+    try {
+      d = await api(`/v1/catalog/datasets/${encodeURIComponent(id)}`);
+    } catch (e) {
+      if (!alive || mine !== gen) return;
+      el.innerHTML = `<div class="c-dhead"><a class="sp-back" href="#/catalog">${icon("back")}Datasets</a></div><div class="sp-none"><b>${e.status === 404 && !catalogUnavailable(e) ? "Dataset not found" : "Could not load this dataset"}</b><span>${escapeHtml(catalogUnavailable(e) ? CATALOG_MISSING : e.message)}</span></div>`;
+      return;
+    }
+    if (!alive || mine !== gen) return;
+    render(d);
+  }
+
+  function render(d) {
+    loStop?.();
+    loStop = null;
+    setCrumbTitle(shortUri(d.uri));
+    const stats = d.stats || [];
+    const timeline = d.schema_timeline || [];
+    const latest = timeline[timeline.length - 1];
+    const cols = latest ? Object.keys((latest.schema && latest.schema.properties) || {}).length : null;
+    const fresh = Date.now() - Date.parse(d.last_success) < DAY;
+    const prof = d.profile;
+    const drift = prof ? prof.latest.drift || [] : [];
+    const sub = [
+      pill(`Last success ${ageOf(d.last_success)} ago`, fresh ? "ok" : "", fresh ? "check" : ""),
+      `<span>${escapeHtml(d.kind)} · ${escapeHtml((d.roles || []).join(" + "))}</span>`,
+      d.pipeline ? `<span>written by <b>${escapeHtml(d.pipeline)}</b></span>` : "",
+      `<span title="${escapeHtml(fmtTime(d.first_seen))}">first seen ${escapeHtml(ageOf(d.first_seen))} ago</span>`,
+    ].filter(Boolean);
+    const upCount = (d.upstream || []).length;
+    const downCount = (d.downstream || []).length;
+    el.innerHTML = `
+      <div class="c-dhead">
+        <a class="sp-back" href="#/catalog">${icon("back")}Datasets</a>
+        ${tabs(
+          [
+            { id: "overview", label: "Overview" },
+            { id: "schema", label: "Schema", count: timeline.length || null },
+            { id: "profile", label: "Profile", count: drift.length || null },
+            { id: "lineage", label: "Lineage", count: upCount + downCount || null },
+            { id: "outputs", label: "Outputs" },
+          ],
+          tab,
+        )}
+        <span class="c-dhead-r">
+          <a class="c-btn" href="#/lineage/${encodeURIComponent(d.id)}">${icon("lineage")}Lineage graph</a>
+        </span>
+      </div>
+      <div><h1 class="c-title" title="${escapeHtml(d.uri)}">${escapeHtml(shortUri(d.uri))}</h1><div class="c-sub">${sub.join('<span class="c-sub-sep">·</span>')}</div></div>
+      <div class="d-pane" data-pane="overview">
+        ${volumeCard(d, stats, latest, cols, prof)}
+        <section class="c-card"><div class="c-card-h">${icon("user")}<b>Owners &amp; consumers</b><span class="c-card-aside">who is told when a change to this dataset is planned</span></div><div id="stewardship"></div></section>
+        ${lineageCard(d)}
+      </div>
+      <div class="d-pane" data-pane="schema" hidden>${schemaCard(timeline)}</div>
+      <div class="d-pane" data-pane="profile" hidden><section class="c-card"><div class="c-card-h"><b>Column profiles</b><span class="c-card-aside">learned per run by a <code>profiling:</code> block</span></div><div id="profile" class="c-card-pad"></div></section></div>
+      <div class="d-pane" data-pane="lineage" hidden>${lineageCard(d)}</div>
+      <div class="d-pane" data-pane="outputs" hidden><section class="c-card"><div class="c-card-h">${icon("logs")}<b>Local outputs</b><span class="c-card-aside">this dataset's files on the server's disk</span></div><div class="c-card-pad" id="lo-section"></div></section></div>`;
+
+    const showTab = (t) => {
+      tab = t;
+      el.querySelectorAll(".c-dhead .c-tab").forEach((b) => {
+        b.classList.toggle("on", b.dataset.tab === t);
+        b.setAttribute("aria-selected", String(b.dataset.tab === t));
+      });
+      el.querySelectorAll(".d-pane").forEach((p) => (p.hidden = p.dataset.pane !== t));
+    };
+    el.querySelectorAll(".c-dhead .c-tab").forEach((b) => (b.onclick = () => showTab(b.dataset.tab)));
+    el.querySelectorAll("[data-tab-link]").forEach((a) => {
+      a.onclick = (e) => {
+        e.preventDefault();
+        showTab(a.dataset.tabLink);
+      };
+    });
+    showTab(tab);
+
+    renderProfile(el.querySelector("#profile"), prof);
+    renderStewardship(el.querySelector("#stewardship"), d, () => {
+      load();
+      hooks.onChanged?.();
+    });
+    renderLocalOutputs(el.querySelector("#lo-section"), { datasetId: d.id, bare: true }).then((stop) => {
+      if (alive) loStop = stop;
+      else stop?.();
+    });
+  }
+
+  load();
+  return () => {
+    alive = false;
+    loStop?.();
+  };
+}
+
+function volumeCard(d, stats, latest, cols, prof) {
+  const pts = stats.map((s) => s.records);
+  const last = stats[stats.length - 1];
+  const avg = pts.length ? pts.reduce((a, b) => a + b, 0) / pts.length : 0;
+  const nullCols = prof ? Object.entries(prof.latest.profile.columns || {}) : [];
+  const worst = nullCols.sort((a, b) => b[1].null_rate - a[1].null_rate)[0];
+  const history = prof ? prof.history.slice().reverse() : [];
+  const items = [
+    {
+      k: "Rows per run",
+      html: `<b>${fmtCompact(last ? last.records : d.last_records)}</b>${pts.length >= 2 ? `<span class="tpl-spark" title="${escapeHtml(`rows per run, oldest → newest: ${pts.map(fmtInt).join(", ")}`)}">${trend(pts, { width: 170, height: 30, color: "var(--text-2)" })}</span>` : ""}<div class="c-kv-s">${pts.length ? `avg ${fmtCompact(Math.round(avg))} over ${fmtInt(pts.length)} run${pts.length === 1 ? "" : "s"}` : "no runs recorded"}</div>`,
+    },
+    worst
+      ? {
+          k: `Null rate · ${worst[0]}`,
+          html: `<b>${(worst[1].null_rate * 100).toFixed(1)}%</b>${history.length >= 2 ? `<span class="tpl-spark" title="${escapeHtml(`null rate of ${worst[0]} per profiled run: ${history.map((r) => (r.profile.columns[worst[0]] ? `${(r.profile.columns[worst[0]].null_rate * 100).toFixed(1)}%` : "—")).join(", ")}`)}">${trend(history.map((r) => (r.profile.columns[worst[0]] ? r.profile.columns[worst[0]].null_rate : 0)), { width: 170, height: 30, color: "var(--text-2)", min: 0 })}</span>` : ""}<div class="c-kv-s">highest of ${fmtInt(nullCols.length)} profiled column${nullCols.length === 1 ? "" : "s"}</div>`,
+        }
+      : { k: "Total rows", html: `<b>${fmtCompact(d.total_records)}</b><div class="c-kv-s">${fmtInt(d.total_records)} across every run</div>` },
+    { k: "Runs", html: `<b>${fmtInt(d.runs)}</b><div class="c-kv-s">last <span class="mono">${escapeHtml(String(d.last_run_id || "").slice(0, 8))}</span> · ${escapeHtml(fmtTime(d.last_success))}</div>` },
+    { k: "Consumers", html: `<b>${fmtInt((d.consumers || []).length)}</b><div class="c-kv-s">${escapeHtml((d.consumers || []).map((c) => c.kind || c.name).slice(0, 3).join(" · ") || "none declared")}</div>` },
+  ];
+  const head = `${fmtCompact(last ? last.records : d.last_records)} rows last run${cols != null ? ` · ${fmtInt(cols)} column${cols === 1 ? "" : "s"}` : ""}`;
+  let note = "";
+  let tone = "";
+  if (latest && latest.diff) {
+    const df = latest.diff;
+    const parts = [
+      ...(df.added || []).map((c) => `+${typeof c === "string" ? c : c.column}`),
+      ...(df.widened || []).map((c) => `~${typeof c === "string" ? c : c.column}`),
+      ...(df.changed || []).map((c) => `!${typeof c === "string" ? c : c.column}`),
+      ...(df.removed || []).map((c) => `−${typeof c === "string" ? c : c.column}`),
+    ];
+    if (parts.length) {
+      note = `Schema v${latest.version} · ${parts.slice(0, 6).join(" ")}${parts.length > 6 ? " …" : ""} · ${ageOf(latest.recorded_at)} ago`;
+      tone = (df.removed || []).length || (df.changed || []).length ? "warn" : "ok";
+    }
+  }
+  if (!note && latest) note = `Schema v${latest.version} since ${fmtTime(latest.recorded_at)}`;
+  return `<section class="c-card"><div class="c-card-h">${icon("db")}<b>${escapeHtml(head)}</b>${latest ? `<span class="c-tag">schema v${latest.version}</span>` : ""}<span class="c-card-r">last change ${latest ? `${escapeHtml(ageOf(latest.recorded_at))} ago` : "—"}</span></div><div class="c-kvgrid" style="--c-cols:4">${items
+    .map((i) => `<div class="c-kv"><small>${escapeHtml(i.k)}</small>${i.html}</div>`)
+    .join("")}</div>${note ? `<div class="c-card-note ${tone}">${escapeHtml(note)}</div>` : ""}${volumeBars(stats)}</section>`;
+}
+
+function volumeBars(stats) {
+  if (stats.length < 3) return "";
+  const max = Math.max(1, ...stats.map((s) => s.records));
+  return `<div class="c-card-note c-vol"><div class="volume-bars">${stats
+    .map(
+      (s) =>
+        `<div class="volume-bar" title="${escapeHtml(`${fmtInt(s.records)} rows — ${fmtTime(s.recorded_at)} (run ${s.run_id})`)}" style="height:${Math.max(4, Math.round((s.records / max) * 56))}px"></div>`,
+    )
+    .join("")}</div></div>`;
+}
+
+function lineageCard(d) {
+  const side = (title, edges, idOf, uriOf) => `
+    <div class="ds-edges"><div class="ds-edges-h">${escapeHtml(title)} <span class="c-muted">${fmtInt(edges.length)}</span></div>${
+      edges.length
+        ? edges
+            .map(
+              (e) =>
+                `<a class="ds-edge" href="#/catalog/${encodeURIComponent(idOf(e))}" title="${escapeHtml(uriOf(e))}"><span class="c-ell">${escapeHtml(shortUri(uriOf(e)))}</span><span class="c-muted">${fmtInt(e.runs)} run${e.runs === 1 ? "" : "s"} · ${fmtCompact(e.last_records)} rows</span></a>`,
+            )
+            .join("")
+        : `<div class="c-muted ds-edge-none">none recorded</div>`
+    }</div>`;
+  return `<section class="c-card"><div class="c-card-h">${icon("lineage")}<b>Lineage</b><span class="c-card-aside">pipelines that read or write this dataset</span><a class="c-card-r" href="#/lineage/${encodeURIComponent(d.id)}">open the graph</a></div><div class="ds-lineage">${side("Upstream", d.upstream || [], (e) => e.src_id, (e) => e.src_uri)}<div class="ds-lineage-mid" title="${escapeHtml(d.uri)}"><span class="c-ell">${escapeHtml(shortUri(d.uri))}</span><span class="c-muted">${escapeHtml(d.kind)}</span></div>${side("Downstream", d.downstream || [], (e) => e.dst_id, (e) => e.dst_uri)}</div></section>`;
+}
+
+function schemaCard(timeline) {
+  if (!timeline.length) {
+    return `<section class="c-card"><div class="c-card-h"><b>Schema timeline</b></div><div class="c-card-empty">No schema observed yet — the catalog samples records from each successful run.</div></section>`;
+  }
+  const rows = timeline
+    .slice()
+    .reverse()
+    .map((v) => {
+      const cols = Object.keys((v.schema && v.schema.properties) || {});
+      const badges = diffBadges(v.diff);
+      return `<tr class="ds-sv" data-v="${v.version}"><td class="mono">v${v.version}</td><td>${badges || `<span class="c-muted">${v.version === timeline[0].version ? "first observed" : "no change"}</span>`}</td><td class="num">${fmtInt(cols.length)}</td><td class="c-muted c-nowrap" title="${escapeHtml(fmtTime(v.recorded_at))}">${escapeHtml(ageOf(v.recorded_at))} ago</td><td><button type="button" class="c-btn ds-sv-btn">JSON</button></td></tr><tr class="ds-sv-json" hidden><td colspan="5"><pre class="mono schema-json">${escapeHtml(JSON.stringify(v.schema, null, 2))}</pre></td></tr>`;
+    })
+    .join("");
+  return `<section class="c-card"><div class="c-card-h"><b>Schema timeline</b><span class="c-card-r">${fmtInt(timeline.length)} version${timeline.length === 1 ? "" : "s"} · newest first</span></div><div class="d-scroll-x"><table class="c-tbl ds-sv-tbl"><colgroup><col style="width:72px" /><col /><col style="width:84px" /><col style="width:110px" /><col style="width:84px" /></colgroup><thead><tr><th>Version</th><th>Change</th><th class="num">Columns</th><th>When</th><th></th></tr></thead><tbody>${rows}</tbody></table></div></section>`;
+}
+
+document.addEventListener("click", (e) => {
+  const b = e.target.closest(".ds-sv-btn");
+  if (!b) return;
+  const next = b.closest("tr").nextElementSibling;
+  if (next) next.hidden = !next.hidden;
+});
+
 
 // ── Local outputs (#587/#588) ───────────────────────────────────────────────
 
@@ -283,9 +550,9 @@ export async function renderLocalOutputs(host, scope = {}) {
   let showExpired = false;
 
   host.innerHTML = `
-    <h2 class="lo-head">Local outputs</h2>
-    <div id="lo-body"><div class="empty">loading…</div></div>`;
-  const body = host.querySelector("#lo-body");
+    ${scope.bare ? "" : `<h2 class="lo-head">Local outputs</h2>`}
+    <div class="lo-body"><div class="sp-loading">loading…</div></div>`;
+  const body = host.querySelector(".lo-body");
 
   async function load() {
     const p = new URLSearchParams();
@@ -701,128 +968,6 @@ function fmtBytes(bytes) {
   return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GiB`;
 }
 
-function row(d) {
-  const el = document.createElement("tr");
-  el.className = "ds-tr";
-  el.onclick = () => navigate(`#/catalog/${d.id}`);
-  el.innerHTML = `
-    <td><span class="pill">${escapeHtml(d.kind)}</span></td>
-    <td class="ds-uri"><div class="ds-uri-in mono" title="${escapeHtml(d.uri)}">${escapeHtml(d.uri)}</div></td>
-    <td class="ds-meta">${escapeHtml(d.roles.join("+"))}</td>
-    <td class="ds-meta ds-num">${fmtInt(d.runs)}</td>
-    <td class="ds-meta ds-num" title="${fmtInt(d.last_records)}">${fmtCompact(d.last_records)}</td>
-    <td class="ds-meta ds-time" title="last success">${fmtTime(d.last_success)}</td>`;
-  // Drop the right-edge fade once the URI is scrolled to its end (or doesn't
-  // scroll at all), so the last characters render crisp instead of faded.
-  const uri = el.querySelector(".ds-uri-in");
-  if (uri) {
-    const syncFade = () =>
-      uri.classList.toggle("at-end", uri.scrollLeft + uri.clientWidth >= uri.scrollWidth - 1);
-    uri.addEventListener("scroll", syncFade, { passive: true });
-    requestAnimationFrame(syncFade); // initial state, after layout
-  }
-  return el;
-}
-
-export async function renderDatasetDetail(container, params) {
-  container.innerHTML = `<div class="empty">loading…</div>`;
-  let d;
-  try {
-    d = await api(`/v1/catalog/datasets/${encodeURIComponent(params.id)}`);
-  } catch (e) {
-    container.innerHTML = `<div class="empty">${
-      catalogUnavailable(e) ? CATALOG_MISSING : escapeHtml(e.message)
-    }</div>`;
-    return;
-  }
-
-  const maxRows = Math.max(1, ...d.stats.map((s) => s.records));
-  container.innerHTML = `
-    <div class="page">
-      <div class="page-head">
-        <h1 class="mono dataset-title">${escapeHtml(d.uri)}</h1>
-      </div>
-      <div class="detail-grid">
-        <div><label>Kind</label><span class="pill">${escapeHtml(d.kind)}</span></div>
-        <div><label>Roles</label>${escapeHtml(d.roles.join(", "))}</div>
-        <div><label>Pipeline</label>${escapeHtml(d.pipeline)}</div>
-        <div><label>Runs</label>${d.runs}</div>
-        <div><label>Rows (last / total)</label>${fmtInt(d.last_records)} / ${fmtInt(d.total_records)}</div>
-        <div><label>First seen</label>${fmtTime(d.first_seen)}</div>
-        <div><label>Last success</label>${fmtTime(d.last_success)}</div>
-        <div><label>Id</label><span class="mono">${escapeHtml(d.id)}</span></div>
-      </div>
-
-      <h2>Owners &amp; consumers</h2>
-      <div id="stewardship"></div>
-
-      <h2>Volume (recent runs)</h2>
-      ${
-        d.stats.length >= 3
-          ? `<div class="volume-bars">${d.stats
-              .slice()
-              .reverse()
-              .map(
-                (s) =>
-                  `<div class="volume-bar" title="${escapeHtml(`${fmtInt(s.records)} rows — ${fmtTime(s.recorded_at)} (run ${s.run_id})`)}"
-                    style="height:${Math.max(4, Math.round((s.records / maxRows) * 64))}px"></div>`,
-              )
-              .join("")}</div>`
-          : d.stats.length
-            ? `<div class="volume-summary">${d.stats.length} run${d.stats.length === 1 ? "" : "s"} recorded · latest <b>${fmtInt(
-                d.stats[d.stats.length - 1].records,
-              )}</b> rows on ${fmtTime(d.stats[d.stats.length - 1].recorded_at)} <span class="volume-hint">— the trend chart appears once there are 3+ runs</span></div>`
-            : `<div class="empty">no volume points yet</div>`
-      }
-
-      <h2>Column profiles</h2>
-      <div id="profile"></div>
-
-      <h2>Schema timeline</h2>
-      <div id="timeline"></div>
-
-      <div id="lo-section"></div>
-
-      <h2>Lineage</h2>
-      <div class="edge-lists">
-        <div>
-          <h3>Upstream</h3>
-          ${edgeList(d.upstream, (e) => e.src_id, (e) => e.src_uri)}
-        </div>
-        <div>
-          <h3>Downstream</h3>
-          ${edgeList(d.downstream, (e) => e.dst_id, (e) => e.dst_uri)}
-        </div>
-      </div>
-      <button class="btn-ghost" id="d-graph">View in lineage graph →</button>
-    </div>`;
-
-  container.querySelector("#d-graph").onclick = () => navigate(`#/lineage/${d.id}`);
-  // This dataset's own local files, with the same controls scoped to it.
-  const loCleanup = await renderLocalOutputs(container.querySelector("#lo-section"), {
-    datasetId: d.id,
-  });
-  container.querySelectorAll(".edge-link").forEach((a) => {
-    a.onclick = () => navigate(`#/catalog/${a.dataset.id}`);
-  });
-
-  renderProfile(container.querySelector("#profile"), d.profile);
-  renderStewardship(container.querySelector("#stewardship"), d, () =>
-    renderDatasetDetail(container, params),
-  );
-
-  const timeline = container.querySelector("#timeline");
-  if (!d.schema_timeline.length) {
-    timeline.innerHTML = `<div class="empty">no schema observed yet</div>`;
-  }
-  for (const v of d.schema_timeline.slice().reverse()) {
-    timeline.appendChild(versionCard(v));
-  }
-  return () => {
-    if (loCleanup) loCleanup();
-  };
-}
-
 // Owners + declared consumers (#707): who is told when a change to this
 // dataset is planned. Pipelines that read it are consumers automatically (the
 // lineage edges below); dashboards, models and exports are declared here.
@@ -1049,36 +1194,8 @@ function sparkline(values, flagged) {
     last !== null
       ? `<circle cx="${x(n - 1).toFixed(1)}" cy="${y(last).toFixed(1)}" r="1.8" class="spark-end"/>`
       : "";
-  return `<svg class="spark" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" aria-hidden="true"><path d="${d.trim()}"/>${dots}${end}</svg>`;
-}
-
-function edgeList(edges, idOf, uriOf) {
-  if (!edges.length) return `<div class="empty">none</div>`;
-  return edges
-    .map(
-      (e) =>
-        `<div class="run-row edge-link" data-id="${escapeHtml(idOf(e))}">
-          <span class="run-name mono">${escapeHtml(uriOf(e))}</span>
-          <span class="run-meta">${fmtInt(e.runs)} run${e.runs === 1 ? "" : "s"}</span>
-          <span class="run-meta">${fmtInt(e.last_records)} rows</span>
-        </div>`,
-    )
-    .join("");
-}
-
-function versionCard(v) {
-  const el = document.createElement("details");
-  el.className = "schema-version";
-  const cols = Object.keys((v.schema && v.schema.properties) || {});
-  el.innerHTML = `
-    <summary>
-      <b>v${v.version}</b>
-      <span class="run-meta">${fmtTime(v.recorded_at)}</span>
-      <span class="run-meta">${cols.length} column${cols.length === 1 ? "" : "s"}</span>
-      ${diffBadges(v.diff)}
-    </summary>
-    <pre class="mono schema-json">${escapeHtml(JSON.stringify(v.schema, null, 2))}</pre>`;
-  return el;
+  const tip = values.map((v) => (v === null ? "—" : `${(v * 100).toFixed(1)}%`)).join(", ");
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" role="img" aria-label="null rate per run"><title>null rate per profiled run, oldest → newest: ${tip}${flagged.some(Boolean) ? " (dots: runs that raised drift)" : ""}</title><path d="${d.trim()}"/>${dots}${end}</svg>`;
 }
 
 function diffBadges(diff) {

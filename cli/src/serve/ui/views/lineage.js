@@ -27,13 +27,15 @@ export async function renderLineage(container, params = {}) {
   }
 
   container.innerHTML = `
-    <div class="page page-wide">
+    <div class="page p3">
       <div class="page-head">
         <h1>Lineage${params.root ? " (rooted)" : ""}</h1>
-        <button class="btn-ghost" id="l-datasets">← Datasets</button>
-        ${params.root ? `<button class="btn-ghost" id="l-all">Whole graph</button>` : ""}
+        <span class="c-dhead-r">
+          ${params.root ? `<button class="c-btn" id="l-all">Whole graph</button>` : ""}
+          <button class="c-btn" id="l-datasets">Datasets</button>
+        </span>
       </div>
-      <p class="lineage-hint">Click a dataset to highlight its connections · double-click to open it · scroll inside a box to read the full name.</p>
+      <p class="p3-sub lineage-hint">Click a dataset to highlight its connections · double-click to open it · scroll inside a box to read the full name.</p>
       <div id="graph" class="lineage-graph"></div>
     </div>`;
   container.querySelector("#l-datasets").onclick = () => navigate("#/catalog");

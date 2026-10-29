@@ -22,7 +22,7 @@ export async function renderSubmit(container) {
   try { catalog = await api("/v1/schemas"); } catch (e) { toast(e.message, "error"); }
 
   container.innerHTML = `
-    <div class="page">
+    <div class="page p3">
       <div class="page-head"><h1>Submit a run</h1>
         <div class="mode-toggle">
           <button id="mode-guided" class="btn-ghost active">Guided</button>

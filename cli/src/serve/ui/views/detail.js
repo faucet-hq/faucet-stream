@@ -369,7 +369,8 @@ export function mountRunDetail(el, id, hooks = {}) {
     $("#d-title").innerHTML = `<h1 class="c-title" title="${escapeHtml(name)}">${escapeHtml(name)}</h1><div class="c-sub">${sub.join('<span class="c-sub-sep">·</span>')}</div>`;
 
     const invErrors = (r.invocations || []).filter((i) => i.error && !i.skipped);
-    const errText = [r.error, ...invErrors.map((i) => `${i.row_id}${i.parent_record_key ? ` (${i.parent_record_key})` : ""}: ${i.error}`)]
+    const generic = invErrors.length && /^\d+ (pipeline )?invocation\(s\) failed\b/.test(String(r.error || "").trim());
+    const errText = [generic ? "" : r.error, ...invErrors.map((i) => `${i.row_id}${i.parent_record_key ? ` (${i.parent_record_key})` : ""}: ${i.error}`)]
       .filter(Boolean)
       .join("\n");
     $("#d-alert").innerHTML = errText

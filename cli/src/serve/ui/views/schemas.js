@@ -22,7 +22,9 @@ export async function renderSchemas(container) {
       .join("")}</div>`;
 
   container.innerHTML = `
-    <div class="page schemas-page">
+    <div class="page p3"><div class="page-head"><h1>Schemas</h1></div>
+      <p class="p3-sub">Every connector, transform and state store compiled into this server, with its config schema.</p>
+      <div class="schemas-page">
       <aside class="schema-list">
         <p class="schema-note">Showing the <b>${catalog.sources.length} source${catalog.sources.length === 1 ? "" : "s"}</b> and <b>${catalog.sinks.length} sink${catalog.sinks.length === 1 ? "" : "s"}</b> built into this server. Rebuild with more Cargo features (e.g. <code>--features full</code>) to enable the rest.</p>
         ${group("Sources", "source", catalog.sources)}
@@ -34,8 +36,8 @@ export async function renderSchemas(container) {
           </div>
         </div>
       </aside>
-      <section id="schema-view" class="schema-view"><div class="empty">Select a connector to view its schema.</div></section>
-    </div>`;
+      <section id="schema-view" class="schema-view"><div class="sp-none"><b>Select a connector</b><span>Its fields, types, defaults and the raw JSON Schema appear here.</span></div></section>
+    </div></div>`;
 
   const view = container.querySelector("#schema-view");
   container.querySelectorAll(".schema-item").forEach((btn) => {
@@ -45,7 +47,7 @@ export async function renderSchemas(container) {
       view.innerHTML = `<div class="empty">loading…</div>`;
       try {
         const schema = await api(`/v1/schemas/${btn.dataset.kind}/${encodeURIComponent(btn.dataset.name)}`);
-        view.innerHTML = `<h2>${escapeHtml(btn.dataset.kind)}: ${escapeHtml(btn.dataset.name)}</h2>` + fieldTable(schema) +
+        view.innerHTML = `<h2 class="schema-h"><span class="c-muted">${escapeHtml(btn.dataset.kind)}</span> ${escapeHtml(btn.dataset.name)}</h2>` + fieldTable(schema) +
           `<details class="raw"><summary>raw JSON Schema</summary><pre>${escapeHtml(JSON.stringify(schema, null, 2))}</pre></details>`;
       } catch (e) {
         view.innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;

@@ -85,6 +85,7 @@ export function sectionList(body, storageKey) {
         r.classList.toggle("on", on);
         if (on) r.setAttribute("aria-current", "true");
         else r.removeAttribute("aria-current");
+        if (on && r.offsetParent) r.scrollIntoView({ block: "nearest" });
       });
     },
     invalidate() {
