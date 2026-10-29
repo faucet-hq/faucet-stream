@@ -41,8 +41,8 @@ impl Registry {
     }
 
     /// Reserve a queue slot. Returns `true` if a slot was reserved, or `false`
-    /// if the queue is full. Atomic against concurrent submits via a CAS loop
-    /// (`AtomicUsize::try_update`, stabilized in Rust 1.95).
+    /// if the queue is full. Atomic against concurrent submits: one
+    /// `AtomicUsize::try_update` compare-and-swap loop.
     pub fn try_reserve(&self) -> bool {
         self.queued
             .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
