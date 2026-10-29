@@ -479,9 +479,7 @@ fn write_all_blocking(
         match write_transaction(&guard, config, records, chunk) {
             Err(e) if attempt < CONFLICT_ATTEMPTS && lost_catalog_race(&e) => {
                 tracing::debug!(attempt, error = %e, "duckdb write lost a catalog race; retrying");
-                #[allow(clippy::disallowed_methods)]
-                // on the blocking pool; a short pause lets the other writer commit
-                std::thread::sleep(std::time::Duration::from_millis(5 * u64::from(attempt)));
+                pause_after_conflict(attempt);
                 attempt += 1;
             }
             other => return other,
