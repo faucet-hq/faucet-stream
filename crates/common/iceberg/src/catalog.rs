@@ -10,7 +10,7 @@
 //! | REST    | `catalog-rest`    | `iceberg-catalog-rest`  |
 //! | Glue    | `catalog-glue`    | `iceberg-catalog-glue`  |
 //! | SQL     | `catalog-sql`     | `iceberg-catalog-sql`   |
-//! | HMS     | `catalog-hms`     | `iceberg-catalog-hms`   |
+//! | HMS     | `catalog-hms`     | `iceberg-catalog-hms` + [`crate::hms`] for commits |
 
 #[cfg(any(
     feature = "catalog-rest",
@@ -32,6 +32,7 @@ use crate::config::{CatalogConfig, CatalogInner};
 /// - The chosen catalog type's Cargo feature is not enabled.
 /// - The catalog client fails to initialise (bad URI, auth failure, etc.).
 pub async fn build_catalog(cfg: &CatalogConfig) -> Result<Arc<dyn Catalog>, FaucetError> {
+    faucet_core::ensure_crypto_provider();
     match cfg {
         CatalogConfig::Rest(inner) => build_rest(inner).await,
         CatalogConfig::Glue(inner) => build_glue(inner).await,
@@ -180,17 +181,26 @@ async fn build_sql(_inner: &CatalogInner) -> Result<Arc<dyn Catalog>, FaucetErro
 
 // ── HMS ───────────────────────────────────────────────────────────────────────
 
+/// The `host:port` the HMS client dials: it resolves the address as a socket
+/// address, so the documented `thrift://host:port` form loses its scheme.
+#[cfg_attr(not(feature = "catalog-hms"), allow(dead_code))]
+fn hms_address(uri: &str) -> &str {
+    uri.strip_prefix("thrift://")
+        .unwrap_or(uri)
+        .trim_end_matches('/')
+}
+
 #[cfg(feature = "catalog-hms")]
 async fn build_hms(inner: &CatalogInner) -> Result<Arc<dyn Catalog>, FaucetError> {
-    use iceberg::CatalogBuilder;
-    use iceberg_catalog_hms::{
-        HMS_CATALOG_PROP_URI, HMS_CATALOG_PROP_WAREHOUSE, HmsCatalogBuilder,
-    };
+    use iceberg_catalog_hms::{HMS_CATALOG_PROP_URI, HMS_CATALOG_PROP_WAREHOUSE};
 
     let mut props: HashMap<String, String> = inner.properties.clone();
 
     if let Some(uri) = &inner.uri {
-        props.insert(HMS_CATALOG_PROP_URI.to_string(), uri.clone());
+        props.insert(
+            HMS_CATALOG_PROP_URI.to_string(),
+            hms_address(uri).to_string(),
+        );
     }
     if let Some(warehouse) = &inner.warehouse {
         props.insert(HMS_CATALOG_PROP_WAREHOUSE.to_string(), warehouse.clone());
@@ -198,11 +208,8 @@ async fn build_hms(inner: &CatalogInner) -> Result<Arc<dyn Catalog>, FaucetError
 
     let storage_factory = crate::storage_factory::select_storage_factory(inner)?;
 
-    let catalog = HmsCatalogBuilder::default()
-        .with_storage_factory(storage_factory)
-        .load(crate::CATALOG_NAME, props)
-        .await
-        .map_err(|e| FaucetError::Config(format!("iceberg: HMS catalog init failed: {e}")))?;
+    let catalog =
+        crate::hms::HmsCommitCatalog::load(crate::CATALOG_NAME, props, storage_factory).await?;
 
     Ok(Arc::new(catalog))
 }
@@ -233,6 +240,13 @@ mod tests {
         for uri in ["postgres://h/m", "postgresql://h/m", "", "other://h"] {
             assert!(!uses_qmark(uri), "{uri}");
         }
+    }
+
+    #[test]
+    fn hms_address_drops_the_thrift_scheme() {
+        assert_eq!(hms_address("thrift://hms:9083"), "hms:9083");
+        assert_eq!(hms_address("thrift://hms:9083/"), "hms:9083");
+        assert_eq!(hms_address("127.0.0.1:9083"), "127.0.0.1:9083");
     }
 
     #[allow(dead_code)]

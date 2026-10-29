@@ -143,3 +143,41 @@ async fn a_deeply_nested_xml_response_is_refused() {
     let err = stream.fetch_all().await.unwrap_err();
     assert!(err.to_string().contains("nesting exceeds"), "{err}");
 }
+
+/// An Excel workbook body is parsed from the named sheet and header row (#967).
+#[cfg(feature = "excel")]
+#[tokio::test]
+async fn parses_an_xlsx_workbook_download() {
+    use rust_xlsxwriter::Workbook;
+    let mut book = Workbook::new();
+    book.add_worksheet().set_name("Cover").unwrap();
+    let sheet = book.add_worksheet().set_name("Data").unwrap();
+    sheet.write_string(0, 0, "exported by test").unwrap();
+    sheet.write_string(1, 0, "id").unwrap();
+    sheet.write_string(1, 1, "name").unwrap();
+    sheet.write_number(2, 0, 1).unwrap();
+    sheet.write_string(2, 1, "alice").unwrap();
+    sheet.write_number(3, 0, 2).unwrap();
+    sheet.write_string(3, 1, "bob").unwrap();
+    let bytes = book.save_to_buffer().unwrap();
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/report.xlsx"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+        .mount(&server)
+        .await;
+    let mut spec = parse(ParseFormat::Xlsx);
+    spec.sheet = Some("Data".into());
+    spec.header_row = 1;
+    let stream = RestStream::new(
+        RestStreamConfig::new(&server.uri(), "/report.xlsx")
+            .decode(vec![DecodeStep::Parse { parse: spec }]),
+    )
+    .unwrap();
+    let records = stream.fetch_all().await.unwrap();
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records[0]["name"], "alice");
+    assert_eq!(records[1]["name"], "bob");
+    assert_eq!(records[1]["id"].as_f64(), Some(2.0), "{records:?}");
+}

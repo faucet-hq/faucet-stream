@@ -21,6 +21,7 @@ tracing.workspace = true
 sqlx = { workspace = true, features = ["mysql", "json"] }
 tokio.workspace = true
 base64.workspace = true
+chrono.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

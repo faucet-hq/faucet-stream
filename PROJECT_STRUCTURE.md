@@ -4,9 +4,9 @@ Where everything lives in the faucet-stream repository. For how the pieces fit
 together at run time, see the [architecture guide](docs/architecture/README.md);
 to start contributing, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-The workspace has <!--COUNT:crates-->113<!--/COUNT--> crates: <!--COUNT:sources-->43<!--/COUNT-->
+The workspace has <!--COUNT:crates-->114<!--/COUNT--> crates: <!--COUNT:sources-->43<!--/COUNT-->
 source connectors, <!--COUNT:sinks-->35<!--/COUNT--> sink connectors and
-<!--COUNT:common-->25<!--/COUNT--> shared connector libraries, plus the core, auth, state,
+<!--COUNT:common-->26<!--/COUNT--> shared connector libraries, plus the core, auth, state,
 lineage, transform and test crates below.
 
 ```
@@ -16,7 +16,7 @@ crates/
   auth/                       — faucet-auth: shared OAuth2 / token-endpoint providers
   source/                     — source connectors (rest, graphql, xml, grpc, *-cdc, kafka, s3, azure-blob, redshift, clickhouse, pubsub, delta, databricks, iceberg, dynamodb, oracle, oracle-cdc, singer, duckdb, sqs, nats, rabbitmq, sftp, file, …)
   sink/                       — sink connectors (bigquery, iceberg, delta, databricks, dynamodb, oracle, postgres, parquet, kafka, redshift, clickhouse, pubsub, azure-blob, duckdb, sqs, nats, rabbitmq, sftp, singer, …)
-  common/                     — shared connector libraries (bigquery, elasticsearch, gcs, kafka, snowflake, mssql, kinesis, spanner, delta, redshift, pubsub, clickhouse, azure, s3, sqs, nats, rabbitmq, sftp, iceberg, dynamodb, databricks, oracle, singer, file, sql — the shared SQL dialects and sink engine)
+  common/                     — shared connector libraries (bigquery, elasticsearch, gcs, kafka, snowflake, mssql, kinesis, spanner, delta, redshift, pubsub, clickhouse, azure, s3, sqs, nats, rabbitmq, sftp, iceberg, dynamodb, databricks, oracle, singer, redis, file, sql — the shared SQL dialects and sink engine)
   state/                      — Redis- and Postgres-backed StateStore backends
   lineage/                    — faucet-lineage: OpenLineage event emission
   transform-sql/              — faucet-transform-sql: embedded DuckDB SQL transform
@@ -35,6 +35,9 @@ skills/                       — agent skills (Claude Code / Codex plugin), ver
 schemas/                      — committed JSON Schema for pipeline configs (editor validation)
 examples/                     — repo-level examples: docker-compose infra stack + run index
   orchestration/              — ELT recipe: faucet (EL) + dbt (T) + Airflow/Dagster
+  wasm-transforms/            — reference `wasm` transform modules (hand-written .wat, Rust, AssemblyScript)
+fuzz/                         — cargo-fuzz targets (own workspace, nightly, never published)
+.clusterfuzzlite/             — ClusterFuzzLite build for fuzz/ (run on PRs by cflite_pr.yml)
 benchmarks/                   — benchmark harness and configs
 observability/                — Prometheus alert rules and Grafana dashboards
 Dockerfile                    — multi-stage image build (name-based connector selection)
@@ -47,6 +50,7 @@ deploy/                       — container + Kubernetes assets
 scripts/                      — helper and CI-check scripts (try-local.sh, build-image.sh, chaos/run.sh, …)
 docs/book/                    — mdBook documentation site (source under docs/book/src)
 rfcs/                         — design RFCs
-.github/workflows/            — ci.yml, release-plz.yml, docs.yml, docker-images.yml, chaos.yml, …
+.github/workflows/            — ci.yml, release-plz.yml, docs.yml, docker-images.yml, chaos.yml, codeql.yml, scorecard.yml, …
+.github/codeql/               — codeql-config.yml (CodeQL scan scope: test code excluded)
 .github/assets/               — brand assets: logo, wordmark, social-preview banner, favicon
 ```

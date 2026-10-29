@@ -1057,3 +1057,35 @@ async fn spawn_fake_gcs() -> Option<(ContainerAsync<GenericImage>, String, Strin
     }
     started
 }
+
+/// XML and Excel objects, written by the shared encoder, decode back (#967).
+#[cfg(all(feature = "file-format-xml", feature = "file-format-excel"))]
+#[tokio::test]
+async fn source_reads_xml_and_xlsx_objects() {
+    use faucet_core::file_format::{FileFormat, FormatOptions, encode};
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
+        return;
+    };
+    let rows = vec![
+        serde_json::json!({"id": "1", "name": "ada"}),
+        serde_json::json!({"id": "2", "name": "grace"}),
+    ];
+    for (format, shared, name) in [
+        (GcsFileFormat::Xml, FileFormat::Xml, "xml/rows.xml"),
+        (GcsFileFormat::Xlsx, FileFormat::Xlsx, "xlsx/rows.xlsx"),
+    ] {
+        let body = encode(&rows, shared, &FormatOptions::default()).unwrap();
+        seed_bytes(&host, &bucket, name, body, "application/octet-stream").await;
+        let prefix = name.split('/').next().unwrap();
+        let source = GcsSource::new(
+            GcsSourceConfig::new(&bucket)
+                .prefix(format!("{prefix}/"))
+                .file_format(format)
+                .auth(GcsCredentials::Anonymous)
+                .storage_host(&host),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stream_all(&source).await, rows, "{shared:?}");
+    }
+}

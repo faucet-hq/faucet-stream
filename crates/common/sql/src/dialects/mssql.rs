@@ -91,6 +91,10 @@ impl SqlDialect for Mssql {
         }
     }
 
+    fn time_fraction_digits(&self) -> Option<usize> {
+        Some(7)
+    }
+
     fn declared_type_name(&self, t: &LogicalType) -> Option<String> {
         Some(match t {
             LogicalType::Int64 => "BIGINT".into(),

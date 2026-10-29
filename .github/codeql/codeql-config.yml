@@ -1,0 +1,10 @@
+# CodeQL configuration (#978). Test code is left out of the scan: its fixture
+# credentials, test certificates and printed values are not shipped.
+name: faucet-stream CodeQL
+paths-ignore:
+  - "**/tests/**"
+  - "**/benches/**"
+  - "**/examples/**"
+  - crates/conformance
+  - crates/interop-tests
+  - fuzz

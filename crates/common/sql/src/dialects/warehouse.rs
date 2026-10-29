@@ -45,6 +45,10 @@ impl SqlDialect for Snowflake {
         "STRING"
     }
 
+    fn time_fraction_digits(&self) -> Option<usize> {
+        Some(9)
+    }
+
     /// Declared columns (#955) take their type: the row writer's `::string`
     /// projection is coerced into it on `INSERT`. Binary and JSON stay
     /// `STRING` (a `::string` value is neither hex nor parsed JSON).
@@ -125,6 +129,10 @@ impl SqlDialect for Databricks {
             SqlBaseType::Boolean => "BOOLEAN",
             SqlBaseType::Text | SqlBaseType::Json => "STRING",
         }
+    }
+
+    fn time_fraction_digits(&self) -> Option<usize> {
+        Some(6)
     }
 
     fn declared_type_name(&self, t: &LogicalType) -> Option<String> {
@@ -227,6 +235,45 @@ impl SqlDialect for BigQuery {
             SqlBaseType::Text => "STRING",
             SqlBaseType::Json => "JSON",
         }
+    }
+
+    /// A value fits the column created: `NUMERIC` (29 integer, 9 fractional
+    /// digits) or `BIGNUMERIC` (38 and 38); timestamps keep microseconds.
+    fn declared_fits(&self, t: &LogicalType, value: &faucet_core::Value) -> bool {
+        let created = match *t {
+            LogicalType::Decimal { precision, scale } => {
+                let s = scale.unwrap_or(0);
+                match precision {
+                    Some(p) if s <= 9 && p.saturating_sub(s) <= 29 => (38, 9),
+                    // Created as STRING, which holds any digits exactly.
+                    Some(p) if s > 38 || p.saturating_sub(s) > 38 => {
+                        return LogicalType::Decimal {
+                            precision: None,
+                            scale: None,
+                        }
+                        .accepts(value);
+                    }
+                    _ => (76, 38),
+                }
+            }
+            _ => {
+                return super::fits_bounded(
+                    t,
+                    value,
+                    Some((76, Some(38))),
+                    self.time_fraction_digits(),
+                );
+            }
+        };
+        LogicalType::Decimal {
+            precision: Some(created.0),
+            scale: Some(created.1),
+        }
+        .accepts(value)
+    }
+
+    fn time_fraction_digits(&self) -> Option<usize> {
+        Some(6)
     }
 
     /// `NUMERIC` holds 29 integer and 9 fractional digits, `BIGNUMERIC` 38

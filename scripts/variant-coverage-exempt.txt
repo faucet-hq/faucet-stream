@@ -1,0 +1,8 @@
+# Connector config variants with no integration test, and why (#967).
+# Format: <crate dir>::<Enum>::<Variant> -- <reason>
+common/gcs::GcsCredentials::ServiceAccountJsonFile -- a key file is refused for any storage_host that is not googleapis.com (refuse_held_credentials_off_google), so it only runs against real GCS
+common/gcs::GcsCredentials::ServiceAccountJsonInline -- fake-gcs-server is plaintext http and refuse_credentials_over_plaintext refuses every non-anonymous credential there; the key is only sent to an https Google endpoint
+common/pubsub::PubsubCredentials::ServiceAccountJsonFile -- with emulator_host set the client skips authentication entirely (use_auth is false), so the key is only read against real Pub/Sub
+common/pubsub::PubsubCredentials::ServiceAccountJsonInline -- with emulator_host set the client skips authentication entirely (use_auth is false), so the key is only read against real Pub/Sub
+common/spanner::SpannerCredentials::ServiceAccountKey -- under emulator_host the client uses the emulator environment and credential application is a no-op, so the key only runs against real Spanner
+common/spanner::SpannerCredentials::ServiceAccountKeyPath -- under emulator_host the client uses the emulator environment and credential application is a no-op, so the key only runs against real Spanner

@@ -237,6 +237,42 @@ impl Inner {
         )
     }
 
+    /// Whether an empty run may create the declared destination (#955).
+    fn creates_declared(&self) -> bool {
+        self.config.create_table
+            && matches!(
+                self.config.column_mapping,
+                OracleColumnMapping::AutoColumns { .. }
+            )
+            && !self.ready.load(Ordering::Relaxed)
+            && self.declared.for_empty_run().is_some()
+    }
+
+    /// Create the declared destination of an empty run — staging during an
+    /// overwrite — unless the target (or that staging) already exists.
+    fn create_declared(&self, conn: &Connection) -> Result<(), FaucetError> {
+        if self.table_exists(conn, &self.target)? {
+            return Ok(());
+        }
+        let (table, quoted) = self.effective();
+        if table != self.target && self.table_exists(conn, table)? {
+            return Ok(());
+        }
+        let key: &[String] = if self.config.write.dedups_by_key() {
+            &self.config.write.key
+        } else {
+            &[]
+        };
+        let declared = self.declared.for_empty_run();
+        let Some(cols) = faucet_core::plan_table_declared(&[], key, declared.as_ref()) else {
+            return Ok(());
+        };
+        let ddl = create_table_sql(quoted, &cols, key)?;
+        exec(conn, &ignoring(&ddl, &[ORA_NAME_IN_USE]), "create table")?;
+        self.forget_columns();
+        Ok(())
+    }
+
     /// The table appends land in: staging during an overwrite.
     fn effective(&self) -> (&str, &str) {
         if self.config.write.is_overwrite() {
@@ -410,7 +446,14 @@ impl Inner {
                     &[]
                 };
                 let declared = self.declared.get();
-                faucet_core::plan_table_declared(records, key, declared.as_ref())
+                let fits = |t: &faucet_core::LogicalType, v: &Value| {
+                    faucet_common_sql::SqlDialect::declared_fits(
+                        &faucet_common_sql::dialects::Oracle,
+                        t,
+                        v,
+                    )
+                };
+                faucet_core::plan_table_declared_with(records, key, declared.as_ref(), &fits)
                     .map(|c| create_table_sql(quoted, &c, key))
                     .transpose()?
             }
@@ -985,10 +1028,13 @@ impl SinkDriver for OracleDriver {
     fn capabilities(&self, derived: faucet_core::Capabilities) -> faucet_core::Capabilities {
         derived
             .to_builder()
-            .declared_types(matches!(
-                self.inner.config.column_mapping,
-                OracleColumnMapping::AutoColumns { .. }
-            ))
+            .declared_types(
+                self.inner.config.create_table
+                    && matches!(
+                        self.inner.config.column_mapping,
+                        OracleColumnMapping::AutoColumns { .. }
+                    ),
+            )
             .build()
     }
 
@@ -1004,34 +1050,15 @@ impl SinkDriver for OracleDriver {
         self.inner.declared.set(columns);
     }
 
-    /// A run that wrote nothing creates the declared target (#955).
+    /// A run that wrote nothing creates the declared target (#955); an
+    /// overwrite creates its staging, which the commit publishes (#975).
     async fn complete_run(&self, calls: &CallSlot) -> Result<(), FaucetError> {
-        let cfg = &self.inner.config;
-        if !cfg.create_table
-            || !matches!(cfg.column_mapping, OracleColumnMapping::AutoColumns { .. })
-            || self.inner.ready.load(Ordering::Relaxed)
-            || self.inner.declared.for_empty_run().is_none()
-        {
+        if !self.inner.creates_declared() {
             return Ok(());
         }
         self.run(calls, "complete_run", |i| {
             let conn = i.conn()?;
-            if i.table_exists(&conn, &i.target)? {
-                return Ok(());
-            }
-            let key: &[String] = if i.config.write.dedups_by_key() {
-                &i.config.write.key
-            } else {
-                &[]
-            };
-            let declared = i.declared.for_empty_run();
-            let Some(cols) = faucet_core::plan_table_declared(&[], key, declared.as_ref()) else {
-                return Ok(());
-            };
-            let ddl = create_table_sql(&i.target_quoted, &cols, key)?;
-            exec(&conn, &ignoring(&ddl, &[ORA_NAME_IN_USE]), "create table")?;
-            i.forget_columns();
-            Ok(())
+            i.create_declared(&conn)
         })
         .await
     }
@@ -1084,6 +1111,9 @@ impl StagingDriver for OracleDriver {
         self.run(calls, "commit_overwrite", |i| {
             let conn = i.conn()?;
             if !i.table_exists(&conn, &i.target)? {
+                if !i.table_exists(&conn, &i.staging)? && i.creates_declared() {
+                    i.create_declared(&conn)?;
+                }
                 if i.table_exists(&conn, &i.staging)? {
                     exec(
                         &conn,

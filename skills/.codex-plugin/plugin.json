@@ -1,7 +1,7 @@
 {
   "name": "faucet",
   "version": "1.15.1",
-  "description": "Skills for writing, running, debugging and deploying faucet-stream data pipelines, Template Hub templates and connector crates. The version equals the faucet-cli release it ships with.",
+  "description": "Skills for writing, running, debugging, verifying, tuning, deploying and operating faucet-stream data pipelines, its HTTP API, Template Hub templates and connector crates. The version equals the faucet-cli release it ships with.",
   "author": {
     "name": "faucet-hq",
     "url": "https://faucet-hq.github.io"
@@ -21,7 +21,7 @@
   "interface": {
     "displayName": "faucet",
     "shortDescription": "Move data with faucet-stream.",
-    "longDescription": "Skills for faucet-stream: author pipeline YAML that passes validation, diagnose failed, slow or lagging runs, deploy and migrate, compose and publish Template Hub templates, and implement faucet-source-* / faucet-sink-* crates.",
+    "longDescription": "Skills for faucet-stream: author pipeline YAML that passes validation, diagnose failed, slow, lagging or unreachable runs, verify copies, tune throughput, deploy, operate and migrate, drive the faucet serve API, keep credentials out of responses and history, compose and publish Template Hub templates, and implement faucet-source-* / faucet-sink-* crates.",
     "developerName": "faucet-hq",
     "category": "Developer Tools",
     "capabilities": [

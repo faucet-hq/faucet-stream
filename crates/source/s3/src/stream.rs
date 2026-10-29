@@ -122,7 +122,12 @@ impl S3Source {
         }
 
         let sdk_config = config_loader.load().await;
-        let client = Client::new(&sdk_config);
+        // S3-compatible stores (MinIO) do not serve virtual-hosted bucket names.
+        let client = Client::from_conf(
+            aws_sdk_s3::config::Builder::from(&sdk_config)
+                .force_path_style(config.endpoint_url.is_some())
+                .build(),
+        );
         Ok(client)
     }
 

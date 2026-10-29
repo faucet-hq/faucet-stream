@@ -111,7 +111,8 @@
 //! With the `containers` feature, the `containers` module is the one way integration
 //! tests start a testcontainers backend: a shared start-up budget, a bounded
 //! retry of start-up failures, an optional readiness probe, and the
-//! `FAUCET_REQUIRE_BACKENDS` skip-or-fail rule.
+//! `FAUCET_REQUIRE_BACKENDS` skip-or-fail rule, and the `stores` module
+//! starts the MinIO, Azurite and fake-gcs-server emulators on pinned images.
 
 pub mod calls;
 mod checks;
@@ -125,7 +126,11 @@ pub mod forwarding;
 pub mod hung;
 pub mod required;
 pub mod scripted;
+#[cfg(feature = "containers")]
+pub mod stores;
 pub mod tds;
+#[cfg(feature = "containers")]
+pub mod tls;
 
 /// Stack size [`block_on_large_stack`] gives its thread.
 pub const LARGE_STACK: usize = 32 << 20;
@@ -162,7 +167,8 @@ pub use checks::{
     assert_replay_safe, assert_reported_rows_truthful, assert_rollback_truthful,
 };
 pub use declared::{
-    assert_declared_columns_truthful, assert_declared_types_create, declared_corpus,
+    DECLARED_INSTANT, assert_declared_columns_truthful, assert_declared_instants_exact,
+    assert_declared_overwrite_empty_run, assert_declared_types_create, declared_corpus,
 };
 
 use std::collections::HashMap;

@@ -33,6 +33,12 @@ running/billed compute and no Python.
 | `target_file_size` | int? | *(unset)* | Commit early once the in-memory parquet buffer reaches this many bytes, which both caps output data-file size and bounds peak memory to roughly this value. Unset means one commit per run and a buffer that grows with the whole dataset — fine for small loads, an OOM risk on a large table, since a bulk source emits no bookmarks and so triggers no intermediate flush. Expect a few commits per run when set: that is the trade the knob exists to let you make. |
 
 Cloud backends require the matching crate feature: `s3`, `azure`, `gcs`.
+`s3://` commits use S3 conditional writes (no locking provider), so an
+S3-compatible store must support `If-None-Match` (MinIO does). For an S3-alike,
+set `endpoint_url` (and `allow_http` for plain HTTP) in the `aws` credentials;
+against Azurite set `storage_options.azure_storage_use_emulator: "true"` and the
+`AZURITE_BLOB_STORAGE_URL` environment variable, since Azurite ignores the
+listing offset the Delta log relies on outside emulator mode.
 
 The **`arrow`** feature opts this sink into the columnar fast path (#375): when
 the source is also Arrow-capable (e.g. `faucet-source-parquet` /

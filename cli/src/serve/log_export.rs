@@ -60,6 +60,8 @@ pub struct LogExport {
     lease_ttl: Duration,
     #[cfg(feature = "notify")]
     notifiers: dashmap::DashMap<String, Arc<crate::notify::Notifier>>,
+    #[cfg(all(feature = "encryption", feature = "notify"))]
+    vault: std::sync::RwLock<Option<Arc<crate::serve::vault::Vault>>>,
 }
 
 /// What one shipping pass did.
@@ -102,6 +104,34 @@ impl LogExport {
             lease_ttl: cfg.lease_ttl,
             #[cfg(feature = "notify")]
             notifiers: dashmap::DashMap::new(),
+            #[cfg(all(feature = "encryption", feature = "notify"))]
+            vault: std::sync::RwLock::new(None),
+        }
+    }
+
+    /// The vault key that opens a sealed run's params, for the
+    /// notifications of a run another instance executed (#956).
+    #[cfg(feature = "encryption")]
+    pub fn set_vault(&self, vault: Option<Arc<crate::serve::vault::Vault>>) {
+        #[cfg(feature = "notify")]
+        {
+            *self.vault.write().unwrap_or_else(|e| e.into_inner()) = vault;
+        }
+        #[cfg(not(feature = "notify"))]
+        let _ = vault;
+    }
+
+    #[cfg(feature = "notify")]
+    fn open_sealed(&self, run_id: &str, stored: &str) -> Result<serde_json::Value, String> {
+        #[cfg(feature = "encryption")]
+        {
+            let vault = self.vault.read().unwrap_or_else(|e| e.into_inner()).clone();
+            crate::serve::sealed::open_with(vault.as_deref(), run_id, stored)
+        }
+        #[cfg(not(feature = "encryption"))]
+        {
+            let _ = (run_id, stored);
+            Err("this instance was built without the `encryption` feature".into())
         }
     }
 
@@ -129,15 +159,35 @@ impl LogExport {
     }
 
     #[cfg(feature = "notify")]
-    fn notifier_for(
+    async fn notifier_for(
         &self,
+        history: &dyn RunHistory,
         rec: Option<&RunRecord>,
         run_id: &str,
     ) -> Option<Arc<crate::notify::Notifier>> {
         if let Some(n) = self.notifiers.get(run_id) {
             return Some(n.clone());
         }
-        let n = notifier_from_body(rec?.config_body.as_deref()?)?;
+        let body = rec?.config_body.as_deref()?;
+        let body = match crate::serve::sealed::unseal_with(
+            history,
+            |stored| self.open_sealed(run_id, stored),
+            run_id,
+            body,
+        )
+        .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    run_id,
+                    reason = %e,
+                    "not notifying log_export_failed from the stored config of a sealed run"
+                );
+                return None;
+            }
+        };
+        let n = notifier_from_body(&body)?;
         self.notifiers.insert(run_id.to_string(), n.clone());
         Some(n)
     }
@@ -365,7 +415,7 @@ impl LogExport {
             return Ok(());
         };
         if !row.notified_failure && failing_past(&st, self.notify_after, Utc::now()) {
-            self.notify(rec, run_id, &st, "OTLP log export keeps failing")
+            self.notify(history, rec, run_id, &st, "OTLP log export keeps failing")
                 .await;
             history
                 .log_ship_mark_notified(run_id, true, row.notified_drop)
@@ -380,13 +430,14 @@ impl LogExport {
 
     async fn notify(
         &self,
+        history: &dyn RunHistory,
         rec: Option<&RunRecord>,
         run_id: &str,
         st: &DeliveryState,
         reason: &str,
     ) {
         #[cfg(feature = "notify")]
-        if let Some(n) = self.notifier_for(rec, run_id) {
+        if let Some(n) = self.notifier_for(history, rec, run_id).await {
             let pipeline = rec.and_then(|r| r.name.clone()).unwrap_or_default();
             n.emit(crate::notify::NotifyEvent::log_export_failed(
                 &pipeline,
@@ -398,7 +449,7 @@ impl LogExport {
             ))
             .await;
         }
-        let _ = (rec, run_id, st, reason);
+        let _ = (history, rec, run_id, st, reason);
     }
 
     /// Retention and bounds. With shipping on, delivered lines are kept for
@@ -528,6 +579,7 @@ impl LogExport {
             if row.is_some_and(|r| !r.notified_drop) {
                 let rec = history.get(&run_id).await?;
                 self.notify(
+                    history,
                     rec.as_ref(),
                     &run_id,
                     &st,

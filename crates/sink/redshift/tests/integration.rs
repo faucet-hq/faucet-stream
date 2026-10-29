@@ -8,11 +8,7 @@
 //! discovery, the multi-row `INSERT` builder, bind-param sub-chunking, and
 //! `batch_size` re-chunking (all in `src/sink.rs` / `src/copy.rs`).
 //!
-//! The `copy` strategy stages to S3 and issues Redshift-only `COPY … FROM
-//! 's3://…'` SQL, which a plain Postgres server cannot execute — so it stays
-//! out of scope here (its SQL builders are unit-tested in `src/copy.rs`, and the
-//! full round-trip needs a real cluster + bucket + IAM role). These tests
-//! target `write_strategy: insert` only.
+//! The `copy` strategy (S3 staging + `COPY`) is tested in `tests/copy.rs`.
 //!
 //! The connection points at the container with TLS disabled (`tls: false` →
 //! `sslmode=prefer`). These tests require Docker and are **not** `#[ignore]`d —

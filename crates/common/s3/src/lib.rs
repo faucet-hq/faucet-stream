@@ -30,7 +30,12 @@ pub async fn build_client(region: Option<&str>, endpoint_url: Option<&str>) -> a
     if let Some(endpoint) = endpoint_url {
         loader = loader.endpoint_url(endpoint);
     }
-    aws_sdk_s3::Client::new(&loader.load().await)
+    // S3-compatible stores (MinIO) do not serve virtual-hosted bucket names.
+    aws_sdk_s3::Client::from_conf(
+        aws_sdk_s3::config::Builder::from(&loader.load().await)
+            .force_path_style(endpoint_url.is_some())
+            .build(),
+    )
 }
 
 #[cfg(test)]

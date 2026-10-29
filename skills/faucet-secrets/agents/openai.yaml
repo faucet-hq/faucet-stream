@@ -1,0 +1,5 @@
+interface:
+  display_name: "faucet Secrets"
+  short_description: "Keep credentials out of faucet responses, history and logs"
+  brand_color: "#14B8A6"
+  default_prompt: "Use $faucet-secrets to review this faucet template and the requests that trigger it for credentials that could leak, and pick the right mechanism for each."

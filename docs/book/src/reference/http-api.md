@@ -475,7 +475,10 @@ Request body:
   replication bookmarks.
 - **`labels`** — string key/value metadata stored on the run record and
   filterable with `GET /v1/runs?label=key:value` (#958). Keys are 1–63
-  characters and values at most 256; a longer one is a `422`. The provenance
+  characters without `:` and values at most 256; anything else is a `422`
+  (the filter splits on the first `:`, so a key holding one could never
+  match). A value may hold `:` and `,`; filter on a `,` value with the
+  repeatable `label=` form. The provenance
   keys the server stamps (`template`, `template_version`, `allow_untested`,
   `sink_template`, `sink_template_version`, `overlay`, `overlay_version`,
   `selection`) are refused with a `422`; they stay filterable.
@@ -1216,7 +1219,9 @@ target. `GET /v1/templates/{id}` returns `status`, `versions` (newest first),
 second request. Use `?version=newest` to read a `draft` template. The stored
 `body` is returned only to an admin with no tenant scope; anyone else gets an
 empty `body` and `body_withheld: true` (the parameter surface stays in
-`params`), the same rule as a run's `config_body`.
+`params`), the same rule as a run's `config_body`. In `params`, the
+default of a `secret: true` param always reads `"(hidden)"`, here and in
+`GET /v1/templates`; runs still use the real default.
 
 The trigger body's `params` / `env` / `version` / `sink` / `sink_version` /
 `overlay` / `overlay_version` are template-specific; every other field (`name`, `labels`, `timeout_secs`,

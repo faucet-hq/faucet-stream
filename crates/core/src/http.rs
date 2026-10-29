@@ -239,6 +239,47 @@ impl ClientBuilder {
         self
     }
 
+    /// Apply loaded TLS settings: a configured CA becomes the only trust
+    /// anchor, a client certificate is presented for mutual TLS, and
+    /// `insecure_skip_verify` turns verification off. A malformed certificate
+    /// or key fails [`build`](Self::build) with [`FaucetError::Config`].
+    pub fn tls(mut self, tls: &crate::tls::LoadedTls) -> Self {
+        if self.error.is_some() {
+            return self;
+        }
+        let mut inner = self.inner;
+        if tls.insecure_skip_verify {
+            inner = inner.tls_danger_accept_invalid_certs(true);
+        } else if let Some(ca) = &tls.ca_pem {
+            match reqwest::Certificate::from_pem_bundle(ca) {
+                Ok(certs) if !certs.is_empty() => inner = inner.tls_certs_only(certs),
+                Ok(_) => {
+                    self.error = Some(FaucetError::Config(
+                        "tls: the CA PEM holds no certificate".into(),
+                    ))
+                }
+                Err(e) => {
+                    self.error = Some(FaucetError::Config(format!("tls: invalid CA PEM: {e}")))
+                }
+            }
+        }
+        if let Some(client) = &tls.client {
+            let mut pem = client.cert.clone();
+            pem.push(b'\n');
+            pem.extend_from_slice(&client.key);
+            match reqwest::Identity::from_pem(&pem) {
+                Ok(id) => inner = inner.identity(id),
+                Err(e) => {
+                    self.error.get_or_insert(FaucetError::Config(format!(
+                        "tls: invalid client certificate or key: {e}"
+                    )));
+                }
+            }
+        }
+        self.inner = inner;
+        self
+    }
+
     /// Set any other reqwest option: `|b| b.gzip(true)`, an identity, root
     /// certificates. Don't set a redirect policy here — redirects are followed
     /// by [`Client::send`], which strips credentials on a cross-origin hop.
@@ -272,6 +313,7 @@ impl ClientBuilder {
 
     /// Build the client.
     pub fn build(self) -> Result<Client, FaucetError> {
+        crate::tls::ensure_crypto_provider();
         if let Some(e) = self.error {
             return Err(e);
         }
@@ -1598,5 +1640,51 @@ mod tests {
             status_error(resp).await,
             FaucetError::HttpStatus { status: 200, .. }
         ));
+    }
+
+    #[test]
+    fn tls_hook_reports_bad_material_at_build() {
+        use crate::tls::{ClientPem, LoadedTls};
+        let no_cert = LoadedTls {
+            ca_pem: Some(
+                b"-----BEGIN PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\n".to_vec(),
+            ),
+            ..Default::default()
+        };
+        let e = ClientBuilder::new()
+            .tls(&no_cert)
+            .build()
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("holds no certificate"), "{e}");
+        let bad_ca = LoadedTls {
+            ca_pem: Some(b"-----BEGIN CERTIFICATE-----\n!!!\n-----END CERTIFICATE-----\n".to_vec()),
+            ..Default::default()
+        };
+        let e = ClientBuilder::new()
+            .tls(&bad_ca)
+            .build()
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("tls:"), "{e}");
+        let bad_id = LoadedTls {
+            client: Some(ClientPem {
+                cert: b"junk".to_vec(),
+                key: b"junk".to_vec(),
+            }),
+            ..Default::default()
+        };
+        let e = ClientBuilder::new()
+            .tls(&bad_id)
+            .tls(&LoadedTls::default())
+            .build()
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("invalid client certificate"), "{e}");
+        let insecure = LoadedTls {
+            insecure_skip_verify: true,
+            ..Default::default()
+        };
+        assert!(ClientBuilder::new().tls(&insecure).build().is_ok());
     }
 }

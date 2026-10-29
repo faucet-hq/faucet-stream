@@ -101,6 +101,7 @@ impl RedisSource {
     /// no I/O; it fails only on an invalid config (an out-of-range `batch_size`).
     pub fn new(config: RedisSourceConfig) -> Result<Self, FaucetError> {
         faucet_core::validate_batch_size(config.batch_size)?;
+        config.tls.validate("redis source")?;
         Ok(Self {
             config,
             conn: std::panic::AssertUnwindSafe(tokio::sync::OnceCell::new()),
@@ -117,8 +118,8 @@ impl RedisSource {
             .conn
             .get_or_try_init(|| {
                 calls.call_once("connect", async {
-                    let client = redis::Client::open(self.config.url.as_str())
-                        .map_err(|e| FaucetError::Config(format!("invalid Redis URL: {e}")))?;
+                    let client =
+                        faucet_common_redis::build_client(&self.config.url, &self.config.tls)?;
                     let manager = redis::aio::ConnectionManagerConfig::new()
                         .set_number_of_retries(3)
                         .set_min_delay(std::time::Duration::from_millis(2))

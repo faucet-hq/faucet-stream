@@ -6,20 +6,26 @@ thing: uppercase a top-level `name` field and stamp `wasm_processed: true`.
 
 | Language | Source | Build |
 |---|---|---|
+| WebAssembly text | [`add_field.wat`](./add_field.wat) | none: faucet loads `.wat` directly |
 | Rust | [`rust/`](./rust/) | `cargo build --release --target wasm32-unknown-unknown` |
 | AssemblyScript | [`assemblyscript/`](./assemblyscript/) | `npm install && npm run build` |
 
 Any toolchain that emits core wasm exporting the ABI below works (TinyGo,
 Zig, C/C++, …); these two are the maintained references.
 
-`add_field.wasm` (checked in at this directory) is the Rust build, used by the
-runnable example `cli/examples/csv_to_jsonl_wasm.yaml` and by the CLI
-integration test. Rebuild it with:
+`add_field.wat` is the module the runnable example
+`cli/examples/csv_to_jsonl_wasm.yaml` and the integration tests use. It is
+written by hand in the WebAssembly text format, so the repository holds no
+compiled binary. It edits the record's JSON bytes rather than parsing them, and
+uppercases ASCII letters only; the Rust and AssemblyScript modules use a JSON
+library and full Unicode case mapping. To run the example with the Rust build
+instead:
 
 ```bash
 cd rust
 cargo build --release --target wasm32-unknown-unknown
-cp target/wasm32-unknown-unknown/release/faucet_wasm_example_add_field.wasm ../add_field.wasm
+# then point `module:` at
+# examples/wasm-transforms/rust/target/wasm32-unknown-unknown/release/faucet_wasm_example_add_field.wasm
 ```
 
 ## The ABI in one paragraph

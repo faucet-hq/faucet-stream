@@ -79,8 +79,9 @@ limitation. Where a risk already has a mitigation planned, the relevant
 
 ## Future risks
 
-- **Upstream dependency pins constrain evolution.** `sqlx` is pinned at 0.8 by
-  `pgwire-replication`; the OpenTelemetry stack is pinned to the 0.31 line by
+- **Upstream dependency pins constrain evolution.** `sqlx` is held at 0.8 by
+  `iceberg-catalog-sql` (`pgwire-replication` dropped its `sqlx` dependency in
+  0.5); the OpenTelemetry stack is pinned to the 0.31 line by
   `metrics-exporter-opentelemetry`; Iceberg schema-evolution is blocked on
   `iceberg-rust` 0.9.1. Each pin is a place where the project cannot move until an
   upstream does. These are documented in `CLAUDE.md`, which reduces the surprise

@@ -4299,11 +4299,18 @@ impl Source for BindContextSource {
     // do too. The columnar pair is gated together on this crate's `arrow`.
     faucet_core::forward_source!(inner; except
         fetch_with_context, fetch_with_context_incremental, stream_pages, stream_batches,
-        stream_native, fetch_all, fetch_all_incremental, supports_columnar);
+        stream_native, fetch_all, fetch_all_incremental, supports_columnar, declared_columns);
 
     #[cfg(feature = "arrow")]
     fn supports_columnar(&self) -> bool {
         self.inner.supports_columnar()
+    }
+
+    async fn declared_columns(
+        &self,
+        _ctx: &HashMap<String, Value>,
+    ) -> Result<Option<faucet_core::DeclaredColumns>, FaucetError> {
+        self.inner.declared_columns(&self.ctx).await
     }
 
     async fn fetch_with_context(
@@ -4759,6 +4766,41 @@ mod tests {
         ]
         .concat();
         assert_source_forwards_every_hook(&wrapped, &probe, &skip).await;
+    }
+
+    /// #975 item 5: a fan-out child describes its query with the binds resolved.
+    #[tokio::test]
+    async fn bind_context_source_declares_from_the_bound_query() {
+        struct Describes;
+        #[async_trait]
+        impl Source for Describes {
+            async fn fetch_with_context(
+                &self,
+                _: &HashMap<String, Value>,
+            ) -> Result<Vec<Value>, FaucetError> {
+                Ok(Vec::new())
+            }
+            async fn declared_columns(
+                &self,
+                ctx: &HashMap<String, Value>,
+            ) -> Result<Option<faucet_core::DeclaredColumns>, FaucetError> {
+                Ok(ctx.get("faucet_bind_0").map(|v| {
+                    faucet_core::DeclaredColumns::new([faucet_core::DeclaredColumn::new(
+                        format!("bound_{v}"),
+                        faucet_core::LogicalType::Int64,
+                        false,
+                    )])
+                }))
+            }
+        }
+        let empty = HashMap::new();
+        assert!(Describes.declared_columns(&empty).await.unwrap().is_none());
+        let src = BindContextSource {
+            inner: Box::new(Describes),
+            ctx: HashMap::from([("faucet_bind_0".to_string(), json!(7))]),
+        };
+        let declared = src.declared_columns(&empty).await.unwrap().unwrap();
+        assert_eq!(declared.columns()[0].name, "bound_7");
     }
 
     #[tokio::test]

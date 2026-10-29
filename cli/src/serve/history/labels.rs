@@ -112,8 +112,8 @@ pub fn parse_cli_filters(raw: &[String]) -> Result<Vec<LabelFilter>, String> {
     parse_filters(&normalized, &[])
 }
 
-/// Refuse a label set a run may not carry: an empty or over-long key, or an
-/// over-long value. Keys in `exempt` (server-stamped provenance) are skipped.
+/// Refuse a label set a run may not carry: an empty, over-long or `:`-holding
+/// key, or an over-long value. Keys in `exempt` (server-stamped provenance) are skipped.
 pub fn validate(labels: &BTreeMap<String, String>, exempt: &[&str]) -> Result<(), String> {
     for (k, v) in labels {
         if exempt.contains(&k.as_str()) {
@@ -121,6 +121,12 @@ pub fn validate(labels: &BTreeMap<String, String>, exempt: &[&str]) -> Result<()
         }
         if k.is_empty() {
             return Err("a run label has an empty key".into());
+        }
+        if k.contains(':') {
+            return Err(format!(
+                "run label key '{k}' contains ':' — the `label=key:value` filter splits on the \
+                 first ':', so the run could never be found by it"
+            ));
         }
         if k.chars().count() > MAX_LABEL_KEY_LEN {
             return Err(format!(
@@ -246,6 +252,12 @@ mod tests {
                 .unwrap_err()
                 .contains("empty key")
         );
+        assert!(
+            validate(&labels(&[("a:b", "v")]), &[])
+                .unwrap_err()
+                .contains("contains ':'")
+        );
+        assert!(validate(&labels(&[("url", "https://x:8080")]), &[]).is_ok());
     }
 
     #[test]

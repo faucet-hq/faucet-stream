@@ -35,8 +35,9 @@
 # selected features can contain one (`full` or a name with `oracle`); `true` /
 # `false` force it.
 
-ARG RUST_VERSION=1.99.1
-ARG DEBIAN_RELEASE=bookworm
+# Base images are pinned by digest (the tag stays for readability); Dependabot
+# keeps the digests current. Change the Rust version by editing the builder's
+# FROM line, which must match rust-toolchain.toml.
 ARG ORACLE_CLIENT=auto
 
 # --- feature selection knobs (see header) ---
@@ -56,7 +57,7 @@ ARG CARGO_PROFILE="release"
 ARG FEATURES=""
 
 ########################  builder  ########################
-FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS builder
+FROM rust:1.99.1-bookworm@sha256:e9da6f6c3ed5095fd5d33bf7cdf309830a178a8147888f1b2f76d5769bd9306c AS builder
 
 ARG SOURCES
 ARG SINKS
@@ -122,7 +123,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # stage then installs it when the binary has an Oracle connector. Instant
 # Client is redistributable under the Oracle Free Use Terms and Conditions
 # license.
-FROM debian:${DEBIAN_RELEASE}-slim AS oracle-client
+FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3 AS oracle-client
 ARG TARGETARCH
 ARG ORACLE_CLIENT
 ARG SOURCES
@@ -167,7 +168,7 @@ RUN set -eu; \
     rm -rf /tmp/ic /tmp/ic.zip /var/lib/apt/lists/*
 
 ########################  runtime  ########################
-FROM debian:${DEBIAN_RELEASE}-slim AS runtime
+FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3 AS runtime
 
 LABEL org.opencontainers.image.title="faucet-stream" \
       org.opencontainers.image.description="Config-driven data-movement platform (faucet CLI + serve control plane)" \

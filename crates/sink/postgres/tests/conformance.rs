@@ -276,37 +276,71 @@ async fn conformance_cleanup_scoped_and_rollback_truthful() {
     .await;
 }
 
-/// Check 26: a declaration creates the table, typed, for an empty run.
+async fn pg_types(url: String, table: &'static str) -> Vec<(String, String)> {
+    let pool = sqlx::PgPool::connect(&url).await.expect("pool connect");
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a \
+         WHERE a.attrelid = to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped",
+    )
+    .bind(table)
+    .fetch_all(&pool)
+    .await
+    .expect("columns");
+    pool.close().await;
+    rows
+}
+
+const PG_DECLARED: &[(&str, &str)] = &[
+    ("id", "bigint"),
+    ("amount", "numeric(12,2)"),
+    ("day", "date"),
+    ("at", "timestamp with time zone"),
+    ("note", "text"),
+];
+
+/// Check 26: a declaration creates the table, typed, for an empty run, and
+/// every rendering of the instant keeps it.
 #[tokio::test(flavor = "multi_thread")]
 async fn conformance_declared_types_create() {
     let (_container, url, _sink) = fresh_sink().await;
     let cfg = PostgresSinkConfig::new(&url, "typed").column_mapping(PostgresColumnMapping::AutoMap);
     let sink = PostgresSink::new(cfg).await.expect("sink");
-    let types = || {
+    let read_at = || async {
+        let pool = sqlx::PgPool::connect(&url).await.expect("pool connect");
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT to_char(at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \
+             FROM typed ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("select");
+        pool.close().await;
+        rows.into_iter().map(|(at,)| at).collect()
+    };
+    faucet_conformance::assert_declared_instants_exact(
+        &sink,
+        PG_DECLARED,
+        || pg_types(url.clone(), "typed"),
+        read_at,
+    )
+    .await;
+}
+
+/// Check 27 (#975): a zero-row first overwrite leaves the empty typed table.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_declared_overwrite_empty_run() {
+    let (_container, url, _sink) = fresh_sink().await;
+    let make = |n: usize| {
         let url = url.clone();
         async move {
-            let pool = sqlx::PgPool::connect(&url).await.expect("pool connect");
-            let rows: Vec<(String, String)> = sqlx::query_as(
-                "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a \
-                 WHERE a.attrelid = to_regclass('typed') AND a.attnum > 0 AND NOT a.attisdropped",
-            )
-            .fetch_all(&pool)
-            .await
-            .expect("columns");
-            pool.close().await;
-            rows
+            let mut cfg = PostgresSinkConfig::new(&url, format!("o{n}"))
+                .column_mapping(PostgresColumnMapping::AutoMap);
+            cfg.write.write_mode = WriteMode::Overwrite;
+            Box::new(PostgresSink::new(cfg).await.expect("sink")) as Box<dyn Sink>
         }
     };
-    faucet_conformance::assert_declared_types_create(
-        &sink,
-        &[
-            ("id", "bigint"),
-            ("amount", "numeric(12,2)"),
-            ("day", "date"),
-            ("at", "timestamp with time zone"),
-            ("note", "text"),
-        ],
-        types,
-    )
+    faucet_conformance::assert_declared_overwrite_empty_run(make, PG_DECLARED, |n| {
+        pg_types(url.clone(), if n == 0 { "o0" } else { "o1" })
+    })
     .await;
 }

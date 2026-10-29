@@ -31,6 +31,60 @@ pub use redshift::Redshift;
 pub use sqlite::Sqlite;
 pub use warehouse::{BigQuery, Databricks, Snowflake};
 
+/// [`SqlDialect::declared_fits`](crate::SqlDialect::declared_fits): `value`
+/// is a rendering of `t` and, for a time or timestamp, carries at most
+/// `fraction` fractional-second digits (`None`: any). An unbounded declared
+/// decimal is checked against `unbounded` `(precision, scale)` when the
+/// dialect creates it as a bounded type (`scale: None` = that many
+/// significant digits at any scale); `None` leaves it unbounded.
+pub(crate) fn fits_bounded(
+    t: &faucet_core::LogicalType,
+    value: &faucet_core::Value,
+    unbounded: Option<(u32, Option<u32>)>,
+    fraction: Option<usize>,
+) -> bool {
+    use faucet_core::LogicalType;
+    if !t.accepts(value) || !fraction.is_none_or(|max| t.fits_fraction(value, max)) {
+        return false;
+    }
+    match (t, unbounded) {
+        (
+            LogicalType::Decimal {
+                precision: None,
+                scale: None,
+            },
+            Some((p, Some(s))),
+        ) => LogicalType::Decimal {
+            precision: Some(p),
+            scale: Some(s),
+        }
+        .accepts(value),
+        (
+            LogicalType::Decimal {
+                precision: None,
+                scale: None,
+            },
+            Some((p, None)),
+        ) => significant_digits(value) <= p as usize,
+        _ => true,
+    }
+}
+
+/// The significant digits of an accepted decimal rendering (leading and
+/// trailing zeros change no value).
+fn significant_digits(value: &faucet_core::Value) -> usize {
+    let text = match value {
+        faucet_core::Value::String(s) => s.clone(),
+        faucet_core::Value::Number(n) => n.to_string(),
+        _ => return 0,
+    };
+    let body = text.trim_start_matches(['-', '+']);
+    let (int, frac) = body.split_once('.').unwrap_or((body, ""));
+    format!("{int}{}", frac.trim_end_matches('0'))
+        .trim_start_matches('0')
+        .len()
+}
+
 /// `keyword(p,s)` for a declared decimal of at most `max` digits whose scale
 /// fits it; `unbounded` for one without precision; `None` (text) for anything
 /// the dialect cannot hold exactly.

@@ -91,8 +91,7 @@ impl RedisSink {
     /// This opens the connection to Redis immediately.
     pub async fn new(config: RedisSinkConfig) -> Result<Self, FaucetError> {
         config.validate()?;
-        let client = redis::Client::open(config.url.as_str())
-            .map_err(|e| FaucetError::Config(format!("invalid Redis URL: {e}")))?;
+        let client = faucet_common_redis::build_client(&config.url, &config.tls)?;
         let manager = redis::aio::ConnectionManagerConfig::new()
             .set_number_of_retries(3)
             .set_min_delay(std::time::Duration::from_millis(2))

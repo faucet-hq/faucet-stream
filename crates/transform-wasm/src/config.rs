@@ -6,8 +6,9 @@ use serde::{Deserialize, Serialize};
 /// Configuration for the `wasm` transform.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WasmTransformConfig {
-    /// Filesystem path to the precompiled `.wasm` module (absolute, or relative
-    /// to the working directory). URLs are not supported in v1.
+    /// Filesystem path to the module (absolute, or relative to the working
+    /// directory): a compiled `.wasm` binary or WebAssembly text (`.wat`).
+    /// URLs are not supported in v1.
     #[schemars(extend("x-faucet-resource" = "path"))]
     pub module: String,
     /// Name of the exported transform function. Default `"transform"`.

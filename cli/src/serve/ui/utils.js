@@ -71,6 +71,54 @@ export function mdInline(s) {
     .replace(/`([^`]+)`/g, "<code>$1</code>");
 }
 
+const COPY_ICON = `<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 3.5v-.5a1.5 1.5 0 0 0-1.5-1.5H3A1.5 1.5 0 0 0 1.5 3v6A1.5 1.5 0 0 0 3 10.5h.5"/></svg>`;
+const CHECK_ICON = `<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M3 8.5l3 3 7-7"/></svg>`;
+
+/** Write `text` to the clipboard; falls back to a hidden textarea where the async API is unavailable (plain-http hosts). */
+export async function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.setAttribute("readonly", "");
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  const ok = document.execCommand("copy");
+  ta.remove();
+  if (!ok) throw new Error("copy is not available in this browser");
+}
+
+/** An icon button that copies `getText()` and briefly shows a check mark. */
+export function copyButton(getText, label = "Copy") {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "copy-btn";
+  btn.title = label;
+  btn.setAttribute("aria-label", label);
+  btn.innerHTML = COPY_ICON;
+  let timer;
+  btn.onclick = async (ev) => {
+    ev.stopPropagation();
+    try {
+      await copyText(getText());
+      btn.classList.add("copied");
+      btn.innerHTML = `${CHECK_ICON}<span>Copied</span>`;
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        btn.classList.remove("copied");
+        btn.innerHTML = COPY_ICON;
+      }, 1500);
+    } catch (e) {
+      btn.dispatchEvent(new CustomEvent("copy-failed", { bubbles: true, detail: e }));
+    }
+  };
+  return btn;
+}
+
 /** Run statuses that never change again (mirrors `RunStatus::is_terminal`). */
 export const TERMINAL_RUN_STATUSES = ["completed", "failed", "cancelled"];
 

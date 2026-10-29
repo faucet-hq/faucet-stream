@@ -53,6 +53,7 @@ impl MysqlSource {
         config.validate()?;
 
         let net_write_timeout = config.net_write_timeout_secs;
+        faucet_core::ensure_crypto_provider();
         let pool = MySqlPoolOptions::new()
             .max_connections(config.max_connections)
             .after_connect(move |conn, _meta| {

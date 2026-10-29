@@ -143,6 +143,8 @@ percent-encoding.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
 reqwest.workspace = true
+# Only to install the provider reqwest already links (`aws-lc-rs`), #971.
+rustls = { workspace = true, features = ["aws_lc_rs"] }
 jsonpath-rust.workspace = true
 regex = { workspace = true, optional = true }
 futures-core.workspace = true

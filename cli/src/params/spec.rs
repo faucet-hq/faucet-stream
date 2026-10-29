@@ -182,6 +182,19 @@ impl ParamSpec {
 /// keeps every rendering (schema, list output, audit) deterministic.
 pub type ParamsSpec = BTreeMap<String, ParamSpec>;
 
+/// What a read of a template shows in place of a secret param's default.
+pub const HIDDEN_DEFAULT: &str = "(hidden)";
+
+/// Replaces the default of every secret param with [`HIDDEN_DEFAULT`], for
+/// responses that show a template to someone who may not read its secrets.
+pub fn hide_secret_defaults(params: &mut ParamsSpec) {
+    for spec in params.values_mut() {
+        if spec.is_secret() && spec.default.is_some() {
+            spec.default = Some(Value::String(HIDDEN_DEFAULT.to_string()));
+        }
+    }
+}
+
 /// A param name must be an identifier: `^[A-Za-z_][A-Za-z0-9_]*$`. Dots are
 /// excluded because `${param.a.b}` would be ambiguous with a nested lookup, and
 /// dashes because they read as arithmetic in some config editors.
@@ -710,5 +723,17 @@ mod tests {
             err.to_string().contains("is not a valid int value"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn hide_secret_defaults_masks_only_secret_params_with_a_default() {
+        let mut params: ParamsSpec = crate::yaml::from_str(
+            "token: { secret: true, default: abc }\nplain: { default: 5 }\nnone: { secret: true }\n",
+        )
+        .unwrap();
+        hide_secret_defaults(&mut params);
+        assert_eq!(params["token"].default, Some(Value::from(HIDDEN_DEFAULT)));
+        assert_eq!(params["plain"].default, Some(Value::from(5)));
+        assert_eq!(params["none"].default, None);
     }
 }

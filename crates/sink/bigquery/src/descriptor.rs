@@ -21,7 +21,11 @@ fn capabilities(config: &Value) -> Capabilities {
         .staged_load(true)
         .scoped_overwrite(true)
         .direct_overwrite(true)
-        .declared_types(true);
+        .declared_types(faucet_core::capabilities::config::bool_field(
+            config,
+            "create_table",
+            true,
+        ));
     if config.is_null() {
         return base.columnar(cfg!(feature = "arrow")).native(true).build();
     }

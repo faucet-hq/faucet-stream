@@ -5,11 +5,15 @@ use faucet_core::{Capabilities, ConnectorDescriptor, Value};
 /// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
 pub const DESCRIPTOR: ConnectorDescriptor = ConnectorDescriptor::new("redshift", capabilities);
 
-fn capabilities(_config: &Value) -> Capabilities {
+fn capabilities(config: &Value) -> Capabilities {
     Capabilities::append_only_sink()
         .to_builder()
         .staged_load(true)
-        .declared_types(true)
+        .declared_types(faucet_core::capabilities::config::bool_field(
+            config,
+            "create_table",
+            true,
+        ))
         .build()
 }
 

@@ -7,9 +7,12 @@ description: >-
   landed in the dead-letter queue, wrong values landed in the destination, a
   bookmark needs moving or resetting, stored state will not read after an
   upgrade, a scheduled run was skipped, a run refuses to start because another
-  holds the row, or a connector fails with an auth, permission or network
-  error. Covers `faucet doctor`, `status`, `dlq`, `state`, `verify`,
-  `rollback`, `profiling`, `explain`, `plan`, logs and Prometheus metrics.
+  holds the row, a connector fails with an auth or permission error, or a
+  network failure: "error sending request", connection refused or reset,
+  timeouts, DNS or TLS handshake errors, an IP allowlist, a proxy, or a
+  connection that works locally but not in the cluster (or the reverse).
+  Covers `faucet doctor`, `status`, `dlq`, `state`, `verify`, `rollback`,
+  `profiling`, `explain`, `plan`, logs and Prometheus metrics.
 license: MIT OR Apache-2.0
 ---
 
@@ -134,10 +137,50 @@ faucet validate pipeline.yaml --show-composed
 ```
 
 Find the failed probe and its `hint:` line. A failing source probe means
-credentials, DNS / TLS or reachability. A failing sink probe usually means a
+credentials, DNS / TLS or reachability (for the network cases, follow the
+network recipe below). A failing sink probe usually means a
 missing dataset, table or grant. A failing state probe means no run can save
 progress: fix it before anything else. An empty `${env:VAR}` means the
 variable is unset or `.env` was not loaded (see `--env-file`).
+
+### Network failure: "error sending request", timeouts, TLS errors
+
+A connection error names a host but rarely the cause. Diagnose from **the
+same network location as the faucet worker** (exec into the pod or
+container, or run on the host), never from a laptop: the laptop has
+different DNS, routes and egress IP. Use generic tools there: `dig` or
+`nslookup`, `nc -vz`, `curl -v`, `openssl s_client -connect`.
+
+1. **Name does not resolve:** a typo in the host, or a private DNS name the
+   worker's resolver cannot see. Compare `dig` on the worker with where the
+   name is defined.
+2. **Connection refused:** right host, wrong port or scheme. Some databases
+   expose separate ports for an HTTP interface and a native protocol, and a
+   connector speaks only one; read the connector's expected URL form from
+   `faucet schema source <kind>` or `faucet schema sink <kind>`.
+3. **Connects, then reset during the TLS handshake** (`nc` succeeds,
+   `openssl s_client` or `curl -v` dies right after the ClientHello): almost
+   always an **IP allowlist** on a managed service. Find the egress IP the
+   remote side sees, from the worker (`curl` an IP-echo endpoint you trust),
+   and add it to the allowlist.
+4. **Certificate or TLS-version error:** a private CA the worker does not
+   trust, a host name that does not match the certificate, or a TLS mode in
+   the config that disagrees with the server. Read the TLS settings from the
+   connector's schema.
+5. **Timeout with no answer:** a firewall rule or security group, a missing
+   route, or a private subnet with no NAT. Packets are dropped, not refused.
+6. **Proxy:** check the `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` variables
+   in the worker's environment; a proxy can be in the path locally and not
+   in the cluster, or the reverse.
+7. **Works in one place, not the other:** in Kubernetes the egress IP the
+   remote side sees depends on placement: a node's public IP on a public
+   subnet, the NAT gateway's IP on a private one. Pin runs that need an
+   allowlisted IP or a private network to the replicas that have it (the
+   `faucet-deploy` skill, and
+   [execution pools](https://faucet-hq.github.io/faucet-stream/cookbook/cluster.html#execution-pools)
+   on a cluster).
+
+Then confirm with `faucet doctor pipeline.yaml`, run from that same worker.
 
 ### Slow run
 
@@ -152,7 +195,8 @@ whichever dominates is the bottleneck. Rule out rate-limit waits first (next
 recipe). The knobs are batch size, connector concurrency and how many matrix
 rows run in parallel ([Throughput tuning](https://faucet-hq.github.io/faucet-stream/cookbook/tuning.html));
 read the exact key names from `faucet schema source <kind>`,
-`faucet schema sink <kind>` and `faucet run --help`.
+`faucet schema sink <kind>` and `faucet run --help`. The measure-and-change
+loop for a healthy but slow pipeline is the `faucet-tune` skill.
 
 ### Rate-limited or throttled
 

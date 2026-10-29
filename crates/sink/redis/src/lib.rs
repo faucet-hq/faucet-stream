@@ -11,6 +11,7 @@ pub mod sink;
 pub use faucet_core::{FaucetError, Sink};
 
 pub use config::{RedisSinkConfig, RedisSinkType};
+pub use faucet_common_redis::RedisTls;
 pub use sink::RedisSink;
 
 mod descriptor;

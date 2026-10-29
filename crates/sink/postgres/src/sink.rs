@@ -811,6 +811,7 @@ impl PostgresSink {
             )));
         }
 
+        faucet_core::ensure_crypto_provider();
         let pool = PgPoolOptions::new()
             .max_connections(config.max_connections)
             .connect(&config.connection_url)

@@ -1468,3 +1468,195 @@ fn declared_types_per_dialect() {
     assert_eq!(Mysql.planned_type_name(&planned, true), "VARCHAR(191)");
     assert_eq!(Mysql.planned_type_name(&planned, false), "LONGTEXT");
 }
+
+/// #975: a declared decimal is created typed only when every first-page value
+/// fits the column the dialect would create, so nothing is rounded.
+fn declared_decimals_fit_the_created_column<D: SqlDialect>(d: D) {
+    use faucet_core::{DeclaredColumn, LogicalType as L};
+    let name = d.name();
+    let unbounded = L::Decimal {
+        precision: None,
+        scale: None,
+    };
+    let bounded = L::Decimal {
+        precision: Some(12),
+        scale: Some(2),
+    };
+    let big_frac = json!(format!("0.{}", "1".repeat(40)));
+    let big_int = json!("9".repeat(40));
+    let frac3 = json!("1.125");
+    let int11 = json!("12345678901.5");
+    let decl = faucet_core::DeclaredColumns::new([
+        DeclaredColumn::new("big_frac", unbounded, true),
+        DeclaredColumn::new("big_int", unbounded, true),
+        DeclaredColumn::new("frac3", bounded, true),
+        DeclaredColumn::new("int11", bounded, true),
+    ]);
+    let page = [json!({
+        "big_frac": big_frac, "big_int": big_int, "frac3": frac3, "int11": int11,
+    })];
+    let engine = SqlSinkEngine::new(d, spec(WriteMode::Append, &[]));
+    let t = target(engine.dialect(), "t");
+    let sql = engine
+        .create_table_sql_declared(&t, &page, None, Some(&decl))
+        .unwrap()
+        .expect("a page");
+    let dialect = engine.dialect();
+    for c in decl.columns() {
+        let value = &page[0][&c.name];
+        let col = dialect.quote_ident(&c.name);
+        let fits = dialect.declared_fits(&c.logical_type, value);
+        let ty = if fits {
+            expected_type(dialect, c, false)
+        } else {
+            dialect.type_name(SqlBaseType::Text).to_string()
+        };
+        assert!(
+            sql.contains(&format!("{col} {ty}")),
+            "{name}: {} (fits: {fits}) typed {ty}: {sql}",
+            c.name
+        );
+    }
+    let fixed_scale_unbounded = matches!(name, "mysql" | "clickhouse" | "oracle" | "bigquery");
+    for v in [&big_frac, &big_int] {
+        assert_eq!(
+            dialect.declared_fits(&unbounded, v),
+            !fixed_scale_unbounded,
+            "{name}: an unbounded decimal created as a fixed-scale type refuses {v}"
+        );
+    }
+    for v in [&frac3, &int11] {
+        assert_eq!(
+            dialect.declared_fits(&bounded, v),
+            name == "bigquery",
+            "{name}: DECIMAL(12,2) holds {v} only as BigQuery NUMERIC"
+        );
+    }
+    assert!(
+        dialect.declared_fits(&bounded, &json!("1234567890.12")),
+        "{name}"
+    );
+}
+
+#[test]
+fn matrix_declared_decimal_bounds() {
+    every_dialect!(declared_decimals_fit_the_created_column);
+}
+
+#[test]
+fn declared_time_fractions_fit_the_created_column() {
+    use faucet_core::LogicalType as L;
+    let ts = L::Timestamp { tz: true };
+    let nanos = json!("2024-02-22T02:00:00.123456789Z");
+    let micros = json!("2024-02-22T02:00:00.123456+05:30");
+    for (name, fits_nanos) in [
+        ("mysql", Mysql.declared_fits(&ts, &nanos)),
+        ("clickhouse", ClickHouse.declared_fits(&ts, &nanos)),
+        ("bigquery", BigQuery.declared_fits(&ts, &nanos)),
+    ] {
+        assert!(!fits_nanos, "{name} keeps microseconds");
+    }
+    assert!(Mysql.declared_fits(&ts, &micros));
+    assert!(Mysql.declared_fits(&L::Time, &json!("10:11:12.5")));
+    assert!(!Mysql.declared_fits(&L::Time, &json!("10:11:12.1234567")));
+    assert!(Oracle.declared_fits(&ts, &nanos));
+    assert!(
+        !Postgres.declared_fits(&ts, &nanos),
+        "postgres keeps microseconds"
+    );
+}
+
+/// A time or timestamp value with more fractional-second digits than the
+/// column a dialect creates keeps falls back to the inferred (text) column,
+/// which keeps every digit (#975).
+fn declared_time_fractions_follow_the_dialect<D: SqlDialect>(d: D) {
+    use faucet_core::{DeclaredColumn, LogicalType as L};
+    let name = d.name();
+    let expected = match name {
+        "postgres" | "redshift" | "duckdb" | "mysql" | "clickhouse" | "databricks" | "bigquery" => {
+            Some(6)
+        }
+        "mssql" => Some(7),
+        "oracle" | "snowflake" => Some(9),
+        _ => None,
+    };
+    assert_eq!(d.time_fraction_digits(), expected, "{name}");
+    let frac = |n: usize| "1".repeat(n);
+    let types = [
+        (L::Timestamp { tz: true }, "2024-02-22T02:00:00.{}Z"),
+        (L::Timestamp { tz: true }, "2024-02-22T02:00:00.{}+05:30"),
+        (L::Timestamp { tz: false }, "2024-02-22T02:00:00.{}"),
+        (L::Timestamp { tz: false }, "2024-02-22 02:00:00.{}"),
+        (L::Time, "02:00:00.{}"),
+    ];
+    for (t, shape) in types {
+        let at = |n: usize| json!(shape.replace("{}", &frac(n)));
+        match expected {
+            Some(max) => {
+                assert!(d.declared_fits(&t, &at(max)), "{name}: {t:?} keeps {max}");
+                assert!(
+                    !d.declared_fits(&t, &at(max + 1)),
+                    "{name}: {t:?} rounds {} digits",
+                    max + 1
+                );
+            }
+            None => assert!(d.declared_fits(&t, &at(12)), "{name}: {t:?}"),
+        }
+        assert!(d.declared_fits(&t, &json!(null)), "{name}");
+    }
+
+    let ts = L::Timestamp { tz: true };
+    let decl = faucet_core::DeclaredColumns::new([DeclaredColumn::new("at", ts, true)]);
+    let page = [json!({"at": "2024-01-01T00:00:00.1234567891Z"})];
+    let engine = SqlSinkEngine::new(d, spec(WriteMode::Append, &[]));
+    let t = target(engine.dialect(), "t");
+    let sql = engine
+        .create_table_sql_declared(&t, &page, None, Some(&decl))
+        .unwrap()
+        .expect("a page");
+    let dialect = engine.dialect();
+    let text = dialect.type_name(SqlBaseType::Text);
+    let col = dialect.quote_ident("at");
+    if expected.is_some() {
+        assert!(
+            sql.contains(&format!("{col} {text}")),
+            "{name}: ten digits fall back to text: {sql}"
+        );
+    }
+}
+
+#[test]
+fn matrix_declared_time_fractions() {
+    every_dialect!(declared_time_fractions_follow_the_dialect);
+}
+
+/// A declared precision without a scale has scale 0 on every dialect, as
+/// SQL reads `numeric(p)` and as each dialect creates it (#975).
+fn declared_precision_without_scale_is_an_integer<D: SqlDialect>(d: D) {
+    use faucet_core::LogicalType as L;
+    let name = d.name();
+    let t = L::Decimal {
+        precision: Some(10),
+        scale: None,
+    };
+    let Some(created) = d.declared_type_name(&t) else {
+        return;
+    };
+    assert!(
+        d.declared_fits(&t, &json!("1234567890")),
+        "{name}: {created}"
+    );
+    assert!(d.declared_fits(&t, &json!(12)), "{name}: {created}");
+    if name != "bigquery" {
+        assert!(
+            !d.declared_fits(&t, &json!("12.3")),
+            "{name}: {created} would round 12.3"
+        );
+    }
+    assert!(!t.accepts(&json!("12.3")), "{name}");
+}
+
+#[test]
+fn matrix_declared_precision_without_scale() {
+    every_dialect!(declared_precision_without_scale_is_an_integer);
+}

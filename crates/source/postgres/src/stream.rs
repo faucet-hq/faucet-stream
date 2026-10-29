@@ -43,6 +43,7 @@ impl PostgresSource {
     /// Create a new PostgreSQL source. Establishes a connection pool.
     pub async fn new(config: PostgresSourceConfig) -> Result<Self, FaucetError> {
         config.validate()?;
+        faucet_core::ensure_crypto_provider();
 
         let pool = PgPoolOptions::new()
             .max_connections(config.max_connections)

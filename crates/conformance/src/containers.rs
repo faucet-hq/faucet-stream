@@ -591,6 +591,25 @@ fn missing(required: bool, var: &str, why: &str) {
         panic!("{why} ({var} is set)");
     }
     eprintln!("skipping: {why}");
+    if let Some(summary) = std::env::var_os("GITHUB_STEP_SUMMARY") {
+        record_skip(std::path::Path::new(&summary), var, why);
+    }
+}
+
+/// Appends a skipped backend to the CI job summary, which a passing test's
+/// captured stderr never reaches.
+fn record_skip(summary: &std::path::Path, var: &str, why: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(summary)
+    {
+        let _ = writeln!(
+            f,
+            "- :warning: test backend skipped: {why} (set `{var}` to fail instead)"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -861,6 +880,26 @@ mod tests {
             )
         );
         assert_eq!(o.ready.map(|p| p.port()), Some(5));
+    }
+
+    #[test]
+    fn a_skip_is_recorded_in_the_job_summary() {
+        let dir = std::env::temp_dir().join(format!("faucet-skip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let summary = dir.join("summary.md");
+        record_skip(&summary, REQUIRE_ORACLE, "no oracle image");
+        record_skip(&summary, REQUIRE_BACKENDS, "no docker");
+        let text = std::fs::read_to_string(&summary).unwrap();
+        assert!(
+            text.contains("test backend skipped: no oracle image (set `FAUCET_REQUIRE_ORACLE`")
+        );
+        assert_eq!(text.lines().count(), 2);
+        record_skip(
+            &dir,
+            REQUIRE_BACKENDS,
+            "a directory is not writable as a file",
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

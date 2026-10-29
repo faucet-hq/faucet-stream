@@ -337,10 +337,113 @@ async fn conformance_declared_types_create() {
                 .collect::<Vec<_>>()
         }
     };
-    faucet_conformance::assert_declared_types_create(
+    let read_at = || async {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("connect");
+        let rows = sqlx::query("SELECT at FROM d ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .expect("select");
+        pool.close().await;
+        rows.iter().map(|r| r.get::<String, _>("at")).collect()
+    };
+    faucet_conformance::assert_declared_instants_exact(
         &sink,
         &[("id", "integer"), ("amount", "text"), ("day", "text")],
         types,
+        read_at,
     )
     .await;
+}
+
+async fn table_types(url: String, table: String) -> Vec<(String, String)> {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .expect("connect");
+    let rows = sqlx::query(&format!(
+        "SELECT name, type FROM pragma_table_info('{table}')"
+    ))
+    .fetch_all(&pool)
+    .await
+    .expect("pragma");
+    pool.close().await;
+    rows.iter()
+        .map(|r| (r.get::<String, _>("name"), r.get::<String, _>("type")))
+        .collect()
+}
+
+/// Check 27 (#975): a zero-row first overwrite leaves the empty typed table.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_declared_overwrite_empty_run() {
+    let dir = TempDir::new().expect("tempdir");
+    let url = format!("sqlite://{}?mode=rwc", dir.path().join("o.db").display());
+    let make = |n: usize| {
+        let url = url.clone();
+        async move {
+            let mut cfg = SqliteSinkConfig::new(&url, format!("o{n}"))
+                .column_mapping(SqliteColumnMapping::AutoMap);
+            cfg.write.write_mode = WriteMode::Overwrite;
+            Box::new(SqliteSink::new(cfg).await.expect("sink")) as Box<dyn Sink>
+        }
+    };
+    faucet_conformance::assert_declared_overwrite_empty_run(
+        make,
+        &[("id", "integer"), ("amount", "text")],
+        |n| table_types(url.clone(), format!("o{n}")),
+    )
+    .await;
+}
+
+/// A source that declares its columns and counts the describes it is asked for.
+struct Describing(std::sync::atomic::AtomicUsize);
+
+#[faucet_core::async_trait]
+impl faucet_core::Source for Describing {
+    async fn fetch_with_context(
+        &self,
+        _ctx: &std::collections::HashMap<String, faucet_core::Value>,
+    ) -> Result<Vec<faucet_core::Value>, faucet_core::FaucetError> {
+        Ok(vec![faucet_core::json!({"id": 1, "day": "2024-01-02"})])
+    }
+    fn capabilities(&self) -> faucet_core::Capabilities {
+        faucet_core::Capabilities::of_source(self)
+            .to_builder()
+            .declared_columns(true)
+            .build()
+    }
+    async fn declared_columns(
+        &self,
+        _ctx: &std::collections::HashMap<String, faucet_core::Value>,
+    ) -> Result<Option<faucet_core::DeclaredColumns>, faucet_core::FaucetError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Some(faucet_conformance::declared_corpus()))
+    }
+}
+
+/// #975 item 8: a sink that will not create its table asks for no describe.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_create_table_false_run_makes_no_describe_call() {
+    let (_dir, url) = table_with("CREATE TABLE e (id INTEGER, day TEXT)").await;
+    for (create, describes) in [(false, 0), (true, 1)] {
+        let cfg = SqliteSinkConfig::new(&url, "e")
+            .column_mapping(SqliteColumnMapping::AutoMap)
+            .with_create_table(create);
+        let sink = SqliteSink::new(cfg).await.expect("sink");
+        assert_eq!(sink.capabilities().declared_types(), create);
+        let source = Describing(Default::default());
+        faucet_core::Pipeline::new(&source, &sink)
+            .run()
+            .await
+            .expect("run");
+        assert_eq!(
+            source.0.load(std::sync::atomic::Ordering::Relaxed),
+            describes,
+            "create_table: {create}"
+        );
+    }
 }

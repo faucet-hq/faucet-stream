@@ -328,6 +328,9 @@ pub async fn list_templates(
     if let Some(kind) = query.kind {
         templates.retain(|t| t.kind == kind);
     }
+    for t in &mut templates {
+        crate::params::hide_secret_defaults(&mut t.params);
+    }
     Ok(Json(ListResponse {
         templates,
         sync: sync_info(&state),
@@ -469,6 +472,7 @@ pub async fn get_template(
         .await
         .map_err(|e| ServeError::Internal(e.to_string()))?
         .ok_or(ServeError::NotFound)?;
+    crate::params::hide_secret_defaults(&mut template.params);
     let body_withheld = !reads_template_body(&actor);
     if body_withheld {
         template.body.clear();
@@ -1493,6 +1497,48 @@ mod tests {
             assert!(got.body_withheld);
             assert!(got.template.body.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn reads_never_return_a_secret_params_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state();
+        let yaml = template_yaml(&dir.path().join("o.jsonl")).replace(
+            "  page: { type: int, default: 7 }\n",
+            "  page: { type: int, default: 7 }\n  api_key: { secret: true, default: s3cr3t-default }\n",
+        ).replace("missing-${param.tag}", "missing-${param.tag}-${param.api_key}");
+        let _registered = register_template(
+            State(state.clone()),
+            Extension(actor()),
+            Json(RegisterBody {
+                id: None,
+                config: crate::templates::bundle::smoke(&yaml),
+                config_format: ConfigFormatWire::Yaml,
+                description: None,
+                tags: vec![],
+                launch: true,
+            }),
+        )
+        .await
+        .expect("register");
+        let got = get(&state, "tpl-demo", VersionQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            got.template.params["api_key"].default,
+            Some(serde_json::json!(crate::params::HIDDEN_DEFAULT))
+        );
+        assert_eq!(
+            got.template.params["page"].default,
+            Some(serde_json::json!(7))
+        );
+        let listed = list_templates(State(state.clone()), Query(ListQuery::default()))
+            .await
+            .unwrap()
+            .0;
+        let text = serde_json::to_string(&listed.templates).unwrap();
+        assert!(!text.contains("s3cr3t-default"), "{text}");
+        assert!(text.contains(crate::params::HIDDEN_DEFAULT), "{text}");
     }
 
     #[tokio::test]

@@ -30,7 +30,9 @@ faucet-conformance = { workspace = true, features = ["containers"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 serde_yaml = "0.9"
 testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["localstack"] }
 wiremock = "0.6"
+tempfile = "3"
 
 [package.metadata.docs.rs]
 all-features = true

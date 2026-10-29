@@ -38,6 +38,21 @@ with the GitHub CLI:
 gh attestation verify faucet-cli-aarch64-apple-darwin.tar.xz --repo faucet-hq/faucet-stream
 ```
 
+Each release asset also has its attestation attached beside it as
+`<asset>.sigstore.json`, so the check works offline or from a mirror:
+
+```bash
+gh attestation verify faucet-cli-aarch64-apple-darwin.tar.xz \
+  --bundle faucet-cli-aarch64-apple-darwin.tar.xz.sigstore.json \
+  --repo faucet-hq/faucet-stream
+```
+
+**Dependency inventory.** The binaries are built with
+[`cargo-auditable`](https://github.com/rust-secure-code/cargo-auditable), so
+each one carries its exact dependency list: `cargo audit bin faucet` checks
+an installed binary against the RustSec advisory database. Every release also
+attaches a CycloneDX SBOM of the shipped build, `faucet-cli.cdx.json`.
+
 Container images on GHCR carry provenance and an SBOM, and are signed with
 Sigstore keyless signing:
 

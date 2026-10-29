@@ -20,7 +20,7 @@ use tokio_postgres::NoTls;
 /// Start a Postgres container with `wal_level=logical` and return both the
 /// container handle and a connection URL.
 ///
-/// We use PostgreSQL 16 because pgwire-replication 0.3.2 emits
+/// We use PostgreSQL 16 because pgwire-replication emits
 /// `messages 'true'` in its START_REPLICATION command, which requires PG 14+.
 ///
 /// We use `with_host_auth()` (POSTGRES_HOST_AUTH_METHOD=trust) so that

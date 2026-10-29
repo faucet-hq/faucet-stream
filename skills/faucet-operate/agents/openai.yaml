@@ -1,0 +1,5 @@
+interface:
+  display_name: "faucet Operate"
+  short_description: "Keep a running faucet serve or cluster healthy"
+  brand_color: "#14B8A6"
+  default_prompt: "Use $faucet-operate to find out why runs on my faucet serve cluster are stuck and what to do about it."

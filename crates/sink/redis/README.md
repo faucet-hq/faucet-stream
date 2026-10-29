@@ -67,6 +67,7 @@ faucet run pipeline.yaml
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `url` | string | — *(required)* | Redis connection URL, e.g. `redis://127.0.0.1:6379` or `rediss://host:6380` (TLS). Masked as `***` in `Debug` / log output. |
+| `tls` | object | — | TLS settings for a `rediss://` URL: private CA, client certificate, `insecure_skip_verify` — see [TLS](#tls-rediss-private-ca-client-certificates). |
 | `sink_type` | `RedisSinkType` | — *(required)* | The Redis data structure to write to — see [Sink types](#sink-types). |
 
 ### Batching
@@ -103,6 +104,36 @@ For `Stream` mode, each record's top-level JSON object fields are flattened into
 - Nested objects and arrays are serialized as JSON strings.
 
 If a record is not a JSON object (e.g. a bare string), it is stored as a single `_data` field containing the serialized record. A record that flattens to zero fields also falls back to `_data`, because `XADD` requires at least one field.
+
+## TLS (`rediss://`, private CA, client certificates)
+
+`rediss://` URLs negotiate TLS. Without a `tls:` block the server certificate
+is verified against the bundled Mozilla (web PKI) roots. A `tls:` block
+(shared with the other Redis connectors through
+[`faucet-common-redis`](https://crates.io/crates/faucet-common-redis), #972)
+adds a private CA, mutual TLS, or turns verification off:
+
+| field | type | default | description |
+|-------|------|---------|-------------|
+| `ca_cert_path` | path | — | PEM CA certificate(s) that signed the server certificate. When set it is the only trust anchor. |
+| `ca_cert_pem` | string | — | The same CA inline (e.g. `${secret:…}`); mutually exclusive with `ca_cert_path`. |
+| `client_cert_path` | path | — | PEM client certificate for mutual TLS; set with `client_key_path`. |
+| `client_key_path` | path | — | PEM private key (PKCS#8, PKCS#1 or SEC1) for the client certificate. |
+| `insecure_skip_verify` | bool | `false` | Accept any server certificate. Logs a warning; never use in production. |
+
+The hostname is always checked unless `insecure_skip_verify` is on (the URL
+fragment `#insecure` does the same and also logs a warning). `tls` settings on
+a `redis://` URL, an unreadable file or a file that is not PEM is a
+`FaucetError::Config`; a certificate the server presents that does not verify
+fails the connection with a typed error (`FaucetError::Sink`, `Redis connection failed`).
+
+```yaml
+url: rediss://redis.internal:6380/0
+tls:
+  ca_cert_path: /etc/faucet/redis-ca.pem
+  client_cert_path: /etc/faucet/client.pem
+  client_key_path: /etc/faucet/client.key
+```
 
 ## Examples
 
@@ -359,7 +390,7 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 | `Sink: Redis pipeline execution failed` | The server rejected a command mid-pipeline (e.g. `WRONGTYPE` — the key already holds a different data type, or `OOM` under `maxmemory`). Use a fresh key per `sink_type`, or free memory / raise `maxmemory`. |
 | Stream entry has only a `_data` field | The record wasn't a JSON object, or flattened to zero fields. `XADD` requires at least one field, so the whole record is stored under `_data`. Emit object records to get native stream fields. |
 | Numbers/booleans arrive as strings in a stream | Intentional — non-string scalars are stringified for `XADD`, and nested objects/arrays are serialized as JSON strings. Parse them on the consumer side. |
-| TLS connection rejected | Use a `rediss://` URL (double `s`) to negotiate TLS against a server configured for it. |
+| TLS connection rejected | Use a `rediss://` URL (double `s`) to negotiate TLS against a server configured for it. For a server with a private CA set `tls.ca_cert_path`; for one that requires client certificates set `tls.client_cert_path` + `tls.client_key_path`. |
 
 ## See also
 

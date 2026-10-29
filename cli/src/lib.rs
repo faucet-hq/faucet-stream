@@ -140,6 +140,7 @@ pub fn run_main(registry: PluginRegistry) -> std::process::ExitCode {
     use std::process::ExitCode;
 
     set_build_version();
+    faucet_core::ensure_crypto_provider();
 
     if let Err(err) = registry.install() {
         commands::report(&err);

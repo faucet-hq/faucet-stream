@@ -47,7 +47,8 @@ pub enum LogicalType {
     Decimal {
         /// Total significant digits, when the source declares them.
         precision: Option<u32>,
-        /// Digits after the decimal point, when the source declares them.
+        /// Digits after the decimal point, when the source declares them. A
+        /// precision without a scale has scale 0, as SQL reads `numeric(p)`.
         scale: Option<u32>,
     },
     /// A calendar date, `YYYY-MM-DD`.
@@ -81,7 +82,10 @@ impl LogicalType {
         }
     }
 
-    /// Whether `value` is a rendering of this type (`null` always is).
+    /// Whether `value` is a rendering of this type (`null` always is). A
+    /// decimal must also fit its bounds: with a scale, at most `scale`
+    /// fractional and `precision - scale` integer digits; with only a
+    /// precision, scale 0 (an integer of at most `precision` digits).
     pub fn accepts(&self, value: &Value) -> bool {
         use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime};
         if value.is_null() {
@@ -93,9 +97,11 @@ impl LogicalType {
             LogicalType::Bool => value.is_boolean(),
             LogicalType::String => value.is_string(),
             LogicalType::Json => true,
-            LogicalType::Decimal { .. } => match value {
-                Value::Number(n) => n.is_i64() || n.is_u64(),
-                Value::String(s) => is_decimal_text(s),
+            LogicalType::Decimal { precision, scale } => match value {
+                Value::Number(n) if n.is_i64() || n.is_u64() => {
+                    decimal_fits(&n.to_string(), *precision, *scale)
+                }
+                Value::String(s) => is_decimal_text(s) && decimal_fits(s, *precision, *scale),
                 _ => false,
             },
             LogicalType::Date => value
@@ -117,6 +123,19 @@ impl LogicalType {
                 base64::engine::general_purpose::STANDARD.decode(s).is_ok()
             }),
         }
+    }
+
+    /// Whether a time or timestamp `value` keeps every fractional-second
+    /// digit in a column holding `max` of them; any other type or value does.
+    pub fn fits_fraction(&self, value: &Value, max: usize) -> bool {
+        if !matches!(self, LogicalType::Time | LogicalType::Timestamp { .. }) {
+            return true;
+        }
+        value.as_str().is_none_or(|s| {
+            let time = s.rsplit(['T', ' ']).next().unwrap_or(s);
+            time.split_once('.')
+                .is_none_or(|(_, rest)| rest.bytes().take_while(u8::is_ascii_digit).count() <= max)
+        })
     }
 
     /// The logical type of a SQL column type name, as SQL backends spell it
@@ -213,6 +232,23 @@ fn is_decimal_text(s: &str) -> bool {
     match frac {
         Some(f) => digits(int) && digits(f) && !(int.is_empty() && f.is_empty()),
         None => !int.is_empty() && digits(int),
+    }
+}
+
+/// Whether decimal text `s` (already checked by [`is_decimal_text`]) fits
+/// `precision` / `scale`, ignoring leading integer and trailing fractional
+/// zeros, which change no value.
+fn decimal_fits(s: &str, precision: Option<u32>, scale: Option<u32>) -> bool {
+    let body = s.strip_prefix(['-', '+']).unwrap_or(s);
+    let (int, frac) = body.split_once('.').unwrap_or((body, ""));
+    let int = int.trim_start_matches('0');
+    let frac = frac.trim_end_matches('0');
+    let (int_len, frac_len) = (int.len() as u64, frac.len() as u64);
+    match (precision.map(u64::from), scale.map(u64::from)) {
+        (None, None) => true,
+        (None, Some(s)) => frac_len <= s,
+        (Some(p), Some(s)) => frac_len <= s && int_len <= p.saturating_sub(s),
+        (Some(p), None) => frac_len == 0 && int_len <= p,
     }
 }
 
@@ -530,6 +566,58 @@ mod tests {
         for (t, v) in bad {
             assert!(!t.accepts(&v), "{t:?} should refuse {v}");
         }
+    }
+
+    #[test]
+    fn decimals_must_fit_their_bounds() {
+        let d = |p, s| LogicalType::Decimal {
+            precision: p,
+            scale: s,
+        };
+        let fits = [
+            (d(Some(12), Some(2)), json!("1234567890.12")),
+            (d(Some(12), Some(2)), json!("-0012.500")),
+            (d(Some(12), Some(2)), json!(1234567890)),
+            (d(Some(5), Some(0)), json!(99999)),
+            (d(Some(3), None), json!("123")),
+            (d(Some(3), None), json!("12.000")),
+            (d(Some(3), None), json!(-999)),
+            (d(None, Some(2)), json!("123456789.12")),
+            (d(None, None), json!("1.0000000000000000000000000000000001")),
+        ];
+        for (t, v) in fits {
+            assert!(t.accepts(&v), "{t:?} should accept {v}");
+        }
+        let misfits = [
+            (d(Some(12), Some(2)), json!("1.125")),
+            (d(Some(12), Some(2)), json!("12345678901.1")),
+            (d(Some(12), Some(2)), json!(12345678901_i64)),
+            (d(Some(5), Some(0)), json!(100000)),
+            (d(Some(3), None), json!("12.34")),
+            (d(Some(3), None), json!("12.3")),
+            (d(Some(3), None), json!("0.000123")),
+            (d(Some(3), None), json!(1000)),
+            (d(None, Some(2)), json!("0.001")),
+        ];
+        for (t, v) in misfits {
+            assert!(!t.accepts(&v), "{t:?} should refuse {v}");
+        }
+    }
+
+    #[test]
+    fn fraction_digits_are_counted_per_time_type() {
+        use LogicalType as L;
+        let ts = L::Timestamp { tz: true };
+        assert!(ts.fits_fraction(&json!("2024-01-01T00:00:00.123456Z"), 6));
+        assert!(!ts.fits_fraction(&json!("2024-01-01T00:00:00.1234567Z"), 6));
+        assert!(!ts.fits_fraction(&json!("2024-01-01T00:00:00.1234567+05:30"), 6));
+        assert!(ts.fits_fraction(&json!("2024-01-01T00:00:00Z"), 0));
+        let naive = L::Timestamp { tz: false };
+        assert!(!naive.fits_fraction(&json!("2024-01-01 00:00:00.1234567"), 6));
+        assert!(L::Time.fits_fraction(&json!("10:11:12.1234567"), 7));
+        assert!(!L::Time.fits_fraction(&json!("10:11:12.1234567"), 6));
+        assert!(ts.fits_fraction(&Value::Null, 0));
+        assert!(L::String.fits_fraction(&json!("00:00:00.1234567"), 0));
     }
 
     #[test]

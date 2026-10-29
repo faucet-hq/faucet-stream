@@ -134,6 +134,9 @@ impl SqlExecutor for MysqlExec<'_> {
                         ))
                     })?
                 }
+                Value::String(s) if let Some(t) = p.sql_type.and_then(|t| instant_text(s, t)) => {
+                    q.bind(t)
+                }
                 _ if p.non_integer_text().is_some() => {
                     q.bind(p.non_integer_text().expect("checked"))
                 }
@@ -166,6 +169,9 @@ impl SqlExecutor for MysqlExec<'_> {
                             p.column
                         ))
                     })?
+                }
+                Value::String(s) if let Some(t) = p.sql_type.and_then(|t| instant_text(s, t)) => {
+                    q.bind(t)
                 }
                 _ if p.non_integer_text().is_some() => {
                     q.bind(p.non_integer_text().expect("checked"))
@@ -692,6 +698,29 @@ fn split_writable(
     (split.outcomes, split.writable, split.positions)
 }
 
+/// An RFC 3339 instant bound for a `DATETIME` or `TIMESTAMP` column, as text
+/// MySQL stores as that instant (#975), or `None` for any other value or
+/// column. MySQL refuses a `Z` suffix and shifts an offset into the session
+/// time zone for `DATETIME`, so a `DATETIME` gets the UTC wall-clock time and
+/// a `TIMESTAMP` the instant at `+00:00`.
+pub(crate) fn instant_text(value: &str, data_type: &str) -> Option<String> {
+    let base = data_type
+        .trim()
+        .split(|c: char| c == '(' || c.is_whitespace())
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let suffix = match base.as_str() {
+        "datetime" => "",
+        "timestamp" => "+00:00",
+        _ => return None,
+    };
+    let utc = chrono::DateTime::parse_from_rfc3339(value)
+        .ok()?
+        .with_timezone(&chrono::Utc);
+    Some(format!("{}{suffix}", utc.format("%Y-%m-%d %H:%M:%S%.f")))
+}
+
 /// Whether a MySQL `DATA_TYPE` (or a full `COLUMN_TYPE` such as
 /// `varbinary(32)`) stores raw bytes.
 pub(crate) fn is_binary_type(data_type: &str) -> bool {
@@ -1074,6 +1103,7 @@ impl MysqlSink {
             ));
         }
 
+        faucet_core::ensure_crypto_provider();
         let pool = MySqlPoolOptions::new()
             .max_connections(config.max_connections)
             .after_connect(|conn, _meta| Box::pin(async move { strict_session(conn).await }))
@@ -2253,6 +2283,24 @@ mod tests {
             relax_column_sql("`t`", "s", &def).as_deref(),
             Some("ALTER TABLE `t` MODIFY COLUMN `s` varchar(5) NULL DEFAULT 'a\\\\b'")
         );
+    }
+
+    #[test]
+    fn instants_bind_as_text_mysql_keeps() {
+        assert_eq!(
+            instant_text("2024-02-22T02:00:00Z", "datetime").as_deref(),
+            Some("2024-02-22 02:00:00")
+        );
+        assert_eq!(
+            instant_text("2024-02-22T07:30:00.5+05:30", "DATETIME(6)").as_deref(),
+            Some("2024-02-22 02:00:00.500")
+        );
+        assert_eq!(
+            instant_text("2024-02-22T02:00:00.123456-01:00", "timestamp").as_deref(),
+            Some("2024-02-22 03:00:00.123456+00:00")
+        );
+        assert_eq!(instant_text("2024-02-22 02:00:00", "datetime"), None);
+        assert_eq!(instant_text("2024-02-22T02:00:00Z", "varchar"), None);
     }
 
     #[test]

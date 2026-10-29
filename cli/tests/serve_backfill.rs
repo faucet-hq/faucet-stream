@@ -723,6 +723,7 @@ async fn submitted_labels_are_checked() {
         (json!({ ("k".repeat(64)): "v" }), "longer than 63"),
         (json!({ "k": ("v".repeat(257)) }), "longer than 256"),
         (json!({ "template": "fake" }), "set by the server"),
+        (json!({ "team:x": "data" }), "contains ':'"),
     ] {
         let resp = run(labels).await.unwrap();
         assert_eq!(resp.status(), 422);

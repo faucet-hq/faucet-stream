@@ -27,7 +27,9 @@ unacked page). The final page's acks are flushed before the run ends.
 
 The shared connection surface (`servers` / `auth` / `tls` / `name` — see
 [`faucet-common-nats`](https://crates.io/crates/faucet-common-nats)) is flattened
-in alongside these fields:
+in alongside these fields. `tls` is `true` or a block with a private CA
+(`ca_cert_path` / `ca_cert_pem`), a client certificate (`client_cert_path` +
+`client_key_path`) and `insecure_skip_verify`:
 
 | field               | type             | default | description                                                        |
 |---------------------|------------------|---------|--------------------------------------------------------------------|

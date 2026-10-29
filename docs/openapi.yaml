@@ -2037,7 +2037,8 @@ paths:
       description: >
         One version of a template — the launched (`stable`) one unless `version`
         is given — including the stored config body (admins without a tenant
-        scope only; others get an empty `body` and `body_withheld: true`), the
+        scope only; others get an empty `body` and `body_withheld: true`; a
+        secret param's default always reads `(hidden)`), the
         template's whole release state, and the launch log. Pass `version=newest` to open a `draft`
         template, which has no `stable` version yet. Requires the `TemplateRead`
         permission (viewer).
@@ -2818,7 +2819,9 @@ components:
           additionalProperties: { type: string, maxLength: 256 }
           description: >-
             Free-form run labels, filterable with `GET /v1/runs?label=` (#958).
-            Keys are 1–63 characters, values at most 256, else 422. The
+            Keys are 1–63 characters without `:`, values at most 256, else
+            422 (a value holding `,` is filtered with the repeatable `label=`
+            form). The
             provenance keys the server stamps (`template`, `template_version`,
             `allow_untested`, `sink_template`, `sink_template_version`,
             `overlay`, `overlay_version`, `selection`) are refused with 422.

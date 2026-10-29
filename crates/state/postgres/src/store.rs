@@ -44,6 +44,7 @@ impl PostgresStateStore {
         table: &str,
     ) -> Result<Self, FaucetError> {
         validate_table_name(table)?;
+        faucet_core::ensure_crypto_provider();
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
             .connect(connection_url)

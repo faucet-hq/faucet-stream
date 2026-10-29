@@ -67,15 +67,48 @@ pub fn resolve_table(project_id: &str, read_table: Option<&str>) -> Result<Strin
     }
 }
 
+/// Fail a message whose decoded rows differ from the count the server sent,
+/// rather than dropping rows silently.
+fn check_row_count(sent: i64, decoded: usize) -> Result<(), FaucetError> {
+    if sent > 0 && usize::try_from(sent).ok() != Some(decoded) {
+        return Err(FaucetError::Source(format!(
+            "BigQuery Storage Read: a message of {sent} row(s) decoded to {decoded}"
+        )));
+    }
+    Ok(())
+}
+
+/// The Arrow IPC end-of-stream marker (continuation token, zero length).
+const IPC_EOS: [u8; 8] = [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
+
+/// Whether `buf` starts with an IPC schema message, i.e. is a whole IPC
+/// stream rather than a bare record-batch message.
+fn starts_with_schema(buf: &[u8]) -> bool {
+    let body = buf.strip_prefix(&IPC_EOS[..4]).unwrap_or(buf);
+    let Some(len) = body
+        .get(..4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+    else {
+        return false;
+    };
+    body.get(4..4 + len)
+        .and_then(|meta| arrow::ipc::root_as_message(meta).ok())
+        .is_some_and(|m| m.header_type() == arrow::ipc::MessageHeader::Schema)
+}
+
 /// Decode one Storage Read API Arrow message. The API sends the IPC schema
 /// once (first response) and each batch as a standalone IPC record-batch
-/// message; concatenating schema + batch bytes yields a decodable IPC stream.
+/// message; reading schema then batch yields a decodable IPC stream.
 fn decode_arrow(schema: &[u8], batch: &[u8]) -> Result<Vec<RecordBatch>, FaucetError> {
     use arrow::ipc::reader::StreamReader;
-    let mut buf = Vec::with_capacity(schema.len() + batch.len());
-    buf.extend_from_slice(schema);
-    buf.extend_from_slice(batch);
-    let reader = StreamReader::try_new(std::io::Cursor::new(buf), None)
+    use std::io::Read as _;
+    // Some servers send each message as a whole IPC stream (schema, batch, end marker).
+    let schema: &[u8] = if starts_with_schema(batch) {
+        &[]
+    } else {
+        schema.strip_suffix(&IPC_EOS).unwrap_or(schema)
+    };
+    let reader = StreamReader::try_new(schema.chain(batch), None)
         .map_err(|e| FaucetError::Source(format!("BigQuery Storage Read arrow decode: {e}")))?;
     let mut out = Vec::new();
     for b in reader {
@@ -267,7 +300,10 @@ fn read_batches<'a>(
     let cfg = src.config();
     let calls = src.call_context().without_retry();
     async_stream::try_stream! {
-        let env = build_environment(&cfg.auth).await?;
+        let env = match &cfg.storage_host {
+            Some(host) => Environment::Emulator(host.clone()),
+            None => build_environment(&cfg.auth).await?,
+        };
         let cm = call(
             &calls,
             "connect",
@@ -361,7 +397,10 @@ fn read_batches<'a>(
                                     .into(),
                             )
                         })?;
-                        for batch in decode_arrow(sch, &rb.serialized_record_batch)? {
+                        let batches = decode_arrow(sch, &rb.serialized_record_batch)?;
+                        let decoded: usize = batches.iter().map(RecordBatch::num_rows).sum();
+                        check_row_count(msg.row_count, decoded)?;
+                        for batch in batches {
                             if batch.num_rows() > 0 {
                                 yield batch;
                             }
@@ -443,6 +482,55 @@ pub fn stream_pages_arrow_with<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn decodes_separate_schema_and_batch_messages_and_whole_streams() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
+                .unwrap();
+        let mut stream = Vec::new();
+        let mut w = arrow::ipc::writer::StreamWriter::try_new(&mut stream, &schema).unwrap();
+        w.write(&batch).unwrap();
+        w.finish().unwrap();
+        drop(w);
+        let len = u32::from_le_bytes(stream[4..8].try_into().unwrap()) as usize;
+        let (schema_msg, rest) = stream.split_at(8 + len);
+        let batch_msg = &rest[..rest.len() - super::IPC_EOS.len()];
+        let rows = |b: Vec<RecordBatch>| b.iter().map(RecordBatch::num_rows).sum::<usize>();
+        assert_eq!(rows(super::decode_arrow(schema_msg, batch_msg).unwrap()), 2);
+        let mut schema_stream = schema_msg.to_vec();
+        schema_stream.extend_from_slice(&super::IPC_EOS);
+        assert_eq!(
+            rows(super::decode_arrow(&schema_stream, batch_msg).unwrap()),
+            2
+        );
+        assert_eq!(
+            rows(super::decode_arrow(&schema_stream, &stream).unwrap()),
+            2
+        );
+        assert!(super::decode_arrow(b"junk", batch_msg).is_err());
+        assert!(super::starts_with_schema(&stream));
+        assert!(super::starts_with_schema(schema_msg));
+        assert!(!super::starts_with_schema(batch_msg));
+        assert!(!super::starts_with_schema(b"junk"));
+        assert!(!super::starts_with_schema(&[]));
+        // The pre-0.15 framing (no continuation marker) is a whole stream too.
+        let legacy = &stream[4..];
+        assert!(super::starts_with_schema(legacy));
+    }
+
+    #[test]
+    fn a_row_count_mismatch_fails_the_read() {
+        super::check_row_count(3, 3).unwrap();
+        super::check_row_count(0, 2).unwrap();
+        let err = super::check_row_count(3, 0).unwrap_err().to_string();
+        assert!(err.contains("3 row(s) decoded to 0"), "{err}");
+    }
+
     #[tokio::test]
     async fn grpc_waits_are_bounded() {
         let ok = super::within(async { 1 }, "x").await.unwrap();

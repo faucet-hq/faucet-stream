@@ -1433,12 +1433,19 @@ select {
 .tpl-launch-tbl th:nth-child(2), .tpl-launch-tbl td:nth-child(2) { width: 6rem; }
 .tpl-launch-tbl th:nth-child(3), .tpl-launch-tbl td:nth-child(3) { width: 14rem; }
 .tpl-launch-when { white-space: nowrap; font-variant-numeric: tabular-nums; }
-.tpl-body {
+.tpl-body-wrap {
   flex: 1 1 100%;
+  position: relative;
   margin: 6px 0 0;
+  min-width: 0;
+}
+.tpl-body-wrap[hidden] { display: none; }
+.tpl-body {
+  margin: 0;
   max-height: 340px;
   overflow: auto;
-  padding: 13px 15px;
+  /* The right side clears the copy button. */
+  padding: 13px 52px 13px 15px;
   background: var(--term-bg);
   color: var(--term-ink);
   border: 1px solid var(--border-strong);
@@ -1450,6 +1457,33 @@ select {
   white-space: pre;
 }
 .tpl-body.tpl-body-withheld { font-style: italic; white-space: normal; }
+
+/* Icon button pinned to the top-right of a code box; stays put while the box scrolls. */
+.copy-btn {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  min-width: 26px;
+  padding: 0 6px;
+  justify-content: center;
+  border: 1px solid color-mix(in srgb, var(--term-ink) 22%, transparent);
+  border-radius: var(--r-sm);
+  background: color-mix(in srgb, var(--term-bg) 82%, var(--term-ink));
+  color: var(--term-ink);
+  font: inherit;
+  font-size: 0.72rem;
+  cursor: pointer;
+  opacity: 0.75;
+  transition: opacity 0.12s, border-color 0.12s;
+}
+.copy-btn:hover, .copy-btn:focus-visible { opacity: 1; border-color: color-mix(in srgb, var(--term-ink) 45%, transparent); }
+.copy-btn svg { fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
+.copy-btn.copied { color: var(--ok); opacity: 1; border-color: color-mix(in srgb, var(--ok) 55%, transparent); }
+.copy-btn[hidden] { display: none; }
 
 .tpl-trigger {
   display: flex;
@@ -1550,7 +1584,7 @@ select {
   .tpl-version .tpl-vnum { flex: 0 0 42px; }
   .tpl-version .tpl-vchannels { flex: 1 1 calc(100% - 52px); }
   .tpl-version .tpl-assign { max-width: none; flex: 1 1 100%; }
-  .tpl-version .tpl-body { flex: 1 1 100%; }
+  .tpl-version .tpl-body-wrap { flex: 1 1 100%; }
   /* The fixed column header can't line up once rows stack — hide it and let the
      rows collapse to status + name with the meta wrapping below. */
   .tpl-list-head { display: none; }

@@ -25,11 +25,11 @@ base64 = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
-url = { workspace = true, optional = true }
+url.workspace = true
 
 [features]
 # Test helpers for the Azurite emulator (container creation); dev-dependency use only.
-testing = ["dep:base64", "dep:chrono", "dep:hmac", "dep:sha2", "dep:url"]
+testing = ["dep:base64", "dep:chrono", "dep:hmac", "dep:sha2"]
 
 [dev-dependencies]
 chrono.workspace = true

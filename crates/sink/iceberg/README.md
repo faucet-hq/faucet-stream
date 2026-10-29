@@ -121,9 +121,13 @@ The `catalog` block is an internally-tagged enum selected by `type`. Every varia
 | REST (Polaris, Nessie, Tabular, …) | `rest` | `catalog-rest` | **yes** |
 | AWS Glue | `glue` | `catalog-glue` | no |
 | SQL-backed (Postgres, SQLite, …) | `sql` | `catalog-sql` | no |
-| Hive Metastore | `hms` | `catalog-hms` | no |
+| Hive Metastore (3.x) | `hms` | `catalog-hms` | no |
 
 Configuring a catalog type whose feature is not compiled in returns `FaucetError::Config` at startup.
+
+**Hive Metastore:** `uri` is `thrift://host:port`; a **Hive 3.x** metastore is required (iceberg-rust's HMS client calls `get_table`, which Hive 4 removed). iceberg-rust's own HMS client cannot commit (`update_table` is unimplemented), so faucet commits itself (`faucet_common_iceberg::HmsCommitCatalog`) the way Iceberg's Java `HiveCatalog` does: it takes an `EXCLUSIVE` metastore lock on the table, writes the next metadata file, checks the table's `metadata_location` is still the one the commit was built on, and `alter_table`s it to the new file (keeping the old one as `previous_metadata_location`). A commit that loses to another writer is retried under the table's `commit.retry.*` properties; one whose `alter_table` got no answer is reported, never retried. `catalog.properties."hms.lock-timeout-ms"` bounds the wait for the lock (default 180000). Other writers must take the same metastore lock (Spark and Trino with the Hive lock enabled do). A table's location follows its database's, so tables the sink creates land under the metastore's `hive.metastore.warehouse.dir`.
+
+**AWS Glue:** `uri` overrides the Glue endpoint (for a Glue-compatible service); `properties` takes `aws_access_key_id`, `aws_secret_access_key`, `aws_session_token`, `region_name` and `profile_name`, which also serve as S3 credentials when no `s3.*` key is set.
 
 ### Warehouse storage
 

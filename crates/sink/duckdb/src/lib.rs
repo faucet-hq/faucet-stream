@@ -30,6 +30,8 @@ fn capabilities(config: &faucet_core::Value) -> faucet_core::Capabilities {
         );
     faucet_core::Capabilities::append_only_sink()
         .to_builder()
-        .declared_types(!json)
+        .declared_types(
+            !json && faucet_core::capabilities::config::bool_field(config, "create_table", true),
+        )
         .build()
 }

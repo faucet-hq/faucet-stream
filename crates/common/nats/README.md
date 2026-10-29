@@ -27,8 +27,22 @@ imports do not change.
   |-----------|-----------------|------------------------------|------------------------------------------|
   | `servers` | `Vec<String>`   | `["nats://127.0.0.1:4222"]`  | server URLs (first reachable wins)       |
   | `auth`    | `NatsAuth`      | `none`                       | authentication mode                      |
-  | `tls`     | `bool`          | `false`                      | require a TLS connection                 |
+  | `tls`     | `bool` or block | `false`                      | `true` requires TLS with the platform roots; a block (below) also requires TLS |
   | `name`    | `Option<String>`| —                            | client connection name (server monitor)  |
+
+  In Rust the block lands in `NatsConnectionConfig::tls_options`
+  (`NatsTls`, an alias of `faucet_core::TlsOptions`, #973):
+
+  | field | type | default | description |
+  |-------|------|---------|-------------|
+  | `ca_cert_path` | path | — | PEM CA certificate(s) that signed the server certificate; the only trust anchor when set. |
+  | `ca_cert_pem` | string | — | The same CA inline; mutually exclusive with `ca_cert_path`. |
+  | `client_cert_path` | path | — | PEM client certificate for mutual TLS; set with `client_key_path`. |
+  | `client_key_path` | path | — | PEM private key for the client certificate. |
+  | `insecure_skip_verify` | bool | `false` | Accept any server certificate. Logs a warning. |
+
+  Without a CA the platform roots are used. The hostname is always checked
+  unless `insecure_skip_verify` is on.
 
 - **`connect(&NatsConnectionConfig) -> Result<async_nats::Client, FaucetError>`**
   — the single client builder both connectors use. Retry-on-initial-connect is
@@ -44,6 +58,16 @@ auth:
     token: ${env:NATS_TOKEN}
 tls: false
 name: faucet
+```
+
+With a private CA and mutual TLS:
+
+```yaml
+servers: ["tls://nats.internal:4222"]
+tls:
+  ca_cert_path: /etc/faucet/nats-ca.pem
+  client_cert_path: /etc/faucet/client.pem
+  client_key_path: /etc/faucet/client.key
 ```
 
 ## License

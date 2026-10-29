@@ -160,6 +160,16 @@ impl SqlDialect for Oracle {
         column_type(t, false)
     }
 
+    /// An unbounded decimal is created as `NUMBER`: 38 significant digits;
+    /// timestamps keep nanoseconds.
+    fn declared_fits(&self, t: &LogicalType, value: &faucet_core::Value) -> bool {
+        super::fits_bounded(t, value, Some((38, None)), self.time_fraction_digits())
+    }
+
+    fn time_fraction_digits(&self) -> Option<usize> {
+        Some(9)
+    }
+
     fn declared_type_name(&self, t: &LogicalType) -> Option<String> {
         Some(match t {
             LogicalType::Int64 => "NUMBER(19)".into(),

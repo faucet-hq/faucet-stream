@@ -1,0 +1,56 @@
+[package]
+name = "faucet-fuzz"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT OR Apache-2.0"
+description = "cargo-fuzz targets for faucet-stream's parsers (not published)"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Its own workspace: the fuzz crate builds on nightly with sanitizer flags and
+# must never join the main workspace's build, lockfile or release.
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+serde_json = "1"
+chrono = "0.4"
+faucet-core = { path = "../crates/core" }
+faucet-cli = { path = "../cli", default-features = false }
+# The pgoutput decoder is compiled from its source files (fuzz_targets/pgoutput.rs)
+# so the postgres-cdc crate, and the sqlx macros the sanitizer build cannot load, stay out.
+base64 = "0.22"
+byteorder = "1"
+tracing = "0.1"
+
+[[bin]]
+name = "interpolate"
+path = "fuzz_targets/interpolate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "quote_ident"
+path = "fuzz_targets/quote_ident.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pgoutput"
+path = "fuzz_targets/pgoutput.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fidelity_from_str"
+path = "fuzz_targets/fidelity_from_str.rs"
+test = false
+doc = false
+bench = false

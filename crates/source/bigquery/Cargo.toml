@@ -47,7 +47,8 @@ arrow = [
 ]
 
 [dev-dependencies]
-faucet-conformance.workspace = true
+faucet-conformance = { workspace = true, features = ["containers"] }
+testcontainers = "0.27"
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
 futures = { workspace = true }
 serde_json.workspace = true

@@ -4,8 +4,23 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # Wait a week before proposing a new release, so a compromised or yanked
+    # version has time to be caught upstream.
+    cooldown:
+      default-days: 7
     groups:
       github-actions:
         patterns: ["*"]
     commit-message:
       prefix: ci
+  # Keeps the Dockerfile's digest-pinned base images current.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    # Wait a week before proposing a new release, so a compromised or yanked
+    # version has time to be caught upstream.
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: build

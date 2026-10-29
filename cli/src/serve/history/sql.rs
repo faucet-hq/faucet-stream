@@ -245,14 +245,31 @@ macro_rules! migrate {
                     .map_err(|e| ctx("backfilling change tenants", e))?;
                 }
             }
-            // Every run without label rows (written before v7, or by an older
-            // peer since) gets them from its body (#958). Idempotent.
-            let rows = sqlx::query(
-                "SELECT r.run_id, r.body FROM faucet_serve_runs r WHERE NOT EXISTS \
-                 (SELECT 1 FROM faucet_serve_run_labels l WHERE l.run_id = r.run_id)",
-            )
-            .fetch_all($pool)
+            // A run without label rows (written before v7, or by a v6 peer
+            // during a rolling upgrade) gets them from its body (#958). Each
+            // pass reads only runs submitted since the previous one began,
+            // less a margin for clock skew and in-flight inserts.
+            let backfill_from = $crate::serve::history::sql::label_backfill_mark(chrono::Utc::now());
+            let since: Option<String> = sqlx::query(&format!(
+                "SELECT version FROM faucet_serve_schema WHERE id='{}'",
+                $crate::serve::history::sql::LABEL_BACKFILL_ID
+            ))
+            .fetch_optional($pool)
             .await
+            .map_err(|e| ctx("backfilling run labels", e))?
+            .and_then(|r| r.try_get::<String, _>("version").ok());
+            let scan = "SELECT r.run_id, r.body FROM faucet_serve_runs r WHERE NOT EXISTS \
+                 (SELECT 1 FROM faucet_serve_run_labels l WHERE l.run_id = r.run_id)";
+            let rows = match &since {
+                Some(from) => sqlx::query(&format!(
+                    "{scan} AND r.submitted_at >= {}",
+                    $crate::serve::history::sql::bind_mark(&*$pool, 1)
+                ))
+                .bind(from)
+                .fetch_all($pool)
+                .await,
+                None => sqlx::query(scan).fetch_all($pool).await,
+            }
             .map_err(|e| ctx("backfilling run labels", e))?;
             for row in rows {
                 let body: String = row.try_get("body").unwrap_or_default();
@@ -273,6 +290,18 @@ macro_rules! migrate {
                     .map_err(|e| ctx("backfilling run labels", e))?;
                 }
             }
+            sqlx::query(&format!(
+                "INSERT INTO faucet_serve_schema (id, version) VALUES ('{}', {}) \
+                 ON CONFLICT (id) DO UPDATE SET version = CASE \
+                 WHEN faucet_serve_schema.version < excluded.version \
+                 THEN excluded.version ELSE faucet_serve_schema.version END",
+                $crate::serve::history::sql::LABEL_BACKFILL_ID,
+                $crate::serve::history::sql::bind_mark(&*$pool, 1)
+            ))
+            .bind(backfill_from)
+            .execute($pool)
+            .await
+            .map_err(|e| ctx("backfilling run labels", e))?;
             for stmt in POST_MIGRATION_DDL {
                 sqlx::query(stmt)
                     .execute($pool)
@@ -733,6 +762,8 @@ pub struct Stmts {
     pub upsert: String,
     /// `upsert` that leaves an existing row alone.
     pub insert_new: String,
+    /// `upsert` that only updates an existing row (same binds).
+    pub update_run: String,
     pub select_body: String,
     /// A run's owner and status (lease-ownership check).
     pub select_run_owner: String,
@@ -960,6 +991,10 @@ pub struct Stmts {
     pub purge_orphan_tenant_runs: String,
     /// Insert one `(run_id, key, value)` label row (#958).
     pub run_label_insert: String,
+    /// Insert one label row unless the run already has that key (#975).
+    pub run_label_insert_missing: String,
+    /// `1` when the run has any label row. Param: run id.
+    pub run_labels_exist: String,
     /// Drop every label row of one run.
     pub run_labels_delete: String,
     /// Drop label rows whose run is gone. No params.
@@ -1332,6 +1367,10 @@ impl Stmts {
             insert_new: "INSERT INTO faucet_serve_runs \
                 (run_id,name,status,submitted_at,finished_at,idempotency_key,owner,lease_expires_at,body,pool) \
                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (run_id) DO NOTHING"
+                .into(),
+            update_run: "UPDATE faucet_serve_runs SET name=$2,status=$3,submitted_at=$4,\
+                finished_at=$5,idempotency_key=$6,owner=$7,lease_expires_at=$8,body=$9,pool=$10 \
+                WHERE run_id=$1"
                 .into(),
             select_body: "SELECT body FROM faucet_serve_runs WHERE run_id=$1".into(),
             select_run_owner: "SELECT owner, status FROM faucet_serve_runs WHERE run_id=$1".into(),
@@ -1734,6 +1773,11 @@ impl Stmts {
                 VALUES ($1,$2,$3) \
                 ON CONFLICT (run_id, key) DO UPDATE SET value=excluded.value"
                 .into(),
+            run_label_insert_missing: "INSERT INTO faucet_serve_run_labels (run_id, key, value) \
+                VALUES ($1,$2,$3) ON CONFLICT (run_id, key) DO NOTHING"
+                .into(),
+            run_labels_exist: "SELECT 1 FROM faucet_serve_run_labels WHERE run_id=$1 LIMIT 1"
+                .into(),
             run_labels_delete: "DELETE FROM faucet_serve_run_labels WHERE run_id=$1".into(),
             purge_orphan_run_labels: "DELETE FROM faucet_serve_run_labels \
                 WHERE run_id NOT IN (SELECT run_id FROM faucet_serve_runs)"
@@ -1936,6 +1980,10 @@ impl Stmts {
             insert_new: "INSERT INTO faucet_serve_runs \
                 (run_id,name,status,submitted_at,finished_at,idempotency_key,owner,lease_expires_at,body,pool) \
                 VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT (run_id) DO NOTHING"
+                .into(),
+            update_run: "UPDATE faucet_serve_runs SET name=?2,status=?3,submitted_at=?4,\
+                finished_at=?5,idempotency_key=?6,owner=?7,lease_expires_at=?8,body=?9,pool=?10 \
+                WHERE run_id=?1"
                 .into(),
             select_body: "SELECT body FROM faucet_serve_runs WHERE run_id=?".into(),
             select_run_owner: "SELECT owner, status FROM faucet_serve_runs WHERE run_id=?".into(),
@@ -2330,6 +2378,11 @@ impl Stmts {
                 VALUES (?,?,?) \
                 ON CONFLICT (run_id, key) DO UPDATE SET value=excluded.value"
                 .into(),
+            run_label_insert_missing: "INSERT INTO faucet_serve_run_labels (run_id, key, value) \
+                VALUES (?,?,?) ON CONFLICT (run_id, key) DO NOTHING"
+                .into(),
+            run_labels_exist: "SELECT 1 FROM faucet_serve_run_labels WHERE run_id=? LIMIT 1"
+                .into(),
             run_labels_delete: "DELETE FROM faucet_serve_run_labels WHERE run_id=?".into(),
             purge_orphan_run_labels: "DELETE FROM faucet_serve_run_labels \
                 WHERE run_id NOT IN (SELECT run_id FROM faucet_serve_runs)"
@@ -2563,6 +2616,16 @@ pub async fn retry_backoff(attempt: usize) {
 /// Fixed-width RFC3339 (nanoseconds + `Z`) — lexicographically sortable.
 pub fn fmt_ts(dt: DateTime<Utc>) -> String {
     dt.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+}
+
+/// The `faucet_serve_schema` row recording where the next run-label backfill
+/// starts (#958).
+pub const LABEL_BACKFILL_ID: &str = "run_labels_backfill_from";
+
+/// Where the run-label backfill that starts at `now` lets the next one begin:
+/// an hour earlier, so a peer's run submitted just before is still read.
+pub fn label_backfill_mark(now: DateTime<Utc>) -> String {
+    fmt_ts(now - chrono::Duration::hours(1))
 }
 
 /// Zero-pad a run-log sequence to a fixed 20 digits (the width of `u64::MAX`) so
@@ -2999,33 +3062,64 @@ macro_rules! impl_sql_history {
                 let lease = sql::fmt_ts(chrono::Utc::now() + self.lease_ttl);
                 let backend = $crate::serve::history::sql::classify_backend_error;
                 let mut tx = self.pool.begin_with($begin_write).await.map_err(backend)?;
-                sqlx::query(&self.stmts.upsert)
-                    .bind(&rec.run_id)
-                    .bind(rec.name.as_deref())
-                    .bind(rec.status.as_str())
-                    .bind(&submitted)
-                    .bind(finished.as_deref())
-                    .bind(rec.idempotency_key.as_deref())
-                    .bind(&self.instance_id)
-                    .bind(&lease)
-                    .bind(&body)
-                    .bind(&rec.pool)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(backend)?;
-                sqlx::query(&self.stmts.run_labels_delete)
-                    .bind(&rec.run_id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(backend)?;
-                for (k, v) in &rec.labels {
-                    sqlx::query(&self.stmts.run_label_insert)
+                // Labels never change after submit: they are written with the
+                // row, and a status update only fills them in when the row has
+                // none (#975).
+                let attempts = [
+                    &self.stmts.update_run,
+                    &self.stmts.insert_new,
+                    &self.stmts.upsert,
+                ];
+                for (i, stmt) in attempts.into_iter().enumerate() {
+                    let written = sqlx::query(stmt)
                         .bind(&rec.run_id)
-                        .bind(k)
-                        .bind(v)
+                        .bind(rec.name.as_deref())
+                        .bind(rec.status.as_str())
+                        .bind(&submitted)
+                        .bind(finished.as_deref())
+                        .bind(rec.idempotency_key.as_deref())
+                        .bind(&self.instance_id)
+                        .bind(&lease)
+                        .bind(&body)
+                        .bind(&rec.pool)
                         .execute(&mut *tx)
                         .await
-                        .map_err(backend)?;
+                        .map_err(backend)?
+                        .rows_affected();
+                    if written == 0 {
+                        continue;
+                    }
+                    if i == 1 {
+                        for (k, v) in &rec.labels {
+                            sqlx::query(&self.stmts.run_label_insert)
+                                .bind(&rec.run_id)
+                                .bind(k)
+                                .bind(v)
+                                .execute(&mut *tx)
+                                .await
+                                .map_err(backend)?;
+                        }
+                    } else if !rec.labels.is_empty()
+                        && sqlx::query(&self.stmts.run_labels_exist)
+                            .bind(&rec.run_id)
+                            .fetch_optional(&mut *tx)
+                            .await
+                            .map_err(backend)?
+                            .is_none()
+                    {
+                        // A row written without its labels (a v6 peer, or a
+                        // concurrent insert) gets them on its next write.
+                        for (k, v) in &rec.labels {
+                            sqlx::query(&self.stmts.run_label_insert_missing)
+                                .bind(&rec.run_id)
+                                .bind(k)
+                                .bind(v)
+                                .execute(&mut *tx)
+                                .await
+                                .map_err(backend)?;
+                        }
+                    }
+                    break;
                 }
                 tx.commit().await.map_err(backend)?;
                 Ok(())

@@ -9,7 +9,7 @@
 //   • `stable` / `previous` / `newest` are derived; `dev`…`prod` are assignable
 import { api, toast } from "../api.js";
 import { navigate } from "../router.js";
-import { escapeHtml, mdInline } from "../utils.js";
+import { copyButton, escapeHtml, mdInline } from "../utils.js";
 import { fmtTime } from "./runs.js";
 
 const TEMPLATES_MISSING =
@@ -890,7 +890,7 @@ function renderVersions(host, id, st, d, reload) {
         title="${retired ? `make v${v} usable again` : `retire v${v}: pinned runs still work but warn, newest skips it, launch refuses it`}">${retired ? "Revive" : "Deprecate"}</button>
       <button class="btn-danger tpl-del" data-perm="template_admin">Delete</button>
       ${tb.body}
-      <pre class="tpl-body" hidden></pre>`;
+      <div class="tpl-body-wrap" hidden><pre class="tpl-body"></pre></div>`;
 
     const runTests = row.querySelector(".tpl-runtests");
     if (runTests) {
@@ -945,14 +945,18 @@ function renderVersions(host, id, st, d, reload) {
     };
 
     const body = row.querySelector(".tpl-body");
+    const wrap = row.querySelector(".tpl-body-wrap");
+    const copy = copyButton(() => body.textContent, "Copy config");
+    copy.addEventListener("copy-failed", (ev) => toast(ev.detail.message, "error"));
+    wrap.appendChild(copy);
     // Config = raw stored body; Clean = comments stripped, canonical YAML (the
     // server renders it via ?clean=true, sharing the CLI's clean_config_yaml).
     // Each toggles the shared <pre>; switching modes refetches so the two views
     // never collide.
     const showConfig = async (clean) => {
       const mode = clean ? "clean" : "raw";
-      if (!body.hidden && body.dataset.mode === mode) {
-        body.hidden = true;
+      if (!wrap.hidden && body.dataset.mode === mode) {
+        wrap.hidden = true;
         return;
       }
       try {
@@ -962,8 +966,11 @@ function renderVersions(host, id, st, d, reload) {
           ? "Config withheld: only an unscoped admin can read a template's stored config."
           : rec.body;
         body.classList.toggle("tpl-body-withheld", !!rec.body_withheld);
+        copy.hidden = !!rec.body_withheld;
+        copy.title = clean ? "Copy clean config" : "Copy config";
+        copy.setAttribute("aria-label", copy.title);
         body.dataset.mode = mode;
-        body.hidden = false;
+        wrap.hidden = false;
       } catch (e) {
         toast(e.message, "error");
       }

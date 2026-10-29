@@ -20,7 +20,7 @@ shape). Variants:
 | `sas_token` | `sas_token` | Shared-access-signature token |
 | `connection_string` | `connection_string` | Full storage connection string (`EndpointSuffix`, `DefaultEndpointsProtocol` and `UseDevelopmentStorage=true` are honoured) |
 | `managed_identity` | `client_id` (optional) | IMDS; omit `client_id` for the system-assigned identity |
-| `service_principal` | `client_id`, `client_secret`, `tenant_id` | Azure AD client credentials |
+| `service_principal` | `client_id`, `client_secret`, `tenant_id`, `authority_host` (optional) | Azure AD client credentials. `authority_host` selects a sovereign or private cloud (`https://login.microsoftonline.us`, `https://login.chinacloudapi.cn`); unset, `AZURE_AUTHORITY_HOST` from the environment applies, else the public cloud (`https://login.microsoftonline.com`). It must be `https://` (`http://` only to a loopback host, which also needs `allow_http`); a bad value is a `FaucetError::Config` when the client is built |
 | `default` | — | Default credential chain (env / workload identity / managed identity / Azure CLI). **Default.** |
 
 ## Connection
@@ -31,7 +31,8 @@ shape). Variants:
 builder starts from `MicrosoftAzureBuilder::from_env()`, so the environment's
 credential chain applies. With any explicit `auth` only the non-credential
 `AZURE_*` settings (account, endpoint, emulator and HTTP-client options) are
-taken from the environment, so a key, secret or workload identity there can
+taken from the environment (plus `AZURE_AUTHORITY_HOST` for a service principal
+without an `authority_host`), so a key, secret or workload identity there can
 never replace the configured credential.
 
 ```rust

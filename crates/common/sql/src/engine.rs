@@ -343,7 +343,8 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
         if let Some(column) = json_column {
             return self.dialect.create_json_table_sql(target, column).map(Some);
         }
-        match faucet_core::plan_table_declared(records, self.table_key(), declared) {
+        let fits = |t: &faucet_core::LogicalType, v: &Value| self.dialect.declared_fits(t, v);
+        match faucet_core::plan_table_declared_with(records, self.table_key(), declared, &fits) {
             Some(columns) => self
                 .dialect
                 .create_table_sql(target, &columns, self.table_key())

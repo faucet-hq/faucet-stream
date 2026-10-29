@@ -656,6 +656,17 @@ mod tests {
     }
 
     #[test]
+    fn an_hms_catalog_is_accepted() {
+        let cfg = parse(serde_json::json!({
+            "catalog": { "type": "hms", "uri": "thrift://hms:9083", "warehouse": "s3://b/w" },
+            "namespace": ["analytics"],
+            "table": "events"
+        }));
+        cfg.validate()
+            .expect("an HMS catalog with uri and warehouse is valid");
+    }
+
+    #[test]
     fn sql_and_hms_without_uri_are_rejected() {
         for ty in ["sql", "hms"] {
             let cfg = parse(serde_json::json!({

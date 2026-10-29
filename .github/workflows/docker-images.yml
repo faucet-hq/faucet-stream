@@ -99,8 +99,12 @@ jobs:
             oracle: "false"
             cargo_profile: release-lto
     steps:
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Check the release matches this commit's faucet-cli version
@@ -265,8 +269,12 @@ jobs:
       matrix:
         profile: [full, core, analytics, cdc]
     steps:
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -281,8 +289,10 @@ jobs:
 
       - name: Compute tags
         id: tags
+        env:
+          IMAGE_NAME: ${{ steps.img.outputs.name }}
         run: |
-          base="${{ steps.img.outputs.name }}"
+          base="${IMAGE_NAME}"
           profile="${{ matrix.profile }}"
           v=""
           if [ "${{ github.event_name }}" = "release" ]; then
@@ -358,7 +368,8 @@ jobs:
       - name: Sign the image (keyless)
         env:
           DIGEST: ${{ steps.index.outputs.digest }}
-        run: cosign sign --yes --recursive "${{ steps.img.outputs.name }}@${DIGEST}"
+          IMAGE_NAME: ${{ steps.img.outputs.name }}
+        run: cosign sign --yes --recursive "${IMAGE_NAME}@${DIGEST}"
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
@@ -389,8 +400,12 @@ jobs:
     env:
       RELEASE: ${{ inputs.release }}
     steps:
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
@@ -418,35 +433,44 @@ jobs:
           echo "app=$app" >>"$GITHUB_OUTPUT"
 
       - name: Package chart
+        env:
+          CHART_VERSION: ${{ steps.v.outputs.v }}
+          APP_VERSION: ${{ steps.v.outputs.app }}
         run: |
           helm package deploy/helm/faucet-stream \
-            --version "${{ steps.v.outputs.v }}" \
-            --app-version "${{ steps.v.outputs.app }}"
+            --version "${CHART_VERSION}" \
+            --app-version "${APP_VERSION}"
 
       - name: Push chart to GHCR (OCI)
         if: github.event_name == 'release' || inputs.push
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          CHART_VERSION: ${{ steps.v.outputs.v }}
         run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" \
-            | helm registry login "${REGISTRY}" -u "${{ github.actor }}" --password-stdin
-          helm push "faucet-stream-${{ steps.v.outputs.v }}.tgz" \
+          echo "$REGISTRY_TOKEN" \
+            | helm registry login "${REGISTRY}" -u "$ACTOR" --password-stdin
+          helm push "faucet-stream-${CHART_VERSION}.tgz" \
             "oci://${REGISTRY}/${GITHUB_REPOSITORY_OWNER}/charts"
 
       - name: Build deploy bundle (Dockerfile + chart + README)
+        env:
+          CHART_VERSION: ${{ steps.v.outputs.v }}
         run: |
-          root="faucet-stream-deploy-${{ steps.v.outputs.v }}"
+          root="faucet-stream-deploy-${CHART_VERSION}"
           mkdir -p "bundle/${root}"
           cp Dockerfile "bundle/${root}/"
           cp -r deploy/helm/faucet-stream "bundle/${root}/helm-chart"
           cat > "bundle/${root}/README.md" <<MD
-          # faucet-stream deployment bundle (v${{ steps.v.outputs.v }})
+          # faucet-stream deployment bundle (v${CHART_VERSION})
 
           Self-contained Dockerfile + Helm chart.
 
           ## Container image (prebuilt, GHCR)
-              docker pull ${REGISTRY}/${GITHUB_REPOSITORY_OWNER}/faucet-stream:${{ steps.v.outputs.v }}
+              docker pull ${REGISTRY}/${GITHUB_REPOSITORY_OWNER}/faucet-stream:${CHART_VERSION}
 
           ## Helm chart (OCI, GHCR)
-              helm install faucet oci://${REGISTRY}/${GITHUB_REPOSITORY_OWNER}/charts/faucet-stream --version ${{ steps.v.outputs.v }}
+              helm install faucet oci://${REGISTRY}/${GITHUB_REPOSITORY_OWNER}/charts/faucet-stream --version ${CHART_VERSION}
 
           ## Or from this bundle
               helm install faucet ./helm-chart
@@ -458,4 +482,5 @@ jobs:
         if: github.event_name == 'release'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${GITHUB_REF_NAME}" "faucet-stream-deploy-${{ steps.v.outputs.v }}.tar.gz" --clobber
+          CHART_VERSION: ${{ steps.v.outputs.v }}
+        run: gh release upload "${GITHUB_REF_NAME}" "faucet-stream-deploy-${CHART_VERSION}.tar.gz" --clobber

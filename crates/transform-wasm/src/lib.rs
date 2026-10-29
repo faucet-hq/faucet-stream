@@ -1,8 +1,9 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 //! WebAssembly-as-transform for faucet-stream.
 //!
-//! Loads a user-provided, precompiled `.wasm` module through [`wasmtime`] and
-//! invokes an exported function once per record. Any language that compiles to
+//! Loads a user-provided module (a compiled `.wasm` binary or `.wat` text)
+//! through [`wasmtime`] and invokes an exported function once per record. Any
+//! language that compiles to
 //! core WebAssembly (Rust, TinyGo, AssemblyScript, Zig, C/C++, …) can express
 //! arbitrary per-record logic in a faucet pipeline without forking the project.
 //!

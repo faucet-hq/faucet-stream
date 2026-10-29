@@ -257,6 +257,37 @@ status-error shape. `faucet_core::batching` re-chunks under the `batch_size`
 contract (`chunks`, `into_chunks`) and bounds concurrency (`map_concurrent`,
 `for_each_concurrent`, `ConcurrencyLimit`).
 
+### TLS: private CAs and client certificates
+
+`faucet_core::TlsOptions` is the shared `tls:` config block for connectors
+that dial a TLS server themselves (Redis, NATS, Elasticsearch, #972 / #973):
+`ca_cert_path` or `ca_cert_pem` (the only trust anchor when set),
+`client_cert_path` + `client_key_path` (mutual TLS, both paths annotated
+`x-faucet-resource: path`) and `insecure_skip_verify` (default `false`).
+`validate(connector)` checks its shape without I/O; `load(connector)` reads the
+files into a `LoadedTls` (PEM bytes, a `ClientPem` pair, the insecure flag),
+logs a warning when verification is off, and fails with `FaucetError::Config`
+on an unreadable or non-PEM file.
+
+An HTTP connector applies it with `ClientBuilder::tls(&LoadedTls)`: the CA
+replaces the platform roots (the same on every OS), the client certificate is
+presented on every request, and `insecure_skip_verify` turns verification
+off. A malformed certificate or key fails `build()` with `FaucetError::Config`.
+
+```rust
+let tls = config.tls.load("my-connector")?;
+let client = faucet_core::http::Client::builder().tls(&tls).build()?;
+```
+
+`TlsClientConfig` remains the client-identity block of the `rest` / `xml` /
+`graphql` sources.
+
+A connector that opens a TLS connection through anything other than
+`faucet_core::http::Client` (a database driver, a broker client, a WebSocket)
+calls `faucet_core::ensure_crypto_provider()` before connecting. A build that
+links two rustls providers otherwise has no default, and the first TLS connect
+panics (#971). It is idempotent and keeps a provider the application installed.
+
 The workspace `clippy.toml` disallows constructing reqwest clients directly and
 `tokio::time::sleep` / `sleep_until` / `std::thread::sleep`; a sanctioned site
 carries `#[allow(clippy::disallowed_methods)] // <reason>`.
@@ -789,6 +820,7 @@ wrapper with `faucet_conformance::forwarding::assert_sink_forwards_every_hook` /
 | `retry` | `execute_with_retry` (exponential backoff + jitter) |
 | `io` | `CallContext`, `CallSlot`, `DEFAULT_CALL_TIMEOUT` — the backend-call wrapper (#880) |
 | `http` | `Client`, `ClientBuilder`, `status_error`, `is_cross_origin`, `strip_credentials`, `ResponseTooLarge` |
+| `tls` | `TlsOptions`, `LoadedTls`, `ClientPem` (server verification + client certificates), `TlsClientConfig` (HTTP-source mTLS), `ensure_crypto_provider` (the process-wide rustls provider) |
 | `batching` | `chunks`, `into_chunks`, `map_concurrent`, `for_each_concurrent`, `ConcurrencyLimit` |
 | `schema` | `infer_schema` from record samples |
 | `check` | `CheckContext`, `Probe`, `CheckReport` for `faucet doctor` |

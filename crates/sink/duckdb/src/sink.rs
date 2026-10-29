@@ -529,7 +529,9 @@ fn prepare_table_blocking(
     }
     let mut columns = match (
         json_column,
-        faucet_core::plan_columns_declared(records, declared),
+        faucet_core::plan_columns_declared_with(records, declared, &|t, v| {
+            Duckdb.declared_fits(t, v)
+        }),
     ) {
         (Some(_), _) => Vec::new(),
         (None, Some(c)) => c,
@@ -815,10 +817,10 @@ impl SinkDriver for DuckdbDriver {
     fn capabilities(&self, derived: faucet_core::Capabilities) -> faucet_core::Capabilities {
         derived
             .to_builder()
-            .declared_types(matches!(
-                self.config.column_mapping,
-                DuckdbColumnMapping::AutoMap
-            ))
+            .declared_types(
+                self.config.create_table
+                    && matches!(self.config.column_mapping, DuckdbColumnMapping::AutoMap),
+            )
             .build()
     }
 

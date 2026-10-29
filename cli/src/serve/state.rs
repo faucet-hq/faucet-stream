@@ -206,6 +206,7 @@ impl ServerState {
     /// Attach the vault key (server startup, #956).
     #[cfg(feature = "encryption")]
     pub fn set_vault(&self, vault: Option<Arc<crate::serve::vault::Vault>>) {
+        self.inner.log_export.set_vault(vault.clone());
         *self.inner.vault.write().unwrap_or_else(|e| e.into_inner()) = vault;
     }
 

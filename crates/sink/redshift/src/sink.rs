@@ -12,10 +12,12 @@
 
 use async_trait::async_trait;
 use aws_sdk_s3::Client as S3Client;
+use faucet_common_redshift::data_api::{Effect, Statement};
+use faucet_common_redshift::{DataApiClient, RedshiftPool};
 use faucet_core::driver::{DriverSink, PageWrite, RowPolicy, SinkDriver};
 use faucet_core::{CallSlot, FaucetError};
 use serde_json::Value;
-use sqlx::{PgPool, Row};
+use sqlx::Row;
 
 use crate::config::{RedshiftCopyFormat, RedshiftSinkConfig, RedshiftWriteStrategy};
 use crate::copy::{
@@ -106,12 +108,65 @@ pub(crate) struct RedshiftDriver {
     /// pressure.
     pending: tokio::sync::Mutex<faucet_core::PageAccumulator>,
     config: RedshiftSinkConfig,
-    pool: PgPool,
+    backend: Backend,
     /// S3 client, built only for the `copy` strategy.
     s3: Option<S3Client>,
 }
 
+/// How statements reach Redshift.
+enum Backend {
+    /// The PostgreSQL wire protocol (`password`, `iam`).
+    Wire(RedshiftPool),
+    /// The Redshift Data API over HTTPS (`redshift_data_api`).
+    DataApi(Box<DataApiClient>),
+}
+
+/// How many bytes of SQL and parameter text one Data API `INSERT` carries
+/// at most; a longer page is split into several statements.
+const DATA_API_STATEMENT_BUDGET: usize = 60_000;
+
 impl RedshiftDriver {
+    /// Run `sql` (DDL, `COPY`) as one write; `what` prefixes the error.
+    async fn execute_sql(
+        &self,
+        calls: &CallSlot,
+        op: &'static str,
+        sql: &str,
+        what: &str,
+    ) -> Result<(), FaucetError> {
+        match &self.backend {
+            Backend::Wire(pool) => {
+                let pool = pool.get(&calls.get()).await?;
+                self.call(calls, op, async {
+                    sqlx::query(sql)
+                        .execute(&pool)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| FaucetError::Sink(format!("{what}: {e}")))
+                })
+                .await
+            }
+            Backend::DataApi(api) => {
+                Box::pin(api.execute(&calls.get(), Effect::Write, &Statement::new(sql)))
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| prefixed(e, what))
+            }
+        }
+    }
+
+    /// Run a catalog query through the Data API.
+    async fn data_api_rows(
+        &self,
+        calls: &CallSlot,
+        api: &DataApiClient,
+        sql: &str,
+        binds: &[Value],
+    ) -> Result<Vec<serde_json::Map<String, Value>>, FaucetError> {
+        let st = faucet_common_redshift::data_api::named_parameters(sql, binds);
+        Ok(Box::pin(api.query(&calls.get(), &st)).await?.1)
+    }
+
     /// Run `fut` as the single backend call `op` (#880).
     async fn call<T>(
         &self,
@@ -198,21 +253,35 @@ impl RedshiftDriver {
             return Ok(());
         }
         if !self.config.create_table {
-            let exists: Option<i32> = self
-                .call(calls, "query", async {
-                    sqlx::query_scalar(&format!(
-                        "SELECT 1 FROM pg_catalog.pg_class c \
-                         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-                         WHERE {TARGET_RELATION} LIMIT 1"
-                    ))
-                    .bind(&self.config.table_name)
-                    .bind(self.config.schema.as_deref())
-                    .fetch_optional(&self.pool)
+            let probe = format!(
+                "SELECT 1 FROM pg_catalog.pg_class c \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE {TARGET_RELATION} LIMIT 1"
+            );
+            let exists = match &self.backend {
+                Backend::Wire(pool) => {
+                    let pool = pool.get(&calls.get()).await?;
+                    let found: Option<i32> = self
+                        .call(calls, "query", async {
+                            sqlx::query_scalar(&probe)
+                                .bind(&self.config.table_name)
+                                .bind(self.config.schema.as_deref())
+                                .fetch_optional(&pool)
+                                .await
+                                .map_err(|e| {
+                                    FaucetError::Sink(format!("redshift table probe failed: {e}"))
+                                })
+                        })
+                        .await?;
+                    found.is_some()
+                }
+                Backend::DataApi(api) => !self
+                    .data_api_rows(calls, api, &probe, &self.catalog_binds())
                     .await
-                    .map_err(|e| FaucetError::Sink(format!("redshift table probe failed: {e}")))
-                })
-                .await?;
-            if exists.is_none() {
+                    .map_err(|e| prefixed(e, "redshift table probe failed"))?
+                    .is_empty(),
+            };
+            if !exists {
                 return Err(faucet_core::missing_target_error(
                     "redshift sink",
                     &self.table_ref(),
@@ -224,7 +293,16 @@ impl RedshiftDriver {
         // A page with nothing inferable leaves the table uncreated so the next
         // page can try, rather than emitting a zero-column CREATE.
         let declared = self.declared.get();
-        let Some(columns) = faucet_core::plan_columns_declared(records, declared.as_ref()) else {
+        let fits = |t: &faucet_core::LogicalType, v: &Value| {
+            faucet_common_sql::SqlDialect::declared_fits(
+                &faucet_common_sql::dialects::Redshift,
+                t,
+                v,
+            )
+        };
+        let Some(columns) =
+            faucet_core::plan_columns_declared_with(records, declared.as_ref(), &fits)
+        else {
             return Ok(());
         };
         if let Some(schema) = self.config.schema.as_deref() {
@@ -232,22 +310,12 @@ impl RedshiftDriver {
                 "CREATE SCHEMA IF NOT EXISTS {}",
                 faucet_core::util::quote_ident(schema)
             );
-            self.call(calls, "execute", async {
-                sqlx::query(&sql)
-                    .execute(&self.pool)
-                    .await
-                    .map_err(|e| FaucetError::Sink(format!("redshift CREATE SCHEMA failed: {e}")))
-            })
-            .await?;
+            self.execute_sql(calls, "execute", &sql, "redshift CREATE SCHEMA failed")
+                .await?;
         }
         let sql = build_create_table_sql(&self.table_ref(), &columns);
-        self.call(calls, "execute", async {
-            sqlx::query(&sql)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| FaucetError::Sink(format!("redshift CREATE TABLE failed: {e}")))
-        })
-        .await?;
+        self.execute_sql(calls, "execute", &sql, "redshift CREATE TABLE failed")
+            .await?;
         self.table_ready.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -284,11 +352,12 @@ impl RedshiftDriver {
             };
             let sql = crate::copy::add_column_sql(&self.table_ref(), col);
             let added = self
-                .call(calls, "execute", async {
-                    sqlx::query(&sql).execute(&self.pool).await.map_err(|e| {
-                        FaucetError::Sink(format!("redshift: ALTER TABLE ADD COLUMN failed: {e}"))
-                    })
-                })
+                .execute_sql(
+                    calls,
+                    "execute",
+                    &sql,
+                    "redshift: ALTER TABLE ADD COLUMN failed",
+                )
                 .await;
             if let Err(e) = added {
                 if matches!(
@@ -328,8 +397,13 @@ impl RedshiftDriver {
     /// for the `copy` strategy — an S3 client.
     async fn new(config: RedshiftSinkConfig) -> Result<Self, FaucetError> {
         config.validate()?;
-        let pool =
-            faucet_common_redshift::build_pool_lazy(&config.connection, config.max_connections)?;
+        let backend = match DataApiClient::from_connection(&config.connection, FaucetError::Sink)? {
+            Some(api) => Backend::DataApi(Box::new(api)),
+            None => Backend::Wire(faucet_common_redshift::connect_lazy(
+                &config.connection,
+                config.max_connections,
+            )?),
+        };
         let s3 = if config.write_strategy == RedshiftWriteStrategy::Copy {
             Some(Self::build_s3_client(&config).await)
         } else {
@@ -345,7 +419,7 @@ impl RedshiftDriver {
                 config.commit_bytes,
             )),
             config,
-            pool,
+            backend,
             s3,
         })
     }
@@ -361,11 +435,26 @@ impl RedshiftDriver {
             loader = loader.endpoint_url(endpoint);
         }
         let sdk_config = loader.load().await;
-        S3Client::new(&sdk_config)
+        // S3-compatible stores (MinIO) do not serve virtual-hosted bucket names.
+        let s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
+            .force_path_style(copy_cfg.endpoint_url.is_some())
+            .build();
+        S3Client::from_conf(s3_config)
     }
 
     fn table_ref(&self) -> String {
         qualified_table_ref(self.config.schema.as_deref(), &self.config.table_name)
+    }
+
+    /// The `$1` table / `$2` schema binds of [`TARGET_RELATION`].
+    fn catalog_binds(&self) -> [Value; 2] {
+        [
+            Value::String(self.config.table_name.clone()),
+            self.config
+                .schema
+                .clone()
+                .map_or(Value::Null, Value::String),
+        ]
     }
 
     /// Generate a unique staging object key for one page.
@@ -402,34 +491,55 @@ impl RedshiftDriver {
         &self,
         calls: &CallSlot,
     ) -> Result<Vec<(String, String)>, FaucetError> {
-        let rows = self
-            .call(calls, "query", async {
-                sqlx::query(&format!(
-                    "SELECT a.attname::text AS column_name, \
-                     format_type(a.atttypid, a.atttypmod)::text AS data_type \
-                     FROM pg_catalog.pg_attribute a \
-                     JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
-                     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-                     WHERE {TARGET_RELATION} AND a.attnum > 0 AND NOT a.attisdropped \
-                     ORDER BY a.attnum"
-                ))
-                .bind(&self.config.table_name)
-                .bind(self.config.schema.as_deref())
-                .fetch_all(&self.pool)
+        let sql = format!(
+            "SELECT a.attname::text AS column_name, \
+             format_type(a.atttypid, a.atttypmod)::text AS data_type \
+             FROM pg_catalog.pg_attribute a \
+             JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE {TARGET_RELATION} AND a.attnum > 0 AND NOT a.attisdropped \
+             ORDER BY a.attnum"
+        );
+        let cols: Vec<(String, String)> = match &self.backend {
+            Backend::Wire(pool) => {
+                let pool = pool.get(&calls.get()).await?;
+                let rows = self
+                    .call(calls, "query", async {
+                        sqlx::query(&sql)
+                            .bind(&self.config.table_name)
+                            .bind(self.config.schema.as_deref())
+                            .fetch_all(&pool)
+                            .await
+                            .map_err(|e| {
+                                FaucetError::Sink(format!("redshift: column discovery failed: {e}"))
+                            })
+                    })
+                    .await?;
+                rows.iter()
+                    .map(|r| {
+                        (
+                            r.get::<String, _>("column_name"),
+                            r.get::<String, _>("data_type"),
+                        )
+                    })
+                    .collect()
+            }
+            Backend::DataApi(api) => self
+                .data_api_rows(calls, api, &sql, &self.catalog_binds())
                 .await
-                .map_err(|e| FaucetError::Sink(format!("redshift: column discovery failed: {e}")))
-            })
-            .await?;
-
-        let cols: Vec<(String, String)> = rows
-            .iter()
-            .map(|r| {
-                (
-                    r.get::<String, _>("column_name"),
-                    r.get::<String, _>("data_type"),
-                )
-            })
-            .collect();
+                .map_err(|e| prefixed(e, "redshift: column discovery failed"))?
+                .iter()
+                .map(|r| {
+                    let text = |k: &str| {
+                        r.get(k)
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string()
+                    };
+                    (text("column_name"), text("data_type"))
+                })
+                .collect(),
+        };
         if cols.is_empty() {
             return Err(FaucetError::Sink(format!(
                 "redshift: table {} has no columns or does not exist",
@@ -519,12 +629,7 @@ impl RedshiftDriver {
             sql.push_str(" MANIFEST");
         }
         let copy_result = self
-            .call(calls, "execute", async {
-                sqlx::query(&sql)
-                    .execute(&self.pool)
-                    .await
-                    .map_err(|e| FaucetError::Sink(format!("redshift: COPY failed: {e}")))
-            })
+            .execute_sql(calls, "execute", &sql, "redshift: COPY failed")
             .await;
         // A failed COPY still leaves the objects behind.
         staged.delete().await;
@@ -627,6 +732,22 @@ impl RedshiftDriver {
         );
         let mut total = 0usize;
 
+        if let Backend::DataApi(api) = &self.backend {
+            for sub in insertable.chunks(max_rows) {
+                for (statement, rows) in data_api_inserts(&self.table_ref(), &present, &casts, sub)?
+                {
+                    Box::pin(api.execute(&calls.get(), Effect::Write, &statement))
+                        .await
+                        .map_err(|e| prefixed(e, "redshift: INSERT failed"))?;
+                    total += rows;
+                }
+            }
+            return Ok(total);
+        }
+        let Backend::Wire(pool) = &self.backend else {
+            return Ok(total);
+        };
+        let pool = pool.get(&calls.get()).await?;
         for sub in insertable.chunks(max_rows) {
             let sql = insert_statement(&self.table_ref(), &present, &casts, sub.len());
             let mut q = sqlx::query(&sql);
@@ -643,7 +764,7 @@ impl RedshiftDriver {
                 }
             }
             self.call(calls, "execute", async {
-                q.execute(&self.pool)
+                q.execute(&pool)
                     .await
                     .map_err(|e| FaucetError::Sink(format!("redshift: INSERT failed: {e}")))
             })
@@ -652,6 +773,114 @@ impl RedshiftDriver {
         }
         Ok(total)
     }
+}
+
+/// `err` with `what` in front of its message (Data API errors carry no
+/// operation name of their own).
+fn prefixed(err: FaucetError, what: &str) -> FaucetError {
+    match err {
+        FaucetError::Sink(m) => FaucetError::Sink(format!("{what}: {m}")),
+        other => other,
+    }
+}
+
+/// The multi-row `INSERT`s for `rows` through the Data API, each with how
+/// many rows it carries. Values are `:pN` parameters (cast like the wire
+/// path's binds); a NULL or empty string is written into the SQL, since a
+/// parameter can be neither. A statement holds at most
+/// [`DATA_API_STATEMENT_BUDGET`] bytes of SQL and parameters, or one row.
+fn data_api_inserts(
+    table_ref: &str,
+    columns: &[String],
+    casts: &[Option<&str>],
+    rows: &[&Value],
+) -> Result<Vec<(Statement, usize)>, FaucetError> {
+    let head = format!(
+        "INSERT INTO {table_ref} ({}) VALUES ",
+        columns
+            .iter()
+            .map(|c| faucet_core::util::quote_ident(c))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let mut out = Vec::new();
+    let mut current = Statement::new(head.clone());
+    let mut size = head.len();
+    let mut count = 0usize;
+    for record in rows {
+        let obj = record.as_object().ok_or_else(|| {
+            FaucetError::Sink("redshift: insert requires JSON object records".into())
+        })?;
+        let mut row = insert_tuple(obj, columns, casts, current.parameters.len())?;
+        if count > 0 && size + row.2 > DATA_API_STATEMENT_BUDGET {
+            out.push((
+                std::mem::replace(&mut current, Statement::new(head.clone())),
+                count,
+            ));
+            size = head.len();
+            count = 0;
+            row = insert_tuple(obj, columns, casts, 0)?;
+        }
+        if count > 0 {
+            current.sql.push_str(", ");
+        }
+        current.sql.push_str(&row.0);
+        current.parameters.extend(row.1);
+        size += row.2;
+        count += 1;
+    }
+    if count > 0 {
+        out.push((current, count));
+    }
+    Ok(out)
+}
+
+/// A `VALUES` tuple, its parameters, and its size in bytes.
+type InsertTuple = (String, Vec<(String, String)>, usize);
+
+/// One `VALUES` tuple whose parameters are numbered after `first`, its
+/// parameters, and its size in bytes.
+fn insert_tuple(
+    obj: &serde_json::Map<String, Value>,
+    columns: &[String],
+    casts: &[Option<&str>],
+    first: usize,
+) -> Result<InsertTuple, FaucetError> {
+    let mut tuple = String::from("(");
+    let mut params: Vec<(String, String)> = Vec::new();
+    for (i, (col, cast)) in columns.iter().zip(casts).enumerate() {
+        if i > 0 {
+            tuple.push_str(", ");
+        }
+        let text = match crate::copy::field(obj, col) {
+            None | Some(Value::Null) => {
+                tuple.push_str("NULL");
+                continue;
+            }
+            Some(Value::String(s)) if s.is_empty() => {
+                tuple.push_str("''");
+                continue;
+            }
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Number(n)) if cast.is_none() && n.is_u64() && !n.is_i64() => {
+                faucet_core::util::u64_to_signed(
+                    n.as_u64().unwrap_or_default(),
+                    &format!("column {}", faucet_core::util::quote_ident(col)),
+                )?;
+                n.to_string()
+            }
+            Some(other) => other.to_string(),
+        };
+        let name = format!("p{}", first + params.len() + 1);
+        match cast {
+            Some(t) => tuple.push_str(&format!("CAST(:{name} AS {t})")),
+            None => tuple.push_str(&format!(":{name}")),
+        }
+        params.push((name, text));
+    }
+    tuple.push(')');
+    let size = tuple.len() + 2 + params.iter().map(|(n, v)| n.len() + v.len()).sum::<usize>();
+    Ok((tuple, params, size))
 }
 
 /// Whether a column of `sql_type` takes its value as text cast to the type:
@@ -902,7 +1131,10 @@ impl RedshiftDriver {
 #[async_trait]
 impl SinkDriver for RedshiftDriver {
     fn capabilities(&self, derived: faucet_core::Capabilities) -> faucet_core::Capabilities {
-        derived.to_builder().declared_types(true).build()
+        derived
+            .to_builder()
+            .declared_types(self.config.create_table)
+            .build()
     }
 
     fn set_declared_columns(&self, columns: faucet_core::DeclaredColumns) {
@@ -956,6 +1188,14 @@ impl SinkDriver for RedshiftDriver {
             Some(s) => format!("{}.{}", s, self.config.table_name),
             None => self.config.table_name.clone(),
         };
+        let conn = &self.config.connection;
+        if conn.uses_data_api() {
+            return format!(
+                "redshift://{}/{}?table={table}",
+                conn.endpoint_label(),
+                conn.database
+            );
+        }
         format!(
             "redshift://{}:{}/{}?table={}",
             self.config.connection.host,
@@ -977,9 +1217,11 @@ impl SinkDriver for RedshiftDriver {
     ) -> Result<PageWrite, FaucetError> {
         match policy {
             RowPolicy::PerRow => Ok(PageWrite::from_outcomes(
-                self.write_partial(calls, rows).await?,
+                Box::pin(self.write_partial(calls, rows)).await?,
             )),
-            _ => Ok(PageWrite::reported(self.write_page(calls, rows).await?)),
+            _ => Ok(PageWrite::reported(
+                Box::pin(self.write_page(calls, rows)).await?,
+            )),
         }
     }
 
@@ -993,12 +1235,26 @@ impl SinkDriver for RedshiftDriver {
         use faucet_core::check::{CheckReport, Probe};
 
         let started = std::time::Instant::now();
-        let ping = self.call(calls, "query", async {
-            sqlx::query("SELECT 1")
-                .execute(&self.pool)
-                .await
-                .map_err(|e| FaucetError::Sink(e.to_string()))
-        });
+        let ping = async {
+            match &self.backend {
+                Backend::Wire(pool) => {
+                    let pool = pool.get(&calls.get()).await?;
+                    self.call(calls, "query", async {
+                        sqlx::query("SELECT 1")
+                            .execute(&pool)
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| FaucetError::Sink(e.to_string()))
+                    })
+                    .await
+                }
+                Backend::DataApi(api) => {
+                    Box::pin(api.query(&calls.get(), &Statement::new("SELECT 1")))
+                        .await
+                        .map(|_| ())
+                }
+            }
+        };
         let probe = match tokio::time::timeout(ctx.timeout, ping).await {
             Ok(Ok(_)) => Probe::pass("auth", started.elapsed()),
             Ok(Err(e)) => Probe::fail_hint(
@@ -1128,18 +1384,86 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn new_surfaces_unsupported_credentials() {
-        let mut c = insert_config();
-        c.connection.credentials = faucet_common_redshift::RedshiftCredentials::RedshiftDataApi {
-            region: None,
-            cluster_identifier: None,
-            workgroup_name: None,
-            secret_arn: None,
-            db_user: None,
+    async fn new_builds_iam_and_data_api_sinks_and_validates_them() {
+        let with = |creds: Value| {
+            let mut c = insert_config();
+            c.connection.credentials = serde_json::from_value(creds).unwrap();
+            c
         };
+        let s = sink(with(
+            json!({"type": "iam", "config": {"workgroup_name": "wg"}}),
+        ))
+        .await;
+        assert!(matches!(&s.inner.driver().backend, Backend::Wire(p) if p.is_iam()));
+        let s = sink(with(json!({"type": "redshift_data_api", "config": {"cluster_identifier": "c", "db_user": "u"}}))).await;
+        assert!(matches!(s.inner.driver().backend, Backend::DataApi(_)));
+        assert_eq!(
+            s.dataset_uri(),
+            "redshift://cluster:c/db?table=public.events"
+        );
+        for bad in [
+            json!({"type": "iam", "config": {"cluster_identifier": "c", "workgroup_name": "w"}}),
+            json!({"type": "redshift_data_api", "config": {}}),
+        ] {
+            assert!(matches!(
+                RedshiftSink::new(with(bad)).await,
+                Err(FaucetError::Config(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn data_api_inserts_bind_parameters_and_split_by_size() {
+        let cols = vec!["id".to_string(), "amount".to_string(), "note".to_string()];
+        let casts = [None, Some("numeric(12,2)"), None];
+        let rows = [
+            json!({"id": 1, "amount": 12.5, "note": "it's"}),
+            json!({"ID": 2, "amount": null, "note": ""}),
+            json!({"id": 3, "note": {"k": [true]}}),
+        ];
+        let refs: Vec<&Value> = rows.iter().collect();
+        let out = data_api_inserts("\"t\"", &cols, &casts, &refs).unwrap();
+        assert_eq!(out.len(), 1);
+        let (st, n) = &out[0];
+        assert_eq!(*n, 3);
+        assert_eq!(
+            st.sql,
+            "INSERT INTO \"t\" (\"id\", \"amount\", \"note\") VALUES \
+             (:p1, CAST(:p2 AS numeric(12,2)), :p3), (:p4, NULL, ''), (:p5, NULL, :p6)"
+        );
+        let values: Vec<&str> = st.parameters.iter().map(|(_, v)| v.as_str()).collect();
+        assert_eq!(values, ["1", "12.5", "it's", "2", "3", r#"{"k":[true]}"#]);
+
+        let wide = "x".repeat(DATA_API_STATEMENT_BUDGET / 2);
+        let big = [
+            json!({"id": 1, "note": wide}),
+            json!({"id": 2, "note": wide}),
+            json!({"id": 3}),
+        ];
+        let refs: Vec<&Value> = big.iter().collect();
+        let out = data_api_inserts("t", &cols, &casts, &refs).unwrap();
+        assert_eq!(out.iter().map(|(_, n)| *n).collect::<Vec<_>>(), [1, 2]);
+        assert!(
+            out[1]
+                .0
+                .sql
+                .ends_with("VALUES (:p1, NULL, :p2), (:p3, NULL, NULL)"),
+            "{}",
+            out[1].0.sql
+        );
+
+        let err = data_api_inserts("t", &cols, &casts, &[&json!({"id": u64::MAX})])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("\"id\""), "{err}");
+        assert!(data_api_inserts("t", &cols, &casts, &[&json!(1)]).is_err());
         assert!(matches!(
-            RedshiftSink::new(c).await,
-            Err(FaucetError::Config(_))
+            prefixed(FaucetError::Sink("x".into()), "w"),
+            FaucetError::Sink(m) if m == "w: x"
+        ));
+        assert!(matches!(
+            prefixed(FaucetError::Config("x".into()), "w"),
+            FaucetError::Config(_)
         ));
     }
 

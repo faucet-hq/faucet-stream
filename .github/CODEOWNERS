@@ -1,3 +1,5 @@
+# Default owner for every path (no review is required to merge).
+* @pecsorabs
 /.github/workflows/ @pecsorabs
 /.github/CODEOWNERS @pecsorabs
 /.github/dependabot.yml @pecsorabs

@@ -13,7 +13,7 @@ categories.workspace = true
 [features]
 default = []
 ## TLS (`amqps://`) connections via rustls with the platform's native root store.
-tls = ["lapin/rustls--ring", "lapin/rustls-native-certs", "dep:rustls", "rustls/ring"]
+tls = ["lapin/rustls--ring", "lapin/rustls-native-certs"]
 
 [dependencies]
 faucet-core.workspace = true
@@ -23,7 +23,6 @@ schemars.workspace = true
 lapin.workspace = true
 base64.workspace = true
 tokio = { workspace = true, features = ["time"] }
-rustls = { workspace = true, optional = true }
 
 [dev-dependencies]
 faucet-conformance = { workspace = true, features = ["containers"] }

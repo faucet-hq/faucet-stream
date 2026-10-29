@@ -10,11 +10,15 @@
 
 pub mod catalog;
 pub mod config;
+#[cfg(feature = "catalog-hms")]
+pub mod hms;
 #[cfg(feature = "storage-opendal")]
 pub mod storage_factory;
 
 pub use catalog::build_catalog;
 pub use config::{CatalogConfig, CatalogInner, WarehouseScheme, warehouse_scheme};
+#[cfg(feature = "catalog-hms")]
+pub use hms::{HMS_LOCK_TIMEOUT_PROP, HmsCommitCatalog};
 #[cfg(feature = "storage-opendal")]
 pub use storage_factory::select_storage_factory;
 

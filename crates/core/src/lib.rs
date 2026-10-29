@@ -127,9 +127,10 @@ pub use columnar::{
     values_to_record_batch, values_to_record_batch_inferred,
 };
 pub use create_table::{
-    PlannedColumn, missing_target_error, plan_columns, plan_columns_declared, plan_keyed_columns,
-    plan_keyed_columns_declared, plan_table_declared, render_column_defs, render_columns,
-    render_primary_key,
+    DeclaredFit, PlannedColumn, missing_target_error, plan_columns, plan_columns_declared,
+    plan_columns_declared_with, plan_keyed_columns, plan_keyed_columns_declared,
+    plan_keyed_columns_declared_with, plan_table_declared, plan_table_declared_with,
+    render_column_defs, render_columns, render_primary_key,
 };
 #[cfg(feature = "transform-cross-join")]
 pub use cross_join::{CompiledCrossJoin, CrossJoinSpec, OnEmpty as CrossJoinOnEmpty};
@@ -248,7 +249,7 @@ pub use state_version::{
     ResolvedState, STATE_FORMAT, StateCompat, StoredState, check_compat, peel_versioned,
     resolve_for_source, wrap_versioned,
 };
-pub use tls::TlsClientConfig;
+pub use tls::{ClientPem, LoadedTls, TlsClientConfig, TlsOptions, ensure_crypto_provider};
 pub use topology::{
     Edge, JoinNode, Node, NodeKind, Topology, TopologyBuilder, TopologyOnError, TopologyOptions,
     TopologyResult,

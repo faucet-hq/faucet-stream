@@ -5,7 +5,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-pub use faucet_common_elasticsearch::ElasticsearchAuth;
+pub use faucet_common_elasticsearch::{ElasticsearchAuth, ElasticsearchTls};
 
 /// Configuration for the Elasticsearch search source.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -50,6 +50,10 @@ pub struct ElasticsearchSourceConfig {
     /// half-open connection or a wedged node cannot hang a run forever.
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
+    /// TLS settings for an `https://` cluster: a private CA, a client
+    /// certificate for mutual TLS, or `insecure_skip_verify`.
+    #[serde(default, skip_serializing_if = "ElasticsearchTls::is_default")]
+    pub tls: ElasticsearchTls,
 }
 
 fn default_query() -> Value {
@@ -85,6 +89,7 @@ impl ElasticsearchSourceConfig {
             batch_size: DEFAULT_BATCH_SIZE,
             connect_timeout_secs: default_connect_timeout_secs(),
             request_timeout_secs: default_request_timeout_secs(),
+            tls: ElasticsearchTls::default(),
         }
     }
 
@@ -97,6 +102,12 @@ impl ElasticsearchSourceConfig {
     /// Set the scroll context timeout (e.g. `"5m"`).
     pub fn scroll_timeout(mut self, t: impl Into<String>) -> Self {
         self.scroll_timeout = t.into();
+        self
+    }
+
+    /// Set the [`tls`](Self::tls) block.
+    pub fn with_tls(mut self, tls: ElasticsearchTls) -> Self {
+        self.tls = tls;
         self
     }
 
@@ -138,6 +149,7 @@ impl ElasticsearchSourceConfig {
             ));
         }
         validate_batch_size(self.batch_size)?;
+        self.tls.validate("elasticsearch source")?;
         if self.connect_timeout_secs == 0 || self.request_timeout_secs == 0 {
             return Err(FaucetError::Config(
                 "Elasticsearch source: connect_timeout_secs and request_timeout_secs must be > 0"

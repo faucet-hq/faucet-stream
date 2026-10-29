@@ -118,6 +118,14 @@ creates the table — `postgres`, `mysql`, `sqlite`, `mssql`, `duckdb`,
 | `uuid` | `STRING` |
 | `bytes` / `json` | `BYTES` / `JSON` |
 
+A declared instant (`timestamp { tz: true }`) keeps its instant in every
+sink. MySQL has no zoned type, so its `DATETIME(6)` holds the instant as UTC
+wall-clock time: the sink converts each RFC 3339 value bound for a `DATETIME`
+column to UTC (and one for a `TIMESTAMP` column to `+00:00`), whatever the
+session time zone — MySQL itself refuses a `Z` suffix and shifts an offset
+into the session zone. The `mysql` source reads a `DATETIME` back at
+`+00:00`, so the round trip is exact.
+
 A type a dialect cannot hold exactly — a decimal wider than its widest exact
 type, a time of day where there is no time type — keeps the inferred column
 (text), never a rounding one. The renderings load into the typed columns as
@@ -129,7 +137,16 @@ The rules every sink follows:
   declared type that differs from an existing column is the
   [`schema:` drift policy](../cookbook/schema-drift.md)'s business.
 - **The first page decides, column by column.** A declared type is used only
-  when every value of the first page is a rendering of it. A transform or a
+  when every value of the first page is a rendering of it **that fits the
+  column the dialect creates** — a decimal within its precision and scale (an
+  unbounded decimal checked against the fixed type it becomes: MySQL
+  `DECIMAL(65,30)`, ClickHouse `Decimal(76, 38)`, Oracle `NUMBER`'s 38
+  significant digits, BigQuery `NUMERIC` / `BIGNUMERIC`; a precision without
+  a scale, `numeric(p)`, is scale 0), a time or timestamp within the
+  sub-second digits the column keeps (microseconds in PostgreSQL, Redshift,
+  DuckDB, MySQL, ClickHouse, Databricks and BigQuery; 7 digits in SQL Server;
+  nanoseconds in Oracle, Snowflake and Spanner). A value that would be rounded
+  keeps the inferred column. A transform or a
   masking rule that rewrote a column (a hashed date, a renamed field) therefore
   keeps today's inferred type for that column. A column the page does not
   carry is not created, and an undeclared one (a transform's output, the
@@ -139,7 +156,8 @@ The rules every sink follows:
   complete: nothing between source and sink renamed, added, removed or
   rewrote a column (no transform stage other than a filter, no masking rule).
   The `metadata_columns` decorator adds its own columns to the declaration.
-  Under `write_mode: overwrite` the table appears after the commit. Without a
+  Under `write_mode: overwrite` the empty run creates the staging table and
+  the commit publishes it, so the table appears after the commit. Without a
   complete declaration an empty source still creates nothing.
 - **Without a declaration nothing changes**: a source that declares nothing, a
   sink that does not type, or a declaration the source could not produce (the

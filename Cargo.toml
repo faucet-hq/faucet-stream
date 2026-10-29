@@ -93,6 +93,7 @@ members = [
     "crates/source/sqs",
     "crates/sink/sqs",
     "crates/common/nats",
+    "crates/common/redis",
     "crates/source/nats",
     "crates/sink/nats",
     "crates/common/sftp",
@@ -126,6 +127,7 @@ members = [
 # `[patch]`, and they are never published.
 exclude = [
     "examples/wasm-transforms/rust",
+    "fuzz",
     "skills/faucet-connector/examples",
 ]
 
@@ -250,6 +252,7 @@ faucet-sink-databricks = { path = "crates/sink/databricks", version = "1" }
 faucet-source-sqs = { path = "crates/source/sqs", version = "1" }
 faucet-sink-sqs = { path = "crates/sink/sqs", version = "1" }
 faucet-common-nats = { path = "crates/common/nats", version = "1" }
+faucet-common-redis = { path = "crates/common/redis", version = "1" }
 faucet-source-nats = { path = "crates/source/nats", version = "1" }
 faucet-sink-nats = { path = "crates/sink/nats", version = "1" }
 faucet-common-sftp = { path = "crates/common/sftp", version = "1" }
@@ -288,7 +291,7 @@ tiberius = { version = "0.12", default-features = false, features = ["rustls", "
 bb8 = "0.9"
 bb8-tiberius = { version = "0.16", default-features = false, features = ["with-tokio", "tds73", "tls"] }
 rust_decimal = "1"
-pgwire-replication = "=0.3.2"
+pgwire-replication = "0.5.0"
 byteorder = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 chrono-tz = "0.10"
@@ -339,6 +342,9 @@ aws-sdk-dynamodbstreams = { version = "1", default-features = false, features = 
 aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
 aws-sdk-sqs = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-secretsmanager = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-redshift = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-redshiftserverless = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-redshiftdata = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 oracle = "0.6"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 # NATS (JetStream-capable async client) for the nats source/sink pair.
@@ -363,7 +369,7 @@ csv = "1.3"
 csv-async = { version = "1.3", features = ["tokio"] }
 calamine = { version = "0.37", features = ["dates"] }
 rust_xlsxwriter = "0.100"
-redis = { version = "1.7.1", features = ["tokio-comp", "aio", "connection-manager", "tokio-rustls-comp", "tls-rustls-webpki-roots"] }
+redis = { version = "1.7.1", features = ["tokio-comp", "aio", "connection-manager", "tokio-rustls-comp", "tls-rustls-webpki-roots", "tls-rustls-insecure"] }
 axum = "0.8"
 subtle = "2"
 tower-http = { version = "0.6", features = ["limit", "cors", "trace", "request-id", "util"] }
@@ -430,7 +436,8 @@ duckdb = "~1.10506.1"
 # WebAssembly runtime for the `wasm` transform (issue #124). Lean embedding:
 # JIT via Cranelift + the runtime, on std platforms (native signal traps). We
 # drive core-wasm modules only — no component model, async, cache, or GC.
-wasmtime = { version = "49", default-features = false, features = ["cranelift", "runtime", "std"] }
+# `wat` lets a module be given as WebAssembly text as well as a binary.
+wasmtime = { version = "49", default-features = false, features = ["cranelift", "runtime", "std", "wat"] }
 # WAT → wasm assembler, used to build tiny fixture modules in `transform-wasm`
 # tests without a wasm toolchain on the CI runner.
 wat = "1"

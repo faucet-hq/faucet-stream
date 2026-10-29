@@ -331,3 +331,41 @@ fn set_test_env() {
         std::env::set_var("AWS_DEFAULT_REGION", REGION);
     });
 }
+
+/// `raw_text` turns each object into one `{key, content}` record. The source
+/// is pointed at MinIO by host name, which only works path-style (#967).
+#[tokio::test(flavor = "multi_thread")]
+async fn raw_text_objects_read_whole_through_a_host_named_endpoint() {
+    let (_c, endpoint) = start_minio().await;
+    seed(
+        &endpoint,
+        &[
+            (
+                "notes/a.txt".to_string(),
+                b"first line\nsecond line\n".to_vec(),
+            ),
+            (
+                "notes/b.txt".to_string(),
+                "caf\u{e9} \u{2603}".as_bytes().to_vec(),
+            ),
+        ],
+    )
+    .await;
+    let src = build_source(
+        &endpoint.replace("127.0.0.1", "localhost"),
+        S3SourceConfig::new(TEST_BUCKET)
+            .prefix("notes/")
+            .file_format(S3FileFormat::RawText)
+            .with_batch_size(0),
+    )
+    .await;
+    let mut got = drain(&src).await;
+    got.sort_by(|a, b| a["key"].as_str().cmp(&b["key"].as_str()));
+    assert_eq!(
+        got,
+        vec![
+            json!({"key": "notes/a.txt", "content": "first line\nsecond line\n"}),
+            json!({"key": "notes/b.txt", "content": "caf\u{e9} \u{2603}"}),
+        ]
+    );
+}
