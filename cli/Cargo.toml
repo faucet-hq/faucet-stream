@@ -663,7 +663,7 @@ serde.workspace = true
 # `preserve_order`: `faucet fmt` (and every rendered config) keeps insertion
 # order whatever else the build enables, so slim and full binaries agree.
 serde_json = { workspace = true, features = ["preserve_order"] }
-yaml_serde = "0.10"
+yaml_serde.workspace = true
 semver = "1"
 toml_edit = "0.25"
 thiserror.workspace = true
