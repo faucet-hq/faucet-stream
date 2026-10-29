@@ -1,0 +1,11 @@
+# Advisories accepted in the fuzz crate's own lockfile (osv-scanner reads the
+# config beside each lockfile). Same reasons as the root osv-scanner.toml;
+# keep the two in sync.
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0449"
+reason = "unsafe-libyaml via serde_yaml (faucet-cli); replaced in the YAML move (#929, #935) (2026-10-29)"
+
+[[IgnoredVulns]]
+id = "GHSA-qwgh-2vcv-g2f7"
+reason = "block-buffer 0.10.4 only via the RustCrypto 0.10 digest crates; needs a panic inside a hash update (2026-10-29)"
