@@ -1218,7 +1218,8 @@ pub async fn materialize(
     }
     let mut doc = parse_body(&record.body, record.format)?;
     let name = default_name(&mut doc, &record.id);
-    let (body, bound) = bind_document_for_run(doc, supplied, env_overrides, mode)?;
+    let (body, bound) =
+        bind_document_for_run(doc, supplied, env_overrides, mode, &Default::default())?;
     Ok(MaterializedConfig {
         template_id: record.id.clone(),
         version: record.version,
@@ -1649,9 +1650,9 @@ async fn materialize_pair_selected(
     }
     let overlay_contributes = std::mem::take(&mut composition.overlay_contributes);
     let warnings = std::mem::take(&mut composition.warnings);
-    let mut caller_fields = expanded.composed_fields(&composition.document);
-    let (body, bound) = bind_document_for_run(composition.document, supplied, env_overrides, mode)?;
-    caller_fields.extend(&bound.fields);
+    let items = expanded.composed_fields(&composition.document);
+    let (body, bound) =
+        bind_document_for_run(composition.document, supplied, env_overrides, mode, &items)?;
     Ok(MaterializedConfig {
         template_id: src_rec.id.clone(),
         version: src_rec.version,
@@ -1670,7 +1671,7 @@ async fn materialize_pair_selected(
         selection: effective,
         depends_on: depends_on.filter(|d| !d.is_empty()),
         untested: None,
-        caller_fields,
+        caller_fields: bound.fields,
     })
 }
 
@@ -1702,24 +1703,29 @@ fn default_name(doc: &mut Value, id: &str) -> String {
     id.to_string()
 }
 
+/// `carried` is caller text already in `doc` (a `for_each` item); the bound
+/// params' `fields` hold it where it lands, with every `env` override's.
 fn bind_document_for_run(
     mut doc: Value,
     supplied: &SuppliedParams,
     env_overrides: &BTreeMap<String, String>,
     mode: Materialize,
+    carried: &params::CallerFields,
 ) -> CliResult<(String, params::BoundParams)> {
     if let Some(map) = doc.as_object_mut() {
         map.remove("tests");
     }
     check_env_overrides(&doc, env_overrides)?;
-    if mode == Materialize::Local {
+    let carried = if mode == Materialize::Local {
         let overlay: crate::interpolate::EnvOverlay = env_overrides
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        crate::interpolate::interpolate_value_with_env(&mut doc, &overlay)?;
-    }
-    let bound = params::bind_document(&mut doc, supplied, BindMode::Strict)?;
+        crate::interpolate::interpolate_value_traced(&mut doc, &overlay, carried)?
+    } else {
+        carried.clone()
+    };
+    let bound = params::bind_document_traced(&mut doc, supplied, BindMode::Strict, &carried)?;
     // Drop the declaration block: materialization is the moment params cease to
     // exist. Leaving it would make any later load re-run the bind pass with no
     // supplied values and reject the config for a "missing" required param —

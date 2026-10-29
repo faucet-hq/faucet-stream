@@ -494,8 +494,36 @@ pub fn bind_document(
     supplied: &SuppliedParams,
     mode: BindMode,
 ) -> CliResult<BoundParams> {
+    bind_document_traced(doc, supplied, mode, &Default::default())
+}
+
+/// [`bind_document`], moving `carried` — where caller text already is in
+/// `doc` as it stands (an `env` override, a `for_each` item) — to where it
+/// reads once keys are rewritten. A param whose default an `env` override
+/// wrote (`carried` under its `params:` default) is the caller's text too.
+pub fn bind_document_traced(
+    doc: &mut Value,
+    supplied: &SuppliedParams,
+    mode: BindMode,
+    carried: &super::caller::CallerFields,
+) -> CliResult<BoundParams> {
     let spec = declared(doc)?;
     let mut bound = resolve(&spec, supplied, mode)?;
+
+    // Defaults an `env` override wrote, by param, with the overrides' names.
+    let mut via_env: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for name in spec.keys().filter(|n| !supplied.contains_key(*n)) {
+        let base = super::caller::child(&super::caller::child("", PARAMS_KEY), name);
+        let names = carried.under(&format!("{base}/default")).params_at("");
+        if !names.is_empty() {
+            via_env.insert(name.clone(), names);
+        }
+    }
+    if !via_env.is_empty() {
+        let mut from_caller = bound.caller_supplied.clone();
+        from_caller.extend(via_env.keys().cloned());
+        bound.free_text = super::caller::free_text_params(&spec, &bound.values, &from_caller);
+    }
 
     // Lift the declaration block out so defaults are never rewritten, then put
     // it back byte-identical — the block is part of the config and is persisted
@@ -510,7 +538,23 @@ pub fn bind_document(
         .filter(|n| spec.get(*n).is_none_or(|p| p.values.is_empty()))
         .cloned()
         .collect();
-    let mut fields = super::caller::CallerFields::default();
+    let mut secret = bound.secret_names.clone();
+    secret.extend(bound.secret_fields.keys().cloned());
+    let mut fields = carried.empty_like();
+    // What a refusal may show of the caller's text: never a secret's.
+    let redacted = bound.redacted();
+    for name in bound.free_text.iter().filter(|n| !secret.contains(*n)) {
+        if via_env.contains_key(name) {
+            continue;
+        }
+        let mut leaves = Vec::new();
+        if let Some(v) = redacted.get(name) {
+            super::list::leaves(v, &mut leaves);
+        }
+        for l in leaves.into_iter().filter(|l| l != "***") {
+            fields.add_text(name.clone(), l);
+        }
+    }
     let result = substitute(
         doc,
         &Subst {
@@ -519,9 +563,12 @@ pub fn bind_document(
             inert: inert.as_ref(),
             guarded: &guarded,
             free: &bound.free_text,
+            secret: &secret,
+            via_env: &via_env,
+            carried,
         },
         None,
-        "",
+        &super::caller::Cursor::default(),
         &mut fields,
     );
     if let (Some(block), Some(map)) = (stashed, doc.as_object_mut()) {
@@ -609,40 +656,92 @@ struct Subst<'a> {
     guarded: &'a BTreeSet<String>,
     /// Params whose text is recorded where it lands (#989).
     free: &'a BTreeSet<String>,
+    /// Params whose value is secret: never shown, and a key holding one is
+    /// never part of a recorded pointer.
+    secret: &'a BTreeSet<String>,
+    /// Free-text params whose default an `env` override wrote: recorded
+    /// under the overrides' names.
+    via_env: &'a BTreeMap<String, BTreeSet<String>>,
+    /// Caller text recorded before binding, moved to where it lands.
+    carried: &'a super::caller::CallerFields,
 }
 
-/// The free-text params `s` references (`${param.NAME}`).
-fn free_refs(s: &str, free: &BTreeSet<String>) -> BTreeSet<String> {
-    if free.is_empty() {
-        return BTreeSet::new();
+/// The free-text params `s` references (`${param.NAME}`), by the names they
+/// are recorded under; [`Wrote::Whole`] only when `whole` (the string is the
+/// one token) and the value is not secret.
+///
+/// [`Wrote::Whole`]: super::caller::Wrote::Whole
+fn free_refs(s: &str, cx: &Subst<'_>, whole: bool) -> BTreeMap<String, super::caller::Wrote> {
+    use super::caller::Wrote;
+    let mut out = BTreeMap::new();
+    if cx.free.is_empty() {
+        return out;
     }
-    iter_directives(s)
-        .filter_map(|(_, d)| match d {
-            Directive::Deferred { id, path } if id == PARAM_ID && free.contains(path) => {
-                Some(path.to_string())
+    for (_, d) in iter_directives(s) {
+        let Directive::Deferred { id, path } = d else {
+            continue;
+        };
+        if id != PARAM_ID || !cx.free.contains(path) {
+            continue;
+        }
+        let how = if whole && !cx.secret.contains(path) {
+            Wrote::Whole
+        } else {
+            Wrote::Part
+        };
+        match cx.via_env.get(path) {
+            Some(names) => {
+                for n in names {
+                    out.insert(n.clone(), Wrote::Part);
+                }
             }
-            _ => None,
-        })
-        .collect()
+            None => {
+                out.insert(path.to_string(), how);
+            }
+        }
+    }
+    out
 }
 
-/// Substitute `${param.NAME}` throughout `v` (at JSON pointer `ptr`),
-/// recording in `fields` where caller free text lands. With `inert` set,
-/// refuse any directive that exists only because of caller-supplied text
-/// (CLI-37).
+fn record(
+    fields: &mut super::caller::CallerFields,
+    at: &str,
+    refs: BTreeMap<String, super::caller::Wrote>,
+) {
+    for (name, how) in refs {
+        fields.insert_as(at, name, how);
+    }
+}
+
+/// Whether a key references a secret param, or holds a load-time directive
+/// (an `${env:}` / `${file:}` / secret-manager value resolved later).
+fn refs_secret(key: &str, secret: &BTreeSet<String>) -> bool {
+    iter_directives(key).any(|(_, d)| match d {
+        Directive::Deferred { id, path } => id == PARAM_ID && secret.contains(path),
+        Directive::LoadTime { prefix, .. } => prefix != "map",
+    })
+}
+
+/// Substitute `${param.NAME}` throughout `v` (at `cur`), recording in
+/// `fields` where caller free text lands. With `inert` set, refuse any
+/// directive that exists only because of caller-supplied text (CLI-37).
 fn substitute(
     v: &mut Value,
     cx: &Subst<'_>,
     field: Option<&str>,
-    ptr: &str,
+    cur: &super::caller::Cursor,
     fields: &mut super::caller::CallerFields,
 ) -> CliResult<()> {
     let (bound, lenient, inert, guarded) = (cx.bound, cx.lenient, cx.inert, cx.guarded);
+    cur.carry(cx.carried, fields);
     if let Value::String(s) = v {
-        fields.insert_all(ptr, &free_refs(s, cx.free));
         let replaced = match whole_token(s, bound, bound, lenient)? {
-            Some(typed) => typed,
+            Some(typed) => {
+                record(fields, &cur.at, free_refs(s, cx, true));
+                typed
+            }
             None => {
+                record(fields, &cur.at, free_refs(s, cx, false));
                 refuse_embedded(s, bound, guarded, field)?;
                 Value::String(rewrite_text(s, bound, bound, lenient)?)
             }
@@ -656,26 +755,25 @@ fn substitute(
     match v {
         Value::Array(items) => {
             for (i, item) in items.iter_mut().enumerate() {
-                substitute(item, cx, field, &format!("{ptr}/{i}"), fields)?;
+                substitute(item, cx, field, &cur.index(i), fields)?;
             }
         }
         Value::Object(map) => {
             // Keys may carry tokens too (a param-named header, say). Rebuild the
             // map so a rewritten key is honoured — mirrors `interpolate_value`.
+            // The key is rewritten once: its value lands under that text.
             let entries: Vec<(String, Value)> = std::mem::take(map).into_iter().collect();
             for (key, mut val) in entries {
-                // Where the value lands: under its rewritten key.
-                let at = super::caller::child(
-                    ptr,
-                    &rewrite_text(&key, bound, bound, lenient).unwrap_or_else(|_| key.clone()),
-                );
-                substitute(&mut val, cx, Some(&key), &at, fields)?;
                 refuse_embedded(&key, bound, guarded, None)?;
                 let new_key = rewrite_text(&key, bound, bound, lenient)?;
                 if let Some(inert) = inert {
                     refuse_new_directives(&key, &new_key, bound, lenient, inert)?;
                 }
-                fields.insert_all(&at, &free_refs(&key, cx.free));
+                let secret = refs_secret(&key, cx.secret)
+                    || (new_key != key && super::caller::key_is_secret(&new_key));
+                let next = cur.key(&key, &new_key, secret);
+                substitute(&mut val, cx, Some(&key), &next, fields)?;
+                record(fields, &next.at, free_refs(&key, cx, false));
                 map.insert(new_key, val);
             }
         }
@@ -2005,5 +2103,84 @@ mod tests {
         let mut doc = json!({ "params": { "d": { "default": "/x" } }, "p": "${param.d}" });
         let bound = bind_document(&mut doc, &SuppliedParams::new(), BindMode::Strict).unwrap();
         assert!(bound.fields.is_empty());
+    }
+
+    /// #989: a pointer never holds a secret param's text — a value under a
+    /// key a secret names is recorded at the key's object — and the stored
+    /// form of the fields (what a run record persists) holds no secret; the
+    /// key is rewritten once, so the pointer is where the value lands.
+    #[test]
+    fn a_secret_key_never_reaches_a_recorded_pointer() {
+        let mut doc = json!({
+            "params": { "tok": { "secret": true }, "dir": {} },
+            "pipeline": { "sink": { "type": "file", "config": {
+                "headers": { "${param.tok}": { "to": "${param.dir}/x" } },
+                "plain": { "k-${param.dir}": "${param.dir}" },
+            } } },
+        });
+        let supplied: SuppliedParams = [
+            ("tok", json!("tok-989-secret-key-value")),
+            ("dir", json!("/etc")),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let bound = bind_document(&mut doc, &supplied, BindMode::Strict).unwrap();
+        let stored = serde_json::to_string(&bound.fields).unwrap();
+        assert!(!stored.contains("tok-989-secret-key-value"), "{stored}");
+        assert!(bound.fields.covers("/pipeline/sink/config/headers"));
+        assert!(bound.fields.covers("/pipeline/sink/config/plain/k-~1etc"));
+        assert!(
+            doc["pipeline"]["sink"]["config"]["headers"]["tok-989-secret-key-value"]["to"]
+                == json!("/etc/x")
+        );
+        // What a refusal may show: the whole value a whole token wrote, and
+        // only the caller's own text of a spliced one.
+        let f = &bound.fields;
+        assert_eq!(
+            f.shown("/pipeline/sink/config/plain/k-~1etc", "/etc")
+                .as_deref(),
+            Some("/etc")
+        );
+        assert_eq!(
+            f.shown("/pipeline/sink/config/headers", "/etc/x")
+                .as_deref(),
+            Some("/etc…")
+        );
+        // Stored and read back, nothing is shown.
+        let back: super::super::CallerFields = serde_json::from_str(&stored).unwrap();
+        assert_eq!(
+            back.shown("/pipeline/sink/config/plain/k-~1etc", "/etc"),
+            None
+        );
+    }
+
+    /// An `env` override that wrote a param's default makes that param's
+    /// text the caller's, recorded under the override's name.
+    #[test]
+    fn a_default_an_env_override_wrote_is_recorded() {
+        let mut doc = json!({
+            "params": { "d": { "default": "${env:FAUCET_989_D}" } },
+            "p": { "path": "${param.d}/x" },
+        });
+        let overlay: crate::interpolate::EnvOverlay =
+            [("FAUCET_989_D".to_string(), "/srv/faucet-989-d".to_string())].into();
+        let carried =
+            crate::interpolate::interpolate_value_traced(&mut doc, &overlay, &Default::default())
+                .unwrap();
+        let bound =
+            bind_document_traced(&mut doc, &SuppliedParams::new(), BindMode::Strict, &carried)
+                .unwrap();
+        assert_eq!(
+            bound.fields.params_at("/p/path"),
+            BTreeSet::from(["env:FAUCET_989_D".to_string()])
+        );
+        assert_eq!(
+            bound
+                .fields
+                .shown("/p/path", "/srv/faucet-989-d/x")
+                .as_deref(),
+            Some("/srv/faucet-989-d…")
+        );
     }
 }

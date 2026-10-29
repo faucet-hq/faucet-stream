@@ -17,73 +17,218 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// How a caller's text fills the value a [`CallerFields`] entry points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Wrote {
+    /// The whole value is the caller's text (a whole `${param.x}`).
+    Whole,
+    /// The caller's text is part of the value, beside the author's (or the
+    /// value is secret): only the caller's own text may be shown.
+    Part,
+}
+
 /// JSON pointers (RFC 6901) of the config values that hold caller-chosen
-/// text, each with the params that wrote it. A pointer covers its whole
-/// subtree (a list param substituted whole, an object key).
+/// text, each with the params (or `env:NAME` overrides) that wrote it. A
+/// pointer covers its whole subtree (a list param substituted whole, an
+/// object key). A pointer never holds secret text: under a key that does,
+/// the entry stands at the key's object instead.
+///
+/// What a refusal may show travels with it in memory only — which entries
+/// the caller wrote whole, and the caller's own texts — and is never
+/// persisted: a stored set shows no values.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(transparent)]
-pub struct CallerFields(BTreeMap<String, BTreeSet<String>>);
+pub struct CallerFields {
+    entries: BTreeMap<String, BTreeSet<String>>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    whole: BTreeSet<(String, String)>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    texts: BTreeMap<String, BTreeSet<String>>,
+}
+
+/// The name an `env` override is recorded under.
+pub fn env_name(var: &str) -> String {
+    format!("env:{var}")
+}
+
+/// How a recorded name reads in a message: `param 'x'` / `env override 'X'`.
+pub fn describe(name: &str) -> String {
+    match name.strip_prefix("env:") {
+        Some(var) => format!("env override '{var}'"),
+        None => format!("param '{name}'"),
+    }
+}
 
 impl CallerFields {
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.entries.is_empty()
     }
 
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.entries.len()
     }
 
-    /// Record that `param` wrote the value at `pointer`.
+    /// An empty set carrying this one's texts.
+    pub fn empty_like(&self) -> CallerFields {
+        CallerFields {
+            texts: self.texts.clone(),
+            ..Default::default()
+        }
+    }
+
+    /// Record that `param`'s text is the whole value at `pointer`.
     pub fn insert(&mut self, pointer: impl Into<String>, param: impl Into<String>) {
-        self.0
-            .entry(pointer.into())
-            .or_default()
-            .insert(param.into());
+        self.insert_as(pointer, param, Wrote::Whole);
     }
 
-    /// Record every param of `params` at `pointer`.
+    /// Record that `param` wrote (`how`) the value at `pointer`. A name
+    /// recorded both ways at one pointer counts as [`Wrote::Part`].
+    pub fn insert_as(&mut self, pointer: impl Into<String>, param: impl Into<String>, how: Wrote) {
+        let (pointer, param) = (pointer.into(), param.into());
+        let fresh = self
+            .entries
+            .entry(pointer.clone())
+            .or_default()
+            .insert(param.clone());
+        let key = (pointer, param);
+        if how == Wrote::Whole && fresh {
+            self.whole.insert(key);
+        } else if how == Wrote::Part {
+            self.whole.remove(&key);
+        }
+    }
+
+    /// Record every param of `params` at `pointer`, as part of its value.
     pub fn insert_all(&mut self, pointer: &str, params: &BTreeSet<String>) {
         for p in params {
-            self.insert(pointer, p.clone());
+            self.insert_as(pointer, p.clone(), Wrote::Part);
+        }
+    }
+
+    /// Record every name `other` has at `from` at `pointer`, as it wrote it.
+    pub fn copy_entry(&mut self, other: &CallerFields, from: &str, pointer: &str) {
+        for n in other.entries.get(from).into_iter().flatten() {
+            let how = if other.whole.contains(&(from.to_string(), n.clone())) {
+                Wrote::Whole
+            } else {
+                Wrote::Part
+            };
+            self.insert_as(pointer, n.clone(), how);
+        }
+    }
+
+    /// Record a text `name`'s caller sent (shown in a refusal).
+    pub fn add_text(&mut self, name: impl Into<String>, text: impl Into<String>) {
+        let text = text.into();
+        if !text.is_empty() {
+            self.texts.entry(name.into()).or_default().insert(text);
         }
     }
 
     pub fn extend(&mut self, other: &CallerFields) {
-        for (ptr, params) in &other.0 {
-            self.insert_all(ptr, params);
+        for ptr in other.entries.keys() {
+            self.copy_entry(other, ptr, ptr);
+        }
+        for (n, t) in &other.texts {
+            self.texts
+                .entry(n.clone())
+                .or_default()
+                .extend(t.iter().cloned());
         }
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&String, &BTreeSet<String>)> {
-        self.0.iter()
+        self.entries.iter()
     }
 
     /// Whether any recorded value overlaps `pointer` (is it, inside it, or
     /// holds it).
     pub fn covers(&self, pointer: &str) -> bool {
-        self.0.keys().any(|p| overlaps(p, pointer))
+        self.entries.keys().any(|p| overlaps(p, pointer))
     }
 
     /// The params whose values overlap `pointer`.
     pub fn params_at(&self, pointer: &str) -> BTreeSet<String> {
-        self.0
+        self.entries
             .iter()
             .filter(|(p, _)| overlaps(p, pointer))
             .flat_map(|(_, names)| names.iter().cloned())
             .collect()
     }
 
+    /// Whether every name overlapping `pointer` wrote all of it: an entry at
+    /// or above it written whole (an entry inside it wrote only part).
+    fn all_whole(&self, pointer: &str) -> bool {
+        let mut any = false;
+        for (p, names) in &self.entries {
+            if !overlaps(p, pointer) {
+                continue;
+            }
+            for n in names {
+                if !(is_within(pointer, p) && self.whole.contains(&(p.clone(), n.clone()))) {
+                    return false;
+                }
+                any = true;
+            }
+        }
+        any
+    }
+
+    fn texts_at(&self, pointer: &str) -> Vec<&str> {
+        self.params_at(pointer)
+            .iter()
+            .filter_map(|n| self.texts.get(n))
+            .flatten()
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// `value` (the value at `pointer`) as a refusal may show it: whole when
+    /// the caller wrote all of it, else only the caller's own texts with the
+    /// rest elided (`…`) — `None` when nothing of it is known to be theirs.
+    pub fn shown(&self, pointer: &str, value: &str) -> Option<String> {
+        if self.all_whole(pointer) {
+            return Some(value.to_string());
+        }
+        let out = elide(value, &self.texts_at(pointer));
+        (out != ELIDED).then_some(out)
+    }
+
+    /// `text` (a refusal reason about the value at `pointer`) with every
+    /// backquoted span that is not the caller's own text elided.
+    pub fn shown_reason(&self, pointer: &str, text: &str) -> String {
+        if self.all_whole(pointer) {
+            return text.to_string();
+        }
+        let texts = self.texts_at(pointer);
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(open) = rest.find('`') {
+            let Some(close) = rest[open + 1..].find('`') else {
+                break;
+            };
+            out.push_str(&rest[..=open]);
+            out.push_str(&elide(&rest[open + 1..open + 1 + close], &texts));
+            out.push('`');
+            rest = &rest[open + close + 2..];
+        }
+        out.push_str(rest);
+        out
+    }
+
     /// The entries inside (or holding) `base`, relative to it: an entry that
     /// holds `base` becomes the whole of it (`""`).
     pub fn under(&self, base: &str) -> CallerFields {
-        let mut out = CallerFields::default();
-        for (p, params) in &self.0 {
+        let mut out = self.empty_like();
+        for p in self.entries.keys() {
             if is_within(base, p) {
-                out.insert_all("", params);
+                out.copy_entry(self, p, "");
             } else if let Some(rest) = p.strip_prefix(base)
                 && rest.starts_with('/')
             {
-                out.insert_all(rest, params);
+                out.copy_entry(self, p, rest);
             }
         }
         out
@@ -91,9 +236,9 @@ impl CallerFields {
 
     /// Every entry with `base` prepended.
     pub fn rebased(&self, base: &str) -> CallerFields {
-        let mut out = CallerFields::default();
-        for (p, params) in &self.0 {
-            out.insert_all(&format!("{base}{p}"), params);
+        let mut out = self.empty_like();
+        for p in self.entries.keys() {
+            out.copy_entry(self, p, &format!("{base}{p}"));
         }
         out
     }
@@ -103,18 +248,101 @@ impl CallerFields {
     /// key the config reads under another name (an alias).
     pub fn with_alias(mut self, depth: usize, from: &str, to: &str) -> CallerFields {
         let mut extra = Vec::new();
-        for (p, params) in &self.0 {
+        for p in self.entries.keys() {
             let mut segs: Vec<&str> = p.split('/').skip(1).collect();
             if segs.get(depth) == Some(&from) {
                 segs[depth] = to;
-                extra.push((format!("/{}", segs.join("/")), params.clone()));
+                extra.push((p.clone(), format!("/{}", segs.join("/"))));
             }
         }
-        for (p, params) in extra {
-            self.insert_all(&p, &params);
+        let src = self.clone();
+        for (p, alias) in extra {
+            self.copy_entry(&src, &p, &alias);
         }
         self
     }
+}
+
+/// What [`elide`] writes for text that is not the caller's.
+const ELIDED: &str = "…";
+
+/// `value` with every run of text that is not one of `texts` replaced by `…`.
+fn elide(value: &str, texts: &[&str]) -> String {
+    let mut texts: Vec<&str> = texts.iter().copied().filter(|t| !t.is_empty()).collect();
+    texts.sort_by_key(|t| std::cmp::Reverse(t.len()));
+    let mut out = String::new();
+    let mut rest = value;
+    let mut gap = false;
+    'scan: while let Some(c) = rest.chars().next() {
+        for t in &texts {
+            if rest.starts_with(t) {
+                if gap {
+                    out.push_str(ELIDED);
+                    gap = false;
+                }
+                out.push_str(t);
+                rest = &rest[t.len()..];
+                continue 'scan;
+            }
+        }
+        gap = true;
+        rest = &rest[c.len_utf8()..];
+    }
+    if gap {
+        out.push_str(ELIDED);
+    }
+    out
+}
+
+/// Where a binding walk is in the document it rewrites: the pointer of the
+/// node as written (`from`) and as it will read (`at`). Under a key whose
+/// text is secret, `at` stops at that key's object, so no recorded pointer
+/// holds the secret.
+#[derive(Debug, Clone, Default)]
+pub struct Cursor {
+    pub from: String,
+    pub at: String,
+    hidden: bool,
+}
+
+impl Cursor {
+    pub fn index(&self, i: usize) -> Cursor {
+        Cursor {
+            from: format!("{}/{i}", self.from),
+            at: if self.hidden {
+                self.at.clone()
+            } else {
+                format!("{}/{i}", self.at)
+            },
+            hidden: self.hidden,
+        }
+    }
+
+    /// The child under `key`, which reads as `new_key`; `secret` hides it.
+    pub fn key(&self, key: &str, new_key: &str, secret: bool) -> Cursor {
+        let hidden = self.hidden || secret;
+        Cursor {
+            from: child(&self.from, key),
+            at: if hidden {
+                self.at.clone()
+            } else {
+                child(&self.at, new_key)
+            },
+            hidden,
+        }
+    }
+
+    /// Move what `carried` recorded at this node (as written) to where it
+    /// reads.
+    pub fn carry(&self, carried: &CallerFields, out: &mut CallerFields) {
+        out.copy_entry(carried, &self.from, &self.at);
+    }
+}
+
+/// Whether a rewritten key holds text registered as secret (a `secret: true`
+/// param, an `${env:}` / `${file:}` value).
+pub fn key_is_secret(new_key: &str) -> bool {
+    crate::secrets::registry::redact(new_key) != new_key
 }
 
 /// Escape one key for a JSON pointer.
