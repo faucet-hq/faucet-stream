@@ -117,7 +117,12 @@ async fn conformance_bounded_memory() {
     )
     .await;
 
-    faucet_conformance::assert_bounded_memory(&source, 250, 5_000).await;
+    support::phase_within(
+        "bounded memory read",
+        std::time::Duration::from_secs(90),
+        faucet_conformance::assert_bounded_memory(&source, 250, 5_000),
+    )
+    .await;
     // _container stays alive to here
 }
 
@@ -142,7 +147,12 @@ async fn conformance_bookmark_roundtrip() {
         .await
         .expect("source");
 
-    assert_bookmark_roundtrip(&source).await;
+    support::phase_within(
+        "bookmark round trip",
+        std::time::Duration::from_secs(120),
+        assert_bookmark_roundtrip(&source),
+    )
+    .await;
     // _container stays alive to here
 }
 
@@ -227,5 +237,9 @@ async fn conformance_roundtrips_recorded() {
     let mut cfg = source_config(&endpoint, "recorded");
     cfg.idle_termination_secs = Some(2);
     let source = KinesisSource::new(cfg).await.expect("source");
-    faucet_conformance::calls::assert_source_records_roundtrips(&source).await;
+    support::phase(
+        "recorded round trips",
+        faucet_conformance::calls::assert_source_records_roundtrips(&source),
+    )
+    .await;
 }
