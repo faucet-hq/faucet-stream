@@ -28,7 +28,6 @@ async-trait.workspace = true
 tracing.workspace = true
 tiberius.workspace = true
 bb8.workspace = true
-bb8-tiberius.workspace = true
 rust_decimal.workspace = true
 chrono.workspace = true
 tokio.workspace = true

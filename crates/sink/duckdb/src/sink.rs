@@ -353,6 +353,7 @@ fn insert_auto_map(
             return Err(FaucetError::Sink(missing_columns_message(table, &missing)));
         }
         let planned = faucet_core::plan_columns(records).unwrap_or_default();
+        // A lost catalog race aborts the transaction; the caller re-runs it.
         for column in planned.iter().filter(|c| missing.contains(&c.name)) {
             conn.execute_batch(&add_column_sql(table, column))
                 .map_err(|e| FaucetError::Sink(format!("duckdb ADD COLUMN failed: {e}")))?;
@@ -473,6 +474,28 @@ fn write_all_blocking(
         config.batch_size
     };
 
+    let mut attempt = 1;
+    loop {
+        match write_transaction(&guard, config, records, chunk) {
+            Err(e) if attempt < CONFLICT_ATTEMPTS && lost_catalog_race(&e) => {
+                tracing::debug!(attempt, error = %e, "duckdb write lost a catalog race; retrying");
+                #[allow(clippy::disallowed_methods)]
+                // on the blocking pool; a short pause lets the other writer commit
+                std::thread::sleep(std::time::Duration::from_millis(5 * u64::from(attempt)));
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// One `BEGIN`/`COMMIT` page transaction; rolled back on error.
+fn write_transaction(
+    guard: &Connection,
+    config: &DuckdbSinkConfig,
+    records: &[Value],
+    chunk: usize,
+) -> Result<usize, FaucetError> {
     guard
         .execute_batch("BEGIN TRANSACTION")
         .map_err(|e| FaucetError::Sink(format!("DuckDB begin failed: {e}")))?;
@@ -482,10 +505,10 @@ fn write_all_blocking(
         for c in records.chunks(chunk) {
             total += match &config.column_mapping {
                 DuckdbColumnMapping::Json { column } => {
-                    insert_json(&guard, &config.table_name, column, c)?
+                    insert_json(guard, &config.table_name, column, c)?
                 }
                 DuckdbColumnMapping::AutoMap => {
-                    insert_auto_map(&guard, &config.table_name, c, config.create_table)?
+                    insert_auto_map(guard, &config.table_name, c, config.create_table)?
                 }
             };
         }
@@ -493,12 +516,13 @@ fn write_all_blocking(
     })();
 
     match applied {
-        Ok(total) => {
-            guard
-                .execute_batch("COMMIT")
-                .map_err(|e| FaucetError::Sink(format!("DuckDB commit failed: {e}")))?;
-            Ok(total)
-        }
+        Ok(total) => match guard.execute_batch("COMMIT") {
+            Ok(()) => Ok(total),
+            Err(e) => {
+                let _ = guard.execute_batch("ROLLBACK");
+                Err(FaucetError::Sink(format!("DuckDB commit failed: {e}")))
+            }
+        },
         Err(e) => {
             let _ = guard.execute_batch("ROLLBACK");
             Err(e)
@@ -540,9 +564,74 @@ fn prepare_table_blocking(
     let mut seen = HashSet::new();
     columns.retain(|c| seen.insert(c.name.to_ascii_lowercase()));
     let sql = build_create_table_sql(&config.table_name, &columns, json_column)?;
-    conn.execute_batch(&sql)
-        .map_err(|e| FaucetError::Sink(format!("duckdb CREATE TABLE failed: {e}")))?;
+    settle_catalog_race(
+        "CREATE TABLE",
+        || conn.execute_batch(&sql).map_err(|e| e.to_string()),
+        || table_exists(conn, &config.table_name),
+        pause_after_conflict,
+    )?;
     Ok(true)
+}
+
+/// Whether DuckDB refused a catalog change because another transaction on the
+/// same database instance changed the same entry first (#990).
+fn is_catalog_conflict(message: &str) -> bool {
+    message.contains("Catalog write-write conflict")
+}
+
+/// A pause before re-running a statement that lost a catalog race, so the
+/// other writer can commit.
+fn pause_after_conflict(attempt: u32) {
+    #[allow(clippy::disallowed_methods)] // runs on the blocking pool
+    std::thread::sleep(std::time::Duration::from_millis(5 * u64::from(attempt)));
+}
+
+/// Run a `what` statement that another writer on the same database instance
+/// may race (#990). When it loses a catalog race, the other writer's change is
+/// used once `present` sees it committed, re-running the statement while it is
+/// not; any other failure, or the change still missing after
+/// [`CONFLICT_ATTEMPTS`], fails with DuckDB's error text.
+fn settle_catalog_race(
+    what: &str,
+    mut run: impl FnMut() -> Result<(), String>,
+    mut present: impl FnMut() -> Result<bool, FaucetError>,
+    pause: impl Fn(u32),
+) -> Result<(), FaucetError> {
+    let mut attempt = 1;
+    loop {
+        let message = match run() {
+            Ok(()) => return Ok(()),
+            Err(m) => m,
+        };
+        if !is_catalog_conflict(&message) {
+            return Err(FaucetError::Sink(format!(
+                "duckdb {what} failed: {message}"
+            )));
+        }
+        if present()? {
+            tracing::debug!("duckdb {what} lost a race to another writer; using its change");
+            return Ok(());
+        }
+        if attempt >= CONFLICT_ATTEMPTS {
+            return Err(FaucetError::Sink(format!(
+                "duckdb {what} failed: {message}"
+            )));
+        }
+        pause(attempt);
+        attempt += 1;
+    }
+}
+
+/// How many times a page transaction that lost a catalog race is re-run.
+const CONFLICT_ATTEMPTS: u32 = 10;
+
+/// Whether a failed page transaction lost a race with another writer changing
+/// the table (an `ADD COLUMN` made first, or one made while this page
+/// inserted). DuckDB rolled it back, so re-running it lands the page once and
+/// sees the other's change.
+fn lost_catalog_race(e: &FaucetError) -> bool {
+    matches!(e, FaucetError::Sink(m)
+        if is_catalog_conflict(m) || m.contains("has been altered by a different transaction"))
 }
 
 impl DuckdbDriver {
@@ -909,6 +998,108 @@ mod tests {
         )
         .await;
         drop(guards);
+    }
+
+    #[test]
+    fn a_lost_catalog_race_is_tolerated_only_when_the_change_landed() {
+        use std::cell::Cell;
+        let conflict =
+            "TransactionContext Error: Catalog write-write conflict on create with \"t\"";
+        let lose = || Err(conflict.to_string());
+        let pauses = Cell::new(0);
+        let pause = |_| pauses.set(pauses.get() + 1);
+
+        // The other writer's change is already committed.
+        settle_catalog_race("CREATE TABLE", lose, || Ok(true), pause).unwrap();
+        assert_eq!(pauses.get(), 0);
+
+        // It commits while this writer waits: the statement is re-run.
+        let runs = Cell::new(0);
+        settle_catalog_race(
+            "CREATE TABLE",
+            || {
+                runs.set(runs.get() + 1);
+                if runs.get() < 3 { lose() } else { Ok(()) }
+            },
+            || Ok(false),
+            pause,
+        )
+        .unwrap();
+        assert_eq!((runs.get(), pauses.get()), (3, 2));
+
+        // It never shows up: DuckDB's error text after the last attempt.
+        pauses.set(0);
+        let err = settle_catalog_race("CREATE TABLE", lose, || Ok(false), pause).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("Sink error: duckdb CREATE TABLE failed: {conflict}")
+        );
+        assert_eq!(pauses.get(), CONFLICT_ATTEMPTS - 1);
+
+        let probe_err = settle_catalog_race(
+            "CREATE TABLE",
+            lose,
+            || Err(FaucetError::Sink("probe failed".into())),
+            pause,
+        )
+        .unwrap_err();
+        assert!(
+            probe_err.to_string().contains("probe failed"),
+            "{probe_err}"
+        );
+
+        let other = settle_catalog_race(
+            "CREATE TABLE",
+            || Err("Catalog Error: no schema".into()),
+            || panic!("an unrelated error never probes"),
+            |_| panic!("an unrelated error is not retried"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            other.to_string(),
+            "Sink error: duckdb CREATE TABLE failed: Catalog Error: no schema"
+        );
+
+        assert!(lost_catalog_race(&FaucetError::Sink(format!(
+            "duckdb ADD COLUMN failed: {conflict}"
+        ))));
+        assert!(lost_catalog_race(&FaucetError::Sink(
+            "DuckDB insert failed: TransactionContext Error: Transaction conflict: attempting to \
+             insert into table \"t\" but it has been altered by a different transaction"
+                .into()
+        )));
+        assert!(!lost_catalog_race(&FaucetError::Sink(
+            "Constraint Error".into()
+        )));
+        assert!(!lost_catalog_race(&FaucetError::Config(conflict.into())));
+        pause_after_conflict(1);
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_create_table_error_still_fails_with_duckdbs_text() {
+        let sink = DuckdbSink::new(
+            DuckdbSinkConfig::new(":memory:", "missing_schema.t")
+                .column_mapping(DuckdbColumnMapping::AutoMap),
+        )
+        .await
+        .unwrap();
+        let err = sink.write_batch(&[json!({"id": 1})]).await.unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("duckdb CREATE TABLE failed"), "{text}");
+        assert!(text.contains("missing_schema"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_write_error_is_not_retried() {
+        let sink = sink_with_table(
+            "CREATE TABLE t (id BIGINT NOT NULL)",
+            "t",
+            DuckdbColumnMapping::AutoMap,
+        )
+        .await;
+        let err = sink.write_batch(&[json!({"id": null})]).await.unwrap_err();
+        assert!(err.to_string().contains("NOT NULL"), "{err}");
+        assert_eq!(count(&sink, "t"), 0);
     }
 
     async fn sink_with_table(ddl: &str, table: &str, mapping: DuckdbColumnMapping) -> DuckdbSink {

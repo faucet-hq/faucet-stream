@@ -24,6 +24,7 @@ pub const BATCH_BYTES: u64 = 1024 * 1024;
 fn kv(key: &str, value: &str) -> KeyValue {
     KeyValue {
         key: key.to_string(),
+        key_strindex: 0,
         value: Some(AnyValue {
             value: Some(any_value::Value::StringValue(value.to_string())),
         }),
@@ -33,6 +34,7 @@ fn kv(key: &str, value: &str) -> KeyValue {
 fn kv_int(key: &str, value: i64) -> KeyValue {
     KeyValue {
         key: key.to_string(),
+        key_strindex: 0,
         value: Some(AnyValue {
             value: Some(any_value::Value::IntValue(value)),
         }),

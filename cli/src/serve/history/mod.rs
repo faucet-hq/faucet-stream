@@ -237,6 +237,12 @@ pub struct RunRecord {
     /// column; defaulted for records written before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<crate::select::SelectionRequest>,
+    /// The completion dependencies the run request added between its rows /
+    /// streams (#960), as the caller sent them. Already folded into the
+    /// stored config, so a claim or shard applies them; kept here to show
+    /// which edges were request-supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depends_on: Option<crate::run_deps::RunDependencies>,
     /// The run's config came from a file on the server (the triggers file),
     /// so a claim or resume keeps its SQL connectors' host access (#862 H-04).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -246,6 +252,12 @@ pub struct RunRecord {
     /// caller reference policy wherever it runs (#881).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub caller_config: bool,
+    /// Where a template run's trusted config holds values its caller supplied
+    /// for the template's params (#989): a claim, a shard or a rollback
+    /// re-checks them against the caller reference policy of the instance
+    /// that loads the body.
+    #[serde(default, skip_serializing_if = "crate::params::CallerFields::is_empty")]
+    pub caller_params: crate::params::CallerFields,
     /// The execution pool the run belongs to (#957): only a replica serving
     /// it claims the run, its shards and its re-claims. Records written before
     /// pools existed read as `default`.
@@ -286,8 +298,10 @@ impl RunRecord {
             callback: None,
             tenant: None,
             selection: None,
+            depends_on: None,
             host_access: false,
             caller_config: false,
+            caller_params: Default::default(),
             pool: crate::serve::pools::default_pool(),
         }
     }

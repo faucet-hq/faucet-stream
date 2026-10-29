@@ -1,4 +1,5 @@
-# Default owner for every path (no review is required to merge).
+# Default owner for every path. The main ruleset requires a code-owner review;
+# the maintainer, as admin, merges their own pull requests with the bypass.
 * @pecsorabs
 /.github/workflows/ @pecsorabs
 /.github/CODEOWNERS @pecsorabs

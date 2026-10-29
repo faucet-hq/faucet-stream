@@ -1200,6 +1200,7 @@ mod tests {
             error: None,
             tenant: None,
             trusted_config: false,
+            caller_params: Default::default(),
         }
     }
 

@@ -12,40 +12,8 @@ id = "RUSTSEC-2026-0173"
 reason = "proc-macro-error2 via mysql-common-derive and validator_derive (2026-10-27)"
 
 [[IgnoredVulns]]
-id = "RUSTSEC-2025-0134"
-reason = "rustls-pemfile 1 via tiberius 0.12; needs tiberius 0.13 (#919) (2026-10-27)"
-
-[[IgnoredVulns]]
-id = "RUSTSEC-2024-0449"
-reason = "unsafe-libyaml via serde_yaml; replaced in the YAML move (#929, #935) (2026-10-27)"
-
-[[IgnoredVulns]]
 id = "RUSTSEC-2023-0071"
 reason = "no fix; upstream signers only (reqsign, russh) (2026-10-16)"
-
-[[IgnoredVulns]]
-id = "RUSTSEC-2026-0098"
-reason = "tiberius 0.12 TLS; needs tiberius 0.13 (2026-10-16)"
-
-[[IgnoredVulns]]
-id = "RUSTSEC-2026-0099"
-reason = "tiberius 0.12 TLS; needs tiberius 0.13 (2026-10-16)"
-
-[[IgnoredVulns]]
-id = "RUSTSEC-2026-0104"
-reason = "tiberius 0.12 TLS; needs tiberius 0.13 (2026-10-16)"
-
-[[IgnoredVulns]]
-id = "RUSTSEC-2026-0346"
-reason = "tiberius 0.12 TLS; needs tiberius 0.13 (2026-10-16)"
-
-[[IgnoredVulns]]
-id = "RUSTSEC-2026-0382"
-reason = "only tiberius 0.12's rustls-webpki 0.101.7 remains; needs tiberius 0.13 (2026-10-21)"
-
-[[IgnoredVulns]]
-id = "RUSTSEC-2026-0349"
-reason = "tiberius 0.12 TLS; needs tiberius 0.13 (2026-10-16)"
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0387"
@@ -112,16 +80,8 @@ id = "RUSTSEC-2026-0406"
 reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; affected APIs unused (2026-10-28)"
 
 [[IgnoredVulns]]
-id = "GHSA-h2v8-394m-p7vv"
-reason = "rustls 0.21.12 only via tiberius 0.12 (MSSQL); the brotli certificate-decompression path is a rustls 0.23 feature, not compiled; needs tiberius 0.13 (#919) (2026-10-28)"
-
-[[IgnoredVulns]]
 id = "GHSA-2f9f-gq7v-9h6m"
 reason = "thrift 0.17 only via parquet 58 (Arrow 58 pin, #981); no thrift-0.23 parquet release we can take yet (2026-10-28)"
-
-[[IgnoredVulns]]
-id = "GHSA-w9wp-h8wv-79jx"
-reason = "opentelemetry_sdk 0.31 (pinned by metrics-exporter-opentelemetry, #980); only TraceContextPropagator is installed, the W3C baggage propagator is never used (2026-10-28)"
 
 [[IgnoredVulns]]
 id = "GHSA-qwgh-2vcv-g2f7"

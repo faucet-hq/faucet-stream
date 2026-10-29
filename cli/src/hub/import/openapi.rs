@@ -1877,6 +1877,7 @@ impl Mapper<'_> {
             },
             parent,
             parent_key,
+            depends_on: Vec::new(),
             inherit_transforms: true,
             for_each: None,
             r#as: None,

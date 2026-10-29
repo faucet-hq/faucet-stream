@@ -7,7 +7,7 @@
 
 Shared connection, TLS, and pooling types for the Microsoft SQL Server **source** and **sink** connectors. Part of the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem.
 
-This is an internal building block. It holds the configuration the MSSQL [source](https://crates.io/crates/faucet-source-mssql) and [sink](https://crates.io/crates/faucet-sink-mssql) must agree on — how to parse a connection target, apply TLS, and build a [`tiberius`](https://crates.io/crates/tiberius) + [`bb8`](https://crates.io/crates/bb8) connection pool — so both connectors behave identically instead of duplicating the logic. End users configure MSSQL through the source/sink crates, which re-export these types; you only depend on this crate directly if you are building your own MSSQL connector.
+This is an internal building block. It holds the configuration the MSSQL [source](https://crates.io/crates/faucet-source-mssql) and [sink](https://crates.io/crates/faucet-sink-mssql) must agree on — how to parse a connection target, apply TLS, and build a [`tiberius`](https://crates.io/crates/tiberius) 0.13 + [`bb8`](https://crates.io/crates/bb8) connection pool (through this crate's own `bb8` connection manager) — so both connectors behave identically instead of duplicating the logic. End users configure MSSQL through the source/sink crates, which re-export these types; you only depend on this crate directly if you are building your own MSSQL connector.
 
 ## What it provides
 
@@ -21,6 +21,7 @@ This is an internal building block. It holds the configuration the MSSQL [source
 | `quote_ident_mssql` | fn | `[bracket]` identifier quoting (doubles interior `]`). |
 | `PARAM_LIMIT` | const | `2100` — MSSQL's per-request bind-parameter ceiling. |
 | `MssqlPool` / `MssqlPooledConnection<'a>` | type alias | The `bb8` pool and a checked-out connection (derefs to `tiberius::Client`). |
+| `ConnectionManager` / `MssqlClient` | struct / type alias | The `bb8::ManageConnection` behind the pool: TCP connect with keepalive, the TDS handshake, one routing redirect followed; `is_valid` runs `SELECT 1`. `MssqlClient` is the pooled `tiberius::Client` type. |
 
 ### `MssqlConnectionConfig` fields
 
@@ -34,7 +35,9 @@ This is an internal building block. It holds the configuration the MSSQL [source
 
 ### `MssqlTls` modes
 
-`MssqlTls { type: <mode>, ca_cert_path: <path?> }`. `ca_cert_path` trusts a specific CA for server validation and is ignored when `mode` is `disable`.
+`MssqlTls { type: <mode>, ca_cert_path: <path?> }`. `ca_cert_path` trusts a specific CA for server validation, in addition to the system trust store (tiberius 0.13 layers it on top; 0.12 used it as the only anchor), and is ignored when `mode` is `disable`. A `connection_string` that sets `TrustServerCertificate=true` together with a CA (`TrustServerCertificateCA` or `ca_cert_path`), or `TrustServerCertificateCA` with `type: trust_server_certificate`, is a config error.
+
+tiberius 0.13 bounds each server round trip at 30 s by default; `build_config` turns that off, because the connectors' `statement_timeout_secs` owns the statement bound. The TLS/login handshake is bounded by tiberius's 15 s `handshake_timeout`.
 
 | Mode | `tiberius` encryption | Notes |
 |------|-----------------------|-------|

@@ -77,7 +77,7 @@ streams:
 | `sources` | Additional named connectors for streams that read a second endpoint family (a reports API beside the entity API). A stream picks one with `source.ref`. |
 | `transforms` | The pipeline layer — runs before any sink, so every destination receives the same record shape (`keys_case`, `json_encode` for nested fields, `cast`, …). |
 | `contract` | Optional data contract, passed through as `pipeline.contract`. |
-| `streams[]` | One table each: `name`, `source.config` override, per-stream `transforms` (the matrix-row layer), `primary_keys`, `write`, and optionally `parent` / `parent_key` (per-record fan-out), `inherit_transforms: false`, and `for_each` / `as` / `name_case` ([one row per list item](#repeating-a-stream-over-a-list-param-for_each)). |
+| `streams[]` | One table each: `name`, `source.config` override, per-stream `transforms` (the matrix-row layer), `primary_keys`, `write`, and optionally `parent` / `parent_key` (per-record fan-out), `depends_on` (streams this one starts after — completion order only; a run request can add more, #960), `inherit_transforms: false`, and `for_each` / `as` / `name_case` ([one row per list item](#repeating-a-stream-over-a-list-param-for_each)). |
 
 `write` is a single mode or an **ordered preference list**: `overwrite` for a
 full refresh, `upsert` (needs `primary_keys`, which become the sink's `key`),

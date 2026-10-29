@@ -188,6 +188,14 @@ pub fn validate_template(src: &SourceTemplate) -> CliResult<()> {
                 src.name, s.name
             )));
         }
+        if let Some(d) = s.depends_on.iter().find(|d| repeated.contains(d.as_str())) {
+            return Err(CliError::Config(format!(
+                "source-template '{}': stream '{}' depends on the `for_each` stream '{d}' — its \
+                 rows are named only at trigger time; name one in the run request's \
+                 `depends_on` instead",
+                src.name, s.name
+            )));
+        }
         if s.for_each.is_none() {
             continue;
         }
@@ -308,6 +316,9 @@ struct Item<'a> {
     /// Caller-supplied free text, held to the `${param.*}` splice rules.
     guarded: bool,
     items: &'a ParamSpec,
+    /// The caller's free text is recorded where it lands (#989): the list
+    /// was supplied and is not `trusted`.
+    traced: bool,
 }
 
 impl Item<'_> {
@@ -414,24 +425,53 @@ fn render_string(s: &str, item: &Item<'_>, field: Option<&str>) -> CliResult<Val
     Ok(Value::String(out))
 }
 
-fn render_tree(v: &mut Value, item: &Item<'_>, field: Option<&str>) -> CliResult<()> {
+/// Whether `s` splices caller free text of `item` (#989).
+fn splices_free_text(s: &str, item: &Item<'_>) -> bool {
+    item.traced
+        && var_refs(s, item.var)
+            .iter()
+            .any(|(_, f)| crate::params::caller::item_field_text(item.items, item.value, *f))
+}
+
+/// Render every reference to `item` in `v` (at JSON pointer `ptr`),
+/// recording in `traced` where caller free text lands.
+fn render_tree(
+    v: &mut Value,
+    item: &Item<'_>,
+    field: Option<&str>,
+    ptr: &str,
+    traced: &mut Vec<String>,
+) -> CliResult<()> {
     match v {
         Value::String(s) => {
+            if splices_free_text(s, item) {
+                traced.push(ptr.to_string());
+            }
             *v = render_string(s, item, field)?;
         }
         Value::Array(a) => {
-            for x in a {
-                render_tree(x, item, field)?;
+            for (i, x) in a.iter_mut().enumerate() {
+                render_tree(x, item, field, &format!("{ptr}/{i}"), traced)?;
             }
         }
         Value::Object(o) => {
             let entries: Vec<(String, Value)> = std::mem::take(o).into_iter().collect();
             for (key, mut val) in entries {
-                render_tree(&mut val, item, Some(&key))?;
+                let rendered = render_string(&key, item, None)
+                    .map(|k| match k {
+                        Value::String(k) => k,
+                        other => value_to_string(&other),
+                    })
+                    .unwrap_or_else(|_| key.clone());
+                let at = crate::params::caller::child(ptr, &rendered);
+                render_tree(&mut val, item, Some(&key), &at, traced)?;
                 let key = match render_string(&key, item, None)? {
                     Value::String(k) => k,
                     other => value_to_string(&other),
                 };
+                if splices_free_text(&key, item) {
+                    traced.push(at);
+                }
                 o.insert(key, val);
             }
         }
@@ -509,8 +549,55 @@ pub fn expand(
     mode: BindMode,
     env: Option<&EnvOverlay>,
 ) -> CliResult<SourceTemplate> {
+    expand_traced(src, supplied, mode, env).map(|e| e.template)
+}
+
+/// A template with its `for_each` streams expanded, and where the caller's
+/// list items landed.
+#[derive(Debug, Clone)]
+pub struct Expanded {
+    pub template: SourceTemplate,
+    /// Caller free text an item wrote (#989), by stream: the stream's name,
+    /// a JSON pointer into the stream (`/source/config/…`,
+    /// `/transforms/0/config/…`) and the list param.
+    pub caller_fields: Vec<(String, String, String)>,
+}
+
+impl Expanded {
+    /// [`Self::caller_fields`] as pointers into a composed document, whose
+    /// matrix row `id` is the stream name (rows a selection dropped are
+    /// skipped).
+    pub fn composed_fields(&self, document: &Value) -> crate::params::CallerFields {
+        let mut out = crate::params::CallerFields::default();
+        let rows = document
+            .get("matrix")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for (stream, ptr, param) in &self.caller_fields {
+            if let Some(i) = rows
+                .iter()
+                .position(|r| r.get("id").and_then(Value::as_str) == Some(stream.as_str()))
+            {
+                out.insert(format!("/matrix/{i}{ptr}"), param.clone());
+            }
+        }
+        out
+    }
+}
+
+/// [`expand`], recording where caller free text landed.
+pub fn expand_traced(
+    src: &SourceTemplate,
+    supplied: &SuppliedParams,
+    mode: BindMode,
+    env: Option<&EnvOverlay>,
+) -> CliResult<Expanded> {
     if !has_for_each(src) {
-        return Ok(src.clone());
+        return Ok(Expanded {
+            template: src.clone(),
+            caller_fields: Vec::new(),
+        });
     }
     src.validate()?;
     let spec: ParamsSpec = match env {
@@ -531,6 +618,7 @@ pub fn expand(
     let bound = crate::params::resolve(&spec, &own, mode)?;
 
     let mut streams = Vec::with_capacity(src.streams.len());
+    let mut caller_fields = Vec::new();
     // Rendered name → where it came from, for the duplicate error.
     let mut origin: BTreeMap<String, String> = src
         .streams
@@ -560,6 +648,7 @@ pub fn expand(
                 label: format!("{pname}[{i}]"),
                 guarded: bound.caller_supplied.contains(pname),
                 items: &items_spec,
+                traced: bound.caller_supplied.contains(pname) && !p.trusted,
             };
             let name = render_name(s, &item, &bound, &what)?;
             if let Some(prev) = origin.insert(name.clone(), format!("item {}", item.label)) {
@@ -570,10 +659,19 @@ pub fn expand(
                 )));
             }
             let mut parts = rendered_parts(s);
-            render_tree(&mut parts, &item, None).map_err(|e| match e {
+            let mut traced = Vec::new();
+            render_tree(&mut parts, &item, None, "", &mut traced).map_err(|e| match e {
                 CliError::Config(m) => CliError::Config(format!("{what}: {m}")),
                 other => other,
             })?;
+            // A row's source config and transforms reach connectors; its
+            // keys, write modes and name are checked as stream data.
+            caller_fields.extend(
+                traced
+                    .into_iter()
+                    .filter(|p| p.starts_with("/source/config") || p.starts_with("/transforms/"))
+                    .map(|p| (name.clone(), p, pname.to_string())),
+            );
             let mut out = s.clone();
             out.name = name;
             out.for_each = None;
@@ -593,7 +691,10 @@ pub fn expand(
     let mut expanded = src.clone();
     expanded.streams = streams;
     expanded.validate()?;
-    Ok(expanded)
+    Ok(Expanded {
+        template: expanded,
+        caller_fields,
+    })
 }
 
 /// [`expand`] with placeholder items — the structural view of a template
@@ -1018,6 +1119,7 @@ streams:
             label: "tables[0]".into(),
             guarded: false,
             items: &item_spec,
+            traced: false,
         };
         let err = render_string("${t}{env:HOME}", &item, Some("query"))
             .unwrap_err()
@@ -1088,6 +1190,13 @@ streams:
         .unwrap_err()
         .to_string();
         assert!(err.contains("cannot have children"), "{err}");
+        let err = src(&format!(
+            "{TABLES}  - name: after\n    depends_on: [\"${{t.schema}}_${{t.table}}\"]\n"
+        ))
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("run request's"), "{err}");
         let err = src(&SCALARS.replace("name: \"events_shard_${n}\"", "name: \"events_${n.id}\""))
             .validate()
             .unwrap_err()
@@ -1221,5 +1330,83 @@ streams:
             &json!({"table_id": "${param.table}"}),
             s
         ));
+    }
+
+    /// #989: an item a caller supplied is recorded where it lands in a
+    /// stream's source config and transforms, and maps onto the composed
+    /// document's matrix row of that stream; an int item, a closed field and
+    /// a `trusted` list are not recorded.
+    #[test]
+    fn caller_items_are_traced_into_the_composed_rows() {
+        let t = src(r#"
+kind: source-template
+name: files
+params:
+  dirs:
+    type: list
+    items:
+      type: object
+      properties:
+        name: { type: string, required: true }
+        dir: { type: string, required: true }
+        fmt: { type: string, values: [csv, jsonl] }
+  ids: { type: list, items: { type: int } }
+  ok: { type: list, items: { type: string }, trusted: true }
+source:
+  type: file
+  config: { path: "/data" }
+streams:
+  - for_each: ${param.dirs}
+    as: d
+    name: "f_${d.name}"
+    source: { config: { path: "${d.dir}/*.${d.fmt}", format: "${d.fmt}" } }
+  - for_each: ${param.ids}
+    as: n
+    name: "id_${n}"
+    source: { config: { path: "/data/${n}.csv" } }
+  - for_each: ${param.ok}
+    as: o
+    name: "ok_${o}"
+    source: { config: { path: "${o}" } }
+"#);
+        let e = expand_traced(
+            &t,
+            &params(json!({
+                "dirs": [{ "name": "a", "dir": "/etc", "fmt": "csv" }],
+                "ids": [7],
+                "ok": ["x"],
+            })),
+            BindMode::Strict,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            e.caller_fields,
+            vec![(
+                "f_a".to_string(),
+                "/source/config/path".to_string(),
+                "dirs".to_string()
+            )]
+        );
+        let doc = json!({ "matrix": [{ "id": "id_7" }, { "id": "f_a" }] });
+        let fields = e.composed_fields(&doc);
+        assert!(fields.covers("/matrix/1/source/config/path"));
+        assert!(!fields.covers("/matrix/0"));
+        assert!(e.composed_fields(&json!({})).is_empty());
+        // Defaults bound by the author are never traced.
+        let d = src(r#"
+kind: source-template
+name: files
+params:
+  dirs: { type: list, items: { type: string }, default: ["etc"] }
+source: { type: file, config: { path: "/data" } }
+streams:
+  - for_each: ${param.dirs}
+    as: d
+    name: "f_${d}"
+    source: { config: { path: "/data/${d}" } }
+"#);
+        let traced = expand_traced(&d, &params(json!({})), BindMode::Strict, None).unwrap();
+        assert!(traced.caller_fields.is_empty());
     }
 }

@@ -97,14 +97,17 @@ async fn resolve(
             .await?
         }
         (None, Some(id)) => {
-            let body = template_body(state, id, src).await?;
+            // The template is the operator's; the params are the caller's
+            // and meet the caller reference policy (#989).
+            let (body, params) = template_body(state, id, src).await?;
             crate::runtime::server::load(
                 state,
                 &crate::runtime::Principal::new(actor.clone(), crate::runtime::Origin::Trusted),
                 crate::runtime::server::Submission::new(
                     &body,
                     crate::serve::load::ConfigFormat::Json,
-                ),
+                )
+                .with_caller_fields(&params),
             )
             .await?
         }
@@ -129,7 +132,7 @@ async fn template_body(
     state: &ServerState,
     id: &str,
     src: &ConfigSource,
-) -> Result<String, ServeError> {
+) -> Result<(String, crate::params::CallerFields), ServeError> {
     use crate::serve::history::templates::VersionSelector;
     let selector = match &src.version {
         None => VersionSelector::default(),
@@ -157,11 +160,15 @@ async fn template_body(
     )
     .await
     .map_err(cli_to_serve)?;
-    Ok(m.body)
+    Ok((m.body, m.caller_fields))
 }
 
 #[cfg(not(feature = "templates"))]
-async fn template_body(_: &ServerState, _: &str, _: &ConfigSource) -> Result<String, ServeError> {
+async fn template_body(
+    _: &ServerState,
+    _: &str,
+    _: &ConfigSource,
+) -> Result<(String, crate::params::CallerFields), ServeError> {
     Err(ServeError::BadConfig(
         "`template` needs a faucet build with the `templates` feature; pass `config` instead"
             .into(),

@@ -439,6 +439,34 @@ pub enum CliError {
     )]
     SelectorsWithoutMatrix { flags: String },
 
+    /// A run request's `depends_on` (#960) names a row or stream the run does
+    /// not have.
+    #[error(
+        "run request `depends_on`: {edge}: no row or stream '{name}' in this run ({})",
+        if available.is_empty() {
+            "it has no matrix rows or streams to order".to_string()
+        } else {
+            format!("it has: {}", available.join(", "))
+        }
+    )]
+    UnknownRunDependency {
+        edge: String,
+        name: String,
+        available: Vec<String>,
+    },
+
+    /// A run request's `depends_on` (#960) closes a dependency cycle with the
+    /// run's own `parent:` / `depends_on:` edges (or among themselves).
+    #[error(
+        "run request `depends_on` closes a dependency cycle: {} (rows in the cycle: {})",
+        edges.join(", "),
+        rows.join(", ")
+    )]
+    RunDependencyCycle {
+        edges: Vec<String>,
+        rows: Vec<String>,
+    },
+
     /// The resolved run set is empty after status gating / tag narrowing / skip
     /// (#371). Not a silent no-op — names each row's status and how to include.
     #[error(

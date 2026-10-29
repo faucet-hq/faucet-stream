@@ -329,6 +329,7 @@ params:
 | `properties` | — | *(object items)* Each field's spec: a scalar `type`, `required`, `default`, `values`, `secret`. An element may carry no other field. |
 | `min_items` | `1` | *(list)* The fewest elements. An empty list is refused by default rather than running with no rows. |
 | `max_items` | — | *(list)* The most elements. |
+| `trusted` | `false` | On `faucet serve`, a caller's value of this param reaches path, URL and command fields without the caller reference policy (#989). Without it such a value is checked like a submitted config — see [template params a caller supplies](http-api.md#template-params-a-caller-supplies). Not allowed on `computed` params or on a list's `items` / fields. |
 
 **List params.** `type: list` (#952) takes a JSON array over HTTP
 (`"tables": ["orders", "customers"]`), `--param tables='["orders","customers"]'`

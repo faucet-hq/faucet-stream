@@ -284,6 +284,13 @@ export async function renderDetail(container, { id }) {
     }
   }
 
+  function dependsOn(deps) {
+    const edges = Object.entries(deps || {})
+      .filter(([, after]) => (after || []).length)
+      .map(([row, after]) => `<div title="${escapeHtml(row)} starts after ${escapeHtml(after.join(", "))}">${escapeHtml(row)} ← ${after.map(escapeHtml).join(", ")}</div>`);
+    return edges.join("");
+  }
+
   function renderHead(rec) {
     const errors = rec.error ? `<div class="error-box">${escapeHtml(rec.error)}</div>` : "";
     const logsLink = container.querySelector("#logs-link");
@@ -299,6 +306,7 @@ export async function renderDetail(container, { id }) {
     const provenance = [
       templateLink(rec) && `<dt>Template</dt><dd>${templateLink(rec)}</dd>`,
       rec.pool && `<dt title="execution pool">Pool</dt><dd class="mono">${escapeHtml(rec.pool)}</dd>`,
+      dependsOn(rec.depends_on) && `<dt title="completion order the run request added">Depends on</dt><dd class="mono">${dependsOn(rec.depends_on)}</dd>`,
       rec.idempotency_key && `<dt>Idempotency key</dt><dd class="mono">${escapeHtml(rec.idempotency_key)}</dd>`,
     ].filter(Boolean).join("");
     container.querySelector("#detail-head").innerHTML = `

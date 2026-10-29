@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-const LIBRARY: &str = "serde_yaml";
+const LIBRARY: &str = "yaml_serde";
 const BOUNDARY: &str = "src/yaml.rs";
 
 fn scan(dir: &Path, root: &Path, offenders: &mut Vec<String>) {

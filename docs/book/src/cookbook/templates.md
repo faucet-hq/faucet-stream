@@ -115,6 +115,33 @@ Values are accepted in either wire shape, so a CLI `--param page_size=500` and a
 HTTP `{"page_size": 500}` behave identically — and `--param page_size=abc` is
 rejected up front, naming the param.
 
+### Params that reach paths and URLs
+
+On `faucet serve` a template's body is the operator's, but the values a
+caller supplies for its params are the caller's. When one lands in a path,
+URL or command field — a sink `path: ${param.out}`, a source
+`base_url: ${param.api_root}`, a DLQ path — the server holds it to its
+caller reference policy (`--allow-path-root`, `--allow-url-host`, …) exactly
+as it would a config the caller submitted, and refuses the run with a `403`
+naming the param and the field. Defaults, closed `values:` sets, `int` /
+`float` / `bool` params and `${map:}`-computed params are the author's and
+are never checked; see
+[the HTTP API reference](../reference/http-api.md#template-params-a-caller-supplies).
+
+When the author means a param's value to reach such a field as given, mark
+it `trusted`:
+
+```yaml
+params:
+  out_dir: { required: true, trusted: true, description: "Any directory on the host" }
+```
+
+`faucet template show` lists such a param as `[trusted]` and the console
+marks it with a `trusted` pill. Registering a template already needs the
+admin role, so only an admin can make that choice. `trusted` applies to a
+whole param (not a list's `items` or one of their fields) and not to a
+`computed` param — mark the params it reads instead.
+
 ## Running a parameterized config directly
 
 `faucet run` and `faucet validate` take `--param`:
@@ -894,6 +921,30 @@ needs `upsert` on a file sink) no longer blocks the others.
 | `eligible` | runnable (`mandatory` / `active`) ancestors are pulled in; a parked (`available` / `draft` / `archived`) one is refused |
 | `all` | every ancestor is pulled in (parked ones with a warning) |
 
+**Ordering rows from the request.** A source template's stream (like a
+matrix row) can declare `depends_on: [other_stream]` — it starts only after
+that stream completes, with no record hand-off. A caller who knows of an
+order the template does not encode adds it to the trigger instead:
+
+```bash
+curl -sX POST localhost:8080/v1/templates/crm/runs -H "Authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"sink":"files","depends_on":{"deals":["accounts"]}}'
+```
+
+The request's edges are **added** to the template's own (never removing
+one), checked like them — every name must be a stream or row of the run (a
+`for_each` stream by its rendered name), and the combined `parent:` +
+`depends_on:` graph must stay acyclic, else a `400` naming the edge — and
+applied before the selection resolves, so a prerequisite the selection
+leaves out follows `include_parents` exactly as in the table above. An edge
+on a stream the selection leaves out is dropped with it. A failed
+prerequisite skips its dependents under the run's `on_error`. The run record
+keeps the edges (`depends_on`), the run is labelled
+`depends_on=deals:accounts`, and they are part of the idempotency fingerprint
+and of a change request's plan. `POST /v1/runs` takes the same field for a
+config's matrix rows.
+
 **What a selection does not change.** State keys are per row
 (`{pipeline}::{row}`), so running a subset never touches another row's
 bookmark. The run is labelled `selection=<canonical form>` (for example
@@ -1176,6 +1227,10 @@ Metrics: `faucet_serve_template_sync_runs_total{origin,outcome=ok|partial|error}
   *before* params bind, so a supplied value is never itself scanned for
   directives. A supplied value containing `${` is rejected outright: params are
   data, not directives.
+- **Caller values meet the caller policy.** On a server, a caller-supplied
+  param value that reaches a path, URL or command is checked like a submitted
+  config (see [Params that reach paths and URLs](#params-that-reach-paths-and-urls));
+  `trusted: true` opts a param out.
 - **Typos fail loudly.** An undeclared `--param`, an undeclared `${param.x}`
   reference, a missing `required` param, or a type mismatch is an error naming the
   param — never a silent no-op.

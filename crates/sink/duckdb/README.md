@@ -66,6 +66,15 @@ the field. With `auto_map`, a field first seen on a later page (or missing
 from a pre-existing table) is added with `ALTER TABLE … ADD COLUMN IF NOT
 EXISTS`, typed the same way, in the page's transaction — it is never dropped.
 
+Sinks on one database file in one process (matrix rows, fan-out children)
+share one DuckDB instance and may create or widen the same table at the same
+moment (#990). DuckDB lets only one of them change the catalog entry; the
+other writer waits for that change to commit and uses it, and a page whose
+transaction lost the race (its `ADD COLUMN`, or an insert into a table another
+writer altered meanwhile) is rolled back and re-run, up to 10 attempts. Any
+other error fails the write with DuckDB's text. Writers in separate processes
+cannot share a file: DuckDB allows one writing process per database.
+
 Set `create_table: false` to require a pre-existing target; a missing one then
 fails fast with the same error every table sink raises, naming both ways out,
 and with `auto_map` a record field the table has no column for fails the write
@@ -93,7 +102,7 @@ Append only. `faucet list --json` prints the declaration.
 
 ## Timeouts, cancellation and retries
 
-Every page write runs through the pipeline's `CallContext` (#880): the run's deadline ends it promptly, and a write cut short is interrupted inside DuckDB so its transaction rolls back. Each write counts as one `write` round trip in `faucet_sink_roundtrips_total`. The sink never retries a write itself.
+Every page write runs through the pipeline's `CallContext` (#880): the run's deadline ends it promptly, and a write cut short is interrupted inside DuckDB so its transaction rolls back. Each write counts as one `write` round trip in `faucet_sink_roundtrips_total`. The sink re-runs a page transaction only when it lost a race with another writer changing the same table (see [Auto-create](#auto-create-create_table)); DuckDB rolled it back, so the re-run lands the page once. It retries nothing else.
 
 ## Shared SQL layer
 

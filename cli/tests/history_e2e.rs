@@ -61,8 +61,10 @@ fn record(id: &str, row_id: &str) -> RunRecord {
         callback: None,
         tenant: None,
         selection: None,
+        depends_on: None,
         host_access: false,
         caller_config: false,
+        caller_params: Default::default(),
         pool: "default".into(),
     }
 }

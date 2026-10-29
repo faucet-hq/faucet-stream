@@ -187,7 +187,7 @@ mod layer {
     use tracing_subscriber::layer::{Context, Layer};
 
     /// A `tracing` layer that counts ERROR/WARN events emitted by the
-    /// opentelemetry SDK (its only error channel in the 0.31 line, since
+    /// opentelemetry SDK (its only error channel since the 0.31 line, when
     /// `global::set_error_handler` was removed) into
     /// `faucet_otel_export_failures_total{signal}`.
     pub struct OtelErrorCountLayer;
@@ -277,11 +277,87 @@ mod sdk {
         Ok(provider)
     }
 
+    /// The `metrics`-facade recorder that forwards every counter, gauge and
+    /// histogram to an OpenTelemetry meter (counter → monotonic `u64` sum, gauge →
+    /// `f64` gauge, histogram → `f64` histogram with the SDK's default buckets;
+    /// labels become attributes). Faucet-owned so the bridge crate behind it
+    /// (`metrics-opentelemetry`) stays an implementation detail of this module.
+    #[derive(Clone)]
+    pub struct OtelRecorder(std::sync::Arc<metrics_opentelemetry::OpenTelemetryRecorder>);
+
+    impl std::fmt::Debug for OtelRecorder {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("OtelRecorder").finish_non_exhaustive()
+        }
+    }
+
+    impl metrics::Recorder for OtelRecorder {
+        fn describe_counter(
+            &self,
+            key: metrics::KeyName,
+            unit: Option<metrics::Unit>,
+            description: metrics::SharedString,
+        ) {
+            self.0.describe_counter(key, unit, description)
+        }
+        fn describe_gauge(
+            &self,
+            key: metrics::KeyName,
+            unit: Option<metrics::Unit>,
+            description: metrics::SharedString,
+        ) {
+            self.0.describe_gauge(key, unit, description)
+        }
+        fn describe_histogram(
+            &self,
+            key: metrics::KeyName,
+            unit: Option<metrics::Unit>,
+            description: metrics::SharedString,
+        ) {
+            self.0.describe_histogram(key, unit, description)
+        }
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            self.0.register_counter(key, metadata)
+        }
+        fn register_gauge(
+            &self,
+            key: &metrics::Key,
+            metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Gauge {
+            self.0.register_gauge(key, metadata)
+        }
+        fn register_histogram(
+            &self,
+            key: &metrics::Key,
+            metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            self.0.register_histogram(key, metadata)
+        }
+    }
+
+    /// Bridge the `metrics` facade onto a meter of `provider`, scoped
+    /// `scope_name`. The only place the bridge crate is named.
+    pub(super) fn bridge(provider: &SdkMeterProvider, scope_name: &str) -> OtelRecorder {
+        use opentelemetry::InstrumentationScope;
+        use opentelemetry::metrics::MeterProvider as _;
+        let meter =
+            provider.meter_with_scope(InstrumentationScope::builder(scope_name.to_owned()).build());
+        OtelRecorder(std::sync::Arc::new(
+            metrics_opentelemetry::OpenTelemetryRecorder::new(
+                metrics_opentelemetry::OpenTelemetryMetrics::new(meter),
+            ),
+        ))
+    }
+
     /// Build a NON-global metrics recorder bridging the `metrics` facade to an
     /// OTLP PeriodicReader, plus its meter provider (kept alive by the caller).
     pub fn build_meter_provider(
         cfg: &OtelConfig,
-    ) -> Result<(SdkMeterProvider, metrics_exporter_opentelemetry::Recorder), OtelError> {
+    ) -> Result<(SdkMeterProvider, OtelRecorder), OtelError> {
         let endpoint = cfg.resolve_endpoint();
         let timeout = Duration::from_secs(cfg.timeout_secs);
         let exporter = match cfg.protocol {
@@ -301,11 +377,11 @@ mod sdk {
         let reader = PeriodicReader::builder(exporter)
             .with_interval(Duration::from_secs(cfg.metric_interval_secs))
             .build();
-        let res = resource(cfg);
-        let (provider, recorder) =
-            metrics_exporter_opentelemetry::Recorder::builder(cfg.service_name.clone())
-                .with_meter_provider(move |mb| mb.with_reader(reader).with_resource(res))
-                .build();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(reader)
+            .with_resource(resource(cfg))
+            .build();
+        let recorder = bridge(&provider, &cfg.service_name);
         Ok((provider, recorder))
     }
 
@@ -392,7 +468,7 @@ mod sdk {
 
 #[cfg(feature = "otel")]
 pub use sdk::{
-    OtelError, OtelGuard, TraceLayer, build_meter_provider, build_trace_provider,
+    OtelError, OtelGuard, OtelRecorder, TraceLayer, build_meter_provider, build_trace_provider,
     install_propagator, register_trace_layer_slot, set_guard, shutdown_otel,
 };
 #[cfg(feature = "otel")]

@@ -496,6 +496,7 @@ otel = [
     "dep:opentelemetry-proto",
     "dep:tonic-otlp",
     "dep:prost-otlp",
+    "dep:opentelemetry",
     "dep:tracing-opentelemetry",
     "dep:reqwest",
 ]
@@ -662,7 +663,7 @@ serde.workspace = true
 # `preserve_order`: `faucet fmt` (and every rendered config) keeps insertion
 # order whatever else the build enables, so slim and full binaries agree.
 serde_json = { workspace = true, features = ["preserve_order"] }
-serde_yaml = "0.9"
+yaml_serde = "0.10"
 semver = "1"
 toml_edit = "0.25"
 thiserror.workspace = true
@@ -723,6 +724,7 @@ redis = { workspace = true, optional = true }
 rdkafka = { workspace = true, optional = true }
 # OTLP log shipping (#806, `otel`).
 opentelemetry-proto = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
 tonic-otlp = { workspace = true, optional = true }
 prost-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
@@ -760,9 +762,10 @@ testcontainers-modules = { version = "0.15", features = ["postgres", "redis", "m
 # destination DBs directly (offline — no Docker).
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "postgres", "mysql"] }
 tokio-postgres = "0.7"
-# Mock OTLP/gRPC log collector for the log-shipping tests (#806).
+# Mock OTLP/gRPC collector for the log-shipping tests (#806) and the
+# metrics-bridge export test (#980).
 tonic-otlp = { workspace = true, features = ["server", "router"] }
-opentelemetry-proto = { workspace = true }
+opentelemetry-proto = { workspace = true, features = ["metrics"] }
 prost-otlp = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }

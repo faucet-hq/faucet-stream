@@ -319,10 +319,12 @@ pub async fn submit_backfill(
             budget: None,
             approved_change: None,
             selection: None,
+            depends_on: None,
             pool: req.pool.clone(),
             trusted_config: false,
             server_file: false,
             sealed_params: None,
+            caller_fields: Default::default(),
         };
         let outcome = crate::runtime::server::submit(
             &state,

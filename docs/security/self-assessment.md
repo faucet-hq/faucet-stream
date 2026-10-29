@@ -204,12 +204,13 @@ crates.io, and the incident is described in an advisory.
 
 ### Known issues and accepted gaps
 
-- **One maintainer (accepted).** Changes are not reviewed by a second person;
-  the required checks are the review bar. Branch protection on `main` requires
-  the status checks and forbids force pushes and branch deletion, but requires
-  no approving review. Scorecard's Branch-Protection, Code-Review and
-  Contributors checks score low as a result; these are accepted gaps, not
-  planned work. See [GOVERNANCE.md](../../GOVERNANCE.md#accepted-gaps-of-a-single-maintainer-project).
+- **One maintainer (accepted).** The maintainer's changes are not reviewed by
+  a second person; the required checks are the review bar. `main`'s rulesets
+  require two approving reviews, a code-owner review and the required checks on
+  an up-to-date branch, and forbid force pushes and branch deletion; the
+  maintainer merges with the admin bypass once the checks pass. Scorecard's
+  Code-Review and Contributors checks score low, and Branch-Protection short of
+  10, as a result; these are accepted gaps, not planned work. See [GOVERNANCE.md](../../GOVERNANCE.md#accepted-gaps-of-a-single-maintainer-project).
 - **Connector code is not sandboxed.** A plugin or a driver can read anything
   the process can.
 - **Redaction covers faucet's own output only.** Third-party debug logging can

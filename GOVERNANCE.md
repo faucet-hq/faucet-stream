@@ -81,15 +81,21 @@ Continuity plan:
 
 These are deliberate, not planned work, while the project has one maintainer:
 
-- **No required pull-request review.** There is no second person to review, so
-  `main` does not require an approving review; GitHub would otherwise block
-  every merge. Branch protection on `main` today: required status checks (the
-  CI gates listed in [CONTRIBUTING.md](CONTRIBUTING.md)), no force pushes and no
-  branch deletion.
-- **OpenSSF Scorecard** therefore scores *Branch-Protection* and *Code-Review*
-  low, and *Contributors* (contributors from several organizations) low. These
-  results are accepted. Nothing else is loosened or worked around to raise
-  them; they are revisited when a second maintainer joins.
+- **Reviews are required, and the maintainer bypasses them.** `main` is
+  governed by two public repository rulesets: *main protection* (no force
+  pushes, no deletion, with no bypass for anyone) and *main reviews and
+  checks*. The second requires two approving reviews including a code owner,
+  dismisses stale approvals, requires approval of the last push, and requires
+  the CI gates listed in [CONTRIBUTING.md](CONTRIBUTING.md) on an up-to-date
+  branch. Repository admins may bypass it. Every outside contribution goes
+  through those rules. With no second reviewer, the maintainer merges their own
+  pull requests with the admin bypass, and only after every required check has
+  passed.
+- **OpenSSF Scorecard** therefore scores *Code-Review* at 0 (the maintainer's
+  own changes are not approved by anyone else), *Branch-Protection* short of 10
+  (the admin bypass), and *Contributors* low (contributors from one
+  organization). These gaps are accepted and revisited when a second maintainer
+  joins: the bypass then goes away and reviews apply to everyone.
 
 ## Code of conduct
 

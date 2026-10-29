@@ -127,7 +127,7 @@ cargo add faucet-common-kafka --features schema-registry   # for the Confluent v
 use faucet_common_kafka::{KafkaAuth, KafkaValueFormat, CompressionType};
 
 // Built straight from a YAML/JSON config, or constructed in code:
-let auth: KafkaAuth = serde_yaml::from_str(
+let auth: KafkaAuth = yaml_serde::from_str(
     "type: sasl_plain\nusername: u\npassword: p",
 )?;
 let format = KafkaValueFormat::default();      // KafkaValueFormat::Json
