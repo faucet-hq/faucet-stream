@@ -10,7 +10,7 @@
   <a href="https://github.com/faucet-hq/faucet-stream/actions/workflows/ci.yml"><img src="https://github.com/faucet-hq/faucet-stream/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://codecov.io/gh/faucet-hq/faucet-stream"><img src="https://codecov.io/gh/faucet-hq/faucet-stream/branch/main/graph/badge.svg" alt="Coverage"></a>
   <a href="https://crates.io/crates/faucet-core"><img src="https://img.shields.io/crates/d/faucet-core.svg?label=downloads" alt="faucet-core downloads"></a>
-  <a href="rust-toolchain.toml"><img src="https://img.shields.io/crates/msrv/faucet-stream.svg" alt="MSRV"></a>
+  <a href="Cargo.toml"><img src="https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Ffaucet-hq%2Ffaucet-stream%2Fmain%2FCargo.toml&query=%24.workspace.package%5B%27rust-version%27%5D&label=MSRV&color=blue" alt="MSRV (from Cargo.toml on main)"></a>
   <a href="deny.toml"><img src="https://img.shields.io/badge/deps-cargo--deny-blue" alt="Dependencies"></a>
   <a href="https://scorecard.dev/viewer/?uri=github.com/faucet-hq/faucet-stream"><img src="https://api.scorecard.dev/projects/github.com/faucet-hq/faucet-stream/badge" alt="OpenSSF Scorecard"></a>
   <!-- OpenSSF Best Practices badge: add once the bestpractices.dev entry exists (#978):
@@ -424,4 +424,4 @@ best signal for the next person deciding whether to bet a pipeline on it.
 
 ## License
 
-Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.
+Licensed under either of [Apache License 2.0](LICENSE-Apache-2.0) or [MIT](LICENSE-MIT), at your option.

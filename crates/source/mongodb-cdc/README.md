@@ -468,7 +468,7 @@ Opening the change stream, each `getMore` poll and the catalog and capture queri
 
 Licensed under either of:
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](https://github.com/faucet-hq/faucet-stream/blob/main/LICENSE-APACHE))
+- Apache License, Version 2.0 ([LICENSE-Apache-2.0](https://github.com/faucet-hq/faucet-stream/blob/main/LICENSE-Apache-2.0))
 - MIT license ([LICENSE-MIT](https://github.com/faucet-hq/faucet-stream/blob/main/LICENSE-MIT))
 
 at your option.
