@@ -63,6 +63,7 @@ fn record(id: &str, row_id: &str) -> RunRecord {
         selection: None,
         host_access: false,
         caller_config: false,
+        caller_params: Default::default(),
         pool: "default".into(),
     }
 }
