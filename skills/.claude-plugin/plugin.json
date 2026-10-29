@@ -1,7 +1,7 @@
 {
   "name": "faucet",
   "description": "Skills for coding agents working with faucet-stream: write and validate pipeline configs, debug failed, slow or unreachable runs, verify a copy against its source, tune throughput, deploy and operate faucet serve, drive its HTTP API, keep credentials out of responses and history, migrate to faucet, use and publish Template Hub templates, and build connector crates. The version equals the faucet-cli release it ships with.",
-  "version": "1.15.1",
+  "version": "1.16.0",
   "author": {
     "name": "faucet-hq",
     "url": "https://faucet-hq.github.io"
