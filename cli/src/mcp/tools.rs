@@ -888,14 +888,12 @@ async fn run_pipeline(ctx: &McpContext, args: &Value) -> Result<String, String> 
         }));
     }
 
-    let depended = match depends_on_arg(args)? {
-        Some(deps) => deps
-            .apply_to_text(text, false)
-            .map_err(|e| e.to_string())?
-            .map(|t| (t, deps)),
+    let deps = depends_on_arg(args)?.filter(|d| !d.is_empty());
+    let rewritten = match &deps {
+        Some(d) => d.apply_to_text(text, false).map_err(|e| e.to_string())?,
         None => None,
     };
-    let text = depended.as_ref().map_or(text, |(t, _)| t.as_str());
+    let text = rewritten.as_deref().unwrap_or(text);
     let summary = crate::run_from_yaml_str_selected(text, selection.as_ref())
         .await
         .map_err(|e| e.to_string())?;
@@ -903,7 +901,7 @@ async fn run_pipeline(ctx: &McpContext, args: &Value) -> Result<String, String> 
     let total: usize = summary.invocations.iter().map(|i| i.records_written).sum();
     let doc = json!({
         "selection": selection.as_ref().map(|s| s.canonical()),
-        "depends_on": depended.as_ref().map(|(_, d)| d.canonical()),
+        "depends_on": deps.as_ref().map(|d| d.canonical()),
         "invocations": summary.invocations.len(),
         "ok": summary.invocations.len() - failed,
         "failed": failed,
@@ -2155,6 +2153,27 @@ mod tests {
             assert_eq!(out["isError"], true);
             assert!(out.to_string().contains("depends_on"), "{out}");
             assert!(!dir.path().join("b.jsonl").exists());
+        }
+
+        #[tokio::test]
+        async fn run_pipeline_reports_request_edges_the_config_already_declares() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("in.csv"), "id\n1\n").unwrap();
+            let config = format!(
+                "version: 1\nname: m\npipeline:\n  source: {{ type: csv, config: {{ path: {d}/in.csv }} }}\n  sink: {{ type: jsonl, config: {{ path: {d}/x.jsonl }} }}\nmatrix:\n  - {{ id: a, sink: {{ config: {{ path: {d}/a.jsonl }} }} }}\n  - {{ id: b, depends_on: [a], sink: {{ config: {{ path: {d}/b.jsonl }} }} }}\n",
+                d = dir.path().display()
+            );
+            let out = call_tool(
+                &ctx(true),
+                "run_pipeline",
+                &json!({"config": config, "depends_on": {"b": ["a"]}}),
+            )
+            .await;
+            assert_eq!(out["isError"], false, "{out}");
+            let text = out["content"][0]["text"].as_str().unwrap();
+            let doc: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(doc["depends_on"], json!("b:a"), "{doc}");
+            assert_eq!(doc["failed"], json!(0), "{doc}");
         }
 
         #[tokio::test]
