@@ -167,6 +167,21 @@ async fn submit_poll_get_completes_and_records_metrics() {
         metrics.contains("faucet_serve_requests_total"),
         "metrics missing requests_total"
     );
+    // #1004: histograms render with buckets, not as summaries, so the
+    // dashboards' `histogram_quantile` panels have data.
+    assert!(
+        metrics.contains("faucet_serve_request_duration_seconds_bucket{"),
+        "request-duration histogram has no buckets:\n{metrics}"
+    );
+    assert!(
+        !metrics.contains("faucet_serve_request_duration_seconds{"),
+        "request duration still rendered as a summary:\n{metrics}"
+    );
+    assert!(
+        metrics.contains("faucet_pipeline_run_duration_seconds_bucket{")
+            && metrics.contains("le=\"3600\""),
+        "run-duration histogram lacks the long buckets:\n{metrics}"
+    );
 
     // #832: the build-info label is the binary's version — what `faucet
     // --version` prints — not faucet-core's.

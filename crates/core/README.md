@@ -846,7 +846,7 @@ Defaults: `transform-flatten`, `transform-rename-keys`, `transform-keys-case`.
 | `file-format-avro` | Avro Object Container Files (`apache-avro`) — read with an optional reader schema, write with a supplied or inferred schema and a `null` / `deflate` / `snappy` / `zstd` codec |
 | `file-format-orc` | ORC reading (`orc-rust`, Arrow-native, so it turns on `arrow`); read-only by design |
 | `file-formats` | All of the above |
-| `observability-install` | `install_observability` (Prometheus exporter + tracing subscriber) |
+| `observability-install` | `install_observability` (Prometheus exporter + tracing subscriber) and `observability::with_default_buckets` (faucet's histogram buckets for a recorder you build yourself) |
 | `otel` | OTLP export of traces and metrics (`OtelSignal::Logs` is accepted in `export` for the CLI's durable log shipping, #806; this crate's installer does not export logs itself). A host that installs its own global subscriber first registers a `tracing_subscriber::reload` slot with `observability::otel::register_trace_layer_slot`; `install_observability` puts the OTLP trace layer there. A host that renders `/metrics` from its own Prometheus recorder installs `observability::install_prometheus_with_otel_metrics` to fan its metrics out to OTLP too |
 
 > Connector authors: enable in your **own** `Cargo.toml` every feature your crate uses — the feature-isolation CI matrix builds each connector alone, so relying on workspace feature unification compiles locally but fails CI.

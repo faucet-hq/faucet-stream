@@ -330,7 +330,7 @@
     },
     {
       "type": "stat",
-      "title": "Bookmark staleness (max)",
+      "title": "Bookmark staleness (now)",
       "gridPos": {
         "x": 12,
         "y": 24,
@@ -344,7 +344,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "max by (pipeline) (faucet_pipeline_seconds_since_last_bookmark{pipeline=~\"$pipeline\"})",
+          "expr": "time() - max by (pipeline) (faucet_pipeline_last_bookmark_unix_seconds{pipeline=~\"$pipeline\"})",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -861,7 +861,7 @@
     },
     {
       "type": "stat",
-      "title": "Age of the newest bookmarked data",
+      "title": "Data lag when the last bookmark was written",
       "gridPos": {
         "x": 12,
         "y": 65,
@@ -875,7 +875,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "time() - max by (pipeline) (faucet_pipeline_last_bookmark_unix_seconds{pipeline=~\"$pipeline\"})",
+          "expr": "max by (pipeline) (faucet_pipeline_seconds_since_last_bookmark{pipeline=~\"$pipeline\"})",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"

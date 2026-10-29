@@ -335,12 +335,26 @@ fn with_buckets(
     builder: metrics_exporter_prometheus::PrometheusBuilder,
     p: &PrometheusConfig,
 ) -> Result<metrics_exporter_prometheus::PrometheusBuilder, InstallError> {
-    use metrics_exporter_prometheus::Matcher;
     let err =
         |e: metrics_exporter_prometheus::BuildError| InstallError::PrometheusInstall(e.to_string());
     if let Some(buckets) = p.buckets.as_deref() {
         return builder.set_buckets(buckets).map_err(err);
     }
+    with_default_buckets(builder)
+}
+
+/// Give a Prometheus builder faucet's default histogram buckets: the buckets
+/// [`install_observability`] uses when `prometheus.buckets` is unset, with
+/// longer ones for the histograms that time whole runs. Without buckets the
+/// exporter renders every histogram as a summary, which `histogram_quantile`
+/// cannot read. For a process that installs its own recorder (`faucet serve`).
+#[cfg(feature = "observability-install")]
+pub fn with_default_buckets(
+    builder: metrics_exporter_prometheus::PrometheusBuilder,
+) -> Result<metrics_exporter_prometheus::PrometheusBuilder, InstallError> {
+    use metrics_exporter_prometheus::Matcher;
+    let err =
+        |e: metrics_exporter_prometheus::BuildError| InstallError::PrometheusInstall(e.to_string());
     let mut builder = builder.set_buckets(DEFAULT_BUCKETS).map_err(err)?;
     for name in LONG_RUNNING_HISTOGRAMS {
         builder = builder

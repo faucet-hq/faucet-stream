@@ -28,27 +28,34 @@ groups:
             the connector error counters.
 
       - alert: FaucetNoBookmarkProgress
-        expr: faucet_pipeline_seconds_since_last_bookmark > 3600
+        expr: |
+          (time() - max by (pipeline, row) (faucet_pipeline_last_bookmark_unix_seconds)) > 3600
+            and on (pipeline, row) max by (pipeline, row) (faucet_pipeline_in_flight) > 0
         for: 10m
         labels:
           severity: warning
         annotations:
           summary: "Pipeline {{ $labels.pipeline }} bookmark stale for over 1h"
           description: >
-            No bookmark has been persisted for pipeline {{ $labels.pipeline }}
-            (row {{ $labels.row }}) in over an hour — the incremental sync is
-            not making durable progress.
+            Pipeline {{ $labels.pipeline }} (row {{ $labels.row }}) is running,
+            but its newest bookmarked position is over an hour old — the
+            incremental sync is not making durable progress. Only pipelines
+            with a timestamp bookmark report it; a pipeline between scheduled
+            runs is not checked.
 
       - alert: FaucetNoBookmarkProgressCritical
-        expr: faucet_pipeline_seconds_since_last_bookmark > 21600
+        expr: |
+          (time() - max by (pipeline, row) (faucet_pipeline_last_bookmark_unix_seconds)) > 21600
+            and on (pipeline, row) max by (pipeline, row) (faucet_pipeline_in_flight) > 0
         for: 10m
         labels:
           severity: critical
         annotations:
           summary: "Pipeline {{ $labels.pipeline }} bookmark stale for over 6h"
           description: >
-            No durable progress for six hours. Downstream data is stale;
-            investigate the source connection and the state store.
+            No durable progress for six hours while the pipeline runs.
+            Downstream data is stale; investigate the source connection and
+            the state store.
 
       - alert: FaucetSlaViolations
         expr: increase(faucet_pipeline_sla_violations_total[1h]) > 0

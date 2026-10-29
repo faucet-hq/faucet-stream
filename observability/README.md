@@ -12,7 +12,7 @@ list with a reason (#1004).
 
 | Dashboard | uid | Shows |
 |-----------|-----|-------|
-| `faucet-pipeline-overview.json` | `faucet-pipeline-overview` | Runs by status, run-duration p50/p95, source/sink throughput + errors by connector, transform in/out, bookmark staleness, effectively-once page skips, state-store ops; pages and writes per second, page / flush / invocation / transform / state-op p95, in-flight work, replication-key misses, newest-data age, uptime; adaptive batching; topology tee / merge / join nodes; peak RSS; WASM transforms. A `faucet_build_info` annotation marks version rollouts. |
+| `faucet-pipeline-overview.json` | `faucet-pipeline-overview` | Runs by status, run-duration p50/p95, source/sink throughput + errors by connector, transform in/out, bookmark staleness, effectively-once page skips, state-store ops; pages and writes per second, page / flush / invocation / transform / state-op p95, in-flight work, replication-key misses, data lag at the last bookmark write, uptime; adaptive batching; topology tee / merge / join nodes; peak RSS; WASM transforms. A `faucet_build_info` annotation marks version rollouts. |
 | `faucet-reliability.json` | `faucet-reliability` | Resilience retries / sleep / give-ups / circuit state, DLQ traffic (pages by reason, write / flush p95, failure-limit hits), poison rows, SLA violations + time since last success, backfill progress, source lag + staleness, sink batch outcomes, source throttling; log shipping (backlog age, buffer, shipped / dropped, export and local write failures, OTLP failures); lineage events / emit p95 / drops; notifications sent / dropped / dispatch p95. |
 | `faucet-governance.json` | `faucet-governance` | Quality checks, quarantines and aborts, contract violations, schema drift, PII masking, policy violations, column-profile drift / runs / baseline, rows unaccounted, non-finite values, verify runs / differences / ranges / duration, scoped-cleanup deletes and runs. |
 | `faucet-cost.json` | `faucet-cost` | Estimated cost vs the hosted-ELT equivalent (counters are thousandths of a currency unit, divided by 1000), budget refusals, usage bytes, source / sink bytes, cost signals, local-output retention, backend round trips and p95 by op, rate limits and retries on both sides. |
@@ -33,7 +33,7 @@ exactly that (`examples/infra/grafana/`).
 | Alert | Condition | Severity |
 |-------|-----------|----------|
 | `FaucetPipelineErrorRateSpike` | >50% of runs failing over 15 m | critical |
-| `FaucetNoBookmarkProgress` / `…Critical` | bookmark stale >1 h / >6 h | warning / critical |
+| `FaucetNoBookmarkProgress` / `…Critical` | running pipeline's bookmark >1 h / >6 h old | warning / critical |
 | `FaucetSlaViolations` | any `sla:` violation in the last hour | warning |
 | `FaucetSourceLagHigh` | source >1 GiB or >1 h behind, for 15 m | warning |
 | `FaucetSourceThrottled` | source rate-limited >25% of 15 m, for 15 m | warning |
