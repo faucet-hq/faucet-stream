@@ -1,8 +1,12 @@
 # CodeQL configuration (#978). Test code is left out of the scan: its fixture
-# credentials, test certificates and printed values are not shipped.
+# credentials, test certificates and printed values are not shipped. Unit tests
+# with fixture credentials or printed secrets go in a sibling `tests.rs`
+# (`#[cfg(test)] mod tests;`), which `**/tests.rs` leaves out.
 name: faucet-stream CodeQL
 paths-ignore:
   - "**/tests/**"
+  - "**/tests.rs"
+  - cli/src/runtime/adapter_matrix.rs
   - "**/benches/**"
   - "**/examples/**"
   - crates/conformance
