@@ -17,8 +17,9 @@ serde_json.workspace = true
 schemars.workspace = true
 tiberius.workspace = true
 bb8.workspace = true
-bb8-tiberius.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["net"] }
+# `Compat` adapter: tiberius speaks futures-io, tokio sockets speak tokio-io.
+tokio-util = { workspace = true, features = ["compat"] }
 url.workspace = true
 percent-encoding.workspace = true
 tracing.workspace = true

@@ -5,7 +5,7 @@
 [![MSRV](https://img.shields.io/crates/msrv/faucet-sink-mssql.svg)](https://github.com/faucet-hq/faucet-stream/blob/main/rust-toolchain.toml)
 [![License](https://img.shields.io/crates/l/faucet-sink-mssql.svg)](https://github.com/faucet-hq/faucet-stream#license)
 
-Microsoft **SQL Server** sink for the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem. Writes records via parameterized multi-row `INSERT`s — either auto-mapped to same-named table columns or serialized into a single JSON column — built on [`tiberius`](https://crates.io/crates/tiberius) + [`bb8-tiberius`](https://crates.io/crates/bb8-tiberius) with a pooled, statement-timeout-aware connection.
+Microsoft **SQL Server** sink for the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem. Writes records via parameterized multi-row `INSERT`s — either auto-mapped to same-named table columns or serialized into a single JSON column — built on [`tiberius`](https://crates.io/crates/tiberius) 0.13 + [`bb8`](https://crates.io/crates/bb8) with a pooled, statement-timeout-aware connection.
 
 Reach for it when you want to land records from any faucet-stream source into SQL Server or Azure SQL with one declarative config: multi-row INSERTs auto-split to stay under SQL Server's 2100-parameter ceiling, batches commit atomically inside a transaction, per-row failures are isolated for dead-letter routing, and `upsert`/`delete` write modes plus effectively-once delivery are available for keyed mirrors.
 
@@ -95,7 +95,7 @@ The `tls` block governs encryption for both connection forms:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `tls.type` | `prefer` \| `require` \| `trust_server_certificate` \| `disable` | `prefer` | Encryption mode — see [TLS modes](#tls-modes). |
-| `tls.ca_cert_path` | path | *(unset)* | CA certificate (PEM/DER) to trust for server validation. Ignored when `tls.type` is `disable`. |
+| `tls.ca_cert_path` | path | *(unset)* | CA certificate (PEM/DER) to trust for server validation, in addition to the system trust store. Ignored when `tls.type` is `disable`. |
 
 ## Column mapping
 

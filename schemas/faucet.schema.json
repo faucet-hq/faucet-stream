@@ -9089,7 +9089,7 @@
           "default": "prefer"
         },
         "ca_cert_path": {
-          "description": "Optional path to a CA certificate (PEM/DER) to trust for server\nvalidation. Ignored when `mode` is [`MssqlTlsMode::Disable`].",
+          "description": "Optional path to a CA certificate (PEM/DER) to trust for server\nvalidation, in addition to the system trust store. Ignored when `mode`\nis [`MssqlTlsMode::Disable`].",
           "type": [
             "string",
             "null"
@@ -10784,7 +10784,7 @@
           "default": "prefer"
         },
         "ca_cert_path": {
-          "description": "Optional path to a CA certificate (PEM/DER) to trust for server\nvalidation. Ignored when `mode` is [`MssqlTlsMode::Disable`].",
+          "description": "Optional path to a CA certificate (PEM/DER) to trust for server\nvalidation, in addition to the system trust store. Ignored when `mode`\nis [`MssqlTlsMode::Disable`].",
           "type": [
             "string",
             "null"
@@ -15327,7 +15327,7 @@
           "default": "prefer"
         },
         "ca_cert_path": {
-          "description": "Optional path to a CA certificate (PEM/DER) to trust for server\nvalidation. Ignored when `mode` is [`MssqlTlsMode::Disable`].",
+          "description": "Optional path to a CA certificate (PEM/DER) to trust for server\nvalidation, in addition to the system trust store. Ignored when `mode`\nis [`MssqlTlsMode::Disable`].",
           "type": [
             "string",
             "null"

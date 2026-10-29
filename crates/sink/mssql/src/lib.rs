@@ -5,7 +5,7 @@
 //! Microsoft SQL Server sink for the
 //! [`faucet-stream`](https://crates.io/crates/faucet-stream) ecosystem, built on
 //! [`tiberius`](https://crates.io/crates/tiberius) +
-//! [`bb8-tiberius`](https://crates.io/crates/bb8-tiberius).
+//! [`bb8`](https://crates.io/crates/bb8).
 //!
 //! Inserts records via parameterized multi-row `INSERT` statements with
 //! auto-mapped columns or a single JSON column, mirroring `faucet-sink-postgres`

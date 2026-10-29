@@ -12,7 +12,7 @@ Reach for it when you want to pull tables, views, or ad-hoc query results out of
 ## Feature highlights
 
 - **Native row streaming** — overrides `Source::stream_pages` to walk `tiberius`'s `QueryStream` row-by-row, buffering into pages of `batch_size` and yielding each page as it fills. Peak memory is `O(batch_size)`, never the full result set.
-- **Connection pooling** — a [`bb8`](https://crates.io/crates/bb8) + [`bb8-tiberius`](https://crates.io/crates/bb8-tiberius) pool is built once in `new()` and reused for every query; size it with `max_connections` (default 10).
+- **Connection pooling** — a [`bb8`](https://crates.io/crates/bb8) pool of [`tiberius`](https://crates.io/crates/tiberius) 0.13 clients (connection manager in `faucet-common-mssql`) is built once in `new()` and reused for every query; size it with `max_connections` (default 10).
 - **Incremental replication** — track a cursor column (e.g. `updated_at`) and read only rows not yet delivered, in cursor order, without skipping rows that share a cursor value (ties, late commits, `DATETIME`'s 1/300 s ticks); a crash replays at most one page (see [Resumable](#resumable)).
 - **Positional bind parameters** — `params` are sent as `@P1`, `@P2`, … bind values, and `${parent.path}` matrix-context placeholders resolve to additional bind markers at runtime — no string interpolation into SQL.
 - **Type-aware row decoding** — integers, floats, `BIT`, decimals (precision-preserving strings), dates/times, `DATETIMEOFFSET`, `UNIQUEIDENTIFIER`, and binary (base64) all map to sensible JSON.
@@ -93,7 +93,7 @@ faucet run pipeline.yaml
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `tls.type` | enum | `prefer` | Encryption mode — see the table below. |
-| `tls.ca_cert_path` | path | *(unset)* | Optional CA certificate (PEM/DER) to trust for server validation. Ignored when `tls.type` is `disable`. |
+| `tls.ca_cert_path` | path | *(unset)* | Optional CA certificate (PEM/DER) to trust for server validation, in addition to the system trust store. Ignored when `tls.type` is `disable`. |
 
 | `tls.type` | Behavior |
 |------------|----------|
@@ -300,7 +300,7 @@ For incremental replication, set `cfg.replication` to `MssqlReplication::Increme
 
 ## How it works
 
-1. `new()` validates the config, then builds the `bb8` + `bb8-tiberius` connection pool **once** via `faucet-common-mssql::build_pool` (TLS mode applied).
+1. `new()` validates the config, then builds the `bb8` connection pool **once** via `faucet-common-mssql::build_pool` (TLS mode applied).
 2. Each query checks out a pooled connection, binds `params` (and, for incremental runs, the bookmark) as typed `@Pn` parameters, and runs under `statement_timeout_secs`.
 3. `tiberius`'s `QueryStream` is walked row-by-row; each row is decoded by its column type into JSON and buffered into `batch_size` pages.
 4. For incremental runs, rows already emitted at the bookmark value are dropped and every page carries the position after its last row, so the pipeline persists it only after the sink confirms.
