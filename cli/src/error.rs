@@ -688,6 +688,130 @@ impl From<faucet_core::InstallError> for CliError {
     }
 }
 
+/// A registry error as the CLI variant that always carried it, so the
+/// rendering (and any `match` on it) is what it was before the registry moved
+/// into `faucet-registry` (#995).
+impl From<faucet_registry::RegistryError> for CliError {
+    fn from(e: faucet_registry::RegistryError) -> Self {
+        use faucet_registry::RegistryError as R;
+        match e {
+            R::UnknownConnector {
+                kind,
+                name,
+                available,
+            } => CliError::UnknownConnector {
+                kind,
+                name,
+                available,
+            },
+            R::InvalidConnectorConfig {
+                kind,
+                name,
+                message,
+                ..
+            } => CliError::InvalidConnectorConfig {
+                kind,
+                name,
+                message,
+            },
+            R::UnknownAuthProvider { name, known } => CliError::UnknownAuthProvider { name, known },
+            R::AuthProviderBuild { name, message } => CliError::AuthProviderBuild { name, message },
+            R::Config(msg) => CliError::Config(msg),
+            R::Faucet(e) => CliError::Faucet(e),
+            R::Other(e) => match e.downcast::<CliError>() {
+                Ok(cli) => *cli,
+                Err(other) => CliError::Faucet(faucet_core::FaucetError::Custom(other)),
+            },
+            other => CliError::Config(other.to_string()),
+        }
+    }
+}
+
+/// The reverse, so a plugin factory written against the CLI's error type keeps
+/// compiling (`?` on a [`CliError`] inside a `register_*` closure).
+impl From<CliError> for faucet_registry::RegistryError {
+    fn from(e: CliError) -> Self {
+        use faucet_registry::RegistryError as R;
+        match e {
+            CliError::Faucet(e) => R::Faucet(e),
+            other => R::Other(Box::new(other)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod registry_error_tests {
+    use super::*;
+    use faucet_registry::RegistryError as R;
+
+    #[test]
+    fn registry_errors_render_as_their_cli_variants() {
+        let cases: Vec<(R, &str)> = vec![
+            (
+                R::UnknownConnector {
+                    kind: "sink",
+                    name: "x".into(),
+                    available: "a".into(),
+                },
+                "unknown sink 'x'. Available: a",
+            ),
+            (
+                R::UnknownAuthProvider {
+                    name: "p".into(),
+                    known: vec![],
+                },
+                "auth references unknown provider 'p'. Declared providers: (none)",
+            ),
+            (
+                R::AuthProviderBuild {
+                    name: "p".into(),
+                    message: "m".into(),
+                },
+                "failed to build auth provider 'p': m",
+            ),
+            (R::Config("c".into()), "config error: c"),
+        ];
+        for (r, text) in cases {
+            assert_eq!(r.to_string(), text);
+            assert_eq!(CliError::from(r).to_string(), text);
+        }
+        let r = R::InvalidConnectorConfig {
+            kind: "source",
+            name: "n".into(),
+            message: "m".into(),
+            path: Some("a.b".into()),
+        };
+        assert!(matches!(
+            CliError::from(r),
+            CliError::InvalidConnectorConfig { kind: "source", .. }
+        ));
+        let r = R::from(faucet_core::FaucetError::Config("f".into()));
+        assert!(matches!(CliError::from(r), CliError::Faucet(_)));
+        let r = R::SubprocessRefused {
+            role: "sink",
+            kind: "singer".into(),
+        };
+        assert!(matches!(CliError::from(r), CliError::Config(_)));
+        let r = R::other(std::io::Error::other("plugin"));
+        assert!(matches!(
+            CliError::from(r),
+            CliError::Faucet(faucet_core::FaucetError::Custom(_))
+        ));
+    }
+
+    #[test]
+    fn a_cli_error_round_trips_through_the_registry_error() {
+        let back = CliError::from(R::from(CliError::Config("x".into())));
+        assert!(matches!(back, CliError::Config(m) if m == "x"));
+        let back = CliError::from(R::from(CliError::Faucet(faucet_core::FaucetError::Config(
+            "f".into(),
+        ))));
+        assert!(matches!(back, CliError::Faucet(_)));
+        let back = CliError::from(R::from(CliError::ScheduleOverlapForbidden));
+        assert!(matches!(back, CliError::ScheduleOverlapForbidden));
+    }
+}
+
 #[cfg(test)]
 mod secrets_error_tests {
     use super::*;

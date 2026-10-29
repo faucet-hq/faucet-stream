@@ -775,6 +775,13 @@ jobs:
           - secrets-aws-sm
           - secrets-gcp-sm
           - secrets-azure-kv
+          # The by-name connector registry for embedders (#995): the crate on
+          # its own (no connector, one pair, everything) and via the umbrella.
+          - "registry:"
+          - "registry:source-rest,sink-jsonl"
+          - "registry:source-postgres"
+          - "registry:full"
+          - "registry,source-postgres"
           # CLI build matrix — verify the binary builds with every default-on
           # feature plus a slim "only the bare minimum" combo.
     steps:
@@ -804,7 +811,10 @@ jobs:
           # Secrets, schedule, serve, catalog, templates, and triggers features
           # live in faucet-cli (CLI layer), not in the faucet-stream umbrella
           # crate. Route accordingly.
-          if [[ "${{ matrix.feature }}" == secrets-* || "${{ matrix.feature }}" == "schedule" || "${{ matrix.feature }}" == serve* || "${{ matrix.feature }}" == "mcp" || "${{ matrix.feature }}" == "catalog" || "${{ matrix.feature }}" == triggers* || "${{ matrix.feature }}" == templates* || "${{ matrix.feature }}" == "tenants" || "${{ matrix.feature }}" == "hub-remote" || "${{ matrix.feature }}" == "notify" || "${{ matrix.feature }}" == "cli-dev" || "${{ matrix.feature }}" == "cli-tui" || "${{ matrix.feature }}" == "cli-progress" ]]; then
+          if [[ "${{ matrix.feature }}" == registry:* ]]; then
+            features="${{ matrix.feature }}"
+            cargo check -p faucet-registry --no-default-features --features "${features#registry:}"
+          elif [[ "${{ matrix.feature }}" == secrets-* || "${{ matrix.feature }}" == "schedule" || "${{ matrix.feature }}" == serve* || "${{ matrix.feature }}" == "mcp" || "${{ matrix.feature }}" == "catalog" || "${{ matrix.feature }}" == triggers* || "${{ matrix.feature }}" == templates* || "${{ matrix.feature }}" == "tenants" || "${{ matrix.feature }}" == "hub-remote" || "${{ matrix.feature }}" == "notify" || "${{ matrix.feature }}" == "cli-dev" || "${{ matrix.feature }}" == "cli-tui" || "${{ matrix.feature }}" == "cli-progress" ]]; then
             cargo check -p faucet-cli --no-default-features --features ${{ matrix.feature }}
           else
             cargo check -p faucet-stream --no-default-features --features ${{ matrix.feature }}

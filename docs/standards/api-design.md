@@ -8,7 +8,7 @@ Related decisions: [ADR 0003 — Builder Pattern](../adr/0003-builder-pattern.md
 
 ## Traits
 
-- **MUST keep `Source` and `Sink` object-safe.** They are consumed as `Box<dyn Source>` / `Box<dyn Sink>` throughout the pipeline and the CLI registry (`crates/core/src/traits.rs`, `cli/src/registry.rs`). No generic type parameters on trait methods, no associated types, no `Self`-returning methods, no `impl Trait` in return position that would break `dyn`.
+- **MUST keep `Source` and `Sink` object-safe.** They are consumed as `Box<dyn Source>` / `Box<dyn Sink>` throughout the pipeline and the CLI registry (`crates/core/src/traits.rs`, `crates/registry/src/connectors.rs`). No generic type parameters on trait methods, no associated types, no `Self`-returning methods, no `impl Trait` in return position that would break `dyn`.
 - **MUST give every new trait method a default implementation.** A new method without a default is a breaking change for every existing connector. All capability methods added over time — `stream_pages`, `state_key`, `capture_resume_position`, `supports_exactly_once`, `is_shardable`/`enumerate_shards`/`apply_shard`, `supports_discover`/`discover`, `current_schema`/`supports_schema_evolution`/`evolve_schema`, `check` — ship with a safe default so a connector written against an older core still compiles.
 
   ```rust

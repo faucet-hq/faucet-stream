@@ -1743,7 +1743,14 @@ A complete, runnable example lives in
 [`cli/examples/custom-cli/`](examples/custom-cli/main.rs) (build it with
 `cargo run --example custom-cli -- list`).
 
-[`PluginRegistry`]: https://docs.rs/faucet-cli/latest/faucet_cli/registry/struct.PluginRegistry.html
+To use faucet's connectors from **another tool** rather than a `faucet`
+binary — build any connector from its `type:` name and a JSON config — depend
+on [`faucet-registry`](https://crates.io/crates/faucet-registry) instead of `faucet-cli`:
+it is the same registry (`faucet_cli::registry` and `faucet_cli::auth_catalog`
+re-export it), without the CLI's dependencies, and it follows semver. See
+[Embedding faucet in another tool](https://faucet-hq.github.io/faucet-stream/extending/embedding.html).
+
+[`PluginRegistry`]: https://docs.rs/faucet-registry/latest/faucet_registry/struct.PluginRegistry.html
 
 ## Troubleshooting / FAQ
 

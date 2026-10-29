@@ -111,6 +111,7 @@ The `memory` and `file` state stores are always available via `faucet-core`. The
 | Feature | Description |
 |---------|-------------|
 | `auth` | Shared single-flight auth providers (`faucet-auth`) — OAuth2 client-credentials / refresh, token-endpoint — reusable across connectors |
+| `registry` | The by-name connector registry (`faucet_stream::registry`, from [`faucet-registry`](../crates/registry/README.md)): build any enabled connector from its `type:` name and a JSON config, as the `faucet` CLI does |
 | `quality` | Data-quality checks (the `quality:` config block) — per-record and per-batch |
 | `quality-jsonschema` | Adds the `json_schema` record check (implies `quality`) |
 | `contract` | Data contracts (the `contract:` config block) — a versioned output schema/constraint promise enforced per page (fail / quarantine / warn) |
@@ -152,7 +153,8 @@ Transforms reshape records mid-pipeline. Enabling `source-rest` (the default) al
 | `sink` | Every sink connector |
 | `state` | Every state-store backend (`state-redis`, `state-postgres`) |
 | `auth` | Shared auth providers |
-| `full` | Everything — all sources, sinks, state backends, `auth`, `kafka-schema-registry`, `compression`, `quality`, `quality-jsonschema`, `lineage`, `lineage-kafka`, `transform-sql`, `transform-cdc-unwrap` |
+| `registry` | Build connectors by `type:` name |
+| `full` | Everything — all sources, sinks, state backends, `auth`, `registry`, `kafka-schema-registry`, `compression`, `quality`, `quality-jsonschema`, `lineage`, `lineage-kafka`, `transform-sql`, `transform-cdc-unwrap` |
 
 ## Pick your connectors
 

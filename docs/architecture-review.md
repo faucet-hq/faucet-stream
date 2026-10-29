@@ -44,7 +44,7 @@ limitation. Where a risk already has a mitigation planned, the relevant
   [ADR 0008](./adr/0008-observability.md).
 - **A genuinely extensible core.** `faucet-core` is object-safe, has one required
   dependency, re-exports what authors need, and grows via defaulted trait methods.
-  The compile-time `PluginRegistry` (`cli/src/registry.rs`) lets a third party
+  The compile-time `PluginRegistry` (`faucet-registry`, re-exported as `faucet_cli::registry`) lets a third party
   ship a custom CLI. See [Extensibility](./architecture/extensibility.md).
 - **Operational maturity beyond its version.** A control plane (`faucet serve`),
   clustering, RBAC + audit log, run history with instance-fenced orphan recovery,

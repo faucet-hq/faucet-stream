@@ -9,7 +9,7 @@ agent skills point at them instead of carrying copies, so a feature with no
 example has no checked documentation.
 
 The registry is read from the source: kinds from `builtin_source_descriptions`
-/ `builtin_sink_descriptions` in `cli/src/registry.rs`, top-level keys from the
+/ `builtin_sink_descriptions` in `crates/registry/src/connectors.rs`, top-level keys from the
 `PipelineConfig` struct in `cli/src/config.rs`, write modes from `WriteMode` in
 `crates/core/src/write_mode.rs`, mirror modes from `ReplicationMode` in
 `cli/src/replication/spec.rs`, replication methods from `ReplicationMethod` in
@@ -27,7 +27,7 @@ import sys
 
 import yaml
 
-REGISTRY = "cli/src/registry.rs"
+REGISTRY = "crates/registry/src/connectors.rs"
 CONFIG = "cli/src/config.rs"
 WRITE_MODE = "crates/core/src/write_mode.rs"
 MIRROR_SPEC = "cli/src/replication/spec.rs"

@@ -68,7 +68,7 @@ runtime surface.
 Work that extends the framework's reach, each gated on an accepted RFC.
 
 - **Plugin-system maturity.** The CLI already supports compile-time plugin
-  registration via `PluginRegistry` (`cli/src/registry.rs`). The next step is a
+  registration via `PluginRegistry` (`faucet-registry`, re-exported as `faucet_cli::registry`). The next step is a
   documented, stable SDK contract for out-of-tree connectors — and, longer term,
   the question of dynamic loading. Design in
   [RFC 0003](../rfcs/0003-plugin-system.md).

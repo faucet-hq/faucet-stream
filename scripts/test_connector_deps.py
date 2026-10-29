@@ -78,7 +78,7 @@ class Violations(unittest.TestCase):
             '[dev-dependencies]\nfaucet-sink-jsonl = "1"\n'
         )
         self.assertEqual(cd.violations(core), ["faucet-lineage: [dev-dependencies] faucet-sink-jsonl"])
-        for agg in ("faucet-stream", "faucet-cli"):
+        for agg in ("faucet-stream", "faucet-cli", "faucet-registry"):
             m = manifest(f'[package]\nname = "{agg}"\n[dependencies]\nfaucet-sink-jsonl = "1"\n')
             self.assertEqual(cd.violations(m), [])
 

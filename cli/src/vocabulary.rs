@@ -218,32 +218,9 @@ fn format_option_spellings(v: &Value, out: &mut BTreeSet<String>) {
 /// Connector kinds replaced by `type: file` (#779).
 pub const DEPRECATED_FILE_KINDS: &[&str] = &["csv", "jsonl", "parquet"];
 
-/// Per deprecated kind: what it reads or writes, and what replaces it. The one
-/// source of the deprecation wording on every CLI surface.
-const FILE_KIND_REPLACEMENTS: &[(&str, &str, &str)] = &[
-    (
-        "csv",
-        "CSV file",
-        "`type: file` with `format: csv` (dialect options under `csv:`)",
-    ),
-    (
-        "jsonl",
-        "JSON Lines file",
-        "`type: file` with a `.jsonl` path (or `format: json_lines`)",
-    ),
-    (
-        "parquet",
-        "Parquet file",
-        "`type: file` with `format: parquet`, or `type: s3` for an S3 location",
-    ),
-];
-
 /// What replaces a deprecated file kind, or `None` for any other kind.
 pub fn file_kind_replacement(kind: &str) -> Option<&'static str> {
-    FILE_KIND_REPLACEMENTS
-        .iter()
-        .find(|(k, _, _)| *k == kind)
-        .map(|(_, _, r)| *r)
+    faucet_registry::internal::file_kind_replacement(kind)
 }
 
 /// The load-time warning for a deprecated file kind.
@@ -258,17 +235,7 @@ pub fn deprecated_kind_warning(kind: &str) -> Option<String> {
 
 /// The `faucet list` / schema-catalog description of a deprecated file kind.
 pub fn deprecated_kind_description(kind: &str) -> Option<&'static str> {
-    static LABELS: std::sync::LazyLock<Vec<(&'static str, String)>> =
-        std::sync::LazyLock::new(|| {
-            FILE_KIND_REPLACEMENTS
-                .iter()
-                .map(|(k, what, r)| (*k, format!("Deprecated {what} connector: use {r}.")))
-                .collect()
-        });
-    LABELS
-        .iter()
-        .find(|(k, _)| *k == kind)
-        .map(|(_, l)| l.as_str())
+    faucet_registry::internal::deprecated_kind_description(kind)
 }
 
 /// Connector blocks anywhere in the document that use a deprecated kind: an
