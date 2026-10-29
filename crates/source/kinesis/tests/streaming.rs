@@ -4,25 +4,19 @@
 //! so they are isolated and safe to run in parallel.
 #![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
+mod support;
+use support::create_stream;
+
 use faucet_core::Source;
 use faucet_source_kinesis::{KinesisCredentials, KinesisSource, KinesisSourceConfig};
 use futures::StreamExt;
 use std::collections::HashMap;
-use testcontainers::ContainerAsync;
-use testcontainers_modules::localstack::LocalStack;
 
-/// Start LocalStack with the kinesis service and return (container, endpoint).
-async fn start_localstack() -> (ContainerAsync<LocalStack>, String) {
-    use testcontainers::ImageExt;
-    let container = faucet_conformance::containers::start(|| {
-        LocalStack::default().with_env_var("SERVICES", "kinesis")
-    })
-    .await;
-    let port = container
-        .get_host_port_ipv4(4566)
-        .await
-        .expect("localstack port");
-    (container, format!("http://127.0.0.1:{port}"))
+/// Start LocalStack with the kinesis service and return (emulator, endpoint).
+async fn start_localstack() -> (support::Emulator, String) {
+    let emulator = support::start("kinesis").await;
+    let endpoint = emulator.endpoint.clone();
+    (emulator, endpoint)
 }
 
 fn test_credentials() -> KinesisCredentials {
@@ -34,50 +28,11 @@ fn test_credentials() -> KinesisCredentials {
 }
 
 async fn raw_client(endpoint: &str) -> aws_sdk_kinesis::Client {
-    faucet_source_kinesis::build_client(Some("us-east-1"), Some(endpoint), &test_credentials())
-        .await
-        .expect("client")
-}
-
-/// Wait until the mapped endpoint actually accepts Kinesis API calls —
-/// the container's port maps before the service is ready.
-async fn await_ready(client: &aws_sdk_kinesis::Client) {
-    for _ in 0..120 {
-        if client.list_streams().send().await.is_ok() {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
-    panic!("localstack kinesis never became ready");
-}
-
-/// Create a stream and wait until it is ACTIVE.
-async fn create_stream(client: &aws_sdk_kinesis::Client, name: &str, shards: i32) {
-    await_ready(client).await;
-    client
-        .create_stream()
-        .stream_name(name)
-        .shard_count(shards)
-        .send()
-        .await
-        .expect("create stream");
-    for _ in 0..60 {
-        let out = client
-            .describe_stream_summary()
-            .stream_name(name)
-            .send()
+    support::bounded(
+        faucet_source_kinesis::build_client(Some("us-east-1"), Some(endpoint), &test_credentials())
             .await
-            .expect("describe");
-        if out
-            .stream_description_summary()
-            .map(|d| d.stream_status() == &aws_sdk_kinesis::types::StreamStatus::Active)
-            .unwrap_or(false)
-        {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
-    panic!("stream {name} never became ACTIVE");
+            .expect("client"),
+    )
 }
 
 /// Put `n` JSON records with rotating partition keys.
