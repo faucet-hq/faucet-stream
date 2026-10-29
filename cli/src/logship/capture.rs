@@ -156,9 +156,9 @@ where
                     );
                 }
             }
-            trace_context(&ext, &mut attrs);
         }
     }
+    trace_context(&mut attrs);
     attrs.insert("target".to_string(), meta.target().to_string());
     CapturedEvent {
         ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
@@ -169,32 +169,24 @@ where
     }
 }
 
+/// The trace and span id of the OpenTelemetry context the event was emitted
+/// in. The OTLP trace layer activates a span's context while it is entered, so
+/// this reads the innermost entered span — also when that layer sits behind a
+/// `reload` slot, which a per-span lookup could not see through.
 #[cfg(feature = "otel")]
-fn trace_context(
-    ext: &tracing_subscriber::registry::Extensions<'_>,
-    attrs: &mut BTreeMap<String, String>,
-) {
-    let valid = |s: &str| s.bytes().any(|b| b != b'0');
-    if let Some(d) = ext.get::<tracing_opentelemetry::OtelData>() {
-        if let Some(t) = d.trace_id().map(|t| t.to_string())
-            && valid(&t)
-        {
-            attrs.insert("trace_id".to_string(), t);
-        }
-        if let Some(s) = d.span_id().map(|s| s.to_string())
-            && valid(&s)
-        {
-            attrs.insert("span_id".to_string(), s);
-        }
+fn trace_context(attrs: &mut BTreeMap<String, String>) {
+    use opentelemetry::trace::TraceContextExt as _;
+    let cx = opentelemetry::Context::current();
+    let span = cx.span();
+    let sc = span.span_context();
+    if sc.is_valid() {
+        attrs.insert("trace_id".to_string(), sc.trace_id().to_string());
+        attrs.insert("span_id".to_string(), sc.span_id().to_string());
     }
 }
 
 #[cfg(not(feature = "otel"))]
-fn trace_context(
-    _ext: &tracing_subscriber::registry::Extensions<'_>,
-    _attrs: &mut BTreeMap<String, String>,
-) {
-}
+fn trace_context(_attrs: &mut BTreeMap<String, String>) {}
 
 /// Targets whose events are never captured: the shipper and its transports
 /// would otherwise log about shipping into the logs being shipped.

@@ -3,7 +3,7 @@
 //! in-process axum mock OTLP/HTTP collector and assert both signals arrive —
 //! WITHOUT touching the global recorder/subscriber.
 //!
-//! Note on endpoint handling: opentelemetry-otlp 0.31's HTTP exporter uses a
+//! Note on endpoint handling: opentelemetry-otlp's HTTP exporter uses a
 //! programmatically supplied `.with_endpoint(...)` value **verbatim** — unlike
 //! the `OTEL_EXPORTER_OTLP_ENDPOINT` env var, it does NOT append the standard
 //! `/v1/traces` / `/v1/metrics` signal path. `http_signal_endpoint` in `otel.rs`
