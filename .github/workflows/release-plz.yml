@@ -5,13 +5,15 @@ name: release-plz
 #
 # - `release-plz-pr` (every push to main): opens or updates a "chore: release"
 #   PR that bumps versions and prepends changelog entries for every crate with
-#   feat/fix/perf commits since its last per-crate tag. Review the PR like any
-#   other change; merging it triggers the publish job.
+#   feat/fix/perf commits since its last per-crate tag, then bumps faucet-cli
+#   (the product version) whenever a crate it builds in is bumped. Review the
+#   PR like any other change; merging it triggers the publish job.
 # - `release-plz-release` (only when the pushed commit is a release commit,
 #   `chore: release …` / `chore(<crate>): release …` / `chore(release): …`):
 #   waits for approval in the protected `release` environment, then publishes the bumped crates to crates.io
-#   in dependency order, creates per-crate GitHub releases, and pushes
-#   per-crate `<crate>-v<X.Y.Z>` tags.
+#   in dependency order, pushes per-crate `<crate>-v<X.Y.Z>` tags, and creates
+#   ONE GitHub release (faucet-cli's), whose body it rewrites to list every
+#   crate the release published (#1005).
 #
 # Config lives in /release-plz.toml. The legacy manual `release.yml`
 # (`workflow_dispatch` waves-of-5) is retained as a fallback only — see
@@ -116,13 +118,20 @@ jobs:
           # No CARGO_REGISTRY_TOKEN: release-pr only reads the public index.
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
 
-      # release-plz bumps Cargo manifests only. The Helm chart's image tag
-      # defaults to its appVersion, and the agent-skills plugin version names
-      # the faucet-cli release whose skills it carries, so the release PR must
-      # carry the new faucet-cli version in both (#830, #853); CI fails when
-      # they differ. The subject deliberately is not `chore: release`, which
-      # the release gate above treats as a release commit.
-      - name: Sync the Helm chart appVersion and the skills plugin version on the release PR
+      # faucet-cli is the product version (#1005): whenever the release PR
+      # bumps a crate faucet-cli builds in, faucet-cli is bumped by at least
+      # the same level (scripts/release-cli-bump.py, compared with the main
+      # commit this run started from, so a re-run never bumps twice; a major
+      # in its closure fails the job for a maintainer). release-plz bumps
+      # Cargo manifests only. The Helm chart's image tag defaults to its
+      # appVersion, and the agent-skills plugin version names the faucet-cli
+      # release whose skills it carries, so the release PR must carry the new
+      # faucet-cli version in both (#830, #853); CI fails when they differ.
+      # The commit is a bot's, so release-plz's next update overwrites it and
+      # this step re-applies it. The subject deliberately is not
+      # `chore: release`, which the release gate above treats as a release
+      # commit.
+      - name: Bump faucet-cli with the crates it builds in, and sync the Helm chart and skills plugin versions
         env:
           PR: ${{ steps.release-plz.outputs.pr }}
           PUSH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
@@ -134,6 +143,7 @@ jobs:
           fi
           git fetch --quiet origin "$branch"
           git switch --quiet -C "$branch" FETCH_HEAD
+          python3 scripts/release-cli-bump.py --base "$GITHUB_SHA" --write
           python3 scripts/helm-app-version.py --write
           python3 scripts/plugin-version.py --write
           if git diff --quiet; then
@@ -141,7 +151,7 @@ jobs:
           fi
           git -c user.name="github-actions[bot]" \
               -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-              commit --quiet -am "chore: sync the Helm chart and skills plugin versions with faucet-cli"
+              commit --quiet -am "chore: bump faucet-cli with the crates it builds in, and sync the Helm chart and skills plugin versions"
           git push --quiet "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${branch}"
 
   release-plz-release:
@@ -249,6 +259,32 @@ jobs:
             fi
             attempt=$(( attempt + 1 ))
           done
+
+      # One GitHub release per release PR, faucet-cli's (#1005). Rewrite its
+      # body to cover the whole release: faucet-cli's changelog section and a
+      # table of every crate whose `<crate>-v<version>` tag points at this
+      # commit. The whole body is replaced, so a re-run after a partial publish
+      # is safe; when faucet-cli has not published yet there is no release and
+      # nothing to do. Only the body changes, so release-binaries.yml's asset
+      # uploads are untouched.
+      - name: Write the faucet-cli release notes for the whole release
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch --quiet --force --tags origin
+          notes="$RUNNER_TEMP/faucet-cli-release-notes.md"
+          python3 scripts/release-notes.py --sha "$GITHUB_SHA" --out "$notes"
+          if [ ! -s "$notes" ]; then
+            exit 0
+          fi
+          tag=$(git tag --points-at "$GITHUB_SHA" | grep -E '^faucet-cli-v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            echo "::warning::$tag has no GitHub release yet; re-run this job once release-plz has created it."
+            exit 0
+          fi
+          gh release edit "$tag" --notes-file "$notes"
+          echo "Release notes for $tag cover $(grep -c '^| `' "$notes") crates."
 
       # crates.io makes the publishing account the only owner of a brand-new
       # crate. Add the org team to every crate this run released (its

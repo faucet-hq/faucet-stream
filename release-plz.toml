@@ -5,8 +5,9 @@
 #
 # Companion workflow: .github/workflows/release-plz.yml runs `release-pr` on
 # every push to main (opens/updates a "chore: release" PR with the bumped
-# versions + changelog entries) and `release` on PR merge (publishes the
-# bumped crates to crates.io and creates per-crate GitHub releases).
+# versions + changelog entries, and bumps faucet-cli with every crate it builds
+# in) and `release` on PR merge (publishes the bumped crates to crates.io, tags
+# each one, and creates ONE GitHub release: faucet-cli's).
 #
 # The legacy manual `.github/workflows/release.yml` (`workflow_dispatch` with
 # waves-of-5 publishing) is retained as a fallback for ad-hoc / partial
@@ -24,9 +25,17 @@
 # but we pin it explicitly to future-proof against default changes.
 git_tag_name = "{{ package }}-v{{ version }}"
 
-# Create a per-crate GitHub release for each crate that bumps. The release
-# notes use the changelog body template below.
-git_release_enable = true
+# One GitHub release per release PR, faucet-cli's (#1005): it carries the
+# binaries, images and Homebrew formula, and faucet-cli is bumped whenever a
+# crate it builds in is (scripts/release-cli-bump.py on the release PR), so
+# every release that changes shipped code has one. release-plz cannot do that
+# bump itself without tightening the major-only internal requirements:
+# `changelog_include` bumps at most a patch and copies every included commit
+# into faucet-cli's changelog, and `version_group` forces equal versions.
+# Every crate still gets its
+# `<crate>-v<X.Y.Z>` tag. The release job rewrites the faucet-cli release body
+# to list every crate the release published (scripts/release-notes.py).
+git_release_enable = false
 
 # Per-package changelogs (release-plz default): each crate's entries go to a
 # `CHANGELOG.md` in that crate's own directory (e.g. crates/core/CHANGELOG.md).
@@ -131,3 +140,7 @@ commit_parsers = [
     { message = "^chore", group = "Miscellaneous" },
     { message = ".*", group = "Other" },
 ]
+
+[[package]]
+name = "faucet-cli"
+git_release_enable = true
