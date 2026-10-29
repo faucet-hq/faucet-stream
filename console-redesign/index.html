@@ -51,7 +51,7 @@ const ic = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${P[n]}</s
 const params = new URLSearchParams(location.search);
 const view = params.get('view') || 'runs';
 const theme = params.get('theme');
-if (theme === 'light' || theme === 'teal') document.documentElement.dataset.theme = theme;
+if (['light', 'teal', 'teal-dark'].includes(theme)) document.documentElement.dataset.theme = theme;
 
 const NAV = [
   ['Operate', [['runs', 'Runs', '3'], ['changes', 'Changes', '2', true], ['trig', 'Triggers'], ['sched', 'Schedules']]],
