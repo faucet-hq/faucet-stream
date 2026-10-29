@@ -9,4 +9,4 @@ Open `console-redesign/index.html` in a browser (from a local checkout; GitHub s
 
 For example `console-redesign/index.html?view=runs&theme=teal`.
 
-The `teal` theme is the light theme with teal-tinted surfaces, lines and text, a teal accent on the selected item, and a soft teal gradient behind the shell. Screenshots of every view in each theme are in `console-redesign/<view>-<dark|light|teal>.png`.
+The `teal` theme is the light theme with teal used only to highlight: the active nav item, the selected row, active tabs and the `stable` channel chip. Screenshots of every view in each theme are in `console-redesign/<view>-<dark|light|teal>.png`.
