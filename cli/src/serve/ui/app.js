@@ -1,5 +1,5 @@
 import { token, onUnauthorized, authOk } from "./api.js";
-import { startRouter, navigate, refresh } from "./router.js";
+import { startRouter, refresh } from "./router.js";
 import { getTz, setTz, TZ_OPTIONS } from "./tz.js";
 import { renderRuns } from "./views/runs.js";
 import { renderDetail } from "./views/detail.js";
@@ -14,6 +14,7 @@ import { renderTenants } from "./views/tenants.js";
 import { loadTenants } from "./tenant.js";
 import { route } from "./router.js";
 import { loadAccess } from "./access.js";
+import { startShell, refreshBadges } from "./shell.js";
 
 // --- theme ---
 const THEME_KEY = "faucet.theme";
@@ -38,21 +39,12 @@ function closeTokenModal() {
 }
 
 function wireChrome() {
-  document.getElementById("nav-runs").onclick = () => navigate("#/runs");
-  document.getElementById("nav-submit").onclick = () => navigate("#/submit");
-  document.getElementById("nav-schemas").onclick = () => navigate("#/schemas");
-  document.getElementById("nav-templates").onclick = () => navigate("#/templates");
-  document.getElementById("nav-datasets").onclick = () => navigate("#/catalog");
-  document.getElementById("nav-lineage").onclick = () => navigate("#/lineage");
-  document.getElementById("nav-usage").onclick = () => navigate("#/usage");
-  document.getElementById("nav-changes").onclick = () => navigate("#/changes");
-  document.getElementById("nav-tenants").onclick = () => navigate("#/tenants");
   // One click always flips what is on screen. `auto` (follow the OS) is the
   // starting state only: cycling through it made the first click a no-op
   // whenever the OS theme matched the next state.
   document.getElementById("theme-toggle").onclick = () => {
     const cur = document.documentElement.dataset.theme;
-    const dark = cur === "dark" || (cur !== "light" && matchMedia("(prefers-color-scheme: dark)").matches);
+    const dark = cur === "dark" || (cur !== "light" && !matchMedia("(prefers-color-scheme: light)").matches);
     applyTheme(dark ? "light" : "dark");
   };
   // Display-timezone selector: populate, reflect the saved choice, and re-render
@@ -64,14 +56,6 @@ function wireChrome() {
     ).join("");
     tzSel.value = getTz();
     tzSel.onchange = () => { setTz(tzSel.value); refresh(); };
-  }
-  // Sticky table headers sit just under the top bar, which wraps onto a second
-  // row in a narrow window, so they follow its real height.
-  const topbar = document.querySelector(".topbar");
-  if (topbar && "ResizeObserver" in window) {
-    new ResizeObserver(() => {
-      document.documentElement.style.setProperty("--topbar-h", `${topbar.offsetHeight}px`);
-    }).observe(topbar);
   }
   document.getElementById("token-btn").onclick = openTokenModal;
   document.getElementById("token-save").onclick = () => {
@@ -113,7 +97,11 @@ async function main() {
   // If the server requires auth and we have no valid token, prompt first.
   if (!(await authOk())) openTokenModal();
   await loadAccess();
-  await loadTenants(refresh);
+  await loadTenants(() => {
+    refresh();
+    refreshBadges(true);
+  });
+  startShell();
   startRouter(document.getElementById("view"));
 }
 main();

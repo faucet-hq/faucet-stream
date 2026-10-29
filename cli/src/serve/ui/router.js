@@ -63,7 +63,7 @@ async function dispatch(container) {
       return;
     }
   }
-  host.innerHTML = `<div class="empty">Not found</div>`;
+  host.innerHTML = `<div class="page"><div class="empty">Not found</div></div>`;
 }
 
 export function startRouter(container) {

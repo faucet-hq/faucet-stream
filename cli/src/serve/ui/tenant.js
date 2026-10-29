@@ -59,9 +59,10 @@ export async function loadTenants(onChange) {
   const pinned = !!(me && me.tenant);
   const cur = currentTenant();
   if (cur && !tenants.some((t) => t.id === cur) && !pinned) setTenant("");
+  const listed = pinned && !tenants.some((t) => t.id === cur) ? [{ id: cur }, ...tenants] : tenants;
   sel.innerHTML =
     (pinned ? "" : `<option value="">All tenants</option>`) +
-    tenants
+    listed
       .map((t) => `<option value="${escapeAttr(t.id)}">${escapeAttr(t.name || t.id)}</option>`)
       .join("");
   sel.value = currentTenant();
