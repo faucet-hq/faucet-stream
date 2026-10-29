@@ -257,6 +257,10 @@ async fn read_raw(client: &aws_sdk_kinesis::Client, stream: &str) -> Vec<Vec<u8>
         .unwrap()
         .shard_iterator()
         .map(str::to_string);
+    // The emulator can hand back an iterator that re-reads records it already
+    // returned, so records are kept once per sequence number; a real double
+    // write still shows up, under a second sequence number.
+    let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for _ in 0..5 {
         let Some(i) = it else { break };
@@ -266,7 +270,11 @@ async fn read_raw(client: &aws_sdk_kinesis::Client, stream: &str) -> Vec<Vec<u8>
             .send()
             .await
             .unwrap();
-        out.extend(resp.records().iter().map(|r| r.data().as_ref().to_vec()));
+        for r in resp.records() {
+            if seen.insert(r.sequence_number().to_string()) {
+                out.push(r.data().as_ref().to_vec());
+            }
+        }
         it = resp.next_shard_iterator().map(str::to_string);
     }
     out
