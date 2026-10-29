@@ -170,10 +170,12 @@ are tracked in the roadmap epic (search the `epic` label).
   manual `git cliff` invocations on demand but is no longer the auto-generation
   path. Write commit subjects as `type(scope): summary` (`feat`, `fix`, `perf`,
   `refactor`, `docs`, `test`, `ci`, `chore`) so they're grouped correctly.
-- **MSRV.** The minimum supported Rust version is pinned in
-  `rust-toolchain.toml` and enforced by CI (fmt/clippy/test/docs all run on it).
-  Bumping the MSRV is itself a notable change — raise it only when needed and
-  note it in the changelog.
+- **MSRV.** The minimum supported Rust version is
+  `workspace.package.rust-version` in the root `Cargo.toml`; every crate
+  inherits it and publishes it in its manifest, so raising the MSRV means
+  editing that field. `rust-toolchain.toml` separately pins the toolchain this
+  repo builds and tests with in CI. The MSRV tracks the latest stable Rust
+  release; a bump is a notable change, so note it in the changelog.
 
 ## Release process
 
