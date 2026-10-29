@@ -6,6 +6,10 @@ listed here with the versions it was triaged for: a package version that the
 advisory affects must be one of them. A new affected copy (a dependency
 falling back to an old release) then fails CI instead of passing silently.
 
+It also fails when fuzz/osv-scanner.toml ignores an advisory the root
+osv-scanner.toml does not: the fuzz lockfile shares crates with the
+workspace, so every fuzz entry must be accepted in the root config too.
+
 Usage: scripts/advisory-scope.py   (run from the repo root)
 """
 
@@ -38,11 +42,31 @@ def violations(lock, deny):
     return found
 
 
+def osv_ids(osv):
+    return {e["id"] for e in osv.get("IgnoredVulns", [])}
+
+
+def fuzz_only_ignores(root_osv, fuzz_osv):
+    """Advisory ids fuzz/osv-scanner.toml ignores that the root config does not."""
+    return sorted(osv_ids(fuzz_osv) - osv_ids(root_osv))
+
+
 def main():
     with open("Cargo.lock", "rb") as f:
         lock = tomllib.load(f)
     with open("deny.toml", "rb") as f:
         deny = tomllib.load(f)
+    with open("osv-scanner.toml", "rb") as f:
+        root_osv = tomllib.load(f)
+    with open("fuzz/osv-scanner.toml", "rb") as f:
+        fuzz_osv = tomllib.load(f)
+    missing = fuzz_only_ignores(root_osv, fuzz_osv)
+    if missing:
+        print("fuzz/osv-scanner.toml ignores advisories the root osv-scanner.toml does not:")
+        for vid in missing:
+            print(f"  {vid}")
+        print("Add each to osv-scanner.toml (with its reason), or drop it from the fuzz config.")
+        return 1
     found = violations(lock, deny)
     if found:
         print("A version-blind advisory ignore in deny.toml now covers an untriaged copy:")

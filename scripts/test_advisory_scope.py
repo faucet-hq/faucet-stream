@@ -38,6 +38,21 @@ class Violations(unittest.TestCase):
         self.assertEqual(asc.violations(lock("0.38.1"), {"advisories": {"ignore": []}}), [])
 
 
+def osv(*ids):
+    return {"IgnoredVulns": [{"id": i, "reason": "x"} for i in ids]}
+
+
+class FuzzOsv(unittest.TestCase):
+    def test_fuzz_entries_present_in_the_root_pass(self):
+        self.assertEqual(asc.fuzz_only_ignores(osv("A", "B"), osv("B")), [])
+
+    def test_a_fuzz_only_entry_is_named(self):
+        self.assertEqual(asc.fuzz_only_ignores(osv("A"), osv("C", "A", "B")), ["B", "C"])
+
+    def test_empty_configs_pass(self):
+        self.assertEqual(asc.fuzz_only_ignores({}, {}), [])
+
+
 class Workspace(unittest.TestCase):
     def test_the_workspace_passes(self):
         cwd = os.getcwd()
