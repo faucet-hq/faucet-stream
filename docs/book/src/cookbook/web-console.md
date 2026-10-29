@@ -13,8 +13,8 @@ leaving a browser tab.
 > **Want to see it populated in one command?** The
 > [Try it locally](../getting-started/try-it-locally.md) quickstart builds the
 > CLI, runs a battery of demo pipelines, and leaves this console up with Runs,
-> Datasets, Lineage, and Templates already filled in — the screenshots below are
-> from it.
+> Datasets, Lineage, and Templates already filled in — the screenshots below use
+> its demo workspace.
 
 ## Enabling the feature
 
@@ -100,7 +100,7 @@ The list pane has:
 While any listed run is still going, the list and the stat strip refresh every
 few seconds in place, without moving the selection or the scroll position.
 
-![The Runs dashboard, listing completed runs with status badges, record counts, and timestamps](../assets/console/runs.png)
+![The Runs split pane: the run list on the left (All runs / Active / Failed tabs, the running / succeeded / failed / records stat strip, and Failed and Succeeded sections of rows with status rings and one-line facts), and the selected ui-matrix-fanout run's Overview on the right](../assets/console/runs.png)
 
 The detail pane has four tabs, with **Cancel run** (while it runs), **Roll
 back…** and **Delete** (once it has finished) on the right:
@@ -152,7 +152,7 @@ run's config. The result renders inline: what was deleted / restored, any
 conflicts, and whether the bookmark was rewound (backed by
 `POST /v1/runs/{id}/rollback`; see [Undoing a run](./rollback.md)).
 
-![A run's detail view showing the status summary, the Roll back… and Delete actions, the invocations table with a run id column, the log panel, and the dead-letter-queue inspect/replay/discard panel](../assets/console/run-detail.png)
+![A failed run's Overview tab: the Overview / Invocations / Logs / Dead-letter queue tabs with Roll back… and Delete on the right, the failure alert naming the invocation's quality-check error, the records and timings card, the invocations and provenance cards, the labels and the log tail](../assets/console/run-detail.png)
 
 ### Changes
 
@@ -192,60 +192,93 @@ Two modes for submitting a new pipeline run:
   contract, PII masking, schema drift). Each block is off until you add it;
   its form comes from `GET /v1/schemas/block/{name}`.
 
-![The Submit view in guided mode: a schema-driven form generated from the selected connector's JSON Schema](../assets/console/submit.png)
+![The Submit page in guided mode: the Guided / Editor toggle and the schema-driven form generated from the rest source's JSON Schema](../assets/console/submit.png)
 
 ### Schemas explorer
 
 Browses the connector catalog compiled into the running server
-(`GET /v1/schemas`). Click any source, sink, or transform to view its full
-JSON Schema — useful for checking config field names and types without leaving
-the browser.
+(`GET /v1/schemas`): sources, sinks and transforms in a list on the left, the
+state stores with a line each. Click any source, sink, or transform to see its
+fields (type, default, first sentence of the description) and the raw JSON
+Schema — useful for checking config field names and types without leaving the
+browser.
+
+### Usage
+
+The **Usage** page reads `GET /v1/usage`: a filter bar (group by pipeline, row,
+dataset, sink, day, or tenant on a server with tenants; a pipeline name; a date
+range), a stat strip of the window's totals (invocations, rows and bytes
+written, estimated cost, hosted equivalent) and a table with one line per
+group. Every figure is an estimate; see [Cost & usage](./usage.md).
 
 ### Templates
 
-When the server is built with the `templates` feature, a **Templates** view browses
-the [template registry](./templates.md) in the `--history` backend. Every row
-carries a **kind** pill — `source` (a system and its streams), `sink` (a
-destination), `deployment` (the operational blocks — state, DLQ, notifications,
-SLA — applied over a composed run), or `pipeline` (a complete config) — beside its lifecycle status
-(`draft` / `launched` / `deprecated`), which version is live, the build tip, and
-its parameter count. Chips filter by status and by kind (deprecated templates are
-hidden until their chip is toggled on). As soon as the registry holds a source
-template and a sink template, a **Compatibility** grid sits above the list —
-one row per source, one column per sink, ✓ where every stream has a write mode
-the sink supports (the tooltip lists the per-stream plan); clicking a cell opens
-the source's page with that sink preselected in its trigger form:
+When the server is built with the `templates` feature, **Templates** is a split
+pane over the [template registry](./templates.md) in the `--history` backend:
+`#/templates` lists every template, `#/templates/<id>` selects one (append
+`?sink=<id>` to preselect a sink in a source template's trigger form).
 
-![The Templates view: a Compatibility grid (the example-csv source template × the jsonl and sqlite sink templates, both ✓) above the list of deployment, source, sink and pipeline templates, each with a kind pill, its live and newest version, and the status / kind filter chips](../assets/console/templates.png)
+The list has tabs for **All**, **Launched** and **Draft** (the filter button
+adds a search, a sort by name or last update, and *include deprecated
+templates*), a stat strip (templates, launched, draft, and failing — templates
+whose newest version fails its tests), and one collapsible section per kind:
+**Source templates** (a system and its streams), **Sink templates** (a
+destination), **Deployments** (the operational blocks — state, DLQ,
+notifications, SLA — applied over a composed run) and **Pipelines** (complete
+configs). Each row shows a status ring, the id, the newest version, and its
+release state: `stable vN` and the channels pointing elsewhere, `draft · never
+launched`, or `vN tests failing`, then the test status and the parameter count.
 
-Clicking one opens its **versions page** — the release console for that template:
+With no template selected the right-hand side is the registry itself:
 
-- for a launched **pipeline** template, a **Health** card: the live version's
-  [`faucet status`](./state-and-status.md) screen — per row a status pill,
-  last success, bookmark, DLQ backlog, and where the next run resumes, with
-  the reasons under any row that is not healthy (a template whose required
-  params have no defaults says so instead — its state location depends on them)
-- one row per stored version, with the channels currently pointing at it
-  (`stable` / `previous` / `newest` derived, `dev`…`prod` assigned) and an
-  **assign-channel** dropdown
-- **Launch** on any version (disabled on the live one), **Roll back** to the
-  previous launch, and **Deprecate** / **Revive**
-- **Config** to expand the stored body verbatim, and **Delete** for one version
-- a **Trigger a run** form generated from the template's declared `params:` —
-  typed inputs, required/secret badges, descriptions — plus a version selector
-  listing only channels that actually resolve
-- the **launch history**: who blessed which build, and when
+- **Compatibility** — one row per source template, one column per sink
+  template, ✓ where every stream has a write mode the sink supports (the
+  tooltip lists the per-stream plan), filterable by owner and type. Clicking a
+  ✓ opens the source template with that sink preselected.
+- **Register** — an editor with `id` / format / description and a **launch
+  it** checkbox, so a template can go from config to live without leaving the
+  browser (the **+** button in the list header opens it too).
+- **Sync** — on a server started with `--templates-sync`: the configured
+  remote origins (repo or bucket, prefix, launch / prune policy), a **Dry run**
+  that lists what a pull would register, launch, deprecate, or skip, and
+  **Pull now** to apply it — see
+  [Hosting templates in a repo or bucket](./templates.md#hosting-templates-in-a-repo-or-bucket-sync).
 
-![The versions page for orders-by-country: the Health card for the launched version (one row, ok, last success, DLQ 0, next run resumes from a full snapshot), v3 as newest/staging, v2 as dev, v1 as stable/prod, and the typed trigger form](../assets/console/template-detail.png)
+![The Templates split pane with nothing selected: the template list by kind (source templates, all drafts, with their newest versions) beside the Compatibility matrix of source templates against sink templates, every cell a ✓](../assets/console/templates.png)
 
-A **source template**'s page adds a **sink template** selector (plus its version
-channel) to the trigger form: the chosen sink's params join the form, tagged
-`sink`, and the run composes the two at submit time — the same source can be
-sent to BigQuery today and Postgres tomorrow from one page. A **deployment**
-selector applies a registered [deployment overlay](./template-hub.md#deployment-overlays)
-to the run; its params join the form tagged `deployment`. A **sink template**'s
-or **deployment**'s page has no trigger form; it lists the source templates it
-can be used with.
+A selected template opens its **versions page**, the release console for it.
+The header has **New version** (the register editor, seeded with the newest
+config), **Roll back** to the previous launch, **Deprecate** / **Revive**, and
+**Launch vN** when the newest version can become stable. Its tabs:
+
+- **Versions** — the launch-gate card for the newest version (its latest test
+  run: cases passed by origin, retries, shared suites, faucet version, and
+  whether it can be launched); the versions table, newest first, with the
+  channels pointing at each version (`stable` / `previous` / `newest` derived,
+  `dev`…`prod` assigned), its test status, when it was last tested and how
+  many runs it served in the last 7 days; and the launch history (who launched
+  which version, on what test evidence). Each version row has **Run** (opens
+  the trigger form with that version), **Launch** (disabled on the live
+  version and on one whose tests do not pass) and **More**: assign a channel,
+  test history, run tests, show the stored or the clean config, deprecate /
+  revive the version, delete it.
+- **Run** — a trigger form generated from the declared `params:` (typed
+  inputs, required/secret badges, descriptions) with a version selector.
+  A sink template's page has **Pairings** here and a deployment's has **Use**:
+  the source templates it can be composed with.
+- **Health** — for a launched **pipeline** template, the live version's
+  [`faucet status`](./state-and-status.md) screen: per row a status pill, last
+  success, bookmark, DLQ backlog, and where the next run resumes, with the
+  reasons under any row that is not healthy.
+
+![The versions page for orders-by-country: Launched · v2 with Launch v3 in the header, the launch-gate card showing v3 passed 1 of 1 case with the gate open, the versions table (v4 failing a fixture and unable to take a channel, v3 newest/staging, v2 stable/dev, v1 previous/prod) with Run / Launch / More per row, and the launch history](../assets/console/template-detail.png)
+
+A **source template**'s trigger form adds a **sink template** selector (plus
+its version): the chosen sink's params join the form, tagged `sink`, and the
+run composes the two at submit time — the same source can be sent to BigQuery
+today and Postgres tomorrow from one page. A **deployment** selector applies a
+registered [deployment overlay](./template-hub.md#deployment-overlays) to the
+run; its params join the form tagged `deployment`.
 
 Below the params, a **Streams** section (**Rows** for a pipeline template with
 a `matrix:`) lists what the run can include, from
@@ -258,41 +291,46 @@ highlighted, a blocked one says why — and the line under the list previews the
 run set the server resolves before you press **Run**. See
 [Running a subset of streams](./templates.md#running-a-subset-of-streams).
 
-![The trigger form of the example-csv source template, scrolled to the sink-template picker, the deployment selector and the Streams section: orders checked, customers unchecked, both resolving overwrite→append on the csv sink, include parents set to off, and the resolved run set "orders"](../assets/console/template-source-detail.png)
-
-When the server was started with `--templates-sync`, the Templates page also
-shows **Sync from origins**: the configured remote origins (repo or bucket,
-prefix, launch / prune policy), a **Dry run** that lists exactly what a pull
-would register, launch, deprecate, or skip, and **Pull now** to apply it — see
-[Hosting templates in a repo or bucket](./templates.md#hosting-templates-in-a-repo-or-bucket-sync).
-
-Registering is in the UI too — **Register a template** opens an editor with `id` /
-format / description and a **launch it** checkbox, so a template can go from
-config to live without leaving the browser.
+![The Run tab of the example-csv source template, scrolled to the sink section (faucet-hq/jsonl with its out_dir param), the deployment selector, and the Streams section: orders and customers checked, both resolving to overwrite, include parents off, and the resolved run set orders → customers](../assets/console/template-source-detail.png)
 
 ### Datasets & Lineage (Data Movement Catalog)
 
 When the server is built with the `catalog` feature, two more views browse the
 [Data Movement Catalog](./catalog.md) accumulated in the `--history` backend:
 
-- **Datasets** — a filterable list (kind / URI search) of every dataset the
-  server's pipelines have touched. Clicking a dataset opens its detail:
-  freshness and run counters, per-run volume bars, the deduplicated schema
-  timeline with per-version diff badges, its upstream/downstream edges, and —
-  for a dataset written by a [`profiling:`](./profiling.md) pipeline — a
-  **Column profiles** table: per column the type mix, null rate with a
-  sparkline over the recorded runs (drift runs marked), distinct estimate,
-  numeric / string summary, and top values, with the latest run's drift
-  findings listed above it.
+- **Datasets** — a split pane: `#/catalog` lists every dataset the server's
+  pipelines have touched, `#/catalog/<id>` selects one. The list has **All**,
+  **Destinations** and **Sources** tabs, filters (URI search, kind, a
+  last-success range), a stat strip (datasets, written in the last 24 hours,
+  evolved — more than one schema version — and with owners) and sections for
+  destinations and sources. Each row shows the URI, the time since the last
+  successful run, the kind, the last run's rows, the schema version, the
+  consumers, the owner and the pipeline that wrote it.
 
-  ![The Datasets view listing every dataset touched, each with a kind badge, URI, source/sink role, and run/row counts](../assets/console/datasets.png)
+  A dataset's **Overview** tab has a card with the last run's rows and column
+  count, a rows-per-run trend, the null rate of its emptiest profiled column
+  with its trend, the run count, the declared consumers, the latest schema
+  change and per-run volume bars (hover any trend or bar for the values); the
+  **owners & consumers**, with an **Annotate…** form for `catalog_annotate`
+  holders; and its upstream and downstream edges. **Schema** is the
+  deduplicated schema timeline with per-version diff badges and each version's
+  JSON; **Profile** is, for a dataset written by a
+  [`profiling:`](./profiling.md) pipeline, the **column profiles** table — per
+  column the type mix, null rate with a sparkline over the recorded runs
+  (drift runs marked), distinct estimate, numeric / string summary, and top
+  values, with the latest run's drift findings listed above it; **Lineage**
+  repeats the edges; **Outputs** is the dataset's local outputs (below). With
+  no dataset selected, the right-hand side is the server's local outputs.
+
+  ![The Datasets split pane: the dataset list with its tabs, stat strip and destination rows, beside the Overview of ./out/orders_profiled.jsonl: the rows / null-rate / runs / consumers card with the schema v2 +discount_code note and volume bars, the owners and declared consumers with the Annotate form, and the lineage card](../assets/console/datasets.png)
 
 - **Lineage** — the source→sink edge graph rendered as a layered SVG (sources
   left, sinks right). Hover an edge for the pipeline/run context; click a node
-  to open its dataset detail; open a rooted, depth-bounded slice from any
-  dataset's detail page.
+  to highlight its connections and double-click it to open the dataset; a
+  rooted, depth-bounded slice opens from any dataset's **Lineage graph**
+  button.
 
-  ![The Lineage graph showing source CSV datasets on the left fanning out to JSONL/Parquet/stdout sink datasets on the right](../assets/console/lineage.png)
+  ![The Lineage graph showing the source CSV datasets on the left fanning out to the JSONL, SQLite and stdout sink datasets on the right](../assets/console/lineage.png)
 
 On a server built without the `catalog` feature both views show a short
 "not available" notice (the endpoints are absent).
@@ -302,8 +340,10 @@ On a server built without the `catalog` feature both views show a short
 The Datasets page is also where the **local files** the server's sinks wrote
 (jsonl / csv / parquet) are listed and reclaimed — cleanup of *data artifacts*
 belongs next to the data artifacts, not on the Runs tab, which is about execution
-history. A **Local outputs** panel sits under the dataset list (and under each
-dataset's detail, scoped to it) showing every tracked file with its age and state:
+history. A **Local outputs** panel fills the Datasets detail pane while no dataset
+is selected (the list's outputs button opens it), and each dataset's **Outputs**
+tab holds the same panel scoped to that dataset. Each tracked file shows its age
+and state:
 
 | State | Meaning |
 |---|---|
@@ -397,19 +437,23 @@ record is kept" message in place of the table, never an error toast. Full detail
 
 ### Tenants
 
-On a server built with the `tenants` feature, the **Tenants** page lists every
-[tenant](./embedded-integrations.md) with its connections (and any that need
-re-authorization), active runs and limits. A tenant's page edits its limits,
-lists its connections — names, types and status, never credentials — and
-offers a **Connect** button per `--connect-providers` provider (the
-authorization page opens in a new tab and returns to the console), a form for
-stored credentials, and suspend / delete. Delete asks you to type the tenant id
-first. The **tenant switcher** in the top bar scopes Runs, Usage and Changes to
-one tenant; a tenant-scoped principal is pinned to its own. Controls follow
-the caller's role: creating, suspending and deleting tenants needs
-`tenant_admin`, connections need `connection_manage`.
+On a server built with the `tenants` feature, **Tenants** is a split pane:
+`#/tenants` lists every [tenant](./embedded-integrations.md) — with a stat strip
+(tenants, running runs, connections and any that need re-authorization) and
+**Active** and **Suspended** sections — and `#/tenants/<id>` selects one. The
+**+** button opens the create form. A tenant's **Overview** tab edits its
+limits, shows its labels and its ten most recent runs, and holds the delete
+form, which asks you to type the tenant id first; its **Connections** tab lists
+the connections — names, types and status, never credentials — with a
+**Connect** form per `--connect-providers` provider (the authorization page
+opens in a new tab and returns to the console), a form for stored credentials,
+and **Reconnect** / **Delete** per connection. **Runs for this tenant** and
+**Suspend** / **Resume** sit in the header. The **tenant switcher** in the top
+bar scopes Runs, Usage and Changes to one tenant; a tenant-scoped principal is
+pinned to its own. Controls follow the caller's role: creating, suspending and
+deleting tenants needs `tenant_admin`, connections need `connection_manage`.
 
-![A tenant's page: its limits form, the connections table with each connection's type and status, the connect-provider panel, a stored-credentials form, and the suspend and delete controls](../assets/console/tenants.png)
+![A tenant's page: the tenant list beside Acme Corp's Overview tab with the limits form, its labels, the recent runs and the delete form, and Runs for this tenant and Suspend in the header](../assets/console/tenants.png)
 
 ## Disabling the console at runtime
 
