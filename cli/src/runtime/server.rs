@@ -485,6 +485,11 @@ pub async fn submit(
     if let Some(p) = req.pool.as_deref() {
         crate::serve::pools::resolve(Some(p), None)?;
     }
+    // The request's `depends_on` edges (#960) join the config's own before
+    // anything reads it: the change-request plan, the load (expansion and
+    // the selection check them like declared edges), the stored body a peer
+    // re-runs and the idempotency fingerprint.
+    apply_request_dependencies(&mut req)?;
     let gated = req.approved_change.is_none()
         && (req.require_approval
             || (approval == Approval::Required
@@ -527,6 +532,12 @@ pub async fn submit(
             .entry(crate::select::LABEL_SELECTION.to_string())
             .or_insert_with(|| sel.canonical());
     }
+    if let Some(deps) = req.depends_on.as_ref().filter(|d| !d.is_empty()) {
+        req.labels.insert(
+            crate::run_deps::LABEL_DEPENDS_ON.to_string(),
+            crate::serve::history::labels::clamp_value(&deps.canonical()),
+        );
+    }
     let admitted = admit(
         state,
         principal,
@@ -552,6 +563,28 @@ pub async fn submit(
     runner::enqueue(state, principal, admitted, req)
         .await
         .map(SubmitOutcome::Accepted)
+}
+
+/// Fold a request's `depends_on` (#960) into its config text. A body that
+/// already holds every edge (a materialized template) is left as written.
+fn apply_request_dependencies(req: &mut SubmitRequest) -> Result<(), ServeError> {
+    let Some(deps) = req.depends_on.as_ref() else {
+        return Ok(());
+    };
+    let json = req.config_format == runner::ConfigFormatWire::Json;
+    let rewritten = deps.apply_to_text(&req.config, json).map_err(|e| {
+        ServeError::BadConfig(crate::secrets::registry::redact(&e.to_string()).into_owned())
+    })?;
+    if let Some(text) = rewritten {
+        req.config = text;
+        req.config_format = runner::ConfigFormatWire::Json;
+        // The persisted sealed body is what a peer runs, so it carries the edges too.
+        if let Some(sp) = req.sealed_params.take() {
+            req.sealed_params = crate::serve::sealed::tokenize(&req.config, sp.values())
+                .map_err(ServeError::Internal)?;
+        }
+    }
+    Ok(())
 }
 
 impl SubmitOutcome {
@@ -1516,6 +1549,7 @@ mod templates {
             &body.env,
             mode,
             body.selection.as_ref(),
+            body.depends_on.as_ref(),
         )
         .await
         .map_err(map_err)?;
@@ -1632,6 +1666,7 @@ mod templates {
             budget: body.budget,
             approved_change: None,
             selection: materialized.selection.clone(),
+            depends_on: materialized.depends_on.clone(),
             pool: body.pool,
             trusted_config: true,
             server_file: false,
@@ -1681,6 +1716,7 @@ mod templates {
             params: materialized.params_redacted,
             deprecated,
             selection: body.selection,
+            depends_on: materialized.depends_on,
         }))
     }
 }

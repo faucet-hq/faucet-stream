@@ -243,6 +243,10 @@ pub struct RunTemplate {
     /// triggers over one template.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<crate::select::SelectionRequest>,
+    /// Completion dependencies between the fired run's rows / streams
+    /// (#960), added to the pipeline's or template's own `depends_on:`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depends_on: Option<crate::run_deps::RunDependencies>,
     /// The execution pool the fired runs go to (#957); wins over the
     /// pipeline's or template's `pool:`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

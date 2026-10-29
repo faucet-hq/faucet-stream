@@ -544,6 +544,9 @@ pub fn compose_with(
         if let Some(k) = &s.parent_key {
             row.insert("parent_key".into(), Value::String(k.clone()));
         }
+        if !s.depends_on.is_empty() {
+            row.insert("depends_on".into(), json!(s.depends_on));
+        }
         if !s.inherit_transforms {
             row.insert("inherit_transforms".into(), Value::Bool(false));
         }
@@ -996,6 +999,7 @@ per_stream:
             write: WriteChoice::One(WriteMode::Append),
             parent: Some("bills".into()),
             parent_key: Some("id".into()),
+            depends_on: vec!["users".into()],
             inherit_transforms: false,
             for_each: None,
             r#as: None,
@@ -1009,10 +1013,12 @@ per_stream:
         assert_eq!(row["parent"], "bills");
         assert_eq!(row["parent_key"], "id");
         assert_eq!(row["inherit_transforms"], false);
+        assert_eq!(row["depends_on"], json!(["users"]));
         assert_eq!(row["source"]["ref"], "reports");
         assert!(
             d["matrix"][0].get("parent").is_none()
                 && d["matrix"][0].get("inherit_transforms").is_none()
+                && d["matrix"][0].get("depends_on").is_none()
         );
         crate::config::PipelineConfig::from_value(c.document.clone()).unwrap();
     }
@@ -1030,6 +1036,7 @@ per_stream:
             write,
             parent: Some("bills".into()),
             parent_key: Some("id".into()),
+            depends_on: Vec::new(),
             inherit_transforms: true,
             for_each: None,
             r#as: None,
@@ -1207,6 +1214,7 @@ per_stream:
             write: WriteChoice::One(WriteMode::Overwrite),
             parent: None,
             parent_key: None,
+            depends_on: Vec::new(),
             inherit_transforms: true,
             for_each: None,
             r#as: None,

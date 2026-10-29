@@ -168,6 +168,10 @@ pub struct MaterializedConfig {
     /// the caller's for a `pipeline`; for a composed run, the streams the
     /// caller's selection resolved to (the composition carries only those).
     pub selection: Option<crate::select::SelectionRequest>,
+    /// The run request's completion dependencies (#960), already folded into
+    /// [`Self::body`]: the caller's for a `pipeline`; for a composed run, the
+    /// edges of the streams the composition carries.
+    pub depends_on: Option<crate::run_deps::RunDependencies>,
     /// Where [`Self::body`] holds text the caller chose through a param
     /// (#989): `faucet serve` holds those values to the caller reference
     /// policy although the body loads trusted.
@@ -1231,6 +1235,7 @@ pub async fn materialize(
         overlay_contributes: Vec::new(),
         warnings: Vec::new(),
         selection: None,
+        depends_on: None,
         untested: None,
         caller_fields: bound.fields,
     })
@@ -1354,6 +1359,7 @@ pub async fn materialize_for_run(
         env_overrides,
         mode,
         None,
+        None,
     )
     .await
 }
@@ -1361,7 +1367,8 @@ pub async fn materialize_for_run(
 /// [`materialize_for_run`] for a subset of the template's rows (#741). A
 /// `pipeline` carries the selection through to the run; a `source-template`
 /// composes only the streams the selection resolves to, so a stream the sink
-/// cannot run does not block the ones selected.
+/// cannot run does not block the ones selected. `depends_on` (#960) adds
+/// completion dependencies between the rows / streams, folded into the body.
 #[allow(clippy::too_many_arguments)]
 pub async fn materialize_for_run_selected(
     store: &TemplateStore,
@@ -1372,6 +1379,7 @@ pub async fn materialize_for_run_selected(
     env_overrides: &BTreeMap<String, String>,
     mode: Materialize,
     selection: Option<&crate::select::SelectionRequest>,
+    depends_on: Option<&crate::run_deps::RunDependencies>,
 ) -> CliResult<MaterializedConfig> {
     let mut untested = run_gate(store, id, version, sink.allow_untested).await?;
     // Each composed part is checked through its own label.
@@ -1397,6 +1405,7 @@ pub async fn materialize_for_run_selected(
         env_overrides,
         mode,
         selection,
+        depends_on.filter(|d| !d.is_empty()),
     )
     .await?;
     m.untested = untested;
@@ -1454,6 +1463,7 @@ async fn materialize_kind(
     env_overrides: &BTreeMap<String, String>,
     mode: Materialize,
     selection: Option<&crate::select::SelectionRequest>,
+    depends_on: Option<&crate::run_deps::RunDependencies>,
 ) -> CliResult<MaterializedConfig> {
     let record = fetch_version(store, id, version).await?;
     match record.kind {
@@ -1471,6 +1481,12 @@ async fn materialize_kind(
             }
             let mut m = materialize(store, id, version, supplied, env_overrides, mode).await?;
             m.selection = selection.cloned();
+            if let Some(deps) = depends_on {
+                if let Some(body) = deps.apply_to_text(&m.body, true)? {
+                    m.body = body;
+                }
+                m.depends_on = Some(deps.clone());
+            }
             Ok(m)
         }
         TemplateKind::SourceTemplate => {
@@ -1492,6 +1508,7 @@ async fn materialize_kind(
                 env_overrides,
                 mode,
                 selection,
+                depends_on,
             )
             .await
         }
@@ -1540,6 +1557,7 @@ pub async fn materialize_pair_overlaid(
         env_overrides,
         mode,
         None,
+        None,
     )
     .await
 }
@@ -1554,6 +1572,7 @@ async fn materialize_pair_selected(
     env_overrides: &BTreeMap<String, String>,
     mode: Materialize,
     selection: Option<&crate::select::SelectionRequest>,
+    depends_on: Option<&crate::run_deps::RunDependencies>,
 ) -> CliResult<MaterializedConfig> {
     let src_rec = fetch_version(store, source_id, source_version).await?;
     let sink_rec = fetch_version(store, sink_id, sink_version).await?;
@@ -1594,7 +1613,12 @@ async fn materialize_pair_selected(
         BindMode::Strict,
         (mode == Materialize::Local).then_some(&env_overlay),
     )?;
-    let source = expanded.template.clone();
+    let mut source = expanded.template.clone();
+    // The request's edges (#960) join the streams' own before the selection
+    // resolves, so `include_parents` follows them like declared edges.
+    if let Some(deps) = depends_on {
+        deps.apply_to_streams(&mut source)?;
+    }
     let all_streams: Vec<String> = source.streams.iter().map(|s| s.name.clone()).collect();
     let (source, effective) = match selection {
         Some(sel) => {
@@ -1603,6 +1627,18 @@ async fn materialize_pair_selected(
         }
         None => (source, None),
     };
+    // The edges of the streams composed (a narrowed-out stream does not run).
+    let depends_on = depends_on.map(|deps| {
+        let kept: std::collections::BTreeSet<&str> =
+            source.streams.iter().map(|s| s.name.as_str()).collect();
+        crate::run_deps::RunDependencies(
+            deps.0
+                .iter()
+                .filter(|(row, _)| kept.contains(row.as_str()))
+                .map(|(row, d)| (row.clone(), d.clone()))
+                .collect(),
+        )
+    });
     let mut composition = crate::hub::compose(&source, &sink)?;
     let (mut overlay_id, mut overlay_version) = (None, None);
     if let Some(choice) = overlay {
@@ -1632,6 +1668,7 @@ async fn materialize_pair_selected(
         overlay_contributes,
         warnings,
         selection: effective,
+        depends_on: depends_on.filter(|d| !d.is_empty()),
         untested: None,
         caller_fields,
     })

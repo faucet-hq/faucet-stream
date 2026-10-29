@@ -447,6 +447,22 @@ pub fn run_material(rows: &[Value], selection: Option<&str>) -> String {
     }
 }
 
+/// [`run_material`] with the completion dependencies the request added
+/// (#960, canonical form): a different order is a different change.
+pub fn run_material_ordered(
+    rows: &[Value],
+    selection: Option<&str>,
+    depends_on: Option<&str>,
+) -> String {
+    match depends_on {
+        None => run_material(rows, selection),
+        Some(d) => sha_hex(&format!(
+            "{}\ndepends_on={d}",
+            run_material(rows, selection)
+        )),
+    }
+}
+
 /// Which row-level facts differ between two plans (for the invalidation
 /// message). Empty when nothing material moved.
 pub fn material_diff(before: &[Value], after: &[Value]) -> Vec<String> {
@@ -561,12 +577,18 @@ async fn plan_run(
         .into_iter()
         .collect();
     let selection = req.selection.as_ref().map(|s| s.canonical());
+    let depends_on = req
+        .depends_on
+        .as_ref()
+        .filter(|d| !d.is_empty())
+        .map(|d| d.canonical());
     Ok(ChangePlan {
-        material: run_material(&rows, selection.as_deref()),
+        material: run_material_ordered(&rows, selection.as_deref(), depends_on.as_deref()),
         summary: json!({
             "pipeline": loaded.cfg.name,
             "rows": rows.len(),
             "selection": selection,
+            "depends_on": req.depends_on.as_ref().filter(|d| !d.is_empty()),
             "sinks": sinks,
             "delivery": loaded.cfg.delivery,
             "budget": loaded.cfg.budget,

@@ -2824,7 +2824,8 @@ components:
             form). The
             provenance keys the server stamps (`template`, `template_version`,
             `allow_untested`, `sink_template`, `sink_template_version`,
-            `overlay`, `overlay_version`, `selection`) are refused with 422.
+            `overlay`, `overlay_version`, `selection`, `depends_on`) are
+            refused with 422.
         timeout_secs: { type: integer, nullable: true }
         doctor_first: { type: boolean, default: false, description: "Run doctor probes first; 422 with report on failure." }
         idempotency_key: { type: string, nullable: true }
@@ -2835,6 +2836,7 @@ components:
         reason: { type: string, description: "Why, for the approvers (with require_approval)." }
         budget: { $ref: "#/components/schemas/BudgetSpec" }
         selection: { $ref: "#/components/schemas/RowSelection" }
+        depends_on: { $ref: "#/components/schemas/RunDependencies" }
         pool: { type: string, pattern: "^[a-z0-9][a-z0-9_-]{0,62}$", description: "Execution pool to run in (#957). Wins over the config's `pool:`; omitted with no `pool:` = `default`. A clustered replica claims only runs in the pools it serves (`--pool`); a pool no live member serves (or, on a single server, one it does not serve) is a 422 naming the pool." }
       example:
         name: orders_to_warehouse
@@ -3043,6 +3045,7 @@ components:
         records_written: { type: integer }
         tenant: { type: string, description: "The tenant this run was started for (#709); absent for an ordinary run." }
         selection: { $ref: "#/components/schemas/RowSelection" }
+        depends_on: { $ref: "#/components/schemas/RunDependencies" }
         host_access: { type: boolean, description: "The config came from the server's --triggers file, so its SQL connectors are not sandboxed (#862). Absent otherwise." }
         caller_config: { type: boolean, description: "The request carried the config, so its HTTP requests and redirect hops are checked against the caller reference policy wherever the run executes (#881). Absent otherwise." }
         pool: { type: string, default: default, description: "The execution pool the run belongs to (#957): only a replica serving it claims the run, its shards and its re-claims. Runs recorded before pools existed read as `default`." }
@@ -4240,6 +4243,28 @@ components:
         status: { type: array, items: { type: string, enum: [mandatory, active, available, draft, archived] }, description: "Status tiers added to the default eligible set." }
         include_parents: { type: string, nullable: true, enum: ["off", eligible, all], description: "A selected row's missing parent / depends_on ancestors: `off` refuses (default), `eligible` pulls in runnable ones and refuses a parked one, `all` pulls in every one." }
       example: { select: [deals], include_parents: eligible }
+    RunDependencies:
+      type: object
+      nullable: true
+      additionalProperties: { type: array, items: { type: string } }
+      description: >
+        Completion dependencies between the run's matrix rows / a source
+        template's streams (#960): each key starts only after every row it
+        lists completes (ordering only, no record hand-off — that is
+        `parent:`). Added to the config's or template's own `depends_on:`
+        edges, never removing one; a failed prerequisite skips its dependents
+        under the run's `on_error`. Every name must be a row / stream of the
+        run (`for_each` rows by their rendered names), and the combined
+        `parent:` + `depends_on:` graph must stay acyclic — else a `400`
+        naming the edge. Under a `selection`, a prerequisite left out follows
+        `include_parents`; for a source template, an edge whose row the
+        selection leaves out is dropped with it. A topology or a config
+        without `matrix:` has no rows to order (`400`). The edges are folded
+        into the stored config (so a claimed / sharded run applies them and
+        they are part of the idempotency fingerprint), stored on the run
+        record as sent, and the run is labelled
+        `depends_on=<row>:<prerequisites>;…`.
+      example: { orders: [customers], payments: [orders] }
     TemplateRows:
       type: object
       required: [template, kind, selectable, rows]
@@ -4391,6 +4416,7 @@ components:
         concurrency: { type: integer, minimum: 1, nullable: true, description: "Override this run's connector concurrency (source + sink connections/fetches), whatever the config says. Maps onto whichever knob the connector declares (max_connections / request_concurrency / partition_concurrency / shard_concurrency / concurrency); a connector with none ignores it. Does not change matrix parallelism or the server's --max-concurrent slots. Per-shard for a sharded run. 0 is rejected." }
         budget: { $ref: "#/components/schemas/BudgetSpec" }
         selection: { $ref: "#/components/schemas/RowSelection" }
+        depends_on: { $ref: "#/components/schemas/RunDependencies" }
         pool: { type: string, pattern: "^[a-z0-9][a-z0-9_-]{0,62}$", description: "Execution pool to run in (#957). Wins over the template's `pool:`; omitted with no `pool:` = `default`. A clustered replica claims only runs in the pools it serves (`--pool`); a pool no live member serves (or, on a single server, one it does not serve) is a 422 naming the pool." }
       example:
         params:
@@ -4447,6 +4473,7 @@ components:
             but the caller should migrate. Carries the retirement reason when one
             was given.
         selection: { $ref: "#/components/schemas/RowSelection" }
+        depends_on: { $ref: "#/components/schemas/RunDependencies" }
       example:
         run_id: run_01HZY8K3QK7
         status: queued
