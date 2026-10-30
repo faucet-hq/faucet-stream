@@ -18,7 +18,7 @@ import {
   btn, ibtn, input, select, check, toggle, field, alert, empty, skelRows, skelCards, lnk, code, diff, head, steps,
   meter, meta, dotText, attrs,
 } from "../components.js";
-import { layout, setQuery, patch, errorAlert, hashFor, ago, dialog, confirmAction, toast, poll } from "../page.js";
+import { layout, setQuery, patch, errorAlert, hashFor, ago, dialog, confirmAction, toast, poll, sections } from "../page.js";
 import { setCrumbs, setDelta, setContext } from "../shell.js";
 import { navigate } from "../router.js";
 import { fmtInt, mdInline, copyText } from "../utils.js";
@@ -127,6 +127,7 @@ export async function renderTemplates(host, params) {
   let P = { id: params.id || "", q: params.query };
   const Q = (k) => P.q.get(k) || "";
   const runForms = new Map();
+  const sects = sections("faucet.templates.sections");
   let alive = true;
 
   // ── data ───────────────────────────────────────────────────────────────
@@ -328,7 +329,7 @@ export async function renderTemplates(host, params) {
       ? join(SECTIONS.map(([k, label]) => {
           const items = rows.filter((t) => kindOf(t) === k);
           if (!items.length) return "";
-          return html`${sect(label, items.length, { id: k })}<div class="sect-rows rows">${items.map((t) => {
+          return html`${sect(label, items.length, { id: k, closed: sects.isClosed(k) })}<div class="sect-rows rows${sects.isClosed(k) ? " closed" : ""}">${items.map((t) => {
             const s = rowState(t);
             return row(ring(s.tone, s.shape), t.id, `v${stateOf(t).newest ?? t.version}`, rowMeta(t), { on: t.id === P.id, id: t.id, href: tHref(t.id), tip: `${t.id}${t.description ? ` — ${t.description}` : ""}` });
           })}</div>`;
@@ -348,6 +349,7 @@ export async function renderTemplates(host, params) {
     const s = e.target.closest(".stats > div[data-q]");
     if (s) return setQuery({ lt: Q("lt") === s.dataset.q ? "" : s.dataset.q });
   });
+  L.list.addEventListener("sect-toggle", (e) => { if (sects.isClosed(e.detail.id) !== e.detail.closed) sects.toggle(e.detail.id); L.list.__html = ""; });
   L.list.addEventListener("input", (e) => {
     if (e.target.name === "q") setQuery({ q: e.target.value }, { replace: true });
   });
@@ -424,6 +426,7 @@ export async function renderTemplates(host, params) {
     } else what = k === "deployment" ? "deployment overlay" : "pipeline";
     const sub = [status, html`<span>${what} · ${plural(Object.keys(d.params || {}).length, "param")}</span>`];
     const reg = registeredBy(d, st.newest);
+    if (d.name && d.name !== d.id) sub.push(html`<span>config name <b>${d.name}</b></span>`);
     if (reg && reg.by) sub.push(html`<span>registered by ${who(reg.by)}</span>`);
     else if (reg) sub.push(html`<span>registered ${ago(reg.at, " ago")}</span>`);
     return head(d.id, sub, d.description || "");
@@ -902,6 +905,7 @@ export async function renderTemplates(host, params) {
         const bits = [];
         if (secret) bits.push(html`${tag("secret")} never stored in the run record`);
         if (p.description) bits.push(raw(mdInline(p.description)));
+        if (p.trusted) bits.push(html`<span title="the template author lets this value reach paths, URLs and commands without the caller reference policy">${tag("trusted")}</span>`);
         if (p.from !== "source") bits.push(`from ${p.from} ${p.tid}`);
         if (p.default != null && val === "") bits.push(`default ${String(p.default)}`);
         let control;
