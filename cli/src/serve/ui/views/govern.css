@@ -15,3 +15,8 @@ td.num { white-space: nowrap; }
 .chg-timeline .ts { display: inline-block; width: 120px; }
 .chg-timeline .dot { margin-right: 8px; }
 .dialog .input.err, .dialog .input.err:focus-within { border-color: var(--bad); }
+
+/* tenants: row actions, change rows inside a card, JSON field error */
+.tn-acts { display: inline-flex; gap: 6px; justify-content: flex-end; }
+.tn-chg { display: flex; flex-direction: column; gap: 4px; padding: 6px 8px 8px; }
+textarea.area.err { border-color: var(--bad); }
