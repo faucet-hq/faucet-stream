@@ -266,6 +266,9 @@ fn list_runs_documents_every_query_parameter() {
         "submitted_by",
         "mine",
         "dataset_id",
+        "name_contains",
+        "pool",
+        "counts",
         "label",
         "labels",
     ]
