@@ -335,7 +335,11 @@ jobs:
           cargo cyclonedx --manifest-path cli/Cargo.toml --features full --target all \
             --format json --spec-version 1.5 --override-filename faucet-cli
           # The file name --override-filename produces differs between cargo-cyclonedx releases.
-          sbom=$(find . -path ./target -prune -o -name 'faucet-cli*.json' -newer "$RUNNER_TEMP/sbom-start" -print | head -n 1)
+          sbom=""
+          while IFS= read -r f; do
+            echo "candidate: $f"
+            if [ -z "$sbom" ] && grep -q '"bomFormat"' "$f"; then sbom=$f; fi
+          done < <(find . -path ./target -prune -o -name 'faucet-cli*.json' -newer "$RUNNER_TEMP/sbom-start" -print)
           if [ -z "$sbom" ]; then
             echo "::error::cargo cyclonedx wrote no faucet-cli SBOM"
             exit 1
