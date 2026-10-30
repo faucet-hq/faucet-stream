@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Console mockups</title>
+<style>
+  :root { --bg:#0a0b0d; --panel:#121417; --line:#22262c; --text:#e8e9ec; --muted:#7d838c; --fill:rgba(45,212,191,.10); --tline:rgba(45,212,191,.26); --tink:#5eead4; color-scheme: dark; }
+  :root[data-ui="light"] { --bg:#f4f4f2; --panel:#ffffff; --line:#e4e4e0; --text:#16181b; --muted:#6b7179; --fill:#e3f4f1; --tline:#bfe3dc; --tink:#0b5d56; color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:13px/1.45 -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif; }
+  .bar { position:sticky; top:0; z-index:2; display:flex; flex-wrap:wrap; gap:10px; align-items:center; padding:10px 16px; background:var(--panel); border-bottom:1px solid var(--line); }
+  .bar b { margin-right:6px; }
+  select { font:inherit; color:var(--text); background:var(--bg); border:1px solid var(--line); border-radius:7px; padding:5px 8px; }
+  .seg { display:inline-flex; border:1px solid var(--line); border-radius:7px; overflow:hidden; }
+  .seg button { font:inherit; color:var(--muted); background:transparent; border:0; padding:5px 12px; cursor:pointer; }
+  .seg button.on { background:var(--fill); color:var(--tink); box-shadow: inset 0 0 0 1px var(--tline); }
+  .nav button { font:inherit; color:var(--text); background:transparent; border:1px solid var(--line); border-radius:7px; padding:5px 10px; cursor:pointer; }
+  .meta { margin-left:auto; color:var(--muted); }
+  .shot { padding:16px; }
+  .shot img { display:block; max-width:100%; margin:0 auto; border:1px solid var(--line); border-radius:10px; }
+  .missing { padding:40px; text-align:center; color:var(--muted); }
+  kbd { font:11px ui-monospace, Menlo, monospace; border:1px solid var(--line); border-radius:4px; padding:0 4px; }
+</style>
+</head>
+<body>
+<div class="bar">
+  <b>Console mockups</b>
+  <label>Page <select id="page"></select></label>
+  <label>Screen <select id="state"></select></label>
+  <span class="seg" id="theme"><button data-v="dark">Dark</button><button data-v="light">Light</button></span>
+  <span class="seg" id="width"><button data-v="wide">1440 px</button><button data-v="narrow">1000 px</button></span>
+  <span class="nav"><button id="prev" title="Previous screen (←)">←</button> <button id="next" title="Next screen (→)">→</button></span>
+  <span class="meta" id="meta"></span>
+</div>
+<div class="shot" id="shot"></div>
+<script>
+const $ = (id) => document.getElementById(id);
+const params = new URLSearchParams(location.hash.slice(1));
+let m = {};
+let sel = { page: params.get('page'), state: params.get('state'), theme: params.get('theme') || 'dark', width: params.get('width') || 'wide' };
+
+function seg(id, key) {
+  for (const b of $(id).querySelectorAll('button')) {
+    b.classList.toggle('on', b.dataset.v === sel[key]);
+    b.onclick = () => { sel[key] = b.dataset.v; render(); };
+  }
+}
+function opts(el, values, current) {
+  el.innerHTML = values.map((v) => `<option${v === current ? ' selected' : ''}>${v}</option>`).join('');
+}
+function flat() {
+  const out = [];
+  for (const p of Object.keys(m)) for (const s of Object.keys(m[p])) out.push([p, s]);
+  return out;
+}
+function step(d) {
+  const all = flat();
+  const i = all.findIndex(([p, s]) => p === sel.page && s === sel.state);
+  const [p, s] = all[(i + d + all.length) % all.length];
+  sel.page = p; sel.state = s; render();
+}
+function render() {
+  const pages = Object.keys(m);
+  if (!m[sel.page]) sel.page = pages[0];
+  const states = Object.keys(m[sel.page]);
+  if (!m[sel.page][sel.state]) sel.state = states[0];
+  opts($('page'), pages, sel.page);
+  opts($('state'), states, sel.state);
+  document.documentElement.dataset.ui = sel.theme;
+  seg('theme', 'theme');
+  const entry = (m[sel.page][sel.state] || {})[sel.theme] || {};
+  const hasNarrow = Object.values(m[sel.page][sel.state]).some((t) => t.narrow);
+  $('width').style.display = hasNarrow ? '' : 'none';
+  if (!hasNarrow) sel.width = 'wide';
+  seg('width', 'width');
+  const src = entry[sel.width] || entry.wide;
+  $('shot').innerHTML = src ? `<img src="${src}" alt="${sel.page} – ${sel.state} (${sel.theme})">` : '<div class="missing">No render for this combination.</div>';
+  const all = flat();
+  const i = all.findIndex(([p, s]) => p === sel.page && s === sel.state);
+  $('meta').innerHTML = `${i + 1} of ${all.length} screens · <kbd>←</kbd> <kbd>→</kbd> step · <kbd>D</kbd> theme`;
+  history.replaceState(null, '', '#' + new URLSearchParams(sel).toString());
+}
+$('page').onchange = (e) => { sel.page = e.target.value; sel.state = null; render(); };
+$('state').onchange = (e) => { sel.state = e.target.value; render(); };
+$('prev').onclick = () => step(-1);
+$('next').onclick = () => step(1);
+document.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'SELECT') return;
+  if (e.key === 'ArrowRight') step(1);
+  if (e.key === 'ArrowLeft') step(-1);
+  if (e.key === 'd' || e.key === 'D') { sel.theme = sel.theme === 'dark' ? 'light' : 'dark'; render(); }
+});
+fetch('shots/manifest.json').then((r) => r.json()).then((j) => { m = j; render(); });
+</script>
+</body>
+</html>

@@ -1,0 +1,1314 @@
+{
+ "audit": {
+  "denials": {
+   "dark": {
+    "narrow": "shots/audit-denials-dark-1000.png",
+    "wide": "shots/audit-denials-dark.png"
+   },
+   "light": {
+    "narrow": "shots/audit-denials-light-1000.png",
+    "wide": "shots/audit-denials-light.png"
+   }
+  },
+  "entry": {
+   "dark": {
+    "narrow": "shots/audit-entry-dark-1000.png",
+    "wide": "shots/audit-entry-dark.png"
+   },
+   "light": {
+    "narrow": "shots/audit-entry-light-1000.png",
+    "wide": "shots/audit-entry-light.png"
+   }
+  },
+  "filtered": {
+   "dark": {
+    "narrow": "shots/audit-filtered-dark-1000.png",
+    "wide": "shots/audit-filtered-dark.png"
+   },
+   "light": {
+    "narrow": "shots/audit-filtered-light-1000.png",
+    "wide": "shots/audit-filtered-light.png"
+   }
+  },
+  "forbidden": {
+   "dark": {
+    "wide": "shots/audit-forbidden-dark.png"
+   },
+   "light": {
+    "wide": "shots/audit-forbidden-light.png"
+   }
+  },
+  "none": {
+   "dark": {
+    "narrow": "shots/audit-none-dark-1000.png",
+    "wide": "shots/audit-none-dark.png"
+   },
+   "light": {
+    "narrow": "shots/audit-none-light-1000.png",
+    "wide": "shots/audit-none-light.png"
+   }
+  },
+  "run": {
+   "dark": {
+    "narrow": "shots/audit-run-dark-1000.png",
+    "wide": "shots/audit-run-dark.png"
+   },
+   "light": {
+    "narrow": "shots/audit-run-light-1000.png",
+    "wide": "shots/audit-run-light.png"
+   }
+  }
+ },
+ "changes": {
+  "approve": {
+   "dark": {
+    "narrow": "shots/changes-approve-dark-1000.png",
+    "wide": "shots/changes-approve-dark.png"
+   },
+   "light": {
+    "narrow": "shots/changes-approve-light-1000.png",
+    "wide": "shots/changes-approve-light.png"
+   }
+  },
+  "executed": {
+   "dark": {
+    "narrow": "shots/changes-executed-dark-1000.png",
+    "wide": "shots/changes-executed-dark.png"
+   },
+   "light": {
+    "narrow": "shots/changes-executed-light-1000.png",
+    "wide": "shots/changes-executed-light.png"
+   }
+  },
+  "failed": {
+   "dark": {
+    "narrow": "shots/changes-failed-dark-1000.png",
+    "wide": "shots/changes-failed-dark.png"
+   },
+   "light": {
+    "narrow": "shots/changes-failed-light-1000.png",
+    "wide": "shots/changes-failed-light.png"
+   }
+  },
+  "history": {
+   "dark": {
+    "narrow": "shots/changes-history-dark-1000.png",
+    "wide": "shots/changes-history-dark.png"
+   },
+   "light": {
+    "narrow": "shots/changes-history-light-1000.png",
+    "wide": "shots/changes-history-light.png"
+   }
+  },
+  "impact": {
+   "dark": {
+    "narrow": "shots/changes-impact-dark-1000.png",
+    "wide": "shots/changes-impact-dark.png"
+   },
+   "light": {
+    "narrow": "shots/changes-impact-light-1000.png",
+    "wide": "shots/changes-impact-light.png"
+   }
+  },
+  "needs": {
+   "dark": {
+    "narrow": "shots/changes-needs-dark-1000.png",
+    "wide": "shots/changes-needs-dark.png"
+   },
+   "light": {
+    "narrow": "shots/changes-needs-light-1000.png",
+    "wide": "shots/changes-needs-light.png"
+   }
+  },
+  "none": {
+   "dark": {
+    "narrow": "shots/changes-none-dark-1000.png",
+    "wide": "shots/changes-none-dark.png"
+   },
+   "light": {
+    "narrow": "shots/changes-none-light-1000.png",
+    "wide": "shots/changes-none-light.png"
+   }
+  },
+  "plan": {
+   "dark": {
+    "narrow": "shots/changes-plan-dark-1000.png",
+    "wide": "shots/changes-plan-dark.png"
+   },
+   "light": {
+    "narrow": "shots/changes-plan-light-1000.png",
+    "wide": "shots/changes-plan-light.png"
+   }
+  },
+  "reject": {
+   "dark": {
+    "narrow": "shots/changes-reject-dark-1000.png",
+    "wide": "shots/changes-reject-dark.png"
+   },
+   "light": {
+    "narrow": "shots/changes-reject-light-1000.png",
+    "wide": "shots/changes-reject-light.png"
+   }
+  },
+  "toast": {
+   "dark": {
+    "narrow": "shots/changes-toast-dark-1000.png",
+    "wide": "shots/changes-toast-dark.png"
+   },
+   "light": {
+    "narrow": "shots/changes-toast-light-1000.png",
+    "wide": "shots/changes-toast-light.png"
+   }
+  },
+  "viewer": {
+   "dark": {
+    "narrow": "shots/changes-viewer-dark-1000.png",
+    "wide": "shots/changes-viewer-dark.png"
+   },
+   "light": {
+    "narrow": "shots/changes-viewer-light-1000.png",
+    "wide": "shots/changes-viewer-light.png"
+   }
+  }
+ },
+ "datasets": {
+  "activity": {
+   "dark": {
+    "narrow": "shots/datasets-activity-dark-1000.png",
+    "wide": "shots/datasets-activity-dark.png"
+   },
+   "light": {
+    "narrow": "shots/datasets-activity-light-1000.png",
+    "wide": "shots/datasets-activity-light.png"
+   }
+  },
+  "annotate": {
+   "dark": {
+    "narrow": "shots/datasets-annotate-dark-1000.png",
+    "wide": "shots/datasets-annotate-dark.png"
+   },
+   "light": {
+    "narrow": "shots/datasets-annotate-light-1000.png",
+    "wide": "shots/datasets-annotate-light.png"
+   }
+  },
+  "catalog": {
+   "dark": {
+    "narrow": "shots/datasets-catalog-dark-1000.png",
+    "wide": "shots/datasets-catalog-dark.png"
+   },
+   "light": {
+    "narrow": "shots/datasets-catalog-light-1000.png",
+    "wide": "shots/datasets-catalog-light.png"
+   }
+  },
+  "compare": {
+   "dark": {
+    "narrow": "shots/datasets-compare-dark-1000.png",
+    "wide": "shots/datasets-compare-dark.png"
+   },
+   "light": {
+    "narrow": "shots/datasets-compare-light-1000.png",
+    "wide": "shots/datasets-compare-light.png"
+   }
+  },
+  "empty": {
+   "dark": {
+    "narrow": "shots/datasets-empty-dark-1000.png",
+    "wide": "shots/datasets-empty-dark.png"
+   },
+   "light": {
+    "narrow": "shots/datasets-empty-light-1000.png",
+    "wide": "shots/datasets-empty-light.png"
+   }
+  },
+  "error": {
+   "dark": {
+    "narrow": "shots/datasets-error-dark-1000.png",
+    "wide": "shots/datasets-error-dark.png"
+   },
+   "light": {
+    "narrow": "shots/datasets-error-light-1000.png",
+    "wide": "shots/datasets-error-light.png"
+   }
+  },
+  "filters": {
+   "dark": {
+    "narrow": "shots/datasets-filters-dark-1000.png",
+    "wide": "shots/datasets-filters-dark.png"
+   },
+   "light": {
+    "narrow": "shots/datasets-filters-light-1000.png",
+    "wide": "shots/datasets-filters-light.png"
+   }
+  },
+  "lineage": {
+   "dark": {
+    "narrow": "shots/datasets-lineage-dark-1000.png",
+    "wide": "shots/datasets-lineage-dark.png"
+   },
+   "light": {
+    "narrow": "shots/datasets-lineage-light-1000.png",
+    "wide": "shots/datasets-lineage-light.png"
+   }
+  },
+  "loading": {
+   "dark": {
+    "narrow": "shots/datasets-loading-dark-1000.png",
+    "wide": "shots/datasets-loading-dark.png"
+   },
+   "light": {
+    "narrow": "shots/datasets-loading-light-1000.png",
+    "wide": "shots/datasets-loading-light.png"
+   }
+  },
+  "outputs": {
+   "dark": {
+    "narrow": "shots/datasets-outputs-dark-1000.png",
+    "wide": "shots/datasets-outputs-dark.png"
+   },
+   "light": {
+    "narrow": "shots/datasets-outputs-light-1000.png",
+    "wide": "shots/datasets-outputs-light.png"
+   }
+  },
+  "overview": {
+   "dark": {
+    "narrow": "shots/datasets-overview-dark-1000.png",
+    "wide": "shots/datasets-overview-dark.png"
+   },
+   "light": {
+    "narrow": "shots/datasets-overview-light-1000.png",
+    "wide": "shots/datasets-overview-light.png"
+   }
+  },
+  "profile": {
+   "dark": {
+    "narrow": "shots/datasets-profile-dark-1000.png",
+    "wide": "shots/datasets-profile-dark.png"
+   },
+   "light": {
+    "narrow": "shots/datasets-profile-light-1000.png",
+    "wide": "shots/datasets-profile-light.png"
+   }
+  },
+  "schema": {
+   "dark": {
+    "narrow": "shots/datasets-schema-dark-1000.png",
+    "wide": "shots/datasets-schema-dark.png"
+   },
+   "light": {
+    "narrow": "shots/datasets-schema-light-1000.png",
+    "wide": "shots/datasets-schema-light.png"
+   }
+  },
+  "stale": {
+   "dark": {
+    "narrow": "shots/datasets-stale-dark-1000.png",
+    "wide": "shots/datasets-stale-dark.png"
+   },
+   "light": {
+    "narrow": "shots/datasets-stale-light-1000.png",
+    "wide": "shots/datasets-stale-light.png"
+   }
+  },
+  "viewer": {
+   "dark": {
+    "narrow": "shots/datasets-viewer-dark-1000.png",
+    "wide": "shots/datasets-viewer-dark.png"
+   },
+   "light": {
+    "narrow": "shots/datasets-viewer-light-1000.png",
+    "wide": "shots/datasets-viewer-light.png"
+   }
+  }
+ },
+ "lineage": {
+  "column": {
+   "dark": {
+    "narrow": "shots/lineage-column-dark-1000.png",
+    "wide": "shots/lineage-column-dark.png"
+   },
+   "light": {
+    "narrow": "shots/lineage-column-light-1000.png",
+    "wide": "shots/lineage-column-light.png"
+   }
+  },
+  "edge": {
+   "dark": {
+    "narrow": "shots/lineage-edge-dark-1000.png",
+    "wide": "shots/lineage-edge-dark.png"
+   },
+   "light": {
+    "narrow": "shots/lineage-edge-light-1000.png",
+    "wide": "shots/lineage-edge-light.png"
+   }
+  },
+  "empty": {
+   "dark": {
+    "wide": "shots/lineage-empty-dark.png"
+   },
+   "light": {
+    "wide": "shots/lineage-empty-light.png"
+   }
+  },
+  "focus": {
+   "dark": {
+    "narrow": "shots/lineage-focus-dark-1000.png",
+    "wide": "shots/lineage-focus-dark.png"
+   },
+   "light": {
+    "narrow": "shots/lineage-focus-light-1000.png",
+    "wide": "shots/lineage-focus-light.png"
+   }
+  },
+  "loading": {
+   "dark": {
+    "wide": "shots/lineage-loading-dark.png"
+   },
+   "light": {
+    "wide": "shots/lineage-loading-light.png"
+   }
+  },
+  "overview": {
+   "dark": {
+    "wide": "shots/lineage-overview-dark.png"
+   },
+   "light": {
+    "wide": "shots/lineage-overview-light.png"
+   }
+  },
+  "zoomed": {
+   "dark": {
+    "wide": "shots/lineage-zoomed-dark.png"
+   },
+   "light": {
+    "wide": "shots/lineage-zoomed-light.png"
+   }
+  }
+ },
+ "overview": {
+  "first-run": {
+   "dark": {
+    "wide": "shots/overview-first-run-dark.png"
+   },
+   "light": {
+    "wide": "shots/overview-first-run-light.png"
+   }
+  },
+  "home": {
+   "dark": {
+    "wide": "shots/overview-home-dark.png"
+   },
+   "light": {
+    "wide": "shots/overview-home-light.png"
+   }
+  },
+  "loading": {
+   "dark": {
+    "wide": "shots/overview-loading-dark.png"
+   },
+   "light": {
+    "wide": "shots/overview-loading-light.png"
+   }
+  }
+ },
+ "policy": {
+  "soon": {
+   "dark": {
+    "wide": "shots/policy-soon-dark.png"
+   },
+   "light": {
+    "wide": "shots/policy-soon-light.png"
+   }
+  }
+ },
+ "runs": {
+  "cancel": {
+   "dark": {
+    "narrow": "shots/runs-cancel-dark-1000.png",
+    "wide": "shots/runs-cancel-dark.png"
+   },
+   "light": {
+    "narrow": "shots/runs-cancel-light-1000.png",
+    "wide": "shots/runs-cancel-light.png"
+   }
+  },
+  "compare": {
+   "dark": {
+    "narrow": "shots/runs-compare-dark-1000.png",
+    "wide": "shots/runs-compare-dark.png"
+   },
+   "light": {
+    "narrow": "shots/runs-compare-light-1000.png",
+    "wide": "shots/runs-compare-light.png"
+   }
+  },
+  "config": {
+   "dark": {
+    "narrow": "shots/runs-config-dark-1000.png",
+    "wide": "shots/runs-config-dark.png"
+   },
+   "light": {
+    "narrow": "shots/runs-config-light-1000.png",
+    "wide": "shots/runs-config-light.png"
+   }
+  },
+  "delete": {
+   "dark": {
+    "narrow": "shots/runs-delete-dark-1000.png",
+    "wide": "shots/runs-delete-dark.png"
+   },
+   "light": {
+    "narrow": "shots/runs-delete-light-1000.png",
+    "wide": "shots/runs-delete-light.png"
+   }
+  },
+  "dlq": {
+   "dark": {
+    "narrow": "shots/runs-dlq-dark-1000.png",
+    "wide": "shots/runs-dlq-dark.png"
+   },
+   "light": {
+    "narrow": "shots/runs-dlq-light-1000.png",
+    "wide": "shots/runs-dlq-light.png"
+   }
+  },
+  "empty": {
+   "dark": {
+    "narrow": "shots/runs-empty-dark-1000.png",
+    "wide": "shots/runs-empty-dark.png"
+   },
+   "light": {
+    "narrow": "shots/runs-empty-light-1000.png",
+    "wide": "shots/runs-empty-light.png"
+   }
+  },
+  "error": {
+   "dark": {
+    "narrow": "shots/runs-error-dark-1000.png",
+    "wide": "shots/runs-error-dark.png"
+   },
+   "light": {
+    "narrow": "shots/runs-error-light-1000.png",
+    "wide": "shots/runs-error-light.png"
+   }
+  },
+  "failed": {
+   "dark": {
+    "narrow": "shots/runs-failed-dark-1000.png",
+    "wide": "shots/runs-failed-dark.png"
+   },
+   "light": {
+    "narrow": "shots/runs-failed-light-1000.png",
+    "wide": "shots/runs-failed-light.png"
+   }
+  },
+  "filtered-empty": {
+   "dark": {
+    "narrow": "shots/runs-filtered-empty-dark-1000.png",
+    "wide": "shots/runs-filtered-empty-dark.png"
+   },
+   "light": {
+    "narrow": "shots/runs-filtered-empty-light-1000.png",
+    "wide": "shots/runs-filtered-empty-light.png"
+   }
+  },
+  "filters": {
+   "dark": {
+    "narrow": "shots/runs-filters-dark-1000.png",
+    "wide": "shots/runs-filters-dark.png"
+   },
+   "light": {
+    "narrow": "shots/runs-filters-light-1000.png",
+    "wide": "shots/runs-filters-light.png"
+   }
+  },
+  "invocations": {
+   "dark": {
+    "narrow": "shots/runs-invocations-dark-1000.png",
+    "wide": "shots/runs-invocations-dark.png"
+   },
+   "light": {
+    "narrow": "shots/runs-invocations-light-1000.png",
+    "wide": "shots/runs-invocations-light.png"
+   }
+  },
+  "kb": {
+   "dark": {
+    "narrow": "shots/runs-kb-dark-1000.png",
+    "wide": "shots/runs-kb-dark.png"
+   },
+   "light": {
+    "narrow": "shots/runs-kb-light-1000.png",
+    "wide": "shots/runs-kb-light.png"
+   }
+  },
+  "loading": {
+   "dark": {
+    "narrow": "shots/runs-loading-dark-1000.png",
+    "wide": "shots/runs-loading-dark.png"
+   },
+   "light": {
+    "narrow": "shots/runs-loading-light-1000.png",
+    "wide": "shots/runs-loading-light.png"
+   }
+  },
+  "logs": {
+   "dark": {
+    "narrow": "shots/runs-logs-dark-1000.png",
+    "wide": "shots/runs-logs-dark.png"
+   },
+   "light": {
+    "narrow": "shots/runs-logs-light-1000.png",
+    "wide": "shots/runs-logs-light.png"
+   }
+  },
+  "menu": {
+   "dark": {
+    "narrow": "shots/runs-menu-dark-1000.png",
+    "wide": "shots/runs-menu-dark.png"
+   },
+   "light": {
+    "narrow": "shots/runs-menu-light-1000.png",
+    "wide": "shots/runs-menu-light.png"
+   }
+  },
+  "overview": {
+   "dark": {
+    "narrow": "shots/runs-overview-dark-1000.png",
+    "wide": "shots/runs-overview-dark.png"
+   },
+   "light": {
+    "narrow": "shots/runs-overview-light-1000.png",
+    "wide": "shots/runs-overview-light.png"
+   }
+  },
+  "palette": {
+   "dark": {
+    "narrow": "shots/runs-palette-dark-1000.png",
+    "wide": "shots/runs-palette-dark.png"
+   },
+   "light": {
+    "narrow": "shots/runs-palette-light-1000.png",
+    "wide": "shots/runs-palette-light.png"
+   }
+  },
+  "rollback": {
+   "dark": {
+    "narrow": "shots/runs-rollback-dark-1000.png",
+    "wide": "shots/runs-rollback-dark.png"
+   },
+   "light": {
+    "narrow": "shots/runs-rollback-light-1000.png",
+    "wide": "shots/runs-rollback-light.png"
+   }
+  },
+  "stat-filter": {
+   "dark": {
+    "narrow": "shots/runs-stat-filter-dark-1000.png",
+    "wide": "shots/runs-stat-filter-dark.png"
+   },
+   "light": {
+    "narrow": "shots/runs-stat-filter-light-1000.png",
+    "wide": "shots/runs-stat-filter-light.png"
+   }
+  },
+  "summary": {
+   "dark": {
+    "narrow": "shots/runs-summary-dark-1000.png",
+    "wide": "shots/runs-summary-dark.png"
+   },
+   "light": {
+    "narrow": "shots/runs-summary-light-1000.png",
+    "wide": "shots/runs-summary-light.png"
+   }
+  },
+  "tenant": {
+   "dark": {
+    "narrow": "shots/runs-tenant-dark-1000.png",
+    "wide": "shots/runs-tenant-dark.png"
+   },
+   "light": {
+    "narrow": "shots/runs-tenant-light-1000.png",
+    "wide": "shots/runs-tenant-light.png"
+   }
+  },
+  "toast": {
+   "dark": {
+    "narrow": "shots/runs-toast-dark-1000.png",
+    "wide": "shots/runs-toast-dark.png"
+   },
+   "light": {
+    "narrow": "shots/runs-toast-light-1000.png",
+    "wide": "shots/runs-toast-light.png"
+   }
+  },
+  "viewer": {
+   "dark": {
+    "narrow": "shots/runs-viewer-dark-1000.png",
+    "wide": "shots/runs-viewer-dark.png"
+   },
+   "light": {
+    "narrow": "shots/runs-viewer-light-1000.png",
+    "wide": "shots/runs-viewer-light.png"
+   }
+  }
+ },
+ "schedules": {
+  "soon": {
+   "dark": {
+    "wide": "shots/schedules-soon-dark.png"
+   },
+   "light": {
+    "wide": "shots/schedules-soon-light.png"
+   }
+  }
+ },
+ "schemas": {
+  "catalogue": {
+   "dark": {
+    "narrow": "shots/schemas-catalogue-dark-1000.png",
+    "wide": "shots/schemas-catalogue-dark.png"
+   },
+   "light": {
+    "narrow": "shots/schemas-catalogue-light-1000.png",
+    "wide": "shots/schemas-catalogue-light.png"
+   }
+  },
+  "field": {
+   "dark": {
+    "narrow": "shots/schemas-field-dark-1000.png",
+    "wide": "shots/schemas-field-dark.png"
+   },
+   "light": {
+    "narrow": "shots/schemas-field-light-1000.png",
+    "wide": "shots/schemas-field-light.png"
+   }
+  },
+  "loading": {
+   "dark": {
+    "narrow": "shots/schemas-loading-dark-1000.png",
+    "wide": "shots/schemas-loading-dark.png"
+   },
+   "light": {
+    "narrow": "shots/schemas-loading-light-1000.png",
+    "wide": "shots/schemas-loading-light.png"
+   }
+  },
+  "search": {
+   "dark": {
+    "narrow": "shots/schemas-search-dark-1000.png",
+    "wide": "shots/schemas-search-dark.png"
+   },
+   "light": {
+    "narrow": "shots/schemas-search-light-1000.png",
+    "wide": "shots/schemas-search-light.png"
+   }
+  },
+  "sink": {
+   "dark": {
+    "narrow": "shots/schemas-sink-dark-1000.png",
+    "wide": "shots/schemas-sink-dark.png"
+   },
+   "light": {
+    "narrow": "shots/schemas-sink-light-1000.png",
+    "wide": "shots/schemas-sink-light.png"
+   }
+  },
+  "source": {
+   "dark": {
+    "narrow": "shots/schemas-source-dark-1000.png",
+    "wide": "shots/schemas-source-dark.png"
+   },
+   "light": {
+    "narrow": "shots/schemas-source-light-1000.png",
+    "wide": "shots/schemas-source-light.png"
+   }
+  },
+  "transform": {
+   "dark": {
+    "narrow": "shots/schemas-transform-dark-1000.png",
+    "wide": "shots/schemas-transform-dark.png"
+   },
+   "light": {
+    "narrow": "shots/schemas-transform-light-1000.png",
+    "wide": "shots/schemas-transform-light.png"
+   }
+  }
+ },
+ "settings": {
+  "overview": {
+   "dark": {
+    "wide": "shots/settings-overview-dark.png"
+   },
+   "light": {
+    "wide": "shots/settings-overview-light.png"
+   }
+  },
+  "reloaded": {
+   "dark": {
+    "wide": "shots/settings-reloaded-dark.png"
+   },
+   "light": {
+    "wide": "shots/settings-reloaded-light.png"
+   }
+  },
+  "viewer": {
+   "dark": {
+    "wide": "shots/settings-viewer-dark.png"
+   },
+   "light": {
+    "wide": "shots/settings-viewer-light.png"
+   }
+  }
+ },
+ "submit": {
+  "editor": {
+   "dark": {
+    "wide": "shots/submit-editor-dark.png"
+   },
+   "light": {
+    "wide": "shots/submit-editor-light.png"
+   }
+  },
+  "errors": {
+   "dark": {
+    "wide": "shots/submit-errors-dark.png"
+   },
+   "light": {
+    "wide": "shots/submit-errors-light.png"
+   }
+  },
+  "fromrun": {
+   "dark": {
+    "wide": "shots/submit-fromrun-dark.png"
+   },
+   "light": {
+    "wide": "shots/submit-fromrun-light.png"
+   }
+  },
+  "options": {
+   "dark": {
+    "wide": "shots/submit-options-dark.png"
+   },
+   "light": {
+    "wide": "shots/submit-options-light.png"
+   }
+  },
+  "review": {
+   "dark": {
+    "wide": "shots/submit-review-dark.png"
+   },
+   "light": {
+    "wide": "shots/submit-review-light.png"
+   }
+  },
+  "sink": {
+   "dark": {
+    "wide": "shots/submit-sink-dark.png"
+   },
+   "light": {
+    "wide": "shots/submit-sink-light.png"
+   }
+  },
+  "source": {
+   "dark": {
+    "wide": "shots/submit-source-dark.png"
+   },
+   "light": {
+    "wide": "shots/submit-source-light.png"
+   }
+  },
+  "submitted": {
+   "dark": {
+    "wide": "shots/submit-submitted-dark.png"
+   },
+   "light": {
+    "wide": "shots/submit-submitted-light.png"
+   }
+  },
+  "transforms": {
+   "dark": {
+    "wide": "shots/submit-transforms-dark.png"
+   },
+   "light": {
+    "wide": "shots/submit-transforms-light.png"
+   }
+  },
+  "viewer": {
+   "dark": {
+    "wide": "shots/submit-viewer-dark.png"
+   },
+   "light": {
+    "wide": "shots/submit-viewer-light.png"
+   }
+  }
+ },
+ "system": {
+  "content": {
+   "dark": {
+    "wide": "shots/system-content-dark.png"
+   },
+   "light": {
+    "wide": "shots/system-content-light.png"
+   }
+  },
+  "controls": {
+   "dark": {
+    "wide": "shots/system-controls-dark.png"
+   },
+   "light": {
+    "wide": "shots/system-controls-light.png"
+   }
+  },
+  "feedback": {
+   "dark": {
+    "wide": "shots/system-feedback-dark.png"
+   },
+   "light": {
+    "wide": "shots/system-feedback-light.png"
+   }
+  },
+  "shapes": {
+   "dark": {
+    "wide": "shots/system-shapes-dark.png"
+   },
+   "light": {
+    "wide": "shots/system-shapes-light.png"
+   }
+  },
+  "tokens": {
+   "dark": {
+    "wide": "shots/system-tokens-dark.png"
+   },
+   "light": {
+    "wide": "shots/system-tokens-light.png"
+   }
+  }
+ },
+ "templates": {
+  "activity": {
+   "dark": {
+    "narrow": "shots/templates-activity-dark-1000.png",
+    "wide": "shots/templates-activity-dark.png"
+   },
+   "light": {
+    "narrow": "shots/templates-activity-light-1000.png",
+    "wide": "shots/templates-activity-light.png"
+   }
+  },
+  "deprecated": {
+   "dark": {
+    "narrow": "shots/templates-deprecated-dark-1000.png",
+    "wide": "shots/templates-deprecated-dark.png"
+   },
+   "light": {
+    "narrow": "shots/templates-deprecated-light-1000.png",
+    "wide": "shots/templates-deprecated-light.png"
+   }
+  },
+  "diff": {
+   "dark": {
+    "narrow": "shots/templates-diff-dark-1000.png",
+    "wide": "shots/templates-diff-dark.png"
+   },
+   "light": {
+    "narrow": "shots/templates-diff-light-1000.png",
+    "wide": "shots/templates-diff-light.png"
+   }
+  },
+  "draft": {
+   "dark": {
+    "narrow": "shots/templates-draft-dark-1000.png",
+    "wide": "shots/templates-draft-dark.png"
+   },
+   "light": {
+    "narrow": "shots/templates-draft-light-1000.png",
+    "wide": "shots/templates-draft-light.png"
+   }
+  },
+  "empty": {
+   "dark": {
+    "narrow": "shots/templates-empty-dark-1000.png",
+    "wide": "shots/templates-empty-dark.png"
+   },
+   "light": {
+    "narrow": "shots/templates-empty-light-1000.png",
+    "wide": "shots/templates-empty-light.png"
+   }
+  },
+  "error": {
+   "dark": {
+    "narrow": "shots/templates-error-dark-1000.png",
+    "wide": "shots/templates-error-dark.png"
+   },
+   "light": {
+    "narrow": "shots/templates-error-light-1000.png",
+    "wide": "shots/templates-error-light.png"
+   }
+  },
+  "filtered": {
+   "dark": {
+    "narrow": "shots/templates-filtered-dark-1000.png",
+    "wide": "shots/templates-filtered-dark.png"
+   },
+   "light": {
+    "narrow": "shots/templates-filtered-light-1000.png",
+    "wide": "shots/templates-filtered-light.png"
+   }
+  },
+  "health": {
+   "dark": {
+    "narrow": "shots/templates-health-dark-1000.png",
+    "wide": "shots/templates-health-dark.png"
+   },
+   "light": {
+    "narrow": "shots/templates-health-light-1000.png",
+    "wide": "shots/templates-health-light.png"
+   }
+  },
+  "launch": {
+   "dark": {
+    "narrow": "shots/templates-launch-dark-1000.png",
+    "wide": "shots/templates-launch-dark.png"
+   },
+   "light": {
+    "narrow": "shots/templates-launch-light-1000.png",
+    "wide": "shots/templates-launch-light.png"
+   }
+  },
+  "loading": {
+   "dark": {
+    "narrow": "shots/templates-loading-dark-1000.png",
+    "wide": "shots/templates-loading-dark.png"
+   },
+   "light": {
+    "narrow": "shots/templates-loading-light-1000.png",
+    "wide": "shots/templates-loading-light.png"
+   }
+  },
+  "matrix": {
+   "dark": {
+    "narrow": "shots/templates-matrix-dark-1000.png",
+    "wide": "shots/templates-matrix-dark.png"
+   },
+   "light": {
+    "narrow": "shots/templates-matrix-light-1000.png",
+    "wide": "shots/templates-matrix-light.png"
+   }
+  },
+  "newversion": {
+   "dark": {
+    "narrow": "shots/templates-newversion-dark-1000.png",
+    "wide": "shots/templates-newversion-dark.png"
+   },
+   "light": {
+    "narrow": "shots/templates-newversion-light-1000.png",
+    "wide": "shots/templates-newversion-light.png"
+   }
+  },
+  "overview": {
+   "dark": {
+    "narrow": "shots/templates-overview-dark-1000.png",
+    "wide": "shots/templates-overview-dark.png"
+   },
+   "light": {
+    "narrow": "shots/templates-overview-light-1000.png",
+    "wide": "shots/templates-overview-light.png"
+   }
+  },
+  "pairings": {
+   "dark": {
+    "narrow": "shots/templates-pairings-dark-1000.png",
+    "wide": "shots/templates-pairings-dark.png"
+   },
+   "light": {
+    "narrow": "shots/templates-pairings-light-1000.png",
+    "wide": "shots/templates-pairings-light.png"
+   }
+  },
+  "register": {
+   "dark": {
+    "narrow": "shots/templates-register-dark-1000.png",
+    "wide": "shots/templates-register-dark.png"
+   },
+   "light": {
+    "narrow": "shots/templates-register-light-1000.png",
+    "wide": "shots/templates-register-light.png"
+   }
+  },
+  "registry": {
+   "dark": {
+    "narrow": "shots/templates-registry-dark-1000.png",
+    "wide": "shots/templates-registry-dark.png"
+   },
+   "light": {
+    "narrow": "shots/templates-registry-light-1000.png",
+    "wide": "shots/templates-registry-light.png"
+   }
+  },
+  "rollback": {
+   "dark": {
+    "narrow": "shots/templates-rollback-dark-1000.png",
+    "wide": "shots/templates-rollback-dark.png"
+   },
+   "light": {
+    "narrow": "shots/templates-rollback-light-1000.png",
+    "wide": "shots/templates-rollback-light.png"
+   }
+  },
+  "rows": {
+   "dark": {
+    "narrow": "shots/templates-rows-dark-1000.png",
+    "wide": "shots/templates-rows-dark.png"
+   },
+   "light": {
+    "narrow": "shots/templates-rows-light-1000.png",
+    "wide": "shots/templates-rows-light.png"
+   }
+  },
+  "run": {
+   "dark": {
+    "narrow": "shots/templates-run-dark-1000.png",
+    "wide": "shots/templates-run-dark.png"
+   },
+   "light": {
+    "narrow": "shots/templates-run-light-1000.png",
+    "wide": "shots/templates-run-light.png"
+   }
+  },
+  "sync": {
+   "dark": {
+    "narrow": "shots/templates-sync-dark-1000.png",
+    "wide": "shots/templates-sync-dark.png"
+   },
+   "light": {
+    "narrow": "shots/templates-sync-light-1000.png",
+    "wide": "shots/templates-sync-light.png"
+   }
+  },
+  "tests": {
+   "dark": {
+    "narrow": "shots/templates-tests-dark-1000.png",
+    "wide": "shots/templates-tests-dark.png"
+   },
+   "light": {
+    "narrow": "shots/templates-tests-light-1000.png",
+    "wide": "shots/templates-tests-light.png"
+   }
+  },
+  "toast": {
+   "dark": {
+    "narrow": "shots/templates-toast-dark-1000.png",
+    "wide": "shots/templates-toast-dark.png"
+   },
+   "light": {
+    "narrow": "shots/templates-toast-light-1000.png",
+    "wide": "shots/templates-toast-light.png"
+   }
+  },
+  "versions": {
+   "dark": {
+    "narrow": "shots/templates-versions-dark-1000.png",
+    "wide": "shots/templates-versions-dark.png"
+   },
+   "light": {
+    "narrow": "shots/templates-versions-light-1000.png",
+    "wide": "shots/templates-versions-light.png"
+   }
+  },
+  "viewer": {
+   "dark": {
+    "narrow": "shots/templates-viewer-dark-1000.png",
+    "wide": "shots/templates-viewer-dark.png"
+   },
+   "light": {
+    "narrow": "shots/templates-viewer-light-1000.png",
+    "wide": "shots/templates-viewer-light.png"
+   }
+  }
+ },
+ "tenants": {
+  "connections": {
+   "dark": {
+    "narrow": "shots/tenants-connections-dark-1000.png",
+    "wide": "shots/tenants-connections-dark.png"
+   },
+   "light": {
+    "narrow": "shots/tenants-connections-light-1000.png",
+    "wide": "shots/tenants-connections-light.png"
+   }
+  },
+  "create": {
+   "dark": {
+    "narrow": "shots/tenants-create-dark-1000.png",
+    "wide": "shots/tenants-create-dark.png"
+   },
+   "light": {
+    "narrow": "shots/tenants-create-light-1000.png",
+    "wide": "shots/tenants-create-light.png"
+   }
+  },
+  "del": {
+   "dark": {
+    "narrow": "shots/tenants-del-dark-1000.png",
+    "wide": "shots/tenants-del-dark.png"
+   },
+   "light": {
+    "narrow": "shots/tenants-del-light-1000.png",
+    "wide": "shots/tenants-del-light.png"
+   }
+  },
+  "jsonerr": {
+   "dark": {
+    "narrow": "shots/tenants-jsonerr-dark-1000.png",
+    "wide": "shots/tenants-jsonerr-dark.png"
+   },
+   "light": {
+    "narrow": "shots/tenants-jsonerr-light-1000.png",
+    "wide": "shots/tenants-jsonerr-light.png"
+   }
+  },
+  "none": {
+   "dark": {
+    "narrow": "shots/tenants-none-dark-1000.png",
+    "wide": "shots/tenants-none-dark.png"
+   },
+   "light": {
+    "narrow": "shots/tenants-none-light-1000.png",
+    "wide": "shots/tenants-none-light.png"
+   }
+  },
+  "off": {
+   "dark": {
+    "wide": "shots/tenants-off-dark.png"
+   },
+   "light": {
+    "wide": "shots/tenants-off-light.png"
+   }
+  },
+  "overview": {
+   "dark": {
+    "narrow": "shots/tenants-overview-dark-1000.png",
+    "wide": "shots/tenants-overview-dark.png"
+   },
+   "light": {
+    "narrow": "shots/tenants-overview-light-1000.png",
+    "wide": "shots/tenants-overview-light.png"
+   }
+  },
+  "scoped": {
+   "dark": {
+    "wide": "shots/tenants-scoped-dark.png"
+   },
+   "light": {
+    "wide": "shots/tenants-scoped-light.png"
+   }
+  },
+  "suspend": {
+   "dark": {
+    "narrow": "shots/tenants-suspend-dark-1000.png",
+    "wide": "shots/tenants-suspend-dark.png"
+   },
+   "light": {
+    "narrow": "shots/tenants-suspend-light-1000.png",
+    "wide": "shots/tenants-suspend-light.png"
+   }
+  }
+ },
+ "triggers": {
+  "empty": {
+   "dark": {
+    "narrow": "shots/triggers-empty-dark-1000.png",
+    "wide": "shots/triggers-empty-dark.png"
+   },
+   "light": {
+    "narrow": "shots/triggers-empty-light-1000.png",
+    "wide": "shots/triggers-empty-light.png"
+   }
+  },
+  "fire": {
+   "dark": {
+    "narrow": "shots/triggers-fire-dark-1000.png",
+    "wide": "shots/triggers-fire-dark.png"
+   },
+   "light": {
+    "narrow": "shots/triggers-fire-light-1000.png",
+    "wide": "shots/triggers-fire-light.png"
+   }
+  },
+  "fired": {
+   "dark": {
+    "narrow": "shots/triggers-fired-dark-1000.png",
+    "wide": "shots/triggers-fired-dark.png"
+   },
+   "light": {
+    "narrow": "shots/triggers-fired-light-1000.png",
+    "wide": "shots/triggers-fired-light.png"
+   }
+  },
+  "unhealthy": {
+   "dark": {
+    "narrow": "shots/triggers-unhealthy-dark-1000.png",
+    "wide": "shots/triggers-unhealthy-dark.png"
+   },
+   "light": {
+    "narrow": "shots/triggers-unhealthy-light-1000.png",
+    "wide": "shots/triggers-unhealthy-light.png"
+   }
+  },
+  "webhook": {
+   "dark": {
+    "narrow": "shots/triggers-webhook-dark-1000.png",
+    "wide": "shots/triggers-webhook-dark.png"
+   },
+   "light": {
+    "narrow": "shots/triggers-webhook-light-1000.png",
+    "wide": "shots/triggers-webhook-light.png"
+   }
+  }
+ },
+ "usage": {
+  "day": {
+   "dark": {
+    "wide": "shots/usage-day-dark.png"
+   },
+   "light": {
+    "wide": "shots/usage-day-light.png"
+   }
+  },
+  "drill": {
+   "dark": {
+    "wide": "shots/usage-drill-dark.png"
+   },
+   "light": {
+    "wide": "shots/usage-drill-light.png"
+   }
+  },
+  "loading": {
+   "dark": {
+    "wide": "shots/usage-loading-dark.png"
+   },
+   "light": {
+    "wide": "shots/usage-loading-light.png"
+   }
+  },
+  "none": {
+   "dark": {
+    "wide": "shots/usage-none-dark.png"
+   },
+   "light": {
+    "wide": "shots/usage-none-light.png"
+   }
+  },
+  "report": {
+   "dark": {
+    "wide": "shots/usage-report-dark.png"
+   },
+   "light": {
+    "wide": "shots/usage-report-light.png"
+   }
+  }
+ }
+}
