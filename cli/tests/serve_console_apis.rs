@@ -243,10 +243,7 @@ async fn runs_and_audit(history: Option<String>, cluster: bool) {
         assert!(body.contains("***"), "{body}");
         // Every read is audited.
         let (_, audit) = api
-            .get(
-                "admin-tok",
-                &format!("/v1/audit?action=run.config&limit=10"),
-            )
+            .get("admin-tok", "/v1/audit?action=run.config&limit=10")
             .await;
         assert_eq!(audit["entries"].as_array().unwrap().len(), 2, "{audit}");
     } else {
