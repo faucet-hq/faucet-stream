@@ -264,6 +264,10 @@ svg.i { width: 15px; height: 15px; stroke: currentColor; fill: none; stroke-widt
 .tab.on { background: var(--teal-fill); color: var(--teal-ink); border-color: var(--teal-line); }
 .tabs .tools { margin-left: auto; display: flex; gap: 2px; color: var(--muted); position: relative; }
 .tabs .tools .ibtn { width: 28px; height: 28px; }
+.list .tabs { flex-wrap: nowrap; gap: 2px; }
+.list .tabs .tab { padding: 4px 6px; }
+.list .tabs .tools { gap: 0; }
+.list .tabs .tools .ibtn { width: 26px; height: 26px; }
 .stats { display: grid; grid-template-columns: repeat(var(--n, 4), minmax(0, 1fr)); border: 1px solid var(--line-soft); border-radius: var(--r); background: var(--panel); overflow: hidden; }
 .stats > div { padding: 9px 11px; border-left: 1px solid var(--line-soft); min-width: 0; }
 .stats > div:first-child { border-left: 0; }
@@ -547,8 +551,8 @@ details.menu.left > .pop { right: auto; left: 0; }
 .top .right .chip[data-copy] { cursor: pointer; }
 .nav .n[hidden] { display: none; }
 [hidden] { display: none !important; }
-.sect-rows.closed { display: none; }
 .list .rows { display: flex; flex-direction: column; gap: 2px; }
+.sect-rows.closed, .list .sect-rows.closed { display: none; }
 .list .load-more { align-self: center; }
 time { white-space: nowrap; }
 

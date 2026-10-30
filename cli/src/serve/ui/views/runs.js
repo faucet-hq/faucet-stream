@@ -244,9 +244,10 @@ export async function renderRuns(host, params) {
   const tabFor = () => {
     if (f.mine && !f.status.length) return "Mine";
     const k = [...f.status].sort().join(",");
-    if (!k) return "All runs";
+    if (!k) return "All";
     if (k === [...ACTIVE].sort().join(",")) return "Active";
     if (k === "failed") return "Failed";
+    if (k === "completed") return "Succeeded";
     return "";
   };
   const extraFilters = () => [f.q, f.since, f.until, f.pool, f.by, ...f.labels, f.status.length && !tabFor()].filter(Boolean).length;
@@ -370,7 +371,7 @@ export async function renderRuns(host, params) {
   }
 
   function paintList() {
-    const tabList = [["All runs"], ...(hasPrincipal() ? [["Mine"]] : []), ["Active"], ["Failed"]];
+    const tabList = [["All"], ...(hasPrincipal() ? [["Mine"]] : []), ["Active"], ["Failed"], ["Succeeded"]];
     const tools = html`${ibtn("filter", { on: f.open, dot: extraFilters() > 0, title: "Filters", data: { act: "filters" } })}${ibtn("refresh", { title: "Refresh", data: { act: "refresh" } })}${ibtn("plus", { title: "Submit a run", href: href.submit(), perm: "config_submit" })}`;
     const top = tabs(tabList, tabFor(), tools);
     let body;
@@ -435,7 +436,7 @@ export async function renderRuns(host, params) {
     const t = e.target.closest("[data-tab]");
     if (t && L.list.querySelector(".ru-top").contains(t)) {
       const name = t.dataset.tab;
-      const status = name === "Active" ? ACTIVE.join(",") : name === "Failed" ? "failed" : "";
+      const status = name === "Active" ? ACTIVE.join(",") : name === "Failed" ? "failed" : name === "Succeeded" ? "completed" : "";
       // `mine` and `by` are one filter: picking Mine drops a named submitter.
       setQuery({ status, mine: name === "Mine" ? "1" : "", ...(name === "Mine" ? { by: "" } : {}) });
       return;
@@ -1009,7 +1010,7 @@ export async function renderRuns(host, params) {
     if (recErr && !rec) {
       setCrumbs(["Operate", { label: "Runs", href: listHref() }, shortId(selected)]);
       const nf = recErr.status === 404;
-      patch(L.detail, html`${dhead("", "", backLink())}${nf ? empty("Run not found", "It may have been deleted, or it aged out of the run history.", { icon: "runs", btns: btn("All runs", { href: listHref() }) }) : errorAlert("this run", recErr)}`);
+      patch(L.detail, html`${dhead("", "", backLink())}${nf ? empty("Run not found", "It may have been deleted, or it aged out of the run history.", { icon: "runs", btns: btn("All", { href: listHref() }) }) : errorAlert("this run", recErr)}`);
       L.detail.querySelector("[data-retry]")?.addEventListener("click", loadDetail);
       return;
     }
