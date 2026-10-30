@@ -31,3 +31,25 @@
 .sc-field tr[data-id] { cursor: pointer; }
 .sc-field tr[data-id]:hover td { background: var(--hover); }
 .sc-field tr.sel td { background: var(--teal-fill); }
+/* submit: live preview, kind picker, editor, stepper */
+.sb-side { position: sticky; top: 0; }
+.sb-preview .code { max-height: calc(100vh - 330px); overflow: auto; }
+.card > .h .select.sb-kind { height: 28px; width: 170px; }
+.card > .h .select.sb-kind select { font-family: var(--mono); font-size: var(--fs-sm); }
+.card > .h .select.sb-fmt { height: 26px; width: 90px; }
+.sb-steps .step[data-go] { cursor: pointer; border-radius: var(--r-sm); }
+.sb-steps .step[data-go]:hover { color: var(--text); }
+.sb-mode .seg span { cursor: pointer; }
+.sb-ed { display: grid; grid-template-columns: auto minmax(0, 1fr); height: 430px; }
+.sb-gutter { margin: 0; padding: 8px 8px 8px 12px; font: var(--fs-sm)/1.75 var(--mono); color: var(--faint); text-align: right; overflow: hidden; user-select: none; background: var(--panel); }
+.sb-text { border: 0; outline: none; resize: none; background: var(--panel); color: var(--text-2); font: var(--fs-sm)/1.75 var(--mono); padding: 8px 10px; white-space: pre; overflow: auto; height: 100%; }
+.sb-banner:empty { display: none; }
+.sb-txadd { align-self: flex-start; }
+.sb-txadd details.menu > .pop { width: 320px; max-height: 360px; overflow: auto; }
+.sb-txadd summary.btn svg.i { width: 14px; height: 14px; }
+.sb-sub > div > .form:first-child { padding-top: 12px; }
+.sb-sub .form .help .btn { margin-left: 6px; }
+.sb-labels:empty { display: none; }
+@media (max-width: 1100px) { .sb-side { position: static; } }
+.sb-grid textarea.area { min-height: 46px; }
+.sb-grid .field .check { min-height: var(--ctl-h); }
