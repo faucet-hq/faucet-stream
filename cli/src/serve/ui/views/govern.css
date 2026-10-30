@@ -20,3 +20,13 @@ td.num { white-space: nowrap; }
 .tn-acts { display: inline-flex; gap: 6px; justify-content: flex-end; }
 .tn-chg { display: flex; flex-direction: column; gap: 4px; padding: 6px 8px 8px; }
 textarea.area.err { border-color: var(--bad); }
+
+/* usage: filter bar, sortable headers, day bars */
+.us-bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.us-bar > .input:not([style]) { width: 150px; }
+.us-tbl th.sortable { cursor: pointer; user-select: none; }
+.us-tbl th.sortable:hover { color: var(--text); }
+.us-tbl td .tag { margin-left: 4px; }
+.us-bar-col { fill: var(--line-strong); }
+.us-bar-last { fill: var(--text-2); }
+.us-axis { display: flex; justify-content: space-between; color: var(--muted); font-size: var(--fs-sm); margin-top: 6px; }
