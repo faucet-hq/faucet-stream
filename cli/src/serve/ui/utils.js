@@ -8,23 +8,6 @@ export function fmtInt(v) {
   return Number.isFinite(n) ? n.toLocaleString("en-US") : String(v ?? "");
 }
 
-/** Format a duration in seconds as compact h/m/s, no spaces, showing only the
- * two highest units (e.g. 3723 → "1h2m", 184 → "3m4s", 45.2 → "45s",
- * <1s → "0.8s"). Seconds are dropped once the run is an hour or more — the exact
- * value belongs in a tooltip. Nullish → "—". */
-export function fmtDuration(secs) {
-  const s = Number(secs);
-  if (!Number.isFinite(s)) return "—";
-  if (s < 1) return `${s.toFixed(1)}s`;
-  const t = Math.round(s);
-  const h = Math.floor(t / 3600);
-  const m = Math.floor((t % 3600) / 60);
-  const sec = t % 60;
-  if (h) return `${h}h${m}m`;
-  if (m) return `${m}m${sec}s`;
-  return `${sec}s`;
-}
-
 /** How long ago an RFC 3339 instant was, compactly: `12s`, `14m`, `3h`, `2d`, `5w`. */
 export function fmtAge(iso, now = Date.now()) {
   const t = Date.parse(iso);
@@ -83,9 +66,6 @@ export function mdInline(s) {
     .replace(/`([^`]+)`/g, "<code>$1</code>");
 }
 
-const COPY_ICON = `<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 3.5v-.5a1.5 1.5 0 0 0-1.5-1.5H3A1.5 1.5 0 0 0 1.5 3v6A1.5 1.5 0 0 0 3 10.5h.5"/></svg>`;
-const CHECK_ICON = `<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M3 8.5l3 3 7-7"/></svg>`;
-
 /** Write `text` to the clipboard; falls back to a hidden textarea where the async API is unavailable (plain-http hosts). */
 export async function copyText(text) {
   if (navigator.clipboard && window.isSecureContext) {
@@ -102,33 +82,6 @@ export async function copyText(text) {
   const ok = document.execCommand("copy");
   ta.remove();
   if (!ok) throw new Error("copy is not available in this browser");
-}
-
-/** An icon button that copies `getText()` and briefly shows a check mark. */
-export function copyButton(getText, label = "Copy") {
-  const btn = document.createElement("button");
-  btn.type = "button";
-  btn.className = "copy-btn";
-  btn.title = label;
-  btn.setAttribute("aria-label", label);
-  btn.innerHTML = COPY_ICON;
-  let timer;
-  btn.onclick = async (ev) => {
-    ev.stopPropagation();
-    try {
-      await copyText(getText());
-      btn.classList.add("copied");
-      btn.innerHTML = `${CHECK_ICON}<span>Copied</span>`;
-      clearTimeout(timer);
-      timer = setTimeout(() => {
-        btn.classList.remove("copied");
-        btn.innerHTML = COPY_ICON;
-      }, 1500);
-    } catch (e) {
-      btn.dispatchEvent(new CustomEvent("copy-failed", { bubbles: true, detail: e }));
-    }
-  };
-  return btn;
 }
 
 /** Run statuses that never change again (mirrors `RunStatus::is_terminal`). */
@@ -151,11 +104,4 @@ export function sortedLabels(labels) {
   return Object.entries(labels || {})
     .map(([k, v]) => [k, String(v), isProvenanceLabel(k)])
     .sort((a, b) => (a[2] - b[2]) || a[0].localeCompare(b[0]));
-}
-
-/** One clickable `key: value` chip; long values are cut with a tooltip. */
-export function labelChip(key, value, provenance) {
-  const shown = value.length > 40 ? `${value.slice(0, 39)}…` : value;
-  const filter = `${key}:${value}`;
-  return `<button type="button" class="label-chip${provenance ? " label-chip-prov" : ""}" data-label="${escapeHtml(filter)}" title="Filter runs by ${escapeHtml(filter)}"><span class="label-chip-k">${escapeHtml(key)}</span><span class="label-chip-v">${escapeHtml(shown)}</span></button>`;
 }
