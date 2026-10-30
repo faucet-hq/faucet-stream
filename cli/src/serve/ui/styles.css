@@ -538,7 +538,7 @@ details.menu.left > .pop { right: auto; left: 0; }
 /* the router renders into a host that must not break the body grid */
 .view-host { display: contents; }
 .main > .body { position: relative; }
-.app[data-expanded="true"] { grid-template-columns: 0 1fr; gap: 0; }
+.app[data-expanded="true"] { grid-template-columns: 1fr; }
 .app[data-expanded="true"] .side { display: none; }
 .who { min-width: 0; }
 .who .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
