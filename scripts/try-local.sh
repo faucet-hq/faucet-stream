@@ -115,6 +115,19 @@ step_expect_fail() {
   fi
 }
 
+# finish: print the failed steps (battery, smoke test and console seeding)
+# and exit non-zero when there were any, so a regression is never silent.
+SEED_FAILED=0
+finish() {
+  if [ "$FAIL" -gt 0 ] || [ "$SEED_FAILED" -ne 0 ]; then
+    echo "${RED}${BOLD}try-local: failed${RESET}"
+    for s in ${FAILED_STEPS[@]+"${FAILED_STEPS[@]}"}; do echo "${RED}  - ${s}${RESET}"; done
+    [ "$SEED_FAILED" -ne 0 ] && echo "${RED}  - seeding the demo template catalog${RESET}"
+    exit 1
+  fi
+  exit 0
+}
+
 # launch_ui: start the web console against a shared SQLite history DB, submit a
 # few demo runs through the HTTP API so Runs / Datasets / Lineage arrive
 # populated, then BLOCK (server stays up) until Ctrl+C.
@@ -137,10 +150,10 @@ launch_ui() {
   # Use --clean to reset the whole workspace (including this DB).
   hdr "Starting the web console on ${base}"
   # Run from DEMO_DIR so submitted configs' ./data and ./out paths resolve.
-  ( cd "$DEMO_DIR" && FAUCET_VAULT_KEY="${FAUCET_VAULT_KEY:-local-demo-vault-key}" exec "$FAUCET" serve --listen "127.0.0.1:${SERVE_PORT}" \
+  ( cd "$DEMO_DIR" && FAUCET_VAULT_KEY="${FAUCET_VAULT_KEY:-6c6f63616c2d64656d6f2d7661756c742d6b65792d6e6f742d612d736563726574}" exec "$FAUCET" serve --listen "127.0.0.1:${SERVE_PORT}" \
       --no-auth --history "sqlite:./faucet-meta.db" --preview-local-outputs ) >"${DEMO_DIR}/serve.log" 2>&1 &
   SERVE_PID=$!
-  trap 'echo; info "Stopping web console (pid '"$SERVE_PID"')"; stop_serve; exit 0' INT TERM
+  trap 'echo; info "Stopping web console (pid '"$SERVE_PID"')"; stop_serve; finish' INT TERM
 
   for _ in $(seq 1 40); do curl -sf "${base}/healthz" >/dev/null 2>&1 && break; sleep 0.5; done
   if ! curl -sf "${base}/healthz" >/dev/null 2>&1; then
@@ -169,40 +182,6 @@ launch_ui() {
     done
     sleep 2
 
-    # Seed the template registry over HTTP if it is empty — so `--serve-only`
-    # (which skips the CLI battery) still opens on a populated Templates view.
-    if curl -s "${base}/v1/templates" | grep -q '"templates":\[\]'; then
-      local tcfg="${DEMO_DIR}/23_templated.yaml"
-      if [ -f "$tcfg" ]; then
-        info "Seeding the template registry (3 versions, one launched)…"
-        for tbody in \
-          '{"description":"Per-country orders export","launch":true}' \
-          '{"tags":["dev"]}' \
-          '{"tags":["staging"]}'
-        do
-          body="$(python3 -c 'import json,sys;b=json.loads(sys.argv[2]);b["config"]=open(sys.argv[1]).read();print(json.dumps(b))' "$tcfg" "$tbody")"
-          curl -s -o /dev/null -X POST "${base}/v1/templates" \
-            -H 'content-type: application/json' -d "$body"
-        done
-        curl -s -o /dev/null -X POST "${base}/v1/templates/orders-by-country/tags" \
-          -H 'content-type: application/json' -d '{"tag":"prod","version":1}'
-        # A source template + a sink template, so the console shows every kind.
-        for hub in "hub/source-templates/faucet-hq/example-csv.yaml" "hub/sink-templates/faucet-hq/jsonl.yaml"; do
-          [ -f "${REPO_ROOT}/${hub}" ] || continue
-          body="$(python3 -c 'import json,sys;print(json.dumps({"config":open(sys.argv[1]).read(),"launch":True}))' "${REPO_ROOT}/${hub}")"
-          curl -s -o /dev/null -X POST "${base}/v1/templates" \
-            -H 'content-type: application/json' -d "$body"
-        done
-        # A deployment overlay (#679): the operational blocks a composed run
-        # gets from neither template — here file-backed bookmarks and an SLA.
-        body="$(python3 -c 'import json;print(json.dumps({"config":"kind: deployment\nname: demo-ops\ndescription: File-backed bookmarks and a row-count SLA for composed demo runs\nparams:\n  state_dir: { type: string, default: ./state, description: \"Where bookmarks live\" }\nstate: { type: file, config: { path: \"${param.state_dir}\" } }\nsla: { min_rows_per_run: 1 }\n","launch":True}))')"
-        curl -s -o /dev/null -X POST "${base}/v1/templates" \
-          -H 'content-type: application/json' -d "$body"
-      fi
-    fi
-    # A demo catalog big enough to show the Templates list, its filters and the
-    # compatibility grid at volume: 10 source + 10 sink templates across several
-    # owners and lifecycle states. Idempotent — existing ids are left alone.
     # Two tenants with a stored connection each (#709), so the Tenants page and
     # the tenant switcher have something to show. Idempotent: a repeat create
     # is a 409 and ignored.
@@ -217,8 +196,17 @@ launch_ui() {
           -d '{"name":"crm","provider":{"type":"static","config":{"token":"demo-token"}}}'
       done
     fi
+    # A demo catalog big enough to show the Templates list, its filters and the
+    # compatibility grid at volume: 10 source + 10 sink templates across several
+    # owners and lifecycle states. Idempotent — existing ids are left alone.
+    # Plus — into an empty registry, as on
+    # `--serve-only` with a fresh workspace — the templates the CLI battery
+    # registers, walked through the same lifecycle.
     info "Seeding the demo template catalog…"
-    python3 "${REPO_ROOT}/scripts/demo_catalog.py" "${base}" || info "  (demo catalog seeding reported failures — continuing)"
+    if ! python3 "${REPO_ROOT}/scripts/demo_catalog.py" "${base}" "${DEMO_DIR}"; then
+      echo "${RED}✗ demo template catalog seeding reported failures (see above)${RESET}"
+      SEED_FAILED=1
+    fi
   else
     info "python3/curl unavailable — the console will start empty; use the Submit tab."
   fi
@@ -248,9 +236,13 @@ launch_ui() {
   echo "  Run history DB: ${DEMO_DIR}/faucet-meta.db   (accumulates; reset with --clean)"
   echo "  DLQ files:      ${DEMO_DIR}/dlq/{contract,quality}.jsonl"
   echo "  Server log:     ${DEMO_DIR}/serve.log"
+  if [ "$FAIL" -gt 0 ] || [ "$SEED_FAILED" -ne 0 ]; then
+    echo "  ${RED}${BOLD}Some steps failed — listed again when you stop the server.${RESET}"
+  fi
   echo "  ${BOLD}Press Ctrl+C to stop the server and exit.${RESET}"
   echo
   wait "$SERVE_PID"
+  finish
 }
 
 # ----------------------------------------------------------------------------
@@ -280,18 +272,22 @@ info "cargo: $(command -v cargo)  ($(cargo --version 2>/dev/null))"
 # ----------------------------------------------------------------------------
 # Build the CLI with every feature (this downloads all crates)
 # ----------------------------------------------------------------------------
+# cargo's output directory: $CARGO_TARGET_DIR when set (relative to where the
+# script was started, as cargo reads it), else the repo's target/.
+TARGET_DIR="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
+case "$TARGET_DIR" in /*) ;; *) TARGET_DIR="$(pwd)/${TARGET_DIR}" ;; esac
 if [ "$DO_BUILD" -eq 1 ]; then
   hdr "Building faucet CLI with --features ${BUILD_FEATURES}"
   [ "$BUILD_FEATURES" = "full" ] && info "Full build compiles DuckDB / librdkafka / OpenSSL from source (needs cmake; ~15-30 min)."
   if [ "$BUILD_PROFILE" = "release" ]; then
     cargo build --release -p faucet-cli --features "$BUILD_FEATURES" || { echo "${RED}Build failed.${RESET}"; exit 1; }
-    FAUCET="${REPO_ROOT}/target/release/faucet"
+    FAUCET="${TARGET_DIR}/release/faucet"
   else
     cargo build -p faucet-cli --features "$BUILD_FEATURES" || { echo "${RED}Build failed.${RESET}"; exit 1; }
-    FAUCET="${REPO_ROOT}/target/debug/faucet"
+    FAUCET="${TARGET_DIR}/debug/faucet"
   fi
 else
-  FAUCET="${REPO_ROOT}/target/${BUILD_PROFILE}/faucet"
+  FAUCET="${TARGET_DIR}/${BUILD_PROFILE}/faucet"
 fi
 
 if [ ! -x "$FAUCET" ]; then
@@ -319,7 +315,7 @@ if [ "$DO_CLEAN" -eq 1 ]; then
   rm -rf "$DEMO_DIR"
 fi
 mkdir -p "$DEMO_DIR"/{data,out,dlq,state,catalog,tests}
-cd "$DEMO_DIR"
+cd "$DEMO_DIR" || exit 1
 
 hdr "Generating dummy data + configs under ${DEMO_DIR}"
 
@@ -772,6 +768,75 @@ pipeline:
   sink:
     type: file
     config: { path: "./out/orders-${param.country}.jsonl" }
+
+# Launching a version or putting it on a channel needs passing tests (#859).
+# Registering runs this bundle offline and records the result on the version.
+tests:
+  fixtures:
+    - name: keeps-one-country-and-labels-it
+      params: { country: US }
+      input:
+        - { order_id: "1", country_code: US }
+        - { order_id: "2", country_code: GB }
+      expect:
+        records:
+          - { order_id: "1", country_code: US, export_label: nightly }
+YAML
+
+# The same template with a fixture that expects the wrong label: registered as
+# a version whose tests fail, so the console shows one that cannot be launched.
+sed 's/export_label: nightly }$/export_label: weekly }  # wrong on purpose/' \
+  23_templated.yaml > 23_templated_broken.yaml
+
+# --- 24. Hub templates + a deployment overlay, with test bundles -------------
+# Local copies of two hub templates, each with a `tests:` bundle naming its
+# companion, and the hub's example CSVs under ./data/hub — every path the
+# demo registers or runs is relative to this workspace.
+mkdir -p templates data/hub
+cp "${REPO_ROOT}/hub/examples/data/"*.csv data/hub/
+sed 's#default: ./hub/examples/data#default: ./data/hub#' \
+  "${REPO_ROOT}/hub/source-templates/faucet-hq/example-csv.yaml" > templates/example-csv.yaml
+cat >> templates/example-csv.yaml <<'YAML'
+tests:
+  sink: faucet-hq/jsonl
+  fixtures:
+    - name: orders-keys-become-snake-case
+      row: orders
+      input:
+        - { ID: 1, Amount: 10.5 }
+      expect:
+        records:
+          - { id: 1, amount: 10.5 }
+YAML
+cp "${REPO_ROOT}/hub/sink-templates/faucet-hq/jsonl.yaml" templates/jsonl.yaml
+cat >> templates/jsonl.yaml <<'YAML'
+tests:
+  source: faucet-hq/example-csv
+  fixtures:
+    - name: customers-land-unchanged
+      row: customers
+      input:
+        - { id: 7, name: Acme }
+      expect:
+        records:
+          - { id: 7, name: Acme }
+YAML
+# Left as a draft: it is never launched, so it carries no tests.
+cp "${REPO_ROOT}/hub/sink-templates/faucet-hq/sqlite.yaml" templates/sqlite.yaml
+
+# A deployment overlay (#679): state + SLA for a composed run, owned by
+# neither template. Its bundle is structural: it names the pair it composes.
+cat > 24_demo_ops.yaml <<'YAML'
+kind: deployment
+name: demo-ops
+description: File-backed bookmarks and a row-count SLA for composed demo runs
+params:
+  state_dir: { type: string, default: ./state, description: "Where bookmarks live" }
+state: { type: file, config: { path: "${param.state_dir}" } }
+sla: { min_rows_per_run: 1 }
+tests:
+  source: faucet-hq/example-csv
+  sink: faucet-hq/jsonl
 YAML
 
 # --- 22. Scheduler config (validated at compile time; not run here) ---------
@@ -817,7 +882,7 @@ step "schema masking"         "$FAUCET" schema masking
 [ "$HAVE_TRIGGERS" -eq 1 ] && step "schema triggers"  "$FAUCET" schema triggers
 step "schema catalog"         "$FAUCET" schema catalog
 step "schema test"            "$FAUCET" schema test
-step "init scaffold"          "$FAUCET" init --source file --sink file --output scaffold_demo.yaml --force scaffold_demo
+step "init scaffold"          "$FAUCET" init --source file --sink file --output scaffold_demo.yaml --force --no-pin scaffold_demo
 
 hdr "Validate every generated config"
 VALIDATE_CFGS="01_basic 02_transforms 03_quality 04_contract 05_masking \
@@ -921,6 +986,22 @@ if [ "$HAVE_TEMPLATES" -eq 1 ]; then
   step "template rollback"  "$FAUCET" template rollback orders-by-country --store "$TPL_STORE"
   step "template launch (back to newest)" \
     "$FAUCET" template launch orders-by-country --store "$TPL_STORE"
+  # A version whose fixture fails: registering records the red result (the
+  # command exits non-zero), and the version can never be launched.
+  BROKEN_VERSION=""
+  register_broken() {
+    local out
+    out="$("$FAUCET" template register 23_templated_broken.yaml --store "$TPL_STORE" --json)"
+    local rc=$?
+    echo "$out"
+    BROKEN_VERSION="$(printf '%s' "$out" | python3 -c 'import json,sys;print(json.load(sys.stdin)["version"])' 2>/dev/null)"
+    return "$rc"
+  }
+  step_expect_fail "template register a version with a failing fixture" register_broken
+  if [ -n "$BROKEN_VERSION" ]; then
+    step_expect_fail "template launch v${BROKEN_VERSION} is refused (its tests fail)" \
+      "$FAUCET" template launch orders-by-country --store "$TPL_STORE" --version "$BROKEN_VERSION"
+  fi
   # Two more so every lifecycle status is represented in `list` / the console.
   step "template register a draft (never launched)" \
     "$FAUCET" template register 23_templated.yaml --store "$TPL_STORE" \
@@ -934,35 +1015,32 @@ if [ "$HAVE_TEMPLATES" -eq 1 ]; then
   step "template list (all three statuses)" "$FAUCET" template list --store "$TPL_STORE"
   # The hub kinds (RFC 0008): a source template and a sink template register
   # under their own names and compose at run time — no pre-composed pipeline.
-  if [ -f "${REPO_ROOT}/hub/source-templates/faucet-hq/example-csv.yaml" ]; then
-    step "template register a source-template (example-csv)" \
-      "$FAUCET" template register "${REPO_ROOT}/hub/source-templates/faucet-hq/example-csv.yaml" --store "$TPL_STORE" --launch
-    step "template register a sink-template (jsonl)" \
-      "$FAUCET" template register "${REPO_ROOT}/hub/sink-templates/faucet-hq/jsonl.yaml" --store "$TPL_STORE" --launch
-    step "template register a sink-template (sqlite, left as a draft)" \
-      "$FAUCET" template register "${REPO_ROOT}/hub/sink-templates/faucet-hq/sqlite.yaml" --store "$TPL_STORE"
-    step "template list --kind sink-template" "$FAUCET" template list --store "$TPL_STORE" --kind sink-template
-    step "template run source × sink (composed at run time)" \
-      "$FAUCET" template run faucet-hq/example-csv --store "$TPL_STORE" --sink faucet-hq/jsonl \
-        --param data_dir="${REPO_ROOT}/hub/examples/data" --param out_dir=./out/hub
-    # A deployment overlay (#679): state + SLA for a composed run, owned by
-    # neither template.
-    cat > 24_demo_ops.yaml <<'YAML'
-kind: deployment
-name: demo-ops
-description: File-backed bookmarks and a row-count SLA for composed demo runs
-params:
-  state_dir: { type: string, default: ./state, description: "Where bookmarks live" }
-state: { type: file, config: { path: "${param.state_dir}" } }
-sla: { min_rows_per_run: 1 }
-YAML
-    step "template register a deployment overlay (demo-ops)" \
-      "$FAUCET" template register 24_demo_ops.yaml --store "$TPL_STORE" --launch
-    step "template run source × sink + deployment overlay" \
-      "$FAUCET" template run faucet-hq/example-csv --store "$TPL_STORE" --sink faucet-hq/jsonl \
-        --overlay demo-ops --param data_dir="${REPO_ROOT}/hub/examples/data" \
-        --param out_dir=./out/hub --param state_dir=./state/demo-ops
-  fi
+  # Each names the other in its `tests:`, so the first one registered is red
+  # until its companion exists; registering the companion re-tests it.
+  # Red on a fresh registry (no sink yet), so the exit code is not the check:
+  # the launch steps below are, once the sink's registration re-tests it.
+  register_first_half() {
+    "$FAUCET" template register templates/example-csv.yaml --store "$TPL_STORE" \
+      || info "example-csv's tests are red until faucet-hq/jsonl is registered (expected on a fresh registry)"
+  }
+  step "template register a source-template (example-csv)" register_first_half
+  step "template register a sink-template (jsonl; re-tests example-csv)" \
+    "$FAUCET" template register templates/jsonl.yaml --store "$TPL_STORE"
+  step "template launch the source-template" \
+    "$FAUCET" template launch faucet-hq/example-csv --store "$TPL_STORE"
+  step "template launch the sink-template" \
+    "$FAUCET" template launch faucet-hq/jsonl --store "$TPL_STORE"
+  step "template register a sink-template (sqlite, left as a draft)" \
+    "$FAUCET" template register templates/sqlite.yaml --store "$TPL_STORE"
+  step "template list --kind sink-template" "$FAUCET" template list --store "$TPL_STORE" --kind sink-template
+  step "template run source × sink (composed at run time)" \
+    "$FAUCET" template run faucet-hq/example-csv --store "$TPL_STORE" --sink faucet-hq/jsonl \
+      --param out_dir=./out/hub
+  step "template register a deployment overlay (demo-ops)" \
+    "$FAUCET" template register 24_demo_ops.yaml --store "$TPL_STORE" --launch
+  step "template run source × sink + deployment overlay" \
+    "$FAUCET" template run faucet-hq/example-csv --store "$TPL_STORE" --sink faucet-hq/jsonl \
+      --overlay demo-ops --param out_dir=./out/hub --param state_dir=./state/demo-ops
 else
   info "Skipping the template registry (built without the \`templates\` feature)."
 fi
@@ -1024,5 +1102,5 @@ else
   echo
   echo "${BOLD}Battery finished (--no-serve). PASS: ${PASS}  FAIL: ${FAIL}${RESET}"
   echo "To browse the UI later:  ./scripts/try-local.sh --serve-only"
-  [ "$FAIL" -eq 0 ]
+  finish
 fi
