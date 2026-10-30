@@ -331,9 +331,21 @@ jobs:
       - id: cargo-cyclonedx
         run: |
           set -euo pipefail
+          touch "$RUNNER_TEMP/sbom-start"
           cargo cyclonedx --manifest-path cli/Cargo.toml --features full --target all \
             --format json --spec-version 1.5 --override-filename faucet-cli
-          mv cli/faucet-cli.cdx.json target/distrib/faucet-cli.cdx.json
+          # The file name --override-filename produces differs between cargo-cyclonedx releases.
+          sbom=""
+          while IFS= read -r f; do
+            echo "candidate: $f"
+            if [ -z "$sbom" ] && grep -q '"bomFormat"' "$f"; then sbom=$f; fi
+          done < <(find . -path ./target -prune -o -name 'faucet-cli*.json' -newer "$RUNNER_TEMP/sbom-start" -print)
+          if [ -z "$sbom" ]; then
+            echo "::error::cargo cyclonedx wrote no faucet-cli SBOM"
+            exit 1
+          fi
+          echo "SBOM written to $sbom"
+          mv "$sbom" target/distrib/faucet-cli.cdx.json
           echo "path=target/distrib/faucet-cli.cdx.json" >> "$GITHUB_OUTPUT"
       - name: "Upload artifacts"
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
