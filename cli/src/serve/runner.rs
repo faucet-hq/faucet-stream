@@ -279,24 +279,30 @@ pub fn usage_options(
 /// Run label naming the pipeline (`cfg.name`, else `serve`) a run belongs to.
 pub const LABEL_PIPELINE: &str = "pipeline";
 
-/// DLQ sink kinds that write local files `POST /v1/dlq/inspect` can read.
-const LOCAL_DLQ_KINDS: &[&str] = &["file", "jsonl"];
-
-/// The local path a submission's dead-letter queue writes to (#998): the
-/// `path` of the first row's (else the pipeline's) `dlq:` sink when that sink
-/// writes local files. Credentials in a URL-shaped path are masked.
+/// Where a submission's dead-letter queue can be inspected (#998): the first
+/// row's (else the pipeline's) `dlq:` sink, when it writes local JSON Lines the
+/// DLQ tooling reads back (`dlq_replay::plan::writes_json_lines` — the test
+/// `faucet status` uses), as the location `POST /v1/dlq/inspect` expands (a
+/// dated `${…}` path becomes a glob; a `{part}` template is read as numbered
+/// parts). Credentials in a URL-shaped path are masked.
 pub fn dlq_location(loaded: &crate::serve::load::LoadedSubmission) -> Option<String> {
     let spec = loaded.nodes.iter().find_map(|n| n.dlq.as_ref()).or(loaded
         .cfg
         .pipeline
         .dlq
         .as_ref())?;
-    if !LOCAL_DLQ_KINDS.contains(&spec.sink.kind.as_str()) {
+    dlq_location_of(spec)
+}
+
+/// [`dlq_location`] for one `dlq:` block.
+pub fn dlq_location_of(spec: &crate::config::DlqSpec) -> Option<String> {
+    if !crate::dlq_replay::plan::writes_json_lines(&spec.sink) {
         return None;
     }
     let path = spec.sink.config.get("path")?.as_str()?;
     (!path.is_empty()).then(|| {
-        crate::secrets::registry::redact_message(&faucet_core::util::redact_uri_credentials(path))
+        let glob = crate::status::dlq::location_glob(path);
+        crate::secrets::registry::redact_message(&faucet_core::util::redact_uri_credentials(&glob))
     })
 }
 
@@ -2344,6 +2350,71 @@ fn recount_refusal(
 #[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
+
+    fn dlq(kind: &str, config: serde_json::Value) -> crate::config::DlqSpec {
+        serde_json::from_value(serde_json::json!({ "sink": { "type": kind, "config": config } }))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_dlq_location_is_set_exactly_when_inspect_can_read_it() {
+        let at = |kind: &str, config: serde_json::Value| dlq_location_of(&dlq(kind, config));
+        // Local JSON Lines, however the sink is spelled.
+        assert_eq!(
+            at("file", serde_json::json!({ "path": "/d/dlq.jsonl" })).as_deref(),
+            Some("/d/dlq.jsonl")
+        );
+        assert_eq!(
+            at("jsonl", serde_json::json!({ "path": "/d/dlq.out" })).as_deref(),
+            Some("/d/dlq.out")
+        );
+        assert_eq!(
+            at(
+                "file",
+                serde_json::json!({ "path": "/d/dlq", "format": "json_lines" })
+            )
+            .as_deref(),
+            Some("/d/dlq")
+        );
+        // A dated path is every dated file; a `{part}` template stays, inspect
+        // reads it as numbered parts.
+        assert_eq!(
+            at(
+                "file",
+                serde_json::json!({ "path": "/d/${now.date}/dlq.jsonl" })
+            )
+            .as_deref(),
+            Some("/d/*/dlq.jsonl")
+        );
+        assert_eq!(
+            at("file", serde_json::json!({ "path": "/d/dlq-{part}.jsonl" })).as_deref(),
+            Some("/d/dlq-{part}.jsonl")
+        );
+        assert!(
+            crate::dlq_replay::reader::expand_location("/nonexistent/dlq-{part}.jsonl")
+                .unwrap_err()
+                .to_string()
+                .contains("matched no files"),
+            "inspect understands the template"
+        );
+        // Formats and sinks the DLQ reader cannot read back.
+        for (kind, config) in [
+            ("csv", serde_json::json!({ "path": "/d/dlq.csv" })),
+            ("file", serde_json::json!({ "path": "/d/dlq.csv" })),
+            ("file", serde_json::json!({ "path": "/d/dlq.parquet" })),
+            (
+                "file",
+                serde_json::json!({ "path": "/d/dlq.jsonl", "compression": "gzip" }),
+            ),
+            (
+                "s3",
+                serde_json::json!({ "bucket": "b", "path": "dlq.jsonl" }),
+            ),
+            ("file", serde_json::json!({ "path": "" })),
+        ] {
+            assert_eq!(at(kind, config.clone()), None, "{kind} {config}");
+        }
+    }
 
     /// A memory store whose owner-fenced finalize fails while `down` is set.
     struct FlakyFinalize {
