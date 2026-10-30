@@ -80,6 +80,7 @@ paths:
         - { name: tenant, in: query, schema: { type: string }, description: "Only runs started for this tenant (#709). A tenant-scoped principal always sees only its own tenant; naming another is a 404." }
         - { name: submitted_by, in: query, schema: { type: string }, description: "Only runs this principal submitted (#998), exact match on `RunRecord.submitted_by`. Runs recorded before the field existed have no submitter and never match." }
         - { name: mine, in: query, schema: { type: boolean, default: false }, description: "`true`: only runs the caller submitted — `submitted_by` set to the caller's own principal (#998). Setting both `mine` and `submitted_by` is a 400." }
+        - { name: dataset_id, in: query, schema: { type: string, pattern: "^[A-Za-z0-9-]{1,64}$" }, description: "Only runs one of whose invocations wrote this catalog dataset (#998): the `usage.dataset_id` its usage record names (recorded when the catalog is active). Anything but letters, digits and `-` is a 400." }
         - name: label
           in: query
           style: form
@@ -193,6 +194,37 @@ paths:
         "404": { $ref: "#/components/responses/Error" }
         "409": { description: The run has not finished yet }
         "422": { description: The run's config is not stored and none was supplied, or it recorded no invocation ids }
+  /v1/runs/{id}/config:
+    get:
+      summary: A run's stored config
+      description: >
+        The config the run was submitted with, as the server stored it (#998).
+        Only clustered runs store one; any other run answers 404. An unscoped
+        admin gets the body as stored; every other caller gets it re-rendered
+        with every value under a credential-looking key (`password`, `token`,
+        `secret`, `key`, …) replaced by `***` — `${…}` references are kept, as
+        they name a secret rather than hold it. Secrets the server resolved
+        are masked for everyone. Sealed secret params stay `${sealed:N}`
+        tokens. Requires `RunRead`; audited as `run.config`. A tenant-scoped
+        principal sees only its own tenant's runs (another tenant's is a 404).
+      operationId: getRunConfig
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The stored config.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [format, body, redacted]
+                properties:
+                  format: { type: string, enum: [yaml, json] }
+                  body: { type: string }
+                  redacted: { type: boolean, description: Whether any value was masked. }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { description: Principal's role lacks the RunRead permission }
+        "404": { description: Unknown run, another tenant's run, or no config stored for it }
   /v1/runs/{id}/logs:
     get:
       summary: Stream a run's logs (SSE), or read persisted logs
@@ -288,6 +320,32 @@ paths:
           content: { application/json: { schema: { type: object } } }
         "401": { description: Missing or invalid bearer token }
         "404": { description: Unknown kind or name }
+  /v1/triggers:
+    get:
+      summary: List the configured triggers
+      description: >
+        Every trigger in the `--triggers` file, enabled or not, in file order,
+        with its live health and the fires and errors counted since the server
+        started (#998). Store and queue addresses are not listed (they can
+        carry credentials); a config is named by its file name. A server
+        started without `--triggers` lists none. Requires `StatusRead`
+        (viewer+) and the `triggers` Cargo feature; audited as `trigger.list`
+        on denial.
+      operationId: listTriggers
+      responses:
+        "200":
+          description: The triggers.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [triggers]
+                properties:
+                  triggers:
+                    type: array
+                    items: { $ref: "#/components/schemas/TriggerInfo" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { description: Principal's role lacks the StatusRead permission, or a tenant-scoped principal }
   /v1/triggers/{name}:
     post:
       summary: Fire a named webhook trigger
@@ -2489,6 +2547,34 @@ paths:
         "404": { $ref: "#/components/responses/Error" }
         "422": { $ref: "#/components/responses/Error" }
   /v1/templates/{id}/runs:
+    get:
+      summary: Runs started from a template
+      description: >
+        The runs labelled `template: <id>` (#998), newest first and paged like
+        `GET /v1/runs`, with exact per-status `counts`. 404 for an id that was
+        never registered. A tenant-scoped principal sees only its own tenant's
+        runs. Requires `TemplateRead`; audited as `template.runs` on denial.
+      operationId: listTemplateRuns
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 500 } }
+        - { name: cursor, in: query, schema: { type: string }, description: "The previous page's `next_cursor`." }
+      responses:
+        "200":
+          description: The template's runs.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [runs, counts]
+                properties:
+                  runs: { type: array, items: { $ref: "#/components/schemas/RunRecord" } }
+                  next_cursor: { type: string }
+                  counts: { type: object, additionalProperties: { type: integer } }
+        "400": { description: Unknown query parameter }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { description: Principal's role lacks the TemplateRead permission }
+        "404": { $ref: "#/components/responses/Error" }
     post:
       summary: Trigger a run from a template (a source template composed with a sink, or a pipeline)
       description: >
@@ -2591,6 +2677,8 @@ paths:
         - { name: tenant, in: query, required: false, schema: { type: string }, description: "Only actions taken for this tenant (#709)." }
         - { name: since, in: query, required: false, schema: { type: string, format: date-time } }
         - { name: until, in: query, required: false, schema: { type: string, format: date-time } }
+        - { name: result, in: query, required: false, schema: { type: string }, description: "Only entries with this outcome: `ok`, `denied`, … (#998)." }
+        - { name: before, in: query, required: false, schema: { type: string }, description: "Page cursor (#998): the previous page's `next_before` — entries older than the entry with this id. An id no longer stored yields an empty page." }
         - { name: limit, in: query, required: false, schema: { type: integer, default: 100, maximum: 1000 } }
       responses:
         "200":
@@ -2603,9 +2691,30 @@ paths:
                   entries:
                     type: array
                     items: { $ref: "#/components/schemas/AuditEntry" }
+                  next_before: { type: string, description: "Pass as `before` for the next (older) page; absent when the page is not full." }
         "400": { description: Malformed `since` / `until` timestamp }
         "401": { description: Missing or invalid bearer token }
         "403": { description: Principal's role lacks the AuditRead permission }
+  /v1/audit/{id}:
+    get:
+      summary: One audit entry
+      description: >
+        The audit entry with this id (#998), for a deep link to an entry older
+        than the listed page. 404 once the entry is purged by the run-retention
+        window. Requires `AuditRead` (admin role).
+      operationId: getAuditEntry
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The entry.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuditEntry" }
+        "401": { description: Missing or invalid bearer token }
+        "403": { description: Principal's role lacks the AuditRead permission }
+        "404": { description: No entry with that id }
   /v1/reload:
     post:
       summary: Hot-reload the server's --default-config merge base (admin-only)
@@ -2627,6 +2736,7 @@ paths:
                 properties:
                   reloaded: { type: boolean }
                   path: { type: string }
+                  loaded_at: { type: string, format: date-time, description: "When the merge base now in use was loaded (#998)." }
                   reason: { type: string }
         "401": { description: Missing or invalid bearer token }
         "403": { description: Principal's role lacks the Reload permission }
@@ -3120,6 +3230,7 @@ components:
         caller_config: { type: boolean, description: "The request carried the config, so its HTTP requests and redirect hops are checked against the caller reference policy wherever the run executes (#881). Absent otherwise." }
         pool: { type: string, default: default, description: "The execution pool the run belongs to (#957): only a replica serving it claims the run, its shards and its re-claims. Runs recorded before pools existed read as `default`." }
         submitted_by: { type: string, description: "Who submitted the run (#998): the authenticated principal the `run.submit` audit entry names — `trigger:<name>` for a trigger, the requester for an approved change request, `anonymous` under `--no-auth`, `token` for the single `--auth-token`. Set by the server; a request cannot supply it. Absent on runs recorded before the field existed." }
+        dlq_location: { type: string, description: "Where the run's dead-letter queue writes (#998): the `path` of its `dlq:` sink as configured at submit, when that sink writes local files (`file`, `jsonl`) — the `location` `POST /v1/dlq/inspect` takes. Set by the server; absent without a file DLQ." }
         invocations:
           type: array
           items: { $ref: "#/components/schemas/InvocationRecord" }
@@ -3189,6 +3300,30 @@ components:
           completed: 41
           failed: 2
           running: 1
+    TriggerInfo:
+      type: object
+      description: One configured trigger as `GET /v1/triggers` lists it (#998).
+      required: [name, type, enabled, healthy, consecutive_failures, fired_total, errors_total]
+      properties:
+        name: { type: string }
+        type: { type: string, enum: [object_arrival, webhook, queue_depth, schedule] }
+        enabled: { type: boolean }
+        healthy: { type: boolean, description: "Live health; a disabled trigger runs no watcher and reads healthy." }
+        consecutive_failures: { type: integer }
+        last_fire: { type: string, format: date-time, description: Last fire since the server started. }
+        fired_total: { type: integer, description: Fires since the server started. }
+        errors_total: { type: integer, description: Failed polls and fires since the server started. }
+        methods: { type: array, items: { type: string }, description: "Webhook: the accepted HTTP methods." }
+        debounce_secs: { type: integer, description: "Webhook: the leading-edge debounce window." }
+        cron: { type: string, description: "Schedule: the cron expression." }
+        timezone: { type: string, description: "Schedule: the cron's timezone." }
+        poll_interval_secs: { type: integer, description: "Object arrival / queue depth: seconds between polls." }
+        threshold: { type: integer, description: "Queue depth: the depth that fires." }
+        template: { type: string, description: "The template it triggers, `id` or `id@version`." }
+        config: { type: string, description: "The config it runs: the file's name, or `inline`." }
+        tenants:
+          description: "The tenants a fire fans out to: `all` or a list of ids."
+          oneOf: [{ type: string }, { type: array, items: { type: string } }]
     AuditEntry:
       type: object
       required: [id, timestamp, principal, role, action, result]

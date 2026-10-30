@@ -265,6 +265,7 @@ fn list_runs_documents_every_query_parameter() {
         "tenant",
         "submitted_by",
         "mine",
+        "dataset_id",
         "label",
         "labels",
     ]

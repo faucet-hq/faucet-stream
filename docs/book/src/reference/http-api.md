@@ -113,7 +113,7 @@ someone does.
 
 | Route | viewer | operator | admin |
 |---|:--:|:--:|:--:|
-| `GET /v1/runs`, `/v1/runs/{id}`, `/v1/runs/{id}/logs` | ✓ | ✓ | ✓ |
+| `GET /v1/runs`, `/v1/runs/{id}`, `/v1/runs/{id}/logs`, `/v1/runs/{id}/config`³ | ✓ | ✓ | ✓ |
 | `GET /v1/overview` | ✓ | ✓ | ✓ |
 | `POST /v1/runs`, `DELETE /v1/runs/{id}`, `POST /v1/runs/{id}/cancel` | — | ✓ | ✓ |
 | `POST /v1/backfill` | — | ✓ | ✓ |
@@ -124,6 +124,7 @@ someone does.
 | `POST /v1/doctor` | — | ✓ | ✓ |
 | `POST /v1/dlq/inspect` | ✓ | ✓ | ✓ |
 | `POST /v1/dlq/replay`, `/v1/dlq/discard` | — | ✓ | ✓ |
+| `GET /v1/triggers` | ✓ | ✓ | ✓ |
 | `POST`/`PUT /v1/triggers/{name}` | — | ✓ | ✓ |
 | `GET /v1/catalog/*` | ✓ | ✓ | ✓ |
 | `POST /v1/catalog/datasets/{id}/consumers` | — | ✓ | ✓ |
@@ -133,7 +134,7 @@ someone does.
 | `GET`/`PUT`/`DELETE /v1/state/{pipeline}/{row}` | — | — | ✓ |
 | `GET /v1/local-outputs`, `/v1/local-outputs/{id}/preview` | ✓ | ✓ | ✓ |
 | `DELETE /v1/local-outputs/{id}`, `POST /v1/local-outputs/cleanup` | — | ✓ | ✓ |
-| `GET /v1/templates`, `/v1/templates/{id}`, `/v1/templates/{id}/rows` | ✓ | ✓ | ✓ |
+| `GET /v1/templates`, `/v1/templates/{id}`, `/v1/templates/{id}/rows`, `/v1/templates/{id}/runs` | ✓ | ✓ | ✓ |
 | `POST /v1/templates/{id}/runs` (trigger) | — | ✓ | ✓ |
 | `POST /v1/templates`, `DELETE /v1/templates/{id}` | — | — | ✓ |
 | `POST /v1/templates/{id}/{tags,launch,rollback,deprecate}` | — | — | ✓ |
@@ -150,11 +151,12 @@ someone does.
 | `POST /v1/tenants/{tenant}/runs`, `…/templates/{id}/runs`, `POST /v1/templates/{id}/fanout` | — | ✓ | ✓ |
 | `POST /v1/tenants`, `PATCH`/`DELETE /v1/tenants/{tenant}` | — | — | ✓ |
 | `POST /mcp` | ✓ | ✓ | ✓ |
-| `GET /v1/audit` | — | — | ✓ |
+| `GET /v1/audit`, `/v1/audit/{id}` | — | — | ✓ |
 | `POST /v1/reload` | — | — | ✓ |
 | *any unclassified `/v1` route* | — | — | ✓ |
 
 ¹ Reaching the route; the `approvals:` policy then decides whether the approval counts.
+³ Below an unscoped admin, credential-looking values come back masked.
 ² With a registered `template` and its declared param defaults. An inline `config` is loaded on the server, and caller `params` decide what it connects to, so either needs `operator` (`403` for a viewer).
 
 Two entries are POSTs a **read** token can reach, because they change nothing:
@@ -404,7 +406,9 @@ each route still enforces its own permission.
 (`policy.denied` — by the submitting principal at submit time, by `runtime`
 when the backstop denied a page mid-run) and every denied attempt is recorded with principal, role, action, run id,
 config fingerprint (submit), source IP, timestamp, and result. Admins read it via
-`GET /v1/audit`. Records persist in the run-history backend (`faucet_serve_audit`
+`GET /v1/audit` (newest first; `result=denied` keeps the refusals; when a page
+is full, `next_before` is the cursor for the next, older one: pass it as
+`before`) and one entry by id via `GET /v1/audit/{id}`. Records persist in the run-history backend (`faucet_serve_audit`
 for the SQL backends; an in-memory ring otherwise) and expire with the
 `--retain-terminal-runs-secs` window.
 
@@ -446,10 +450,12 @@ template) `POST /v1/templates/{id}/runs`, `run_template` and a template trigger.
 | `DELETE` | `/v1/runs/{id}` | `204` | Remove a terminal run from history |
 | `POST` | `/v1/runs/{id}/cancel` | `202` / `200` | Request cancel (202) or no-op if terminal (200) |
 | `GET` | `/v1/overview` | `200` | Fleet trends over the run history for the console's Overview page (`since`, `until`, `bucket`, `pipeline`, `pool`, `label`, `tenant`, `stale_after`, `top`) — viewer / `RunRead` |
+| `GET` | `/v1/runs/{id}/config` | `200` | The run's stored config (`{format, body, redacted}`); masked below an unscoped admin; `404` when none was stored (only clustered runs store one) — `RunRead`, audit `run.config` |
 | `GET` | `/v1/runs/{id}/logs` | `200` | Stream the run's logs (`text/event-stream`), or read persisted logs with `?format=jsonl\|text` |
 | `POST` | `/v1/backfill` | `202` | Submit a windowed backfill: one tracked run per window unit (operator) |
-| `GET` | `/v1/audit` | `200` | Read the audit log — **admin only** (RBAC). Filters: `principal`, `action`, `since`, `until`, `limit`. Each entry's `target` names what was touched (`template:<id>@<version>`, `connection:<tenant>/<name>`, `origin:<name>`, `mcp:<tool>`); an MCP tool call is one entry per call, under the calling principal, `result: error` when the tool failed |
-| `POST` | `/v1/reload` | `200` / `422` | Hot-reload the `--default-config` merge base — **admin only** (RBAC). No-op (`reloaded:false`) if no default-config; `422` (old config kept) if the new one is invalid |
+| `GET` | `/v1/audit` | `200` | Read the audit log — **admin only** (RBAC). Filters: `principal`, `action`, `result`, `tenant`, `since`, `until`, `limit`; page with `before=<next_before>`. Each entry's `target` names what was touched (`template:<id>@<version>`, `connection:<tenant>/<name>`, `origin:<name>`, `mcp:<tool>`); an MCP tool call is one entry per call, under the calling principal, `result: error` when the tool failed |
+| `GET` | `/v1/audit/{id}` | `200` | One audit entry; `404` once purged — **admin only** |
+| `POST` | `/v1/reload` | `200` / `422` | Hot-reload the `--default-config` merge base — **admin only** (RBAC). No-op (`reloaded:false`) if no default-config; `422` (old config kept) if the new one is invalid. A reload answers `{reloaded, path, loaded_at}` |
 | `GET` | `/v1/catalog/datasets` | `200` | List catalogued datasets (`kind`, `q`, `limit`, `cursor`) — requires the `catalog` build feature |
 | `GET` | `/v1/catalog/datasets/{id}` | `200` | One dataset's detail: schema timeline, volume, edges |
 | `GET` | `/v1/catalog/lineage` | `200` | The lineage edge graph (`root`, `depth`) |
@@ -463,6 +469,7 @@ template) `POST /v1/templates/{id}/runs`, `run_template` and a template trigger.
 | `GET` | `/v1/templates/{id}/rows` | `200` | The template's selectable rows (streams / matrix rows) with their metadata; selector params (`select`, `only`, `skip`, `tags`, `status`, `include_parents`) turn it into a dry-run resolve (`TemplateRead`, audit `template.rows`) |
 | `DELETE` | `/v1/templates/{id}` | `204` | Delete one version (`?version=<channel\|N>`) or all (admin / `TemplateAdmin`) |
 | `POST` | `/v1/templates/{id}/runs` | `202` | Trigger a run from a template with `params` / `env` (operator / `RunWrite`) |
+| `GET` | `/v1/templates/{id}/runs` | `200` | The runs started from the template (label `template: <id>`), paged like `GET /v1/runs` (`limit`, `cursor`) with `counts`; `404` for an id never registered (viewer / `TemplateRead`) |
 | `POST` | `/v1/templates/{id}/tags` | `200` | Point an assignable channel (`prod`, `dev`, …) at a version (admin / `TemplateAdmin`) |
 | `POST` | `/v1/templates/{id}/launch` | `200` | Make a version live — moves `stable` and so unpinned callers (admin / `TemplateAdmin`) |
 | `POST` | `/v1/templates/{id}/rollback` | `200` | Re-launch `previous` (admin / `TemplateAdmin`) |
@@ -494,6 +501,7 @@ template) `POST /v1/templates/{id}/runs`, `run_template` and a template trigger.
 | `POST` | `/v1/tenants/{tenant}/runs` | `202` | A `POST /v1/runs` body, run as the tenant — operator / `RunWrite` |
 | `POST` | `/v1/tenants/{tenant}/templates/{id}/runs` | `202` | A template trigger, run as the tenant — operator / `RunWrite` |
 | `POST` | `/v1/templates/{id}/fanout` | `200` | Trigger a template once per tenant (`tenants: "all" \| [ids]`, `fanout_concurrency`) — operator / `RunWrite` |
+| `GET` | `/v1/triggers` | `200` | The `--triggers` file's triggers with live health, `last_fire`, `fired_total` / `errors_total` since start (viewer / `StatusRead`; `triggers` feature) |
 | `GET` | `/healthz` | `200` | Liveness (unauthenticated) |
 | `GET` | `/readyz` | `200`/`503` | Readiness (unauthenticated) |
 | `GET` | `/metrics` | `200` | Prometheus exposition (unauthenticated) |
@@ -612,7 +620,7 @@ submitted config (submitted values win).
 ### `GET /v1/runs`
 
 Query parameters: `status`, `name`, `since`, `until` (RFC3339), `limit` (default
-50, max 500), `cursor`, `tenant`, `submitted_by`, `mine`, `label`, `labels`. Ordering is
+50, max 500), `cursor`, `tenant`, `submitted_by`, `mine`, `dataset_id`, `label`, `labels`. Ordering is
 `(submitted_at DESC, run_id DESC)`; `cursor` is the previous page's
 `next_cursor` — the last row's sort key (`<submitted_at>~<run_id>`), so paging
 stays correct when that run is deleted or purged between requests. A bare
@@ -644,6 +652,11 @@ cannot. `submitted_by=<principal>` keeps that principal's runs, and `mine=true`
 keeps the caller's own (setting both is a `400`). Runs recorded before the
 field existed have no submitter and match neither.
 
+**Filtering by dataset (#998).** `dataset_id=<catalog dataset id>` keeps the
+runs one of whose invocations wrote that dataset — the `usage.dataset_id` a
+run records while the catalog is active. Anything but letters, digits and `-`
+is a `400`.
+
 **Exact counts (#998).** `counts` holds how many runs match the filters, per
 status, ignoring `limit` and `cursor` — so a dashboard can show totals without
 paging through every run. Only statuses with at least one run appear.
@@ -673,6 +686,7 @@ token, an empty label key and more than 10 label filters.
   "records_written": 4096,
   "pool": "default",
   "submitted_by": "alice",
+  "dlq_location": "./dlq/orders.jsonl",
   "invocations": [
     {"row_id": "default", "parent_record_key": null, "records_written": 4096, "error": null,
      "status": "succeeded",
@@ -712,6 +726,28 @@ A DLQ replay that writes (`POST /v1/dlq/replay` without `dry_run`) is recorded
 as a run under its `id` while it runs, with the label `dlq_replay: "true"` and
 `replay_of` naming the DLQ location it read, so it appears in `GET /v1/runs`
 and holds one of its tenant's `max_concurrent_runs` slots until it ends.
+
+`dlq_location` (#998) is where the run's dead-letter queue writes: the `path`
+of its `dlq:` sink as configured at submit, when that sink writes local files
+(`file`, `jsonl`) — the `location` `POST /v1/dlq/inspect` takes. The server
+sets it; it is absent without a file DLQ.
+
+### `GET /v1/runs/{id}/config`
+
+The config a run was submitted with, as stored (#998). Only clustered runs
+store one (any instance must be able to run them); other runs answer `404`.
+
+```json
+{ "format": "yaml", "body": "version: 1\npipeline: …", "redacted": true }
+```
+
+An unscoped admin gets the body as stored. Anyone else gets it re-rendered in
+the same format with every value under a credential-looking key (`password`,
+`token`, `secret`, `key`, `credentials`, …) replaced by `***`; `${env:…}` /
+`${vault:…}` references are kept, since they name a secret rather than hold
+one. Secrets the server resolved are masked for everyone, and sealed template
+params stay `${sealed:N}`. `redacted` says whether anything was masked. Every
+read is audited as `run.config`.
 
 > **Bookmarks:** run records carry record counts + per-row outcomes, not
 > replication bookmarks. Bookmark state is per-row/per-state-key and lives in the

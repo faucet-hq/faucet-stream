@@ -376,6 +376,7 @@ fn a_read_token_can_reach_every_read_route() {
         // The audit log and pipeline state (#735) are admin-only by design.
         if method != axum::http::Method::GET
             || path == "/v1/audit"
+            || path == "/v1/audit/{id}"
             || path == "/v1/state/{pipeline}/{row}"
         {
             continue;

@@ -14,6 +14,7 @@ const ROUTES_BASE: &[(&str, &str)] = &[
     ("POST", "/v1/runs/{id}/cancel"),
     ("POST", "/v1/runs/{id}/rollback"),
     ("GET", "/v1/runs/{id}/logs"),
+    ("GET", "/v1/runs/{id}/config"),
     ("GET", "/v1/overview"),
     ("GET", "/v1/schemas"),
     ("GET", "/v1/schemas/{kind}/{name}"),
@@ -25,6 +26,7 @@ const ROUTES_BASE: &[(&str, &str)] = &[
     ("POST", "/v1/dlq/replay"),
     ("POST", "/v1/dlq/discard"),
     ("GET", "/v1/audit"),
+    ("GET", "/v1/audit/{id}"),
     ("POST", "/v1/reload"),
     ("GET", "/v1/whoami"),
     // Pipeline health + durable state (#732, #735).
@@ -51,6 +53,7 @@ const ROUTES_BASE: &[(&str, &str)] = &[
 /// Routes that are only registered when the `triggers` feature is compiled in.
 #[cfg(feature = "triggers")]
 const ROUTES_TRIGGERS: &[(&str, &str)] = &[
+    ("GET", "/v1/triggers"),
     ("POST", "/v1/triggers/{name}"),
     ("PUT", "/v1/triggers/{name}"),
 ];
@@ -84,6 +87,7 @@ const ROUTES_TEMPLATES: &[(&str, &str)] = &[
     ("GET", "/v1/templates/{id}"),
     ("DELETE", "/v1/templates/{id}"),
     ("POST", "/v1/templates/{id}/runs"),
+    ("GET", "/v1/templates/{id}/runs"),
     ("GET", "/v1/templates/{id}/rows"),
     ("POST", "/v1/templates/{id}/tags"),
     ("POST", "/v1/templates/{id}/launch"),

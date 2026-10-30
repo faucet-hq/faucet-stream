@@ -826,4 +826,30 @@ mod tests {
             RunStatus::Cancelled
         );
     }
+
+    #[test]
+    fn credentials_are_masked_and_references_kept() {
+        use crate::serve::load::ConfigFormat;
+        let body = "version: 1\nvars:\n  api_token: plain-secret\n  db_password: \"${env:PG_PASS}\"\n  port: 5432\n\
+                    auth:\n  idp:\n    type: static\n    config:\n      secret: [s1, 7]\n      pin: 1234\n      enabled: true\n";
+        let (out, masked) = masked_body(body, ConfigFormat::Yaml).unwrap();
+        assert!(masked);
+        assert!(
+            !out.contains("plain-secret") && !out.contains("s1"),
+            "{out}"
+        );
+        assert!(out.contains("${env:PG_PASS}"), "{out}");
+        assert!(out.contains("5432"), "a port is not a credential: {out}");
+        let (json, _) = masked_body(
+            r#"{"vars":{"client_secret":"x","name":"orders"}}"#,
+            ConfigFormat::Json,
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["vars"]["client_secret"], "***");
+        assert_eq!(v["vars"]["name"], "orders");
+        let (_, masked) = masked_body("version: 1\nname: plain\n", ConfigFormat::Yaml).unwrap();
+        assert!(!masked);
+        assert!(masked_body("a: [unclosed", ConfigFormat::Yaml).is_none());
+    }
 }

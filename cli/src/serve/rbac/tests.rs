@@ -525,4 +525,51 @@ fn audit_action_labels() {
         "template.run"
     );
     assert_eq!(audit_action(&Method::GET, "/v1/whatever"), "unknown");
+    // The console's read routes (#998).
+    for (method, path, label, perm) in [
+        (
+            Method::GET,
+            "/v1/runs/{id}/config",
+            "run.config",
+            Permission::RunRead,
+        ),
+        (
+            Method::GET,
+            "/v1/audit/{id}",
+            "audit.get",
+            Permission::AuditRead,
+        ),
+        (
+            Method::GET,
+            "/v1/triggers",
+            "trigger.list",
+            Permission::StatusRead,
+        ),
+        (
+            Method::GET,
+            "/v1/templates/{id}/runs",
+            "template.runs",
+            Permission::TemplateRead,
+        ),
+    ] {
+        assert_eq!(audit_action(&method, path), label, "{path}");
+        assert_eq!(required_permission(&method, path), Some(perm), "{path}");
+    }
+}
+
+#[test]
+fn a_tenant_principal_reads_its_run_configs_and_template_runs_but_not_triggers_or_audit() {
+    use TenantScopeDecision::*;
+    for (path, matched, want) in [
+        ("/v1/runs/r1/config", "/v1/runs/{id}/config", Allow),
+        ("/v1/templates/t/runs", "/v1/templates/{id}/runs", Allow),
+        ("/v1/triggers", "/v1/triggers", Deny),
+        ("/v1/audit/a1", "/v1/audit/{id}", Deny),
+    ] {
+        assert_eq!(
+            tenant_scope_decision(&Method::GET, matched, path, "acme"),
+            want,
+            "{path}"
+        );
+    }
 }
