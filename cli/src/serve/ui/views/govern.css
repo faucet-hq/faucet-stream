@@ -6,3 +6,12 @@ td.num { white-space: nowrap; }
 .avatar.vacant { background: transparent; border: 1px dashed var(--line-strong); }
 .toast.done { border-left-color: var(--ok); }
 .toast.done > svg.i { color: var(--ok); }
+
+/* changes: list body spacing as the mock (rows 10px apart), timeline */
+.list .list-body.rows { display: flex; flex-direction: column; gap: 10px; }
+.list .list-body .sect-rows { display: flex; flex-direction: column; gap: 10px; }
+.list .list-body .sect-rows.closed { display: none; }
+.chg-timeline { font-family: var(--sans); font-size: 12.5px; line-height: 2; }
+.chg-timeline .ts { display: inline-block; width: 120px; }
+.chg-timeline .dot { margin-right: 8px; }
+.dialog .input.err, .dialog .input.err:focus-within { border-color: var(--bad); }
