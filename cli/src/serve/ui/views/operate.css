@@ -33,7 +33,8 @@
 .ru-acct .muted { font-size: var(--fs-sm); }
 .ru-dur { width: 90px; white-space: nowrap; }
 .ru-dur .meter { margin-top: 4px; }
-.card .select.ru-sm { height: 26px; }
+.card .select.ru-sm { height: 26px; min-width: 150px; }
+.card .h .select.ru-sm { min-width: 240px; }
 .card .select.ru-sm select { font-size: var(--fs-sm); }
 .ru-logbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .ru-logbox { max-height: calc(100vh - 340px); min-height: 160px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }

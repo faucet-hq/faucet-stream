@@ -710,7 +710,7 @@ export async function renderRuns(host, params) {
       written ? { label: "Open in lineage", icon: "lineage", href: href.lineage(written.dataset_id) } : null,
       { label: "Inspect a dead-letter queue", icon: "alert", href: tabHref("dlq") },
       "-",
-      { label: "Roll back…", icon: "undo", cls: undoable ? "" : "dis", hint: undoable ? "" : "when finished", action: "rollback", perm: "rollback" },
+      { label: "Roll back…", icon: "undo", cls: undoable ? "" : "dis", hint: undoable ? "" : live ? "when finished" : "nothing to undo", action: "rollback", perm: "rollback" },
       { label: "Delete run", icon: "trash", cls: live ? "danger dis" : "danger", hint: live ? "when finished" : "", action: "delete", perm: "run_write" },
     ]);
     if (live) return html`${btn("Cancel run", { icon: "x", perm: "run_write", data: { action: "cancel" } })}${more}`;
@@ -967,7 +967,7 @@ export async function renderRuns(host, params) {
     const dqA = (sa.failed || 0) + (sa.quarantined || 0), dqB = (sb.failed || 0) + (sb.quarantined || 0);
     const rows = [
       ["Records written", fmtInt(r.records_written || 0), fmtInt(other.records_written || 0), delta(r.records_written || 0, other.records_written || 0)],
-      ["Duration", fmtSecs(durA), fmtSecs(durB), Math.round(durA) === Math.round(durB) ? html`<span class="faint">same</span>` : `${durA > durB ? "+" : "−"}${fmtSecs(Math.abs(durA - durB))}`],
+      ["Duration", secsText(durA), secsText(durB), Math.round(durA) === Math.round(durB) ? html`<span class="faint">same</span>` : `${durA > durB ? "+" : "−"}${fmtSecs(Math.abs(durA - durB))}`],
       ["Rows offered", fmtInt(sa.offered || 0), fmtInt(sb.offered || 0), delta(sa.offered || 0, sb.offered || 0)],
       ["Dead-lettered or quarantined", fmtInt(dqA), fmtInt(dqB), delta(dqA, dqB, "up")],
       ["Estimated cost", money(costOf(r), currencyOf(r)), money(costOf(other), currencyOf(other)), delta(costOf(r), costOf(other), "up")],
@@ -977,7 +977,7 @@ export async function renderRuns(host, params) {
     const cfgCard = ui.cmpCfg === undefined ? "" : cfg && cfg.body && ui.cmpCfg
       ? card({ icon: "code", title: "Config difference", aside: "only lines that changed, previous → this run", body: diff(lineDiff(ui.cmpCfg, cfg.body)) })
       : card({ icon: "code", title: "Config difference", body: html`<div class="empty-line">The server did not keep both configs, so they can’t be compared.</div>` });
-    return html`${card({ icon: "diff", title: "What changed between the two runs", aside: html`compared with ${lnk(`the run ${fmtAge(other.submitted_at, Date.parse(r.submitted_at))} earlier`, runHref(other.run_id))} · ${other.status}`, right: select(cands.slice(0, 20).map((x) => [x.run_id, `vs. ${shortDate(x.submitted_at)} · ${x.status}`]), other.run_id, { name: "cmp-with", cls: "ru-sm" }),
+    return html`${card({ icon: "diff", title: "What changed between the two runs", aside: html`against ${lnk(`the run ${fmtAge(other.submitted_at, Date.parse(r.submitted_at))} earlier`, runHref(other.run_id))}`, right: select(cands.slice(0, 20).map((x) => [x.run_id, `vs. ${shortDate(x.submitted_at)} · ${x.status === "completed" ? "succeeded" : x.status}`]), other.run_id, { name: "cmp-with", cls: "ru-sm" }),
       body: tbl(["", ["This run", "num"], ["Previous", "num"], ["Change", "num"]], rows) })}${cfgCard}`;
   }
   async function loadPrev(r) {
