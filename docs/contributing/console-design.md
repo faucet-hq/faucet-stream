@@ -154,3 +154,5 @@ sizes; "Loading…" text.
    becomes a component in `components.js` + `styles.css`.
 5. Render every state in both themes at 1440 and 1000px against the mock PNGs,
    click everything, and check the browser console is clean.
+
+The functionality walk for the redesign (every old capability ✅ / ⚠️ / ❌ / 🆕) is in [console-inventory.md](console-inventory.md).
