@@ -4,7 +4,8 @@
 
 <p align="center">
   <a href="https://github.com/faucet-hq/faucet-stream/releases?q=faucet-cli&expanded=true"><img src="https://img.shields.io/crates/v/faucet-cli.svg?label=faucet" alt="faucet release (CLI, Docker image, binaries)"></a>
-  <a href="https://crates.io/crates/faucet-stream"><img src="https://img.shields.io/crates/v/faucet-stream.svg?label=library" alt="faucet-stream library on crates.io"></a>
+  <!-- Disabling it for now as it can be confusing:
+  <a href="https://crates.io/crates/faucet-stream"><img src="https://img.shields.io/crates/v/faucet-stream.svg?label=library" alt="faucet-stream library on crates.io"></a>-->
   <a href="https://docs.rs/faucet-stream"><img src="https://docs.rs/faucet-stream/badge.svg" alt="Docs.rs"></a>
   <a href="https://faucet-hq.github.io/faucet-stream/"><img src="https://img.shields.io/badge/guide-faucet--hq.github.io-1f6feb" alt="Guide"></a>
   <a href="https://github.com/faucet-hq/faucet-stream/actions/workflows/ci.yml"><img src="https://github.com/faucet-hq/faucet-stream/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
