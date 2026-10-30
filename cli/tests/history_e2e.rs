@@ -67,6 +67,7 @@ fn record(id: &str, row_id: &str) -> RunRecord {
         caller_params: Default::default(),
         pool: "default".into(),
         submitted_by: None,
+        dlq_location: None,
     }
 }
 

@@ -279,6 +279,27 @@ pub fn usage_options(
 /// Run label naming the pipeline (`cfg.name`, else `serve`) a run belongs to.
 pub const LABEL_PIPELINE: &str = "pipeline";
 
+/// DLQ sink kinds that write local files `POST /v1/dlq/inspect` can read.
+const LOCAL_DLQ_KINDS: &[&str] = &["file", "jsonl"];
+
+/// The local path a submission's dead-letter queue writes to (#998): the
+/// `path` of the first row's (else the pipeline's) `dlq:` sink when that sink
+/// writes local files. Credentials in a URL-shaped path are masked.
+pub fn dlq_location(loaded: &crate::serve::load::LoadedSubmission) -> Option<String> {
+    let spec = loaded.nodes.iter().find_map(|n| n.dlq.as_ref()).or(loaded
+        .cfg
+        .pipeline
+        .dlq
+        .as_ref())?;
+    if !LOCAL_DLQ_KINDS.contains(&spec.sink.kind.as_str()) {
+        return None;
+    }
+    let path = spec.sink.config.get("path")?.as_str()?;
+    (!path.is_empty()).then(|| {
+        crate::secrets::registry::redact_message(&faucet_core::util::redact_uri_credentials(path))
+    })
+}
+
 /// Wire enum mirroring `load::ConfigFormat` with serde rename.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1116,6 +1137,7 @@ pub(crate) async fn enqueue(
         .clone()
         .unwrap_or_else(crate::serve::pools::default_pool);
     rec.submitted_by = Some(actor.principal.clone());
+    rec.dlq_location = dlq_location(&loaded);
 
     if state.cluster().enabled() {
         // A degraded (DB-unreachable) backend can't coordinate a cluster: the

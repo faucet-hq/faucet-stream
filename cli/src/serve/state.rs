@@ -34,6 +34,8 @@ struct Inner {
     default_base: RwLock<Option<Value>>,
     /// Path the default-config was loaded from, so a reload can re-read it.
     default_config_path: Option<PathBuf>,
+    /// When the current merge base was loaded (startup or the last reload).
+    default_loaded_at: RwLock<Option<chrono::DateTime<chrono::Utc>>>,
     idempotency_retention: Duration,
     probe_timeout: Duration,
     /// Default retention window (days) for local sink outputs (#587), so the
@@ -109,6 +111,7 @@ impl ServerState {
                 history,
                 log_hub,
                 log_export: Arc::new(crate::serve::log_export::LogExport::from_config(config)),
+                default_loaded_at: RwLock::new(default_base.as_ref().map(|_| chrono::Utc::now())),
                 default_base: RwLock::new(default_base),
                 default_config_path: config.default_config_path.clone(),
                 idempotency_retention: config.idempotency_retention,
@@ -381,7 +384,14 @@ impl ServerState {
 
     /// Atomically swap the `--default-config` merge base (hot reload, #198).
     pub fn set_default_base(&self, base: Option<Value>) {
+        *self.inner.default_loaded_at.write().unwrap() = base.as_ref().map(|_| chrono::Utc::now());
         *self.inner.default_base.write().unwrap() = base;
+    }
+
+    /// When the current `--default-config` merge base was loaded (#998):
+    /// at startup or by the last reload; `None` without one.
+    pub fn default_loaded_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        *self.inner.default_loaded_at.read().unwrap()
     }
 
     pub fn idempotency_retention(&self) -> Duration {

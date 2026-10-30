@@ -20,6 +20,41 @@ use super::{HistoryError, RunRecord, RunStatus, Transience};
 use chrono::{DateTime, Utc};
 use std::time::Duration;
 
+/// One `faucet_serve_audit` row (joined with its tenant) as an entry.
+pub fn decode_audit_row<R>(
+    r: &R,
+) -> Result<crate::serve::history::AuditEntry, crate::serve::history::HistoryError>
+where
+    R: sqlx::Row,
+    for<'a> &'a str: sqlx::ColumnIndex<R>,
+    for<'a> String: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> Option<String>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+{
+    let backend = classify_backend_error;
+    let ts: String = r.try_get("ts").map_err(backend)?;
+    Ok(crate::serve::history::AuditEntry {
+        id: r.try_get("id").map_err(backend)?,
+        timestamp: parse_ts(&ts),
+        principal: r.try_get("principal").map_err(backend)?,
+        role: r.try_get("role").map_err(backend)?,
+        action: r.try_get("action").map_err(backend)?,
+        run_id: r.try_get("run_id").map_err(backend)?,
+        config_fingerprint: r.try_get("config_fingerprint").map_err(backend)?,
+        source_ip: r.try_get("source_ip").map_err(backend)?,
+        tenant: r.try_get("tenant").map_err(backend)?,
+        target: r.try_get("target").map_err(backend)?,
+        detail: r.try_get("detail").map_err(backend)?,
+        result: r.try_get("result").map_err(backend)?,
+    })
+}
+
+/// The `LIKE` pattern matching a run body whose usage record names the
+/// dataset `id` (#998). `serde_json` writes the field without spaces.
+pub fn dataset_like(id: &str) -> String {
+    debug_assert!(crate::serve::history::is_dataset_id(id));
+    format!("%\"dataset_id\":\"{id}\"%")
+}
+
 /// The schema version this binary writes (#789 SERVE-33 / SUPPLY-19), kept
 /// in `faucet_serve_schema`. A database stamped with a newer version is
 /// refused at startup instead of being written by code that does not know
@@ -888,6 +923,8 @@ pub struct Stmts {
     pub list_audit: String,
     /// Purge audit records older than a threshold (retention).
     pub purge_audit: String,
+    /// One audit record by id (#998), with its tenant.
+    pub get_audit: String,
     pub insert_audit_tenant: String,
     pub purge_audit_tenants: String,
     // ── Persistent run logs (#529) ────────────────────────────────────────────
@@ -1319,13 +1356,14 @@ impl Stmts {
     pub const LIST_BINDS: usize = 16;
 
     /// The run-listing query: [`Stmts::list`]'s sixteen binds, then one
-    /// clause per label filter, then the `LIMIT` bind. Returns the SQL and the
-    /// label binds, in bind order (#958).
+    /// clause per label filter (#958) and the dataset clause (#998), then the
+    /// `LIMIT` bind. Returns the SQL and the extra binds, in bind order.
     pub fn list_query(
         &self,
         labels: &[crate::serve::history::labels::LabelFilter],
+        dataset_id: Option<&str>,
     ) -> (String, Vec<String>) {
-        let (mut sql, binds) = self.label_clauses(self.list.clone(), labels);
+        let (mut sql, binds) = self.label_clauses(self.list.clone(), labels, dataset_id);
         sql.push_str(&format!(
             " ORDER BY submitted_at DESC, run_id DESC LIMIT {}",
             self.placeholder(Self::LIST_BINDS + 1 + binds.len())
@@ -1339,11 +1377,12 @@ impl Stmts {
     pub fn count_query(
         &self,
         labels: &[crate::serve::history::labels::LabelFilter],
+        dataset_id: Option<&str>,
     ) -> (String, Vec<String>) {
         let base = self
             .list
             .replacen("SELECT body FROM", "SELECT status, COUNT(*) AS n FROM", 1);
-        let (mut sql, binds) = self.label_clauses(base, labels);
+        let (mut sql, binds) = self.label_clauses(base, labels, dataset_id);
         sql.push_str(" GROUP BY status");
         (sql, binds)
     }
@@ -1352,8 +1391,19 @@ impl Stmts {
         &self,
         mut sql: String,
         labels: &[crate::serve::history::labels::LabelFilter],
+        dataset_id: Option<&str>,
     ) -> (String, Vec<String>) {
         let mut binds = Vec::new();
+        // A run names its sink dataset only inside the stored record (each
+        // invocation's usage), so match the serialized field. The id is
+        // checked by `is_dataset_id` first: no LIKE wildcard can reach here.
+        if let Some(id) = dataset_id {
+            binds.push(dataset_like(id));
+            sql.push_str(&format!(
+                " AND body LIKE {}",
+                self.placeholder(Self::LIST_BINDS + binds.len())
+            ));
+        }
         for f in labels {
             binds.push(f.key.clone());
             let key = self.placeholder(Self::LIST_BINDS + binds.len());
@@ -1648,9 +1698,18 @@ impl Stmts {
                 AND ($5::text IS NULL OR ts >= $6::text) \
                 AND ($7::text IS NULL OR ts <= $8::text) \
                 AND ($9::text IS NULL OR t.tenant = $10::text) \
-                ORDER BY a.ts DESC, a.id DESC LIMIT $11"
+                AND ($11::text IS NULL OR result = $12::text) \
+                AND ($13::text IS NULL OR a.ts < (SELECT ts FROM faucet_serve_audit WHERE id = $14::text) \
+                    OR (a.ts = (SELECT ts FROM faucet_serve_audit WHERE id = $15::text) AND a.id < $16::text)) \
+                ORDER BY a.ts DESC, a.id DESC LIMIT $17"
                 .into(),
             purge_audit: "DELETE FROM faucet_serve_audit WHERE ts < $1".into(),
+            get_audit: "SELECT a.id AS id, ts, principal, role, action, run_id, \
+                config_fingerprint, source_ip, result, a.target AS target, a.detail AS detail, \
+                t.tenant AS tenant \
+                FROM faucet_serve_audit a LEFT JOIN faucet_serve_audit_tenants t ON t.id = a.id \
+                WHERE a.id = $1"
+                .into(),
             insert_audit_tenant: "INSERT INTO faucet_serve_audit_tenants (id, tenant) \
                 VALUES ($1,$2) ON CONFLICT (id) DO NOTHING"
                 .into(),
@@ -2258,9 +2317,18 @@ impl Stmts {
                 AND (? IS NULL OR ts >= ?) \
                 AND (? IS NULL OR ts <= ?) \
                 AND (? IS NULL OR t.tenant = ?) \
+                AND (? IS NULL OR result = ?) \
+                AND (? IS NULL OR a.ts < (SELECT ts FROM faucet_serve_audit WHERE id = ?) \
+                    OR (a.ts = (SELECT ts FROM faucet_serve_audit WHERE id = ?) AND a.id < ?)) \
                 ORDER BY a.ts DESC, a.id DESC LIMIT ?"
                 .into(),
             purge_audit: "DELETE FROM faucet_serve_audit WHERE ts < ?".into(),
+            get_audit: "SELECT a.id AS id, ts, principal, role, action, run_id, \
+                config_fingerprint, source_ip, result, a.target AS target, a.detail AS detail, \
+                t.tenant AS tenant \
+                FROM faucet_serve_audit a LEFT JOIN faucet_serve_audit_tenants t ON t.id = a.id \
+                WHERE a.id = ?"
+                .into(),
             insert_audit_tenant: "INSERT INTO faucet_serve_audit_tenants (id, tenant) \
                 VALUES (?,?) ON CONFLICT (id) DO NOTHING"
                 .into(),
@@ -3307,7 +3375,9 @@ macro_rules! impl_sql_history {
                 let limit = filter.limit.max(1);
                 let fetch_n = limit as i64 + 1; // +1 to detect a next page
 
-                let (list_sql, label_binds) = self.stmts.list_query(&filter.labels);
+                let (list_sql, label_binds) = self
+                    .stmts
+                    .list_query(&filter.labels, filter.dataset_id.as_deref());
                 let mut q = sqlx::query(&list_sql)
                     .bind(status_s)
                     .bind(status_s)
@@ -3370,7 +3440,9 @@ macro_rules! impl_sql_history {
                 let since_s = filter.since.map(sql::fmt_ts);
                 let until_s = filter.until.map(sql::fmt_ts);
                 let none: Option<&str> = None;
-                let (count_sql, label_binds) = self.stmts.count_query(&filter.labels);
+                let (count_sql, label_binds) = self
+                    .stmts
+                    .count_query(&filter.labels, filter.dataset_id.as_deref());
                 let mut q = sqlx::query(&count_sql)
                     .bind(status_s.as_deref())
                     .bind(status_s.as_deref())
@@ -4590,14 +4662,14 @@ macro_rules! impl_sql_history {
                 Vec<$crate::serve::history::AuditEntry>,
                 $crate::serve::history::HistoryError,
             > {
-                use sqlx::Row as _;
-                use $crate::serve::history::AuditEntry;
                 use $crate::serve::history::sql;
                 let backend = $crate::serve::history::sql::classify_backend_error;
                 let principal = filter.principal.as_deref();
                 let action = filter.action.as_deref();
                 let since = filter.since.map(sql::fmt_ts);
                 let until = filter.until.map(sql::fmt_ts);
+                let result = filter.result.as_deref();
+                let before = filter.before.as_deref();
                 let limit = filter.limit.max(1) as i64;
                 let rows = sqlx::query(&self.stmts.list_audit)
                     .bind(principal)
@@ -4610,30 +4682,35 @@ macro_rules! impl_sql_history {
                     .bind(until.as_deref())
                     .bind(filter.tenant.as_deref())
                     .bind(filter.tenant.as_deref())
+                    .bind(result)
+                    .bind(result)
+                    .bind(before)
+                    .bind(before)
+                    .bind(before)
+                    .bind(before)
                     .bind(limit)
                     .fetch_all(&self.pool)
                     .await
                     .map_err(backend)?;
-                let mut out = Vec::with_capacity(rows.len());
-                for r in &rows {
-                    let ts: String = r.try_get("ts").map_err(backend)?;
-                    let timestamp = $crate::serve::history::sql::parse_ts(&ts);
-                    out.push(AuditEntry {
-                        id: r.try_get("id").map_err(backend)?,
-                        timestamp,
-                        principal: r.try_get("principal").map_err(backend)?,
-                        role: r.try_get("role").map_err(backend)?,
-                        action: r.try_get("action").map_err(backend)?,
-                        run_id: r.try_get("run_id").map_err(backend)?,
-                        config_fingerprint: r.try_get("config_fingerprint").map_err(backend)?,
-                        source_ip: r.try_get("source_ip").map_err(backend)?,
-                        tenant: r.try_get("tenant").map_err(backend)?,
-                        target: r.try_get("target").map_err(backend)?,
-                        detail: r.try_get("detail").map_err(backend)?,
-                        result: r.try_get("result").map_err(backend)?,
-                    });
-                }
-                Ok(out)
+                rows.iter().map(sql::decode_audit_row).collect()
+            }
+
+            async fn get_audit(
+                &self,
+                id: &str,
+            ) -> Result<
+                Option<$crate::serve::history::AuditEntry>,
+                $crate::serve::history::HistoryError,
+            > {
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let row = sqlx::query(&self.stmts.get_audit)
+                    .bind(id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                row.as_ref()
+                    .map($crate::serve::history::sql::decode_audit_row)
+                    .transpose()
             }
 
             // ── Persistent run logs (#529) ────────────────────────────────────
@@ -7439,7 +7516,7 @@ mod tests {
         let lite = Stmts::new(Dialect::Sqlite);
         assert!(pg.upsert.contains("$1") && lite.upsert.contains('?'));
         assert!(pg.list.contains("$13") && lite.list.contains('?'));
-        let (q, _) = pg.list_query(&[]);
+        let (q, _) = pg.list_query(&[], None);
         assert!(
             q.ends_with(&format!("LIMIT ${}", Stmts::LIST_BINDS + 1)),
             "{q}"
@@ -7459,7 +7536,7 @@ mod tests {
             LabelFilter::parse("team:data").unwrap(),
             LabelFilter::parse("env").unwrap(),
         ];
-        let (q, binds) = Stmts::new(Dialect::Postgres).list_query(&f);
+        let (q, binds) = Stmts::new(Dialect::Postgres).list_query(&f, None);
         assert_eq!(binds, ["team", "data", "env"]);
         // The submitter filter (#998) takes binds 15 and 16, so labels start at 17.
         assert!(q.contains("submitted_by = $16::text"), "{q}");
@@ -7469,7 +7546,7 @@ mod tests {
             q.ends_with("ORDER BY submitted_at DESC, run_id DESC LIMIT $20"),
             "{q}"
         );
-        let (q, binds) = Stmts::new(Dialect::Sqlite).list_query(&f);
+        let (q, binds) = Stmts::new(Dialect::Sqlite).list_query(&f, None);
         assert_eq!(binds.len(), 3);
         assert_eq!(q.matches("faucet_serve_run_labels").count(), 2);
         assert!(q.ends_with("LIMIT ?"), "{q}");
@@ -7479,7 +7556,7 @@ mod tests {
     fn count_query_groups_the_list_filter_by_status_without_a_limit() {
         use crate::serve::history::labels::LabelFilter;
         let f = [LabelFilter::parse("team:data").unwrap()];
-        let (q, binds) = Stmts::new(Dialect::Postgres).count_query(&f);
+        let (q, binds) = Stmts::new(Dialect::Postgres).count_query(&f, None);
         assert_eq!(binds, ["team", "data"]);
         assert!(
             q.starts_with("SELECT status, COUNT(*) AS n FROM faucet_serve_runs"),
@@ -7488,9 +7565,20 @@ mod tests {
         assert!(q.contains("WHERE key = $17 AND value = $18)"), "{q}");
         assert!(q.ends_with(" GROUP BY status"), "{q}");
         assert!(!q.contains("LIMIT") && !q.contains("ORDER BY"), "{q}");
-        let (q, binds) = Stmts::new(Dialect::Sqlite).count_query(&[]);
+        let (q, binds) = Stmts::new(Dialect::Sqlite).count_query(&[], None);
         assert!(binds.is_empty());
         assert_eq!(q.matches('?').count(), Stmts::LIST_BINDS, "{q}");
+    }
+
+    #[test]
+    fn a_dataset_filter_matches_the_stored_usage_field_before_the_limit() {
+        let (q, binds) = Stmts::new(Dialect::Postgres).list_query(&[], Some("471f19a6"));
+        assert_eq!(binds, [r#"%"dataset_id":"471f19a6"%"#]);
+        assert!(q.contains("AND body LIKE $17 ORDER BY"), "{q}");
+        assert!(q.ends_with("LIMIT $18"), "{q}");
+        let (q, binds) = Stmts::new(Dialect::Sqlite).count_query(&[], Some("ab-1"));
+        assert_eq!(binds.len(), 1);
+        assert!(q.contains("AND body LIKE ? GROUP BY status"), "{q}");
     }
 
     #[test]

@@ -473,6 +473,58 @@ pub struct TestsView {
 /// How many recent runs the template detail carries per version.
 const DETAIL_TEST_RUNS: usize = 5;
 
+/// `GET /v1/templates/{id}/runs` query string (#998).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemplateRunsQuery {
+    /// Page size, 1–500 (default 50).
+    pub limit: Option<usize>,
+    /// `next_cursor` of the previous page.
+    pub cursor: Option<String>,
+}
+
+/// `GET /v1/templates/{id}/runs` → 200 the runs started from this template
+/// (newest first; the `template` run label), paged like `GET /v1/runs` / 404
+/// for an id that was never registered. A tenant-scoped caller sees only its
+/// own tenant's runs.
+pub async fn list_template_runs(
+    State(server): State<ServerState>,
+    Extension(actor): Extension<AuthContext>,
+    Path(id): Path<String>,
+    Query(q): Query<TemplateRunsQuery>,
+) -> Result<Json<crate::serve::handlers::runs::ListResponse>, ServeError> {
+    let s = store(&server);
+    if s.template_get(&id, None)
+        .await
+        .map_err(|e| ServeError::Internal(e.to_string()))?
+        .is_none()
+    {
+        return Err(ServeError::NotFound);
+    }
+    let filter = crate::serve::history::ListFilter {
+        limit: q.limit.unwrap_or(50).clamp(1, 500),
+        cursor: q.cursor,
+        tenant: actor.tenant_filter(None)?,
+        labels: vec![crate::serve::history::labels::LabelFilter {
+            key: LABEL_TEMPLATE.to_string(),
+            value: Some(id.clone()),
+        }],
+        ..Default::default()
+    };
+    let history = server.history();
+    let (page, counts) = tokio::try_join!(history.list(&filter), history.count_by_status(&filter))
+        .map_err(|e| ServeError::Internal(e.to_string()))?;
+    let mut runs = page.runs;
+    for rec in &mut runs {
+        crate::serve::handlers::runs::redact_record(rec, &actor);
+    }
+    Ok(Json(crate::serve::handlers::runs::ListResponse {
+        runs,
+        next_cursor: page.next_cursor,
+        counts,
+    }))
+}
+
 /// `GET /v1/templates/{id}[?version=N]` → 200 / 404.
 pub async fn get_template(
     State(server): State<ServerState>,

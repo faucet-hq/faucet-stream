@@ -516,6 +516,9 @@ impl RunHistory for FallbackHistory {
     async fn list_audit(&self, filter: &AuditFilter) -> Result<Vec<AuditEntry>, HistoryError> {
         via!(self, p => p.list_audit(filter), f => f.list_audit(filter))
     }
+    async fn get_audit(&self, id: &str) -> Result<Option<AuditEntry>, HistoryError> {
+        via!(self, p => p.get_audit(id), f => f.get_audit(id))
+    }
 
     // ── Persistent run logs (#529) ────────────────────────────────────────────
 

@@ -232,6 +232,8 @@ pub struct ListQuery {
     /// `mine=true`: only runs the caller submitted (#998).
     #[serde(default)]
     pub mine: bool,
+    /// Only runs that wrote this catalog dataset (its id) (#998).
+    pub dataset_id: Option<String>,
     /// Repeatable `label=key:value` / `label=key` filters, ANDed (#958).
     #[serde(skip)]
     pub label: Vec<String>,
@@ -313,8 +315,16 @@ impl ListQuery {
                 ));
             }
         };
+        if let Some(d) = self.dataset_id.as_deref()
+            && !crate::serve::history::is_dataset_id(d)
+        {
+            return Err(ServeError::BadConfig(format!(
+                "invalid `dataset_id` '{d}': a catalog dataset id is letters, digits and `-`"
+            )));
+        }
         Ok(ListFilter {
             submitted_by,
+            dataset_id: self.dataset_id,
             status,
             name: self.name,
             since: self.since.map(|p| p.0),
@@ -347,6 +357,104 @@ pub async fn list_runs(
         runs,
         next_cursor: page.next_cursor,
         counts,
+    }))
+}
+
+/// `GET /v1/runs/{id}/config` response body (#998).
+#[derive(Debug, Serialize)]
+pub struct RunConfigResponse {
+    /// `yaml` or `json`, as submitted.
+    pub format: crate::serve::load::ConfigFormat,
+    /// The stored config. Sealed secret params stay `${sealed:N}` tokens.
+    pub body: String,
+    /// Whether values were masked: credential-looking keys for anyone but an
+    /// unscoped admin, and registered secrets for everyone.
+    pub redacted: bool,
+}
+
+/// The mask written over a credential-looking value.
+const MASK: &str = "***";
+
+/// Mask every string value under a credential-looking key (and every scalar
+/// below one) in a parsed config, keeping `${…}` references, which name a
+/// secret rather than hold it. Returns whether anything was masked.
+fn mask_credentials(v: &mut serde_json::Value, under_secret: bool) -> bool {
+    use serde_json::Value;
+    match v {
+        Value::Object(map) => {
+            let mut masked = false;
+            for (k, child) in map.iter_mut() {
+                let secret = under_secret || crate::hub::catalog::is_secret_key(k);
+                masked |= mask_credentials(child, secret);
+            }
+            masked
+        }
+        Value::Array(items) => items
+            .iter_mut()
+            .fold(false, |m, child| mask_credentials(child, under_secret) | m),
+        Value::String(s) if under_secret && !s.contains("${") && !s.is_empty() => {
+            *s = MASK.to_string();
+            true
+        }
+        Value::Number(_) | Value::Bool(_) if under_secret => {
+            *v = Value::String(MASK.to_string());
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The stored body as a viewer may see it: re-rendered in its own format with
+/// credentials masked, or `None` when it does not parse (then nothing of it
+/// is shown).
+fn masked_body(body: &str, format: crate::serve::load::ConfigFormat) -> Option<(String, bool)> {
+    let mut doc: serde_json::Value = crate::yaml::from_str(body).ok()?;
+    let masked = mask_credentials(&mut doc, false);
+    let out = match format {
+        crate::serve::load::ConfigFormat::Json => serde_json::to_string_pretty(&doc).ok()?,
+        crate::serve::load::ConfigFormat::Yaml => crate::yaml::to_string(&doc).ok()?,
+    };
+    Some((out, masked))
+}
+
+/// `GET /v1/runs/{id}/config` → 200 the run's stored config / 404 when the
+/// run is unknown, belongs to another tenant, or no config was stored (only
+/// clustered runs store one). An unscoped admin gets the body as stored;
+/// everyone else gets it with credential-looking values masked. Audited as
+/// `run.config`.
+pub async fn get_run_config(
+    State(state): State<ServerState>,
+    Extension(actor): Extension<AuthContext>,
+    Path(id): Path<String>,
+) -> Result<Json<RunConfigResponse>, ServeError> {
+    let rec = state
+        .history()
+        .get(&id)
+        .await
+        .map_err(|e| ServeError::Internal(e.to_string()))?
+        .ok_or(ServeError::NotFound)?;
+    if !actor.sees_tenant(rec.tenant.as_deref()) {
+        return Err(ServeError::NotFound);
+    }
+    let Some(stored) = rec.config_body.as_deref() else {
+        return Err(ServeError::NotFound);
+    };
+    let format = rec.config_format.unwrap_or_default();
+    let full = actor.role == crate::serve::rbac::Role::Admin && actor.tenant.is_none();
+    let (body, masked) = if full {
+        (stored.to_string(), false)
+    } else {
+        masked_body(stored, format).ok_or_else(|| {
+            ServeError::Internal("the stored config does not parse; it is not shown".into())
+        })?
+    };
+    let scrubbed = crate::secrets::registry::redact_message(&body);
+    let redacted = masked || scrubbed != body;
+    crate::serve::audit::write(&state, &actor, "run.config", Some(id), None, "ok").await;
+    Ok(Json(RunConfigResponse {
+        format,
+        body: scrubbed,
+        redacted,
     }))
 }
 

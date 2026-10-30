@@ -358,24 +358,37 @@ impl RunHistory for MemoryHistory {
             .audit
             .lock()
             .map_err(|_| HistoryError::Backend("audit ring lock poisoned".into()))?;
+        // The cursor is the position of the entry `before` names; one no longer
+        // in the ring yields nothing older, as on the SQL backends.
+        let cursor = match filter.before.as_deref() {
+            Some(id) => match ring.iter().find(|e| e.id == id) {
+                Some(e) => Some((e.timestamp, e.id.clone())),
+                None => return Ok(Vec::new()),
+            },
+            None => None,
+        };
         let mut rows: Vec<AuditEntry> = ring
             .iter()
-            .filter(|e| filter.principal.as_deref().is_none_or(|p| e.principal == p))
-            .filter(|e| filter.action.as_deref().is_none_or(|a| e.action == a))
+            .filter(|e| filter.matches(e))
             .filter(|e| {
-                filter
-                    .tenant
-                    .as_deref()
-                    .is_none_or(|t| e.tenant.as_deref() == Some(t))
+                cursor
+                    .as_ref()
+                    .is_none_or(|(ts, id)| (e.timestamp, &e.id) < (*ts, id))
             })
-            .filter(|e| filter.since.is_none_or(|t| e.timestamp >= t))
-            .filter(|e| filter.until.is_none_or(|t| e.timestamp <= t))
             .cloned()
             .collect();
         // Newest first (timestamp DESC, id DESC).
         rows.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then_with(|| b.id.cmp(&a.id)));
         rows.truncate(filter.limit.max(1));
         Ok(rows)
+    }
+
+    async fn get_audit(&self, id: &str) -> Result<Option<AuditEntry>, HistoryError> {
+        let ring = self
+            .audit
+            .lock()
+            .map_err(|_| HistoryError::Backend("audit ring lock poisoned".into()))?;
+        Ok(ring.iter().find(|e| e.id == id).cloned())
     }
 
     // ── Persistent run logs (#529) ────────────────────────────────────────────

@@ -573,6 +573,8 @@ pub fn required_permission(method: &Method, matched_path: &str) -> Option<Permis
         (&Method::DELETE, "/v1/runs/{id}") => Some(RunWrite),
         (&Method::POST, "/v1/runs/{id}/cancel") => Some(RunWrite),
         (&Method::GET, "/v1/runs/{id}/logs") => Some(RunRead),
+        // A run's stored config (#998): masked below an unscoped admin.
+        (&Method::GET, "/v1/runs/{id}/config") => Some(RunRead),
         // Fleet overview (#1006): aggregates of what `GET /v1/runs` lists.
         (&Method::GET, "/v1/overview") => Some(RunRead),
         (&Method::GET, "/v1/schemas") => Some(SchemaRead),
@@ -590,6 +592,9 @@ pub fn required_permission(method: &Method, matched_path: &str) -> Option<Permis
         (&Method::POST, "/v1/dlq/replay") => Some(DlqManage),
         (&Method::POST, "/v1/dlq/discard") => Some(DlqManage),
         (&Method::GET, "/v1/audit") => Some(AuditRead),
+        (&Method::GET, "/v1/audit/{id}") => Some(AuditRead),
+        // The configured triggers and their health (#998): a read, viewer+.
+        (&Method::GET, "/v1/triggers") => Some(StatusRead),
         (&Method::POST, "/v1/triggers/{name}") => Some(TriggerFire),
         (&Method::PUT, "/v1/triggers/{name}") => Some(TriggerFire),
         (&Method::GET, "/v1/catalog/datasets") => Some(CatalogRead),
@@ -635,6 +640,7 @@ pub fn required_permission(method: &Method, matched_path: &str) -> Option<Permis
         (&Method::GET, "/v1/templates/{id}/rows") => Some(TemplateRead),
         (&Method::DELETE, "/v1/templates/{id}") => Some(TemplateAdmin),
         (&Method::POST, "/v1/templates/{id}/runs") => Some(RunWrite),
+        (&Method::GET, "/v1/templates/{id}/runs") => Some(TemplateRead),
         (&Method::POST, "/v1/templates/{id}/tags") => Some(TemplateAdmin),
         (&Method::POST, "/v1/templates/{id}/launch") => Some(TemplateAdmin),
         (&Method::POST, "/v1/templates/{id}/rollback") => Some(TemplateAdmin),
@@ -723,12 +729,14 @@ pub fn tenant_scope_decision(
         | (_, "/v1/runs/{id}")
         | (_, "/v1/runs/{id}/cancel")
         | (_, "/v1/runs/{id}/logs")
+        | (&Method::GET, "/v1/runs/{id}/config")
         | (&Method::GET, "/v1/overview")
         | (&Method::GET, "/v1/schemas")
         | (&Method::GET, "/v1/schemas/{kind}/{name}")
         | (&Method::GET, "/v1/templates")
         | (&Method::GET, "/v1/templates/{id}")
         | (&Method::GET, "/v1/templates/{id}/rows")
+        | (&Method::GET, "/v1/templates/{id}/runs")
         | (&Method::GET, "/v1/templates/{id}/versions/{version}/tests")
         | (_, "/v1/changes")
         | (_, "/v1/changes/counts")
@@ -751,6 +759,7 @@ pub fn audit_action(method: &Method, matched_path: &str) -> &'static str {
         (&Method::DELETE, "/v1/runs/{id}") => "run.delete",
         (&Method::POST, "/v1/runs/{id}/cancel") => "run.cancel",
         (&Method::GET, "/v1/runs/{id}/logs") => "run.logs",
+        (&Method::GET, "/v1/runs/{id}/config") => "run.config",
         (&Method::GET, "/v1/overview") => "overview.get",
         (&Method::GET, "/v1/schemas") => "schema.list",
         (&Method::GET, "/v1/schemas/{kind}/{name}") => "schema.get",
@@ -763,6 +772,8 @@ pub fn audit_action(method: &Method, matched_path: &str) -> &'static str {
         (&Method::POST, "/v1/dlq/replay") => "dlq.replay",
         (&Method::POST, "/v1/dlq/discard") => "dlq.discard",
         (&Method::GET, "/v1/audit") => "audit.list",
+        (&Method::GET, "/v1/audit/{id}") => "audit.get",
+        (&Method::GET, "/v1/triggers") => "trigger.list",
         (&Method::POST | &Method::PUT, "/v1/triggers/{name}") => "trigger.fire",
         (&Method::GET, "/v1/catalog/datasets") => "catalog.list",
         (&Method::GET, "/v1/catalog/datasets/{id}") => "catalog.get",
@@ -790,6 +801,7 @@ pub fn audit_action(method: &Method, matched_path: &str) -> &'static str {
         (&Method::GET, "/v1/templates/{id}/rows") => "template.rows",
         (&Method::DELETE, "/v1/templates/{id}") => "template.delete",
         (&Method::POST, "/v1/templates/{id}/runs") => "template.run",
+        (&Method::GET, "/v1/templates/{id}/runs") => "template.runs",
         (&Method::POST, "/v1/templates/{id}/tags") => "template.promote",
         (&Method::POST, "/v1/templates/{id}/launch") => "template.launch",
         (&Method::POST, "/v1/templates/{id}/rollback") => "template.rollback",

@@ -270,6 +270,13 @@ pub struct RunRecord {
     /// `None` for runs recorded before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submitted_by: Option<String>,
+    /// Where the run's dead-letter queue writes (#998): the `path` of the
+    /// config's `dlq:` sink as configured at submit, when that sink writes
+    /// local files — the location `POST /v1/dlq/inspect` takes. Set only by
+    /// the server; `None` without a file DLQ or for runs recorded before the
+    /// field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dlq_location: Option<String>,
 }
 
 impl RunRecord {
@@ -311,7 +318,16 @@ impl RunRecord {
             caller_params: Default::default(),
             pool: crate::serve::pools::default_pool(),
             submitted_by: None,
+            dlq_location: None,
         }
+    }
+
+    /// Whether any invocation of this run read or wrote the catalog dataset
+    /// `dataset_id` (#998): the id its usage record names.
+    pub fn touches_dataset(&self, dataset_id: &str) -> bool {
+        self.invocations
+            .iter()
+            .any(|inv| inv.usage.as_ref().and_then(|u| u.dataset_id.as_deref()) == Some(dataset_id))
     }
 }
 
@@ -401,6 +417,16 @@ pub struct ListFilter {
     pub labels: Vec<labels::LabelFilter>,
     /// Only runs this principal submitted (#998).
     pub submitted_by: Option<String>,
+    /// Only runs one of whose invocations names this catalog dataset in its
+    /// usage record (#998). Must pass [`is_dataset_id`].
+    pub dataset_id: Option<String>,
+}
+
+/// Whether `s` has the shape of a catalog dataset id (#998): 1–64 ASCII
+/// letters, digits or `-`. The SQL backends match the id inside the stored
+/// record text, so anything else is refused before it reaches a query.
+pub fn is_dataset_id(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
 impl ListFilter {
@@ -421,6 +447,10 @@ impl ListFilter {
                 .submitted_by
                 .as_deref()
                 .is_none_or(|p| rec.submitted_by.as_deref() == Some(p))
+            && self
+                .dataset_id
+                .as_deref()
+                .is_none_or(|d| rec.touches_dataset(d))
             && labels::matches_all(&self.labels, &rec.labels)
     }
 }
@@ -685,8 +715,7 @@ pub struct AuditEntry {
     pub result: String,
 }
 
-/// Filter + limit for `list_audit` (newest-first). No cursor: a bounded,
-/// most-recent view is the audit-console primitive.
+/// Filter + limit for `list_audit` (newest-first, by timestamp then id).
 #[derive(Debug, Default, Clone)]
 pub struct AuditFilter {
     pub principal: Option<String>,
@@ -695,7 +724,27 @@ pub struct AuditFilter {
     pub action: Option<String>,
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
+    /// Only entries with this outcome (`ok`, `denied`, …) (#998).
+    pub result: Option<String>,
+    /// Keyset cursor (#998): only entries listed after the entry with this
+    /// id in newest-first order. An id no longer stored yields nothing older.
+    pub before: Option<String>,
     pub limit: usize,
+}
+
+impl AuditFilter {
+    /// Whether `e` passes every filter except `before` and the limit.
+    pub fn matches(&self, e: &AuditEntry) -> bool {
+        self.principal.as_deref().is_none_or(|p| e.principal == p)
+            && self.action.as_deref().is_none_or(|a| e.action == a)
+            && self.result.as_deref().is_none_or(|r| e.result == r)
+            && self
+                .tenant
+                .as_deref()
+                .is_none_or(|t| e.tenant.as_deref() == Some(t))
+            && self.since.is_none_or(|t| e.timestamp >= t)
+            && self.until.is_none_or(|t| e.timestamp <= t)
+    }
 }
 
 /// One persisted log line for a completed run (#529). Stored in
@@ -1204,6 +1253,12 @@ pub trait RunHistory: Send + Sync {
     async fn list_audit(&self, filter: &AuditFilter) -> Result<Vec<AuditEntry>, HistoryError> {
         let _ = filter;
         Ok(Vec::new())
+    }
+
+    /// One audit record by id (#998); `None` once purged. Default: none.
+    async fn get_audit(&self, id: &str) -> Result<Option<AuditEntry>, HistoryError> {
+        let _ = id;
+        Ok(None)
     }
 
     // ── Persistent run logs (#529) ────────────────────────────────────────────
