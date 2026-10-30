@@ -71,6 +71,40 @@ the next refused call makes the console re-read it and redraw.
 
 ## Views
 
+### Overview
+
+The Overview is the first item under **Operate** and the page the console
+opens on (`#/overview`). It answers "is the fleet healthy, what is failing,
+what does it cost, and what needs me?" from the server's run history, which
+outlives restarts and is shared by every replica of a cluster. Real-time
+metrics stay in Grafana.
+
+- **Range:** 24h, 7d or 30d (remembered per browser, and in the URL as
+  `#/overview?range=24h`). The last 24 hours are bucketed by hour, longer
+  ranges by day; buckets are UTC and labelled in the display time zone.
+- **Needs attention:** failed runs, change requests waiting for approval,
+  unhealthy triggers, templates whose newest version fails its tests, and
+  tenant connections that need re-authorization. Each item links to its
+  page (`#/runs?status=failed&name=…`, `#/changes/<id>`, `#/templates/<id>`,
+  `#/tenants/<id>`). A group appears only when its feature is built in and
+  in use on the server.
+- **Stat strip:** runs, failure rate, records written, estimated cost (when
+  usage is recorded) and runs executing now.
+- **Cards:** runs per bucket by outcome, records written with the top
+  pipelines, failure rate by pipeline, the slowest pipelines by p95
+  invocation time, rows not written (filtered, quarantined, sent to the DLQ,
+  coalesced, skipped, dropped), estimated cost by pipeline, and freshness:
+  datasets with no successful run in 24 hours and datasets whose schema
+  changed in the range. Pipeline names link to the Runs list filtered to
+  them; datasets link to the Datasets page.
+
+Started with `--grafana-url`, every card links to the matching dashboard
+from `observability/grafana/` over the same range. A tenant-scoped principal
+sees its own tenant's runs only, and no catalog freshness. The page reads
+`GET /v1/overview` ([HTTP API](../reference/http-api.md#get-v1overview-fleet-trends)).
+
+![The Overview page for the last 7 days: the 7d range picker, the Needs attention card listing failed runs by pipeline, the stat strip (runs, failure rate, records written, running now), the runs-per-day bars by outcome, records written with the top pipelines, failure rate by pipeline, the slowest pipelines by p95, and the rows-not-written and freshness cards](../assets/console/overview.png)
+
 ### Runs
 
 Runs is a split pane: the run list on the left, the selected run's detail on
@@ -482,6 +516,7 @@ The `serve-ui` feature ships three new bearer-gated endpoints that the console
 | `GET` | `/v1/schemas` | Catalog of all compiled sources, sinks, transforms, and state-store kinds. |
 | `GET` | `/v1/schemas/{kind}/{name}` | JSON Schema for one connector, transform, or pipeline block (`kind` ∈ `source`/`sink`/`transform`/`block`). Returns 404 for unknown kind or name. |
 | `GET` | `/v1/whoami` | The caller's principal, role and permissions; the console uses it to hide controls the role cannot use. |
+| `GET` | `/v1/overview` | Fleet trends over the run history, behind the Overview page. |
 | `POST` | `/v1/doctor` | Validate and probe a submitted config without running it. Returns 200 (all probes pass) or 422 (any probe fails) with a probe report. Request body: `{ "config": "<yaml-or-json>", "config_format": "yaml" }`. |
 
 With the `catalog` feature the console also drives the local-output endpoints —

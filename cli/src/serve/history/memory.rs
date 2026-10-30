@@ -1192,6 +1192,37 @@ impl RunHistory for MemoryHistory {
         Ok(())
     }
 
+    async fn overview_aggregates(
+        &self,
+        q: &super::overview::OverviewQuery,
+    ) -> Result<super::overview::OverviewAggregates, HistoryError> {
+        let runs: Vec<RunRecord> = self.runs.iter().map(|r| r.clone()).collect();
+        let freshness = match q.stale_before {
+            None => None,
+            Some(_) => {
+                let c = self
+                    .catalog
+                    .lock()
+                    .map_err(|_| HistoryError::Backend("catalog lock poisoned".into()))?;
+                super::overview::freshness_from(
+                    q,
+                    c.datasets.values(),
+                    c.schema_versions.values().flatten(),
+                )
+            }
+        };
+        let usage = self
+            .usage
+            .lock()
+            .map_err(|_| HistoryError::Backend("usage lock poisoned".into()))?;
+        Ok(super::overview::aggregate_in_memory(
+            q,
+            runs.iter(),
+            usage.iter(),
+            freshness,
+        ))
+    }
+
     async fn usage_list(
         &self,
         filter: &crate::usage::UsageFilter,

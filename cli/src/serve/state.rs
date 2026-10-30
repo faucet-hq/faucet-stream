@@ -78,6 +78,8 @@ struct Inner {
     allow_subprocess_connectors: bool,
     /// What a caller-supplied config may reach (#881).
     references: Arc<crate::serve::references::ServeReferencePolicy>,
+    /// Grafana base URL the Overview page links to (`--grafana-url`).
+    grafana_url: Option<String>,
     /// Set when shutdown begins: new work is refused and `/readyz` is 503.
     draining: std::sync::atomic::AtomicBool,
     /// Clustered terminal records whose owner-fenced write failed (the
@@ -136,6 +138,7 @@ impl ServerState {
                 approval_expiry: config.approval_expiry,
                 allow_subprocess_connectors: config.allow_subprocess_connectors,
                 references: Arc::new(config.references.clone()),
+                grafana_url: config.grafana_url.clone(),
                 draining: std::sync::atomic::AtomicBool::new(false),
                 pending_finalize: std::sync::Mutex::new(Vec::new()),
             }),
@@ -150,6 +153,11 @@ impl ServerState {
 
     /// How a config the request carried is loaded: subprocess connectors only
     /// with `--allow-subprocess-connectors`.
+    /// The Grafana base URL the Overview page links to (`--grafana-url`).
+    pub fn grafana_url(&self) -> Option<&str> {
+        self.inner.grafana_url.as_deref()
+    }
+
     pub fn caller_origin(&self) -> crate::serve::load::BodyOrigin {
         crate::serve::load::BodyOrigin::Caller {
             allow_subprocess: self.inner.allow_subprocess_connectors,
@@ -468,6 +476,7 @@ mod tests {
             vault: None,
             connect_providers_path: None,
             allow_subprocess_connectors: false,
+            grafana_url: None,
             references: Default::default(),
         }
     }

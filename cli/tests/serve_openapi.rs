@@ -157,6 +157,7 @@ async fn every_documented_route_is_wired_on_the_live_server() {
         vault_previous_key: Vec::new(),
         connect_providers: None,
         allow_subprocess_connectors: false,
+        grafana_url: None,
         references: Default::default(),
         pools: Default::default(),
     };

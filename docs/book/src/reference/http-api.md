@@ -27,7 +27,7 @@ built-in roles form a ladder:
 
 | Role | Permitted |
 |------|-----------|
-| `viewer` | read-only: `GET /v1/runs*`, `GET /v1/schemas*`, `GET /v1/catalog/*`, `GET /v1/usage`, `GET`/`POST /v1/status` and `GET`/`POST /v1/mirror/{name}` for a registered `template` (without caller `params`), `GET /v1/changes*`, `GET /v1/templates*`, `GET /v1/local-outputs`, `GET /v1/tenants*` |
+| `viewer` | read-only: `GET /v1/runs*`, `GET /v1/overview`, `GET /v1/schemas*`, `GET /v1/catalog/*`, `GET /v1/usage`, `GET`/`POST /v1/status` and `GET`/`POST /v1/mirror/{name}` for a registered `template` (without caller `params`), `GET /v1/changes*`, `GET /v1/templates*`, `GET /v1/local-outputs`, `GET /v1/tenants*` |
 | `operator` | everything a viewer can do **plus** submit / cancel / delete runs, trigger registered pipeline templates, propose and approve / reject change requests (as far as the `approvals:` policy allows), `POST /v1/doctor`, `POST /v1/plan`, `/v1/status` and `/v1/mirror/{name}` with an inline `config` or template `params`, firing triggers, deleting local sink outputs, running for tenants and fanning templates out across them, and managing tenant connections (including hosted OAuth connect flows) |
 | `admin` | everything, including the template lifecycle (register, launch, roll back, deprecate, assign channels, delete, sync, publish), the tenant lifecycle (create, update, suspend, delete), pipeline state (`/v1/state/{pipeline}/{row}`) and `GET /v1/audit` |
 
@@ -114,6 +114,7 @@ someone does.
 | Route | viewer | operator | admin |
 |---|:--:|:--:|:--:|
 | `GET /v1/runs`, `/v1/runs/{id}`, `/v1/runs/{id}/logs` | ✓ | ✓ | ✓ |
+| `GET /v1/overview` | ✓ | ✓ | ✓ |
 | `POST /v1/runs`, `DELETE /v1/runs/{id}`, `POST /v1/runs/{id}/cancel` | — | ✓ | ✓ |
 | `POST /v1/backfill` | — | ✓ | ✓ |
 | `POST /v1/verify` | — | ✓ | ✓ |
@@ -444,6 +445,7 @@ template) `POST /v1/templates/{id}/runs`, `run_template` and a template trigger.
 | `GET` | `/v1/runs/{id}` | `200` | Get one run record |
 | `DELETE` | `/v1/runs/{id}` | `204` | Remove a terminal run from history |
 | `POST` | `/v1/runs/{id}/cancel` | `202` / `200` | Request cancel (202) or no-op if terminal (200) |
+| `GET` | `/v1/overview` | `200` | Fleet trends over the run history for the console's Overview page (`since`, `until`, `bucket`, `pipeline`, `pool`, `label`, `tenant`, `stale_after`, `top`) — viewer / `RunRead` |
 | `GET` | `/v1/runs/{id}/logs` | `200` | Stream the run's logs (`text/event-stream`), or read persisted logs with `?format=jsonl\|text` |
 | `POST` | `/v1/backfill` | `202` | Submit a windowed backfill: one tracked run per window unit (operator) |
 | `GET` | `/v1/audit` | `200` | Read the audit log — **admin only** (RBAC). Filters: `principal`, `action`, `since`, `until`, `limit`. Each entry's `target` names what was touched (`template:<id>@<version>`, `connection:<tenant>/<name>`, `origin:<name>`, `mcp:<tool>`); an MCP tool call is one entry per call, under the calling principal, `result: error` when the tool failed |
@@ -936,6 +938,50 @@ references a missing connection or one that needs re-authorization, is a
 the server's `--vault-key`; without it those routes answer `503`. Audited as
 `tenant.*`, `connection.*` (`connection.needs_reauth` when a grant is revoked)
 and `connect.start` / `connect.complete`.
+
+### `GET /v1/overview` (fleet trends)
+
+The aggregates behind the console's [Overview](../cookbook/web-console.md#overview)
+page, read from the run history rather than Prometheus, so they survive a
+restart and cover every replica of a cluster:
+
+- `runs`: totals `by_status`, a `series` of succeeded / failed / cancelled per
+  bucket, `failure_rate_by_pipeline` (finished runs, highest rate first),
+  `slowest` (p95 invocation time per pipeline), and `queued` / `running`
+  now, whatever the window;
+- `records`: records written per bucket and the `top_pipelines`;
+- `governance`: rows not written, from each invocation's row accounting:
+  `filtered` by a transform, `quarantined`, sent to the DLQ (`dlq`),
+  `coalesced`, `skipped` and `dropped`, per bucket;
+- `cost` (the `catalog` build, when usage records exist): the estimated cost
+  and hosted equivalent per bucket and by pipeline, in the currency most
+  invocations were priced in (`other_currencies` lists the rest);
+- `freshness` (the `catalog` build, when datasets are catalogued; not for a
+  tenant-scoped principal): datasets with no successful run within
+  `stale_after` (default `24h`), and datasets whose schema changed in the
+  window;
+- `attention`: change requests waiting for approval, unhealthy triggers,
+  templates whose newest version's tests fail, and tenant connections that
+  need re-authorization. A group is present only when its feature is built
+  in and in use, with a `count` and the first 20 `items`;
+- `grafana` (with `--grafana-url`): a link per section to the matching
+  dashboard from `observability/grafana/`, over the same range.
+
+The window is `[since, until)`: `since` is a duration back from `until`
+(`30m`, `24h`, `7d`, `2w`, default `7d`) or an RFC 3339 instant, and `until`
+defaults to now. Buckets are UTC hours up to three days and days beyond
+(`bucket=hour|day` overrides; at most 1,000 buckets). `pipeline`, `pool`,
+`label` / `labels` and `tenant` filter runs as on `GET /v1/runs`; a
+tenant-scoped principal sees its own tenant only. The SQL history backends
+group in the database; the p95 is computed over the newest 10,000 finished
+invocations in the window (`runs.duration_sample.truncated` says when the
+window held more), and `top` (1–50, default 10) bounds every list. `RunRead`
+(viewer and up); audited `overview.get`; `400` for a bad parameter.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:8080/v1/overview?since=24h&pipeline=orders"
+```
 
 ### `GET /v1/usage` (cost & usage)
 

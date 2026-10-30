@@ -573,6 +573,8 @@ pub fn required_permission(method: &Method, matched_path: &str) -> Option<Permis
         (&Method::DELETE, "/v1/runs/{id}") => Some(RunWrite),
         (&Method::POST, "/v1/runs/{id}/cancel") => Some(RunWrite),
         (&Method::GET, "/v1/runs/{id}/logs") => Some(RunRead),
+        // Fleet overview (#1006): aggregates of what `GET /v1/runs` lists.
+        (&Method::GET, "/v1/overview") => Some(RunRead),
         (&Method::GET, "/v1/schemas") => Some(SchemaRead),
         (&Method::GET, "/v1/schemas/{kind}/{name}") => Some(SchemaRead),
         (&Method::POST, "/v1/doctor") => Some(Doctor),
@@ -721,6 +723,7 @@ pub fn tenant_scope_decision(
         | (_, "/v1/runs/{id}")
         | (_, "/v1/runs/{id}/cancel")
         | (_, "/v1/runs/{id}/logs")
+        | (&Method::GET, "/v1/overview")
         | (&Method::GET, "/v1/schemas")
         | (&Method::GET, "/v1/schemas/{kind}/{name}")
         | (&Method::GET, "/v1/templates")
@@ -748,6 +751,7 @@ pub fn audit_action(method: &Method, matched_path: &str) -> &'static str {
         (&Method::DELETE, "/v1/runs/{id}") => "run.delete",
         (&Method::POST, "/v1/runs/{id}/cancel") => "run.cancel",
         (&Method::GET, "/v1/runs/{id}/logs") => "run.logs",
+        (&Method::GET, "/v1/overview") => "overview.get",
         (&Method::GET, "/v1/schemas") => "schema.list",
         (&Method::GET, "/v1/schemas/{kind}/{name}") => "schema.get",
         (&Method::POST, "/v1/doctor") => "doctor",

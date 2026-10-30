@@ -39,7 +39,7 @@ function match(path, query) {
 }
 
 function parseHash() {
-  const hash = window.location.hash || "#/runs";
+  const hash = window.location.hash || "#/overview";
   // `#/path?k=v` — the query never takes part in matching; views read it as
   // `params.query` (a URLSearchParams).
   const qIdx = hash.indexOf("?");

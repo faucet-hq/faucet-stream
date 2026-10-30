@@ -2854,6 +2854,7 @@ mod tests {
             vault: None,
             connect_providers_path: None,
             allow_subprocess_connectors: false,
+            grafana_url: None,
             references: Default::default(),
         };
         let history = Arc::new(MemoryHistory::new(Duration::from_secs(60))) as Arc<dyn RunHistory>;
@@ -2974,6 +2975,7 @@ mod tests {
             vault: None,
             connect_providers_path: None,
             allow_subprocess_connectors: false,
+            grafana_url: None,
             references: Default::default(),
         };
         let history = Arc::new(MemoryHistory::new(Duration::from_secs(60))) as Arc<dyn RunHistory>;
@@ -3066,6 +3068,7 @@ mod tests {
             vault: None,
             connect_providers_path: None,
             allow_subprocess_connectors: false,
+            grafana_url: None,
             references: Default::default(),
         };
         let history = Arc::new(MemoryHistory::new(Duration::from_secs(60))) as Arc<dyn RunHistory>;
@@ -3197,6 +3200,7 @@ mod tests {
             vault: None,
             connect_providers_path: None,
             allow_subprocess_connectors: false,
+            grafana_url: None,
             references: Default::default(),
         };
         // A backend that is degraded from startup (primary unreachable).
@@ -3320,6 +3324,7 @@ mod tests {
                 vault: None,
                 connect_providers_path: None,
                 allow_subprocess_connectors: false,
+                grafana_url: None,
                 references: Default::default(),
             };
             ServerState::new(

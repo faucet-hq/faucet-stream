@@ -72,6 +72,7 @@ fn args(port: u16, history: String, cluster: bool, pools: &[&str]) -> faucet_cli
         vault_previous_key: Vec::new(),
         connect_providers: None,
         allow_subprocess_connectors: false,
+        grafana_url: None,
         references: Default::default(),
         pools: faucet_cli::cli::PoolArgs {
             pool: pools.iter().map(|p| p.to_string()).collect(),

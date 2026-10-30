@@ -794,6 +794,12 @@ impl RunHistory for FallbackHistory {
     ) -> Result<Vec<crate::usage::UsageRecord>, HistoryError> {
         via!(self, p => p.usage_list(filter), f => f.usage_list(filter))
     }
+    async fn overview_aggregates(
+        &self,
+        q: &super::overview::OverviewQuery,
+    ) -> Result<super::overview::OverviewAggregates, HistoryError> {
+        via!(self, p => p.overview_aggregates(q), f => f.overview_aggregates(q))
+    }
     async fn local_output_record(
         &self,
         obs: &crate::local_outputs::LocalOutputObservation,

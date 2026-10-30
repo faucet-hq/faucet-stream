@@ -14,6 +14,7 @@ const ROUTES_BASE: &[(&str, &str)] = &[
     ("POST", "/v1/runs/{id}/cancel"),
     ("POST", "/v1/runs/{id}/rollback"),
     ("GET", "/v1/runs/{id}/logs"),
+    ("GET", "/v1/overview"),
     ("GET", "/v1/schemas"),
     ("GET", "/v1/schemas/{kind}/{name}"),
     ("POST", "/v1/doctor"),

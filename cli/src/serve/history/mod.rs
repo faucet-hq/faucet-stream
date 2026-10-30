@@ -9,6 +9,7 @@ pub mod catalog;
 pub mod fallback;
 pub mod labels;
 pub mod memory;
+pub mod overview;
 #[cfg(feature = "serve-history-postgres")]
 pub mod postgres;
 #[cfg(any(feature = "serve-history-postgres", feature = "serve-history-sqlite"))]
@@ -1842,6 +1843,18 @@ pub trait RunHistory: Send + Sync {
     ) -> Result<Vec<crate::usage::UsageRecord>, HistoryError> {
         let _ = filter;
         Ok(Vec::new())
+    }
+
+    /// Fleet aggregates for `GET /v1/overview` (#1006). The default reads
+    /// runs through [`list`](Self::list) and usage through
+    /// [`usage_list`](Self::usage_list), at most
+    /// [`overview::DEFAULT_SCAN_CAP`] each; the built-in backends aggregate in
+    /// place.
+    async fn overview_aggregates(
+        &self,
+        q: &overview::OverviewQuery,
+    ) -> Result<overview::OverviewAggregates, HistoryError> {
+        overview::aggregate_by_listing(self, q).await
     }
 
     // ── Pipeline-template registry (#444) ────────────────────────────────────

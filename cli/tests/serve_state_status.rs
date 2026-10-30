@@ -81,6 +81,7 @@ async fn spawn_server(port: u16, dir: &Path) {
         vault_previous_key: Vec::new(),
         connect_providers: None,
         allow_subprocess_connectors: false,
+        grafana_url: None,
         references: Default::default(),
         pools: Default::default(),
     };

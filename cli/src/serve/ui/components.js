@@ -4,6 +4,7 @@
 import { escapeHtml, fmtInt } from "./utils.js";
 
 const PATHS = {
+  overview: '<rect x="3" y="3" width="8" height="10" rx="1.5"/><rect x="13" y="3" width="8" height="6" rx="1.5"/><rect x="13" y="11" width="8" height="10" rx="1.5"/><rect x="3" y="15" width="8" height="6" rx="1.5"/>',
   runs: '<path d="M5 4l14 8-14 8z"/>',
   changes: '<path d="M6 3v12"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/>',
   triggers: '<path d="M13 2L4 14h7l-1 8 9-12h-7z"/>',

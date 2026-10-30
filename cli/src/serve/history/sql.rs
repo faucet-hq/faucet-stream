@@ -2945,6 +2945,8 @@ macro_rules! impl_sql_history {
                 }
             }
 
+            $crate::serve::history::overview::overview_sql!();
+
             /// Decode one `faucet_serve_log_ship` row (#806).
             fn decode_log_ship_row<R>(
                 r: &R,
@@ -6122,6 +6124,16 @@ macro_rules! impl_sql_history {
                 }
                 out.truncate(sql::usage_limit(filter));
                 Ok(out)
+            }
+
+            async fn overview_aggregates(
+                &self,
+                q: &$crate::serve::history::overview::OverviewQuery,
+            ) -> Result<
+                $crate::serve::history::overview::OverviewAggregates,
+                $crate::serve::history::HistoryError,
+            > {
+                self.overview_from_sql(q).await
             }
 
             // ── Pipeline-template registry (#444) ────────────────────────────

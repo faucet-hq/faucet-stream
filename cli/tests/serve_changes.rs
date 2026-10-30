@@ -83,6 +83,7 @@ fn serve_args(
         vault_previous_key: Vec::new(),
         connect_providers: None,
         allow_subprocess_connectors: false,
+        grafana_url: None,
         // A submitted config reads only the variables the operator allows (#881).
         references: faucet_cli::cli::ReferenceArgs {
             allow_env: vec!["FAUCET_789_*".into()],

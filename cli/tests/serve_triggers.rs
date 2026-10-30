@@ -52,6 +52,7 @@ fn test_config() -> ServeConfig {
         vault: None,
         connect_providers_path: None,
         allow_subprocess_connectors: false,
+        grafana_url: None,
         references: Default::default(),
     }
 }
@@ -1167,6 +1168,7 @@ async fn spawn_serve_with_triggers(
         vault_previous_key: Vec::new(),
         connect_providers: None,
         allow_subprocess_connectors: false,
+        grafana_url: None,
         references: Default::default(),
         pools: Default::default(),
     };

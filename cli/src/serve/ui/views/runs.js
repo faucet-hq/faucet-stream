@@ -64,6 +64,16 @@ export async function renderRuns(container, params = {}) {
   const statusSel = new Set();
   let mine = false;
   let tab = "all";
+  // `#/runs?status=failed&name=orders` (the Overview links here).
+  for (const st of (params.query?.get("status") || "").split(",")) {
+    if (STATUSES.includes(st)) statusSel.add(st);
+  }
+  if (statusSel.size) {
+    filters.status = [...statusSel].join(",");
+    const key = [...statusSel].sort().join(",");
+    tab = TABS.find((t) => [...t.statuses].sort().join(",") === key)?.id || "";
+  }
+  filters.name = params.query?.get("name") || "";
   let pollTimer = null;
   let selected = params.id || null;
   let detailStop = null;
@@ -98,6 +108,7 @@ export async function renderRuns(container, params = {}) {
       <div id="r-stats"></div>`,
   });
   const $ = (sel) => pane.head.querySelector(sel);
+  $("#f-name").value = filters.name;
   const labelBox = $("#f-labels");
   const labelInput = $("#f-label");
   const list = sectionList(pane.body, "faucet.runs.sections");
@@ -193,6 +204,8 @@ export async function renderRuns(container, params = {}) {
     if (statusDd.open && !statusDd.contains(e.target)) statusDd.open = false;
   };
   document.addEventListener("click", closeStatusDd);
+  syncStatusBoxes();
+  markFiltered();
 
   function setTab(id) {
     tab = id;

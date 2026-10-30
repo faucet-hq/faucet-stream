@@ -4,8 +4,8 @@ use crate::error::{CliError, CliResult};
 use crate::serve::config::ServeConfig;
 use crate::serve::handlers::state as state_h;
 use crate::serve::handlers::{
-    audit, backfill, changes, dlq, doctor, health, logs, plan, reload, runs, schemas, verify,
-    whoami,
+    audit, backfill, changes, dlq, doctor, health, logs, overview, plan, reload, runs, schemas,
+    verify, whoami,
 };
 use crate::serve::history::RunHistory;
 use crate::serve::state::ServerState;
@@ -56,6 +56,7 @@ pub fn build_router(
         .route("/v1/runs/{id}/cancel", post(runs::cancel_run))
         .route("/v1/runs/{id}/rollback", post(runs::rollback_run))
         .route("/v1/runs/{id}/logs", get(logs::stream_logs))
+        .route("/v1/overview", get(overview::overview))
         .route("/v1/schemas", get(schemas::list_schemas))
         .route("/v1/schemas/{kind}/{name}", get(schemas::get_schema))
         .route("/v1/doctor", post(doctor::doctor))

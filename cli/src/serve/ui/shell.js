@@ -9,6 +9,7 @@ import { tenantList, withTenant } from "./tenant.js";
 // console does not have yet: listed (disabled) so the layout is stable.
 const NAV = [
   ["Operate", [
+    ["overview", "Overview", "#/overview"],
     ["runs", "Runs", "#/runs"],
     ["changes", "Changes", "#/changes"],
     ["triggers", "Triggers"],
@@ -85,7 +86,7 @@ function renderNav() {
 }
 
 function entryFor(path) {
-  const top = "#/" + (path.split("/")[1] || "runs");
+  const top = "#/" + (path.split("/")[1] || "overview");
   for (const [group, items] of NAV) {
     for (const [key, label, hash] of items) {
       if (hash === top) return { group, key, label, hash };
@@ -95,7 +96,7 @@ function entryFor(path) {
 }
 
 function currentPath() {
-  const hash = location.hash || "#/runs";
+  const hash = location.hash || "#/overview";
   const q = hash.indexOf("?");
   return q === -1 ? hash : hash.slice(0, q);
 }

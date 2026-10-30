@@ -1196,6 +1196,48 @@ paths:
         "403": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
         "409": { description: The request is not pending }
+  /v1/overview:
+    get:
+      summary: Fleet overview
+      description: >
+        Trends over the run history for the console's Overview page (#1006):
+        run outcomes, records written and rows not written (from each
+        invocation's row accounting) per UTC bucket, the pipelines with the
+        highest failure rate and the slowest p95 invocation time, estimated
+        cost from usage records, catalog freshness, and what needs attention.
+        The SQL history backends group in the database; the p95 is computed
+        over the newest 10,000 finished invocations in the window
+        (`runs.duration_sample`). A section is left out when its feature is
+        not built in or not in use: `cost` without usage records (the
+        `catalog` feature), `freshness` without catalogued datasets or for a
+        tenant-scoped principal, each `attention` group without its feature
+        (`unhealthy_triggers` without `--triggers`, `failing_templates`
+        without templates, `connections_needing_reauth` without tenants,
+        `pending_changes` when approvals are off and none are pending).
+        Requires `RunRead` (viewer); a tenant-scoped principal sees only its
+        tenant's runs. Audited as `overview.get`.
+      operationId: getOverview
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: since, in: query, required: false, schema: { type: string, default: 7d }, description: "A duration back from `until` (`30m`, `24h`, `7d`, `2w`) or an RFC 3339 instant." }
+        - { name: until, in: query, required: false, schema: { type: string, format: date-time }, description: "End of the window (exclusive); default now." }
+        - { name: bucket, in: query, required: false, schema: { type: string, enum: [hour, day] }, description: "Series bucket; default `hour` up to three days, else `day`. At most 1,000 buckets." }
+        - { name: pipeline, in: query, required: false, schema: { type: string }, description: "Only runs with this name." }
+        - { name: pool, in: query, required: false, schema: { type: string }, description: "Only runs in this execution pool." }
+        - { name: label, in: query, required: false, schema: { type: array, items: { type: string } }, style: form, explode: true, description: "`key:value` or `key`; repeatable, ANDed (as on `GET /v1/runs`)." }
+        - { name: labels, in: query, required: false, schema: { type: string }, description: "Comma-separated form of `label`." }
+        - { name: tenant, in: query, required: false, schema: { type: string }, description: "Only runs for this tenant; forced for a tenant-scoped principal." }
+        - { name: stale_after, in: query, required: false, schema: { type: string, default: 24h }, description: "A dataset with no successful run for this long is stale." }
+        - { name: top, in: query, required: false, schema: { type: integer, default: 10, minimum: 1, maximum: 50 }, description: "Entries per top-N list." }
+      responses:
+        "200":
+          description: The aggregates.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Overview" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { description: A tenant-scoped principal named another tenant }
   /v1/usage:
     get:
       summary: Cost & usage report
@@ -3555,6 +3597,176 @@ components:
         cost: { type: number }
         hosted_equivalent: { type: number }
         not_reported: { type: array, items: { type: string } }
+    Overview:
+      type: object
+      required: [since, until, bucket, runs, records, governance, attention]
+      properties:
+        since: { type: string, format: date-time }
+        until: { type: string, format: date-time }
+        bucket: { type: string, enum: [hour, day] }
+        runs:
+          type: object
+          required: [total, by_status, series, failure_rate_by_pipeline, slowest, duration_sample, queued, running]
+          properties:
+            total: { type: integer, description: Runs submitted in the window. }
+            by_status: { type: object, additionalProperties: { type: integer } }
+            series:
+              type: array
+              items:
+                type: object
+                required: [bucket_start, succeeded, failed, cancelled]
+                properties:
+                  bucket_start: { type: string, format: date-time }
+                  succeeded: { type: integer }
+                  failed: { type: integer }
+                  cancelled: { type: integer }
+            failure_rate_by_pipeline:
+              type: array
+              items:
+                type: object
+                required: [pipeline, runs, failed, rate]
+                properties:
+                  pipeline: { type: string, description: The run name; empty for runs without one. }
+                  runs: { type: integer, description: Finished runs. }
+                  failed: { type: integer }
+                  rate: { type: number }
+            slowest:
+              type: array
+              items:
+                type: object
+                required: [pipeline, p95_ms, runs]
+                properties:
+                  pipeline: { type: string }
+                  p95_ms: { type: integer }
+                  runs: { type: integer, description: Invocations in the sample. }
+            duration_sample:
+              type: object
+              required: [invocations, truncated]
+              properties:
+                invocations: { type: integer }
+                truncated: { type: boolean }
+            queued: { type: integer, description: Queued or pending now. }
+            running: { type: integer, description: Running or sharded now. }
+        records:
+          type: object
+          required: [total, series, top_pipelines]
+          properties:
+            total: { type: integer }
+            series:
+              type: array
+              items:
+                type: object
+                required: [bucket_start, written]
+                properties:
+                  bucket_start: { type: string, format: date-time }
+                  written: { type: integer }
+            top_pipelines:
+              type: array
+              items:
+                type: object
+                required: [pipeline, written]
+                properties:
+                  pipeline: { type: string }
+                  written: { type: integer }
+        governance:
+          type: object
+          required: [totals, series]
+          properties:
+            totals: { $ref: "#/components/schemas/OverviewGovernanceCounts" }
+            series:
+              type: array
+              items:
+                allOf:
+                  - $ref: "#/components/schemas/OverviewGovernanceCounts"
+                  - type: object
+                    required: [bucket_start]
+                    properties:
+                      bucket_start: { type: string, format: date-time }
+        cost:
+          type: object
+          required: [currency, invocations, estimated, hosted_equivalent, series, by_pipeline]
+          properties:
+            currency: { type: string, description: The currency most invocations were priced in. }
+            invocations: { type: integer }
+            estimated: { type: number }
+            hosted_equivalent: { type: number }
+            series:
+              type: array
+              items:
+                type: object
+                required: [bucket_start, estimated, hosted_equivalent]
+                properties:
+                  bucket_start: { type: string, format: date-time }
+                  estimated: { type: number }
+                  hosted_equivalent: { type: number }
+            by_pipeline:
+              type: array
+              items:
+                type: object
+                required: [pipeline, estimated]
+                properties:
+                  pipeline: { type: string }
+                  estimated: { type: number }
+            other_currencies: { type: array, items: { type: string } }
+        freshness:
+          type: object
+          required: [datasets, stale_before, stale_count, stale, schema_changed_count, schema_changed]
+          properties:
+            datasets: { type: integer }
+            stale_before: { type: string, format: date-time }
+            stale_count: { type: integer }
+            stale:
+              type: array
+              items:
+                type: object
+                required: [id, uri, pipeline, last_success]
+                properties:
+                  id: { type: string }
+                  uri: { type: string }
+                  pipeline: { type: string }
+                  last_success: { type: string, format: date-time }
+            schema_changed_count: { type: integer }
+            schema_changed:
+              type: array
+              items:
+                type: object
+                required: [id, uri, changes, last_changed]
+                properties:
+                  id: { type: string }
+                  uri: { type: string }
+                  changes: { type: integer }
+                  last_changed: { type: string, format: date-time }
+        attention:
+          type: object
+          properties:
+            pending_changes: { $ref: "#/components/schemas/OverviewAttentionGroup" }
+            unhealthy_triggers: { $ref: "#/components/schemas/OverviewAttentionGroup" }
+            failing_templates: { $ref: "#/components/schemas/OverviewAttentionGroup" }
+            connections_needing_reauth: { $ref: "#/components/schemas/OverviewAttentionGroup" }
+        grafana:
+          type: object
+          description: Dashboard links over the same range, by section (`runs`, `reliability`, `governance`, `cost`, `serve`); present with `--grafana-url`.
+          additionalProperties: { type: string, format: uri }
+    OverviewGovernanceCounts:
+      type: object
+      required: [filtered, quarantined, dlq, coalesced, skipped, dropped]
+      properties:
+        filtered: { type: integer, description: Rows a transform removed. }
+        quarantined: { type: integer }
+        dlq: { type: integer, description: Rows the sink failed per row, sent to the DLQ. }
+        coalesced: { type: integer }
+        skipped: { type: integer }
+        dropped: { type: integer }
+    OverviewAttentionGroup:
+      type: object
+      required: [count, more, items]
+      properties:
+        count: { type: integer }
+        more: { type: boolean, description: More exist than were read. }
+        items:
+          type: array
+          maxItems: 20
+          items: { type: object, additionalProperties: true }
     UsageReport:
       type: object
       description: An aggregation over a window, plus the total row.

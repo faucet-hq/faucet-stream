@@ -97,6 +97,7 @@ fn tenant_scoped_principals_reach_only_their_tenant() {
     );
     assert_eq!(d(Method::POST, "/v1/runs", "/v1/runs"), Allow);
     assert_eq!(d(Method::GET, "/v1/usage", "/v1/usage"), Allow);
+    assert_eq!(d(Method::GET, "/v1/overview", "/v1/overview"), Allow);
     assert_eq!(
         d(Method::GET, "/v1/templates/{id}", "/v1/templates/x"),
         Allow
@@ -294,6 +295,7 @@ fn required_permission_covers_all_routes() {
         (Method::GET, "/v1/catalog/datasets/{id}", CatalogRead),
         (Method::GET, "/v1/catalog/lineage", CatalogRead),
         (Method::GET, "/v1/usage", UsageRead),
+        (Method::GET, "/v1/overview", RunRead),
         (Method::POST, "/v1/changes", ChangeRequest),
         (Method::GET, "/v1/changes", ChangeRead),
         (Method::GET, "/v1/changes/{id}", ChangeRead),
@@ -392,6 +394,7 @@ fn required_permission_covers_all_routes() {
     assert!(Role::Operator.grants(Permission::UsageRead));
     assert!(Role::Admin.grants(Permission::UsageRead));
     assert_eq!(audit_action(&Method::GET, "/v1/usage"), "usage.list");
+    assert_eq!(audit_action(&Method::GET, "/v1/overview"), "overview.get");
     // Change requests (#703): everyone reads; proposing and approving are
     // operator scopes (the approvals policy narrows approving further).
     assert!(Role::Viewer.grants(Permission::ChangeRead));

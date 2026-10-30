@@ -2,6 +2,7 @@ import { token, onUnauthorized, authOk } from "./api.js";
 import { startRouter, refresh } from "./router.js";
 import { getTz, setTz, TZ_OPTIONS } from "./tz.js";
 import { renderRuns } from "./views/runs.js";
+import { renderOverview } from "./views/overview.js";
 import { renderSubmit } from "./views/submit.js";
 import { renderSchemas } from "./views/schemas.js";
 import { renderTemplates } from "./views/templates.js";
@@ -72,6 +73,7 @@ function wireChrome() {
 }
 
 function registerRoutes() {
+  route("#/overview", renderOverview);
   route("#/runs", renderRuns, { group: "runs" });
   route("#/runs/:id", renderRuns, { group: "runs" });
   route("#/submit", renderSubmit);
