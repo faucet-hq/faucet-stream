@@ -425,14 +425,20 @@ async fn failing_templates(
     }
     use futures::{StreamExt as _, TryStreamExt as _};
     let all = templates.len() <= TEMPLATE_SCAN;
-    let history = &history;
-    let newest: Vec<_> = futures::stream::iter(templates.iter().take(TEMPLATE_SCAN))
-        .map(|t| async move {
-            history
-                .template_test_results(&t.id, Some(t.version), 1)
-                .await
-                .map(|r| (t, r))
+    let reads: Vec<_> = templates
+        .into_iter()
+        .take(TEMPLATE_SCAN)
+        .map(|t| {
+            let history = history.clone();
+            async move {
+                history
+                    .template_test_results(&t.id, Some(t.version), 1)
+                    .await
+                    .map(|r| (t, r))
+            }
         })
+        .collect();
+    let newest: Vec<_> = futures::stream::iter(reads)
         .buffered(ATTENTION_READS)
         .try_collect()
         .await
@@ -478,8 +484,15 @@ async fn reauth_connections(
     }
     use futures::{StreamExt as _, TryStreamExt as _};
     let all = tenants.len() <= TENANT_SCAN;
-    let listed: Vec<_> = futures::stream::iter(tenants.iter().take(TENANT_SCAN))
-        .map(|t| history.connection_list(t))
+    let reads: Vec<_> = tenants
+        .into_iter()
+        .take(TENANT_SCAN)
+        .map(|t| {
+            let history = history.clone();
+            async move { history.connection_list(&t).await }
+        })
+        .collect();
+    let listed: Vec<_> = futures::stream::iter(reads)
         .buffered(ATTENTION_READS)
         .try_collect()
         .await

@@ -453,7 +453,7 @@ pub struct GetResponse {
 }
 
 /// When and by whom one template version was registered (#998).
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct VersionRegistration {
     pub version: u32,
     pub registered_at: chrono::DateTime<chrono::Utc>,
@@ -564,20 +564,21 @@ pub async fn get_template(
     // Every version's registration metadata and test history, read a few at
     // a time (a template keeps at most `VERSION_RETAIN` versions).
     use futures::{StreamExt as _, TryStreamExt as _};
-    let registrations: Vec<VersionRegistration> = futures::stream::iter(&state.versions)
-        .map(|v| {
-            let s = &s;
-            let id = &id;
-            let current = &template;
+    let current = VersionRegistration {
+        version: template.version,
+        registered_at: template.created_at,
+        registered_by: template.created_by.clone(),
+    };
+    let reads: Vec<_> = state
+        .versions
+        .iter()
+        .map(|&v| {
+            let (s, id, current) = (s.clone(), id.clone(), current.clone());
             async move {
-                if *v == current.version {
-                    return Ok(Some(VersionRegistration {
-                        version: *v,
-                        registered_at: current.created_at,
-                        registered_by: current.created_by.clone(),
-                    }));
+                if v == current.version {
+                    return Ok(Some(current));
                 }
-                s.template_get(id, Some(*v)).await.map(|rec| {
+                s.template_get(&id, Some(v)).await.map(|rec| {
                     rec.map(|rec| VersionRegistration {
                         version: rec.version,
                         registered_at: rec.created_at,
@@ -586,13 +587,25 @@ pub async fn get_template(
                 })
             }
         })
+        .collect();
+    let registrations: Vec<VersionRegistration> = futures::stream::iter(reads)
         .buffered(DETAIL_READS)
         .try_filter_map(|r| async move { Ok(r) })
         .try_collect()
         .await
         .map_err(|e| ServeError::Internal(e.to_string()))?;
-    let versions: Vec<_> = futures::stream::iter(&state.versions)
-        .map(|v| crate::templates::bundle::version_tests(&s, &id, *v, DETAIL_TEST_RUNS))
+    let tests: Vec<_> =
+        state
+            .versions
+            .iter()
+            .map(|&v| {
+                let (s, id) = (s.clone(), id.clone());
+                async move {
+                    crate::templates::bundle::version_tests(&s, &id, v, DETAIL_TEST_RUNS).await
+                }
+            })
+            .collect();
+    let versions: Vec<_> = futures::stream::iter(tests)
         .buffered(DETAIL_READS)
         .try_collect()
         .await
