@@ -950,7 +950,7 @@ pub mod sql {
         }
 
         /// A text value at `path` of a JSON document (`doc` already JSON for
-        /// Postgres: see [`doc`](Self::doc)).
+        /// Postgres: see `doc`).
         pub fn text(&self, doc: &str, path: &[&str]) -> String {
             if self.pg() {
                 format!("({doc} #>> '{{{}}}')", path.join(","))
