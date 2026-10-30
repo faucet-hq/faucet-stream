@@ -16,8 +16,9 @@ use base64::Engine as _;
 use faucet_core::Source;
 use faucet_source_kinesis::{KinesisCredentials, KinesisSource, KinesisSourceConfig, ValueFormat};
 use serde_json::Value;
-use testcontainers::ImageExt;
-use testcontainers_modules::localstack::LocalStack;
+
+mod support;
+use support::phase;
 
 const REGION: &str = "us-east-1";
 const ENV_KEYS: [&str; 2] = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"];
@@ -40,56 +41,31 @@ fn unset(vars: &[&str]) {
     }
 }
 
-/// Bounds one phase so a stalled emulator fails the test with its name instead of hanging CI.
-async fn phase<T>(name: &str, fut: impl std::future::Future<Output = T>) -> T {
-    tokio::time::timeout(std::time::Duration::from_secs(180), fut)
-        .await
-        .unwrap_or_else(|_| panic!("{name} did not finish within 180s"))
-}
-
 fn role(account: &str) -> String {
     format!("arn:aws:iam::{account}:role/faucet-reader")
 }
 
-async fn seed(endpoint: &str, account: &str, stream: &str, payloads: &[&[u8]]) {
-    let admin = faucet_source_kinesis::build_client(
-        Some(REGION),
-        Some(endpoint),
-        &KinesisCredentials::AccessKey {
-            access_key_id: account.into(),
-            secret_access_key: "test".into(),
-            session_token: None,
-        },
-    )
-    .await
-    .unwrap();
-    for _ in 0..120 {
-        if admin.list_streams().send().await.is_ok() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
-    admin
-        .create_stream()
-        .stream_name(stream)
-        .shard_count(1)
-        .send()
+/// A bounded client for `account` (LocalStack scopes resources by the
+/// 12-digit access key).
+async fn admin(endpoint: &str, account: &str) -> aws_sdk_kinesis::Client {
+    support::bounded(
+        faucet_source_kinesis::build_client(
+            Some(REGION),
+            Some(endpoint),
+            &KinesisCredentials::AccessKey {
+                access_key_id: account.into(),
+                secret_access_key: "test".into(),
+                session_token: None,
+            },
+        )
         .await
-        .unwrap();
-    for _ in 0..60 {
-        let d = admin
-            .describe_stream_summary()
-            .stream_name(stream)
-            .send()
-            .await
-            .unwrap();
-        if d.stream_description_summary().map(|s| s.stream_status())
-            == Some(&aws_sdk_kinesis::types::StreamStatus::Active)
-        {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    }
+        .unwrap(),
+    )
+}
+
+async fn seed(endpoint: &str, account: &str, stream: &str, payloads: &[&[u8]]) {
+    let admin = admin(endpoint, account).await;
+    support::create_stream(&admin, stream, 1).await;
     for p in payloads {
         admin
             .put_record()
@@ -98,16 +74,25 @@ async fn seed(endpoint: &str, account: &str, stream: &str, payloads: &[&[u8]]) {
             .data(Blob::new(p.to_vec()))
             .send()
             .await
-            .unwrap();
+            .unwrap_or_else(|e| panic!("PutRecord on {stream}: {e:?}"));
     }
 }
 
+/// Read `stream` (owned by `account`) through the connector with `credentials`,
+/// stopping after `expected` records.
+///
+/// The connector retries a failed `GetRecords` forever, so a bounded
+/// `GetRecords` with the owner's key runs first: a stalled emulator then fails
+/// here with the SDK error rather than at the phase timeout.
 async fn read(
     endpoint: &str,
+    account: &str,
     stream: &str,
     credentials: KinesisCredentials,
     format: ValueFormat,
+    expected: usize,
 ) -> Vec<Value> {
+    support::probe_reads(&admin(endpoint, account).await, stream).await;
     let label = format!("{credentials:?}");
     let mut cfg = KinesisSourceConfig::new(stream);
     cfg.region = Some(REGION.into());
@@ -116,6 +101,7 @@ async fn read(
     cfg.value_format = format;
     cfg.poll_interval_ms = 200;
     cfg.idle_termination_secs = Some(2);
+    cfg.max_messages = Some(expected);
     let source = KinesisSource::new(cfg).await.unwrap();
     let records = source
         .fetch_all()
@@ -132,15 +118,9 @@ async fn profile_assume_role_and_web_identity_read_string_and_bytes_payloads() {
         .with_env_filter("aws_config=debug,aws_smithy_runtime=debug,aws_sdk_sts=debug,faucet_source_kinesis=debug")
         .with_test_writer()
         .try_init();
-    let container = phase(
-        "starting LocalStack",
-        faucet_conformance::containers::start(|| {
-            LocalStack::default().with_env_var("SERVICES", "kinesis,sts")
-        }),
-    )
-    .await;
-    let port = container.get_host_port_ipv4(4566).await.unwrap();
-    let endpoint = format!("http://127.0.0.1:{port}");
+    // Prints the emulator's log if anything below panics.
+    let emulator = support::start("kinesis,sts").await;
+    let endpoint = emulator.endpoint.clone();
     set(&[
         ("AWS_ENDPOINT_URL_STS", endpoint.as_str()),
         ("AWS_EC2_METADATA_DISABLED", "true"),
@@ -186,11 +166,13 @@ async fn profile_assume_role_and_web_identity_read_string_and_bytes_payloads() {
         "the profile read",
         read(
             &endpoint,
+            "111111111111",
             "text",
             KinesisCredentials::Profile {
                 name: "faucet-test".into(),
             },
             ValueFormat::String,
+            2,
         ),
     )
     .await;
@@ -215,6 +197,7 @@ async fn profile_assume_role_and_web_identity_read_string_and_bytes_payloads() {
         "the assume_role read",
         read(
             &endpoint,
+            "222222222222",
             "binary",
             KinesisCredentials::AssumeRole {
                 role_arn: role("222222222222"),
@@ -222,6 +205,7 @@ async fn profile_assume_role_and_web_identity_read_string_and_bytes_payloads() {
                 external_id: Some("ext-1".into()),
             },
             ValueFormat::Bytes,
+            1,
         ),
     )
     .await;
@@ -241,9 +225,11 @@ async fn profile_assume_role_and_web_identity_read_string_and_bytes_payloads() {
         "the web_identity read",
         read(
             &endpoint,
+            "333333333333",
             "text",
             KinesisCredentials::WebIdentity,
             ValueFormat::String,
+            2,
         ),
     )
     .await;

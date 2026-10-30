@@ -4,25 +4,19 @@
 //! so they are isolated and safe to run in parallel.
 #![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
+mod support;
+use support::create_stream;
+
 use faucet_core::Source;
 use faucet_source_kinesis::{KinesisCredentials, KinesisSource, KinesisSourceConfig};
 use futures::StreamExt;
 use std::collections::HashMap;
-use testcontainers::ContainerAsync;
-use testcontainers_modules::localstack::LocalStack;
 
-/// Start LocalStack with the kinesis service and return (container, endpoint).
-async fn start_localstack() -> (ContainerAsync<LocalStack>, String) {
-    use testcontainers::ImageExt;
-    let container = faucet_conformance::containers::start(|| {
-        LocalStack::default().with_env_var("SERVICES", "kinesis")
-    })
-    .await;
-    let port = container
-        .get_host_port_ipv4(4566)
-        .await
-        .expect("localstack port");
-    (container, format!("http://127.0.0.1:{port}"))
+/// Start LocalStack with the kinesis service and return (emulator, endpoint).
+async fn start_localstack() -> (support::Emulator, String) {
+    let emulator = support::start("kinesis").await;
+    let endpoint = emulator.endpoint.clone();
+    (emulator, endpoint)
 }
 
 fn test_credentials() -> KinesisCredentials {
@@ -34,50 +28,11 @@ fn test_credentials() -> KinesisCredentials {
 }
 
 async fn raw_client(endpoint: &str) -> aws_sdk_kinesis::Client {
-    faucet_source_kinesis::build_client(Some("us-east-1"), Some(endpoint), &test_credentials())
-        .await
-        .expect("client")
-}
-
-/// Wait until the mapped endpoint actually accepts Kinesis API calls —
-/// the container's port maps before the service is ready.
-async fn await_ready(client: &aws_sdk_kinesis::Client) {
-    for _ in 0..120 {
-        if client.list_streams().send().await.is_ok() {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
-    panic!("localstack kinesis never became ready");
-}
-
-/// Create a stream and wait until it is ACTIVE.
-async fn create_stream(client: &aws_sdk_kinesis::Client, name: &str, shards: i32) {
-    await_ready(client).await;
-    client
-        .create_stream()
-        .stream_name(name)
-        .shard_count(shards)
-        .send()
-        .await
-        .expect("create stream");
-    for _ in 0..60 {
-        let out = client
-            .describe_stream_summary()
-            .stream_name(name)
-            .send()
+    support::bounded(
+        faucet_source_kinesis::build_client(Some("us-east-1"), Some(endpoint), &test_credentials())
             .await
-            .expect("describe");
-        if out
-            .stream_description_summary()
-            .map(|d| d.stream_status() == &aws_sdk_kinesis::types::StreamStatus::Active)
-            .unwrap_or(false)
-        {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
-    panic!("stream {name} never became ACTIVE");
+            .expect("client"),
+    )
 }
 
 /// Put `n` JSON records with rotating partition keys.
@@ -136,7 +91,7 @@ async fn consumes_across_shards_with_metadata_and_bookmarks() {
 
     let mut records = Vec::new();
     let mut last_bookmark = None;
-    while let Some(page) = pages.next().await {
+    while let Some(page) = support::phase("next page", pages.next()).await {
         let page = page.expect("page");
         assert!(page.bookmark.is_some(), "every page carries the shard map");
         last_bookmark = page.bookmark;
@@ -179,7 +134,9 @@ async fn consumes_across_shards_with_metadata_and_bookmarks() {
         .apply_start_bookmark(bookmark)
         .await
         .expect("apply bookmark");
-    let records = resumed.fetch_all().await.expect("resume fetch");
+    let records = support::phase("fetch_all", resumed.fetch_all())
+        .await
+        .expect("resume fetch");
     let mut is: Vec<i64> = records
         .iter()
         .map(|r| r["data"]["i"].as_i64().unwrap())
@@ -212,7 +169,10 @@ async fn mid_batch_page_bookmark_is_a_valid_resume_point() {
     let mut pages = source.stream_pages(&ctx, 10);
 
     // Capture the FIRST full page (10 records) and its bookmark.
-    let first = pages.next().await.expect("a page").expect("ok");
+    let first = support::phase("next page", pages.next())
+        .await
+        .expect("a page")
+        .expect("ok");
     assert_eq!(
         first.records.len(),
         10,
@@ -220,7 +180,7 @@ async fn mid_batch_page_bookmark_is_a_valid_resume_point() {
     );
     let first_bookmark = first.bookmark.expect("first page carries a bookmark");
     // Drain the rest so the source terminates cleanly.
-    while let Some(p) = pages.next().await {
+    while let Some(p) = support::phase("next page", pages.next()).await {
         let _ = p.expect("ok");
     }
 
@@ -234,7 +194,9 @@ async fn mid_batch_page_bookmark_is_a_valid_resume_point() {
         .apply_start_bookmark(first_bookmark)
         .await
         .expect("apply bookmark");
-    let records = resumed.fetch_all().await.expect("resume fetch");
+    let records = support::phase("fetch_all", resumed.fetch_all())
+        .await
+        .expect("resume fetch");
     let mut is: Vec<i64> = records
         .iter()
         .map(|r| r["data"]["i"].as_i64().unwrap())
@@ -258,7 +220,9 @@ async fn max_messages_and_check_probe() {
     cfg.idle_termination_secs = None;
     cfg.max_messages = Some(10);
     let source = KinesisSource::new(cfg).await.expect("source");
-    let records = source.fetch_all().await.expect("fetch");
+    let records = support::phase("fetch_all", source.fetch_all())
+        .await
+        .expect("fetch");
     assert_eq!(records.len(), 10, "stops at max_messages");
 
     // check(): a healthy stream passes, a missing stream fails.
@@ -297,7 +261,7 @@ async fn lag_reports_millis_behind_latest() {
     let ctx: HashMap<String, serde_json::Value> = HashMap::new();
     let mut pages = source.stream_pages(&ctx, 25);
     let mut n = 0;
-    while let Some(page) = pages.next().await {
+    while let Some(page) = support::phase("next page", pages.next()).await {
         n += page.expect("page").records.len();
     }
     drop(pages);
@@ -325,7 +289,9 @@ async fn every_shard_is_read_when_shards_outnumber_shard_concurrency() {
     let mut cfg = source_config(&endpoint, "wide");
     cfg.shard_concurrency = 1;
     let source = KinesisSource::new(cfg).await.expect("source");
-    let records = source.fetch_all().await.expect("fetch");
+    let records = support::phase("fetch_all", source.fetch_all())
+        .await
+        .expect("fetch");
     let shards: std::collections::HashSet<&str> = records
         .iter()
         .map(|r| r["shard_id"].as_str().unwrap())
@@ -349,7 +315,7 @@ async fn a_reshard_drains_the_parent_tail_before_its_children() {
     let mut pages = source.stream_pages(&ctx, 10);
     let mut bookmark = None;
     let mut read = Vec::new();
-    while let Some(page) = pages.next().await {
+    while let Some(page) = support::phase("next page", pages.next()).await {
         let page = page.expect("page");
         read.extend(page.records);
         if bookmark.is_none() {
@@ -398,7 +364,9 @@ async fn a_reshard_drains_the_parent_tail_before_its_children() {
         .await
         .expect("resumed");
     resumed.apply_start_bookmark(bookmark).await.expect("apply");
-    let records = resumed.fetch_all().await.expect("resume fetch");
+    let records = support::phase("fetch_all", resumed.fetch_all())
+        .await
+        .expect("resume fetch");
     let mut expected: Vec<i64> = (10..30).collect();
     expected.extend(100..120);
     assert_eq!(
@@ -466,8 +434,7 @@ async fn undecodable_records_follow_on_decode_error() {
     let skip = KinesisSource::new(run(faucet_source_kinesis::OnDecodeError::Skip))
         .await
         .unwrap();
-    let got = skip
-        .fetch_all()
+    let got = support::phase("fetch_all", skip.fetch_all())
         .await
         .expect("skip drains past the bad record");
     let is: Vec<i64> = got
@@ -479,14 +446,14 @@ async fn undecodable_records_follow_on_decode_error() {
     let raw = KinesisSource::new(run(faucet_source_kinesis::OnDecodeError::Raw))
         .await
         .unwrap();
-    let got = raw.fetch_all().await.unwrap();
+    let got = support::phase("fetch_all", raw.fetch_all()).await.unwrap();
     assert_eq!(got.len(), 3);
     assert_eq!(got[1]["data"]["raw_base64"], "bm90IGpzb24=");
 
     let fail = KinesisSource::new(run(faucet_source_kinesis::OnDecodeError::Fail))
         .await
         .unwrap();
-    assert!(fail.fetch_all().await.is_err());
+    assert!(support::phase("fetch_all", fail.fetch_all()).await.is_err());
 
     let resumed = KinesisSource::new(source_config(&endpoint, "mixed"))
         .await
@@ -514,7 +481,7 @@ async fn a_quiet_shard_under_latest_does_not_skip_records_written_between_runs()
     let ctx: HashMap<String, serde_json::Value> = HashMap::new();
     let mut pages = first.stream_pages(&ctx, 25);
     let mut bookmark = None;
-    while let Some(page) = pages.next().await {
+    while let Some(page) = support::phase("next page", pages.next()).await {
         let page = page.expect("page");
         assert!(page.records.is_empty());
         bookmark = page.bookmark.or(bookmark);
@@ -530,8 +497,7 @@ async fn a_quiet_shard_under_latest_does_not_skip_records_written_between_runs()
     put_records(&client, "quiet", 0, 10).await;
     let second = KinesisSource::new(cfg).await.expect("source");
     second.apply_start_bookmark(bookmark).await.expect("apply");
-    let mut is: Vec<i64> = second
-        .fetch_all()
+    let mut is: Vec<i64> = support::phase("fetch_all", second.fetch_all())
         .await
         .expect("resume fetch")
         .iter()

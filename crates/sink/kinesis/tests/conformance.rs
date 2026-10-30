@@ -9,25 +9,20 @@
 //!
 //! Check 5 requires Docker (LocalStack via testcontainers), mirroring `sink.rs`.
 #![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
+
+mod support;
 use faucet_conformance::assert_config_schema_valid_value;
 use faucet_core::Sink;
 use faucet_sink_kinesis::{KinesisCredentials, KinesisSink, KinesisSinkConfig};
-use testcontainers::ContainerAsync;
-use testcontainers_modules::localstack::LocalStack;
+use support::await_ready;
 
 const STREAM: &str = "conformance";
 
-async fn start_localstack() -> (ContainerAsync<LocalStack>, String) {
-    use testcontainers::ImageExt;
-    let container = faucet_conformance::containers::start(|| {
-        LocalStack::default().with_env_var("SERVICES", "kinesis")
-    })
-    .await;
-    let port = container
-        .get_host_port_ipv4(4566)
-        .await
-        .expect("localstack port");
-    (container, format!("http://127.0.0.1:{port}"))
+/// Start LocalStack with the kinesis service and return (emulator, endpoint).
+async fn start_localstack() -> (support::Emulator, String) {
+    let emulator = support::start("kinesis").await;
+    let endpoint = emulator.endpoint.clone();
+    (emulator, endpoint)
 }
 
 fn test_credentials() -> KinesisCredentials {
@@ -39,19 +34,11 @@ fn test_credentials() -> KinesisCredentials {
 }
 
 async fn raw_client(endpoint: &str) -> aws_sdk_kinesis::Client {
-    faucet_sink_kinesis::build_client(Some("us-east-1"), Some(endpoint), &test_credentials())
-        .await
-        .expect("client")
-}
-
-async fn await_ready(client: &aws_sdk_kinesis::Client) {
-    for _ in 0..120 {
-        if client.list_streams().send().await.is_ok() {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
-    panic!("localstack kinesis never became ready");
+    support::bounded(
+        faucet_sink_kinesis::build_client(Some("us-east-1"), Some(endpoint), &test_credentials())
+            .await
+            .expect("client"),
+    )
 }
 
 async fn create_stream(client: &aws_sdk_kinesis::Client) {

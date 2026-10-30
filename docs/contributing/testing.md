@@ -12,7 +12,11 @@ in [`CONTRIBUTING.md`](../../CONTRIBUTING.md).
 - **Unit tests** live in `#[cfg(test)]` modules at the bottom of the source file
   they exercise. Use them for anything that doesn't need real I/O: pagination
   state transitions, JSONPath extraction, auth-header generation, config
-  validation, error/`match` branches. This is the bulk of the suite.
+  validation, error/`match` branches. This is the bulk of the suite. When the
+  tests hold fixture credentials, keys or print secret-shaped values, put them
+  in a sibling file instead (`src/foo/tests.rs`, declared `#[cfg(test)] mod
+  tests;` in `src/foo.rs`): CodeQL skips `**/tests.rs`, so the fixtures don't
+  raise code-scanning alerts on every PR that touches the file.
 - **Integration tests** live in the crate's `tests/` directory. HTTP connectors
   use [`wiremock`](https://docs.rs/wiremock); database/queue connectors use
   [`testcontainers`](https://docs.rs/testcontainers) (these need Docker and are
