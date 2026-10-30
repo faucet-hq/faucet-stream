@@ -259,7 +259,10 @@ async fn runs_and_audit(history: Option<String>, cluster: bool) {
         .expect("serve records the sink dataset")
         .to_string();
     let (code, list) = api
-        .get("viewer-tok", &format!("/v1/runs?dataset_id={dataset}"))
+        .get(
+            "viewer-tok",
+            &format!("/v1/runs?dataset_id={dataset}&counts=true"),
+        )
         .await;
     assert_eq!(code, 200, "{list}");
     let ids: Vec<&str> = list["runs"]
@@ -273,6 +276,37 @@ async fn runs_and_audit(history: Option<String>, cluster: bool) {
     let (_, none) = api.get("viewer-tok", "/v1/runs?dataset_id=ffff").await;
     assert!(none["runs"].as_array().unwrap().is_empty(), "{none}");
     let (code, bad) = api.get("viewer-tok", "/v1/runs?dataset_id=a%25b").await;
+    assert_eq!(code, 400, "{bad}");
+
+    // Title (name, else `pipeline` label) substring and pool filters run on
+    // the server, over the whole history.
+    let names = |v: &Value| -> Vec<String> {
+        let mut n: Vec<String> = v["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                r["name"]
+                    .as_str()
+                    .or(r["labels"]["pipeline"].as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        n.sort();
+        n
+    };
+    let (code, list) = api.get("viewer-tok", "/v1/runs?name_contains=rder").await;
+    assert_eq!(code, 200, "{list}");
+    assert_eq!(names(&list), ["orders"], "{list}");
+    let (_, list) = api.get("viewer-tok", "/v1/runs?name_contains=RDER").await;
+    assert!(names(&list).is_empty(), "case-sensitive: {list}");
+    let (_, list) = api.get("viewer-tok", "/v1/runs?pool=default").await;
+    assert_eq!(names(&list), ["nodlq", "orders"], "{list}");
+    let (_, list) = api.get("viewer-tok", "/v1/runs?pool=gpu&counts=true").await;
+    assert!(names(&list).is_empty(), "{list}");
+    assert_eq!(list["counts"], json!({}), "{list}");
+    let (code, bad) = api.get("viewer-tok", "/v1/runs?pool=Not%20A%20Pool").await;
     assert_eq!(code, 400, "{bad}");
 
     // A denial, then the audit filters and the keyset cursor.
@@ -423,7 +457,7 @@ async fn a_template_lists_its_runs_and_reload_names_the_load_time() {
         .await;
 
     let (code, runs) = api
-        .get("viewer-tok", "/v1/templates/orders-sync/runs")
+        .get("viewer-tok", "/v1/templates/orders-sync/runs?counts=true")
         .await;
     assert_eq!(code, 200, "{runs}");
     let runs_list = runs["runs"].as_array().unwrap();

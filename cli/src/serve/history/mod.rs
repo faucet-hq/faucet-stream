@@ -324,6 +324,13 @@ impl RunRecord {
 
     /// Whether any invocation of this run read or wrote the catalog dataset
     /// `dataset_id` (#998): the id its usage record names.
+    /// What a listing calls the run: its name, else its `pipeline` label.
+    pub fn title(&self) -> Option<&str> {
+        self.name
+            .as_deref()
+            .or_else(|| self.labels.get("pipeline").map(String::as_str))
+    }
+
     pub fn touches_dataset(&self, dataset_id: &str) -> bool {
         self.invocations
             .iter()
@@ -420,6 +427,12 @@ pub struct ListFilter {
     /// Only runs one of whose invocations names this catalog dataset in its
     /// usage record (#998). Must pass [`is_dataset_id`].
     pub dataset_id: Option<String>,
+    /// Only runs whose title contains this text, case-sensitively (#998):
+    /// the run's name, or its `pipeline` label when it has no name.
+    pub name_contains: Option<String>,
+    /// Only runs in this execution pool; a run stored before pools existed is
+    /// in `default` (#957, #998).
+    pub pool: Option<String>,
 }
 
 /// Whether `s` has the shape of a catalog dataset id (#998): 1–64 ASCII
@@ -437,6 +450,11 @@ impl ListFilter {
                 .name
                 .as_deref()
                 .is_none_or(|n| rec.name.as_deref() == Some(n))
+            && self
+                .name_contains
+                .as_deref()
+                .is_none_or(|n| rec.title().is_some_and(|t| t.contains(n)))
+            && self.pool.as_deref().is_none_or(|p| rec.pool == p)
             && self.since.is_none_or(|t| rec.submitted_at >= t)
             && self.until.is_none_or(|t| rec.submitted_at <= t)
             && self
@@ -2458,6 +2476,153 @@ fn into_history<H: RunHistory + 'static>(
     }
 }
 
+/// The run-list filters every backend must apply alike (#998), checked
+/// against one backend: the name substring, the pool and the dataset filter
+/// (which names the usage record's dataset, never the same text elsewhere).
+#[cfg(test)]
+pub(crate) async fn assert_list_filters_agree(h: &dyn RunHistory) {
+    let t0 = Utc::now();
+    let put =
+        async |id: &str, name: &str, pool: &str, dataset: Option<&str>, label: Option<&str>| {
+            let mut rec =
+                RunRecord::queued(id.into(), Some(name.into()), Default::default(), None, t0);
+            rec.pool = pool.into();
+            if let Some(l) = label {
+                rec.labels.insert("dataset_id".into(), l.into());
+            }
+            rec.invocations.push(InvocationRecord {
+                row_id: "r".into(),
+                parent_record_key: None,
+                run_id: None,
+                records_written: 1,
+                duration_ms: 0,
+                error: None,
+                usage: dataset.map(|d| crate::usage::UsageRecord {
+                    run_id: id.into(),
+                    pipeline: name.into(),
+                    row: "r".into(),
+                    source_kind: "file".into(),
+                    sink_kind: "file".into(),
+                    dataset_id: Some(d.into()),
+                    dataset_uri: None,
+                    recorded_at: t0,
+                    duration_ms: 0,
+                    failed: false,
+                    usage: Default::default(),
+                    cost: Default::default(),
+                    tenant: None,
+                }),
+                batches: None,
+                source_lag: None,
+                rows: None,
+                skipped: false,
+                status: None,
+            });
+            h.upsert(&rec).await.unwrap();
+        };
+    put("a", "orders-daily", "default", Some("ds-a"), None).await;
+    put("b", "Orders-50%_off", "gpu", Some("DS-A"), None).await;
+    put("c", "customers", "gpu", None, Some("ds-a")).await;
+    // An unnamed run is listed under its `pipeline` label.
+    let mut d = RunRecord::queued("d".into(), None, Default::default(), None, t0);
+    d.labels.insert("pipeline".into(), "orders-weekly".into());
+    h.upsert(&d).await.unwrap();
+    let mut e = RunRecord::queued(
+        "e".into(),
+        Some("named".into()),
+        Default::default(),
+        None,
+        t0,
+    );
+    e.labels.insert("pipeline".into(), "orders-hidden".into());
+    h.upsert(&e).await.unwrap();
+    let ids = async |f: ListFilter| {
+        let mut ids: Vec<String> = h
+            .list(&ListFilter {
+                limit: 50,
+                ..f.clone()
+            })
+            .await
+            .unwrap()
+            .runs
+            .into_iter()
+            .map(|r| r.run_id)
+            .collect();
+        ids.sort();
+        let counted: u64 = h.count_by_status(&f).await.unwrap().values().sum();
+        assert_eq!(counted as usize, ids.len(), "{f:?}");
+        ids
+    };
+
+    assert_eq!(
+        ids(ListFilter {
+            name_contains: Some("rders".into()),
+            ..Default::default()
+        })
+        .await,
+        ["a", "b", "d"]
+    );
+    // Case-sensitive, and LIKE wildcards are plain text.
+    assert_eq!(
+        ids(ListFilter {
+            name_contains: Some("Orders".into()),
+            ..Default::default()
+        })
+        .await,
+        ["b"]
+    );
+    assert_eq!(
+        ids(ListFilter {
+            name_contains: Some("%_".into()),
+            ..Default::default()
+        })
+        .await,
+        ["b"]
+    );
+    assert!(
+        ids(ListFilter {
+            name_contains: Some("o_d".into()),
+            ..Default::default()
+        })
+        .await
+        .is_empty()
+    );
+    assert_eq!(
+        ids(ListFilter {
+            pool: Some("gpu".into()),
+            ..Default::default()
+        })
+        .await,
+        ["b", "c"]
+    );
+    assert_eq!(
+        ids(ListFilter {
+            pool: Some("default".into()),
+            ..Default::default()
+        })
+        .await,
+        ["a", "d", "e"]
+    );
+    // Only the usage record names a dataset: not a label, not another case.
+    assert_eq!(
+        ids(ListFilter {
+            dataset_id: Some("ds-a".into()),
+            ..Default::default()
+        })
+        .await,
+        ["a"]
+    );
+    assert_eq!(
+        ids(ListFilter {
+            dataset_id: Some("ds-a".into()),
+            pool: Some("gpu".into()),
+            ..Default::default()
+        })
+        .await,
+        Vec::<String>::new()
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2679,6 +2844,11 @@ mod tests {
         with.submitted_by = Some("alice".into());
         let back: RunRecord = serde_json::from_value(serde_json::to_value(&with).unwrap()).unwrap();
         assert_eq!(back.submitted_by.as_deref(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn memory_list_filters_match_name_pool_and_usage_dataset() {
+        assert_list_filters_agree(&memory::MemoryHistory::new(Duration::from_secs(60))).await;
     }
 
     #[test]

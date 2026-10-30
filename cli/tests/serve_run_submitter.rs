@@ -222,8 +222,11 @@ async fn scenario(history: Option<String>) {
     let (_, rec) = api.get("viewer-tok", &format!("/v1/runs/{a2}")).await;
     assert_eq!(rec["status"], "failed", "{rec}");
 
+    // Counts are opt-in: a plain listing carries none.
+    let (_, plain) = api.get("viewer-tok", "/v1/runs?limit=1").await;
+    assert!(plain.get("counts").is_none(), "{plain}");
     // Exact counts over the whole filter, whatever the page size.
-    let (code, list) = api.get("viewer-tok", "/v1/runs?limit=1").await;
+    let (code, list) = api.get("viewer-tok", "/v1/runs?limit=1&counts=true").await;
     assert_eq!(code, 200, "{list}");
     assert_eq!(list["runs"].as_array().unwrap().len(), 1);
     assert!(list["next_cursor"].is_string());
@@ -234,21 +237,28 @@ async fn scenario(history: Option<String>) {
     );
 
     // The submitter filter, by name and as `mine`.
-    let (code, list) = api.get("viewer-tok", "/v1/runs?submitted_by=alice").await;
+    let (code, list) = api
+        .get("viewer-tok", "/v1/runs?submitted_by=alice&counts=true")
+        .await;
     assert_eq!(code, 200, "{list}");
     let mut want = vec![a1.clone(), a2.clone()];
     want.sort();
     assert_eq!(ids(&list), want);
     assert_eq!(list["counts"], json!({ "completed": 1, "failed": 1 }));
-    let (_, list) = api.get("bob-tok", "/v1/runs?mine=true").await;
+    let (_, list) = api.get("bob-tok", "/v1/runs?mine=true&counts=true").await;
     assert_eq!(ids(&list), vec![b1.clone()]);
     assert_eq!(list["counts"], json!({ "completed": 1 }));
-    let (_, list) = api.get("viewer-tok", "/v1/runs?mine=true").await;
+    let (_, list) = api
+        .get("viewer-tok", "/v1/runs?mine=true&counts=true")
+        .await;
     assert!(ids(&list).is_empty());
     assert_eq!(list["counts"], json!({}));
     // Filters compose with the counts.
     let (_, list) = api
-        .get("viewer-tok", "/v1/runs?submitted_by=alice&status=failed")
+        .get(
+            "viewer-tok",
+            "/v1/runs?submitted_by=alice&status=failed&counts=true",
+        )
         .await;
     assert_eq!(ids(&list), vec![a2.clone()]);
     assert_eq!(list["counts"], json!({ "failed": 1 }));

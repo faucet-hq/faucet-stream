@@ -165,7 +165,7 @@ export function refreshBadges(force = false) {
   clearTimeout(badgeTimer);
   badgeTimer = setTimeout(() => refreshBadges(true), 30000);
   const scoped = !!(whoami() && whoami().tenant);
-  api(`/v1/runs?${withTenant(new URLSearchParams({ status: "running,sharded", limit: "1" }))}`)
+  api(`/v1/runs?${withTenant(new URLSearchParams({ status: "running,sharded", limit: "1", counts: "true" }))}`)
     .then((r) => setBadge("runs", r && r.counts ? (r.counts.running || 0) + (r.counts.sharded || 0) : (r?.runs || []).length))
     .catch(() => setBadge("runs", 0));
   api(`/v1/changes/counts?${withTenant(new URLSearchParams())}`)

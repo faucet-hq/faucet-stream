@@ -157,7 +157,7 @@ export async function renderSettings(host, params) {
   paint();
   const [r, runs] = await Promise.all([
     fetch("/readyz").then((x) => x.json()).catch(() => null),
-    api(`/v1/runs?${withTenant(new URLSearchParams({ status: "running,sharded", limit: "100" }))}`).catch(() => null),
+    api(`/v1/runs?${withTenant(new URLSearchParams({ status: "running,sharded", limit: "100", counts: "true" }))}`).catch(() => null),
   ]);
   ready = r;
   running = runs ? (runs.counts ? (runs.counts.running || 0) + (runs.counts.sharded || 0) : (runs.runs || []).length) : null;

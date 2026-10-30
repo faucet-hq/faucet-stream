@@ -47,7 +47,7 @@ export async function renderOverview(host, params) {
       safe(api(`/v1/overview?${new URLSearchParams({ ...Object.fromEntries(t), since: other })}`)),
       safe(api(`/v1/runs?${withTenant(new URLSearchParams({ status: ACTIVE, limit: "6" }))}`)),
       safe(api(`/v1/runs?${withTenant(new URLSearchParams({ status: "failed", since: runSince, limit: "5" }))}`)),
-      safe(api(`/v1/runs?${withTenant(new URLSearchParams({ limit: "1" }))}`)),
+      safe(api(`/v1/runs?${withTenant(new URLSearchParams({ limit: "1", counts: "true" }))}`)),
       safe(api(`/v1/changes?${withTenant(new URLSearchParams({ limit: "3" }))}`)),
       safe(api("/v1/templates")),
     ]);

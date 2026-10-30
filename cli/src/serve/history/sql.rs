@@ -1355,15 +1355,12 @@ impl Stmts {
     /// How many fixed binds [`Stmts::list`] takes before the label clauses.
     pub const LIST_BINDS: usize = 16;
 
-    /// The run-listing query: [`Stmts::list`]'s sixteen binds, then one
-    /// clause per label filter (#958) and the dataset clause (#998), then the
-    /// `LIMIT` bind. Returns the SQL and the extra binds, in bind order.
-    pub fn list_query(
-        &self,
-        labels: &[crate::serve::history::labels::LabelFilter],
-        dataset_id: Option<&str>,
-    ) -> (String, Vec<String>) {
-        let (mut sql, binds) = self.label_clauses(self.list.clone(), labels, dataset_id);
+    /// The run-listing query: [`Stmts::list`]'s sixteen binds, then the
+    /// clauses only some filters need — dataset, name substring and pool
+    /// (#998), one per label filter (#958) — then the `LIMIT` bind. Returns
+    /// the SQL and the extra binds, in bind order.
+    pub fn list_query(&self, filter: &crate::serve::history::ListFilter) -> (String, Vec<String>) {
+        let (mut sql, binds) = self.filter_clauses(self.list.clone(), filter);
         sql.push_str(&format!(
             " ORDER BY submitted_at DESC, run_id DESC LIMIT {}",
             self.placeholder(Self::LIST_BINDS + 1 + binds.len())
@@ -1372,45 +1369,78 @@ impl Stmts {
     }
 
     /// The per-status count over the same filter as [`Stmts::list_query`]
-    /// (#998): its sixteen binds (pass the cursor ones as NULL), then the label
-    /// binds; no `LIMIT`.
-    pub fn count_query(
-        &self,
-        labels: &[crate::serve::history::labels::LabelFilter],
-        dataset_id: Option<&str>,
-    ) -> (String, Vec<String>) {
+    /// (#998): its sixteen binds (pass the cursor ones as NULL), then the
+    /// extra binds; no `LIMIT`.
+    pub fn count_query(&self, filter: &crate::serve::history::ListFilter) -> (String, Vec<String>) {
         let base = self
             .list
             .replacen("SELECT body FROM", "SELECT status, COUNT(*) AS n FROM", 1);
-        let (mut sql, binds) = self.label_clauses(base, labels, dataset_id);
+        let (mut sql, binds) = self.filter_clauses(base, filter);
         sql.push_str(" GROUP BY status");
         (sql, binds)
     }
 
-    fn label_clauses(
+    fn filter_clauses(
         &self,
         mut sql: String,
-        labels: &[crate::serve::history::labels::LabelFilter],
-        dataset_id: Option<&str>,
+        filter: &crate::serve::history::ListFilter,
     ) -> (String, Vec<String>) {
         let mut binds = Vec::new();
+        let next = |binds: &mut Vec<String>, v: String| {
+            binds.push(v);
+            self.placeholder(Self::LIST_BINDS + binds.len())
+        };
         // A run names its sink dataset only inside the stored record (each
-        // invocation's usage), so match the serialized field. The id is
-        // checked by `is_dataset_id` first: no LIKE wildcard can reach here.
-        if let Some(id) = dataset_id {
-            binds.push(dataset_like(id));
+        // invocation's usage). The LIKE narrows the rows cheaply; the JSON
+        // test then matches exactly what `RunRecord::touches_dataset` does, so
+        // the field elsewhere in the body (a label, an error) never matches.
+        // The id is checked by `is_dataset_id` first: no wildcard reaches here.
+        if let Some(id) = filter.dataset_id.as_deref() {
+            let like = next(&mut binds, dataset_like(id));
+            let exact = next(&mut binds, id.to_string());
+            let json = match self.dialect {
+                Dialect::Postgres => format!(
+                    "body::jsonb @> jsonb_build_object('invocations', jsonb_build_array(\
+                     jsonb_build_object('usage', jsonb_build_object('dataset_id', {exact}::text))))"
+                ),
+                Dialect::Sqlite => format!(
+                    "EXISTS (SELECT 1 FROM json_each(body, '$.invocations') \
+                     WHERE json_extract(value, '$.usage.dataset_id') = {exact})"
+                ),
+            };
+            sql.push_str(&format!(" AND body LIKE {like} AND {json}"));
+        }
+        // Substring tests without LIKE, so no wildcard needs escaping and both
+        // dialects compare case-sensitively, like the memory backend.
+        // The run's title: its name, else its `pipeline` label.
+        if let Some(n) = filter.name_contains.as_deref() {
+            let a = next(&mut binds, n.to_string());
+            let b = next(&mut binds, n.to_string());
+            let has = |hay: &str, p: &str| match self.dialect {
+                Dialect::Postgres => format!("position({p}::text in {hay}) > 0"),
+                Dialect::Sqlite => format!("instr({hay}, {p}) > 0"),
+            };
             sql.push_str(&format!(
-                " AND body LIKE {}",
-                self.placeholder(Self::LIST_BINDS + binds.len())
+                " AND ({} OR (name IS NULL AND run_id IN (SELECT run_id FROM \
+                 faucet_serve_run_labels WHERE key = 'pipeline' AND {})))",
+                has("name", &a),
+                has("value", &b)
             ));
         }
-        for f in labels {
-            binds.push(f.key.clone());
-            let key = self.placeholder(Self::LIST_BINDS + binds.len());
+        if let Some(pool) = filter.pool.as_deref() {
+            let p = next(&mut binds, pool.to_string());
+            let cast = if matches!(self.dialect, Dialect::Postgres) {
+                "::text"
+            } else {
+                ""
+            };
+            sql.push_str(&format!(" AND COALESCE(pool, 'default') = {p}{cast}"));
+        }
+        for f in &filter.labels {
+            let key = next(&mut binds, f.key.clone());
             match &f.value {
                 Some(v) => {
-                    binds.push(v.clone());
-                    let value = self.placeholder(Self::LIST_BINDS + binds.len());
+                    let value = next(&mut binds, v.clone());
                     sql.push_str(&format!(
                         " AND run_id IN (SELECT run_id FROM faucet_serve_run_labels \
                          WHERE key = {key} AND value = {value})"
@@ -3377,7 +3407,7 @@ macro_rules! impl_sql_history {
 
                 let (list_sql, label_binds) = self
                     .stmts
-                    .list_query(&filter.labels, filter.dataset_id.as_deref());
+                    .list_query(filter);
                 let mut q = sqlx::query(&list_sql)
                     .bind(status_s)
                     .bind(status_s)
@@ -3442,7 +3472,7 @@ macro_rules! impl_sql_history {
                 let none: Option<&str> = None;
                 let (count_sql, label_binds) = self
                     .stmts
-                    .count_query(&filter.labels, filter.dataset_id.as_deref());
+                    .count_query(filter);
                 let mut q = sqlx::query(&count_sql)
                     .bind(status_s.as_deref())
                     .bind(status_s.as_deref())
@@ -7516,7 +7546,7 @@ mod tests {
         let lite = Stmts::new(Dialect::Sqlite);
         assert!(pg.upsert.contains("$1") && lite.upsert.contains('?'));
         assert!(pg.list.contains("$13") && lite.list.contains('?'));
-        let (q, _) = pg.list_query(&[], None);
+        let (q, _) = pg.list_query(&Default::default());
         assert!(
             q.ends_with(&format!("LIMIT ${}", Stmts::LIST_BINDS + 1)),
             "{q}"
@@ -7532,11 +7562,14 @@ mod tests {
     #[test]
     fn list_query_adds_one_clause_per_label_filter_before_the_limit() {
         use crate::serve::history::labels::LabelFilter;
-        let f = [
-            LabelFilter::parse("team:data").unwrap(),
-            LabelFilter::parse("env").unwrap(),
-        ];
-        let (q, binds) = Stmts::new(Dialect::Postgres).list_query(&f, None);
+        let f = crate::serve::history::ListFilter {
+            labels: vec![
+                LabelFilter::parse("team:data").unwrap(),
+                LabelFilter::parse("env").unwrap(),
+            ],
+            ..Default::default()
+        };
+        let (q, binds) = Stmts::new(Dialect::Postgres).list_query(&f);
         assert_eq!(binds, ["team", "data", "env"]);
         // The submitter filter (#998) takes binds 15 and 16, so labels start at 17.
         assert!(q.contains("submitted_by = $16::text"), "{q}");
@@ -7546,7 +7579,7 @@ mod tests {
             q.ends_with("ORDER BY submitted_at DESC, run_id DESC LIMIT $20"),
             "{q}"
         );
-        let (q, binds) = Stmts::new(Dialect::Sqlite).list_query(&f, None);
+        let (q, binds) = Stmts::new(Dialect::Sqlite).list_query(&f);
         assert_eq!(binds.len(), 3);
         assert_eq!(q.matches("faucet_serve_run_labels").count(), 2);
         assert!(q.ends_with("LIMIT ?"), "{q}");
@@ -7555,8 +7588,11 @@ mod tests {
     #[test]
     fn count_query_groups_the_list_filter_by_status_without_a_limit() {
         use crate::serve::history::labels::LabelFilter;
-        let f = [LabelFilter::parse("team:data").unwrap()];
-        let (q, binds) = Stmts::new(Dialect::Postgres).count_query(&f, None);
+        let f = crate::serve::history::ListFilter {
+            labels: vec![LabelFilter::parse("team:data").unwrap()],
+            ..Default::default()
+        };
+        let (q, binds) = Stmts::new(Dialect::Postgres).count_query(&f);
         assert_eq!(binds, ["team", "data"]);
         assert!(
             q.starts_with("SELECT status, COUNT(*) AS n FROM faucet_serve_runs"),
@@ -7565,20 +7601,62 @@ mod tests {
         assert!(q.contains("WHERE key = $17 AND value = $18)"), "{q}");
         assert!(q.ends_with(" GROUP BY status"), "{q}");
         assert!(!q.contains("LIMIT") && !q.contains("ORDER BY"), "{q}");
-        let (q, binds) = Stmts::new(Dialect::Sqlite).count_query(&[], None);
+        let (q, binds) = Stmts::new(Dialect::Sqlite).count_query(&Default::default());
         assert!(binds.is_empty());
         assert_eq!(q.matches('?').count(), Stmts::LIST_BINDS, "{q}");
     }
 
     #[test]
-    fn a_dataset_filter_matches_the_stored_usage_field_before_the_limit() {
-        let (q, binds) = Stmts::new(Dialect::Postgres).list_query(&[], Some("471f19a6"));
-        assert_eq!(binds, [r#"%"dataset_id":"471f19a6"%"#]);
-        assert!(q.contains("AND body LIKE $17 ORDER BY"), "{q}");
-        assert!(q.ends_with("LIMIT $18"), "{q}");
-        let (q, binds) = Stmts::new(Dialect::Sqlite).count_query(&[], Some("ab-1"));
-        assert_eq!(binds.len(), 1);
-        assert!(q.contains("AND body LIKE ? GROUP BY status"), "{q}");
+    fn a_dataset_filter_matches_the_usage_field_exactly_before_the_limit() {
+        // The LIKE alone also matched the field anywhere in the body (a label),
+        // and case-insensitively on SQLite; the JSON test pins the usage field.
+        let f = crate::serve::history::ListFilter {
+            dataset_id: Some("471f19a6".into()),
+            ..Default::default()
+        };
+        let (q, binds) = Stmts::new(Dialect::Postgres).list_query(&f);
+        assert_eq!(binds, [r#"%"dataset_id":"471f19a6"%"#, "471f19a6"]);
+        assert!(q.contains("AND body LIKE $17 AND body::jsonb @> "), "{q}");
+        assert!(q.contains("'dataset_id', $18::text"), "{q}");
+        assert!(q.ends_with("LIMIT $19"), "{q}");
+        let f = crate::serve::history::ListFilter {
+            dataset_id: Some("ab-1".into()),
+            ..Default::default()
+        };
+        let (q, binds) = Stmts::new(Dialect::Sqlite).count_query(&f);
+        assert_eq!(binds.len(), 2);
+        assert!(q.contains("json_each(body, '$.invocations')"), "{q}");
+        assert!(q.ends_with("= ?) GROUP BY status"), "{q}");
+    }
+
+    #[test]
+    fn name_and_pool_filters_bind_after_the_fixed_binds() {
+        let f = crate::serve::history::ListFilter {
+            name_contains: Some("50%_off".into()),
+            pool: Some("gpu".into()),
+            ..Default::default()
+        };
+        let (q, binds) = Stmts::new(Dialect::Postgres).list_query(&f);
+        assert_eq!(binds, ["50%_off", "50%_off", "gpu"]);
+        assert!(
+            q.contains("AND (position($17::text in name) > 0 OR (name IS NULL"),
+            "{q}"
+        );
+        assert!(
+            q.contains("key = 'pipeline' AND position($18::text in value) > 0"),
+            "{q}"
+        );
+        assert!(
+            q.contains("AND COALESCE(pool, 'default') = $19::text"),
+            "{q}"
+        );
+        assert!(!q.contains("LIKE"), "{q}");
+        let (q, _) = Stmts::new(Dialect::Sqlite).count_query(&f);
+        assert!(q.contains("AND (instr(name, ?) > 0 OR"), "{q}");
+        assert!(
+            q.contains("AND COALESCE(pool, 'default') = ? GROUP BY"),
+            "{q}"
+        );
     }
 
     #[test]

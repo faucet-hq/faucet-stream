@@ -239,7 +239,7 @@ export async function renderRuns(host, params) {
 
   function readFilters(q) {
     const status = (q.get("status") || "").split(",").filter((s) => STATUSES.includes(s));
-    return { status, q: q.get("q") || "", since: q.get("since") || "", until: q.get("until") || "", pool: q.get("pool") || "", by: q.get("by") || "", mine: q.get("mine") === "1", labels: [...new Set(q.getAll("label").filter(Boolean))], open: q.get("f") === "1" };
+    return { status, q: q.get("q") || "", since: q.get("since") || "", until: q.get("until") || "", pool: q.get("pool") || "", by: q.get("by") || "", mine: q.get("mine") === "1" && !q.get("by"), labels: [...new Set(q.getAll("label").filter(Boolean))], open: q.get("f") === "1" };
   }
   const tabFor = () => {
     if (f.mine && !f.status.length) return "Mine";
@@ -262,10 +262,12 @@ export async function renderRuns(host, params) {
     if (f.status.length) p.set("status", f.status.join(","));
     if (f.mine) p.set("mine", "true");
     if (f.by) p.set("submitted_by", f.by);
-    if (f.q) p.set("name", f.q);
+    if (f.q) p.set("name_contains", f.q);
+    if (f.pool) p.set("pool", f.pool);
     if (f.since) p.set("since", f.since);
     if (f.until) p.set("until", f.until);
     p.set("limit", String(mode === "refresh" ? Math.min(500, Math.max(PAGE, runs.length)) : PAGE));
+    p.set("counts", "true");
     if (mode === "more" && cursor) p.set("cursor", cursor);
     for (const l of f.labels) p.append("label", l);
     withTenant(p);
@@ -322,7 +324,7 @@ export async function renderRuns(host, params) {
     });
   }
   const count = (sts) => (counts ? sts.reduce((n, s) => n + (counts[s] || 0), 0) : runs.filter((r) => sts.includes(r.status)).length);
-  const shownRuns = () => (f.pool ? runs.filter((r) => (r.pool || "default") === f.pool) : runs);
+  const shownRuns = () => runs;
 
   function statStrip() {
     const plus = !counts && cursor ? "+" : "";
@@ -338,7 +340,7 @@ export async function renderRuns(host, params) {
   }
   function filterPanel() {
     const statusLabel = f.status.length ? `Status · ${f.status.join(", ")}` : "Status · any";
-    const pools = [...new Set(["default", ...runs.map((r) => r.pool || "default"), f.pool].filter(Boolean))].sort();
+    const pools = [...new Set(["default", ...(window.__faucetPools || []), ...runs.map((r) => r.pool || "default"), f.pool].filter(Boolean))].sort();
     return html`<form class="filters" id="ru-filters" autocomplete="off">
       ${input(f.q, { icon: "search", ph: "Name contains", name: "q", type: "search" })}
       <div class="r2">
@@ -387,7 +389,7 @@ export async function renderRuns(host, params) {
           const rs = shown.filter((r) => sts.includes(r.status));
           if (!rs.length) return "";
           const closed = secs.isClosed(sid);
-          return html`${sect(label, fmtInt(counts && !f.pool ? count(sts) : rs.length), { id: sid, closed })}<div class="sect-rows rows${closed ? " closed" : ""}">${rs.map(runRow)}</div>`;
+          return html`${sect(label, fmtInt(counts ? count(sts) : rs.length), { id: sid, closed })}<div class="sect-rows rows${closed ? " closed" : ""}">${rs.map(runRow)}</div>`;
         }));
         if (cursor) rowsHtml = html`${rowsHtml}${btn("Load more", { kind: "quiet", cls: "load-more", data: { act: "more" } })}`;
       }
@@ -434,7 +436,8 @@ export async function renderRuns(host, params) {
     if (t && L.list.querySelector(".ru-top").contains(t)) {
       const name = t.dataset.tab;
       const status = name === "Active" ? ACTIVE.join(",") : name === "Failed" ? "failed" : "";
-      setQuery({ status, mine: name === "Mine" ? "1" : "" });
+      // `mine` and `by` are one filter: picking Mine drops a named submitter.
+      setQuery({ status, mine: name === "Mine" ? "1" : "", ...(name === "Mine" ? { by: "" } : {}) });
       return;
     }
     const s = e.target.closest(".stats > div[data-q]");

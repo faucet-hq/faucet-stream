@@ -469,7 +469,7 @@ template) `POST /v1/templates/{id}/runs`, `run_template` and a template trigger.
 | `GET` | `/v1/templates/{id}/rows` | `200` | The template's selectable rows (streams / matrix rows) with their metadata; selector params (`select`, `only`, `skip`, `tags`, `status`, `include_parents`) turn it into a dry-run resolve (`TemplateRead`, audit `template.rows`) |
 | `DELETE` | `/v1/templates/{id}` | `204` | Delete one version (`?version=<channel\|N>`) or all (admin / `TemplateAdmin`) |
 | `POST` | `/v1/templates/{id}/runs` | `202` | Trigger a run from a template with `params` / `env` (operator / `RunWrite`) |
-| `GET` | `/v1/templates/{id}/runs` | `200` | The runs started from the template (label `template: <id>`), paged like `GET /v1/runs` (`limit`, `cursor`) with `counts`; `404` for an id never registered (viewer / `TemplateRead`) |
+| `GET` | `/v1/templates/{id}/runs` | `200` | The runs started from the template (label `template: <id>`), paged like `GET /v1/runs` (`limit`, `cursor`, and `counts=true` for totals); `404` for an id never registered (viewer / `TemplateRead`) |
 | `POST` | `/v1/templates/{id}/tags` | `200` | Point an assignable channel (`prod`, `dev`, …) at a version (admin / `TemplateAdmin`) |
 | `POST` | `/v1/templates/{id}/launch` | `200` | Make a version live — moves `stable` and so unpinned callers (admin / `TemplateAdmin`) |
 | `POST` | `/v1/templates/{id}/rollback` | `200` | Re-launch `previous` (admin / `TemplateAdmin`) |
@@ -620,7 +620,7 @@ submitted config (submitted values win).
 ### `GET /v1/runs`
 
 Query parameters: `status`, `name`, `since`, `until` (RFC3339), `limit` (default
-50, max 500), `cursor`, `tenant`, `submitted_by`, `mine`, `dataset_id`, `label`, `labels`. Ordering is
+50, max 500), `cursor`, `tenant`, `submitted_by`, `mine`, `dataset_id`, `name_contains`, `pool`, `counts`, `label`, `labels`. Ordering is
 `(submitted_at DESC, run_id DESC)`; `cursor` is the previous page's
 `next_cursor` — the last row's sort key (`<submitted_at>~<run_id>`), so paging
 stays correct when that run is deleted or purged between requests. A bare
@@ -654,12 +654,19 @@ field existed have no submitter and match neither.
 
 **Filtering by dataset (#998).** `dataset_id=<catalog dataset id>` keeps the
 runs one of whose invocations wrote that dataset — the `usage.dataset_id` a
-run records while the catalog is active. Anything but letters, digits and `-`
-is a `400`.
+run records while the catalog is active, and only that field (the same text
+in a label does not match). Anything but letters, digits and `-` is a `400`.
 
-**Exact counts (#998).** `counts` holds how many runs match the filters, per
-status, ignoring `limit` and `cursor` — so a dashboard can show totals without
-paging through every run. Only statuses with at least one run appear.
+**Filtering by title and pool (#998).** `name_contains=<text>` keeps runs whose
+title — the run's `name`, or its `pipeline` label when it has none — contains
+the text, case-sensitively (`%` and `_` are ordinary characters). `pool=<name>`
+keeps runs in that execution pool; runs recorded before pools existed are in
+`default`. An invalid pool name is a `400`.
+
+**Exact counts (#998).** With `counts=true`, `counts` holds how many runs match
+the filters, per status, ignoring `limit` and `cursor` — so a dashboard can show
+totals without paging through every run. Only statuses with at least one run
+appear. Without it the field is omitted: counting reads every matching run.
 
 **Unknown parameters are a `400`.** A typo such as `?lables=team:data` is
 refused rather than silently returning every run. So are an unknown `status`

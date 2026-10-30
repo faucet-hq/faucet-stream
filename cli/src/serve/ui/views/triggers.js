@@ -183,7 +183,7 @@ triggers:
     if (!state.name) return;
     const name = state.name;
     try {
-      const r = await api(`/v1/runs?${new URLSearchParams({ label: `${RUN_LABEL}:${name}`, limit: "50" })}`);
+      const r = await api(`/v1/runs?${new URLSearchParams({ label: `${RUN_LABEL}:${name}`, limit: "50", counts: "true" })}`);
       if (state.name !== name) return;
       const total = r.counts ? Object.values(r.counts).reduce((a, b) => a + b, 0) : (r.runs || []).length;
       runs = { name, list: r.runs || [], total };

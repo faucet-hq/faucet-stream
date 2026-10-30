@@ -80,7 +80,10 @@ paths:
         - { name: tenant, in: query, schema: { type: string }, description: "Only runs started for this tenant (#709). A tenant-scoped principal always sees only its own tenant; naming another is a 404." }
         - { name: submitted_by, in: query, schema: { type: string }, description: "Only runs this principal submitted (#998), exact match on `RunRecord.submitted_by`. Runs recorded before the field existed have no submitter and never match." }
         - { name: mine, in: query, schema: { type: boolean, default: false }, description: "`true`: only runs the caller submitted — `submitted_by` set to the caller's own principal (#998). Setting both `mine` and `submitted_by` is a 400." }
-        - { name: dataset_id, in: query, schema: { type: string, pattern: "^[A-Za-z0-9-]{1,64}$" }, description: "Only runs one of whose invocations wrote this catalog dataset (#998): the `usage.dataset_id` its usage record names (recorded when the catalog is active). Anything but letters, digits and `-` is a 400." }
+        - { name: dataset_id, in: query, schema: { type: string, pattern: "^[A-Za-z0-9-]{1,64}$" }, description: "Only runs one of whose invocations wrote this catalog dataset (#998): the `usage.dataset_id` its usage record names (recorded when the catalog is active). Anything but letters, digits and `-` is a 400. Matches only that usage field — the same text in a label or an error does not count." }
+        - { name: name_contains, in: query, schema: { type: string }, description: "Only runs whose title contains this text, case-sensitively (#998): the run's `name`, or its `pipeline` label when it has no name. `%` and `_` are plain characters." }
+        - { name: pool, in: query, schema: { type: string }, description: "Only runs in this execution pool (#957, #998); a run recorded before pools existed is in `default`. An invalid pool name is a 400." }
+        - { name: counts, in: query, schema: { type: boolean, default: false }, description: "`true`: also return `counts`, the per-status totals over the whole filter (#998). Off by default, since counting reads every matching run." }
         - name: label
           in: query
           style: form
@@ -102,7 +105,7 @@ paths:
             repeatable `label=` form.
       responses:
         "200":
-          description: A page of runs, newest first, plus exact per-status counts over the whole filter.
+          description: A page of runs, newest first, plus exact per-status counts over the whole filter when `counts=true`.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ListResponse" }
@@ -110,8 +113,8 @@ paths:
           description: >-
             An unknown query parameter (a typo such as `lables` is refused
             rather than returning an unfiltered list), an unknown status, an
-            empty label key, more than 10 label filters, or both `mine` and
-            `submitted_by`.
+            empty label key, more than 10 label filters, an invalid `pool`,
+            or both `mine` and `submitted_by`.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -2551,7 +2554,7 @@ paths:
       summary: Runs started from a template
       description: >
         The runs labelled `template: <id>` (#998), newest first and paged like
-        `GET /v1/runs`, with exact per-status `counts`. 404 for an id that was
+        `GET /v1/runs`, with exact per-status `counts` when `counts=true`. 404 for an id that was
         never registered. A tenant-scoped principal sees only its own tenant's
         runs. Requires `TemplateRead`; audited as `template.runs` on denial.
       operationId: listTemplateRuns
@@ -2559,6 +2562,7 @@ paths:
         - { name: id, in: path, required: true, schema: { type: string } }
         - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 500 } }
         - { name: cursor, in: query, schema: { type: string }, description: "The previous page's `next_cursor`." }
+        - { name: counts, in: query, schema: { type: boolean, default: false }, description: "`true`: also return per-status `counts`." }
       responses:
         "200":
           description: The template's runs.
@@ -2566,7 +2570,7 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [runs, counts]
+                required: [runs]
                 properties:
                   runs: { type: array, items: { $ref: "#/components/schemas/RunRecord" } }
                   next_cursor: { type: string }
@@ -3269,13 +3273,13 @@ components:
           - {}
     ListResponse:
       type: object
-      required: [runs, counts]
+      required: [runs]
       properties:
         runs:
           type: array
           items: { $ref: "#/components/schemas/RunRecord" }
         next_cursor: { type: string, nullable: true }
-        counts: { $ref: "#/components/schemas/StatusCounts" }
+        counts: { $ref: "#/components/schemas/StatusCounts", description: "Present only when the request set `counts=true`." }
       example:
         runs:
         - run_id: run_01HZY8K3QK7

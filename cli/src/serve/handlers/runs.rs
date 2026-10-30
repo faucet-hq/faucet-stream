@@ -234,6 +234,14 @@ pub struct ListQuery {
     pub mine: bool,
     /// Only runs that wrote this catalog dataset (its id) (#998).
     pub dataset_id: Option<String>,
+    /// Only runs whose name contains this text, case-sensitively (#998).
+    pub name_contains: Option<String>,
+    /// Only runs in this execution pool (#957, #998).
+    pub pool: Option<String>,
+    /// `counts=true`: also return per-status totals over the whole filter
+    /// (#998). Off by default: counting reads every matching run.
+    #[serde(default)]
+    pub counts: bool,
     /// Repeatable `label=key:value` / `label=key` filters, ANDed (#958).
     #[serde(skip)]
     pub label: Vec<String>,
@@ -277,8 +285,32 @@ pub struct ListResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
     /// Every run the filter matches, per status, ignoring `limit` and
-    /// `cursor` (#998): exact totals, not just the page.
-    pub counts: crate::serve::history::StatusCounts,
+    /// `cursor` (#998): exact totals, not just the page. Present only when
+    /// the request asked for them (`counts=true`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub counts: Option<crate::serve::history::StatusCounts>,
+}
+
+/// The page for `filter`, plus its per-status totals when `with_counts`.
+pub(crate) async fn list_page(
+    history: &dyn crate::serve::history::RunHistory,
+    filter: &ListFilter,
+    with_counts: bool,
+) -> Result<
+    (
+        crate::serve::history::ListPage,
+        Option<crate::serve::history::StatusCounts>,
+    ),
+    ServeError,
+> {
+    let counts = async {
+        if with_counts {
+            history.count_by_status(filter).await.map(Some)
+        } else {
+            Ok(None)
+        }
+    };
+    tokio::try_join!(history.list(filter), counts).map_err(|e| ServeError::Internal(e.to_string()))
 }
 
 const DEFAULT_LIMIT: usize = 50;
@@ -322,9 +354,16 @@ impl ListQuery {
                 "invalid `dataset_id` '{d}': a catalog dataset id is letters, digits and `-`"
             )));
         }
+        let name_contains = self.name_contains.filter(|n| !n.is_empty());
+        let pool = self.pool.filter(|p| !p.is_empty());
+        if let Some(p) = pool.as_deref() {
+            crate::serve::pools::validate_name(p).map_err(ServeError::BadConfig)?;
+        }
         Ok(ListFilter {
             submitted_by,
             dataset_id: self.dataset_id,
+            name_contains,
+            pool,
             status,
             name: self.name,
             since: self.since.map(|p| p.0),
@@ -345,10 +384,9 @@ pub async fn list_runs(
     RawQuery(raw): RawQuery,
 ) -> Result<Json<ListResponse>, ServeError> {
     let query = ListQuery::from_raw(raw.as_deref())?;
+    let with_counts = query.counts;
     let filter = query.into_filter(&actor)?;
-    let history = state.history();
-    let (page, counts) = tokio::try_join!(history.list(&filter), history.count_by_status(&filter))
-        .map_err(|e| ServeError::Internal(e.to_string()))?;
+    let (page, counts) = list_page(state.history().as_ref(), &filter, with_counts).await?;
     let mut runs = page.runs;
     for rec in &mut runs {
         redact_record(rec, &actor);
