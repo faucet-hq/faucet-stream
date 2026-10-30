@@ -163,7 +163,7 @@ export async function renderLineage(host, params) {
   // ── svg ──
   function svgMarkup() {
     const g = graph;
-    const sel = q.sel || (q.col ? q.root : "");
+    const sel = q.sel || q.root;
     const nb = new Set();
     if (q.sel) for (const e of g.shown) { if (e.src_id === q.sel) nb.add(e.dst_id); if (e.dst_id === q.sel) nb.add(e.src_id); }
     const s = q.q.toLowerCase();
@@ -236,7 +236,7 @@ export async function renderLineage(host, params) {
     const { cw, ch } = box();
     const pad = 20;
     const w0 = b.w + pad * 2, h0 = b.h + pad * 2;
-    const scale = Math.max(w0 / cw, h0 / ch, 1);
+    const scale = Math.max(w0 / cw, h0 / ch, 0.8);
     const w = cw * scale, h = ch * scale;
     return { x: b.x - pad - (w - w0) / 2, y: b.y - pad - (h - h0) / 2, w, h };
   }
@@ -374,12 +374,14 @@ export async function renderLineage(host, params) {
     L.detail.innerHTML = v(html`${headLine()}<div class="card lg">${bar()}<div class="graph"><svg class="g-main" role="img" aria-label="Lineage graph" preserveAspectRatio="xMidYMid meet">${svgMarkup()}</svg>${tools}<span class="lg-zoom">100%</span><div class="minimap" title="Click or drag to move the view">${minimapMarkup()}</div>${legend}</div></div>`);
     canvasEl = L.detail.querySelector(".graph");
     if (focusQ) { const i = L.detail.querySelector("input[name=q]"); i.focus(); i.setSelectionRange(caret, caret); }
-    fitVb = fitTo();
-    if (!vb || refit || !sameShape) vb = openingView();
-    applyVb();
     const open = !!(q.sel || q.edge || (q.col && q.root));
+    const wasOpen = !L.panel.hidden;
     showPanel(open);
     if (open) L.panel.innerHTML = v(q.edge ? edgePanel(q.edge) : nodePanel(q.sel || q.root));
+    // Measure after the panel takes its column, so the view fits the canvas it gets.
+    fitVb = fitTo();
+    if (!vb || refit || !sameShape || wasOpen !== open) vb = openingView();
+    applyVb();
     wireCanvas();
   }
   function showPanel(on) {
@@ -404,7 +406,7 @@ export async function renderLineage(host, params) {
     svg.addEventListener("pointerdown", (ev) => {
       if (ev.button !== 0) return;
       drag = { x: ev.clientX, y: ev.clientY, vb: { ...vb }, moved: false, s: svgPoint(ev).s };
-      svg.setPointerCapture(ev.pointerId);
+      try { svg.setPointerCapture(ev.pointerId); } catch { /* synthetic or lost pointer */ }
     });
     svg.addEventListener("pointermove", (ev) => {
       if (!drag) return;
@@ -441,7 +443,7 @@ export async function renderLineage(host, params) {
       applyVb();
     };
     let mmDrag = false;
-    mm.addEventListener("pointerdown", (ev) => { mmDrag = true; mm.setPointerCapture(ev.pointerId); mmMove(ev); });
+    mm.addEventListener("pointerdown", (ev) => { mmDrag = true; try { mm.setPointerCapture(ev.pointerId); } catch { /* synthetic or lost pointer */ } mmMove(ev); });
     mm.addEventListener("pointermove", (ev) => { if (mmDrag) mmMove(ev); });
     mm.addEventListener("pointerup", () => { mmDrag = false; });
   }
