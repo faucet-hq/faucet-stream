@@ -43,20 +43,22 @@ The static shell at `/` is served **without authentication** so the browser can
 load the page before it has a token. All `/v1` API calls that populate the
 console's data are bearer-gated as usual.
 
-On first load (or after a 401) the console prompts you to paste the bearer
-token (the same value as `FAUCET_SERVE_AUTH_TOKEN` / `--auth-token`). The token
-is stored in browser `localStorage` and sent as `Authorization: Bearer <token>`
-on every subsequent `/v1` request. A key-icon button in the top bar lets you
-update or clear it at any time.
+On first load (or after a 401) the console asks for the bearer token (the same
+value as `FAUCET_SERVE_AUTH_TOKEN` / `--auth-token`). The token is stored in
+browser `localStorage` and sent as `Authorization: Bearer <token>` on every
+subsequent `/v1` request. **Settings → Access token** (also in the ⌘K palette)
+updates or clears it.
 
 The console then asks `GET /v1/whoami` who the token belongs to, shows the
-principal and role beside the key icon, and hides what that role cannot do. A
-**viewer** (shown as *read-only*) sees no Submit, Run, Cancel, Delete, Launch or
-Deprecate controls; an **operator** can submit and trigger runs but not
-register, launch, roll back, deprecate, assign channels to, sync or delete
-templates, which is **admin** work. Hiding a control is only a convenience: the
-server refuses the action either way, and if a token loses a role mid-session
-the next refused call makes the console re-read it and redraw.
+principal and role at the foot of the sidebar, and hides what that role cannot
+do. A **viewer** (shown as *read-only*) sees no Submit, Run, Cancel, Delete,
+Launch or Deprecate controls; an **operator** can submit and trigger runs but
+not register, launch, roll back, deprecate, assign channels to, sync or delete
+templates, which is **admin** work. A tenant-scoped principal sees its own
+tenant only, with no Tenants, Audit log, Submit or Schemas pages. Hiding a
+control is only a convenience: the server refuses the action either way, and if
+a token loses a role mid-session the next refused call makes the console
+re-read it and redraw.
 
 > **Security:** the bearer token is as sensitive as the API itself — anyone who
 > obtains it can submit arbitrary pipeline configs with the server's identity
@@ -69,310 +71,179 @@ the next refused call makes the console re-read it and redraw.
 > `X-Frame-Options: DENY`), plus `X-Content-Type-Options: nosniff` and
 > `Referrer-Policy: no-referrer`. A proxy in front must not strip them.
 
+## Finding your way around
+
+The sidebar groups the pages: **Operate** (Overview, Runs, Changes, Triggers,
+Schedules), **Data** (Datasets, Lineage), **Build** (Templates, Schemas,
+Submit), **Govern** (Policy, Usage, Tenants) and **Admin** (Audit log,
+Settings). Badges count running runs, pending change requests, datasets,
+templates and tenants. Schedules and Policy are marked *soon*: their pages say
+what will live there and how to do it today.
+
+- **Go to… / ⌘K** (Ctrl+K) opens a palette over pages, recent runs, datasets,
+  templates, change requests, tenants and actions (submit a run, switch theme,
+  copy a link).
+- **Keyboard:** in any list `j` / `k` move, `Enter` opens, `Esc` goes back (or
+  closes a menu), `/` focuses the search.
+- **Every screen is a link.** Filters, tabs and the selected item live in the
+  URL, so Back works and the link icon in the top bar copies the page you are
+  looking at. Every run, dataset, template and tenant name links to its page;
+  ids, URIs and configs have a copy button; relative times show the absolute
+  time on hover.
+- The **top bar** holds the tenant switcher (Runs, Usage and Changes follow
+  it), the display time zone (every time and date input follows it), the light
+  / dark switch and a button that hides the sidebar. The **status line** shows
+  the run-history backend's health, cluster size and the server version.
+- Below 1100px the sidebar shrinks to icons and list pages show the selected
+  item in place of the list, with a back link.
+
 ## Views
 
 ### Overview
 
-The Overview is the first item under **Operate** and the page the console
-opens on (`#/overview`). It answers "is the fleet healthy, what is failing,
-what does it cost, and what needs me?" from the server's run history, which
-outlives restarts and is shared by every replica of a cluster. Real-time
-metrics stay in Grafana.
+The page the console opens on (`#/overview`): what needs you, what is running
+now, and how the fleet did today or this week (`?range=24h|7d`), from the
+server's run history (`GET /v1/overview`), which outlives restarts and is shared
+by every replica of a cluster.
 
-- **Range:** 24h, 7d or 30d (remembered per browser, and in the URL as
-  `#/overview?range=24h`). The last 24 hours are bucketed by hour, longer
-  ranges by day; buckets are UTC and labelled in the display time zone.
+- **Last 24 hours / Last 7 days:** runs, success rate, records written and the
+  estimated cost, each with a trend line.
 - **Needs attention:** failed runs, change requests waiting for approval,
-  unhealthy triggers, templates whose newest version fails its tests, and
-  tenant connections that need re-authorization. Each item links to its
-  page (`#/runs?status=failed&name=…`, `#/changes/<id>`, `#/templates/<id>`,
-  `#/tenants/<id>`). A group appears only when its feature is built in and
-  in use on the server.
-- **Stat strip:** runs, failure rate, records written, estimated cost (when
-  usage is recorded) and runs executing now.
-- **Cards:** runs per bucket by outcome, records written with the top
-  pipelines, failure rate by pipeline, the slowest pipelines by p95
-  invocation time, rows not written (filtered, quarantined, sent to the DLQ,
-  coalesced, skipped, dropped), estimated cost by pipeline, and freshness:
-  datasets with no successful run in 24 hours and datasets whose schema
-  changed in the range. Pipeline names link to the Runs list filtered to
-  them; datasets link to the Datasets page.
+  unhealthy triggers, templates whose newest version fails its tests and tenant
+  connections that need re-authorization, each with an **Open** link.
+- **Running now**, **Data freshness** (fresh, stale and schema-changed
+  datasets) and the latest **Change requests**.
 
-Started with `--grafana-url`, every card links to the matching dashboard
-from `observability/grafana/` over the same range. A tenant-scoped principal
-sees its own tenant's runs only, and no catalog freshness. The page reads
-`GET /v1/overview` ([HTTP API](../reference/http-api.md#get-v1overview-fleet-trends)).
-
-![The Overview page for the last 7 days: the 7d range picker, the Needs attention card listing failed runs by pipeline, the stat strip (runs, failure rate, records written, running now), the runs-per-day bars by outcome, records written with the top pipelines, failure rate by pipeline, the slowest pipelines by p95, and the rows-not-written and freshness cards](../assets/console/overview.png)
+![The Overview page for this week: the Today / This week tabs, the last-7-days card with runs, success rate, records written and estimated cost, the Needs attention table of failed runs and a failing template, Running now, Data freshness and Change requests](../assets/console/overview.png)
 
 ### Runs
 
-Runs is a split pane: the run list on the left, the selected run's detail on
-the right. `#/runs` opens the list; `#/runs/<id>` selects a run, so a run is a
-shareable link, and choosing another run keeps the list where it was (filters,
-scroll position, collapsed sections). Below about 1100 px wide the detail
-replaces the list, with a **← Runs** link back.
+Runs is a split pane: the run list on the left, the selected run on the right
+(`#/runs/<id>`). The list has **All runs / Active / Failed** tabs, a stat strip
+(running, succeeded, failed, records — each a filter), a filter panel (status,
+name, submitter, pool, time range, labels — all in the URL), and sections for
+running, queued, failed, succeeded and cancelled runs. It refreshes every few
+seconds while anything is running and keeps your scroll and selection.
 
-The list pane has:
+With nothing selected the detail pane summarizes the last 24 hours and lists
+the runs that need attention.
 
-- Tabs for **All runs**, **Mine** (runs you submitted; hidden under
-  `--no-auth`, where every caller is `anonymous`), **Active** (queued, pending,
-  running, sharded) and **Failed**.
-- A stat strip — running, succeeded and failed counts plus the records written.
-  The status counts are exact totals from the server over every run the
-  filters match; records are summed over the runs loaded (a `+` means more
-  pages exist). Section headers show the same exact totals.
-- Sections for **Running**, **Queued**, **Failed**, **Succeeded** and
-  **Cancelled**, each collapsible. Every row shows a status ring, the run's name
-  (its pipeline when it has none), how long ago it was submitted, and one line
-  of facts: the first invocation's error for a failed run, else the template,
-  backfill unit or `source → sink`, then records, invocations, duration, pool
-  and tenant. Long names are cut with an ellipsis; hover for the full text.
-- The filter button opens name, status, time-range and label filters. A label
-  filter is `key:value` (or a bare `key`), entered with Enter; each becomes a
-  removable chip, every chip must match, and the filters live in the URL
-  (`#/runs?label=team:data`), so a filtered list is a shareable link too.
-- **+** goes to the Submit view.
+![The Runs split pane with nothing selected: the run list with its tabs, stat strip and Failed / Succeeded sections, and the last-24-hours summary with the runs that need attention](../assets/console/runs.png)
 
-While any listed run is still going, the list and the stat strip refresh every
-few seconds in place, without moving the selection or the scroll position.
+A selected run has tabs:
 
-![The Runs split pane: the run list on the left (All runs / Active / Failed tabs, the running / succeeded / failed / records stat strip, and Failed and Succeeded sections of rows with status rings and one-line facts), and the selected ui-matrix-fanout run's Overview on the right](../assets/console/runs.png)
+- **Overview:** status, what it moved, the row accounting (accepted, coalesced,
+  filtered, quarantined, dead-lettered — every row offered is accounted for),
+  invocations, governance outcomes, provenance (template, pool, who submitted
+  it, labels — click a label to filter runs) and the datasets it read and wrote.
+  A failed run leads with its error and links to the log line and to a
+  comparison with the last good run.
+- **Invocations**, **Logs** (live while the run is going, with level filters),
+  **Config** (the stored config, credentials masked — `GET /v1/runs/{id}/config`;
+  re-run it or open it in Submit), **Dead-letter queue** (inspect, replay or
+  discard, prefilled with the run's own DLQ) and **Compare** (against another
+  run of the same pipeline).
+- **Cancel**, **Roll back…** and **Delete** sit in the header and the **⋯**
+  menu, each behind a confirmation.
 
-The detail pane has four tabs, with **Cancel run** (while it runs), **Roll
-back…** and **Delete** (once it has finished) on the right:
-
-- **Overview**: the name, status, `source → sink` and run id; any error, with
-  each failed invocation's own error; a card with the records written, the
-  submitted / started / finished times and the duration, and the
-  [row accounting](../reference/http-api.md#get-v1runsid--runrecord) of every
-  invocation summed into one bar (written, merged, skipped, to the DLQ,
-  quarantined, dropped, and `unaccounted` in red when a sink lost rows); the
-  slowest invocations; provenance (who submitted it, template and version, pool, tenant,
-  `depends_on` edges, the DLQ it replayed, idempotency key, clock, timeout);
-  the labels; and the last lines of the log. Clicking a label adds it to the
-  list's filters.
-- **Invocations**: every invocation, slowest first, with its own run id,
-  records, rows, batches, source lag, duration bar and error.
-- **Logs**: the full log, streamed live over SSE for an in-flight run (the
-  same `GET /v1/runs/{id}/logs` endpoint).
-- **Dead-letter queue**: the DLQ tools described below.
-
-With [log shipping](../operations/observability.md#shipping-logs) on, a **Log
-export** panel shows whether the run's lines reached the log service —
-`exported`, `pending`, `failed` (with the last error), or `partially_dropped`
-(with the dropped count) — and how many lines are still buffered locally. With
-`--log-link-template` set, **View logs ↗** (and the link beside the *Logs*
-tab) opens the run in the log service; once the local copy has aged out, the
-log pane says so and points there.
-
-The **Dead-letter queue** tab holds the DLQ tools (not tied to the run) — enter a server-local DLQ location
-(a `.jsonl` file, a directory, or a glob), then **Inspect** it (grouped by
-reason), **Discard** envelopes (optionally archiving first), or **Replay
-through a config** — paste a pipeline config and re-feed the quarantined
-payloads through its transforms / quality / contract / sink, with a dry-run
-toggle. This is the [DLQ replay](./dlq.md) workflow, in the browser (backed by
-`POST /v1/dlq/{inspect,replay,discard}`).
-
-The **Invocations** tab's **rows** column says where each invocation's rows went
-— `98 ok · 2 dlq`, plus any rows merged by a keyed write, skipped by the sink,
-quarantined, dropped or `unaccounted` (red: a sink lost them and the run
-failed); hovering it shows how many rows were offered and how many the
-transforms filtered out ([row accounting](../reference/http-api.md#get-v1runsid--runrecord)).
-
-The same table carries each invocation's own **run id** — the value of
-the `_faucet_run_id` column and what a rollback undoes — and a finished run
-made with a `rollback:` block gets a **Roll back…** button (admin-only) that
-opens a panel on the Overview tab with an invocation picker, a dry-run toggle, a *force* toggle for
-keys a later run changed, and a config editor for servers that did not store the
-run's config. The result renders inline: what was deleted / restored, any
-conflicts, and whether the bookmark was rewound (backed by
-`POST /v1/runs/{id}/rollback`; see [Undoing a run](./rollback.md)).
-
-![A failed run's Overview tab: the Overview / Invocations / Logs / Dead-letter queue tabs with Roll back… and Delete on the right, the failure alert naming the invocation's quality-check error, the records and timings card, the invocations and provenance cards, the labels and the log tail](../assets/console/run-detail.png)
+![A failed run selected in the Runs split pane: the run list with its tabs, stat strip and Failed / Succeeded sections; on the right the Overview tab with the error and its actions, the timing card, the failed invocations, Governance and Provenance with the run's labels](../assets/console/run-detail.png)
 
 ### Changes
 
-Change requests ([plan → approve → run](./approvals.md)) use the same split
-pane: `#/changes` lists them, `#/changes/<id>` selects one. The list has a
-**Needs me** tab (pending requests you may approve: not your own, not already
-approved by you; shown to principals with the `change_approve` permission) and
-**All**, a stat strip (pending, executed, rejected, failed — exact totals from
-`GET /v1/changes/counts`), and sections for
-**Pending**, **Approved, executing** and **Decided**. Each row shows the
-proposal, its age, and its kind and approvals, or its outcome.
+On a server started with `--require-approval`, **Changes** lists the change
+requests (`#/changes/<id>`): **Needs me** and **All** tabs, a stat strip from
+`GET /v1/changes/counts`, and sections for pending, executed and closed
+requests. A request shows its plan (what the run, registration or launch will
+do), its impact on downstream datasets, the approvals so far and its history;
+**Approve** and **Reject** (with a reason) follow the server's approval policy.
 
-The detail pane's **Plan** tab shows the requester's reason, then the stored
-plan as a diff: one block per pipeline row (`source → sink`, write mode,
-delivery guarantee, transforms, schema drift, governance passes) and the
-budget, or for a template change the version being launched, registered,
-deleted or retired. Its footnote gives the verdict of the impact and policy
-analysis. Below it are the approvals so far, the budget, and, for a pending
-request, the comment and rejection-reason fields behind **Reject** and
-**Approve** (hidden without `change_approve`; the server's approval policy
-still decides, and its refusal names the rule). **Impact** lists each row's
-schema delta, affected downstream datasets and owners, and policy violations;
-**History** is the timeline of the request, its approvals and its outcome, with
-a link to the run it started.
+### Triggers
+
+**Triggers** lists the event triggers loaded from `--triggers`
+(`GET /v1/triggers`): type, schedule or webhook methods, health, last fire and
+fire / error counts. A webhook trigger shows a ready-to-paste `curl` and a
+**Fire** button; a trigger in error backoff shows its last error. Without a
+triggers file the page says how to add one.
 
 ### Submit
 
-Two modes for submitting a new pipeline run:
+Submit builds a pipeline config and runs it, step by step: **Source**,
+**Transforms**, **Sink**, **Options**, **Review**. **Guided** mode generates a
+form from each connector's schema; **Editor** mode takes YAML or JSON. The live
+preview on the right shows the config as it will be sent. **Validate** probes
+it with the doctor, **Plan** shows what the run will do, and **Submit run**
+starts it — or, when approval is required, **Request approval** creates a
+change request. `#/submit?from=<run id>` starts from a past run's config;
+Schemas' **Use in Submit** starts from one connector.
 
-- **Raw editor** — paste or type YAML/JSON directly into a text area. The same
-  format accepted by `POST /v1/runs`.
-- **Schema wizard** — select a source and sink from the compiled connector list,
-  fill in the generated form fields, and the wizard assembles a valid config.
-  The form is derived from the same JSON Schemas returned by
-  `GET /v1/schemas/{kind}/{name}`. Below the transforms, two optional
-  sections add the rest of a pipeline: **Reliability** (state, dead-letter
-  queue, delivery, resilience, SLA) and **Data governance** (quality checks,
-  contract, PII masking, schema drift). Each block is off until you add it;
-  its form comes from `GET /v1/schemas/block/{name}`.
+![The Submit page: the five-step stepper, the Guided / Editor switch, the source form generated from the connector schema, and the live config preview](../assets/console/submit.png)
 
-![The Submit page in guided mode: the Guided / Editor toggle and the schema-driven form generated from the rest source's JSON Schema](../assets/console/submit.png)
+### Schemas
 
-### Schemas explorer
-
-Browses the connector catalog compiled into the running server
-(`GET /v1/schemas`): sources, sinks and transforms in a list on the left, the
-state stores with a line each. Click any source, sink, or transform to see its
-fields (type, default, first sentence of the description) and the raw JSON
-Schema — useful for checking config field names and types without leaving the
-browser.
+**Schemas** lists every source, sink, transform and state store compiled into
+the server, with search and tabs. A connector (`#/schemas/<kind>/<name>`) shows
+its fields with type, default and description — click a field for its full
+description, values and constraints — an example config like `faucet init`, the
+raw JSON Schema, and **Use in Submit**.
 
 ### Usage
 
-The **Usage** page reads `GET /v1/usage`: a filter bar (group by pipeline, row,
-dataset, sink, day, or tenant on a server with tenants; a pipeline name; a date
-range), a stat strip of the window's totals (invocations, rows and bytes
-written, estimated cost, hosted equivalent) and a table with one line per
-group. Every figure is an estimate; see [Cost & usage](./usage.md).
+**Usage** groups the recorded usage (`GET /v1/usage`) by pipeline, row,
+dataset, sink, day or tenant over a date range, with sortable columns, a daily
+chart and a CSV download; click a row to drill into it.
 
 ### Templates
 
-When the server is built with the `templates` feature, **Templates** is a split
-pane over the [template registry](./templates.md) in the `--history` backend:
-`#/templates` lists every template, `#/templates/<id>` selects one (append
-`?sink=<id>` to preselect a sink in a source template's trigger form).
+**Templates** is a split pane over the [template registry](./templates.md):
+sections for source templates, sink templates, pipelines and deployments, each
+row with its stable version and status. With nothing selected the detail pane
+holds the registry views: the **Matrix** of source × sink pairings, **Register**
+(paste a document; the server tests it if it has a `tests:` block) and **Sync**
+from configured origins.
 
-The list has tabs for **All**, **Launched** and **Draft** (the filter button
-adds a search, a sort by name or last update, and *include deprecated
-templates*), a stat strip (templates, launched, draft, and failing — templates
-whose newest version fails its tests), and one collapsible section per kind:
-**Source templates** (a system and its streams), **Sink templates** (a
-destination), **Deployments** (the operational blocks — state, DLQ,
-notifications, SLA — applied over a composed run) and **Pipelines** (complete
-configs). Each row shows a status ring, the id, the newest version, and its
-release state: `stable vN` and the channels pointing elsewhere, `draft · never
-launched`, or `vN tests failing`, then the test status and the parameter count.
+![The Templates split pane with nothing selected: the template list by kind with stable versions and drafts, and the registry overview](../assets/console/templates.png)
 
-With no template selected the right-hand side is the registry itself:
+A template (`#/templates/<id>`) has tabs:
 
-- **Compatibility** — one row per source template, one column per sink
-  template, ✓ where every stream has a write mode the sink supports (the
-  tooltip lists the per-stream plan), filterable by owner and type. Clicking a
-  ✓ opens the source template with that sink preselected.
-- **Register** — an editor with `id` / format / description and a **launch
-  it** checkbox, so a template can go from config to live without leaving the
-  browser (the **+** button in the list header opens it too).
-- **Sync** — on a server started with `--templates-sync`: the configured
-  remote origins (repo or bucket, prefix, launch / prune policy), a **Dry run**
-  that lists what a pull would register, launch, deprecate, or skip, and
-  **Pull now** to apply it — see
-  [Hosting templates in a repo or bucket](./templates.md#hosting-templates-in-a-repo-or-bucket-sync).
+- **Overview:** its lifecycle (registered → tested → launched), params, streams
+  and who uses it.
+- **Versions:** every version with its channels, test status and runs in the
+  last 7 days, **Run** and a **⋯** menu (assign a channel, run tests, show
+  config, deprecate, delete); **Compare** diffs two versions; **Launch**,
+  **Roll back** and **New version** sit in the header; the launch history below.
+- **Tests:** the test bundle and its results per version.
+- **Run:** a form generated from the template's `params:`, the sink template
+  and overlay to pair a source template with, and the streams to run with the
+  resolved run set.
+- **Pairings** (source templates) and **Activity** (its runs and registrations).
 
-![The Templates split pane with nothing selected: the template list by kind (source templates, all drafts, with their newest versions) beside the Compatibility matrix of source templates against sink templates, every cell a ✓](../assets/console/templates.png)
+![The versions page for orders-by-country: the template list with its tabs and stat strip, and the Versions tab with three versions, their channels and test status, Run buttons, Compare and New version, and the launch history](../assets/console/template-detail.png)
 
-A selected template opens its **versions page**, the release console for it.
-The header has **New version** (the register editor, seeded with the newest
-config), **Roll back** to the previous launch, **Deprecate** / **Revive**, and
-**Launch vN** when the newest version can become stable. Its tabs:
-
-- **Versions** — the launch-gate card for the newest version (its latest test
-  run: cases passed by origin, retries, shared suites, faucet version, and
-  whether it can be launched); the versions table, newest first, with when
-  and by whom each version was registered ("—" for a version recorded without
-  it), the channels pointing at each version (`stable` / `previous` / `newest` derived,
-  `dev`…`prod` assigned), its test status, when it was last tested and how
-  many runs it served in the last 7 days; and the launch history (who launched
-  which version, on what test evidence). Each version row has **Run** (opens
-  the trigger form with that version), **Launch** (disabled on the live
-  version and on one whose tests do not pass) and **More**: assign a channel,
-  test history, run tests, show the stored or the clean config, deprecate /
-  revive the version, delete it.
-- **Run** — a trigger form generated from the declared `params:` (typed
-  inputs, required/secret badges, descriptions) with a version selector.
-  A sink template's page has **Pairings** here and a deployment's has **Use**:
-  the source templates it can be composed with.
-- **Health** — for a launched **pipeline** template, the live version's
-  [`faucet status`](./state-and-status.md) screen: per row a status pill, last
-  success, bookmark, DLQ backlog, and where the next run resumes, with the
-  reasons under any row that is not healthy.
-
-![The versions page for orders-by-country: Launched · v2 with Launch v3 in the header, the launch-gate card showing v3 passed 1 of 1 case with the gate open, the versions table (v4 failing a fixture and unable to take a channel, v3 newest/staging, v2 stable/dev, v1 previous/prod) with Run / Launch / More per row, and the launch history](../assets/console/template-detail.png)
-
-A **source template**'s trigger form adds a **sink template** selector (plus
-its version): the chosen sink's params join the form, tagged `sink`, and the
-run composes the two at submit time — the same source can be sent to BigQuery
-today and Postgres tomorrow from one page. A **deployment** selector applies a
-registered [deployment overlay](./template-hub.md#deployment-overlays) to the
-run; its params join the form tagged `deployment`.
-
-Below the params, a **Streams** section (**Rows** for a pipeline template with
-a `matrix:`) lists what the run can include, from
-`GET /v1/templates/{id}/rows`: each stream with its status, tags, parent /
-dependency and the write mode it resolves to on the chosen sink. Rows a bare
-run would pick are checked; a stream the sink cannot run is disabled with the
-reason. **include parents** (`off` / `eligible` / `all`) decides what happens
-to a checked child whose parent is not checked — the rows it would pull in are
-highlighted, a blocked one says why — and the line under the list previews the
-run set the server resolves before you press **Run**. See
-[Running a subset of streams](./templates.md#running-a-subset-of-streams).
-
-![The Run tab of the example-csv source template, scrolled to the sink section (faucet-hq/jsonl with its out_dir param), the deployment selector, and the Streams section: orders and customers checked, both resolving to overwrite, include parents off, and the resolved run set orders → customers](../assets/console/template-source-detail.png)
+![The Run tab of the example-csv source template: the param form, the sink template to pair it with, and the streams to run](../assets/console/template-source-detail.png)
 
 ### Datasets & Lineage (Data Movement Catalog)
 
-When the server is built with the `catalog` feature, two more views browse the
-[Data Movement Catalog](./catalog.md) accumulated in the `--history` backend:
+On a server built with the `catalog` feature, **Datasets** lists every dataset
+a pipeline has read or written (`#/catalog/<id>`): **All / Destinations /
+Sources** tabs, filters, and freshness at a glance. A dataset has tabs:
 
-- **Datasets** — a split pane: `#/catalog` lists every dataset the server's
-  pipelines have touched, `#/catalog/<id>` selects one. The list has **All**,
-  **Destinations** and **Sources** tabs, filters (URI search, kind, a
-  last-success range), a stat strip (datasets, written in the last 24 hours,
-  evolved — more than one schema version — and with owners) and sections for
-  destinations and sources. Each row shows the URI, the time since the last
-  successful run, the kind, the last run's rows, the schema version, the
-  consumers, the owner and the pipeline that wrote it.
+- **Overview:** rows, columns, rows per run, null rates, usual cadence,
+  consumers, a small lineage graph, owners and consumers, and the runs that
+  wrote it.
+- **Schema:** the schema timeline; compare any two versions.
+- **Profile:** column profiles and drift findings.
+- **Lineage**, **Activity** (runs that read or wrote it,
+  `GET /v1/runs?dataset_id=`) and **Outputs** (local files, below).
+- **Annotate** records owners and consumers (`catalog_annotate`).
 
-  A dataset's **Overview** tab has a card with the last run's rows and column
-  count, a rows-per-run trend, the null rate of its emptiest profiled column
-  with its trend, the run count, the declared consumers, the latest schema
-  change and per-run volume bars (hover any trend or bar for the values); the
-  **owners & consumers**, with an **Annotate…** form for `catalog_annotate`
-  holders; and its upstream and downstream edges. **Schema** is the
-  deduplicated schema timeline with per-version diff badges and each version's
-  JSON; **Profile** is, for a dataset written by a
-  [`profiling:`](./profiling.md) pipeline, the **column profiles** table — per
-  column the type mix, null rate with a sparkline over the recorded runs
-  (drift runs marked), distinct estimate, numeric / string summary, and top
-  values, with the latest run's drift findings listed above it; **Lineage**
-  repeats the edges; **Outputs** is the dataset's local outputs (below). With
-  no dataset selected, the right-hand side is the server's local outputs.
+![A dataset's Overview: the dataset list with its tabs and stat strip, and out/orders_profiled.jsonl with its rows, columns, cadence and consumers, the lineage graph, owners and consumers, and rows per run](../assets/console/datasets.png)
 
-  ![The Datasets split pane: the dataset list with its tabs, stat strip and destination rows, beside the Overview of ./out/orders_profiled.jsonl: the rows / null-rate / runs / consumers card with the schema v2 +discount_code note and volume bars, the owners and declared consumers with the Annotate form, and the lineage card](../assets/console/datasets.png)
+**Lineage** draws every dataset and the pipelines between them: drag to pan,
+scroll to zoom, fit and a minimap; pick a dataset to focus on it with a number
+of hops up and down, see it in the side panel, and trace one column through
+the graph.
 
-- **Lineage** — the source→sink edge graph rendered as a layered SVG (sources
-  left, sinks right). Hover an edge for the pipeline/run context; click a node
-  to highlight its connections and double-click it to open the dataset; a
-  rooted, depth-bounded slice opens from any dataset's **Lineage graph**
-  button.
-
-  ![The Lineage graph showing the source CSV datasets on the left fanning out to the JSONL, SQLite and stdout sink datasets on the right](../assets/console/lineage.png)
-
-On a server built without the `catalog` feature both views show a short
-"not available" notice (the endpoints are absent).
+![The Lineage graph: the source CSV datasets fanning out to the JSONL and stdout datasets, with the search, kind filter, zoom tools and minimap](../assets/console/lineage.png)
 
 ### Cleaning up local outputs
 
@@ -476,23 +347,26 @@ record is kept" message in place of the table, never an error toast. Full detail
 
 ### Tenants
 
-On a server built with the `tenants` feature, **Tenants** is a split pane:
-`#/tenants` lists every [tenant](./embedded-integrations.md) — with a stat strip
-(tenants, running runs, connections and any that need re-authorization) and
-**Active** and **Suspended** sections — and `#/tenants/<id>` selects one. The
-**+** button opens the create form. A tenant's **Overview** tab edits its
-limits, shows its labels and its ten most recent runs, and holds the delete
-form, which asks you to type the tenant id first; its **Connections** tab lists
-the connections — names, types and status, never credentials — with a
-**Connect** form per `--connect-providers` provider (the authorization page
-opens in a new tab and returns to the console), a form for stored credentials,
-and **Reconnect** / **Delete** per connection. **Runs for this tenant** and
-**Suspend** / **Resume** sit in the header. The **tenant switcher** in the top
-bar scopes Runs, Usage and Changes to one tenant; a tenant-scoped principal is
-pinned to its own. Controls follow the caller's role: creating, suspending and
-deleting tenants needs `tenant_admin`, connections need `connection_manage`.
+On a server built with the `tenants` feature, **Tenants** is a split pane over
+the [tenants](./embedded-integrations.md) (`#/tenants/<id>`), with active and
+suspended sections and **+** to create one. A tenant has **Overview** (limits,
+labels, recent runs), **Connections** (names, types and status — never
+credentials — with a **Connect** flow per `--connect-providers` provider, stored
+credentials, **Reconnect** and **Delete**) and **Activity**. **Suspend** /
+**Resume** and **Delete** (type the id to confirm) sit in the header. Creating,
+suspending and deleting tenants needs `tenant_admin`; connections need
+`connection_manage`.
 
-![A tenant's page: the tenant list beside Acme Corp's Overview tab with the limits form, its labels, the recent runs and the delete form, and Runs for this tenant and Suspend in the header](../assets/console/tenants.png)
+![A tenant's page: the tenant list beside Acme Corp's Overview tab with its limits, labels and recent runs](../assets/console/tenants.png)
+
+### Audit log and Settings
+
+**Audit log** (admins) lists every recorded action and denial (`GET /v1/audit`):
+filters by principal, action, result and time, a **Denials** tab, and the
+entry's detail with the run it started (`#/audit/<id>`). **Settings** shows who
+you are and what you may do, the access token, theme and time zone, the
+keyboard shortcuts, the server (version, history backend, cluster replicas) and
+the default config with **Reload**.
 
 ## Disabling the console at runtime
 
@@ -508,8 +382,7 @@ FAUCET_SERVE_AUTH_TOKEN=s3cret faucet serve --no-ui
 
 ## New API endpoints
 
-The `serve-ui` feature ships three new bearer-gated endpoints that the console
-(and any other client) can call:
+The console calls these bearer-gated endpoints (any other client can too):
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -517,6 +390,9 @@ The `serve-ui` feature ships three new bearer-gated endpoints that the console
 | `GET` | `/v1/schemas/{kind}/{name}` | JSON Schema for one connector, transform, or pipeline block (`kind` ∈ `source`/`sink`/`transform`/`block`). Returns 404 for unknown kind or name. |
 | `GET` | `/v1/whoami` | The caller's principal, role and permissions; the console uses it to hide controls the role cannot use. |
 | `GET` | `/v1/overview` | Fleet trends over the run history, behind the Overview page. |
+| `GET` | `/v1/runs/{id}/config` | A run's stored config, credentials masked, behind the run's Config tab. |
+| `GET` | `/v1/triggers` | The loaded triggers with health and fire counts, behind the Triggers page. |
+| `GET` | `/v1/audit/{id}` | One audit entry, behind the Audit log's entry links. |
 | `POST` | `/v1/doctor` | Validate and probe a submitted config without running it. Returns 200 (all probes pass) or 422 (any probe fails) with a probe report. Request body: `{ "config": "<yaml-or-json>", "config_format": "yaml" }`. |
 
 With the `catalog` feature the console also drives the local-output endpoints —
