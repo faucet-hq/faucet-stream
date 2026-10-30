@@ -11,7 +11,7 @@ import { href } from "../links.js";
 import { withTenant } from "../tenant.js";
 
 const KINDS = [["source", "Sources", "db"], ["sink", "Sinks", "db"], ["transform", "Transforms", "code"], ["state", "State stores", "key"]];
-const TAB_KIND = { Sources: "source", Sinks: "sink", Transforms: "transform" };
+const TAB_KIND = { Sources: "source", Sinks: "sink", Transforms: "transform", State: "state" };
 const STATE_DESC = {
   memory: "In-process only: nothing survives a restart",
   file: "One JSON file per key, fsync and atomic rename",
@@ -84,7 +84,7 @@ export async function renderSchemas(host, params) {
 
   function renderList() {
     if (!catalog) {
-      L.list.innerHTML = v(html`${tabs([["All"], "Sources", "Sinks", "Transforms"], "All")}${input("", { ph: "Search connectors and fields", icon: "search", type: "search", name: "q" })}${skelRows(9)}`);
+      L.list.innerHTML = v(html`${tabs([["All"], "Sources", "Sinks", "Transforms", "State"], "All")}${input("", { ph: "Search connectors and fields", icon: "search", type: "search", name: "q" })}${skelRows(9)}`);
       return;
     }
     const all = items();
@@ -102,7 +102,7 @@ export async function renderSchemas(host, params) {
             }))}</div>`;
         }))
       : empty(`No connector matches “${state.q}”`, html`Check the spelling, or the connector may not be compiled into this server. <a class="lnk" href="${href.schemas()}">Clear the search</a>`, { icon: "search" });
-    const top = tabs([["All", all.length], "Sources", "Sinks", "Transforms"], state.tab, ibtn("refresh", { title: "Reload the catalogue", data: { reload: "1" } }));
+    const top = tabs([["All", all.length], "Sources", "Sinks", "Transforms", "State"], state.tab, ibtn("refresh", { title: "Reload the catalogue", data: { reload: "1" } }));
     if (!L.list.querySelector(".list-body")) {
       L.list.innerHTML = v(html`<div class="list-top" style="display:contents"></div>${input(state.q, { ph: "Search connectors and fields", icon: "search", type: "search", name: "q" })}<div class="list-body" style="display:flex;flex-direction:column;gap:10px"></div>`);
       const qi = L.list.querySelector("input[name=q]");
