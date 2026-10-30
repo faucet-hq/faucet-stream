@@ -1,3 +1,4 @@
+import { tmpdir } from "node:os";
 // Render every view × state × theme of the mockups to shots/.
 // usage: node render.mjs [--views a,b] [--port 9350]
 import { spawn } from "node:child_process";
@@ -12,7 +13,7 @@ const port = Number(arg("--port", "9350"));
 const themes = (arg("--themes", "dark,light")).split(",");
 mkdirSync(path.join(here, "shots"), { recursive: true });
 const CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
-const chrome = spawn(CHROME, ["--headless=new", `--remote-debugging-port=${port}`, "--disable-gpu", "--no-first-run", "--allow-file-access-from-files", `--user-data-dir=/tmp/claude-502/mock-prof-${port}-${Date.now()}`, "about:blank"], { stdio: "ignore" });
+const chrome = spawn(CHROME, ["--headless=new", `--remote-debugging-port=${port}`, "--disable-gpu", "--no-first-run", "--allow-file-access-from-files", `--user-data-dir=${path.join(tmpdir(), `mock-prof-${port}-${Date.now()}`)}`, "about:blank"], { stdio: "ignore" });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let ver;
 for (let i = 0; i < 60; i++) { try { ver = await (await fetch(`http://127.0.0.1:${port}/json/version`)).json(); break; } catch { await sleep(200); } }
