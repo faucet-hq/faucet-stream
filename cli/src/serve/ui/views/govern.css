@@ -1,0 +1,8 @@
+/* area: govern — page layout rules only, tokens only */
+.vote { white-space: nowrap; min-width: 0; }
+.vote .avatar { height: 22px; }
+.vote .r { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+td.num { white-space: nowrap; }
+.avatar.vacant { background: transparent; border: 1px dashed var(--line-strong); }
+.toast.done { border-left-color: var(--ok); }
+.toast.done > svg.i { color: var(--ok); }

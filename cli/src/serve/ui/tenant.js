@@ -48,26 +48,31 @@ export async function loadTenants(onChange) {
     tenants = null;
   }
   const sel = document.getElementById("tenant-select");
-  const nav = document.getElementById("nav-tenants");
-  if (nav) nav.hidden = tenants === null;
-  if (!sel) return;
-  if (tenants === null || (!tenants.length && !currentTenant())) {
-    sel.hidden = true;
-    return;
-  }
+  const wrap = document.getElementById("tenant-wrap");
+  const pin = document.getElementById("tenant-pin");
+  if (!sel || !wrap) return;
   const me = whoami();
   const pinned = !!(me && me.tenant);
+  if (pinned) {
+    // A tenant-scoped principal sees its own tenant as a fixed chip.
+    wrap.hidden = true;
+    if (pin) {
+      pin.hidden = false;
+      pin.innerHTML = `<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><path d="M16 4.5a3.5 3.5 0 0 1 0 7M21.5 20a6.5 6.5 0 0 0-4-6"/></svg>${escapeAttr(me.tenant)}`;
+    }
+    return;
+  }
+  if (tenants === null || (!tenants.length && !currentTenant())) {
+    wrap.hidden = true;
+    return;
+  }
   const cur = currentTenant();
-  if (cur && !tenants.some((t) => t.id === cur) && !pinned) setTenant("");
-  const listed = pinned && !tenants.some((t) => t.id === cur) ? [{ id: cur }, ...tenants] : tenants;
+  if (cur && !tenants.some((t) => t.id === cur)) setTenant("");
   sel.innerHTML =
-    (pinned ? "" : `<option value="">All tenants</option>`) +
-    listed
-      .map((t) => `<option value="${escapeAttr(t.id)}">${escapeAttr(t.name || t.id)}</option>`)
-      .join("");
+    `<option value="">All tenants</option>` +
+    tenants.map((t) => `<option value="${escapeAttr(t.id)}">${escapeAttr(t.name || t.id)}</option>`).join("");
   sel.value = currentTenant();
-  sel.disabled = pinned;
-  sel.hidden = false;
+  wrap.hidden = false;
   sel.onchange = () => {
     setTenant(sel.value);
     onChange();

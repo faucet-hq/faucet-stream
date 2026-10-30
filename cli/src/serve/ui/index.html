@@ -3,53 +3,36 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>faucet stream — console</title>
+    <title>faucet console</title>
     <link rel="icon" href="/assets/mark.svg" />
     <link rel="stylesheet" href="/assets/styles.css" />
+    <link rel="stylesheet" href="/assets/views/operate.css" />
+    <link rel="stylesheet" href="/assets/views/templates.css" />
+    <link rel="stylesheet" href="/assets/views/data.css" />
+    <link rel="stylesheet" href="/assets/views/govern.css" />
+    <link rel="stylesheet" href="/assets/views/build.css" />
   </head>
   <body>
-    <div class="sh-app" id="app">
-      <aside class="sh-side" aria-label="Console navigation">
-        <a class="sh-ws" href="#/overview" title="faucet stream">
-          <svg class="sh-logo" viewBox="6 6 116 116" aria-hidden="true"><rect x="6" y="6" width="116" height="116" rx="28" fill="#14B8A6"/><g fill="none" stroke="#fff" stroke-width="11" stroke-linecap="round" stroke-linejoin="round" transform="translate(-2,2)"><path d="M55 40 V26"/><path d="M44 26 H66"/><path d="M34 40 H76 a14 14 0 0 1 14 14 V64"/></g><g fill="#fff" transform="translate(-2,2)"><circle cx="90" cy="79" r="5.5"/><circle cx="90" cy="95" r="4.6" opacity="0.85"/><circle cx="90" cy="108" r="3.6" opacity="0.6"/></g></svg>
-          <span class="sh-ws-text"><b>faucet</b><span id="server-id">faucet serve</span></span>
-        </a>
-        <nav class="sh-nav-scroll" id="side-nav"></nav>
-        <div class="sh-foot">
-          <span id="whoami" class="whoami" hidden></span>
-        </div>
-      </aside>
-      <div class="sh-main">
-        <header class="topbar">
-          <div class="sh-crumb" id="crumb"></div>
-          <div class="sh-top-right">
-            <span class="sh-ctx" id="ctx-chip"></span>
-            <select id="tenant-select" class="tz-select" title="Tenant — scopes Runs, Usage and Changes" hidden></select>
-            <select id="tz-select" class="tz-select" title="Display timezone — how all times are shown"></select>
-            <button id="theme-toggle" class="icon-btn" title="Toggle theme" aria-label="Toggle theme"></button>
-            <button id="token-btn" class="icon-btn" title="Access token" aria-label="Access token"></button>
-            <button id="copy-link" class="icon-btn" title="Copy link to this page" aria-label="Copy link"></button>
-            <button id="expand-btn" class="icon-btn" title="Hide the sidebar" aria-label="Expand" aria-pressed="false"></button>
+    <div class="app" id="app">
+      <aside class="side" id="side" aria-label="Console navigation"></aside>
+      <main class="main" id="main">
+        <header class="top" id="top">
+          <div class="crumb" id="crumb"></div>
+          <span class="delta" id="delta"></span>
+          <div class="right">
+            <span id="ctx" style="display:contents"></span>
+            <span class="select" id="tenant-wrap" hidden><select id="tenant-select" title="Tenant: scopes Runs, Usage and Changes" aria-label="Tenant"></select></span>
+            <span class="chip" id="tenant-pin" hidden></span>
+            <span class="select"><select id="tz-select" title="Display timezone: how every time is shown" aria-label="Display timezone"></select></span>
+            <button type="button" class="ibtn" id="theme-toggle" title="Switch light / dark" aria-label="Switch light / dark"></button>
+            <button type="button" class="ibtn" id="copy-link" title="Copy a link to this page" aria-label="Copy a link to this page"></button>
+            <button type="button" class="ibtn" id="expand-btn" title="Hide the sidebar" aria-label="Hide the sidebar" aria-pressed="false"></button>
           </div>
         </header>
-        <main id="view" class="view"><div class="page"><div class="empty">loading…</div></div></main>
-        <footer class="sh-status" id="status-line"></footer>
-      </div>
+        <section class="body" id="view"></section>
+        <footer class="status" id="status"></footer>
+      </main>
     </div>
-
-    <div id="token-modal" class="modal">
-      <div class="modal-card">
-        <h2>Access token</h2>
-        <p>This server requires a bearer token for the API.</p>
-        <input id="token-input" type="password" placeholder="paste bearer token" />
-        <div class="modal-actions">
-          <button id="token-clear" class="btn-ghost">Clear</button>
-          <button id="token-save" class="btn-primary">Save</button>
-        </div>
-      </div>
-    </div>
-
-    <div id="toasts" class="toasts"></div>
     <script type="module" src="/assets/app.js"></script>
   </body>
 </html>

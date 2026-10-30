@@ -88,7 +88,8 @@ async function dispatch(container, force = false) {
     if (td && typeof td === "object" && td.update) active = { group: r.group, update: td.update };
     return;
   }
-  host.innerHTML = `<div class="page"><div class="empty">Not found</div></div>`;
+  document.getElementById("view").className = "body canvas";
+  host.innerHTML = `<div class="detail"><div class="empty"><b>Page not found</b><span>Nothing lives at this address. <a class="lnk" href="#/overview">Go to the overview</a></span></div></div>`;
 }
 
 export function startRouter(container) {

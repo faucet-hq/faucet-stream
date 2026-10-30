@@ -40,28 +40,6 @@ function applyStyle() {
     .join("\n");
 }
 
-function renderBadge() {
-  const el = document.getElementById("whoami");
-  if (!el) return;
-  if (!me) {
-    el.hidden = true;
-    return;
-  }
-  el.hidden = false;
-  el.dataset.role = me.role;
-  el.title = `${me.principal} · ${me.role}${me.role === "viewer" ? " (read-only access)" : ""}`;
-  el.innerHTML = `<span class="sh-avatar"></span><span class="whoami-name"></span><span class="whoami-role c-tag"></span>`;
-  el.querySelector(".sh-avatar").textContent = initials(me.principal);
-  el.querySelector(".whoami-name").textContent = me.principal;
-  el.querySelector(".whoami-role").textContent = me.role === "viewer" ? "read-only" : me.role;
-}
-
-function initials(name) {
-  const parts = String(name || "?").split(/[^A-Za-z0-9]+/).filter(Boolean);
-  const two = parts.length > 1 ? parts[0][0] + parts[1][0] : (parts[0] || "?").slice(0, 2);
-  return two.toUpperCase();
-}
-
 /** Fetch the caller's identity and apply it. A server without the endpoint
  *  (404) or an unauthenticated caller leaves everything visible. */
 export async function loadAccess() {
@@ -71,7 +49,6 @@ export async function loadAccess() {
     me = null;
   }
   applyStyle();
-  renderBadge();
   document.documentElement.dataset.role = me ? me.role : "";
 }
 
