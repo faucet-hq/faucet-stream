@@ -12,7 +12,7 @@ import { href, datasetName } from "../links.js";
 import { navigate } from "../router.js";
 import { catalogUnavailable } from "./datasets.js";
 
-const W = 210, H = 46, CW = 290, RG = 34, PAD = 40;
+const W = 210, H = 46, CW = 470, RG = 34, PAD = 40;
 const BW = 210, ROW = 20, MAXCOLS = 10;
 const DAY = 86400000;
 
@@ -47,9 +47,11 @@ function layoutGraph(ids, edges, heightOf = () => H) {
     }
   }
   const pos = new Map();
+  const colH = cols.map((c) => c.reduce((a, i) => a + heightOf(i) + RG, 0));
+  const tallest = Math.max(0, ...colH);
   let maxY = 0;
   cols.forEach((c, l) => {
-    let y = PAD;
+    let y = PAD + (tallest - colH[l]) / 2;
     for (const i of c) { const h = heightOf(i); pos.set(i, { x: PAD + l * CW, y, h, layer: l }); y += h + RG; }
     maxY = Math.max(maxY, y);
   });
