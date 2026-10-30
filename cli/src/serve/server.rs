@@ -87,6 +87,7 @@ pub fn build_router(
             "/v1/changes",
             post(changes::create_change).get(changes::list_changes),
         )
+        .route("/v1/changes/counts", get(changes::count_changes))
         .route("/v1/changes/{id}", get(changes::get_change))
         .route("/v1/changes/{id}/approve", post(changes::approve_change))
         .route("/v1/changes/{id}/reject", post(changes::reject_change));

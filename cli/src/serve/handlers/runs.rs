@@ -227,6 +227,11 @@ pub struct ListQuery {
     pub cursor: Option<String>,
     /// Only runs started for this tenant (#709).
     pub tenant: Option<String>,
+    /// Only runs this principal submitted (#998).
+    pub submitted_by: Option<String>,
+    /// `mine=true`: only runs the caller submitted (#998).
+    #[serde(default)]
+    pub mine: bool,
     /// Repeatable `label=key:value` / `label=key` filters, ANDed (#958).
     #[serde(skip)]
     pub label: Vec<String>,
@@ -269,6 +274,9 @@ pub struct ListResponse {
     pub runs: Vec<RunRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    /// Every run the filter matches, per status, ignoring `limit` and
+    /// `cursor` (#998): exact totals, not just the page.
+    pub counts: crate::serve::history::StatusCounts,
 }
 
 const DEFAULT_LIMIT: usize = 50;
@@ -296,7 +304,17 @@ impl ListQuery {
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         };
+        let submitted_by = match (self.mine, self.submitted_by) {
+            (false, by) => by,
+            (true, None) => Some(actor.principal.clone()),
+            (true, Some(_)) => {
+                return Err(ServeError::BadConfig(
+                    "set `mine` or `submitted_by`, not both".into(),
+                ));
+            }
+        };
         Ok(ListFilter {
+            submitted_by,
             status,
             name: self.name,
             since: self.since.map(|p| p.0),
@@ -317,10 +335,9 @@ pub async fn list_runs(
     RawQuery(raw): RawQuery,
 ) -> Result<Json<ListResponse>, ServeError> {
     let query = ListQuery::from_raw(raw.as_deref())?;
-    let page = state
-        .history()
-        .list(&query.into_filter(&actor)?)
-        .await
+    let filter = query.into_filter(&actor)?;
+    let history = state.history();
+    let (page, counts) = tokio::try_join!(history.list(&filter), history.count_by_status(&filter))
         .map_err(|e| ServeError::Internal(e.to_string()))?;
     let mut runs = page.runs;
     for rec in &mut runs {
@@ -329,6 +346,7 @@ pub async fn list_runs(
     Ok(Json(ListResponse {
         runs,
         next_cursor: page.next_cursor,
+        counts,
     }))
 }
 

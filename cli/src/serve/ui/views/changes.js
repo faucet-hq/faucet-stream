@@ -72,6 +72,7 @@ export async function renderChanges(container, params = {}) {
   let tab = approver ? "mine" : "all";
   let changes = [];
   let truncated = false;
+  let counts = null;
   let selected = params.id || null;
   let alive = true;
   let pollTimer = null;
@@ -110,10 +111,18 @@ export async function renderChanges(container, params = {}) {
     const mine = ++seq;
     const p = new URLSearchParams({ limit: String(LIMIT) });
     withTenant(p);
+    const cp = new URLSearchParams();
+    withTenant(cp);
     try {
-      const rows = await api(`/v1/changes?${p}`);
+      // Counts are exact over every request; an older server without the
+      // endpoint falls back to counting the loaded rows.
+      const [rows, totals] = await Promise.all([
+        api(`/v1/changes?${p}`),
+        api(`/v1/changes/counts?${cp}`).catch(() => null),
+      ]);
       if (!alive || mine !== seq) return;
       changes = rows;
+      counts = totals ? totals.counts : null;
       truncated = rows.length >= LIMIT;
       paint();
     } catch (e) {
@@ -127,8 +136,9 @@ export async function renderChanges(container, params = {}) {
   }
 
   function paint() {
-    const more = truncated ? "+" : "";
-    const n = (sts) => changes.filter((c) => sts.includes(c.status)).length;
+    const more = counts ? "" : truncated ? "+" : "";
+    const n = (sts) =>
+      counts ? sts.reduce((t, s) => t + (counts[s] || 0), 0) : changes.filter((c) => sts.includes(c.status)).length;
     pane.head.querySelector("#c-stats").innerHTML = statStrip([
       { label: "Pending", value: `${fmtInt(n(["pending"]))}${more}`, tone: n(["pending"]) ? "warn" : "" },
       { label: "Executed", value: `${fmtInt(n(["executed"]))}${more}`, tone: "ok" },

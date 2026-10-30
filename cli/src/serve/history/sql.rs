@@ -24,7 +24,7 @@ use std::time::Duration;
 /// in `faucet_serve_schema`. A database stamped with a newer version is
 /// refused at startup instead of being written by code that does not know
 /// its columns.
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// The oldest binary schema version that can still read a database this
 /// binary writes, kept as the `min_readable` row of `faucet_serve_schema`.
@@ -47,6 +47,7 @@ pub const ADDED_COLUMNS: &[(u32, &str, &str)] = &[
     (6, "faucet_template_launches", "evidence"),
     (7, "faucet_serve_runs", "pool"),
     (7, "faucet_serve_instance_caps", "pools"),
+    (8, "faucet_serve_runs", "submitted_by"),
 ];
 
 /// The columns of a `faucet_serve_log_ship` row, in [`decode_log_ship`] order.
@@ -106,6 +107,8 @@ pub const POST_MIGRATION_DDL: &[&str] = &[
         ON faucet_serve_changes (tenant, created_at)",
     "CREATE INDEX IF NOT EXISTS faucet_serve_runs_pool_idx \
         ON faucet_serve_runs (status, pool, submitted_at)",
+    "CREATE INDEX IF NOT EXISTS faucet_serve_runs_submitted_by_idx \
+        ON faucet_serve_runs (submitted_by, submitted_at)",
 ];
 
 /// Decode `faucet_template_test_results` bodies.
@@ -1312,22 +1315,52 @@ impl Stmts {
         (sql, binds)
     }
 
-    /// The run-listing query: [`Stmts::list`]'s fourteen binds, then one
+    /// How many fixed binds [`Stmts::list`] takes before the label clauses.
+    pub const LIST_BINDS: usize = 16;
+
+    /// The run-listing query: [`Stmts::list`]'s sixteen binds, then one
     /// clause per label filter, then the `LIMIT` bind. Returns the SQL and the
     /// label binds, in bind order (#958).
     pub fn list_query(
         &self,
         labels: &[crate::serve::history::labels::LabelFilter],
     ) -> (String, Vec<String>) {
-        let mut sql = self.list.clone();
+        let (mut sql, binds) = self.label_clauses(self.list.clone(), labels);
+        sql.push_str(&format!(
+            " ORDER BY submitted_at DESC, run_id DESC LIMIT {}",
+            self.placeholder(Self::LIST_BINDS + 1 + binds.len())
+        ));
+        (sql, binds)
+    }
+
+    /// The per-status count over the same filter as [`Stmts::list_query`]
+    /// (#998): its sixteen binds (pass the cursor ones as NULL), then the label
+    /// binds; no `LIMIT`.
+    pub fn count_query(
+        &self,
+        labels: &[crate::serve::history::labels::LabelFilter],
+    ) -> (String, Vec<String>) {
+        let base = self
+            .list
+            .replacen("SELECT body FROM", "SELECT status, COUNT(*) AS n FROM", 1);
+        let (mut sql, binds) = self.label_clauses(base, labels);
+        sql.push_str(" GROUP BY status");
+        (sql, binds)
+    }
+
+    fn label_clauses(
+        &self,
+        mut sql: String,
+        labels: &[crate::serve::history::labels::LabelFilter],
+    ) -> (String, Vec<String>) {
         let mut binds = Vec::new();
         for f in labels {
             binds.push(f.key.clone());
-            let key = self.placeholder(14 + binds.len());
+            let key = self.placeholder(Self::LIST_BINDS + binds.len());
             match &f.value {
                 Some(v) => {
                     binds.push(v.clone());
-                    let value = self.placeholder(14 + binds.len());
+                    let value = self.placeholder(Self::LIST_BINDS + binds.len());
                     sql.push_str(&format!(
                         " AND run_id IN (SELECT run_id FROM faucet_serve_run_labels \
                          WHERE key = {key} AND value = {value})"
@@ -1338,11 +1371,22 @@ impl Stmts {
                 )),
             }
         }
-        sql.push_str(&format!(
-            " ORDER BY submitted_at DESC, run_id DESC LIMIT {}",
-            self.placeholder(15 + binds.len())
-        ));
         (sql, binds)
+    }
+
+    /// The per-status count of change requests matching `filter` (#998): the
+    /// clauses of [`Stmts::change_query`] without its order and limit.
+    pub fn change_count_query(
+        &self,
+        filter: &crate::serve::changes::ChangeListFilter,
+    ) -> (String, Vec<String>) {
+        let (sql, binds) = self.change_query(filter);
+        let head = sql.split(" ORDER BY ").next().unwrap_or_default().replacen(
+            "SELECT body FROM",
+            "SELECT status, COUNT(*) AS n FROM",
+            1,
+        );
+        (format!("{head} GROUP BY status"), binds)
     }
 
     /// The dialect's positional placeholder for the `n`-th (1-based) bind.
@@ -1356,20 +1400,24 @@ impl Stmts {
     fn postgres() -> Self {
         Self {
             upsert: "INSERT INTO faucet_serve_runs \
-                (run_id,name,status,submitted_at,finished_at,idempotency_key,owner,lease_expires_at,body,pool) \
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) \
+                (run_id,name,status,submitted_at,finished_at,idempotency_key,owner,lease_expires_at,body,pool,\
+                submitted_by) \
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
                 ON CONFLICT (run_id) DO UPDATE SET \
                 name=excluded.name,status=excluded.status,submitted_at=excluded.submitted_at,\
                 finished_at=excluded.finished_at,idempotency_key=excluded.idempotency_key,\
                 owner=excluded.owner,lease_expires_at=excluded.lease_expires_at,\
-                body=excluded.body,pool=excluded.pool"
+                body=excluded.body,pool=excluded.pool,\
+                submitted_by=COALESCE(excluded.submitted_by,faucet_serve_runs.submitted_by)"
                 .into(),
             insert_new: "INSERT INTO faucet_serve_runs \
-                (run_id,name,status,submitted_at,finished_at,idempotency_key,owner,lease_expires_at,body,pool) \
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (run_id) DO NOTHING"
+                (run_id,name,status,submitted_at,finished_at,idempotency_key,owner,lease_expires_at,body,pool,\
+                submitted_by) \
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (run_id) DO NOTHING"
                 .into(),
             update_run: "UPDATE faucet_serve_runs SET name=$2,status=$3,submitted_at=$4,\
-                finished_at=$5,idempotency_key=$6,owner=$7,lease_expires_at=$8,body=$9,pool=$10 \
+                finished_at=$5,idempotency_key=$6,owner=$7,lease_expires_at=$8,body=$9,pool=$10,\
+                submitted_by=COALESCE($11,submitted_by) \
                 WHERE run_id=$1"
                 .into(),
             select_body: "SELECT body FROM faucet_serve_runs WHERE run_id=$1".into(),
@@ -1390,7 +1438,8 @@ impl Stmts {
                 AND ($9::text IS NULL OR (submitted_at < $10::text \
                     OR (submitted_at = $11::text AND run_id < $12::text))) \
                 AND ($13::text IS NULL OR run_id IN \
-                    (SELECT run_id FROM faucet_tenant_runs WHERE tenant = $14::text))"
+                    (SELECT run_id FROM faucet_tenant_runs WHERE tenant = $14::text)) \
+                AND ($15::text IS NULL OR submitted_by = $16::text)"
                 .into(),
             purge_runs: "DELETE FROM faucet_serve_runs \
                 WHERE status IN ('completed','failed','cancelled') \
@@ -1969,20 +2018,24 @@ impl Stmts {
     fn sqlite() -> Self {
         Self {
             upsert: "INSERT INTO faucet_serve_runs \
-                (run_id,name,status,submitted_at,finished_at,idempotency_key,owner,lease_expires_at,body,pool) \
-                VALUES (?,?,?,?,?,?,?,?,?,?) \
+                (run_id,name,status,submitted_at,finished_at,idempotency_key,owner,lease_expires_at,body,pool,\
+                submitted_by) \
+                VALUES (?,?,?,?,?,?,?,?,?,?,?) \
                 ON CONFLICT (run_id) DO UPDATE SET \
                 name=excluded.name,status=excluded.status,submitted_at=excluded.submitted_at,\
                 finished_at=excluded.finished_at,idempotency_key=excluded.idempotency_key,\
                 owner=excluded.owner,lease_expires_at=excluded.lease_expires_at,\
-                body=excluded.body,pool=excluded.pool"
+                body=excluded.body,pool=excluded.pool,\
+                submitted_by=COALESCE(excluded.submitted_by,faucet_serve_runs.submitted_by)"
                 .into(),
             insert_new: "INSERT INTO faucet_serve_runs \
-                (run_id,name,status,submitted_at,finished_at,idempotency_key,owner,lease_expires_at,body,pool) \
-                VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT (run_id) DO NOTHING"
+                (run_id,name,status,submitted_at,finished_at,idempotency_key,owner,lease_expires_at,body,pool,\
+                submitted_by) \
+                VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (run_id) DO NOTHING"
                 .into(),
             update_run: "UPDATE faucet_serve_runs SET name=?2,status=?3,submitted_at=?4,\
-                finished_at=?5,idempotency_key=?6,owner=?7,lease_expires_at=?8,body=?9,pool=?10 \
+                finished_at=?5,idempotency_key=?6,owner=?7,lease_expires_at=?8,body=?9,pool=?10,\
+                submitted_by=COALESCE(?11,submitted_by) \
                 WHERE run_id=?1"
                 .into(),
             select_body: "SELECT body FROM faucet_serve_runs WHERE run_id=?".into(),
@@ -2001,7 +2054,8 @@ impl Stmts {
                 AND (? IS NULL OR (submitted_at < ? \
                     OR (submitted_at = ? AND run_id < ?))) \
                 AND (? IS NULL OR run_id IN \
-                    (SELECT run_id FROM faucet_tenant_runs WHERE tenant = ?))"
+                    (SELECT run_id FROM faucet_tenant_runs WHERE tenant = ?)) \
+                AND (? IS NULL OR submitted_by = ?)"
                 .into(),
             purge_runs: "DELETE FROM faucet_serve_runs \
                 WHERE status IN ('completed','failed','cancelled') \
@@ -3082,6 +3136,7 @@ macro_rules! impl_sql_history {
                         .bind(&lease)
                         .bind(&body)
                         .bind(&rec.pool)
+                        .bind(rec.submitted_by.as_deref())
                         .execute(&mut *tx)
                         .await
                         .map_err(backend)?
@@ -3147,6 +3202,7 @@ macro_rules! impl_sql_history {
                     .bind(&lease)
                     .bind(&body)
                     .bind(&rec.pool)
+                    .bind(rec.submitted_by.as_deref())
                     .execute(&mut *tx)
                     .await
                     .map_err(backend)?;
@@ -3264,7 +3320,9 @@ macro_rules! impl_sql_history {
                     .bind(cursor_ts.as_deref())
                     .bind(cur_id)
                     .bind(filter.tenant.as_deref())
-                    .bind(filter.tenant.as_deref());
+                    .bind(filter.tenant.as_deref())
+                    .bind(filter.submitted_by.as_deref())
+                    .bind(filter.submitted_by.as_deref());
                 for b in &label_binds {
                     q = q.bind(b.as_str());
                 }
@@ -3286,6 +3344,62 @@ macro_rules! impl_sql_history {
                 };
                 runs.truncate(limit);
                 Ok(ListPage { runs, next_cursor })
+            }
+
+            async fn count_by_status(
+                &self,
+                filter: &$crate::serve::history::ListFilter,
+            ) -> Result<
+                $crate::serve::history::StatusCounts,
+                $crate::serve::history::HistoryError,
+            > {
+                use $crate::serve::history::sql;
+                let status_s: Option<String> = (!filter.status.is_empty()).then(|| {
+                    format!(
+                        ",{},",
+                        filter
+                            .status
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                });
+                let since_s = filter.since.map(sql::fmt_ts);
+                let until_s = filter.until.map(sql::fmt_ts);
+                let none: Option<&str> = None;
+                let (count_sql, label_binds) = self.stmts.count_query(&filter.labels);
+                let mut q = sqlx::query(&count_sql)
+                    .bind(status_s.as_deref())
+                    .bind(status_s.as_deref())
+                    .bind(filter.name.as_deref())
+                    .bind(filter.name.as_deref())
+                    .bind(since_s.as_deref())
+                    .bind(since_s.as_deref())
+                    .bind(until_s.as_deref())
+                    .bind(until_s.as_deref())
+                    .bind(none)
+                    .bind(none)
+                    .bind(none)
+                    .bind(none)
+                    .bind(filter.tenant.as_deref())
+                    .bind(filter.tenant.as_deref())
+                    .bind(filter.submitted_by.as_deref())
+                    .bind(filter.submitted_by.as_deref());
+                for b in &label_binds {
+                    q = q.bind(b.as_str());
+                }
+                {
+                    use sqlx::Row as _;
+                    let backend = $crate::serve::history::sql::classify_backend_error;
+                    let mut counts = $crate::serve::history::StatusCounts::new();
+                    for row in q.fetch_all(&self.pool).await.map_err(backend)? {
+                        let status: String = row.try_get("status").map_err(backend)?;
+                        let n: i64 = row.try_get("n").map_err(backend)?;
+                        counts.insert(status, u64::try_from(n).unwrap_or_default());
+                    }
+                    Ok(counts)
+                }
             }
 
             async fn delete(
@@ -5938,6 +6052,31 @@ macro_rules! impl_sql_history {
                 Ok(out)
             }
 
+            async fn change_counts(
+                &self,
+                filter: &$crate::serve::changes::ChangeListFilter,
+            ) -> Result<
+                $crate::serve::history::StatusCounts,
+                $crate::serve::history::HistoryError,
+            > {
+                let (sql, binds) = self.stmts.change_count_query(filter);
+                let mut query = sqlx::query(&sql);
+                for bind in &binds {
+                    query = query.bind(bind);
+                }
+                {
+                    use sqlx::Row as _;
+                    let backend = $crate::serve::history::sql::classify_backend_error;
+                    let mut counts = $crate::serve::history::StatusCounts::new();
+                    for row in query.fetch_all(&self.pool).await.map_err(backend)? {
+                        let status: String = row.try_get("status").map_err(backend)?;
+                        let n: i64 = row.try_get("n").map_err(backend)?;
+                        counts.insert(status, u64::try_from(n).unwrap_or_default());
+                    }
+                    Ok(counts)
+                }
+            }
+
             // ── Cost & usage accounting (#704) ───────────────────────────────
 
             async fn usage_record(
@@ -7289,7 +7428,10 @@ mod tests {
         assert!(pg.upsert.contains("$1") && lite.upsert.contains('?'));
         assert!(pg.list.contains("$13") && lite.list.contains('?'));
         let (q, _) = pg.list_query(&[]);
-        assert!(q.ends_with("LIMIT $15"), "{q}");
+        assert!(
+            q.ends_with(&format!("LIMIT ${}", Stmts::LIST_BINDS + 1)),
+            "{q}"
+        );
         // Both target the same tables / conflict targets.
         assert!(pg.insert_idem.contains("ON CONFLICT (key) DO NOTHING"));
         assert!(lite.insert_idem.contains("ON CONFLICT (key) DO NOTHING"));
@@ -7307,16 +7449,59 @@ mod tests {
         ];
         let (q, binds) = Stmts::new(Dialect::Postgres).list_query(&f);
         assert_eq!(binds, ["team", "data", "env"]);
-        assert!(q.contains("WHERE key = $15 AND value = $16)"), "{q}");
-        assert!(q.contains("WHERE key = $17)"), "{q}");
+        // The submitter filter (#998) takes binds 15 and 16, so labels start at 17.
+        assert!(q.contains("submitted_by = $16::text"), "{q}");
+        assert!(q.contains("WHERE key = $17 AND value = $18)"), "{q}");
+        assert!(q.contains("WHERE key = $19)"), "{q}");
         assert!(
-            q.ends_with("ORDER BY submitted_at DESC, run_id DESC LIMIT $18"),
+            q.ends_with("ORDER BY submitted_at DESC, run_id DESC LIMIT $20"),
             "{q}"
         );
         let (q, binds) = Stmts::new(Dialect::Sqlite).list_query(&f);
         assert_eq!(binds.len(), 3);
         assert_eq!(q.matches("faucet_serve_run_labels").count(), 2);
         assert!(q.ends_with("LIMIT ?"), "{q}");
+    }
+
+    #[test]
+    fn count_query_groups_the_list_filter_by_status_without_a_limit() {
+        use crate::serve::history::labels::LabelFilter;
+        let f = [LabelFilter::parse("team:data").unwrap()];
+        let (q, binds) = Stmts::new(Dialect::Postgres).count_query(&f);
+        assert_eq!(binds, ["team", "data"]);
+        assert!(
+            q.starts_with("SELECT status, COUNT(*) AS n FROM faucet_serve_runs"),
+            "{q}"
+        );
+        assert!(q.contains("WHERE key = $17 AND value = $18)"), "{q}");
+        assert!(q.ends_with(" GROUP BY status"), "{q}");
+        assert!(!q.contains("LIMIT") && !q.contains("ORDER BY"), "{q}");
+        let (q, binds) = Stmts::new(Dialect::Sqlite).count_query(&[]);
+        assert!(binds.is_empty());
+        assert_eq!(q.matches('?').count(), Stmts::LIST_BINDS, "{q}");
+    }
+
+    #[test]
+    fn change_count_query_keeps_the_filter_and_drops_order_and_limit() {
+        use crate::serve::changes::{ChangeKind, ChangeListFilter};
+        let filter = ChangeListFilter {
+            kind: Some(ChangeKind::Run),
+            requester: Some("bob".into()),
+            limit: 5,
+            ..Default::default()
+        };
+        let (q, binds) = Stmts::new(Dialect::Postgres).change_count_query(&filter);
+        assert_eq!(binds, ["run", "bob"]);
+        assert_eq!(
+            q,
+            "SELECT status, COUNT(*) AS n FROM faucet_serve_changes \
+             WHERE kind=$1 AND requester=$2 GROUP BY status"
+        );
+        let (q, _) = Stmts::new(Dialect::Sqlite).change_count_query(&ChangeListFilter::default());
+        assert_eq!(
+            q,
+            "SELECT status, COUNT(*) AS n FROM faucet_serve_changes GROUP BY status"
+        );
     }
 
     #[test]

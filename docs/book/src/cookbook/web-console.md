@@ -81,10 +81,13 @@ replaces the list, with a **← Runs** link back.
 
 The list pane has:
 
-- Tabs for **All runs**, **Active** (queued, pending, running, sharded) and
-  **Failed**.
-- A stat strip — running, succeeded and failed counts plus the records written
-  — over the runs loaded (a `+` means more pages exist).
+- Tabs for **All runs**, **Mine** (runs you submitted; hidden under
+  `--no-auth`, where every caller is `anonymous`), **Active** (queued, pending,
+  running, sharded) and **Failed**.
+- A stat strip — running, succeeded and failed counts plus the records written.
+  The status counts are exact totals from the server over every run the
+  filters match; records are summed over the runs loaded (a `+` means more
+  pages exist). Section headers show the same exact totals.
 - Sections for **Running**, **Queued**, **Failed**, **Succeeded** and
   **Cancelled**, each collapsible. Every row shows a status ring, the run's name
   (its pipeline when it has none), how long ago it was submitted, and one line
@@ -111,7 +114,7 @@ back…** and **Delete** (once it has finished) on the right:
   [row accounting](../reference/http-api.md#get-v1runsid--runrecord) of every
   invocation summed into one bar (written, merged, skipped, to the DLQ,
   quarantined, dropped, and `unaccounted` in red when a sink lost rows); the
-  slowest invocations; provenance (template and version, pool, tenant,
+  slowest invocations; provenance (who submitted it, template and version, pool, tenant,
   `depends_on` edges, the DLQ it replayed, idempotency key, clock, timeout);
   the labels; and the last lines of the log. Clicking a label adds it to the
   list's filters.
@@ -160,7 +163,8 @@ Change requests ([plan → approve → run](./approvals.md)) use the same split
 pane: `#/changes` lists them, `#/changes/<id>` selects one. The list has a
 **Needs me** tab (pending requests you may approve: not your own, not already
 approved by you; shown to principals with the `change_approve` permission) and
-**All**, a stat strip (pending, executed, rejected, failed), and sections for
+**All**, a stat strip (pending, executed, rejected, failed — exact totals from
+`GET /v1/changes/counts`), and sections for
 **Pending**, **Approved, executing** and **Decided**. Each row shows the
 proposal, its age, and its kind and approvals, or its outcome.
 
@@ -253,8 +257,9 @@ config), **Roll back** to the previous launch, **Deprecate** / **Revive**, and
 
 - **Versions** — the launch-gate card for the newest version (its latest test
   run: cases passed by origin, retries, shared suites, faucet version, and
-  whether it can be launched); the versions table, newest first, with the
-  channels pointing at each version (`stable` / `previous` / `newest` derived,
+  whether it can be launched); the versions table, newest first, with when
+  and by whom each version was registered ("—" for a version recorded without
+  it), the channels pointing at each version (`stable` / `previous` / `newest` derived,
   `dev`…`prod` assigned), its test status, when it was last tested and how
   many runs it served in the last 7 days; and the launch history (who launched
   which version, on what test evidence). Each version row has **Run** (opens

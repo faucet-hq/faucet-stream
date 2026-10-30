@@ -361,6 +361,13 @@ impl RunHistory for FallbackHistory {
         via!(self, p => p.list(filter), f => f.list(filter))
     }
 
+    async fn count_by_status(
+        &self,
+        filter: &ListFilter,
+    ) -> Result<crate::serve::history::StatusCounts, HistoryError> {
+        via!(self, p => p.count_by_status(filter), f => f.count_by_status(filter))
+    }
+
     async fn delete(&self, id: &str) -> Result<DeleteOutcome, HistoryError> {
         via!(self, p => p.delete(id), f => f.delete(id))
     }
@@ -771,6 +778,12 @@ impl RunHistory for FallbackHistory {
         filter: &crate::serve::changes::ChangeListFilter,
     ) -> Result<Vec<crate::serve::changes::ChangeRequest>, HistoryError> {
         strict!(self, p => p.change_list(filter), f => f.change_list(filter))
+    }
+    async fn change_counts(
+        &self,
+        filter: &crate::serve::changes::ChangeListFilter,
+    ) -> Result<crate::serve::history::StatusCounts, HistoryError> {
+        strict!(self, p => p.change_counts(filter), f => f.change_counts(filter))
     }
     async fn usage_record(&self, record: &crate::usage::UsageRecord) -> Result<(), HistoryError> {
         via!(self, p => p.usage_record(record), f => f.usage_record(record))

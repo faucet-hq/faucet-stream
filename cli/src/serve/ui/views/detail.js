@@ -535,6 +535,7 @@ function invStatus(i, live) {
 function provenance(r) {
   const kv = (k, v, title = "") => `<div class="c-kv"><small${title ? ` title="${escapeHtml(title)}"` : ""}>${escapeHtml(k)}</small><b>${v}</b></div>`;
   const out = [];
+  if (r.submitted_by) out.push(kv("Submitted by", `<span class="mono">${escapeHtml(r.submitted_by)}</span>`, "the principal that submitted the run"));
   if (templateLink(r)) out.push(kv("Template", templateLink(r)));
   if (r.pool) out.push(kv("Pool", `<span class="mono">${escapeHtml(r.pool)}</span>`, "execution pool"));
   if (r.tenant) out.push(kv("Tenant", `<a href="#/tenants/${encodeURIComponent(r.tenant)}">${escapeHtml(r.tenant)}</a>`));

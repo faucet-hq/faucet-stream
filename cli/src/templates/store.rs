@@ -81,6 +81,23 @@ pub struct RegisterRequest {
     pub created_by: Option<String>,
 }
 
+/// The actor a local `faucet template` command records (#998): `local:<user>`
+/// from `$USER` / `$USERNAME`, else `local`.
+pub fn local_actor() -> String {
+    local_actor_from(
+        std::env::var("USER")
+            .ok()
+            .or_else(|| std::env::var("USERNAME").ok()),
+    )
+}
+
+fn local_actor_from(user: Option<String>) -> String {
+    match user.as_deref().map(str::trim) {
+        Some(u) if !u.is_empty() => format!("local:{u}"),
+        _ => "local".to_string(),
+    }
+}
+
 /// What [`register_tested`] did: the new version, its test run, its launch.
 #[derive(Debug)]
 pub struct Registration {
@@ -1823,6 +1840,14 @@ pub async fn resolve_store_url(url: &str) -> CliResult<TemplateStore> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_local_registration_names_the_user_when_known() {
+        assert_eq!(local_actor_from(Some("pat".into())), "local:pat");
+        assert_eq!(local_actor_from(Some("  ".into())), "local");
+        assert_eq!(local_actor_from(None), "local");
+        assert!(local_actor().starts_with("local"));
+    }
 
     #[test]
     fn a_degraded_registry_is_history_unavailable() {

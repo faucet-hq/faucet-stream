@@ -141,7 +141,7 @@ someone does.
 | `POST /v1/templates/{id}/versions/{version}/test` | — | — | ✓ |
 | `POST /v1/templates/sync`, `POST /v1/templates/{id}/publish` | — | — | ✓ |
 | `GET /v1/whoami` | ✓ | ✓ | ✓ |
-| `GET /v1/changes`, `GET /v1/changes/{id}` | ✓ | ✓ | ✓ |
+| `GET /v1/changes`, `GET /v1/changes/counts`, `GET /v1/changes/{id}` | ✓ | ✓ | ✓ |
 | `POST /v1/changes` | — | ✓ | ✓ |
 | `POST /v1/changes/{id}/approve`, `/reject` | — | ✓¹ | ✓¹ |
 | `GET /v1/tenants`, `/v1/tenants/{tenant}`, `/v1/tenants/{tenant}/connections[/{name}]`, `GET /v1/connect/providers` | ✓ | ✓ | ✓ |
@@ -478,6 +478,7 @@ template) `POST /v1/templates/{id}/runs`, `run_template` and a template trigger.
 | `DELETE` | `/v1/state/{pipeline}/{row}` | `200` / `409` | Reset the row so its next run re-syncs (admin / `StateAdmin`); `409` while a run holds the row |
 | `POST` | `/v1/changes` | `201` | Propose a [change request](../cookbook/approvals.md) (`kind` = `run` / `template_register` / `template_launch` / `template_delete` / `template_deprecate`, `payload`, `reason`, `budget`); planned now, executed on approval — operator / `ChangeRequest` |
 | `GET` | `/v1/changes` | `200` | List change requests (`status`, `kind`, `requester`, `limit`), newest first, plan rows omitted — viewer / `ChangeRead` |
+| `GET` | `/v1/changes/counts` | `200` | `{"counts": {status: n}}`: exact totals over every request matching `kind`, `requester`, `tenant` (lapsed pending requests count as `expired`) — viewer / `ChangeRead` |
 | `GET` | `/v1/changes/{id}` | `200` | One change request with its plan — viewer / `ChangeRead` |
 | `POST` | `/v1/changes/{id}/approve` | `200` | Approve (`comment`); at quorum re-plans and executes, or marks it `invalidated` — `ChangeApprove`, then the `approvals:` policy |
 | `POST` | `/v1/changes/{id}/reject` | `200` | Reject with a `reason`; the requester may withdraw their own — `ChangeApprove`, then the policy |
@@ -609,7 +610,7 @@ submitted config (submitted values win).
 ### `GET /v1/runs`
 
 Query parameters: `status`, `name`, `since`, `until` (RFC3339), `limit` (default
-50, max 500), `cursor`, `tenant`, `label`, `labels`. Ordering is
+50, max 500), `cursor`, `tenant`, `submitted_by`, `mine`, `label`, `labels`. Ordering is
 `(submitted_at DESC, run_id DESC)`; `cursor` is the previous page's
 `next_cursor` — the last row's sort key (`<submitted_at>~<run_id>`), so paging
 stays correct when that run is deleted or purged between requests. A bare
@@ -633,12 +634,28 @@ At most 10 label filters per request. Provenance labels filter like any other �
 `label=pipeline:<name>`. A sharded run is listed once, as its parent, with the
 labels it was submitted with.
 
+**Filtering by submitter (#998).** Every run records who submitted it in
+`submitted_by`: the authenticated principal (`trigger:<name>` for a trigger,
+the requester for an approved change request, `anonymous` under `--no-auth`,
+`token` for the single `--auth-token`). The server sets it; a request body
+cannot. `submitted_by=<principal>` keeps that principal's runs, and `mine=true`
+keeps the caller's own (setting both is a `400`). Runs recorded before the
+field existed have no submitter and match neither.
+
+**Exact counts (#998).** `counts` holds how many runs match the filters, per
+status, ignoring `limit` and `cursor` — so a dashboard can show totals without
+paging through every run. Only statuses with at least one run appear.
+
 **Unknown parameters are a `400`.** A typo such as `?lables=team:data` is
 refused rather than silently returning every run. So are an unknown `status`
 token, an empty label key and more than 10 label filters.
 
 ```json
-{ "runs": [ { "run_id": "…", "status": "completed", … } ], "next_cursor": "2026-10-01T12:00:00.000000000Z~0192…" }
+{
+  "runs": [ { "run_id": "…", "status": "completed", "submitted_by": "alice", … } ],
+  "next_cursor": "2026-10-01T12:00:00.000000000Z~0192…",
+  "counts": { "completed": 41, "failed": 2, "running": 1 }
+}
 ```
 
 ### `GET /v1/runs/{id}` → `RunRecord`
@@ -653,6 +670,7 @@ token, an empty label key and more than 10 label filters.
   "elapsed_secs": 12.4,
   "records_written": 4096,
   "pool": "default",
+  "submitted_by": "alice",
   "invocations": [
     {"row_id": "default", "parent_record_key": null, "records_written": 4096, "error": null,
      "status": "succeeded",
@@ -1288,9 +1306,12 @@ channel names are rejected rather than silently falling back, and asking for an
 defaults to `newest` and returns `{version, replaced, already_launched, status}`;
 re-launching the live version is a no-op, which keeps `previous` a real rollback
 target. `GET /v1/templates/{id}` returns `status`, `versions` (newest first),
-`stable` / `previous` / `newest`, `is_stable`, the `tags` pointer map, and the
-`launches` log — so a client can pin, promote, launch, or roll back without a
-second request. Use `?version=newest` to read a `draft` template. The stored
+`stable` / `previous` / `newest`, `is_stable`, the `tags` pointer map, the
+`launches` log, and `registrations` — each stored version's `registered_at` and
+`registered_by` (the principal; `sync:<origin>` for a template sync,
+`local:<user>` for `faucet template register`; absent for a version recorded
+without one), newest first — so a client can pin, promote, launch, or roll back
+without a second request. Use `?version=newest` to read a `draft` template. The stored
 `body` is returned only to an admin with no tenant scope; anyone else gets an
 empty `body` and `body_withheld: true` (the parameter surface stays in
 `params`), the same rule as a run's `config_body`. In `params`, the

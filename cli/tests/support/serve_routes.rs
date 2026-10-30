@@ -38,6 +38,7 @@ const ROUTES_BASE: &[(&str, &str)] = &[
     // Change requests (#703).
     ("POST", "/v1/changes"),
     ("GET", "/v1/changes"),
+    ("GET", "/v1/changes/counts"),
     ("GET", "/v1/changes/{id}"),
     ("POST", "/v1/changes/{id}/approve"),
     ("POST", "/v1/changes/{id}/reject"),

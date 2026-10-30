@@ -263,6 +263,12 @@ pub struct RunRecord {
     /// pools existed read as `default`.
     #[serde(default = "crate::serve::pools::default_pool")]
     pub pool: String,
+    /// Who submitted the run (#998): the authenticated principal the
+    /// `run.submit` audit entry names — `trigger:<name>` for a trigger, the
+    /// requester for an approved change request. Set only by the server;
+    /// `None` for runs recorded before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitted_by: Option<String>,
 }
 
 impl RunRecord {
@@ -303,6 +309,7 @@ impl RunRecord {
             caller_config: false,
             caller_params: Default::default(),
             pool: crate::serve::pools::default_pool(),
+            submitted_by: None,
         }
     }
 }
@@ -391,7 +398,34 @@ pub struct ListFilter {
     pub tenant: Option<String>,
     /// Only runs carrying every one of these labels (#958).
     pub labels: Vec<labels::LabelFilter>,
+    /// Only runs this principal submitted (#998).
+    pub submitted_by: Option<String>,
 }
+
+impl ListFilter {
+    /// Whether `rec` passes every filter except the cursor and limit.
+    pub fn matches(&self, rec: &RunRecord) -> bool {
+        (self.status.is_empty() || self.status.contains(&rec.status))
+            && self
+                .name
+                .as_deref()
+                .is_none_or(|n| rec.name.as_deref() == Some(n))
+            && self.since.is_none_or(|t| rec.submitted_at >= t)
+            && self.until.is_none_or(|t| rec.submitted_at <= t)
+            && self
+                .tenant
+                .as_deref()
+                .is_none_or(|t| rec.tenant.as_deref() == Some(t))
+            && self
+                .submitted_by
+                .as_deref()
+                .is_none_or(|p| rec.submitted_by.as_deref() == Some(p))
+            && labels::matches_all(&self.labels, &rec.labels)
+    }
+}
+
+/// Runs per status (`completed` → 12, …): only statuses with at least one run.
+pub type StatusCounts = BTreeMap<String, u64>;
 
 /// The keyset cursor after `rec`: `<submitted_at>~<run_id>`, so the next page
 /// starts after that position even if the run is deleted or purged meanwhile.
@@ -786,6 +820,26 @@ pub trait RunHistory: Send + Sync {
     async fn get(&self, id: &str) -> Result<Option<RunRecord>, HistoryError>;
 
     async fn list(&self, filter: &ListFilter) -> Result<ListPage, HistoryError>;
+
+    /// How many runs match `filter` per status, ignoring its cursor and limit
+    /// (#998). The default pages through [`list`](Self::list); the built-in
+    /// backends count in one query.
+    async fn count_by_status(&self, filter: &ListFilter) -> Result<StatusCounts, HistoryError> {
+        let mut page_filter = filter.clone();
+        page_filter.limit = 500;
+        page_filter.cursor = None;
+        let mut counts = StatusCounts::new();
+        loop {
+            let page = self.list(&page_filter).await?;
+            for rec in &page.runs {
+                *counts.entry(rec.status.as_str().to_string()).or_default() += 1;
+            }
+            match page.next_cursor {
+                Some(c) => page_filter.cursor = Some(c),
+                None => return Ok(counts),
+            }
+        }
+    }
 
     /// Delete a terminal run. Non-terminal → `StillRunning` (caller maps to 409).
     async fn delete(&self, id: &str) -> Result<DeleteOutcome, HistoryError>;
@@ -1565,6 +1619,22 @@ pub trait RunHistory: Send + Sync {
     ) -> Result<Vec<crate::serve::changes::ChangeRequest>, HistoryError> {
         let _ = filter;
         Ok(Vec::new())
+    }
+
+    /// How many change requests match `filter` per status, ignoring its
+    /// limit (#998). The default counts an unbounded [`change_list`](Self::change_list);
+    /// the built-in backends count in one query.
+    async fn change_counts(
+        &self,
+        filter: &crate::serve::changes::ChangeListFilter,
+    ) -> Result<StatusCounts, HistoryError> {
+        let mut all = filter.clone();
+        all.limit = usize::MAX;
+        let mut counts = StatusCounts::new();
+        for c in self.change_list(&all).await? {
+            *counts.entry(c.status.as_str().to_string()).or_default() += 1;
+        }
+        Ok(counts)
     }
 
     // ── Tenants (#709) ───────────────────────────────────────────────────────
@@ -2472,6 +2542,92 @@ mod tests {
         assert!(h.insert_new(&rec).await.unwrap());
         assert!(!h.insert_new(&rec).await.unwrap(), "the id is taken");
         assert!(h.get("r1").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn the_default_count_pages_through_every_matching_run() {
+        let h = ReadThenWrite(memory::MemoryHistory::new(Duration::from_secs(60)));
+        let t0 = Utc::now();
+        for i in 0..1203u32 {
+            let mut rec = RunRecord::queued(
+                format!("r{i:05}"),
+                None,
+                Default::default(),
+                None,
+                t0 + chrono::Duration::milliseconds(i64::from(i)),
+            );
+            rec.status = if i % 3 == 0 {
+                RunStatus::Failed
+            } else {
+                RunStatus::Completed
+            };
+            rec.submitted_by = Some(if i % 2 == 0 { "alice" } else { "bob" }.into());
+            h.upsert(&rec).await.unwrap();
+        }
+        let all = h
+            .count_by_status(&ListFilter {
+                limit: 1,
+                cursor: Some("ignored".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(all.get("failed"), Some(&401));
+        assert_eq!(all.get("completed"), Some(&802));
+        let alice = h
+            .count_by_status(&ListFilter {
+                submitted_by: Some("alice".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(alice.values().sum::<u64>(), 602);
+    }
+
+    #[tokio::test]
+    async fn the_default_change_counts_count_the_listing() {
+        let counts = Bare
+            .change_counts(&crate::serve::changes::ChangeListFilter::default())
+            .await
+            .unwrap();
+        assert!(counts.is_empty());
+    }
+
+    #[test]
+    fn a_run_recorded_before_submitters_reads_without_one() {
+        let mut v = serde_json::to_value(RunRecord::queued(
+            "old".into(),
+            None,
+            Default::default(),
+            None,
+            Utc::now(),
+        ))
+        .unwrap();
+        assert!(v.get("submitted_by").is_none(), "None is not serialized");
+        v.as_object_mut().unwrap().remove("pool");
+        let rec: RunRecord = serde_json::from_value(v).unwrap();
+        assert_eq!(rec.submitted_by, None);
+        let mut with = rec.clone();
+        with.submitted_by = Some("alice".into());
+        let back: RunRecord = serde_json::from_value(serde_json::to_value(&with).unwrap()).unwrap();
+        assert_eq!(back.submitted_by.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn list_filter_matches_on_the_submitter() {
+        let mut rec = RunRecord::queued("r".into(), None, Default::default(), None, Utc::now());
+        let by = |p: &str| ListFilter {
+            submitted_by: Some(p.into()),
+            ..Default::default()
+        };
+        assert!(ListFilter::default().matches(&rec));
+        assert!(
+            !by("alice").matches(&rec),
+            "an unattributed run matches no submitter"
+        );
+        rec.submitted_by = Some("alice".into());
+        assert!(by("alice").matches(&rec));
+        assert!(!by("bob").matches(&rec));
     }
 
     #[tokio::test]

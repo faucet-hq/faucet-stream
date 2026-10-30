@@ -767,7 +767,7 @@ export function mountTemplateDetail(el, id, hooks = {}) {
           <div class="c-card-h"><b>Versions</b><span class="c-card-aside">${runnable ? (can("run_write") ? "Run opens the trigger form with that version" : "") : "a sink or deployment runs through a source template"}</span><span class="c-card-r">runs: last 7 days</span></div>
           <div class="d-scroll-x"><table class="c-tbl tpl-vtbl">
             <colgroup><col style="width:72px" /><col /><col style="width:104px" /><col style="width:112px" /><col style="width:78px" /><col style="width:208px" /></colgroup>
-            <thead><tr><th>Version</th><th>Channels</th><th>Tests</th><th>Last tested</th><th class="num" title="runs submitted from this version in the last 7 days">Runs</th><th></th></tr></thead>
+            <thead><tr><th>Version</th><th title="when the version was registered, and by whom">Registered</th><th>Channels</th><th>Tests</th><th>Last tested</th><th class="num" title="runs submitted from this version in the last 7 days">Runs</th><th></th></tr></thead>
             <tbody id="t-vrows"></tbody>
           </table></div>
         </section>
@@ -974,9 +974,19 @@ async function loadRuns7d(tbody, id) {
   });
 }
 
+// When and by whom a version was registered; "—" for what the server didn't record.
+function registeredCell(reg) {
+  if (!reg) return `<td class="c-muted">—</td>`;
+  const who = reg.registered_by || "";
+  const title = `registered ${fmtTime(reg.registered_at)}${who ? ` by ${who}` : ""}`;
+  return `<td class="c-muted c-nowrap" title="${escapeHtml(title)}">${escapeHtml(fmtAge(reg.registered_at))} ago${
+    who ? ` · <span class="mono">${escapeHtml(who)}</span>` : ""
+  }</td>`;
+}
+
 function renderVersions(tbody, id, st, d, { reload, launchVersion, onRun, onDeleted }) {
   if (!st.versions.length) {
-    tbody.innerHTML = `<tr><td colspan="6" class="c-muted">No versions stored.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="7" class="c-muted">No versions stored.</td></tr>`;
     return;
   }
   tbody.innerHTML = "";
@@ -993,6 +1003,7 @@ function renderVersions(tbody, id, st, d, { reload, launchVersion, onRun, onDele
     row.className = "tpl-vrow" + (st.stable === v ? " is-live" : "") + (retired ? " is-retired" : "");
     row.innerHTML = `
       <td class="mono">v${v}</td>
+      ${registeredCell((d.registrations || []).find((x) => x.version === v))}
       <td><span class="tpl-chips">${chips || `<span class="c-muted">no channel</span>`}</span></td>
       <td title="${escapeHtml((t && t.reason) || "")}">${testCell(t)}</td>
       <td class="c-muted c-nowrap" title="${when ? escapeHtml(fmtTime(when)) : ""}">${when ? `${escapeHtml(fmtAge(when))} ago` : "—"}</td>
@@ -1020,7 +1031,7 @@ function renderVersions(tbody, id, st, d, { reload, launchVersion, onRun, onDele
       </td>`;
     const extra = document.createElement("tr");
     extra.className = "tpl-vextra";
-    extra.innerHTML = `<td colspan="6">${tb.body}<div class="tpl-body-wrap" hidden><pre class="tpl-body"></pre></div></td>`;
+    extra.innerHTML = `<td colspan="7">${tb.body}<div class="tpl-body-wrap" hidden><pre class="tpl-body"></pre></div></td>`;
     const history = extra.querySelector(".tpl-tests-runs");
     const hasWhy = !!extra.querySelector(".tpl-tests-why");
     const syncExtra = () => {

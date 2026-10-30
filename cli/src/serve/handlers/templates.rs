@@ -447,6 +447,20 @@ pub struct GetResponse {
     /// `config_body`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub body_withheld: bool,
+    /// When and by whom each stored version was registered, newest first
+    /// (#998).
+    pub registrations: Vec<VersionRegistration>,
+}
+
+/// When and by whom one template version was registered (#998).
+#[derive(Debug, Serialize, PartialEq)]
+pub struct VersionRegistration {
+    pub version: u32,
+    pub registered_at: chrono::DateTime<chrono::Utc>,
+    /// The principal (`sync:<origin>` for a sync, `local:<user>` for the CLI);
+    /// `None` for a version recorded without one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registered_by: Option<String>,
 }
 
 /// The test view of a template's versions.
@@ -490,6 +504,26 @@ pub async fn get_template(
         .await
         .map_err(|e| ServeError::Internal(e.to_string()))?;
     let is_stable = state.stable == Some(template.version);
+    let mut registrations = Vec::with_capacity(state.versions.len());
+    for v in &state.versions {
+        if *v == template.version {
+            registrations.push(VersionRegistration {
+                version: *v,
+                registered_at: template.created_at,
+                registered_by: template.created_by.clone(),
+            });
+        } else if let Some(rec) = s
+            .template_get(&id, Some(*v))
+            .await
+            .map_err(|e| ServeError::Internal(e.to_string()))?
+        {
+            registrations.push(VersionRegistration {
+                version: rec.version,
+                registered_at: rec.created_at,
+                registered_by: rec.created_by,
+            });
+        }
+    }
     let mut versions = Vec::with_capacity(state.versions.len());
     for v in &state.versions {
         versions.push(
@@ -505,6 +539,7 @@ pub async fn get_template(
         launches,
         tests: TestsView { versions },
         body_withheld,
+        registrations,
     }))
 }
 

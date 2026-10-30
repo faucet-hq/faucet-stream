@@ -78,6 +78,8 @@ paths:
         - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 500 } }
         - { name: cursor, in: query, schema: { type: string }, description: "The previous page's `next_cursor` (`<submitted_at>~<run_id>`; a bare run_id is still accepted)." }
         - { name: tenant, in: query, schema: { type: string }, description: "Only runs started for this tenant (#709). A tenant-scoped principal always sees only its own tenant; naming another is a 404." }
+        - { name: submitted_by, in: query, schema: { type: string }, description: "Only runs this principal submitted (#998), exact match on `RunRecord.submitted_by`. Runs recorded before the field existed have no submitter and never match." }
+        - { name: mine, in: query, schema: { type: boolean, default: false }, description: "`true`: only runs the caller submitted — `submitted_by` set to the caller's own principal (#998). Setting both `mine` and `submitted_by` is a 400." }
         - name: label
           in: query
           style: form
@@ -99,7 +101,7 @@ paths:
             repeatable `label=` form.
       responses:
         "200":
-          description: A page of runs, newest first.
+          description: A page of runs, newest first, plus exact per-status counts over the whole filter.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ListResponse" }
@@ -107,7 +109,8 @@ paths:
           description: >-
             An unknown query parameter (a typo such as `lables` is refused
             rather than returning an unfiltered list), an unknown status, an
-            empty label key, or more than 10 label filters.
+            empty label key, more than 10 label filters, or both `mine` and
+            `submitted_by`.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1088,6 +1091,31 @@ paths:
               schema:
                 type: array
                 items: { $ref: "#/components/schemas/ChangeRequest" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+  /v1/changes/counts:
+    get:
+      summary: Count change requests by status
+      description: >
+        Exact per-status totals over every request the filters match (#998);
+        a pending request past its window is expired first, so it counts as
+        `expired`. Requires `ChangeRead` (viewer).
+      operationId: countChanges
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: kind, in: query, required: false, schema: { type: string, enum: [run, template_register, template_launch, template_delete, template_deprecate] } }
+        - { name: requester, in: query, required: false, schema: { type: string } }
+        - { name: tenant, in: query, required: false, schema: { type: string }, description: "Only requests for this tenant (#709); forced for a tenant-scoped principal." }
+      responses:
+        "200":
+          description: The counts.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [counts]
+                properties:
+                  counts: { $ref: "#/components/schemas/StatusCounts" }
         "400": { $ref: "#/components/responses/Error" }
         "401": { $ref: "#/components/responses/Error" }
   /v1/changes/{id}:
@@ -3049,6 +3077,7 @@ components:
         host_access: { type: boolean, description: "The config came from the server's --triggers file, so its SQL connectors are not sandboxed (#862). Absent otherwise." }
         caller_config: { type: boolean, description: "The request carried the config, so its HTTP requests and redirect hops are checked against the caller reference policy wherever the run executes (#881). Absent otherwise." }
         pool: { type: string, default: default, description: "The execution pool the run belongs to (#957): only a replica serving it claims the run, its shards and its re-claims. Runs recorded before pools existed read as `default`." }
+        submitted_by: { type: string, description: "Who submitted the run (#998): the authenticated principal the `run.submit` audit entry names — `trigger:<name>` for a trigger, the requester for an approved change request, `anonymous` under `--no-auth`, `token` for the single `--auth-token`. Set by the server; a request cannot supply it. Absent on runs recorded before the field existed." }
         invocations:
           type: array
           items: { $ref: "#/components/schemas/InvocationRecord" }
@@ -3087,12 +3116,13 @@ components:
           - {}
     ListResponse:
       type: object
-      required: [runs]
+      required: [runs, counts]
       properties:
         runs:
           type: array
           items: { $ref: "#/components/schemas/RunRecord" }
         next_cursor: { type: string, nullable: true }
+        counts: { $ref: "#/components/schemas/StatusCounts" }
       example:
         runs:
         - run_id: run_01HZY8K3QK7
@@ -3113,6 +3143,10 @@ components:
             key: value
           callback: {}
         next_cursor: example
+        counts:
+          completed: 41
+          failed: 2
+          running: 1
     AuditEntry:
       type: object
       required: [id, timestamp, principal, role, action, result]
@@ -4065,6 +4099,28 @@ components:
       oneOf:
         - { $ref: "#/components/schemas/VersionChannel" }
         - { type: integer, minimum: 1 }
+    StatusCounts:
+      type: object
+      description: >
+        How many records match the request's filters, per status, ignoring
+        `limit` and `cursor` (#998). Only statuses with at least one record
+        appear.
+      additionalProperties: { type: integer, minimum: 0 }
+      example: { completed: 41, failed: 2, running: 1 }
+    VersionRegistration:
+      type: object
+      description: When and by whom one template version was registered (#998).
+      required: [version, registered_at]
+      properties:
+        version: { type: integer }
+        registered_at: { type: string, format: date-time }
+        registered_by:
+          type: string
+          description: >
+            The registering principal: the HTTP / MCP principal, `sync:<origin>`
+            for a template sync, `local:<user>` (or `local`) for
+            `faucet template register`. Absent for a version recorded without
+            one.
     TemplateDetail:
       description: >
         One version, plus the template's whole release state (flattened) — so a
@@ -4073,8 +4129,12 @@ components:
         - { $ref: "#/components/schemas/TemplateSummary" }
         - { $ref: "#/components/schemas/TemplateState" }
         - type: object
-          required: [body, format, is_stable, launches]
+          required: [body, format, is_stable, launches, registrations]
           properties:
+            registrations:
+              type: array
+              description: When and by whom each stored version was registered, newest first (#998).
+              items: { $ref: "#/components/schemas/VersionRegistration" }
             body: { type: string, description: "The config document, stored verbatim (interpolation directives unresolved). Empty unless the caller is an admin with no tenant scope — see `body_withheld`." }
             body_withheld: { type: boolean, description: "Present and true when `body` was withheld because the caller is not an unscoped admin (the stored config can hold inline credentials)." }
             format: { type: string, enum: [yaml, json] }

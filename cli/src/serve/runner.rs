@@ -1115,6 +1115,7 @@ pub(crate) async fn enqueue(
         .pool
         .clone()
         .unwrap_or_else(crate::serve::pools::default_pool);
+    rec.submitted_by = Some(actor.principal.clone());
 
     if state.cluster().enabled() {
         // A degraded (DB-unreachable) backend can't coordinate a cluster: the

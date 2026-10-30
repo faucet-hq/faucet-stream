@@ -606,6 +606,7 @@ pub fn required_permission(method: &Method, matched_path: &str) -> Option<Permis
         // `approvals:` policy decides further.
         (&Method::POST, "/v1/changes") => Some(ChangeRequest),
         (&Method::GET, "/v1/changes") => Some(ChangeRead),
+        (&Method::GET, "/v1/changes/counts") => Some(ChangeRead),
         (&Method::GET, "/v1/changes/{id}") => Some(ChangeRead),
         (&Method::POST, "/v1/changes/{id}/approve") => Some(ChangeApprove),
         (&Method::POST, "/v1/changes/{id}/reject") => Some(ChangeApprove),
@@ -727,6 +728,7 @@ pub fn tenant_scope_decision(
         | (&Method::GET, "/v1/templates/{id}/rows")
         | (&Method::GET, "/v1/templates/{id}/versions/{version}/tests")
         | (_, "/v1/changes")
+        | (_, "/v1/changes/counts")
         | (_, "/v1/changes/{id}")
         | (_, "/v1/changes/{id}/approve")
         | (_, "/v1/changes/{id}/reject")
@@ -770,6 +772,7 @@ pub fn audit_action(method: &Method, matched_path: &str) -> &'static str {
         (&Method::DELETE, "/v1/state/{pipeline}/{row}") => "state.reset",
         (&Method::POST, "/v1/changes") => "change.request",
         (&Method::GET, "/v1/changes") => "change.list",
+        (&Method::GET, "/v1/changes/counts") => "change.counts",
         (&Method::GET, "/v1/changes/{id}") => "change.get",
         (&Method::POST, "/v1/changes/{id}/approve") => "change.approve",
         (&Method::POST, "/v1/changes/{id}/reject") => "change.reject",

@@ -10,6 +10,7 @@ import { currentTenant, tenantList, withTenant } from "../tenant.js";
 import { icon, statStrip, listRow, tabs } from "../components.js";
 import { splitPane, sectionList } from "./split.js";
 import { mountRunDetail } from "./detail.js";
+import { whoami } from "../access.js";
 
 // Every RunStatus the API accepts — pending/sharded appear in cluster mode.
 const STATUSES = ["queued", "pending", "running", "sharded", "completed", "failed", "cancelled"];
@@ -19,9 +20,17 @@ const PAGE = 100;
 
 const TABS = [
   { id: "all", label: "All runs", statuses: [] },
+  { id: "mine", label: "Mine", statuses: [], mine: true },
   { id: "active", label: "Active", statuses: ["queued", "pending", "running", "sharded"] },
   { id: "failed", label: "Failed", statuses: ["failed"] },
 ];
+
+// "Mine" filters by the submitter the server records; it means nothing for
+// the anonymous principal `--no-auth` gives every caller.
+function hasPrincipal() {
+  const me = whoami();
+  return !!(me && me.principal && me.principal !== "anonymous");
+}
 
 const SECTIONS = [
   ["running", "Running", ["running", "sharded"]],
@@ -44,6 +53,8 @@ const RING = {
 export async function renderRuns(container, params = {}) {
   let cursor = null;
   let runs = [];
+  // Exact per-status totals from the server; null on a server without them.
+  let counts = null;
   let filters = { status: "", name: "", since: "", until: "" };
   // `key:value` / `key` label filters, kept in the URL hash (`#/runs?label=…`).
   const labelFilters = [];
@@ -51,6 +62,7 @@ export async function renderRuns(container, params = {}) {
     if (l && !labelFilters.includes(l)) labelFilters.push(l);
   }
   const statusSel = new Set();
+  let mine = false;
   let tab = "all";
   let pollTimer = null;
   let selected = params.id || null;
@@ -61,7 +73,7 @@ export async function renderRuns(container, params = {}) {
     name: "Runs",
     listHead: `
       <div class="sp-tabs">
-        ${tabs(TABS, tab)}
+        ${tabs(TABS.map((t) => (t.mine && !hasPrincipal() ? { ...t, hidden: true } : t)), tab)}
         <span class="sp-tools">
           <button type="button" class="icon-btn" id="f-toggle" title="Filters" aria-label="Filters" aria-expanded="false">${icon("filter")}<span class="sp-dot" hidden></span></button>
           <button type="button" class="icon-btn" id="f-refresh" title="Refresh" aria-label="Refresh">${icon("refresh")}</button>
@@ -140,7 +152,7 @@ export async function renderRuns(container, params = {}) {
   }
 
   function markFiltered() {
-    const on = !!(filters.name || filters.since || filters.until || labelFilters.length || (statusSel.size && !TABS.some((t) => t.id === tab && t.statuses.length)));
+    const on = !!(filters.name || filters.since || filters.until || labelFilters.length || (statusSel.size && !TABS.some((t) => t.id === tab && !t.mine && t.statuses.length)));
     $("#f-toggle .sp-dot").hidden = !on;
   }
 
@@ -194,6 +206,7 @@ export async function renderRuns(container, params = {}) {
     b.onclick = () => {
       const t = TABS.find((x) => x.id === b.dataset.tab);
       setTab(t.id);
+      mine = !!t.mine;
       statusSel.clear();
       t.statuses.forEach((s) => statusSel.add(s));
       syncStatusBoxes();
@@ -204,7 +217,7 @@ export async function renderRuns(container, params = {}) {
   });
   function tabForStatuses() {
     const key = [...statusSel].sort().join(",");
-    const t = TABS.find((x) => [...x.statuses].sort().join(",") === key);
+    const t = TABS.find((x) => !!x.mine === mine && [...x.statuses].sort().join(",") === key);
     setTab(t ? t.id : "");
   }
 
@@ -213,6 +226,7 @@ export async function renderRuns(container, params = {}) {
   function query(mode) {
     const p = new URLSearchParams();
     if (filters.status) p.set("status", filters.status);
+    if (mine) p.set("mine", "true");
     if (filters.name) p.set("name", filters.name);
     if (filters.since) p.set("since", new Date(filters.since).toISOString());
     if (filters.until) p.set("until", new Date(filters.until).toISOString());
@@ -231,6 +245,7 @@ export async function renderRuns(container, params = {}) {
       const data = await api(`/v1/runs?${query(mode)}`);
       if (!alive || mine !== seq) return;
       runs = mode === "more" ? runs.concat(data.runs) : data.runs;
+      counts = data.counts || null;
       cursor = data.next_cursor || null;
       paint();
       maybePoll();
@@ -249,24 +264,29 @@ export async function renderRuns(container, params = {}) {
   }
 
   function paint() {
+    // Statuses come exact from the server; records are summed over the loaded
+    // rows, so they stay a lower bound ("+") while more pages exist.
     const more = cursor ? "+" : "";
-    const count = (sts) => runs.filter((r) => sts.includes(r.status)).length;
+    const exact = !!counts;
+    const count = (sts) =>
+      exact ? sts.reduce((n, s) => n + (counts[s] || 0), 0) : runs.filter((r) => sts.includes(r.status)).length;
+    const shown = (sts) => `${fmtInt(count(sts))}${exact ? "" : more}`;
     const records = runs.reduce((n, r) => n + (r.records_written || 0), 0);
     $("#r-stats").innerHTML = statStrip([
-      { label: "Running", value: `${fmtInt(count(["running", "sharded"]))}${more}`, tone: "info" },
-      { label: "Succeeded", value: `${fmtInt(count(["completed"]))}${more}`, tone: "ok" },
-      { label: "Failed", value: `${fmtInt(count(["failed"]))}${more}`, tone: count(["failed"]) ? "bad" : "" },
+      { label: "Running", value: shown(["running", "sharded"]), tone: "info" },
+      { label: "Succeeded", value: shown(["completed"]), tone: "ok" },
+      { label: "Failed", value: shown(["failed"]), tone: count(["failed"]) ? "bad" : "" },
       { label: "Records", value: `${fmtCompact(records)}${more}` },
     ]);
     const now = Date.now();
-    const filtered = !!(filters.status || filters.name || filters.since || filters.until || labelFilters.length);
+    const filtered = !!(filters.status || filters.name || filters.since || filters.until || labelFilters.length || mine);
     const empty = filtered
       ? `<div class="sp-empty"><b>No runs match these filters.</b><span>Clear the filters, or widen the date range.</span></div>`
       : `<div class="sp-empty"><b>No runs yet.</b><span>Submit a pipeline config on the <a href="#/submit">Submit</a> page, trigger a template, or <code>POST /v1/runs</code>.</span></div>`;
     list.render(
       SECTIONS.map(([id, label, sts]) => {
         const rows = runs.filter((r) => sts.includes(r.status));
-        return { id, label, count: rows.length, rows: rows.map((r) => runRow(r, now)) };
+        return { id, label, count: exact ? count(sts) : rows.length, rows: rows.map((r) => runRow(r, now)) };
       }),
       {
         empty,
@@ -322,6 +342,7 @@ export async function renderRuns(container, params = {}) {
     labelFilters.length = 0;
     labelInput.value = "";
     filters = { status: "", name: "", since: "", until: "" };
+    mine = false;
     setTab("all");
     renderLabelFilters();
     syncHash();

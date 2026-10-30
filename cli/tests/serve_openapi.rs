@@ -255,7 +255,17 @@ fn list_runs_documents_every_query_parameter() {
         .map(|p| p["name"].as_str().unwrap().to_string())
         .collect();
     let expected: BTreeSet<String> = [
-        "status", "name", "since", "until", "limit", "cursor", "tenant", "label", "labels",
+        "status",
+        "name",
+        "since",
+        "until",
+        "limit",
+        "cursor",
+        "tenant",
+        "submitted_by",
+        "mine",
+        "label",
+        "labels",
     ]
     .into_iter()
     .map(str::to_string)
