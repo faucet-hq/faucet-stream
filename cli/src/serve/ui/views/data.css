@@ -1,16 +1,24 @@
 /* area: data — page layout rules only, tokens only */
 
 /* datasets: list filters */
-.ds-kindpop { left: 10px; right: 10px; top: 182px; min-width: 0; }
+.ds-kind { display: block; min-width: 0; }
+.ds-kind > summary.select { padding: 0 26px 0 10px; cursor: pointer; overflow: hidden; text-overflow: ellipsis; }
+details.menu.ds-kind > .pop.ds-kindpop { left: 0; right: auto; width: 220px; min-width: 0; max-height: 300px; overflow: auto; }
+.ds-opt { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 6px; cursor: pointer; }
+.ds-opt:hover { background: var(--hover); }
+.ds-opt .muted { margin-left: auto; font-size: var(--fs-sm); }
+.ds-filters .r2 > .input input[type=datetime-local] { font-size: var(--fs-sm); }
+.ds-filters .r2 > .input input::-webkit-calendar-picker-indicator { opacity: .5; }
 .ds-filters { position: relative; }
 .ds-sel-pair { display: flex; align-items: center; gap: 8px; }
 .ds-sel-pair .select { width: 150px; }
 .ds-vol { display: flex; align-items: flex-end; gap: 3px; height: 120px; padding: 0 16px 14px; }
-.ds-vol i { flex: 1; background: var(--line-strong); border-radius: 2px 2px 0 0; min-height: 3px; }
+.ds-vol i { flex: 1; max-width: 14px; background: var(--line-strong); border-radius: 2px 2px 0 0; min-height: 3px; }
 .ds-vol i.last { background: var(--text-2); }
 .ds-field-hl td { background: var(--teal-fill); }
 .ds-pre td { font-family: var(--mono); font-size: var(--fs-sm); white-space: nowrap; }
-.ds-pre td.null { color: var(--faint); font-style: italic; font-family: var(--sans); }
+.ds-pre td.null, .ds-pre .null { color: var(--faint); font-style: italic; font-family: var(--sans); }
+.ds-pre th { font-family: var(--mono); }
 .ds-manage { position: absolute; right: 16px; top: 52px; }
 .ds-cons { display: flex; flex-direction: column; gap: 6px; }
 .ds-mini { display: block; width: 100%; }
@@ -48,3 +56,18 @@
 .lg-list > div:first-child { border-top: 0; }
 .lg-list .r { margin-left: auto; color: var(--muted); font-size: var(--fs-sm); }
 .panel .card .grid2 { gap: 12px 14px; }
+
+.ds-tw { overflow-x: auto; }
+.ds-tw td .mono { white-space: nowrap; }
+.ds-null { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }
+.ds-null .spark { display: inline-block; }
+.lg-depth button { padding: 2px 8px; color: var(--muted); border-radius: 5px; }
+.lg-depth button:hover { color: var(--text); background: var(--hover); }
+.lg .graph { min-height: 420px; }
+.lg .graph svg.g-main { cursor: grab; touch-action: none; user-select: none; }
+.lg .graph svg.g-main.panning { cursor: grabbing; }
+.lg .minimap { cursor: pointer; }
+.lg .minimap svg { touch-action: none; }
+.lg .lg-bar .chip.x { cursor: pointer; }
+.panel .lg-list .lnk, .panel .lg-list .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.panel .lg-list .r { white-space: nowrap; }
