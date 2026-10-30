@@ -4,216 +4,38 @@
 <meta charset="utf-8">
 <title>faucet console mockup</title>
 <link rel="stylesheet" href="console.css">
+<link rel="stylesheet" href="views/operate.css">
+<link rel="stylesheet" href="views/templates.css">
+<link rel="stylesheet" href="views/data.css">
+<link rel="stylesheet" href="views/govern.css">
+<link rel="stylesheet" href="views/build.css">
 </head>
 <body>
 <div class="app">
   <aside class="side" id="side"></aside>
-  <main class="main">
+  <main class="main" id="main">
     <header class="top" id="top"></header>
-    <section class="body"><div class="list" id="list"></div><div class="detail" id="detail"></div></section>
+    <section class="body" id="body"><div class="list" id="list"></div><div class="detail" id="detail"></div></section>
     <footer class="status" id="status"></footer>
   </main>
 </div>
-<script>
-const P = {
-  home: '<path d="M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/>',
-  runs: '<path d="M5 4l14 8-14 8z"/>',
-  changes: '<path d="M6 3v12"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/>',
-  trig: '<path d="M13 2L4 14h7l-1 8 9-12h-7z"/>',
-  sched: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
-  db: '<ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/>',
-  lineage: '<circle cx="5" cy="6" r="2.5"/><circle cx="5" cy="18" r="2.5"/><circle cx="19" cy="12" r="2.5"/><path d="M7.5 6h3a4 4 0 0 1 4 4v0M7.5 18h3a4 4 0 0 0 4-4"/>',
-  tpl: '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><path d="M17.5 14v7M14 17.5h7"/>',
-  schema: '<path d="M8 3H6a2 2 0 0 0-2 2v4l-2 3 2 3v4a2 2 0 0 0 2 2h2M16 3h2a2 2 0 0 1 2 2v4l2 3-2 3v4a2 2 0 0 1-2 2h-2"/>',
-  submit: '<path d="M12 19V5M5 12l7-7 7 7"/>',
-  policy: '<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/>',
-  usage: '<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>',
-  tenants: '<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><path d="M16 4.5a3.5 3.5 0 0 1 0 7M21.5 20a6.5 6.5 0 0 0-4-6"/>',
-  audit: '<path d="M9 4h10v16H5V8z"/><path d="M9 4v4H5M9 13h6M9 17h6"/>',
-  settings: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 0 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 0 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 0 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 0 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>',
-  search: '<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/>',
-  filter: '<path d="M3 5h18M6 12h12M10 19h4"/>',
-  sliders: '<path d="M4 6h10M18 6h2M4 18h4M12 18h8M14 4v4M8 16v4"/>',
-  link: '<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/>',
-  expand: '<path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>',
-  chev: '<path d="M6 9l6 6 6-6"/>',
-  updown: '<path d="M8 9l4-4 4 4M8 15l4 4 4-4"/>',
-  bell: '<path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.9 1.9 0 0 0 3.4 0"/>',
-  logs: '<path d="M4 6h16M4 12h16M4 18h10"/>',
-  check: '<path d="M20 6L9 17l-5-5"/>',
-  x: '<path d="M18 6L6 18M6 6l12 12"/>',
-  play: '<path d="M6 4l14 8-14 8z"/>',
-  undo: '<path d="M9 14L4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 0 10h-3"/>',
-  flask: '<path d="M9 3h6M10 3v6L4 19a1.5 1.5 0 0 0 1.3 2h13.4A1.5 1.5 0 0 0 20 19l-6-10V3"/>',
-  rocket: '<path d="M12 15l-3-3a22 22 0 0 1 2-4A12.9 12.9 0 0 1 22 2c0 2.7-.8 7.5-6 11a22.4 22.4 0 0 1-4 2z"/><path d="M9 12H5s.6-3 2-4c1.6-1.1 4 0 4 0"/><path d="M12 15v4s3-.6 4-2c1.1-1.6 0-4 0-4"/><circle cx="15.5" cy="8.5" r="1.5"/><path d="M7 17l-3 3M5 14.5l-1.5 1.5M9.5 19.5L8 21"/>'
-};
-const ic = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${P[n]}</svg>`;
-const params = new URLSearchParams(location.search);
-const view = params.get('view') || 'runs';
-const theme = params.get('theme');
-if (theme === 'light' || theme === 'teal') document.documentElement.dataset.theme = 'light';
-
-const NAV = [
-  ['Operate', [['runs', 'Runs', '3'], ['changes', 'Changes', '2', true], ['trig', 'Triggers'], ['sched', 'Schedules']]],
-  ['Data', [['db', 'Datasets', '48'], ['lineage', 'Lineage']]],
-  ['Build', [['tpl', 'Templates', '17'], ['schema', 'Schemas'], ['submit', 'Submit']]],
-  ['Govern', [['policy', 'Policy'], ['usage', 'Usage'], ['tenants', 'Tenants', '6']]],
-  ['Admin', [['audit', 'Audit log'], ['settings', 'Settings']]]
-];
-const active = { runs: 'runs', templates: 'tpl', changes: 'changes', datasets: 'db' }[view];
-document.getElementById('side').innerHTML = `
-  <div class="ws"><svg class="logo" viewBox="6 6 116 116" width="30" height="30" aria-label="faucet-stream logo"><rect x="6" y="6" width="116" height="116" rx="28" fill="#14B8A6"/><g fill="none" stroke="#fff" stroke-width="11" stroke-linecap="round" stroke-linejoin="round" transform="translate(-2,2)"><path d="M55 40 V26"/><path d="M44 26 H66"/><path d="M34 40 H76 a14 14 0 0 1 14 14 V64"/></g><g fill="#fff" transform="translate(-2,2)"><circle cx="90" cy="79" r="5.5"/><circle cx="90" cy="95" r="4.6" opacity="0.85"/><circle cx="90" cy="108" r="3.6" opacity="0.6"/></g></svg>
-    <div><b>faucet</b><span>prod-eu · 3 replicas</span></div>${ic('updown', 'i chev')}</div>
-  <div class="quick"><div class="on">${ic('home')}</div><div>${ic('search')}</div><div>${ic('logs')}</div><div>${ic('bell')} 4</div></div>
-  ${NAV.map(([g, items]) => `<div class="grp"><h6>${g} ${ic('chev')}</h6>${items.map(([k, l, n, hot]) =>
-    `<div class="nav ${k === active ? 'on' : ''}">${ic(k)}${l}${n ? `<span class="n ${hot ? 'hot' : ''}">${n}</span>` : ''}</div>`).join('')}</div>`).join('')}
-  <div class="foot"><div class="who"><span class="avatar">PS</span>ops-admin</div><span class="tag">admin</span></div>`;
-
-const ring = (c, k = '') => `<span class="ring ${k} ${c}"></span>`;
-const row = (st, t, age, meta, on) => `<div class="row ${on ? 'on' : ''}">${st}<span class="t">${t}</span><span class="age">${age}</span><span class="meta">${meta}</span></div>`;
-const sect = (l, c) => `<div class="sect">${ic('chev')}${l}<span class="c">${c}</span></div>`;
-const stats = (items) => `<div class="stats">${items.map(([k, v, cls]) => `<div><small>${k}</small><b class="${cls || ''}">${v}</b></div>`).join('')}</div>`;
-const tabs = (a, b) => `<div class="tabs"><span class="tab on">${a}</span><span class="tab">${b}</span><span class="tools">${ic('filter')}${ic('sliders')}</span></div>`;
-const kv = (k, v, s) => `<div class="kv"><small>${k}</small><b>${v}</b>${s ? `<div class="s">${s}</div>` : ''}</div>`;
-const bar_ = (crumbs, delta, right) => `<div class="crumb">${crumbs.map((c, i) => i === crumbs.length - 1 ? `<b>${c}</b>` : `${c}<span class="muted">/</span>`).join(' ')}</div>${delta ? `<span class="delta">${delta}</span>` : ''}<div class="right">${right}${ic('link')}${ic('expand')}</div>`;
-const spark = (pts, color, w = 180, h = 34, mark, lo, hi) => {
-  const max = hi ?? Math.max(...pts), min = lo ?? Math.min(...pts);
-  const xy = pts.map((p, i) => [i * (w / (pts.length - 1)), h - 4 - ((p - min) / (max - min || 1)) * (h - 8)]);
-  return `<svg class="spark" width="${w}" height="${h}"><polyline fill="none" stroke="${color}" stroke-width="1.6" points="${xy.map(p => p.join(',')).join(' ')}"/>${mark != null ? `<circle cx="${xy[mark][0]}" cy="${xy[mark][1]}" r="3" fill="var(--warn)"/>` : ''}</svg>`;
-};
-
-const V = {};
-V.runs = () => {
-  top_(bar_(['Operate', 'Runs', 'orders_cdc_mirror'], '', `<span class="chip"><span class="dot"></span>cluster · 3 live</span><span class="chip mono">run 7f3c…a91e</span>`));
-  list_(`${tabs('All runs', 'Mine')}
-  ${stats([['Running', '3'], ['Succeeded', '412', 'ok'], ['Failed', '7', 'bad'], ['Records', '18.4M']])}
-  ${sect('Running', '3')}
-  ${row(ring('info', 'half'), 'orders_cdc_mirror', '14m', '<b>postgres-cdc → bigquery</b> · 1.24M rows · pool cdc', true)}
-  ${row(ring('info', 'half'), 'payments_events_backfill', '41m', '<b>backfill 2026-09</b> · unit 18 / 30 · rest → snowflake')}
-  ${row(ring('info', 'half'), 'clickstream_kafka', '2h', '<b>kafka → iceberg</b> · exactly-once · 6.8M rows')}
-  ${sect('Failed', '7')}
-  ${row(ring('bad'), 'crm_contacts_upsert', '22m', '<b>rate_limited</b> · rest → postgres · gave up after 6 tries')}
-  ${row(ring('bad'), 'warehouse_daily_rollup', '3h', '<b>contract_violation</b> · 12 rows quarantined')}
-  ${sect('Succeeded', '412')}
-  ${row(ring('ok'), 'invoices_s3_to_duckdb', '5m', '<b>s3 → duckdb</b> · 84,210 rows · 38s')}
-  ${row(ring('ok'), 'tenant-acme · hr_sync', '9m', '<b>template hr-sync@v7</b> · 3 streams · 2,914 rows')}`);
-  detail_(`<div class="dhead"><span class="tab on">Overview</span><span class="tab">Logs</span><span class="tab">Invocations</span><span class="tab">Audit</span><span class="r btn">${ic('x')}Cancel run</span></div>
-  <div><h1>orders_cdc_mirror</h1><div class="sub"><span class="pill info">${ic('play')}Running</span><span>postgres-cdc → bigquery</span>·<span>started 14m ago by trigger:orders-wal</span></div></div>
-  <div class="card"><div class="h">${ic('runs')}<b>1,240,512 rows moved</b><span class="tag">exactly-once</span><span class="muted">atomic watermark · token #00000000001842</span><span class="r">updated 4s ago</span></div>
-    <div class="grid4">${kv('Throughput', '1,476 rows/s', 'peak 2,310')}${kv('Lag behind source', '3.2s', 'LSN 2F/A81C4E10')}${kv('Last bookmark', '6s ago', 'flushed with page 1,842')}${kv('Estimated cost', '$0.84', 'bytes streamed 4.1 GiB')}</div>
-    <div class="note" style="border-top:1px solid var(--line-soft)">
-      <div style="display:flex;justify-content:space-between"><span>Row accounting · every row offered is accounted for</span><span class="ok">balanced</span></div>
-      <div class="bar"><i style="width:96.7%;background:var(--ok)"></i><i style="width:2.6%;background:var(--info)"></i><i style="width:.5%;background:var(--warn)"></i><i style="width:.2%;background:var(--bad)"></i></div>
-      <div class="legend"><span style="--c:var(--ok)">accepted 1,199,830</span><span style="--c:var(--info)">coalesced 32,410</span><span style="--c:var(--warn)">filtered 6,210</span><span style="--c:var(--bad)">DLQ 2,062</span></div>
-    </div></div>
-  <div class="two">
-    <div class="card"><div class="h"><b>Invocations</b><span class="r">2 rows</span></div>
-      <table><tr><th>Row</th><th>Status</th><th class="num">Rows</th><th class="num">Duration</th></tr>
-      <tr><td class="mono">orders</td><td><span class="ok">● running</span></td><td class="num">1,024,880</td><td class="num">14m 02s</td></tr>
-      <tr><td class="mono">order_items</td><td><span class="ok">● running</span></td><td class="num">215,632</td><td class="num">14m 02s</td></tr></table></div>
-    <div class="card"><div class="h"><b>Governance</b><span class="r">5 passes</span></div>
-      <div class="grid3" style="grid-template-columns:1fr 1fr">${kv('Masking', '2 rules', 'email · card hashed')}${kv('Contract', 'v3', '0 breaches')}${kv('Schema drift', 'evolve', '+1 column today')}${kv('Budget', '41% used', 'max 5M rows')}</div></div>
-  </div>
-  <div class="card"><div class="h">${ic('logs')}<b>Live log</b><span class="r">streaming</span></div>
-    <div class="log"><div><span class="muted">10:42:07</span> <span class="lv info">INFO</span> page 1842 written · 680 rows · bookmark committed</div>
-    <div><span class="muted">10:42:05</span> <span class="lv warn">WARN</span> schema drift: added column <b>discount_code</b> (string) — evolved</div>
-    <div><span class="muted">10:42:01</span> <span class="lv info">INFO</span> page 1841 written · 702 rows · bookmark committed</div></div></div>`);
-};
-
-V.templates = () => {
-  top_(bar_(['Build', 'Templates', 'faucet-hq/rest-orders'], '<span class="muted">source-template</span>', `<span class="chip">${ic('trig')}3 triggers</span>`));
-  list_(`${tabs('Registry', 'Hub')}
-  ${stats([['Templates', '17'], ['Launched', '13', 'ok'], ['Draft', '3'], ['Failing', '1', 'bad']])}
-  ${sect('Source templates', '9')}
-  ${row(ring('ok'), 'faucet-hq/rest-orders', 'v12', '<b>stable v11</b> · canary v12 · 4 streams · tests passed', true)}
-  ${row(ring('ok'), 'acme/billing-api', 'v7', '<b>stable v7</b> · 6 streams · 12 tenants')}
-  ${row(ring('warn', 'half'), 'acme/ticketing', 'v3', '<b>draft</b> · never launched · tests not run')}
-  ${row(ring('bad'), 'faucet-hq/graphql-catalog', 'v5', '<b>tests failing</b> · 2 of 31 cases · launch blocked')}
-  ${sect('Sink templates', '5')}
-  ${row(ring('ok'), 'faucet-hq/bigquery', 'v4', '<b>stable v4</b> · upsert · overwrite → append')}
-  ${row(ring('ok'), 'faucet-hq/postgres', 'v6', '<b>stable v6</b> · upsert · delete · overwrite')}
-  ${sect('Deployments', '3')}
-  ${row(ring('ok'), 'prod-eu', 'v9', '<b>state postgres</b> · DLQ s3 · SLA 2h')}`);
-  detail_(`<div class="dhead"><span class="tab on">Versions</span><span class="tab">Run</span><span class="tab">Rows</span><span class="tab">Pairings</span><span class="r" style="display:flex;gap:8px"><span class="btn">${ic('undo')}Roll back</span><span class="btn primary">${ic('rocket')}Launch v12</span></span></div>
-  <div><h1>faucet-hq/rest-orders</h1><div class="sub"><span class="pill ok">${ic('check')}Launched</span><span>REST source · 4 streams · 3 params</span>·<span>registered by sync:template-hub</span></div></div>
-  <div class="card"><div class="h">${ic('flask')}<b>v12 passed 31 of 31 cases</b><span class="tag">same body sha</span><span class="muted">faucet 2.4</span><span class="r">tested 2h ago</span></div>
-    <div class="grid4">${kv('Fixture cases', '18 / 18')}${kv('Parameter sweep', '9 / 9', 'all-pairs, 3 params')}${kv('Shared suites', 'rest-contract@1.4')}${kv('Pairings checked', '4 sinks', 'bigquery · postgres · sqlite · file')}</div>
-    <div class="note"><span class="ok">Launch gate open</span> · v12 can become stable. Unpinned triggers keep resolving <b>v11</b> until it does.</div></div>
-  <div class="card"><div class="h"><b>Versions</b><span class="r">newest first</span></div>
-    <table><tr><th>Version</th><th>Channels</th><th>Tests</th><th>Registered</th><th class="num">Runs (7d)</th></tr>
-    <tr><td class="mono">v12</td><td><span class="ch">canary</span> <span class="ch">newest</span></td><td class="ok">● passed</td><td>2h ago · sync</td><td class="num">38</td></tr>
-    <tr><td class="mono">v11</td><td><span class="ch stable">stable</span> <span class="ch">prod</span></td><td class="ok">● passed</td><td>6d ago · sync</td><td class="num">1,204</td></tr>
-    <tr><td class="mono">v10</td><td><span class="ch">previous</span></td><td class="ok">● passed</td><td>19d ago · ops-admin</td><td class="num">0</td></tr>
-    <tr><td class="mono">v9</td><td><span class="tag">deprecated</span></td><td class="muted">stale</td><td>34d ago · sync</td><td class="num">0</td></tr></table></div>
-  <div class="card"><div class="h"><b>Launch history</b></div>
-    <div class="log"><div><span class="muted">6d ago</span>&nbsp; v11 launched by <b>ops-admin</b> · tests passed</div><div><span class="muted">19d ago</span>&nbsp; v10 launched by <b>sync:template-hub</b> · tests passed</div></div></div>`);
-};
-
-V.changes = () => {
-  top_(bar_(['Operate', 'Changes', 'CR-0142'], '<span class="warn">awaiting 1 approval</span>', `<span class="chip">expires in 22h</span>`));
-  list_(`${tabs('Needs me', 'All')}
-  ${stats([['Pending', '2', 'warn'], ['Approved', '18', 'ok'], ['Rejected', '3'], ['Expired', '1']])}
-  ${sect('Pending', '2')}
-  ${row(ring('warn', 'hollow'), 'Overwrite finance.ledger nightly', '3h', '<b>run</b> · write_mode overwrite · by analyst-ana', true)}
-  ${row(ring('warn', 'hollow'), 'Launch acme/billing-api v8', '1d', '<b>template launch</b> · tests passed · by ops-raj')}
-  ${sect('Recently decided', '22')}
-  ${row(ring('ok'), 'Register faucet-hq/bigquery v4', '2d', '<b>executed</b> · approved by ops-admin')}
-  ${row(ring('bad'), 'Run ad-hoc PII export to s3', '4d', '<b>rejected</b> · policy eu-pii denies sink')}
-  ${row(ring('ok'), 'Backfill payments 2026-09', '5d', '<b>executed</b> · 30 units')}`);
-  detail_(`<div class="dhead"><span class="tab on">Plan</span><span class="tab">Impact</span><span class="tab">History</span><span class="r" style="display:flex;gap:8px"><span class="btn danger">${ic('x')}Reject</span><span class="btn primary">${ic('check')}Approve and run</span></span></div>
-  <div><h1>Overwrite finance.ledger nightly</h1><div class="sub"><span class="pill warn">Pending · 1 of 2 approvals</span><span>requested by analyst-ana · operator</span>·<span>3h ago</span></div></div>
-  <div class="card"><div class="h">${ic('changes')}<b>What changes if this runs</b><span class="tag">re-planned on approve</span><span class="r">material fingerprint 9b1f…</span></div>
-    <div class="diff"><div class="k">row ledger · sink postgres.finance.ledger</div>
-    <div class="d">- write_mode: upsert   key: [entry_id]</div><div class="a">+ write_mode: overwrite</div>
-    <div class="a">+ budget.max_records: 2,000,000</div><div class="k">  transforms · quality · contract v5 — unchanged</div></div>
-    <div class="note"><span class="warn">Breaking for 2 downstream datasets</span> · <b>bi.ledger_daily</b> and <b>ml.cashflow_features</b> read <span class="mono">entry_id</span> history that an overwrite replaces.</div></div>
-  <div class="two">
-    <div class="card"><div class="h"><b>Approvals</b><span class="r">rule: finance writes · 2 admins</span></div>
-      <div class="vote"><span class="avatar">OA</span>ops-admin<span class="ok">${ic('check')}</span><span class="r">1h ago · "staging verified"</span></div>
-      <div class="vote"><span class="avatar">PS</span>you<span class="muted">waiting</span><span class="r">self-approval off for requester</span></div></div>
-    <div class="card"><div class="h"><b>Owners notified</b></div>
-      <div class="grid3" style="grid-template-columns:1fr 1fr">${kv('bi.ledger_daily', 'team-bi', 'dashboard · 3 columns')}${kv('ml.cashflow_features', 'team-ml', 'model · 2 columns')}</div></div>
-  </div>`);
-};
-
-V.datasets = () => {
-  top_(bar_(['Data', 'Datasets', 'bigquery://analytics.orders'], '', `<span class="chip">owner team-commerce</span>`));
-  list_(`${tabs('All', 'Owned by me')}
-  ${stats([['Datasets', '48'], ['Fresh', '45', 'ok'], ['Stale', '2', 'warn'], ['Drifted', '1', 'bad']])}
-  ${sect('Destinations', '31')}
-  ${row(ring('ok'), 'analytics.orders', '6s', '<b>bigquery</b> · 41.2M rows · schema v14 · 3 consumers', true)}
-  ${row(ring('warn', 'half'), 'finance.ledger', '26h', '<b>postgres</b> · stale · SLA 24h breached')}
-  ${row(ring('bad'), 'ml.cashflow_features', '2h', '<b>iceberg</b> · profile drift · null rate 0.4% → 11%')}
-  ${row(ring('ok'), 'lake/invoices/dt=*', '5m', '<b>s3 parquet</b> · 84k rows/day')}
-  ${sect('Sources', '17')}
-  ${row(ring('ok'), 'orders-db.public.orders', '6s', '<b>postgres</b> · CDC slot faucet_orders')}
-  ${row(ring('ok'), 'billing REST /v2/invoices', '5m', '<b>rest</b> · incremental on updated_at')}`);
-  const vol = [38, 40, 39, 42, 41, 44, 43, 45, 47, 46, 48, 50, 49, 52];
-  const nul = [.3, .4, .3, .5, .4, .3, .4, .4, .3, .5, .4, .4, .3, .4];
-  detail_(`<div class="dhead"><span class="tab on">Overview</span><span class="tab">Schema</span><span class="tab">Profile</span><span class="tab">Lineage</span></div>
-  <div><h1>analytics.orders</h1><div class="sub"><span class="pill ok">${ic('check')}Fresh · 6s</span><span>bigquery · written by orders_cdc_mirror</span>·<span>first seen 112d ago</span></div></div>
-  <div class="card"><div class="h">${ic('db')}<b>41.2M rows · 23 columns</b><span class="tag">schema v14</span><span class="r">last change today</span></div>
-    <div class="grid4">${kv('Rows per run', '1.24M', spark(vol, 'var(--accent)', 150, 30))}${kv('Null rate · discount_code', '0.4%', spark(nul, 'var(--text-2)', 150, 30, null, 0, 5))}${kv('Freshness SLA', '15 min', 'met in 30 of 30 runs')}${kv('Consumers', '3', '2 dashboards · 1 model')}</div>
-    <div class="note"><span class="ok">Schema v14</span> · added <span class="mono">discount_code STRING</span> (additive, evolved automatically). No downstream reader uses it yet.</div></div>
-  <div class="card"><div class="h">${ic('lineage')}<b>Lineage</b><span class="r">2 hops</span></div>
-    <svg width="100%" height="150" viewBox="0 0 760 150" style="display:block">
-      <g font-size="12" font-family="var(--sans)">
-      ${[[20, 30, 'orders-db.public.orders', 'postgres'], [20, 90, 'billing /v2/invoices', 'rest'], [290, 60, 'analytics.orders', 'bigquery'], [560, 20, 'bi.orders_daily', 'dashboard'], [560, 100, 'ml.cashflow_features', 'iceberg']].map(([x, y, n, k], i) =>
-        `<rect x="${x}" y="${y}" width="180" height="36" rx="8" fill="var(--panel-2)" stroke="${i === 2 ? 'var(--accent)' : 'var(--line)'}"/><text x="${x + 12}" y="${y + 16}" fill="var(--text)">${n}</text><text x="${x + 12}" y="${y + 29}" fill="var(--muted)" font-size="10.5">${k}</text>`).join('')}
-      </g>
-      <g fill="none" stroke="var(--faint)" stroke-width="1.4"><path d="M200 48 C245 48 245 78 290 78"/><path d="M200 108 C245 108 245 78 290 78"/><path d="M470 78 C515 78 515 38 560 38"/><path d="M470 78 C515 78 515 118 560 118"/></g>
-    </svg></div>
-  <div class="card"><div class="h"><b>Schema timeline</b></div>
-    <table><tr><th>Version</th><th>Change</th><th>Run</th><th>When</th></tr>
-    <tr><td class="mono">v14</td><td><span class="ok">+ discount_code</span> string</td><td class="mono">7f3c…a91e</td><td>today</td></tr>
-    <tr><td class="mono">v13</td><td><span class="info">~ amount</span> integer → number</td><td class="mono">2e81…05bd</td><td>9d ago</td></tr></table></div>`);
-};
-
-function top_(h) { document.getElementById('top').innerHTML = h; }
-function list_(h) { document.getElementById('list').innerHTML = h; }
-function detail_(h) { document.getElementById('detail').innerHTML = h; }
-V[view]();
-document.getElementById('status').innerHTML = `<span><span class="dot"></span>history postgres · healthy</span><span>faucet serve 2.4.0</span><span>Design mockup · sample data</span>`;
-</script>
+<script src="mock.js"></script>
+<script src="views/system.js"></script>
+<script src="views/overview.js"></script>
+<script src="views/runs.js"></script>
+<script src="views/changes.js"></script>
+<script src="views/templates.js"></script>
+<script src="views/datasets.js"></script>
+<script src="views/lineage.js"></script>
+<script src="views/schemas.js"></script>
+<script src="views/submit.js"></script>
+<script src="views/usage.js"></script>
+<script src="views/tenants.js"></script>
+<script src="views/audit.js"></script>
+<script src="views/triggers.js"></script>
+<script src="views/schedules.js"></script>
+<script src="views/policy.js"></script>
+<script src="views/settings.js"></script>
+<script>M.boot()</script>
 </body>
 </html>

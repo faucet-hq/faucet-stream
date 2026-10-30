@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>faucet console mockups — gallery</title>
+<link rel="stylesheet" href="console.css">
+<link rel="stylesheet" href="views/operate.css">
+<link rel="stylesheet" href="views/templates.css">
+<link rel="stylesheet" href="views/data.css">
+<link rel="stylesheet" href="views/govern.css">
+<link rel="stylesheet" href="views/build.css">
+<style>
+  body { overflow: auto; height: auto; }
+  .gal { max-width: 1360px; margin: 0 auto; padding: 28px 24px 60px; display: flex; flex-direction: column; gap: 22px; }
+  .gal header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .gal header h1 { margin: 0; }
+  .gal header .r { margin-left: auto; display: flex; gap: 8px; }
+  .gv { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; padding: 14px 16px; }
+  .gs { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+  .gs .th { aspect-ratio: 16 / 10; border: 1px solid var(--line-soft); border-radius: 8px; overflow: hidden; background: var(--panel-2); display: grid; place-items: center; color: var(--faint); font-size: var(--fs-sm); }
+  .gs .th img { width: 100%; height: 100%; object-fit: cover; object-position: top left; display: block; }
+  .gs b { font-weight: 500; }
+  .gs .links { display: flex; gap: 10px; font-size: var(--fs-sm); flex-wrap: wrap; }
+  .gs .links a { color: var(--text-2); text-decoration: underline; text-decoration-color: var(--line-strong); }
+  .gs .nw { font-size: var(--fs-sm); color: var(--muted); }
+  .gs .nw span { color: var(--info); }
+</style>
+</head>
+<body>
+<div id="side" hidden></div><div id="top" hidden></div><div id="status" hidden></div>
+<script src="mock.js"></script>
+<script src="views/system.js"></script>
+<script src="views/overview.js"></script>
+<script src="views/runs.js"></script>
+<script src="views/changes.js"></script>
+<script src="views/templates.js"></script>
+<script src="views/datasets.js"></script>
+<script src="views/lineage.js"></script>
+<script src="views/schemas.js"></script>
+<script src="views/submit.js"></script>
+<script src="views/usage.js"></script>
+<script src="views/tenants.js"></script>
+<script src="views/audit.js"></script>
+<script src="views/triggers.js"></script>
+<script src="views/schedules.js"></script>
+<script src="views/policy.js"></script>
+<script src="views/settings.js"></script>
+<div class="gal" id="gal"></div>
+<script>
+  const theme = new URLSearchParams(location.search).get('theme') || 'dark';
+  if (theme === 'light') document.documentElement.dataset.theme = 'light';
+  const other = theme === 'light' ? 'dark' : 'light';
+  const q = (o) => Object.entries(o).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&');
+  let total = 0;
+  const cards = Object.values(M.VIEWS).map((v) => {
+    const items = Object.entries(v.states).map(([key, st]) => {
+      total++;
+      const p = { view: v.name, state: key, ...(st.params || {}) };
+      const shot = `shots/${v.name}-${key}-${theme}.png`;
+      const narrow = (st.shape || v.shape || 'split') === 'split' ? ` · <a href="shots/${v.name}-${key}-${theme}-1000.png">1000px</a>` : '';
+      return `<div class="gs"><a class="th" href="index.html?${q({ ...p, theme })}"><img src="${shot}" alt="" onerror="this.replaceWith('not rendered yet')"></a>
+        <b>${st.label || key}</b>
+        <div class="links"><a href="index.html?${q({ ...p, theme })}">open ${theme}</a><a href="index.html?${q({ ...p, theme: other })}">${other}</a><a href="${shot}">png</a>${narrow}</div>
+        ${st.covers && st.covers.length ? `<div class="nw">covers: ${st.covers.join(' · ')}</div>` : ''}
+        ${st.new && st.new.length ? `<div class="nw"><span>🆕</span> ${st.new.join(' · ')}</div>` : ''}</div>`;
+    }).join('');
+    return M.card({ icon: v.icon || '', title: v.label, aside: v.summary || '', right: `${Object.keys(v.states).length} screens`, body: `<div class="gv">${items}</div>` });
+  }).join('');
+  document.getElementById('gal').innerHTML = `<header><h1>faucet console · design mockups</h1><span class="muted">${Object.keys(M.VIEWS).length} pages · ${total} screens · sample data</span><span class="r"><a class="btn" href="gallery.html?theme=${other}">${other} theme</a><a class="btn" href="index.html?view=system&theme=${theme}">Design system</a></span></header>${cards}`;
+</script>
+</body>
+</html>

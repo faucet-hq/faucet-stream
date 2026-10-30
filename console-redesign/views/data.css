@@ -1,0 +1,50 @@
+/* area: data — page layout rules only, tokens only */
+
+/* datasets: list filters */
+.ds-kindpop { left: 10px; right: 10px; top: 182px; min-width: 0; }
+.ds-filters { position: relative; }
+.ds-sel-pair { display: flex; align-items: center; gap: 8px; }
+.ds-sel-pair .select { width: 150px; }
+.ds-vol { display: flex; align-items: flex-end; gap: 3px; height: 120px; padding: 0 16px 14px; }
+.ds-vol i { flex: 1; background: var(--line-strong); border-radius: 2px 2px 0 0; min-height: 3px; }
+.ds-vol i.last { background: var(--text-2); }
+.ds-field-hl td { background: var(--teal-fill); }
+.ds-pre td { font-family: var(--mono); font-size: var(--fs-sm); white-space: nowrap; }
+.ds-pre td.null { color: var(--faint); font-style: italic; font-family: var(--sans); }
+.ds-manage { position: absolute; right: 16px; top: 52px; }
+.ds-cons { display: flex; flex-direction: column; gap: 6px; }
+.ds-mini { display: block; width: 100%; }
+
+/* lineage: graph canvas */
+.detail > .card.lg { flex: 1 1 auto; }
+.lg { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+.lg .graph { flex: 1; min-height: 0; border-radius: 0 0 var(--r-card) var(--r-card); }
+.lg .graph > svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+.lg-bar { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--line-soft); flex-wrap: wrap; }
+.lg-bar .input { width: 220px; }
+.lg-bar .r { margin-left: auto; display: flex; gap: 8px; align-items: center; color: var(--muted); }
+.lg-depth { display: inline-flex; align-items: center; gap: 2px; padding: 2px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--panel); }
+.lg-depth span { padding: 2px 8px; color: var(--muted); }
+.lg-depth b { padding: 0 8px; font-weight: 500; }
+.lg .gtools { right: 12px; top: 12px; }
+.lg .minimap { right: 12px; bottom: 12px; }
+.lg .minimap svg { width: 100%; height: 100%; display: block; }
+.lg-legend { position: absolute; left: 12px; bottom: 12px; display: flex; gap: 14px; padding: 6px 10px; background: var(--panel); border: 1px solid var(--line-soft); border-radius: var(--r); color: var(--muted); font-size: var(--fs-sm); }
+.lg-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.lg-zoom { position: absolute; right: 56px; top: 14px; color: var(--muted); font-size: var(--fs-sm); }
+.lg-hint { position: absolute; left: 12px; top: 12px; color: var(--muted); font-size: var(--fs-sm); padding: 5px 10px; background: var(--panel); border: 1px solid var(--line-soft); border-radius: var(--r); }
+.mm-vp { fill: none; stroke: var(--muted); stroke-width: 1.2; }
+.mm-n { fill: var(--line-strong); }
+.mm-n.sel { fill: var(--accent); }
+.gn .gcol { fill: var(--text-2); font: 11px var(--mono); }
+.gn .gcol.hl { fill: var(--teal-ink); }
+.gn rect.colhl { fill: var(--teal-fill); stroke: none; }
+.gn line.sep { stroke: var(--line-soft); }
+.ge-lbl { fill: var(--muted); font: 10.5px var(--sans); }
+.ge-lbl-bg { fill: var(--panel); stroke: var(--line-soft); }
+.ge.sel { stroke: var(--accent); stroke-width: 2; }
+.lg-list { display: flex; flex-direction: column; }
+.lg-list > div { display: flex; align-items: center; gap: 8px; padding: 7px 16px; border-top: 1px solid var(--line-soft); }
+.lg-list > div:first-child { border-top: 0; }
+.lg-list .r { margin-left: auto; color: var(--muted); font-size: var(--fs-sm); }
+.panel .card .grid2 { gap: 12px 14px; }
