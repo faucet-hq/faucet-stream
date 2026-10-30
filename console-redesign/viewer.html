@@ -18,7 +18,10 @@
   .nav button { font:inherit; color:var(--text); background:transparent; border:1px solid var(--line); border-radius:7px; padding:5px 10px; cursor:pointer; }
   .meta { margin-left:auto; color:var(--muted); }
   .shot { padding:16px; }
-  .shot img { display:block; max-width:100%; margin:0 auto; border:1px solid var(--line); border-radius:10px; }
+  .shot img { display:block; margin:0 auto; border:1px solid var(--line); border-radius:10px; }
+  .shot.fit img { max-width:100%; max-height:calc(100vh - 92px); width:auto; height:auto; }
+  .shot.actual img { width:1440px; max-width:none; }
+  .shot.actual { overflow:auto; }
   .missing { padding:40px; text-align:center; color:var(--muted); }
   kbd { font:11px ui-monospace, Menlo, monospace; border:1px solid var(--line); border-radius:4px; padding:0 4px; }
 </style>
@@ -30,6 +33,7 @@
   <label>Screen <select id="state"></select></label>
   <span class="seg" id="theme"><button data-v="dark">Dark</button><button data-v="light">Light</button></span>
   <span class="seg" id="width"><button data-v="wide">1440 px</button><button data-v="narrow">1000 px</button></span>
+  <span class="seg" id="zoom"><button data-v="fit">Fit to window</button><button data-v="actual">Actual size</button></span>
   <span class="nav"><button id="prev" title="Previous screen (←)">←</button> <button id="next" title="Next screen (→)">→</button></span>
   <span class="meta" id="meta"></span>
 </div>
@@ -38,7 +42,7 @@
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.hash.slice(1));
 let m = {};
-let sel = { page: params.get('page'), state: params.get('state'), theme: params.get('theme') || 'dark', width: params.get('width') || 'wide' };
+let sel = { page: params.get('page'), state: params.get('state'), theme: params.get('theme') || 'dark', width: params.get('width') || 'wide', zoom: params.get('zoom') || 'fit' };
 
 function seg(id, key) {
   for (const b of $(id).querySelectorAll('button')) {
@@ -74,11 +78,13 @@ function render() {
   $('width').style.display = hasNarrow ? '' : 'none';
   if (!hasNarrow) sel.width = 'wide';
   seg('width', 'width');
+  seg('zoom', 'zoom');
+  $('shot').className = 'shot ' + sel.zoom;
   const src = entry[sel.width] || entry.wide;
   $('shot').innerHTML = src ? `<img src="${src}" alt="${sel.page} – ${sel.state} (${sel.theme})">` : '<div class="missing">No render for this combination.</div>';
   const all = flat();
   const i = all.findIndex(([p, s]) => p === sel.page && s === sel.state);
-  $('meta').innerHTML = `${i + 1} of ${all.length} screens · <kbd>←</kbd> <kbd>→</kbd> step · <kbd>D</kbd> theme`;
+  $('meta').innerHTML = `${i + 1} of ${all.length} screens · <kbd>←</kbd> <kbd>→</kbd> step · <kbd>D</kbd> theme · <kbd>F</kbd> fit`;
   history.replaceState(null, '', '#' + new URLSearchParams(sel).toString());
 }
 $('page').onchange = (e) => { sel.page = e.target.value; sel.state = null; render(); };
@@ -89,6 +95,7 @@ document.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'SELECT') return;
   if (e.key === 'ArrowRight') step(1);
   if (e.key === 'ArrowLeft') step(-1);
+  if (e.key === 'f' || e.key === 'F') { sel.zoom = sel.zoom === 'fit' ? 'actual' : 'fit'; render(); }
   if (e.key === 'd' || e.key === 'D') { sel.theme = sel.theme === 'dark' ? 'light' : 'dark'; render(); }
 });
 fetch('shots/manifest.json').then((r) => r.json()).then((j) => { m = j; render(); });
