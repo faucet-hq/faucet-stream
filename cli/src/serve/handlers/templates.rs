@@ -472,6 +472,8 @@ pub struct TestsView {
 
 /// How many recent runs the template detail carries per version.
 const DETAIL_TEST_RUNS: usize = 5;
+/// Store reads `GET /v1/templates/{id}` has in flight at once.
+const DETAIL_READS: usize = 8;
 
 /// `GET /v1/templates/{id}/runs` query string (#998).
 #[derive(Debug, Default, Deserialize)]
@@ -481,6 +483,9 @@ pub struct TemplateRunsQuery {
     pub limit: Option<usize>,
     /// `next_cursor` of the previous page.
     pub cursor: Option<String>,
+    /// `counts=true`: also return per-status totals (#998).
+    #[serde(default)]
+    pub counts: bool,
 }
 
 /// `GET /v1/templates/{id}/runs` → 200 the runs started from this template
@@ -511,9 +516,9 @@ pub async fn list_template_runs(
         }],
         ..Default::default()
     };
-    let history = server.history();
-    let (page, counts) = tokio::try_join!(history.list(&filter), history.count_by_status(&filter))
-        .map_err(|e| ServeError::Internal(e.to_string()))?;
+    let (page, counts) =
+        crate::serve::handlers::runs::list_page(server.history().as_ref(), &filter, q.counts)
+            .await?;
     let mut runs = page.runs;
     for rec in &mut runs {
         crate::serve::handlers::runs::redact_record(rec, &actor);
@@ -556,34 +561,42 @@ pub async fn get_template(
         .await
         .map_err(|e| ServeError::Internal(e.to_string()))?;
     let is_stable = state.stable == Some(template.version);
-    let mut registrations = Vec::with_capacity(state.versions.len());
-    for v in &state.versions {
-        if *v == template.version {
-            registrations.push(VersionRegistration {
-                version: *v,
-                registered_at: template.created_at,
-                registered_by: template.created_by.clone(),
-            });
-        } else if let Some(rec) = s
-            .template_get(&id, Some(*v))
-            .await
-            .map_err(|e| ServeError::Internal(e.to_string()))?
-        {
-            registrations.push(VersionRegistration {
-                version: rec.version,
-                registered_at: rec.created_at,
-                registered_by: rec.created_by,
-            });
-        }
-    }
-    let mut versions = Vec::with_capacity(state.versions.len());
-    for v in &state.versions {
-        versions.push(
-            crate::templates::bundle::version_tests(&s, &id, *v, DETAIL_TEST_RUNS)
-                .await
-                .map_err(map_err)?,
-        );
-    }
+    // Every version's registration metadata and test history, read a few at
+    // a time (a template keeps at most `VERSION_RETAIN` versions).
+    use futures::{StreamExt as _, TryStreamExt as _};
+    let registrations: Vec<VersionRegistration> = futures::stream::iter(&state.versions)
+        .map(|v| {
+            let s = &s;
+            let id = &id;
+            let current = &template;
+            async move {
+                if *v == current.version {
+                    return Ok(Some(VersionRegistration {
+                        version: *v,
+                        registered_at: current.created_at,
+                        registered_by: current.created_by.clone(),
+                    }));
+                }
+                s.template_get(id, Some(*v)).await.map(|rec| {
+                    rec.map(|rec| VersionRegistration {
+                        version: rec.version,
+                        registered_at: rec.created_at,
+                        registered_by: rec.created_by,
+                    })
+                })
+            }
+        })
+        .buffered(DETAIL_READS)
+        .try_filter_map(|r| async move { Ok(r) })
+        .try_collect()
+        .await
+        .map_err(|e| ServeError::Internal(e.to_string()))?;
+    let versions: Vec<_> = futures::stream::iter(&state.versions)
+        .map(|v| crate::templates::bundle::version_tests(&s, &id, *v, DETAIL_TEST_RUNS))
+        .buffered(DETAIL_READS)
+        .try_collect()
+        .await
+        .map_err(map_err)?;
     Ok(Json(GetResponse {
         template,
         state,

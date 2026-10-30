@@ -21,6 +21,8 @@ pub const ATTENTION_LIMIT: usize = 20;
 pub const TEMPLATE_SCAN: usize = 200;
 /// Tenants whose connections are read for the attention card.
 pub const TENANT_SCAN: usize = 200;
+/// Store reads the attention card has in flight at once.
+pub const ATTENTION_READS: usize = 8;
 
 /// The Grafana dashboards (`observability/grafana/`) the sections link to.
 pub const DASHBOARDS: [(&str, &str); 5] = [
@@ -102,9 +104,9 @@ impl OverviewParams {
             Some(s) => parse_instant(s).map_err(|e| bad(format!("until: {e}")))?,
         };
         let since = match self.since.as_deref() {
-            None => until - TimeDelta::days(7),
+            None => back(until, TimeDelta::days(7), "since")?,
             Some(s) => match parse_duration(s) {
-                Some(d) => until - d,
+                Some(d) => back(until, d, "since")?,
                 None => parse_instant(s).map_err(|e| bad(format!("since: {e}")))?,
             },
         };
@@ -142,7 +144,7 @@ impl OverviewParams {
             labels,
             tenant,
             top,
-            stale_before: Some(now - stale_after),
+            stale_before: Some(back(now, stale_after, "stale_after")?),
         };
         if q.bucket_count() > MAX_BUCKETS {
             return Err(bad(format!(
@@ -156,10 +158,21 @@ impl OverviewParams {
     }
 }
 
+/// `at - d`, or a 400 naming `field` when that is before the earliest
+/// representable instant.
+fn back(at: DateTime<Utc>, d: TimeDelta, field: &str) -> Result<DateTime<Utc>, ServeError> {
+    at.checked_sub_signed(d).ok_or_else(|| {
+        ServeError::BadConfig(format!(
+            "`{field}` reaches too far back: use a shorter duration"
+        ))
+    })
+}
+
 /// `30m`, `24h`, `7d`, `2w`.
 pub fn parse_duration(s: &str) -> Option<TimeDelta> {
     let s = s.trim();
-    let (n, unit) = s.split_at(s.len().checked_sub(1)?);
+    let unit_at = s.char_indices().next_back()?.0;
+    let (n, unit) = s.split_at(unit_at);
     let n: i64 = n.parse().ok().filter(|n| *n > 0)?;
     match unit {
         "m" => TimeDelta::try_minutes(n),
@@ -410,14 +423,23 @@ async fn failing_templates(
     if templates.is_empty() {
         return Ok(None);
     }
+    use futures::{StreamExt as _, TryStreamExt as _};
     let all = templates.len() <= TEMPLATE_SCAN;
+    let history = &history;
+    let newest: Vec<_> = futures::stream::iter(templates.iter().take(TEMPLATE_SCAN))
+        .map(|t| async move {
+            history
+                .template_test_results(&t.id, Some(t.version), 1)
+                .await
+                .map(|r| (t, r))
+        })
+        .buffered(ATTENTION_READS)
+        .try_collect()
+        .await
+        .map_err(|e| ServeError::Internal(e.to_string()))?;
     let mut failing = Vec::new();
-    for t in templates.iter().take(TEMPLATE_SCAN) {
-        let newest = history
-            .template_test_results(&t.id, Some(t.version), 1)
-            .await
-            .map_err(|e| ServeError::Internal(e.to_string()))?;
-        if let Some(r) = newest.into_iter().next().filter(|r| !r.passed) {
+    for (t, results) in newest {
+        if let Some(r) = results.into_iter().next().filter(|r| !r.passed) {
             failing.push(FailingTemplate {
                 id: t.id.clone(),
                 version: t.version,
@@ -454,10 +476,17 @@ async fn reauth_connections(
     if tenants.is_empty() {
         return Ok(None);
     }
+    use futures::{StreamExt as _, TryStreamExt as _};
     let all = tenants.len() <= TENANT_SCAN;
+    let listed: Vec<_> = futures::stream::iter(tenants.iter().take(TENANT_SCAN))
+        .map(|t| history.connection_list(t))
+        .buffered(ATTENTION_READS)
+        .try_collect()
+        .await
+        .map_err(internal)?;
     let mut items = Vec::new();
-    for t in tenants.iter().take(TENANT_SCAN) {
-        for c in history.connection_list(t).await.map_err(internal)? {
+    for connections in listed {
+        for c in connections {
             if c.status == crate::serve::history::tenants::ConnectionStatus::NeedsReauth {
                 items.push(ReauthConnection {
                     tenant: c.tenant,
@@ -490,6 +519,28 @@ mod tests {
         assert_eq!(parse_duration("7"), None);
         assert_eq!(parse_duration("7y"), None);
         assert_eq!(parse_duration(""), None);
+        // A multi-byte last character is an unknown unit, not a panic.
+        assert_eq!(parse_duration("7é"), None);
+        assert_eq!(parse_duration("é"), None);
+    }
+
+    #[test]
+    fn a_window_past_the_earliest_instant_is_a_400_not_a_panic() {
+        for raw in ["since=20000000w", "stale_after=20000000w"] {
+            let err = OverviewParams::parse(Some(raw))
+                .unwrap()
+                .into_query(now(), None)
+                .unwrap_err();
+            assert!(
+                matches!(&err, ServeError::BadConfig(m) if m.contains("too far back")),
+                "{raw}: {err:?}"
+            );
+        }
+        let err = OverviewParams::parse(Some("since=7%C3%A9"))
+            .unwrap()
+            .into_query(now(), None)
+            .unwrap_err();
+        assert!(matches!(err, ServeError::BadConfig(_)), "{err:?}");
     }
 
     #[test]
