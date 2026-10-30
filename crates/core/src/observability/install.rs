@@ -328,6 +328,11 @@ const LONG_RUNNING_HISTOGRAMS: &[&str] = &[
     "faucet_verify_duration_seconds",
 ];
 
+#[cfg(feature = "observability-install")]
+fn bucket_error(e: metrics_exporter_prometheus::BuildError) -> InstallError {
+    InstallError::PrometheusInstall(e.to_string())
+}
+
 /// Apply `p.buckets` to every histogram, or the defaults with longer buckets
 /// for the run-length histograms.
 #[cfg(feature = "observability-install")]
@@ -335,10 +340,8 @@ fn with_buckets(
     builder: metrics_exporter_prometheus::PrometheusBuilder,
     p: &PrometheusConfig,
 ) -> Result<metrics_exporter_prometheus::PrometheusBuilder, InstallError> {
-    let err =
-        |e: metrics_exporter_prometheus::BuildError| InstallError::PrometheusInstall(e.to_string());
     if let Some(buckets) = p.buckets.as_deref() {
-        return builder.set_buckets(buckets).map_err(err);
+        return builder.set_buckets(buckets).map_err(bucket_error);
     }
     with_default_buckets(builder)
 }
@@ -353,13 +356,11 @@ pub fn with_default_buckets(
     builder: metrics_exporter_prometheus::PrometheusBuilder,
 ) -> Result<metrics_exporter_prometheus::PrometheusBuilder, InstallError> {
     use metrics_exporter_prometheus::Matcher;
-    let err =
-        |e: metrics_exporter_prometheus::BuildError| InstallError::PrometheusInstall(e.to_string());
-    let mut builder = builder.set_buckets(DEFAULT_BUCKETS).map_err(err)?;
+    let mut builder = builder.set_buckets(DEFAULT_BUCKETS).map_err(bucket_error)?;
     for name in LONG_RUNNING_HISTOGRAMS {
         builder = builder
             .set_buckets_for_metric(Matcher::Full((*name).to_string()), LONG_BUCKETS)
-            .map_err(err)?;
+            .map_err(bucket_error)?;
     }
     Ok(builder)
 }
@@ -578,6 +579,16 @@ pub fn register_build_info() {
 
 #[cfg(all(test, feature = "observability-install"))]
 mod tests {
+    #[cfg(feature = "observability-install")]
+    #[test]
+    fn rejected_buckets_become_an_install_error() {
+        let err = metrics_exporter_prometheus::PrometheusBuilder::new()
+            .set_buckets(&[])
+            .map_err(bucket_error)
+            .unwrap_err();
+        assert!(matches!(err, InstallError::PrometheusInstall(_)), "{err:?}");
+    }
+
     use super::*;
     use std::sync::Mutex;
 
