@@ -567,3 +567,6 @@ details.card.fold > summary::-webkit-details-marker { display: none; }
 details.card.fold:not([open]) > summary { border-bottom: 0; }
 details.card.fold:not([open]) > summary svg.i:first-child { transform: rotate(-90deg); }
 .sc-open td { border-top: 0; }
+
+/* area: govern fork — list parts wrapped in display:contents slots keep their size (#998) */
+.list > .list-top > *, .list > .list-search > *, .list > .list-body { flex: none; }
