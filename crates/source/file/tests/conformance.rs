@@ -152,5 +152,13 @@ async fn conformance_first_page_before_exhaustion() {
         server.served()
     })
     .await;
+    // The server tallies a line after its write returns, which can trail the reader.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while server.served() < total {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the counter saw every line");
     assert_eq!(server.served(), total, "the counter saw every line");
 }

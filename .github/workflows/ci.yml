@@ -1072,6 +1072,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.99.1"
+      - name: Free runner disk space
+        # Rustdoc for every publishable crate plus each crate's crates.io
+        # baseline outgrows the runner's free disk on a cold cache (a
+        # lockfile change rotates the key).
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift \
+            /usr/local/share/powershell /usr/local/share/chromium /usr/lib/jvm
+          df -h /
       # This job builds rustdoc for every publishable crate, which reaches
       # rdkafka's `sasl2-sys` and its bundled C build. Every other build job
       # already installs these; this one did not, and a warm `rust-cache`
