@@ -51,8 +51,8 @@ flowchart TD
   correlate across events.
 - **Metrics.** The universal metric set is emitted automatically — no per-run
   flag. `faucet_source_records_total`, `faucet_sink_errors_total`,
-  `faucet_pipeline_seconds_since_last_bookmark`, and
-  `faucet_pipeline_pages_skipped_total` are the first gauges to check for a
+  `time() - faucet_pipeline_last_bookmark_unix_seconds`, and
+  `faucet_pipeline_pages_skipped_total` are the first series to check for a
   stalled or replaying run. See [observability](../architecture/observability.md).
 - **The DLQ.** If rows are being quarantined, `faucet dlq inspect <location>`
   classifies and summarizes the dead-letter envelopes, and

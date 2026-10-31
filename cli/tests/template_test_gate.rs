@@ -621,6 +621,7 @@ async fn serve_with_history(
             vault_previous_key: Vec::new(),
             connect_providers: None,
             allow_subprocess_connectors: false,
+            grafana_url: None,
             references: Default::default(),
             pools: Default::default(),
         };

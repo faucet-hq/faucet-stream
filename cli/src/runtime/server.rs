@@ -1122,7 +1122,17 @@ pub async fn replay_dlq(
         drop(admission);
         None
     } else {
-        Some(replay::start(state, &id, &req.from, tenant.as_deref(), admission).await?)
+        Some(
+            replay::start(
+                state,
+                &id,
+                &req.from,
+                tenant.as_deref(),
+                &principal.actor().principal,
+                admission,
+            )
+            .await?,
+        )
     };
     // The replay runs on its own task: a client that goes away cancels it
     // cooperatively (it stops at a page boundary and flushes) instead of
@@ -1250,6 +1260,7 @@ pub(crate) mod replay {
         id: &str,
         from: &str,
         tenant: Option<&str>,
+        submitted_by: &str,
         admission: Option<Admission>,
     ) -> Result<Record, ServeError> {
         let history = state.history();
@@ -1264,6 +1275,7 @@ pub(crate) mod replay {
         rec.started_at = Some(now);
         rec.replay_of = Some(from.to_string());
         rec.tenant = tenant.map(str::to_string);
+        rec.submitted_by = Some(submitted_by.to_string());
         if !history
             .insert_new(&rec)
             .await

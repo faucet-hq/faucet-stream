@@ -387,7 +387,18 @@ fn now_token(path: &str, clock: DateTime<FixedOffset>) -> CliResult<String> {
                 "invalid strftime format in `${{now.strftime.{fmt}}}`"
             )));
         }
-        return Ok(clock.format_with_items(items.iter()).to_string());
+        // A specifier that parses but cannot format (`%#z`) errors here.
+        let mut out = String::new();
+        std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!("{}", clock.format_with_items(items.iter())),
+        )
+        .map_err(|_| {
+            CliError::Config(format!(
+                "invalid strftime format in `${{now.strftime.{fmt}}}`"
+            ))
+        })?;
+        return Ok(out);
     }
     let rendered = match path {
         "date" => clock.format("%Y-%m-%d").to_string(),
@@ -1916,6 +1927,9 @@ matrix:
         // `%Q` is not a valid strftime specifier in chrono and produces Item::Error.
         let err = resolve_now("${now.strftime.%Q}", c).unwrap_err();
         assert!(err.to_string().contains("strftime"));
+        // Parses as a specifier but only exists for parsing; formatting it fails.
+        let err = resolve_now("${now.strftime.%#z}", c).unwrap_err();
+        assert!(err.to_string().contains("strftime"), "{err}");
     }
 
     #[test]

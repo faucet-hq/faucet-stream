@@ -361,6 +361,13 @@ impl RunHistory for FallbackHistory {
         via!(self, p => p.list(filter), f => f.list(filter))
     }
 
+    async fn count_by_status(
+        &self,
+        filter: &ListFilter,
+    ) -> Result<crate::serve::history::StatusCounts, HistoryError> {
+        via!(self, p => p.count_by_status(filter), f => f.count_by_status(filter))
+    }
+
     async fn delete(&self, id: &str) -> Result<DeleteOutcome, HistoryError> {
         via!(self, p => p.delete(id), f => f.delete(id))
     }
@@ -508,6 +515,9 @@ impl RunHistory for FallbackHistory {
     }
     async fn list_audit(&self, filter: &AuditFilter) -> Result<Vec<AuditEntry>, HistoryError> {
         via!(self, p => p.list_audit(filter), f => f.list_audit(filter))
+    }
+    async fn get_audit(&self, id: &str) -> Result<Option<AuditEntry>, HistoryError> {
+        via!(self, p => p.get_audit(id), f => f.get_audit(id))
     }
 
     // ── Persistent run logs (#529) ────────────────────────────────────────────
@@ -772,6 +782,12 @@ impl RunHistory for FallbackHistory {
     ) -> Result<Vec<crate::serve::changes::ChangeRequest>, HistoryError> {
         strict!(self, p => p.change_list(filter), f => f.change_list(filter))
     }
+    async fn change_counts(
+        &self,
+        filter: &crate::serve::changes::ChangeListFilter,
+    ) -> Result<crate::serve::history::StatusCounts, HistoryError> {
+        strict!(self, p => p.change_counts(filter), f => f.change_counts(filter))
+    }
     async fn usage_record(&self, record: &crate::usage::UsageRecord) -> Result<(), HistoryError> {
         via!(self, p => p.usage_record(record), f => f.usage_record(record))
     }
@@ -780,6 +796,12 @@ impl RunHistory for FallbackHistory {
         filter: &crate::usage::UsageFilter,
     ) -> Result<Vec<crate::usage::UsageRecord>, HistoryError> {
         via!(self, p => p.usage_list(filter), f => f.usage_list(filter))
+    }
+    async fn overview_aggregates(
+        &self,
+        q: &super::overview::OverviewQuery,
+    ) -> Result<super::overview::OverviewAggregates, HistoryError> {
+        via!(self, p => p.overview_aggregates(q), f => f.overview_aggregates(q))
     }
     async fn local_output_record(
         &self,

@@ -183,6 +183,12 @@ pub fn build_submit_request(
     }
 }
 
+/// Count a failed fire in the metrics and the `GET /v1/triggers` tally.
+fn count_error(state: &ServerState, compiled: &CompiledTrigger, kind: &'static str) {
+    metrics::error(compiled.name(), kind);
+    state.triggers().note_error(compiled.name());
+}
+
 /// Resolve + submit. `fired_at` is RFC3339 (caller-stamped). With
 /// `tenants:` the fire fans out to one run per tenant (#709), each keyed
 /// `…:<tenant>` so a replayed fire never doubles a tenant's run.
@@ -194,10 +200,11 @@ pub async fn fire(
 ) -> FireOutcome {
     let kind = compiled.kind_label();
     metrics::fired(compiled.name(), kind);
+    state.triggers().note_fired(compiled.name());
     let targets = match fire_targets(state, compiled).await {
         Ok(t) => t,
         Err(e) => {
-            metrics::error(compiled.name(), kind);
+            count_error(state, compiled, kind);
             return FireOutcome::Error(e);
         }
     };
@@ -379,14 +386,14 @@ async fn fire_one(
             let sub = match resolve_config(config, event, compiled.name(), fired_at).await {
                 Ok(s) => s,
                 Err(ResolveError::Read(e)) => {
-                    metrics::error(compiled.name(), kind);
+                    count_error(state, compiled, kind);
                     return FireOutcome::Error(e);
                 }
                 // The event itself cannot be substituted (an unknown token, a
                 // value its placement refuses): a retry gives the same answer,
                 // so a watcher skips past it rather than stalling on it.
                 Err(ResolveError::Substitute(e)) => {
-                    metrics::error(compiled.name(), kind);
+                    count_error(state, compiled, kind);
                     return if e.by_sender {
                         FireOutcome::Refused(e.message)
                     } else {
@@ -395,7 +402,7 @@ async fn fire_one(
                 }
             };
             if let Err(e) = screen_event_values(state, tenant, &sub.event_values) {
-                metrics::error(compiled.name(), kind);
+                count_error(state, compiled, kind);
                 return FireOutcome::Refused(e);
             }
             let text = sub.text;
@@ -428,7 +435,7 @@ async fn fire_one(
             let (body, event_values) = match template_body_tracked(compiled, tpl, event, fired_at) {
                 Ok(b) => b,
                 Err(e) => {
-                    metrics::error(compiled.name(), kind);
+                    count_error(state, compiled, kind);
                     return if e.by_sender {
                         FireOutcome::Refused(e.message)
                     } else {
@@ -437,7 +444,7 @@ async fn fire_one(
                 }
             };
             if let Err(e) = screen_event_values(state, tenant, &event_values) {
-                metrics::error(compiled.name(), kind);
+                count_error(state, compiled, kind);
                 return FireOutcome::Refused(e);
             }
             submit_template(state, tpl, body, actor, idem).await
@@ -471,7 +478,7 @@ async fn fire_one(
             FireOutcome::Dropped(TENANT_LIMIT)
         }
         Err(crate::serve::error::ServeError::Conflict(m)) if kind == "queue_depth" => {
-            metrics::error(compiled.name(), kind);
+            count_error(state, compiled, kind);
             FireOutcome::Error(format!(
                 "{EDGE_KEY_USED} for a different run, not committing: {m}"
             ))
@@ -482,7 +489,7 @@ async fn fire_one(
             FireOutcome::Coalesced
         }
         Err(e) => {
-            metrics::error(compiled.name(), kind);
+            count_error(state, compiled, kind);
             if is_deterministic(&e) {
                 FireOutcome::Failed(e.api_error().error.message)
             } else {

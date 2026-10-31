@@ -264,23 +264,8 @@ impl RunHistory for MemoryHistory {
         let mut rows: Vec<RunRecord> = self
             .runs
             .iter()
+            .filter(|r| filter.matches(r))
             .map(|r| r.clone())
-            .filter(|r| filter.status.is_empty() || filter.status.contains(&r.status))
-            .filter(|r| {
-                filter
-                    .name
-                    .as_deref()
-                    .is_none_or(|n| r.name.as_deref() == Some(n))
-            })
-            .filter(|r| filter.since.is_none_or(|t| r.submitted_at >= t))
-            .filter(|r| filter.until.is_none_or(|t| r.submitted_at <= t))
-            .filter(|r| {
-                filter
-                    .tenant
-                    .as_deref()
-                    .is_none_or(|t| r.tenant.as_deref() == Some(t))
-            })
-            .filter(|r| crate::serve::history::labels::matches_all(&filter.labels, &r.labels))
             .collect();
         // (submitted_at DESC, run_id DESC)
         rows.sort_by(|a, b| {
@@ -306,6 +291,17 @@ impl RunHistory for MemoryHistory {
             runs: rows,
             next_cursor,
         })
+    }
+
+    async fn count_by_status(
+        &self,
+        filter: &ListFilter,
+    ) -> Result<crate::serve::history::StatusCounts, HistoryError> {
+        let mut counts = crate::serve::history::StatusCounts::new();
+        for r in self.runs.iter().filter(|r| filter.matches(r)) {
+            *counts.entry(r.status.as_str().to_string()).or_default() += 1;
+        }
+        Ok(counts)
     }
 
     async fn delete(&self, id: &str) -> Result<DeleteOutcome, HistoryError> {
@@ -362,24 +358,37 @@ impl RunHistory for MemoryHistory {
             .audit
             .lock()
             .map_err(|_| HistoryError::Backend("audit ring lock poisoned".into()))?;
+        // The cursor is the position of the entry `before` names; one no longer
+        // in the ring yields nothing older, as on the SQL backends.
+        let cursor = match filter.before.as_deref() {
+            Some(id) => match ring.iter().find(|e| e.id == id) {
+                Some(e) => Some((e.timestamp, e.id.clone())),
+                None => return Ok(Vec::new()),
+            },
+            None => None,
+        };
         let mut rows: Vec<AuditEntry> = ring
             .iter()
-            .filter(|e| filter.principal.as_deref().is_none_or(|p| e.principal == p))
-            .filter(|e| filter.action.as_deref().is_none_or(|a| e.action == a))
+            .filter(|e| filter.matches(e))
             .filter(|e| {
-                filter
-                    .tenant
-                    .as_deref()
-                    .is_none_or(|t| e.tenant.as_deref() == Some(t))
+                cursor
+                    .as_ref()
+                    .is_none_or(|(ts, id)| (e.timestamp, &e.id) < (*ts, id))
             })
-            .filter(|e| filter.since.is_none_or(|t| e.timestamp >= t))
-            .filter(|e| filter.until.is_none_or(|t| e.timestamp <= t))
             .cloned()
             .collect();
         // Newest first (timestamp DESC, id DESC).
         rows.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then_with(|| b.id.cmp(&a.id)));
         rows.truncate(filter.limit.max(1));
         Ok(rows)
+    }
+
+    async fn get_audit(&self, id: &str) -> Result<Option<AuditEntry>, HistoryError> {
+        let ring = self
+            .audit
+            .lock()
+            .map_err(|_| HistoryError::Backend("audit ring lock poisoned".into()))?;
+        Ok(ring.iter().find(|e| e.id == id).cloned())
     }
 
     // ── Persistent run logs (#529) ────────────────────────────────────────────
@@ -1167,6 +1176,21 @@ impl RunHistory for MemoryHistory {
         Ok(out)
     }
 
+    async fn change_counts(
+        &self,
+        filter: &crate::serve::changes::ChangeListFilter,
+    ) -> Result<crate::serve::history::StatusCounts, HistoryError> {
+        let rows = self
+            .changes
+            .lock()
+            .map_err(|_| HistoryError::Backend("changes lock poisoned".into()))?;
+        let mut counts = crate::serve::history::StatusCounts::new();
+        for c in rows.values().filter(|c| filter.matches(c)) {
+            *counts.entry(c.status.as_str().to_string()).or_default() += 1;
+        }
+        Ok(counts)
+    }
+
     // ── Cost & usage accounting (#704) ───────────────────────────────────────
 
     async fn usage_record(&self, record: &crate::usage::UsageRecord) -> Result<(), HistoryError> {
@@ -1179,6 +1203,37 @@ impl RunHistory for MemoryHistory {
             rows.pop_front();
         }
         Ok(())
+    }
+
+    async fn overview_aggregates(
+        &self,
+        q: &super::overview::OverviewQuery,
+    ) -> Result<super::overview::OverviewAggregates, HistoryError> {
+        let runs: Vec<RunRecord> = self.runs.iter().map(|r| r.clone()).collect();
+        let freshness = match q.stale_before {
+            None => None,
+            Some(_) => {
+                let c = self
+                    .catalog
+                    .lock()
+                    .map_err(|_| HistoryError::Backend("catalog lock poisoned".into()))?;
+                super::overview::freshness_from(
+                    q,
+                    c.datasets.values(),
+                    c.schema_versions.values().flatten(),
+                )
+            }
+        };
+        let usage = self
+            .usage
+            .lock()
+            .map_err(|_| HistoryError::Backend("usage lock poisoned".into()))?;
+        Ok(super::overview::aggregate_in_memory(
+            q,
+            runs.iter(),
+            usage.iter(),
+            freshness,
+        ))
     }
 
     async fn usage_list(
@@ -2026,6 +2081,117 @@ mod tests {
             r.finished_at = Some(submitted);
         }
         r
+    }
+
+    #[tokio::test]
+    async fn counts_follow_the_filter_and_ignore_the_page() {
+        let h = MemoryHistory::new(Duration::from_secs(60));
+        let t0 = Utc::now();
+        for (i, (status, by)) in [
+            (RunStatus::Completed, Some("alice")),
+            (RunStatus::Failed, Some("alice")),
+            (RunStatus::Completed, Some("bob")),
+            (RunStatus::Running, None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut r = rec(
+                &format!("r{i}"),
+                status,
+                t0 + chrono::Duration::seconds(i as i64),
+            );
+            r.submitted_by = by.map(str::to_string);
+            h.upsert(&r).await.unwrap();
+        }
+        let all = h
+            .count_by_status(&ListFilter {
+                limit: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            all,
+            [("completed", 2), ("failed", 1), ("running", 1)]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect::<crate::serve::history::StatusCounts>()
+        );
+        let alice = ListFilter {
+            submitted_by: Some("alice".into()),
+            limit: 10,
+            ..Default::default()
+        };
+        let page = h.list(&alice).await.unwrap();
+        assert_eq!(page.runs.len(), 2);
+        assert!(
+            page.runs
+                .iter()
+                .all(|r| r.submitted_by.as_deref() == Some("alice"))
+        );
+        let counts = h.count_by_status(&alice).await.unwrap();
+        assert_eq!(counts.get("completed"), Some(&1));
+        assert_eq!(counts.get("failed"), Some(&1));
+        assert_eq!(counts.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn change_counts_cover_every_matching_request() {
+        use crate::serve::changes::{ChangeKind, ChangeListFilter, ChangeRequest, ChangeStatus};
+        let h = MemoryHistory::new(Duration::from_secs(60));
+        let now = Utc::now();
+        for (i, (status, requester)) in [
+            (ChangeStatus::Pending, "bob"),
+            (ChangeStatus::Executed, "bob"),
+            (ChangeStatus::Executed, "dave"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            h.change_upsert(&ChangeRequest {
+                id: format!("c{i}"),
+                kind: ChangeKind::Run,
+                status,
+                requester: requester.into(),
+                requester_role: crate::serve::rbac::Role::Operator,
+                reason: None,
+                payload: serde_json::json!({}),
+                plan: None,
+                budget: None,
+                required_approvals: 1,
+                approvals: Vec::new(),
+                rejection: None,
+                created_at: now,
+                updated_at: now,
+                expires_at: now,
+                run_id: None,
+                template: None,
+                error: None,
+                tenant: None,
+                trusted_config: false,
+                caller_params: Default::default(),
+            })
+            .await
+            .unwrap();
+        }
+        let all = h
+            .change_counts(&ChangeListFilter {
+                limit: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(all.get("executed"), Some(&2));
+        assert_eq!(all.get("pending"), Some(&1));
+        let bob = h
+            .change_counts(&ChangeListFilter {
+                requester: Some("bob".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(bob.values().sum::<u64>(), 2);
     }
 
     #[tokio::test]

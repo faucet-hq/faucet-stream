@@ -45,7 +45,7 @@ pub fn install(
 fn install_recorder(otel: Option<&faucet_core::OtelConfig>) -> Option<PrometheusHandle> {
     #[cfg(feature = "otel")]
     if let Some(otel) = otel.filter(|o| o.exports(faucet_core::OtelSignal::Metrics)) {
-        let recorder = PrometheusBuilder::new().build_recorder();
+        let recorder = bucketed_builder().build_recorder();
         let handle = recorder.handle();
         return match faucet_core::observability::install_prometheus_with_otel_metrics(
             recorder, otel,
@@ -63,13 +63,20 @@ fn install_recorder(otel: Option<&faucet_core::OtelConfig>) -> Option<Prometheus
         };
     }
     let _ = otel;
-    match PrometheusBuilder::new().install_recorder() {
+    match bucketed_builder().install_recorder() {
         Ok(h) => Some(h),
         Err(e) => {
             tracing::warn!("Prometheus recorder already installed or failed: {e}");
             None
         }
     }
+}
+
+/// A builder with faucet's default histogram buckets, so `/metrics` exposes
+/// `_bucket` series rather than summaries.
+fn bucketed_builder() -> PrometheusBuilder {
+    faucet_core::observability::with_default_buckets(PrometheusBuilder::new())
+        .expect("faucet's default histogram buckets are non-empty")
 }
 
 /// OTLP traces through the trace-layer slot at the bottom of the serve

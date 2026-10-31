@@ -174,6 +174,7 @@ fn config() -> ServeConfig {
         vault: None,
         connect_providers_path: None,
         allow_subprocess_connectors: false,
+        grafana_url: None,
         references: Default::default(),
     }
 }

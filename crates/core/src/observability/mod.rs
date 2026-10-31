@@ -32,6 +32,8 @@ pub use decorator::{InstrumentedSink, InstrumentedSource};
 pub use drift::schema_drift;
 #[cfg(all(feature = "observability-install", feature = "otel"))]
 pub use install::install_prometheus_with_otel_metrics;
+#[cfg(feature = "observability-install")]
+pub use install::with_default_buckets;
 pub use install::{
     InstallError, InstallReport, ObservabilityConfig, PrometheusConfig, TracingConfig,
     build_version, install_observability, register_build_info, set_build_version,

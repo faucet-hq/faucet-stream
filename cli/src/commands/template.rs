@@ -161,7 +161,7 @@ async fn register(args: TemplateRegisterArgs) -> CliResult<()> {
             description: args.description.clone(),
             tags: tags.clone(),
             launch: args.launch,
-            created_by: None,
+            created_by: Some(crate::templates::local_actor()),
         },
     )
     .await?;

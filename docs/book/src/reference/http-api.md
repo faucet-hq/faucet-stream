@@ -27,7 +27,7 @@ built-in roles form a ladder:
 
 | Role | Permitted |
 |------|-----------|
-| `viewer` | read-only: `GET /v1/runs*`, `GET /v1/schemas*`, `GET /v1/catalog/*`, `GET /v1/usage`, `GET`/`POST /v1/status` and `GET`/`POST /v1/mirror/{name}` for a registered `template` (without caller `params`), `GET /v1/changes*`, `GET /v1/templates*`, `GET /v1/local-outputs`, `GET /v1/tenants*` |
+| `viewer` | read-only: `GET /v1/runs*`, `GET /v1/overview`, `GET /v1/schemas*`, `GET /v1/catalog/*`, `GET /v1/usage`, `GET`/`POST /v1/status` and `GET`/`POST /v1/mirror/{name}` for a registered `template` (without caller `params`), `GET /v1/changes*`, `GET /v1/templates*`, `GET /v1/local-outputs`, `GET /v1/tenants*` |
 | `operator` | everything a viewer can do **plus** submit / cancel / delete runs, trigger registered pipeline templates, propose and approve / reject change requests (as far as the `approvals:` policy allows), `POST /v1/doctor`, `POST /v1/plan`, `/v1/status` and `/v1/mirror/{name}` with an inline `config` or template `params`, firing triggers, deleting local sink outputs, running for tenants and fanning templates out across them, and managing tenant connections (including hosted OAuth connect flows) |
 | `admin` | everything, including the template lifecycle (register, launch, roll back, deprecate, assign channels, delete, sync, publish), the tenant lifecycle (create, update, suspend, delete), pipeline state (`/v1/state/{pipeline}/{row}`) and `GET /v1/audit` |
 
@@ -113,7 +113,8 @@ someone does.
 
 | Route | viewer | operator | admin |
 |---|:--:|:--:|:--:|
-| `GET /v1/runs`, `/v1/runs/{id}`, `/v1/runs/{id}/logs` | ✓ | ✓ | ✓ |
+| `GET /v1/runs`, `/v1/runs/{id}`, `/v1/runs/{id}/logs`, `/v1/runs/{id}/config`³ | ✓ | ✓ | ✓ |
+| `GET /v1/overview` | ✓ | ✓ | ✓ |
 | `POST /v1/runs`, `DELETE /v1/runs/{id}`, `POST /v1/runs/{id}/cancel` | — | ✓ | ✓ |
 | `POST /v1/backfill` | — | ✓ | ✓ |
 | `POST /v1/verify` | — | ✓ | ✓ |
@@ -123,6 +124,7 @@ someone does.
 | `POST /v1/doctor` | — | ✓ | ✓ |
 | `POST /v1/dlq/inspect` | ✓ | ✓ | ✓ |
 | `POST /v1/dlq/replay`, `/v1/dlq/discard` | — | ✓ | ✓ |
+| `GET /v1/triggers` | ✓ | ✓ | ✓ |
 | `POST`/`PUT /v1/triggers/{name}` | — | ✓ | ✓ |
 | `GET /v1/catalog/*` | ✓ | ✓ | ✓ |
 | `POST /v1/catalog/datasets/{id}/consumers` | — | ✓ | ✓ |
@@ -132,7 +134,7 @@ someone does.
 | `GET`/`PUT`/`DELETE /v1/state/{pipeline}/{row}` | — | — | ✓ |
 | `GET /v1/local-outputs`, `/v1/local-outputs/{id}/preview` | ✓ | ✓ | ✓ |
 | `DELETE /v1/local-outputs/{id}`, `POST /v1/local-outputs/cleanup` | — | ✓ | ✓ |
-| `GET /v1/templates`, `/v1/templates/{id}`, `/v1/templates/{id}/rows` | ✓ | ✓ | ✓ |
+| `GET /v1/templates`, `/v1/templates/{id}`, `/v1/templates/{id}/rows`, `/v1/templates/{id}/runs` | ✓ | ✓ | ✓ |
 | `POST /v1/templates/{id}/runs` (trigger) | — | ✓ | ✓ |
 | `POST /v1/templates`, `DELETE /v1/templates/{id}` | — | — | ✓ |
 | `POST /v1/templates/{id}/{tags,launch,rollback,deprecate}` | — | — | ✓ |
@@ -141,7 +143,7 @@ someone does.
 | `POST /v1/templates/{id}/versions/{version}/test` | — | — | ✓ |
 | `POST /v1/templates/sync`, `POST /v1/templates/{id}/publish` | — | — | ✓ |
 | `GET /v1/whoami` | ✓ | ✓ | ✓ |
-| `GET /v1/changes`, `GET /v1/changes/{id}` | ✓ | ✓ | ✓ |
+| `GET /v1/changes`, `GET /v1/changes/counts`, `GET /v1/changes/{id}` | ✓ | ✓ | ✓ |
 | `POST /v1/changes` | — | ✓ | ✓ |
 | `POST /v1/changes/{id}/approve`, `/reject` | — | ✓¹ | ✓¹ |
 | `GET /v1/tenants`, `/v1/tenants/{tenant}`, `/v1/tenants/{tenant}/connections[/{name}]`, `GET /v1/connect/providers` | ✓ | ✓ | ✓ |
@@ -149,11 +151,12 @@ someone does.
 | `POST /v1/tenants/{tenant}/runs`, `…/templates/{id}/runs`, `POST /v1/templates/{id}/fanout` | — | ✓ | ✓ |
 | `POST /v1/tenants`, `PATCH`/`DELETE /v1/tenants/{tenant}` | — | — | ✓ |
 | `POST /mcp` | ✓ | ✓ | ✓ |
-| `GET /v1/audit` | — | — | ✓ |
+| `GET /v1/audit`, `/v1/audit/{id}` | — | — | ✓ |
 | `POST /v1/reload` | — | — | ✓ |
 | *any unclassified `/v1` route* | — | — | ✓ |
 
 ¹ Reaching the route; the `approvals:` policy then decides whether the approval counts.
+³ Below an unscoped admin, credential-looking values come back masked.
 ² With a registered `template` and its declared param defaults. An inline `config` is loaded on the server, and caller `params` decide what it connects to, so either needs `operator` (`403` for a viewer).
 
 Two entries are POSTs a **read** token can reach, because they change nothing:
@@ -403,7 +406,9 @@ each route still enforces its own permission.
 (`policy.denied` — by the submitting principal at submit time, by `runtime`
 when the backstop denied a page mid-run) and every denied attempt is recorded with principal, role, action, run id,
 config fingerprint (submit), source IP, timestamp, and result. Admins read it via
-`GET /v1/audit`. Records persist in the run-history backend (`faucet_serve_audit`
+`GET /v1/audit` (newest first; `result=denied` keeps the refusals; when a page
+is full, `next_before` is the cursor for the next, older one: pass it as
+`before`) and one entry by id via `GET /v1/audit/{id}`. Records persist in the run-history backend (`faucet_serve_audit`
 for the SQL backends; an in-memory ring otherwise) and expire with the
 `--retain-terminal-runs-secs` window.
 
@@ -444,10 +449,13 @@ template) `POST /v1/templates/{id}/runs`, `run_template` and a template trigger.
 | `GET` | `/v1/runs/{id}` | `200` | Get one run record |
 | `DELETE` | `/v1/runs/{id}` | `204` | Remove a terminal run from history |
 | `POST` | `/v1/runs/{id}/cancel` | `202` / `200` | Request cancel (202) or no-op if terminal (200) |
+| `GET` | `/v1/overview` | `200` | Fleet trends over the run history for the console's Overview page (`since`, `until`, `bucket`, `pipeline`, `pool`, `label`, `tenant`, `stale_after`, `top`) — viewer / `RunRead` |
+| `GET` | `/v1/runs/{id}/config` | `200` | The run's stored config (`{format, body, redacted}`); masked below an unscoped admin; `404` when none was stored (only clustered runs store one) — `RunRead`, audit `run.config` |
 | `GET` | `/v1/runs/{id}/logs` | `200` | Stream the run's logs (`text/event-stream`), or read persisted logs with `?format=jsonl\|text` |
 | `POST` | `/v1/backfill` | `202` | Submit a windowed backfill: one tracked run per window unit (operator) |
-| `GET` | `/v1/audit` | `200` | Read the audit log — **admin only** (RBAC). Filters: `principal`, `action`, `since`, `until`, `limit`. Each entry's `target` names what was touched (`template:<id>@<version>`, `connection:<tenant>/<name>`, `origin:<name>`, `mcp:<tool>`); an MCP tool call is one entry per call, under the calling principal, `result: error` when the tool failed |
-| `POST` | `/v1/reload` | `200` / `422` | Hot-reload the `--default-config` merge base — **admin only** (RBAC). No-op (`reloaded:false`) if no default-config; `422` (old config kept) if the new one is invalid |
+| `GET` | `/v1/audit` | `200` | Read the audit log — **admin only** (RBAC). Filters: `principal`, `action`, `result`, `tenant`, `since`, `until`, `limit`; page with `before=<next_before>`. Each entry's `target` names what was touched (`template:<id>@<version>`, `connection:<tenant>/<name>`, `origin:<name>`, `mcp:<tool>`); an MCP tool call is one entry per call, under the calling principal, `result: error` when the tool failed |
+| `GET` | `/v1/audit/{id}` | `200` | One audit entry; `404` once purged — **admin only** |
+| `POST` | `/v1/reload` | `200` / `422` | Hot-reload the `--default-config` merge base — **admin only** (RBAC). No-op (`reloaded:false`) if no default-config; `422` (old config kept) if the new one is invalid. A reload answers `{reloaded, path, loaded_at}` |
 | `GET` | `/v1/catalog/datasets` | `200` | List catalogued datasets (`kind`, `q`, `limit`, `cursor`) — requires the `catalog` build feature |
 | `GET` | `/v1/catalog/datasets/{id}` | `200` | One dataset's detail: schema timeline, volume, edges |
 | `GET` | `/v1/catalog/lineage` | `200` | The lineage edge graph (`root`, `depth`) |
@@ -461,6 +469,7 @@ template) `POST /v1/templates/{id}/runs`, `run_template` and a template trigger.
 | `GET` | `/v1/templates/{id}/rows` | `200` | The template's selectable rows (streams / matrix rows) with their metadata; selector params (`select`, `only`, `skip`, `tags`, `status`, `include_parents`) turn it into a dry-run resolve (`TemplateRead`, audit `template.rows`) |
 | `DELETE` | `/v1/templates/{id}` | `204` | Delete one version (`?version=<channel\|N>`) or all (admin / `TemplateAdmin`) |
 | `POST` | `/v1/templates/{id}/runs` | `202` | Trigger a run from a template with `params` / `env` (operator / `RunWrite`) |
+| `GET` | `/v1/templates/{id}/runs` | `200` | The runs started from the template (label `template: <id>`), paged like `GET /v1/runs` (`limit`, `cursor`, and `counts=true` for totals); `404` for an id never registered (viewer / `TemplateRead`) |
 | `POST` | `/v1/templates/{id}/tags` | `200` | Point an assignable channel (`prod`, `dev`, …) at a version (admin / `TemplateAdmin`) |
 | `POST` | `/v1/templates/{id}/launch` | `200` | Make a version live — moves `stable` and so unpinned callers (admin / `TemplateAdmin`) |
 | `POST` | `/v1/templates/{id}/rollback` | `200` | Re-launch `previous` (admin / `TemplateAdmin`) |
@@ -478,6 +487,7 @@ template) `POST /v1/templates/{id}/runs`, `run_template` and a template trigger.
 | `DELETE` | `/v1/state/{pipeline}/{row}` | `200` / `409` | Reset the row so its next run re-syncs (admin / `StateAdmin`); `409` while a run holds the row |
 | `POST` | `/v1/changes` | `201` | Propose a [change request](../cookbook/approvals.md) (`kind` = `run` / `template_register` / `template_launch` / `template_delete` / `template_deprecate`, `payload`, `reason`, `budget`); planned now, executed on approval — operator / `ChangeRequest` |
 | `GET` | `/v1/changes` | `200` | List change requests (`status`, `kind`, `requester`, `limit`), newest first, plan rows omitted — viewer / `ChangeRead` |
+| `GET` | `/v1/changes/counts` | `200` | `{"counts": {status: n}}`: exact totals over every request matching `kind`, `requester`, `tenant` (lapsed pending requests count as `expired`) — viewer / `ChangeRead` |
 | `GET` | `/v1/changes/{id}` | `200` | One change request with its plan — viewer / `ChangeRead` |
 | `POST` | `/v1/changes/{id}/approve` | `200` | Approve (`comment`); at quorum re-plans and executes, or marks it `invalidated` — `ChangeApprove`, then the `approvals:` policy |
 | `POST` | `/v1/changes/{id}/reject` | `200` | Reject with a `reason`; the requester may withdraw their own — `ChangeApprove`, then the policy |
@@ -491,6 +501,7 @@ template) `POST /v1/templates/{id}/runs`, `run_template` and a template trigger.
 | `POST` | `/v1/tenants/{tenant}/runs` | `202` | A `POST /v1/runs` body, run as the tenant — operator / `RunWrite` |
 | `POST` | `/v1/tenants/{tenant}/templates/{id}/runs` | `202` | A template trigger, run as the tenant — operator / `RunWrite` |
 | `POST` | `/v1/templates/{id}/fanout` | `200` | Trigger a template once per tenant (`tenants: "all" \| [ids]`, `fanout_concurrency`) — operator / `RunWrite` |
+| `GET` | `/v1/triggers` | `200` | The `--triggers` file's triggers with live health, `last_fire`, `fired_total` / `errors_total` since start (viewer / `StatusRead`; `triggers` feature) |
 | `GET` | `/healthz` | `200` | Liveness (unauthenticated) |
 | `GET` | `/readyz` | `200`/`503` | Readiness (unauthenticated) |
 | `GET` | `/metrics` | `200` | Prometheus exposition (unauthenticated) |
@@ -609,7 +620,7 @@ submitted config (submitted values win).
 ### `GET /v1/runs`
 
 Query parameters: `status`, `name`, `since`, `until` (RFC3339), `limit` (default
-50, max 500), `cursor`, `tenant`, `label`, `labels`. Ordering is
+50, max 500), `cursor`, `tenant`, `submitted_by`, `mine`, `dataset_id`, `name_contains`, `pool`, `counts`, `label`, `labels`. Ordering is
 `(submitted_at DESC, run_id DESC)`; `cursor` is the previous page's
 `next_cursor` — the last row's sort key (`<submitted_at>~<run_id>`), so paging
 stays correct when that run is deleted or purged between requests. A bare
@@ -633,12 +644,40 @@ At most 10 label filters per request. Provenance labels filter like any other �
 `label=pipeline:<name>`. A sharded run is listed once, as its parent, with the
 labels it was submitted with.
 
+**Filtering by submitter (#998).** Every run records who submitted it in
+`submitted_by`: the authenticated principal (`trigger:<name>` for a trigger,
+the requester for an approved change request, `anonymous` under `--no-auth`,
+`token` for the single `--auth-token`). The server sets it; a request body
+cannot. `submitted_by=<principal>` keeps that principal's runs, and `mine=true`
+keeps the caller's own (setting both is a `400`). Runs recorded before the
+field existed have no submitter and match neither.
+
+**Filtering by dataset (#998).** `dataset_id=<catalog dataset id>` keeps the
+runs one of whose invocations wrote that dataset — the `usage.dataset_id` a
+run records while the catalog is active, and only that field (the same text
+in a label does not match). Anything but letters, digits and `-` is a `400`.
+
+**Filtering by title and pool (#998).** `name_contains=<text>` keeps runs whose
+title — the run's `name`, or its `pipeline` label when it has none — contains
+the text, case-sensitively (`%` and `_` are ordinary characters). `pool=<name>`
+keeps runs in that execution pool; runs recorded before pools existed are in
+`default`. An invalid pool name is a `400`.
+
+**Exact counts (#998).** With `counts=true`, `counts` holds how many runs match
+the filters, per status, ignoring `limit` and `cursor` — so a dashboard can show
+totals without paging through every run. Only statuses with at least one run
+appear. Without it the field is omitted: counting reads every matching run.
+
 **Unknown parameters are a `400`.** A typo such as `?lables=team:data` is
 refused rather than silently returning every run. So are an unknown `status`
 token, an empty label key and more than 10 label filters.
 
 ```json
-{ "runs": [ { "run_id": "…", "status": "completed", … } ], "next_cursor": "2026-10-01T12:00:00.000000000Z~0192…" }
+{
+  "runs": [ { "run_id": "…", "status": "completed", "submitted_by": "alice", … } ],
+  "next_cursor": "2026-10-01T12:00:00.000000000Z~0192…",
+  "counts": { "completed": 41, "failed": 2, "running": 1 }
+}
 ```
 
 ### `GET /v1/runs/{id}` → `RunRecord`
@@ -653,6 +692,8 @@ token, an empty label key and more than 10 label filters.
   "elapsed_secs": 12.4,
   "records_written": 4096,
   "pool": "default",
+  "submitted_by": "alice",
+  "dlq_location": "./dlq/orders.jsonl",
   "invocations": [
     {"row_id": "default", "parent_record_key": null, "records_written": 4096, "error": null,
      "status": "succeeded",
@@ -692,6 +733,28 @@ A DLQ replay that writes (`POST /v1/dlq/replay` without `dry_run`) is recorded
 as a run under its `id` while it runs, with the label `dlq_replay: "true"` and
 `replay_of` naming the DLQ location it read, so it appears in `GET /v1/runs`
 and holds one of its tenant's `max_concurrent_runs` slots until it ends.
+
+`dlq_location` (#998) is where the run's dead-letter queue writes: the `path`
+of its `dlq:` sink as configured at submit, when that sink writes local files
+(`file`, `jsonl`) — the `location` `POST /v1/dlq/inspect` takes. The server
+sets it; it is absent without a file DLQ.
+
+### `GET /v1/runs/{id}/config`
+
+The config a run was submitted with, as stored (#998). Only clustered runs
+store one (any instance must be able to run them); other runs answer `404`.
+
+```json
+{ "format": "yaml", "body": "version: 1\npipeline: …", "redacted": true }
+```
+
+An unscoped admin gets the body as stored. Anyone else gets it re-rendered in
+the same format with every value under a credential-looking key (`password`,
+`token`, `secret`, `key`, `credentials`, …) replaced by `***`; `${env:…}` /
+`${vault:…}` references are kept, since they name a secret rather than hold
+one. Secrets the server resolved are masked for everyone, and sealed template
+params stay `${sealed:N}`. `redacted` says whether anything was masked. Every
+read is audited as `run.config`.
 
 > **Bookmarks:** run records carry record counts + per-row outcomes, not
 > replication bookmarks. Bookmark state is per-row/per-state-key and lives in the
@@ -918,6 +981,50 @@ references a missing connection or one that needs re-authorization, is a
 the server's `--vault-key`; without it those routes answer `503`. Audited as
 `tenant.*`, `connection.*` (`connection.needs_reauth` when a grant is revoked)
 and `connect.start` / `connect.complete`.
+
+### `GET /v1/overview` (fleet trends)
+
+The aggregates behind the console's [Overview](../cookbook/web-console.md#overview)
+page, read from the run history rather than Prometheus, so they survive a
+restart and cover every replica of a cluster:
+
+- `runs`: totals `by_status`, a `series` of succeeded / failed / cancelled per
+  bucket, `failure_rate_by_pipeline` (finished runs, highest rate first),
+  `slowest` (p95 invocation time per pipeline), and `queued` / `running`
+  now, whatever the window;
+- `records`: records written per bucket and the `top_pipelines`;
+- `governance`: rows not written, from each invocation's row accounting:
+  `filtered` by a transform, `quarantined`, sent to the DLQ (`dlq`),
+  `coalesced`, `skipped` and `dropped`, per bucket;
+- `cost` (the `catalog` build, when usage records exist): the estimated cost
+  and hosted equivalent per bucket and by pipeline, in the currency most
+  invocations were priced in (`other_currencies` lists the rest);
+- `freshness` (the `catalog` build, when datasets are catalogued; not for a
+  tenant-scoped principal): datasets with no successful run within
+  `stale_after` (default `24h`), and datasets whose schema changed in the
+  window;
+- `attention`: change requests waiting for approval, unhealthy triggers,
+  templates whose newest version's tests fail, and tenant connections that
+  need re-authorization. A group is present only when its feature is built
+  in and in use, with a `count` and the first 20 `items`;
+- `grafana` (with `--grafana-url`): a link per section to the matching
+  dashboard from `observability/grafana/`, over the same range.
+
+The window is `[since, until)`: `since` is a duration back from `until`
+(`30m`, `24h`, `7d`, `2w`, default `7d`) or an RFC 3339 instant, and `until`
+defaults to now. Buckets are UTC hours up to three days and days beyond
+(`bucket=hour|day` overrides; at most 1,000 buckets). `pipeline`, `pool`,
+`label` / `labels` and `tenant` filter runs as on `GET /v1/runs`; a
+tenant-scoped principal sees its own tenant only. The SQL history backends
+group in the database; the p95 is computed over the newest 10,000 finished
+invocations in the window (`runs.duration_sample.truncated` says when the
+window held more), and `top` (1–50, default 10) bounds every list. `RunRead`
+(viewer and up); audited `overview.get`; `400` for a bad parameter.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:8080/v1/overview?since=24h&pipeline=orders"
+```
 
 ### `GET /v1/usage` (cost & usage)
 
@@ -1288,9 +1395,12 @@ channel names are rejected rather than silently falling back, and asking for an
 defaults to `newest` and returns `{version, replaced, already_launched, status}`;
 re-launching the live version is a no-op, which keeps `previous` a real rollback
 target. `GET /v1/templates/{id}` returns `status`, `versions` (newest first),
-`stable` / `previous` / `newest`, `is_stable`, the `tags` pointer map, and the
-`launches` log — so a client can pin, promote, launch, or roll back without a
-second request. Use `?version=newest` to read a `draft` template. The stored
+`stable` / `previous` / `newest`, `is_stable`, the `tags` pointer map, the
+`launches` log, and `registrations` — each stored version's `registered_at` and
+`registered_by` (the principal; `sync:<origin>` for a template sync,
+`local:<user>` for `faucet template register`; absent for a version recorded
+without one), newest first — so a client can pin, promote, launch, or roll back
+without a second request. Use `?version=newest` to read a `draft` template. The stored
 `body` is returned only to an admin with no tenant scope; anyone else gets an
 empty `body` and `body_withheld: true` (the parameter surface stays in
 `params`), the same rule as a run's `config_body`. In `params`, the

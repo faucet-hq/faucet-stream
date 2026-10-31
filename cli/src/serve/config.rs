@@ -154,6 +154,8 @@ pub struct ServeConfig {
     pub allow_subprocess_connectors: bool,
     /// What a caller-supplied config may reach (#881): the `--allow-*` flags.
     pub references: crate::serve::references::ServeReferencePolicy,
+    /// Grafana base URL the console's Overview links to (`--grafana-url`).
+    pub grafana_url: Option<String>,
 }
 
 /// Log-shipping buffer bounds and the console's log link (#806).
@@ -501,8 +503,35 @@ impl ServeConfig {
             allow_subprocess_connectors: args.allow_subprocess_connectors,
             references: crate::serve::references::ServeReferencePolicy::from_args(&args.references)
                 .map_err(CliError::Config)?,
+            grafana_url: grafana_url(args.grafana_url.as_deref())?,
         })
     }
+}
+
+/// Validate `--grafana-url`: an absolute `http(s)` URL without credentials,
+/// kept without a trailing slash. Blank = unset.
+pub fn grafana_url(raw: Option<&str>) -> CliResult<Option<String>> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let url = url::Url::parse(raw)
+        .map_err(|e| CliError::Config(format!("--grafana-url `{raw}`: {e}")))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(CliError::Config(format!(
+            "--grafana-url `{raw}` must be an http:// or https:// URL"
+        )));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(CliError::Config(
+            "--grafana-url must not carry credentials: the console shows it to every viewer".into(),
+        ));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(CliError::Config(format!(
+            "--grafana-url `{raw}` must be a base URL, without a query or fragment"
+        )));
+    }
+    Ok(Some(url.as_str().trim_end_matches('/').to_string()))
 }
 
 /// Read a `--otel-config` file: a pipeline config's `observability.otel`
@@ -673,6 +702,7 @@ mod tests {
             vault_previous_key: Vec::new(),
             connect_providers: None,
             allow_subprocess_connectors: false,
+            grafana_url: None,
             references: Default::default(),
             pools: Default::default(),
         }

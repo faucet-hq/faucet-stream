@@ -629,7 +629,9 @@ const CONFLICT_ATTEMPTS: u32 = 10;
 /// sees the other's change.
 fn lost_catalog_race(e: &FaucetError) -> bool {
     matches!(e, FaucetError::Sink(m)
-        if is_catalog_conflict(m) || m.contains("has been altered by a different transaction"))
+        if is_catalog_conflict(m)
+            || m.contains("has been altered by a different transaction")
+            || m.contains("table state was reverted by a concurrent transaction"))
 }
 
 impl DuckdbDriver {
@@ -996,6 +998,23 @@ mod tests {
         )
         .await;
         drop(guards);
+    }
+
+    #[test]
+    fn every_duckdb_conflict_message_reruns_the_page() {
+        for m in [
+            "TransactionContext Error: Catalog write-write conflict on alter with \"prices\"",
+            "TransactionContext Error: Failed to commit: Table \"prices\" has been altered by a different transaction",
+            "DuckDB commit failed: TransactionContext Error: Failed to commit: Failed to alter table \"prices\" because the underlying table state was reverted by a concurrent transaction",
+        ] {
+            assert!(lost_catalog_race(&FaucetError::Sink(m.into())), "{m}");
+        }
+        assert!(!lost_catalog_race(&FaucetError::Sink(
+            "Constraint Error: duplicate key".into()
+        )));
+        assert!(!lost_catalog_race(&FaucetError::Config(
+            "Catalog write-write conflict".into()
+        )));
     }
 
     #[test]

@@ -9,6 +9,7 @@ pub mod catalog;
 pub mod fallback;
 pub mod labels;
 pub mod memory;
+pub mod overview;
 #[cfg(feature = "serve-history-postgres")]
 pub mod postgres;
 #[cfg(any(feature = "serve-history-postgres", feature = "serve-history-sqlite"))]
@@ -263,6 +264,19 @@ pub struct RunRecord {
     /// pools existed read as `default`.
     #[serde(default = "crate::serve::pools::default_pool")]
     pub pool: String,
+    /// Who submitted the run (#998): the authenticated principal the
+    /// `run.submit` audit entry names — `trigger:<name>` for a trigger, the
+    /// requester for an approved change request. Set only by the server;
+    /// `None` for runs recorded before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitted_by: Option<String>,
+    /// Where the run's dead-letter queue writes (#998): the `path` of the
+    /// config's `dlq:` sink as configured at submit, when that sink writes
+    /// local files — the location `POST /v1/dlq/inspect` takes. Set only by
+    /// the server; `None` without a file DLQ or for runs recorded before the
+    /// field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dlq_location: Option<String>,
 }
 
 impl RunRecord {
@@ -303,7 +317,24 @@ impl RunRecord {
             caller_config: false,
             caller_params: Default::default(),
             pool: crate::serve::pools::default_pool(),
+            submitted_by: None,
+            dlq_location: None,
         }
+    }
+
+    /// Whether any invocation of this run read or wrote the catalog dataset
+    /// `dataset_id` (#998): the id its usage record names.
+    /// What a listing calls the run: its name, else its `pipeline` label.
+    pub fn title(&self) -> Option<&str> {
+        self.name
+            .as_deref()
+            .or_else(|| self.labels.get("pipeline").map(String::as_str))
+    }
+
+    pub fn touches_dataset(&self, dataset_id: &str) -> bool {
+        self.invocations
+            .iter()
+            .any(|inv| inv.usage.as_ref().and_then(|u| u.dataset_id.as_deref()) == Some(dataset_id))
     }
 }
 
@@ -391,7 +422,59 @@ pub struct ListFilter {
     pub tenant: Option<String>,
     /// Only runs carrying every one of these labels (#958).
     pub labels: Vec<labels::LabelFilter>,
+    /// Only runs this principal submitted (#998).
+    pub submitted_by: Option<String>,
+    /// Only runs one of whose invocations names this catalog dataset in its
+    /// usage record (#998). Must pass [`is_dataset_id`].
+    pub dataset_id: Option<String>,
+    /// Only runs whose title contains this text, case-sensitively (#998):
+    /// the run's name, or its `pipeline` label when it has no name.
+    pub name_contains: Option<String>,
+    /// Only runs in this execution pool; a run stored before pools existed is
+    /// in `default` (#957, #998).
+    pub pool: Option<String>,
 }
+
+/// Whether `s` has the shape of a catalog dataset id (#998): 1–64 ASCII
+/// letters, digits or `-`. The SQL backends match the id inside the stored
+/// record text, so anything else is refused before it reaches a query.
+pub fn is_dataset_id(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+impl ListFilter {
+    /// Whether `rec` passes every filter except the cursor and limit.
+    pub fn matches(&self, rec: &RunRecord) -> bool {
+        (self.status.is_empty() || self.status.contains(&rec.status))
+            && self
+                .name
+                .as_deref()
+                .is_none_or(|n| rec.name.as_deref() == Some(n))
+            && self
+                .name_contains
+                .as_deref()
+                .is_none_or(|n| rec.title().is_some_and(|t| t.contains(n)))
+            && self.pool.as_deref().is_none_or(|p| rec.pool == p)
+            && self.since.is_none_or(|t| rec.submitted_at >= t)
+            && self.until.is_none_or(|t| rec.submitted_at <= t)
+            && self
+                .tenant
+                .as_deref()
+                .is_none_or(|t| rec.tenant.as_deref() == Some(t))
+            && self
+                .submitted_by
+                .as_deref()
+                .is_none_or(|p| rec.submitted_by.as_deref() == Some(p))
+            && self
+                .dataset_id
+                .as_deref()
+                .is_none_or(|d| rec.touches_dataset(d))
+            && labels::matches_all(&self.labels, &rec.labels)
+    }
+}
+
+/// Runs per status (`completed` → 12, …): only statuses with at least one run.
+pub type StatusCounts = BTreeMap<String, u64>;
 
 /// The keyset cursor after `rec`: `<submitted_at>~<run_id>`, so the next page
 /// starts after that position even if the run is deleted or purged meanwhile.
@@ -650,8 +733,7 @@ pub struct AuditEntry {
     pub result: String,
 }
 
-/// Filter + limit for `list_audit` (newest-first). No cursor: a bounded,
-/// most-recent view is the audit-console primitive.
+/// Filter + limit for `list_audit` (newest-first, by timestamp then id).
 #[derive(Debug, Default, Clone)]
 pub struct AuditFilter {
     pub principal: Option<String>,
@@ -660,7 +742,27 @@ pub struct AuditFilter {
     pub action: Option<String>,
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
+    /// Only entries with this outcome (`ok`, `denied`, …) (#998).
+    pub result: Option<String>,
+    /// Keyset cursor (#998): only entries listed after the entry with this
+    /// id in newest-first order. An id no longer stored yields nothing older.
+    pub before: Option<String>,
     pub limit: usize,
+}
+
+impl AuditFilter {
+    /// Whether `e` passes every filter except `before` and the limit.
+    pub fn matches(&self, e: &AuditEntry) -> bool {
+        self.principal.as_deref().is_none_or(|p| e.principal == p)
+            && self.action.as_deref().is_none_or(|a| e.action == a)
+            && self.result.as_deref().is_none_or(|r| e.result == r)
+            && self
+                .tenant
+                .as_deref()
+                .is_none_or(|t| e.tenant.as_deref() == Some(t))
+            && self.since.is_none_or(|t| e.timestamp >= t)
+            && self.until.is_none_or(|t| e.timestamp <= t)
+    }
 }
 
 /// One persisted log line for a completed run (#529). Stored in
@@ -786,6 +888,26 @@ pub trait RunHistory: Send + Sync {
     async fn get(&self, id: &str) -> Result<Option<RunRecord>, HistoryError>;
 
     async fn list(&self, filter: &ListFilter) -> Result<ListPage, HistoryError>;
+
+    /// How many runs match `filter` per status, ignoring its cursor and limit
+    /// (#998). The default pages through [`list`](Self::list); the built-in
+    /// backends count in one query.
+    async fn count_by_status(&self, filter: &ListFilter) -> Result<StatusCounts, HistoryError> {
+        let mut page_filter = filter.clone();
+        page_filter.limit = 500;
+        page_filter.cursor = None;
+        let mut counts = StatusCounts::new();
+        loop {
+            let page = self.list(&page_filter).await?;
+            for rec in &page.runs {
+                *counts.entry(rec.status.as_str().to_string()).or_default() += 1;
+            }
+            match page.next_cursor {
+                Some(c) => page_filter.cursor = Some(c),
+                None => return Ok(counts),
+            }
+        }
+    }
 
     /// Delete a terminal run. Non-terminal → `StillRunning` (caller maps to 409).
     async fn delete(&self, id: &str) -> Result<DeleteOutcome, HistoryError>;
@@ -1149,6 +1271,12 @@ pub trait RunHistory: Send + Sync {
     async fn list_audit(&self, filter: &AuditFilter) -> Result<Vec<AuditEntry>, HistoryError> {
         let _ = filter;
         Ok(Vec::new())
+    }
+
+    /// One audit record by id (#998); `None` once purged. Default: none.
+    async fn get_audit(&self, id: &str) -> Result<Option<AuditEntry>, HistoryError> {
+        let _ = id;
+        Ok(None)
     }
 
     // ── Persistent run logs (#529) ────────────────────────────────────────────
@@ -1567,6 +1695,22 @@ pub trait RunHistory: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// How many change requests match `filter` per status, ignoring its
+    /// limit (#998). The default counts an unbounded [`change_list`](Self::change_list);
+    /// the built-in backends count in one query.
+    async fn change_counts(
+        &self,
+        filter: &crate::serve::changes::ChangeListFilter,
+    ) -> Result<StatusCounts, HistoryError> {
+        let mut all = filter.clone();
+        all.limit = usize::MAX;
+        let mut counts = StatusCounts::new();
+        for c in self.change_list(&all).await? {
+            *counts.entry(c.status.as_str().to_string()).or_default() += 1;
+        }
+        Ok(counts)
+    }
+
     // ── Tenants (#709) ───────────────────────────────────────────────────────
     //
     // Multi-tenant embedded integrations: tenants, their sealed connections,
@@ -1772,6 +1916,18 @@ pub trait RunHistory: Send + Sync {
     ) -> Result<Vec<crate::usage::UsageRecord>, HistoryError> {
         let _ = filter;
         Ok(Vec::new())
+    }
+
+    /// Fleet aggregates for `GET /v1/overview` (#1006). The default reads
+    /// runs through [`list`](Self::list) and usage through
+    /// [`usage_list`](Self::usage_list), at most
+    /// [`overview::DEFAULT_SCAN_CAP`] each; the built-in backends aggregate in
+    /// place.
+    async fn overview_aggregates(
+        &self,
+        q: &overview::OverviewQuery,
+    ) -> Result<overview::OverviewAggregates, HistoryError> {
+        overview::aggregate_by_listing(self, q).await
     }
 
     // ── Pipeline-template registry (#444) ────────────────────────────────────
@@ -2320,6 +2476,153 @@ fn into_history<H: RunHistory + 'static>(
     }
 }
 
+/// The run-list filters every backend must apply alike (#998), checked
+/// against one backend: the name substring, the pool and the dataset filter
+/// (which names the usage record's dataset, never the same text elsewhere).
+#[cfg(test)]
+pub(crate) async fn assert_list_filters_agree(h: &dyn RunHistory) {
+    let t0 = Utc::now();
+    let put =
+        async |id: &str, name: &str, pool: &str, dataset: Option<&str>, label: Option<&str>| {
+            let mut rec =
+                RunRecord::queued(id.into(), Some(name.into()), Default::default(), None, t0);
+            rec.pool = pool.into();
+            if let Some(l) = label {
+                rec.labels.insert("dataset_id".into(), l.into());
+            }
+            rec.invocations.push(InvocationRecord {
+                row_id: "r".into(),
+                parent_record_key: None,
+                run_id: None,
+                records_written: 1,
+                duration_ms: 0,
+                error: None,
+                usage: dataset.map(|d| crate::usage::UsageRecord {
+                    run_id: id.into(),
+                    pipeline: name.into(),
+                    row: "r".into(),
+                    source_kind: "file".into(),
+                    sink_kind: "file".into(),
+                    dataset_id: Some(d.into()),
+                    dataset_uri: None,
+                    recorded_at: t0,
+                    duration_ms: 0,
+                    failed: false,
+                    usage: Default::default(),
+                    cost: Default::default(),
+                    tenant: None,
+                }),
+                batches: None,
+                source_lag: None,
+                rows: None,
+                skipped: false,
+                status: None,
+            });
+            h.upsert(&rec).await.unwrap();
+        };
+    put("a", "orders-daily", "default", Some("ds-a"), None).await;
+    put("b", "Orders-50%_off", "gpu", Some("DS-A"), None).await;
+    put("c", "customers", "gpu", None, Some("ds-a")).await;
+    // An unnamed run is listed under its `pipeline` label.
+    let mut d = RunRecord::queued("d".into(), None, Default::default(), None, t0);
+    d.labels.insert("pipeline".into(), "orders-weekly".into());
+    h.upsert(&d).await.unwrap();
+    let mut e = RunRecord::queued(
+        "e".into(),
+        Some("named".into()),
+        Default::default(),
+        None,
+        t0,
+    );
+    e.labels.insert("pipeline".into(), "orders-hidden".into());
+    h.upsert(&e).await.unwrap();
+    let ids = async |f: ListFilter| {
+        let mut ids: Vec<String> = h
+            .list(&ListFilter {
+                limit: 50,
+                ..f.clone()
+            })
+            .await
+            .unwrap()
+            .runs
+            .into_iter()
+            .map(|r| r.run_id)
+            .collect();
+        ids.sort();
+        let counted: u64 = h.count_by_status(&f).await.unwrap().values().sum();
+        assert_eq!(counted as usize, ids.len(), "{f:?}");
+        ids
+    };
+
+    assert_eq!(
+        ids(ListFilter {
+            name_contains: Some("rders".into()),
+            ..Default::default()
+        })
+        .await,
+        ["a", "b", "d"]
+    );
+    // Case-sensitive, and LIKE wildcards are plain text.
+    assert_eq!(
+        ids(ListFilter {
+            name_contains: Some("Orders".into()),
+            ..Default::default()
+        })
+        .await,
+        ["b"]
+    );
+    assert_eq!(
+        ids(ListFilter {
+            name_contains: Some("%_".into()),
+            ..Default::default()
+        })
+        .await,
+        ["b"]
+    );
+    assert!(
+        ids(ListFilter {
+            name_contains: Some("o_d".into()),
+            ..Default::default()
+        })
+        .await
+        .is_empty()
+    );
+    assert_eq!(
+        ids(ListFilter {
+            pool: Some("gpu".into()),
+            ..Default::default()
+        })
+        .await,
+        ["b", "c"]
+    );
+    assert_eq!(
+        ids(ListFilter {
+            pool: Some("default".into()),
+            ..Default::default()
+        })
+        .await,
+        ["a", "d", "e"]
+    );
+    // Only the usage record names a dataset: not a label, not another case.
+    assert_eq!(
+        ids(ListFilter {
+            dataset_id: Some("ds-a".into()),
+            ..Default::default()
+        })
+        .await,
+        ["a"]
+    );
+    assert_eq!(
+        ids(ListFilter {
+            dataset_id: Some("ds-a".into()),
+            pool: Some("gpu".into()),
+            ..Default::default()
+        })
+        .await,
+        Vec::<String>::new()
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2472,6 +2775,97 @@ mod tests {
         assert!(h.insert_new(&rec).await.unwrap());
         assert!(!h.insert_new(&rec).await.unwrap(), "the id is taken");
         assert!(h.get("r1").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn the_default_count_pages_through_every_matching_run() {
+        let h = ReadThenWrite(memory::MemoryHistory::new(Duration::from_secs(60)));
+        let t0 = Utc::now();
+        for i in 0..1203u32 {
+            let mut rec = RunRecord::queued(
+                format!("r{i:05}"),
+                None,
+                Default::default(),
+                None,
+                t0 + chrono::Duration::milliseconds(i64::from(i)),
+            );
+            rec.status = if i % 3 == 0 {
+                RunStatus::Failed
+            } else {
+                RunStatus::Completed
+            };
+            rec.submitted_by = Some(if i % 2 == 0 { "alice" } else { "bob" }.into());
+            h.upsert(&rec).await.unwrap();
+        }
+        let all = h
+            .count_by_status(&ListFilter {
+                limit: 1,
+                cursor: Some("ignored".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(all.get("failed"), Some(&401));
+        assert_eq!(all.get("completed"), Some(&802));
+        let alice = h
+            .count_by_status(&ListFilter {
+                submitted_by: Some("alice".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(alice.values().sum::<u64>(), 602);
+    }
+
+    #[tokio::test]
+    async fn the_default_change_counts_count_the_listing() {
+        let counts = Bare
+            .change_counts(&crate::serve::changes::ChangeListFilter::default())
+            .await
+            .unwrap();
+        assert!(counts.is_empty());
+    }
+
+    #[test]
+    fn a_run_recorded_before_submitters_reads_without_one() {
+        let mut v = serde_json::to_value(RunRecord::queued(
+            "old".into(),
+            None,
+            Default::default(),
+            None,
+            Utc::now(),
+        ))
+        .unwrap();
+        assert!(v.get("submitted_by").is_none(), "None is not serialized");
+        v.as_object_mut().unwrap().remove("pool");
+        let rec: RunRecord = serde_json::from_value(v).unwrap();
+        assert_eq!(rec.submitted_by, None);
+        let mut with = rec.clone();
+        with.submitted_by = Some("alice".into());
+        let back: RunRecord = serde_json::from_value(serde_json::to_value(&with).unwrap()).unwrap();
+        assert_eq!(back.submitted_by.as_deref(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn memory_list_filters_match_name_pool_and_usage_dataset() {
+        assert_list_filters_agree(&memory::MemoryHistory::new(Duration::from_secs(60))).await;
+    }
+
+    #[test]
+    fn list_filter_matches_on_the_submitter() {
+        let mut rec = RunRecord::queued("r".into(), None, Default::default(), None, Utc::now());
+        let by = |p: &str| ListFilter {
+            submitted_by: Some(p.into()),
+            ..Default::default()
+        };
+        assert!(ListFilter::default().matches(&rec));
+        assert!(
+            !by("alice").matches(&rec),
+            "an unattributed run matches no submitter"
+        );
+        rec.submitted_by = Some("alice".into());
+        assert!(by("alice").matches(&rec));
+        assert!(!by("bob").matches(&rec));
     }
 
     #[tokio::test]

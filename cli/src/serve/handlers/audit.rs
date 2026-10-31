@@ -1,12 +1,13 @@
-//! `GET /v1/audit` — read the control-plane audit log (RBAC, #205). The route
-//! requires the `AuditRead` permission (admin-only), enforced by the auth
-//! middleware, so reaching this handler already means the caller is authorized.
+//! `GET /v1/audit` / `GET /v1/audit/{id}` — read the control-plane audit log
+//! (RBAC, #205; one entry and paging, #998). The routes require the
+//! `AuditRead` permission (admin-only), enforced by the auth middleware, so
+//! reaching a handler already means the caller is authorized.
 
 use crate::serve::error::ServeError;
 use crate::serve::history::{AuditEntry, AuditFilter};
 use crate::serve::state::ServerState;
 use axum::Json;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +23,11 @@ pub struct AuditQuery {
     pub tenant: Option<String>,
     pub since: Option<String>,
     pub until: Option<String>,
+    /// Only entries with this outcome: `ok`, `denied`, … (#998).
+    pub result: Option<String>,
+    /// Page cursor (#998): the `next_before` of the previous page — entries
+    /// older than the one with this id.
+    pub before: Option<String>,
     pub limit: Option<usize>,
 }
 
@@ -29,6 +35,9 @@ pub struct AuditQuery {
 #[derive(Debug, Serialize)]
 pub struct AuditListResponse {
     pub entries: Vec<AuditEntry>,
+    /// Pass as `before` for the next (older) page; absent on the last page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_before: Option<String>,
 }
 
 /// Parse an RFC3339 query timestamp, restoring the `+` that form-encoding turns
@@ -58,6 +67,8 @@ pub async fn list_audit(
             .as_deref()
             .map(|s| parse_ts(s, "until"))
             .transpose()?,
+        result: query.result,
+        before: query.before,
         limit: query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT),
     };
     let entries = state
@@ -65,7 +76,29 @@ pub async fn list_audit(
         .list_audit(&filter)
         .await
         .map_err(|e| ServeError::Internal(e.to_string()))?;
-    Ok(Json(AuditListResponse { entries }))
+    // A full page may have more behind it; a short one is the last.
+    let next_before = (entries.len() == filter.limit)
+        .then(|| entries.last().map(|e| e.id.clone()))
+        .flatten();
+    Ok(Json(AuditListResponse {
+        entries,
+        next_before,
+    }))
+}
+
+/// `GET /v1/audit/{id}` → 200 one entry / 404 when no entry has that id
+/// (never written, or purged by the retention window).
+pub async fn get_audit(
+    State(state): State<ServerState>,
+    Path(id): Path<String>,
+) -> Result<Json<AuditEntry>, ServeError> {
+    state
+        .history()
+        .get_audit(&id)
+        .await
+        .map_err(|e| ServeError::Internal(e.to_string()))?
+        .map(Json)
+        .ok_or(ServeError::NotFound)
 }
 
 #[cfg(test)]

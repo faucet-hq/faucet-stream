@@ -162,8 +162,19 @@ are tracked in the roadmap epic (search the `epic` label).
 - **Independent crate versions.** Connector crates version independently on
   crates.io, so `faucet-source-rest` and `faucet-sink-bigquery` may sit at
   different versions. Per-crate tags use the form `<crate>-v<X.Y.Z>` (e.g.
-  `faucet-source-rest-v0.2.0`); the repo-level `vX.Y.Z` tags track the overall
-  release line.
+  `faucet-source-rest-v0.2.0`).
+- **`faucet-cli` is the product version.** The prebuilt binaries, container
+  images, Helm chart and Homebrew formula are all `faucet-cli` releases, so
+  `faucet-cli` is bumped whenever a crate it builds in is bumped (every
+  workspace crate reachable from its `full` feature): at least the highest
+  bump among those crates, a patch for fixes and a minor for features. A
+  release PR that changes shipped code therefore always releases `faucet-cli`,
+  and the binaries never lag crates.io. A major bump of a crate it builds in
+  stops the release PR job for the maintainer to decide. Internal requirements
+  stay major-only (`version = "1"`); the bump is done by
+  `scripts/release-cli-bump.py` on the release PR, not by tightening them. The
+  umbrella `faucet-stream` crate is not bumped this way: it ships source only,
+  and its major-only requirements already resolve to the newest connectors.
 - **Changelog.** Notable changes are recorded in [CHANGELOG.md](./CHANGELOG.md).
   release-plz appends a per-crate section every time it opens a release PR,
   reading the commit log via git-cliff internals; `cliff.toml` is retained for
@@ -187,7 +198,9 @@ The default release path is automated by [release-plz](https://release-plz.dev/)
    tag and opens (or updates) a `chore: release` PR that:
    - bumps the version of every crate with qualifying commits,
    - prepends a per-crate section to `CHANGELOG.md`,
-   - leaves the other 44 crates untouched.
+   - bumps `faucet-cli` when a crate it builds in is bumped, listing those
+     crates under `### Dependencies` in its changelog section,
+   - leaves the other crates untouched.
 2. **Review the release PR** like any other change. Edit the changelog text if
    you want different wording; the version bumps follow SemVer from the commit
    prefixes (`feat` → minor, `fix` / `perf` → patch, anything tagged
@@ -195,8 +208,12 @@ The default release path is automated by [release-plz](https://release-plz.dev/)
 3. **Merge the release PR.** release-plz then publishes the bumped crates to
    crates.io in dependency order (`faucet-core` and the `faucet-common-*` crates
    before connectors before `faucet-stream` and `faucet-cli`), waits for the
-   sparse index to propagate between dependents, creates per-crate GitHub
-   releases, and pushes the `<crate>-v<X.Y.Z>` tags.
+   sparse index to propagate between dependents, pushes the
+   `<crate>-v<X.Y.Z>` tags, and creates one GitHub release, `faucet-cli`'s. The
+   job then rewrites that release's notes: `faucet-cli`'s changelog section
+   followed by a table of every crate the release published, with links to
+   each crate's `CHANGELOG.md` at its tag and to crates.io. Older per-crate
+   GitHub releases are kept.
 4. **Approve the deployment.** Publishing jobs run in the protected `release`
    environment and wait for a required reviewer to approve them in the Actions
    tab. That applies to the crates.io publish (only on a release commit:
@@ -219,7 +236,12 @@ for the crates it was asked to publish (both call `scripts/add-crate-team.sh`).
 **Manual fallback.** `.github/workflows/release.yml` (`Release (manual fallback)`)
 is kept as a `workflow_dispatch` workflow for ad-hoc / bulk re-publishes (e.g.
 after a registry incident, or to re-publish all 46 crates from a known-good
-revision). Day-to-day releases should go through release-plz.
+revision). Day-to-day releases should go through release-plz. It creates no
+GitHub release, and `release-binaries.yml` only uploads to an existing one: after
+a manual publish of `faucet-cli`, create the `faucet-cli-vX.Y.Z` release by hand
+(`gh release create faucet-cli-vX.Y.Z --notes-file <(scripts/release-notes.py --sha <commit>)`),
+then dispatch `release-binaries.yml` with that `tag` if the tag push did not
+start it.
 
 **Recovering a stalled release.** If the publish job dies mid-release, the
 release commit's push is consumed and no new release PR appears while `main`'s

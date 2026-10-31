@@ -78,6 +78,12 @@ paths:
         - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 500 } }
         - { name: cursor, in: query, schema: { type: string }, description: "The previous page's `next_cursor` (`<submitted_at>~<run_id>`; a bare run_id is still accepted)." }
         - { name: tenant, in: query, schema: { type: string }, description: "Only runs started for this tenant (#709). A tenant-scoped principal always sees only its own tenant; naming another is a 404." }
+        - { name: submitted_by, in: query, schema: { type: string }, description: "Only runs this principal submitted (#998), exact match on `RunRecord.submitted_by`. Runs recorded before the field existed have no submitter and never match." }
+        - { name: mine, in: query, schema: { type: boolean, default: false }, description: "`true`: only runs the caller submitted — `submitted_by` set to the caller's own principal (#998). Setting both `mine` and `submitted_by` is a 400." }
+        - { name: dataset_id, in: query, schema: { type: string, pattern: "^[A-Za-z0-9-]{1,64}$" }, description: "Only runs one of whose invocations wrote this catalog dataset (#998): the `usage.dataset_id` its usage record names (recorded when the catalog is active). Anything but letters, digits and `-` is a 400. Matches only that usage field — the same text in a label or an error does not count." }
+        - { name: name_contains, in: query, schema: { type: string }, description: "Only runs whose title contains this text, case-sensitively (#998): the run's `name`, or its `pipeline` label when it has no name. `%` and `_` are plain characters." }
+        - { name: pool, in: query, schema: { type: string }, description: "Only runs in this execution pool (#957, #998); a run recorded before pools existed is in `default`. An invalid pool name is a 400." }
+        - { name: counts, in: query, schema: { type: boolean, default: false }, description: "`true`: also return `counts`, the per-status totals over the whole filter (#998). Off by default, since counting reads every matching run." }
         - name: label
           in: query
           style: form
@@ -99,7 +105,7 @@ paths:
             repeatable `label=` form.
       responses:
         "200":
-          description: A page of runs, newest first.
+          description: A page of runs, newest first, plus exact per-status counts over the whole filter when `counts=true`.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ListResponse" }
@@ -107,7 +113,8 @@ paths:
           description: >-
             An unknown query parameter (a typo such as `lables` is refused
             rather than returning an unfiltered list), an unknown status, an
-            empty label key, or more than 10 label filters.
+            empty label key, more than 10 label filters, an invalid `pool`,
+            or both `mine` and `submitted_by`.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -190,6 +197,37 @@ paths:
         "404": { $ref: "#/components/responses/Error" }
         "409": { description: The run has not finished yet }
         "422": { description: The run's config is not stored and none was supplied, or it recorded no invocation ids }
+  /v1/runs/{id}/config:
+    get:
+      summary: A run's stored config
+      description: >
+        The config the run was submitted with, as the server stored it (#998).
+        Only clustered runs store one; any other run answers 404. An unscoped
+        admin gets the body as stored; every other caller gets it re-rendered
+        with every value under a credential-looking key (`password`, `token`,
+        `secret`, `key`, …) replaced by `***` — `${…}` references are kept, as
+        they name a secret rather than hold it. Secrets the server resolved
+        are masked for everyone. Sealed secret params stay `${sealed:N}`
+        tokens. Requires `RunRead`; audited as `run.config`. A tenant-scoped
+        principal sees only its own tenant's runs (another tenant's is a 404).
+      operationId: getRunConfig
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The stored config.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [format, body, redacted]
+                properties:
+                  format: { type: string, enum: [yaml, json] }
+                  body: { type: string }
+                  redacted: { type: boolean, description: Whether any value was masked. }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { description: Principal's role lacks the RunRead permission }
+        "404": { description: Unknown run, another tenant's run, or no config stored for it }
   /v1/runs/{id}/logs:
     get:
       summary: Stream a run's logs (SSE), or read persisted logs
@@ -285,6 +323,32 @@ paths:
           content: { application/json: { schema: { type: object } } }
         "401": { description: Missing or invalid bearer token }
         "404": { description: Unknown kind or name }
+  /v1/triggers:
+    get:
+      summary: List the configured triggers
+      description: >
+        Every trigger in the `--triggers` file, enabled or not, in file order,
+        with its live health and the fires and errors counted since the server
+        started (#998). Store and queue addresses are not listed (they can
+        carry credentials); a config is named by its file name. A server
+        started without `--triggers` lists none. Requires `StatusRead`
+        (viewer+) and the `triggers` Cargo feature; audited as `trigger.list`
+        on denial.
+      operationId: listTriggers
+      responses:
+        "200":
+          description: The triggers.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [triggers]
+                properties:
+                  triggers:
+                    type: array
+                    items: { $ref: "#/components/schemas/TriggerInfo" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { description: Principal's role lacks the StatusRead permission, or a tenant-scoped principal }
   /v1/triggers/{name}:
     post:
       summary: Fire a named webhook trigger
@@ -1090,6 +1154,31 @@ paths:
                 items: { $ref: "#/components/schemas/ChangeRequest" }
         "400": { $ref: "#/components/responses/Error" }
         "401": { $ref: "#/components/responses/Error" }
+  /v1/changes/counts:
+    get:
+      summary: Count change requests by status
+      description: >
+        Exact per-status totals over every request the filters match (#998);
+        a pending request past its window is expired first, so it counts as
+        `expired`. Requires `ChangeRead` (viewer).
+      operationId: countChanges
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: kind, in: query, required: false, schema: { type: string, enum: [run, template_register, template_launch, template_delete, template_deprecate] } }
+        - { name: requester, in: query, required: false, schema: { type: string } }
+        - { name: tenant, in: query, required: false, schema: { type: string }, description: "Only requests for this tenant (#709); forced for a tenant-scoped principal." }
+      responses:
+        "200":
+          description: The counts.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [counts]
+                properties:
+                  counts: { $ref: "#/components/schemas/StatusCounts" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
   /v1/changes/{id}:
     get:
       summary: Get a change request
@@ -1168,6 +1257,48 @@ paths:
         "403": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
         "409": { description: The request is not pending }
+  /v1/overview:
+    get:
+      summary: Fleet overview
+      description: >
+        Trends over the run history for the console's Overview page (#1006):
+        run outcomes, records written and rows not written (from each
+        invocation's row accounting) per UTC bucket, the pipelines with the
+        highest failure rate and the slowest p95 invocation time, estimated
+        cost from usage records, catalog freshness, and what needs attention.
+        The SQL history backends group in the database; the p95 is computed
+        over the newest 10,000 finished invocations in the window
+        (`runs.duration_sample`). A section is left out when its feature is
+        not built in or not in use: `cost` without usage records (the
+        `catalog` feature), `freshness` without catalogued datasets or for a
+        tenant-scoped principal, each `attention` group without its feature
+        (`unhealthy_triggers` without `--triggers`, `failing_templates`
+        without templates, `connections_needing_reauth` without tenants,
+        `pending_changes` when approvals are off and none are pending).
+        Requires `RunRead` (viewer); a tenant-scoped principal sees only its
+        tenant's runs. Audited as `overview.get`.
+      operationId: getOverview
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: since, in: query, required: false, schema: { type: string, default: 7d }, description: "A duration back from `until` (`30m`, `24h`, `7d`, `2w`) or an RFC 3339 instant." }
+        - { name: until, in: query, required: false, schema: { type: string, format: date-time }, description: "End of the window (exclusive); default now." }
+        - { name: bucket, in: query, required: false, schema: { type: string, enum: [hour, day] }, description: "Series bucket; default `hour` up to three days, else `day`. At most 1,000 buckets." }
+        - { name: pipeline, in: query, required: false, schema: { type: string }, description: "Only runs with this name." }
+        - { name: pool, in: query, required: false, schema: { type: string }, description: "Only runs in this execution pool." }
+        - { name: label, in: query, required: false, schema: { type: array, items: { type: string } }, style: form, explode: true, description: "`key:value` or `key`; repeatable, ANDed (as on `GET /v1/runs`)." }
+        - { name: labels, in: query, required: false, schema: { type: string }, description: "Comma-separated form of `label`." }
+        - { name: tenant, in: query, required: false, schema: { type: string }, description: "Only runs for this tenant; forced for a tenant-scoped principal." }
+        - { name: stale_after, in: query, required: false, schema: { type: string, default: 24h }, description: "A dataset with no successful run for this long is stale." }
+        - { name: top, in: query, required: false, schema: { type: integer, default: 10, minimum: 1, maximum: 50 }, description: "Entries per top-N list." }
+      responses:
+        "200":
+          description: The aggregates.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Overview" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { description: A tenant-scoped principal named another tenant }
   /v1/usage:
     get:
       summary: Cost & usage report
@@ -2419,6 +2550,35 @@ paths:
         "404": { $ref: "#/components/responses/Error" }
         "422": { $ref: "#/components/responses/Error" }
   /v1/templates/{id}/runs:
+    get:
+      summary: Runs started from a template
+      description: >
+        The runs labelled `template: <id>` (#998), newest first and paged like
+        `GET /v1/runs`, with exact per-status `counts` when `counts=true`. 404 for an id that was
+        never registered. A tenant-scoped principal sees only its own tenant's
+        runs. Requires `TemplateRead`; audited as `template.runs` on denial.
+      operationId: listTemplateRuns
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 500 } }
+        - { name: cursor, in: query, schema: { type: string }, description: "The previous page's `next_cursor`." }
+        - { name: counts, in: query, schema: { type: boolean, default: false }, description: "`true`: also return per-status `counts`." }
+      responses:
+        "200":
+          description: The template's runs.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [runs]
+                properties:
+                  runs: { type: array, items: { $ref: "#/components/schemas/RunRecord" } }
+                  next_cursor: { type: string }
+                  counts: { type: object, additionalProperties: { type: integer } }
+        "400": { description: Unknown query parameter }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { description: Principal's role lacks the TemplateRead permission }
+        "404": { $ref: "#/components/responses/Error" }
     post:
       summary: Trigger a run from a template (a source template composed with a sink, or a pipeline)
       description: >
@@ -2521,6 +2681,8 @@ paths:
         - { name: tenant, in: query, required: false, schema: { type: string }, description: "Only actions taken for this tenant (#709)." }
         - { name: since, in: query, required: false, schema: { type: string, format: date-time } }
         - { name: until, in: query, required: false, schema: { type: string, format: date-time } }
+        - { name: result, in: query, required: false, schema: { type: string }, description: "Only entries with this outcome: `ok`, `denied`, … (#998)." }
+        - { name: before, in: query, required: false, schema: { type: string }, description: "Page cursor (#998): the previous page's `next_before` — entries older than the entry with this id. An id no longer stored yields an empty page." }
         - { name: limit, in: query, required: false, schema: { type: integer, default: 100, maximum: 1000 } }
       responses:
         "200":
@@ -2533,9 +2695,30 @@ paths:
                   entries:
                     type: array
                     items: { $ref: "#/components/schemas/AuditEntry" }
+                  next_before: { type: string, description: "Pass as `before` for the next (older) page; absent when the page is not full." }
         "400": { description: Malformed `since` / `until` timestamp }
         "401": { description: Missing or invalid bearer token }
         "403": { description: Principal's role lacks the AuditRead permission }
+  /v1/audit/{id}:
+    get:
+      summary: One audit entry
+      description: >
+        The audit entry with this id (#998), for a deep link to an entry older
+        than the listed page. 404 once the entry is purged by the run-retention
+        window. Requires `AuditRead` (admin role).
+      operationId: getAuditEntry
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The entry.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuditEntry" }
+        "401": { description: Missing or invalid bearer token }
+        "403": { description: Principal's role lacks the AuditRead permission }
+        "404": { description: No entry with that id }
   /v1/reload:
     post:
       summary: Hot-reload the server's --default-config merge base (admin-only)
@@ -2557,6 +2740,7 @@ paths:
                 properties:
                   reloaded: { type: boolean }
                   path: { type: string }
+                  loaded_at: { type: string, format: date-time, description: "When the merge base now in use was loaded (#998)." }
                   reason: { type: string }
         "401": { description: Missing or invalid bearer token }
         "403": { description: Principal's role lacks the Reload permission }
@@ -3049,6 +3233,8 @@ components:
         host_access: { type: boolean, description: "The config came from the server's --triggers file, so its SQL connectors are not sandboxed (#862). Absent otherwise." }
         caller_config: { type: boolean, description: "The request carried the config, so its HTTP requests and redirect hops are checked against the caller reference policy wherever the run executes (#881). Absent otherwise." }
         pool: { type: string, default: default, description: "The execution pool the run belongs to (#957): only a replica serving it claims the run, its shards and its re-claims. Runs recorded before pools existed read as `default`." }
+        submitted_by: { type: string, description: "Who submitted the run (#998): the authenticated principal the `run.submit` audit entry names — `trigger:<name>` for a trigger, the requester for an approved change request, `anonymous` under `--no-auth`, `token` for the single `--auth-token`. Set by the server; a request cannot supply it. Absent on runs recorded before the field existed." }
+        dlq_location: { type: string, description: "Where the run's dead-letter queue writes (#998): the `path` of its `dlq:` sink as configured at submit, when that sink writes local files (`file`, `jsonl`) — the `location` `POST /v1/dlq/inspect` takes. Set by the server; absent without a file DLQ." }
         invocations:
           type: array
           items: { $ref: "#/components/schemas/InvocationRecord" }
@@ -3093,6 +3279,7 @@ components:
           type: array
           items: { $ref: "#/components/schemas/RunRecord" }
         next_cursor: { type: string, nullable: true }
+        counts: { $ref: "#/components/schemas/StatusCounts", description: "Present only when the request set `counts=true`." }
       example:
         runs:
         - run_id: run_01HZY8K3QK7
@@ -3113,6 +3300,34 @@ components:
             key: value
           callback: {}
         next_cursor: example
+        counts:
+          completed: 41
+          failed: 2
+          running: 1
+    TriggerInfo:
+      type: object
+      description: One configured trigger as `GET /v1/triggers` lists it (#998).
+      required: [name, type, enabled, healthy, consecutive_failures, fired_total, errors_total]
+      properties:
+        name: { type: string }
+        type: { type: string, enum: [object_arrival, webhook, queue_depth, schedule] }
+        enabled: { type: boolean }
+        healthy: { type: boolean, description: "Live health; a disabled trigger runs no watcher and reads healthy." }
+        consecutive_failures: { type: integer }
+        last_fire: { type: string, format: date-time, description: Last fire since the server started. }
+        fired_total: { type: integer, description: Fires since the server started. }
+        errors_total: { type: integer, description: Failed polls and fires since the server started. }
+        methods: { type: array, items: { type: string }, description: "Webhook: the accepted HTTP methods." }
+        debounce_secs: { type: integer, description: "Webhook: the leading-edge debounce window." }
+        cron: { type: string, description: "Schedule: the cron expression." }
+        timezone: { type: string, description: "Schedule: the cron's timezone." }
+        poll_interval_secs: { type: integer, description: "Object arrival / queue depth: seconds between polls." }
+        threshold: { type: integer, description: "Queue depth: the depth that fires." }
+        template: { type: string, description: "The template it triggers, `id` or `id@version`." }
+        config: { type: string, description: "The config it runs: the file's name, or `inline`." }
+        tenants:
+          description: "The tenants a fire fans out to: `all` or a list of ids."
+          oneOf: [{ type: string }, { type: array, items: { type: string } }]
     AuditEntry:
       type: object
       required: [id, timestamp, principal, role, action, result]
@@ -3521,6 +3736,176 @@ components:
         cost: { type: number }
         hosted_equivalent: { type: number }
         not_reported: { type: array, items: { type: string } }
+    Overview:
+      type: object
+      required: [since, until, bucket, runs, records, governance, attention]
+      properties:
+        since: { type: string, format: date-time }
+        until: { type: string, format: date-time }
+        bucket: { type: string, enum: [hour, day] }
+        runs:
+          type: object
+          required: [total, by_status, series, failure_rate_by_pipeline, slowest, duration_sample, queued, running]
+          properties:
+            total: { type: integer, description: Runs submitted in the window. }
+            by_status: { type: object, additionalProperties: { type: integer } }
+            series:
+              type: array
+              items:
+                type: object
+                required: [bucket_start, succeeded, failed, cancelled]
+                properties:
+                  bucket_start: { type: string, format: date-time }
+                  succeeded: { type: integer }
+                  failed: { type: integer }
+                  cancelled: { type: integer }
+            failure_rate_by_pipeline:
+              type: array
+              items:
+                type: object
+                required: [pipeline, runs, failed, rate]
+                properties:
+                  pipeline: { type: string, description: The run name; empty for runs without one. }
+                  runs: { type: integer, description: Finished runs. }
+                  failed: { type: integer }
+                  rate: { type: number }
+            slowest:
+              type: array
+              items:
+                type: object
+                required: [pipeline, p95_ms, runs]
+                properties:
+                  pipeline: { type: string }
+                  p95_ms: { type: integer }
+                  runs: { type: integer, description: Invocations in the sample. }
+            duration_sample:
+              type: object
+              required: [invocations, truncated]
+              properties:
+                invocations: { type: integer }
+                truncated: { type: boolean }
+            queued: { type: integer, description: Queued or pending now. }
+            running: { type: integer, description: Running or sharded now. }
+        records:
+          type: object
+          required: [total, series, top_pipelines]
+          properties:
+            total: { type: integer }
+            series:
+              type: array
+              items:
+                type: object
+                required: [bucket_start, written]
+                properties:
+                  bucket_start: { type: string, format: date-time }
+                  written: { type: integer }
+            top_pipelines:
+              type: array
+              items:
+                type: object
+                required: [pipeline, written]
+                properties:
+                  pipeline: { type: string }
+                  written: { type: integer }
+        governance:
+          type: object
+          required: [totals, series]
+          properties:
+            totals: { $ref: "#/components/schemas/OverviewGovernanceCounts" }
+            series:
+              type: array
+              items:
+                allOf:
+                  - $ref: "#/components/schemas/OverviewGovernanceCounts"
+                  - type: object
+                    required: [bucket_start]
+                    properties:
+                      bucket_start: { type: string, format: date-time }
+        cost:
+          type: object
+          required: [currency, invocations, estimated, hosted_equivalent, series, by_pipeline]
+          properties:
+            currency: { type: string, description: The currency most invocations were priced in. }
+            invocations: { type: integer }
+            estimated: { type: number }
+            hosted_equivalent: { type: number }
+            series:
+              type: array
+              items:
+                type: object
+                required: [bucket_start, estimated, hosted_equivalent]
+                properties:
+                  bucket_start: { type: string, format: date-time }
+                  estimated: { type: number }
+                  hosted_equivalent: { type: number }
+            by_pipeline:
+              type: array
+              items:
+                type: object
+                required: [pipeline, estimated]
+                properties:
+                  pipeline: { type: string }
+                  estimated: { type: number }
+            other_currencies: { type: array, items: { type: string } }
+        freshness:
+          type: object
+          required: [datasets, stale_before, stale_count, stale, schema_changed_count, schema_changed]
+          properties:
+            datasets: { type: integer }
+            stale_before: { type: string, format: date-time }
+            stale_count: { type: integer }
+            stale:
+              type: array
+              items:
+                type: object
+                required: [id, uri, pipeline, last_success]
+                properties:
+                  id: { type: string }
+                  uri: { type: string }
+                  pipeline: { type: string }
+                  last_success: { type: string, format: date-time }
+            schema_changed_count: { type: integer }
+            schema_changed:
+              type: array
+              items:
+                type: object
+                required: [id, uri, changes, last_changed]
+                properties:
+                  id: { type: string }
+                  uri: { type: string }
+                  changes: { type: integer }
+                  last_changed: { type: string, format: date-time }
+        attention:
+          type: object
+          properties:
+            pending_changes: { $ref: "#/components/schemas/OverviewAttentionGroup" }
+            unhealthy_triggers: { $ref: "#/components/schemas/OverviewAttentionGroup" }
+            failing_templates: { $ref: "#/components/schemas/OverviewAttentionGroup" }
+            connections_needing_reauth: { $ref: "#/components/schemas/OverviewAttentionGroup" }
+        grafana:
+          type: object
+          description: Dashboard links over the same range, by section (`runs`, `reliability`, `governance`, `cost`, `serve`); present with `--grafana-url`.
+          additionalProperties: { type: string, format: uri }
+    OverviewGovernanceCounts:
+      type: object
+      required: [filtered, quarantined, dlq, coalesced, skipped, dropped]
+      properties:
+        filtered: { type: integer, description: Rows a transform removed. }
+        quarantined: { type: integer }
+        dlq: { type: integer, description: Rows the sink failed per row, sent to the DLQ. }
+        coalesced: { type: integer }
+        skipped: { type: integer }
+        dropped: { type: integer }
+    OverviewAttentionGroup:
+      type: object
+      required: [count, more, items]
+      properties:
+        count: { type: integer }
+        more: { type: boolean, description: More exist than were read. }
+        items:
+          type: array
+          maxItems: 20
+          items: { type: object, additionalProperties: true }
     UsageReport:
       type: object
       description: An aggregation over a window, plus the total row.
@@ -4065,6 +4450,28 @@ components:
       oneOf:
         - { $ref: "#/components/schemas/VersionChannel" }
         - { type: integer, minimum: 1 }
+    StatusCounts:
+      type: object
+      description: >
+        How many records match the request's filters, per status, ignoring
+        `limit` and `cursor` (#998). Only statuses with at least one record
+        appear.
+      additionalProperties: { type: integer, minimum: 0 }
+      example: { completed: 41, failed: 2, running: 1 }
+    VersionRegistration:
+      type: object
+      description: When and by whom one template version was registered (#998).
+      required: [version, registered_at]
+      properties:
+        version: { type: integer }
+        registered_at: { type: string, format: date-time }
+        registered_by:
+          type: string
+          description: >
+            The registering principal: the HTTP / MCP principal, `sync:<origin>`
+            for a template sync, `local:<user>` (or `local`) for
+            `faucet template register`. Absent for a version recorded without
+            one.
     TemplateDetail:
       description: >
         One version, plus the template's whole release state (flattened) — so a
@@ -4073,8 +4480,12 @@ components:
         - { $ref: "#/components/schemas/TemplateSummary" }
         - { $ref: "#/components/schemas/TemplateState" }
         - type: object
-          required: [body, format, is_stable, launches]
+          required: [body, format, is_stable, launches, registrations]
           properties:
+            registrations:
+              type: array
+              description: When and by whom each stored version was registered, newest first (#998).
+              items: { $ref: "#/components/schemas/VersionRegistration" }
             body: { type: string, description: "The config document, stored verbatim (interpolation directives unresolved). Empty unless the caller is an admin with no tenant scope — see `body_withheld`." }
             body_withheld: { type: boolean, description: "Present and true when `body` was withheld because the caller is not an unscoped admin (the stored config can hold inline credentials)." }
             format: { type: string, enum: [yaml, json] }
