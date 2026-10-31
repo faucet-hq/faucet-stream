@@ -1819,3 +1819,68 @@ async fn a_template_trigger_refuses_a_sender_url_its_policy_does_not_allow() {
     let body = resp.text().await.unwrap();
     assert!(body.contains("trigger.header.x-host"), "{body}");
 }
+
+/// A failed poll is tallied once in `GET /v1/triggers`: an uncounted poll
+/// error adds one, a fire the fire path already counted adds none.
+#[tokio::test]
+async fn a_failed_poll_is_tallied_once_in_the_trigger_list() {
+    use faucet_cli::serve::triggers::watcher::{PollError, Watcher, run_supervised};
+
+    struct Failing(u32);
+    #[async_trait::async_trait]
+    impl Watcher for Failing {
+        fn name(&self) -> &str {
+            "hook"
+        }
+        fn kind(&self) -> &'static str {
+            "webhook"
+        }
+        fn poll_interval(&self) -> Duration {
+            Duration::from_millis(5)
+        }
+        async fn poll(&mut self, _: &ServerState) -> Result<bool, PollError> {
+            self.0 += 1;
+            match self.0 {
+                1 => Err(PollError::from("backend unreachable".to_string())),
+                2 => Err(PollError::fired("fire refused")),
+                _ => Ok(false),
+            }
+        }
+    }
+
+    let file: faucet_cli::serve::triggers::spec::TriggersFile = faucet_cli::yaml::from_str(
+        "version: 1\ntriggers:\n  - name: hook\n    type: webhook\n    config: { version: 1 }\n",
+    )
+    .unwrap();
+    let compiled = CompiledTriggers::compile(file).unwrap();
+    let state = build_state(&compiled);
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(run_supervised(
+        Failing(0),
+        state.clone(),
+        state.triggers().clone(),
+        shutdown.clone(),
+    ));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let row = state
+            .triggers()
+            .list()
+            .into_iter()
+            .find(|t| t.name == "hook")
+            .unwrap();
+        if row.healthy && row.errors_total > 0 || tokio::time::Instant::now() > deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    shutdown.cancel();
+    task.await.unwrap();
+    let row = state
+        .triggers()
+        .list()
+        .into_iter()
+        .find(|t| t.name == "hook")
+        .unwrap();
+    assert_eq!(row.errors_total, 1, "{row:?}");
+}
