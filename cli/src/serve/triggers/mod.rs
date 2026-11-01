@@ -10,6 +10,7 @@ pub mod compiled;
 pub mod context;
 pub mod enqueue;
 pub mod health;
+pub mod list;
 pub mod metrics;
 pub mod spec;
 pub mod watcher;

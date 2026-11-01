@@ -1,0 +1,52 @@
+/* area: operate — page layout rules only, tokens only */
+
+/* ---- runs: list ---- */
+.ru-top > *, .ru-body > * { flex: none; }
+.ru-status { display: block; min-width: 0; }
+.ru-status > summary.select { height: var(--ctl-h); padding: 0 26px 0 10px; cursor: pointer; }
+.ru-status > summary.select > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ru-status > .pop { left: 0; right: auto; min-width: 100%; }
+.ru-status .mi { padding: 0; }
+.ru-status .mi .check { width: 100%; padding: 6px 10px; }
+.filters .input input[type="datetime-local"] { color-scheme: inherit; font-size: var(--fs-sm); }
+.filters .input input[type="datetime-local"]:invalid, .filters .input input[type="datetime-local"][value=""] { color: var(--faint); }
+.active-f .chip.x { cursor: pointer; }
+.active-f .chip.x:hover { border-color: var(--line-strong); color: var(--text); }
+.list .load-more { align-self: center; margin-top: 4px; }
+
+/* ---- runs: summary ---- */
+.ru-spark svg { width: 100%; height: 40px; }
+.ru-spark { padding: 2px 0; }
+.ru-keys { display: flex; gap: 16px; flex-wrap: wrap; font-size: var(--fs-sm); }
+
+/* ---- runs: detail ---- */
+.ru-err { display: flex; align-items: flex-start; gap: 2px; margin-top: 4px; }
+.ru-err .mono { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text-2); }
+.ru-labels { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.ru-labels button.chip { cursor: pointer; }
+.ru-labels button.chip:hover { border-color: var(--line-strong); color: var(--text); }
+.ru-labels .ru-prov { color: var(--muted); }
+.ru-nowrap { white-space: nowrap; }
+.ru-sub { font-size: var(--fs-sm); }
+.ru-acct { width: 160px; }
+.ru-acct .bar { margin: 2px 0 4px; }
+.ru-acct .muted { font-size: var(--fs-sm); }
+.ru-dur { width: 90px; white-space: nowrap; }
+.ru-dur .meter { margin-top: 4px; }
+.card .select.ru-sm { height: 26px; min-width: 150px; }
+.card .h .select.ru-sm { min-width: 240px; }
+.card .select.ru-sm select { font-size: var(--fs-sm); }
+.ru-logbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.ru-logbox { max-height: calc(100vh - 340px); min-height: 160px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.ru-clip { display: inline-block; max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
+.ru-payload { display: inline-block; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
+.ru-dlqform { gap: 10px; align-items: end; }
+.ru-row { display: flex; gap: 8px; align-items: end; }
+.ru-grow { flex: 1; }
+.card .note textarea.area, .card .form textarea.area { min-height: 110px; }
+
+/* ---- overview ---- */
+.ov-att td:first-child { width: 28px; padding-right: 0; }
+.ov-att td:last-child { width: 1%; white-space: nowrap; }
+.ov-rows { padding: 6px 6px 8px; display: flex; flex-direction: column; gap: 2px; }
+.ov-checklist { display: flex; gap: 8px; flex-wrap: wrap; }

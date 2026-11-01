@@ -378,3 +378,94 @@ async fn concurrent_connects_on_a_fresh_database_all_succeed() {
         "every instance migrates the fresh database: {failures:?}"
     );
 }
+
+/// The name-substring, pool and dataset filters (#998) on the Postgres
+/// dialect: case-sensitive, wildcards as text, the dataset only in usage.
+#[tokio::test]
+async fn postgres_list_filters_match_name_pool_and_usage_dataset() {
+    let Some((_pg, url)) = postgres().await else {
+        return;
+    };
+    let h = PostgresHistory::connect(
+        &url,
+        Duration::from_secs(3600),
+        Duration::from_secs(60),
+        "pg-filters".into(),
+    )
+    .await
+    .expect("connect postgres history");
+    let p = format!("pf{}", Utc::now().timestamp_nanos_opt().unwrap_or(0));
+    let put = async |id: &str, name: &str, pool: &str, dataset: Option<&str>, label: bool| {
+        let mut r = rec(&format!("{p}-{id}"), RunStatus::Completed);
+        r.name = Some(format!("{p}-{name}"));
+        r.pool = pool.into();
+        if label {
+            r.labels.insert("dataset_id".into(), format!("{p}-ds"));
+        }
+        r.invocations
+            .push(faucet_cli::serve::history::InvocationRecord {
+                row_id: "r".into(),
+                parent_record_key: None,
+                run_id: None,
+                records_written: 1,
+                duration_ms: 0,
+                error: None,
+                usage: dataset.map(|d| faucet_cli::usage::UsageRecord {
+                    run_id: id.into(),
+                    pipeline: "x".into(),
+                    row: "r".into(),
+                    source_kind: "file".into(),
+                    sink_kind: "file".into(),
+                    dataset_id: Some(format!("{p}-{d}")),
+                    dataset_uri: None,
+                    recorded_at: Utc::now(),
+                    duration_ms: 0,
+                    failed: false,
+                    usage: Default::default(),
+                    cost: Default::default(),
+                    tenant: None,
+                }),
+                batches: None,
+                source_lag: None,
+                rows: None,
+                skipped: false,
+                status: None,
+            });
+        h.upsert(&r).await.unwrap();
+    };
+    put("a", "orders", "default", Some("ds"), false).await;
+    put("b", "Orders-50%_off", "gpu", Some("DS"), false).await;
+    put("c", "customers", "gpu", None, true).await;
+    let ids = async |f: ListFilter| {
+        let mut ids: Vec<String> = h
+            .list(&ListFilter {
+                limit: 50,
+                ..f.clone()
+            })
+            .await
+            .unwrap()
+            .runs
+            .into_iter()
+            .map(|r| r.run_id.trim_start_matches(&format!("{p}-")).to_string())
+            .collect();
+        ids.sort();
+        let counted: u64 = h.count_by_status(&f).await.unwrap().values().sum();
+        assert_eq!(counted as usize, ids.len(), "{f:?}");
+        ids
+    };
+    let named = |n: &str| ListFilter {
+        name_contains: Some(format!("{p}-{n}")),
+        ..Default::default()
+    };
+    assert_eq!(ids(named("Orders")).await, ["b"]);
+    assert_eq!(ids(named("Orders-50%_")).await, ["b"]);
+    assert!(ids(named("O_ders")).await.is_empty());
+    let mut f = named("");
+    f.pool = Some("gpu".into());
+    assert_eq!(ids(f).await, ["b", "c"]);
+    let ds = ListFilter {
+        dataset_id: Some(format!("{p}-ds")),
+        ..Default::default()
+    };
+    assert_eq!(ids(ds).await, ["a"]);
+}

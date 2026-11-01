@@ -199,7 +199,7 @@ mod tests {
         tenant: Option<&str>,
         admission: Option<crate::runtime::server::Admission>,
     ) -> Result<crate::runtime::server::replay::Record, ServeError> {
-        crate::runtime::server::replay::start(state, id, from, tenant, admission).await
+        crate::runtime::server::replay::start(state, id, from, tenant, "alice", admission).await
     }
 
     fn actor(tenant: Option<&str>) -> AuthContext {

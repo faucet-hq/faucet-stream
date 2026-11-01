@@ -18,7 +18,7 @@ const LOCAL_ZONE = (() => {
 
 /** Curated zone list for the selector (Local first, then UTC, then a spread). */
 export const TZ_OPTIONS = [
-  { value: "local", label: `Local${LOCAL_ZONE ? ` - ${LOCAL_ZONE}` : ""}` },
+  { value: "local", label: "Local" },
   { value: "UTC", label: "UTC" },
   { value: "America/Los_Angeles", label: "Los Angeles" },
   { value: "America/New_York", label: "New York" },

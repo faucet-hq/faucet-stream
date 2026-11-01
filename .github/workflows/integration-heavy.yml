@@ -18,6 +18,8 @@ env:
   RUSTFLAGS: "-C debuginfo=0"
   CARGO_NET_RETRY: "10"
   CARGO_HTTP_MULTIPLEXING: "false"
+  # Same test-thread stack as ci.yml: the scripted MSSQL CDC tests overflow 2 MiB.
+  RUST_MIN_STACK: "8388608"
   FAUCET_REQUIRE_BACKENDS: "1"
 
 permissions:

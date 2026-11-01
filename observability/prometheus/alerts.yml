@@ -28,27 +28,34 @@ groups:
             the connector error counters.
 
       - alert: FaucetNoBookmarkProgress
-        expr: faucet_pipeline_seconds_since_last_bookmark > 3600
+        expr: |
+          (time() - max by (pipeline, row) (faucet_pipeline_last_bookmark_unix_seconds)) > 3600
+            and on (pipeline, row) max by (pipeline, row) (faucet_pipeline_in_flight) > 0
         for: 10m
         labels:
           severity: warning
         annotations:
           summary: "Pipeline {{ $labels.pipeline }} bookmark stale for over 1h"
           description: >
-            No bookmark has been persisted for pipeline {{ $labels.pipeline }}
-            (row {{ $labels.row }}) in over an hour — the incremental sync is
-            not making durable progress.
+            Pipeline {{ $labels.pipeline }} (row {{ $labels.row }}) is running,
+            but its newest bookmarked position is over an hour old — the
+            incremental sync is not making durable progress. Only pipelines
+            with a timestamp bookmark report it; a pipeline between scheduled
+            runs is not checked.
 
       - alert: FaucetNoBookmarkProgressCritical
-        expr: faucet_pipeline_seconds_since_last_bookmark > 21600
+        expr: |
+          (time() - max by (pipeline, row) (faucet_pipeline_last_bookmark_unix_seconds)) > 21600
+            and on (pipeline, row) max by (pipeline, row) (faucet_pipeline_in_flight) > 0
         for: 10m
         labels:
           severity: critical
         annotations:
           summary: "Pipeline {{ $labels.pipeline }} bookmark stale for over 6h"
           description: >
-            No durable progress for six hours. Downstream data is stale;
-            investigate the source connection and the state store.
+            No durable progress for six hours while the pipeline runs.
+            Downstream data is stale; investigate the source connection and
+            the state store.
 
       - alert: FaucetSlaViolations
         expr: increase(faucet_pipeline_sla_violations_total[1h]) > 0
@@ -121,6 +128,57 @@ groups:
             The resilience circuit breaker has been open for 5 minutes —
             consecutive fully-failed pages exceeded the configured threshold
             and writes are suspended.
+
+  - name: faucet-governance
+    rules:
+      - alert: FaucetRowsUnaccounted
+        expr: increase(faucet_rows_unaccounted_total[1h]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Sink {{ $labels.connector }} lost rows without saying why on pipeline {{ $labels.pipeline }}"
+          description: >
+            A sink accepted fewer rows than it was offered and reported no
+            coalesced, skipped or failed rows to explain the gap (row
+            {{ $labels.row }}). The page failed before its bookmark advanced,
+            but the sink is miscounting or silently dropping rows; check its
+            connector version and the run's error.
+
+      - alert: FaucetPolicyRuntimeViolations
+        expr: increase(faucet_policy_violations_total{phase="runtime"}[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Data-flow policy rule {{ $labels.rule }} caught data at runtime on pipeline {{ $labels.pipeline }}"
+          description: >
+            The runtime policy backstop found labelled data the static check
+            did not predict ({{ $labels.action }}). The rows were refused or
+            quarantined; add a contract or sample so `faucet policy` sees the
+            column before the run.
+
+      - alert: FaucetVerifyDifferences
+        expr: increase(faucet_verify_differences_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Destination differs from the source on pipeline {{ $labels.pipeline }} ({{ $labels.kind }})"
+          description: >
+            `faucet verify` found keys whose destination rows are missing,
+            extra, changed or duplicated (row {{ $labels.row }}). Inspect with
+            `faucet verify --json`; repair with `faucet verify --repair`.
+
+  - name: faucet-cost
+    rules:
+      - alert: FaucetBudgetExceeded
+        expr: increase(faucet_budget_exceeded_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pipeline {{ $labels.pipeline }} hit its {{ $labels.budget }} budget"
+          description: >
+            A run of row {{ $labels.row }} was stopped by its `budget:`
+            ceiling. The page that would have crossed it was not written and
+            the bookmark did not advance; raise the ceiling or narrow the run.
 
   - name: faucet-logs
     rules:
@@ -250,6 +308,40 @@ groups:
             serve instance was running. With catch_up (the default) only the
             latest missed tick ran; check whether the skipped windows need a
             backfill.
+
+      - alert: FaucetServeConnectionsNeedReauth
+        expr: max(faucet_serve_connections{status="needs_reauth"}) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Tenant connections need re-authorization"
+          description: >
+            {{ $value }} tenant connection(s) were revoked by their provider.
+            Runs that reference them are refused until the tenant reconnects
+            through the connect flow.
+
+      - alert: FaucetServeTemplateSyncFailing
+        expr: increase(faucet_serve_template_sync_runs_total{outcome="error"}[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Template sync from origin {{ $labels.origin }} is failing"
+          description: >
+            Pulls from this origin failed in the last hour, so the registry
+            no longer matches it. Check the origin's credentials and
+            reachability; `faucet template sync --dry-run` shows the error.
+
+      - alert: FaucetNotificationsFailing
+        expr: increase(faucet_notifications_sent_total{outcome="error"}[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Notifications to {{ $labels.channel }} are failing ({{ $labels.event }})"
+          description: >
+            Deliveries to this channel failed in the last hour, so on-call is
+            not hearing about {{ $labels.event }} events. Check the channel's
+            webhook URL or token.
 
   - name: faucet-telemetry
     rules:

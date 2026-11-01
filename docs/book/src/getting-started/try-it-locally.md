@@ -68,7 +68,19 @@ Everything below runs against generated CSV data in `faucet-local-demo/`:
 - **Templates**: a parameterized config registered into the template registry,
   then walked through the release lifecycle — `--launch`, `promote` up the
   channels, `launch` from a channel, `rollback`, `deprecate` — plus a run
-  triggered by id + `--param`.
+  triggered by id + `--param`. Every template the demo launches carries a small
+  `tests:` bundle, because a version needs passing tests before it can be
+  launched or put on a channel (see
+  [Template tests and labels](../cookbook/templates.md#template-tests-and-labels)).
+  One version's fixture fails on purpose, so the registry also shows a version
+  that cannot be launched, next to a draft and a deprecated template. A source
+  template and a sink template name each other in their bundles: the first one
+  registered is red until the second exists, and registering the second
+  re-tests it.
+
+The script prints a summary of passed and failed steps and exits non-zero
+when any step failed, listing them. With the console left running, the list
+is printed again when you stop it with Ctrl+C.
 
 With `--full`, the embedded DuckDB **SQL transform** step is included too.
 

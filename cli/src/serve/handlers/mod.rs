@@ -10,6 +10,7 @@ pub mod health;
 #[cfg(feature = "catalog")]
 pub mod local_outputs;
 pub mod logs;
+pub mod overview;
 pub mod plan;
 #[cfg(feature = "catalog")]
 pub mod preview;

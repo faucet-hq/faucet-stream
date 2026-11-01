@@ -156,6 +156,7 @@ pub async fn run_supervised<W: Watcher>(
                         tracing::warn!(trigger = watcher.name(), error = %e, "trigger poll failed");
                         if !e.counted {
                             metrics::error(watcher.name(), watcher.kind());
+                            health.note_error(watcher.name());
                         }
                         health.record_err(watcher.name(), e.message, UNHEALTHY_THRESHOLD);
                         if failures >= UNHEALTHY_THRESHOLD {

@@ -56,6 +56,7 @@ fn test_config_with(listen: &str, concurrent: usize, queued: usize) -> ServeConf
         vault_previous_key: Vec::new(),
         connect_providers: None,
         allow_subprocess_connectors: false,
+        grafana_url: None,
         references: Default::default(),
         pools: Default::default(),
     };

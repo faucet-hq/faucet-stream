@@ -362,6 +362,8 @@ async fn audited(state: &ServerState, action: &str) -> Vec<crate::serve::history
             action: Some(action.into()),
             since: None,
             until: None,
+            result: None,
+            before: None,
             limit: 100,
         })
         .await

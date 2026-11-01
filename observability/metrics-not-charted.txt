@@ -1,0 +1,6 @@
+# Metrics the code emits that no dashboard in observability/grafana/ shows.
+#
+# One `<metric>: <reason>` per line. `cli/tests/observability_artifacts.rs`
+# fails when an emitted metric is on no dashboard and not listed here, and
+# when a listed metric is charted or no longer emitted. Chart a metric unless
+# it genuinely has no place on a dashboard.

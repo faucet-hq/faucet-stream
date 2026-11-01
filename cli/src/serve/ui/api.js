@@ -1,3 +1,4 @@
+import { toast as showToast } from "./page.js";
 // Centralized API client: base path, bearer token (localStorage), error envelope.
 const TOKEN_KEY = "faucet.token";
 
@@ -68,12 +69,8 @@ export async function authOk() {
   return resp.status !== 401;
 }
 
+/** Back-compat shim: `toast(message, "info"|"success"|"error"|"warn")`. */
 export function toast(message, kind = "info") {
-  const host = document.getElementById("toasts");
-  if (!host) return;
-  const el = document.createElement("div");
-  el.className = `toast toast-${kind}`;
-  el.textContent = message;
-  host.appendChild(el);
-  setTimeout(() => el.remove(), 5000);
+  const tone = { success: "ok", error: "bad", info: "info", warn: "warn", ok: "ok", bad: "bad" }[kind] || "info";
+  showToast(message, tone);
 }

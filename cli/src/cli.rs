@@ -2454,6 +2454,11 @@ pub struct ServeArgs {
     /// tenant are refused regardless; registered templates are always allowed.
     #[arg(long)]
     pub allow_subprocess_connectors: bool,
+    /// Base URL of a Grafana that has faucet's dashboards imported
+    /// (`observability/grafana/`). The console's Overview page links each
+    /// section to the matching dashboard, over the same time range.
+    #[arg(long, value_name = "URL", env = "FAUCET_SERVE_GRAFANA_URL")]
+    pub grafana_url: Option<String>,
     /// What a config submitted over HTTP or MCP may reach (#881): the
     /// `--allow-*` reference-policy flags.
     #[command(flatten)]

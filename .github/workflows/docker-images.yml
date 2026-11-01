@@ -9,9 +9,9 @@ name: Docker images
 #   - manual (workflow_dispatch), optional push: `:<profile>-<sha>` only (the
 #     chart as `<appVersion>-g<sha>`)
 #   - on a published `faucet-cli-v*` GitHub release (pushes :<profile> and
-#     :<version>-<profile>). release-plz publishes a GitHub release per crate
-#     tag, so both jobs gate on the faucet-cli tag to build ONCE per app
-#     release rather than once per crate.
+#     :<version>-<profile>). release-plz publishes only the faucet-cli GitHub
+#     release (#1005); both jobs still gate on the faucet-cli tag so a release
+#     created by hand for another crate cannot trigger a build.
 #   - manual with `release: X.Y.Z`: publishes THIS commit's build under that
 #     release's tags (`:<X.Y.Z>-<profile>`, and `:latest` / `:<X.Y.Z>` for
 #     full), so a release can be re-imaged after an image-only fix (#845). It
@@ -53,10 +53,10 @@ jobs:
       # Keyless signing + build provenance (#789 SUPPLY-05).
       id-token: write
       attestations: write
-    # release-plz publishes one GitHub release per crate tag, but the images
-    # should build ONCE per app release. Gate to the faucet-cli release (or a
-    # manual dispatch) so a `faucet-source-*` / `faucet-sink-*` crate tag does
-    # not trigger a full image build. Mirrors the `helm` job's guard below.
+    # The images build ONCE per app release. release-plz creates only the
+    # faucet-cli GitHub release (#1005); the gate keeps any other release (or a
+    # hand-made one for a `faucet-source-*` / `faucet-sink-*` crate) from
+    # triggering a full image build. Mirrors the `helm` job's guard below.
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref_name, 'faucet-cli-v')
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     # A full build takes about an hour; anything far past that is a hang.

@@ -1,7 +1,7 @@
 {
   "uid": "faucet-reliability",
   "title": "faucet · Reliability & data quality",
-  "description": "Retries, circuit breakers, DLQ traffic, quality/contract/drift/masking counters, SLA and backfill progress, source throttling.",
+  "description": "Retries, circuit breaker, DLQ, poison rows, SLA, backfill, source lag, batch outcomes, throttling, log shipping, lineage and notifications. Data-quality and governance panels live on the faucet-governance dashboard.",
   "tags": [
     "faucet",
     "reliability",
@@ -70,12 +70,24 @@
   },
   "panels": [
     {
+      "type": "row",
+      "title": "Resilience & DLQ",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
       "type": "timeseries",
       "title": "Resilience retries (by op & class)",
       "gridPos": {
         "x": 0,
-        "y": 0,
-        "w": 12,
+        "y": 1,
+        "w": 8,
         "h": 8
       },
       "datasource": {
@@ -103,11 +115,43 @@
     },
     {
       "type": "timeseries",
+      "title": "Retry sleep p95 (by op)",
+      "gridPos": {
+        "x": 8,
+        "y": 1,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (pipeline, op, le) (rate(faucet_resilience_retry_sleep_seconds_bucket{pipeline=~\"$pipeline\"}[5m])))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "{{pipeline}} {{op}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "timeseries",
       "title": "Retry give-ups & circuit opens",
       "gridPos": {
-        "x": 12,
-        "y": 0,
-        "w": 12,
+        "x": 16,
+        "y": 1,
+        "w": 8,
         "h": 8
       },
       "datasource": {
@@ -147,7 +191,7 @@
       "title": "Circuit breaker state (1 = open)",
       "gridPos": {
         "x": 0,
-        "y": 8,
+        "y": 9,
         "w": 6,
         "h": 8
       },
@@ -201,7 +245,7 @@
       "title": "DLQ records routed / errors",
       "gridPos": {
         "x": 6,
-        "y": 8,
+        "y": 9,
         "w": 9,
         "h": 8
       },
@@ -242,7 +286,7 @@
       "title": "Poison rows (by action)",
       "gridPos": {
         "x": 15,
-        "y": 8,
+        "y": 9,
         "w": 9,
         "h": 8
       },
@@ -271,11 +315,11 @@
     },
     {
       "type": "timeseries",
-      "title": "Quality: quarantined & aborts",
+      "title": "DLQ pages (by reason)",
       "gridPos": {
         "x": 0,
-        "y": 16,
-        "w": 12,
+        "y": 17,
+        "w": 8,
         "h": 8
       },
       "datasource": {
@@ -285,26 +329,58 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (pipeline) (increase(faucet_quality_records_quarantined_total{pipeline=~\"$pipeline\"}[1h]))",
+          "expr": "sum by (pipeline, reason) (increase(faucet_sink_dlq_pages_total{pipeline=~\"$pipeline\"}[1h]))",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "legendFormat": "{{pipeline}} quarantined"
+          "legendFormat": "{{pipeline}} {{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "timeseries",
+      "title": "DLQ write / flush p95",
+      "gridPos": {
+        "x": 8,
+        "y": 17,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (pipeline, le) (rate(faucet_sink_dlq_write_duration_seconds_bucket{pipeline=~\"$pipeline\"}[5m])))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "{{pipeline}} write"
         },
         {
           "refId": "B",
-          "expr": "sum by (pipeline) (increase(faucet_quality_aborts_total{pipeline=~\"$pipeline\"}[1h]))",
+          "expr": "histogram_quantile(0.95, sum by (pipeline, le) (rate(faucet_sink_dlq_flush_duration_seconds_bucket{pipeline=~\"$pipeline\"}[5m])))",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "legendFormat": "{{pipeline}} aborts"
+          "legendFormat": "{{pipeline}} flush"
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "short"
+          "unit": "s"
         },
         "overrides": []
       },
@@ -312,11 +388,11 @@
     },
     {
       "type": "timeseries",
-      "title": "Contract violations (by rule) & aborts",
+      "title": "DLQ failure limit hits (by scope)",
       "gridPos": {
-        "x": 12,
-        "y": 16,
-        "w": 12,
+        "x": 16,
+        "y": 17,
+        "w": 8,
         "h": 8
       },
       "datasource": {
@@ -326,21 +402,12 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (pipeline, rule) (increase(faucet_contract_violations_total{pipeline=~\"$pipeline\"}[1h]))",
+          "expr": "sum by (pipeline, scope) (increase(faucet_sink_dlq_budget_exceeded_total{pipeline=~\"$pipeline\"}[1h]))",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "legendFormat": "{{pipeline}} {{rule}}"
-        },
-        {
-          "refId": "B",
-          "expr": "sum by (pipeline) (increase(faucet_contract_aborts_total{pipeline=~\"$pipeline\"}[1h]))",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "legendFormat": "{{pipeline}} aborts"
+          "legendFormat": "{{pipeline}} {{scope}}"
         }
       ],
       "fieldConfig": {
@@ -352,76 +419,24 @@
       "options": {}
     },
     {
-      "type": "timeseries",
-      "title": "Schema drift (by kind & mode)",
+      "type": "row",
+      "title": "SLA & backfill",
+      "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 24,
-        "w": 12,
-        "h": 8
+        "y": 25,
+        "w": 24,
+        "h": 1
       },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "sum by (pipeline, kind, mode) (increase(faucet_schema_drift_total{pipeline=~\"$pipeline\"}[1h]))",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "legendFormat": "{{pipeline}} {{kind}} ({{mode}})"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "options": {}
-    },
-    {
-      "type": "timeseries",
-      "title": "PII fields masked (by rule & action)",
-      "gridPos": {
-        "x": 12,
-        "y": 24,
-        "w": 12,
-        "h": 8
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "sum by (rule, action) (rate(faucet_masking_fields_total{pipeline=~\"$pipeline\"}[5m]))",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "legendFormat": "{{rule}} {{action}}"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ops"
-        },
-        "overrides": []
-      },
-      "options": {}
+      "panels": []
     },
     {
       "type": "timeseries",
       "title": "SLA violations (by kind)",
       "gridPos": {
         "x": 0,
-        "y": 32,
-        "w": 12,
+        "y": 26,
+        "w": 8,
         "h": 8
       },
       "datasource": {
@@ -449,10 +464,49 @@
     },
     {
       "type": "stat",
+      "title": "Time since last successful run",
+      "gridPos": {
+        "x": 8,
+        "y": 26,
+        "w": 4,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "time() - max by (pipeline) (faucet_pipeline_sla_last_success_unix_seconds{pipeline=~\"$pipeline\"})",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "{{pipeline}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "area"
+      }
+    },
+    {
+      "type": "stat",
       "title": "SLA volume baseline (runs)",
       "gridPos": {
         "x": 12,
-        "y": 32,
+        "y": 26,
         "w": 4,
         "h": 8
       },
@@ -491,7 +545,7 @@
       "title": "Backfill progress",
       "gridPos": {
         "x": 16,
-        "y": 32,
+        "y": 26,
         "w": 4,
         "h": 8
       },
@@ -525,7 +579,7 @@
       "title": "Backfill units (by outcome)",
       "gridPos": {
         "x": 20,
-        "y": 32,
+        "y": 26,
         "w": 4,
         "h": 8
       },
@@ -553,11 +607,23 @@
       "options": {}
     },
     {
+      "type": "row",
+      "title": "Source lag, batches & throttling",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 34,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
       "type": "timeseries",
       "title": "Source lag — bytes (#733)",
       "gridPos": {
         "x": 0,
-        "y": 40,
+        "y": 35,
         "w": 8,
         "h": 8
       },
@@ -589,7 +655,7 @@
       "title": "Source lag — events / seconds (#733)",
       "gridPos": {
         "x": 8,
-        "y": 40,
+        "y": 35,
         "w": 8,
         "h": 8
       },
@@ -626,12 +692,64 @@
       "options": {}
     },
     {
+      "type": "stat",
+      "title": "Lag gauges stale (1 = stale)",
+      "gridPos": {
+        "x": 16,
+        "y": 35,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (pipeline, row, connector) (faucet_source_lag_stale{pipeline=~\"$pipeline\"})",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "{{pipeline}} {{row}} {{connector}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "area"
+      }
+    },
+    {
       "type": "timeseries",
       "title": "Sink batch outcomes (#737)",
       "gridPos": {
-        "x": 16,
-        "y": 40,
-        "w": 8,
+        "x": 0,
+        "y": 43,
+        "w": 6,
         "h": 8
       },
       "datasource": {
@@ -661,9 +779,9 @@
       "type": "timeseries",
       "title": "Source throttling — rate-limit responses (#734)",
       "gridPos": {
-        "x": 0,
-        "y": 48,
-        "w": 8,
+        "x": 6,
+        "y": 43,
+        "w": 6,
         "h": 8
       },
       "datasource": {
@@ -693,9 +811,9 @@
       "type": "timeseries",
       "title": "Source throttling — share of time waiting (#734)",
       "gridPos": {
-        "x": 8,
-        "y": 48,
-        "w": 8,
+        "x": 12,
+        "y": 43,
+        "w": 6,
         "h": 8
       },
       "datasource": {
@@ -725,9 +843,9 @@
       "type": "timeseries",
       "title": "Source retries (by class) (#734)",
       "gridPos": {
-        "x": 16,
-        "y": 48,
-        "w": 8,
+        "x": 18,
+        "y": 43,
+        "w": 6,
         "h": 8
       },
       "datasource": {
@@ -748,6 +866,461 @@
       "fieldConfig": {
         "defaults": {
           "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "row",
+      "title": "Log shipping (#806)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 51,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "Oldest undelivered log line",
+      "gridPos": {
+        "x": 0,
+        "y": 52,
+        "w": 6,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max(faucet_logs_oldest_undelivered_seconds)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "oldest"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 900
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "area"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Log buffer (lines)",
+      "gridPos": {
+        "x": 6,
+        "y": 52,
+        "w": 6,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(faucet_logs_buffered_lines)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "buffered lines"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "timeseries",
+      "title": "Log buffer (bytes)",
+      "gridPos": {
+        "x": 12,
+        "y": 52,
+        "w": 6,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(faucet_logs_buffered_bytes)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "buffered bytes"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "timeseries",
+      "title": "Log lines shipped / dropped (by reason)",
+      "gridPos": {
+        "x": 18,
+        "y": 52,
+        "w": 6,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(faucet_logs_shipped_lines_total[5m]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "shipped"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (reason) (rate(faucet_logs_dropped_lines_total[5m]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "dropped {{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "timeseries",
+      "title": "Log export errors & local write failures (per hour)",
+      "gridPos": {
+        "x": 0,
+        "y": 60,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(faucet_logs_export_errors_total[1h]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "export errors"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(increase(faucet_logs_local_write_failures_total[1h]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "local write failures"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "timeseries",
+      "title": "OTLP export failures (by signal, per hour)",
+      "gridPos": {
+        "x": 12,
+        "y": 60,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (signal) (increase(faucet_otel_export_failures_total[1h]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "{{signal}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "row",
+      "title": "Lineage & notifications",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 68,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Lineage events (by type & outcome)",
+      "gridPos": {
+        "x": 0,
+        "y": 69,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (event_type, outcome) (increase(faucet_lineage_events_total[1h]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "{{event_type}} {{outcome}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (event_type) (increase(faucet_lineage_events_skipped_total[1h]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "{{event_type}} skipped"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "timeseries",
+      "title": "Lineage emit p95 (by type)",
+      "gridPos": {
+        "x": 8,
+        "y": 69,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (event_type, le) (rate(faucet_lineage_emit_duration_seconds_bucket[5m])))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "{{event_type}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "timeseries",
+      "title": "Lineage events dropped (by reason)",
+      "gridPos": {
+        "x": 16,
+        "y": 69,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason) (increase(faucet_lineage_dropped_total[1h]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "{{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "timeseries",
+      "title": "Notifications sent (by channel, event & outcome)",
+      "gridPos": {
+        "x": 0,
+        "y": 77,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (channel, event, outcome) (increase(faucet_notifications_sent_total[1h]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "{{channel}} {{event}} {{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "timeseries",
+      "title": "Notifications dropped (by channel & reason)",
+      "gridPos": {
+        "x": 8,
+        "y": 77,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (channel, reason) (increase(faucet_notifications_dropped_total[1h]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "{{channel}} {{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "timeseries",
+      "title": "Notification dispatch p95 (by channel)",
+      "gridPos": {
+        "x": 16,
+        "y": 77,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (channel, le) (rate(faucet_notification_dispatch_duration_seconds_bucket[5m])))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "{{channel}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
         },
         "overrides": []
       },

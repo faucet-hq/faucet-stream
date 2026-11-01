@@ -20,8 +20,125 @@ pub struct TriggerHealth {
     pub last_error: Option<String>,
 }
 
+/// One configured trigger as `GET /v1/triggers` lists it (#998): what the
+/// triggers file declares (no store or queue addresses, which can carry
+/// credentials) plus its live health and fire / error tallies since start.
+#[derive(Debug, Clone, Serialize)]
+pub struct TriggerInfo {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub enabled: bool,
+    /// Live health; a disabled trigger runs no watcher and reads healthy.
+    pub healthy: bool,
+    pub consecutive_failures: u64,
+    /// RFC 3339 time of the last fire since the server started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_fire: Option<String>,
+    /// Fires since the server started.
+    pub fired_total: u64,
+    /// Failed polls and fires since the server started.
+    pub errors_total: u64,
+    /// Webhook: the accepted HTTP methods.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub methods: Option<Vec<String>>,
+    /// Webhook: the leading-edge debounce window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debounce_secs: Option<u64>,
+    /// Schedule: the cron expression and its timezone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    /// Object arrival / queue depth: seconds between polls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll_interval_secs: Option<u64>,
+    /// Queue depth: the depth that fires.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<u64>,
+    /// The template it triggers, as `id` or `id@version`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    /// The config it runs: the file's name, or `inline`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<String>,
+    /// The tenants a fire fans out to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenants: Option<crate::serve::history::tenants::TenantSelector>,
+}
+
+impl TriggerInfo {
+    fn from_compiled(t: &CompiledTrigger) -> Self {
+        use super::spec::{PipelineRef, TriggerKind};
+        let mut info = TriggerInfo {
+            name: t.name().to_string(),
+            kind: t.kind_label().to_string(),
+            enabled: t.spec.enabled,
+            healthy: true,
+            consecutive_failures: 0,
+            last_fire: None,
+            fired_total: 0,
+            errors_total: 0,
+            methods: None,
+            debounce_secs: None,
+            cron: None,
+            timezone: None,
+            poll_interval_secs: None,
+            threshold: None,
+            template: t.spec.template.as_ref().map(|tt| match &tt.version {
+                Some(v) => format!("{}@{v}", tt.id),
+                None => tt.id.clone(),
+            }),
+            config: t.spec.config.as_ref().map(|c| match c {
+                PipelineRef::Path(p) => std::path::Path::new(p)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.clone()),
+                PipelineRef::Inline(_) => "inline".to_string(),
+            }),
+            tenants: t.spec.tenants.clone(),
+        };
+        match &t.spec.kind {
+            TriggerKind::Webhook {
+                methods,
+                debounce_secs,
+                ..
+            } => {
+                info.methods = Some(methods.clone());
+                info.debounce_secs = Some(*debounce_secs);
+            }
+            TriggerKind::Schedule { cron, timezone, .. } => {
+                info.cron = Some(cron.clone());
+                info.timezone = Some(timezone.clone());
+            }
+            TriggerKind::ObjectArrival {
+                poll_interval_secs, ..
+            } => info.poll_interval_secs = Some(*poll_interval_secs),
+            TriggerKind::QueueDepth {
+                poll_interval_secs,
+                threshold,
+                ..
+            } => {
+                info.poll_interval_secs = Some(*poll_interval_secs);
+                info.threshold = Some(*threshold);
+            }
+        }
+        info
+    }
+}
+
+/// Fires and errors counted since the server started.
+#[derive(Debug, Default, Clone, Copy)]
+struct Tally {
+    fired: u64,
+    errors: u64,
+}
+
 struct Inner {
     health: DashMap<String, TriggerHealth>,
+    /// Every configured trigger, enabled or not, in file order.
+    catalog: Vec<TriggerInfo>,
+    tally: DashMap<String, Tally>,
     /// name → compiled webhook trigger (for the webhook route handler).
     webhooks: std::collections::HashMap<String, Arc<CompiledTrigger>>,
     /// Webhook leading-edge debounce: trigger name → the last accepted fire.
@@ -68,6 +185,8 @@ impl TriggersHandle {
         Self {
             inner: Arc::new(Inner {
                 health: DashMap::new(),
+                catalog: Vec::new(),
+                tally: DashMap::new(),
                 webhooks: std::collections::HashMap::new(),
                 debounce: DashMap::new(),
             }),
@@ -100,6 +219,8 @@ impl TriggersHandle {
         Self {
             inner: Arc::new(Inner {
                 health,
+                catalog: triggers.iter().map(TriggerInfo::from_compiled).collect(),
+                tally: DashMap::new(),
                 webhooks,
                 debounce: DashMap::new(),
             }),
@@ -202,6 +323,38 @@ impl TriggersHandle {
             .collect();
         v.sort_by(|a, b| a.name.cmp(&b.name));
         v
+    }
+
+    /// Count one fire of `name` (#998).
+    pub fn note_fired(&self, name: &str) {
+        self.inner.tally.entry(name.to_string()).or_default().fired += 1;
+    }
+
+    /// Count one failed poll or fire of `name` (#998).
+    pub fn note_error(&self, name: &str) {
+        self.inner.tally.entry(name.to_string()).or_default().errors += 1;
+    }
+
+    /// Every configured trigger with its live health and tallies, in the
+    /// order of the triggers file (`GET /v1/triggers`, #998).
+    pub fn list(&self) -> Vec<TriggerInfo> {
+        self.inner
+            .catalog
+            .iter()
+            .map(|t| {
+                let mut t = t.clone();
+                if let Some(h) = self.inner.health.get(&t.name) {
+                    t.healthy = h.healthy;
+                    t.consecutive_failures = h.consecutive_failures;
+                    t.last_fire = h.last_fire.clone();
+                }
+                if let Some(c) = self.inner.tally.get(&t.name) {
+                    t.fired_total = c.fired;
+                    t.errors_total = c.errors;
+                }
+                t
+            })
+            .collect()
     }
 
     pub fn is_empty(&self) -> bool {

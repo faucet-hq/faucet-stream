@@ -163,6 +163,13 @@ mod shard_tests {
     }
 
     #[tokio::test]
+    async fn sqlite_list_filters_match_the_memory_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = backend(&url_in(dir.path()), "a", Duration::from_secs(60)).await;
+        crate::serve::history::assert_list_filters_agree(&h).await;
+    }
+
+    #[tokio::test]
     async fn insert_shards_is_idempotent_and_progress_counts() {
         let dir = tempfile::tempdir().unwrap();
         let h = backend(&url_in(dir.path()), "a", Duration::from_secs(60)).await;

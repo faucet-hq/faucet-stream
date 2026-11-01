@@ -14,7 +14,8 @@ use axum::Json;
 use axum::extract::{Extension, State};
 use serde_json::{Value, json};
 
-/// `POST /v1/reload` → 200 `{reloaded, path?}` / 422 (invalid new config).
+/// `POST /v1/reload` → 200 `{reloaded, path?, loaded_at?}` / 422 (invalid new
+/// config). `loaded_at` (#998) is when the merge base now in use was loaded.
 ///
 /// Writes a `config.reload` audit record on every outcome — this is a
 /// server-wide privileged mutation (it swaps the config merge base every later
@@ -45,6 +46,7 @@ pub async fn reload(
             Ok(Json(json!({
                 "reloaded": true,
                 "path": path.display().to_string(),
+                "loaded_at": state.default_loaded_at(),
             })))
         }
         Err(e) => {

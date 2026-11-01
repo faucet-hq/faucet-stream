@@ -34,6 +34,8 @@ struct Inner {
     default_base: RwLock<Option<Value>>,
     /// Path the default-config was loaded from, so a reload can re-read it.
     default_config_path: Option<PathBuf>,
+    /// When the current merge base was loaded (startup or the last reload).
+    default_loaded_at: RwLock<Option<chrono::DateTime<chrono::Utc>>>,
     idempotency_retention: Duration,
     probe_timeout: Duration,
     /// Default retention window (days) for local sink outputs (#587), so the
@@ -78,6 +80,8 @@ struct Inner {
     allow_subprocess_connectors: bool,
     /// What a caller-supplied config may reach (#881).
     references: Arc<crate::serve::references::ServeReferencePolicy>,
+    /// Grafana base URL the Overview page links to (`--grafana-url`).
+    grafana_url: Option<String>,
     /// Set when shutdown begins: new work is refused and `/readyz` is 503.
     draining: std::sync::atomic::AtomicBool,
     /// Clustered terminal records whose owner-fenced write failed (the
@@ -107,6 +111,7 @@ impl ServerState {
                 history,
                 log_hub,
                 log_export: Arc::new(crate::serve::log_export::LogExport::from_config(config)),
+                default_loaded_at: RwLock::new(default_base.as_ref().map(|_| chrono::Utc::now())),
                 default_base: RwLock::new(default_base),
                 default_config_path: config.default_config_path.clone(),
                 idempotency_retention: config.idempotency_retention,
@@ -136,6 +141,7 @@ impl ServerState {
                 approval_expiry: config.approval_expiry,
                 allow_subprocess_connectors: config.allow_subprocess_connectors,
                 references: Arc::new(config.references.clone()),
+                grafana_url: config.grafana_url.clone(),
                 draining: std::sync::atomic::AtomicBool::new(false),
                 pending_finalize: std::sync::Mutex::new(Vec::new()),
             }),
@@ -150,6 +156,11 @@ impl ServerState {
 
     /// How a config the request carried is loaded: subprocess connectors only
     /// with `--allow-subprocess-connectors`.
+    /// The Grafana base URL the Overview page links to (`--grafana-url`).
+    pub fn grafana_url(&self) -> Option<&str> {
+        self.inner.grafana_url.as_deref()
+    }
+
     pub fn caller_origin(&self) -> crate::serve::load::BodyOrigin {
         crate::serve::load::BodyOrigin::Caller {
             allow_subprocess: self.inner.allow_subprocess_connectors,
@@ -373,7 +384,14 @@ impl ServerState {
 
     /// Atomically swap the `--default-config` merge base (hot reload, #198).
     pub fn set_default_base(&self, base: Option<Value>) {
+        *self.inner.default_loaded_at.write().unwrap() = base.as_ref().map(|_| chrono::Utc::now());
         *self.inner.default_base.write().unwrap() = base;
+    }
+
+    /// When the current `--default-config` merge base was loaded (#998):
+    /// at startup or by the last reload; `None` without one.
+    pub fn default_loaded_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        *self.inner.default_loaded_at.read().unwrap()
     }
 
     pub fn idempotency_retention(&self) -> Duration {
@@ -468,6 +486,7 @@ mod tests {
             vault: None,
             connect_providers_path: None,
             allow_subprocess_connectors: false,
+            grafana_url: None,
             references: Default::default(),
         }
     }

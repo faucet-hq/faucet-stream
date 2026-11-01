@@ -1593,6 +1593,21 @@ pub async fn list(
     Ok(out)
 }
 
+/// Change requests per status matching `filter`, ignoring its limit (#998).
+/// Pending requests past their window are expired first, so a lapsed one
+/// counts as `expired` here exactly as the listing shows it.
+pub async fn counts(
+    state: &ServerState,
+    filter: &ChangeListFilter,
+) -> Result<crate::serve::history::StatusCounts, ServeError> {
+    expire_due(state).await;
+    state
+        .history()
+        .change_counts(filter)
+        .await
+        .map_err(store_err)
+}
+
 /// Expire every pending request past its window. Returns how many lapsed.
 pub async fn expire_due(state: &ServerState) -> usize {
     let pending = match state

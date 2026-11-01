@@ -4,8 +4,8 @@ use crate::error::{CliError, CliResult};
 use crate::serve::config::ServeConfig;
 use crate::serve::handlers::state as state_h;
 use crate::serve::handlers::{
-    audit, backfill, changes, dlq, doctor, health, logs, plan, reload, runs, schemas, verify,
-    whoami,
+    audit, backfill, changes, dlq, doctor, health, logs, overview, plan, reload, runs, schemas,
+    verify, whoami,
 };
 use crate::serve::history::RunHistory;
 use crate::serve::state::ServerState;
@@ -56,6 +56,8 @@ pub fn build_router(
         .route("/v1/runs/{id}/cancel", post(runs::cancel_run))
         .route("/v1/runs/{id}/rollback", post(runs::rollback_run))
         .route("/v1/runs/{id}/logs", get(logs::stream_logs))
+        .route("/v1/runs/{id}/config", get(runs::get_run_config))
+        .route("/v1/overview", get(overview::overview))
         .route("/v1/schemas", get(schemas::list_schemas))
         .route("/v1/schemas/{kind}/{name}", get(schemas::get_schema))
         .route("/v1/doctor", post(doctor::doctor))
@@ -66,6 +68,7 @@ pub fn build_router(
         .route("/v1/dlq/replay", post(dlq::replay))
         .route("/v1/dlq/discard", post(dlq::discard))
         .route("/v1/audit", get(audit::list_audit))
+        .route("/v1/audit/{id}", get(audit::get_audit))
         .route("/v1/reload", post(reload::reload))
         .route("/v1/whoami", get(whoami::whoami))
         .route(
@@ -87,16 +90,22 @@ pub fn build_router(
             "/v1/changes",
             post(changes::create_change).get(changes::list_changes),
         )
+        .route("/v1/changes/counts", get(changes::count_changes))
         .route("/v1/changes/{id}", get(changes::get_change))
         .route("/v1/changes/{id}/approve", post(changes::approve_change))
         .route("/v1/changes/{id}/reject", post(changes::reject_change));
     #[cfg(feature = "triggers")]
     {
-        api = api.route(
-            "/v1/triggers/{name}",
-            post(crate::serve::triggers::webhook::handle)
-                .put(crate::serve::triggers::webhook::handle),
-        );
+        api = api
+            .route(
+                "/v1/triggers",
+                get(crate::serve::triggers::list::list_triggers),
+            )
+            .route(
+                "/v1/triggers/{name}",
+                post(crate::serve::triggers::webhook::handle)
+                    .put(crate::serve::triggers::webhook::handle),
+            );
     }
     #[cfg(feature = "catalog")]
     {
@@ -142,7 +151,10 @@ pub fn build_router(
             )
             // Static `/matrix` is matched ahead of `{id}` (same reservation as `/sync`).
             .route("/v1/templates/matrix", get(templates::template_matrix))
-            .route("/v1/templates/{id}/runs", post(templates::trigger_template))
+            .route(
+                "/v1/templates/{id}/runs",
+                post(templates::trigger_template).get(templates::list_template_runs),
+            )
             .route("/v1/templates/{id}/rows", get(templates::template_rows))
             .route("/v1/templates/{id}/tags", post(templates::promote_template))
             .route(

@@ -23,7 +23,7 @@ export const can = (perm) => {
 };
 
 const ALL = [
-  "run_write", "config_submit", "doctor", "dlq_manage", "template_admin", "local_output_manage", "audit_read", "reload",
+  "run_write", "config_submit", "doctor", "dlq_manage", "rollback", "catalog_annotate", "template_admin", "local_output_manage", "audit_read", "reload",
   "change_request", "change_approve", "status_read", "state_admin",
   "tenant_admin", "connection_manage",
 ];
@@ -40,21 +40,6 @@ function applyStyle() {
     .join("\n");
 }
 
-function renderBadge() {
-  const el = document.getElementById("whoami");
-  if (!el) return;
-  if (!me) {
-    el.hidden = true;
-    return;
-  }
-  el.hidden = false;
-  el.dataset.role = me.role;
-  el.title = `${me.principal} · ${me.role}${me.role === "viewer" ? " (read-only access)" : ""}`;
-  el.innerHTML = `<span class="whoami-name"></span><span class="whoami-role"></span>`;
-  el.querySelector(".whoami-name").textContent = me.principal;
-  el.querySelector(".whoami-role").textContent = me.role === "viewer" ? "read-only" : me.role;
-}
-
 /** Fetch the caller's identity and apply it. A server without the endpoint
  *  (404) or an unauthenticated caller leaves everything visible. */
 export async function loadAccess() {
@@ -64,7 +49,6 @@ export async function loadAccess() {
     me = null;
   }
   applyStyle();
-  renderBadge();
   document.documentElement.dataset.role = me ? me.role : "";
 }
 

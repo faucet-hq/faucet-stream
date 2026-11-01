@@ -157,6 +157,7 @@ async fn every_documented_route_is_wired_on_the_live_server() {
         vault_previous_key: Vec::new(),
         connect_providers: None,
         allow_subprocess_connectors: false,
+        grafana_url: None,
         references: Default::default(),
         pools: Default::default(),
     };
@@ -255,7 +256,21 @@ fn list_runs_documents_every_query_parameter() {
         .map(|p| p["name"].as_str().unwrap().to_string())
         .collect();
     let expected: BTreeSet<String> = [
-        "status", "name", "since", "until", "limit", "cursor", "tenant", "label", "labels",
+        "status",
+        "name",
+        "since",
+        "until",
+        "limit",
+        "cursor",
+        "tenant",
+        "submitted_by",
+        "mine",
+        "dataset_id",
+        "name_contains",
+        "pool",
+        "counts",
+        "label",
+        "labels",
     ]
     .into_iter()
     .map(str::to_string)

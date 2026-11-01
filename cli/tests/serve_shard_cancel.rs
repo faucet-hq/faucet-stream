@@ -59,6 +59,7 @@ fn args(port: u16, history: String) -> faucet_cli::cli::ServeArgs {
         vault_previous_key: Vec::new(),
         connect_providers: None,
         allow_subprocess_connectors: false,
+        grafana_url: None,
         references: Default::default(),
         pools: Default::default(),
     }

@@ -8,9 +8,11 @@ name: Notify site of a release
 # much later, by release-binaries.yml's connector-export job, which sends
 # its own dispatch once the upload lands.
 #
-# release-plz publishes one GitHub release per crate, so a single release of
-# the project fires this dozens of times. The concurrency group plus the short
-# wait below collapse that burst into one dispatch after the last release.
+# A release PR produces one GitHub release, faucet-cli's (#1005), so this
+# fires once per release. The wait below gives the release job time to
+# rewrite that release's body with every crate the release published
+# (scripts/release-notes.py) before the site reads it; the concurrency group
+# still collapses a burst (for example several releases re-run by hand).
 #
 # Token: `SITE_DISPATCH_TOKEN` when set, else `RELEASE_PLZ_TOKEN`. It needs
 # `contents: write` on faucet-hq/faucet-hq.github.io (the repository_dispatch
@@ -33,7 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Wait for the rest of the release burst
+      - name: Wait for the release job to write the release notes
         if: github.event_name == 'release'
         run: sleep 120
       - name: Dispatch faucet-release to the site

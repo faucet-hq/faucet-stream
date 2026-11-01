@@ -74,6 +74,8 @@ fn record(id: &str, status: RunStatus, rows: u64, elapsed: Option<f64>) -> RunRe
         caller_config: false,
         caller_params: Default::default(),
         pool: "default".into(),
+        submitted_by: None,
+        dlq_location: None,
     }
 }
 

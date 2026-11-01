@@ -89,6 +89,47 @@ pub async fn list_changes(
     ))
 }
 
+/// `GET /v1/changes/counts` query string: the list filters without `limit`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CountQuery {
+    pub kind: Option<String>,
+    pub requester: Option<String>,
+    /// Only requests for this tenant (#709).
+    pub tenant: Option<String>,
+}
+
+/// `GET /v1/changes/counts` → `{"counts": {status: n}}` over every request
+/// the filter matches (#998), with lapsed pending requests expired first.
+pub async fn count_changes(
+    State(state): State<ServerState>,
+    Extension(actor): Extension<AuthContext>,
+    Query(q): Query<CountQuery>,
+) -> Result<Json<CountsResponse>, ServeError> {
+    let kind = q
+        .kind
+        .as_deref()
+        .map(str::parse::<ChangeKind>)
+        .transpose()
+        .map_err(ServeError::BadConfig)?;
+    let filter = ChangeListFilter {
+        status: None,
+        kind,
+        requester: q.requester,
+        tenant: actor.tenant_filter(q.tenant)?,
+        limit: 0,
+    };
+    Ok(Json(CountsResponse {
+        counts: changes::counts(&state, &filter).await?,
+    }))
+}
+
+/// `GET /v1/changes/counts` response body.
+#[derive(Debug, serde::Serialize)]
+pub struct CountsResponse {
+    pub counts: crate::serve::history::StatusCounts,
+}
+
 /// A change request the principal may see, or 404 (#709).
 async fn visible_change(
     state: &ServerState,

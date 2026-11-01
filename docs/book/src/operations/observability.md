@@ -86,7 +86,12 @@ cardinality and never a Prometheus label.
   `faucet_pipeline_last_bookmark_unix_seconds`, and
   `faucet_pipeline_invocation_duration_seconds{pipeline,row,source,sink,status}`
   — the wall-clock of one matrix-row invocation, measured after it gets its
-  concurrency slot (queue wait excluded). `kind` on a failed run is the
+  concurrency slot (queue wait excluded). The two bookmark gauges are set only
+  when a bookmark holding a timestamp is written:
+  `faucet_pipeline_last_bookmark_unix_seconds` is that timestamp and
+  `faucet_pipeline_seconds_since_last_bookmark` is how old it was at the
+  write. The second gauge stops changing when writes stop, so measure
+  staleness as `time() - faucet_pipeline_last_bookmark_unix_seconds`. `kind` on a failed run is the
   [error kind](./troubleshooting.md#error-kinds).
 - **Local outputs** (`catalog` feature): the retention GC for local sink output
   files — `faucet_local_outputs_recorded_total{kind}`,
@@ -120,7 +125,7 @@ Compare series **by `row`**; each question has a home:
   slept on rate limits is not a speed problem
   ([source-side throttling](../cookbook/resilience.md#source-side-throttling)).
 - **Is it behind?** The `faucet_source_lag_*` gauges and
-  `faucet_pipeline_seconds_since_last_bookmark`
+  `time() - faucet_pipeline_last_bookmark_unix_seconds`
   ([source lag](../cookbook/sla.md#source-lag)).
 - **Why did it fail?** `kind` on `faucet_pipeline_runs_total{status="err"}`,
   `faucet_{source,sink,state}_errors_total`, and the `faucet_resilience_*`
@@ -135,6 +140,19 @@ Compare series **by `row`**; each question has a home:
 A one-shot `faucet run` exits when it finishes, so a Prometheus scrape can miss
 it entirely; use `faucet run --output json` and the logs for one-shot runs, and
 metrics for `faucet schedule` and `faucet serve`.
+
+## Dashboards for these metrics
+
+The six Grafana dashboards under `observability/grafana/` chart every metric
+on this page; [Dashboards & alerts](../cookbook/dashboards.md) lists what each
+one shows and the alert rules that go with them. Row accounting, verify
+results, policy violations and the other governance signals are on
+`faucet-governance`. Estimated cost, bytes moved and backend round trips are
+on `faucet-cost`. Log shipping, lineage and notification delivery are on
+`faucet-reliability`. A CI check fails when the code emits a metric that no
+dashboard shows and that `observability/metrics-not-charted.txt` does not list
+with a reason. So a new metric needs a panel, or a line in that file saying why
+it has none.
 
 ## Reliability properties
 

@@ -58,6 +58,7 @@ fn args(port: u16) -> ServeArgs {
         vault_previous_key: Vec::new(),
         connect_providers: None,
         allow_subprocess_connectors: false,
+        grafana_url: None,
         references: Default::default(),
         pools: Default::default(),
     }
