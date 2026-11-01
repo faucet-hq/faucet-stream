@@ -205,7 +205,10 @@ Useful alert expressions:
   An instance that cannot renew its run and shard leases for two heartbeats
   (two thirds of `--lease-ttl-secs`) cancels every run and shard it is
   executing, before the leases expire, so a peer that reclaims them never runs
-  them at the same time.
+  them at the same time. Those runs and shards are not cancelled for good: once
+  the database answers again, the instance hands each one back as `pending`
+  (unless a peer has already reclaimed it), and the cluster resumes it from its
+  bookmark, as after a clustered shutdown.
 
 ## Delivery guarantees and double-run boundary
 
