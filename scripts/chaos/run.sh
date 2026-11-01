@@ -93,7 +93,24 @@ run_scenario() { # name function
   rc=$?
   evidence="$(tail -1 "${OUT}/${name}.log")"
   if [ "$rc" -eq 0 ]; then record "$name" PASS "$(( $(date +%s) - t0 ))" "$evidence"
-  else record "$name" FAIL "$(( $(date +%s) - t0 ))" "$evidence"; fi
+  else
+    record "$name" FAIL "$(( $(date +%s) - t0 ))" "$evidence"
+    dump_pods "$name"
+  fi
+}
+
+# Keep the evidence of a failed scenario: every serve pod's log (and the
+# previous container's, after a restart) plus the namespace events.
+dump_pods() {
+  local dir="${OUT}/${1}-pods" p
+  mkdir -p "$dir"
+  for p in $(k get pod -l app.kubernetes.io/component=serve -o name 2>/dev/null); do
+    p="${p#pod/}"
+    serve_log "$p" > "${dir}/${p}.log"
+    serve_log "$p" --previous > "${dir}/${p}.previous.log"
+    [ -s "${dir}/${p}.previous.log" ] || rm -f "${dir}/${p}.previous.log"
+  done
+  k get events --sort-by=.lastTimestamp > "${dir}/events.txt" 2>&1
 }
 
 # ------------------------------------------------------------------ image ---
@@ -350,7 +367,7 @@ field() { api "$1" "/v1/runs/$2" | jq -r ".${3}"; }
 owner_of() { # run id -> pod that last started it
   local id="$1" p t best="" best_t=""
   for p in $(pods); do
-    t="$(k logs "$p" -c serve 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | grep "serve_run_id=${id}" | grep 'pipeline run starting' | tail -1 | cut -c1-27)"
+    t="$(serve_log "$p" | grep "serve_run_id=${id}" | grep 'pipeline run starting' | tail -1 | cut -c1-27)"
     if [ -n "$t" ] && [[ "$t" > "$best_t" ]]; then best="$p"; best_t="$t"; fi
   done
   echo "$best"
@@ -375,6 +392,14 @@ any_port() { port_for "$(pods | head -1)"; }
 
 fail() { echo "FAIL: $*"; return 1; }
 
+# A serve pod's log without colour codes.
+serve_log() { k logs "$1" -c serve "${@:2}" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g'; }
+
+# Whether a serve pod's log holds a line matching $2. Never `serve_log | grep -q`:
+# grep -q exits on the first match, the writer dies of SIGPIPE, and pipefail
+# turns every match into a failure (#1024).
+serve_log_has() { local text; text="$(serve_log "$1")"; grep -q -- "$2" <<<"$text"; }
+
 # -------------------------------------------------------------- scenarios ---
 
 s_membership() { # #914 too: pods started together must not start degraded
@@ -384,7 +409,7 @@ s_membership() { # #914 too: pods started together must not start degraded
     body="$(curl -s "localhost:${port}/readyz")"
     [ "$(jq -r .cluster.instances <<<"$body")" = "$REPLICAS" ] || fail "${p}: ${body}" || return 1
     [ "$(jq -r .history_ok <<<"$body")" = true ] || fail "${p}: ${body}" || return 1
-    if k logs "$p" -c serve | sed 's/\x1b\[[0-9;]*m//g' | grep -q 'starting DEGRADED'; then fail "${p} started degraded (#914)"; return 1; fi
+    if serve_log_has "$p" 'starting DEGRADED'; then fail "${p} started degraded (#914)"; return 1; fi
   done
   echo "every pod ready, ${REPLICAS} members, none started degraded"
 }
@@ -515,7 +540,7 @@ s_history_outage() { # #905: readiness must see it; no run executes twice
   [ "$st" = completed ] || fail "status ${st}" || return 1
   [ "$(sql 'SELECT count(*) FROM slow_out')" = 600 ] || fail "rows" || return 1
   single_writer || return 1
-  k logs "$owner" -c serve | sed 's/\x1b\[[0-9;]*m//g' | grep -q 'could not renew run leases' || fail "the owner never fenced itself" || return 1
+  serve_log_has "$owner" 'could not renew run leases' || fail "the owner never fenced itself" || return 1
   echo "every pod reported history_ok=false within the lease window; owner self-fenced; run completed, 600 rows, $(writers) writers never concurrent"
 }
 

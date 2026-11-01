@@ -794,9 +794,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.99.1"
+      # Cache keys may not contain commas.
+      - id: cache-key
+        shell: bash
+        env:
+          FEATURES: ${{ matrix.feature }}
+        run: echo "key=${FEATURES//,/__}" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          key: ${{ matrix.feature }}
+          key: ${{ steps.cache-key.outputs.key }}
       - name: Install librdkafka prerequisites (Ubuntu)
         if: runner.os == 'Linux'
         run: |
@@ -853,9 +859,15 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
+      # Cache keys may not contain commas.
+      - id: cache-key
+        shell: bash
+        env:
+          FEATURES: ${{ matrix.features }}
+        run: echo "key=${FEATURES//,/__}" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          key: ${{ matrix.features }}
+          key: ${{ steps.cache-key.outputs.key }}
       - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
         run: cargo build -p faucet-cli --no-default-features --features "${{ matrix.features }}"
       # The Connector Hub feed (#572) must cover every registry connector.
