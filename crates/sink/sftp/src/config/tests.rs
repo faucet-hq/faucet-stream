@@ -174,3 +174,65 @@ fn the_avro_block_reaches_the_encoder() {
         faucet_core::AvroCodec::Snappy
     );
 }
+
+use faucet_common_file::write::ParquetCodec;
+
+#[test]
+fn parquet_defaults_to_zstd_even_when_other_options_are_given() {
+    let c: SftpSinkConfig = serde_json::from_value(serde_json::json!({"host":"h","username":"u","type":"password","config":{"password":"p"},"path":"/o"})).unwrap();
+    assert_eq!(c.parquet.compression, None);
+    assert_eq!(c.settings().unwrap().parquet_codec(), ParquetCodec::Zstd);
+    let c: SftpSinkConfig = serde_json::from_value(
+        serde_json::json!({"host":"h","username":"u","type":"password","config":{"password":"p"},"path":"/o","parquet":{"row_group_size":5}}),
+    )
+    .unwrap();
+    assert_eq!(c.parquet.row_group_size, 5);
+    let s = c.settings().unwrap();
+    assert_eq!(s.parquet_codec(), ParquetCodec::Zstd);
+    assert_eq!(s.parquet.row_group_size, 5);
+}
+
+#[cfg(feature = "arrow")]
+#[test]
+fn batch_size_zero_writes_a_parquet_object_per_batch_write() {
+    let mut c = SftpSinkConfig::new(SftpConnectionConfig::with_password("h", "u", "p"), "/o");
+    c.format = SftpSinkFormat::Parquet;
+    c.batch_size = 0;
+    assert!(c.settings().unwrap().object_per_write);
+    c.format = SftpSinkFormat::JsonLines;
+    assert!(
+        !c.settings().unwrap().object_per_write,
+        "json lines: per flush"
+    );
+    c.format = SftpSinkFormat::Parquet;
+    c.batch_size = 10;
+    assert!(!c.settings().unwrap().object_per_write, "a record cap");
+    c.batch_size = 0;
+    c.max_bytes_per_file = Some(10);
+    assert!(!c.settings().unwrap().object_per_write, "a byte cap");
+    c.max_bytes_per_file = None;
+    c.max_records_per_file = Some(3);
+    assert!(!c.settings().unwrap().object_per_write, "a record cap");
+    c.max_records_per_file = None;
+    c.file_name = Some("part-{part}.parquet".into());
+    assert!(!c.settings().unwrap().object_per_write, "path: per part");
+}
+
+#[test]
+fn auto_maps_onto_json_lines_and_a_bad_config_is_best_effort() {
+    assert_eq!(
+        SftpSinkFormat::Auto.shared(),
+        faucet_core::FileFormat::JsonLines
+    );
+    let mut c = SftpSinkConfig::new(
+        faucet_common_sftp::SftpConnectionConfig::with_password("h", "u", "p"),
+        "/d",
+    )
+    .concurrency(3);
+    assert_eq!(c.concurrency, 3);
+    c.max_records_per_file = Some(0);
+    c.write_mode = faucet_common_file::write::FileWriteMode::Overwrite;
+    c.mode = faucet_common_file::write::IfExists::Append;
+    assert!(c.settings().and_then(|s| s.validate()).is_err());
+    assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
+}
