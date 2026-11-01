@@ -79,7 +79,8 @@ impl bb8::ManageConnection for ConnectionManager {
     type Error = tiberius::error::Error;
 
     async fn connect(&self) -> Result<Self::Connection, Self::Error> {
-        self.connect_client().await
+        // The TDS handshake future is ~300 KB; boxed so callers' frames stay small (#1011).
+        Box::pin(self.connect_client()).await
     }
 
     async fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Self::Error> {
