@@ -4,7 +4,8 @@
 
 <p align="center">
   <a href="https://github.com/faucet-hq/faucet-stream/releases?q=faucet-cli&expanded=true"><img src="https://img.shields.io/crates/v/faucet-cli.svg?label=faucet" alt="faucet release (CLI, Docker image, binaries)"></a>
-  <a href="https://crates.io/crates/faucet-stream"><img src="https://img.shields.io/crates/v/faucet-stream.svg?label=library" alt="faucet-stream library on crates.io"></a>
+  <!-- Disabling it for now as it can be confusing:
+  <a href="https://crates.io/crates/faucet-stream"><img src="https://img.shields.io/crates/v/faucet-stream.svg?label=library" alt="faucet-stream library on crates.io"></a>-->
   <a href="https://docs.rs/faucet-stream"><img src="https://docs.rs/faucet-stream/badge.svg" alt="Docs.rs"></a>
   <a href="https://faucet-hq.github.io/faucet-stream/"><img src="https://img.shields.io/badge/guide-faucet--hq.github.io-1f6feb" alt="Guide"></a>
   <a href="https://github.com/faucet-hq/faucet-stream/actions/workflows/ci.yml"><img src="https://github.com/faucet-hq/faucet-stream/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
@@ -13,8 +14,7 @@
   <a href="Cargo.toml"><img src="https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Ffaucet-hq%2Ffaucet-stream%2Fmain%2FCargo.toml&query=%24.workspace.package%5B%27rust-version%27%5D&label=MSRV&color=blue" alt="MSRV (from Cargo.toml on main)"></a>
   <a href="deny.toml"><img src="https://img.shields.io/badge/deps-cargo--deny-blue" alt="Dependencies"></a>
   <a href="https://scorecard.dev/viewer/?uri=github.com/faucet-hq/faucet-stream"><img src="https://api.scorecard.dev/projects/github.com/faucet-hq/faucet-stream/badge" alt="OpenSSF Scorecard"></a>
-  <!-- OpenSSF Best Practices badge: add once the bestpractices.dev entry exists (#978):
-  <a href="https://www.bestpractices.dev/projects/PROJECT_ID"><img src="https://www.bestpractices.dev/projects/PROJECT_ID/badge" alt="OpenSSF Best Practices"></a> -->
+  <a href="https://www.bestpractices.dev/projects/16043"><img src="https://www.bestpractices.dev/projects/16043/badge"></a>
   <a href="#license"><img src="https://img.shields.io/crates/l/faucet-stream.svg" alt="License"></a>
   <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/changelog-keep%20a%20changelog-orange" alt="Changelog"></a>
   <a href="https://www.linkedin.com/company/faucet-stream"><img src="https://img.shields.io/badge/LinkedIn-follow-0A66C2?logo=linkedin" alt="LinkedIn"></a>
