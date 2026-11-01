@@ -573,7 +573,7 @@
       "gridPos": {
         "x": 6,
         "y": 33,
-        "w": 18,
+        "w": 12,
         "h": 8
       },
       "datasource": {
@@ -589,6 +589,38 @@
             "uid": "${datasource}"
           },
           "legendFormat": "{{pool}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "timeseries",
+      "title": "History connections discarded (per hour)",
+      "gridPos": {
+        "x": 18,
+        "y": 33,
+        "w": 6,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(faucet_serve_history_connections_discarded_total[1h]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "discarded"
         }
       ],
       "fieldConfig": {

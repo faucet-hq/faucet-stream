@@ -224,7 +224,9 @@ async fn backfill_submits_one_run_per_unit_and_replays_on_repost() {
 }
 
 async fn wait_completed(client: &reqwest::Client, url: &str, want: usize) {
-    for _ in 0..200 {
+    // The slow runs take seconds each, longer under coverage instrumentation.
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    while std::time::Instant::now() < deadline {
         let runs: Value = client
             .get(format!("{url}/v1/runs?limit=50"))
             .send()
