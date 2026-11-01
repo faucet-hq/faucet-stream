@@ -38,13 +38,24 @@ export async function renderOverview(host, params) {
   let alive = true;
 
   const safe = (p) => p.catch(() => null);
+  // The other range only supplies one cost figure, so it is re-read at most every 5 minutes.
+  const OTHER_TTL_MS = 5 * 60 * 1000;
+  let otherCache = null;
+  function otherOverview(t, other) {
+    const key = `${t}|${other}`;
+    if (otherCache && otherCache.key === key && Date.now() - otherCache.at < OTHER_TTL_MS) return otherCache.value;
+    const value = safe(api(`/v1/overview?${new URLSearchParams({ ...Object.fromEntries(t), since: other, top: "1" })}`));
+    otherCache = { key, at: Date.now(), value };
+    value.then((v) => { if (v === null && otherCache && otherCache.value === value) otherCache = null; });
+    return value;
+  }
   async function load() {
     const t = withTenant(new URLSearchParams());
     const other = range === "24h" ? "7d" : "24h";
     const runSince = new Date(Date.now() - (range === "24h" ? 1 : 7) * 86400000).toISOString();
     const [ov, ovOther, active, failed, any, changes, templates] = await Promise.all([
       api(`/v1/overview?${new URLSearchParams({ ...Object.fromEntries(t), since: range, bucket: range === "24h" ? "hour" : "day" })}`).catch((e) => (e.status === 404 ? null : Promise.reject(e))),
-      safe(api(`/v1/overview?${new URLSearchParams({ ...Object.fromEntries(t), since: other })}`)),
+      otherOverview(t, other),
       safe(api(`/v1/runs?${withTenant(new URLSearchParams({ status: ACTIVE, limit: "6" }))}`)),
       safe(api(`/v1/runs?${withTenant(new URLSearchParams({ status: "failed", since: runSince, limit: "5" }))}`)),
       safe(api(`/v1/runs?${withTenant(new URLSearchParams({ limit: "1", counts: "true" }))}`)),

@@ -172,8 +172,8 @@ export function refreshBadges(force = false) {
     .then((c) => setBadge("changes", c && c.counts ? c.counts.pending || 0 : 0, { hot: true }))
     .catch(() => setBadge("changes", 0));
   if (scoped) return;
-  api("/v1/catalog/datasets?limit=1000")
-    .then((d) => setBadge("datasets", d && d.datasets ? d.datasets.length : 0))
+  api("/v1/catalog/datasets?limit=1")
+    .then((d) => setBadge("datasets", d ? (d.total ?? (d.datasets || []).length) : 0))
     .catch(() => setBadge("datasets", 0));
   api("/v1/templates")
     .then((t) => { const l = (t && (t.templates || t)) || []; setBadge("templates", Array.isArray(l) ? l.length : 0); })

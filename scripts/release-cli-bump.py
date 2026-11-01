@@ -143,7 +143,7 @@ def plan(closure, bumps, cli_base, cli_head):
     """Return (new faucet-cli version, [(crate, old, new)] that drove it) or raise on a major."""
     crates = sorted((n, o, v) for n, (o, v) in bumps.items() if n in closure and n != ROOT)
     majors = [c for c in crates if bump_level(c[1], c[2]) == "major"]
-    if majors:
+    if majors and parse_version(cli_head) < parse_version(next_version(cli_base, "major")):
         names = ", ".join(f"{n} {o} -> {v}" for n, o, v in majors)
         raise SystemExit(
             f"::error::a crate faucet-cli builds in has a major bump ({names}); "

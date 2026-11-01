@@ -333,6 +333,9 @@ pub struct CatalogDatasetPage {
     pub datasets: Vec<CatalogDataset>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    /// How many datasets match the filters, on the first page only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<usize>,
 }
 
 /// The full detail view for one dataset.
@@ -684,6 +687,7 @@ pub fn filter_datasets(
         all.retain(|d| d.uri.to_lowercase().contains(&q));
     }
     all.sort_by(|a, b| b.last_seen.cmp(&a.last_seen).then_with(|| b.id.cmp(&a.id)));
+    let total = filter.cursor.is_none().then_some(all.len());
     // Keyset paging on the sort key itself (#789 SERVE-50): `last_seen` moves
     // with every run, so a position in the list is not stable between pages.
     match filter.cursor.as_deref().map(decode_cursor) {
@@ -711,6 +715,7 @@ pub fn filter_datasets(
     CatalogDatasetPage {
         datasets: all,
         next_cursor,
+        total,
     }
 }
 
@@ -1025,6 +1030,7 @@ mod tests {
             },
         );
         assert_eq!(page.datasets.len(), 2);
+        assert_eq!(page.total, Some(2));
         // Newest-first + pagination.
         let page = filter_datasets(
             all.clone(),
@@ -1034,6 +1040,7 @@ mod tests {
             },
         );
         assert_eq!(page.datasets[0].kind, "postgres");
+        assert_eq!(page.total, Some(3));
         let cursor = page.next_cursor.expect("3 rows, page of 2");
         let page2 = filter_datasets(
             all,
@@ -1045,6 +1052,7 @@ mod tests {
         );
         assert_eq!(page2.datasets.len(), 1);
         assert!(page2.next_cursor.is_none());
+        assert_eq!(page2.total, None, "only the first page counts");
     }
 
     #[test]

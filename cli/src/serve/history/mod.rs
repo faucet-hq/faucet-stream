@@ -322,8 +322,6 @@ impl RunRecord {
         }
     }
 
-    /// Whether any invocation of this run read or wrote the catalog dataset
-    /// `dataset_id` (#998): the id its usage record names.
     /// What a listing calls the run: its name, else its `pipeline` label.
     pub fn title(&self) -> Option<&str> {
         self.name
@@ -331,6 +329,18 @@ impl RunRecord {
             .or_else(|| self.labels.get("pipeline").map(String::as_str))
     }
 
+    /// The pipeline the run belongs to: its `pipeline` label, else its name,
+    /// else empty. The Overview groups and filters by it, as usage records do.
+    pub fn pipeline_key(&self) -> &str {
+        self.labels
+            .get("pipeline")
+            .map(String::as_str)
+            .or(self.name.as_deref())
+            .unwrap_or("")
+    }
+
+    /// Whether any invocation of this run read or wrote the catalog dataset
+    /// `dataset_id` (#998): the id its usage record names.
     pub fn touches_dataset(&self, dataset_id: &str) -> bool {
         self.invocations
             .iter()
@@ -1466,6 +1476,7 @@ pub trait RunHistory: Send + Sync {
         Ok(catalog::CatalogDatasetPage {
             datasets: Vec::new(),
             next_cursor: None,
+            total: None,
         })
     }
 

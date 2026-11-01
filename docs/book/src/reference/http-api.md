@@ -1013,13 +1013,16 @@ restart and cover every replica of a cluster:
 The window is `[since, until)`: `since` is a duration back from `until`
 (`30m`, `24h`, `7d`, `2w`, default `7d`) or an RFC 3339 instant, and `until`
 defaults to now. Buckets are UTC hours up to three days and days beyond
-(`bucket=hour|day` overrides; at most 1,000 buckets). `pipeline`, `pool`,
+(`bucket=hour|day` overrides; at most 1,000 buckets). Runs are grouped by
+pipeline: a run's `pipeline` label (the config's `name:`), else its run name,
+the same key cost uses. `pipeline` filters by that key; `pool`,
 `label` / `labels` and `tenant` filter runs as on `GET /v1/runs`; a
 tenant-scoped principal sees its own tenant only. The SQL history backends
 group in the database; the p95 is computed over the newest 10,000 finished
 invocations in the window (`runs.duration_sample.truncated` says when the
 window held more), and `top` (1–50, default 10) bounds every list. `RunRead`
-(viewer and up); audited `overview.get`; `400` for a bad parameter.
+(viewer and up); not audited when allowed, since the console polls it (a
+denial is audited `overview.get`); `400` for a bad parameter.
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" \

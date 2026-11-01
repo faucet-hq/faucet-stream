@@ -217,6 +217,20 @@ async fn catalog_endpoints_accumulate_runs_and_enforce_rbac() {
         .await
         .unwrap();
     assert_eq!(filtered["datasets"].as_array().unwrap().len(), 1);
+    assert_eq!(page["total"], 2, "{page}");
+
+    // The console's badge reads the count from a one-row page.
+    let counted: Value = client
+        .get(format!("{base}/v1/catalog/datasets?limit=1"))
+        .bearer_auth("viewer-tok")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(counted["datasets"].as_array().unwrap().len(), 1);
+    assert_eq!(counted["total"], 2, "{counted}");
 
     // Detail: schema timeline (2 entries, the second with a diff), stats, edge.
     let id = csv["id"].as_str().unwrap();

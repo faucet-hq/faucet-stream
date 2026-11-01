@@ -315,7 +315,6 @@ pub async fn overview(
         aggregates.cost = None;
     }
     let attention = attention(&state, &actor).await;
-    crate::serve::audit::write(&state, &actor, "overview.get", None, None, "ok").await;
     Ok(Json(OverviewResponse {
         since: q.since,
         until: q.until,

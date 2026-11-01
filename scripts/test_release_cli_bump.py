@@ -148,6 +148,12 @@ class Plan(unittest.TestCase):
             rcb.plan(self.closure, {"faucet-core": ("1.14.0", "2.0.0")}, "1.15.1", "1.15.1")
         self.assertIn("faucet-core 1.14.0 -> 2.0.0", str(e.exception))
 
+    def test_a_major_passes_once_faucet_cli_was_bumped_by_hand(self):
+        bumps = {"faucet-core": ("1.14.0", "2.0.0")}
+        new, crates = rcb.plan(self.closure, bumps, "1.15.1", "2.0.0")
+        self.assertEqual(new, "2.0.0")
+        self.assertEqual(crates, [("faucet-core", "1.14.0", "2.0.0")])
+
 
 HEADER = "# Changelog\n\nAll notable changes.\n"
 RELEASED = ("## [1.15.1](https://github.com/o/r/compare/faucet-cli-v1.15.0...faucet-cli-v1.15.1) - 2026-10-22\n\n"

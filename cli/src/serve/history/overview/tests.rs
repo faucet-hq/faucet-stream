@@ -613,3 +613,121 @@ fn postgres_statements_number_their_binds_in_order() {
     let (text, _) = sql::schema_changed_count(Dialect::Postgres, &q);
     assert!(text.contains("COUNT(DISTINCT"), "{text}");
 }
+
+fn labelled(id: &str, name: Option<&str>, pipeline: &str, status: RunStatus) -> RunRecord {
+    let mut r = run(id, "x", status, "2026-10-30T05:00:00Z", 10, &[5]);
+    r.name = name.map(Into::into);
+    r.labels.insert("pipeline".into(), pipeline.into());
+    r
+}
+
+fn labelled_fleet() -> Vec<RunRecord> {
+    vec![
+        labelled("p1", None, "orders", RunStatus::Completed),
+        labelled("p2", Some("nightly"), "orders", RunStatus::Failed),
+        labelled("p3", None, "users", RunStatus::Failed),
+    ]
+}
+
+#[test]
+fn runs_group_and_filter_by_their_pipeline_label() {
+    let runs = labelled_fleet();
+    let agg = aggregate_in_memory(&day_query(), runs.iter(), std::iter::empty(), None);
+    let mut failures = agg.runs.failure_rate_by_pipeline.clone();
+    failures.sort_by(|a, b| a.pipeline.cmp(&b.pipeline));
+    assert_eq!(
+        failures
+            .iter()
+            .map(|f| (f.pipeline.as_str(), f.runs, f.failed))
+            .collect::<Vec<_>>(),
+        vec![("orders", 2, 1), ("users", 1, 1)]
+    );
+    assert_eq!(agg.records.top_pipelines[0].pipeline, "orders");
+    let mut q = day_query();
+    q.pipeline = Some("orders".into());
+    let only = aggregate_in_memory(&q, runs.iter(), std::iter::empty(), None);
+    assert_eq!(only.runs.total, 2);
+    let mut bare = run(
+        "p4",
+        "named",
+        RunStatus::Completed,
+        "2026-10-30T05:00:00Z",
+        0,
+        &[],
+    );
+    assert_eq!(bare.pipeline_key(), "named");
+    bare.name = None;
+    assert_eq!(bare.pipeline_key(), "");
+}
+
+#[cfg(feature = "serve-history-sqlite")]
+#[tokio::test]
+async fn sqlite_groups_by_the_pipeline_label_like_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let sql = crate::serve::history::sqlite::SqliteHistory::connect(
+        &format!("sqlite:{}", dir.path().join("h.db").display()),
+        Duration::from_secs(60),
+        Duration::from_secs(30),
+        "i".into(),
+    )
+    .await
+    .unwrap();
+    let mem = MemoryHistory::new(Duration::from_secs(60));
+    for r in labelled_fleet() {
+        sql.upsert(&r).await.unwrap();
+        mem.upsert(&r).await.unwrap();
+    }
+    let mut filtered = day_query();
+    filtered.pipeline = Some("orders".into());
+    for q in [day_query(), filtered] {
+        let s = sql.overview_aggregates(&q).await.unwrap();
+        assert_eq!(s, mem.overview_aggregates(&q).await.unwrap(), "{q:?}");
+        assert!(
+            s.runs
+                .failure_rate_by_pipeline
+                .iter()
+                .all(|f| !f.pipeline.is_empty())
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_listing_default_reports_schema_changes() {
+    use crate::serve::history::catalog::{CatalogUpdate, DatasetObservation, DatasetRole};
+    let h = MemoryHistory::new(Duration::from_secs(60));
+    let observe = |at: &str, schema: serde_json::Value| CatalogUpdate {
+        run_id: at.into(),
+        pipeline: "orders".into(),
+        row: "default".into(),
+        recorded_at: ts(at),
+        sources: vec![DatasetObservation {
+            uri: "file://in".into(),
+            kind: "csv".into(),
+            role: DatasetRole::Source,
+            schema: None,
+            records: 1,
+        }],
+        sink: DatasetObservation {
+            uri: "file://out".into(),
+            kind: "jsonl".into(),
+            role: DatasetRole::Sink,
+            schema: Some(schema),
+            records: 1,
+        },
+        column_lineage: None,
+    };
+    let a = serde_json::json!({"type": "object", "properties": {"id": {"type": "integer"}}});
+    let b = serde_json::json!({"type": "object", "properties": {"id": {"type": "integer"}, "v": {"type": "string"}}});
+    h.catalog_record(&observe("2026-10-30T01:00:00Z", a))
+        .await
+        .unwrap();
+    h.catalog_record(&observe("2026-10-30T02:00:00Z", b))
+        .await
+        .unwrap();
+    let mut q = day_query();
+    q.stale_before = Some(ts("2026-10-29T12:00:00Z"));
+    let direct = h.overview_aggregates(&q).await.unwrap();
+    let listed = aggregate_by_listing(&h, &q).await.unwrap();
+    assert_eq!(direct, listed);
+    assert_eq!(listed.freshness.unwrap().schema_changed_count, 1);
+}

@@ -414,8 +414,8 @@ pub struct RunConfigResponse {
 const MASK: &str = "***";
 
 /// Mask every string value under a credential-looking key (and every scalar
-/// below one) in a parsed config, keeping `${…}` references, which name a
-/// secret rather than hold it. Returns whether anything was masked.
+/// below one) in a parsed config, keeping whole `${…}` references, and strip
+/// credentials embedded in URLs anywhere else. Returns whether anything was masked.
 fn mask_credentials(v: &mut serde_json::Value, under_secret: bool) -> bool {
     use serde_json::Value;
     match v {
@@ -430,9 +430,15 @@ fn mask_credentials(v: &mut serde_json::Value, under_secret: bool) -> bool {
         Value::Array(items) => items
             .iter_mut()
             .fold(false, |m, child| mask_credentials(child, under_secret) | m),
-        Value::String(s) if under_secret && !s.contains("${") && !s.is_empty() => {
+        Value::String(s) if under_secret && !s.is_empty() && !is_reference(s) => {
             *s = MASK.to_string();
             true
+        }
+        Value::String(s) => {
+            let redacted = faucet_core::util::redact_uri_credentials(s);
+            let changed = redacted != *s;
+            *s = redacted;
+            changed
         }
         Value::Number(_) | Value::Bool(_) if under_secret => {
             *v = Value::String(MASK.to_string());
@@ -440,6 +446,13 @@ fn mask_credentials(v: &mut serde_json::Value, under_secret: bool) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether `s` is exactly one `${…}` reference, which names a secret rather than holds it.
+fn is_reference(s: &str) -> bool {
+    s.strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .is_some_and(|inner| !inner.contains(['{', '}']))
 }
 
 /// The stored body as a viewer may see it: re-rendered in its own format with
@@ -889,5 +902,21 @@ mod tests {
         let (_, masked) = masked_body("version: 1\nname: plain\n", ConfigFormat::Yaml).unwrap();
         assert!(!masked);
         assert!(masked_body("a: [unclosed", ConfigFormat::Yaml).is_none());
+    }
+
+    #[test]
+    fn url_credentials_and_partial_references_are_masked() {
+        use crate::serve::load::ConfigFormat;
+        let body = "sink:\n  config:\n    connection_url: postgres://etl:S3cr3t@db.internal/prod\n\
+                    vars:\n  api_token: tok_live_abc${x}\n  db_password: \"${env:PG_PASS}\"\n";
+        let (out, masked) = masked_body(body, ConfigFormat::Yaml).unwrap();
+        assert!(masked);
+        assert!(!out.contains("S3cr3t") && !out.contains("etl:"), "{out}");
+        assert!(out.contains("db.internal/prod"), "{out}");
+        assert!(!out.contains("tok_live_abc"), "{out}");
+        assert!(out.contains("${env:PG_PASS}"), "{out}");
+        assert!(is_reference("${vault:a/b#c}"));
+        assert!(!is_reference("${a}${b}"));
+        assert!(!is_reference("x${a}"));
     }
 }

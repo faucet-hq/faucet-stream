@@ -154,13 +154,13 @@ impl ServerState {
         self.inner.require_approval.contains(&kind)
     }
 
-    /// How a config the request carried is loaded: subprocess connectors only
-    /// with `--allow-subprocess-connectors`.
     /// The Grafana base URL the Overview page links to (`--grafana-url`).
     pub fn grafana_url(&self) -> Option<&str> {
         self.inner.grafana_url.as_deref()
     }
 
+    /// How a config the request carried is loaded: subprocess connectors only
+    /// with `--allow-subprocess-connectors`.
     pub fn caller_origin(&self) -> crate::serve::load::BodyOrigin {
         crate::serve::load::BodyOrigin::Caller {
             allow_subprocess: self.inner.allow_subprocess_connectors,

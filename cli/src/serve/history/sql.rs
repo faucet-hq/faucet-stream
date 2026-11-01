@@ -1390,11 +1390,7 @@ impl Stmts {
             binds.push(v);
             self.placeholder(Self::LIST_BINDS + binds.len())
         };
-        // A run names its sink dataset only inside the stored record (each
-        // invocation's usage). The LIKE narrows the rows cheaply; the JSON
-        // test then matches exactly what `RunRecord::touches_dataset` does, so
-        // the field elsewhere in the body (a label, an error) never matches.
-        // The id is checked by `is_dataset_id` first: no wildcard reaches here.
+        // LIKE prefilters cheaply; the JSON test matches as `RunRecord::touches_dataset` does.
         if let Some(id) = filter.dataset_id.as_deref() {
             let like = next(&mut binds, dataset_like(id));
             let exact = next(&mut binds, id.to_string());
@@ -1410,9 +1406,7 @@ impl Stmts {
             };
             sql.push_str(&format!(" AND body LIKE {like} AND {json}"));
         }
-        // Substring tests without LIKE, so no wildcard needs escaping and both
-        // dialects compare case-sensitively, like the memory backend.
-        // The run's title: its name, else its `pipeline` label.
+        // Case-sensitive substring on the run's title, without LIKE wildcards.
         if let Some(n) = filter.name_contains.as_deref() {
             let a = next(&mut binds, n.to_string());
             let b = next(&mut binds, n.to_string());
