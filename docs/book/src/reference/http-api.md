@@ -1682,7 +1682,9 @@ pool),
 `faucet_serve_idempotency_hits_total`, `faucet_serve_history_degraded` (the
 backend fell back to memory) and `faucet_serve_history_unreachable` (the last
 lease heartbeat did not reach the history database; `/readyz` is `503` while
-it is `1`).
+it is `1`), and `faucet_serve_history_connections_discarded_total` (pooled
+history connections dropped because a failed commit left them inside a
+transaction; the pool opens a fresh one).
 With the `tenants` feature: `faucet_serve_tenant_runs_total{tenant,outcome}`,
 `faucet_serve_tenant_limit_rejections_total{tenant,limit}`,
 `faucet_serve_connections{status}` and

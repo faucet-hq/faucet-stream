@@ -2852,6 +2852,18 @@ pub fn saturated(size: u32, idle: usize, max: u32) -> bool {
 /// for request handlers.
 pub const POOL_MAX_CONNECTIONS: u32 = 16;
 
+/// The pools' `before_acquire` check (#1010): a connection still inside a
+/// transaction (a commit failed and its rollback did not run) is discarded and
+/// counted, so the pool opens a fresh one instead of failing every later write.
+pub fn usable_connection<C: sqlx::Connection>(conn: &C) -> bool {
+    if conn.is_in_transaction() {
+        tracing::warn!("run history: discarding a pooled connection left inside a transaction");
+        metrics::counter!("faucet_serve_history_connections_discarded_total").increment(1);
+        return false;
+    }
+    true
+}
+
 /// Whether a driver error means the database could not be reached, as opposed
 /// to the database answering with an error.
 pub fn unreachable_of(e: &sqlx::Error) -> bool {
