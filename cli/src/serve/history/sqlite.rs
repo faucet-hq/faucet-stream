@@ -549,6 +549,7 @@ mod shard_tests {
             .unwrap();
         assert_eq!(page.datasets.len(), 1);
         assert_eq!(page.datasets[0].uri, "csv://./in.csv");
+        assert_eq!(page.total, Some(1));
 
         // Detail: counters, deduped timeline with a diff, stats, edges.
         let src_id = catalog::dataset_id("csv://./in.csv");
@@ -587,6 +588,28 @@ mod shard_tests {
             2,
             "catalog rows are never purged by run retention"
         );
+        let mut more = update("r4", serde_json::json!({"type":"object"}), 1);
+        more.sources[0].uri = "csv://./second.csv".into();
+        more.sink.uri = "jsonl://./second.jsonl".into();
+        h.catalog_record(&more).await.unwrap();
+        let first = h
+            .catalog_list_datasets(&CatalogListFilter {
+                limit: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(first.datasets.len(), 1);
+        assert_eq!(first.total, Some(4), "counted past the page limit");
+        let next = h
+            .catalog_list_datasets(&CatalogListFilter {
+                limit: 1,
+                cursor: first.next_cursor.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(next.total, None);
     }
 
     #[tokio::test]

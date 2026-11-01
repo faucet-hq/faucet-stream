@@ -20,6 +20,8 @@ pub const DURATION_SAMPLE_CAP: usize = 10_000;
 pub const MAX_BUCKETS: usize = 1_000;
 /// Runs the trait default reads through `list` (backends without an override).
 pub const DEFAULT_SCAN_CAP: usize = 50_000;
+/// Dataset details the trait default reads at once for schema changes.
+const DETAIL_CONCURRENCY: usize = 8;
 
 /// The width of one series bucket. Boundaries are UTC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -845,7 +847,25 @@ pub async fn aggregate_by_listing<H: super::RunHistory + ?Sized>(
         until: None,
         ..windowed.clone()
     };
+    let mut bases = Vec::new();
     for base in [windowed, current] {
+        match &q.pipeline {
+            Some(p) => {
+                let mut by_label = base.clone();
+                by_label.labels.push(super::labels::LabelFilter {
+                    key: "pipeline".into(),
+                    value: Some(p.clone()),
+                });
+                bases.push(by_label);
+                bases.push(super::ListFilter {
+                    name: Some(p.clone()),
+                    ..base
+                });
+            }
+            None => bases.push(base),
+        }
+    }
+    for base in bases {
         let mut filter = super::ListFilter {
             limit: 1_000,
             ..base
@@ -867,7 +887,7 @@ pub async fn aggregate_by_listing<H: super::RunHistory + ?Sized>(
         .usage_list(&crate::usage::UsageFilter {
             since: Some(q.since),
             until: Some(q.until),
-            pipeline: q.pipeline.clone(),
+            pipeline: None,
             tenant: q.tenant.clone(),
             limit: DEFAULT_SCAN_CAP,
         })
@@ -881,20 +901,34 @@ pub async fn aggregate_by_listing<H: super::RunHistory + ?Sized>(
                     ..Default::default()
                 })
                 .await?;
-            let mut versions = Vec::new();
-            for d in page
+            use futures::{StreamExt as _, TryStreamExt as _};
+            let ids: Vec<String> = page
                 .datasets
                 .iter()
                 .filter(|d| d.schema_versions > 1 && d.last_seen >= q.since)
-            {
-                if let Some(detail) = h.catalog_get_dataset(&d.id).await? {
-                    versions.extend(detail.schema_timeline);
-                }
-            }
+                .map(|d| d.id.clone())
+                .collect();
+            let details: Vec<_> = futures::stream::iter(ids)
+                .map(|id| async move { h.catalog_get_dataset(&id).await })
+                .buffered(DETAIL_CONCURRENCY)
+                .try_collect()
+                .await?;
+            let versions: Vec<CatalogSchemaVersion> = details
+                .into_iter()
+                .flatten()
+                .flat_map(|d| d.schema_timeline)
+                .collect();
             freshness_from(q, &page.datasets, &versions)
         }
     };
     Ok(aggregate_in_memory(q, runs.values(), &usage, freshness))
+}
+
+/// Whether a run can change the aggregates: still active, or finished at or after the window start.
+pub fn may_contribute(q: &OverviewQuery, r: &RunRecord) -> bool {
+    !r.status.is_terminal()
+        || r.finished_at.is_none_or(|f| f >= q.since)
+        || q.in_window(r.submitted_at)
 }
 
 /// Whether a usage record falls in the window and the tenant filter. The

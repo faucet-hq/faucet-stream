@@ -329,8 +329,7 @@ impl RunRecord {
             .or_else(|| self.labels.get("pipeline").map(String::as_str))
     }
 
-    /// The pipeline the run belongs to: its `pipeline` label, else its name,
-    /// else empty. The Overview groups and filters by it, as usage records do.
+    /// The run's pipeline for the Overview: its `pipeline` label, else its name, else empty.
     pub fn pipeline_key(&self) -> &str {
         self.labels
             .get("pipeline")

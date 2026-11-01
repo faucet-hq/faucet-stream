@@ -1209,7 +1209,12 @@ impl RunHistory for MemoryHistory {
         &self,
         q: &super::overview::OverviewQuery,
     ) -> Result<super::overview::OverviewAggregates, HistoryError> {
-        let runs: Vec<_> = self.runs.iter().filter(|r| q.in_scope(r)).collect();
+        let runs: Vec<RunRecord> = self
+            .runs
+            .iter()
+            .filter(|r| q.in_scope(r) && super::overview::may_contribute(q, r))
+            .map(|r| r.value().clone())
+            .collect();
         let freshness = match q.stale_before {
             None => None,
             Some(_) => {
@@ -1230,7 +1235,7 @@ impl RunHistory for MemoryHistory {
             .map_err(|_| HistoryError::Backend("usage lock poisoned".into()))?;
         Ok(super::overview::aggregate_in_memory(
             q,
-            runs.iter().map(|r| r.value()),
+            runs.iter(),
             usage.iter(),
             freshness,
         ))

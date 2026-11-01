@@ -1317,6 +1317,26 @@ impl Stmts {
         (sql, binds)
     }
 
+    /// `SELECT COUNT(*)` of the datasets `filter.kind` matches, for a first page whose rows were limited.
+    pub fn catalog_count_query(
+        &self,
+        filter: &crate::serve::history::catalog::CatalogListFilter,
+    ) -> (String, Vec<String>) {
+        match &filter.kind {
+            Some(kind) => (
+                format!(
+                    "SELECT COUNT(*) AS n FROM faucet_catalog_datasets WHERE kind={}",
+                    self.placeholder(1)
+                ),
+                vec![kind.clone()],
+            ),
+            None => (
+                "SELECT COUNT(*) AS n FROM faucet_catalog_datasets".into(),
+                Vec::new(),
+            ),
+        }
+    }
+
     /// Build the change-request listing query for `filter` (#703): clauses
     /// mirror [`ChangeListFilter::matches`](crate::serve::changes::ChangeListFilter::matches)
     /// exactly, pushed into SQL so a never-purged table is not scanned whole.
@@ -2852,9 +2872,7 @@ pub fn saturated(size: u32, idle: usize, max: u32) -> bool {
 /// for request handlers.
 pub const POOL_MAX_CONNECTIONS: u32 = 16;
 
-/// The pools' `before_acquire` check (#1010): a connection still inside a
-/// transaction (a commit failed and its rollback did not run) is discarded and
-/// counted, so the pool opens a fresh one instead of failing every later write.
+/// The pools' `before_acquire` check: false (and counted) for a connection left inside a transaction (#1010).
 pub fn usable_connection<C: sqlx::Connection>(conn: &C) -> bool {
     if conn.is_in_transaction() {
         tracing::warn!("run history: discarding a pooled connection left inside a transaction");
@@ -5299,7 +5317,22 @@ macro_rules! impl_sql_history {
                     let body: String = r.try_get("body").map_err(backend)?;
                     all.push(sql::decode_json(&body, "catalog dataset")?);
                 }
-                Ok(catalog::filter_datasets(all, filter))
+                let mut page = catalog::filter_datasets(all, filter);
+                if filter.cursor.is_none() && filter.q.is_none() {
+                    let (count_text, count_binds) = self.stmts.catalog_count_query(filter);
+                    let mut count = sqlx::query(&count_text);
+                    for bind in &count_binds {
+                        count = count.bind(bind);
+                    }
+                    let n: i64 = count
+                        .fetch_one(&self.pool)
+                        .await
+                        .map_err(backend)?
+                        .try_get("n")
+                        .map_err(backend)?;
+                    page.total = Some(usize::try_from(n).unwrap_or(0));
+                }
+                Ok(page)
             }
 
             async fn catalog_get_dataset(

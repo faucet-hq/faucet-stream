@@ -173,6 +173,7 @@ export function refreshBadges(force = false) {
     .catch(() => setBadge("changes", 0));
   if (scoped) return;
   api("/v1/catalog/datasets?limit=1")
+    .then((d) => (d && d.total != null ? d : api("/v1/catalog/datasets?limit=1000")))
     .then((d) => setBadge("datasets", d ? (d.total ?? (d.datasets || []).length) : 0))
     .catch(() => setBadge("datasets", 0));
   api("/v1/templates")

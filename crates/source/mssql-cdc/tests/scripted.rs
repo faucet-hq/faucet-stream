@@ -219,6 +219,28 @@ async fn a_stalled_change_stream_ends_at_the_call_deadline() {
     assert!(pages(&source).await.is_err());
 }
 
+#[test]
+fn a_reconnect_fits_a_default_two_mib_thread() {
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let server = TdsServer::start().await.unwrap();
+                    preflight(&server, 1);
+                    server.on(CHANGES, Reply::Close);
+                    let source = MssqlCdcSource::new(cfg(&server, json!({}))).await.unwrap();
+                    assert!(pages(&source).await.is_err());
+                })
+        })
+        .unwrap()
+        .join()
+        .expect("the reconnect path overflowed a 2 MiB stack");
+}
+
 #[tokio::test]
 async fn a_change_stream_that_ends_mid_row_fails() {
     let server = TdsServer::start().await.unwrap();

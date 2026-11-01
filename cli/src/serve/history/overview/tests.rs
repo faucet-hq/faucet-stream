@@ -731,3 +731,47 @@ async fn the_listing_default_reports_schema_changes() {
     assert_eq!(direct, listed);
     assert_eq!(listed.freshness.unwrap().schema_changed_count, 1);
 }
+
+#[tokio::test]
+async fn the_listing_default_narrows_a_pipeline_filter_like_memory() {
+    let h = MemoryHistory::new(Duration::from_secs(60));
+    let mut runs = labelled_fleet();
+    let mut named = run(
+        "p5",
+        "orders",
+        RunStatus::Completed,
+        "2026-10-30T06:00:00Z",
+        3,
+        &[1],
+    );
+    named.labels.clear();
+    runs.push(named);
+    for r in &runs {
+        h.upsert(r).await.unwrap();
+    }
+    let mut q = day_query();
+    q.pipeline = Some("orders".into());
+    let direct = h.overview_aggregates(&q).await.unwrap();
+    assert_eq!(direct, aggregate_by_listing(&h, &q).await.unwrap());
+    assert_eq!(direct.runs.total, 3);
+}
+
+#[test]
+fn only_a_run_finished_before_the_window_is_left_out() {
+    let q = day_query();
+    let mut old = run(
+        "o",
+        "a",
+        RunStatus::Completed,
+        "2026-10-29T01:00:00Z",
+        0,
+        &[],
+    );
+    old.finished_at = Some(ts("2026-10-29T02:00:00Z"));
+    assert!(!may_contribute(&q, &old));
+    old.finished_at = Some(ts("2026-10-30T02:00:00Z"));
+    assert!(may_contribute(&q, &old));
+    old.status = RunStatus::Running;
+    old.finished_at = None;
+    assert!(may_contribute(&q, &old));
+}
