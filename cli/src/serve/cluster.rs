@@ -213,6 +213,11 @@ impl ClusterHandle {
         self.inner.fence_grace_ms.store(ms, Ordering::Release);
     }
 
+    /// Whether this instance has fenced itself because it cannot renew its leases.
+    pub fn is_fenced(&self) -> bool {
+        self.inner.fence_grace_ms.load(Ordering::Acquire) != 0
+    }
+
     /// How long a cancelled run may take to flush: `normal`, or the shorter
     /// fence grace while this instance cannot renew its leases.
     pub fn flush_grace(&self, normal: Duration) -> Duration {

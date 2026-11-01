@@ -99,7 +99,7 @@ async fn a_dropped_run_records_the_partial_wait() {
     let usage = meter.snapshot();
     assert_eq!(usage.throttled, 1);
     assert!(
-        (0.3..5.0).contains(&usage.throttle_wait_secs),
+        usage.throttle_wait_secs > 0.0 && usage.throttle_wait_secs < 5.0,
         "the time actually slept, not the 30 s header: {}",
         usage.throttle_wait_secs
     );

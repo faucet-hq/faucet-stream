@@ -30,6 +30,9 @@ impl SqliteHistory {
             .busy_timeout(Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(super::sql::POOL_MAX_CONNECTIONS)
+            .before_acquire(|conn, _| {
+                Box::pin(async move { Ok(super::sql::usable_connection(conn)) })
+            })
             .connect_with(opts)
             .await
             .map_err(|e| classify_backend_error_with_context("SQLite connection failed", e))?;
@@ -79,6 +82,46 @@ mod shard_tests {
 
     fn url_in(dir: &std::path::Path) -> String {
         format!("sqlite://{}/h.db", dir.display())
+    }
+
+    #[tokio::test]
+    async fn a_connection_left_inside_a_transaction_is_not_reused() {
+        use sqlx::TransactionManager as _;
+        let dir = tempfile::tempdir().unwrap();
+        let h = backend(&url_in(dir.path()), "a", Duration::from_secs(30)).await;
+        let mut conns = Vec::new();
+        for _ in 0..super::super::sql::POOL_MAX_CONNECTIONS {
+            let mut c = h.pool.acquire().await.unwrap();
+            <sqlx::Sqlite as sqlx::Database>::TransactionManager::begin(&mut c, None)
+                .await
+                .unwrap();
+            assert!(sqlx::Connection::is_in_transaction(&*c));
+            conns.push(c);
+        }
+        drop(conns);
+        seed_run(&h, "after").await;
+        assert!(h.get("after").await.unwrap().is_some());
+        let mut c = h.pool.acquire().await.unwrap();
+        assert!(!sqlx::Connection::is_in_transaction(&*c));
+        sqlx::query("SELECT 1").execute(&mut *c).await.unwrap();
+    }
+
+    #[test]
+    fn only_a_connection_outside_a_transaction_is_usable() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            use sqlx::{Connection as _, TransactionManager as _};
+            let mut c = sqlx::SqliteConnection::connect("sqlite::memory:")
+                .await
+                .unwrap();
+            assert!(super::super::sql::usable_connection(&c));
+            <sqlx::Sqlite as sqlx::Database>::TransactionManager::begin(&mut c, None)
+                .await
+                .unwrap();
+            assert!(!super::super::sql::usable_connection(&c));
+        });
     }
 
     #[tokio::test]
@@ -506,6 +549,7 @@ mod shard_tests {
             .unwrap();
         assert_eq!(page.datasets.len(), 1);
         assert_eq!(page.datasets[0].uri, "csv://./in.csv");
+        assert_eq!(page.total, Some(1));
 
         // Detail: counters, deduped timeline with a diff, stats, edges.
         let src_id = catalog::dataset_id("csv://./in.csv");
@@ -544,6 +588,28 @@ mod shard_tests {
             2,
             "catalog rows are never purged by run retention"
         );
+        let mut more = update("r4", serde_json::json!({"type":"object"}), 1);
+        more.sources[0].uri = "csv://./second.csv".into();
+        more.sink.uri = "jsonl://./second.jsonl".into();
+        h.catalog_record(&more).await.unwrap();
+        let first = h
+            .catalog_list_datasets(&CatalogListFilter {
+                limit: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(first.datasets.len(), 1);
+        assert_eq!(first.total, Some(4), "counted past the page limit");
+        let next = h
+            .catalog_list_datasets(&CatalogListFilter {
+                limit: 1,
+                cursor: first.next_cursor.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(next.total, None);
     }
 
     #[tokio::test]

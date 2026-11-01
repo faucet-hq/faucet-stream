@@ -85,6 +85,8 @@ run_scenario() { # name function
   wanted "$name" || return 0
   log "── ${name}"
   local t0 rc evidence
+  # The previous scenario may leave pods not yet Ready again (a history outage).
+  wait_all_ready || log "not every serve pod became Ready before ${name}"
   t0=$(date +%s)
   # Not a subshell: port-forwards a scenario opens must reach the cleanup trap.
   "$fn" > "${OUT}/${name}.log" 2>&1
@@ -309,6 +311,19 @@ pods() {
   k get pod -l app.kubernetes.io/component=serve -o json \
     | jq -r '.items[] | select(.metadata.deletionTimestamp == null)
         | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .metadata.name' | sort
+}
+
+# Wait until every serve pod that is not being deleted is Ready (at least one).
+wait_all_ready() {
+  local all ready
+  for _ in $(seq 1 180); do
+    all="$(k get pod -l app.kubernetes.io/component=serve -o json \
+      | jq '[.items[] | select(.metadata.deletionTimestamp == null)] | length')"
+    ready="$(pods | grep -c . || true)"
+    [ "${all:-0}" -gt 0 ] && [ "$ready" = "$all" ] && return 0
+    sleep 1
+  done
+  return 1
 }
 
 NEXT_PORT=19100

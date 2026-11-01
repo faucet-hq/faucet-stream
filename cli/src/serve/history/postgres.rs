@@ -20,6 +20,9 @@ impl PostgresHistory {
     ) -> Result<Self, HistoryError> {
         let pool = PgPoolOptions::new()
             .max_connections(super::sql::POOL_MAX_CONNECTIONS)
+            .before_acquire(|conn, _| {
+                Box::pin(async move { Ok(super::sql::usable_connection(conn)) })
+            })
             .connect(url)
             .await
             .map_err(|e| classify_backend_error_with_context("Postgres connection failed", e))?;

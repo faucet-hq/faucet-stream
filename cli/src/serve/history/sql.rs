@@ -1317,6 +1317,26 @@ impl Stmts {
         (sql, binds)
     }
 
+    /// `SELECT COUNT(*)` of the datasets `filter.kind` matches, for a first page whose rows were limited.
+    pub fn catalog_count_query(
+        &self,
+        filter: &crate::serve::history::catalog::CatalogListFilter,
+    ) -> (String, Vec<String>) {
+        match &filter.kind {
+            Some(kind) => (
+                format!(
+                    "SELECT COUNT(*) AS n FROM faucet_catalog_datasets WHERE kind={}",
+                    self.placeholder(1)
+                ),
+                vec![kind.clone()],
+            ),
+            None => (
+                "SELECT COUNT(*) AS n FROM faucet_catalog_datasets".into(),
+                Vec::new(),
+            ),
+        }
+    }
+
     /// Build the change-request listing query for `filter` (#703): clauses
     /// mirror [`ChangeListFilter::matches`](crate::serve::changes::ChangeListFilter::matches)
     /// exactly, pushed into SQL so a never-purged table is not scanned whole.
@@ -1390,11 +1410,7 @@ impl Stmts {
             binds.push(v);
             self.placeholder(Self::LIST_BINDS + binds.len())
         };
-        // A run names its sink dataset only inside the stored record (each
-        // invocation's usage). The LIKE narrows the rows cheaply; the JSON
-        // test then matches exactly what `RunRecord::touches_dataset` does, so
-        // the field elsewhere in the body (a label, an error) never matches.
-        // The id is checked by `is_dataset_id` first: no wildcard reaches here.
+        // LIKE prefilters cheaply; the JSON test matches as `RunRecord::touches_dataset` does.
         if let Some(id) = filter.dataset_id.as_deref() {
             let like = next(&mut binds, dataset_like(id));
             let exact = next(&mut binds, id.to_string());
@@ -1410,9 +1426,7 @@ impl Stmts {
             };
             sql.push_str(&format!(" AND body LIKE {like} AND {json}"));
         }
-        // Substring tests without LIKE, so no wildcard needs escaping and both
-        // dialects compare case-sensitively, like the memory backend.
-        // The run's title: its name, else its `pipeline` label.
+        // Case-sensitive substring on the run's title, without LIKE wildcards.
         if let Some(n) = filter.name_contains.as_deref() {
             let a = next(&mut binds, n.to_string());
             let b = next(&mut binds, n.to_string());
@@ -2857,6 +2871,16 @@ pub fn saturated(size: u32, idle: usize, max: u32) -> bool {
 /// lease, log persist, log export, change expiry, trigger watchers) plus room
 /// for request handlers.
 pub const POOL_MAX_CONNECTIONS: u32 = 16;
+
+/// The pools' `before_acquire` check: false (and counted) for a connection left inside a transaction (#1010).
+pub fn usable_connection<C: sqlx::Connection>(conn: &C) -> bool {
+    if conn.is_in_transaction() {
+        tracing::warn!("run history: discarding a pooled connection left inside a transaction");
+        metrics::counter!("faucet_serve_history_connections_discarded_total").increment(1);
+        return false;
+    }
+    true
+}
 
 /// Whether a driver error means the database could not be reached, as opposed
 /// to the database answering with an error.
@@ -5293,7 +5317,22 @@ macro_rules! impl_sql_history {
                     let body: String = r.try_get("body").map_err(backend)?;
                     all.push(sql::decode_json(&body, "catalog dataset")?);
                 }
-                Ok(catalog::filter_datasets(all, filter))
+                let mut page = catalog::filter_datasets(all, filter);
+                if filter.cursor.is_none() && filter.q.is_none() {
+                    let (count_text, count_binds) = self.stmts.catalog_count_query(filter);
+                    let mut count = sqlx::query(&count_text);
+                    for bind in &count_binds {
+                        count = count.bind(bind);
+                    }
+                    let n: i64 = count
+                        .fetch_one(&self.pool)
+                        .await
+                        .map_err(backend)?
+                        .try_get("n")
+                        .map_err(backend)?;
+                    page.total = Some(usize::try_from(n).unwrap_or(0));
+                }
+                Ok(page)
             }
 
             async fn catalog_get_dataset(

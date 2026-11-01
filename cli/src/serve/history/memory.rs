@@ -1209,7 +1209,12 @@ impl RunHistory for MemoryHistory {
         &self,
         q: &super::overview::OverviewQuery,
     ) -> Result<super::overview::OverviewAggregates, HistoryError> {
-        let runs: Vec<RunRecord> = self.runs.iter().map(|r| r.clone()).collect();
+        let runs: Vec<RunRecord> = self
+            .runs
+            .iter()
+            .filter(|r| q.in_scope(r) && super::overview::may_contribute(q, r))
+            .map(|r| r.value().clone())
+            .collect();
         let freshness = match q.stale_before {
             None => None,
             Some(_) => {

@@ -993,6 +993,7 @@ paths:
                     type: array
                     items: { $ref: "#/components/schemas/CatalogDataset" }
                   next_cursor: { type: string, nullable: true }
+                  total: { type: integer, description: "How many datasets match `kind` / `q`; on the first page (no `cursor`) only." }
         "401": { $ref: "#/components/responses/Error" }
         "403": { description: Principal's role lacks the required permission }
   /v1/catalog/datasets/{id}:
@@ -1276,7 +1277,7 @@ paths:
         without templates, `connections_needing_reauth` without tenants,
         `pending_changes` when approvals are off and none are pending).
         Requires `RunRead` (viewer); a tenant-scoped principal sees only its
-        tenant's runs. Audited as `overview.get`.
+        tenant's runs. Not audited when allowed (the console polls it); a 403 denial is audited as `overview.get`.
       operationId: getOverview
       security: [{ bearerAuth: [] }]
       parameters:
@@ -3765,7 +3766,7 @@ components:
                 type: object
                 required: [pipeline, runs, failed, rate]
                 properties:
-                  pipeline: { type: string, description: The run name; empty for runs without one. }
+                  pipeline: { type: string, description: "The run's pipeline: its `pipeline` label (set to the config name unless the submitter set it), else its run name; empty for neither." }
                   runs: { type: integer, description: Finished runs. }
                   failed: { type: integer }
                   rate: { type: number }

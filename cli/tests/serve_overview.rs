@@ -226,20 +226,20 @@ async fn exercise(history: Option<String>, grafana: Option<&str>) {
     assert_eq!(runs["running"], 0);
     assert_eq!(
         runs["failure_rate_by_pipeline"],
-        serde_json::json!([{ "pipeline": "bad-b", "runs": 1, "failed": 1, "rate": 1.0 }])
+        serde_json::json!([{ "pipeline": "overview-bad", "runs": 1, "failed": 1, "rate": 1.0 }])
     );
     let slowest = runs["slowest"].as_array().unwrap();
     assert!(
         slowest
             .iter()
-            .any(|p| p["pipeline"] == "ok-a" && p["runs"] == 2),
+            .any(|p| p["pipeline"] == "overview-e2e" && p["runs"] == 2),
         "{o}"
     );
     assert_eq!(o["records"]["total"], 6);
     assert_eq!(sum(&o["records"]["series"], "written"), 6);
     assert_eq!(
         o["records"]["top_pipelines"],
-        serde_json::json!([{ "pipeline": "ok-a", "written": 6 }])
+        serde_json::json!([{ "pipeline": "overview-e2e", "written": 6 }])
     );
     assert_eq!(o["governance"]["totals"]["quarantined"], 0);
     let cost = &o["cost"];
@@ -275,7 +275,12 @@ async fn exercise(history: Option<String>, grafana: Option<&str>) {
         None => assert!(o.get("grafana").is_none()),
     }
 
-    let (_, only) = get(&client, &url("?since=7d&pipeline=ok-a"), "viewer-tok").await;
+    let (_, only) = get(
+        &client,
+        &url("?since=7d&pipeline=overview-e2e"),
+        "viewer-tok",
+    )
+    .await;
     assert_eq!(only["bucket"], "day");
     assert_eq!(only["runs"]["total"], 2);
     assert_eq!(
@@ -316,7 +321,10 @@ async fn exercise(history: Option<String>, grafana: Option<&str>) {
         .as_array()
         .or_else(|| audit["entries"].as_array())
         .unwrap();
-    assert!(entries.iter().any(|e| e["principal"] == "bob"), "{audit}");
+    assert!(
+        entries.iter().all(|e| e["result"] != "ok"),
+        "a polled read is not audited: {audit}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

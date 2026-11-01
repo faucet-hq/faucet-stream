@@ -621,7 +621,7 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
             shard_id: shard_id.clone(),
         };
         let principal = crate::runtime::Principal::stored(AuthContext::runtime(), &run);
-        let (outcome, shutdown) = crate::runtime::under(
+        let (outcome, exit) = crate::runtime::under(
             &principal,
             execute_shard(
                 &state,
@@ -642,7 +642,23 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
         // A clustered shutdown hands the shard back to the cluster instead of
         // failing it, as it does a whole run (#789 SERVE-25): a peer resumes it
         // from its per-shard bookmark.
-        if shutdown && state.cluster().enabled() {
+        if exit == ShardExit::Fenced {
+            hand_back(
+                &state,
+                PendingFinalize::ReleaseShard {
+                    run_id: run_id.clone(),
+                    shard_id: shard_id.clone(),
+                },
+            )
+            .await;
+            drop(_shard_guard);
+            if !state.registry().has_run_shards(&run_id) {
+                state.log_hub().finish(&run_id);
+                schedule_log_drop(state.clone(), run_id.clone());
+            }
+            return;
+        }
+        if exit == ShardExit::Shutdown && state.cluster().enabled() {
             match state.history().release_shard(&run_id, &shard_id).await {
                 Ok(true) => {
                     tracing::info!(
@@ -696,12 +712,12 @@ async fn execute_shard(
     clock_flag: Option<String>,
     concurrency: Option<usize>,
     submitted_at: DateTime<Utc>,
-) -> (ShardOutcome, bool) {
+) -> (ShardOutcome, ShardExit) {
     let auth = match loaded.auth_catalog() {
         Ok(a) => a,
         Err(e) => {
             tracing::error!(run_id, shard_id, "shard auth catalog: {e}");
-            return (ShardOutcome::Failed, false);
+            return (ShardOutcome::Failed, ShardExit::Finished);
         }
     };
     let LoadedSubmission { cfg, nodes, tenant } = loaded;
@@ -714,7 +730,7 @@ async fn execute_shard(
                 "shard clock: {}",
                 e.api_error().error.message
             );
-            return (ShardOutcome::Failed, false);
+            return (ShardOutcome::Failed, ShardExit::Finished);
         }
     };
     // `coop` is the per-shard cancel token registered by `resume_claimed_shard`;
@@ -740,7 +756,7 @@ async fn execute_shard(
         Ok(o) => o,
         Err(e) => {
             tracing::error!(run_id, shard_id, "shard {e}");
-            return (ShardOutcome::Failed, false);
+            return (ShardOutcome::Failed, ShardExit::Finished);
         }
     };
 
@@ -771,17 +787,20 @@ async fn execute_shard(
     // token: `cancel_run` flags the parent → `pending_cancellations` →
     // `claim_loop` fires `registry().cancel(run_id)`. The token is registered
     // under the run id by `resume_claimed_shard` before this runs.
+    let mut fenced = false;
     let terminal = tokio::select! {
         biased;
-        t = &mut work => t,
+        // A cancelled shard's pipeline also returns Ok, so the cancel is checked first.
         _ = coop.cancelled() => {
             // Fired by the claim loop for a remote cancel. Flush within the grace
             // window; a cooperative cancel returns Ok(partial), so the shard is
             // Cancelled — but a flush that FAILS must surface, not be masked.
+            fenced = state.cluster().is_fenced();
             let grace = state.cluster().flush_grace(RUN_FLUSH_GRACE);
             Terminal::cancelled()
                 .after_interrupt(tokio::time::timeout(grace, &mut work).await.ok())
         }
+        t = &mut work => t,
         _ = server_shutdown.cancelled() => {
             coop.cancel();
             Terminal::shutdown_failed()
@@ -793,13 +812,25 @@ async fn execute_shard(
                 .after_interrupt(tokio::time::timeout(RUN_FLUSH_GRACE, &mut work).await.ok())
         }
     };
-    let shutdown = matches!(terminal, Terminal::ShutdownFailed { .. });
+    let exit = match terminal {
+        Terminal::ShutdownFailed { .. } => ShardExit::Shutdown,
+        Terminal::Cancelled { .. } if fenced => ShardExit::Fenced,
+        _ => ShardExit::Finished,
+    };
     let outcome = match terminal {
         Terminal::Completed { .. } => ShardOutcome::Completed,
         Terminal::Cancelled { .. } => ShardOutcome::Cancelled,
         _ => ShardOutcome::Failed,
     };
-    (outcome, shutdown)
+    (outcome, exit)
+}
+
+/// Why a shard stopped, which decides whether it is finalized or handed back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShardExit {
+    Finished,
+    Shutdown,
+    Fenced,
 }
 
 /// The owner-fenced terminal write of one shard, then the parent's finalize
@@ -2003,6 +2034,7 @@ async fn execute_run(
     };
 
     let shutting_down = matches!(trigger, Trigger::Shutdown);
+    let fenced = matches!(trigger, Trigger::Cancel) && state.cluster().is_fenced();
     let terminal = match trigger {
         Trigger::Done(t) => t,
         triggered => {
@@ -2035,6 +2067,20 @@ async fn execute_run(
         && matches!(terminal, Terminal::ShutdownFailed { .. })
         && release_for_peer(&state, &run_id).await
     {
+        state.log_hub().finish(&run_id);
+        schedule_log_drop(state.clone(), run_id.clone());
+        return;
+    }
+    // A run cancelled by this instance's own fence was not cancelled by anyone:
+    // it goes back to the cluster, once the backend answers again.
+    if fenced && matches!(terminal, Terminal::Cancelled { .. }) {
+        hand_back(
+            &state,
+            PendingFinalize::ReleaseRun {
+                run_id: run_id.clone(),
+            },
+        )
+        .await;
         state.log_hub().finish(&run_id);
         schedule_log_drop(state.clone(), run_id.clone());
         return;
@@ -2149,14 +2195,34 @@ pub(crate) enum PendingFinalize {
         shard_id: String,
         outcome: ShardOutcome,
     },
+    /// A run this instance's fence interrupted, to hand back as `pending`.
+    ReleaseRun { run_id: String },
+    /// A shard this instance's fence interrupted, to hand back as `pending`.
+    ReleaseShard { run_id: String, shard_id: String },
 }
 
 impl PendingFinalize {
     fn run_id(&self) -> &str {
         match self {
             PendingFinalize::Run { rec, .. } => &rec.run_id,
-            PendingFinalize::Shard { run_id, .. } => run_id,
+            PendingFinalize::Shard { run_id, .. }
+            | PendingFinalize::ReleaseRun { run_id }
+            | PendingFinalize::ReleaseShard { run_id, .. } => run_id,
         }
+    }
+}
+
+/// Hand a fenced run or shard back to the cluster; while the backend is still
+/// unreachable the release is queued and retried from the lease loop, which
+/// keeps renewing the row's lease until it lands so no peer runs it meanwhile.
+async fn hand_back(state: &ServerState, pending: PendingFinalize) {
+    if let Err(e) = write_pending(state, &pending).await {
+        tracing::warn!(
+            run_id = %pending.run_id(),
+            error = %e,
+            "fence: could not hand the run back yet; retrying from the lease loop"
+        );
+        state.queue_finalize(pending);
     }
 }
 
@@ -2186,6 +2252,28 @@ async fn write_pending(
                 );
             }
             maybe_finalize_parent(state, run_id).await;
+            Ok(())
+        }
+        PendingFinalize::ReleaseRun { run_id } => {
+            let released = match state.history().get(run_id).await? {
+                Some(rec) => state.history().release_owned(&rec).await?,
+                None => false,
+            };
+            if released {
+                tracing::info!(%run_id, "fence: run handed back to the cluster as pending");
+                state.cluster().kick();
+            } else {
+                tracing::warn!(%run_id, "fence: run is no longer this instance's; not handed back");
+            }
+            Ok(())
+        }
+        PendingFinalize::ReleaseShard { run_id, shard_id } => {
+            if state.history().release_shard(run_id, shard_id).await? {
+                tracing::info!(%run_id, %shard_id, "fence: shard handed back to the cluster as pending");
+                state.cluster().kick();
+            } else {
+                tracing::warn!(%run_id, %shard_id, "fence: shard is no longer this instance's; not handed back");
+            }
             Ok(())
         }
     }
@@ -2494,6 +2582,111 @@ mod tests {
                 .push((run_id.into(), shard_id.into(), outcome));
             Ok(true)
         }
+        async fn release_owned(
+            &self,
+            rec: &RunRecord,
+        ) -> Result<bool, crate::serve::history::HistoryError> {
+            if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::serve::history::HistoryError::Backend("down".into()));
+            }
+            let mut rec = rec.clone();
+            rec.status = RunStatus::Pending;
+            self.inner.upsert(&rec).await.map(|_| true)
+        }
+        async fn release_shard(
+            &self,
+            run_id: &str,
+            shard_id: &str,
+        ) -> Result<bool, crate::serve::history::HistoryError> {
+            if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::serve::history::HistoryError::Backend("down".into()));
+            }
+            Ok(run_id == "r1" && shard_id == "0")
+        }
+    }
+
+    fn flaky_state(down: bool) -> (ServerState, std::sync::Arc<FlakyFinalize>) {
+        let mut config = crate::serve::test_support::test_config();
+        config.cluster.enabled = true;
+        let history = std::sync::Arc::new(FlakyFinalize {
+            inner: crate::serve::history::memory::MemoryHistory::new(Duration::from_secs(60)),
+            down: std::sync::atomic::AtomicBool::new(down),
+            shards: Default::default(),
+        });
+        let state = ServerState::new(
+            &config,
+            None,
+            CancellationToken::new(),
+            history.clone(),
+            crate::serve::logs::LogHub::new(),
+            None,
+            #[cfg(feature = "triggers")]
+            crate::serve::triggers::health::TriggersHandle::empty(),
+        );
+        (state, history)
+    }
+
+    /// A fenced run handed back while the backend is still down waits in the
+    /// queue and lands as `pending` once it answers, never as `cancelled`.
+    #[tokio::test]
+    async fn a_fenced_hand_back_waits_for_the_backend() {
+        let (state, history) = flaky_state(true);
+        let mut rec = RunRecord::queued("r1".into(), None, BTreeMap::new(), None, Utc::now());
+        rec.status = RunStatus::Running;
+        state.history().upsert(&rec).await.unwrap();
+        hand_back(
+            &state,
+            PendingFinalize::ReleaseRun {
+                run_id: "r1".into(),
+            },
+        )
+        .await;
+        hand_back(
+            &state,
+            PendingFinalize::ReleaseShard {
+                run_id: "r1".into(),
+                shard_id: "0".into(),
+            },
+        )
+        .await;
+        assert_eq!(retry_pending_finalize(&state).await, 0, "still down");
+        let now = state.history().get("r1").await.unwrap().unwrap();
+        assert_eq!(now.status, RunStatus::Running);
+        history
+            .down
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(retry_pending_finalize(&state).await, 2);
+        let now = state.history().get("r1").await.unwrap().unwrap();
+        assert_eq!(now.status, RunStatus::Pending);
+        assert_eq!(retry_pending_finalize(&state).await, 0);
+    }
+
+    /// A hand-back of a run or shard this instance no longer holds is dropped.
+    #[tokio::test]
+    async fn a_hand_back_of_a_run_no_longer_held_is_dropped() {
+        let (state, _) = flaky_state(false);
+        hand_back(
+            &state,
+            PendingFinalize::ReleaseRun {
+                run_id: "gone".into(),
+            },
+        )
+        .await;
+        hand_back(
+            &state,
+            PendingFinalize::ReleaseShard {
+                run_id: "r1".into(),
+                shard_id: "9".into(),
+            },
+        )
+        .await;
+        assert_eq!(retry_pending_finalize(&state).await, 0, "nothing queued");
+        assert!(state.history().get("gone").await.unwrap().is_none());
+        let p = PendingFinalize::ReleaseShard {
+            run_id: "r1".into(),
+            shard_id: "0".into(),
+        };
+        assert_eq!(p.run_id(), "r1");
     }
 
     /// A clustered terminal write the backend refuses is kept and retried by
@@ -3823,10 +4016,13 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 fire.cancel();
             });
-            assert_ne!(run(coop, None).await, (ShardOutcome::Failed, false));
+            assert_ne!(
+                run(coop, None).await,
+                (ShardOutcome::Failed, ShardExit::Finished)
+            );
             assert_eq!(
                 run(CancellationToken::new(), Some(1)).await,
-                (ShardOutcome::Failed, false)
+                (ShardOutcome::Failed, ShardExit::Finished)
             );
             let shutdown = state.shutdown_token();
             tokio::spawn(async move {
@@ -3835,7 +4031,7 @@ mod tests {
             });
             assert_eq!(
                 run(CancellationToken::new(), None).await,
-                (ShardOutcome::Failed, true)
+                (ShardOutcome::Failed, ShardExit::Shutdown)
             );
         }
 
@@ -3929,6 +4125,92 @@ mod tests {
                 }
             }
             assert_eq!(status, RunStatus::Pending, "handed back to the cluster");
+        }
+
+        /// A run this instance's own fence cancels goes back to the cluster
+        /// as `pending`, not `cancelled`: nobody cancelled it.
+        #[cfg(feature = "source-webhook")]
+        #[tokio::test]
+        async fn a_fenced_run_is_handed_back_not_cancelled() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cluster = crate::serve::cluster::ClusterConfig::disabled();
+            cluster.enabled = true;
+            let state = sqlite_state_with(dir.path(), cluster).await;
+            let mut rec = RunRecord::queued("r".into(), None, BTreeMap::new(), None, Utc::now());
+            rec.status = RunStatus::Pending;
+            rec.config_body = Some(waiting_yaml(dir.path()));
+            state.history().upsert(&rec).await.unwrap();
+            let claimed = state
+                .history()
+                .claim_pending(1, &crate::serve::pools::default_only())
+                .await
+                .unwrap();
+            resume_claimed_run(state.clone(), claimed.into_iter().next().unwrap());
+            let mut status = RunStatus::Pending;
+            for _ in 0..100 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                status = state.history().get("r").await.unwrap().unwrap().status;
+                if status == RunStatus::Running {
+                    break;
+                }
+            }
+            assert_eq!(status, RunStatus::Running);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            state.cluster().set_fenced(Some(Duration::from_secs(2)));
+            assert!(state.cluster().is_fenced());
+            assert!(state.registry().cancel_all() > 0);
+            for _ in 0..200 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                status = state.history().get("r").await.unwrap().unwrap().status;
+                if status != RunStatus::Running {
+                    break;
+                }
+            }
+            assert_eq!(status, RunStatus::Pending, "handed back, not cancelled");
+            state.cluster().set_fenced(None);
+            assert!(!state.cluster().is_fenced());
+        }
+
+        /// A shard this instance's own fence cancels goes back as `pending`.
+        #[cfg(feature = "source-webhook")]
+        #[tokio::test]
+        async fn a_fenced_shard_is_handed_back_not_cancelled() {
+            use crate::serve::history::ShardInsert;
+            let dir = tempfile::tempdir().unwrap();
+            let mut cluster = crate::serve::cluster::ClusterConfig::disabled();
+            cluster.enabled = true;
+            let state = sqlite_state_with(dir.path(), cluster).await;
+            let mut rec = RunRecord::queued("r".into(), None, BTreeMap::new(), None, Utc::now());
+            rec.status = RunStatus::Sharded;
+            rec.config_body = Some(waiting_yaml(dir.path()));
+            state.history().upsert(&rec).await.unwrap();
+            let shards = [ShardInsert {
+                shard_id: "0".into(),
+                descriptor: serde_json::Value::Null,
+                size_estimate: None,
+            }];
+            state.history().insert_shards("r", &shards).await.unwrap();
+            let claimed = state
+                .history()
+                .claim_shards(1, &crate::serve::pools::default_only())
+                .await
+                .unwrap();
+            resume_claimed_shard(state.clone(), claimed.into_iter().next().unwrap());
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            state.cluster().set_fenced(Some(Duration::from_secs(2)));
+            state.registry().cancel_all();
+            let mut progress = state.history().shard_progress("r").await.unwrap();
+            for _ in 0..200 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                progress = state.history().shard_progress("r").await.unwrap();
+                if progress.running == 0 {
+                    break;
+                }
+            }
+            assert_eq!(progress.pending, 1, "{progress:?}");
+            assert_eq!(progress.cancelled, 0, "{progress:?}");
+            let parent = state.history().get("r").await.unwrap().unwrap();
+            assert_eq!(parent.status, RunStatus::Sharded, "the parent stays open");
         }
 
         #[tokio::test]

@@ -1013,13 +1013,18 @@ restart and cover every replica of a cluster:
 The window is `[since, until)`: `since` is a duration back from `until`
 (`30m`, `24h`, `7d`, `2w`, default `7d`) or an RFC 3339 instant, and `until`
 defaults to now. Buckets are UTC hours up to three days and days beyond
-(`bucket=hour|day` overrides; at most 1,000 buckets). `pipeline`, `pool`,
+(`bucket=hour|day` overrides; at most 1,000 buckets). Runs are grouped by
+pipeline: a run's `pipeline` label, else its run name. The server sets that
+label to the config's `name:` (`serve` for an unnamed config) unless the
+submitter set it, so it normally matches the pipeline cost is grouped by.
+`pipeline` filters by that key; `pool`,
 `label` / `labels` and `tenant` filter runs as on `GET /v1/runs`; a
 tenant-scoped principal sees its own tenant only. The SQL history backends
 group in the database; the p95 is computed over the newest 10,000 finished
 invocations in the window (`runs.duration_sample.truncated` says when the
 window held more), and `top` (1–50, default 10) bounds every list. `RunRead`
-(viewer and up); audited `overview.get`; `400` for a bad parameter.
+(viewer and up); not audited when allowed, since the console polls it (a
+`403` denial is audited `overview.get`); `400` for a bad parameter.
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" \
@@ -1679,7 +1684,9 @@ pool),
 `faucet_serve_idempotency_hits_total`, `faucet_serve_history_degraded` (the
 backend fell back to memory) and `faucet_serve_history_unreachable` (the last
 lease heartbeat did not reach the history database; `/readyz` is `503` while
-it is `1`).
+it is `1`), and `faucet_serve_history_connections_discarded_total` (pooled
+history connections dropped because a failed commit left them inside a
+transaction; the pool opens a fresh one).
 With the `tenants` feature: `faucet_serve_tenant_runs_total{tenant,outcome}`,
 `faucet_serve_tenant_limit_rejections_total{tenant,limit}`,
 `faucet_serve_connections{status}` and

@@ -20,8 +20,8 @@ pub const DURATION_SAMPLE_CAP: usize = 10_000;
 pub const MAX_BUCKETS: usize = 1_000;
 /// Runs the trait default reads through `list` (backends without an override).
 pub const DEFAULT_SCAN_CAP: usize = 50_000;
-/// The name a run without one is grouped under.
-pub const UNNAMED: &str = "";
+/// Dataset details the trait default reads at once for schema changes.
+const DETAIL_CONCURRENCY: usize = 8;
 
 /// The width of one series bucket. Boundaries are UTC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,7 +128,7 @@ impl OverviewQuery {
     pub fn in_scope(&self, r: &RunRecord) -> bool {
         self.pipeline
             .as_deref()
-            .is_none_or(|p| r.name.as_deref().unwrap_or(UNNAMED) == p)
+            .is_none_or(|p| r.pipeline_key() == p)
             && self.pool.as_deref().is_none_or(|p| r.pool == p)
             && self
                 .tenant
@@ -437,7 +437,7 @@ impl Aggregator {
             return;
         }
         let bucket = q.bucket.floor(r.submitted_at);
-        let name = r.name.as_deref().unwrap_or(UNNAMED);
+        let name = r.pipeline_key();
         self.add_status(bucket, r.status.as_str(), 1);
         self.add_written(bucket, r.records_written);
         if r.status.is_terminal() {
@@ -454,7 +454,7 @@ impl Aggregator {
     /// Feed the durations of in-window, finished, in-scope runs, newest first.
     pub fn add_run_durations<'a>(&mut self, runs: impl IntoIterator<Item = &'a RunRecord>) {
         for r in runs {
-            let name = r.name.as_deref().unwrap_or(UNNAMED);
+            let name = r.pipeline_key();
             for inv in r.invocations.iter().filter(|i| !i.skipped) {
                 if !self.add_duration(name, inv.duration_ms) {
                     return;
@@ -830,7 +830,6 @@ pub async fn aggregate_by_listing<H: super::RunHistory + ?Sized>(
 ) -> Result<OverviewAggregates, super::HistoryError> {
     let mut runs: BTreeMap<String, RunRecord> = BTreeMap::new();
     let windowed = super::ListFilter {
-        name: q.pipeline.clone(),
         since: Some(q.since),
         until: Some(q.until),
         tenant: q.tenant.clone(),
@@ -848,7 +847,25 @@ pub async fn aggregate_by_listing<H: super::RunHistory + ?Sized>(
         until: None,
         ..windowed.clone()
     };
+    let mut bases = Vec::new();
     for base in [windowed, current] {
+        match &q.pipeline {
+            Some(p) => {
+                let mut by_label = base.clone();
+                by_label.labels.push(super::labels::LabelFilter {
+                    key: "pipeline".into(),
+                    value: Some(p.clone()),
+                });
+                bases.push(by_label);
+                bases.push(super::ListFilter {
+                    name: Some(p.clone()),
+                    ..base
+                });
+            }
+            None => bases.push(base),
+        }
+    }
+    for base in bases {
         let mut filter = super::ListFilter {
             limit: 1_000,
             ..base
@@ -870,7 +887,7 @@ pub async fn aggregate_by_listing<H: super::RunHistory + ?Sized>(
         .usage_list(&crate::usage::UsageFilter {
             since: Some(q.since),
             until: Some(q.until),
-            pipeline: q.pipeline.clone(),
+            pipeline: None,
             tenant: q.tenant.clone(),
             limit: DEFAULT_SCAN_CAP,
         })
@@ -884,10 +901,34 @@ pub async fn aggregate_by_listing<H: super::RunHistory + ?Sized>(
                     ..Default::default()
                 })
                 .await?;
-            freshness_from(q, &page.datasets, std::iter::empty())
+            use futures::{StreamExt as _, TryStreamExt as _};
+            let ids: Vec<String> = page
+                .datasets
+                .iter()
+                .filter(|d| d.schema_versions > 1 && d.last_seen >= q.since)
+                .map(|d| d.id.clone())
+                .collect();
+            let details: Vec<_> = futures::stream::iter(ids)
+                .map(|id| async move { h.catalog_get_dataset(&id).await })
+                .buffered(DETAIL_CONCURRENCY)
+                .try_collect()
+                .await?;
+            let versions: Vec<CatalogSchemaVersion> = details
+                .into_iter()
+                .flatten()
+                .flat_map(|d| d.schema_timeline)
+                .collect();
+            freshness_from(q, &page.datasets, &versions)
         }
     };
     Ok(aggregate_in_memory(q, runs.values(), &usage, freshness))
+}
+
+/// Whether a run can change the aggregates: still active, or finished at or after the window start.
+pub fn may_contribute(q: &OverviewQuery, r: &RunRecord) -> bool {
+    !r.status.is_terminal()
+        || r.finished_at.is_none_or(|f| f >= q.since)
+        || q.in_window(r.submitted_at)
 }
 
 /// Whether a usage record falls in the window and the tenant filter. The
@@ -913,6 +954,15 @@ pub fn filters_by_run(q: &OverviewQuery) -> bool {
 pub mod sql {
     use super::{DURATION_SAMPLE_CAP, OverviewQuery};
     use crate::serve::history::sql::{Dialect, fmt_ts};
+
+    /// A run's pipeline: its `pipeline` label, else its name (as `RunRecord::pipeline_key`).
+    const PIPELINE_KEY: &str = "COALESCE((SELECT l.value FROM faucet_serve_run_labels l \
+         WHERE l.run_id = r.run_id AND l.key = 'pipeline'), r.name, '')";
+
+    /// The runs table with each run's pipeline as `r.pk`, so a query can group by it.
+    fn runs_with_pipeline() -> String {
+        format!("(SELECT r.*, {PIPELINE_KEY} AS pk FROM faucet_serve_runs r) r")
+    }
 
     /// A statement under construction: its binds, numbered for the dialect.
     pub struct Built {
@@ -1046,7 +1096,7 @@ pub mod sql {
             let mut out = Vec::new();
             if let Some(p) = &q.pipeline {
                 let b = self.bind(p.clone());
-                out.push(format!("COALESCE(r.name, '') = {b}"));
+                out.push(format!("{PIPELINE_KEY} = {b}"));
             }
             if let Some(p) = &q.pool {
                 let b = self.bind(p.clone());
@@ -1113,11 +1163,12 @@ pub mod sql {
         let real = if x.pg() { "DOUBLE PRECISION" } else { "REAL" };
         (
             format!(
-                "SELECT COALESCE(r.name, '') AS p, {finished} AS n, {failed} AS f \
-                 FROM faucet_serve_runs r WHERE {w} GROUP BY COALESCE(r.name, '') \
+                "SELECT r.pk AS p, {finished} AS n, {failed} AS f \
+                 FROM {} WHERE {w} GROUP BY r.pk \
                  HAVING {failed} > 0 \
                  ORDER BY CAST({failed} AS {real}) / {finished} DESC, {failed} DESC, \
-                 COALESCE(r.name, '') ASC LIMIT {}",
+                 r.pk ASC LIMIT {}",
+                runs_with_pipeline(),
                 q.top()
             ),
             x.binds,
@@ -1131,9 +1182,10 @@ pub mod sql {
         let written = x.sum_int(&x.int(&x.doc("r.body"), &["records_written"]));
         (
             format!(
-                "SELECT COALESCE(r.name, '') AS p, {written} AS w \
-                 FROM faucet_serve_runs r WHERE {w} GROUP BY COALESCE(r.name, '') \
-                 HAVING {written} > 0 ORDER BY {written} DESC, COALESCE(r.name, '') ASC LIMIT {}",
+                "SELECT r.pk AS p, {written} AS w \
+                 FROM {} WHERE {w} GROUP BY r.pk \
+                 HAVING {written} > 0 ORDER BY {written} DESC, r.pk ASC LIMIT {}",
+                runs_with_pipeline(),
                 q.top()
             ),
             x.binds,
@@ -1174,7 +1226,7 @@ pub mod sql {
         let w = x.run_where(q);
         (
             format!(
-                "SELECT COALESCE(r.name, '') AS p, {} AS d FROM {} \
+                "SELECT {PIPELINE_KEY} AS p, {} AS d FROM {} \
                  WHERE {w} AND {TERMINAL} AND {} \
                  ORDER BY r.submitted_at DESC, r.run_id DESC LIMIT {}",
                 x.int("i.value", &["duration_ms"]),
