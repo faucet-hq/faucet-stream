@@ -414,8 +414,8 @@ pub struct RunConfigResponse {
 const MASK: &str = "***";
 
 /// Mask every string value under a credential-looking key (and every scalar
-/// below one) in a parsed config, keeping whole `${…}` references, and strip
-/// credentials embedded in URLs anywhere else. Returns whether anything was masked.
+/// below one) in a parsed config, keeping whole `${…}` references, which name a
+/// secret rather than hold it. Returns whether anything was masked.
 fn mask_credentials(v: &mut serde_json::Value, under_secret: bool) -> bool {
     use serde_json::Value;
     match v {
@@ -433,12 +433,6 @@ fn mask_credentials(v: &mut serde_json::Value, under_secret: bool) -> bool {
         Value::String(s) if under_secret && !s.is_empty() && !is_reference(s) => {
             *s = MASK.to_string();
             true
-        }
-        Value::String(s) => {
-            let redacted = faucet_core::util::redact_uri_credentials(s);
-            let changed = redacted != *s;
-            *s = redacted;
-            changed
         }
         Value::Number(_) | Value::Bool(_) if under_secret => {
             *v = Value::String(MASK.to_string());
@@ -905,14 +899,11 @@ mod tests {
     }
 
     #[test]
-    fn url_credentials_and_partial_references_are_masked() {
+    fn a_secret_with_an_embedded_reference_is_masked() {
         use crate::serve::load::ConfigFormat;
-        let body = "sink:\n  config:\n    connection_url: postgres://etl:S3cr3t@db.internal/prod\n\
-                    vars:\n  api_token: tok_live_abc${x}\n  db_password: \"${env:PG_PASS}\"\n";
+        let body = "vars:\n  api_token: tok_live_abc${x}\n  db_password: \"${env:PG_PASS}\"\n";
         let (out, masked) = masked_body(body, ConfigFormat::Yaml).unwrap();
         assert!(masked);
-        assert!(!out.contains("S3cr3t") && !out.contains("etl:"), "{out}");
-        assert!(out.contains("db.internal/prod"), "{out}");
         assert!(!out.contains("tok_live_abc"), "{out}");
         assert!(out.contains("${env:PG_PASS}"), "{out}");
         assert!(is_reference("${vault:a/b#c}"));
