@@ -53,7 +53,6 @@ async fn a_run_keeps_the_default_state_store_but_may_not_read_it_as_data() {
         CALLER,
     )
     .await
-    .err()
-    .expect("reading the state directory is refused");
+    .expect_err("reading the state directory is refused");
     assert!(matches!(err, ServeError::Forbidden(_)), "{err}");
 }

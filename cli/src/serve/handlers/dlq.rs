@@ -22,24 +22,18 @@ use serde_json::Value;
 /// a client error (400); anything else is internal (500).
 fn cli_to_serve(e: CliError) -> ServeError {
     match e {
-        CliError::Config(m) => ServeError::BadConfig(m),
+        CliError::Config(m) | CliError::Faucet(faucet_core::FaucetError::Config(m)) => {
+            ServeError::BadConfig(m)
+        }
         other => ServeError::Internal(other.to_string()),
     }
 }
 
 /// Screen a request's DLQ location (system trees, the server's own files,
-/// the caller path roots) and only then refuse one that names nothing on disk
-/// (a glob is resolved by the reader, which reports a pattern that matches
-/// nothing).
+/// the caller path roots). A location that matches nothing is reported by the
+/// reader as a client error.
 fn require_location(location: &str, write: bool, tenant: Option<&str>) -> Result<(), ServeError> {
-    refuse_request_path("location", location, write, tenant)?;
-    let is_glob = location.contains(['*', '?', '[']);
-    if is_glob || std::path::Path::new(location).exists() {
-        return Ok(());
-    }
-    Err(ServeError::BadConfig(format!(
-        "DLQ location '{location}' does not exist"
-    )))
+    refuse_request_path("location", location, write, tenant)
 }
 
 fn default_sample_limit() -> usize {

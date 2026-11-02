@@ -315,7 +315,7 @@ async fn a_dlq_location_that_does_not_exist_is_a_client_error() {
             body["error"]["message"]
                 .as_str()
                 .unwrap()
-                .contains("does not exist"),
+                .contains("matched no files"),
             "{body}"
         );
     }

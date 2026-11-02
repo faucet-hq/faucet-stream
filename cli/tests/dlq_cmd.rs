@@ -86,6 +86,7 @@ async fn discard_human_and_json_render() {
             before: Some("1s".into()),
             delete: false,
             purge: false,
+            reseal_plain: false,
             json: false,
         }),
     };
@@ -99,6 +100,7 @@ async fn discard_human_and_json_render() {
             before: None,
             delete: true,
             purge: false,
+            reseal_plain: false,
             json: true,
         }),
     };
@@ -113,6 +115,7 @@ async fn discard_human_and_json_render() {
             before: Some("soon".into()),
             delete: false,
             purge: false,
+            reseal_plain: false,
             json: false,
         }),
     };
@@ -135,6 +138,7 @@ async fn discard_purge_removes_the_envelopes_from_disk() {
                 before: None,
                 delete: false,
                 purge: true,
+                reseal_plain: false,
                 json,
             }),
         };

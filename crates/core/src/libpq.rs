@@ -130,6 +130,14 @@ pub fn refuse_env_vars(
     }
 }
 
+/// `url` with an empty `password` query parameter, which sqlx reads instead
+/// of `PGPASSWORD` or the password file.
+#[cfg(feature = "libpq-sqlx")]
+fn with_empty_password(url: &str) -> String {
+    let sep = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{sep}password=")
+}
+
 /// sqlx connect options for `url`. With [`set_config_only`] off this is the
 /// URL parsed as sqlx parses it (environment and password file included);
 /// with it on, only what the URL names (see [`config_only`]). `parse_err`
@@ -163,10 +171,12 @@ pub fn connect_options_with(
     } else {
         LibpqPins::default()
     };
+    let url = if pins.empty_password {
+        with_empty_password(url)
+    } else {
+        url.to_string()
+    };
     let mut opts: sqlx::postgres::PgConnectOptions = url.parse().map_err(parse_err)?;
-    if pins.empty_password {
-        opts = opts.password("");
-    }
     if pins.default_host {
         opts = opts.host("localhost");
     }

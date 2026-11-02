@@ -718,7 +718,7 @@ fn numbered_parts(glob: &str, location: &str) -> Result<Vec<PathBuf>, FaucetErro
         })
         .collect();
     if files.is_empty() {
-        return Err(FaucetError::Source(format!(
+        return Err(FaucetError::Config(format!(
             "DLQ location '{location}' matched no files (expected a .jsonl file, a directory of \
              .jsonl / .ndjson files (optionally .gz / .zst), or a glob)"
         )));
@@ -786,7 +786,7 @@ fn expand_plain(location: &str) -> Result<Vec<PathBuf>, FaucetError> {
     };
     files.sort();
     if files.is_empty() {
-        return Err(FaucetError::Source(format!(
+        return Err(FaucetError::Config(format!(
             "DLQ location '{location}' matched no files (expected a .jsonl file, a directory of \
              .jsonl files, or a glob)"
         )));

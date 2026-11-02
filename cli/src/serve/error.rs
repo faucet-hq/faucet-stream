@@ -270,16 +270,8 @@ mod tests {
     fn internal_errors_answer_with_a_reference_not_the_detail() {
         let body = ServeError::Internal("reading '/srv/data/x.jsonl': denied".into()).api_error();
         assert_eq!(body.error.code, "internal");
-        assert!(
-            !body.error.message.contains("/srv/data"),
-            "{}",
-            body.error.message
-        );
-        assert!(
-            body.error.message.contains("reference "),
-            "{}",
-            body.error.message
-        );
+        assert!(!body.error.message.contains("/srv/data"));
+        assert!(body.error.message.contains("(reference "));
         let again = ServeError::Internal("boom".into()).api_error();
         assert_ne!(body.error.message, again.error.message);
         assert!(
