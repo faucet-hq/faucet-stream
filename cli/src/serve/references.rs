@@ -15,7 +15,13 @@
 //!   `--allow-url-host` hosts (default: any host except link-local / metadata
 //!   endpoints);
 //! - connectors that run a program only with `--allow-subprocess-connectors`,
-//!   and never for a tenant.
+//!   and never for a tenant;
+//! - settings that turn off certificate or host-key verification (fields
+//!   annotated `x-faucet-unverified`) only with `--allow-unverified-tls`, and
+//!   never for a tenant;
+//! - never settings that authenticate with the server's own credentials
+//!   (fields annotated `x-faucet-host-credentials`, e.g. Oracle
+//!   `external_auth`).
 //!
 //! A run for a tenant is further confined to `<--tenant-path-root>/<tenant>`.
 //!
@@ -84,7 +90,8 @@ impl ServeReferencePolicy {
         let mut caller = ReferencePolicy::deny_all()
             .with_path_roots(roots)
             .with_env(args.allow_env.iter().cloned())
-            .with_secret_schemes(&args.allow_secret_scheme);
+            .with_secret_schemes(&args.allow_secret_scheme)
+            .with_unverified(args.allow_unverified_tls);
         caller = if args.allow_url_scheme.is_empty() {
             caller.any_url_scheme()
         } else {
@@ -117,10 +124,12 @@ impl ServeReferencePolicy {
         match origin {
             BodyOrigin::Trusted | BodyOrigin::ServerFile => ReferencePolicy::open(),
             BodyOrigin::Caller { allow_subprocess } => {
+                let unverified = self.caller.allows_unverified() && tenant.is_none();
                 let mut p = self
                     .caller
                     .clone()
-                    .with_subprocess(allow_subprocess && tenant.is_none());
+                    .with_subprocess(allow_subprocess && tenant.is_none())
+                    .with_unverified(unverified);
                 if let (Some(root), Some(t)) = (&self.tenant_root, tenant) {
                     p = p.with_path_roots([root.join(t)]);
                 }
@@ -257,6 +266,7 @@ mod tests {
             allow_env: vec!["APP_*".into()],
             allow_secret_scheme: vec!["vault".into()],
             tenant_path_root: Some("/srv/tenants".into()),
+            allow_unverified_tls: true,
         };
         let p = ServeReferencePolicy::from_args(&args).unwrap();
         let c = p.caller();
@@ -285,6 +295,9 @@ mod tests {
             None,
         );
         assert!(caller.allows_subprocess());
+        assert!(caller.allows_unverified());
+        assert!(!tenant.allows_unverified());
+        assert!(!ServeReferencePolicy::default().caller().allows_unverified());
         for origin in [BodyOrigin::Trusted, BodyOrigin::ServerFile] {
             assert_eq!(p.for_origin(origin, Some("t")), ReferencePolicy::open());
         }

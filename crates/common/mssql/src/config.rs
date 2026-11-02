@@ -53,6 +53,7 @@ pub struct MssqlConnectionConfig {
 pub struct MssqlTls {
     /// Encryption mode. Defaults to [`MssqlTlsMode::Prefer`].
     #[serde(rename = "type", default)]
+    #[schemars(extend("x-faucet-unverified" = ["trust_server_certificate"]))]
     pub mode: MssqlTlsMode,
     /// Optional path to a CA certificate (PEM/DER) to trust for server
     /// validation, in addition to the system trust store. Ignored when `mode`
