@@ -77,6 +77,35 @@ fn check_unique_headers(names: &[String], what: &str) -> Result<(), FaucetError>
     Ok(())
 }
 
+/// Refuse a worksheet whose used range is too large to hold densely, before
+/// it is read whole.
+#[cfg(feature = "excel")]
+fn check_sheet_extent<RS: std::io::Read + std::io::Seek>(
+    wb: &mut calamine::Xlsx<RS>,
+    name: &str,
+    what: &str,
+) -> Result<(), FaucetError> {
+    let mut cells = match wb.worksheet_cells_reader(name) {
+        Ok(cells) => cells,
+        Err(calamine::XlsxError::NotAWorksheet(_)) => return Ok(()),
+        Err(e) => {
+            return Err(FaucetError::Source(format!(
+                "{what}: reading sheet '{name}': {e}"
+            )));
+        }
+    };
+    let mut extent = faucet_core::file_format::SheetExtent::default();
+    while let Some(cell) = cells
+        .next_cell()
+        .map_err(|e| FaucetError::Source(format!("{what}: reading sheet '{name}': {e}")))?
+    {
+        if !matches!(cell.get_value(), calamine::DataRef::Empty) {
+            extent.add(cell.get_position());
+        }
+    }
+    extent.check(what)
+}
+
 /// Parse Excel bytes into records. Requires the `excel` feature.
 #[cfg(feature = "excel")]
 pub fn parse_excel(
@@ -107,6 +136,7 @@ pub fn parse_excel(
             .cloned()
             .ok_or_else(|| FaucetError::Source("rest: Excel workbook has no worksheets".into()))?,
     };
+    check_sheet_extent(&mut wb, &name, "rest: Excel")?;
     let range = wb
         .worksheet_range(&name)
         .map_err(|e| FaucetError::Source(format!("rest: reading Excel sheet '{name}': {e}")))?;
@@ -204,6 +234,19 @@ fn cell_to_value(cell: &calamine::Data) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "excel")]
+    #[test]
+    fn a_sheet_whose_cells_span_too_large_a_range_is_refused() {
+        let mut book = rust_xlsxwriter::Workbook::new();
+        let ws = book.add_worksheet();
+        ws.write_string(0, 0, "id").unwrap();
+        ws.write_string(1_048_575, 16_383, "far").unwrap();
+        let err = parse_excel(&book.save_to_buffer().unwrap(), None, 0)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("used range spans"), "{err}");
+    }
 
     #[cfg(feature = "excel")]
     #[test]
