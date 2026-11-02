@@ -148,7 +148,8 @@ software, not a hosted service). It tracks the
   workflows (`.github/workflows/codeql.yml`).
 - Dynamic analysis: `cargo-fuzz` targets for configuration interpolation,
   pipeline config parsing and expansion, template param binding, identifier
-  quoting, the PostgreSQL logical-replication (pgoutput) decoder, REST record
+  quoting, the PostgreSQL logical-replication (pgoutput) decoder, the MySQL
+  binlog statement and XA-identifier decoders, REST record
   extraction, the CSV / XML / JSON / xlsx file readers with gzip, zstd and zip
   decompression, the REST and XML response-decode chains, MCP JSON-RPC message
   handling and the exact-number JSON parser (`fuzz/`), run on pull requests by

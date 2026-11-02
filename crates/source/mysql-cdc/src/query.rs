@@ -47,6 +47,37 @@ pub(crate) enum QueryKind {
     Ddl,
 }
 
+/// Replace each executable comment (`/*!NNNNN body */`, MariaDB `/*M!NNNNN
+/// body */`) with its body, which the server runs as part of the statement.
+fn expand_executable_comments(query: &str) -> std::borrow::Cow<'_, str> {
+    if !query.contains("/*!") && !query.contains("/*M!") {
+        return std::borrow::Cow::Borrowed(query);
+    }
+    let mut out = String::with_capacity(query.len());
+    let mut rest = query;
+    while let Some(start) = rest.find("/*") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let body = after.strip_prefix('!').or_else(|| after.strip_prefix("M!"));
+        let Some(end) = after.find("*/") else {
+            out.push_str(&rest[start..]);
+            return std::borrow::Cow::Owned(out);
+        };
+        match body {
+            Some(body) => {
+                let body = &body[..end - (after.len() - body.len())];
+                out.push(' ');
+                out.push_str(body.trim_start_matches(|c: char| c.is_ascii_digit()));
+                out.push(' ');
+            }
+            None => out.push_str(&rest[start..start + 2 + end + 2]),
+        }
+        rest = &after[end + 2..];
+    }
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out)
+}
+
 /// Strip leading `/* … */` comments and whitespace.
 fn strip_leading_comments(mut s: &str) -> &str {
     loop {
@@ -82,7 +113,8 @@ fn leading_words(s: &str, n: usize) -> (Vec<String>, &str) {
 /// Classify one `QueryEvent` statement. `default_schema` is the event's
 /// current database, used for an unqualified `TRUNCATE`.
 pub(crate) fn classify_query(query: &str, default_schema: &str) -> QueryKind {
-    let q = strip_leading_comments(query);
+    let expanded = expand_executable_comments(query);
+    let q = strip_leading_comments(&expanded);
     let (w, rest) = leading_words(q, 2);
     let first = w.first().map(String::as_str).unwrap_or("");
     let second = w.get(1).map(String::as_str).unwrap_or("");
@@ -199,12 +231,14 @@ fn parse_xid_part(s: &str) -> Option<(Vec<u8>, &str)> {
 }
 
 fn decode_hex(h: &str) -> Option<Vec<u8>> {
-    if !h.len().is_multiple_of(2) {
+    let bytes = h.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
         return None;
     }
-    (0..h.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&h[i..i + 2], 16).ok())
+    let nibble = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+    bytes
+        .chunks_exact(2)
+        .map(|pair| Some((nibble(pair[0])? << 4) | nibble(pair[1])?))
         .collect()
 }
 
@@ -264,6 +298,41 @@ mod tests {
             gtrid: g.to_vec(),
             bqual: b.to_vec(),
         }
+    }
+
+    #[test]
+    fn executable_comments_are_read_as_statement_text() {
+        assert_eq!(
+            classify_query("/*!40000 DROP TABLE IF EXISTS */ TRUNCATE victim", "d"),
+            QueryKind::Ddl
+        );
+        assert_eq!(
+            classify_query("/*M!100000 RENAME TABLE a TO */ TRUNCATE b", "d"),
+            QueryKind::Ddl
+        );
+        assert_eq!(
+            classify_query("/*!50000 TRUNCATE TABLE */ `t1`", "d"),
+            QueryKind::Truncate {
+                schema: "d".into(),
+                table: "t1".into()
+            }
+        );
+        assert_eq!(
+            classify_query("/* note */ TRUNCATE t2 /*!", "d"),
+            QueryKind::Truncate {
+                schema: "d".into(),
+                table: "t2".into()
+            }
+        );
+        assert_eq!(classify_query("/*!*/COMMIT", "d"), QueryKind::Commit);
+    }
+
+    #[test]
+    fn hex_xid_with_non_ascii_digits_is_rejected() {
+        assert_eq!(parse_query_xid("X'éa'"), None);
+        assert_eq!(parse_query_xid("X'aé'"), None);
+        assert_eq!(parse_query_xid("X'zz'"), None);
+        assert_eq!(parse_query_xid("X'6A'").map(|x| x.gtrid), Some(vec![0x6a]));
     }
 
     #[test]
