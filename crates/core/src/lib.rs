@@ -61,6 +61,7 @@ pub mod join;
 pub mod json_numbers;
 pub mod lag;
 pub mod lease;
+pub mod libpq;
 pub mod local_outputs;
 #[cfg(feature = "masking")]
 pub mod masking;

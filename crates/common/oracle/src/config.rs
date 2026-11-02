@@ -45,6 +45,7 @@ pub struct OracleConnectionConfig {
     /// Authenticate with external credentials (OS authentication or a wallet
     /// holding the credentials) instead of `username` / `password`.
     #[serde(default)]
+    #[schemars(extend("x-faucet-host-credentials" = true))]
     pub external_auth: bool,
     /// Transport encryption (TCPS) for the `host` form.
     #[serde(default)]

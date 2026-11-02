@@ -11,6 +11,7 @@ on:
       - ".github/workflows/cflite_pr.yml"
       - "crates/core/**"
       - "crates/source/postgres-cdc/**"
+      - "crates/source/mysql-cdc/**"
       - "crates/source/rest/**"
       - "crates/source/xml/**"
       - "cli/src/interpolate.rs"

@@ -159,9 +159,26 @@ connector's `tls` / transport option as something to configure, not to inherit.
   fields that name a path, URL or program carry an `x-faucet-resource` schema
   annotation (`faucet_core::resolve`), so a config sent over HTTP or MCP is
   confined to `--allow-path-root` directories, `--allow-url-scheme` /
-  `--allow-url-host` URLs (link-local and metadata hosts refused unless
-  listed), `--allow-env` variables and `--allow-secret-scheme` secret managers,
-  and runs a program only with `--allow-subprocess-connectors`. The defaults
+  `--allow-url-host` URLs, `--allow-env` variables and `--allow-secret-scheme`
+  secret managers, and runs a program only with
+  `--allow-subprocess-connectors`. Link-local addresses and the cloud
+  instance-metadata endpoints (`169.254.169.254`, `100.100.100.200`,
+  `fd00:ec2::254`, `fd20:ce::254`, `fd00:c1::a9fe:a9fe`,
+  `metadata.google.internal`) are refused unless listed by name: a literal
+  address in the URL is refused when the config loads, and a host name is
+  refused at connection time when it resolves only to such addresses. The
+  connection-time check covers connectors that use the shared HTTP client
+  (through a proxy, the name is resolved and checked first); a database
+  driver resolves names itself, so its URL is checked as written. A database
+  URL's `host=` / `hostaddr=` and file parameters (`sslkey=`, `sslrootcert=`,
+  `socket=`, …) are checked like its host and paths. Settings that turn off
+  certificate or host-key verification (fields annotated
+  `x-faucet-unverified`, `verify_ca=false` in a MySQL URL, `#insecure` on a
+  `rediss://` URL) need `--allow-unverified-tls`, and never apply to a tenant;
+  settings that authenticate with the server's own credentials (Oracle
+  `external_auth`, marked `x-faucet-host-credentials`) are refused. Database
+  connectors never fill a missing password, user or client certificate from
+  the server's environment (`PGPASSWORD`, `~/.pgpass`, …). The defaults
   deny environment and secret-manager reads. A substituted value
   (`${vars.*}`, `${sources.*}`, `${sinks.*}`) can never form a new `${…}`
   directive, and every secret-manager reference is checked against the policy

@@ -227,6 +227,10 @@ pub struct KafkaSinkConfig {
     /// which the transactional producer force-sets on top so an override
     /// cannot break EOS.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[schemars(extend("x-faucet-unverified" = {
+        "enable.ssl.certificate.verification": ["false", "0"],
+        "ssl.endpoint.identification.algorithm": ["none", ""]
+    }))]
     pub extra_client_config: BTreeMap<String, String>,
 }
 

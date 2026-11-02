@@ -9090,7 +9090,10 @@
         "type": {
           "description": "Encryption mode. Defaults to [`MssqlTlsMode::Prefer`].",
           "$ref": "#/$defs/source_mssql__MssqlTlsMode",
-          "default": "prefer"
+          "default": "prefer",
+          "x-faucet-unverified": [
+            "trust_server_certificate"
+          ]
         },
         "ca_cert_path": {
           "description": "Optional path to a CA certificate (PEM/DER) to trust for server\nvalidation, in addition to the system trust store. Ignored when `mode`\nis [`MssqlTlsMode::Disable`].",
@@ -9440,7 +9443,8 @@
             "boolean",
             "string"
           ],
-          "default": false
+          "default": false,
+          "x-faucet-unverified": true
         }
       },
       "additionalProperties": true
@@ -9714,7 +9718,8 @@
               "type": "string",
               "const": "insecure"
             }
-          }
+          },
+          "x-faucet-unverified": true
         }
       ]
     },
@@ -10785,7 +10790,10 @@
         "type": {
           "description": "Encryption mode. Defaults to [`MssqlTlsMode::Prefer`].",
           "$ref": "#/$defs/source_mssql-cdc__MssqlTlsMode",
-          "default": "prefer"
+          "default": "prefer",
+          "x-faucet-unverified": [
+            "trust_server_certificate"
+          ]
         },
         "ca_cert_path": {
           "description": "Optional path to a CA certificate (PEM/DER) to trust for server\nvalidation, in addition to the system trust store. Ignored when `mode`\nis [`MssqlTlsMode::Disable`].",
@@ -11825,7 +11833,8 @@
             "boolean",
             "string"
           ],
-          "default": false
+          "default": false,
+          "x-faucet-unverified": true
         }
       },
       "additionalProperties": true
@@ -12251,7 +12260,8 @@
             "boolean",
             "string"
           ],
-          "default": false
+          "default": false,
+          "x-faucet-unverified": true
         }
       },
       "additionalProperties": true
@@ -15328,7 +15338,10 @@
         "type": {
           "description": "Encryption mode. Defaults to [`MssqlTlsMode::Prefer`].",
           "$ref": "#/$defs/sink_mssql__MssqlTlsMode",
-          "default": "prefer"
+          "default": "prefer",
+          "x-faucet-unverified": [
+            "trust_server_certificate"
+          ]
         },
         "ca_cert_path": {
           "description": "Optional path to a CA certificate (PEM/DER) to trust for server\nvalidation, in addition to the system trust store. Ignored when `mode`\nis [`MssqlTlsMode::Disable`].",
@@ -16026,7 +16039,8 @@
             "boolean",
             "string"
           ],
-          "default": false
+          "default": false,
+          "x-faucet-unverified": true
         }
       },
       "additionalProperties": true
@@ -16203,7 +16217,8 @@
               "type": "string",
               "const": "insecure"
             }
-          }
+          },
+          "x-faucet-unverified": true
         }
       ]
     },
@@ -17441,7 +17456,8 @@
             "boolean",
             "string"
           ],
-          "default": false
+          "default": false,
+          "x-faucet-unverified": true
         }
       },
       "additionalProperties": true
@@ -17690,7 +17706,8 @@
             "boolean",
             "string"
           ],
-          "default": false
+          "default": false,
+          "x-faucet-unverified": true
         }
       },
       "additionalProperties": true
@@ -23361,7 +23378,7 @@
                       "default": 300
                     },
                     "max_staged_records": {
-                      "description": "Maximum number of change records buffered in memory for a *single*\nin-progress transaction before it is aborted.\n\nLogical replication requires a transaction to be buffered until its\nCOMMIT so it can be emitted atomically (partial transactions must\nnever leak downstream). A single bulk `UPDATE`/`DELETE`/`COPY` of\nmillions of rows therefore buffers every decoded row as a\n`serde_json::Value` in RAM, which can OOM the process. This bound is a\nsafety valve: when an in-progress transaction's staged record count\nexceeds it, the source aborts with a typed\n[`FaucetError::Source`] rather than\nbeing OOM-killed.\n\n`None` (the default) means unbounded — atomic delivery of arbitrarily\nlarge transactions at the cost of unbounded memory. Set a value sized\nto your available memory if you replicate tables subject to large\nbulk writes.",
+                      "description": "Maximum number of change records buffered in memory for a *single*\nin-progress transaction before it is aborted.\n\nLogical replication requires a transaction to be buffered until its\nCOMMIT so it can be emitted atomically (partial transactions must\nnever leak downstream). A single bulk `UPDATE`/`DELETE`/`COPY` of\nmillions of rows therefore buffers every decoded row as a\n`serde_json::Value` in RAM, which can OOM the process. This bound is a\nsafety valve: when an in-progress transaction's staged record count\nexceeds it, the source aborts with a typed\n[`FaucetError::Source`] rather than\nbeing OOM-killed.\n\nDefaults to 1,000,000. `null` means unbounded — atomic delivery of\narbitrarily large transactions at the cost of unbounded memory. Size it\nto your available memory if you replicate tables subject to large bulk\nwrites.",
                       "type": [
                         "integer",
                         "null",
@@ -23369,7 +23386,7 @@
                       ],
                       "format": "uint",
                       "minimum": 0,
-                      "default": null
+                      "default": 1000000
                     },
                     "max_buffered_events": {
                       "description": "Replication events read ahead while the pipeline is busy writing a\npage. Reading ahead keeps the replication client sending its status\nupdates, so a long sink write does not let the server's\n`wal_sender_timeout` (default 60 s) end the connection. Past this many\nbuffered events reading pauses until the pipeline catches up — keep a\npage write well under `wal_sender_timeout`, or raise it, if a page\nwrite can outlast that much change volume. Default 100 000.",
@@ -25625,7 +25642,7 @@
                       "default": 1000
                     },
                     "max_staged_records": {
-                      "description": "Max change records buffered in memory before a page is emitted, after\nwhich the run aborts with a typed [`FaucetError::Source`]. `None` =\nunbounded. The OOM safety valve: with `batch_size: 0` (or a library\ncaller using `fetch_all`) the change-event buffer would otherwise grow\nwithout bound for the whole fetch cycle and risk an OOM-kill on a\nhigh-throughput stream. Mirrors the same field on the sibling\n`postgres-cdc` / `mysql-cdc` sources.",
+                      "description": "Max change records buffered in memory before a page is emitted, after\nwhich the run aborts with a typed [`FaucetError::Source`]. Defaults to\n1,000,000; `null` = unbounded. The OOM safety valve: with `batch_size: 0` (or a library\ncaller using `fetch_all`) the change-event buffer would otherwise grow\nwithout bound for the whole fetch cycle and risk an OOM-kill on a\nhigh-throughput stream. Mirrors the same field on the sibling\n`postgres-cdc` / `mysql-cdc` sources.",
                       "type": [
                         "integer",
                         "null",
@@ -25633,7 +25650,7 @@
                       ],
                       "format": "uint",
                       "minimum": 0,
-                      "default": null
+                      "default": 1000000
                     }
                   }
                 },
@@ -25784,7 +25801,7 @@
                       "default": 30
                     },
                     "max_staged_records": {
-                      "description": "Max records buffered for a single in-progress transaction before abort.\n`None` = unbounded. Also caps the rows held behind an undecided XA\ntransaction, which default to 1,000,000 when this is unset.",
+                      "description": "Max records buffered for a single in-progress transaction before abort.\nDefaults to 1,000,000; `null` = unbounded. Also caps the rows held\nbehind an undecided XA transaction, which default to 1,000,000 when this\nis `null`.",
                       "type": [
                         "integer",
                         "null",
@@ -25792,7 +25809,7 @@
                       ],
                       "format": "uint",
                       "minimum": 0,
-                      "default": null
+                      "default": 1000000
                     },
                     "batch_size": {
                       "description": "Advisory per-page record count. `0` = accumulate all txns into one page.",
@@ -25936,7 +25953,7 @@
                       "default": 30
                     },
                     "max_staged_records": {
-                      "description": "Max records buffered for a single in-progress transaction before the run\naborts with a typed error (rather than risking unbounded memory growth).\n`None` = unbounded.",
+                      "description": "Max records buffered for a single in-progress transaction before the run\naborts with a typed error (rather than risking unbounded memory growth).\nDefaults to 1,000,000; `null` = unbounded.",
                       "type": [
                         "integer",
                         "null",
@@ -25944,7 +25961,7 @@
                       ],
                       "format": "uint",
                       "minimum": 0,
-                      "default": null
+                      "default": 1000000
                     },
                     "batch_size": {
                       "description": "Advisory per-page record count. `0` accumulates every change into a\nsingle trailing page (snapshot/test convenience). Default\n[`DEFAULT_BATCH_SIZE`].",
@@ -27909,6 +27926,16 @@
                       "type": "object",
                       "additionalProperties": {
                         "type": "string"
+                      },
+                      "x-faucet-unverified": {
+                        "enable.ssl.certificate.verification": [
+                          "false",
+                          "0"
+                        ],
+                        "ssl.endpoint.identification.algorithm": [
+                          "none",
+                          ""
+                        ]
                       }
                     },
                     "batch_size": {
@@ -29323,7 +29350,8 @@
                         "boolean",
                         "string"
                       ],
-                      "default": false
+                      "default": false,
+                      "x-faucet-host-credentials": true
                     },
                     "tls": {
                       "description": "Transport encryption (TCPS) for the `host` form.",
@@ -29540,7 +29568,8 @@
                         "boolean",
                         "string"
                       ],
-                      "default": false
+                      "default": false,
+                      "x-faucet-host-credentials": true
                     },
                     "tls": {
                       "description": "Transport encryption (TCPS) for the `host` form.",
@@ -29595,14 +29624,15 @@
                       "default": 500000
                     },
                     "max_staged_records": {
-                      "description": "Abort when one in-flight transaction buffers more than this many\nchanges (bounded memory). `None` = unbounded.",
+                      "description": "Abort when one in-flight transaction buffers more than this many\nchanges (bounded memory). Defaults to 1,000,000; `null` = unbounded.",
                       "type": [
                         "integer",
                         "null",
                         "string"
                       ],
                       "format": "uint",
-                      "minimum": 0
+                      "minimum": 0,
+                      "default": 1000000
                     },
                     "batch_size": {
                       "description": "`0` aggregates committed transactions into pages of up to 100,000\nrecords, emitted at least every `idle_timeout`, each with its bookmark;\notherwise each committed transaction is its own page. Default\n[`DEFAULT_BATCH_SIZE`].",
@@ -33638,6 +33668,16 @@
                       "type": "object",
                       "additionalProperties": {
                         "type": "string"
+                      },
+                      "x-faucet-unverified": {
+                        "enable.ssl.certificate.verification": [
+                          "false",
+                          "0"
+                        ],
+                        "ssl.endpoint.identification.algorithm": [
+                          "none",
+                          ""
+                        ]
                       }
                     }
                   }
@@ -36275,7 +36315,8 @@
                         "boolean",
                         "string"
                       ],
-                      "default": false
+                      "default": false,
+                      "x-faucet-host-credentials": true
                     },
                     "tls": {
                       "description": "Transport encryption (TCPS) for the `host` form.",

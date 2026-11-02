@@ -106,3 +106,10 @@ path = "fuzz_targets/xlsx.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "mysql_query"
+path = "fuzz_targets/mysql_query.rs"
+test = false
+doc = false
+bench = false

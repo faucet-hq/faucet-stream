@@ -60,7 +60,7 @@ All fields live under `pipeline.source.config`.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `connection_url` | string | — *(required)* | PostgreSQL connection URL (`postgres://user:pass@host:5432/db`). Masked in `Debug` output and stripped from the lineage URI. |
+| `connection_url` | string | — *(required)* | PostgreSQL connection URL (`postgres://user:pass@host:5432/db`). Masked in `Debug` output and stripped from the lineage URI. Credentials, host and TLS settings come from the URL only: `PGPASSWORD`, the password file (`~/.pgpass` / `PGPASSFILE`) and the other `PG*` environment variables are not read; a URL with no user is refused while `PGUSER` is set, as is one with no client certificate while `PGSSLCERT` / `PGSSLKEY` is set. |
 | `query` | string | — *(required)* | SQL query to execute. May contain positional placeholders `$1`, `$2`, … and `${parent.path}` matrix-context tokens. |
 | `params` | array | `[]` | Bind parameters for the query, in positional order. Each value is bound as its native scalar type (string / integer / float / bool / null). Integer params bind exactly as `int8` — no `f64` precision loss, so large 64-bit ids compare correctly. A value above `i64::MAX` (Postgres has no unsigned 64-bit type) is refused; pass it as a string and cast it (`$1::numeric`). |
 

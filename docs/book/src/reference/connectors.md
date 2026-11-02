@@ -425,7 +425,7 @@ Inspect the exact fields with `faucet schema source <name>` / `faucet schema sin
   so a file written after the source widens picks up the new schema. A Parquet
   file's schema is immutable once opened, so a field appearing only later *within
   a single file* is dropped with a per-file one-shot warning.
-- **MongoDB CDC source** — `max_staged_records` (default unbounded) caps the
+- **MongoDB CDC source** — `max_staged_records` (default 1,000,000) caps the
   in-memory change-event buffer (including under `batch_size: 0`) and aborts with
   a typed error rather than risking OOM, mirroring `postgres-cdc` / `mysql-cdc`.
 - **Postgres / MySQL query sources — JSON columns** — a number inside a `json` /

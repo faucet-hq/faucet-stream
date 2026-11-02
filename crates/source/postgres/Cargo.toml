@@ -24,7 +24,7 @@ futures.workspace = true
 tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util", "net", "io-util"] }
 serde_json.workspace = true
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }

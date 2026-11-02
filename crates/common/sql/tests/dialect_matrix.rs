@@ -1033,6 +1033,12 @@ fn backend_specific_text() {
         "$3::numeric(38,9)"
     );
     assert_eq!(Redshift.placeholder(3, None), "$3");
+    assert_eq!(Postgres.placeholder(1, Some("_int4")), "$1::_int4");
+    assert_eq!(Postgres.placeholder(1, Some("MyEnum")), "$1::\"MyEnum\"");
+    assert_eq!(
+        Postgres.placeholder(2, Some("t\"); DROP TABLE x; --")),
+        "$2::\"t\"\"); DROP TABLE x; --\""
+    );
     assert_eq!(ClickHouse.placeholder(1, None), "{p1:String}");
     assert_eq!(BigQuery.placeholder(1, None), "@p1");
     assert_eq!(Databricks.placeholder(1, None), ":p1");

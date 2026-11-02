@@ -2209,6 +2209,12 @@ pub struct ReferenceArgs {
     /// `<DIR>/<tenant id>`.
     #[arg(long = "tenant-path-root", value_name = "DIR")]
     pub tenant_path_root: Option<PathBuf>,
+    /// Let a submitted config turn off certificate or host-key verification
+    /// (`insecure_skip_verify`, `trust_server_certificate`, an SFTP
+    /// `known_hosts: {mode: insecure}`, …). Default: refused. Never for a
+    /// tenant.
+    #[arg(long = "allow-unverified-tls")]
+    pub allow_unverified_tls: bool,
 }
 
 /// `faucet serve` arguments.

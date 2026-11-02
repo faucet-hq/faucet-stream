@@ -94,8 +94,8 @@ pub struct MssqlCdcSourceConfig {
     pub idle_timeout: Duration,
     /// Max records buffered for a single in-progress transaction before the run
     /// aborts with a typed error (rather than risking unbounded memory growth).
-    /// `None` = unbounded.
-    #[serde(default)]
+    /// Defaults to 1,000,000; `null` = unbounded.
+    #[serde(default = "faucet_core::replication::default_max_staged_records")]
     pub max_staged_records: Option<usize>,
     /// Advisory per-page record count. `0` accumulates every change into a
     /// single trailing page (snapshot/test convenience). Default
@@ -346,7 +346,7 @@ mod tests {
         assert_eq!(c.max_connections, 5);
         assert_eq!(c.statement_timeout_secs, 300);
         assert_eq!(c.start_position, StartPosition::Current);
-        assert!(c.max_staged_records.is_none());
+        assert_eq!(c.max_staged_records, Some(1_000_000));
     }
 
     #[test]

@@ -182,7 +182,7 @@ start_from: { type: timestamp, timestamp_secs: 1779019200 }  # a cluster time, i
 | `idle_timeout` | seconds | `30` | Terminate the current fetch cycle after this long with no new events. The page accumulated so far is flushed and the bookmark is saved. Must be `> 0`. |
 | `max_await_time_ms` | u64 | `1000` | Server-side `maxAwaitTimeMS` on `getMore` requests — how long the server blocks waiting for new events before returning an empty batch. Must be **strictly less than** `idle_timeout` (in milliseconds), else config validation fails. |
 | `batch_size` | usize | `1000` | Records per emitted `StreamPage`. `0` = no batching: drain until idle and emit one page. Max `1,000,000`. |
-| `max_staged_records` | usize \| null | `null` | OOM safety valve. Abort with a typed `FaucetError::Source` once more than this many change events are buffered in memory before a page is emitted. `null` = unbounded. Matters most with `batch_size: 0` (or a library caller using `fetch_all`), where the buffer would otherwise grow without bound for the whole fetch cycle and risk an OOM-kill on a high-throughput stream. Mirrors the same field on the sibling `postgres-cdc` / `mysql-cdc` sources. |
+| `max_staged_records` | usize \| null | `1000000` | OOM safety valve. Abort with a typed `FaucetError::Source` once more than this many change events are buffered in memory before a page is emitted. `null` = unbounded. Matters most with `batch_size: 0` (or a library caller using `fetch_all`), where the buffer would otherwise grow without bound for the whole fetch cycle and risk an OOM-kill on a high-throughput stream. Mirrors the same field on the sibling `postgres-cdc` / `mysql-cdc` sources. |
 
 ## Examples
 

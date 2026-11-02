@@ -526,6 +526,16 @@ pub fn json_gt(a: &Value, b: &Value) -> bool {
 /// [`ReplicationBind::template`].
 pub const BIND_PLACEHOLDER: &str = "${bookmark}";
 
+/// The default bound on change records a CDC source holds for one
+/// in-progress transaction (its `max_staged_records`).
+pub const DEFAULT_MAX_STAGED_RECORDS: usize = 1_000_000;
+
+/// The serde default of a CDC source's `max_staged_records`:
+/// [`DEFAULT_MAX_STAGED_RECORDS`].
+pub fn default_max_staged_records() -> Option<usize> {
+    Some(DEFAULT_MAX_STAGED_RECORDS)
+}
+
 fn default_bind_template() -> String {
     BIND_PLACEHOLDER.to_owned()
 }

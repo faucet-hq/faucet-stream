@@ -309,7 +309,10 @@ are stored and again whenever a run uses them.
 |-----------|-------------------------------|------------|
 | Local path (connector path, `${file:}`, state / DLQ / lineage file) | under the server's working directory or the system temp directory | `--allow-path-root DIR` (repeatable) |
 | URL scheme | any | `--allow-url-scheme` restricts it to the listed schemes |
-| URL host | any, except link-local and cloud-metadata addresses (`169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`, `100.100.100.200`, `metadata.google.internal`) | `--allow-url-host` restricts it to the listed hosts (`*.example.com` matches subdomains); a metadata host is reachable only when listed |
+| URL host (including a database URL's `host=` / `hostaddr=` and the servers or `HOST=` entries of a `key=value` connection string or connect descriptor) | any, except link-local and cloud-metadata addresses (`169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`, `fd20:ce::254`, `fd00:c1::a9fe:a9fe`, `100.100.100.200`, `metadata.google.internal`) | `--allow-url-host` restricts it to the listed hosts (`*.example.com` matches subdomains); a metadata host is reachable only when listed |
+| A file a connection string names (`sslkey=`, `sslrootcert=`, `socket=`, `TrustServerCertificateCA=`, a wallet directory) | under the path roots, like any local path | `--allow-path-root DIR` |
+| A setting that turns off certificate or host-key verification (`insecure_skip_verify`, MSSQL `trust_server_certificate` / `TrustServerCertificate=true`, SFTP `known_hosts: {mode: insecure}`, `verify_ca=false` in a MySQL URL, `#insecure` on a `rediss://` URL, Kafka `enable.ssl.certificate.verification=false`) | refused | `--allow-unverified-tls` (never for a tenant) |
+| A setting that authenticates with the server's own credentials (Oracle `external_auth`) | refused | — (register the pipeline as a template) |
 | `${env:NAME}` / `${secret:NAME}` | none | `--allow-env NAME` or `--allow-env 'PREFIX*'` |
 | `${vault:}` / `${aws-sm:}` / `${gcp-sm:}` / `${azure-kv:}` | none | `--allow-secret-scheme vault,aws-sm` |
 | A program (`singer`) | refused | `--allow-subprocess-connectors` |
@@ -337,6 +340,11 @@ it does for HTTP clients (`http://169.254.169.254\@allowed.example/` names
 `169.254.169.254`). A URL whose host a caller's config takes from
 records (`https://${parent.host}/…`, a whole `${parent.next_url}`) cannot be
 checked, so it is refused; register the pipeline as a template instead.
+
+Database connectors never fill a setting the config leaves out from the
+server's environment: `PGPASSWORD`, `~/.pgpass` and the other `PG*` variables
+are not read by the PostgreSQL connectors, the PostgreSQL state store or
+Redshift, so a config naming no password sends none.
 
 #### Template params a caller supplies
 

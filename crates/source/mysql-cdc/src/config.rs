@@ -89,9 +89,10 @@ pub struct MysqlCdcSourceConfig {
     #[schemars(with = "u64")]
     pub idle_timeout: Duration,
     /// Max records buffered for a single in-progress transaction before abort.
-    /// `None` = unbounded. Also caps the rows held behind an undecided XA
-    /// transaction, which default to 1,000,000 when this is unset.
-    #[serde(default)]
+    /// Defaults to 1,000,000; `null` = unbounded. Also caps the rows held
+    /// behind an undecided XA transaction, which default to 1,000,000 when this
+    /// is `null`.
+    #[serde(default = "faucet_core::replication::default_max_staged_records")]
     pub max_staged_records: Option<usize>,
     /// Advisory per-page record count. `0` = accumulate all txns into one page.
     #[serde(default = "default_batch_size")]
@@ -179,6 +180,7 @@ mod tests {
         assert!(c.include_columns);
         assert!(!c.emit_schema_changes);
         assert_eq!(c.tls, CdcTls::Disable);
+        assert_eq!(c.max_staged_records, Some(1_000_000));
     }
 
     #[test]

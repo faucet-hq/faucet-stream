@@ -53,7 +53,7 @@ Connection fields are documented in [`faucet-common-oracle`](https://crates.io/c
 | `poll_interval` | `1` | Seconds between polls that find nothing. |
 | `idle_timeout` | `30` | End the fetch cycle after this many quiet seconds once mining has reached the current SCN. Re-mining redo from `restart_scn` (held back by the oldest open transaction in the database) never counts as quiet, so a long-open transaction cannot stall capture. |
 | `max_scn_window` | `500000` | Largest SCN range per LogMiner session. |
-| `max_staged_records` | unbounded | Abort when one open transaction buffers more changes. |
+| `max_staged_records` | `1000000` | Abort when one open transaction buffers more changes (`null` = unbounded). |
 | `batch_size` | `1000` | `0` = transactions are aggregated into pages of up to 100,000 records (emitted at least every `idle_timeout`, each with its bookmark); otherwise a page per transaction. |
 | `max_connections` | `2` | Pooled sessions. |
 | `statement_timeout_secs` | `600` | Per-round-trip call timeout (`0` disables). |

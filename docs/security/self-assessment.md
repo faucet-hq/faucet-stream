@@ -102,7 +102,7 @@ independent assessor, and it is updated when a trust boundary changes.
 | Component | What it does | Where |
 |---|---|---|
 | **Trust boundary: CLI vs `faucet serve`** | The CLI and scheduler trust their configs completely (the operator wrote them). `faucet serve` distinguishes a config's *origin*: local or operator-authored (templates, the triggers file, `--default-config`) versus caller-submitted. Only caller-submitted configs are confined. | `cli/src/runtime/principal.rs` (`Principal`, `Origin`), `cli/src/runtime/server.rs` |
-| **Reference policy** | One allow-list for every reference a caller's config makes: path roots (symlinks resolved, `..` refused), URL schemes and hosts (canonical host comparison; link-local and cloud-metadata hosts refused unless listed, on the first request and every redirect), environment variables, secret-manager schemes, and subprocess connectors. Connector config fields that name a path, URL or program are found by a schema annotation (`x-faucet-resource`), so new connectors are covered by declaring the field; a lint test fails on an unannotated one. Default-deny for caller bodies; tenants are confined to their own path root and never run subprocesses. | `faucet_core::resolve` (`ReferencePolicy`), `cli/src/serve/references.rs`, `cli/src/serve/load.rs`, `cli/tests/resource_annotations.rs` |
+| **Reference policy** | One allow-list for every reference a caller's config makes: path roots (symlinks resolved, `..` refused), URL schemes and hosts (canonical host comparison, including a database URL's `host=` / `hostaddr=` parameters; link-local and cloud-metadata addresses, AWS / GCP / OCI IPv6 endpoints included, refused unless listed: as written in the config, and for the shared HTTP client also by the addresses a name resolves to, on the first request and every redirect), settings that turn off certificate or host-key verification (`--allow-unverified-tls`), settings that authenticate with the server's own credentials (refused), environment variables, secret-manager schemes, and subprocess connectors. Connector config fields that name a path, URL or program are found by a schema annotation (`x-faucet-resource`), so new connectors are covered by declaring the field; a lint test fails on an unannotated one. Default-deny for caller bodies; tenants are confined to their own path root and never run subprocesses. | `faucet_core::resolve` (`ReferencePolicy`), `cli/src/serve/references.rs`, `cli/src/serve/load.rs`, `cli/tests/resource_annotations.rs` |
 | **Sandboxed SQL engines** | Connectors whose own input can reach host files (embedded SQLite, DuckDB) expose a confining switch marked `x-faucet-sandbox`; the server forces it on for every config it did not load from its triggers file. | `faucet_core::resolve::sandbox_fields`, `cli/src/serve/load.rs` |
 | **Authentication and RBAC** | Bearer tokens compared in constant time; the server refuses to start without auth unless `--no-auth` is explicit, and warns about a token under 16 characters. An address that presents 20 invalid tokens in a minute is refused (429) until the minute ends. `--auth-config` maps tokens to principals with roles; every `/v1` route has a required permission and an unmapped route is admin-only (fail closed). Tokens are registered for redaction. | `cli/src/serve/auth.rs`, `cli/src/serve/rbac.rs` |
 | **Browser reach** | A `--no-auth` loopback server answers only local host names (`--allowed-host` extends the list and turns the check on for any server); a state-changing request carrying another site's `Origin` is refused unless listed with `--cors-origin` / `--allowed-origin`; `/mcp` and webhook triggers take only the content types they parse; API responses carry `nosniff` and `Cross-Origin-Resource-Policy: same-origin`. | `cli/src/serve/guard.rs` |
@@ -127,7 +127,8 @@ independent assessor, and it is updated when a trust boundary changes.
 - **Run budgets**: hard ceilings on records, bytes, duration and allowed sinks
   per invocation (`faucet_core::budget`).
 - **Bounded parsing**: `${file:}` reads are capped at 1 MiB; HTTP bodies are
-  bounded; CDC decoders buffer at most `max_staged_records` per transaction.
+  bounded; CDC sources buffer at most `max_staged_records` (default 1,000,000)
+  change records per transaction.
 - **State at rest**: optional encryption of the file state store
   (`crates/core/src/encryption.rs`).
 
@@ -151,7 +152,8 @@ software, not a hosted service). It tracks the
   workflows (`.github/workflows/codeql.yml`).
 - Dynamic analysis: `cargo-fuzz` targets for configuration interpolation,
   pipeline config parsing and expansion, template param binding, identifier
-  quoting, the PostgreSQL logical-replication (pgoutput) decoder, REST record
+  quoting, the PostgreSQL logical-replication (pgoutput) decoder, the MySQL
+  binlog statement and XA-identifier decoders, REST record
   extraction, the CSV / XML / JSON / xlsx file readers with gzip, zstd and zip
   decompression, the REST and XML response-decode chains, MCP JSON-RPC message
   handling and the exact-number JSON parser (`fuzz/`), run on pull requests by

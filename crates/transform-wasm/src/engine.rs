@@ -96,6 +96,7 @@ impl WasmEngine {
     /// Compile the module and validate the ABI exports. Fails fast (in `new()`)
     /// on a missing file, a malformed module, or a missing/mis-typed export.
     pub(crate) fn compile(cfg: &WasmTransformConfig) -> Result<Self, FaucetError> {
+        cfg.validate()?;
         let path = PathBuf::from(&cfg.module);
         let module_label = cfg.module_label();
         let bytes = std::fs::read(&path).map_err(|e| {

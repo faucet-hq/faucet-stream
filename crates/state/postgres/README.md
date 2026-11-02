@@ -73,7 +73,7 @@ faucet run pipeline.yaml
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `url` | string | — *(required)* | PostgreSQL connection URL (`postgres://user:pass@host:port/db`). Resolve secrets via `${env:VAR}` / `${secret:…}` indirection — never hard-code credentials. |
+| `url` | string | — *(required)* | PostgreSQL connection URL (`postgres://user:pass@host:port/db`). Resolve secrets via `${env:VAR}` / `${secret:…}` indirection — never hard-code credentials. Credentials, host and TLS settings come from the URL only: `PGPASSWORD`, the password file (`~/.pgpass` / `PGPASSFILE`) and the other `PG*` environment variables are not read; a URL with no user is refused while `PGUSER` is set, as is one with no client certificate while `PGSSLCERT` / `PGSSLKEY` is set. |
 | `table` | string | `faucet_state` | Table that holds state rows. Validated as a Postgres identifier (ASCII letters/digits/underscore, ≤ 63 chars). |
 | `ensure_table` | bool | `false` | When `true`, run `CREATE TABLE IF NOT EXISTS` on startup. Leave `false` if you provision the table via migrations or want to grant the runtime role no DDL. |
 | `max_connections` | integer | `5` | Size of the connection pool backing the state store. Tune it up when many concurrent matrix rows share one state store, or down against a connection-limited managed Postgres. Rejected at config-load time when `0`. |

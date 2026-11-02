@@ -28,6 +28,7 @@ pub type MssqlClient = tiberius::Client<Compat<TcpStream>>;
 /// replaced by the caller through [`replace_connection`].
 pub struct ConnectionManager {
     config: Config,
+    policy: Option<std::sync::Arc<faucet_core::resolve::ReferencePolicy>>,
 }
 
 impl std::fmt::Debug for ConnectionManager {
@@ -39,9 +40,14 @@ impl std::fmt::Debug for ConnectionManager {
 }
 
 impl ConnectionManager {
-    /// A manager connecting with `config`.
+    /// A manager connecting with `config`. A routing redirect is checked
+    /// against the reference policy scoped over the task that builds it
+    /// ([`faucet_core::http::current_reference_policy`]).
     pub fn new(config: Config) -> Self {
-        Self { config }
+        Self {
+            config,
+            policy: faucet_core::http::current_reference_policy(),
+        }
     }
 
     async fn open(config: &Config) -> Result<TcpStream, tiberius::error::Error> {
@@ -56,6 +62,8 @@ impl ConnectionManager {
         match tiberius::Client::connect(self.config.clone(), tcp.compat_write()).await {
             Ok(client) => Ok(client),
             Err(tiberius::error::Error::Routing { host, port }) => {
+                check_redirect(self.policy.as_deref(), &host, port)
+                    .map_err(|e| tiberius::error::Error::Protocol(e.into()))?;
                 let config = routed(&self.config, &host, port);
                 let tcp = Self::open(&config).await?;
                 // One redirect at most: a second one is an error.
@@ -63,6 +71,27 @@ impl ConnectionManager {
             }
             Err(e) => Err(e),
         }
+    }
+}
+
+/// Refuse a routing redirect to a link-local / metadata address, or (under a
+/// reference policy) to a host the policy does not allow.
+fn check_redirect(
+    policy: Option<&faucet_core::resolve::ReferencePolicy>,
+    host: &str,
+    port: u16,
+) -> Result<(), String> {
+    let target = format!("mssql://{host}:{port}");
+    let refusal = match policy {
+        Some(p) => p.check_url(&target).err().map(|r| r.reason),
+        None => faucet_core::resolve::is_metadata_host(host)
+            .then(|| format!("host `{host}` is a link-local / metadata endpoint")),
+    };
+    match refusal {
+        Some(reason) => Err(format!(
+            "MSSQL routing redirect to {host}:{port} refused: {reason}"
+        )),
+        None => Ok(()),
     }
 }
 
@@ -447,6 +476,21 @@ mod tests {
             ))
             .is_ok()
         );
+    }
+
+    #[test]
+    fn a_routing_redirect_is_screened() {
+        assert!(check_redirect(None, "replica.example.com", 11000).is_ok());
+        let err = check_redirect(None, "169.254.169.254", 1433).unwrap_err();
+        assert!(
+            err.contains("routing redirect to 169.254.169.254:1433"),
+            "{err}"
+        );
+        let policy = faucet_core::resolve::ReferencePolicy::deny_all()
+            .any_url_scheme()
+            .with_url_hosts(["*.example.com"]);
+        assert!(check_redirect(Some(&policy), "replica.example.com", 11000).is_ok());
+        assert!(check_redirect(Some(&policy), "db.internal", 1433).is_err());
     }
 
     #[test]

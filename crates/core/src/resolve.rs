@@ -40,6 +40,31 @@ pub const RESOURCE_ANNOTATION: &str = "x-faucet-resource";
 /// ```
 pub const RESOURCE_KEYS_ANNOTATION: &str = "x-faucet-resource-keys";
 
+/// The JSON Schema keyword marking a config setting that turns off
+/// verification of the peer a connector connects to (TLS certificate or SSH
+/// host key). [`annotated_resources`] reports a config that turns it on as a
+/// [`ResourceKind::Unverified`] reference. Its value is one of:
+///
+/// - `true` on a boolean field: the field set to `true`;
+/// - `true` on an object schema (an enum variant): a config object whose
+///   `const` properties all match the variant's;
+/// - an array of strings on a string field: one of those values (any case);
+/// - an object of key → array of strings on a string map: an entry whose
+///   value is one of those listed for its key (any case).
+///
+/// ```ignore
+/// #[schemars(extend("x-faucet-unverified" = true))]
+/// pub insecure_skip_verify: bool,
+/// ```
+pub const UNVERIFIED_ANNOTATION: &str = "x-faucet-unverified";
+
+/// The JSON Schema keyword marking a config setting that authenticates with
+/// credentials held by the host running faucet (OS authentication, a local
+/// wallet) rather than ones the config names. Takes the same values as
+/// [`UNVERIFIED_ANNOTATION`]; a config that turns it on is reported as a
+/// [`ResourceKind::HostCredentials`] reference.
+pub const HOST_CREDENTIALS_ANNOTATION: &str = "x-faucet-host-credentials";
+
 /// Whether map key `key` (any case) matches a [`RESOURCE_KEYS_ANNOTATION`]
 /// pattern.
 fn key_pattern_matches(pattern: &str, key: &str) -> bool {
@@ -76,6 +101,12 @@ pub enum ResourceKind {
     Url,
     /// A program the connector runs.
     Command,
+    /// A setting that turns off peer verification ([`UNVERIFIED_ANNOTATION`]);
+    /// the value is the setting as configured.
+    Unverified,
+    /// A setting that authenticates with the host's own credentials
+    /// ([`HOST_CREDENTIALS_ANNOTATION`]); the value is the setting as configured.
+    HostCredentials,
 }
 
 impl ResourceKind {
@@ -85,6 +116,8 @@ impl ResourceKind {
             ResourceKind::Path => "path",
             ResourceKind::Url => "url",
             ResourceKind::Command => "command",
+            ResourceKind::Unverified => "unverified",
+            ResourceKind::HostCredentials => "host_credentials",
         }
     }
 
@@ -141,6 +174,10 @@ pub enum RefusalKind {
     Url,
     /// A program a connector runs.
     Command,
+    /// A setting that turns off peer verification.
+    Unverified,
+    /// A setting that authenticates with the host's own credentials.
+    HostCredentials,
 }
 
 /// Why a reference was refused.
@@ -185,6 +222,8 @@ pub struct ReferencePolicy {
     env: Option<Vec<String>>,
     secret_schemes: Option<BTreeSet<String>>,
     subprocess: bool,
+    unverified: bool,
+    host_credentials: bool,
 }
 
 impl Default for ReferencePolicy {
@@ -206,6 +245,13 @@ pub fn is_metadata_host(host: &str) -> bool {
     matches!(h, "metadata.google.internal" | "metadata")
 }
 
+/// IPv6 instance-metadata endpoints outside link-local space (AWS, GCP, OCI).
+const METADATA_V6: [std::net::Ipv6Addr; 3] = [
+    std::net::Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254),
+    std::net::Ipv6Addr::new(0xfd20, 0xce, 0, 0, 0, 0, 0, 0x254),
+    std::net::Ipv6Addr::new(0xfd00, 0xc1, 0, 0, 0, 0, 0xa9fe, 0xa9fe),
+];
+
 /// Whether an address is link-local or a cloud instance-metadata endpoint.
 pub fn is_metadata_ip(ip: std::net::IpAddr) -> bool {
     let v4_meta =
@@ -214,7 +260,7 @@ pub fn is_metadata_ip(ip: std::net::IpAddr) -> bool {
         std::net::IpAddr::V4(v4) => v4_meta(v4),
         std::net::IpAddr::V6(v6) => {
             (v6.segments()[0] & 0xffc0) == 0xfe80
-                || v6 == std::net::Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254)
+                || METADATA_V6.contains(&v6)
                 || v6.to_ipv4_mapped().is_some_and(v4_meta)
                 || embedded_ipv4(v6).is_some_and(v4_meta)
         }
@@ -524,37 +570,7 @@ const CONN_ENDPOINT_KEYS: &[&str] = &[
 /// Storage) connects to, or `None` when `value` is not one. A string naming
 /// no server connects to the local machine.
 fn connection_string_hosts(value: &str) -> Option<Vec<String>> {
-    let (first_key, _) = value.split(';').next()?.split_once('=')?;
-    let first_key = first_key.trim();
-    if first_key.is_empty()
-        || !first_key
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '_' | '-'))
-    {
-        return None;
-    }
-    let unquote = |v: &str| {
-        let v = v.trim();
-        v.strip_prefix('{')
-            .and_then(|v| v.strip_suffix('}'))
-            .or_else(|| v.strip_prefix('"').and_then(|v| v.strip_suffix('"')))
-            .or_else(|| v.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
-            .unwrap_or(v)
-            .to_string()
-    };
-    let libpq_style = !value.contains(';')
-        && value.split_whitespace().count() > 1
-        && value.split_whitespace().all(|kv| kv.contains('='));
-    let separators: &[char] = if libpq_style {
-        &[' ', '\t', '\n', '\r']
-    } else {
-        &[';']
-    };
-    let pairs: Vec<(String, String)> = value
-        .split(separators)
-        .filter_map(|kv| kv.split_once('='))
-        .map(|(k, v)| (k.trim().to_ascii_lowercase(), unquote(v)))
-        .collect();
+    let pairs = connection_string_pairs(value)?;
     let get = |key: &str| {
         pairs
             .iter()
@@ -571,6 +587,9 @@ fn connection_string_hosts(value: &str) -> Option<Vec<String>> {
                 .unwrap_or(v);
             let bare = bare.split(',').next().unwrap_or(bare);
             let bare = bare.split('\\').next().unwrap_or(bare);
+            if bare.starts_with('/') {
+                continue;
+            }
             let host = if bare.contains("://") {
                 url_hosts(bare)
             } else {
@@ -597,6 +616,63 @@ fn connection_string_hosts(value: &str) -> Option<Vec<String>> {
     Some(hosts)
 }
 
+/// The innermost `(KEY=value)` pairs of a parenthesised connect descriptor
+/// (Oracle Net), keys lower-cased.
+fn descriptor_pairs(value: &str) -> Vec<(String, String)> {
+    value
+        .split('(')
+        .filter_map(|part| {
+            let (k, v) = part.split_once('=')?;
+            let v = v.split(')').next().unwrap_or(v).trim();
+            (!v.is_empty() && !v.starts_with('(')).then(|| {
+                (
+                    k.trim().to_ascii_lowercase(),
+                    v.trim_matches(|c| c == '"' || c == '\'').to_string(),
+                )
+            })
+        })
+        .collect()
+}
+
+/// The `key=value` pairs of a `key=value;…` (or libpq `key=value key=value`)
+/// connection string, keys lower-cased and values unquoted, or `None` when
+/// `value` is not one.
+fn connection_string_pairs(value: &str) -> Option<Vec<(String, String)>> {
+    let (first_key, _) = value.split(';').next()?.split_once('=')?;
+    let first_key = first_key.trim();
+    if first_key.is_empty()
+        || !first_key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '_' | '-'))
+    {
+        return None;
+    }
+    let unquote = |v: &str| {
+        let v = v.trim();
+        v.strip_prefix('{')
+            .and_then(|v| v.strip_suffix('}'))
+            .or_else(|| v.strip_prefix('"').and_then(|v| v.strip_suffix('"')))
+            .or_else(|| v.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .unwrap_or(v)
+            .to_string()
+    };
+    let libpq_style = !value.contains(';')
+        && value.split_whitespace().count() > 1
+        && value.split_whitespace().all(|kv| kv.contains('='));
+    let separators: &[char] = if libpq_style {
+        &[' ', '\t', '\n', '\r']
+    } else {
+        &[';']
+    };
+    Some(
+        value
+            .split(separators)
+            .filter_map(|kv| kv.split_once('='))
+            .map(|(k, v)| (k.trim().to_ascii_lowercase(), unquote(v)))
+            .collect(),
+    )
+}
+
 /// The hosts a URL's authority names (several for `h1,h2` connection
 /// strings and broker lists, and for the servers a `key=value;…` connection
 /// string names), in canonical form ([`canonical_host`]), without userinfo or
@@ -605,6 +681,19 @@ fn connection_string_hosts(value: &str) -> Option<Vec<String>> {
 /// taken from a `${…}` token is returned lower-cased as written.
 pub fn url_hosts(value: &str) -> Vec<String> {
     let value = value.trim();
+    if value.starts_with('(') {
+        let hosts: Vec<String> = descriptor_pairs(value)
+            .into_iter()
+            .filter(|(k, _)| k == "host")
+            .map(|(_, v)| canonical_host(&v))
+            .filter(|h| !h.is_empty())
+            .collect();
+        return if hosts.is_empty() {
+            vec!["localhost".into()]
+        } else {
+            hosts
+        };
+    }
     if !value.contains("://")
         && let Some(hosts) = connection_string_hosts(value)
     {
@@ -644,7 +733,7 @@ pub fn url_hosts(value: &str) -> Vec<String> {
         None => authority,
     };
     let hosts = hosts.split(';').next().unwrap_or(hosts);
-    hosts
+    let mut out: Vec<String> = hosts
         .split(',')
         .map(|h| {
             let h = if h.starts_with('[') {
@@ -657,6 +746,84 @@ pub fn url_hosts(value: &str) -> Vec<String> {
             canonical_host(h)
         })
         .filter(|h| !h.is_empty())
+        .collect();
+    for (key, v) in database_url_params(value) {
+        if DB_HOST_PARAMS.contains(&key.as_str()) && !v.starts_with('/') {
+            out.extend(
+                v.split(',')
+                    .map(|h| canonical_host(h.trim()))
+                    .filter(|h| !h.is_empty()),
+            );
+        }
+    }
+    out
+}
+
+/// Schemes whose drivers read connection settings from the URL query.
+const DB_URL_SCHEMES: &[&str] = &[
+    "postgres",
+    "postgresql",
+    "redshift",
+    "mysql",
+    "mariadb",
+    "tcp",
+    "tcps",
+];
+
+/// Query parameters of a database URL that name a host (or, starting with
+/// `/`, a Unix socket directory).
+const DB_HOST_PARAMS: &[&str] = &["host", "hostaddr"];
+
+/// Query parameters of a database URL that name a local file.
+const DB_PATH_PARAMS: &[&str] = &[
+    "socket",
+    "passfile",
+    "sslrootcert",
+    "ssl-root-cert",
+    "sslca",
+    "ssl-ca",
+    "sslcert",
+    "ssl-cert",
+    "sslkey",
+    "ssl-key",
+    "sslcrl",
+    "sslcrldir",
+    "trustservercertificateca",
+    "wallet_location",
+    "my_wallet_directory",
+    "directory",
+];
+
+/// Query parameters of a database URL that turn off peer verification, with
+/// the values that do.
+const DB_UNVERIFIED_PARAMS: &[(&str, &[&str])] = &[
+    ("verify_ca", &["false", "0"]),
+    ("verify_identity", &["false", "0"]),
+    ("trustservercertificate", &["true", "yes"]),
+    ("ssl_server_dn_match", &["false", "no", "off"]),
+];
+
+/// The query parameters of a database connection URL, or the pairs of a
+/// `key=value` connection string (lower-cased keys); empty for any other
+/// value.
+fn database_url_params(value: &str) -> Vec<(String, String)> {
+    let value = value.trim();
+    if value.starts_with('(') {
+        return descriptor_pairs(value);
+    }
+    if !value.contains("://") {
+        return connection_string_pairs(value).unwrap_or_default();
+    }
+    let is_db = scheme_of(value).is_some_and(|s| DB_URL_SCHEMES.contains(&s.as_str()));
+    if !is_db {
+        return Vec::new();
+    }
+    let query = value
+        .split_once('?')
+        .map(|(_, q)| q.split('#').next().unwrap_or(q))
+        .unwrap_or("");
+    url::form_urlencoded::parse(query.as_bytes())
+        .map(|(k, v)| (k.to_ascii_lowercase(), v.into_owned()))
         .collect()
 }
 
@@ -670,6 +837,8 @@ impl ReferencePolicy {
             env: None,
             secret_schemes: None,
             subprocess: true,
+            unverified: true,
+            host_credentials: true,
         }
     }
 
@@ -682,6 +851,8 @@ impl ReferencePolicy {
             env: Some(Vec::new()),
             secret_schemes: Some(BTreeSet::new()),
             subprocess: false,
+            unverified: false,
+            host_credentials: false,
         }
     }
 
@@ -782,6 +953,19 @@ impl ReferencePolicy {
         self
     }
 
+    /// Whether settings that turn off peer verification are allowed.
+    pub fn with_unverified(mut self, allowed: bool) -> Self {
+        self.unverified = allowed;
+        self
+    }
+
+    /// Whether settings that authenticate with the host's own credentials are
+    /// allowed.
+    pub fn with_host_credentials(mut self, allowed: bool) -> Self {
+        self.host_credentials = allowed;
+        self
+    }
+
     /// The allowed path roots, `None` when any path is allowed.
     pub fn path_roots(&self) -> Option<&[PathBuf]> {
         self.path_roots.as_deref()
@@ -810,6 +994,17 @@ impl ReferencePolicy {
     /// Whether connectors that run a program are allowed.
     pub fn allows_subprocess(&self) -> bool {
         self.subprocess
+    }
+
+    /// Whether settings that turn off peer verification are allowed.
+    pub fn allows_unverified(&self) -> bool {
+        self.unverified
+    }
+
+    /// Whether settings that authenticate with the host's own credentials are
+    /// allowed.
+    pub fn allows_host_credentials(&self) -> bool {
+        self.host_credentials
     }
 
     /// Check an `${env:NAME}` / `${secret:NAME}` reference.
@@ -935,7 +1130,12 @@ impl ReferencePolicy {
                 };
             }
             None if value.starts_with(['/', '.', '?', '#']) => return Ok(()),
-            None if is_relative_path(value) => return Ok(()),
+            None if is_relative_path(value)
+                && !value.starts_with('(')
+                && connection_string_pairs(value).is_none() =>
+            {
+                return Ok(());
+            }
             _ => {}
         }
         if let (Some(scheme), Some(allowed)) = (&scheme, &self.url_schemes)
@@ -965,6 +1165,33 @@ impl ReferencePolicy {
                 }
                 None => {}
             }
+        }
+        for (key, v) in database_url_params(value) {
+            let names_path = DB_PATH_PARAMS.contains(&key.as_str())
+                || (DB_HOST_PARAMS.contains(&key.as_str()) && v.starts_with('/'));
+            if names_path {
+                self.check_local(&v).map_err(|reason| {
+                    Refusal::new(RefusalKind::Path, value, format!("`{key}`: {reason}"))
+                })?;
+            }
+            let unverified = DB_UNVERIFIED_PARAMS
+                .iter()
+                .any(|(k, vals)| *k == key && vals.iter().any(|x| x.eq_ignore_ascii_case(&v)));
+            if unverified && !self.unverified {
+                return Err(refuse(format!(
+                    "`{key}={v}` turns off certificate verification"
+                )));
+            }
+        }
+        if !self.unverified
+            && matches!(scheme.as_deref(), Some("rediss" | "valkeys"))
+            && value
+                .split_once('#')
+                .is_some_and(|(_, f)| f.eq_ignore_ascii_case("insecure"))
+        {
+            return Err(refuse(
+                "the `#insecure` fragment turns off certificate verification".into(),
+            ));
         }
         Ok(())
     }
@@ -1039,6 +1266,18 @@ impl ReferencePolicy {
             ResourceKind::Path => self.check_path(&r.value),
             ResourceKind::Url => self.check_url(&r.value),
             ResourceKind::Command => self.check_command(&r.value),
+            ResourceKind::Unverified if self.unverified => Ok(()),
+            ResourceKind::Unverified => Err(Refusal::new(
+                RefusalKind::Unverified,
+                r.value.clone(),
+                "settings that turn off certificate or host-key verification are not allowed",
+            )),
+            ResourceKind::HostCredentials if self.host_credentials => Ok(()),
+            ResourceKind::HostCredentials => Err(Refusal::new(
+                RefusalKind::HostCredentials,
+                r.value.clone(),
+                "settings that authenticate with the server's own credentials are not allowed",
+            )),
         }
     }
 }
@@ -1088,6 +1327,48 @@ fn alternatives<'a>(root: &'a Value, node: &'a Value, out: &mut Vec<&'a Value>, 
     }
 }
 
+/// The key below `value` (empty for `value` itself) and the setting, when
+/// `value` turns on what `node`'s `annotation` ([`UNVERIFIED_ANNOTATION`] or
+/// [`HOST_CREDENTIALS_ANNOTATION`]) marks.
+fn flagged_setting(node: &Value, value: &Value, annotation: &str) -> Option<(String, String)> {
+    let in_list = |list: &Value, s: &str| {
+        list.as_array().is_some_and(|l| {
+            l.iter()
+                .filter_map(Value::as_str)
+                .any(|v| v.eq_ignore_ascii_case(s.trim()))
+        })
+    };
+    match (node.get(annotation)?, value) {
+        (Value::Bool(true), Value::Bool(true)) => Some((String::new(), "true".into())),
+        (Value::Bool(true), Value::Object(map)) => {
+            let Some(Value::Object(props)) = node.get("properties") else {
+                return None;
+            };
+            let consts: Vec<(&String, &Value)> = props
+                .iter()
+                .filter_map(|(k, p)| p.get("const").map(|c| (k, c)))
+                .collect();
+            let (key, tag) = consts.first()?;
+            consts
+                .iter()
+                .all(|(k, c)| map.get(*k) == Some(*c))
+                .then(|| ((*key).clone(), tag.as_str().unwrap_or_default().to_string()))
+        }
+        (list @ Value::Array(_), Value::String(s)) => {
+            in_list(list, s).then(|| (String::new(), s.clone()))
+        }
+        (Value::Object(keys), Value::Object(map)) => map.iter().find_map(|(k, v)| {
+            let list = keys
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(k))
+                .map(|(_, l)| l)?;
+            let s = v.as_str()?;
+            in_list(list, s).then(|| (k.clone(), s.to_string()))
+        }),
+        _ => None,
+    }
+}
+
 fn escape_pointer(key: &str) -> String {
     key.replace('~', "~0").replace('/', "~1")
 }
@@ -1105,6 +1386,26 @@ fn visit(
     }
     let mut alts = Vec::new();
     alternatives(root, node, &mut alts, 0);
+    for (annotation, flagged) in [
+        (UNVERIFIED_ANNOTATION, ResourceKind::Unverified),
+        (HOST_CREDENTIALS_ANNOTATION, ResourceKind::HostCredentials),
+    ] {
+        if let Some((key, setting)) = alts
+            .iter()
+            .find_map(|n| flagged_setting(n, value, annotation))
+        {
+            let mut field = pointer.trim_start_matches('/').replace('/', ".");
+            if !key.is_empty() {
+                field = if field.is_empty() {
+                    key
+                } else {
+                    format!("{field}.{key}")
+                };
+            }
+            let text = format!("{field}: {setting}");
+            out.push(ResourceRef::new(pointer, flagged, text));
+        }
+    }
     let kind = alts.iter().find_map(|n| annotation_of(n));
     match value {
         Value::String(s) => {
@@ -1321,6 +1622,188 @@ mod tests {
     }
 
     #[test]
+    fn database_url_query_parameters_are_screened() {
+        assert_eq!(
+            url_hosts("postgres://u@db.example.com/x?host=169.254.169.254,b.example.com"),
+            vec!["db.example.com", "169.254.169.254", "b.example.com"]
+        );
+        assert_eq!(
+            url_hosts("postgres:///x?host=/var/run/postgresql"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            url_hosts("https://api.example.com/x?host=169.254.169.254"),
+            vec!["api.example.com"]
+        );
+        let caller = ReferencePolicy::deny_all()
+            .with_path_roots(["/srv/data"])
+            .any_url_scheme()
+            .any_url_host();
+        for url in [
+            "postgres://u@db.example.com/x?hostaddr=169.254.169.254",
+            "postgresql://u@db.example.com/x?sslkey=/etc/ssl/private/k.pem",
+            "postgres://u@db.example.com/x?SSLROOTCERT=%2Fetc%2Fca.pem",
+            "postgres:///x?host=/etc",
+            "mysql://u@db.example.com/x?socket=/var/run/other.sock",
+            "mysql://u@db.example.com/x?ssl-ca=/etc/ca.pem",
+            "mysql://u@db.example.com/x?require_ssl=true&verify_ca=false",
+            "mysql://u@db.example.com/x?verify_identity=0",
+            "rediss://cache.example.com:6380/0#insecure",
+        ] {
+            assert!(caller.check_url(url).is_err(), "{url}");
+            assert_eq!(
+                ReferencePolicy::open().check_url(url).is_ok(),
+                !url.contains("169.254"),
+                "open policy: {url}"
+            );
+        }
+        for url in [
+            "postgres://u@db.example.com/x?sslmode=verify-full&sslrootcert=/srv/data/ca.pem",
+            "postgres://u@db.example.com/x?host=db2.example.com",
+            "mysql://u@db.example.com/x?require_ssl=true&verify_ca=true",
+            "https://api.example.com/x?sslkey=/etc/k.pem",
+            "rediss://cache.example.com:6380/0",
+        ] {
+            assert!(caller.check_url(url).is_ok(), "{url}");
+        }
+        for cs in [
+            "Server=169.254.169.254;Database=x;Note=a/b",
+            "Server=db.example.com;TrustServerCertificateCA=/etc/ssl/ca.pem",
+            "Server=db.example.com;TrustServerCertificate=yes",
+            "host=db.example.com sslkey=/etc/k.pem",
+        ] {
+            assert!(caller.check_url(cs).is_err(), "{cs}");
+        }
+        assert!(
+            caller
+                .check_url("Server=db.example.com;TrustServerCertificateCA=/srv/data/ca.pem")
+                .is_ok()
+        );
+        assert!(caller.check_url("data/in.csv").is_ok());
+        let descriptor = "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=db.example.com)(PORT=2484))\
+             (CONNECT_DATA=(SERVICE_NAME=svc)))";
+        assert_eq!(url_hosts(descriptor), vec!["db.example.com"]);
+        assert!(caller.check_url(descriptor).is_ok());
+        for bad in [
+            "(DESCRIPTION=(ADDRESS=(HOST=169.254.169.254)(PORT=1521)))",
+            "(DESCRIPTION=(ADDRESS=(HOST=metadata))(SECURITY=(MY_WALLET_DIRECTORY=/srv/data)))",
+            "(DESCRIPTION=(ADDRESS=(HOST=db.example.com))(SECURITY=(MY_WALLET_DIRECTORY=/etc/w)))",
+            "(DESCRIPTION=(ADDRESS=(HOST=db.example.com))(SECURITY=(SSL_SERVER_DN_MATCH=FALSE)))",
+            "tcps://db.example.com:2484/svc?wallet_location=/etc/w",
+            "tcps://db.example.com:2484/svc?ssl_server_dn_match=off",
+        ] {
+            assert!(caller.check_url(bad).is_err(), "{bad}");
+        }
+        let lenient = caller.clone().with_unverified(true);
+        assert!(
+            lenient
+                .check_url("Server=db.example.com;TrustServerCertificate=true")
+                .is_ok()
+        );
+        assert!(
+            lenient
+                .check_url("mysql://u@h.example.com/x?verify_ca=false")
+                .is_ok()
+        );
+        assert!(
+            lenient
+                .check_url("rediss://h.example.com/0#insecure")
+                .is_ok()
+        );
+        let err = caller
+            .check_url("postgres://u@h.example.com/x?sslkey=/etc/k.pem")
+            .unwrap_err();
+        assert_eq!(err.kind, RefusalKind::Path);
+        assert!(err.reason.starts_with("`sslkey`"), "{err}");
+    }
+
+    #[test]
+    fn settings_that_turn_off_verification_are_reported_and_follow_the_policy() {
+        let s = json!({
+            "type": "object",
+            "properties": {
+                "tls": {"$ref": "#/$defs/Tls"},
+                "mode": {"type": "string", "x-faucet-unverified": ["trust_server_certificate"]},
+                "host_key": {"oneOf": [
+                    {"type": "object", "properties": {"mode": {"const": "strict"}}},
+                    {"type": "object", "properties": {"mode": {"const": "insecure"}},
+                     "x-faucet-unverified": true}
+                ]},
+                "extra": {"type": "object", "additionalProperties": {"type": "string"},
+                          "x-faucet-unverified": {"enable.ssl.certificate.verification": ["false"]}}
+            },
+            "$defs": {"Tls": {"type": "object", "properties": {
+                "insecure_skip_verify": {"type": "boolean", "x-faucet-unverified": true}
+            }}}
+        });
+        let quiet = json!({
+            "tls": {"insecure_skip_verify": false},
+            "mode": "require",
+            "host_key": {"mode": "strict"},
+            "extra": {"enable.ssl.certificate.verification": "true"}
+        });
+        assert!(annotated_resources(&s, &quiet).is_empty());
+        let loud = json!({
+            "tls": {"insecure_skip_verify": true},
+            "mode": "Trust_Server_Certificate",
+            "host_key": {"mode": "insecure"},
+            "extra": {"Enable.SSL.Certificate.Verification": "FALSE"}
+        });
+        let found = annotated_resources(&s, &loud);
+        let mut found = found;
+        found.sort_by(|a, b| a.pointer.cmp(&b.pointer));
+        let got: Vec<(&str, &str)> = found
+            .iter()
+            .map(|r| (r.pointer.as_str(), r.value.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("/extra", "extra.Enable.SSL.Certificate.Verification: FALSE"),
+                ("/host_key", "host_key.mode: insecure"),
+                ("/mode", "mode: Trust_Server_Certificate"),
+                (
+                    "/tls/insecure_skip_verify",
+                    "tls.insecure_skip_verify: true"
+                ),
+            ]
+        );
+        assert!(found.iter().all(|r| r.kind == ResourceKind::Unverified));
+        assert_eq!(ResourceKind::Unverified.to_string(), "unverified");
+        let r = &found[0];
+        assert!(ReferencePolicy::open().check(r).is_ok());
+        assert!(ReferencePolicy::open().allows_unverified());
+        let refused = ReferencePolicy::deny_all().check(r).unwrap_err();
+        assert_eq!(refused.kind, RefusalKind::Unverified);
+        assert!(refused.subject.starts_with("extra."), "{refused}");
+        assert!(
+            ReferencePolicy::deny_all()
+                .with_unverified(true)
+                .check_resolved(r)
+                .is_ok()
+        );
+        let os = json!({"properties": {
+            "external_auth": {"type": "boolean", "x-faucet-host-credentials": true}
+        }});
+        assert!(annotated_resources(&os, &json!({"external_auth": false})).is_empty());
+        let found = annotated_resources(&os, &json!({"external_auth": true}));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].kind, ResourceKind::HostCredentials);
+        assert_eq!(found[0].value, "external_auth: true");
+        assert_eq!(ResourceKind::HostCredentials.as_str(), "host_credentials");
+        let refused = ReferencePolicy::deny_all().check(&found[0]).unwrap_err();
+        assert_eq!(refused.kind, RefusalKind::HostCredentials);
+        assert!(ReferencePolicy::open().check(&found[0]).is_ok());
+        assert!(ReferencePolicy::open().allows_host_credentials());
+        assert!(
+            ReferencePolicy::deny_all()
+                .with_host_credentials(true)
+                .check(&found[0])
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn sandbox_fields_are_read_from_the_root_and_its_branches() {
         assert!(sandbox_fields(&schema()).is_empty());
         let s = json!({
@@ -1521,6 +2004,8 @@ mod tests {
             "http://169.254.169.254/latest",
             "http://[fe80::1]/",
             "http://[fd00:ec2::254]/",
+            "http://[fd20:ce::254]/",
+            "http://[fd00:c1::a9fe:a9fe]/",
             "http://[::ffff:169.254.169.254]/",
             "http://metadata.google.internal/x",
             "http://100.100.100.200/",

@@ -50,6 +50,7 @@ fn base_connect_options(conn: &RedshiftConnection) -> Result<PgConnectOptions, F
             "redshift: `database` must not be empty".into(),
         ));
     }
+    faucet_core::libpq::refuse_env_client_cert("redshift", |k| std::env::var(k).ok())?;
     faucet_core::ensure_crypto_provider();
     let ssl_mode = match conn.tls_mode {
         Some(RedshiftTlsMode::Disable) => PgSslMode::Disable,
@@ -68,7 +69,7 @@ fn base_connect_options(conn: &RedshiftConnection) -> Result<PgConnectOptions, F
                 .into(),
         ));
     }
-    let mut opts = PgConnectOptions::new()
+    let mut opts = PgConnectOptions::new_without_pgpass()
         .host(&conn.host)
         .port(conn.port)
         .database(&conn.database)

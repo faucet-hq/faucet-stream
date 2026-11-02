@@ -143,6 +143,7 @@ pub struct TlsOptions {
     /// Accept any server certificate without verification. Defaults to
     /// `false`; a run with it on logs a warning. Never use it in production.
     #[serde(default)]
+    #[schemars(extend("x-faucet-unverified" = true))]
     pub insecure_skip_verify: bool,
 }
 

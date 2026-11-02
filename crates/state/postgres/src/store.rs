@@ -45,9 +45,27 @@ impl PostgresStateStore {
     ) -> Result<Self, FaucetError> {
         validate_table_name(table)?;
         faucet_core::ensure_crypto_provider();
+        let pins = faucet_core::libpq::config_only("postgres state store", connection_url, |k| {
+            std::env::var(k).ok()
+        })?;
+        let mut opts: sqlx::postgres::PgConnectOptions = connection_url.parse().map_err(|e| {
+            FaucetError::State(format!("PostgreSQL state-store connection failed: {e}"))
+        })?;
+        if pins.empty_password {
+            opts = opts.password("");
+        }
+        if pins.default_host {
+            opts = opts.host("localhost");
+        }
+        if pins.default_port {
+            opts = opts.port(5432);
+        }
+        if pins.default_ssl_mode {
+            opts = opts.ssl_mode(sqlx::postgres::PgSslMode::Prefer);
+        }
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
-            .connect(connection_url)
+            .connect_with(opts)
             .await
             .map_err(|e| {
                 FaucetError::State(format!("PostgreSQL state-store connection failed: {e}"))

@@ -156,11 +156,11 @@ pub struct PostgresCdcSourceConfig {
     /// [`FaucetError::Source`] rather than
     /// being OOM-killed.
     ///
-    /// `None` (the default) means unbounded — atomic delivery of arbitrarily
-    /// large transactions at the cost of unbounded memory. Set a value sized
-    /// to your available memory if you replicate tables subject to large
-    /// bulk writes.
-    #[serde(default)]
+    /// Defaults to 1,000,000. `null` means unbounded — atomic delivery of
+    /// arbitrarily large transactions at the cost of unbounded memory. Size it
+    /// to your available memory if you replicate tables subject to large bulk
+    /// writes.
+    #[serde(default = "faucet_core::replication::default_max_staged_records")]
     pub max_staged_records: Option<usize>,
 
     /// Replication events read ahead while the pipeline is busy writing a
@@ -327,6 +327,16 @@ impl PostgresCdcSourceConfig {
                 "postgres-cdc: connection_url must not be empty".into(),
             ));
         }
+        if let Ok(u) = url::Url::parse(self.connection_url.trim())
+            && let Some((k, _)) = u
+                .query_pairs()
+                .find(|(k, _)| matches!(k.as_ref(), "host" | "hostaddr" | "port"))
+        {
+            return Err(FaucetError::Config(format!(
+                "postgres-cdc: `{k}=` in connection_url is not supported; name the host and \
+                 port in the URL authority (postgres://user@host:port/db)"
+            )));
+        }
         validate_slot_name(&self.slot_name)?;
         if self.publication_name.is_empty() {
             return Err(FaucetError::Config(
@@ -408,11 +418,18 @@ fn url_tls(conn: &str) -> Result<Option<CdcTls>, FaucetError> {
             .map(|(k, v)| (k.to_string(), v.trim_matches('\'').to_string()))
             .collect()
     };
+    for (k, _) in &params {
+        if k.starts_with("ssl") && canonical_ssl_param(k).is_none() {
+            return Err(FaucetError::Config(format!(
+                "postgres-cdc: unknown TLS parameter '{k}' in connection_url"
+            )));
+        }
+    }
     let get = |key: &str| {
         params
             .iter()
             .rev()
-            .find(|(k, _)| k == key)
+            .find(|(k, _)| canonical_ssl_param(k) == Some(key))
             .map(|(_, v)| v.clone())
     };
     let ca_path = get("sslrootcert");
@@ -428,6 +445,18 @@ fn url_tls(conn: &str) -> Result<Option<CdcTls>, FaucetError> {
                 "postgres-cdc: unknown sslmode '{other}' in connection_url"
             )));
         }
+    })
+}
+
+/// The libpq name of a TLS connection parameter, folding the spellings the
+/// URL parser also accepts (`ssl-mode`, `ssl-root-cert`, `ssl-ca`, …).
+fn canonical_ssl_param(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "sslmode" | "ssl-mode" => "sslmode",
+        "sslrootcert" | "ssl-root-cert" | "ssl-ca" => "sslrootcert",
+        "sslcert" | "ssl-cert" => "sslcert",
+        "sslkey" | "ssl-key" => "sslkey",
+        _ => return None,
     })
 }
 
@@ -471,7 +500,7 @@ mod tests {
             idle_timeout: std::time::Duration::from_secs(30),
             max_messages: None,
             max_cycle_duration: default_max_cycle_duration(),
-            max_staged_records: None,
+            max_staged_records: faucet_core::replication::default_max_staged_records(),
             max_buffered_events: default_max_buffered_events(),
             max_buffered_bytes: default_max_buffered_bytes(),
             status_update_interval: std::time::Duration::from_secs(10),
@@ -566,6 +595,35 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("contradicts"), "{err}");
+        assert_eq!(
+            eff(
+                "postgres://h/db?ssl-mode=verify-full&ssl-root-cert=/u.pem",
+                CdcTls::FromUrl
+            )
+            .unwrap(),
+            CdcTls::VerifyFull {
+                ca_path: Some("/u.pem".into())
+            }
+        );
+        assert_eq!(
+            eff(
+                "postgres://h/db?ssl-mode=require&ssl-ca=/c.pem",
+                CdcTls::FromUrl
+            )
+            .unwrap(),
+            CdcTls::Require
+        );
+        let err = eff("postgres://h/db?ssl-mode=verify-full", CdcTls::Disable)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("contradicts"), "{err}");
+        let err = eff("postgres://h/db?sslnegotiation=direct", CdcTls::FromUrl)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unknown TLS parameter 'sslnegotiation'"),
+            "{err}"
+        );
         let err = eff("postgres://h/db?sslmode=bogus", CdcTls::FromUrl)
             .unwrap_err()
             .to_string();
@@ -600,6 +658,15 @@ mod tests {
         assert!(value.start_lsn.is_none());
         assert!(value.max_messages.is_none());
         assert_eq!(value.batch_size, DEFAULT_BATCH_SIZE);
+        assert_eq!(value.max_staged_records, Some(1_000_000));
+        let unbounded: PostgresCdcSourceConfig = serde_json::from_value(serde_json::json!({
+            "connection_url": "postgres://u:p@localhost/db",
+            "slot_name": "faucet_slot",
+            "publication_name": "faucet_pub",
+            "max_staged_records": null,
+        }))
+        .unwrap();
+        assert_eq!(unbounded.max_staged_records, None);
     }
 
     #[test]
@@ -652,6 +719,18 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(v.batch_size, 256);
+    }
+
+    #[test]
+    fn rejects_host_and_port_query_parameters() {
+        for q in ["host=other", "hostaddr=10.0.0.9", "port=6543"] {
+            let cfg = PostgresCdcSourceConfig {
+                connection_url: format!("postgres://u:p@h/db?{q}"),
+                ..minimal()
+            };
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("is not supported"), "{q}: {err}");
+        }
     }
 
     #[test]
