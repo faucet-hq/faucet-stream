@@ -155,7 +155,10 @@ connector's `tls` / transport option as something to configure, not to inherit.
   `--allow-url-host` URLs (link-local and metadata hosts refused unless
   listed), `--allow-env` variables and `--allow-secret-scheme` secret managers,
   and runs a program only with `--allow-subprocess-connectors`. The defaults
-  deny environment and secret-manager reads. Operator-written configs
+  deny environment and secret-manager reads. The server's own files (its
+  environment files, input files, run-history database and default-config
+  state directory) are refused as data whatever the path roots allow.
+  Operator-written configs
   (templates, the triggers file, `--default-config`) are not checked. See
   [Reference policy](../book/src/reference/http-api.md#reference-policy).
 - **Run errors are redacted before they are persisted**, so the history

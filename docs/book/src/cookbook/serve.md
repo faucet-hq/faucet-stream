@@ -93,7 +93,15 @@ A viewer's `POST /v1/runs` returns `403`; its `GET /v1/runs` returns `200`.
 reference that does not resolve refuses the start, and a token still holding
 `${` is refused — never accepted literally. No config the server loads can read
 those variables or files, nor `FAUCET_VAULT_KEY` and the server's own token
-variables.
+variables — not as a reference, and not as data either: a connector, state, DLQ
+or preview path that reaches one of the server's own files is refused. Those
+files are the `.env` it loaded and every `.env` / `.env.*` in its working
+directory, the `--auth-config`, `--policy`, `--triggers`, `--templates-sync`,
+`--connect-providers`, `--otel-config` and `--default-config` files and
+everything they read, the SQLite run-history database with its `-wal` / `-shm`
+files, and the `--default-config`'s file state directory. Keep other secrets
+out of the working and temp directories, or start the server with
+`--allow-path-root` set to a data directory of its own.
 
 A config submitted over HTTP or MCP may not use the `singer` source or sink —
 they run a program on the host — unless the server is started with
