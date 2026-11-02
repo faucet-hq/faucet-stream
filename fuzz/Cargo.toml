@@ -19,8 +19,11 @@ members = ["."]
 libfuzzer-sys = "0.4.13"
 serde_json = "1"
 chrono = "0.4"
-faucet-core = { path = "../crates/core" }
-faucet-cli = { path = "../cli", default-features = false }
+faucet-core = { path = "../crates/core", features = ["compression", "file-format-csv", "file-format-xml", "file-format-excel"] }
+faucet-cli = { path = "../cli", default-features = false, features = ["mcp"] }
+faucet-source-rest = { path = "../crates/source/rest", default-features = false, features = ["excel"] }
+faucet-source-xml = { path = "../crates/source/xml", features = ["excel"] }
+tokio = { version = "1", features = ["rt", "io-util"] }
 # The pgoutput decoder is compiled from its source files (fuzz_targets/pgoutput.rs)
 # so the postgres-cdc crate, and the sqlx macros the sanitizer build cannot load, stay out.
 base64 = "0.22"
@@ -51,6 +54,55 @@ bench = false
 [[bin]]
 name = "fidelity_from_str"
 path = "fuzz_targets/fidelity_from_str.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pipeline_config"
+path = "fuzz_targets/pipeline_config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "param_bind"
+path = "fuzz_targets/param_bind.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rest_extract"
+path = "fuzz_targets/rest_extract.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "file_decode"
+path = "fuzz_targets/file_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "response_decode"
+path = "fuzz_targets/response_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mcp_message"
+path = "fuzz_targets/mcp_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xlsx"
+path = "fuzz_targets/xlsx.rs"
 test = false
 doc = false
 bench = false

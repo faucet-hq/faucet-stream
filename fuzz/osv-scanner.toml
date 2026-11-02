@@ -5,3 +5,55 @@
 [[IgnoredVulns]]
 id = "GHSA-qwgh-2vcv-g2f7"
 reason = "block-buffer 0.10.4 only via the RustCrypto 0.10 digest crates; needs a panic inside a hash update (2026-10-29)"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0391"
+reason = "only zstd 0.13.3 via upstream crates remains; with_context unused (2026-10-26)"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0398"
+reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; Seekable unused (2026-10-26)"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0403"
+reason = "only zstd-safe 7.3.0 via zstd 0.13 remains (upstream pins + faucet-core public type); legacy-frame decode errors only (2026-10-26)"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0395"
+reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; affected APIs unused (2026-10-28)"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0396"
+reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; affected APIs unused (2026-10-28)"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0397"
+reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; affected APIs unused (2026-10-28)"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0399"
+reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; affected APIs unused (2026-10-28)"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0400"
+reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; affected APIs unused (2026-10-28)"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0401"
+reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; affected APIs unused (2026-10-28)"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0402"
+reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; affected APIs unused (2026-10-28)"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0404"
+reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; affected APIs unused (2026-10-28)"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0405"
+reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; affected APIs unused (2026-10-28)"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0406"
+reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; affected APIs unused (2026-10-28)"
