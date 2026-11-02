@@ -6,6 +6,7 @@
 //! `arrow` APIs and asserts on the decoded `RecordBatch`. We deliberately do
 //! NOT depend on `faucet-source-parquet` here; that crate is being built in
 //! parallel and round-trips against it are out of scope until both ship.
+#![allow(unsafe_code)] // tests set process environment variables
 
 use std::sync::Arc;
 

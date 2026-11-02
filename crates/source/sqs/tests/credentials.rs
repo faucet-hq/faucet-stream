@@ -9,6 +9,7 @@
 //! environment keys or shared files besides it) and the STS exchanges are read
 //! back from LocalStack's request log.
 #![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
+#![allow(unsafe_code)] // tests set process environment variables
 
 use faucet_core::Source;
 use faucet_source_sqs::{SqsCredentials, SqsSource, SqsSourceConfig};

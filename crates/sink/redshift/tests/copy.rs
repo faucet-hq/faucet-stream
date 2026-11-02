@@ -8,6 +8,7 @@
 //! ignorecase'` maps keys to columns ignoring case, `FORMAT AS CSV NULL AS …`
 //! reads RFC-4180 cells with the unquoted marker as NULL. Every other message
 //! passes through untouched.
+#![allow(unsafe_code)] // tests set process environment variables
 
 #[path = "../../../common/redshift/tests/support/mod.rs"]
 mod support;

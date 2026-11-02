@@ -14,6 +14,7 @@
 //! `sslmode=prefer`). These tests require Docker and are **not** `#[ignore]`d —
 //! they auto-start their own container. A process-wide mutex serializes the
 //! containers within this test binary.
+#![allow(unsafe_code)] // tests set process environment variables
 
 use std::sync::OnceLock;
 

@@ -143,6 +143,9 @@ repository = "https://github.com/faucet-hq/faucet-stream"
 keywords = ["etl", "data-pipeline", "streaming", "connector", "faucet"]
 categories = ["database", "asynchronous"]
 
+[workspace.lints.rust]
+unsafe_code = "deny"
+
 [workspace.dependencies]
 # Internal crates
 faucet-core = { path = "crates/core", version = "1" }

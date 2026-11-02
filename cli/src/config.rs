@@ -1686,6 +1686,7 @@ pub fn parse_with_extension(text: &str, ext: &str) -> CliResult<PipelineConfig> 
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)] // tests set process environment variables
 mod tests {
     use super::*;
     use serde_json::json;

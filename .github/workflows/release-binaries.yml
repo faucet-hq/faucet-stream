@@ -57,14 +57,20 @@ env:
 # trigger workflows; then trigger the release build manually:
 #   gh workflow run release-binaries.yml --ref faucet-cli-vX.Y.Z
 # (workflow_dispatch on the tag ref; the plan job reads the tag from the ref).
+# A dispatch must run on the faucet-cli-vX.Y.Z tag it builds, and it never
+# replaces a release asset with different bytes unless replace_assets is set.
 on:
   pull_request:
   workflow_dispatch:
     inputs:
       tag:
-        description: "faucet-cli-vX.Y.Z tag to build (runs this workflow from the dispatch ref against that tag)"
+        description: "faucet-cli-vX.Y.Z tag to build; must equal the dispatch ref (empty = the dispatch ref)"
         type: string
         default: ""
+      replace_assets:
+        description: "Replace release assets that already exist with different content"
+        type: boolean
+        default: false
   push:
     tags:
       - 'faucet-cli-v[0-9]+.[0-9]+.[0-9]+*'
@@ -78,12 +84,23 @@ jobs:
       tag: ${{ !github.event.pull_request && (inputs.tag || github.ref_name) || '' }}
       tag-flag: ${{ !github.event.pull_request && format('--tag={0}', inputs.tag || github.ref_name) || '' }}
       publishing: ${{ !github.event.pull_request }}
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: audit
+      - name: Check the release tag
+        if: ${{ !github.event.pull_request }}
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          if ! [[ "$TAG" =~ ^faucet-cli-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'$TAG' is not a faucet-cli-vX.Y.Z tag"
+            exit 1
+          fi
+          if [ "$GITHUB_REF" != "refs/tags/$TAG" ]; then
+            echo "::error::run this workflow on the tag it builds: gh workflow run release-binaries.yml --ref $TAG (got $GITHUB_REF)"
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.tag || github.ref }}
@@ -132,6 +149,7 @@ jobs:
       - id: plan
         # Hand edit (#978): the dist arguments reach the shell through env.
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DIST_ARGS: ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', inputs.tag || github.ref_name)) || 'plan' }}
         run: |
           # shellcheck disable=SC2086 # DIST_ARGS is several words
@@ -167,7 +185,6 @@ jobs:
       matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
     runs-on: ${{ matrix.runner }}
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
     steps:
       - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
@@ -241,6 +258,7 @@ jobs:
         run: echo "OPENSSL_SRC_PERL=C:/Strawberry/perl/bin/perl.exe" >> "$GITHUB_ENV"
       - name: Build artifacts
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_FLAG: ${{ needs.plan.outputs.tag-flag }}
           DIST_ARGS: ${{ matrix.dist_args }}
         run: |
@@ -276,7 +294,6 @@ jobs:
       - build-local-artifacts
     runs-on: "ubuntu-22.04"
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
     steps:
       - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
@@ -314,6 +331,7 @@ jobs:
       - id: cargo-dist
         shell: bash
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_FLAG: ${{ needs.plan.outputs.tag-flag }}
         run: |
           dist build ${TAG_FLAG} --output-format=json "--artifacts=global" > dist-manifest.json
@@ -368,8 +386,6 @@ jobs:
       - build-global-artifacts
     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
     if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-22.04"
     outputs:
       val: ${{ steps.host.outputs.manifest }}
@@ -398,6 +414,7 @@ jobs:
       - id: host
         shell: bash
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_FLAG: ${{ needs.plan.outputs.tag-flag }}
         run: |
           dist host ${TAG_FLAG} --steps=upload --steps=release --output-format=json > dist-manifest.json
@@ -441,10 +458,38 @@ jobs:
           done
       - name: Create GitHub Release
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPLACE_ASSETS: ${{ inputs.replace_assets && 'true' || 'false' }}
           PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
           RELEASE_COMMIT: "${{ github.sha }}"
           TAG: ${{ needs.plan.outputs.tag }}
         run: |
+          upload_assets() {
+            # An asset already on the release is kept when its bytes match and
+            # refused otherwise, unless REPLACE_ASSETS is true.
+            local existing new=() differ=0 f name
+            existing="$(gh release view "${TAG}" --json assets --jq '.assets[].name')"
+            mkdir -p "$RUNNER_TEMP/existing"
+            for f in "$@"; do
+              name="$(basename "$f")"
+              if ! grep -qxF -- "$name" <<<"$existing"; then
+                new+=("$f")
+              elif [ "$REPLACE_ASSETS" = "true" ]; then
+                gh release upload "${TAG}" "$f" --clobber
+              else
+                rm -f "$RUNNER_TEMP/existing/$name"
+                gh release download "${TAG}" --pattern "$name" --dir "$RUNNER_TEMP/existing"
+                if cmp -s "$f" "$RUNNER_TEMP/existing/$name"; then
+                  echo "already uploaded: $name"
+                else
+                  echo "::error::${TAG} already has a different $name; dispatch with replace_assets=true to replace it"
+                  differ=1
+                fi
+              fi
+            done
+            if [ "${#new[@]}" -gt 0 ]; then gh release upload "${TAG}" "${new[@]}"; fi
+            return "$differ"
+          }
           # If we're editing a release in place, we need to upload things ahead of time.
           # release-plz creates the GitHub release for this tag (create-release = false
           # in dist-workspace.toml); tolerate the small window where the tag exists but
@@ -454,7 +499,7 @@ jobs:
             echo "release for ${TAG} not visible yet (attempt $i); waiting 30s"
             sleep 30
           done
-          gh release upload "${TAG}" artifacts/* --clobber
+          upload_assets artifacts/*
 
           gh release edit "${TAG}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --draft=false
 
@@ -468,8 +513,6 @@ jobs:
       - host
     if: ${{ always() && needs.host.result == 'success' }}
     runs-on: "ubuntu-22.04"
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
@@ -492,11 +535,39 @@ jobs:
           key: connector-export
       - name: Export and upload connectors.json
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPLACE_ASSETS: ${{ inputs.replace_assets && 'true' || 'false' }}
           TAG: ${{ needs.plan.outputs.tag }}
         run: |
+          upload_assets() {
+            # An asset already on the release is kept when its bytes match and
+            # refused otherwise, unless REPLACE_ASSETS is true.
+            local existing new=() differ=0 f name
+            existing="$(gh release view "${TAG}" --json assets --jq '.assets[].name')"
+            mkdir -p "$RUNNER_TEMP/existing"
+            for f in "$@"; do
+              name="$(basename "$f")"
+              if ! grep -qxF -- "$name" <<<"$existing"; then
+                new+=("$f")
+              elif [ "$REPLACE_ASSETS" = "true" ]; then
+                gh release upload "${TAG}" "$f" --clobber
+              else
+                rm -f "$RUNNER_TEMP/existing/$name"
+                gh release download "${TAG}" --pattern "$name" --dir "$RUNNER_TEMP/existing"
+                if cmp -s "$f" "$RUNNER_TEMP/existing/$name"; then
+                  echo "already uploaded: $name"
+                else
+                  echo "::error::${TAG} already has a different $name; dispatch with replace_assets=true to replace it"
+                  differ=1
+                fi
+              fi
+            done
+            if [ "${#new[@]}" -gt 0 ]; then gh release upload "${TAG}" "${new[@]}"; fi
+            return "$differ"
+          }
           cargo build -p faucet-cli --no-default-features --features full
           ./target/debug/faucet conformance --export --require-all > connectors.json
-          gh release upload "${TAG}" connectors.json --clobber
+          upload_assets connectors.json
       # notify-site fires minutes after the release burst, long before this
       # job finishes, so that rebuild still reads the previous feed. Rebuild
       # the site again now that the feed is attached.
@@ -520,7 +591,6 @@ jobs:
     runs-on: "ubuntu-22.04"
     environment: release
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       PLAN: ${{ needs.plan.outputs.val }}
       GITHUB_USER: "axo bot"
       GITHUB_EMAIL: "admin+bot@axo.dev"
@@ -575,8 +645,6 @@ jobs:
     # "host" however must run to completion, no skipping allowed!
     if: ${{ always() && needs.host.result == 'success' && (needs.publish-homebrew-formula.result == 'skipped' || needs.publish-homebrew-formula.result == 'success') }}
     runs-on: "ubuntu-22.04"
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:

@@ -1838,6 +1838,7 @@ pub async fn resolve_store_url(url: &str) -> CliResult<TemplateStore> {
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)] // tests set process environment variables
 mod tests {
     use super::*;
 

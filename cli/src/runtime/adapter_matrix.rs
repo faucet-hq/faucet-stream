@@ -1047,6 +1047,7 @@ async fn a_trusted_param_passes_unchecked_and_others_get_a_403() {
 /// operator's and is not checked.
 #[tokio::test]
 #[serial_test::serial(env)]
+#[allow(unsafe_code)] // tests set process environment variables
 async fn an_env_override_is_held_to_the_caller_policy() {
     let root = tempfile::tempdir().unwrap();
     let state = fresh_rooted(root.path()).await;

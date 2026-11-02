@@ -9,6 +9,7 @@
 //!
 //! Requires Docker. Each test boots its own MinIO container and bucket.
 #![cfg(feature = "file-format-csv")]
+#![allow(unsafe_code)] // tests set process environment variables
 
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Credentials;

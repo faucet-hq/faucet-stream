@@ -1487,6 +1487,7 @@ pub async fn trigger_template_outcome(
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)] // tests set process environment variables
 mod tests {
     #[test]
     fn every_provenance_label_is_reserved() {

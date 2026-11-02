@@ -31,6 +31,7 @@ fn normalize_maxrss(raw: i64, unit_is_bytes: bool) -> Option<u64> {
 /// `None` if the platform call fails. Unix-only; on other platforms it reports
 /// `None` and callers simply omit the figure.
 #[cfg(unix)]
+#[allow(unsafe_code)] // getrusage FFI call
 pub fn process_peak_rss_bytes() -> Option<u64> {
     // SAFETY: `getrusage` fills a caller-owned `rusage`; we zero-init it and only
     // read the scalar `ru_maxrss` field afterwards. No aliasing or lifetime risk.

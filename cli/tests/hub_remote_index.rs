@@ -3,6 +3,7 @@
 //! body, and the cache never drops what a concurrent run may be reading
 //! (#789 CLI-19, CLI-102, CLI-104).
 #![cfg(feature = "hub-remote")]
+#![allow(unsafe_code)] // tests set process environment variables
 
 use faucet_cli::hub::remote::{CACHE_ENV, OFFLINE_ENV, fetch_cached, fetch_file_at};
 use faucet_cli::hub::{HubLocation, catalog, locate};

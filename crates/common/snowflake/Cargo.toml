@@ -46,3 +46,6 @@ enum_struct_variant_field_added = "allow"
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
 wiremock = "0.6"
+
+[lints]
+workspace = true

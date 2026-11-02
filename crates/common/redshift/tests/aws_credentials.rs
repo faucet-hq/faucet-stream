@@ -5,6 +5,7 @@
 //! `AWS_ENDPOINT_URL_STS`). One test, because each phase rewrites the process
 //! environment the default credential chain reads.
 #![allow(clippy::disallowed_methods)]
+#![allow(unsafe_code)] // tests set process environment variables
 
 use std::sync::{Arc, Mutex};
 

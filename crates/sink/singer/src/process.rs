@@ -343,6 +343,7 @@ impl TargetProcess {
 
     /// Stop the target without waiting for it to finish its work (SIGTERM →
     /// grace → SIGKILL) and reap it.
+    #[allow(unsafe_code)] // sends SIGTERM to the child process
     pub async fn terminate(&mut self) {
         self.stdin = None;
         let Some(child) = self.child.as_mut() else {

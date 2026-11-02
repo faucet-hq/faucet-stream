@@ -1,7 +1,7 @@
 //! The S3 sink's failure paths (#777), against a mock S3 endpoint: each S3
 //! call the sink makes is refused in turn, and the error must name the call
 //! and the key, abort a started multipart upload, and never report success.
-
+#![allow(unsafe_code)] // tests set process environment variables
 #![allow(deprecated)] // the tests drive the 1.x lifecycle hooks directly (RFC 0014)
 use faucet_core::Sink;
 use faucet_core::check::{CheckContext, ProbeStatus};

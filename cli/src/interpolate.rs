@@ -1116,6 +1116,7 @@ pub fn resolve_lineage_job_name(template: &str, name: &str, row_id: &str) -> Str
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)] // tests set process environment variables
 mod tests {
     use super::*;
     use serde_json::json;

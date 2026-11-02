@@ -5,6 +5,7 @@
 //! `FAUCET_PARQUET_MEMORY_ROWS` sets the row count (default 400 000, about
 //! 45 MiB); each row is ~110 bytes of poorly-compressible text.
 #![cfg(all(not(target_os = "windows"), feature = "arrow"))]
+#![allow(unsafe_code)] // a counting global allocator measures peak memory
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::HashMap;

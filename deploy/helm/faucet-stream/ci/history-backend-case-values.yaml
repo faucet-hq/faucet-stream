@@ -1,0 +1,8 @@
+# The backend is matched case-insensitively, so the DSN still reaches the pod from a Secret.
+# expect: name: t-faucet-stream-serve-history
+# expect-not: value: "postgres://
+serve:
+  enabled: true
+  history:
+    backend: Postgres
+    url: "postgres://faucet:dummy-secret@db.example:5432/faucet"

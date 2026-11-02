@@ -5,6 +5,7 @@
 //!
 //! Its own test binary: it installs the process-global plugin registry.
 #![cfg(feature = "serve")]
+#![allow(unsafe_code)] // tests set process environment variables
 
 use faucet_cli::cli::ReferenceArgs;
 use faucet_cli::registry::PluginRegistry;

@@ -105,6 +105,7 @@ impl SecretResolver for VaultResolver {
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)] // tests set process environment variables
 mod tests {
     use super::*;
     use wiremock::matchers::{header, method, path};
