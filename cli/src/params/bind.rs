@@ -1141,6 +1141,7 @@ pub fn collect_env_overrides(args: &[String]) -> CliResult<BTreeMap<String, Stri
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)] // tests set process environment variables
 mod tests {
     use super::*;
     use serde_json::json;

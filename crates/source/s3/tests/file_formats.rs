@@ -5,6 +5,7 @@
 //! loop chunks them. A unit test of the decoder says nothing about whether
 //! the object body reaches it, which is what these cover.
 #![cfg(feature = "file-format-csv")]
+#![allow(unsafe_code)] // tests set process environment variables
 
 use std::collections::HashMap;
 

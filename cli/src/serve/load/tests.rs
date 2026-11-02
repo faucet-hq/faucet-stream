@@ -1,3 +1,4 @@
+#![allow(unsafe_code)] // tests set process environment variables
 use super::*;
 
 /// A caller-supplied fragment (an inline overlay) is screened like a

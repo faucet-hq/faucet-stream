@@ -49,6 +49,11 @@ has a `docker compose` stack and `make demo` for a no-infrastructure smoke test.
 - Every failure path maps to a typed `FaucetError` variant. No `.unwrap()` /
   `.expect()` on anything that can fail at runtime.
 - No hardcoded credentials, tokens, or service URLs — ever.
+- `unsafe` code is denied workspace-wide (`[workspace.lints.rust]`). Where it
+  is unavoidable (an FFI call, a test that sets environment variables), allow
+  it on the smallest item with a one-line reason:
+  `#[allow(unsafe_code)] // gethostname FFI call`. Every member crate carries
+  `[lints] workspace = true`.
 - Reuse clients/connections; pool database connections; prefer bulk/multi-row
   APIs and streaming. Performance and reliability are the project's first
   priority.

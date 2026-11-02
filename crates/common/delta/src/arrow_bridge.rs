@@ -53,6 +53,7 @@ pub fn schema_to_delta(
 /// ABI in every Arrow major: the batch is exported as one struct array and
 /// imported on the other side without copying a buffer (#862 M-068). Only the
 /// schema (a few hundred bytes) is re-encoded, to keep its metadata.
+#[allow(unsafe_code)] // imports through the Arrow C data interface
 pub fn batch_to_delta(
     batch: &arrow::record_batch::RecordBatch,
 ) -> Result<delta_arrow::record_batch::RecordBatch, FaucetError> {
@@ -98,6 +99,7 @@ const _: () = {
 /// major's. Both are `#[repr(C)]` renderings of the same C structs (sizes are
 /// checked at compile time above); ownership — the `release` callback — moves
 /// with the bits, so the originals are not dropped.
+#[allow(unsafe_code)] // moves Arrow C data structs between two arrow versions
 fn into_delta_ffi(
     array: arrow::ffi::FFI_ArrowArray,
     schema: arrow::ffi::FFI_ArrowSchema,

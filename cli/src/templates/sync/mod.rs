@@ -636,6 +636,7 @@ pub fn spawn_interval_syncs(
 
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
+#[allow(unsafe_code)] // tests set process environment variables
 mod tests {
     /// A pull waits for (and, past the wait, gives up on) another instance's
     /// lease on the same origin; a released or expired lease is taken.

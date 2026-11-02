@@ -108,3 +108,6 @@ testcontainers-modules = { version = "0.15", features = ["azurite", "clickhouse"
 tokio = { workspace = true, features = ["full", "test-util"] }
 uuid.workspace = true
 wiremock = "0.6"
+
+[lints]
+workspace = true

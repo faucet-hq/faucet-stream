@@ -8,6 +8,7 @@
 //!   `delivery: exactly_once` for it).
 //!
 //! Check 5 requires Docker (MinIO via testcontainers), mirroring `batching.rs`.
+#![allow(unsafe_code)] // tests set process environment variables
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Credentials;
 use aws_sdk_s3::{Client, Config as S3Config};

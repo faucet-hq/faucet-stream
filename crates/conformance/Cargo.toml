@@ -69,3 +69,6 @@ enum_struct_variant_field_added = "allow"
 # reliability boundary would force a major bump of the harness crate.
 enum_variant_added = "allow"
 enum_marked_non_exhaustive = "allow"
+
+[lints]
+workspace = true

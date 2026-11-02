@@ -2,6 +2,7 @@
 //! An S3 destination is the shared file sink over the S3 backend (#886): its
 //! objects go up with the S3 API and read back as Parquet. Driven against a
 //! mock S3 endpoint, so no container is needed.
+#![allow(unsafe_code)] // tests set process environment variables
 
 use faucet_core::Sink;
 use faucet_sink_parquet::{

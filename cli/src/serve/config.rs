@@ -576,6 +576,7 @@ fn is_loopback(ip: std::net::IpAddr) -> bool {
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)] // tests set process environment variables
 mod tests {
     use super::*;
 

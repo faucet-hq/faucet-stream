@@ -6,6 +6,7 @@
 //!
 //! Requires Docker; the whole file is gated on the `arrow` feature.
 #![cfg(feature = "arrow")]
+#![allow(unsafe_code)] // tests set process environment variables
 
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Credentials;

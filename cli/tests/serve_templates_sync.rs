@@ -6,6 +6,7 @@
 //! with a 422 that names the flag.
 #![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 #![cfg(feature = "templates-sync")]
+#![allow(unsafe_code)] // tests set process environment variables
 
 use std::time::Duration;
 

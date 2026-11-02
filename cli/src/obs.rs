@@ -130,6 +130,7 @@ impl Drop for FlushOnExit {
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)] // tests set process environment variables
 mod tests {
     use super::*;
     use std::sync::Mutex;

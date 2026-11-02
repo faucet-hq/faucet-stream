@@ -9,6 +9,7 @@
 //! table lives in its own account and only the credentials the variant must
 //! produce can scan it.
 #![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
+#![allow(unsafe_code)] // tests set process environment variables
 
 mod common;
 

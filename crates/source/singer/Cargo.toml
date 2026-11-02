@@ -65,3 +65,6 @@ enum_variant_added = "allow"
 enum_missing = "warn"
 function_missing = "warn"
 struct_missing = "warn"
+
+[lints]
+workspace = true
