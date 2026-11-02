@@ -338,6 +338,8 @@ Auth is mandatory: without `--auth-token`/`FAUCET_SERVE_AUTH_TOKEN` **and** with
 | `--history <url>` | `postgres://…` / `sqlite:…` for durable history (`serve-history-postgres` / `serve-history-sqlite`; default in-memory). |
 | `--default-config <path>` | Workspace defaults merged **under** every submitted run. |
 | `--cors-origin <o>` | Allow-list a browser origin (repeatable; CORS off by default). |
+| `--allowed-host <host>` | A host name clients reach the server by (repeatable or comma-separated; `*` for any; env `FAUCET_SERVE_ALLOWED_HOSTS`). Set, any other `Host` gets `403`. Unset, only a `--no-auth` server on loopback checks `Host` (allowing `localhost`, `127.0.0.1`, `[::1]` and its listen address). Health and metrics probes are exempt. |
+| `--allowed-origin <origin>` | A browser origin (`https://app.example`) that may send `POST`/`PUT`/`PATCH`/`DELETE` besides the server's own and the `--cors-origin` list (repeatable; env `FAUCET_SERVE_ALLOWED_ORIGINS`). A state-changing request with any other `Origin` gets `403`. |
 | `--lease-ttl-secs <n>` | Run-ownership lease TTL (default `30`). Set above your worst-case GC/IO stall to avoid false-reclaim of paused instances. |
 | `--cluster` | Enable clustered execution: all instances sharing the same `--history` DB pull-balance `pending` runs and provide crash-failover. Requires a persistent `--history` backend. See the [cluster cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/cluster.html). |
 | `--cluster-poll-secs <n>` | Claim-loop poll interval in seconds (default `2`). Also the maximum cross-instance cancel propagation lag. |

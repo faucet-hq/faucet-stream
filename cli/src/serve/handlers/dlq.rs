@@ -27,6 +27,18 @@ fn cli_to_serve(e: CliError) -> ServeError {
     }
 }
 
+/// Refuse a DLQ location that names nothing on disk (a glob is resolved by
+/// the reader, which reports a pattern that matches nothing).
+fn require_location(location: &str) -> Result<(), ServeError> {
+    let is_glob = location.contains(['*', '?', '[']);
+    if is_glob || std::path::Path::new(location).exists() {
+        return Ok(());
+    }
+    Err(ServeError::BadConfig(format!(
+        "DLQ location '{location}' does not exist"
+    )))
+}
+
 fn default_sample_limit() -> usize {
     5
 }
@@ -52,6 +64,7 @@ pub async fn inspect(
     Json(req): Json<DlqInspectRequest>,
 ) -> Result<Json<Value>, ServeError> {
     refuse_request_path("location", &req.location, false, actor.tenant.as_deref())?;
+    require_location(&req.location)?;
     let location = req.location;
     let reason = req.reason;
     let limit = req.limit;
@@ -149,6 +162,7 @@ pub async fn discard(
     Json(req): Json<DlqDiscardRequest>,
 ) -> Result<Json<Value>, ServeError> {
     refuse_request_path("location", &req.location, true, actor.tenant.as_deref())?;
+    require_location(&req.location)?;
     let location = req.location;
     let reason = req.reason;
     let before_ms = req.before_ms;

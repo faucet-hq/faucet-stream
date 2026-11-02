@@ -84,6 +84,8 @@ struct Inner {
     grafana_url: Option<String>,
     /// Set when shutdown begins: new work is refused and `/readyz` is 503.
     draining: std::sync::atomic::AtomicBool,
+    /// Failed bearer-token attempts per source address.
+    failed_auth: crate::serve::auth::FailedAuth,
     /// Clustered terminal records whose owner-fenced write failed (the
     /// history backend was unreachable), retried by the lease loop so a run
     /// this instance finished never stays `running` in the shared store.
@@ -143,6 +145,7 @@ impl ServerState {
                 references: Arc::new(config.references.clone()),
                 grafana_url: config.grafana_url.clone(),
                 draining: std::sync::atomic::AtomicBool::new(false),
+                failed_auth: Default::default(),
                 pending_finalize: std::sync::Mutex::new(Vec::new()),
             }),
         }
@@ -307,6 +310,11 @@ impl ServerState {
     /// The configured authentication mode (bearer resolution + RBAC).
     pub fn auth_mode(&self) -> &AuthMode {
         &self.inner.auth
+    }
+
+    /// Failed bearer-token attempts per source address.
+    pub fn failed_auth(&self) -> &crate::serve::auth::FailedAuth {
+        &self.inner.failed_auth
     }
 
     pub fn render_metrics(&self) -> Option<String> {
@@ -481,6 +489,7 @@ mod tests {
             policy_path: None,
             otel: None,
             callback_allow_hosts: Vec::new(),
+            request_guard: Default::default(),
             require_approval: Vec::new(),
             approval_expiry: std::time::Duration::from_secs(86_400),
             vault: None,

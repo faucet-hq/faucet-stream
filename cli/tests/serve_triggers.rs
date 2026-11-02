@@ -47,6 +47,7 @@ fn test_config() -> ServeConfig {
         policy_path: None,
         otel: None,
         callback_allow_hosts: Vec::new(),
+        request_guard: Default::default(),
         require_approval: Vec::new(),
         approval_expiry: std::time::Duration::from_secs(86_400),
         vault: None,
@@ -1160,6 +1161,7 @@ async fn spawn_serve_with_triggers(
         policy: None,
         otel_config: None,
         callback_allow_host: Vec::new(),
+        origins: Default::default(),
         mcp: false,
         mcp_allow_mutations: false,
         require_approval: Vec::new(),
@@ -1280,6 +1282,55 @@ async fn webhook_http_boundary_enforces_bearer_auth_and_enqueues() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert_eq!(count, 1, "exactly one run must be enqueued by the fire");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn webhook_triggers_accept_only_their_content_types() {
+    let dir = tempfile::tempdir().unwrap();
+    let csv = dir.path().join("in.csv");
+    std::fs::write(&csv, "a,b\n1,2\n").unwrap();
+    let out = dir.path().join("out.jsonl");
+    let token = "test-token";
+    let client = reqwest::Client::new();
+
+    let triggers = write_triggers_file(dir.path(), "hook", &csv, &out, "");
+    let base = spawn_serve_with_triggers(free_port(), Some(token), &triggers).await;
+    let url = format!("{base}/v1/triggers/hook");
+    let send = |ct: Option<&'static str>, body: &'static str| {
+        let mut req = client.post(&url).bearer_auth(token).body(body);
+        if let Some(ct) = ct {
+            req = req.header("content-type", ct);
+        }
+        req.send()
+    };
+    assert_eq!(send(Some("text/plain"), "{}").await.unwrap().status(), 415);
+    assert_eq!(send(None, "{}").await.unwrap().status(), 415);
+    assert_eq!(
+        send(Some("application/json; charset=utf-8"), "{}")
+            .await
+            .unwrap()
+            .status(),
+        202
+    );
+
+    let dir2 = tempfile::tempdir().unwrap();
+    let triggers = write_triggers_file(
+        dir2.path(),
+        "form",
+        &csv,
+        &dir2.path().join("out.jsonl"),
+        "    content_types: [application/x-www-form-urlencoded]\n",
+    );
+    let base = spawn_serve_with_triggers(free_port(), Some(token), &triggers).await;
+    let form = client
+        .post(format!("{base}/v1/triggers/form"))
+        .bearer_auth(token)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body("a=1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(form.status(), 202);
 }
 
 #[tokio::test(flavor = "multi_thread")]

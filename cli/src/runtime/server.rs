@@ -338,8 +338,9 @@ pub async fn reload(
     rec: &crate::serve::history::RunRecord,
     body: &str,
 ) -> Result<LoadedSubmission, ServeError> {
-    let principal = Principal::stored(AuthContext::runtime(), rec);
-    let body = crate::serve::sealed::unseal(state, &rec.run_id, body).await?;
+    let principal = Principal::stored(state, AuthContext::runtime(), rec);
+    let opened = crate::serve::sealed::open_body(state, &rec.run_id, body)?;
+    let body = crate::serve::sealed::unseal(state, &rec.run_id, &opened).await?;
     load(
         state,
         &principal,
@@ -782,7 +783,7 @@ pub async fn doctor(
     sub: Submission<'_>,
 ) -> Result<Value, ServeError> {
     let loaded = load(state, principal, sub).await?;
-    runner::run_doctor_first(state, &loaded).await
+    super::under(principal, runner::run_doctor_first(state, &loaded)).await
 }
 
 // ── Writing operations ───────────────────────────────────────────────────────
@@ -926,7 +927,11 @@ pub async fn rollback(
     // the run's tenant (#789 SERVE-27).
     let actor = principal.actor();
     let stored_params = rec.config_body.is_some() && req.config.is_none();
-    let (config, format, run_as) = match (req.config, rec.config_body.as_deref()) {
+    let opened = match (&req.config, rec.config_body.as_deref()) {
+        (None, Some(stored)) => Some(crate::serve::sealed::open_body(state, &rec.run_id, stored)?),
+        _ => None,
+    };
+    let (config, format, run_as) = match (req.config, opened.as_deref()) {
         (Some(c), _) => (
             c,
             req.config_format.into(),
@@ -945,7 +950,7 @@ pub async fn rollback(
         (None, Some(stored)) => (
             stored.to_string(),
             rec.config_format.unwrap_or_default(),
-            Principal::stored(actor, &rec),
+            Principal::stored(state, actor, &rec),
         ),
         (None, None) => {
             return Err(ServeError::Unprocessable {

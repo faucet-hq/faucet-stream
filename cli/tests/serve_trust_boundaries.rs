@@ -56,6 +56,7 @@ fn args(port: u16, auth_config: PathBuf) -> faucet_cli::cli::ServeArgs {
         policy: None,
         otel_config: None,
         callback_allow_host: Vec::new(),
+        origins: Default::default(),
         mcp: false,
         mcp_allow_mutations: false,
         require_approval: Vec::new(),
@@ -541,13 +542,10 @@ async fn approval_gates_the_template_lifecycle_and_keeps_secrets_out_of_requests
         as_admin["payload"]["callback"]["headers"]["authorization"],
         "Bearer cb-secret"
     );
+    // The template body is the operator's: only an unscoped admin reads it.
+    assert_eq!(pending["change"]["payload"]["config"], "***", "{pending}");
     let (_, as_operator) = api.get("op-tok", &format!("/v1/changes/{change_id}")).await;
-    assert!(
-        as_operator["payload"]["config"]
-            .as_str()
-            .unwrap()
-            .contains("csv")
-    );
+    assert_eq!(as_operator["payload"]["config"], "***");
     assert_eq!(
         as_operator["payload"]["callback"]["headers"]["authorization"],
         "***"

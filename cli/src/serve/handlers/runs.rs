@@ -484,6 +484,7 @@ pub async fn get_run_config(
     let Some(stored) = rec.config_body.as_deref() else {
         return Err(ServeError::NotFound);
     };
+    let stored = &*crate::serve::sealed::open_body(&state, &rec.run_id, stored)?;
     let format = rec.config_format.unwrap_or_default();
     let full = actor.role == crate::serve::rbac::Role::Admin && actor.tenant.is_none();
     let (body, masked) = if full {

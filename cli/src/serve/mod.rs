@@ -10,6 +10,7 @@ pub mod changes;
 pub mod cluster;
 pub mod config;
 pub mod error;
+pub mod guard;
 pub mod handlers;
 pub mod history;
 pub mod idempotency;

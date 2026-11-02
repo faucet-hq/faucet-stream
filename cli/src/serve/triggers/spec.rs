@@ -97,6 +97,12 @@ pub enum TriggerKind {
         /// within this many seconds of the last accepted fire. Default 0 (off).
         #[serde(default)]
         debounce_secs: u64,
+        /// Request `Content-Type`s the endpoint accepts (media type, without
+        /// parameters). Default `[application/json]`; `type/*` accepts any
+        /// subtype and `*` anything. A request without one is accepted only
+        /// when its body is empty.
+        #[serde(default = "default_webhook_content_types")]
+        content_types: Vec<String>,
     },
     QueueDepth {
         queue: QueueSpec,
@@ -341,6 +347,11 @@ fn default_poll_secs() -> u64 {
 fn default_threshold() -> u64 {
     1
 }
+/// The `Content-Type`s a webhook trigger accepts by default.
+pub fn default_webhook_content_types() -> Vec<String> {
+    vec!["application/json".to_string()]
+}
+
 fn default_webhook_methods() -> Vec<String> {
     vec!["POST".to_string()]
 }
@@ -404,7 +415,9 @@ triggers:
                 methods,
                 dedupe_header,
                 debounce_secs,
+                content_types,
             } => {
+                assert_eq!(content_types, &vec!["application/json".to_string()]);
                 assert_eq!(methods, &vec!["POST".to_string()]);
                 assert_eq!(dedupe_header.as_deref(), Some("Idempotency-Key"));
                 assert_eq!(*debounce_secs, 30);

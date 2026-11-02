@@ -6,6 +6,12 @@ info:
     run status, list/cancel/delete runs, and stream per-run logs over SSE, plus
     unauthenticated health and Prometheus endpoints. All `/v1/*` endpoints
     require a bearer token unless the server was started with `--no-auth`.
+    An address that presents 20 invalid bearer tokens within a minute gets 429
+    until the minute ends. A request whose `Host` the server does not answer
+    (see `--allowed-host`), or a `POST` / `PUT` / `PATCH` / `DELETE` carrying
+    an `Origin` that is neither the server's own nor listed with
+    `--cors-origin` / `--allowed-origin`, gets 403. A 500 carries a reference
+    to the server log line holding the detail, not the detail itself.
 
     This spec is kept in two-way sync with the live router by
     `cli/tests/serve_openapi.rs` (every documented path is routable; every route
@@ -363,8 +369,11 @@ paths:
         no run. Returns 422 when a value the request sent is refused where the
         config places it, or one the config uses is missing; 500 when the
         trigger cannot run whatever is sent (its config does not validate, its
-        template or tenant is gone), which also marks it unhealthy. Requires
-        the `triggers` Cargo feature.
+        template or tenant is gone), which also marks it unhealthy. Returns
+        415 when the body's `Content-Type` is not in the trigger's
+        `content_types` (default `application/json`; a request without one is
+        accepted only with an empty body). Requires the `triggers` Cargo
+        feature.
       operationId: fireTrigger
       parameters:
         - { name: name, in: path, required: true, schema: { type: string }, description: "Trigger name from the triggers file." }
@@ -393,6 +402,7 @@ paths:
         "401": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
         "422": { $ref: "#/components/responses/Error" }
+        "415": { $ref: "#/components/responses/Error" }
         "429": { $ref: "#/components/responses/Error" }
         "500": { $ref: "#/components/responses/Error" }
         "503": { $ref: "#/components/responses/Error" }
@@ -406,7 +416,8 @@ paths:
         or if the server was started without `--triggers`; 400 when `PUT` is not
         in the trigger's `methods` list. A fire coalesced by the trigger's
         leading-edge `debounce_secs` returns 200 with `{ "status": "coalesced" }`
-        and enqueues no run. Requires the `triggers` Cargo feature.
+        and enqueues no run; 415 when the body's `Content-Type` is not in the
+        trigger's `content_types`. Requires the `triggers` Cargo feature.
       operationId: fireTriggerPut
       parameters:
         - { name: name, in: path, required: true, schema: { type: string }, description: "Trigger name from the triggers file." }
@@ -435,6 +446,7 @@ paths:
         "401": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
         "422": { $ref: "#/components/responses/Error" }
+        "415": { $ref: "#/components/responses/Error" }
         "429": { $ref: "#/components/responses/Error" }
         "500": { $ref: "#/components/responses/Error" }
         "503": { $ref: "#/components/responses/Error" }
@@ -2781,6 +2793,7 @@ paths:
         its JSON-RPC result or error. The route needs a read scope; mutating
         tools additionally need `--mcp-allow-mutations` and the caller's
         run-write scope, and the config-executing tools need the doctor scope.
+        The body must be sent as `Content-Type: application/json` (else 415).
       operationId: mcp
       security: [{ bearerAuth: [] }]
       requestBody:
@@ -2803,6 +2816,7 @@ paths:
               schema: { type: object }
         "401": { $ref: "#/components/responses/Error" }
         "403": { $ref: "#/components/responses/Error" }
+        "415": { $ref: "#/components/responses/Error" }
   /healthz:
     get:
       summary: Liveness probe (unauthenticated)

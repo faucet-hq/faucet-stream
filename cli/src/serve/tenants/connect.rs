@@ -397,6 +397,12 @@ pub async fn callback(state: &ServerState, q: CallbackQuery) -> Result<String, S
 
 /// Exchange the code and store the connection.
 async fn complete(state: &ServerState, session: &ConnectSession, code: &str) -> Result<(), String> {
+    match state.history().tenant_get(&session.tenant).await {
+        Ok(Some(t)) if !t.suspended => {}
+        Ok(Some(_)) => return Err(format!("tenant '{}' is suspended", session.tenant)),
+        Ok(None) => return Err(format!("tenant '{}' no longer exists", session.tenant)),
+        Err(e) => return Err(format!("reading tenant '{}': {e}", session.tenant)),
+    }
     let rt = state.tenants();
     let provider = rt
         .providers
@@ -514,6 +520,48 @@ async fn exchange(provider: &ConnectProvider, code: &str, verifier: &str) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_callback_does_not_store_a_connection_for_a_missing_or_suspended_tenant() {
+        let state = crate::serve::test_support::test_state();
+        let now = Utc::now();
+        let session = ConnectSession {
+            state: "st".into(),
+            tenant: "acme".into(),
+            provider: "crm".into(),
+            connection: "crm".into(),
+            redirect: "https://app.example/done".into(),
+            sealed_verifier: "x".into(),
+            created_by: "op".into(),
+            created_at: now,
+            expires_at: now,
+        };
+        let err = complete(&state, &session, "code").await.unwrap_err();
+        assert!(err.contains("no longer exists"), "{err}");
+        let rec = crate::serve::history::tenants::TenantRecord {
+            id: "acme".into(),
+            name: None,
+            labels: Default::default(),
+            limits: Default::default(),
+            notifications: Vec::new(),
+            notifications_sealed: None,
+            suspended: true,
+            created_at: now,
+            updated_at: now,
+            created_by: "admin".into(),
+        };
+        state.history().tenant_upsert(&rec).await.unwrap();
+        let err = complete(&state, &session, "code").await.unwrap_err();
+        assert!(err.contains("suspended"), "{err}");
+        assert!(
+            state
+                .history()
+                .connection_get("acme", "crm")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 
     fn provider() -> ConnectProvider {
         ConnectProvider {

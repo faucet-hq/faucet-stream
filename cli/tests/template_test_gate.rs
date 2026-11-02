@@ -613,6 +613,7 @@ async fn serve_with_history(
             policy: None,
             otel_config: None,
             callback_allow_host: Vec::new(),
+            origins: Default::default(),
             mcp: true,
             mcp_allow_mutations: true,
             require_approval,

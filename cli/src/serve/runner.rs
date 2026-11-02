@@ -132,10 +132,13 @@ impl SubmitRequest {
     }
 }
 
-/// How a stored run's config is re-loaded on claim / resume / rollback.
-pub fn stored_origin(rec: &RunRecord) -> BodyOrigin {
+/// How a stored run's config is re-loaded on claim / resume / rollback: as
+/// the origin it was submitted with.
+pub fn stored_origin(state: &ServerState, rec: &RunRecord) -> BodyOrigin {
     if rec.host_access {
         BodyOrigin::ServerFile
+    } else if rec.caller_config {
+        state.caller_origin()
     } else {
         BodyOrigin::Trusted
     }
@@ -154,10 +157,16 @@ pub enum SubmitOutcome {
 /// The JSON body `POST /v1/runs` / a template trigger answer with when the
 /// submission became a change request instead of a run.
 pub fn pending_approval_body(change: &crate::serve::changes::ChangeRequest) -> serde_json::Value {
+    let requester = AuthContext {
+        principal: change.requester.clone(),
+        role: change.requester_role,
+        source_ip: None,
+        tenant: change.tenant.clone(),
+    };
     serde_json::json!({
         "status": "pending_approval",
         "change_id": change.id,
-        "change": change,
+        "change": change.clone().redacted_for(&requester),
     })
 }
 
@@ -441,7 +450,7 @@ fn resume_claimed(
         // calling registry.cancel) reaches this run.
         let run_token = CancellationToken::new();
         state.registry().register(run_id.clone(), run_token.clone());
-        let principal = crate::runtime::Principal::stored(AuthContext::runtime(), &rec);
+        let principal = crate::runtime::Principal::stored(&state, AuthContext::runtime(), &rec);
         crate::runtime::under(
             &principal.clone(),
             execute_run(
@@ -620,7 +629,7 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
             run_id: run_id.clone(),
             shard_id: shard_id.clone(),
         };
-        let principal = crate::runtime::Principal::stored(AuthContext::runtime(), &run);
+        let principal = crate::runtime::Principal::stored(&state, AuthContext::runtime(), &run);
         let (outcome, exit) = crate::runtime::under(
             &principal,
             execute_shard(
@@ -1192,10 +1201,14 @@ pub(crate) async fn enqueue(
         // run it, mark the run Pending, and wake the local claim loop. No local
         // queue slot / spawn — the claim loop owns execution.
         rec.status = RunStatus::Pending;
-        rec.config_body = Some(match &req.sealed_params {
-            Some(sp) => sp.body().to_string(),
-            None => req.config.clone(),
-        });
+        rec.config_body = Some(crate::serve::sealed::persisted_body(
+            &state,
+            &run_id,
+            match &req.sealed_params {
+                Some(sp) => sp.body().to_string(),
+                None => req.config.clone(),
+            },
+        ));
         if let Some(sp) = &req.sealed_params {
             for v in rec.labels.values_mut() {
                 *v = sp.redact_text(v);
@@ -3135,6 +3148,7 @@ mod tests {
             policy_path: None,
             otel: None,
             callback_allow_hosts: Vec::new(),
+            request_guard: Default::default(),
             require_approval: Vec::new(),
             approval_expiry: std::time::Duration::from_secs(86_400),
             vault: None,
@@ -3256,6 +3270,7 @@ mod tests {
             policy_path: None,
             otel: None,
             callback_allow_hosts: Vec::new(),
+            request_guard: Default::default(),
             require_approval: Vec::new(),
             approval_expiry: std::time::Duration::from_secs(86_400),
             vault: None,
@@ -3349,6 +3364,7 @@ mod tests {
             policy_path: None,
             otel: None,
             callback_allow_hosts: Vec::new(),
+            request_guard: Default::default(),
             require_approval: Vec::new(),
             approval_expiry: std::time::Duration::from_secs(86_400),
             vault: None,
@@ -3481,6 +3497,7 @@ mod tests {
             policy_path: None,
             otel: None,
             callback_allow_hosts: Vec::new(),
+            request_guard: Default::default(),
             require_approval: Vec::new(),
             approval_expiry: std::time::Duration::from_secs(86_400),
             vault: None,
@@ -3605,6 +3622,7 @@ mod tests {
                 policy_path: None,
                 otel: None,
                 callback_allow_hosts: Vec::new(),
+                request_guard: Default::default(),
                 require_approval: Vec::new(),
                 approval_expiry: std::time::Duration::from_secs(86_400),
                 vault: None,

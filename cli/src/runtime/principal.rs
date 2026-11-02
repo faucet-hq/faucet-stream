@@ -122,14 +122,15 @@ impl Principal {
         Self::new(actor, Origin::from(state.origin(trusted)))
     }
 
-    /// The principal a stored run re-executes as: its own tenant, trusted
-    /// (it was screened when it was submitted), under the caller reference
-    /// policy when a caller supplied it.
+    /// The principal a stored run re-executes as: its own tenant and the
+    /// origin it was submitted with, so a caller's body is screened and runs
+    /// under the caller reference policy wherever it is re-loaded.
     pub fn stored(
+        state: &crate::serve::state::ServerState,
         actor: crate::serve::rbac::AuthContext,
         rec: &crate::serve::history::RunRecord,
     ) -> Self {
-        let origin = Origin::from(crate::serve::runner::stored_origin(rec));
+        let origin = Origin::from(crate::serve::runner::stored_origin(state, rec));
         let mut p = Self::new(actor, origin);
         p.tenant = rec.tenant.clone();
         p.caller_body = rec.caller_config;
@@ -241,7 +242,8 @@ mod tests {
 
     #[cfg(feature = "serve")]
     #[test]
-    fn a_stored_run_reloads_trusted_but_keeps_its_callers_policy() {
+    fn a_stored_run_reloads_with_the_origin_it_was_submitted_with() {
+        let state = crate::serve::test_support::test_state();
         let mut rec = crate::serve::history::RunRecord::queued(
             "r".into(),
             None,
@@ -251,13 +253,20 @@ mod tests {
         );
         rec.tenant = Some("acme".into());
         rec.caller_config = true;
-        let p = Principal::stored(crate::serve::rbac::AuthContext::runtime(), &rec);
-        assert_eq!(p.origin(), Origin::Trusted);
+        let runtime = crate::serve::rbac::AuthContext::runtime;
+        let p = Principal::stored(&state, runtime(), &rec);
+        assert!(
+            matches!(p.origin(), Origin::Caller { .. }),
+            "{:?}",
+            p.origin()
+        );
         assert_eq!(p.tenant(), Some("acme"));
         assert!(p.reference_policy().is_some());
-        rec.host_access = true;
         rec.caller_config = false;
-        let p = Principal::stored(crate::serve::rbac::AuthContext::runtime(), &rec);
+        let p = Principal::stored(&state, runtime(), &rec);
+        assert_eq!(p.origin(), Origin::Trusted);
+        rec.host_access = true;
+        let p = Principal::stored(&state, runtime(), &rec);
         assert_eq!(p.origin(), Origin::ServerFile);
         assert!(p.reference_policy().is_none());
     }

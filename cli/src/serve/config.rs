@@ -140,6 +140,8 @@ pub struct ServeConfig {
     /// Allowlist of hosts a per-run completion callback may target (#481).
     /// Empty = any host except link-local / cloud-metadata addresses.
     pub callback_allow_hosts: Vec<String>,
+    /// `--allowed-host` / `--allowed-origin`.
+    pub request_guard: crate::serve::guard::GuardSettings,
     /// Change kinds that need an approved change request (#703).
     pub require_approval: Vec<crate::serve::changes::ChangeKind>,
     /// Fallback expiry of a pending change request.
@@ -300,6 +302,11 @@ impl ServeConfig {
             }
         };
 
+        let request_guard = crate::serve::guard::GuardSettings::from_args(
+            &args.origins.allowed_host,
+            &args.origins.allowed_origin,
+        )
+        .map_err(CliError::Serve)?;
         let listen: SocketAddr = args
             .listen
             .parse()
@@ -487,6 +494,7 @@ impl ServeConfig {
             policy_path: args.policy,
             otel,
             callback_allow_hosts: args.callback_allow_host,
+            request_guard,
             require_approval,
             approval_expiry: Duration::from_secs(args.approval_expiry_secs),
             vault: args.vault_key.filter(|k| !k.is_empty()).map(|key| {
@@ -566,7 +574,7 @@ fn resolve_log_retention(secs: u64, otel: Option<&faucet_core::OtelConfig>) -> D
 }
 
 /// Loopback, counting an IPv4-mapped IPv6 loopback (`::ffff:127.0.0.1`).
-fn is_loopback(ip: std::net::IpAddr) -> bool {
+pub(crate) fn is_loopback(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V6(v6) => {
             v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
@@ -695,6 +703,7 @@ mod tests {
             policy: None,
             otel_config: None,
             callback_allow_host: Vec::new(),
+            origins: Default::default(),
             mcp: false,
             mcp_allow_mutations: false,
             require_approval: Vec::new(),

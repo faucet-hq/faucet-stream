@@ -303,6 +303,15 @@ pub fn build_router(
             state.clone(),
             scope_test_policy,
         ))
+        .layer(axum::middleware::from_fn_with_state(
+            std::sync::Arc::new(crate::serve::guard::RequestGuard::new(
+                &config.request_guard,
+                config.listen,
+                matches!(config.auth, crate::serve::config::AuthMode::None),
+                &config.cors_origins,
+            )),
+            crate::serve::guard::guard,
+        ))
         .with_state(state)
 }
 
@@ -747,6 +756,15 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         config.otel.as_ref(),
     );
     crate::serve::callback::set_allow_hosts(config.callback_allow_hosts.clone());
+    let short = crate::serve::auth::short_tokens(&config.auth);
+    if short > 0 {
+        tracing::warn!(
+            tokens = short,
+            min_len = crate::serve::auth::MIN_TOKEN_LEN,
+            "a bearer token is shorter than the recommended minimum; use a long random value \
+             (for example `openssl rand -hex 32`)"
+        );
+    }
     crate::serve::references::install(config.references.clone());
     crate::serve::metrics::set_cluster_enabled(config.cluster.enabled);
     if let Some(h) = &prom {

@@ -146,8 +146,15 @@ connector's `tls` / transport option as something to configure, not to inherit.
 - **RBAC** (`--auth-config`): principals map to `viewer` (read-only) /
   `operator` (+ run writes, doctor, triggers) / `admin` (+ audit). An unmapped
   `/v1` route is **admin-only, fail-closed**.
-- **Audit log** records `run.submit` / `run.cancel` / `run.delete` and every
-  denial, through a single choke point (`serve/audit.rs`).
+- **Audit log** records `run.submit` / `run.cancel` / `run.delete`, every
+  authorization denial and failed authentication (`auth.failed`, rate-limited),
+  through a single choke point (`serve/audit.rs`). An address that presents 20
+  invalid tokens in a minute is refused (429) for the rest of that minute.
+- **Browser reach** (`serve/guard.rs`): a `--no-auth` loopback server answers
+  only local `Host` names (`--allowed-host` extends and enables the check
+  anywhere); a state-changing request with another site's `Origin` is refused
+  unless listed (`--cors-origin` / `--allowed-origin`); `/mcp` and webhook
+  triggers refuse bodies sent with a content type they do not parse.
 - **One allow-list for every reference a caller's config makes.** Connector
   fields that name a path, URL or program carry an `x-faucet-resource` schema
   annotation (`faucet_core::resolve`), so a config sent over HTTP or MCP is
