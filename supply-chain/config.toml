@@ -26,349 +26,349 @@ url = "https://raw.githubusercontent.com/mozilla/supply-chain/main/audits.toml"
 url = "https://raw.githubusercontent.com/zcash/rust-ecosystem/main/supply-chain/audits.toml"
 
 [policy.faucet-auth]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-cli]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-common-azure]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-common-bigquery]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-common-clickhouse]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-common-databricks]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-common-delta]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-common-dynamodb]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-common-elasticsearch]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-common-file]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-common-gcs]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-common-iceberg]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-common-kafka]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-common-kinesis]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-common-mssql]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-common-nats]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-common-oracle]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-common-pubsub]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-common-rabbitmq]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-common-redis]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-common-redshift]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-common-s3]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-common-sftp]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-common-singer]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-common-snowflake]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-common-spanner]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-common-sql]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-common-sqs]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-conformance]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-core]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-lineage]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-registry]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-azure-blob]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-bigquery]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-clickhouse]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-csv]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-databricks]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-delta]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-duckdb]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-dynamodb]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-elasticsearch]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-file]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-gcs]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-http]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-iceberg]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-jsonl]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-kafka]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-kinesis]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-mongodb]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-mssql]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-mysql]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-nats]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-oracle]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-parquet]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-postgres]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-pubsub]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-rabbitmq]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-redis]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-redshift]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-s3]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-sftp]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-singer]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-snowflake]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-spanner]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-sqlite]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-sqs]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-sink-stdout]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-azure-blob]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-bigquery]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-clickhouse]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-csv]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-databricks]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-delta]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-duckdb]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-dynamodb]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-elasticsearch]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-file]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-gcs]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-graphql]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-grpc]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-iceberg]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-kafka]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-kinesis]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-mongodb]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-mongodb-cdc]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-mssql]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-mssql-cdc]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-mysql]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-mysql-cdc]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-nats]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-oracle]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-oracle-cdc]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-parquet]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-postgres]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-postgres-cdc]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-pubsub]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-rabbitmq]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-redis]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-redshift]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-rest]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-s3]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-sftp]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-singer]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-snowflake]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-spanner]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-sqlite]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-sqs]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-webhook]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-websocket]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-source-xml]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-state-postgres]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-state-redis]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-stream]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-transform-sql]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [policy.faucet-transform-wasm]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [[exemptions.addr2line]]
 version = "0.26.1"
@@ -1672,466 +1672,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.faststr]]
 version = "0.2.34"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-auth]]
-version = "1.5.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-cli]]
-version = "1.16.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-common-azure]]
-version = "1.2.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-common-bigquery]]
-version = "1.3.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-common-clickhouse]]
-version = "1.2.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-common-databricks]]
-version = "1.1.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-common-delta]]
-version = "1.3.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-common-dynamodb]]
-version = "1.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-common-elasticsearch]]
-version = "1.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-common-file]]
-version = "1.1.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-common-gcs]]
-version = "1.3.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-common-iceberg]]
-version = "1.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-common-kafka]]
-version = "1.3.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-common-kinesis]]
-version = "1.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-common-mssql]]
-version = "1.3.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-common-nats]]
-version = "1.2.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-common-oracle]]
-version = "1.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-common-pubsub]]
-version = "1.3.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-common-rabbitmq]]
-version = "1.1.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-common-redis]]
-version = "1.0.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-common-redshift]]
-version = "1.2.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-common-s3]]
-version = "1.0.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-common-sftp]]
-version = "1.1.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-common-singer]]
-version = "1.1.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-common-snowflake]]
-version = "1.3.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-common-spanner]]
-version = "1.2.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-common-sql]]
-version = "1.1.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-common-sqs]]
-version = "1.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-conformance]]
-version = "1.6.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-core]]
-version = "1.15.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-lineage]]
-version = "2.4.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-registry]]
-version = "1.0.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-azure-blob]]
-version = "1.2.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-bigquery]]
-version = "1.10.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-clickhouse]]
-version = "1.4.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-csv]]
-version = "1.6.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-databricks]]
-version = "1.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-delta]]
-version = "1.4.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-duckdb]]
-version = "1.3.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-dynamodb]]
-version = "1.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-elasticsearch]]
-version = "1.8.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-file]]
-version = "1.1.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-gcs]]
-version = "1.6.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-http]]
-version = "1.6.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-iceberg]]
-version = "1.7.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-jsonl]]
-version = "1.6.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-kafka]]
-version = "1.7.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-kinesis]]
-version = "1.3.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-mongodb]]
-version = "1.9.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-mssql]]
-version = "1.8.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-mysql]]
-version = "1.10.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-nats]]
-version = "1.2.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-oracle]]
-version = "1.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-parquet]]
-version = "1.6.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-postgres]]
-version = "1.10.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-pubsub]]
-version = "1.3.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-rabbitmq]]
-version = "1.1.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-redis]]
-version = "1.6.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-redshift]]
-version = "1.4.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-s3]]
-version = "1.7.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-sftp]]
-version = "1.2.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-singer]]
-version = "1.1.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-snowflake]]
-version = "1.8.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-spanner]]
-version = "1.4.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-sqlite]]
-version = "1.10.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-sqs]]
-version = "1.3.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-sink-stdout]]
-version = "1.6.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-azure-blob]]
-version = "1.2.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-bigquery]]
-version = "1.7.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-clickhouse]]
-version = "1.2.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-csv]]
-version = "1.7.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-databricks]]
-version = "1.3.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-delta]]
-version = "1.4.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-duckdb]]
-version = "1.4.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-dynamodb]]
-version = "1.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-elasticsearch]]
-version = "1.7.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-file]]
-version = "1.1.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-gcs]]
-version = "1.9.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-graphql]]
-version = "1.8.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-grpc]]
-version = "1.6.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-iceberg]]
-version = "1.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-kafka]]
-version = "1.6.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-kinesis]]
-version = "1.3.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-mongodb]]
-version = "1.8.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-mongodb-cdc]]
-version = "1.5.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-mssql]]
-version = "1.7.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-mssql-cdc]]
-version = "1.2.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-mysql]]
-version = "1.9.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-mysql-cdc]]
-version = "1.5.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-nats]]
-version = "1.2.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-oracle]]
-version = "1.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-oracle-cdc]]
-version = "1.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-parquet]]
-version = "1.7.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-postgres]]
-version = "1.10.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-postgres-cdc]]
-version = "1.6.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-pubsub]]
-version = "1.3.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-rabbitmq]]
-version = "1.1.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-redis]]
-version = "1.6.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-redshift]]
-version = "1.3.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-rest]]
-version = "1.9.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-s3]]
-version = "1.11.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-sftp]]
-version = "1.3.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-singer]]
-version = "1.3.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-snowflake]]
-version = "1.6.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-spanner]]
-version = "1.3.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-sqlite]]
-version = "1.9.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-sqs]]
-version = "1.3.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-webhook]]
-version = "1.4.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-websocket]]
-version = "1.4.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-source-xml]]
-version = "1.9.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-state-postgres]]
-version = "1.5.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-state-redis]]
-version = "1.3.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-stream]]
-version = "1.11.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-transform-sql]]
-version = "1.5.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.faucet-transform-wasm]]
-version = "1.2.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.ferroid]]
