@@ -2975,7 +2975,12 @@ tests:
         assert!(!stored.contains("sealed-token-value"), "{stored}");
         assert!(!stored.contains("48271"), "{stored}");
         let body = rec.config_body.clone().unwrap();
-        assert!(body.contains("${sealed:"), "{body}");
+        assert!(
+            crate::serve::sealed::is_sealed_body(&body) && !body.contains("${sealed:"),
+            "the stored config is sealed whole: {body}"
+        );
+        let opened = crate::serve::sealed::open_body(&state, &run_id, &body).unwrap();
+        assert!(opened.contains("${sealed:"), "{opened}");
         let sealed = state
             .history()
             .run_secrets_get(&run_id)
@@ -3024,7 +3029,7 @@ tests:
                 .await
                 .unwrap_err(),
         );
-        assert!(m.contains("cannot open them"), "{m}");
+        assert!(m.contains("cannot open it"), "{m}");
         state.set_vault(None);
         let m = refusal(
             crate::runtime::server::reload(&state, &rec, &body)

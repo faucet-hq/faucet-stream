@@ -230,7 +230,15 @@ type: webhook
 methods: [POST]             # allowed HTTP methods (default [POST]); PUT also supported
 dedupe_header: null         # header used as idempotency key (optional; else a per-request UUID)
 debounce_secs: 0            # leading-edge debounce window in seconds (default 0 = off)
+content_types: [application/json]  # accepted request Content-Types (default JSON only)
 ```
+
+> **`content_types`:** the media types (parameters such as `charset` are
+> ignored) a request body may be sent as; anything else gets `415`. `type/*`
+> accepts any subtype and `*` anything. A request without a `Content-Type` is
+> accepted only when its body is empty. A sender that posts form data or plain
+> text needs its type listed here, e.g.
+> `content_types: [application/x-www-form-urlencoded]`.
 
 > **Leading-edge debounce:** when `debounce_secs > 0`, the first request is
 > accepted and any further requests that arrive within `debounce_secs` of that

@@ -90,6 +90,19 @@ An idempotent replay (same `idempotency_key`) answers with the original run
 and does not re-seal; the fingerprint is taken over the tokenized config, so
 the secret values themselves are not part of it.
 
+**With a vault key, the whole stored config is sealed too.** A pending run's
+config, whatever its origin (a submitted body with inline credentials, a
+template's materialized body), is written to the shared history encrypted
+under the vault key and bound to the run id; the member that claims it, a
+shard worker, `GET /v1/runs/{id}/config` and a rollback open it in memory.
+What stays in clear text in the run record: its name, labels, tenant, pool,
+selection, timestamps and error text (redacted where it is created). Without
+a vault key the stored config is kept as submitted, so keep credentials in
+`${env:}` / `${file:}` / secret-manager references, which stay references in
+the stored body and resolve on the member that runs it. A member of an older
+release cannot read a sealed config and fails the run: upgrade every member
+before setting a vault key on a running cluster.
+
 ## Flags
 
 | Flag | Default | Description |

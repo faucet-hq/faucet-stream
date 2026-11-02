@@ -25,8 +25,20 @@ pub async fn handle(
     State(state): State<ServerState>,
     Extension(actor): Extension<AuthContext>,
     Extension(flags): Extension<McpRouteFlags>,
+    headers: axum::http::HeaderMap,
     body: String,
 ) -> axum::response::Response {
+    if !crate::serve::guard::content_type_accepted(
+        &headers,
+        false,
+        &["application/json".to_string()],
+    ) {
+        return crate::serve::error::ServeError::UnsupportedMediaType(
+            "the MCP endpoint takes a JSON-RPC body sent as `Content-Type: application/json`"
+                .into(),
+        )
+        .into_response();
+    }
     // Mutating tools require BOTH the server flag and the caller's RunWrite scope.
     let can_mutate = flags.allow_mutations && actor.role.grants(Permission::RunWrite);
     // The config-executing tools (`validate_config`, `preview`) build the
@@ -125,6 +137,31 @@ mod tests {
         }
     }
 
+    fn json_headers() -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        h
+    }
+
+    #[tokio::test]
+    async fn a_body_not_sent_as_json_is_refused() {
+        let mut plain = axum::http::HeaderMap::new();
+        plain.insert(header::CONTENT_TYPE, "text/plain".parse().unwrap());
+        for headers in [plain, axum::http::HeaderMap::new()] {
+            let resp = handle(
+                State(test_state()),
+                Extension(actor(Role::Admin)),
+                Extension(McpRouteFlags {
+                    allow_mutations: true,
+                }),
+                headers,
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#.to_string(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        }
+    }
+
     async fn body_text(resp: axum::response::Response) -> String {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -141,6 +178,7 @@ mod tests {
             Extension(McpRouteFlags {
                 allow_mutations: true,
             }),
+            json_headers(),
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#.to_string(),
         )
         .await;
@@ -158,6 +196,7 @@ mod tests {
             Extension(McpRouteFlags {
                 allow_mutations: true,
             }),
+            json_headers(),
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#.to_string(),
         )
         .await;
@@ -178,6 +217,7 @@ mod tests {
             Extension(McpRouteFlags {
                 allow_mutations: false,
             }),
+            json_headers(),
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#.to_string(),
         )
         .await;
@@ -197,6 +237,7 @@ mod tests {
             Extension(McpRouteFlags {
                 allow_mutations: false,
             }),
+            json_headers(),
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"preview","arguments":{"config":"version: 1\npipeline:\n  source: { type: csv, config: { path: /etc/passwd } }\n  sink: { type: stdout, config: {} }\n"}}}"#.to_string(),
         )
         .await;
@@ -216,6 +257,7 @@ mod tests {
             Extension(McpRouteFlags {
                 allow_mutations: false,
             }),
+            json_headers(),
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#.to_string(),
         )
         .await;
@@ -233,6 +275,7 @@ mod tests {
             Extension(McpRouteFlags {
                 allow_mutations: false,
             }),
+            json_headers(),
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#.to_string(),
         )
         .await;
@@ -248,6 +291,7 @@ mod tests {
             Extension(McpRouteFlags {
                 allow_mutations: false,
             }),
+            json_headers(),
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_connectors","arguments":{"kind":"state"}}}"#.to_string(),
         )
         .await;
@@ -279,6 +323,7 @@ mod tests {
             Extension(McpRouteFlags {
                 allow_mutations: false,
             }),
+            json_headers(),
             r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.to_string(),
         )
         .await;

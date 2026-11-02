@@ -66,6 +66,17 @@ async fn resolve(
     actor: &AuthContext,
     src: &ConfigSource,
 ) -> Result<(PipelineConfig, String), ServeError> {
+    let (cfg, name, _) = resolve_as(state, actor, src).await?;
+    Ok((cfg, name))
+}
+
+/// [`resolve`], with the principal the config was loaded as: what reads the
+/// pipeline's state or probes its sink runs under its reference policy.
+async fn resolve_as(
+    state: &ServerState,
+    actor: &AuthContext,
+    src: &ConfigSource,
+) -> Result<(PipelineConfig, String, crate::runtime::Principal), ServeError> {
     if src.config.is_some() && !actor.role.grants(crate::serve::rbac::Permission::Doctor) {
         return Err(ServeError::Forbidden(
             "an inline `config` is loaded on the server (its `${env:}` / `${file:}` / secret \
@@ -89,27 +100,32 @@ async fn resolve(
             ));
         }
         (Some(body), None) => {
-            crate::runtime::server::load(
+            let principal = crate::runtime::Principal::caller(state, actor.clone());
+            let loaded = crate::runtime::server::load(
                 state,
-                &crate::runtime::Principal::caller(state, actor.clone()),
+                &principal,
                 crate::runtime::server::Submission::new(body, src.config_format.into()),
             )
-            .await?
+            .await?;
+            (loaded, principal)
         }
         (None, Some(id)) => {
             // The template is the operator's; the params are the caller's
             // and meet the caller reference policy (#989).
             let (body, params) = template_body(state, id, src).await?;
-            crate::runtime::server::load(
+            let principal =
+                crate::runtime::Principal::new(actor.clone(), crate::runtime::Origin::Trusted);
+            let loaded = crate::runtime::server::load(
                 state,
-                &crate::runtime::Principal::new(actor.clone(), crate::runtime::Origin::Trusted),
+                &principal,
                 crate::runtime::server::Submission::new(
                     &body,
                     crate::serve::load::ConfigFormat::Json,
                 )
                 .with_caller_fields(&params),
             )
-            .await?
+            .await?;
+            (loaded, principal)
         }
         (None, None) => {
             return Err(ServeError::BadConfig(
@@ -119,12 +135,13 @@ async fn resolve(
             ));
         }
     };
+    let (loaded, principal) = loaded;
     let name = loaded
         .cfg
         .name
         .clone()
         .unwrap_or_else(|| "serve".to_string());
-    Ok((loaded.cfg, name))
+    Ok((loaded.cfg, name, principal))
 }
 
 #[cfg(feature = "templates")]
@@ -195,7 +212,17 @@ async fn status_for(
     actor: &AuthContext,
     req: StatusRequest,
 ) -> Result<Json<StatusReport>, ServeError> {
-    let (cfg, name) = resolve(state, actor, &req.source).await?;
+    let (cfg, name, principal) = resolve_as(state, actor, &req.source).await?;
+    crate::runtime::under(&principal, status_of(state, actor, req, cfg, name)).await
+}
+
+async fn status_of(
+    state: &ServerState,
+    actor: &AuthContext,
+    req: StatusRequest,
+    cfg: PipelineConfig,
+    name: String,
+) -> Result<Json<StatusReport>, ServeError> {
     let target = PipelineTarget::resolve_live(&cfg, &name)
         .await
         .map_err(cli_to_serve)?;
@@ -318,16 +345,19 @@ async fn mirror_for(
     name: &str,
     src: &ConfigSource,
 ) -> Result<Json<crate::replication::status::MirrorStatus>, ServeError> {
-    let (cfg, pipeline) = resolve(state, actor, src).await?;
+    let (cfg, pipeline, principal) = resolve_as(state, actor, src).await?;
     if pipeline != name {
         return Err(ServeError::Unprocessable {
             message: format!("the config names pipeline '{pipeline}', not mirror '{name}'"),
             details: None,
         });
     }
-    let report = crate::replication::status::read_status(&cfg, name)
-        .await
-        .map_err(cli_to_serve)?;
+    let report = crate::runtime::under(
+        &principal,
+        crate::replication::status::read_status(&cfg, name),
+    )
+    .await
+    .map_err(cli_to_serve)?;
     crate::serve::audit::write(state, actor, "mirror.status", None, None, name).await;
     Ok(Json(report))
 }

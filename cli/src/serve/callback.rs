@@ -151,6 +151,14 @@ impl CallbackSpec {
                 ));
             }
         }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(
+                "callback.url may not carry credentials (`user:password@`): the URL is stored \
+                 with the run and shown to its readers; authenticate the callback with a \
+                 header or a capability token in the path"
+                    .into(),
+            );
+        }
         let host = url
             .host_str()
             .ok_or_else(|| "callback.url has no host".to_string())?;

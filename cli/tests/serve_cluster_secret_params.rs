@@ -75,6 +75,7 @@ fn args(port: u16, history: &str) -> ServeArgs {
         policy: None,
         otel_config: None,
         callback_allow_host: Vec::new(),
+        origins: Default::default(),
         mcp: false,
         mcp_allow_mutations: false,
         require_approval: Vec::new(),
@@ -266,8 +267,8 @@ async fn one_instance_triggers_and_a_peer_executes_with_the_secret_sealed() {
         .await
         .unwrap();
     assert!(
-        body.contains("${sealed:"),
-        "the stored config carries tokens: {body}"
+        body.contains(faucet_cli::serve::sealed::SEALED_BODY_PREFIX) && !body.contains("${sealed:"),
+        "the stored config is sealed whole: {body}"
     );
     let audit: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM faucet_serve_audit")
         .fetch_one(&pool)
@@ -276,7 +277,11 @@ async fn one_instance_triggers_and_a_peer_executes_with_the_secret_sealed() {
     assert!(audit > 0, "the trigger was audited");
     pool.close().await;
     assert!(
-        !files_containing(dir.path(), b"${sealed:").is_empty(),
+        !files_containing(
+            dir.path(),
+            faucet_cli::serve::sealed::SEALED_BODY_PREFIX.as_bytes()
+        )
+        .is_empty(),
         "the scan reads the database files"
     );
     assert_eq!(
@@ -318,7 +323,14 @@ async fn a_peer_enforces_the_request_budget_of_a_sealed_run() {
     let run_id = resp.run.run_id.clone();
 
     let stored = a.history().get(&run_id).await.unwrap().unwrap();
-    let body: Value = serde_json::from_str(stored.config_body.as_deref().unwrap()).unwrap();
+    let sealed = stored.config_body.as_deref().unwrap();
+    assert!(
+        !sealed.contains("max_records"),
+        "the stored config is sealed"
+    );
+    let vault = Vault::new(VAULT_KEY, &[]).unwrap();
+    let opened = faucet_cli::serve::sealed::open_body_with(Some(&vault), &run_id, sealed).unwrap();
+    let body: Value = serde_json::from_str(&opened).unwrap();
     assert_eq!(body["budget"]["max_records"], 1, "{body}");
     assert!(!body.to_string().contains(SECRET));
 
@@ -342,7 +354,9 @@ async fn a_peer_enforces_the_request_budget_of_a_sealed_run() {
     }
     assert_eq!(detail["status"], "failed", "{detail}");
     assert!(
-        detail.to_string().contains("budget"),
+        detail["invocations"][0]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("max_records")),
         "the peer refused on the budget: {detail}"
     );
     let out = std::fs::read_to_string(dir.path().join("out.jsonl")).unwrap_or_default();

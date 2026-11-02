@@ -238,7 +238,9 @@ export async function renderUsage(host, params) {
   function toCsv() {
     const label = (groups().find(([g]) => g === state.by) || [state.by])[1];
     const head0 = [label, "Runs", "Failed runs", "Rows in", "Rows out", "Bytes out", "Duration ms", "Requests", "Est. cost", "Hosted eq.", "Compute not reported"];
-    const q = (s) => `"${String(s ?? "").replace(/"/g, '""')}"`;
+    // A text cell a spreadsheet would read as a formula is kept as text.
+    const asText = (s) => (typeof s === "string" && /^[=+\-@\t\r]/.test(s) ? `'${s}` : s);
+    const q = (s) => `"${String(asText(s) ?? "").replace(/"/g, '""')}"`;
     const lines = [head0.map(q).join(",")];
     for (const r of sorted(report.rows || [])) lines.push([r.key, r.runs, r.failed_runs, r.records_read, r.records_written, r.bytes_written, r.duration_ms, r.roundtrips, r.cost, r.hosted_equivalent, (r.not_reported || []).join(" ")].map(q).join(","));
     const blob = new Blob([lines.join("\n") + "\n"], { type: "text/csv" });

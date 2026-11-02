@@ -270,11 +270,87 @@ mod sdk {
                 .build()?,
         };
         let provider = SdkTracerProvider::builder()
-            .with_batch_exporter(exporter)
+            .with_batch_exporter(RedactingSpanExporter(exporter))
             .with_sampler(Sampler::TraceIdRatioBased(cfg.sample_ratio))
             .with_resource(resource(cfg))
             .build();
         Ok(provider)
+    }
+
+    /// A span exporter that passes every string a span carries (its name,
+    /// attribute values, event names and attributes, error description)
+    /// through the process redactor (`crate::redact`) before it leaves.
+    #[derive(Debug)]
+    pub(super) struct RedactingSpanExporter<E>(pub(super) E);
+
+    type Scrub<'a> = &'a dyn Fn(&str) -> String;
+
+    fn redact_value(v: &mut opentelemetry::Value, scrub: Scrub<'_>) {
+        use opentelemetry::{Array, StringValue, Value};
+        let one = |s: &mut StringValue| {
+            let clean = scrub(s.as_str());
+            if clean != s.as_str() {
+                *s = StringValue::from(clean);
+            }
+        };
+        match v {
+            Value::String(s) => one(s),
+            Value::Array(Array::String(items)) => items.iter_mut().for_each(one),
+            _ => {}
+        }
+    }
+
+    fn redact_cow(text: &mut std::borrow::Cow<'static, str>, scrub: Scrub<'_>) {
+        let clean = scrub(text);
+        if clean != *text {
+            *text = std::borrow::Cow::Owned(clean);
+        }
+    }
+
+    pub(super) fn redact_span(span: &mut opentelemetry_sdk::trace::SpanData, scrub: Scrub<'_>) {
+        redact_cow(&mut span.name, scrub);
+        for kv in &mut span.attributes {
+            redact_value(&mut kv.value, scrub);
+        }
+        for event in &mut span.events.events {
+            redact_cow(&mut event.name, scrub);
+            for kv in &mut event.attributes {
+                redact_value(&mut kv.value, scrub);
+            }
+        }
+        if let opentelemetry::trace::Status::Error { description } = &mut span.status {
+            redact_cow(description, scrub);
+        }
+    }
+
+    impl<E: opentelemetry_sdk::trace::SpanExporter> opentelemetry_sdk::trace::SpanExporter
+        for RedactingSpanExporter<E>
+    {
+        fn export(
+            &self,
+            mut batch: Vec<opentelemetry_sdk::trace::SpanData>,
+        ) -> impl std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send
+        {
+            for span in &mut batch {
+                redact_span(span, &crate::redact::redact);
+            }
+            self.0.export(batch)
+        }
+
+        fn shutdown_with_timeout(
+            &self,
+            timeout: Duration,
+        ) -> opentelemetry_sdk::error::OTelSdkResult {
+            self.0.shutdown_with_timeout(timeout)
+        }
+
+        fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+            self.0.force_flush()
+        }
+
+        fn set_resource(&mut self, resource: &Resource) {
+            self.0.set_resource(resource);
+        }
     }
 
     /// The `metrics`-facade recorder that forwards every counter, gauge and
@@ -482,6 +558,87 @@ pub fn shutdown_otel() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "otel")]
+    fn span(name: &str, url: &str, detail: &str) -> opentelemetry_sdk::trace::SpanData {
+        use opentelemetry::KeyValue;
+        use opentelemetry::trace::{SpanContext, SpanId, SpanKind, Status};
+        let mut events = opentelemetry_sdk::trace::SpanEvents::default();
+        events.events.push(opentelemetry::trace::Event::new(
+            format!("retry {detail}"),
+            std::time::SystemTime::now(),
+            vec![KeyValue::new("error", detail.to_string())],
+            0,
+        ));
+        opentelemetry_sdk::trace::SpanData {
+            span_context: SpanContext::empty_context(),
+            parent_span_id: SpanId::INVALID,
+            parent_span_is_remote: false,
+            span_kind: SpanKind::Internal,
+            name: name.to_string().into(),
+            start_time: std::time::SystemTime::now(),
+            end_time: std::time::SystemTime::now(),
+            attributes: vec![
+                KeyValue::new("url", url.to_string()),
+                KeyValue::new("rows", 3_i64),
+                KeyValue::new(
+                    "hosts",
+                    opentelemetry::Value::Array(opentelemetry::Array::String(vec![
+                        url.to_string().into(),
+                    ])),
+                ),
+            ],
+            dropped_attributes_count: 0,
+            events,
+            links: Default::default(),
+            status: Status::error(detail.to_string()),
+            instrumentation_scope: opentelemetry::InstrumentationScope::builder("t").build(),
+        }
+    }
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn exported_spans_have_every_string_scrubbed() {
+        let scrub = |s: &str| s.replace("dummy-secret", "***");
+        let mut data = span(
+            "fetch dummy-secret",
+            "https://u:dummy-secret@h.example/x",
+            "denied for dummy-secret",
+        );
+        sdk::redact_span(&mut data, &scrub);
+        let text = format!("{data:?}");
+        assert!(!text.contains("dummy-secret"), "{text}");
+        assert_eq!(data.attributes[1].value, opentelemetry::Value::I64(3));
+        assert_eq!(data.name, "fetch ***");
+    }
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn the_redacting_exporter_forwards_to_the_inner_one() {
+        use opentelemetry_sdk::trace::{SpanData, SpanExporter};
+        use std::sync::{Arc, Mutex};
+        #[derive(Debug, Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<SpanData>>>);
+        impl SpanExporter for Capture {
+            async fn export(
+                &self,
+                batch: Vec<SpanData>,
+            ) -> opentelemetry_sdk::error::OTelSdkResult {
+                self.0.lock().unwrap().extend(batch);
+                Ok(())
+            }
+        }
+        let inner = Capture::default();
+        let mut exporter = sdk::RedactingSpanExporter(inner.clone());
+        futures::executor::block_on(exporter.export(vec![span("plain", "https://h.example", "x")]))
+            .unwrap();
+        let got = inner.0.lock().unwrap().clone();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "plain");
+        exporter.set_resource(&opentelemetry_sdk::Resource::builder().build());
+        exporter.force_flush().unwrap();
+        exporter.shutdown().unwrap();
+    }
 
     #[cfg(feature = "otel")]
     #[test]

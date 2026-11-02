@@ -56,6 +56,17 @@ Mitigations are deployment-level and **mandatory**:
   accepts the exposure, and then the server logs a warning at startup. Inside a
   container that binds `0.0.0.0`, publish the port on loopback only
   (`-p 127.0.0.1:8080:8080`) when you pass it.
+- A browser can reach a loopback server too. A `--no-auth` loopback server
+  therefore answers only `localhost`, `127.0.0.1`, `[::1]` and its listen
+  address as `Host`, every server refuses a state-changing request whose
+  `Origin` is another site's, and `/mcp` and webhook triggers take only the
+  content types they parse. Behind a proxy, list the public host name with
+  `--allowed-host` (which also turns the `Host` check on for an authenticating
+  server) and, when the proxy rewrites `Host`, the console's origin with
+  `--allowed-origin`. See [Authentication](../reference/http-api.md#authentication).
+- Use long random tokens (`openssl rand -hex 32`): the server warns about one
+  under 16 characters, and refuses an address for a minute after 20 invalid
+  tokens.
 - Run single-tenant, behind authentication, behind egress controls / network
   policy. The default loopback bind (`127.0.0.1`) is deliberate — exposing
   externally is an explicit choice.

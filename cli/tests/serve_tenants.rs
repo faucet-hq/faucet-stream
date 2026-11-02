@@ -76,6 +76,7 @@ fn serve_args(
         policy: None,
         otel_config: None,
         callback_allow_host: Vec::new(),
+        origins: Default::default(),
         mcp: false,
         mcp_allow_mutations: false,
         require_approval,
@@ -1395,11 +1396,23 @@ async fn tenant_notification_secrets_are_sealed_and_masked_and_run_credentials_a
         "version: 1\nname: cb\npipeline:\n  source:\n    type: rest\n    config:\n      base_url: http://127.0.0.1:9\n      path: /x\n  sink:\n    type: jsonl\n    config:\n      path: {}/o.jsonl\n",
         dir.path().display()
     );
+    let (code, refused) = api
+        .post(
+            "op-tok",
+            "/v1/runs",
+            json!({"config": cfg, "callback": {"url": "https://user:pw@cb.example/done"}}),
+        )
+        .await;
+    assert_eq!(
+        code, 422,
+        "a callback URL may not carry credentials: {refused}"
+    );
+    assert!(!refused.to_string().contains("pw@"), "{refused}");
     let (code, sub) = api
         .post(
             "op-tok",
             "/v1/runs",
-            json!({"config": cfg, "callback": {"url": "https://user:pw@cb.example/done",
+            json!({"config": cfg, "callback": {"url": "https://cb.example/done",
                 "headers": {"Authorization": "Bearer cb-token"}}}),
         )
         .await;

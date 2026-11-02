@@ -116,6 +116,7 @@ mod tests {
             policy_path: None,
             otel: None,
             callback_allow_hosts: Vec::new(),
+            request_guard: Default::default(),
             require_approval: Vec::new(),
             approval_expiry: std::time::Duration::from_secs(86_400),
             vault: None,
