@@ -80,13 +80,13 @@ reachable from your users' browsers at each provider's `redirect_base`.
 {{- if and .Values.serve.templatesSync.enabled (not (include "faucet-stream.durableHistory" .)) }}
 
 WARNING: serve.templatesSync is on with a run history that does not survive a
-restart (serve.history.backend={{ .Values.serve.history.backend }}{{ if eq .Values.serve.history.backend "sqlite" }} without serve.persistence{{ end }}). Synced
+restart (serve.history.backend={{ .Values.serve.history.backend }}{{ if eq (include "faucet-stream.historyBackend" $) "sqlite" }} without serve.persistence{{ end }}). Synced
 templates, their versions and launches live in the run history, so every pod
 restart starts the registry from scratch (each template re-registers as
 version 1 and `stable` follows only the sidecars again). Use sqlite (with
 serve.persistence) or postgres to keep them.
 {{- end }}
-{{- if and .Values.serve.triggers.enabled (eq .Values.serve.history.backend "memory") }}
+{{- if and .Values.serve.triggers.enabled (eq (include "faucet-stream.historyBackend" $) "memory") }}
 
 Note: serve.triggers runs with serve.history.backend=memory, so trigger
 idempotency keys are forgotten on restart (an object_arrival trigger with

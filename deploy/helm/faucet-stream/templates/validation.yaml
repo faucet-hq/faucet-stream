@@ -12,6 +12,9 @@
 {{- if and .Values.serve.enabled (eq .Values.serve.auth.mode "rbac") (not .Values.serve.auth.rbacConfig) (not .Values.serve.auth.existingSecret) -}}
 {{- fail "serve.auth.mode=rbac requires serve.auth.rbacConfig (inline principals) or serve.auth.existingSecret." -}}
 {{- end -}}
+{{- if and .Values.serve.enabled (not (has (include "faucet-stream.historyBackend" .) (list "memory" "sqlite" "postgres"))) -}}
+{{- fail (printf "serve.history.backend must be one of memory|sqlite|postgres (got %q)." (toString .Values.serve.history.backend)) -}}
+{{- end -}}
 {{- if and .Values.serve.enabled .Values.serve.cluster.enabled (not (include "faucet-stream.durableHistory" .)) -}}
 {{- fail "serve.cluster.enabled=true requires a persistent history backend: set serve.history.backend to postgres, or sqlite with serve.persistence.enabled (or serve.persistence.existingClaim) — without a volume the sqlite file is on an emptyDir and is lost on every restart." -}}
 {{- end -}}
@@ -45,13 +48,13 @@
 {{- /* #789 SUPPLY-08: replicas share nothing unless the history is Postgres —
        memory and per-pod SQLite give each pod its own runs and idempotency keys. */ -}}
 {{- $multi := or (gt (int .Values.serve.replicaCount) 1) .Values.serve.autoscaling.enabled -}}
-{{- if and .Values.serve.enabled $multi (ne .Values.serve.history.backend "postgres") -}}
+{{- if and .Values.serve.enabled $multi (ne (include "faucet-stream.historyBackend" $) "postgres") -}}
 {{- fail "serve.replicaCount > 1 or serve.autoscaling.enabled requires serve.history.backend=postgres (a shared history): with memory or a per-pod SQLite file each replica has its own run records and idempotency keys, so GET/cancel 404 on the other pods and a retried keyed submission can run twice." -}}
 {{- end -}}
 {{- if and .Values.serve.enabled $multi (not .Values.serve.cluster.enabled) -}}
 {{- fail "serve.replicaCount > 1 or serve.autoscaling.enabled requires serve.cluster.enabled=true, so runs are claimed and failed over across replicas instead of running only on the pod that received them." -}}
 {{- end -}}
-{{- if and .Values.serve.enabled (eq .Values.serve.history.backend "postgres") (not .Values.serve.history.url) (not .Values.serve.history.existingSecret) -}}
+{{- if and .Values.serve.enabled (eq (include "faucet-stream.historyBackend" $) "postgres") (not .Values.serve.history.url) (not .Values.serve.history.existingSecret) -}}
 {{- fail "serve.history.backend=postgres requires serve.history.url or serve.history.existingSecret." -}}
 {{- end -}}
 {{- if .Values.serve.enabled -}}
