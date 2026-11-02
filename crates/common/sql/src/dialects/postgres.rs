@@ -18,6 +18,12 @@ fn quote(name: &str) -> String {
     faucet_core::util::quote_ident(name)
 }
 
+fn is_plain_type_name(t: &str) -> bool {
+    t.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+        && t.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
 fn placeholder(n: usize) -> String {
     format!("${n}")
 }
@@ -31,9 +37,12 @@ impl SqlDialect for Postgres {
         quote(name)
     }
 
+    /// A type name that is not a plain lower-case identifier (a catalog
+    /// `typname` such as `MyEnum` or one holding spaces or quotes) is quoted.
     fn placeholder(&self, n: usize, sql_type: Option<&str>) -> String {
         match sql_type {
-            Some(t) => format!("${n}::{t}"),
+            Some(t) if is_plain_type_name(t) => format!("${n}::{t}"),
+            Some(t) => format!("${n}::{}", quote(t)),
             None => placeholder(n),
         }
     }
