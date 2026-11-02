@@ -147,8 +147,11 @@ software, not a hosted service). It tracks the
 - Static analysis: Clippy on every change, CodeQL for Rust and GitHub Actions
   workflows (`.github/workflows/codeql.yml`).
 - Dynamic analysis: `cargo-fuzz` targets for configuration interpolation,
-  identifier quoting, the PostgreSQL logical-replication (pgoutput) decoder and
-  the exact-number JSON parser (`fuzz/`), run on pull requests by
+  pipeline config parsing and expansion, template param binding, identifier
+  quoting, the PostgreSQL logical-replication (pgoutput) decoder, REST record
+  extraction, the CSV / XML / JSON / xlsx file readers with gzip, zstd and zip
+  decompression, the REST and XML response-decode chains, MCP JSON-RPC message
+  handling and the exact-number JSON parser (`fuzz/`), run on pull requests by
   ClusterFuzzLite (`.github/workflows/cflite_pr.yml`). Tests run with debug
   assertions; a chaos suite injects failures at named pipeline boundaries.
 - Supply chain: `cargo-deny` (licenses, advisories, sources) as a required

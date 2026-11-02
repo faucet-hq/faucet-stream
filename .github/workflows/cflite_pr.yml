@@ -11,7 +11,14 @@ on:
       - ".github/workflows/cflite_pr.yml"
       - "crates/core/**"
       - "crates/source/postgres-cdc/**"
+      - "crates/source/rest/**"
+      - "crates/source/xml/**"
       - "cli/src/interpolate.rs"
+      - "cli/src/config.rs"
+      - "cli/src/expand.rs"
+      - "cli/src/yaml.rs"
+      - "cli/src/params/**"
+      - "cli/src/mcp/**"
   workflow_dispatch:
 
 permissions: read-all
