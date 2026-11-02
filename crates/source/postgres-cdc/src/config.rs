@@ -408,11 +408,18 @@ fn url_tls(conn: &str) -> Result<Option<CdcTls>, FaucetError> {
             .map(|(k, v)| (k.to_string(), v.trim_matches('\'').to_string()))
             .collect()
     };
+    for (k, _) in &params {
+        if k.starts_with("ssl") && canonical_ssl_param(k).is_none() {
+            return Err(FaucetError::Config(format!(
+                "postgres-cdc: unknown TLS parameter '{k}' in connection_url"
+            )));
+        }
+    }
     let get = |key: &str| {
         params
             .iter()
             .rev()
-            .find(|(k, _)| k == key)
+            .find(|(k, _)| canonical_ssl_param(k) == Some(key))
             .map(|(_, v)| v.clone())
     };
     let ca_path = get("sslrootcert");
@@ -428,6 +435,18 @@ fn url_tls(conn: &str) -> Result<Option<CdcTls>, FaucetError> {
                 "postgres-cdc: unknown sslmode '{other}' in connection_url"
             )));
         }
+    })
+}
+
+/// The libpq name of a TLS connection parameter, folding the spellings the
+/// URL parser also accepts (`ssl-mode`, `ssl-root-cert`, `ssl-ca`, …).
+fn canonical_ssl_param(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "sslmode" | "ssl-mode" => "sslmode",
+        "sslrootcert" | "ssl-root-cert" | "ssl-ca" => "sslrootcert",
+        "sslcert" | "ssl-cert" => "sslcert",
+        "sslkey" | "ssl-key" => "sslkey",
+        _ => return None,
     })
 }
 
@@ -566,6 +585,35 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("contradicts"), "{err}");
+        assert_eq!(
+            eff(
+                "postgres://h/db?ssl-mode=verify-full&ssl-root-cert=/u.pem",
+                CdcTls::FromUrl
+            )
+            .unwrap(),
+            CdcTls::VerifyFull {
+                ca_path: Some("/u.pem".into())
+            }
+        );
+        assert_eq!(
+            eff(
+                "postgres://h/db?ssl-mode=require&ssl-ca=/c.pem",
+                CdcTls::FromUrl
+            )
+            .unwrap(),
+            CdcTls::Require
+        );
+        let err = eff("postgres://h/db?ssl-mode=verify-full", CdcTls::Disable)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("contradicts"), "{err}");
+        let err = eff("postgres://h/db?sslnegotiation=direct", CdcTls::FromUrl)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unknown TLS parameter 'sslnegotiation'"),
+            "{err}"
+        );
         let err = eff("postgres://h/db?sslmode=bogus", CdcTls::FromUrl)
             .unwrap_err()
             .to_string();
