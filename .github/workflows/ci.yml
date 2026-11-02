@@ -238,6 +238,7 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           workspaces: skills/faucet-connector/examples/${{ matrix.crate }}
       # The crates depend on crates.io `faucet-core = "1"` as a third-party
       # connector would; patch them onto this commit's faucet-core and
@@ -273,6 +274,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
@@ -295,6 +298,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Fail on any rustdoc warning (broken intra-doc links, etc.) so the
       # docs.rs render stays clean. The `doc_cfg` feature-badge path itself is
       # nightly-only and exercised by docs.rs, not here.
@@ -394,6 +399,8 @@ jobs:
           echo "LD_LIBRARY_PATH=$dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
           echo "Oracle Instant Client installed at $dir"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Pull Docker Hub images through a mirror
         # Avoids Docker Hub's anonymous pull rate limit on shared runners.
         env:
@@ -465,6 +472,8 @@ jobs:
         with:
           toolchain: "1.99.1"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
         if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
       - name: Engine guarantee suites (Category A) + state-format gates (Category G)
         # No Docker, no network: the scripted doubles inject failures at exact
@@ -504,6 +513,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Serve-ui + serve-openapi isolation tests
         run: cargo test -p faucet-cli --features serve-ui --test serve_ui --test serve_openapi
 
@@ -539,6 +550,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Tests that read docs
         run: >-
           cargo test --no-fail-fast -p faucet-cli --all-features
@@ -802,6 +815,7 @@ jobs:
         run: echo "key=${FEATURES//,/__}" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           key: ${{ steps.cache-key.outputs.key }}
       - name: Install librdkafka prerequisites (Ubuntu)
         if: runner.os == 'Linux'
@@ -867,6 +881,7 @@ jobs:
         run: echo "key=${FEATURES//,/__}" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           key: ${{ steps.cache-key.outputs.key }}
       - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
         run: cargo build -p faucet-cli --no-default-features --features "${{ matrix.features }}"
@@ -925,6 +940,8 @@ jobs:
           choco install nasm --version=3.2.0 --require-checksums --yes --no-progress
           echo "C:\\Program Files\\NASM" >> "$GITHUB_PATH"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build the shipped CLI
         run: cargo build -p faucet-cli --features "$SHIPPED_FEATURES"
       - name: Smoke-test the binary
@@ -959,6 +976,8 @@ jobs:
         with:
           toolchain: "1.99.1"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install valgrind and gungraun-runner
         run: |
           sudo apt-get update
@@ -1012,6 +1031,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Pull Docker Hub images through a mirror
         # Avoids Docker Hub's anonymous pull rate limit on shared runners.
         env:
@@ -1127,6 +1148,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Excluded: faucet-cli / faucet-stream (see
       # scripts/semver-exclude.py for why) plus any crate not yet on crates.io
       # — computed, so a crate is guarded from its first release on without
@@ -1253,6 +1276,8 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Pull Docker Hub images through a mirror
         # Avoids Docker Hub's anonymous pull rate limit on shared runners.
         if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
