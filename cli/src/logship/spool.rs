@@ -78,6 +78,13 @@ pub struct Spool {
     dir: PathBuf,
 }
 
+/// `open` creating its file readable by the owner only.
+fn private(open: &mut OpenOptions) -> &mut OpenOptions {
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(open, 0o600);
+    open
+}
+
 /// Write `value` as JSON to `path` atomically (temp + rename).
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
     let tmp = path.with_extension(format!(
@@ -86,7 +93,8 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()
         std::process::id()
     ));
     {
-        let mut f = File::create(&tmp)?;
+        let mut f =
+            private(OpenOptions::new().write(true).create(true).truncate(true)).open(&tmp)?;
         f.write_all(&serde_json::to_vec(value).map_err(std::io::Error::other)?)?;
         f.sync_all()?;
     }
@@ -102,7 +110,11 @@ impl Spool {
     /// Open (creating) `dir`.
     pub fn open(dir: impl Into<PathBuf>) -> std::io::Result<Self> {
         let dir = dir.into();
-        std::fs::create_dir_all(&dir)?;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(&dir)?;
         Ok(Self { dir })
     }
 
@@ -300,10 +312,7 @@ impl RunLock {
             entry.1 += 1;
             return Some((Self { path }, true));
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
+        let file = private(OpenOptions::new().create(true).truncate(false).write(true))
             .open(&path)
             .ok()?;
         file.try_lock().ok()?;
@@ -382,9 +391,7 @@ impl SpoolWriter {
         if let Err(e) = self.spool.write_meta(&meta) {
             self.failed(0, "run metadata", &e);
         }
-        let file = match OpenOptions::new()
-            .create(true)
-            .append(true)
+        let file = match private(OpenOptions::new().create(true).append(true))
             .open(self.spool.segment(&meta.run_id))
         {
             Ok(f) => f,
@@ -843,6 +850,37 @@ mod tests {
 
     fn opts() -> ShipOptions {
         ShipOptions::from(&crate::logship::LogsSpec::default())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spool_directories_and_files_are_private_to_the_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("spool/nested");
+        let spool = Spool::open(&root).unwrap();
+        let mut w = SpoolWriter::new(spool.clone());
+        w.begin(
+            RunMeta {
+                run_id: "p".into(),
+                ..Default::default()
+            },
+            10,
+        );
+        w.append("p", line("x", &now_ts()));
+        w.flush(true);
+        spool.write_cursor("p", &Cursor::default()).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&root), 0o700);
+        assert_eq!(mode(&dir.path().join("spool")), 0o700);
+        for f in [
+            spool.segment("p"),
+            spool.meta_path("p"),
+            spool.cursor_path("p"),
+            spool.lock_path("p"),
+        ] {
+            assert_eq!(mode(&f), 0o600, "{}", f.display());
+        }
     }
 
     #[tokio::test]
