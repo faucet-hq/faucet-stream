@@ -191,7 +191,28 @@ pub fn build_replay_node(
             .and_then(|o| o.sink.config.get("encryption").cloned())
     });
     let target = replay_target(cfg, &node, all_rows);
-    let reader = DlqReaderSource::new(from_files, reason, decryptor).with_target(target);
+    #[cfg(feature = "masking")]
+    let foreign = match &node.masking {
+        Some(spec) => Some(super::reader::ForeignMasking::new(
+            super::reader::ReplayTarget {
+                pipeline: cfg.name.clone(),
+                row: node.id.clone(),
+            },
+            Some(std::sync::Arc::new(
+                faucet_core::CompiledMasking::compile_for_sink(
+                    spec,
+                    &[node.sink_ref.as_str(), node.sink.kind.as_str()],
+                )
+                .map_err(|e| CliError::Config(format!("masking: {e}")))?,
+            )),
+        )),
+        None => None,
+    };
+    #[cfg(not(feature = "masking"))]
+    let foreign = None;
+    let reader = DlqReaderSource::new(from_files, reason, decryptor)
+        .with_target(target)
+        .with_foreign_masking(foreign);
     node.source_override = Some(SourceOverride::new(Box::new(reader)));
 
     // A DLQ envelope's `payload` is the record as it entered the *write* path —
@@ -200,7 +221,8 @@ pub fn build_replay_node(
     // Re-running those two passes on replay would apply them a second time, and
     // neither is idempotent: the `hash` transform and masking's `hash`/`tokenize`
     // actions would produce H(H(x)), breaking the joinability masking exists to
-    // guarantee; `set` would re-stamp `${now.*}` with the replay time; `cast` /
+    // guarantee. Payloads another row wrote (an all-rows replay, or an envelope
+    // naming no writer) are masked by the reader instead; `set` would re-stamp `${now.*}` with the replay time; `cast` /
     // `json_parse` / `split` would re-run against already-converted values. So a
     // replay skips both (#456 H3).
     //
@@ -895,6 +917,59 @@ pipeline:
                 .opted_out(faucet_core::Pass::Masking)
                 .is_some_and(|r| r.contains("already masked") || r.contains("masked before"))
         );
+    }
+
+    /// An all-rows replay masks the payloads another row (or an unnamed
+    /// writer) dead-lettered with the target sink's rules, and leaves the
+    /// target row's own payloads as they were written.
+    #[cfg(feature = "masking")]
+    #[tokio::test]
+    async fn an_all_rows_replay_masks_payloads_other_rows_wrote() {
+        use faucet_core::Source as _;
+        let cfg = cfg(
+            "  masking:\n    rules:\n      - name: h\n        match: { fields: [email] }\n        action: { type: redact, mask: \"***\" }\n",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let dlq = dir.path().join("in.jsonl");
+        let row = crate::expand::expand(&cfg).unwrap()[0].id.clone();
+        let env = |pipeline: &str, row: &str, email: &str| {
+            serde_json::json!({
+                "error": {"kind": "Sink", "message": "boom"}, "reason": "partial",
+                "payload": {"email": email}, "ts_ms": 1,
+                "pipeline": pipeline, "row": row, "record_index": 0,
+            })
+            .to_string()
+        };
+        std::fs::write(
+            &dlq,
+            [
+                env("replay-shape", &row, "own@x.example"),
+                env("other", "r2", "a@x.example"),
+                env("", "", "b@x.example"),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let node = build_replay_node(
+            &cfg,
+            vec![dlq],
+            None,
+            &dir.path().join("failed.jsonl"),
+            None,
+            DlqDecryptor::default(),
+            true,
+        )
+        .unwrap();
+        let source = node.source_override.as_ref().unwrap().take().unwrap();
+        let mut emails: Vec<String> = source
+            .fetch_all()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r["email"].as_str().unwrap().to_string())
+            .collect();
+        emails.sort();
+        assert_eq!(emails, vec!["***", "***", "own@x.example"]);
     }
 
     /// The replayed row's own `dlq:` (policy and seal) carries over, not the

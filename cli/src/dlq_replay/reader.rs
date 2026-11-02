@@ -937,6 +937,47 @@ pub struct DlqReaderSource {
     reason: Option<String>,
     dec: DlqDecryptor,
     target: Option<ReplayTarget>,
+    foreign: Option<ForeignMasking>,
+}
+
+/// Masking for envelopes a replay's own row cannot be shown to have written:
+/// their payloads were masked for another destination, if at all.
+#[derive(Clone)]
+#[cfg_attr(not(feature = "masking"), allow(dead_code))]
+pub struct ForeignMasking {
+    own: ReplayTarget,
+    #[cfg(feature = "masking")]
+    masking: Option<Arc<faucet_core::CompiledMasking>>,
+}
+
+impl ForeignMasking {
+    /// Mask with `masking` (the target sink's rules) every payload `own` did
+    /// not provably write.
+    #[cfg(feature = "masking")]
+    pub fn new(own: ReplayTarget, masking: Option<Arc<faucet_core::CompiledMasking>>) -> Self {
+        Self { own, masking }
+    }
+
+    fn apply(&self, env: UnwrappedEnvelope) -> Value {
+        #[cfg(feature = "masking")]
+        if let Some(m) = &self.masking
+            && !self.own.wrote(&env)
+        {
+            return faucet_core::apply_masking(vec![env.payload], m)
+                .records
+                .pop()
+                .unwrap_or(Value::Null);
+        }
+        env.payload
+    }
+}
+
+/// An envelope's payload as a replay writes it.
+fn replayed(env: UnwrappedEnvelope, foreign: Option<&ForeignMasking>) -> Value {
+    match foreign {
+        Some(f) => f.apply(env),
+        None => env.payload,
+    }
 }
 
 /// The pipeline and row a replay writes into. A DLQ location is often shared
@@ -970,6 +1011,22 @@ impl ReplayTarget {
         };
         pipeline_ok && row_ok
     }
+
+    /// Whether `env` names this pipeline and row as its writer (an envelope
+    /// that names no writer does not).
+    pub fn wrote(&self, env: &UnwrappedEnvelope) -> bool {
+        let got = env.pipeline.as_deref().filter(|p| !p.is_empty());
+        let pipeline_ok = match (&self.pipeline, got) {
+            (Some(want), Some(got)) => want == got,
+            (None, None) => true,
+            _ => false,
+        };
+        let row_ok = env
+            .row
+            .as_deref()
+            .is_some_and(|got| !got.is_empty() && partition_base(got) == partition_base(&self.row));
+        pipeline_ok && row_ok
+    }
 }
 
 /// The row a partition invocation id (`<row>::partition::<n>`) belongs to.
@@ -997,7 +1054,15 @@ impl DlqReaderSource {
             reason,
             dec,
             target: None,
+            foreign: None,
         }
+    }
+
+    /// Mask the payloads the replay's own row did not write
+    /// ([`ForeignMasking`]).
+    pub fn with_foreign_masking(mut self, foreign: Option<ForeignMasking>) -> Self {
+        self.foreign = foreign;
+        self
     }
 
     /// Keep only the envelopes `target` wrote (see [`ReplayTarget`]).
@@ -1022,12 +1087,13 @@ impl Source for DlqReaderSource {
         let reason = self.reason.clone();
         let target = self.target.clone();
         let dec = self.dec.clone();
+        let foreign = self.foreign.clone();
         // Blocking file IO off the async runtime.
         tokio::task::spawn_blocking(move || {
             let mut out = Vec::new();
             scan_each(&files, &dec, |env| {
                 if replay_selects(&env, reason.as_deref(), target.as_ref()) {
-                    out.push(env.payload);
+                    out.push(replayed(env, foreign.as_ref()));
                 }
                 Ok(())
             })
@@ -1055,13 +1121,14 @@ impl Source for DlqReaderSource {
         let reason = self.reason.clone();
         let target = self.target.clone();
         let dec = self.dec.clone();
+        let foreign = self.foreign.clone();
         Box::pin(faucet_core::async_stream::try_stream! {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Vec<Value>, FaucetError>>(2);
             let reader = tokio::task::spawn_blocking(move || {
                 let mut page = Vec::new();
                 let scanned = scan_each(&files, &dec, |env| {
                     if replay_selects(&env, reason.as_deref(), target.as_ref()) {
-                        page.push(env.payload);
+                        page.push(replayed(env, foreign.as_ref()));
                         if page.len() >= chunk {
                             tx.blocking_send(Ok(std::mem::take(&mut page)))
                                 .map_err(|_| FaucetError::Source("DLQ reader stopped".into()))?;
