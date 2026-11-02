@@ -156,11 +156,11 @@ pub struct PostgresCdcSourceConfig {
     /// [`FaucetError::Source`] rather than
     /// being OOM-killed.
     ///
-    /// `None` (the default) means unbounded — atomic delivery of arbitrarily
-    /// large transactions at the cost of unbounded memory. Set a value sized
-    /// to your available memory if you replicate tables subject to large
-    /// bulk writes.
-    #[serde(default)]
+    /// Defaults to 1,000,000. `null` means unbounded — atomic delivery of
+    /// arbitrarily large transactions at the cost of unbounded memory. Size it
+    /// to your available memory if you replicate tables subject to large bulk
+    /// writes.
+    #[serde(default = "faucet_core::replication::default_max_staged_records")]
     pub max_staged_records: Option<usize>,
 
     /// Replication events read ahead while the pipeline is busy writing a
@@ -327,6 +327,16 @@ impl PostgresCdcSourceConfig {
                 "postgres-cdc: connection_url must not be empty".into(),
             ));
         }
+        if let Ok(u) = url::Url::parse(self.connection_url.trim())
+            && let Some((k, _)) = u
+                .query_pairs()
+                .find(|(k, _)| matches!(k.as_ref(), "host" | "hostaddr" | "port"))
+        {
+            return Err(FaucetError::Config(format!(
+                "postgres-cdc: `{k}=` in connection_url is not supported; name the host and \
+                 port in the URL authority (postgres://user@host:port/db)"
+            )));
+        }
         validate_slot_name(&self.slot_name)?;
         if self.publication_name.is_empty() {
             return Err(FaucetError::Config(
@@ -490,7 +500,7 @@ mod tests {
             idle_timeout: std::time::Duration::from_secs(30),
             max_messages: None,
             max_cycle_duration: default_max_cycle_duration(),
-            max_staged_records: None,
+            max_staged_records: faucet_core::replication::default_max_staged_records(),
             max_buffered_events: default_max_buffered_events(),
             max_buffered_bytes: default_max_buffered_bytes(),
             status_update_interval: std::time::Duration::from_secs(10),
@@ -648,6 +658,15 @@ mod tests {
         assert!(value.start_lsn.is_none());
         assert!(value.max_messages.is_none());
         assert_eq!(value.batch_size, DEFAULT_BATCH_SIZE);
+        assert_eq!(value.max_staged_records, Some(1_000_000));
+        let unbounded: PostgresCdcSourceConfig = serde_json::from_value(serde_json::json!({
+            "connection_url": "postgres://u:p@localhost/db",
+            "slot_name": "faucet_slot",
+            "publication_name": "faucet_pub",
+            "max_staged_records": null,
+        }))
+        .unwrap();
+        assert_eq!(unbounded.max_staged_records, None);
     }
 
     #[test]
@@ -700,6 +719,18 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(v.batch_size, 256);
+    }
+
+    #[test]
+    fn rejects_host_and_port_query_parameters() {
+        for q in ["host=other", "hostaddr=10.0.0.9", "port=6543"] {
+            let cfg = PostgresCdcSourceConfig {
+                connection_url: format!("postgres://u:p@h/db?{q}"),
+                ..minimal()
+            };
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("is not supported"), "{q}: {err}");
+        }
     }
 
     #[test]

@@ -32,7 +32,7 @@ async-stream = { workspace = true }
 
 [dev-dependencies]
 faucet-conformance = { workspace = true, features = ["containers"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "signal", "time", "test-util"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "signal", "time", "test-util", "net", "io-util"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 tokio-postgres = "0.7"

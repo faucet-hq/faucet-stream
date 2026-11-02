@@ -70,7 +70,7 @@ faucet run pipeline.yaml
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `connection_url` | string | — *(required)* | PostgreSQL connection URL, e.g. `postgres://user:pass@host:5432/db`. Masked in logs. |
+| `connection_url` | string | — *(required)* | PostgreSQL connection URL, e.g. `postgres://user:pass@host:5432/db`. Masked in logs. Credentials, host and TLS settings come from the URL only: `PGPASSWORD`, the password file (`~/.pgpass` / `PGPASSFILE`) and the other `PG*` environment variables are not read; a URL with no user is refused while `PGUSER` is set, as is one with no client certificate while `PGSSLCERT` / `PGSSLKEY` is set. |
 | `table_name` | string | — *(required)* | Target table name. |
 | `schema` | string | *(unset)* | Schema (namespace) qualifying `table_name`. When set, both AutoMap column discovery and the `INSERT` target `schema.table_name` explicitly. When unset, the table resolves against the connection's `search_path`. |
 | `column_mapping` | `PostgresColumnMapping` | `{ jsonb: { column: "data" } }` | How to map JSON records to columns — see [Column mapping](#column-mapping). |
