@@ -2,6 +2,7 @@
 //! nothing from the process environment. A one-shot server stands in for
 //! PostgreSQL: it asks for a cleartext password and records what it is sent.
 //! Its own test binary: it sets a process environment variable.
+#![allow(unsafe_code)] // tests set process environment variables
 
 use faucet_sink_postgres::{PostgresSink, PostgresSinkConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
