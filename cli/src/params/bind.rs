@@ -204,9 +204,9 @@ pub fn resolve(
             Some(raw) => {
                 // Before any error below can echo the raw value.
                 if p.is_secret() {
-                    register_secret_leaves(raw);
+                    register_secret_leaves(raw, true);
                 } else {
-                    register_secret_fields(raw, &secret_fields);
+                    register_secret_fields(raw, &secret_fields, true);
                 }
                 reject_directives(name, raw)?;
                 let coerced = spec::coerce_param(name, p, raw).map_err(|e| {
@@ -269,13 +269,13 @@ pub fn resolve(
         if p.is_secret() {
             // Register before the value can reach any log line, error string, or
             // API body. `register` no-ops below the registry's minimum length.
-            register_secret_leaves(&value);
+            register_secret_leaves(&value, supplied.contains_key(name));
             bound.secret_names.insert(name.clone());
             if supplied.contains_key(name) {
                 bound.supplied_secret_names.insert(name.clone());
             }
         } else if !secret_fields.is_empty() {
-            register_secret_fields(&value, &secret_fields);
+            register_secret_fields(&value, &secret_fields, supplied.contains_key(name));
             if supplied.contains_key(name) {
                 bound.supplied_secret_names.insert(name.clone());
             }
@@ -317,7 +317,11 @@ fn resolve_computed(spec: &ParamsSpec, bound: &mut BoundParams) -> CliResult<()>
                 let value = eval_computed_expr(&name, &expr, &bound.values, &bound.placeholders)?;
                 // Derived from a secret, the computed value is one too.
                 if refs.iter().any(|r| bound.secret_names.contains(r)) {
-                    crate::secrets::registry::register(&value);
+                    if refs.iter().any(|r| bound.supplied_secret_names.contains(r)) {
+                        crate::secrets::registry::register_caller(&value);
+                    } else {
+                        crate::secrets::registry::register(&value);
+                    }
                     bound.secret_names.insert(name.clone());
                 }
                 if refs.iter().any(|r| bound.supplied_secret_names.contains(r)) {
@@ -555,6 +559,7 @@ pub fn bind_document_traced(
             fields.add_text(name.clone(), l);
         }
     }
+    let sql = sql_fields_by_config(doc);
     let result = substitute(
         doc,
         &Subst {
@@ -566,11 +571,14 @@ pub fn bind_document_traced(
             secret: &secret,
             via_env: &via_env,
             carried,
+            sql: &sql,
         },
         None,
         &super::caller::Cursor::default(),
         &mut fields,
     );
+    let result =
+        result.and_then(|()| refuse_indirect_splices(doc, &fields, &bound.values, &guarded));
     if let (Some(block), Some(map)) = (stashed, doc.as_object_mut()) {
         map.insert(PARAMS_KEY.to_string(), block);
     }
@@ -579,26 +587,189 @@ pub fn bind_document_traced(
     Ok(bound)
 }
 
+/// Refuse a caller value that reaches a longer string through a config
+/// reference (`${vars.X}`, `${sources.N.PATH}`, `${sinks.N.PATH}`) where it
+/// could change the meaning of the text around it — the rule a direct
+/// `${param.*}` splice is held to, with the destination field's context.
+fn refuse_indirect_splices(
+    doc: &Value,
+    fields: &super::caller::CallerFields,
+    bound: &BTreeMap<String, Value>,
+    guarded: &BTreeSet<String>,
+) -> CliResult<()> {
+    if guarded.is_empty() || fields.is_empty() {
+        return Ok(());
+    }
+    let through = super::caller::through_refs(doc, fields);
+    let sql = sql_fields_by_config(doc);
+    for (ptr, s) in super::caller::reference_leaves(doc) {
+        let field = ptr
+            .rsplit('/')
+            .next()
+            .map(|f| f.replace("~1", "/").replace("~0", "~"));
+        let context = splice_context_at(field.as_deref(), &ptr, &sql);
+        for (token, dir) in iter_directives(&s) {
+            let Directive::Deferred { id, path } = dir else {
+                continue;
+            };
+            if token == s {
+                continue;
+            }
+            let names: BTreeSet<String> = super::caller::ref_targets(id, path)
+                .iter()
+                .flat_map(|t| through.params_at(t))
+                .filter(|n| guarded.contains(n))
+                .collect();
+            for name in names {
+                let Some(value) = bound.get(&name) else {
+                    continue;
+                };
+                let mut texts = Vec::new();
+                super::list::leaves(value, &mut texts);
+                for text in texts {
+                    if let Some(why) = splice_reason(&Value::String(text), &s, token, context) {
+                        return Err(CliError::Config(format!(
+                            "param '{name}': the supplied value contains {why}; the config \
+                             splices it into a longer string (a query, a URL, a path) through \
+                             `{token}`, where it could change the meaning of the text around \
+                             it. Declare a closed `values:` set for the param (or an `int` / \
+                             `float` type), quote it in SQL text, or use it as a whole value"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The SQL fields of each connector or transform config in a document whose
+/// kind is known, by the config's JSON pointer.
+type SqlFields = BTreeMap<String, std::sync::Arc<BTreeSet<String>>>;
+
+/// The top-level config fields of `kind` that hold a SQL statement, read
+/// from its schema (`x-faucet-sql`) — `None` when no compiled connector or
+/// transform has that kind.
+pub(crate) fn kind_sql_fields(kind: &str) -> Option<std::sync::Arc<BTreeSet<String>>> {
+    type Cache = std::sync::RwLock<
+        std::collections::HashMap<String, Option<std::sync::Arc<BTreeSet<String>>>>,
+    >;
+    static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(hit) = cache.read().ok().and_then(|c| c.get(kind).cloned()) {
+        return hit;
+    }
+    let schemas = [
+        crate::registry::source_schema(kind).ok(),
+        crate::registry::sink_schema(kind).ok(),
+        crate::transforms::transform_schema(kind).ok(),
+    ];
+    let found = schemas.iter().any(Option::is_some).then(|| {
+        std::sync::Arc::new(
+            schemas
+                .iter()
+                .flatten()
+                .flat_map(faucet_core::resolve::sql_fields)
+                .collect::<BTreeSet<String>>(),
+        )
+    });
+    if let Ok(mut c) = cache.write() {
+        c.insert(kind.to_string(), found.clone());
+    }
+    found
+}
+
+/// [`SqlFields`] of `doc`: every object with a `config` object and a kind —
+/// its own `type`, or for a row's `source` / `sink` the kind of the template
+/// it refers to.
+fn sql_fields_by_config(doc: &Value) -> SqlFields {
+    fn template_kind(
+        root: &Value,
+        side: &str,
+        obj: &serde_json::Map<String, Value>,
+    ) -> Option<String> {
+        let pipeline = root.get("pipeline")?;
+        let named = pipeline.get(format!("{side}s"));
+        let template = match obj.get("ref").and_then(Value::as_str) {
+            Some(r) => named.and_then(|n| n.get(r)),
+            None => pipeline
+                .get(side)
+                .or_else(|| named.and_then(|n| n.get("default"))),
+        }?;
+        template
+            .get("type")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+    fn walk(root: &Value, v: &Value, ptr: &str, key: Option<&str>, out: &mut SqlFields) {
+        match v {
+            Value::Object(map) => {
+                if map.get("config").is_some_and(Value::is_object) {
+                    let kind = match map.get("type").and_then(Value::as_str) {
+                        Some(t) => Some(t.to_string()),
+                        None => match key {
+                            Some(side @ ("source" | "sink")) => template_kind(root, side, map),
+                            _ => None,
+                        },
+                    };
+                    if let Some(fields) = kind.as_deref().and_then(kind_sql_fields) {
+                        out.insert(super::caller::child(ptr, "config"), fields);
+                    }
+                }
+                for (k, x) in map {
+                    walk(root, x, &super::caller::child(ptr, k), Some(k), out);
+                }
+            }
+            Value::Array(items) => {
+                for (i, x) in items.iter().enumerate() {
+                    walk(root, x, &format!("{ptr}/{i}"), None, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = SqlFields::new();
+    walk(doc, doc, "", None, &mut out);
+    out
+}
+
+/// [`splice_context`] for the string at `ptr`: a field of a config whose
+/// kind's schema marks it `x-faucet-sql` is SQL text whatever its name. A
+/// field named like a statement keeps the stricter rule either way, since
+/// other query languages are spliced the same way.
+fn splice_context_at(field: Option<&str>, ptr: &str, sql: &SqlFields) -> SpliceContext {
+    let parent = ptr.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+    match (field, sql.get(parent)) {
+        (Some(f), Some(known)) if known.contains(f) => SpliceContext::Sql,
+        _ => splice_context(field),
+    }
+}
+
 /// Register every scalar of a secret value with the redaction registry.
 /// Register only the `fields` of each object item of a list value.
-fn register_secret_fields(v: &Value, fields: &std::collections::BTreeSet<String>) {
+fn register_secret_fields(v: &Value, fields: &std::collections::BTreeSet<String>, caller: bool) {
     let Value::Array(items) = v else {
         return;
     };
     for item in items {
         for f in fields {
             if let Some(field) = item.get(f) {
-                register_secret_leaves(field);
+                register_secret_leaves(field, caller);
             }
         }
     }
 }
 
-fn register_secret_leaves(v: &Value) {
+/// `caller`: the value is a caller's, held to the caller-supplied bound.
+fn register_secret_leaves(v: &Value, caller: bool) {
     let mut leaves = Vec::new();
     super::list::leaves(v, &mut leaves);
     for l in leaves {
-        crate::secrets::registry::register(&l);
+        if caller {
+            crate::secrets::registry::register_caller(&l);
+        } else {
+            crate::secrets::registry::register(&l);
+        }
     }
 }
 
@@ -664,6 +835,8 @@ struct Subst<'a> {
     via_env: &'a BTreeMap<String, BTreeSet<String>>,
     /// Caller text recorded before binding, moved to where it lands.
     carried: &'a super::caller::CallerFields,
+    /// The SQL fields of each connector config whose kind is known.
+    sql: &'a SqlFields,
 }
 
 /// The free-text params `s` references (`${param.NAME}`), by the names they
@@ -742,7 +915,8 @@ fn substitute(
             }
             None => {
                 record(fields, &cur.at, free_refs(s, cx, false));
-                refuse_embedded(s, bound, guarded, field)?;
+                let context = splice_context_at(field, &cur.from, cx.sql);
+                refuse_embedded(s, bound, guarded, context)?;
                 Value::String(rewrite_text(s, bound, bound, lenient)?)
             }
         };
@@ -764,7 +938,7 @@ fn substitute(
             // The key is rewritten once: its value lands under that text.
             let entries: Vec<(String, Value)> = std::mem::take(map).into_iter().collect();
             for (key, mut val) in entries {
-                refuse_embedded(&key, bound, guarded, None)?;
+                refuse_embedded(&key, bound, guarded, SpliceContext::Other)?;
                 let new_key = rewrite_text(&key, bound, bound, lenient)?;
                 if let Some(inert) = inert {
                     refuse_new_directives(&key, &new_key, bound, lenient, inert)?;
@@ -878,12 +1052,11 @@ fn refuse_embedded(
     s: &str,
     bound: &BTreeMap<String, Value>,
     guarded: &BTreeSet<String>,
-    field: Option<&str>,
+    context: SpliceContext,
 ) -> CliResult<()> {
     if guarded.is_empty() {
         return Ok(());
     }
-    let context = splice_context(field);
     for (token, dir) in iter_directives(s) {
         let Directive::Deferred { id, path } = dir else {
             continue;
@@ -1162,6 +1335,77 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.clone()))
             .collect()
+    }
+
+    /// The direct-splice rule follows a caller value through `vars:` and
+    /// template fields, with the destination field's context.
+    #[test]
+    fn a_caller_value_reached_through_a_reference_is_held_to_the_splice_rule() {
+        let doc = |query: &str| {
+            json!({
+                "params": { "account": { "required": true } },
+                "vars": { "acct": "${param.account}", "outer": "${vars.acct}" },
+                "pipeline": {
+                    "sources": { "aux": { "type": "postgres", "config": { "filter": "${param.account}" } } },
+                    "source": { "type": "postgres", "config": { "connection_url": "postgres://h/db", "query": query } },
+                    "sink": { "type": "stdout" }
+                }
+            })
+        };
+        let bind = |query: &str, account: &str| {
+            bind_document(
+                &mut doc(query),
+                &supplied(&[("account", json!(account))]),
+                BindMode::Strict,
+            )
+        };
+        for query in [
+            "SELECT * FROM t WHERE a = '${vars.acct}'",
+            "SELECT * FROM t WHERE a = '${vars.outer}'",
+            "SELECT * FROM t WHERE a = '${sources.aux.config.filter}'",
+        ] {
+            let err = bind(query, "x' OR '1'='1").unwrap_err().to_string();
+            assert!(
+                err.contains("param 'account'") && err.contains("through"),
+                "{query}: {err}"
+            );
+            bind(query, "acme-42").unwrap();
+        }
+        let unquoted = "SELECT * FROM t WHERE a = ${vars.acct}";
+        let err = bind(unquoted, "acme").unwrap_err().to_string();
+        assert!(err.contains("unquoted"), "{err}");
+        bind(unquoted, "42").unwrap();
+        bind("${vars.acct}", "x' OR 1;").unwrap();
+
+        let mut no_caller = doc("SELECT '${vars.acct}'");
+        no_caller["params"]["account"] = json!({ "default": "it's" });
+        bind_document(&mut no_caller, &SuppliedParams::new(), BindMode::Strict).unwrap();
+    }
+
+    #[test]
+    fn a_field_its_schema_marks_as_sql_takes_the_sql_rule() {
+        assert!(kind_sql_fields("postgres").is_some_and(|f| f.contains("query")));
+        assert!(kind_sql_fields("no-such-kind").is_none());
+        let doc = json!({
+            "pipeline": {
+                "sources": { "a": { "type": "postgres", "config": { "query": "x" } } },
+                "source": { "type": "rest", "config": {} }
+            },
+            "matrix": [ { "source": { "ref": "a", "config": { "query": "y" } } }, { "source": { "config": {} } } ]
+        });
+        let sql = sql_fields_by_config(&doc);
+        assert!(sql.contains_key("/pipeline/sources/a/config"));
+        assert!(sql.contains_key("/matrix/0/source/config"));
+        assert!(sql.contains_key("/pipeline/source/config"));
+        let mut known = SqlFields::new();
+        known.insert(
+            "/c/config".into(),
+            std::sync::Arc::new(["stmt".to_string()].into()),
+        );
+        assert!(splice_context_at(Some("stmt"), "/c/config/stmt", &known) == SpliceContext::Sql);
+        assert!(splice_context_at(Some("query"), "/c/config/query", &known) == SpliceContext::Sql);
+        assert!(splice_context_at(Some("note"), "/c/config/note", &known) == SpliceContext::Other);
+        assert!(splice_context_at(Some("stmt"), "/d/config/stmt", &known) == SpliceContext::Other);
     }
 
     /// A caller value spliced into a longer string may not carry text that

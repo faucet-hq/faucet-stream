@@ -561,6 +561,14 @@ pub enum CliError {
     #[error("could not authenticate to {scheme}: {hint}")]
     SecretAuthFailed { scheme: String, hint: String },
 
+    /// A secret reference the loader's reference policy does not allow.
+    #[error("secret reference '{reference}' ({scheme}) may not be read here: {reason}")]
+    SecretRefused {
+        scheme: String,
+        reference: String,
+        reason: String,
+    },
+
     /// A `#field` selector was used on a secret that is not JSON.
     #[error("secret '{reference}' from {scheme} is not JSON, but a '#field' selector was used")]
     SecretNotJson { scheme: String, reference: String },

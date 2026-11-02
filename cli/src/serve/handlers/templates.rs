@@ -396,10 +396,36 @@ pub async fn template_matrix(State(state): State<ServerState>) -> Result<Json<Va
         sinks,
         incompatible: Vec::new(),
     };
-    Ok(Json(crate::hub::catalog::index_json_with(
-        &cat,
-        crate::hub::catalog::registry_run_command,
-    )))
+    let mut hidden: std::collections::HashMap<String, crate::params::ParamsSpec> =
+        std::collections::HashMap::new();
+    for (_, s) in &cat.sources {
+        hidden.insert(format!("source:{}", s.id()), s.params.clone());
+    }
+    for (_, k) in &cat.sinks {
+        hidden.insert(format!("sink:{}", k.id()), k.params.clone());
+    }
+    hidden
+        .values_mut()
+        .for_each(crate::params::hide_secret_defaults);
+    let mut index =
+        crate::hub::catalog::index_json_with(&cat, crate::hub::catalog::registry_run_command);
+    for (list, side) in [("sources", "source"), ("sinks", "sink")] {
+        let entries = index.get_mut(list).and_then(Value::as_array_mut);
+        for entry in entries.into_iter().flatten() {
+            let id = entry.get("id").and_then(Value::as_str).unwrap_or_default();
+            let Some(spec) = hidden.get(&format!("{side}:{id}")) else {
+                continue;
+            };
+            let params = entry.get_mut("params").and_then(Value::as_array_mut);
+            for p in params.into_iter().flatten() {
+                let name = p.get("name").and_then(Value::as_str).unwrap_or_default();
+                if let Some(ps) = spec.get(name) {
+                    p["default"] = serde_json::to_value(&ps.default).unwrap_or(Value::Null);
+                }
+            }
+        }
+    }
+    Ok(Json(index))
 }
 
 // ── GET /v1/templates/{id} ──────────────────────────────────────────────────

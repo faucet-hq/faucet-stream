@@ -455,6 +455,46 @@ pub async fn sync_origin(
     result
 }
 
+/// A template under an `<owner>/` directory is its owner's, not the
+/// operator's: unless the origin trusts the owner (or it is the `faucet-hq`
+/// namespace of the official catalog), it is registered only when it reads
+/// nothing of this server's and runs no program — the rule `faucet run`
+/// holds a community hub template to. Otherwise it is reported and skipped.
+fn hold_namespaced_templates(origin: &Origin, templates: &mut [fetch::RemoteTemplate]) {
+    let official_repo = match &origin.source {
+        OriginSource::Github(g) => {
+            g.repo.eq_ignore_ascii_case("faucet-hq/template-hub") && g.r#ref == "main"
+        }
+        _ => false,
+    };
+    for r in templates
+        .iter_mut()
+        .filter(|r| r.unusable.is_none() && r.retired.is_none())
+    {
+        let Some((owner, _)) = r.stem.split_once('/') else {
+            continue;
+        };
+        let official = official_repo && owner == crate::hub::spec::OFFICIAL_OWNER;
+        if official
+            || origin
+                .trust
+                .iter()
+                .any(|t| t == "*" || t == owner || *t == r.stem)
+        {
+            continue;
+        }
+        let Ok(doc) = crate::templates::parse_body(&r.body, r.format) else {
+            continue;
+        };
+        if let Some(why) = crate::hub::untrusted_use(&doc) {
+            r.unusable = Some(format!(
+                "template '{}' {why}; list `{owner}` under the origin's `trust:` after reviewing it",
+                r.stem
+            ));
+        }
+    }
+}
+
 async fn sync_origin_inner(
     store: &TemplateStore,
     origin: &Origin,
@@ -473,6 +513,7 @@ async fn sync_origin_inner(
             "catalog index.json unreadable ({e}); version deprecations not applied"
         )),
     }
+    hold_namespaced_templates(origin, &mut paired.templates);
     let local = local_snapshot(store, &origin.prefix).await?;
     let plan = plan::plan(origin, &paired.templates, &local);
     tracing::info!(
@@ -707,7 +748,57 @@ mod tests {
             launch,
             prune,
             interval_secs: None,
+            trust: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_namespaced_template_needs_the_origin_trust_to_read_server_values() {
+        let remote = |stem: &str, body: &str| fetch::RemoteTemplate {
+            stem: stem.into(),
+            body: body.into(),
+            format: ConfigFormat::Yaml,
+            sidecar: None,
+            retired: None,
+            unusable: None,
+        };
+        let reads = "kind: pipeline\nx: \"${env:HOME}\"\n";
+        let plain = "kind: pipeline\nx: y\n";
+        let mut origin = Origin {
+            name: "hub".into(),
+            source: OriginSource::Github(GithubSource {
+                repo: "faucet-hq/template-hub".into(),
+                r#ref: "main".into(),
+                path: String::new(),
+                paths: vec!["source-templates".into()],
+                token: None,
+                api_base: String::new(),
+            }),
+            prefix: String::new(),
+            launch: LaunchPolicy::Ignore,
+            prune: PrunePolicy::Keep,
+            interval_secs: None,
+            trust: Vec::new(),
+        };
+        let held = |origin: &Origin| {
+            let mut t = vec![
+                remote("mallory/a", reads),
+                remote("mallory/b", plain),
+                remote("faucet-hq/c", reads),
+                remote("top", reads),
+                remote("mallory/d", "{ not: [valid"),
+            ];
+            hold_namespaced_templates(origin, &mut t);
+            t.iter().map(|r| r.unusable.is_some()).collect::<Vec<_>>()
+        };
+        assert_eq!(held(&origin), [true, false, false, false, false]);
+        origin.trust = vec!["mallory".into()];
+        assert_eq!(held(&origin), [false; 5]);
+        origin.trust = Vec::new();
+        if let OriginSource::Github(g) = &mut origin.source {
+            g.repo = "someone/fork".into();
+        }
+        assert_eq!(held(&origin), [true, false, true, false, false]);
     }
 
     /// Mount a directory listing + raw file reads on the mock GitHub API.
@@ -1087,6 +1178,7 @@ mod tests {
             launch: LaunchPolicy::Ignore,
             prune: PrunePolicy::Keep,
             interval_secs: None,
+            trust: Vec::new(),
         };
         assert_eq!(
             publish_name("p-x", &o, ConfigFormat::Yaml).unwrap(),

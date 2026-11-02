@@ -198,9 +198,39 @@ pub const HIDDEN_DEFAULT: &str = "(hidden)";
 /// Replaces the default of every secret param with [`HIDDEN_DEFAULT`], for
 /// responses that show a template to someone who may not read its secrets.
 pub fn hide_secret_defaults(params: &mut ParamsSpec) {
+    let hidden = || Value::String(HIDDEN_DEFAULT.to_string());
     for spec in params.values_mut() {
         if spec.is_secret() && spec.default.is_some() {
-            spec.default = Some(Value::String(HIDDEN_DEFAULT.to_string()));
+            spec.default = Some(hidden());
+        }
+        let fields = super::list::secret_fields(spec);
+        if !fields.is_empty()
+            && let Some(d) = spec.default.as_mut()
+        {
+            hide_item_fields(d, &fields);
+        }
+        if let Some(items) = spec.items.as_deref_mut() {
+            if items.secret && items.default.is_some() {
+                items.default = Some(hidden());
+            }
+            for field in items.properties.values_mut().filter(|f| f.secret) {
+                if field.default.is_some() {
+                    field.default = Some(hidden());
+                }
+            }
+        }
+    }
+}
+
+/// Replace the `fields` of every object item of a list default.
+fn hide_item_fields(v: &mut Value, fields: &std::collections::BTreeSet<String>) {
+    if let Value::Array(items) = v {
+        for item in items.iter_mut().filter_map(Value::as_object_mut) {
+            for (k, x) in item.iter_mut() {
+                if fields.contains(k) {
+                    *x = Value::String(HIDDEN_DEFAULT.to_string());
+                }
+            }
         }
     }
 }
@@ -770,6 +800,30 @@ mod tests {
         assert_eq!(params["token"].default, Some(Value::from(HIDDEN_DEFAULT)));
         assert_eq!(params["plain"].default, Some(Value::from(5)));
         assert_eq!(params["none"].default, None);
+    }
+
+    #[test]
+    fn hide_secret_defaults_masks_secret_item_fields() {
+        let mut params: ParamsSpec = serde_json::from_value(serde_json::json!({
+            "rows": {
+                "type": "list",
+                "default": [ { "table": "t1", "token": "dummy-item-secret" } ],
+                "items": { "type": "object", "properties": {
+                    "table": { "type": "string" },
+                    "token": { "type": "string", "secret": true, "default": "dummy-field-secret" }
+                } }
+            },
+            "keys": {
+                "type": "list",
+                "default": ["dummy-list-secret"],
+                "items": { "type": "string", "secret": true, "default": "dummy-item-default" }
+            }
+        }))
+        .unwrap();
+        hide_secret_defaults(&mut params);
+        let shown = serde_json::to_string(&params).unwrap();
+        assert!(!shown.contains("dummy-"), "{shown}");
+        assert!(shown.contains("t1"), "{shown}");
     }
 
     #[test]

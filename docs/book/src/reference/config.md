@@ -174,6 +174,10 @@ Three stages resolve placeholders:
 - **Load time:** `${env:VAR}`, `${file:PATH}`, `${secret:VAR}` are resolved when
   the file is read. `${vars.X}` resolves against the top-level `vars:` block;
   `${sources.NAME.PATH}` / `${sinks.NAME.PATH}` resolve against named templates.
+  A substituted value is data: it can never combine with the text around it
+  (or another substituted value) into a new `${…}` directive — such a `${`
+  stays literal. A directive written whole inside a `vars:` value still
+  resolves where the value is used.
   Secret-manager directives (see below) run as the final load-time stage.
 - **Trigger time:** `${param.NAME}` resolves against the top-level [`params:`](#params)
   block, bound from `--param` / an HTTP `params` object before the config is

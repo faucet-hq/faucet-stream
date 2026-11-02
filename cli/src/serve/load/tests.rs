@@ -1539,3 +1539,24 @@ fn a_refusal_shows_only_the_callers_own_text() {
     assert!(!err.contains("evil.example.net"), "{err}");
     assert!(!err.contains("svc-key-from-operator-env"), "{err}");
 }
+
+#[test]
+fn a_secret_reference_is_screened_as_it_is_about_to_be_read() {
+    protect_secret_ref("vault", "secret/screen-test#admin");
+    let mut base = std::collections::BTreeSet::new();
+    base.insert("${aws-sm:operator/base}".to_string());
+    let screen = secret_screen(&ReferencePolicy::deny_all(), &base);
+    assert!(screen("vault", "secret/screen-test#other").is_err());
+    let err = screen("vault", "kv/caller").unwrap_err();
+    assert!(err.contains("allow-list"), "{err}");
+    assert!(screen("aws-sm", "operator/base").is_ok());
+    let open = secret_screen(&ReferencePolicy::open(), &Default::default());
+    assert!(open("vault", "kv/caller").is_ok());
+    assert!(open("vault", "secret/screen-test").is_err());
+    let refused = resolution_error(crate::error::CliError::SecretRefused {
+        scheme: "vault".into(),
+        reference: "kv/caller".into(),
+        reason: "no".into(),
+    });
+    assert!(matches!(refused, ServeError::Forbidden(_)));
+}

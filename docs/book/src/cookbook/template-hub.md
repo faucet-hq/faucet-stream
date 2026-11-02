@@ -614,8 +614,12 @@ than the `faucet-hq/template-hub` repository at its default branch (a pinned
 `@<ref>` or `/<path>` is not reviewed), whatever its `owner:` says — may not
 read the machine it runs on: one that uses `${env:…}`, `${file:…}` or a secret-manager
 directive is refused, since it could send a credential to a URL it chooses.
+So is one that reads the other template of the pairing (`${sources.…}`,
+`${sinks.…}`, `${vars.…}`) or names a connector that runs a program (`singer`).
 Hand it credentials through its declared params (`--param`, `--param-env`),
-or review it and pass `--trust <owner>` (or `--trust <owner/name>`).
+or review it and pass `--trust <owner>` (or `--trust <owner/name>`). The owner
+`--trust` matches is the namespace directory the file sits in
+(`source-templates/<owner>/`), not the file's own `owner:` field.
 
 The full id names the composed pipeline, so state keys are
 `acme/erp.faucet-hq/bigquery::invoices` and two publishers' templates never collide in a
