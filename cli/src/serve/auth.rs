@@ -13,8 +13,134 @@ use crate::serve::state::ServerState;
 use axum::extract::{ConnectInfo, MatchedPath, Request, State};
 use axum::middleware::Next;
 use axum::response::Response;
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
+
+/// Failed attempts one source address may make in [`FAILURE_WINDOW`] before
+/// its requests are refused (429) until the window ends.
+pub const MAX_FAILURES: u32 = 20;
+/// The window failed attempts are counted over.
+pub const FAILURE_WINDOW: Duration = Duration::from_secs(60);
+/// Source addresses tracked at once; expired windows are dropped first.
+const MAX_TRACKED: usize = 10_000;
+/// `auth.failed` audit records written per window across all addresses.
+const MAX_AUDITS_PER_WINDOW: u32 = 60;
+/// A token shorter than this draws a startup warning.
+pub const MIN_TOKEN_LEN: usize = 16;
+
+#[derive(Debug, Clone, Copy)]
+struct Window {
+    start: Instant,
+    failures: u32,
+}
+
+impl Window {
+    fn open(&self, now: Instant) -> bool {
+        now.duration_since(self.start) < FAILURE_WINDOW
+    }
+}
+
+/// Failed bearer-token attempts per source address, counted over a fixed
+/// window.
+#[derive(Debug, Default)]
+pub struct FailedAuth {
+    by_source: Mutex<HashMap<String, Window>>,
+    audits: Mutex<Option<Window>>,
+}
+
+/// What recording one failed attempt decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Failure {
+    /// The attempt is worth an audit record: the first of its window, or the
+    /// one that reached the limit.
+    pub audit: bool,
+}
+
+impl FailedAuth {
+    /// Whether `source` is refused until its window ends.
+    pub fn locked(&self, source: &str, now: Instant) -> bool {
+        let map = self.by_source.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(source)
+            .is_some_and(|w| w.open(now) && w.failures >= MAX_FAILURES)
+    }
+
+    /// Count a failed attempt from `source`.
+    pub fn record(&self, source: &str, now: Instant) -> Failure {
+        self.record_capped(source, now, MAX_TRACKED)
+    }
+
+    /// [`record`](Self::record) tracking at most `cap` addresses. When full,
+    /// expired windows go first, then the oldest addresses that are not
+    /// locked; a locked address is never dropped. When every tracked address
+    /// is locked, a new one is not tracked (its attempts still fail).
+    fn record_capped(&self, source: &str, now: Instant, cap: usize) -> Failure {
+        let mut map = self.by_source.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() >= cap && !map.contains_key(source) {
+            map.retain(|_, w| w.open(now));
+            if map.len() >= cap {
+                let mut unlocked: Vec<(Instant, String)> = map
+                    .iter()
+                    .filter(|(_, w)| w.failures < MAX_FAILURES)
+                    .map(|(k, w)| (w.start, k.clone()))
+                    .collect();
+                unlocked.sort();
+                let excess = map.len() + 1 - cap;
+                let drop = excess.max(cap / 10).min(unlocked.len());
+                for (_, k) in unlocked.into_iter().take(drop) {
+                    map.remove(&k);
+                }
+            }
+            if map.len() >= cap {
+                return Failure { audit: false };
+            }
+        }
+        let w = map.entry(source.to_string()).or_insert(Window {
+            start: now,
+            failures: 0,
+        });
+        if !w.open(now) {
+            *w = Window {
+                start: now,
+                failures: 0,
+            };
+        }
+        w.failures = w.failures.saturating_add(1);
+        let notable = w.failures == 1 || w.failures == MAX_FAILURES;
+        drop(map);
+        Failure {
+            audit: notable && self.audit_budget(now),
+        }
+    }
+
+    fn audit_budget(&self, now: Instant) -> bool {
+        let mut slot = self.audits.lock().unwrap_or_else(|e| e.into_inner());
+        let w = match slot.as_mut() {
+            Some(w) if w.open(now) => w,
+            _ => slot.insert(Window {
+                start: now,
+                failures: 0,
+            }),
+        };
+        if w.failures >= MAX_AUDITS_PER_WINDOW {
+            return false;
+        }
+        w.failures += 1;
+        true
+    }
+}
+
+/// The configured bearer tokens shorter than [`MIN_TOKEN_LEN`].
+pub fn short_tokens(mode: &crate::serve::config::AuthMode) -> usize {
+    use crate::serve::config::AuthMode;
+    match mode {
+        AuthMode::Token(t) => usize::from(t.len() < MIN_TOKEN_LEN),
+        AuthMode::Rbac(cfg) => cfg.tokens().filter(|t| t.len() < MIN_TOKEN_LEN).count(),
+        AuthMode::None => 0,
+    }
+}
 
 /// Timing-safe byte-slice equality. Differing lengths return `false` after a
 /// constant-time length check (subtle short-circuits unequal lengths — this
@@ -73,16 +199,34 @@ pub async fn require_auth(
     }
 
     let bearer = bearer_token(req.headers());
-    let mut ctx = state
-        .auth_mode()
-        .resolve(bearer)
-        .ok_or(ServeError::Unauthorized)?;
     // Best-effort source IP (present when the server is served with connect-info;
     // absent when a handler is called directly in tests).
-    ctx.source_ip = req
+    let source_ip = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|c| c.0.ip().to_string());
+    let source = source_ip.as_deref().unwrap_or("unknown");
+    let presented = bearer.is_some_and(|t| !t.is_empty());
+    let Some(mut ctx) = state.auth_mode().resolve(bearer) else {
+        if presented && state.failed_auth().locked(source, Instant::now()) {
+            return Err(ServeError::TooManyRequests(
+                "too many failed authentication attempts from this address; retry in a minute"
+                    .into(),
+            ));
+        }
+        if presented && state.failed_auth().record(source, Instant::now()).audit {
+            tracing::warn!(source = %source, "a request presented an invalid bearer token");
+            let who = rbac::AuthContext {
+                principal: "unauthenticated".into(),
+                role: Role::Viewer,
+                source_ip: source_ip.clone(),
+                tenant: None,
+            };
+            audit::write(&state, &who, "auth.failed", None, None, "denied").await;
+        }
+        return Err(ServeError::Unauthorized);
+    };
+    ctx.source_ip = source_ip;
 
     let method = req.method().clone();
     let matched = req
@@ -149,6 +293,87 @@ pub async fn require_auth(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_attempts_lock_a_source_for_the_window() {
+        let f = FailedAuth::default();
+        let t0 = Instant::now();
+        assert!(
+            f.record("10.0.0.1", t0).audit,
+            "the first failure is audited"
+        );
+        for _ in 1..MAX_FAILURES - 1 {
+            assert!(!f.record("10.0.0.1", t0).audit);
+        }
+        assert!(!f.locked("10.0.0.1", t0));
+        assert!(
+            f.record("10.0.0.1", t0).audit,
+            "reaching the limit is audited"
+        );
+        assert!(f.locked("10.0.0.1", t0));
+        assert!(!f.locked("10.0.0.2", t0), "other sources are unaffected");
+        let later = t0 + FAILURE_WINDOW;
+        assert!(!f.locked("10.0.0.1", later));
+        assert!(
+            f.record("10.0.0.1", later).audit,
+            "a new window starts over"
+        );
+    }
+
+    #[test]
+    fn a_full_tracker_keeps_locked_addresses() {
+        let f = FailedAuth::default();
+        let t0 = Instant::now();
+        for _ in 0..MAX_FAILURES {
+            f.record_capped("10.0.0.1", t0, 3);
+        }
+        assert!(f.locked("10.0.0.1", t0));
+        f.record_capped("10.0.0.2", t0, 3);
+        f.record_capped("10.0.0.3", t0 + Duration::from_secs(1), 3);
+        f.record_capped("10.0.0.4", t0 + Duration::from_secs(2), 3);
+        assert!(f.locked("10.0.0.1", t0), "a locked address is kept");
+        let map = f.by_source.lock().unwrap();
+        assert!(
+            !map.contains_key("10.0.0.2"),
+            "the oldest unlocked one goes"
+        );
+        assert!(map.contains_key("10.0.0.3") && map.contains_key("10.0.0.4"));
+        drop(map);
+
+        let full = FailedAuth::default();
+        for a in ["10.1.0.1", "10.1.0.2"] {
+            for _ in 0..MAX_FAILURES {
+                full.record_capped(a, t0, 2);
+            }
+        }
+        assert_eq!(
+            full.record_capped("10.1.0.3", t0, 2),
+            Failure { audit: false }
+        );
+        assert!(full.locked("10.1.0.1", t0) && full.locked("10.1.0.2", t0));
+        assert!(!full.by_source.lock().unwrap().contains_key("10.1.0.3"));
+        let later = t0 + FAILURE_WINDOW;
+        assert!(full.record_capped("10.1.0.3", later, 2).audit);
+    }
+
+    #[test]
+    fn failure_audits_are_bounded_across_sources() {
+        let f = FailedAuth::default();
+        let t0 = Instant::now();
+        let audited = (0..MAX_AUDITS_PER_WINDOW + 10)
+            .filter(|i| f.record(&format!("10.1.0.{i}"), t0).audit)
+            .count();
+        assert_eq!(audited as u32, MAX_AUDITS_PER_WINDOW);
+        assert!(f.record("10.9.9.9", t0 + FAILURE_WINDOW).audit);
+    }
+
+    #[test]
+    fn short_tokens_are_counted() {
+        use crate::serve::config::AuthMode;
+        assert_eq!(short_tokens(&AuthMode::Token("short".into())), 1);
+        assert_eq!(short_tokens(&AuthMode::Token("x".repeat(MIN_TOKEN_LEN))), 0);
+        assert_eq!(short_tokens(&AuthMode::None), 0);
+    }
 
     #[test]
     fn constant_time_eq_matches_only_identical() {

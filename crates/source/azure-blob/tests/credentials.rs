@@ -5,6 +5,7 @@
 //! calls, which only answer the token IMDS issued. `service_principal` reads
 //! the same way from a wiremock fake of the Azure AD v2 token endpoint, reached
 //! through `authority_host`.
+#![allow(unsafe_code)] // tests set process environment variables
 
 use base64::Engine as _;
 use faucet_core::Source;

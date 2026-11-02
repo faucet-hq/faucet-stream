@@ -132,6 +132,7 @@ pub mod duration_secs_option {
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)] // tests set process environment variables
 mod tests {
     use super::*;
     use serde::Deserialize;

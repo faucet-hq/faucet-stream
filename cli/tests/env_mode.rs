@@ -1,4 +1,5 @@
 //! Integration tests for `faucet run --from-env` (pure-env mode, issue #42).
+#![allow(unsafe_code)] // tests set process environment variables
 
 use assert_cmd::Command;
 use predicates::prelude::*;

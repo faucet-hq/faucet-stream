@@ -23,8 +23,8 @@ pipeline:
       config:
         module: ./transforms/redact.wasm   # path to the precompiled module
         function: transform                 # exported entry point (default)
-        memory_limit_mb: 16                 # linear-memory cap per record
-        fuel_limit: 10000000                # deterministic CPU bound per record
+        memory_limit_mb: 16                 # linear-memory cap per record (1–4096)
+        fuel_limit: 10000000                # deterministic CPU bound per record (at most 10^10)
         on_error: fail                      # fail | skip | passthrough
         reload_on_change: false             # re-stat + hot-swap the module per page
 ```

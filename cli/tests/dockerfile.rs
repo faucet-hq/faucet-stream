@@ -11,10 +11,7 @@ fn dockerfile() -> String {
 #[test]
 fn the_default_command_keeps_serve_auth_on() {
     let text = dockerfile();
-    let cmd: Vec<&str> = text
-        .lines()
-        .filter(|l| l.trim_start().starts_with("CMD "))
-        .collect();
+    let cmd: Vec<&str> = text.lines().filter(|l| l.starts_with("CMD ")).collect();
     assert_eq!(cmd, vec![r#"CMD ["serve"]"#], "{cmd:?}");
     let no_auth: Vec<&str> = text
         .lines()

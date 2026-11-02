@@ -396,6 +396,7 @@ mod tests {
                     methods: vec!["POST".into()],
                     dedupe_header: None,
                     debounce_secs: 0,
+                    content_types: crate::serve::triggers::spec::default_webhook_content_types(),
                 },
             },
             webhook_path: Some(format!("/v1/triggers/{name}")),

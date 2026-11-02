@@ -87,8 +87,8 @@ pub struct OracleCdcSourceConfig {
     #[serde(default = "default_max_scn_window")]
     pub max_scn_window: u64,
     /// Abort when one in-flight transaction buffers more than this many
-    /// changes (bounded memory). `None` = unbounded.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// changes (bounded memory). Defaults to 1,000,000; `null` = unbounded.
+    #[serde(default = "faucet_core::replication::default_max_staged_records")]
     pub max_staged_records: Option<usize>,
     /// `0` aggregates committed transactions into pages of up to 100,000
     /// records, emitted at least every `idle_timeout`, each with its bookmark;
@@ -146,7 +146,7 @@ impl OracleCdcSourceConfig {
             poll_interval: default_poll_interval(),
             idle_timeout: default_idle_timeout(),
             max_scn_window: default_max_scn_window(),
-            max_staged_records: None,
+            max_staged_records: faucet_core::replication::default_max_staged_records(),
             batch_size: default_batch_size(),
             max_connections: default_max_connections(),
             statement_timeout_secs: default_statement_timeout_secs(),

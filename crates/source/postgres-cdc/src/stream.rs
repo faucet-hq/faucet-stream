@@ -387,19 +387,20 @@ impl Source for PostgresCdcSource {
         let start = std::time::Instant::now();
 
         // A bad connection URL is a config error, not an unreachable server.
-        let opts: PgConnectOptions = match self.config.connection_url.parse() {
-            // The probe authenticates under the same TLS policy as every other
-            // connection, never sqlx's downgradable default (#789 SQL-87).
-            Ok(o) => crate::replication::apply_cdc_tls(o, &self.config.tls),
-            Err(e) => {
-                return Ok(CheckReport::single(Probe::fail_hint(
-                    "auth",
-                    start.elapsed(),
-                    format!("invalid connection URL: {e}"),
-                    "connection_url must be a valid postgres:// URL",
-                )));
-            }
-        };
+        let opts: PgConnectOptions =
+            match crate::replication::control_options(&self.config.connection_url) {
+                // The probe authenticates under the same TLS policy as every other
+                // connection, never sqlx's downgradable default (#789 SQL-87).
+                Ok(o) => crate::replication::apply_cdc_tls(o, &self.config.tls),
+                Err(e) => {
+                    return Ok(CheckReport::single(Probe::fail_hint(
+                        "auth",
+                        start.elapsed(),
+                        format!("invalid connection URL: {e}"),
+                        "connection_url must be a valid postgres:// URL",
+                    )));
+                }
+            };
 
         // Bound the whole connect+query under ctx.timeout so an unreachable
         // host doesn't hang the probe.

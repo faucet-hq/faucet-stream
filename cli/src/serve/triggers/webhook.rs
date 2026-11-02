@@ -29,14 +29,22 @@ pub async fn handle(
         .webhook(&name)
         .ok_or(ServeError::NotFound)?;
 
-    let (methods, dedupe_header, debounce_secs) = match &compiled.spec.kind {
+    let (methods, dedupe_header, debounce_secs, content_types) = match &compiled.spec.kind {
         TriggerKind::Webhook {
             methods,
             dedupe_header,
             debounce_secs,
-        } => (methods, dedupe_header, *debounce_secs),
+            content_types,
+        } => (methods, dedupe_header, *debounce_secs, content_types),
         _ => return Err(ServeError::NotFound),
     };
+    if !crate::serve::guard::content_type_accepted(&headers, body.is_empty(), content_types) {
+        return Err(ServeError::UnsupportedMediaType(format!(
+            "webhook trigger '{name}' accepts a body sent as {}; set the trigger's \
+             `content_types` to accept another",
+            content_types.join(", ")
+        )));
+    }
     let m = method.as_str().to_ascii_uppercase();
     if !methods
         .iter()

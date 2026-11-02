@@ -274,6 +274,14 @@ fn known_hosts_markers_and_wildcards_are_honoured() {
     assert!(!hosts_match("other", "host"));
     assert!(wildmatch("SFTP.*", "sftp.example"));
     assert!(!wildmatch("a?", "a"));
+    assert!(wildmatch("*.example.com", "db.EXAMPLE.com"));
+    assert!(wildmatch("a*b*c", "aXXbYYc"));
+    assert!(!wildmatch("a*b*c", "aXXbYY"));
+    assert!(wildmatch("**", ""));
+    assert!(!wildmatch("", "a"));
+    let long = "a".repeat(200_000);
+    assert!(!wildmatch("*a*a*a*a*a*a*a*a*b", &long));
+    assert!(wildmatch("*a", &long));
     let extras = scan_known_hosts("@revoked\nhost ssh-ed25519\n@bogus host t k\n", "host", 22);
     assert!(extras.revoked.is_empty() && !extras.cert_authority);
 }

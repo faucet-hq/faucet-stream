@@ -11,7 +11,7 @@ keywords = ["postgres", "postgresql", "sql", "sink", "pipeline"]
 categories.workspace = true
 
 [dependencies]
-faucet-core.workspace = true
+faucet-core = { workspace = true, features = ["libpq-sqlx"] }
 faucet-common-sql.workspace = true
 schemars.workspace = true
 serde.workspace = true
@@ -23,7 +23,7 @@ sqlx = { workspace = true, features = ["postgres"] }
 base64.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "io-util"] }
 serde_json.workspace = true
 faucet-conformance = { workspace = true, features = ["containers"] }
 schemars.workspace = true
@@ -47,3 +47,6 @@ rustdoc-args = ["--cfg", "docsrs"]
 constructible_struct_adds_field = "allow"
 constructible_struct_adds_private_field = "allow"
 enum_struct_variant_field_added = "allow"
+
+[lints]
+workspace = true

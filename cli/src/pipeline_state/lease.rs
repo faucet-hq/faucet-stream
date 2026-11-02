@@ -83,6 +83,7 @@ fn this_pid_ns() -> &'static Option<String> {
 }
 
 #[cfg(unix)]
+#[allow(unsafe_code)] // gethostname FFI call
 fn os_host_name() -> Option<String> {
     let mut buf = [0u8; 256];
     // SAFETY: the buffer is valid for `buf.len()` bytes; gethostname
@@ -102,6 +103,7 @@ fn os_host_name() -> Option<String> {
 
 /// Whether process `pid` on this host is still running (`None`: cannot tell).
 #[cfg(unix)]
+#[allow(unsafe_code)] // kill(pid, 0) process probe
 fn pid_alive(pid: u32) -> Option<bool> {
     let pid = libc::pid_t::try_from(pid).ok()?;
     // SAFETY: signal 0 only checks that the process exists.

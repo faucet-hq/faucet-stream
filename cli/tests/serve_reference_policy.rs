@@ -5,6 +5,7 @@
 //!
 //! Its own test binary: it installs the process-global plugin registry.
 #![cfg(feature = "serve")]
+#![allow(unsafe_code)] // tests set process environment variables
 
 use faucet_cli::cli::ReferenceArgs;
 use faucet_cli::registry::PluginRegistry;
@@ -54,7 +55,9 @@ fn install() {
                         "properties": {
                             "cert_bundle": {"type": "string", "x-faucet-resource": "path"},
                             "feed": {"type": "string", "x-faucet-resource": "url"},
-                            "label": {"type": "string"}
+                            "label": {"type": "string"},
+                            "skip_verify": {"type": "boolean", "x-faucet-unverified": true},
+                            "os_auth": {"type": "boolean", "x-faucet-host-credentials": true}
                         }
                     })
                 },
@@ -236,4 +239,42 @@ async fn url_hosts_and_env_follow_the_flags() {
     .await
     .unwrap_err();
     assert!(err.contains("${file:/etc/hosts}"), "{err}");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn turning_off_verification_needs_the_server_flag() {
+    install();
+    let strict = ServeReferencePolicy::from_args(&ReferenceArgs::default()).unwrap();
+    let body = config(json!({"skip_verify": true}), "acme-null");
+    let err = load(&body, CALLER, &strict).await.unwrap_err();
+    assert!(
+        err.contains("skip_verify: true") && err.contains("--allow-unverified-tls"),
+        "{err}"
+    );
+    load(
+        &config(json!({"skip_verify": false}), "acme-null"),
+        CALLER,
+        &strict,
+    )
+    .await
+    .expect("verification left on loads");
+    load(&body, BodyOrigin::Trusted, &strict)
+        .await
+        .expect("an operator-written body may turn it off");
+    let wide = ServeReferencePolicy::from_args(&ReferenceArgs {
+        allow_unverified_tls: true,
+        ..Default::default()
+    })
+    .unwrap();
+    load(&body, CALLER, &wide)
+        .await
+        .expect("--allow-unverified-tls admits it");
+    assert!(!wide.for_origin(CALLER, Some("acme")).allows_unverified());
+    let os_auth = config(json!({"os_auth": true}), "acme-null");
+    let err = load(&os_auth, CALLER, &wide).await.unwrap_err();
+    assert!(err.contains("os_auth: true"), "{err}");
+    load(&os_auth, BodyOrigin::Trusted, &wide)
+        .await
+        .expect("an operator-written body may use the server's credentials");
 }

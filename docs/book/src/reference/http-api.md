@@ -18,6 +18,32 @@ was started with `--no-auth`. The token is compared in constant time; the
 scrapers). `OPTIONS` preflight bypasses auth so browsers behind a CORS policy
 work.
 
+**Failed tokens.** A request that presents an invalid bearer token gets `401`
+and counts against its source address: after 20 within a minute, every request
+from that address that carries a token gets `429` until the minute ends. The
+first failure of each minute, and the one that reaches the limit, are written
+to the audit log as `auth.failed` (`denied`, with the source address; at most
+60 such records a minute across all addresses). The token itself is never
+recorded. A token shorter than 16 characters draws a warning at startup.
+
+**Host and origin.** A `--no-auth` server bound to loopback answers only the
+host names `localhost`, `127.0.0.1`, `[::1]` and its listen address; any other
+`Host` gets `403`, so a web page served from another name that resolves to the
+loopback address cannot reach it. On any server, `--allowed-host <name>`
+(repeatable, `*` for any) turns the check on with that list. `/healthz`,
+`/readyz` and `/metrics` are exempt, so load balancers and kubelets can probe
+by address. Independently, a `POST`, `PUT`, `PATCH` or `DELETE` that carries an
+`Origin` header must come from the server's own origin (the `Host`, or the
+`X-Forwarded-Host` a proxy sets), a `--cors-origin`, or an `--allowed-origin`;
+anything else, including `Origin: null`, gets `403`. Clients that send no
+`Origin` (scripts, other servers) are unaffected. Behind a proxy that rewrites
+`Host` and sets no `X-Forwarded-Host`, list the console's public origin with
+`--allowed-origin`.
+
+Every response carries `X-Content-Type-Options: nosniff`; `/v1` and `/mcp`
+responses also carry `Cross-Origin-Resource-Policy: same-origin`. `/mcp`
+takes its JSON-RPC body only as `Content-Type: application/json` (else `415`).
+
 ### RBAC & the audit log (`--auth-config`)
 
 A single `--auth-token` is one implicit **admin** principal. For a team
@@ -231,7 +257,10 @@ extension loading is always off). The server sets the flag on every template,
 row override, topology node, fan-out source, partition bound probe,
 `verify.destination` and DLQ sink, overwriting a `sandbox: false`. Such a query still reads and writes its own database; it
 fails with a `Permission Error` / `too many attached databases` the moment it
-reaches past it. The `sql` transform is always sandboxed this way.
+reaches past it. The `sql` transform is always sandboxed this way, and in a
+config the server loads one that sets no `memory_limit` / `threads` gets `1GB`
+and the machine's parallelism up to 4 threads (DuckDB's own defaults take most
+of the machine).
 
 The one exception is a config in the server's own `--triggers` file: its
 operator wrote it on the server, so its SQL keeps host access (the run record
@@ -283,7 +312,10 @@ are stored and again whenever a run uses them.
 |-----------|-------------------------------|------------|
 | Local path (connector path, `${file:}`, state / DLQ / lineage file) | under the server's working directory or the system temp directory | `--allow-path-root DIR` (repeatable) |
 | URL scheme | any | `--allow-url-scheme` restricts it to the listed schemes |
-| URL host | any, except link-local and cloud-metadata addresses (`169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`, `100.100.100.200`, `metadata.google.internal`) | `--allow-url-host` restricts it to the listed hosts (`*.example.com` matches subdomains); a metadata host is reachable only when listed |
+| URL host (including a database URL's `host=` / `hostaddr=` and the servers or `HOST=` entries of a `key=value` connection string or connect descriptor) | any, except link-local and cloud-metadata addresses (`169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`, `fd20:ce::254`, `fd00:c1::a9fe:a9fe`, `100.100.100.200`, `metadata.google.internal`) | `--allow-url-host` restricts it to the listed hosts (`*.example.com` matches subdomains); a metadata host is reachable only when listed |
+| A file a connection string names (`sslkey=`, `sslrootcert=`, `socket=`, `TrustServerCertificateCA=`, a wallet directory) | under the path roots, like any local path | `--allow-path-root DIR` |
+| A setting that turns off certificate or host-key verification (`insecure_skip_verify`, MSSQL `trust_server_certificate` / `TrustServerCertificate=true`, SFTP `known_hosts: {mode: insecure}`, `verify_ca=false` in a MySQL URL, `#insecure` on a `rediss://` URL, Kafka `enable.ssl.certificate.verification=false`) | refused | `--allow-unverified-tls` (never for a tenant) |
+| A setting that authenticates with the server's own credentials (Oracle `external_auth`) | refused | — (register the pipeline as a template) |
 | `${env:NAME}` / `${secret:NAME}` | none | `--allow-env NAME` or `--allow-env 'PREFIX*'` |
 | `${vault:}` / `${aws-sm:}` / `${gcp-sm:}` / `${azure-kv:}` | none | `--allow-secret-scheme vault,aws-sm` |
 | A program (`singer`) | refused | `--allow-subprocess-connectors` |
@@ -293,7 +325,17 @@ that would allow it. `/dev/null` and `:memory:` are always allowed. A path is
 compared after symlinks are resolved — a `..` after a symlink climbs out of the
 link's target, as the kernel would — and a `..` that leaves a root, or that
 follows a directory which does not exist yet, is refused. A path field that
-holds a remote URL (`s3://…`) is checked as a URL. A URL host is compared in
+holds a remote location (`s3://`, `s3a://`, `gs://`, `gcs://`, `az://`,
+`abfss://`, `http(s)://`, `sftp://`, …) is checked as a URL, and may not
+contain a `..` segment. Anything else is a local path: a relative path whose
+first segment contains `:` (`zz:/x`, `zz://x`) reads as a URL scheme to some
+readers and as a directory to others, so it is refused — write `./zz:/x` or an
+absolute path — and so is a path starting with `~`, which some engines expand
+to a home directory. `sqlite:` and `duckdb:` locations are read the way their
+drivers read them, percent-decoding included (`sqlite://%2Fdata%2Fx.db` is
+`/data/x.db`), and a SQLite name that is itself a `file:` URI is refused. The
+server's own files — its environment files, input files, run-history database
+and default-config state directory — are refused whatever the roots allow. A URL host is compared in
 the form a URL parser reads it, so `2852039166`, `0xa9fea9fe`, `0251.0376.0251.0376`
 or a trailing dot (`169.254.169.254.`, `metadata.google.internal.`) name the
 metadata address they spell, and an `http(s)` URL's authority ends at a `\` as
@@ -301,6 +343,16 @@ it does for HTTP clients (`http://169.254.169.254\@allowed.example/` names
 `169.254.169.254`). A URL whose host a caller's config takes from
 records (`https://${parent.host}/…`, a whole `${parent.next_url}`) cannot be
 checked, so it is refused; register the pipeline as a template instead.
+
+Under `faucet serve`, database connectors never fill a setting the config
+leaves out from the server's environment: `PGPASSWORD`, `~/.pgpass`,
+`PGHOST`, `PGPORT`, `PGDATABASE` and `PGAPPNAME` are not read by the
+PostgreSQL connectors, the PostgreSQL state store or Redshift, so a config
+naming no password sends none; a config that leaves out a user, client
+certificate, root certificate or server options while `PGUSER`,
+`PGSSLCERT` / `PGSSLKEY`, `PGSSLROOTCERT` or `PGOPTIONS` is set is refused.
+`PGSSLMODE` still applies. `faucet run` and library use keep libpq's
+behaviour: those variables fill what the URL leaves out.
 
 #### Template params a caller supplies
 
@@ -377,6 +429,7 @@ account identifier, so its request URL always names a Snowflake host.
 `/v1/dlq/discard`, and the `from` / `failed_dlq` of `POST /v1/dlq/replay`, are
 checked like a connector path: never a system tree or a server credential
 file, and under the path roots — for a tenant, under `--tenant-path-root/<tenant>`.
+An inspect or discard `location` that names nothing on disk is a `400`.
 
 The server's own credentials stay unreadable whatever the flags say:
 `FAUCET_VAULT_KEY`, the serve token variables and the files and variables
@@ -879,10 +932,17 @@ A template trigger that becomes a change request stores the template body
 unresolved (`${env:}` / `${file:}` / secret references stay tokens and resolve
 when the approved run executes), so a trigger that supplies a `secret: true`
 param or `env` overrides is refused with `422`. Responses mask what the reader
-may not see: callback `headers` for everyone but an admin, and the proposed
-`config` for a principal that cannot approve (a viewer). The body a
-`template_register` change proposes is masked for everyone but an unscoped
-admin, as on `GET /v1/templates/{id}`; the plan is not. A tenant-scoped
+may not see: callback `headers`, and credential-like query values in the
+callback `url`, for everyone but an admin, and the proposed `config` for a
+principal that cannot approve (a viewer). The body a `template_register`
+change proposes, and the template body a template trigger's `run` change
+carries, are masked for everyone but an unscoped admin, as on
+`GET /v1/templates/{id}`; the plan is not. A `run` change's callback is
+checked when the change is created, with the rules a submitted run's is
+(above): one with credentials in its URL, or with `headers` on a server with a
+persistent history, is refused with `422`. A `template_register` change that
+also launches the template or assigns channels must satisfy the approval rule
+for `template_launch` as well as its own. A tenant-scoped
 principal cannot `POST /v1/changes` (`403`); its gated template triggers
 become change requests on their own.
 
@@ -1620,6 +1680,7 @@ no-op an hour later):
 | Condition | Why |
 |---|---|
 | Scheme is not `http`/`https` | |
+| The URL carries credentials (`https://user:password@…`) | The URL is stored with the run and shown to its readers. Authenticate with a header (in-memory history) or a capability token in the path. |
 | Host is link-local / cloud-metadata (`169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`, `100.100.100.200`, `metadata.google.internal`, …) | Closes the instance-metadata SSRF hole. Override by naming the host in `--callback-allow-host`. |
 | A **tenant-scoped** principal names a loopback, private, shared (`100.64.0.0/10`), unique-local (`fc00::/7`) or unspecified address, or `localhost` | A tenant cannot submit a config, so its callback must not reach the server's own host or network. Override by naming the host in `--callback-allow-host`. |
 | `--callback-allow-host` is set and the host is not in it | Explicit allowlist mode. |
@@ -1653,13 +1714,14 @@ Every error is a JSON `ApiError`:
 |--------|------|
 | `400` | Malformed body / parse / interpolation failure; a `schedule:` block in the config |
 | `401` | Missing/invalid bearer token |
-| `403` | Authenticated, but the principal's role lacks the required permission (RBAC); a tenant-scoped principal submitting a config; a config that reads the [server's own credentials](#server-credentials) |
+| `403` | Authenticated, but the principal's role lacks the required permission (RBAC); a tenant-scoped principal submitting a config; a config that reads the [server's own credentials](#server-credentials); a `Host` or `Origin` the server does not answer ([Authentication](#authentication)) |
 | `404` | Unknown `run_id` |
 | `409` | `DELETE` on a running run; idempotency key reused with a different payload; a pipeline-state change while a run holds the row; a template lifecycle call the server gates behind approval |
 | `413` | Body exceeds `--body-limit-bytes` |
+| `415` | A body sent with a `Content-Type` the route does not take (`/mcp`, a webhook trigger) |
 | `422` | Expand/validation failure; `doctor_first` failed (report in `details`); a [subprocess connector](#subprocess-connectors) without `--allow-subprocess-connectors` |
-| `429` | Run queue full (carries `Retry-After`) |
-| `500` | Internal error |
+| `429` | Run queue full (carries `Retry-After`); a per-tenant limit; too many invalid bearer tokens from the address |
+| `500` | Internal error. The message is generic and carries a `reference`; the server log line with that reference holds the detail |
 
 **A row that is already running.** Every run takes a lease on each row in the
 config's durable `state:` store, and the server never overrides a live one

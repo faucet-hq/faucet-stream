@@ -49,8 +49,8 @@ binaries.
 |---|---|---|
 | `module` | *(required)* | Filesystem path to the module, a compiled `.wasm` binary or WebAssembly text (`.wat`), absolute or relative to the working directory. URLs are out of scope in v1. |
 | `function` | `"transform"` | Exported entry-point function name. |
-| `memory_limit_mb` | `16` | Linear-memory cap. A record that grows memory past this fails (see `on_error`). ~8 MB is the practical floor for ~1 KB JSON records. |
-| `fuel_limit` | `10_000_000` | wasmtime fuel per record — a deterministic CPU bound. A record that exhausts fuel fails. |
+| `memory_limit_mb` | `16` | Linear-memory cap. A record that grows memory past this fails (see `on_error`). ~8 MB is the practical floor for ~1 KB JSON records. At most `4096`. |
+| `fuel_limit` | `10_000_000` | wasmtime fuel per record — a deterministic CPU bound. A record that exhausts fuel fails. At most `10_000_000_000`. |
 | `on_error` | `fail` | `fail` aborts the run (like every other transform); `skip` drops the failing record; `passthrough` emits it unchanged. |
 | `reload_on_change` | `false` | Re-stat the module mtime before each page; recompile, check the ABI exports, and atomically swap if it changed. A module that fails to compile or to pass the ABI check keeps the last-known-good module and warns. |
 

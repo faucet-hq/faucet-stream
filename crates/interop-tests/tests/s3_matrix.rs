@@ -7,6 +7,7 @@
     feature = "compression",
     feature = "encryption"
 ))]
+#![allow(unsafe_code)] // tests set process environment variables
 
 mod remote_matrix;
 

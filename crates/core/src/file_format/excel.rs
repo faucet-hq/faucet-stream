@@ -15,6 +15,34 @@ use serde_json::{Map, Value};
 /// The worksheet a written workbook gets when the config names none.
 pub const DEFAULT_SHEET: &str = "Sheet1";
 
+/// Refuse a worksheet whose used range is too large to hold densely, before
+/// it is read whole.
+fn check_sheet_extent<RS: std::io::Read + std::io::Seek>(
+    wb: &mut calamine::Xlsx<RS>,
+    name: &str,
+    what: &str,
+) -> Result<(), FaucetError> {
+    let mut cells = match wb.worksheet_cells_reader(name) {
+        Ok(cells) => cells,
+        Err(calamine::XlsxError::NotAWorksheet(_)) => return Ok(()),
+        Err(e) => {
+            return Err(FaucetError::Source(format!(
+                "{what}: reading sheet '{name}': {e}"
+            )));
+        }
+    };
+    let mut extent = super::SheetExtent::default();
+    while let Some(cell) = cells
+        .next_cell()
+        .map_err(|e| FaucetError::Source(format!("{what}: reading sheet '{name}': {e}")))?
+    {
+        if !matches!(cell.get_value(), calamine::DataRef::Empty) {
+            extent.add(cell.get_position());
+        }
+    }
+    extent.check(what)
+}
+
 /// Parse a workbook into records.
 ///
 /// `sheet` is a worksheet name, or an index as a string; `header_row` is the
@@ -35,6 +63,7 @@ pub fn decode(
     let names = wb.sheet_names().to_vec();
     let name = resolve_sheet(&names, sheet)?;
     let name_of_sheet = name.clone();
+    check_sheet_extent(&mut wb, &name, "xlsx")?;
     let range = wb
         .worksheet_range(&name)
         .map_err(|e| FaucetError::Source(format!("xlsx: reading sheet '{name}': {e}")))?;
@@ -371,6 +400,18 @@ mod tests {
         let bytes = encode(&[json!({"a": 1})], None).expect("encode");
         let err = decode(&bytes, None, 99).expect_err("out of range");
         assert!(err.to_string().contains("header_row 99"), "{err}");
+    }
+
+    #[test]
+    fn a_sheet_whose_cells_span_too_large_a_range_is_refused() {
+        let mut book = rust_xlsxwriter::Workbook::new();
+        let ws = book.add_worksheet();
+        ws.write_string(0, 0, "id").unwrap();
+        ws.write_string(1_048_575, 16_383, "far").unwrap();
+        let err = decode(&book.save_to_buffer().unwrap(), None, 0)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("used range spans"), "{err}");
     }
 
     #[test]

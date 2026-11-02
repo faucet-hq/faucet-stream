@@ -16,13 +16,15 @@ pub struct WasmTransformConfig {
     pub function: String,
     /// Linear-memory cap for the module, in mebibytes. A record that grows
     /// memory past this limit fails that record (routed by `on_error`).
-    /// Default `16`. The practical lower bound for ~1 KB JSON records is ~8 MB.
+    /// Default `16`, at most `4096`. The practical lower bound for ~1 KB JSON
+    /// records is ~8 MB.
     #[serde(default = "default_memory_limit_mb")]
     pub memory_limit_mb: u32,
     /// wasmtime fuel budget per record — a deterministic CPU bound. A record
     /// that exhausts its fuel fails (routed by `on_error`). Default
-    /// `10_000_000`. Fuel is the effective CPU limit in v1 (there are no
-    /// blocking host calls, so a wall-clock timeout would be redundant).
+    /// `10_000_000`, at most `10_000_000_000`. Fuel is the effective CPU limit
+    /// in v1 (there are no blocking host calls, so a wall-clock timeout would be
+    /// redundant).
     #[serde(default = "default_fuel_limit")]
     pub fuel_limit: u64,
     /// What to do when a record fails inside the module (trap, fuel/memory
@@ -62,7 +64,30 @@ fn default_fuel_limit() -> u64 {
     10_000_000
 }
 
+/// The largest `memory_limit_mb`: the whole 32-bit linear address space.
+pub const MAX_MEMORY_LIMIT_MB: u32 = 4096;
+
+/// The largest per-record `fuel_limit`.
+pub const MAX_FUEL_LIMIT: u64 = 10_000_000_000;
+
 impl WasmTransformConfig {
+    /// Refuse a memory or fuel limit of zero or above its ceiling.
+    pub(crate) fn validate(&self) -> Result<(), faucet_core::FaucetError> {
+        if !(1..=MAX_MEMORY_LIMIT_MB).contains(&self.memory_limit_mb) {
+            return Err(faucet_core::FaucetError::Config(format!(
+                "wasm transform: memory_limit_mb must be between 1 and {MAX_MEMORY_LIMIT_MB}, got {}",
+                self.memory_limit_mb
+            )));
+        }
+        if !(1..=MAX_FUEL_LIMIT).contains(&self.fuel_limit) {
+            return Err(faucet_core::FaucetError::Config(format!(
+                "wasm transform: fuel_limit must be between 1 and {MAX_FUEL_LIMIT}, got {}",
+                self.fuel_limit
+            )));
+        }
+        Ok(())
+    }
+
     /// The low-cardinality metric label for this module — the file basename.
     pub(crate) fn module_label(&self) -> String {
         std::path::Path::new(&self.module)
@@ -76,6 +101,32 @@ impl WasmTransformConfig {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn limits_are_bounded() {
+        let cfg = |mem: u32, fuel: u64| WasmTransformConfig {
+            module: "m.wasm".into(),
+            function: default_function(),
+            memory_limit_mb: mem,
+            fuel_limit: fuel,
+            on_error: WasmOnError::Fail,
+            reload_on_change: false,
+        };
+        assert!(cfg(16, 10_000_000).validate().is_ok());
+        assert!(cfg(MAX_MEMORY_LIMIT_MB, MAX_FUEL_LIMIT).validate().is_ok());
+        let err = cfg(MAX_MEMORY_LIMIT_MB + 1, 1)
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("memory_limit_mb"), "{err}");
+        assert!(cfg(0, 1).validate().is_err());
+        let err = cfg(16, MAX_FUEL_LIMIT + 1)
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("fuel_limit"), "{err}");
+        assert!(cfg(16, 0).validate().is_err());
+    }
 
     #[test]
     fn decodes_minimal_config_with_defaults() {

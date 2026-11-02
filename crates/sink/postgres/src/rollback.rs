@@ -693,8 +693,8 @@ fn cast_key_placeholders(predicate: &str, key_udts: &[String], key_len: usize) -
             }
             out.push_str(&digits);
             if !digits.is_empty() {
-                out.push_str("::");
-                out.push_str(&key_udts[idx % key_len.max(1)]);
+                let cast = Postgres.placeholder(0, Some(&key_udts[idx % key_len.max(1)]));
+                out.push_str(&cast["$0".len()..]);
                 idx += 1;
             }
         }
@@ -716,7 +716,7 @@ fn positional_key_select(
     for idx in 0..rows {
         let mut cells = vec![idx.to_string()];
         for udt in key_udts {
-            cells.push(format!("${p}::{udt}"));
+            cells.push(Postgres.placeholder(p, Some(udt)));
             p += 1;
         }
         values.push(format!("({})", cells.join(", ")));
@@ -778,6 +778,20 @@ fn cast_journal_placeholders(insert: &str, rows: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_select_quotes_type_names_that_need_it() {
+        let sql = positional_key_select(
+            "\"t\"",
+            &["id".into(), "kind".into()],
+            &["int4".into(), "Kind Enum".into()],
+            1,
+        );
+        assert!(sql.contains("(0, $1::int4, $2::\"Kind Enum\")"), "{sql}");
+        let (pred, _) = journal_sql().keys_in(&["a".into()], 1, 0);
+        let cast = cast_key_placeholders(&pred, &["My\"Type".into()], 1);
+        assert!(cast.ends_with("(($1::\"My\"\"Type\"))"), "{cast}");
+    }
 
     #[test]
     fn key_placeholders_get_column_casts() {

@@ -11,7 +11,7 @@ keywords = ["postgres", "cdc", "replication", "etl", "pipeline"]
 categories.workspace = true
 
 [dependencies]
-faucet-core.workspace = true
+faucet-core = { workspace = true, features = ["libpq-sqlx"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 schemars.workspace = true
@@ -32,7 +32,7 @@ async-stream = { workspace = true }
 
 [dev-dependencies]
 faucet-conformance = { workspace = true, features = ["containers"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "signal", "time", "test-util"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "signal", "time", "test-util", "net", "io-util"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 tokio-postgres = "0.7"
@@ -56,3 +56,6 @@ enum_variant_added = "allow"
 constructible_struct_adds_field = "allow"
 constructible_struct_adds_private_field = "allow"
 enum_struct_variant_field_added = "allow"
+
+[lints]
+workspace = true

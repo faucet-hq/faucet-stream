@@ -118,13 +118,13 @@ pub struct MongoCdcSourceConfig {
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
     /// Max change records buffered in memory before a page is emitted, after
-    /// which the run aborts with a typed [`FaucetError::Source`]. `None` =
-    /// unbounded. The OOM safety valve: with `batch_size: 0` (or a library
+    /// which the run aborts with a typed [`FaucetError::Source`]. Defaults to
+    /// 1,000,000; `null` = unbounded. The OOM safety valve: with `batch_size: 0` (or a library
     /// caller using `fetch_all`) the change-event buffer would otherwise grow
     /// without bound for the whole fetch cycle and risk an OOM-kill on a
     /// high-throughput stream. Mirrors the same field on the sibling
     /// `postgres-cdc` / `mysql-cdc` sources.
-    #[serde(default)]
+    #[serde(default = "faucet_core::replication::default_max_staged_records")]
     pub max_staged_records: Option<usize>,
 }
 
@@ -220,8 +220,7 @@ mod tests {
         assert_eq!(c.start_from, StartFrom::Now);
         assert_eq!(c.full_document, FullDocument::Off);
         assert!(c.operation_types.is_empty());
-        // Defaults to unbounded, matching postgres-cdc / mysql-cdc.
-        assert_eq!(c.max_staged_records, None);
+        assert_eq!(c.max_staged_records, Some(1_000_000));
     }
 
     #[test]

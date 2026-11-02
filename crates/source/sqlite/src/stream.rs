@@ -41,6 +41,7 @@ fn quote_ident_sqlite(name: &str) -> String {
 
 /// Lower the connection's attached-database limit to zero (#862 H-04), so
 /// `ATTACH` and `VACUUM INTO` cannot reach another file.
+#[allow(unsafe_code)] // sets a limit through the raw connection handle
 async fn forbid_attach(conn: &mut sqlx::SqliteConnection) -> Result<(), sqlx::Error> {
     let mut handle = conn.lock_handle().await?;
     let db = handle.as_raw_handle().as_ptr();

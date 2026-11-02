@@ -60,6 +60,14 @@ fn split_columns(
     )
 }
 
+/// Connect options for `url`; under `faucet serve` nothing is taken from the
+/// `PG*` environment variables or the password file.
+pub(crate) fn connect_options(url: &str) -> Result<sqlx::postgres::PgConnectOptions, FaucetError> {
+    faucet_core::libpq::connect_options("postgres", url, |e| {
+        FaucetError::Config(format!("PostgreSQL connection failed: {e}"))
+    })
+}
+
 /// [`split_columns`] over `(name, udt)` pairs.
 #[cfg(test)]
 pub(crate) fn split_writable(
@@ -812,9 +820,10 @@ impl PostgresSink {
         }
 
         faucet_core::ensure_crypto_provider();
+        let opts = connect_options(&config.connection_url)?;
         let pool = PgPoolOptions::new()
             .max_connections(config.max_connections)
-            .connect(&config.connection_url)
+            .connect_with(opts)
             .await
             .map_err(|e| FaucetError::Sink(format!("PostgreSQL connection failed: {e}")))?;
 
@@ -2133,5 +2142,13 @@ mod tests {
         let cfg = PostgresSinkConfig::new("postgres://u@h/db", "t");
         assert!(cfg.create_table);
         assert!(!cfg.with_create_table(false).create_table);
+    }
+
+    #[test]
+    fn connect_options_word_an_unparseable_url() {
+        let err = super::connect_options("postgres://h:x/db")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("PostgreSQL connection failed"), "{err}");
     }
 }

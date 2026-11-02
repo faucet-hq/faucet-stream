@@ -332,9 +332,7 @@ pub async fn ensure_slot(
 ) -> Result<(), FaucetError> {
     use crate::config::SlotType;
     // Use sqlx for the control-plane query (not a replication connection).
-    let opts: PgConnectOptions = connection_url
-        .parse()
-        .map_err(|e| FaucetError::Config(format!("postgres-cdc: invalid connection URL: {e}")))?;
+    let opts = control_options(connection_url)?;
     let opts = apply_cdc_tls(opts, tls);
 
     use sqlx::ConnectOptions as _;
@@ -401,9 +399,7 @@ pub async fn drop_slot(
     slot_name: &str,
     tls: &crate::config::CdcTls,
 ) -> Result<(), FaucetError> {
-    let opts: PgConnectOptions = connection_url
-        .parse()
-        .map_err(|e| FaucetError::Config(format!("postgres-cdc: invalid connection URL: {e}")))?;
+    let opts = control_options(connection_url)?;
     let opts = apply_cdc_tls(opts, tls);
     use sqlx::ConnectOptions as _;
     let mut conn: PgConnection = opts
@@ -429,6 +425,15 @@ pub async fn drop_slot(
         .map_err(|e| pg_err("postgres-cdc drop slot", e))?;
     debug!("postgres-cdc: dropped replication slot '{slot_name}'");
     Ok(())
+}
+
+/// The control-plane connect options for `connection_url`; under
+/// `faucet serve` nothing is taken from the `PG*` environment variables or the
+/// password file.
+pub(crate) fn control_options(connection_url: &str) -> Result<PgConnectOptions, FaucetError> {
+    faucet_core::libpq::connect_options("postgres-cdc", connection_url, |e| {
+        FaucetError::Config(format!("postgres-cdc: invalid connection URL: {e}"))
+    })
 }
 
 /// Apply the CDC [`CdcTls`](crate::config::CdcTls) policy onto the sqlx
@@ -514,9 +519,7 @@ pub async fn advance_slot(
     if lsn == 0 {
         return Ok(());
     }
-    let opts: PgConnectOptions = connection_url
-        .parse()
-        .map_err(|e| FaucetError::Config(format!("postgres-cdc: invalid connection URL: {e}")))?;
+    let opts = control_options(connection_url)?;
     let opts = apply_cdc_tls(opts, tls);
 
     use sqlx::ConnectOptions as _;
@@ -574,9 +577,7 @@ pub async fn ensure_slot_inactive(
     slot_name: &str,
     tls: &crate::config::CdcTls,
 ) -> Result<(), FaucetError> {
-    let opts: PgConnectOptions = connection_url
-        .parse()
-        .map_err(|e| FaucetError::Config(format!("postgres-cdc: invalid connection URL: {e}")))?;
+    let opts = control_options(connection_url)?;
     let opts = apply_cdc_tls(opts, tls);
     use sqlx::ConnectOptions as _;
     let mut conn: PgConnection = opts
@@ -662,9 +663,7 @@ pub async fn ensure_slot_and_current_lsn(
     )
     .await?;
 
-    let opts: PgConnectOptions = connection_url
-        .parse()
-        .map_err(|e| FaucetError::Config(format!("postgres-cdc: invalid connection URL: {e}")))?;
+    let opts = control_options(connection_url)?;
     let opts = apply_cdc_tls(opts, tls);
     use sqlx::ConnectOptions as _;
     let mut conn: PgConnection = opts
@@ -708,9 +707,7 @@ pub async fn slot_positions(
     slot_name: &str,
     tls: &crate::config::CdcTls,
 ) -> Result<Option<(u64, Option<u64>)>, FaucetError> {
-    let opts: PgConnectOptions = connection_url
-        .parse()
-        .map_err(|e| FaucetError::Config(format!("postgres-cdc: invalid connection URL: {e}")))?;
+    let opts = control_options(connection_url)?;
     let opts = apply_cdc_tls(opts, tls);
     use sqlx::ConnectOptions as _;
     let mut conn: PgConnection = opts
@@ -780,9 +777,7 @@ pub async fn control_connection(
     connection_url: &str,
     tls: &crate::config::CdcTls,
 ) -> Result<PgConnection, FaucetError> {
-    let opts: PgConnectOptions = connection_url
-        .parse()
-        .map_err(|e| FaucetError::Config(format!("postgres-cdc: invalid connection URL: {e}")))?;
+    let opts = control_options(connection_url)?;
     let opts = apply_cdc_tls(opts, tls);
     use sqlx::ConnectOptions as _;
     opts.connect()

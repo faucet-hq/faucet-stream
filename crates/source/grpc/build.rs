@@ -9,6 +9,7 @@
 //! generated client/server module is written to `$OUT_DIR/faucet.test.echo.rs`.
 //! Integration tests resolve both paths via `env!("OUT_DIR")`.
 
+#[allow(unsafe_code)] // sets PROTOC for prost-build
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_dir = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
     let descriptor_path = out_dir.join("echo_descriptor.bin");

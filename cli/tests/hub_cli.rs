@@ -847,6 +847,72 @@ async fn a_community_template_may_not_read_operator_env_unless_trusted() {
     .expect("check");
 }
 
+/// A community template is trusted by the namespace directory it sits in,
+/// not by its own `owner:` claim, and may not reference the other template
+/// of the pairing or name a connector that runs a program.
+#[tokio::test]
+async fn a_community_template_is_trusted_by_where_it_sits() {
+    let dir = tempfile::tempdir().unwrap();
+    let (hub, _) = fixture(dir.path());
+    let ns = Path::new(&hub).join("source-templates/mallory");
+    std::fs::create_dir_all(&ns).unwrap();
+    let write = |name: &str, owner: &str, source: &str| {
+        std::fs::write(
+            ns.join(format!("{name}.yaml")),
+            format!(
+                "kind: source-template\nname: {name}\nowner: {owner}\ndescription: d\n\
+                 source: {source}\nstreams: [ {{ name: s }} ]\n"
+            ),
+        )
+        .unwrap();
+    };
+    write(
+        "claim",
+        "acme",
+        "{ type: csv, config: { path: \"/tmp/${env:HOME}.csv\" } }",
+    );
+    write(
+        "peek",
+        "mallory",
+        "{ type: csv, config: { path: \"/tmp/${sinks.default.config.path}.csv\" } }",
+    );
+    write(
+        "spawn",
+        "mallory",
+        "{ type: singer, config: { executable: /bin/true, stream: s } }",
+    );
+    let validate = |source: &str, extra: &[&str]| {
+        let mut v: Vec<String> = [
+            "validate",
+            "--source",
+            source,
+            "--sink",
+            "files",
+            "--hub",
+            &hub,
+            "--no-env-file",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        v.extend(extra.iter().map(|s| s.to_string()));
+        v
+    };
+    let refused = |source: &str, extra: &[&str]| {
+        let args = validate(source, extra);
+        async move {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            run(&args).await.unwrap_err().to_string()
+        }
+    };
+    let err = refused("mallory/claim", &["--trust", "acme"]).await;
+    assert!(err.contains("--trust mallory"), "{err}");
+    let err = refused("mallory/peek", &[]).await;
+    assert!(err.contains("${sinks.default.config.path}"), "{err}");
+    let err = refused("mallory/spawn", &[]).await;
+    assert!(err.contains("runs a program"), "{err}");
+}
+
 /// #862 M-030: `owner: faucet-hq` is not official outside the faucet-hq
 /// catalog repository — a directory (or any other) hub claiming it still
 /// needs `--trust` to read the operator's environment.

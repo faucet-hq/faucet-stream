@@ -22,9 +22,18 @@ use serde_json::Value;
 /// a client error (400); anything else is internal (500).
 fn cli_to_serve(e: CliError) -> ServeError {
     match e {
-        CliError::Config(m) => ServeError::BadConfig(m),
+        CliError::Config(m) | CliError::Faucet(faucet_core::FaucetError::Config(m)) => {
+            ServeError::BadConfig(m)
+        }
         other => ServeError::Internal(other.to_string()),
     }
+}
+
+/// Screen a request's DLQ location (system trees, the server's own files,
+/// the caller path roots). A location that matches nothing is reported by the
+/// reader as a client error.
+fn require_location(location: &str, write: bool, tenant: Option<&str>) -> Result<(), ServeError> {
+    refuse_request_path("location", location, write, tenant)
 }
 
 fn default_sample_limit() -> usize {
@@ -51,7 +60,7 @@ pub async fn inspect(
     Extension(actor): Extension<AuthContext>,
     Json(req): Json<DlqInspectRequest>,
 ) -> Result<Json<Value>, ServeError> {
-    refuse_request_path("location", &req.location, false, actor.tenant.as_deref())?;
+    require_location(&req.location, false, actor.tenant.as_deref())?;
     let location = req.location;
     let reason = req.reason;
     let limit = req.limit;
@@ -148,7 +157,7 @@ pub async fn discard(
     Extension(actor): Extension<AuthContext>,
     Json(req): Json<DlqDiscardRequest>,
 ) -> Result<Json<Value>, ServeError> {
-    refuse_request_path("location", &req.location, true, actor.tenant.as_deref())?;
+    require_location(&req.location, true, actor.tenant.as_deref())?;
     let location = req.location;
     let reason = req.reason;
     let before_ms = req.before_ms;
@@ -439,6 +448,7 @@ mod tests {
             dry_run: false,
             failed_dlq: "/dlq.failed".into(),
             skipped_other_rows: 0,
+            unsealed_discards: 0,
         });
         running.finish(&outcome, false).await;
         let rec = state.history().get("rp-1").await.unwrap().unwrap();

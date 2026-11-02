@@ -383,6 +383,17 @@ The `faucet dlq` verbs handle sealed files transparently:
   longest line.
 - `discard` keeps and archives lines **verbatim** (still sealed) — filtering
   decrypts only in memory; nothing is ever re-written in plaintext.
+- A sealed file's `.discarded` sidecar counts only entries sealed with the
+  key. Plain entries — lines discarded before the file was sealed, or written
+  by someone without the key — are not honoured, so those lines are read
+  again; `inspect`, `replay` and `discard --purge` report how many there are
+  (`unsealed_discards` in `--json`). To discard them again, record them sealed
+  with the key:
+
+  ```console
+  $ faucet dlq discard ./dlq/out.jsonl --reseal-plain --encryption-key-file ./dlq.key
+  DLQ discard: re-recorded 3 discard entr(ies) sealed with the key.
+  ```
 - Rows that fail again during a `replay` land in the fresh failure DLQ sealed
   with the same keys.
 - Supply keys without putting them on the command line with

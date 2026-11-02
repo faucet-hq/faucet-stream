@@ -203,3 +203,19 @@ async fn a_param_only_destination_composes_with_one_stream_only() {
             .contains("invoices and payments")
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_compatibility_matrix_hides_secret_list_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Server::start().await;
+    let body = format!(
+        "kind: sink-template\nname: hdrs\ndescription: Local JSON Lines\nparams:\n  out_dir: {{ type: string, default: {} }}\n  header_values: {{ type: list, items: {{ type: string, secret: true }}, default: [dummy-list-secret] }}\nsink:\n  type: jsonl\n  config: {{}}\nper_stream:\n  path: \"${{param.out_dir}}/${{stream}}.jsonl\"\n",
+        dir.path().display()
+    );
+    let (code, r) = s.register(&body).await;
+    assert_eq!(code, 201, "{r}");
+    let (_, m) = s.call("GET", "/v1/templates/matrix", None).await;
+    let shown = m["sinks"].to_string();
+    assert!(!shown.contains("dummy-list-secret"), "{shown}");
+    assert!(shown.contains("(hidden)"), "{shown}");
+}

@@ -8,7 +8,7 @@
 //! downloaded (it is genuinely incremental).
 //!
 //! Requires Docker.
-
+#![allow(unsafe_code)] // tests set process environment variables
 #![cfg(feature = "arrow")]
 
 use std::collections::HashMap;

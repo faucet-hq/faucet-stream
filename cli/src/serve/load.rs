@@ -4,7 +4,7 @@
 //! `${vault:…}`-style directives resolve against the *server's* environment and
 //! credentials (the documented privilege surface — spec §13).
 
-use crate::config::PipelineConfig;
+use crate::config::{PipelineConfig, TransformSpec};
 use crate::expand::{ExpandedNode, expand};
 use crate::serve::error::ServeError;
 use faucet_core::resolve::{ReferencePolicy, ResourceKind};
@@ -206,11 +206,52 @@ pub fn confine_sql(cfg: &mut PipelineConfig) {
     if let Some(r) = cfg.reconcile.as_mut() {
         force_source(&mut r.count.config, &r.count.kind);
     }
+    let p = &mut cfg.pipeline;
+    bound_sql_transforms(&mut p.transforms);
+    for spec in p.source.iter_mut().chain(p.sources.values_mut()) {
+        bound_sql_transforms(spec.transforms.iter_mut().flatten());
+    }
+    for node in p.nodes.values_mut() {
+        if let crate::config::NodeSpec::Transform { transforms } = node {
+            bound_sql_transforms(transforms);
+        }
+    }
+    for row in &mut cfg.matrix {
+        bound_sql_transforms(row.transforms.iter_mut().flatten());
+    }
+}
+
+/// The DuckDB `memory_limit` a `sql` transform in a request's config gets when
+/// it sets none.
+pub const SQL_TRANSFORM_MEMORY_LIMIT: &str = "1GB";
+
+/// The most DuckDB threads a `sql` transform in a request's config gets when
+/// it sets none.
+pub const SQL_TRANSFORM_MAX_THREADS: usize = 4;
+
+/// Give each `sql` transform that leaves them unset a bounded `memory_limit`
+/// and `threads` (DuckDB's own defaults take most of the machine).
+fn bound_sql_transforms<'a>(transforms: impl IntoIterator<Item = &'a mut TransformSpec>) {
+    for t in transforms.into_iter().filter(|t| t.kind == "sql") {
+        let Some(map) = t.config.as_object_mut() else {
+            continue;
+        };
+        if map.get("memory_limit").is_none_or(Value::is_null) {
+            map.insert("memory_limit".into(), SQL_TRANSFORM_MEMORY_LIMIT.into());
+        }
+        if map.get("threads").is_none_or(Value::is_null) {
+            let threads = std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .min(SQL_TRANSFORM_MAX_THREADS);
+            map.insert("threads".into(), threads.into());
+        }
+    }
 }
 
 /// [`confine_sql`] over expanded rows: the merged configs each row builds.
 pub fn confine_sql_nodes(nodes: &mut [ExpandedNode]) {
     for n in nodes {
+        bound_sql_transforms(&mut n.transforms);
         force_source(&mut n.source.config, &n.source.kind);
         force_sink(&mut n.sink.config, &n.sink.kind);
         if let Some(d) = n.dlq.as_mut() {
@@ -245,6 +286,8 @@ pub const LOCAL_PATH_KINDS: &[&str] = &[
 struct Protected {
     env: std::collections::BTreeSet<String>,
     files: std::collections::BTreeSet<std::path::PathBuf>,
+    dirs: std::collections::BTreeSet<std::path::PathBuf>,
+    own_state: std::collections::BTreeSet<std::path::PathBuf>,
     secrets: std::collections::BTreeSet<(String, String)>,
 }
 
@@ -265,6 +308,59 @@ pub fn protect_env(name: &str) {
 pub fn protect_file(path: &std::path::Path) {
     if let Ok(mut p) = protected().write() {
         p.files.insert(normalize_path(path));
+    }
+}
+
+/// Mark a directory the server keeps its own files in (a file state store) so
+/// no loaded config reads or writes anything under it.
+pub fn protect_dir(path: &std::path::Path) {
+    if let Ok(mut p) = protected().write() {
+        p.dirs.insert(normalize_path(path));
+    }
+}
+
+/// Protect the file state store a `--default-config` keeps its bookmarks in:
+/// no loaded config reads or writes under it as data, while a run that keeps
+/// that same store as its own state (the value it inherits from the default
+/// config) still may.
+pub fn protect_default_state(base: &Value) {
+    let state = &base["pipeline"]["state"];
+    if state["type"] == "file"
+        && let Some(dir) = state["config"]["path"].as_str()
+    {
+        let dir = normalize_path(std::path::Path::new(dir));
+        if let Ok(mut p) = protected().write() {
+            p.dirs.insert(dir.clone());
+            p.own_state.insert(dir);
+        }
+    }
+}
+
+/// Whether a `kind` state store with `config` is the server's own default
+/// state store.
+fn is_default_state(kind: &str, config: &Value) -> bool {
+    kind == "file"
+        && config["path"].as_str().is_some_and(|dir| {
+            let dir = normalize_path(std::path::Path::new(dir));
+            protected()
+                .read()
+                .map(|p| p.own_state.contains(&dir))
+                .unwrap_or(false)
+        })
+}
+
+/// Protect the server's environment files: the one it loaded, and every
+/// `.env` / `.env.*` in its working directory whether loaded or not.
+pub fn protect_env_files(cwd: &std::path::Path, loaded: Option<&std::path::Path>) {
+    if let Some(p) = loaded {
+        protect_file(p);
+    }
+    if let Ok(entries) = std::fs::read_dir(cwd) {
+        for e in entries.flatten() {
+            if e.file_name().to_string_lossy().starts_with(".env") {
+                protect_file(&e.path());
+            }
+        }
     }
 }
 
@@ -305,18 +401,18 @@ pub fn protect_input(path: &std::path::Path, doc: &Value) {
 /// Protect a SQLite database the server keeps (run history), with its
 /// journal files.
 pub fn protect_sqlite_url(url: &str) {
-    if let Some(path) = sqlite_path(url) {
+    if let Some(path) = sqlite_path(url).as_deref() {
         for suffix in ["", "-wal", "-shm", "-journal"] {
             protect_file(std::path::Path::new(&format!("{path}{suffix}")));
         }
     }
 }
 
-fn sqlite_path(url: &str) -> Option<&str> {
-    let rest = url.strip_prefix("sqlite:")?;
-    let rest = rest.strip_prefix("//").unwrap_or(rest);
-    let rest = rest.split('?').next().unwrap_or(rest);
-    (!rest.is_empty() && rest != ":memory:").then_some(rest)
+fn sqlite_path(url: &str) -> Option<std::borrow::Cow<'_, str>> {
+    if !url.starts_with("sqlite:") {
+        return None;
+    }
+    local_path(url)
 }
 
 fn secret_base(reference: &str) -> &str {
@@ -331,6 +427,26 @@ fn secret_is_protected(scheme: &str, reference: &str) -> bool {
                 .contains(&(scheme.to_string(), secret_base(reference).to_string()))
         })
         .unwrap_or(true)
+}
+
+/// The check a secret-manager reference passes right before it is fetched:
+/// never one of the server's own, and allowed by `policy` unless the
+/// operator's `--default-config` base wrote it as is.
+fn secret_screen(
+    policy: &ReferencePolicy,
+    operator_tokens: &std::collections::BTreeSet<String>,
+) -> impl Fn(&str, &str) -> Result<(), String> + Send + Sync + use<> {
+    let policy = policy.clone();
+    let operator_tokens = operator_tokens.clone();
+    move |scheme: &str, reference: &str| {
+        if secret_is_protected(scheme, reference) {
+            return Err("it is one of the server's own credentials".into());
+        }
+        if operator_tokens.contains(&format!("${{{scheme}:{reference}}}")) {
+            return Ok(());
+        }
+        policy.check_secret(scheme, reference).map_err(|e| e.reason)
+    }
 }
 
 fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
@@ -406,6 +522,7 @@ fn file_is_protected(path: &str) -> bool {
         .read()
         .map(|g| g.files.contains(&normalized))
         .unwrap_or(true)
+        || protected_dirs(|d| normalized.starts_with(d))
 }
 
 /// How a connector touches a local path.
@@ -436,6 +553,7 @@ fn data_path_is_protected(path: &str, access: Access) -> bool {
         if in_system_dir(raw) || in_system_dir(&normalized) {
             return true;
         }
+        let recursive = matches!(access, Access::Read { recursive: true });
         return protected_files(|f| match access {
             Access::Write => f == normalized,
             Access::Read { recursive } => {
@@ -443,6 +561,8 @@ fn data_path_is_protected(path: &str, access: Access) -> bool {
                     || f.parent() == Some(normalized.as_path())
                     || (recursive && f.starts_with(&normalized))
             }
+        }) || protected_dirs(|d| {
+            normalized.starts_with(d) || (recursive && d.starts_with(&normalized))
         });
     }
     glob_is_protected(&pattern, access)
@@ -470,7 +590,7 @@ fn glob_is_protected(pattern: &str, access: Access) -> bool {
     let hit = match glob::Pattern::new(&full) {
         Ok(p) => protected_files(|f| p.matches_path(f)),
         Err(_) => protected_files(|f| f.starts_with(&dir)),
-    };
+    } || protected_dirs(|d| dir.starts_with(d) || d.starts_with(&dir));
     hit || (matches!(access, Access::Read { .. }) && glob_match_escapes(&full))
 }
 
@@ -508,7 +628,11 @@ fn glob_match_escapes(pattern: &str) -> bool {
         .take(GLOB_CHECK_LIMIT)
         .filter_map(Result::ok)
         .filter_map(|p| std::fs::canonicalize(p).ok())
-        .any(|real| in_system_dir(&real) || protected_files(|f| f == real))
+        .any(|real| {
+            in_system_dir(&real)
+                || protected_files(|f| f == real)
+                || protected_dirs(|d| real.starts_with(d))
+        })
 }
 
 /// Replace `{…}` path-template segments (a file sink's `{part}`) with `*`.
@@ -551,6 +675,13 @@ fn protected_files(pred: impl Fn(&std::path::Path) -> bool) -> bool {
     protected()
         .read()
         .map(|g| g.files.iter().any(|f| pred(f)))
+        .unwrap_or(true)
+}
+
+fn protected_dirs(pred: impl Fn(&std::path::Path) -> bool) -> bool {
+    protected()
+        .read()
+        .map(|g| g.dirs.iter().any(|d| pred(d)))
         .unwrap_or(true)
 }
 
@@ -612,19 +743,10 @@ fn is_path_key(key: &str) -> bool {
         || key.ends_with("_file")
 }
 
-/// The local filesystem path a config value names, if it names one.
-fn local_path(value: &str) -> Option<&str> {
-    if let Some(p) = sqlite_path(value) {
-        return Some(p);
-    }
-    if let Some(p) = value.strip_prefix("file://") {
-        return Some(p);
-    }
-    if value.contains("://") {
-        return None;
-    }
-    let p = value.strip_prefix("file:").unwrap_or(value);
-    (!p.is_empty() && p != ":memory:").then_some(p)
+/// The local filesystem path a config value names, if it names one: read as
+/// the connector reads it ([`faucet_core::resolve::local_path`]).
+fn local_path(value: &str) -> Option<std::borrow::Cow<'_, str>> {
+    faucet_core::resolve::local_path(value).filter(|p| !p.is_empty() && p != ":memory:")
 }
 
 /// Runtime tokens a local path may carry in a caller-supplied config: their
@@ -771,6 +893,7 @@ fn check_path_value(
     let Some(path) = local_path(s) else {
         return;
     };
+    let path = path.as_ref();
     if scope.caller && takes_record_value(path) {
         found.add(
             scope,
@@ -858,6 +981,7 @@ fn check_connector(
         if r.kind == ResourceKind::Path
             && let Some(path) = local_path(&r.value)
         {
+            let path = path.as_ref();
             if scope.caller && takes_record_value(path) {
                 let text = format!("{} {RECORD_PATH}", r.value);
                 found.add(scope, base, ptr, &r.value, Why::RecordPath, text);
@@ -945,7 +1069,9 @@ fn data_path_findings(doc: &Value, scope: &Scope<'_>) -> Findings {
                         ),
                         None => (String::new(), None),
                     };
-                    if let Some(config) = config {
+                    let own_state = ptr.ends_with("/state")
+                        && config.as_ref().is_some_and(|c| is_default_state(t, c));
+                    if let Some(config) = config.filter(|_| !own_state) {
                         let rel = scope.only.map(|f| f.under(&base));
                         let inner = scope.within(rel.as_ref());
                         if map.contains_key("config") {
@@ -1182,63 +1308,7 @@ fn propagate_caller_fields(
     doc: &Value,
     fields: &crate::params::CallerFields,
 ) -> crate::params::CallerFields {
-    use crate::interpolate::{Directive, iter_directives};
-    use crate::params::caller::{child, escape};
-    fn strings(v: &Value, ptr: &str, out: &mut Vec<(String, String)>) {
-        match v {
-            Value::String(s) if s.contains("${") => out.push((ptr.to_string(), s.clone())),
-            Value::Array(a) => a
-                .iter()
-                .enumerate()
-                .for_each(|(i, x)| strings(x, &format!("{ptr}/{i}"), out)),
-            Value::Object(o) => o.iter().for_each(|(k, x)| strings(x, &child(ptr, k), out)),
-            _ => {}
-        }
-    }
-    let mut leaves = Vec::new();
-    strings(doc, "", &mut leaves);
-    let targets = |id: &str, path: &str| -> Vec<String> {
-        let mut segs = path.split('.');
-        let rest = |segs: std::str::Split<'_, char>| {
-            segs.map(|s| format!("/{}", escape(s))).collect::<String>()
-        };
-        match id {
-            "vars" => vec![format!("/vars{}", rest(segs))],
-            "sources" | "sinks" => {
-                let Some(name) = segs.next() else {
-                    return Vec::new();
-                };
-                let rest = rest(segs);
-                let mut out = vec![format!("/pipeline/{id}/{}{rest}", escape(name))];
-                if name == "default" {
-                    let legacy = if id == "sources" { "source" } else { "sink" };
-                    out.push(format!("/pipeline/{legacy}{rest}"));
-                }
-                out
-            }
-            _ => Vec::new(),
-        }
-    };
-    let mut out = fields.clone();
-    loop {
-        let before = out.clone();
-        for (ptr, s) in &leaves {
-            for (_, d) in iter_directives(s) {
-                let Directive::Deferred { id, path } = d else {
-                    continue;
-                };
-                for t in targets(id, path) {
-                    let params = out.params_at(&t);
-                    if !params.is_empty() {
-                        out.insert_all(ptr, &params);
-                    }
-                }
-            }
-        }
-        if out == before {
-            break;
-        }
-    }
+    let out = crate::params::caller::through_refs(doc, fields);
     let mut out = out.with_alias(0, "replication", "mirror");
     for (ptr, params) in out.clone().iter() {
         let segs: Vec<&str> = ptr.split('/').skip(1).collect();
@@ -1418,7 +1488,8 @@ pub fn refuse_request_path_with(
     for_tenant: bool,
     policy: &ReferencePolicy,
 ) -> Result<(), ServeError> {
-    let local = local_path(path).unwrap_or(path);
+    let local = local_path(path).unwrap_or(std::borrow::Cow::Borrowed(path));
+    let local = local.as_ref();
     let protected = data_path_is_protected(local, Access::Read { recursive: true })
         || (write && data_path_is_protected(local, Access::Write));
     if protected {
@@ -1481,7 +1552,11 @@ pub fn refuse_server_paths_with(
         };
         check(&n.source.kind, &n.source.config, read);
         check(&n.sink.kind, &n.sink.config, Access::Write);
-        if let Some(st) = &n.state {
+        if let Some(st) = n
+            .state
+            .as_ref()
+            .filter(|st| !is_default_state(&st.kind, &st.config))
+        {
             check(&st.kind, &st.config, Access::Write);
         }
         if let Some(d) = &n.dlq {
@@ -1509,7 +1584,8 @@ fn findings_error(mut found: Findings) -> Result<(), ServeError> {
         return Err(ServeError::Forbidden(format!(
             "the config names resources a submitted config may not reach under the server's \
              reference policy: {}; the operator can allow them with --allow-path-root / \
-             --allow-url-host / --allow-url-scheme, or register the pipeline as a template",
+             --allow-url-host / --allow-url-scheme / --allow-unverified-tls, or register the \
+             pipeline as a template",
             found.policy.join(", ")
         )));
     }
@@ -1767,7 +1843,8 @@ fn provider_findings(spec: &Value, at: (&str, &str), scope: &Scope<'_>, found: &
         let ptr = r.pointer.as_str();
         match r.kind {
             ResourceKind::Path => {
-                let path = local_path(&r.value).unwrap_or(&r.value);
+                let path = local_path(&r.value).unwrap_or(std::borrow::Cow::Borrowed(&r.value));
+                let path = path.as_ref();
                 let access = if r.writes {
                     Access::Write
                 } else {
@@ -1917,6 +1994,7 @@ fn resolution_error(e: crate::error::CliError) -> ServeError {
         CliError::ReadInterpolatedFile { .. }
         | CliError::SecretFetchFailed { .. }
         | CliError::SecretAuthFailed { .. } => ServeError::Unavailable(e.to_string()),
+        CliError::SecretRefused { .. } => ServeError::Forbidden(e.to_string()),
         other => ServeError::BadConfig(other.to_string()),
     }
 }
@@ -2237,7 +2315,11 @@ pub async fn load_submission_inputs(
     #[cfg(not(feature = "policy"))]
     let _ = policy;
 
-    crate::secrets::resolve_secrets(&mut cfg)
+    // Each reference is held to the policy again as it is about to be read:
+    // it may have taken its final form only after `${vars.*}` / template
+    // references were substituted.
+    let screen = secret_screen(&refs, &operator_tokens);
+    crate::secrets::resolve_secrets_screened(&mut cfg, &screen)
         .await
         .map_err(resolution_error)?;
 

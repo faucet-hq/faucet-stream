@@ -10,6 +10,7 @@
 //! so each stream is created in its own account and only the credentials the
 //! variant must produce can read it.
 #![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
+#![allow(unsafe_code)] // tests set process environment variables
 
 use aws_sdk_kinesis::primitives::Blob;
 use base64::Engine as _;

@@ -657,6 +657,7 @@ fn prune_old(key_dir: &Path, keep: &str, previous: Option<&str>) {
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)] // tests set process environment variables
 mod tests {
     use super::*;
     use serde_json::json;

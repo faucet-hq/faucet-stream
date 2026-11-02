@@ -302,8 +302,15 @@ true
 on a persistent volume (without one the file sits on an emptyDir).
 */}}
 {{- define "faucet-stream.durableHistory" -}}
-{{- $h := .Values.serve.history.backend -}}
+{{- $h := include "faucet-stream.historyBackend" . -}}
 {{- if or (eq $h "postgres") (and (eq $h "sqlite") (or .Values.serve.persistence.enabled .Values.serve.persistence.existingClaim)) -}}
 true
 {{- end -}}
+{{- end -}}
+
+{{/*
+serve.history.backend, lower-cased (validation.yaml refuses any other value).
+*/}}
+{{- define "faucet-stream.historyBackend" -}}
+{{- .Values.serve.history.backend | toString | lower | trim -}}
 {{- end -}}

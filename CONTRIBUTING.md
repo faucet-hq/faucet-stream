@@ -49,6 +49,11 @@ has a `docker compose` stack and `make demo` for a no-infrastructure smoke test.
 - Every failure path maps to a typed `FaucetError` variant. No `.unwrap()` /
   `.expect()` on anything that can fail at runtime.
 - No hardcoded credentials, tokens, or service URLs — ever.
+- `unsafe` code is denied workspace-wide (`[workspace.lints.rust]`). Where it
+  is unavoidable (an FFI call, a test that sets environment variables), allow
+  it on the smallest item with a one-line reason:
+  `#[allow(unsafe_code)] // gethostname FFI call`. Every member crate carries
+  `[lints] workspace = true`.
 - Reuse clients/connections; pool database connections; prefer bulk/multi-row
   APIs and streaming. Performance and reliability are the project's first
   priority.
@@ -240,8 +245,10 @@ revision). Day-to-day releases should go through release-plz. It creates no
 GitHub release, and `release-binaries.yml` only uploads to an existing one: after
 a manual publish of `faucet-cli`, create the `faucet-cli-vX.Y.Z` release by hand
 (`gh release create faucet-cli-vX.Y.Z --notes-file <(scripts/release-notes.py --sha <commit>)`),
-then dispatch `release-binaries.yml` with that `tag` if the tag push did not
-start it.
+then dispatch `release-binaries.yml` on that tag
+(`gh workflow run release-binaries.yml --ref faucet-cli-vX.Y.Z`) if the tag
+push did not start it. A dispatch on any other ref is refused, and an asset
+already on the release is replaced only with `-f replace_assets=true`.
 
 **Recovering a stalled release.** If the publish job dies mid-release, the
 release commit's push is consumed and no new release PR appears while `main`'s

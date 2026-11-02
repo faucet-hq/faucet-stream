@@ -4,6 +4,7 @@
 //! (bounded-memory streaming) boots MinIO via testcontainers and so requires
 //! Docker — it runs in CI alongside the other integration tests. It matches
 //! the existing streaming integration test's MinIO + bucket setup verbatim.
+#![allow(unsafe_code)] // tests set process environment variables
 
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Credentials;

@@ -28,6 +28,7 @@ impl SqliteHistory {
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .busy_timeout(Duration::from_secs(5));
+        create_private(opts.get_filename());
         let pool = SqlitePoolOptions::new()
             .max_connections(super::sql::POOL_MAX_CONNECTIONS)
             .before_acquire(|conn, _| {
@@ -44,6 +45,54 @@ impl SqliteHistory {
             instance_id,
             Stmts::new(Dialect::Sqlite),
         ))
+    }
+}
+
+/// Create a missing database file readable by its owner only; SQLite gives its
+/// WAL and shared-memory files the database file's permissions. A failure is
+/// left for the connect to report.
+fn create_private(path: &std::path::Path) -> bool {
+    if path.as_os_str().is_empty() || path.to_string_lossy().starts_with("file:") {
+        return false;
+    }
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut open, 0o600);
+    open.open(path).is_ok()
+}
+
+#[cfg(all(test, unix))]
+mod permission_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn a_new_database_and_its_wal_are_private_to_the_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("history.db");
+        let url = format!("sqlite:{}", db.display());
+        let h = SqliteHistory::connect(
+            &url,
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+            "i".into(),
+        )
+        .await
+        .unwrap();
+        drop(h);
+        for f in [db.clone(), dir.path().join("history.db-wal")] {
+            if let Ok(meta) = std::fs::metadata(&f) {
+                assert_eq!(meta.permissions().mode() & 0o777, 0o600, "{}", f.display());
+            }
+        }
+        assert!(db.exists());
+        assert!(!create_private(std::path::Path::new("")));
+        assert!(!create_private(std::path::Path::new(
+            "file:sqlx-in-memory-1"
+        )));
+        assert!(!create_private(&db), "an existing file is left as it is");
+        assert!(!create_private(&dir.path().join("missing/x.db")));
     }
 }
 

@@ -3,6 +3,7 @@
 //! records and an identical Arrow schema. Requires Docker.
 #![allow(deprecated)]
 #![cfg(feature = "arrow")]
+#![allow(unsafe_code)] // tests set process environment variables
 
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Credentials;

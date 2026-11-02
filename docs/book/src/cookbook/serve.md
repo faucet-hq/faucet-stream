@@ -56,6 +56,17 @@ Mitigations are deployment-level and **mandatory**:
   accepts the exposure, and then the server logs a warning at startup. Inside a
   container that binds `0.0.0.0`, publish the port on loopback only
   (`-p 127.0.0.1:8080:8080`) when you pass it.
+- A browser can reach a loopback server too. A `--no-auth` loopback server
+  therefore answers only `localhost`, `127.0.0.1`, `[::1]` and its listen
+  address as `Host`, every server refuses a state-changing request whose
+  `Origin` is another site's, and `/mcp` and webhook triggers take only the
+  content types they parse. Behind a proxy, list the public host name with
+  `--allowed-host` (which also turns the `Host` check on for an authenticating
+  server) and, when the proxy rewrites `Host`, the console's origin with
+  `--allowed-origin`. See [Authentication](../reference/http-api.md#authentication).
+- Use long random tokens (`openssl rand -hex 32`): the server warns about one
+  under 16 characters, and refuses an address for a minute after 20 invalid
+  tokens.
 - Run single-tenant, behind authentication, behind egress controls / network
   policy. The default loopback bind (`127.0.0.1`) is deliberate — exposing
   externally is an explicit choice.
@@ -93,7 +104,15 @@ A viewer's `POST /v1/runs` returns `403`; its `GET /v1/runs` returns `200`.
 reference that does not resolve refuses the start, and a token still holding
 `${` is refused — never accepted literally. No config the server loads can read
 those variables or files, nor `FAUCET_VAULT_KEY` and the server's own token
-variables.
+variables — not as a reference, and not as data either: a connector, state, DLQ
+or preview path that reaches one of the server's own files is refused. Those
+files are the `.env` it loaded and every `.env` / `.env.*` in its working
+directory, the `--auth-config`, `--policy`, `--triggers`, `--templates-sync`,
+`--connect-providers`, `--otel-config` and `--default-config` files and
+everything they read, the SQLite run-history database with its `-wal` / `-shm`
+files, and the `--default-config`'s file state directory. Keep other secrets
+out of the working and temp directories, or start the server with
+`--allow-path-root` set to a data directory of its own.
 
 A config submitted over HTTP or MCP may not use the `singer` source or sink —
 they run a program on the host — unless the server is started with

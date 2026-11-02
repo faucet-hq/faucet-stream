@@ -66,6 +66,11 @@ pub struct InspectSummary {
     /// Sealed (encrypted) lines that could not be decrypted with the
     /// available keys — pass `--encryption-key` to read them.
     pub undecryptable: usize,
+    /// Discard entries of sealed files written without the key (before the
+    /// file was sealed, or by someone without it): not honoured, so those
+    /// lines are read. `faucet dlq discard --reseal-plain` with the key
+    /// records them again.
+    pub unsealed_discards: usize,
     pub by_reason: BTreeMap<String, usize>,
     pub by_error_kind: BTreeMap<String, usize>,
     pub sample: Vec<EnvelopeSummary>,
@@ -85,6 +90,9 @@ pub struct ReplayOutcome {
     pub dry_run: bool,
     /// Where replayed rows that fail *again* are quarantined.
     pub failed_dlq: String,
+    /// Discard entries of sealed files that are not honoured, so their lines
+    /// were candidates (see [`InspectSummary::unsealed_discards`]).
+    pub unsealed_discards: usize,
 }
 
 /// Outcome of a [`discard`] run.
@@ -135,6 +143,7 @@ pub fn inspect(
         malformed: scan.malformed,
         non_envelope: scan.non_envelope,
         undecryptable: scan.undecryptable,
+        unsealed_discards: scan.unsealed_discards,
         by_reason,
         by_error_kind,
         sample,
@@ -210,7 +219,7 @@ pub async fn replay(
     // reader will use.
     let target = plan::replay_target(cfg, &node, inputs.all_rows);
     let (mut matching, mut candidates) = (0usize, 0usize);
-    scan_each(&files, &decryptor, |e| {
+    let scan = scan_each(&files, &decryptor, |e| {
         if reason_matches(&e, reason.as_deref()) {
             matching += 1;
             if replay_selects(&e, None, target.as_ref()) {
@@ -301,6 +310,7 @@ pub async fn replay(
         records_written,
         dry_run: inputs.dry_run,
         failed_dlq: failed.to_string_lossy().into_owned(),
+        unsealed_discards: scan.unsealed_discards,
     })
 }
 
@@ -341,7 +351,8 @@ pub fn discard(
 
     for file in &files {
         let limit = dec.verify_file(file)?;
-        let mut already = reader::discarded_lines(file)?;
+        let sealed = dec.seals(file)?;
+        let mut already = dec.discarded_ids(file)?;
         let mut ids = String::new();
         let archive = archive_path(file);
         let in_archive = if delete {
@@ -360,7 +371,7 @@ pub fn discard(
                 return Ok(());
             }
             file_discarded += 1;
-            ids.push_str(&id);
+            ids.push_str(&dec.discard_entry(file, &id, sealed));
             ids.push('\n');
             let archived_before = in_archive.contains(&id);
             already.insert(id);
@@ -399,6 +410,36 @@ pub fn discard(
     })
 }
 
+/// Record again, sealed with the loaded key, the plain discard entries of the
+/// sealed files at `location` that no sealed entry covers (lines discarded
+/// before the file was sealed). Returns how many were recorded. Needs the
+/// key the files are sealed with; a file that is not sealed is left alone.
+pub fn reseal_plain_discards(location: &str, dec: &DlqDecryptor) -> CliResult<usize> {
+    if !dec.is_active() {
+        return Err(CliError::Config(
+            "re-recording discard entries needs the key the DLQ is sealed with \
+             (--encryption-key or --encryption-key-file)"
+                .into(),
+        ));
+    }
+    let mut recorded = 0usize;
+    for file in &expand_location(location)? {
+        let plain = dec.unsealed_discards(file)?;
+        if plain.is_empty() {
+            continue;
+        }
+        let mut ids: Vec<&String> = plain.iter().collect();
+        ids.sort();
+        let entries: String = ids
+            .iter()
+            .map(|id| format!("{}\n", dec.discard_entry(file, id, true)))
+            .collect();
+        append_to(&reader::discard_sidecar(file), &entries)?;
+        recorded += ids.len();
+    }
+    Ok(recorded)
+}
+
 /// Copy `file` into `tmp` line by line without the lines whose id is in
 /// `drop`; returns how many were dropped.
 fn filter_lines_into(
@@ -435,6 +476,9 @@ pub struct PurgeOutcome {
     pub purged: usize,
     /// DLQ files rewritten.
     pub files_rewritten: usize,
+    /// Discard entries of sealed files that are not honoured, so their lines
+    /// were kept (see [`InspectSummary::unsealed_discards`]).
+    pub unsealed_discards: usize,
 }
 
 /// Physically remove every envelope a discard recorded (#862 M-024): each
@@ -457,7 +501,8 @@ pub fn purge_with(location: &str, dec: &DlqDecryptor) -> CliResult<PurgeOutcome>
     let files = expand_location(location)?;
     let mut out = PurgeOutcome::default();
     for file in &files {
-        let ids = reader::discarded_lines(file)?;
+        out.unsealed_discards += dec.unsealed_discards(file)?.len();
+        let ids = dec.discarded_ids(file)?;
         if ids.is_empty() {
             continue;
         }
@@ -669,9 +714,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("dlq.jsonl");
         std::fs::write(&file, &body).unwrap();
+        let dec = DlqDecryptor::from_keys(&["k".to_string()]).unwrap();
+        let entry = |line: &str| dec.discard_entry(&file, &reader::line_id(line), true);
         std::fs::write(
             reader::discard_sidecar(&file),
-            format!("{}\n", reader::line_id(&lines[1])),
+            format!("{}\n{}\n", entry(&lines[1]), reader::line_id(&lines[0])),
         )
         .unwrap();
         let loc = file.to_str().unwrap();
@@ -683,7 +730,6 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), body, "untouched");
 
-        let dec = DlqDecryptor::from_keys(&["k".to_string()]).unwrap();
         let out = purge_with(loc, &dec).unwrap();
         assert_eq!((out.purged, out.files_rewritten), (1, 1));
         let raw = std::fs::read(&file).unwrap();
@@ -705,7 +751,7 @@ mod tests {
         std::fs::write(&file, &damaged).unwrap();
         std::fs::write(
             reader::discard_sidecar(&file),
-            format!("{}\n", reader::line_id(&lines[0])),
+            format!("{}\n", entry(&lines[0])),
         )
         .unwrap();
         let err = purge_with(loc, &dec).unwrap_err().to_string();
@@ -719,7 +765,7 @@ mod tests {
         std::fs::write(&file, format!("{}\n{}\n", unbound[0], unbound[1])).unwrap();
         std::fs::write(
             reader::discard_sidecar(&file),
-            format!("{}\n", reader::line_id(&unbound[0])),
+            format!("{}\n", entry(&unbound[0])),
         )
         .unwrap();
         let out = purge_with(loc, &dec).unwrap();
@@ -731,6 +777,131 @@ mod tests {
             std::fs::read_to_string(&file).unwrap(),
             format!("{}\n", unbound[1])
         );
+    }
+
+    /// A sealed DLQ file's discard list counts only entries sealed with its
+    /// key for that file; a file that starts in plaintext but holds sealed
+    /// lines is not read.
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn a_sealed_dlq_counts_only_discard_entries_sealed_for_it() {
+        use faucet_common_file::sealed_lines::LineSeal;
+        let enc = faucet_core::CompiledEncryption::compile(&faucet_core::EncryptionSpec {
+            key: "k".into(),
+            previous_keys: vec![],
+            algorithm: Default::default(),
+        })
+        .unwrap();
+        let mut seal = LineSeal::new();
+        let mut body = String::from_utf8(seal.header(&enc)).unwrap();
+        let mut sealed = Vec::new();
+        for id in 1..=3 {
+            let line = env_line("quality", "QualityFailure", id, json!({ "id": id }));
+            let s = String::from_utf8(seal.seal(&enc, line.as_bytes())).unwrap();
+            sealed.push(s.trim_end().to_string());
+            body.push_str(&s);
+        }
+        body.push_str(&String::from_utf8(seal.trailer(&enc)).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("dlq.jsonl");
+        let other = dir.path().join("other.jsonl");
+        std::fs::write(&file, &body).unwrap();
+        std::fs::write(&other, &body).unwrap();
+        let dec = DlqDecryptor::from_keys(&["k".to_string()]).unwrap();
+        assert!(dec.seals(&file).unwrap());
+        let forged = format!(
+            "{}\nsealed:not-base64\n{}\n",
+            reader::line_id(&sealed[0]),
+            dec.discard_entry(&other, &reader::line_id(&sealed[1]), true)
+        );
+        std::fs::write(reader::discard_sidecar(&file), forged).unwrap();
+        let scan = reader::scan_files(std::slice::from_ref(&file), &dec).unwrap();
+        assert_eq!(
+            scan.envelopes.len(),
+            3,
+            "unsealed or foreign entries hide nothing"
+        );
+
+        let out = discard(file.to_str().unwrap(), Some("quality"), None, true, &dec).unwrap();
+        assert_eq!(out.discarded, 3);
+        let scan = reader::scan_files(std::slice::from_ref(&file), &dec).unwrap();
+        assert_eq!(scan.envelopes.len(), 0, "entries the discard sealed count");
+        assert_eq!(
+            dec.discard_entry(&file, "id", false),
+            "id",
+            "a file that is not sealed keeps plain entries"
+        );
+        let plain = dir.path().join("plain.jsonl");
+        std::fs::write(&plain, "{}\n").unwrap();
+        assert!(!dec.seals(&plain).unwrap());
+        assert!(!DlqDecryptor::default().seals(&file).unwrap());
+
+        let mixed = dir.path().join("mixed.jsonl");
+        std::fs::write(
+            &mixed,
+            format!("{}\n{body}", env_line("quality", "Q", 9, json!({}))),
+        )
+        .unwrap();
+        let err = reader::scan_files(std::slice::from_ref(&mixed), &dec).unwrap_err();
+        assert!(
+            err.to_string().contains("starts with a plaintext line"),
+            "{err}"
+        );
+    }
+
+    /// Plain discard entries of a sealed DLQ (written before it was sealed)
+    /// are reported by inspect and purge, and `reseal_plain_discards` with
+    /// the key records them sealed so they are honoured again.
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn plain_discard_entries_of_a_sealed_dlq_are_reported_and_can_be_resealed() {
+        use faucet_common_file::sealed_lines::LineSeal;
+        let enc = faucet_core::CompiledEncryption::compile(&faucet_core::EncryptionSpec {
+            key: "k".into(),
+            previous_keys: vec![],
+            algorithm: Default::default(),
+        })
+        .unwrap();
+        let mut seal = LineSeal::new();
+        let mut body = String::from_utf8(seal.header(&enc)).unwrap();
+        let mut sealed = Vec::new();
+        for id in 1..=2 {
+            let line = env_line("quality", "QualityFailure", id, json!({ "id": id }));
+            let s = String::from_utf8(seal.seal(&enc, line.as_bytes())).unwrap();
+            sealed.push(s.trim_end().to_string());
+            body.push_str(&s);
+        }
+        body.push_str(&String::from_utf8(seal.trailer(&enc)).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("dlq.jsonl");
+        std::fs::write(&file, &body).unwrap();
+        std::fs::write(
+            reader::discard_sidecar(&file),
+            format!("{}\n", reader::line_id(&sealed[0])),
+        )
+        .unwrap();
+        let loc = file.to_str().unwrap();
+        let dec = DlqDecryptor::from_keys(&["k".to_string()]).unwrap();
+
+        let summary = inspect(loc, None, 5, &dec).unwrap();
+        assert_eq!((summary.total_envelopes, summary.unsealed_discards), (2, 1));
+        let err = reseal_plain_discards(loc, &DlqDecryptor::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("needs the key"), "{err}");
+
+        assert_eq!(reseal_plain_discards(loc, &dec).unwrap(), 1);
+        let summary = inspect(loc, None, 5, &dec).unwrap();
+        assert_eq!((summary.total_envelopes, summary.unsealed_discards), (1, 0));
+        assert_eq!(reseal_plain_discards(loc, &dec).unwrap(), 0, "nothing left");
+
+        std::fs::write(
+            reader::discard_sidecar(&file),
+            format!("{}\n", reader::line_id(&sealed[1])),
+        )
+        .unwrap();
+        let out = purge_with(loc, &dec).unwrap();
+        assert_eq!((out.purged, out.unsealed_discards), (0, 1));
     }
 
     #[cfg(feature = "encryption")]
@@ -869,13 +1040,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("dlq.jsonl");
         std::fs::write(&file, &body).unwrap();
+        let dec = DlqDecryptor::from_keys(&["k".to_string()]).unwrap();
         std::fs::write(
             reader::discard_sidecar(&file),
-            format!("{}\n", reader::line_id(&lines[1])),
+            format!(
+                "{}\n",
+                dec.discard_entry(&file, &reader::line_id(&lines[1]), true)
+            ),
         )
         .unwrap();
         std::fs::create_dir(dir.path().join("dlq.jsonl.faucet-purge")).unwrap();
-        let dec = DlqDecryptor::from_keys(&["k".to_string()]).unwrap();
         let err = purge_with(file.to_str().unwrap(), &dec)
             .unwrap_err()
             .to_string();

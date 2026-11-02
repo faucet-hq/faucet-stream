@@ -288,7 +288,9 @@ impl ChangeRequest {
     /// unscoped admin (the rule `GET /v1/templates/{id}` applies to the
     /// registered body).
     pub fn redacted_for(mut self, actor: &AuthContext) -> Self {
-        if self.kind == ChangeKind::TemplateRegister
+        let template_body = self.kind == ChangeKind::TemplateRegister
+            || (self.kind == ChangeKind::Run && self.trusted_config);
+        if template_body
             && !actor.reads_template_bodies()
             && let Some(config) = self.payload.get_mut("config")
         {
@@ -296,6 +298,11 @@ impl ChangeRequest {
         }
         if actor.role == Role::Admin {
             return self;
+        }
+        if let Some(url) = self.payload.pointer_mut("/callback/url")
+            && let Some(text) = url.as_str()
+        {
+            *url = Value::String(faucet_core::redact_uri_credentials(text));
         }
         if let Some(headers) = self
             .payload
@@ -931,6 +938,21 @@ async fn transition_from(
     }
 }
 
+/// The change kinds whose approval rules a request must meet: its own, plus a
+/// launch's when a registration also launches the template or moves a channel.
+fn approval_kinds(kind: ChangeKind, payload: &Value) -> Vec<ChangeKind> {
+    let launches = payload.get("launch").and_then(Value::as_bool) == Some(true)
+        || payload
+            .get("tags")
+            .and_then(Value::as_array)
+            .is_some_and(|t| !t.is_empty());
+    if kind == ChangeKind::TemplateRegister && launches {
+        vec![kind, ChangeKind::TemplateLaunch]
+    } else {
+        vec![kind]
+    }
+}
+
 /// Serializes every transition of one change request within this process.
 fn change_lock(id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     static LOCKS: std::sync::LazyLock<
@@ -975,6 +997,18 @@ pub async fn create(
                 details: None,
             },
         )?;
+        // The request is stored before it runs, so its callback is held to
+        // the rules a submitted run's is, now.
+        if let Some(cb) = payload.get("callback").filter(|c| !c.is_null()) {
+            let cb: crate::serve::callback::CallbackSpec = serde_json::from_value(cb.clone())
+                .map_err(|e| ServeError::BadConfig(format!("callback: {e}")))?;
+            cb.validate_for(state.callback_allow_hosts(), actor.tenant.is_some())
+                .and_then(|()| cb.reject_persisted_headers(state.persistent_history()))
+                .map_err(|message| ServeError::Unprocessable {
+                    message,
+                    details: None,
+                })?;
+        }
     }
     let plan = plan_for(
         state,
@@ -986,7 +1020,11 @@ pub async fn create(
     )
     .await?;
     let policy = state.approvals();
-    let rule = policy.effective(new.kind);
+    let required_approvals = approval_kinds(new.kind, &payload)
+        .into_iter()
+        .map(|k| policy.effective(k).min_approvers)
+        .max()
+        .unwrap_or(1);
     let now = Utc::now();
     let change = ChangeRequest {
         id: uuid::Uuid::now_v7().to_string(),
@@ -998,7 +1036,7 @@ pub async fn create(
         payload,
         plan: Some(plan),
         budget: new.budget,
-        required_approvals: rule.min_approvers,
+        required_approvals,
         approvals: Vec::new(),
         rejection: None,
         created_at: now,
@@ -1066,14 +1104,14 @@ async fn notify_requested(state: &ServerState, change: &ChangeRequest) {
         .unwrap_or_else(|| "serve".to_string());
     match crate::notify::Notifier::from_specs(&loaded.cfg.notifications) {
         Ok(Some(n)) => {
-            n.emit(crate::notify::NotifyEvent::change_requested(
+            let event = crate::notify::NotifyEvent::change_requested(
                 pipeline,
                 &change.id,
                 change.kind.as_str(),
                 &change.requester,
                 change.reason.as_deref().unwrap_or(""),
-            ))
-            .await;
+            );
+            crate::runtime::under(&principal, n.emit(event)).await;
         }
         Ok(None) => {}
         Err(e) => tracing::warn!(change = %change.id, "change_requested notification skipped: {e}"),
@@ -1145,13 +1183,15 @@ pub async fn approve(
         )));
     }
     let before = change.clone();
-    state
-        .approvals()
-        .may_approve(change.kind, actor, &change.requester)
-        .map_err(|reason| {
-            record_metric(change.kind, "denied");
-            ServeError::Forbidden(reason)
-        })?;
+    for kind in approval_kinds(change.kind, &change.payload) {
+        state
+            .approvals()
+            .may_approve(kind, actor, &change.requester)
+            .map_err(|reason| {
+                record_metric(change.kind, "denied");
+                ServeError::Forbidden(reason)
+            })?;
+    }
     if change
         .approvals
         .iter()
@@ -1209,10 +1249,12 @@ pub async fn reject(
         )));
     }
     if actor.principal != change.requester {
-        state
-            .approvals()
-            .may_approve(change.kind, actor, "")
-            .map_err(ServeError::Forbidden)?;
+        for kind in approval_kinds(change.kind, &change.payload) {
+            state
+                .approvals()
+                .may_approve(kind, actor, "")
+                .map_err(ServeError::Forbidden)?;
+        }
     }
     change.status = ChangeStatus::Rejected;
     change.rejection = Some(Rejection {
@@ -2032,6 +2074,79 @@ mod tests {
             ..who(Role::Admin)
         });
         assert_eq!(scoped.payload["config"], REDACTED);
+
+        let mut from_template = stored(
+            ChangeKind::Run,
+            json!({"config": "pipeline: {token: bound}", "callback": {"url": "https://u:dummy-secret@hooks.example/x?token=dummy-secret&job=7"}}),
+            "m",
+            1,
+        );
+        from_template.trusted_config = true;
+        let op = from_template.clone().redacted_for(&who(Role::Operator));
+        assert_eq!(
+            op.payload["config"], REDACTED,
+            "a template body stays the admin's"
+        );
+        let url = op.payload["callback"]["url"].as_str().unwrap();
+        assert!(
+            !url.contains("dummy-secret") && url.contains("job=7"),
+            "{url}"
+        );
+        let scoped = from_template.clone().redacted_for(&AuthContext {
+            tenant: Some("acme".into()),
+            ..who(Role::Admin)
+        });
+        assert_eq!(scoped.payload["config"], REDACTED);
+        assert_eq!(
+            from_template
+                .clone()
+                .redacted_for(&who(Role::Admin))
+                .payload,
+            from_template.payload
+        );
+    }
+
+    #[test]
+    fn a_registration_that_launches_needs_the_launch_rule_too() {
+        assert_eq!(
+            approval_kinds(ChangeKind::Run, &json!({})),
+            vec![ChangeKind::Run]
+        );
+        assert_eq!(
+            approval_kinds(ChangeKind::TemplateRegister, &json!({"launch": false})),
+            vec![ChangeKind::TemplateRegister]
+        );
+        let launches = vec![ChangeKind::TemplateRegister, ChangeKind::TemplateLaunch];
+        assert_eq!(
+            approval_kinds(ChangeKind::TemplateRegister, &json!({"launch": true})),
+            launches
+        );
+        assert_eq!(
+            approval_kinds(ChangeKind::TemplateRegister, &json!({"tags": ["prod"]})),
+            launches
+        );
+
+        let policy: ApprovalPolicy = serde_json::from_value(json!({"rules": [
+            {"kinds": ["template_register"], "roles": ["operator", "admin"]},
+            {"kinds": ["template_launch"], "roles": ["admin"], "min_approvers": 2},
+        ]}))
+        .unwrap();
+        let op = AuthContext {
+            principal: "op".into(),
+            role: Role::Operator,
+            source_ip: None,
+            tenant: None,
+        };
+        let refused = launches
+            .iter()
+            .find_map(|k| policy.may_approve(*k, &op, "bob").err())
+            .expect("the launch rule refuses an operator");
+        assert!(refused.contains("template_launch"), "{refused}");
+        let quorum = launches
+            .iter()
+            .map(|k| policy.effective(*k).min_approvers)
+            .max();
+        assert_eq!(quorum, Some(2));
     }
 
     #[tokio::test]

@@ -80,11 +80,3 @@ reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; affected APIs unused (2026
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0406"
 reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; affected APIs unused (2026-10-28)"
-
-[[IgnoredVulns]]
-id = "GHSA-2f9f-gq7v-9h6m"
-reason = "thrift 0.17 only via parquet 58 (Arrow 58 pin, #981); no thrift-0.23 parquet release we can take yet (2026-10-28)"
-
-[[IgnoredVulns]]
-id = "GHSA-qwgh-2vcv-g2f7"
-reason = "block-buffer 0.10.4 only via the RustCrypto 0.10 digest crates (sha2/hmac upstream); needs a panic inside a hash update; 0.12 line is on the fixed 0.12.1 (2026-10-28)"

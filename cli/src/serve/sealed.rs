@@ -257,6 +257,97 @@ pub fn restore(body: &str, values: &[String]) -> Result<String, String> {
     serde_json::to_string(&doc).map_err(|e| format!("re-serializing config: {e}"))
 }
 
+/// The start of a stored config body sealed whole under the vault key.
+pub const SEALED_BODY_PREFIX: &str = "faucet-sealed-config:v1:";
+
+/// The associated data a run's sealed config body is bound to.
+pub fn body_context(run_id: &str) -> String {
+    format!("run:{run_id}:config")
+}
+
+/// Whether a stored config body is sealed whole.
+pub fn is_sealed_body(body: &str) -> bool {
+    body.starts_with(SEALED_BODY_PREFIX)
+}
+
+/// `body` sealed whole under `vault` for `run_id`, as it is persisted.
+#[cfg(feature = "encryption")]
+pub fn seal_body(vault: &crate::serve::vault::Vault, run_id: &str, body: &str) -> String {
+    format!(
+        "{SEALED_BODY_PREFIX}{}",
+        vault.seal_str_for(body, &body_context(run_id))
+    )
+}
+
+/// The body to persist for a clustered run: sealed whole when the server
+/// has a vault key, else as given.
+pub fn persisted_body(state: &ServerState, run_id: &str, body: String) -> String {
+    #[cfg(feature = "encryption")]
+    if let Some(vault) = state.vault() {
+        return seal_body(&vault, run_id, &body);
+    }
+    let _ = (state, run_id);
+    body
+}
+
+/// A stored config body as text: opened when it was sealed whole.
+pub fn open_body<'a>(
+    state: &ServerState,
+    run_id: &str,
+    stored: &'a str,
+) -> Result<Cow<'a, str>, ServeError> {
+    #[cfg(feature = "encryption")]
+    {
+        open_body_with(state.vault().as_deref(), run_id, stored)
+    }
+    #[cfg(not(feature = "encryption"))]
+    {
+        let _ = state;
+        open_body_with(run_id, stored)
+    }
+}
+
+/// [`open_body`] with an explicit vault (`None`: no key here).
+#[cfg(feature = "encryption")]
+pub fn open_body_with<'a>(
+    vault: Option<&crate::serve::vault::Vault>,
+    run_id: &str,
+    stored: &'a str,
+) -> Result<Cow<'a, str>, ServeError> {
+    let Some(sealed) = stored.strip_prefix(SEALED_BODY_PREFIX) else {
+        return Ok(Cow::Borrowed(stored));
+    };
+    let refuse = |m: String| ServeError::Unprocessable {
+        message: format!("this run's stored config is sealed, and {m}"),
+        details: None,
+    };
+    let vault = vault.ok_or_else(|| {
+        refuse(format!(
+            "this instance was started without a vault key: {NO_VAULT_HINT}"
+        ))
+    })?;
+    vault
+        .open_str_for(sealed, &body_context(run_id))
+        .map(Cow::Owned)
+        .map_err(|e| refuse(format!("this instance cannot open it: {e}")))
+}
+
+/// [`open_body`] in a build without the `encryption` feature.
+#[cfg(not(feature = "encryption"))]
+pub fn open_body_with<'a>(run_id: &str, stored: &'a str) -> Result<Cow<'a, str>, ServeError> {
+    let _ = run_id;
+    if is_sealed_body(stored) {
+        return Err(ServeError::Unprocessable {
+            message: format!(
+                "this run's stored config is sealed, and this instance was built without the \
+                 `encryption` feature: {NO_VAULT_HINT}"
+            ),
+            details: None,
+        });
+    }
+    Ok(Cow::Borrowed(stored))
+}
+
 /// The associated data a run's sealed values are bound to.
 pub fn context(run_id: &str) -> String {
     format!("run:{run_id}:secret-params")
@@ -408,6 +499,39 @@ pub fn open_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn a_stored_body_is_sealed_whole_and_opens_only_for_its_run() {
+        let vault =
+            crate::serve::vault::Vault::new("a-vault-key-for-tests-0123456789abcdef0123", &[])
+                .unwrap();
+        let body = r#"{"pipeline":{"source":{"config":{"password":"dummy-secret"}}}}"#;
+        let sealed = seal_body(&vault, "r1", body);
+        assert!(is_sealed_body(&sealed) && !sealed.contains("dummy-secret"));
+        assert_eq!(open_body_with(Some(&vault), "r1", &sealed).unwrap(), body);
+        assert!(open_body_with(Some(&vault), "r2", &sealed).is_err());
+        let no_key = open_body_with(None, "r1", &sealed).unwrap_err();
+        assert!(no_key.to_string().contains("--vault-key"), "{no_key}");
+        assert!(matches!(
+            open_body_with(None, "r1", body).unwrap(),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[cfg(feature = "encryption")]
+    #[tokio::test]
+    async fn a_server_with_a_vault_key_persists_sealed_bodies() {
+        let state = crate::serve::test_support::test_state();
+        assert_eq!(persisted_body(&state, "r1", "plain".into()), "plain");
+        state.set_vault(Some(std::sync::Arc::new(
+            crate::serve::vault::Vault::new("a-vault-key-for-tests-0123456789abcdef0123", &[])
+                .unwrap(),
+        )));
+        let stored = persisted_body(&state, "r1", "plain".into());
+        assert!(is_sealed_body(&stored));
+        assert_eq!(open_body(&state, "r1", &stored).unwrap(), "plain");
+    }
 
     fn texts(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()

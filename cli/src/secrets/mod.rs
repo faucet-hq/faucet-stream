@@ -337,6 +337,24 @@ pub fn unescape_typed_blocks(cfg: &mut PipelineConfig) -> CliResult<()> {
         Ok(())
     };
     walk_typed(&mut cfg.observability, "observability", &mut f)?;
+    // Connector and transform configs here are unescaped when built.
+    walk_typed(&mut cfg.replication, "mirror", &mut |v| {
+        crate::interpolate::unescape_value_except(
+            v,
+            &[
+                &["snapshot", "source", "config"],
+                &["snapshot", "source", "transforms", "*", "config"],
+            ],
+        );
+        Ok(())
+    })?;
+    walk_typed(&mut cfg.pipeline.nodes, "pipeline.nodes", &mut |v| {
+        crate::interpolate::unescape_value_except(
+            v,
+            &[&["*", "config"], &["*", "transforms", "*", "config"]],
+        );
+        Ok(())
+    })?;
     walk_typed(&mut cfg.verify, "verify", &mut f)?;
     walk_typed(&mut cfg.reconcile, "reconcile", &mut f)?;
     #[cfg(feature = "masking")]
@@ -428,7 +446,7 @@ fn visit_config_values_mut<F: FnMut(&mut Value, bool) -> CliResult<()>>(
         f(v, true)
     })?;
     walk_typed(&mut cfg.observability, "observability", &mut |v| f(v, true))?;
-    walk_typed(&mut cfg.replication, "mirror", &mut |v| f(v, false))?;
+    walk_typed(&mut cfg.replication, "mirror", &mut |v| f(v, true))?;
     walk_typed(&mut cfg.verify, "verify", &mut |v| f(v, true))?;
     walk_typed(&mut cfg.reconcile, "reconcile", &mut |v| f(v, true))?;
     #[cfg(feature = "masking")]
@@ -538,6 +556,45 @@ pub async fn resolve_secrets(cfg: &mut PipelineConfig) -> CliResult<()> {
         set.insert(make_resolver(scheme)?);
     }
     resolve_secrets_with(cfg, &set).await
+}
+
+/// [`resolve_secrets`], holding every reference to `screen` right before it
+/// is fetched: a reference `screen` refuses (`Err(reason)`) fails the load
+/// and nothing is fetched. `faucet serve` passes its reference policy here,
+/// so a reference is judged as it is about to be read, not only as written.
+pub async fn resolve_secrets_screened(
+    cfg: &mut PipelineConfig,
+    screen: &(dyn Fn(&str, &str) -> Result<(), String> + Send + Sync),
+) -> CliResult<()> {
+    let refs = scan_config(cfg);
+    refuse_outside_resolved(cfg)?;
+    if refs.is_empty() {
+        return unescape_typed_blocks(cfg);
+    }
+    screen_refs(&refs, screen)?;
+    let mut set = ResolverSet::default();
+    let schemes: BTreeSet<&str> = refs.iter().map(|(s, _)| s.as_str()).collect();
+    for scheme in schemes {
+        set.insert(make_resolver(scheme)?);
+    }
+    resolve_secrets_with(cfg, &set).await
+}
+
+/// Refuse the first reference `screen` refuses.
+fn screen_refs(
+    refs: &BTreeSet<SecretRef>,
+    screen: &(dyn Fn(&str, &str) -> Result<(), String> + Send + Sync),
+) -> CliResult<()> {
+    for (scheme, reference) in refs {
+        if let Err(reason) = screen(scheme, reference) {
+            return Err(CliError::SecretRefused {
+                scheme: scheme.clone(),
+                reference: reference.clone(),
+                reason,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Resolve all secret directives using a caller-supplied resolver set (the
@@ -824,6 +881,78 @@ mirror:
             cdc["values"]["salt"], stored,
             "both halves of the mirror agree"
         );
+    }
+
+    #[tokio::test]
+    async fn an_escaped_directive_in_a_mirror_table_glob_stays_literal() {
+        let mut set = ResolverSet::default();
+        set.insert(Arc::new(FakeResolver {
+            scheme: "vault",
+            value: "RESOLVED".into(),
+        }));
+        let cfg_yaml = r#"
+version: 1
+name: m
+pipeline:
+  source: { type: postgres-cdc, config: { connection_url: "postgres://h/db", slot_name: s, publication: p } }
+  sink: { type: jsonl, config: { path: ./o.jsonl } }
+mirror:
+  mode: snapshot_then_cdc
+  snapshot:
+    source: { type: postgres, config: { connection_url: "postgres://h/db", query: "SELECT 1", note: "$${vault:kv/a}" } }
+  tables: { include: ["$${vault:kv/app#salt}"] }
+"#;
+        let mut cfg = PipelineConfig::from_text(cfg_yaml, std::path::Path::new("m.yaml")).unwrap();
+        assert!(scan_config(&cfg).is_empty());
+        resolve_secrets_with(&mut cfg, &set).await.unwrap();
+        let mirror = cfg.replication.as_ref().unwrap();
+        assert_eq!(
+            mirror.tables.as_ref().unwrap().include,
+            vec!["${vault:kv/app#salt}".to_string()]
+        );
+        let built = crate::interpolate::unescaped(mirror.snapshot.source.config.clone());
+        assert_eq!(built["note"], "${vault:kv/a}");
+    }
+
+    #[tokio::test]
+    async fn a_screen_refuses_a_reference_before_it_is_fetched() {
+        let cfg_yaml = r#"
+version: 1
+pipeline:
+  source: { type: rest, config: { base_url: https://x, token: "${azure-kv:v/s}" } }
+  sink:   { type: jsonl, config: { path: ./o.jsonl } }
+"#;
+        let mut cfg = PipelineConfig::from_text(cfg_yaml, std::path::Path::new("p.yaml")).unwrap();
+        let refuse =
+            |_: &str, r: &str| -> Result<(), String> { Err(format!("{r} is not on the list")) };
+        match resolve_secrets_screened(&mut cfg, &refuse)
+            .await
+            .unwrap_err()
+        {
+            CliError::SecretRefused {
+                scheme,
+                reference,
+                reason,
+            } => {
+                assert_eq!((scheme.as_str(), reference.as_str()), ("azure-kv", "v/s"));
+                assert!(reason.contains("not on the list"));
+            }
+            other => panic!("expected SecretRefused, got {other:?}"),
+        }
+        let allow = |_: &str, _: &str| -> Result<(), String> { Ok(()) };
+        let err = resolve_secrets_screened(&mut cfg, &allow)
+            .await
+            .unwrap_err();
+        assert!(!matches!(err, CliError::SecretRefused { .. }), "{err:?}");
+
+        let clean = r#"
+version: 1
+pipeline:
+  source: { type: rest, config: { base_url: https://x } }
+  sink:   { type: jsonl, config: { path: ./o.jsonl } }
+"#;
+        let mut cfg = PipelineConfig::from_text(clean, std::path::Path::new("p.yaml")).unwrap();
+        resolve_secrets_screened(&mut cfg, &refuse).await.unwrap();
     }
 
     #[test]

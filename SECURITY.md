@@ -19,6 +19,11 @@ and click **"Report a vulnerability"**
 This creates a private advisory visible only to maintainers, where we can
 discuss the report, prepare a fix and coordinate disclosure with you.
 
+If you cannot use GitHub private vulnerability reporting, email the maintainer
+at [pawansikawat1998@gmail.com](mailto:pawansikawat1998@gmail.com) with
+"faucet-stream security" in the subject. We acknowledge email reports on the
+same timeline.
+
 Please include:
 
 - a description of the vulnerability and its impact,
@@ -40,6 +45,7 @@ Please include:
 - Fixes ship as a patch release of every affected crate on crates.io, the
   prebuilt binaries and the container images; the advisory names the fixed
   versions.
+- With your consent, we'll credit you in the advisory and release notes.
 
 ## Verifying releases
 
@@ -49,7 +55,6 @@ release as `<asset>.sigstore.json`), are built with `cargo-auditable` so
 (`faucet-cli.cdx.json`). Container images are keyless-signed with SLSA
 provenance and an SBOM. Commands:
 [installation guide](https://faucet-hq.github.io/faucet-stream/getting-started/installation.html).
-- With your consent, we'll credit you in the advisory and release notes.
 
 ## What counts as a vulnerability
 

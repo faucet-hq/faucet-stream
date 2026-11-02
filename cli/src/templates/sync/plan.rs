@@ -372,6 +372,7 @@ mod tests {
             launch,
             prune,
             interval_secs: None,
+            trust: Vec::new(),
         }
     }
 

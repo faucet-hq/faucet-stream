@@ -219,6 +219,11 @@ ENV FAUCET_SERVE_LISTEN=0.0.0.0:8080 \
     FAUCET_LOG=info
 EXPOSE 8080
 
+# Probes /healthz when the container runs `faucet serve`; any other command
+# (a one-shot `run`) reports healthy, since it serves nothing.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD ["bash", "-c", "tr '\\0' ' ' </proc/1/cmdline | grep -qw serve || exit 0; port=${FAUCET_SERVE_LISTEN##*:}; exec 3<>/dev/tcp/127.0.0.1/${port:-8080} && printf 'GET /healthz HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && head -n1 <&3 | grep -q ' 200 '"]
+
 ENTRYPOINT ["faucet"]
 # Default: the HTTP control plane, which refuses to start without auth — pass
 #   -e FAUCET_SERVE_AUTH_TOKEN=... (or --auth-config / the role tokens).

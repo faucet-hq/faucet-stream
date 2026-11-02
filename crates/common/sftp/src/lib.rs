@@ -80,6 +80,7 @@ pub enum HostKeyPolicy {
     /// Disable host-key verification entirely. **Insecure** — vulnerable to
     /// man-in-the-middle attacks. Use only against trusted networks / test
     /// servers.
+    #[schemars(extend("x-faucet-unverified" = true))]
     Insecure,
 }
 
@@ -510,17 +511,33 @@ fn hashed_host_matches(hashed: &str, name: &str) -> bool {
     })
 }
 
+/// Case-insensitive `*` / `?` glob match, iterative (linear stack, at most
+/// `pattern.len() * name.len()` steps).
 fn wildmatch(pattern: &str, name: &str) -> bool {
-    fn go(p: &[u8], s: &[u8]) -> bool {
-        match (p.first(), s.first()) {
-            (None, None) => true,
-            (Some(b'*'), _) => go(&p[1..], s) || (!s.is_empty() && go(p, &s[1..])),
-            (Some(b'?'), Some(_)) => go(&p[1..], &s[1..]),
-            (Some(a), Some(b)) if a.eq_ignore_ascii_case(b) => go(&p[1..], &s[1..]),
-            _ => false,
+    let (p, s) = (pattern.as_bytes(), name.as_bytes());
+    let (mut pi, mut si) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None;
+    while si < s.len() {
+        match p.get(pi) {
+            Some(b'*') => {
+                star = Some((pi, si));
+                pi += 1;
+            }
+            Some(&c) if c == b'?' || c.eq_ignore_ascii_case(&s[si]) => {
+                pi += 1;
+                si += 1;
+            }
+            _ => match star {
+                Some((sp, ss)) => {
+                    pi = sp + 1;
+                    si = ss + 1;
+                    star = Some((sp, ss + 1));
+                }
+                None => return false,
+            },
         }
     }
-    go(pattern.as_bytes(), name.as_bytes())
+    p[pi..].iter().all(|&c| c == b'*')
 }
 
 /// Open an SSH transport to the configured server, authenticate, verify the

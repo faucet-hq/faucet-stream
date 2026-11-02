@@ -278,7 +278,8 @@ pub struct HubSides {
     pub sink: Vec<ResolvedHub>,
     pub overlay: Vec<ResolvedHub>,
     /// Owners or template ids (`--trust`) whose hub templates may read the
-    /// operator's environment, files or secrets; `*` trusts every one.
+    /// operator's environment, files or secrets, reference the rest of the
+    /// composed config and run a program; `*` trusts every one.
     pub trusted: Vec<String>,
 }
 
@@ -428,11 +429,11 @@ pub async fn compose_across_with(
     let k = parse_sink_file(&sink_file)?;
     if let Some(hub) = &source_hub {
         let official = s.is_official() && is_official_file(hub, &source_file, catalog::SOURCE_DIR);
-        refuse_untrusted_directives(&source_file, &s.id(), official, &sides.trusted)?;
+        refuse_untrusted_directives(&source_file, catalog::SOURCE_DIR, official, &sides.trusted)?;
     }
     if let Some(hub) = &sink_hub {
         let official = k.is_official() && is_official_file(hub, &sink_file, catalog::SINK_DIR);
-        refuse_untrusted_directives(&sink_file, &k.id(), official, &sides.trusted)?;
+        refuse_untrusted_directives(&sink_file, catalog::SINK_DIR, official, &sides.trusted)?;
     }
     let s = match with {
         Some(w) => w.expand(&s)?,
@@ -447,7 +448,7 @@ pub async fn compose_across_with(
         if let Some(h) = &hub {
             let official = d.owner.as_deref() == Some(spec::OFFICIAL_OWNER)
                 && is_official_file(h, &file, DEPLOYMENT_DIR);
-            refuse_untrusted_directives(&file, &d.id(), official, &sides.trusted)?;
+            refuse_untrusted_directives(&file, DEPLOYMENT_DIR, official, &sides.trusted)?;
         }
         c = c.apply_overlay(&d)?;
         c.overlay_hub = hub;
@@ -495,48 +496,105 @@ const OPERATOR_DIRECTIVES: &[&str] = &[
     "env", "file", "secret", "vault", "aws-sm", "gcp-sm", "azure-kv",
 ];
 
+/// The id a hub file is trusted under: `<owner>/<stem>` from the namespace
+/// directory it sits in below `subdir`, else its stem. A document's own
+/// `owner:` claim does not decide whose it is.
+fn location_id(path: &Path, subdir: &str) -> String {
+    let stem = path
+        .file_stem()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let dir = path.parent();
+    let owner = dir.and_then(Path::file_name).and_then(|n| n.to_str());
+    let above = dir
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .and_then(|n| n.to_str());
+    match (owner, above) {
+        (Some(owner), Some(above)) if above == subdir => format!("{owner}/{stem}"),
+        _ => stem,
+    }
+}
+
 /// A hub template not maintained by faucet-hq (the `faucet-hq` namespace of
 /// the `faucet-hq/template-hub` repository) may not read
 /// the operator's environment, files or secrets — a community template could
-/// otherwise send `~/.aws/credentials` to a URL it controls. Credentials reach
-/// such a template through its params (`--param` / `--param-env`), or the
-/// operator trusts it with `--trust <owner|id>`.
-fn refuse_untrusted_directives(
+/// otherwise send `~/.aws/credentials` to a URL it controls — nor read what the
+/// operator gave the other template of the pairing (`${sources.*}`,
+/// `${sinks.*}`, `${vars.*}`), nor name a connector that runs a program.
+/// Credentials reach such a template through its params (`--param` /
+/// `--param-env`), or the operator trusts it with `--trust <owner|id>`.
+pub(crate) fn refuse_untrusted_directives(
     path: &Path,
-    id: &str,
+    subdir: &str,
     official: bool,
     trusted: &[String],
 ) -> CliResult<()> {
+    let id = location_id(path, subdir);
     let owner = id.split_once('/').map(|(o, _)| o);
     if official
         || trusted
             .iter()
-            .any(|t| t == "*" || t == id || Some(t.as_str()) == owner)
+            .any(|t| t == "*" || *t == id || Some(t.as_str()) == owner)
     {
         return Ok(());
     }
     let doc = parse_untyped(&read(path)?, path)?;
+    let Some(found) = untrusted_use(&doc) else {
+        return Ok(());
+    };
+    Err(CliError::Config(format!(
+        "hub template '{id}' {found}; a community template may not do that unless you trust \
+         it. Supply the value with --param / --param-env, or pass --trust {} after reviewing it",
+        owner.unwrap_or(&id)
+    )))
+}
+
+/// What in a hub document needs the operator's trust: a directive reading
+/// the operator's environment, files or secrets, a reference to another part
+/// of the composed config, or a connector that runs a program.
+pub(crate) fn untrusted_use(doc: &Value) -> Option<String> {
     let mut found = None;
-    visit_strings(&doc, &mut |s| {
+    visit_strings(doc, &mut |s| {
         if found.is_none() {
             found = crate::interpolate::iter_directives(s).find_map(|(token, dir)| match dir {
                 crate::interpolate::Directive::LoadTime { prefix, .. }
                     if OPERATOR_DIRECTIVES.contains(&prefix) =>
                 {
-                    Some(token.to_string())
+                    Some(format!(
+                        "uses `{token}`, which reads this machine's environment, files or secrets"
+                    ))
                 }
+                crate::interpolate::Directive::Deferred {
+                    id: "sources" | "sinks" | "vars",
+                    ..
+                } => Some(format!(
+                    "uses `{token}`, which reads another part of the composed config"
+                )),
                 _ => None,
             });
         }
     });
-    match found {
-        None => Ok(()),
-        Some(token) => Err(CliError::Config(format!(
-            "hub template '{id}' uses `{token}`, which reads this machine's environment, files \
-             or secrets; a community template may not do that unless you trust it. Supply the \
-             value with --param / --param-env, or pass --trust {} after reviewing it",
-            owner.unwrap_or(id)
-        ))),
+    found.or_else(|| {
+        program_kind(doc).map(|k| format!("uses connector `{k}`, which runs a program"))
+    })
+}
+
+/// The first `type:` in `doc` naming a connector that runs a program.
+fn program_kind(v: &Value) -> Option<String> {
+    match v {
+        Value::Object(map) => {
+            if let Some(t) = map.get("type").and_then(Value::as_str)
+                && (crate::registry::source_runs_program(t)
+                    || crate::registry::sink_runs_program(t))
+            {
+                return Some(t.to_string());
+            }
+            map.values().find_map(program_kind)
+        }
+        Value::Array(items) => items.iter().find_map(program_kind),
+        _ => None,
     }
 }
 
@@ -1219,8 +1277,19 @@ pub fn load_composed(c: &Composition, inputs: &RunInputs) -> CliResult<PipelineC
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)] // tests set process environment variables
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hub_file_is_trusted_under_the_directory_it_sits_in() {
+        let id = |p: &str| location_id(Path::new(p), catalog::SOURCE_DIR);
+        assert_eq!(id("/h/source-templates/mallory/x.yaml"), "mallory/x");
+        assert_eq!(id("/h/source-templates/x.yaml"), "x");
+        assert_eq!(id("/h/other/mallory/x.yaml"), "x");
+        assert!(untrusted_use(&serde_json::json!({"a": "${vars.x}"})).is_some());
+        assert!(untrusted_use(&serde_json::json!({"a": "${param.x} ${stream}"})).is_none());
+    }
 
     #[test]
     fn only_the_faucet_hq_catalog_repo_is_official() {

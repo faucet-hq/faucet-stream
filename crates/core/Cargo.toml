@@ -132,6 +132,9 @@ file-format-orc = ["arrow", "dep:orc-rust", "dep:bytes"]
 # Apache Parquet read helpers for the object-store sources (#777): column
 # projection over a Parquet schema and whole-object decoding.
 file-format-parquet = ["arrow", "dep:parquet", "dep:bytes"]
+# PostgreSQL connect options built from a URL alone (`libpq::connect_options`),
+# for the connectors that connect through sqlx.
+libpq-sqlx = ["dep:sqlx"]
 file-formats = ["file-format-csv", "file-format-xml", "file-format-excel", "file-format-avro", "file-format-orc"]
 
 [dependencies]
@@ -139,6 +142,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 url.workspace = true
+sqlx = { workspace = true, optional = true, features = ["postgres"] }
 percent-encoding.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
@@ -252,3 +256,6 @@ enum_struct_variant_field_added = "allow"
 # Deprecating a trait method is a minor change (RFC 0014 deprecates the Sink
 # lifecycle hooks the family drivers replace); the removal is the major (#888).
 trait_method_marked_deprecated = "allow"
+
+[lints]
+workspace = true

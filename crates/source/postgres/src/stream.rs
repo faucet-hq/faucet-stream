@@ -45,9 +45,10 @@ impl PostgresSource {
         config.validate()?;
         faucet_core::ensure_crypto_provider();
 
+        let opts = connect_options(&config.connection_url)?;
         let pool = PgPoolOptions::new()
             .max_connections(config.max_connections)
-            .connect(&config.connection_url)
+            .connect_with(opts)
             .await
             // Connect-time, so `Config` is deliberate and stays: this runs in
             // `new()` at registry-build time, before any data moves, which is
@@ -1461,10 +1462,26 @@ fn key_discovery_error(e: sqlx::Error) -> FaucetError {
     FaucetError::Source(format!("postgres: primary-key discovery failed: {e}"))
 }
 
+/// Connect options for `url`; under `faucet serve` nothing is taken from the
+/// `PG*` environment variables or the password file.
+pub(crate) fn connect_options(url: &str) -> Result<sqlx::postgres::PgConnectOptions, FaucetError> {
+    faucet_core::libpq::connect_options("postgres", url, |e| {
+        FaucetError::Config(format!("PostgreSQL connection failed: {e}"))
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
+
+    #[test]
+    fn connect_options_word_an_unparseable_url() {
+        let err = connect_options("postgres://h:x/db")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("PostgreSQL connection failed"), "{err}");
+    }
 
     #[test]
     fn real_values_use_their_shortest_form() {

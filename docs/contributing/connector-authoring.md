@@ -106,6 +106,26 @@ pub sandbox: bool,
 not load from its own triggers file, wherever the connector appears (template,
 row override, topology node, fan-out source, DLQ sink, …).
 
+A setting that turns off verification of the peer (accept any TLS certificate,
+skip the SSH host-key check) is marked `x-faucet-unverified`, and one that
+authenticates with credentials held by the host (OS authentication, a local
+wallet) is marked `x-faucet-host-credentials`. `faucet serve` refuses a
+caller's config that turns either on (the first only without
+`--allow-unverified-tls`):
+
+```rust
+#[schemars(extend("x-faucet-unverified" = true))]
+pub insecure_skip_verify: bool,
+#[schemars(extend("x-faucet-unverified" = ["trust_server_certificate"]))]
+pub mode: TlsMode,
+```
+
+The value is `true` (a boolean field, or an enum variant whose tag matches), a
+list of string values, or, on a string map, an object of key → values. A
+connector must also build its connections only from its config: never let a
+driver fill a missing password, user or certificate from the process
+environment (see `faucet_core::libpq` for the PostgreSQL drivers).
+
 A field whose value is a SQL statement the connector runs as written (a
 source's `query`) is marked so a server that places values it did not author
 into a config can tell it from a field that only shares the name (a GraphQL

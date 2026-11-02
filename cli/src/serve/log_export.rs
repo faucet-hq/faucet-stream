@@ -169,6 +169,25 @@ impl LogExport {
             return Some(n.clone());
         }
         let body = rec?.config_body.as_deref()?;
+        #[cfg(feature = "encryption")]
+        let opened = {
+            let vault = self.vault.read().unwrap_or_else(|e| e.into_inner()).clone();
+            crate::serve::sealed::open_body_with(vault.as_deref(), run_id, body)
+        };
+        #[cfg(not(feature = "encryption"))]
+        let opened = crate::serve::sealed::open_body_with(run_id, body);
+        let opened = match opened {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    run_id,
+                    reason = %e,
+                    "not notifying log_export_failed from a sealed stored config"
+                );
+                return None;
+            }
+        };
+        let body = &*opened;
         let body = match crate::serve::sealed::unseal_with(
             history,
             |stored| self.open_sealed(run_id, stored),

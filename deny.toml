@@ -15,6 +15,9 @@ version = 2
 # opens an issue, so an advisory published between merges is not missed.
 # Re-triage every entry when its dependency moves; drop it once fixed.
 unmaintained = "all"
+# "unsound" advisories count for every crate in the tree too, not only
+# workspace members' direct dependencies, so the zstd-safe entries below match.
+unsound = "all"
 ignore = [
     # 2026-10-27 — unmaintained, transitive only, no maintained release of the
     # parents yet (#929 section 3). Drop each when its parent moves.

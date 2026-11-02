@@ -68,6 +68,9 @@ checksums, and a Homebrew formula pushed to the `homebrew-faucet-stream` tap.
   trigger workflows. If `RELEASE_PLZ_TOKEN` is not configured, the binary build
   will not fire automatically after a release — dispatch it manually with
   `gh workflow run release-binaries.yml --ref faucet-cli-vX.Y.Z`.
+- A dispatch runs only on a `faucet-cli-vX.Y.Z` tag ref (and `tag`, if given,
+  must name that tag). Re-running keeps release assets whose bytes match and
+  refuses ones that differ; pass `-f replace_assets=true` to replace them.
 
 ## The manual fallback
 

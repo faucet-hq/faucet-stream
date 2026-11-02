@@ -447,7 +447,7 @@ See [`values.yaml`](./values.yaml) — every key is commented. Common ones:
 | `connectors.verify.enabled` | `true` | fail pod start if a declared connector is absent |
 | `serve.enabled` | `true` | deploy the control plane |
 | `serve.auth.mode` | `token` | `token` \| `none` \| `rbac` |
-| `serve.history.backend` | `memory` | `memory` \| `sqlite` \| `postgres` |
+| `serve.history.backend` | `memory` | `memory` \| `sqlite` \| `postgres` (any other value fails rendering) |
 | `serve.localOutputs.retentionDays` | `7` | days before local sink output files (jsonl/csv/parquet) are reclaimed; `0` disables the sweep |
 | `serve.localOutputs.inFlightGraceSeconds` | `60` | never delete an output touched within this window (guards against unlinking a file a run is writing); `0` disables |
 | `serve.preview.enabled` | `false` | serve dataset previews of local sink outputs — the console reads a tracked jsonl/csv/parquet file's first rows back over HTTP. Off by default: it exposes file *contents* to anyone with the `LocalOutputRead` scope (viewer and up) |
@@ -460,6 +460,8 @@ See [`values.yaml`](./values.yaml) — every key is commented. Common ones:
 | `serve.approvals.require` | `[]` | change kinds needing approval: `run`, `template_register`, `template_launch` |
 | `serve.approvals.expirySecs` | `null` | `--approval-expiry-secs` (server default 86400) |
 | `serve.mcp.enabled` / `.allowMutations` | `false` / `false` | `/mcp` endpoint / its mutating tools |
+| `serve.allowedHosts` | `[]` | `--allowed-host`: host names the server answers; a request naming another `Host` is refused |
+| `serve.allowedOrigins` | `[]` | `--allowed-origin`: extra browser origins that may send state-changing requests |
 | `serve.autoscaling.enabled` | `false` | HPA on the Deployment |
 | `serve.persistence.enabled` | `false` | PVC for sqlite history / bookmarks |
 | `serve.strategy` | `{}` | Deployment update strategy; empty = `Recreate` for one replica with a volume, else `RollingUpdate` |

@@ -67,6 +67,10 @@ pub struct KafkaSourceConfig {
     /// Raw librdkafka client properties to pass through. Use with care —
     /// these can override anything set by `auth` or the typed fields above.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[schemars(extend("x-faucet-unverified" = {
+        "enable.ssl.certificate.verification": ["false", "0"],
+        "ssl.endpoint.identification.algorithm": ["none", ""]
+    }))]
     pub extra_client_config: BTreeMap<String, String>,
     /// Messages per emitted [`StreamPage`](faucet_core::StreamPage). Messages
     /// drained from the consumer are accumulated into an in-memory buffer and

@@ -74,8 +74,8 @@ Wire shape: `{ type: sql, config: { query, relations?, memory_limit?, threads? }
 |---|---|---|---|
 | `query` | string | — *(required)* | The SQL statement. The page's records are the relation `batch`. Must produce a result set; each result row becomes one output record. |
 | `relations` | list of [`RelationSpec`](#reference-relations) | `[]` | Reference relations loaded once at compile time and joinable by name. |
-| `memory_limit` | string | *(DuckDB's own)* | DuckDB `memory_limit` pragma (e.g. `"1GB"`). |
-| `threads` | integer | *(DuckDB's own)* | DuckDB `threads` pragma. Set to `1`–`2` in high-fan-out matrices to avoid CPU over-subscription across rows. |
+| `memory_limit` | string | *(DuckDB's own)* | DuckDB `memory_limit` pragma (e.g. `"1GB"`). In a config `faucet serve` loads from a request, unset means `1GB`. |
+| `threads` | integer | *(DuckDB's own)* | DuckDB `threads` pragma. Set to `1`–`2` in high-fan-out matrices to avoid CPU over-subscription across rows. In a config `faucet serve` loads from a request, unset means the machine's parallelism, at most `4`. |
 
 ### Reference-relation fields (`RelationSpec`)
 
@@ -431,7 +431,7 @@ cargo add faucet-stream --features full
 | `WARN ... aggregation is per-page` | An aggregating query saw a second page. Set the source's `batch_size: 0` for global aggregation, or accept per-page aggregates. |
 | Out-of-memory with `batch_size: 0` | The whole result set is buffered in RAM. Cap DuckDB with `memory_limit`, or aggregate in stages, or keep `batch_size` bounded if global aggregation isn't required. |
 | `FaucetError::Config` at validate time, "syntax error" | The query failed DuckDB parse/bind. The error reports line/column — fix the SQL. |
-| Validate fails: relation file not found | A `csv` / `jsonl` relation `path` doesn't exist. Paths are relative to the working directory; use an absolute path or run from the right directory. |
+| Validate fails: relation file not found | A `csv` / `jsonl` relation `path` doesn't exist. Paths are relative to the working directory; use an absolute path or run from the right directory. A path starting with `~` is refused. |
 | Compile error: relation named `batch` | `batch` is reserved for the page relation. Rename the reference relation. |
 | `FaucetError::Transform` aborts the run mid-stream | A runtime query error (e.g. a cast that fails on real data). These are **not** sent to the DLQ — fix the query or pre-clean the data with an earlier transform. |
 | A JSON column won't parse | Cast it: `json_extract(payload::JSON, '$.path')` (see [Working with JSON columns](#working-with-json-columns)). |

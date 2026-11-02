@@ -52,6 +52,14 @@ pub struct Origin {
     /// demand only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interval_secs: Option<u64>,
+    /// Template namespaces (`<owner>`), ids (`<owner>/<name>`) or `"*"`
+    /// whose templates may read this server's environment, files or secrets,
+    /// reference another part of the composed config, or run a program. A
+    /// template under an `<owner>/` directory not listed here is registered
+    /// only when it does none of those — except the `faucet-hq` namespace of
+    /// the `faucet-hq/template-hub` catalog at `main`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trust: Vec<String>,
 }
 
 /// The remote store behind an origin. Adjacently tagged (`{type, config}`) like
@@ -317,6 +325,7 @@ mod tests {
             launch: LaunchPolicy::default(),
             prune: PrunePolicy::default(),
             interval_secs: None,
+            trust: Vec::new(),
         }
     }
 

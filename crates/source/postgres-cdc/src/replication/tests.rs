@@ -481,3 +481,14 @@ async fn retry_on_slot_active_does_not_retry_unrelated_errors() {
         "a non-slot-active error must not be retried"
     );
 }
+
+#[test]
+fn control_options_word_an_unparseable_url() {
+    let err = control_options("postgres://h:x/db")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("postgres-cdc: invalid connection URL"),
+        "{err}"
+    );
+}

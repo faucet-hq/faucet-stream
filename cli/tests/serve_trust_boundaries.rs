@@ -6,6 +6,7 @@
 //! template trigger stores no resolved secret.
 #![cfg(all(feature = "serve", feature = "source-csv", feature = "sink-jsonl"))]
 #![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
+#![allow(unsafe_code)] // tests set process environment variables
 
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -55,6 +56,7 @@ fn args(port: u16, auth_config: PathBuf) -> faucet_cli::cli::ServeArgs {
         policy: None,
         otel_config: None,
         callback_allow_host: Vec::new(),
+        origins: Default::default(),
         mcp: false,
         mcp_allow_mutations: false,
         require_approval: Vec::new(),
@@ -540,13 +542,10 @@ async fn approval_gates_the_template_lifecycle_and_keeps_secrets_out_of_requests
         as_admin["payload"]["callback"]["headers"]["authorization"],
         "Bearer cb-secret"
     );
+    // The template body is the operator's: only an unscoped admin reads it.
+    assert_eq!(pending["change"]["payload"]["config"], "***", "{pending}");
     let (_, as_operator) = api.get("op-tok", &format!("/v1/changes/{change_id}")).await;
-    assert!(
-        as_operator["payload"]["config"]
-            .as_str()
-            .unwrap()
-            .contains("csv")
-    );
+    assert_eq!(as_operator["payload"]["config"], "***");
     assert_eq!(
         as_operator["payload"]["callback"]["headers"]["authorization"],
         "***"
@@ -636,4 +635,113 @@ async fn every_way_a_config_names_a_local_path_is_checked_before_it_runs() {
         .post("admin-tok", "/v1/runs", json!({"config": beside}))
         .await;
     assert_eq!(code, 202, "a state store beside the auth config: {r}");
+}
+
+/// A relative path whose first segment reads as a URL scheme (`zz:/…`) is a
+/// local path: refused rather than opened outside the path roots — as a sink,
+/// a source, a preview and a DLQ location — and the server's own environment
+/// file is out of reach as data.
+#[tokio::test(flavor = "multi_thread")]
+async fn scheme_shaped_paths_and_the_server_env_file_stay_out_of_reach() {
+    let dir = tempfile::tempdir().unwrap();
+    let env_file = dir.path().join(".env");
+    std::fs::write(&env_file, "FAUCET_TRUST_TEST_TOKEN=dummy-secret\n").unwrap();
+    let api = spawn(
+        dir.path(),
+        PRINCIPALS,
+        |a| {
+            a.env_file = Some(env_file.clone());
+            a.no_env_file = false;
+        },
+        true,
+    )
+    .await;
+    let input = csv_input(dir.path());
+    let run = |sink_path: &str| {
+        format!(
+            "version: 1\nname: scheme\npipeline:\n  source: {{ type: csv, config: {{ path: \"{}\" }} }}\n  sink: {{ type: jsonl, config: {{ path: \"{sink_path}\" }} }}\n",
+            input.display()
+        )
+    };
+    for sink_path in [
+        "zz:/x.jsonl",
+        "zz:/../../escaped.jsonl",
+        "zz://../../x.jsonl",
+    ] {
+        let (code, err) = api
+            .post("op-tok", "/v1/runs", json!({"config": run(sink_path)}))
+            .await;
+        assert_eq!(code, 403, "{sink_path}: {err}");
+        assert!(message(&err).contains("URL scheme"), "{err}");
+    }
+    for source in [
+        "zz:/../../../../etc/hosts".to_string(),
+        env_file.display().to_string(),
+    ] {
+        let (code, err) = api
+            .post(
+                "op-tok",
+                "/v1/runs",
+                json!({"config": csv_config(dir.path(), &source)}),
+            )
+            .await;
+        assert_eq!(code, 403, "{source}: {err}");
+    }
+    for location in ["zz:/../../x.jsonl", "zz://../../x.jsonl"] {
+        let (code, err) = api
+            .post("op-tok", "/v1/dlq/inspect", json!({"location": location}))
+            .await;
+        assert_eq!(code, 403, "{location}: {err}");
+    }
+    let (code, err) = api
+        .post(
+            "op-tok",
+            "/v1/dlq/inspect",
+            json!({"location": env_file.display().to_string()}),
+        )
+        .await;
+    assert_eq!(code, 403, "{err}");
+
+    #[cfg(feature = "source-sqlite")]
+    for url in [
+        "sqlite://%2Fusr%2Fshare%2Fx.db".to_string(),
+        format!(
+            "sqlite://{}{}/x.db",
+            dir.path().display(),
+            "/%2e%2e".repeat(12)
+        ),
+        format!("sqlite://file:{}%2Fx.db", dir.path().display()),
+    ] {
+        let config = format!(
+            "version: 1\npipeline:\n  source: {{ type: sqlite, config: {{ database_url: \"{url}\", query: \"SELECT 1\" }} }}\n  sink: {{ type: jsonl, config: {{ path: \"{}\" }} }}\n",
+            dir.path().join("out.jsonl").display()
+        );
+        let (code, err) = api
+            .post("op-tok", "/v1/runs", json!({"config": config}))
+            .await;
+        assert_eq!(code, 403, "{url}: {err}");
+    }
+
+    #[cfg(feature = "mcp")]
+    for source in [
+        "zz:/../../../../etc/hosts".to_string(),
+        env_file.display().to_string(),
+    ] {
+        let config = format!(
+            "version: 1\npipeline:\n  source: {{ type: csv, config: {{ path: \"{source}\" }} }}\n  sink: {{ type: stdout, config: {{}} }}\n"
+        );
+        let (code, body) = api
+            .post(
+                "op-tok",
+                "/mcp",
+                json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                       "params": {"name": "preview", "arguments": {"config": config, "limit": 3}}}),
+            )
+            .await;
+        assert_eq!(code, 200, "{body}");
+        let text = body.to_string();
+        assert!(!text.contains("dummy-secret"), "{text}");
+        assert!(!text.contains("localhost"), "{text}");
+        assert!(text.contains("may not"), "{text}");
+    }
 }

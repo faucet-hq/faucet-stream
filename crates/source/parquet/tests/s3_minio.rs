@@ -4,6 +4,7 @@
 //! the objects under it while hidden segments below it stay excluded.
 //!
 //! Requires Docker.
+#![allow(unsafe_code)] // tests set process environment variables
 
 use std::collections::HashMap;
 use std::sync::Arc;

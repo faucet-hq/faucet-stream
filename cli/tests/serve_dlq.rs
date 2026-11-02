@@ -61,6 +61,7 @@ fn serve_args(port: u16, auth_config: std::path::PathBuf) -> faucet_cli::cli::Se
         policy: None,
         otel_config: None,
         callback_allow_host: Vec::new(),
+        origins: Default::default(),
         mcp: false,
         mcp_allow_mutations: false,
         require_approval: Vec::new(),
@@ -154,6 +155,18 @@ async fn dlq_endpoints_inspect_replay_discard_with_rbac() {
     let summary: Value = insp.json().await.unwrap();
     assert_eq!(summary["total_envelopes"], 2);
     assert_eq!(summary["by_reason"]["quality"], 2);
+
+    // A location outside the path roots is refused before it is looked up.
+    for (route, token) in [("inspect", "viewer-tok"), ("discard", "admin-tok")] {
+        let outside = client
+            .post(format!("{base}/v1/dlq/{route}"))
+            .bearer_auth(token)
+            .json(&json!({ "location": "/var/empty/faucet-nowhere/dlq.jsonl" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(outside.status(), 403, "{route}");
+    }
 
     // Viewer is denied replay/discard (DlqManage = operator+) → 403.
     let denied = client

@@ -45,9 +45,13 @@ impl PostgresStateStore {
     ) -> Result<Self, FaucetError> {
         validate_table_name(table)?;
         faucet_core::ensure_crypto_provider();
+        let opts =
+            faucet_core::libpq::connect_options("postgres state store", connection_url, |e| {
+                FaucetError::State(format!("PostgreSQL state-store connection failed: {e}"))
+            })?;
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
-            .connect(connection_url)
+            .connect_with(opts)
             .await
             .map_err(|e| {
                 FaucetError::State(format!("PostgreSQL state-store connection failed: {e}"))

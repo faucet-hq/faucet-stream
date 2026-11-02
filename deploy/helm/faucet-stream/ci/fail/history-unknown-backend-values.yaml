@@ -1,0 +1,6 @@
+# expect-error: serve.history.backend must be one of memory|sqlite|postgres (got "mysql").
+serve:
+  enabled: true
+  history:
+    backend: mysql
+    url: "mysql://faucet:dummy-secret@db.example:3306/faucet"

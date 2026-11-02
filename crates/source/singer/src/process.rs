@@ -288,6 +288,7 @@ impl TapProcess {
     }
 
     /// SIGTERM → grace → SIGKILL, then reap. Returns the final exit status.
+    #[allow(unsafe_code)] // sends SIGTERM to the child process
     async fn terminate(&mut self) -> std::io::Result<std::process::ExitStatus> {
         if let Ok(Some(status)) = self.child.try_wait() {
             return Ok(status); // already exited

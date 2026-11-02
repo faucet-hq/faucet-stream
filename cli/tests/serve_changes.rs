@@ -9,6 +9,7 @@
     feature = "source-csv",
     feature = "sink-jsonl"
 ))]
+#![allow(unsafe_code)] // tests set process environment variables
 #![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use serde_json::{Value, json};
@@ -75,6 +76,7 @@ fn serve_args(
         policy: None,
         otel_config: None,
         callback_allow_host: Vec::new(),
+        origins: Default::default(),
         mcp: false,
         mcp_allow_mutations: false,
         require_approval,

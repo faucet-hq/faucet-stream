@@ -303,6 +303,15 @@ pub fn build_router(
             state.clone(),
             scope_test_policy,
         ))
+        .layer(axum::middleware::from_fn_with_state(
+            std::sync::Arc::new(crate::serve::guard::RequestGuard::new(
+                &config.request_guard,
+                config.listen,
+                matches!(config.auth, crate::serve::config::AuthMode::None),
+                &config.cors_origins,
+            )),
+            crate::serve::guard::guard,
+        ))
         .with_state(state)
 }
 
@@ -368,11 +377,17 @@ async fn load_default_base(config: &ServeConfig) -> CliResult<Option<Value>> {
             crate::serve::load::protect_file(path);
             // `serve` has no --profile flag; honour FAUCET_PROFILE from the environment directly.
             let profile = std::env::var("FAUCET_PROFILE").ok();
+            if let Ok(text) = std::fs::read_to_string(path)
+                && let Ok(doc) = crate::yaml::from_str::<Value>(&text)
+            {
+                crate::serve::load::protect_references(&doc);
+            }
             let cfg =
                 crate::config::PipelineConfig::from_path_async(path, profile.as_deref()).await?;
-            Ok(Some(serde_json::to_value(&cfg).map_err(|e| {
-                CliError::Serve(format!("serializing --default-config: {e}"))
-            })?))
+            let base = serde_json::to_value(&cfg)
+                .map_err(|e| CliError::Serve(format!("serializing --default-config: {e}")))?;
+            crate::serve::load::protect_default_state(&base);
+            Ok(Some(base))
         }
     }
 }
@@ -747,6 +762,15 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         config.otel.as_ref(),
     );
     crate::serve::callback::set_allow_hosts(config.callback_allow_hosts.clone());
+    let short = crate::serve::auth::short_tokens(&config.auth);
+    if short > 0 {
+        tracing::warn!(
+            tokens = short,
+            min_len = crate::serve::auth::MIN_TOKEN_LEN,
+            "a bearer token is shorter than the recommended minimum; use a long random value \
+             (for example `openssl rand -hex 32`)"
+        );
+    }
     crate::serve::references::install(config.references.clone());
     crate::serve::metrics::set_cluster_enabled(config.cluster.enabled);
     if let Some(h) = &prom {
@@ -765,6 +789,21 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
 
     if let crate::serve::config::HistoryBackendSpec::Sqlite(url) = &config.history {
         crate::serve::load::protect_sqlite_url(url);
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        crate::serve::load::protect_env_files(&cwd, config.env_file.as_deref());
+    }
+    for path in [
+        &config.policy_path,
+        &config.triggers_path,
+        &config.templates_sync_path,
+        &config.connect_providers_path,
+        &config.default_config_path,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        crate::serve::load::protect_file(path);
     }
     #[cfg(feature = "catalog")]
     if let Some(key) = crate::catalog::snapshot::key_file_path() {

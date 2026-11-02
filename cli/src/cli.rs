@@ -1315,9 +1315,10 @@ pub struct HubPairArgs {
     #[arg(long)]
     pub overlay_hub: Option<String>,
     /// Trust hub templates from this owner (or this exact template id) to
-    /// read the environment, files and secrets on this machine. Templates
-    /// outside `faucet-hq` are refused when they do, unless trusted;
-    /// `--trust '*'` trusts every one. Repeatable.
+    /// read the environment, files and secrets on this machine, the other
+    /// template's config and to run a program. Templates outside `faucet-hq`
+    /// are refused when they do, unless trusted; the owner is the template's
+    /// namespace directory. `--trust '*'` trusts every one. Repeatable.
     #[arg(long = "trust", value_name = "OWNER|ID")]
     pub trust: Vec<String>,
 }
@@ -1888,6 +1889,12 @@ pub struct DlqDiscardArgs {
     /// the DLQ. An encrypted file is re-sealed, which needs the key.
     #[arg(long)]
     pub purge: bool,
+    /// Record again, sealed with the key, the discard entries of a sealed DLQ
+    /// that were written without it (before the file was sealed). Those are
+    /// otherwise ignored and their lines read. Only this is done: no other
+    /// envelope is discarded.
+    #[arg(long, conflicts_with_all = ["reason", "before", "delete", "purge"])]
+    pub reseal_plain: bool,
     /// Key for a DLQ sealed at rest by its sink's `encryption` block (a `file`
     /// sink writing JSON Lines, or the deprecated `jsonl` sink).
     /// Repeat the flag to also try older (rotated) keys. Requires a build
@@ -2112,6 +2119,35 @@ impl Default for LogBufferArgs {
     }
 }
 
+/// Which `Host` and `Origin` headers `faucet serve` answers.
+#[cfg(feature = "serve")]
+#[derive(Debug, Clone, Default, clap::Args)]
+pub struct RequestOriginArgs {
+    /// A host name clients reach this server by. Repeatable or
+    /// comma-separated; `*` accepts any. When set, a request whose `Host`
+    /// names another host is refused (403). Without it the check applies
+    /// only to a `--no-auth` server on loopback, which then answers
+    /// `localhost`, `127.0.0.1`, `[::1]` and its listen address.
+    #[arg(
+        long = "allowed-host",
+        value_name = "HOST",
+        value_delimiter = ',',
+        env = "FAUCET_SERVE_ALLOWED_HOSTS"
+    )]
+    pub allowed_host: Vec<String>,
+    /// A browser origin (`https://app.example`) that may send state-changing
+    /// requests besides this server's own and the `--cors-origin` list.
+    /// Repeatable or comma-separated. Any other `Origin` on a `POST`, `PUT`,
+    /// `PATCH` or `DELETE` is refused (403).
+    #[arg(
+        long = "allowed-origin",
+        value_name = "ORIGIN",
+        value_delimiter = ',',
+        env = "FAUCET_SERVE_ALLOWED_ORIGINS"
+    )]
+    pub allowed_origin: Vec<String>,
+}
+
 /// Execution pools (#957): which runs this replica executes.
 #[cfg(feature = "serve")]
 #[derive(Debug, Clone, Default, clap::Args)]
@@ -2179,6 +2215,12 @@ pub struct ReferenceArgs {
     /// `<DIR>/<tenant id>`.
     #[arg(long = "tenant-path-root", value_name = "DIR")]
     pub tenant_path_root: Option<PathBuf>,
+    /// Let a submitted config turn off certificate or host-key verification
+    /// (`insecure_skip_verify`, `trust_server_certificate`, an SFTP
+    /// `known_hosts: {mode: insecure}`, …). Default: refused. Never for a
+    /// tenant.
+    #[arg(long = "allow-unverified-tls")]
+    pub allow_unverified_tls: bool,
 }
 
 /// `faucet serve` arguments.
@@ -2472,6 +2514,9 @@ pub struct ServeArgs {
     /// named here. See the HTTP API reference for the egress posture.
     #[arg(long = "callback-allow-host")]
     pub callback_allow_host: Vec<String>,
+    /// `--allowed-host` / `--allowed-origin`.
+    #[command(flatten)]
+    pub origins: RequestOriginArgs,
     /// Mount the MCP (Model Context Protocol) endpoint at `/mcp`, exposing
     /// faucet as agent tool calls. Effective only in a build with the `mcp`
     /// feature; the endpoint inherits serve's bearer-auth + RBAC + audit.
@@ -2669,9 +2714,10 @@ pub struct RunArgs {
     #[arg(long)]
     pub overlay_hub: Option<String>,
     /// Trust hub templates from this owner (or this exact template id) to
-    /// read the environment, files and secrets on this machine. Templates
-    /// outside `faucet-hq` are refused when they do, unless trusted;
-    /// `--trust '*'` trusts every one. Repeatable.
+    /// read the environment, files and secrets on this machine, the other
+    /// template's config and to run a program. Templates outside `faucet-hq`
+    /// are refused when they do, unless trusted; the owner is the template's
+    /// namespace directory. `--trust '*'` trusts every one. Repeatable.
     #[arg(long = "trust", value_name = "OWNER|ID")]
     pub trust: Vec<String>,
 }
@@ -2946,9 +2992,10 @@ pub struct ValidateArgs {
     #[arg(long)]
     pub overlay_hub: Option<String>,
     /// Trust hub templates from this owner (or this exact template id) to
-    /// read the environment, files and secrets on this machine. Templates
-    /// outside `faucet-hq` are refused when they do, unless trusted;
-    /// `--trust '*'` trusts every one. Repeatable.
+    /// read the environment, files and secrets on this machine, the other
+    /// template's config and to run a program. Templates outside `faucet-hq`
+    /// are refused when they do, unless trusted; the owner is the template's
+    /// namespace directory. `--trust '*'` trusts every one. Repeatable.
     #[arg(long = "trust", value_name = "OWNER|ID")]
     pub trust: Vec<String>,
 }

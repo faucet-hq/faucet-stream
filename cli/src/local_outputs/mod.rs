@@ -99,6 +99,7 @@ fn resolve_host(
 }
 
 #[cfg(unix)]
+#[allow(unsafe_code)] // gethostname FFI call
 fn read_host() -> Option<String> {
     let mut buf = [0u8; 256];
     // SAFETY: `gethostname` writes at most `buf.len()` bytes into a buffer we own.

@@ -456,7 +456,7 @@ pub async fn probe_roots(
         let kinds = (id.clone(), source.kind.clone(), sink.kind.clone());
         handles.push((
             kinds,
-            tokio::spawn(async move {
+            tokio::spawn(faucet_core::http::inherit_reference_policy(async move {
                 let _permit = sem.acquire_owned().await.expect("semaphore not closed");
                 let (source, sink) = match resolve_probe_configs(source, sink, clock) {
                     Ok(pair) => pair,
@@ -482,7 +482,7 @@ pub async fn probe_roots(
                 inv.delivery = Some(guarantee);
                 inv.probes.extend(policy_probes);
                 inv
-            }),
+            })),
         ));
     }
     let mut out = Vec::with_capacity(handles.len());

@@ -7,6 +7,7 @@
 //! unsigned-integer / float JSON type-name reporting on a type-drift error.
 //! As in `roundtrip.rs`, we read the written Parquet back through the raw
 //! `parquet` + `arrow` APIs (no dependency on `faucet-source-parquet`).
+#![allow(unsafe_code)] // tests set process environment variables
 
 use arrow::record_batch::RecordBatch;
 use faucet_core::Sink;

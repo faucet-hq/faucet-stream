@@ -3,6 +3,7 @@
 //!
 //! These tests require Docker. Each test boots its own container and seeds
 //! its own bucket so they are fully isolated and safe to run in parallel.
+#![allow(unsafe_code)] // tests set process environment variables
 
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Credentials;

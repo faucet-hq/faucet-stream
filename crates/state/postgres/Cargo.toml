@@ -11,7 +11,7 @@ keywords = ["postgres", "state", "bookmark", "etl", "faucet"]
 categories.workspace = true
 
 [dependencies]
-faucet-core.workspace = true
+faucet-core = { workspace = true, features = ["libpq-sqlx"] }
 async-trait.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
@@ -41,3 +41,6 @@ rustdoc-args = ["--cfg", "docsrs"]
 constructible_struct_adds_field = "allow"
 constructible_struct_adds_private_field = "allow"
 enum_struct_variant_field_added = "allow"
+
+[lints]
+workspace = true

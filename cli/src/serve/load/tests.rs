@@ -1,3 +1,4 @@
+#![allow(unsafe_code)] // tests set process environment variables
 use super::*;
 
 /// A caller-supplied fragment (an inline overlay) is screened like a
@@ -544,9 +545,12 @@ fn protect_input_covers_the_file_and_everything_it_reads() {
 
 #[test]
 fn sqlite_urls_name_their_file() {
-    assert_eq!(sqlite_path("sqlite:/var/h.db"), Some("/var/h.db"));
     assert_eq!(
-        sqlite_path("sqlite:///var/h.db?mode=rwc"),
+        sqlite_path("sqlite:/var/h.db").as_deref(),
+        Some("/var/h.db")
+    );
+    assert_eq!(
+        sqlite_path("sqlite:///var/h.db?mode=rwc").as_deref(),
         Some("/var/h.db")
     );
     assert_eq!(sqlite_path("sqlite::memory:"), None);
@@ -598,9 +602,9 @@ fn local_paths_and_globs_that_reach_protected_files_are_found() {
         "{d}/data/dt=${{now.date}}/x.jsonl"
     )));
 
-    assert_eq!(local_path("sqlite:/x.db"), Some("/x.db"));
-    assert_eq!(local_path("file:///x"), Some("/x"));
-    assert_eq!(local_path("file:./x"), Some("./x"));
+    assert_eq!(local_path("sqlite:/x.db").as_deref(), Some("/x.db"));
+    assert_eq!(local_path("file:///x").as_deref(), Some("/x"));
+    assert_eq!(local_path("file:./x").as_deref(), Some("./x"));
     assert_eq!(local_path("s3://b/k"), None);
     assert_eq!(local_path(":memory:"), None);
     assert_eq!(replace_tokens("a/${now.date}/b${x"), "a/*/b*");
@@ -1538,4 +1542,167 @@ fn a_refusal_shows_only_the_callers_own_text() {
     );
     assert!(!err.contains("evil.example.net"), "{err}");
     assert!(!err.contains("svc-key-from-operator-env"), "{err}");
+}
+
+#[test]
+fn a_secret_reference_is_screened_as_it_is_about_to_be_read() {
+    protect_secret_ref("vault", "secret/screen-test#admin");
+    let mut base = std::collections::BTreeSet::new();
+    base.insert("${aws-sm:operator/base}".to_string());
+    let screen = secret_screen(&ReferencePolicy::deny_all(), &base);
+    assert!(screen("vault", "secret/screen-test#other").is_err());
+    let err = screen("vault", "kv/caller").unwrap_err();
+    assert!(err.contains("allow-list"), "{err}");
+    assert!(screen("aws-sm", "operator/base").is_ok());
+    let open = secret_screen(&ReferencePolicy::open(), &Default::default());
+    assert!(open("vault", "kv/caller").is_ok());
+    assert!(open("vault", "secret/screen-test").is_err());
+    let refused = resolution_error(crate::error::CliError::SecretRefused {
+        scheme: "vault".into(),
+        reference: "kv/caller".into(),
+        reason: "no".into(),
+    });
+    assert!(matches!(refused, ServeError::Forbidden(_)));
+}
+
+#[test]
+fn environment_files_in_the_working_directory_are_protected() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".env"), "TOKEN=dummy-secret\n").unwrap();
+    std::fs::write(dir.path().join(".env.local"), "X=1\n").unwrap();
+    std::fs::write(dir.path().join("data.csv"), "id\n1\n").unwrap();
+    let loaded = dir.path().join("elsewhere.env");
+    std::fs::write(&loaded, "Y=1\n").unwrap();
+    protect_env_files(dir.path(), Some(&loaded));
+    let d = dir.path().display();
+    assert!(read_protected(&format!("{d}/.env")));
+    assert!(read_protected(&format!("{d}/.env.local")));
+    assert!(read_protected(&loaded.display().to_string()));
+    assert!(file_is_protected(&format!("{d}/.env")));
+    assert!(!read_protected(&format!("{d}/data.csv")));
+    protect_env_files(&dir.path().join("missing"), None);
+}
+
+#[test]
+fn nothing_under_a_protected_directory_is_reachable() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    std::fs::write(state.join("bookmark.json"), "{}").unwrap();
+    protect_dir(&state);
+    let d = dir.path().display();
+    assert!(read_protected(&format!("{d}/state/bookmark.json")));
+    assert!(data_path_is_protected(
+        &format!("{d}/state/new.json"),
+        Access::Write
+    ));
+    assert!(data_path_is_protected(
+        &d.to_string(),
+        Access::Read { recursive: true }
+    ));
+    assert!(!read_protected(&d.to_string()));
+    assert!(read_protected(&format!("{d}/state/*.json")));
+    assert!(read_protected(&format!("{d}/*/*.json")));
+    assert!(file_is_protected(&format!("{d}/state/bookmark.json")));
+    assert!(!read_protected(&format!("{d}/other/*.json")));
+    #[cfg(unix)]
+    {
+        let other = dir.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        std::os::unix::fs::symlink(state.join("bookmark.json"), other.join("b.json")).unwrap();
+        assert!(read_protected(&format!("{d}/other/*.json")));
+    }
+}
+
+#[test]
+fn encoded_and_prefixed_paths_are_read_as_their_connectors_read_them() {
+    let enc = "sqlite://%2Fproc%2Fself%2Fenviron";
+    assert_eq!(local_path(enc).as_deref(), Some("/proc/self/environ"));
+    assert!(read_protected(&local_path(enc).unwrap()));
+    assert_eq!(
+        local_path("duckdb:///proc/self/x").as_deref(),
+        Some("/proc/self/x")
+    );
+    assert_eq!(local_path("sqlite::memory:"), None);
+}
+
+#[test]
+fn sql_transforms_get_bounded_resources_when_they_set_none() {
+    let doc = json!({
+        "version": 1,
+        "pipeline": {
+            "source": { "type": "csv", "config": { "path": "a.csv" },
+                "transforms": [ { "type": "sql", "config": { "query": "SELECT 1" } } ] },
+            "sink": { "type": "jsonl", "config": { "path": "o.jsonl" } },
+            "transforms": [
+                { "type": "sql", "config": { "query": "SELECT 1", "memory_limit": "8GB", "threads": 16 } },
+                { "type": "flatten" }
+            ]
+        },
+        "matrix": [ { "id": "r", "transforms": [ { "type": "sql", "config": { "query": "SELECT 1", "threads": null } } ] } ]
+    });
+    let mut cfg: PipelineConfig = serde_json::from_value(doc).unwrap();
+    confine_sql(&mut cfg);
+    let own = &cfg.pipeline.transforms[0].config;
+    assert_eq!(
+        (own["memory_limit"].clone(), own["threads"].clone()),
+        (json!("8GB"), json!(16))
+    );
+    assert!(
+        cfg.pipeline.transforms[1]
+            .config
+            .get("memory_limit")
+            .is_none()
+    );
+    let unset = [
+        &cfg.pipeline
+            .source
+            .as_ref()
+            .unwrap()
+            .transforms
+            .as_ref()
+            .unwrap()[0]
+            .config,
+        &cfg.matrix[0].transforms.as_ref().unwrap()[0].config,
+    ];
+    for c in unset {
+        assert_eq!(c["memory_limit"], SQL_TRANSFORM_MEMORY_LIMIT);
+        let t = c["threads"].as_u64().unwrap() as usize;
+        assert!((1..=SQL_TRANSFORM_MAX_THREADS).contains(&t), "{c}");
+    }
+
+    let topo = json!({
+        "version": 1,
+        "pipeline": {
+            "nodes": { "t": { "kind": "transform", "transforms": [ { "type": "sql", "config": { "query": "SELECT 1" } } ] } },
+            "edges": []
+        }
+    });
+    let mut cfg: PipelineConfig = serde_json::from_value(topo).unwrap();
+    confine_sql(&mut cfg);
+    let crate::config::NodeSpec::Transform { transforms } = &cfg.pipeline.nodes["t"] else {
+        panic!("transform node");
+    };
+    assert_eq!(
+        transforms[0].config["memory_limit"],
+        SQL_TRANSFORM_MEMORY_LIMIT
+    );
+
+    let mut nodes = expand(
+        &serde_json::from_value(json!({
+            "version": 1,
+            "pipeline": {
+                "source": { "type": "csv", "config": { "path": "a.csv" } },
+                "sink": { "type": "jsonl", "config": { "path": "o.jsonl" } },
+                "transforms": [ { "type": "sql", "config": { "query": "SELECT 1" } } ]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    confine_sql_nodes(&mut nodes);
+    assert_eq!(
+        nodes[0].transforms[0].config["memory_limit"],
+        SQL_TRANSFORM_MEMORY_LIMIT
+    );
 }

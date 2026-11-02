@@ -135,6 +135,13 @@ impl DlqDecryptor {
         #[cfg(feature = "encryption")]
         if let Some(enc) = &self.inner {
             if !starts_sealed(file)? {
+                if has_sealed_line(file)? {
+                    return Err(FaucetError::Source(format!(
+                        "DLQ file '{}' starts with a plaintext line but holds sealed lines, so \
+                         its integrity cannot be checked; it is not read",
+                        file.display()
+                    )));
+                }
                 return Ok(None);
             }
             use faucet_common_file::sealed_lines::{Verdict, Verifier};
@@ -175,6 +182,107 @@ impl DlqDecryptor {
         #[cfg(not(feature = "encryption"))]
         let _ = file;
         Ok(None)
+    }
+
+    /// Whether `file` is sealed with whole-file integrity under a loaded key:
+    /// its discard list is then authenticated with that key.
+    pub fn seals(&self, file: &Path) -> Result<bool, FaucetError> {
+        #[cfg(feature = "encryption")]
+        if let Some(enc) = &self.inner {
+            use base64::Engine as _;
+            return Ok(first_nonblank_line(file)?.is_some_and(|first| {
+                first.trim().starts_with(SEALED_LINE_PREFIX)
+                    && base64::engine::general_purpose::STANDARD
+                        .decode(first.trim())
+                        .is_ok_and(|b| enc.open_line(&b).is_ok())
+            }));
+        }
+        let _ = file;
+        Ok(false)
+    }
+
+    /// The discard-list entry recording `id` for `file`: the id itself, or —
+    /// when `sealed` ([`seals`](Self::seals)) — the id sealed with the key and
+    /// bound to the file's name, so an entry nobody holding the key wrote is
+    /// ignored.
+    pub fn discard_entry(&self, file: &Path, id: &str, sealed: bool) -> String {
+        #[cfg(feature = "encryption")]
+        if let (true, Some(enc)) = (sealed, &self.inner) {
+            use base64::Engine as _;
+            let entry = enc.encrypt_bound(id.as_bytes(), &discard_context(file));
+            return format!(
+                "{SEALED_DISCARD_PREFIX}{}",
+                base64::engine::general_purpose::STANDARD.encode(entry)
+            );
+        }
+        let _ = (file, sealed);
+        id.to_string()
+    }
+
+    /// The ids of the lines discarded from `file`. For a file
+    /// [`seals`](Self::seals) reports, only entries sealed with the key for
+    /// this file count.
+    pub fn discarded_ids(
+        &self,
+        file: &Path,
+    ) -> Result<std::collections::HashSet<String>, FaucetError> {
+        let (ids, plain) = self.discard_entries(file)?;
+        if !plain.is_empty() {
+            tracing::warn!(
+                file = %file.display(),
+                ignored = plain.len(),
+                "DLQ discard list holds entries not sealed with the key for this file; they \
+                 are ignored (`faucet dlq discard --reseal-plain` with the key re-records them)"
+            );
+        }
+        Ok(ids)
+    }
+
+    /// The plain (unsealed) entries in the discard list of a sealed file
+    /// that no sealed entry covers: lines discarded before the file was
+    /// sealed, or by someone without the key. They are not honoured; empty
+    /// for a file that is not sealed.
+    pub fn unsealed_discards(
+        &self,
+        file: &Path,
+    ) -> Result<std::collections::HashSet<String>, FaucetError> {
+        Ok(self.discard_entries(file)?.1)
+    }
+
+    /// The honoured discard ids of `file` and, for a sealed file, the plain
+    /// entries no sealed entry covers.
+    fn discard_entries(
+        &self,
+        file: &Path,
+    ) -> Result<
+        (
+            std::collections::HashSet<String>,
+            std::collections::HashSet<String>,
+        ),
+        FaucetError,
+    > {
+        let entries = discarded_lines(file)?;
+        if !self.seals(file)? {
+            return Ok((entries, Default::default()));
+        }
+        #[cfg(feature = "encryption")]
+        if let Some(enc) = &self.inner {
+            use base64::Engine as _;
+            let context = discard_context(file);
+            let ids: std::collections::HashSet<String> = entries
+                .iter()
+                .filter_map(|e| e.strip_prefix(SEALED_DISCARD_PREFIX))
+                .filter_map(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+                .filter_map(|b| enc.decrypt_bound(&b, &context).ok())
+                .filter_map(|b| String::from_utf8(b).ok())
+                .collect();
+            let plain = entries
+                .into_iter()
+                .filter(|e| !e.starts_with(SEALED_DISCARD_PREFIX) && !ids.contains(e))
+                .collect();
+            return Ok((ids, plain));
+        }
+        Ok((entries, Default::default()))
     }
 
     /// Whether any key is loaded.
@@ -610,7 +718,7 @@ fn numbered_parts(glob: &str, location: &str) -> Result<Vec<PathBuf>, FaucetErro
         })
         .collect();
     if files.is_empty() {
-        return Err(FaucetError::Source(format!(
+        return Err(FaucetError::Config(format!(
             "DLQ location '{location}' matched no files (expected a .jsonl file, a directory of \
              .jsonl / .ndjson files (optionally .gz / .zst), or a glob)"
         )));
@@ -678,7 +786,7 @@ fn expand_plain(location: &str) -> Result<Vec<PathBuf>, FaucetError> {
     };
     files.sort();
     if files.is_empty() {
-        return Err(FaucetError::Source(format!(
+        return Err(FaucetError::Config(format!(
             "DLQ location '{location}' matched no files (expected a .jsonl file, a directory of \
              .jsonl files, or a glob)"
         )));
@@ -703,6 +811,33 @@ pub fn scan_files(files: &[PathBuf], dec: &DlqDecryptor) -> Result<ScanResult, F
         undecryptable: tally.undecryptable,
         files_read: tally.files_read,
     })
+}
+
+/// Prefix of a discard-list entry sealed with the DLQ's key.
+#[cfg(feature = "encryption")]
+const SEALED_DISCARD_PREFIX: &str = "sealed:";
+
+#[cfg(feature = "encryption")]
+fn discard_context(file: &Path) -> Vec<u8> {
+    let name = file.file_name().map(|n| n.to_string_lossy().into_owned());
+    format!("faucet-dlq-discard\0{}", name.unwrap_or_default()).into_bytes()
+}
+
+/// Whether any line of `file` is a sealed line.
+#[cfg(feature = "encryption")]
+fn has_sealed_line(file: &Path) -> Result<bool, FaucetError> {
+    use base64::Engine as _;
+    let mut found = false;
+    for_each_line(file, |line| {
+        let t = line.trim();
+        found = found
+            || (t.starts_with(SEALED_LINE_PREFIX)
+                && base64::engine::general_purpose::STANDARD
+                    .decode(t)
+                    .is_ok_and(|b| faucet_core::encryption::is_encrypted(&b)));
+        Ok(())
+    })?;
+    Ok(found)
 }
 
 /// Whether `file`'s first non-blank line is sealed by the jsonl sink's
@@ -736,6 +871,9 @@ pub struct ScanTally {
     pub non_envelope: usize,
     /// Sealed lines that could not be decrypted.
     pub undecryptable: usize,
+    /// Plain discard entries of sealed files that are not honoured (see
+    /// [`DlqDecryptor::unsealed_discards`]).
+    pub unsealed_discards: usize,
     /// Files that were read.
     pub files_read: usize,
 }
@@ -793,7 +931,8 @@ pub fn scan_each(
     let mut out = ScanTally::default();
     for file in files {
         let limit = dec.verify_file(file)?;
-        let discarded = discarded_lines(file)?;
+        let (discarded, plain) = dec.discard_entries(file)?;
+        out.unsealed_discards += plain.len();
         for_each_verified_line(file, limit, |line| {
             if !discarded.is_empty() && discarded.contains(&line_id(line)) {
                 return Ok(());
@@ -833,6 +972,47 @@ pub struct DlqReaderSource {
     reason: Option<String>,
     dec: DlqDecryptor,
     target: Option<ReplayTarget>,
+    foreign: Option<ForeignMasking>,
+}
+
+/// Masking for envelopes a replay's own row cannot be shown to have written:
+/// their payloads were masked for another destination, if at all.
+#[derive(Clone)]
+#[cfg_attr(not(feature = "masking"), allow(dead_code))]
+pub struct ForeignMasking {
+    own: ReplayTarget,
+    #[cfg(feature = "masking")]
+    masking: Option<Arc<faucet_core::CompiledMasking>>,
+}
+
+impl ForeignMasking {
+    /// Mask with `masking` (the target sink's rules) every payload `own` did
+    /// not provably write.
+    #[cfg(feature = "masking")]
+    pub fn new(own: ReplayTarget, masking: Option<Arc<faucet_core::CompiledMasking>>) -> Self {
+        Self { own, masking }
+    }
+
+    fn apply(&self, env: UnwrappedEnvelope) -> Value {
+        #[cfg(feature = "masking")]
+        if let Some(m) = &self.masking
+            && !self.own.wrote(&env)
+        {
+            return faucet_core::apply_masking(vec![env.payload], m)
+                .records
+                .pop()
+                .unwrap_or(Value::Null);
+        }
+        env.payload
+    }
+}
+
+/// An envelope's payload as a replay writes it.
+fn replayed(env: UnwrappedEnvelope, foreign: Option<&ForeignMasking>) -> Value {
+    match foreign {
+        Some(f) => f.apply(env),
+        None => env.payload,
+    }
 }
 
 /// The pipeline and row a replay writes into. A DLQ location is often shared
@@ -866,6 +1046,22 @@ impl ReplayTarget {
         };
         pipeline_ok && row_ok
     }
+
+    /// Whether `env` names this pipeline and row as its writer (an envelope
+    /// that names no writer does not).
+    pub fn wrote(&self, env: &UnwrappedEnvelope) -> bool {
+        let got = env.pipeline.as_deref().filter(|p| !p.is_empty());
+        let pipeline_ok = match (&self.pipeline, got) {
+            (Some(want), Some(got)) => want == got,
+            (None, None) => true,
+            _ => false,
+        };
+        let row_ok = env
+            .row
+            .as_deref()
+            .is_some_and(|got| !got.is_empty() && partition_base(got) == partition_base(&self.row));
+        pipeline_ok && row_ok
+    }
 }
 
 /// The row a partition invocation id (`<row>::partition::<n>`) belongs to.
@@ -893,7 +1089,15 @@ impl DlqReaderSource {
             reason,
             dec,
             target: None,
+            foreign: None,
         }
+    }
+
+    /// Mask the payloads the replay's own row did not write
+    /// ([`ForeignMasking`]).
+    pub fn with_foreign_masking(mut self, foreign: Option<ForeignMasking>) -> Self {
+        self.foreign = foreign;
+        self
     }
 
     /// Keep only the envelopes `target` wrote (see [`ReplayTarget`]).
@@ -918,12 +1122,13 @@ impl Source for DlqReaderSource {
         let reason = self.reason.clone();
         let target = self.target.clone();
         let dec = self.dec.clone();
+        let foreign = self.foreign.clone();
         // Blocking file IO off the async runtime.
         tokio::task::spawn_blocking(move || {
             let mut out = Vec::new();
             scan_each(&files, &dec, |env| {
                 if replay_selects(&env, reason.as_deref(), target.as_ref()) {
-                    out.push(env.payload);
+                    out.push(replayed(env, foreign.as_ref()));
                 }
                 Ok(())
             })
@@ -951,13 +1156,14 @@ impl Source for DlqReaderSource {
         let reason = self.reason.clone();
         let target = self.target.clone();
         let dec = self.dec.clone();
+        let foreign = self.foreign.clone();
         Box::pin(faucet_core::async_stream::try_stream! {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Vec<Value>, FaucetError>>(2);
             let reader = tokio::task::spawn_blocking(move || {
                 let mut page = Vec::new();
                 let scanned = scan_each(&files, &dec, |env| {
                     if replay_selects(&env, reason.as_deref(), target.as_ref()) {
-                        page.push(env.payload);
+                        page.push(replayed(env, foreign.as_ref()));
                         if page.len() >= chunk {
                             tx.blocking_send(Ok(std::mem::take(&mut page)))
                                 .map_err(|_| FaucetError::Source("DLQ reader stopped".into()))?;

@@ -55,6 +55,8 @@ pub enum ServeError {
     /// 503 — the server is shutting down and takes no new work; retry against
     /// another instance (or this one once it is back).
     Draining,
+    /// 415 — the request body's `Content-Type` is not one the route accepts.
+    UnsupportedMediaType(String),
     Internal(String),
 }
 
@@ -79,6 +81,7 @@ impl ServeError {
             ServeError::QueueFull { .. } => StatusCode::TOO_MANY_REQUESTS,
             ServeError::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             ServeError::Unavailable(_) | ServeError::Draining => StatusCode::SERVICE_UNAVAILABLE,
+            ServeError::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             ServeError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -95,6 +98,7 @@ impl ServeError {
             ServeError::TooManyRequests(_) => "limit_exceeded",
             ServeError::Unavailable(_) => "unavailable",
             ServeError::Draining => "draining",
+            ServeError::UnsupportedMediaType(_) => "unsupported_media_type",
             ServeError::Internal(_) => "internal",
         }
     }
@@ -113,6 +117,7 @@ impl ServeError {
             ServeError::Draining => "the server is shutting down and accepts no new work; retry \
                                      against another instance"
                 .into(),
+            ServeError::UnsupportedMediaType(m) => m.clone(),
             ServeError::Internal(m) => m.clone(),
         }
     }
@@ -126,7 +131,10 @@ impl ServeError {
 
     pub fn api_error(&self) -> ApiError {
         // Scrub resolved secrets and URL credentials from the message and details.
-        let message = crate::secrets::registry::redact_message(&self.message());
+        let message = match self {
+            ServeError::Internal(m) => internal_reference(m),
+            _ => crate::secrets::registry::redact_message(&self.message()),
+        };
         let details = self.details().map(|mut d| {
             redact_strings(&mut d);
             d
@@ -139,6 +147,18 @@ impl ServeError {
             },
         }
     }
+}
+
+/// The client-facing text of an internal error: a generic message and a
+/// reference to the server log line that carries the detail.
+fn internal_reference(detail: &str) -> String {
+    let reference = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
+    tracing::error!(
+        reference = %reference,
+        error = %crate::secrets::registry::redact_message(detail),
+        "request failed with an internal error"
+    );
+    format!("internal server error; the server log has the detail (reference {reference})")
 }
 
 fn redact_strings(v: &mut serde_json::Value) {
@@ -231,15 +251,34 @@ mod tests {
 
     #[test]
     fn dynamic_message_variants_round_trip_to_body() {
-        // BadConfig / Internal carry caller-supplied text — confirm it reaches
-        // the body intact (the redaction pass leaves non-secret text unchanged).
+        // BadConfig carries caller-supplied text — confirm it reaches the body
+        // intact (the redaction pass leaves non-secret text unchanged).
         let body = ServeError::BadConfig("bad thing".into()).api_error();
         assert_eq!(body.error.code, "bad_config");
         assert_eq!(body.error.message, "bad thing");
+    }
 
-        let body = ServeError::Internal("boom".into()).api_error();
+    #[test]
+    fn an_unsupported_media_type_is_a_415() {
+        let e = ServeError::UnsupportedMediaType("send JSON".into());
+        assert_eq!(e.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(e.api_error().error.code, "unsupported_media_type");
+        assert_eq!(e.api_error().error.message, "send JSON");
+    }
+
+    #[test]
+    fn internal_errors_answer_with_a_reference_not_the_detail() {
+        let body = ServeError::Internal("reading '/srv/data/x.jsonl': denied".into()).api_error();
         assert_eq!(body.error.code, "internal");
-        assert_eq!(body.error.message, "boom");
+        assert!(!body.error.message.contains("/srv/data"));
+        assert!(body.error.message.contains("(reference "));
+        let again = ServeError::Internal("boom".into()).api_error();
+        assert_ne!(body.error.message, again.error.message);
+        assert!(
+            ServeError::Internal("boom".into())
+                .to_string()
+                .contains("boom")
+        );
     }
 
     #[test]

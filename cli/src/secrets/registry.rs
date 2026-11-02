@@ -22,6 +22,12 @@ const MIN_LINE_LEN: usize = 8;
 /// secrets are dropped so redaction cost stays bounded.
 pub const MAX_FORMS: usize = 16_384;
 
+/// Most forms of values a caller supplied (a `secret: true` template param)
+/// the registry holds. They are kept apart from [`MAX_FORMS`]: a caller's
+/// values only ever displace other caller-supplied values, never a secret
+/// the server resolved itself.
+pub const MAX_CALLER_FORMS: usize = 4_096;
+
 /// The registered forms, each with the sequence number of its last
 /// registration, plus the matcher compiled from them (rebuilt on change, not
 /// per call).
@@ -30,8 +36,11 @@ struct Registry {
     /// Process-lifetime credentials (the server's own tokens and keys):
     /// never evicted, whatever the churn in `forms`.
     pinned: HashSet<String>,
+    /// Forms of caller-supplied values, bounded on their own.
+    caller: HashMap<String, u64>,
     seq: u64,
     max_forms: usize,
+    max_caller_forms: usize,
     compiled: Option<Arc<Compiled>>,
 }
 
@@ -40,8 +49,10 @@ impl Default for Registry {
         Self {
             forms: HashMap::new(),
             pinned: HashSet::new(),
+            caller: HashMap::new(),
             seq: 0,
             max_forms: MAX_FORMS,
+            max_caller_forms: MAX_CALLER_FORMS,
             compiled: None,
         }
     }
@@ -67,14 +78,18 @@ impl Registry {
                 self.forms.insert(f, self.seq);
             }
         }
-        if self.forms.len() > self.max_forms {
-            let mut by_age: Vec<(u64, String)> =
-                self.forms.iter().map(|(f, s)| (*s, f.clone())).collect();
-            by_age.sort();
-            let excess = self.forms.len() - self.max_forms;
-            let cutoff = by_age[excess - 1].0;
-            self.forms.retain(|_, s| *s > cutoff);
+        evict_oldest(&mut self.forms, self.max_forms);
+        self.compiled = None;
+    }
+
+    fn insert_caller(&mut self, forms: Vec<String>) {
+        self.seq += 1;
+        for f in forms {
+            if !self.pinned.contains(&f) && !self.forms.contains_key(&f) {
+                self.caller.insert(f, self.seq);
+            }
         }
+        evict_oldest(&mut self.caller, self.max_caller_forms);
         self.compiled = None;
     }
 
@@ -91,6 +106,7 @@ impl Registry {
             .forms
             .keys()
             .chain(self.pinned.iter())
+            .chain(self.caller.keys().filter(|f| !self.forms.contains_key(*f)))
             .cloned()
             .collect();
         patterns.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
@@ -110,6 +126,17 @@ impl Registry {
             matcher,
             patterns,
         }
+    }
+}
+
+/// Drop the least recently registered forms of `forms` above `max`.
+fn evict_oldest(forms: &mut HashMap<String, u64>, max: usize) {
+    if forms.len() > max {
+        let mut by_age: Vec<(u64, String)> = forms.iter().map(|(f, s)| (*s, f.clone())).collect();
+        by_age.sort();
+        let excess = forms.len() - max;
+        let cutoff = by_age[excess - 1].0;
+        forms.retain(|_, s| *s > cutoff);
     }
 }
 
@@ -169,6 +196,20 @@ pub fn register(secret: &str) {
         .insert(forms_of(secret));
 }
 
+/// [`register`] for a value a caller supplied (a `secret: true` template
+/// param): scrubbed like any secret, but held in its own bounded set, so
+/// however many a caller sends, no secret registered with [`register`] or
+/// [`register_pinned`] is dropped for it.
+pub fn register_caller(secret: &str) {
+    if secret.len() < MIN_REDACT_LEN {
+        return;
+    }
+    registry()
+        .write()
+        .expect("secret registry lock poisoned")
+        .insert_caller(forms_of(secret));
+}
+
 /// [`register`] for a credential the process holds for its whole life (a
 /// server's bearer tokens, vault keys, provider client secrets): it is never
 /// evicted when the registry reaches [`MAX_FORMS`], and never unregistered.
@@ -185,11 +226,12 @@ pub fn register_pinned(secret: &str) {
 /// Stop scrubbing `secret`: a refresh token rotated away (#789 SERVE-24).
 pub fn unregister(secret: &str) {
     let mut reg = registry().write().expect("secret registry lock poisoned");
-    let before = reg.forms.len();
+    let before = reg.forms.len() + reg.caller.len();
     for f in forms_of(secret) {
         reg.forms.remove(&f);
+        reg.caller.remove(&f);
     }
-    if reg.forms.len() != before {
+    if reg.forms.len() + reg.caller.len() != before {
         reg.compiled = None;
     }
 }
