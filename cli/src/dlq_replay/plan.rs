@@ -925,7 +925,6 @@ pipeline:
     #[cfg(feature = "masking")]
     #[tokio::test]
     async fn an_all_rows_replay_masks_payloads_other_rows_wrote() {
-        use faucet_core::Source as _;
         let cfg = cfg(
             "  masking:\n    rules:\n      - name: h\n        match: { fields: [email] }\n        action: { type: redact, mask: \"***\" }\n",
         );

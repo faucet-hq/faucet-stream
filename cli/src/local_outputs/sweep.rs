@@ -333,7 +333,7 @@ async fn apply(store: &dyn RunHistory, sel: Selection, opts: &SweepOptions) -> S
 
     // The only deletion in this subsystem: one recorded file, through its
     // directory as it resolves now, and only while it is the file just checked.
-    let target = match resolved_target(&rec.fs_path(), seen).await {
+    let target = match resolved_target(rec.fs_path(), seen).await {
         Ok(Some(target)) => target,
         Ok(None) => {
             outcome.skipped = Some(SkipReason::Changed);
