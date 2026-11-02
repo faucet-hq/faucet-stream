@@ -7,6 +7,16 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
 
+## [1.1.3](https://github.com/faucet-hq/faucet-stream/compare/faucet-common-sftp-v1.1.2...faucet-common-sftp-v1.1.3) - 2026-11-02
+
+### Bug Fixes
+
+- Tighten caller-config screening, connection defaults and serve request handling ([#1027](https://github.com/faucet-hq/faucet-stream/pull/1027))
+
+### Testing
+
+- Kinesis LocalStack tests fail fast ([#999](https://github.com/faucet-hq/faucet-stream/pull/999)), and fixture-heavy unit tests move out of CodeQL's scan ([#1001](https://github.com/faucet-hq/faucet-stream/pull/1001))
+
 ## [1.1.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-common-sftp-v1.1.1...faucet-common-sftp-v1.1.2) - 2026-10-29
 
 ### Bug Fixes
