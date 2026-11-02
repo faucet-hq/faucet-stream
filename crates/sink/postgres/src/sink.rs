@@ -60,8 +60,6 @@ fn split_columns(
     )
 }
 
-/// [`split_columns`] over `(name, udt)` pairs.
-
 /// Connect options from `url` alone: nothing is taken from the `PG*`
 /// environment variables or the password file.
 pub(crate) fn connect_options(url: &str) -> Result<sqlx::postgres::PgConnectOptions, FaucetError> {
@@ -91,6 +89,7 @@ fn connect_options_with(
     Ok(opts)
 }
 
+/// [`split_columns`] over `(name, udt)` pairs.
 #[cfg(test)]
 pub(crate) fn split_writable(
     records: &[Value],
