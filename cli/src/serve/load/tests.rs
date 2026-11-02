@@ -544,9 +544,12 @@ fn protect_input_covers_the_file_and_everything_it_reads() {
 
 #[test]
 fn sqlite_urls_name_their_file() {
-    assert_eq!(sqlite_path("sqlite:/var/h.db"), Some("/var/h.db"));
     assert_eq!(
-        sqlite_path("sqlite:///var/h.db?mode=rwc"),
+        sqlite_path("sqlite:/var/h.db").as_deref(),
+        Some("/var/h.db")
+    );
+    assert_eq!(
+        sqlite_path("sqlite:///var/h.db?mode=rwc").as_deref(),
         Some("/var/h.db")
     );
     assert_eq!(sqlite_path("sqlite::memory:"), None);
@@ -598,9 +601,9 @@ fn local_paths_and_globs_that_reach_protected_files_are_found() {
         "{d}/data/dt=${{now.date}}/x.jsonl"
     )));
 
-    assert_eq!(local_path("sqlite:/x.db"), Some("/x.db"));
-    assert_eq!(local_path("file:///x"), Some("/x"));
-    assert_eq!(local_path("file:./x"), Some("./x"));
+    assert_eq!(local_path("sqlite:/x.db").as_deref(), Some("/x.db"));
+    assert_eq!(local_path("file:///x").as_deref(), Some("/x"));
+    assert_eq!(local_path("file:./x").as_deref(), Some("./x"));
     assert_eq!(local_path("s3://b/k"), None);
     assert_eq!(local_path(":memory:"), None);
     assert_eq!(replace_tokens("a/${now.date}/b${x"), "a/*/b*");
@@ -1538,4 +1541,65 @@ fn a_refusal_shows_only_the_callers_own_text() {
     );
     assert!(!err.contains("evil.example.net"), "{err}");
     assert!(!err.contains("svc-key-from-operator-env"), "{err}");
+}
+
+#[test]
+fn environment_files_in_the_working_directory_are_protected() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".env"), "TOKEN=dummy-secret\n").unwrap();
+    std::fs::write(dir.path().join(".env.local"), "X=1\n").unwrap();
+    std::fs::write(dir.path().join("data.csv"), "id\n1\n").unwrap();
+    let loaded = dir.path().join("elsewhere.env");
+    std::fs::write(&loaded, "Y=1\n").unwrap();
+    protect_env_files(dir.path(), Some(&loaded));
+    let d = dir.path().display();
+    assert!(read_protected(&format!("{d}/.env")));
+    assert!(read_protected(&format!("{d}/.env.local")));
+    assert!(read_protected(&loaded.display().to_string()));
+    assert!(file_is_protected(&format!("{d}/.env")));
+    assert!(!read_protected(&format!("{d}/data.csv")));
+    protect_env_files(&dir.path().join("missing"), None);
+}
+
+#[test]
+fn nothing_under_a_protected_directory_is_reachable() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    std::fs::write(state.join("bookmark.json"), "{}").unwrap();
+    protect_dir(&state);
+    let d = dir.path().display();
+    assert!(read_protected(&format!("{d}/state/bookmark.json")));
+    assert!(data_path_is_protected(
+        &format!("{d}/state/new.json"),
+        Access::Write
+    ));
+    assert!(data_path_is_protected(
+        &d.to_string(),
+        Access::Read { recursive: true }
+    ));
+    assert!(!read_protected(&d.to_string()));
+    assert!(read_protected(&format!("{d}/state/*.json")));
+    assert!(read_protected(&format!("{d}/*/*.json")));
+    assert!(file_is_protected(&format!("{d}/state/bookmark.json")));
+    assert!(!read_protected(&format!("{d}/other/*.json")));
+    #[cfg(unix)]
+    {
+        let other = dir.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        std::os::unix::fs::symlink(state.join("bookmark.json"), other.join("b.json")).unwrap();
+        assert!(read_protected(&format!("{d}/other/*.json")));
+    }
+}
+
+#[test]
+fn encoded_and_prefixed_paths_are_read_as_their_connectors_read_them() {
+    let enc = "sqlite://%2Fproc%2Fself%2Fenviron";
+    assert_eq!(local_path(enc).as_deref(), Some("/proc/self/environ"));
+    assert!(read_protected(&local_path(enc).unwrap()));
+    assert_eq!(
+        local_path("duckdb:///proc/self/x").as_deref(),
+        Some("/proc/self/x")
+    );
+    assert_eq!(local_path("sqlite::memory:"), None);
 }

@@ -245,6 +245,7 @@ pub const LOCAL_PATH_KINDS: &[&str] = &[
 struct Protected {
     env: std::collections::BTreeSet<String>,
     files: std::collections::BTreeSet<std::path::PathBuf>,
+    dirs: std::collections::BTreeSet<std::path::PathBuf>,
     secrets: std::collections::BTreeSet<(String, String)>,
 }
 
@@ -265,6 +266,29 @@ pub fn protect_env(name: &str) {
 pub fn protect_file(path: &std::path::Path) {
     if let Ok(mut p) = protected().write() {
         p.files.insert(normalize_path(path));
+    }
+}
+
+/// Mark a directory the server keeps its own files in (a file state store) so
+/// no loaded config reads or writes anything under it.
+pub fn protect_dir(path: &std::path::Path) {
+    if let Ok(mut p) = protected().write() {
+        p.dirs.insert(normalize_path(path));
+    }
+}
+
+/// Protect the server's environment files: the one it loaded, and every
+/// `.env` / `.env.*` in its working directory whether loaded or not.
+pub fn protect_env_files(cwd: &std::path::Path, loaded: Option<&std::path::Path>) {
+    if let Some(p) = loaded {
+        protect_file(p);
+    }
+    if let Ok(entries) = std::fs::read_dir(cwd) {
+        for e in entries.flatten() {
+            if e.file_name().to_string_lossy().starts_with(".env") {
+                protect_file(&e.path());
+            }
+        }
     }
 }
 
@@ -305,18 +329,18 @@ pub fn protect_input(path: &std::path::Path, doc: &Value) {
 /// Protect a SQLite database the server keeps (run history), with its
 /// journal files.
 pub fn protect_sqlite_url(url: &str) {
-    if let Some(path) = sqlite_path(url) {
+    if let Some(path) = sqlite_path(url).as_deref() {
         for suffix in ["", "-wal", "-shm", "-journal"] {
             protect_file(std::path::Path::new(&format!("{path}{suffix}")));
         }
     }
 }
 
-fn sqlite_path(url: &str) -> Option<&str> {
-    let rest = url.strip_prefix("sqlite:")?;
-    let rest = rest.strip_prefix("//").unwrap_or(rest);
-    let rest = rest.split('?').next().unwrap_or(rest);
-    (!rest.is_empty() && rest != ":memory:").then_some(rest)
+fn sqlite_path(url: &str) -> Option<std::borrow::Cow<'_, str>> {
+    if !url.starts_with("sqlite:") {
+        return None;
+    }
+    local_path(url)
 }
 
 fn secret_base(reference: &str) -> &str {
@@ -406,6 +430,7 @@ fn file_is_protected(path: &str) -> bool {
         .read()
         .map(|g| g.files.contains(&normalized))
         .unwrap_or(true)
+        || protected_dirs(|d| normalized.starts_with(d))
 }
 
 /// How a connector touches a local path.
@@ -436,6 +461,7 @@ fn data_path_is_protected(path: &str, access: Access) -> bool {
         if in_system_dir(raw) || in_system_dir(&normalized) {
             return true;
         }
+        let recursive = matches!(access, Access::Read { recursive: true });
         return protected_files(|f| match access {
             Access::Write => f == normalized,
             Access::Read { recursive } => {
@@ -443,6 +469,8 @@ fn data_path_is_protected(path: &str, access: Access) -> bool {
                     || f.parent() == Some(normalized.as_path())
                     || (recursive && f.starts_with(&normalized))
             }
+        }) || protected_dirs(|d| {
+            normalized.starts_with(d) || (recursive && d.starts_with(&normalized))
         });
     }
     glob_is_protected(&pattern, access)
@@ -470,7 +498,7 @@ fn glob_is_protected(pattern: &str, access: Access) -> bool {
     let hit = match glob::Pattern::new(&full) {
         Ok(p) => protected_files(|f| p.matches_path(f)),
         Err(_) => protected_files(|f| f.starts_with(&dir)),
-    };
+    } || protected_dirs(|d| dir.starts_with(d) || d.starts_with(&dir));
     hit || (matches!(access, Access::Read { .. }) && glob_match_escapes(&full))
 }
 
@@ -508,7 +536,11 @@ fn glob_match_escapes(pattern: &str) -> bool {
         .take(GLOB_CHECK_LIMIT)
         .filter_map(Result::ok)
         .filter_map(|p| std::fs::canonicalize(p).ok())
-        .any(|real| in_system_dir(&real) || protected_files(|f| f == real))
+        .any(|real| {
+            in_system_dir(&real)
+                || protected_files(|f| f == real)
+                || protected_dirs(|d| real.starts_with(d))
+        })
 }
 
 /// Replace `{…}` path-template segments (a file sink's `{part}`) with `*`.
@@ -551,6 +583,13 @@ fn protected_files(pred: impl Fn(&std::path::Path) -> bool) -> bool {
     protected()
         .read()
         .map(|g| g.files.iter().any(|f| pred(f)))
+        .unwrap_or(true)
+}
+
+fn protected_dirs(pred: impl Fn(&std::path::Path) -> bool) -> bool {
+    protected()
+        .read()
+        .map(|g| g.dirs.iter().any(|d| pred(d)))
         .unwrap_or(true)
 }
 
@@ -612,19 +651,10 @@ fn is_path_key(key: &str) -> bool {
         || key.ends_with("_file")
 }
 
-/// The local filesystem path a config value names, if it names one.
-fn local_path(value: &str) -> Option<&str> {
-    if let Some(p) = sqlite_path(value) {
-        return Some(p);
-    }
-    if let Some(p) = value.strip_prefix("file://") {
-        return Some(p);
-    }
-    if value.contains("://") {
-        return None;
-    }
-    let p = value.strip_prefix("file:").unwrap_or(value);
-    (!p.is_empty() && p != ":memory:").then_some(p)
+/// The local filesystem path a config value names, if it names one: read as
+/// the connector reads it ([`faucet_core::resolve::local_path`]).
+fn local_path(value: &str) -> Option<std::borrow::Cow<'_, str>> {
+    faucet_core::resolve::local_path(value).filter(|p| !p.is_empty() && p != ":memory:")
 }
 
 /// Runtime tokens a local path may carry in a caller-supplied config: their
@@ -771,6 +801,7 @@ fn check_path_value(
     let Some(path) = local_path(s) else {
         return;
     };
+    let path = path.as_ref();
     if scope.caller && takes_record_value(path) {
         found.add(
             scope,
@@ -858,6 +889,7 @@ fn check_connector(
         if r.kind == ResourceKind::Path
             && let Some(path) = local_path(&r.value)
         {
+            let path = path.as_ref();
             if scope.caller && takes_record_value(path) {
                 let text = format!("{} {RECORD_PATH}", r.value);
                 found.add(scope, base, ptr, &r.value, Why::RecordPath, text);
@@ -1418,7 +1450,8 @@ pub fn refuse_request_path_with(
     for_tenant: bool,
     policy: &ReferencePolicy,
 ) -> Result<(), ServeError> {
-    let local = local_path(path).unwrap_or(path);
+    let local = local_path(path).unwrap_or(std::borrow::Cow::Borrowed(path));
+    let local = local.as_ref();
     let protected = data_path_is_protected(local, Access::Read { recursive: true })
         || (write && data_path_is_protected(local, Access::Write));
     if protected {
@@ -1767,7 +1800,8 @@ fn provider_findings(spec: &Value, at: (&str, &str), scope: &Scope<'_>, found: &
         let ptr = r.pointer.as_str();
         match r.kind {
             ResourceKind::Path => {
-                let path = local_path(&r.value).unwrap_or(&r.value);
+                let path = local_path(&r.value).unwrap_or(std::borrow::Cow::Borrowed(&r.value));
+                let path = path.as_ref();
                 let access = if r.writes {
                     Access::Write
                 } else {

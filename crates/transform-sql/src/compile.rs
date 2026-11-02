@@ -1,6 +1,8 @@
 //! Connection setup, reference-relation loading, and query validation.
 
-use crate::config::{RelationSource, RelationSpec, SqlTransformConfig};
+use crate::config::{
+    DEFAULT_MAX_THREADS, DEFAULT_MEMORY_LIMIT, RelationSource, RelationSpec, SqlTransformConfig,
+};
 use crate::http::fetch_http_rows;
 use crate::shovel::{records_to_record_batch, values_to_record_batch};
 use duckdb::Connection;
@@ -28,14 +30,12 @@ pub(crate) fn build_connection(
     cfg: &SqlTransformConfig,
 ) -> Result<(Connection, Vec<Reloadable>), FaucetError> {
     let conn = Connection::open_in_memory().map_err(|e| cfg_err(format!("open duckdb: {e}")))?;
-    if let Some(ref m) = cfg.memory_limit {
-        conn.execute_batch(&format!("SET memory_limit='{}';", sql_escape(m)))
-            .map_err(|e| cfg_err(format!("memory_limit: {e}")))?;
-    }
-    if let Some(t) = cfg.threads {
-        conn.execute_batch(&format!("SET threads={t};"))
-            .map_err(|e| cfg_err(format!("threads: {e}")))?;
-    }
+    let memory = cfg.memory_limit.as_deref().unwrap_or(DEFAULT_MEMORY_LIMIT);
+    conn.execute_batch(&format!("SET memory_limit='{}';", sql_escape(memory)))
+        .map_err(|e| cfg_err(format!("memory_limit: {e}")))?;
+    let threads = cfg.threads.unwrap_or_else(default_threads);
+    conn.execute_batch(&format!("SET threads={threads};"))
+        .map_err(|e| cfg_err(format!("threads: {e}")))?;
     conn.register_table_function::<ArrowVTab>("arrow")
         .map_err(|e| cfg_err(format!("register arrow vtab: {e}")))?;
 
@@ -81,6 +81,12 @@ fn sandbox(conn: &Connection, reloadables: &[Reloadable]) -> Result<(), FaucetEr
         .map_err(|e| cfg_err(format!("sandbox duckdb: {e}")))
 }
 
+fn default_threads() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(DEFAULT_MAX_THREADS)
+}
+
 fn validate_ident(name: &str) -> Result<(), FaucetError> {
     let ok = !name.is_empty()
         && name
@@ -99,21 +105,21 @@ fn validate_ident(name: &str) -> Result<(), FaucetError> {
 fn load_relation(conn: &Connection, rel: &RelationSpec) -> Result<(), FaucetError> {
     match &rel.source {
         RelationSource::Csv { path, has_header } => {
-            check_exists(path)?;
+            let path = relation_path(path)?;
             conn.execute_batch(&format!(
                 "CREATE OR REPLACE TABLE \"{}\" AS SELECT * FROM read_csv_auto('{}', header={});",
                 rel.name,
-                sql_escape(path),
+                sql_escape(&path),
                 has_header
             ))
             .map_err(|e| cfg_err(format!("load csv relation '{}': {e}", rel.name)))
         }
         RelationSource::Jsonl { path } => {
-            check_exists(path)?;
+            let path = relation_path(path)?;
             conn.execute_batch(&format!(
                 "CREATE OR REPLACE TABLE \"{}\" AS SELECT * FROM read_json_auto('{}', format='newline_delimited');",
                 rel.name,
-                sql_escape(path)
+                sql_escape(&path)
             ))
             .map_err(|e| cfg_err(format!("load jsonl relation '{}': {e}", rel.name)))
         }
@@ -177,13 +183,11 @@ fn reloadable_for(rel: &RelationSpec) -> Result<Option<Reloadable>, FaucetError>
         // no file to re-stat, so they are never reloadable.
         RelationSource::Values { .. } | RelationSource::Http { .. } => return Ok(None),
     };
-    let last_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
     // The sandbox's `allowed_paths` and every reload must name the file the
     // same way; a canonical path survives `./`, relative paths and symlinked
     // directories (#862 M-014).
-    let path = std::fs::canonicalize(&path)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or(path);
+    let path = relation_path(&path)?;
+    let last_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
     Ok(Some(Reloadable {
         name: rel.name.clone(),
         path,
@@ -193,14 +197,18 @@ fn reloadable_for(rel: &RelationSpec) -> Result<Option<Reloadable>, FaucetError>
     }))
 }
 
-fn check_exists(path: &str) -> Result<(), FaucetError> {
-    if std::path::Path::new(path).exists() {
-        Ok(())
-    } else {
-        Err(cfg_err(format!(
-            "reference relation file does not exist: {path}"
-        )))
+/// The canonical absolute path DuckDB is given for a relation file. A leading
+/// `~` is refused: DuckDB expands it to a home directory, while every other
+/// reader takes it literally.
+fn relation_path(path: &str) -> Result<String, FaucetError> {
+    if path.starts_with('~') {
+        return Err(cfg_err(format!(
+            "reference relation path may not start with `~`; use an absolute path: {path}"
+        )));
     }
+    std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .map_err(|_| cfg_err(format!("reference relation file does not exist: {path}")))
 }
 
 /// Escape a string literal for safe interpolation inside a single-quoted SQL
