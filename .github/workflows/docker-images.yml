@@ -12,9 +12,9 @@ name: Docker images
 #     :<version>-<profile>). release-plz publishes only the faucet-cli GitHub
 #     release (#1005); both jobs still gate on the faucet-cli tag so a release
 #     created by hand for another crate cannot trigger a build.
-#   - manual with `release: X.Y.Z`: publishes THIS commit's build under that
-#     release's tags (`:<X.Y.Z>-<profile>`, and `:latest` / `:<X.Y.Z>` for
-#     full), so a release can be re-imaged after an image-only fix (#845). It
+#   - manual with `release: X.Y.Z`, run on the `faucet-cli-vX.Y.Z` tag or on
+#     main: publishes THIS commit's build under that release's tags
+#     (`:<X.Y.Z>-<profile>`, and `:latest` / `:<X.Y.Z>` for full), so a release can be re-imaged after an image-only fix (#845). It
 #     refuses unless this commit's faucet-cli version is X.Y.Z and it differs
 #     from the `faucet-cli-vX.Y.Z` tag only in image-build files (Dockerfile,
 #     .github, scripts, deploy, docs), so a tag never names another binary.
@@ -110,9 +110,16 @@ jobs:
       - name: Check the release matches this commit's faucet-cli version
         if: env.RELEASE != ''
         run: |
-          case "$RELEASE" in
-            ""|*[!0-9.]*) echo "::error::release must look like X.Y.Z, got '$RELEASE'"; exit 1 ;;
-          esac
+          if ! [[ "$RELEASE" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::release must look like X.Y.Z, got '$RELEASE'"
+            exit 1
+          fi
+          # Version tags are published only from reviewed code: the release tag
+          # itself, or main (an image-only fix made after the release).
+          if [ "$GITHUB_REF" != "refs/tags/faucet-cli-v$RELEASE" ] && [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::run with release=$RELEASE on the tag faucet-cli-v$RELEASE or on main, not $GITHUB_REF"
+            exit 1
+          fi
           v="$(sed -n 's/^version = "\(.*\)"$/\1/p' cli/Cargo.toml | head -1)"
           if [ "$v" != "$RELEASE" ]; then
             echo "::error::this commit's faucet-cli is $v, not $RELEASE; run the workflow on a commit of that version"
