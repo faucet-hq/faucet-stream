@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.17.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-cli-v1.16.0...faucet-cli-v1.17.0) - 2026-11-02
+
+### Bug Fixes
+
+- Tighten caller-config screening, connection defaults and serve request handling ([#1027](https://github.com/faucet-hq/faucet-stream/pull/1027))
+- #1007 review findings, history pool, MSSQL reconnect stack, code-scanning and advisories ([#1018](https://github.com/faucet-hq/faucet-stream/pull/1018))
+
+### Features
+
+- Web console redesign + Overview, Grafana dashboards, one GitHub release per release PR, demo template tests ([#1007](https://github.com/faucet-hq/faucet-stream/pull/1007))
+
+### Testing
+
+- Kinesis LocalStack tests fail fast ([#999](https://github.com/faucet-hq/faucet-stream/pull/999)), and fixture-heavy unit tests move out of CodeQL's scan ([#1001](https://github.com/faucet-hq/faucet-stream/pull/1001))
+
 ## [1.16.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-cli-v1.15.1...faucet-cli-v1.16.0) - 2026-10-29
 
 ### Bug Fixes

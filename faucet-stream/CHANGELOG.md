@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.11.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-stream-v1.11.0...faucet-stream-v1.11.1) - 2026-11-02
+
+### Bug Fixes
+
+- Tighten caller-config screening, connection defaults and serve request handling ([#1027](https://github.com/faucet-hq/faucet-stream/pull/1027))
+
+### Other
+
+- Update README.md ([#1015](https://github.com/faucet-hq/faucet-stream/pull/1015))
+- Update README.md ([#1014](https://github.com/faucet-hq/faucet-stream/pull/1014))
+
 ## [1.11.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-stream-v1.10.0...faucet-stream-v1.11.0) - 2026-10-29
 
 ### Bug Fixes

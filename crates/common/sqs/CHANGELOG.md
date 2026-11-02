@@ -7,6 +7,12 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
 
+## [1.2.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-common-sqs-v1.2.0...faucet-common-sqs-v1.2.1) - 2026-11-02
+
+### Bug Fixes
+
+- Tighten caller-config screening, connection defaults and serve request handling ([#1027](https://github.com/faucet-hq/faucet-stream/pull/1027))
+
 ## [1.2.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-common-sqs-v1.1.1...faucet-common-sqs-v1.2.0) - 2026-10-29
 
 ### Bug Fixes
