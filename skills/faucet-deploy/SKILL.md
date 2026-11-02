@@ -30,17 +30,33 @@ config written for a newer faucet can fail or be misread on an older one.
 
 1. Find the pin: the `"github:faucet-hq/faucet-stream"` entry under `[tools]`
    in the project's `mise.toml` (`faucet init` writes it). A config may also
-   carry `requires_faucet: ">=X.Y"`.
+   carry `requires_faucet: ">=X.Y"`. The pin is used in commands, URLs and
+   image tags below, so accept only a release version: it must match
+   `^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$`. Stop and ask the user about
+   anything else.
 2. Run `faucet --version`. Use that binary if it equals the pin (with no pin:
    if it satisfies every `requires_faucet` in the project).
 3. Otherwise, if [mise](https://mise.jdx.dev) is installed, run `mise install`
    in the project and prefix every command with `mise exec --`.
 4. Otherwise use the pinned container image; its entrypoint is `faucet`:
    `docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -w /work ghcr.io/faucet-hq/faucet-stream:<version> --version`.
-5. Otherwise install exactly that version:
-   `curl --proto '=https' --tlsv1.2 -LsSf https://github.com/faucet-hq/faucet-stream/releases/download/faucet-cli-v<version>/faucet-cli-installer.sh | sh`.
-6. With no pin at all, install the latest release (the same installer from
-   `releases/latest/download/`) and pin it as described in
+5. Otherwise download that version's archive for this platform, check it, and
+   only then unpack it. Never pipe a download into a shell.
+
+   ```sh
+   v=<version>   # the checked pin
+   t=aarch64-apple-darwin   # or x86_64-apple-darwin, x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu
+   printf '%s\n' "$v" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?' || exit 1
+   base="https://github.com/faucet-hq/faucet-stream/releases/download/faucet-cli-v$v"
+   curl --proto '=https' --tlsv1.2 -fLsS -O "$base/faucet-cli-$t.tar.xz" -O "$base/faucet-cli-$t.tar.xz.sha256"
+   shasum -a 256 -c "faucet-cli-$t.tar.xz.sha256"
+   gh attestation verify "faucet-cli-$t.tar.xz" --repo faucet-hq/faucet-stream   # when gh is installed
+   tar -xJf "faucet-cli-$t.tar.xz"   # the binary is faucet-cli-$t/faucet
+   ```
+
+   If the checksum or the attestation does not verify, stop and tell the user.
+6. With no pin at all, install the latest release the same way (the archive
+   and its `.sha256` from `releases/latest/download/`) and pin it as described in
    [Pinning the faucet version](https://faucet-hq.github.io/faucet-stream/operations/pinning.html).
 
 Every version-specific fact (which connectors and blocks exist, config keys,
