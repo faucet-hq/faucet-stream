@@ -36,6 +36,7 @@ async fn capture_password(listener: TcpListener) -> Option<String> {
 async fn control_connections_use_config_credentials_only() {
     // SAFETY: this test binary runs this one test; nothing else reads the environment concurrently.
     unsafe { std::env::set_var("PGPASSWORD", "dummy-secret") };
+    faucet_core::libpq::set_config_only(true);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = tokio::spawn(capture_password(listener));

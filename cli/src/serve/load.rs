@@ -4,7 +4,7 @@
 //! `${vault:…}`-style directives resolve against the *server's* environment and
 //! credentials (the documented privilege surface — spec §13).
 
-use crate::config::PipelineConfig;
+use crate::config::{PipelineConfig, TransformSpec};
 use crate::expand::{ExpandedNode, expand};
 use crate::serve::error::ServeError;
 use faucet_core::resolve::{ReferencePolicy, ResourceKind};
@@ -206,11 +206,52 @@ pub fn confine_sql(cfg: &mut PipelineConfig) {
     if let Some(r) = cfg.reconcile.as_mut() {
         force_source(&mut r.count.config, &r.count.kind);
     }
+    let p = &mut cfg.pipeline;
+    bound_sql_transforms(&mut p.transforms);
+    for spec in p.source.iter_mut().chain(p.sources.values_mut()) {
+        bound_sql_transforms(spec.transforms.iter_mut().flatten());
+    }
+    for node in p.nodes.values_mut() {
+        if let crate::config::NodeSpec::Transform { transforms } = node {
+            bound_sql_transforms(transforms);
+        }
+    }
+    for row in &mut cfg.matrix {
+        bound_sql_transforms(row.transforms.iter_mut().flatten());
+    }
+}
+
+/// The DuckDB `memory_limit` a `sql` transform in a request's config gets when
+/// it sets none.
+pub const SQL_TRANSFORM_MEMORY_LIMIT: &str = "1GB";
+
+/// The most DuckDB threads a `sql` transform in a request's config gets when
+/// it sets none.
+pub const SQL_TRANSFORM_MAX_THREADS: usize = 4;
+
+/// Give each `sql` transform that leaves them unset a bounded `memory_limit`
+/// and `threads` (DuckDB's own defaults take most of the machine).
+fn bound_sql_transforms<'a>(transforms: impl IntoIterator<Item = &'a mut TransformSpec>) {
+    for t in transforms.into_iter().filter(|t| t.kind == "sql") {
+        let Some(map) = t.config.as_object_mut() else {
+            continue;
+        };
+        if map.get("memory_limit").is_none_or(Value::is_null) {
+            map.insert("memory_limit".into(), SQL_TRANSFORM_MEMORY_LIMIT.into());
+        }
+        if map.get("threads").is_none_or(Value::is_null) {
+            let threads = std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .min(SQL_TRANSFORM_MAX_THREADS);
+            map.insert("threads".into(), threads.into());
+        }
+    }
 }
 
 /// [`confine_sql`] over expanded rows: the merged configs each row builds.
 pub fn confine_sql_nodes(nodes: &mut [ExpandedNode]) {
     for n in nodes {
+        bound_sql_transforms(&mut n.transforms);
         force_source(&mut n.source.config, &n.source.kind);
         force_sink(&mut n.sink.config, &n.sink.kind);
         if let Some(d) = n.dlq.as_mut() {
@@ -246,6 +287,7 @@ struct Protected {
     env: std::collections::BTreeSet<String>,
     files: std::collections::BTreeSet<std::path::PathBuf>,
     dirs: std::collections::BTreeSet<std::path::PathBuf>,
+    own_state: std::collections::BTreeSet<std::path::PathBuf>,
     secrets: std::collections::BTreeSet<(String, String)>,
 }
 
@@ -275,6 +317,36 @@ pub fn protect_dir(path: &std::path::Path) {
     if let Ok(mut p) = protected().write() {
         p.dirs.insert(normalize_path(path));
     }
+}
+
+/// Protect the file state store a `--default-config` keeps its bookmarks in:
+/// no loaded config reads or writes under it as data, while a run that keeps
+/// that same store as its own state (the value it inherits from the default
+/// config) still may.
+pub fn protect_default_state(base: &Value) {
+    let state = &base["pipeline"]["state"];
+    if state["type"] == "file"
+        && let Some(dir) = state["config"]["path"].as_str()
+    {
+        let dir = normalize_path(std::path::Path::new(dir));
+        if let Ok(mut p) = protected().write() {
+            p.dirs.insert(dir.clone());
+            p.own_state.insert(dir);
+        }
+    }
+}
+
+/// Whether a `kind` state store with `config` is the server's own default
+/// state store.
+fn is_default_state(kind: &str, config: &Value) -> bool {
+    kind == "file"
+        && config["path"].as_str().is_some_and(|dir| {
+            let dir = normalize_path(std::path::Path::new(dir));
+            protected()
+                .read()
+                .map(|p| p.own_state.contains(&dir))
+                .unwrap_or(false)
+        })
 }
 
 /// Protect the server's environment files: the one it loaded, and every
@@ -997,7 +1069,9 @@ fn data_path_findings(doc: &Value, scope: &Scope<'_>) -> Findings {
                         ),
                         None => (String::new(), None),
                     };
-                    if let Some(config) = config {
+                    let own_state = ptr.ends_with("/state")
+                        && config.as_ref().is_some_and(|c| is_default_state(t, c));
+                    if let Some(config) = config.filter(|_| !own_state) {
                         let rel = scope.only.map(|f| f.under(&base));
                         let inner = scope.within(rel.as_ref());
                         if map.contains_key("config") {
@@ -1478,7 +1552,11 @@ pub fn refuse_server_paths_with(
         };
         check(&n.source.kind, &n.source.config, read);
         check(&n.sink.kind, &n.sink.config, Access::Write);
-        if let Some(st) = &n.state {
+        if let Some(st) = n
+            .state
+            .as_ref()
+            .filter(|st| !is_default_state(&st.kind, &st.config))
+        {
             check(&st.kind, &st.config, Access::Write);
         }
         if let Some(d) = &n.dlq {

@@ -1889,6 +1889,12 @@ pub struct DlqDiscardArgs {
     /// the DLQ. An encrypted file is re-sealed, which needs the key.
     #[arg(long)]
     pub purge: bool,
+    /// Record again, sealed with the key, the discard entries of a sealed DLQ
+    /// that were written without it (before the file was sealed). Those are
+    /// otherwise ignored and their lines read. Only this is done: no other
+    /// envelope is discarded.
+    #[arg(long, conflicts_with_all = ["reason", "before", "delete", "purge"])]
+    pub reseal_plain: bool,
     /// Key for a DLQ sealed at rest by its sink's `encryption` block (a `file`
     /// sink writing JSON Lines, or the deprecated `jsonl` sink).
     /// Repeat the flag to also try older (rotated) keys. Requires a build

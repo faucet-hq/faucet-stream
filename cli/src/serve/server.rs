@@ -368,16 +368,6 @@ fn spawn_metrics_upkeep(
     })
 }
 
-/// Protect the file state store a `--default-config` keeps its bookmarks in.
-fn protect_file_state(base: &Value) {
-    let state = &base["pipeline"]["state"];
-    if state["type"] == "file"
-        && let Some(dir) = state["config"]["path"].as_str()
-    {
-        crate::serve::load::protect_dir(std::path::Path::new(dir));
-    }
-}
-
 /// Load the optional `--default-config` once at startup, fully resolved, as a
 /// merge base `Value`.
 async fn load_default_base(config: &ServeConfig) -> CliResult<Option<Value>> {
@@ -396,7 +386,7 @@ async fn load_default_base(config: &ServeConfig) -> CliResult<Option<Value>> {
                 crate::config::PipelineConfig::from_path_async(path, profile.as_deref()).await?;
             let base = serde_json::to_value(&cfg)
                 .map_err(|e| CliError::Serve(format!("serializing --default-config: {e}")))?;
-            protect_file_state(&base);
+            crate::serve::load::protect_default_state(&base);
             Ok(Some(base))
         }
     }

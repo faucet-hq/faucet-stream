@@ -11,7 +11,7 @@ keywords = ["postgres", "postgresql", "sql", "sink", "pipeline"]
 categories.workspace = true
 
 [dependencies]
-faucet-core.workspace = true
+faucet-core = { workspace = true, features = ["libpq-sqlx"] }
 faucet-common-sql.workspace = true
 schemars.workspace = true
 serde.workspace = true

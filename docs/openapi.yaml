@@ -887,7 +887,7 @@ paths:
                   description: Keys for a DLQ sealed at rest by the jsonl sink's `encryption` block (first = current, rest = rotated). Requires a server built with the `encryption` feature.
       responses:
         "200":
-          description: Grouped DLQ summary
+          description: Grouped DLQ summary (`unsealed_discards` counts discard entries of a sealed DLQ written without its key, which are not honoured)
           content: { application/json: { schema: { type: object } } }
         "400": { description: Bad location or reason filter }
         "401": { description: Missing or invalid bearer token }
@@ -936,7 +936,7 @@ paths:
                   description: Replay on behalf of this tenant (`tenants` feature) — the config loads under the tenant's scope and the replay is admitted against its limits, whose per-run ceilings bound it. A principal confined to another tenant gets a 404.
       responses:
         "200":
-          description: Replay outcome (id, tenant, candidates, skipped_other_rows, records_written, failed_dlq)
+          description: Replay outcome (id, tenant, candidates, skipped_other_rows, records_written, failed_dlq, unsealed_discards — discard entries of a sealed DLQ written without its key, which are not honoured)
           content: { application/json: { schema: { type: object } } }
         "400": { description: Bad config, location, or reason filter }
         "401": { description: Missing or invalid bearer token }

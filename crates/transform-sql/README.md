@@ -74,8 +74,8 @@ Wire shape: `{ type: sql, config: { query, relations?, memory_limit?, threads? }
 |---|---|---|---|
 | `query` | string | — *(required)* | The SQL statement. The page's records are the relation `batch`. Must produce a result set; each result row becomes one output record. |
 | `relations` | list of [`RelationSpec`](#reference-relations) | `[]` | Reference relations loaded once at compile time and joinable by name. |
-| `memory_limit` | string | `"1GB"` | DuckDB `memory_limit` pragma (e.g. `"4GB"`). |
-| `threads` | integer | the machine's parallelism, at most `4` | DuckDB `threads` pragma. Set to `1`–`2` in high-fan-out matrices to avoid CPU over-subscription across rows. |
+| `memory_limit` | string | *(DuckDB's own)* | DuckDB `memory_limit` pragma (e.g. `"1GB"`). In a config `faucet serve` loads from a request, unset means `1GB`. |
+| `threads` | integer | *(DuckDB's own)* | DuckDB `threads` pragma. Set to `1`–`2` in high-fan-out matrices to avoid CPU over-subscription across rows. In a config `faucet serve` loads from a request, unset means the machine's parallelism, at most `4`. |
 
 ### Reference-relation fields (`RelationSpec`)
 

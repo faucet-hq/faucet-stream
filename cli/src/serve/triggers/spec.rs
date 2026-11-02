@@ -98,9 +98,10 @@ pub enum TriggerKind {
         #[serde(default)]
         debounce_secs: u64,
         /// Request `Content-Type`s the endpoint accepts (media type, without
-        /// parameters). Default `[application/json]`; `type/*` accepts any
-        /// subtype and `*` anything. A request without one is accepted only
-        /// when its body is empty.
+        /// parameters). Default `[application/json, application/*+json]`;
+        /// `type/*` accepts any subtype, `type/*+suffix` any subtype ending in
+        /// `+suffix`, and `*` anything. A form-encoded request, or one
+        /// without a `Content-Type` that has a body, is refused unless listed.
         #[serde(default = "default_webhook_content_types")]
         content_types: Vec<String>,
     },
@@ -347,9 +348,13 @@ fn default_poll_secs() -> u64 {
 fn default_threshold() -> u64 {
     1
 }
-/// The `Content-Type`s a webhook trigger accepts by default.
+/// The `Content-Type`s a webhook trigger accepts by default: JSON, including
+/// the structured `+json` types (`application/cloudevents+json`, …).
 pub fn default_webhook_content_types() -> Vec<String> {
-    vec!["application/json".to_string()]
+    vec![
+        "application/json".to_string(),
+        "application/*+json".to_string(),
+    ]
 }
 
 fn default_webhook_methods() -> Vec<String> {
@@ -417,7 +422,7 @@ triggers:
                 debounce_secs,
                 content_types,
             } => {
-                assert_eq!(content_types, &vec!["application/json".to_string()]);
+                assert_eq!(content_types, &default_webhook_content_types());
                 assert_eq!(methods, &vec!["POST".to_string()]);
                 assert_eq!(dedupe_header.as_deref(), Some("Idempotency-Key"));
                 assert_eq!(*debounce_secs, 30);

@@ -156,6 +156,18 @@ async fn dlq_endpoints_inspect_replay_discard_with_rbac() {
     assert_eq!(summary["total_envelopes"], 2);
     assert_eq!(summary["by_reason"]["quality"], 2);
 
+    // A location outside the path roots is refused before it is looked up.
+    for (route, token) in [("inspect", "viewer-tok"), ("discard", "admin-tok")] {
+        let outside = client
+            .post(format!("{base}/v1/dlq/{route}"))
+            .bearer_auth(token)
+            .json(&json!({ "location": "/var/empty/faucet-nowhere/dlq.jsonl" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(outside.status(), 403, "{route}");
+    }
+
     // Viewer is denied replay/discard (DlqManage = operator+) → 403.
     let denied = client
         .post(format!("{base}/v1/dlq/discard"))

@@ -144,3 +144,20 @@ async fn build_pool_lazy_does_no_io() {
     let pool = build_pool_lazy(&conn(), 4).unwrap();
     assert_eq!(pool.size(), 0);
 }
+
+#[test]
+fn environment_settings_the_connection_does_not_name_are_refused() {
+    fn one(var: &'static str) -> impl Fn(&str) -> Option<String> {
+        move |k: &str| (k == var).then(|| "/x".to_string())
+    }
+    assert!(refuse_env_settings(&conn(), |_: &str| None).is_ok());
+    for var in ["PGSSLCERT", "PGSSLROOTCERT", "PGOPTIONS"] {
+        let err = refuse_env_settings(&conn(), one(var))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(var), "{err}");
+    }
+    let mut named = conn();
+    named.ssl_root_cert = Some("/own.pem".into());
+    assert!(refuse_env_settings(&named, one("PGSSLROOTCERT")).is_ok());
+}

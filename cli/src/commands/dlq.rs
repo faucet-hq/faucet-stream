@@ -67,6 +67,9 @@ fn inspect(args: DlqInspectArgs) -> CliResult<()> {
             summary.undecryptable
         );
     }
+    if let Some(hint) = unsealed_discards_hint(summary.unsealed_discards) {
+        println!("  {hint}");
+    }
     if !summary.by_reason.is_empty() {
         println!("  by reason:");
         for (reason, count) in &summary.by_reason {
@@ -158,6 +161,9 @@ async fn replay(args: DlqReplayArgs) -> CliResult<()> {
             outcome.candidates, args.from, outcome.records_written, outcome.failed_dlq
         );
     }
+    if let Some(hint) = unsealed_discards_hint(outcome.unsealed_discards) {
+        println!("{hint}");
+    }
     if outcome.skipped_other_rows > 0 {
         println!(
             "Skipped {} envelope(s) another pipeline or row wrote (pass --all-rows to replay \
@@ -174,6 +180,15 @@ fn discard(args: DlqDiscardArgs) -> CliResult<()> {
         None => None,
     };
     let dec = decryptor(&args.encryption_key, &args.encryption_key_file)?;
+    if args.reseal_plain {
+        let recorded = dlq_replay::reseal_plain_discards(&args.location, &dec)?;
+        if args.json {
+            println!("{}", to_json(&serde_json::json!({ "resealed": recorded }))?);
+        } else {
+            println!("DLQ discard: re-recorded {recorded} discard entr(ies) sealed with the key.");
+        }
+        return Ok(());
+    }
     let outcome = dlq_replay::discard(
         &args.location,
         args.reason.as_deref(),
@@ -193,6 +208,9 @@ fn discard(args: DlqDiscardArgs) -> CliResult<()> {
                 "DLQ discard: purged {} envelope(s) from {} file(s).",
                 purged.purged, purged.files_rewritten
             );
+            if let Some(hint) = unsealed_discards_hint(purged.unsealed_discards) {
+                println!("{hint}");
+            }
         }
         return Ok(());
     }
@@ -219,6 +237,17 @@ fn discard(args: DlqDiscardArgs) -> CliResult<()> {
         );
     }
     Ok(())
+}
+
+/// The notice for discard entries a sealed DLQ holds unsealed, if any.
+fn unsealed_discards_hint(count: usize) -> Option<String> {
+    (count > 0).then(|| {
+        format!(
+            "{count} discard entr(ies) in sealed DLQ files were written without the key and are \
+             not honoured, so those lines are still read; to discard them again, run \
+             `faucet dlq discard <location> --reseal-plain` with the key"
+        )
+    })
 }
 
 /// Parse a `--before` value into an epoch-millis cutoff: an RFC3339 timestamp
@@ -259,6 +288,16 @@ fn parse_relative_age(s: &str, now: DateTime<Utc>) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsealed_discard_entries_get_a_notice() {
+        assert_eq!(unsealed_discards_hint(0), None);
+        let hint = unsealed_discards_hint(3).unwrap();
+        assert!(
+            hint.starts_with("3 discard") && hint.contains("--reseal-plain"),
+            "{hint}"
+        );
+    }
 
     #[test]
     fn out_of_range_or_multibyte_ages_are_rejected_not_panicking() {

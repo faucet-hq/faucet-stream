@@ -257,7 +257,10 @@ extension loading is always off). The server sets the flag on every template,
 row override, topology node, fan-out source, partition bound probe,
 `verify.destination` and DLQ sink, overwriting a `sandbox: false`. Such a query still reads and writes its own database; it
 fails with a `Permission Error` / `too many attached databases` the moment it
-reaches past it. The `sql` transform is always sandboxed this way.
+reaches past it. The `sql` transform is always sandboxed this way, and in a
+config the server loads one that sets no `memory_limit` / `threads` gets `1GB`
+and the machine's parallelism up to 4 threads (DuckDB's own defaults take most
+of the machine).
 
 The one exception is a config in the server's own `--triggers` file: its
 operator wrote it on the server, so its SQL keeps host access (the run record
@@ -341,10 +344,15 @@ it does for HTTP clients (`http://169.254.169.254\@allowed.example/` names
 records (`https://${parent.host}/…`, a whole `${parent.next_url}`) cannot be
 checked, so it is refused; register the pipeline as a template instead.
 
-Database connectors never fill a setting the config leaves out from the
-server's environment: `PGPASSWORD`, `~/.pgpass` and the other `PG*` variables
-are not read by the PostgreSQL connectors, the PostgreSQL state store or
-Redshift, so a config naming no password sends none.
+Under `faucet serve`, database connectors never fill a setting the config
+leaves out from the server's environment: `PGPASSWORD`, `~/.pgpass`,
+`PGHOST`, `PGPORT`, `PGDATABASE` and `PGAPPNAME` are not read by the
+PostgreSQL connectors, the PostgreSQL state store or Redshift, so a config
+naming no password sends none; a config that leaves out a user, client
+certificate, root certificate or server options while `PGUSER`,
+`PGSSLCERT` / `PGSSLKEY`, `PGSSLROOTCERT` or `PGOPTIONS` is set is refused.
+`PGSSLMODE` still applies. `faucet run` and library use keep libpq's
+behaviour: those variables fill what the URL leaves out.
 
 #### Template params a caller supplies
 

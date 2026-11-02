@@ -5,12 +5,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-/// The DuckDB `memory_limit` a transform gets when `memory_limit` is unset.
-pub const DEFAULT_MEMORY_LIMIT: &str = "1GB";
-
-/// The most DuckDB threads a transform gets when `threads` is unset.
-pub const DEFAULT_MAX_THREADS: usize = 4;
-
 /// Configuration for the `sql` transform.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SqlTransformConfig {
@@ -21,13 +15,11 @@ pub struct SqlTransformConfig {
     /// Reference relations loaded once at compile time and joinable by name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relations: Vec<RelationSpec>,
-    /// DuckDB `memory_limit` pragma (e.g. "4GB"). Default: `1GB`
-    /// ([`DEFAULT_MEMORY_LIMIT`]).
+    /// Optional DuckDB `memory_limit` pragma (e.g. "1GB"). Default: DuckDB's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_limit: Option<String>,
-    /// DuckDB `threads` pragma. Default: the machine's parallelism, at most 4
-    /// ([`DEFAULT_MAX_THREADS`]). Set to 1–2 for high-fan-out matrices to
-    /// avoid CPU over-subscription across rows.
+    /// Optional DuckDB `threads` pragma. Default: DuckDB's own. Set to 1–2 for
+    /// high-fan-out matrices to avoid CPU over-subscription across rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<usize>,
 }

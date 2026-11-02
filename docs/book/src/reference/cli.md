@@ -745,6 +745,7 @@ every reader skips, and their payloads stay on disk until `--purge`.
 | `--before <when>` | Only discard envelopes older than an RFC 3339 timestamp or a relative age (`7d` / `24h` / `30m`). |
 | `--delete` | Only record the discard, without copying the envelopes to a `<file>.archived` sibling. |
 | `--purge` | Physically remove every discarded envelope from the DLQ files (implies `--delete`). Without it a discarded envelope's payload stays on disk, hidden from readers — use `--purge` to remove data that must not be kept. Rewrites each file atomically and refuses a file that changes meanwhile, so run it while nothing writes the DLQ. An encrypted file is re-sealed (fresh header and integrity trailer, current key), which needs `--encryption-key`. |
+| `--reseal-plain` | For a sealed (encrypted) DLQ: record again, sealed with the key, the discard entries written without it (lines discarded before the file was sealed). Those entries are otherwise not honoured — `inspect`, `replay` and `--purge` report how many — and their lines are read. Does nothing else; needs `--encryption-key`. |
 | `--encryption-key <k>` | Key for a sealed DLQ (repeatable). Kept/archived lines stay sealed verbatim; decryption happens only in memory for filtering. |
 | `--encryption-key-file <path>` | Read a DLQ key from a file (repeatable). `FAUCET_DLQ_ENCRYPTION_KEY` also supplies `--encryption-key`; both keep the key out of `ps` and shell history. Keys are redacted from faucet's output. |
 | `--json` | Emit a JSON result. |

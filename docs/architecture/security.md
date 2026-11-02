@@ -176,9 +176,9 @@ connector's `tls` / transport option as something to configure, not to inherit.
   `x-faucet-unverified`, `verify_ca=false` in a MySQL URL, `#insecure` on a
   `rediss://` URL) need `--allow-unverified-tls`, and never apply to a tenant;
   settings that authenticate with the server's own credentials (Oracle
-  `external_auth`, marked `x-faucet-host-credentials`) are refused. Database
-  connectors never fill a missing password, user or client certificate from
-  the server's environment (`PGPASSWORD`, `~/.pgpass`, …). The defaults
+  `external_auth`, marked `x-faucet-host-credentials`) are refused. Under
+  `faucet serve`, database connectors never fill a missing password, user or
+  certificate from the server's environment (`PGPASSWORD`, `~/.pgpass`, …). The defaults
   deny environment and secret-manager reads. A substituted value
   (`${vars.*}`, `${sources.*}`, `${sinks.*}`) can never form a new `${…}`
   directive, and every secret-manager reference is checked against the policy

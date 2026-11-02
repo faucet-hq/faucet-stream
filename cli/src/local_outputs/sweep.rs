@@ -333,13 +333,12 @@ async fn apply(store: &dyn RunHistory, sel: Selection, opts: &SweepOptions) -> S
 
     // The only deletion in this subsystem: one recorded file, through its
     // directory as it resolves now, and only while it is the file just checked.
-    let target = match resolved_target(rec.fs_path(), seen).await {
-        Ok(Some(target)) => target,
-        Ok(None) => {
-            outcome.skipped = Some(SkipReason::Changed);
+    let target = match checked_target(resolved_target(rec.fs_path(), seen).await) {
+        Ok(target) => target,
+        Err(reason) => {
+            outcome.skipped = Some(reason);
             return outcome;
         }
-        Err(_) => rec.fs_path().to_path_buf(),
     };
     match tokio::fs::remove_file(&target).await {
         Ok(()) => {
@@ -364,6 +363,17 @@ async fn apply(store: &dyn RunHistory, sel: Selection, opts: &SweepOptions) -> S
         }
     }
     outcome
+}
+
+/// The path to unlink, or why the file is left: one whose directory cannot be
+/// resolved, or that is no longer the file just checked, has changed.
+fn checked_target(
+    resolved: std::io::Result<Option<std::path::PathBuf>>,
+) -> Result<std::path::PathBuf, SkipReason> {
+    match resolved {
+        Ok(Some(target)) => Ok(target),
+        Ok(None) | Err(_) => Err(SkipReason::Changed),
+    }
 }
 
 /// `path` with its directory resolved, when the file there is still the one
@@ -439,6 +449,15 @@ mod tests {
     use crate::serve::history::memory::MemoryHistory;
     use std::path::PathBuf;
     use std::time::Duration;
+
+    #[test]
+    fn a_target_whose_directory_cannot_be_resolved_is_left() {
+        let gone = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(checked_target(Err(gone)), Err(SkipReason::Changed));
+        assert_eq!(checked_target(Ok(None)), Err(SkipReason::Changed));
+        let p = PathBuf::from("/x/out.jsonl");
+        assert_eq!(checked_target(Ok(Some(p.clone()))), Ok(p));
+    }
 
     fn ts(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)

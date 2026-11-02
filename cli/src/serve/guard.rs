@@ -269,8 +269,8 @@ pub async fn guard(State(guard): State<Arc<RequestGuard>>, req: Request, next: N
 }
 
 /// Whether a request's `Content-Type` is one of `accepted` (`*` or `*/*`
-/// accepts any, `type/*` any subtype). A request without one is accepted
-/// only when its body is empty.
+/// accepts any, `type/*` any subtype, `type/*+suffix` any subtype ending in
+/// `+suffix`). A request without one is accepted only when its body is empty.
 pub fn content_type_accepted(headers: &HeaderMap, body_empty: bool, accepted: &[String]) -> bool {
     let Some(raw) = headers.get(header::CONTENT_TYPE) else {
         return body_empty;
@@ -291,6 +291,14 @@ pub fn content_type_accepted(headers: &HeaderMap, body_empty: bool, accepted: &[
             || a == media
             || a.strip_suffix("/*")
                 .is_some_and(|t| media.split('/').next() == Some(t))
+            || a.split_once("/*+").is_some_and(|(t, suffix)| {
+                media.split_once('/').is_some_and(|(mt, sub)| {
+                    mt == t
+                        && sub
+                            .strip_suffix(suffix)
+                            .is_some_and(|rest| rest.len() > 1 && rest.ends_with('+'))
+                })
+            })
     })
 }
 
@@ -418,5 +426,23 @@ mod tests {
             false,
             &["application/*".to_string()]
         ));
+    }
+
+    #[test]
+    fn structured_json_types_match_a_suffix_pattern() {
+        let defaults = vec![
+            "application/json".to_string(),
+            "application/*+json".to_string(),
+        ];
+        let accepts =
+            |ct: &str| content_type_accepted(&headers(&[("content-type", ct)]), false, &defaults);
+        assert!(accepts("application/cloudevents+json"));
+        assert!(accepts("application/vnd.api+json; charset=utf-8"));
+        assert!(accepts("application/json"));
+        assert!(!accepts("application/+json"));
+        assert!(!accepts("application/xjson"));
+        assert!(!accepts("text/cloudevents+json"));
+        assert!(!accepts("application/x-www-form-urlencoded"));
+        assert!(!content_type_accepted(&HeaderMap::new(), false, &defaults));
     }
 }

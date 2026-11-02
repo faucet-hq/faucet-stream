@@ -69,11 +69,32 @@ impl FailedAuth {
 
     /// Count a failed attempt from `source`.
     pub fn record(&self, source: &str, now: Instant) -> Failure {
+        self.record_capped(source, now, MAX_TRACKED)
+    }
+
+    /// [`record`](Self::record) tracking at most `cap` addresses. When full,
+    /// expired windows go first, then the oldest addresses that are not
+    /// locked; a locked address is never dropped. When every tracked address
+    /// is locked, a new one is not tracked (its attempts still fail).
+    fn record_capped(&self, source: &str, now: Instant, cap: usize) -> Failure {
         let mut map = self.by_source.lock().unwrap_or_else(|e| e.into_inner());
-        if map.len() >= MAX_TRACKED && !map.contains_key(source) {
+        if map.len() >= cap && !map.contains_key(source) {
             map.retain(|_, w| w.open(now));
-            if map.len() >= MAX_TRACKED {
-                map.clear();
+            if map.len() >= cap {
+                let mut unlocked: Vec<(Instant, String)> = map
+                    .iter()
+                    .filter(|(_, w)| w.failures < MAX_FAILURES)
+                    .map(|(k, w)| (w.start, k.clone()))
+                    .collect();
+                unlocked.sort();
+                let excess = map.len() + 1 - cap;
+                let drop = excess.max(cap / 10).min(unlocked.len());
+                for (_, k) in unlocked.into_iter().take(drop) {
+                    map.remove(&k);
+                }
+            }
+            if map.len() >= cap {
+                return Failure { audit: false };
             }
         }
         let w = map.entry(source.to_string()).or_insert(Window {
@@ -186,12 +207,13 @@ pub async fn require_auth(
         .map(|c| c.0.ip().to_string());
     let source = source_ip.as_deref().unwrap_or("unknown");
     let presented = bearer.is_some_and(|t| !t.is_empty());
-    if presented && state.failed_auth().locked(source, Instant::now()) {
-        return Err(ServeError::TooManyRequests(
-            "too many failed authentication attempts from this address; retry in a minute".into(),
-        ));
-    }
     let Some(mut ctx) = state.auth_mode().resolve(bearer) else {
+        if presented && state.failed_auth().locked(source, Instant::now()) {
+            return Err(ServeError::TooManyRequests(
+                "too many failed authentication attempts from this address; retry in a minute"
+                    .into(),
+            ));
+        }
         if presented && state.failed_auth().record(source, Instant::now()).audit {
             tracing::warn!(source = %source, "a request presented an invalid bearer token");
             let who = rbac::AuthContext {
@@ -296,6 +318,42 @@ mod tests {
             f.record("10.0.0.1", later).audit,
             "a new window starts over"
         );
+    }
+
+    #[test]
+    fn a_full_tracker_keeps_locked_addresses() {
+        let f = FailedAuth::default();
+        let t0 = Instant::now();
+        for _ in 0..MAX_FAILURES {
+            f.record_capped("10.0.0.1", t0, 3);
+        }
+        assert!(f.locked("10.0.0.1", t0));
+        f.record_capped("10.0.0.2", t0, 3);
+        f.record_capped("10.0.0.3", t0 + Duration::from_secs(1), 3);
+        f.record_capped("10.0.0.4", t0 + Duration::from_secs(2), 3);
+        assert!(f.locked("10.0.0.1", t0), "a locked address is kept");
+        let map = f.by_source.lock().unwrap();
+        assert!(
+            !map.contains_key("10.0.0.2"),
+            "the oldest unlocked one goes"
+        );
+        assert!(map.contains_key("10.0.0.3") && map.contains_key("10.0.0.4"));
+        drop(map);
+
+        let full = FailedAuth::default();
+        for a in ["10.1.0.1", "10.1.0.2"] {
+            for _ in 0..MAX_FAILURES {
+                full.record_capped(a, t0, 2);
+            }
+        }
+        assert_eq!(
+            full.record_capped("10.1.0.3", t0, 2),
+            Failure { audit: false }
+        );
+        assert!(full.locked("10.1.0.1", t0) && full.locked("10.1.0.2", t0));
+        assert!(!full.by_source.lock().unwrap().contains_key("10.1.0.3"));
+        let later = t0 + FAILURE_WINDOW;
+        assert!(full.record_capped("10.1.0.3", later, 2).audit);
     }
 
     #[test]

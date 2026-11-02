@@ -11,7 +11,7 @@ keywords = ["postgres", "postgresql", "sql", "etl", "pipeline"]
 categories.workspace = true
 
 [dependencies]
-faucet-core.workspace = true
+faucet-core = { workspace = true, features = ["libpq-sqlx"] }
 schemars.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

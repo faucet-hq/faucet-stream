@@ -226,9 +226,44 @@ impl DlqDecryptor {
         &self,
         file: &Path,
     ) -> Result<std::collections::HashSet<String>, FaucetError> {
+        let (ids, plain) = self.discard_entries(file)?;
+        if !plain.is_empty() {
+            tracing::warn!(
+                file = %file.display(),
+                ignored = plain.len(),
+                "DLQ discard list holds entries not sealed with the key for this file; they \
+                 are ignored (`faucet dlq discard --reseal-plain` with the key re-records them)"
+            );
+        }
+        Ok(ids)
+    }
+
+    /// The plain (unsealed) entries in the discard list of a sealed file
+    /// that no sealed entry covers: lines discarded before the file was
+    /// sealed, or by someone without the key. They are not honoured; empty
+    /// for a file that is not sealed.
+    pub fn unsealed_discards(
+        &self,
+        file: &Path,
+    ) -> Result<std::collections::HashSet<String>, FaucetError> {
+        Ok(self.discard_entries(file)?.1)
+    }
+
+    /// The honoured discard ids of `file` and, for a sealed file, the plain
+    /// entries no sealed entry covers.
+    fn discard_entries(
+        &self,
+        file: &Path,
+    ) -> Result<
+        (
+            std::collections::HashSet<String>,
+            std::collections::HashSet<String>,
+        ),
+        FaucetError,
+    > {
         let entries = discarded_lines(file)?;
         if !self.seals(file)? {
-            return Ok(entries);
+            return Ok((entries, Default::default()));
         }
         #[cfg(feature = "encryption")]
         if let Some(enc) = &self.inner {
@@ -241,17 +276,13 @@ impl DlqDecryptor {
                 .filter_map(|b| enc.decrypt_bound(&b, &context).ok())
                 .filter_map(|b| String::from_utf8(b).ok())
                 .collect();
-            if ids.len() < entries.len() {
-                tracing::warn!(
-                    file = %file.display(),
-                    ignored = entries.len() - ids.len(),
-                    "DLQ discard list holds entries not sealed with the key for this file; \
-                     they are ignored"
-                );
-            }
-            return Ok(ids);
+            let plain = entries
+                .into_iter()
+                .filter(|e| !e.starts_with(SEALED_DISCARD_PREFIX) && !ids.contains(e))
+                .collect();
+            return Ok((ids, plain));
         }
-        Ok(entries)
+        Ok((entries, Default::default()))
     }
 
     /// Whether any key is loaded.
@@ -840,6 +871,9 @@ pub struct ScanTally {
     pub non_envelope: usize,
     /// Sealed lines that could not be decrypted.
     pub undecryptable: usize,
+    /// Plain discard entries of sealed files that are not honoured (see
+    /// [`DlqDecryptor::unsealed_discards`]).
+    pub unsealed_discards: usize,
     /// Files that were read.
     pub files_read: usize,
 }
@@ -897,7 +931,8 @@ pub fn scan_each(
     let mut out = ScanTally::default();
     for file in files {
         let limit = dec.verify_file(file)?;
-        let discarded = dec.discarded_ids(file)?;
+        let (discarded, plain) = dec.discard_entries(file)?;
+        out.unsealed_discards += plain.len();
         for_each_verified_line(file, limit, |line| {
             if !discarded.is_empty() && discarded.contains(&line_id(line)) {
                 return Ok(());

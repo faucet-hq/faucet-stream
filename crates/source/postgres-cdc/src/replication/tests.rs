@@ -483,29 +483,12 @@ async fn retry_on_slot_active_does_not_retry_unrelated_errors() {
 }
 
 #[test]
-fn connect_options_take_nothing_from_the_environment() {
-    let env = |k: &str| {
-        [
-            ("PGPASSWORD", "dummy-secret"),
-            ("PGHOST", "db.internal"),
-            ("PGPORT", "6543"),
-            ("PGSSLMODE", "disable"),
-        ]
-        .iter()
-        .find(|(n, _)| *n == k)
-        .map(|(_, v)| v.to_string())
-    };
-    let opts = control_options_with("postgres:///db?user=u", env).unwrap();
-    assert_eq!(opts.get_host(), "localhost");
-    assert_eq!(opts.get_port(), 5432);
-    assert_eq!(opts.get_username(), "u");
-    assert!(matches!(
-        opts.get_ssl_mode(),
-        sqlx::postgres::PgSslMode::Prefer
-    ));
-    let opts = control_options_with("postgres://u:p@h:1/db", env).unwrap();
-    assert_eq!((opts.get_host(), opts.get_port()), ("h", 1));
-    let pguser = |k: &str| (k == "PGUSER").then(|| "svc".to_string());
-    assert!(control_options_with("postgres://h/db", pguser).is_err());
-    assert!(control_options_with("not a url", |_| None).is_err());
+fn control_options_word_an_unparseable_url() {
+    let err = control_options("postgres://h:x/db")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("postgres-cdc: invalid connection URL"),
+        "{err}"
+    );
 }

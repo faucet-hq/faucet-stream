@@ -130,6 +130,18 @@ curl -XPOST http://127.0.0.1:8080/v1/triggers/sync-hook \
      -d '{"dataset":"orders"}'
 ```
 
+The endpoint takes JSON bodies (`application/json` and the `+json` types such
+as `application/cloudevents+json`) by default; any other `Content-Type` gets
+`415`. A sender that posts form data, or a body with no `Content-Type`, needs
+its type listed on the trigger:
+
+```yaml
+  - name: form-hook
+    type: webhook
+    config: ./pipelines/load.yaml
+    content_types: [application/json, application/x-www-form-urlencoded]
+```
+
 The server returns `202 Accepted` with a `{run_id, status}` body. A second
 call with the same `Idempotency-Key` returns the same `run_id`.
 

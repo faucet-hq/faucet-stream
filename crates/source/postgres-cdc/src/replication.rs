@@ -427,30 +427,13 @@ pub async fn drop_slot(
     Ok(())
 }
 
-/// The control-plane connect options from `connection_url` alone: nothing
-/// is taken from the `PG*` environment variables or the password file.
+/// The control-plane connect options for `connection_url`; under
+/// `faucet serve` nothing is taken from the `PG*` environment variables or the
+/// password file.
 pub(crate) fn control_options(connection_url: &str) -> Result<PgConnectOptions, FaucetError> {
-    control_options_with(connection_url, |k| std::env::var(k).ok())
-}
-
-fn control_options_with(
-    connection_url: &str,
-    env: impl Fn(&str) -> Option<String>,
-) -> Result<PgConnectOptions, FaucetError> {
-    let pins = faucet_core::libpq::config_only("postgres-cdc", connection_url, env)?;
-    let mut opts: PgConnectOptions = connection_url
-        .parse()
-        .map_err(|e| FaucetError::Config(format!("postgres-cdc: invalid connection URL: {e}")))?;
-    if pins.empty_password {
-        opts = opts.password("");
-    }
-    if pins.default_host {
-        opts = opts.host("localhost");
-    }
-    if pins.default_port {
-        opts = opts.port(5432);
-    }
-    Ok(opts)
+    faucet_core::libpq::connect_options("postgres-cdc", connection_url, |e| {
+        FaucetError::Config(format!("postgres-cdc: invalid connection URL: {e}"))
+    })
 }
 
 /// Apply the CDC [`CdcTls`](crate::config::CdcTls) policy onto the sqlx

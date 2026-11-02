@@ -60,33 +60,12 @@ fn split_columns(
     )
 }
 
-/// Connect options from `url` alone: nothing is taken from the `PG*`
-/// environment variables or the password file.
+/// Connect options for `url`; under `faucet serve` nothing is taken from the
+/// `PG*` environment variables or the password file.
 pub(crate) fn connect_options(url: &str) -> Result<sqlx::postgres::PgConnectOptions, FaucetError> {
-    connect_options_with(url, |k| std::env::var(k).ok())
-}
-
-fn connect_options_with(
-    url: &str,
-    env: impl Fn(&str) -> Option<String>,
-) -> Result<sqlx::postgres::PgConnectOptions, FaucetError> {
-    let pins = faucet_core::libpq::config_only("postgres", url, env)?;
-    let mut opts: sqlx::postgres::PgConnectOptions = url
-        .parse()
-        .map_err(|e| FaucetError::Config(format!("PostgreSQL connection failed: {e}")))?;
-    if pins.empty_password {
-        opts = opts.password("");
-    }
-    if pins.default_host {
-        opts = opts.host("localhost");
-    }
-    if pins.default_port {
-        opts = opts.port(5432);
-    }
-    if pins.default_ssl_mode {
-        opts = opts.ssl_mode(sqlx::postgres::PgSslMode::Prefer);
-    }
-    Ok(opts)
+    faucet_core::libpq::connect_options("postgres", url, |e| {
+        FaucetError::Config(format!("PostgreSQL connection failed: {e}"))
+    })
 }
 
 /// [`split_columns`] over `(name, udt)` pairs.
@@ -2166,30 +2145,10 @@ mod tests {
     }
 
     #[test]
-    fn connect_options_take_nothing_from_the_environment() {
-        let env = |k: &str| {
-            [
-                ("PGPASSWORD", "dummy-secret"),
-                ("PGHOST", "db.internal"),
-                ("PGPORT", "6543"),
-                ("PGSSLMODE", "disable"),
-            ]
-            .iter()
-            .find(|(n, _)| *n == k)
-            .map(|(_, v)| v.to_string())
-        };
-        let opts = super::connect_options_with("postgres:///db?user=u", env).unwrap();
-        assert_eq!(opts.get_host(), "localhost");
-        assert_eq!(opts.get_port(), 5432);
-        assert_eq!(opts.get_username(), "u");
-        assert!(matches!(
-            opts.get_ssl_mode(),
-            sqlx::postgres::PgSslMode::Prefer
-        ));
-        let opts = super::connect_options_with("postgres://u:p@h:1/db", env).unwrap();
-        assert_eq!((opts.get_host(), opts.get_port()), ("h", 1));
-        let pguser = |k: &str| (k == "PGUSER").then(|| "svc".to_string());
-        assert!(super::connect_options_with("postgres://h/db", pguser).is_err());
-        assert!(super::connect_options_with("not a url", |_| None).is_err());
+    fn connect_options_word_an_unparseable_url() {
+        let err = super::connect_options("postgres://h:x/db")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("PostgreSQL connection failed"), "{err}");
     }
 }

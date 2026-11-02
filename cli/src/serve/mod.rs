@@ -57,7 +57,10 @@ pub struct McpServeSettings {
     pub allow_mutations: bool,
 }
 
-/// Boot the HTTP control plane and serve until SIGTERM/SIGINT.
+/// Boot the HTTP control plane and serve until SIGTERM/SIGINT. PostgreSQL
+/// connections take their settings from their configuration alone from here
+/// on (no `PG*` environment variables or password file).
 pub async fn run_server(config: ServeConfig, mcp: McpServeSettings) -> CliResult<()> {
+    faucet_core::libpq::set_config_only(true);
     server::serve(config, mcp).await
 }

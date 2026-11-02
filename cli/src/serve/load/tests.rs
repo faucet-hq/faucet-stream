@@ -1625,3 +1625,84 @@ fn encoded_and_prefixed_paths_are_read_as_their_connectors_read_them() {
     );
     assert_eq!(local_path("sqlite::memory:"), None);
 }
+
+#[test]
+fn sql_transforms_get_bounded_resources_when_they_set_none() {
+    let doc = json!({
+        "version": 1,
+        "pipeline": {
+            "source": { "type": "csv", "config": { "path": "a.csv" },
+                "transforms": [ { "type": "sql", "config": { "query": "SELECT 1" } } ] },
+            "sink": { "type": "jsonl", "config": { "path": "o.jsonl" } },
+            "transforms": [
+                { "type": "sql", "config": { "query": "SELECT 1", "memory_limit": "8GB", "threads": 16 } },
+                { "type": "flatten" }
+            ]
+        },
+        "matrix": [ { "id": "r", "transforms": [ { "type": "sql", "config": { "query": "SELECT 1", "threads": null } } ] } ]
+    });
+    let mut cfg: PipelineConfig = serde_json::from_value(doc).unwrap();
+    confine_sql(&mut cfg);
+    let own = &cfg.pipeline.transforms[0].config;
+    assert_eq!(
+        (own["memory_limit"].clone(), own["threads"].clone()),
+        (json!("8GB"), json!(16))
+    );
+    assert!(
+        cfg.pipeline.transforms[1]
+            .config
+            .get("memory_limit")
+            .is_none()
+    );
+    let unset = [
+        &cfg.pipeline
+            .source
+            .as_ref()
+            .unwrap()
+            .transforms
+            .as_ref()
+            .unwrap()[0]
+            .config,
+        &cfg.matrix[0].transforms.as_ref().unwrap()[0].config,
+    ];
+    for c in unset {
+        assert_eq!(c["memory_limit"], SQL_TRANSFORM_MEMORY_LIMIT);
+        let t = c["threads"].as_u64().unwrap() as usize;
+        assert!((1..=SQL_TRANSFORM_MAX_THREADS).contains(&t), "{c}");
+    }
+
+    let topo = json!({
+        "version": 1,
+        "pipeline": {
+            "nodes": { "t": { "kind": "transform", "transforms": [ { "type": "sql", "config": { "query": "SELECT 1" } } ] } },
+            "edges": []
+        }
+    });
+    let mut cfg: PipelineConfig = serde_json::from_value(topo).unwrap();
+    confine_sql(&mut cfg);
+    let crate::config::NodeSpec::Transform { transforms } = &cfg.pipeline.nodes["t"] else {
+        panic!("transform node");
+    };
+    assert_eq!(
+        transforms[0].config["memory_limit"],
+        SQL_TRANSFORM_MEMORY_LIMIT
+    );
+
+    let mut nodes = expand(
+        &serde_json::from_value(json!({
+            "version": 1,
+            "pipeline": {
+                "source": { "type": "csv", "config": { "path": "a.csv" } },
+                "sink": { "type": "jsonl", "config": { "path": "o.jsonl" } },
+                "transforms": [ { "type": "sql", "config": { "query": "SELECT 1" } } ]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    confine_sql_nodes(&mut nodes);
+    assert_eq!(
+        nodes[0].transforms[0].config["memory_limit"],
+        SQL_TRANSFORM_MEMORY_LIMIT
+    );
+}

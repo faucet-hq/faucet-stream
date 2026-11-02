@@ -1,8 +1,6 @@
 //! Connection setup, reference-relation loading, and query validation.
 
-use crate::config::{
-    DEFAULT_MAX_THREADS, DEFAULT_MEMORY_LIMIT, RelationSource, RelationSpec, SqlTransformConfig,
-};
+use crate::config::{RelationSource, RelationSpec, SqlTransformConfig};
 use crate::http::fetch_http_rows;
 use crate::shovel::{records_to_record_batch, values_to_record_batch};
 use duckdb::Connection;
@@ -30,12 +28,14 @@ pub(crate) fn build_connection(
     cfg: &SqlTransformConfig,
 ) -> Result<(Connection, Vec<Reloadable>), FaucetError> {
     let conn = Connection::open_in_memory().map_err(|e| cfg_err(format!("open duckdb: {e}")))?;
-    let memory = cfg.memory_limit.as_deref().unwrap_or(DEFAULT_MEMORY_LIMIT);
-    conn.execute_batch(&format!("SET memory_limit='{}';", sql_escape(memory)))
-        .map_err(|e| cfg_err(format!("memory_limit: {e}")))?;
-    let threads = cfg.threads.unwrap_or_else(default_threads);
-    conn.execute_batch(&format!("SET threads={threads};"))
-        .map_err(|e| cfg_err(format!("threads: {e}")))?;
+    if let Some(ref m) = cfg.memory_limit {
+        conn.execute_batch(&format!("SET memory_limit='{}';", sql_escape(m)))
+            .map_err(|e| cfg_err(format!("memory_limit: {e}")))?;
+    }
+    if let Some(t) = cfg.threads {
+        conn.execute_batch(&format!("SET threads={t};"))
+            .map_err(|e| cfg_err(format!("threads: {e}")))?;
+    }
     conn.register_table_function::<ArrowVTab>("arrow")
         .map_err(|e| cfg_err(format!("register arrow vtab: {e}")))?;
 
@@ -79,12 +79,6 @@ fn sandbox(conn: &Connection, reloadables: &[Reloadable]) -> Result<(), FaucetEr
     stmts.push("SET lock_configuration=true;".to_string());
     conn.execute_batch(&stmts.concat())
         .map_err(|e| cfg_err(format!("sandbox duckdb: {e}")))
-}
-
-fn default_threads() -> usize {
-    std::thread::available_parallelism()
-        .map_or(1, usize::from)
-        .min(DEFAULT_MAX_THREADS)
 }
 
 fn validate_ident(name: &str) -> Result<(), FaucetError> {

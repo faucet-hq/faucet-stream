@@ -11,7 +11,7 @@ keywords = ["postgres", "state", "bookmark", "etl", "faucet"]
 categories.workspace = true
 
 [dependencies]
-faucet-core.workspace = true
+faucet-core = { workspace = true, features = ["libpq-sqlx"] }
 async-trait.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

@@ -206,9 +206,14 @@ async fn failed_tokens_are_audited_and_then_refused_for_a_while() {
     }
     assert_eq!(attempt("wrong-token").await.unwrap().status(), 429);
     assert_eq!(
-        attempt(ADMIN).await.unwrap().status(),
+        attempt("wrong-token").await.unwrap().status(),
         429,
-        "the address is refused until its window ends"
+        "invalid tokens from the address are refused until its window ends"
+    );
+    assert_eq!(
+        attempt(ADMIN).await.unwrap().status(),
+        200,
+        "a valid token from a locked address still proceeds"
     );
     let anonymous = client.get(format!("{base}/v1/runs")).send().await.unwrap();
     assert_eq!(anonymous.status(), 401);

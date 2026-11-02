@@ -1,5 +1,5 @@
-//! The sink connects with the credentials its `connection_url` names and
-//! nothing from the process environment. A one-shot server stands in for
+//! Under config-only connections the sink connects with the credentials its
+//! `connection_url` names and nothing from the process environment. A one-shot server stands in for
 //! PostgreSQL: it asks for a cleartext password and records what it is sent.
 //! Its own test binary: it sets a process environment variable.
 #![allow(unsafe_code)] // tests set process environment variables
@@ -30,10 +30,8 @@ async fn capture_password(listener: TcpListener) -> Option<String> {
     (tag == b'p').then(|| String::from_utf8_lossy(body.strip_suffix(&[0]).unwrap_or(&body)).into())
 }
 
-#[tokio::test]
-async fn connects_with_config_credentials_only() {
-    // SAFETY: this test binary runs this one test; nothing else reads the environment concurrently.
-    unsafe { std::env::set_var("PGPASSWORD", "dummy-secret") };
+/// Start a connection attempt and return the password the server was sent.
+async fn sent_password() -> Option<String> {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = tokio::spawn(capture_password(listener));
@@ -42,9 +40,21 @@ async fn connects_with_config_credentials_only() {
         "events",
     );
     assert!(PostgresSink::new(config).await.is_err());
-    let sent = server.await.unwrap();
+    server.await.unwrap()
+}
+
+#[tokio::test]
+async fn connects_with_config_credentials_only_under_config_only() {
+    // SAFETY: this test binary runs this one test; nothing else reads the environment concurrently.
+    unsafe { std::env::set_var("PGPASSWORD", "dummy-secret") };
     assert_eq!(
-        sent.as_deref(),
+        sent_password().await.as_deref(),
+        Some("dummy-secret"),
+        "by default the environment fills in what the URL leaves out"
+    );
+    faucet_core::libpq::set_config_only(true);
+    assert_eq!(
+        sent_password().await.as_deref(),
         Some(""),
         "no password but the URL's is sent"
     );

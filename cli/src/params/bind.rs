@@ -578,7 +578,7 @@ pub fn bind_document_traced(
         &mut fields,
     );
     let result =
-        result.and_then(|()| refuse_indirect_splices(doc, &fields, &bound.values, &guarded));
+        result.and_then(|()| refuse_indirect_splices(doc, &fields, &bound.values, &guarded, &sql));
     if let (Some(block), Some(map)) = (stashed, doc.as_object_mut()) {
         map.insert(PARAMS_KEY.to_string(), block);
     }
@@ -596,18 +596,18 @@ fn refuse_indirect_splices(
     fields: &super::caller::CallerFields,
     bound: &BTreeMap<String, Value>,
     guarded: &BTreeSet<String>,
+    sql: &SqlFields,
 ) -> CliResult<()> {
     if guarded.is_empty() || fields.is_empty() {
         return Ok(());
     }
     let through = super::caller::through_refs(doc, fields);
-    let sql = sql_fields_by_config(doc);
     for (ptr, s) in super::caller::reference_leaves(doc) {
         let field = ptr
             .rsplit('/')
             .next()
             .map(|f| f.replace("~1", "/").replace("~0", "~"));
-        let context = splice_context_at(field.as_deref(), &ptr, &sql);
+        let context = splice_context_at(field.as_deref(), &ptr, sql);
         for (token, dir) in iter_directives(&s) {
             let Directive::Deferred { id, path } = dir else {
                 continue;

@@ -50,7 +50,9 @@ fn base_connect_options(conn: &RedshiftConnection) -> Result<PgConnectOptions, F
             "redshift: `database` must not be empty".into(),
         ));
     }
-    faucet_core::libpq::refuse_env_client_cert("redshift", |k| std::env::var(k).ok())?;
+    if faucet_core::libpq::config_only_enabled() {
+        refuse_env_settings(conn, |k| std::env::var(k).ok())?;
+    }
     faucet_core::ensure_crypto_provider();
     let ssl_mode = match conn.tls_mode {
         Some(RedshiftTlsMode::Disable) => PgSslMode::Disable,
@@ -79,6 +81,20 @@ fn base_connect_options(conn: &RedshiftConnection) -> Result<PgConnectOptions, F
         opts = opts.ssl_root_cert(cert.as_str());
     }
     Ok(opts)
+}
+
+/// Refuse the environment settings the connection options would pick up and
+/// the connection does not name: a client certificate or key, a root
+/// certificate, server options.
+fn refuse_env_settings(
+    conn: &RedshiftConnection,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<(), FaucetError> {
+    faucet_core::libpq::refuse_env_client_files("redshift", &env)?;
+    if conn.ssl_root_cert.is_none() {
+        faucet_core::libpq::refuse_env_vars("redshift", &["PGSSLROOTCERT"], &env)?;
+    }
+    faucet_core::libpq::refuse_env_vars("redshift", &["PGOPTIONS"], &env)
 }
 
 /// Build the `sqlx` [`PgConnectOptions`] for a `password` [`RedshiftConnection`].
