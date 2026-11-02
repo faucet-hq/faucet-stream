@@ -700,3 +700,65 @@ fn mixed_number_and_string_field_coerces_to_string() {
         vec![json!({"k": "1", "v": "1"}), json!({"k": "2", "v": "x"})]
     );
 }
+
+#[test]
+fn a_relation_path_starting_with_a_tilde_is_refused() {
+    for path in ["~/data.csv", "~"] {
+        let err = SqlTransform::compile(&SqlTransformConfig {
+            query: "SELECT * FROM batch JOIN home USING (id)".into(),
+            relations: vec![RelationSpec {
+                name: "home".into(),
+                source: RelationSource::Csv {
+                    path: path.into(),
+                    has_header: true,
+                },
+                reload_on_change: false,
+            }],
+            memory_limit: None,
+            threads: None,
+        })
+        .unwrap_err();
+        assert!(format!("{err}").contains("may not start with `~`"), "{err}");
+    }
+}
+
+#[test]
+fn a_relation_reached_through_a_relative_path_reads_that_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("ref.jsonl");
+    std::fs::write(&file, "{\"id\":1,\"label\":\"one\"}\n").unwrap();
+    let dotted = format!("{}/./ref.jsonl", dir.path().display());
+    let s = stage(SqlTransformConfig {
+        query: "SELECT b.id, r.label FROM batch b JOIN r ON r.id = b.id".into(),
+        relations: vec![RelationSpec {
+            name: "r".into(),
+            source: RelationSource::Jsonl { path: dotted },
+            reload_on_change: true,
+        }],
+        memory_limit: None,
+        threads: None,
+    });
+    let out = apply_stages_to_page(vec![json!({"id": 1})], &[s]).unwrap();
+    assert_eq!(out, vec![json!({"id": 1, "label": "one"})]);
+}
+
+#[test]
+fn unset_pragmas_get_bounded_defaults() {
+    let out = run(
+        "SELECT current_setting('threads') AS t, current_setting('memory_limit') AS m",
+        vec![json!({"x": 1})],
+    );
+    let threads = out[0]["t"]
+        .as_i64()
+        .unwrap_or_else(|| out[0]["t"].as_str().and_then(|s| s.parse().ok()).unwrap());
+    assert!(
+        (1..=faucet_transform_sql::DEFAULT_MAX_THREADS as i64).contains(&threads),
+        "{out:?}"
+    );
+    let memory = out[0]["m"].as_str().unwrap();
+    assert!(
+        memory.contains("GiB") || memory.contains("MiB") || memory.contains("GB"),
+        "{memory}"
+    );
+    assert!(!memory.starts_with("0"), "{memory}");
+}

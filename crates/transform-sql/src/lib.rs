@@ -13,5 +13,8 @@ mod http;
 mod runtime;
 mod shovel;
 
-pub use config::{HttpMethod, RelationSource, RelationSpec, SqlTransformConfig};
+pub use config::{
+    DEFAULT_MAX_THREADS, DEFAULT_MEMORY_LIMIT, HttpMethod, RelationSource, RelationSpec,
+    SqlTransformConfig,
+};
 pub use runtime::SqlTransform;

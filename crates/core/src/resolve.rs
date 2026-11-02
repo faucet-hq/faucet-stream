@@ -351,37 +351,133 @@ fn scheme_of(value: &str) -> Option<String> {
     (valid && !port).then(|| scheme.to_ascii_lowercase())
 }
 
-/// A local path a value names behind a `file:` / `sqlite:` prefix, or the
-/// value itself when it carries no scheme. `None` for a remote location.
-fn local_part(value: &str) -> Option<&str> {
+/// Schemes a path field opens as a remote location (object stores, HTTP,
+/// SFTP) when written `scheme://…`. Any other prefix in a path field is a
+/// local path.
+const REMOTE_PATH_SCHEMES: &[&str] = &[
+    "http", "https", "s3", "s3a", "s3n", "gs", "gcs", "az", "azure", "abfs", "abfss", "adl",
+    "wasb", "wasbs", "oss", "sftp", "ftp", "hdfs", "memory",
+];
+
+/// What a value in a path field names.
+enum Location<'a> {
+    /// A local path, with any `file:` / `sqlite:` / `duckdb:` prefix removed
+    /// and decoded the way its consumer decodes it.
+    Local(std::borrow::Cow<'a, str>),
+    /// A remote location (`s3://…`), checked as a URL.
+    Remote,
+    /// A local path whose meaning cannot be checked.
+    Refused(&'static str),
+}
+
+/// Percent-decode `s` (`None` when the bytes are not UTF-8).
+fn percent_decoded(s: &str) -> Option<std::borrow::Cow<'_, str>> {
+    percent_encoding::percent_decode_str(s).decode_utf8().ok()
+}
+
+/// The file a `sqlite:` connection URL opens, read exactly as sqlx reads it:
+/// the `sqlite://` then `sqlite:` prefixes removed (case-sensitively, each as
+/// often as it repeats), the part before the first `?`, percent-decoded.
+fn sqlite_file(value: &str) -> Location<'_> {
+    let rest = value
+        .trim_start_matches("sqlite://")
+        .trim_start_matches("sqlite:");
+    let database = rest.split('?').next().unwrap_or(rest);
+    match percent_decoded(database) {
+        // SQLite opens a name starting `file:` as a URI and decodes it again.
+        Some(name) if name.len() >= 5 && name[..5].eq_ignore_ascii_case("file:") => {
+            Location::Refused(
+                "a SQLite database name that is itself a `file:` URI cannot be checked",
+            )
+        }
+        Some(name) => Location::Local(name),
+        None => Location::Refused("a percent-encoded path that is not UTF-8 cannot be checked"),
+    }
+}
+
+fn locate(value: &str) -> Location<'_> {
+    use std::borrow::Cow;
     match scheme_of(value).as_deref() {
         Some("file") => {
             let rest = &value[5..];
-            let Some(after) = rest.strip_prefix("//") else {
-                return Some(rest);
+            let local = match rest.strip_prefix("//") {
+                None => rest,
+                Some(after) => {
+                    // `file://host/path` (RFC 8089): an empty authority or
+                    // `localhost` names the local absolute path; any other
+                    // host is not local.
+                    let (authority, path) = match after.find('/') {
+                        Some(i) => (&after[..i], &after[i..]),
+                        None => (after, ""),
+                    };
+                    if authority.is_empty() || authority.eq_ignore_ascii_case("localhost") {
+                        path
+                    } else if authority == "." || authority == ".." {
+                        after
+                    } else {
+                        return Location::Remote;
+                    }
+                }
             };
-            // `file://host/path` (RFC 8089): an empty authority or `localhost`
-            // names the local absolute path; any other host is not local.
-            let (authority, path) = match after.find('/') {
-                Some(i) => (&after[..i], &after[i..]),
-                None => (after, ""),
-            };
-            if authority.is_empty() || authority.eq_ignore_ascii_case("localhost") {
-                Some(path)
-            } else if authority == "." || authority == ".." {
-                Some(after)
-            } else {
-                None
+            match percent_decoded(local) {
+                Some(p) => Location::Local(p),
+                None => {
+                    Location::Refused("a percent-encoded path that is not UTF-8 cannot be checked")
+                }
             }
         }
-        Some("sqlite") => {
-            let rest = &value[7..];
-            let rest = rest.strip_prefix("//").unwrap_or(rest);
-            Some(rest.split('?').next().unwrap_or(rest))
+        Some("sqlite") if value.starts_with("sqlite:") => sqlite_file(value),
+        Some("duckdb") if value.starts_with("duckdb:") => Location::Local(Cow::Borrowed(
+            value
+                .trim_start_matches("duckdb://")
+                .trim_start_matches("duckdb:"),
+        )),
+        Some(s) if REMOTE_PATH_SCHEMES.contains(&s) && value[s.len() + 1..].starts_with("//") => {
+            Location::Remote
         }
-        Some(_) => None,
-        None => Some(value),
+        _ => Location::Local(Cow::Borrowed(value)),
     }
+}
+
+/// A local path a value names behind a `file:` / `sqlite:` / `duckdb:`
+/// prefix, or the value itself. `None` for a remote location.
+fn local_part(value: &str) -> Option<std::borrow::Cow<'_, str>> {
+    match locate(value) {
+        Location::Local(p) => Some(p),
+        Location::Remote => None,
+        Location::Refused(_) => Some(std::borrow::Cow::Borrowed(value)),
+    }
+}
+
+/// The local filesystem path a path-field value opens: a `file:` URL's path,
+/// the file a `sqlite:` URL opens (decoded as sqlx decodes it), a `duckdb:`
+/// path without its prefix, or the value itself. `None` for a remote location
+/// (`s3://…`, `https://…`). A value whose local meaning cannot be checked is
+/// returned as written, and [`ReferencePolicy::check_path`] refuses it.
+pub fn local_path(value: &str) -> Option<std::borrow::Cow<'_, str>> {
+    local_part(value)
+}
+
+/// Whether a remote location's path climbs with a `..` segment (written
+/// plainly or percent-encoded), which a client may resolve against a local
+/// directory or another prefix.
+fn has_parent_segment(value: &str) -> bool {
+    let after = value.split_once("://").map_or(value, |(_, a)| a);
+    after
+        .split(['/', '\\'])
+        .any(|seg| percent_decoded(seg).is_some_and(|d| d.trim() == "..") || seg == "..")
+}
+
+/// Whether a relative path's first segment carries a `:` (other than a
+/// Windows drive letter), which reads as a URL scheme to some consumers and
+/// as a directory name to others.
+fn ambiguous_first_segment(path: &str) -> bool {
+    if path.starts_with('/') {
+        return false;
+    }
+    let first = path.split(['/', '\\']).next().unwrap_or(path);
+    let drive = first.len() == 2 && first.as_bytes()[0].is_ascii_alphabetic();
+    first.contains(':') && !drive
 }
 
 /// Whether a scheme-less value is a relative path (`jobs/${id}`) rather than
@@ -751,11 +847,15 @@ impl ReferencePolicy {
     /// Check a path a connector reads or writes. A value with a remote scheme
     /// (`s3://…`) is checked as a URL.
     pub fn check_path(&self, value: &str) -> Result<(), Refusal> {
-        match local_part(value) {
-            Some(local) => self
-                .check_local(local)
-                .map_err(|reason| Refusal::new(RefusalKind::Path, value, reason)),
-            None => self.check_url(value),
+        let refuse = |reason: String| Refusal::new(RefusalKind::Path, value, reason);
+        match locate(value) {
+            Location::Local(local) => self.check_local(&local).map_err(refuse),
+            Location::Remote if self.path_roots.is_some() && has_parent_segment(value) => Err(
+                refuse("a remote location in a path field may not contain a `..` segment".into()),
+            ),
+            Location::Remote => self.check_url(value),
+            Location::Refused(reason) if self.path_roots.is_some() => Err(refuse(reason.into())),
+            Location::Refused(_) => Ok(()),
         }
     }
 
@@ -765,6 +865,20 @@ impl ReferencePolicy {
         };
         if path.is_empty() || path == ":memory:" || path == "/dev/null" {
             return Ok(());
+        }
+        if ambiguous_first_segment(path) {
+            return Err(
+                "a relative path whose first segment contains `:` reads as a URL scheme; \
+                 write it as `./…` or use an absolute path"
+                    .into(),
+            );
+        }
+        if path.starts_with('~') {
+            return Err(
+                "a path starting with `~` may be expanded to a home directory; \
+                 use an absolute path"
+                    .into(),
+            );
         }
         let dynamic = path.find(['*', '?', '[', '{']).unwrap_or(path.len());
         let (base, rest) = match path[..dynamic].rfind('/') {
@@ -807,12 +921,15 @@ impl ReferencePolicy {
         let scheme = scheme_of(value).filter(|_| !value.starts_with('/'));
         match scheme.as_deref() {
             Some("file") | Some("sqlite") => {
-                return match local_part(value) {
-                    Some(local) => self
-                        .check_local(local)
+                return match locate(value) {
+                    Location::Local(local) => self
+                        .check_local(&local)
                         .map_err(|reason| Refusal::new(RefusalKind::Path, value, reason)),
-                    None if self.path_roots.is_none() => Ok(()),
-                    None => Err(refuse(
+                    _ if self.path_roots.is_none() => Ok(()),
+                    Location::Refused(reason) => {
+                        Err(Refusal::new(RefusalKind::Path, value, reason))
+                    }
+                    Location::Remote => Err(refuse(
                         "a `file:` URL that names a remote host is not a local path".into(),
                     )),
                 };
@@ -896,7 +1013,7 @@ impl ReferencePolicy {
     pub fn check_resolved(&self, r: &ResourceRef) -> Result<(), Refusal> {
         match r.kind {
             ResourceKind::Url => self.check_url_resolved(&r.value),
-            ResourceKind::Path if local_part(&r.value).is_none() => {
+            ResourceKind::Path if matches!(locate(&r.value), Location::Remote) => {
                 self.check_url_resolved(&r.value)
             }
             _ => self.check(r),
@@ -1164,10 +1281,10 @@ fn flagged_fields(schema: &Value, annotation: &str) -> Vec<String> {
 mod tests {
     #[test]
     fn local_part_reads_bare_and_relative_file_authorities() {
-        assert_eq!(local_part("file://localhost"), Some(""));
-        assert_eq!(local_part("file://"), Some(""));
-        assert_eq!(local_part("file://./data/x"), Some("./data/x"));
-        assert_eq!(local_part("file://../x"), Some("../x"));
+        assert_eq!(local_part("file://localhost").as_deref(), Some(""));
+        assert_eq!(local_part("file://").as_deref(), Some(""));
+        assert_eq!(local_part("file://./data/x").as_deref(), Some("./data/x"));
+        assert_eq!(local_part("file://../x").as_deref(), Some("../x"));
         assert_eq!(local_part("file://host/x"), None);
     }
     use super::*;
@@ -1497,6 +1614,102 @@ mod tests {
                 .check_path("/x")
                 .is_ok()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_scheme_a_path_field_does_not_open_remotely_is_a_path() {
+        let dir = std::env::temp_dir().join(format!("faucet-scheme-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("zz:")).unwrap();
+        let p = ReferencePolicy::deny_all()
+            .any_url_scheme()
+            .any_url_host()
+            .with_path_roots([&dir]);
+        for bad in [
+            "zz:/x.jsonl",
+            "zz:/../../escaped.jsonl",
+            "zz:/../../../../etc/hosts",
+            "zz://../../x.jsonl",
+            "Http:x",
+            "s3:/bucket/key",
+            "~/x.csv",
+            "~",
+        ] {
+            let e = p.check_path(bad).unwrap_err();
+            assert_eq!(e.kind, RefusalKind::Path, "{bad}");
+        }
+        for bad in [
+            "s3://bucket/../x",
+            "s3://bucket/%2e%2E/x",
+            "https://h/a/..\\b",
+        ] {
+            assert!(p.check_path(bad).is_err(), "{bad}");
+        }
+        let d = dir.display();
+        assert!(p.check_path(&format!("{d}/zz:/x.jsonl")).is_ok());
+        assert!(p.check_path("s3://bucket/key").is_ok());
+        assert!(p.check_path("https://h/a/b.csv").is_ok());
+        assert!(
+            p.check_path(&format!("{d}/a/2026-01-01T00:00:00.jsonl"))
+                .is_ok()
+        );
+        assert!(!ambiguous_first_segment("C:/data/x"));
+        assert!(!ambiguous_first_segment("/abs/zz:/x"));
+        assert!(ReferencePolicy::open().check_path("zz:/x").is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn duckdb_and_sqlite_prefixes_are_read_as_their_drivers_read_them() {
+        let dir = std::env::temp_dir().join(format!("faucet-sqlite-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = ReferencePolicy::deny_all().with_path_roots([&dir]);
+        let d = dir.display().to_string();
+        let enc = d.replace('/', "%2F");
+        for ok in [
+            format!("sqlite://{enc}%2Fx.db"),
+            format!("sqlite:{d}/x%20y.db?mode=rwc"),
+            format!("duckdb://{d}/x.duckdb"),
+            format!("duckdb:{d}/x.duckdb"),
+            "duckdb::memory:".to_string(),
+            "sqlite::memory:".to_string(),
+            "sqlite://?mode=memory".to_string(),
+        ] {
+            assert!(p.check_path(&ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "sqlite://%2Fetc%2Fx.db".to_string(),
+            format!("sqlite://{d}/%2e%2e/x.db"),
+            format!("sqlite://{d}/%2E%2E%2F%2E%2E%2Fx.db"),
+            format!("sqlite://file:{d}/x.db"),
+            format!("sqlite:FILE:{enc}%2Fx.db"),
+            "sqlite://%FF.db".to_string(),
+            "SQLITE:///etc/x.db".to_string(),
+            "duckdb:/etc/x.duckdb".to_string(),
+            "duckdb://~/x.duckdb".to_string(),
+            "DUCKDB:x.duckdb".to_string(),
+            format!("file://{enc}%2F..%2F..%2Fetc"),
+            "file:///%FF".to_string(),
+        ] {
+            assert!(p.check_path(&bad).is_err(), "{bad}");
+        }
+        assert!(p.check_url(&format!("sqlite://file:{d}/x.db")).is_err());
+        assert!(
+            ReferencePolicy::open()
+                .check_url("sqlite://file:x.db")
+                .is_ok()
+        );
+        assert!(
+            ReferencePolicy::open()
+                .check_path("sqlite://%FF.db")
+                .is_ok()
+        );
+        assert_eq!(
+            local_path("sqlite://%2Ftmp%2Fx.db?mode=ro").as_deref(),
+            Some("/tmp/x.db")
+        );
+        assert_eq!(local_path("s3://b/k"), None);
+        assert_eq!(local_path("duckdb://x.duckdb").as_deref(), Some("x.duckdb"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

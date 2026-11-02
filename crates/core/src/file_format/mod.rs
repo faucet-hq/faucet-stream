@@ -616,6 +616,48 @@ impl std::fmt::Display for LineTooLong {
 
 impl std::error::Error for LineTooLong {}
 
+/// The most cells a worksheet's used range may span (rows × columns between
+/// its first and last non-empty cell). A spreadsheet reader holds that range
+/// densely, so two cells far apart in a small file would otherwise ask for an
+/// allocation the process cannot make.
+pub const MAX_SHEET_CELLS: u64 = 20_000_000;
+
+/// The used range of a worksheet, gathered cell by cell before the sheet is
+/// read whole.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SheetExtent {
+    bounds: Option<((u32, u32), (u32, u32))>,
+}
+
+impl SheetExtent {
+    /// Widen the range to cover a non-empty cell at `(row, column)`.
+    pub fn add(&mut self, (row, col): (u32, u32)) {
+        self.bounds = Some(match self.bounds {
+            None => ((row, col), (row, col)),
+            Some(((r0, c0), (r1, c1))) => ((r0.min(row), c0.min(col)), (r1.max(row), c1.max(col))),
+        });
+    }
+
+    /// How many cells the range spans.
+    pub fn cells(&self) -> u64 {
+        self.bounds.map_or(0, |((r0, c0), (r1, c1))| {
+            (u64::from(r1 - r0) + 1).saturating_mul(u64::from(c1 - c0) + 1)
+        })
+    }
+
+    /// Refuse a range larger than [`MAX_SHEET_CELLS`].
+    pub fn check(&self, what: &str) -> Result<(), FaucetError> {
+        let cells = self.cells();
+        if cells > MAX_SHEET_CELLS {
+            return Err(FaucetError::Source(format!(
+                "{what}: the sheet's used range spans {cells} cells, more than the \
+                 {MAX_SHEET_CELLS} a sheet may hold"
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// The error for a file past `max_object_bytes`.
 pub fn check_object_size(len: u64, max: u64, what: &str) -> Result<(), FaucetError> {
     if len > max {
@@ -816,6 +858,25 @@ mod capped_read_tests {
                 .is_err()
         );
         assert!(check_object_size(5, 4, "x").is_err());
+    }
+}
+
+#[cfg(test)]
+mod sheet_extent_tests {
+    use super::*;
+
+    #[test]
+    fn a_sparse_sheet_spanning_too_many_cells_is_refused() {
+        let mut e = SheetExtent::default();
+        assert_eq!(e.cells(), 0);
+        e.check("x").unwrap();
+        e.add((3, 2));
+        e.add((1, 4));
+        assert_eq!(e.cells(), 9);
+        e.check("x").unwrap();
+        e.add((1_048_575, 16_383));
+        let err = e.check("xlsx").unwrap_err().to_string();
+        assert!(err.contains("used range spans"), "{err}");
     }
 }
 

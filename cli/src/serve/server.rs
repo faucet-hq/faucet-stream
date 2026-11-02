@@ -368,6 +368,16 @@ fn spawn_metrics_upkeep(
     })
 }
 
+/// Protect the file state store a `--default-config` keeps its bookmarks in.
+fn protect_file_state(base: &Value) {
+    let state = &base["pipeline"]["state"];
+    if state["type"] == "file"
+        && let Some(dir) = state["config"]["path"].as_str()
+    {
+        crate::serve::load::protect_dir(std::path::Path::new(dir));
+    }
+}
+
 /// Load the optional `--default-config` once at startup, fully resolved, as a
 /// merge base `Value`.
 async fn load_default_base(config: &ServeConfig) -> CliResult<Option<Value>> {
@@ -377,11 +387,17 @@ async fn load_default_base(config: &ServeConfig) -> CliResult<Option<Value>> {
             crate::serve::load::protect_file(path);
             // `serve` has no --profile flag; honour FAUCET_PROFILE from the environment directly.
             let profile = std::env::var("FAUCET_PROFILE").ok();
+            if let Ok(text) = std::fs::read_to_string(path)
+                && let Ok(doc) = crate::yaml::from_str::<Value>(&text)
+            {
+                crate::serve::load::protect_references(&doc);
+            }
             let cfg =
                 crate::config::PipelineConfig::from_path_async(path, profile.as_deref()).await?;
-            Ok(Some(serde_json::to_value(&cfg).map_err(|e| {
-                CliError::Serve(format!("serializing --default-config: {e}"))
-            })?))
+            let base = serde_json::to_value(&cfg)
+                .map_err(|e| CliError::Serve(format!("serializing --default-config: {e}")))?;
+            protect_file_state(&base);
+            Ok(Some(base))
         }
     }
 }
@@ -783,6 +799,21 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
 
     if let crate::serve::config::HistoryBackendSpec::Sqlite(url) = &config.history {
         crate::serve::load::protect_sqlite_url(url);
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        crate::serve::load::protect_env_files(&cwd, config.env_file.as_deref());
+    }
+    for path in [
+        &config.policy_path,
+        &config.triggers_path,
+        &config.templates_sync_path,
+        &config.connect_providers_path,
+        &config.default_config_path,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        crate::serve::load::protect_file(path);
     }
     #[cfg(feature = "catalog")]
     if let Some(key) = crate::catalog::snapshot::key_file_path() {

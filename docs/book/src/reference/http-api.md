@@ -319,7 +319,17 @@ that would allow it. `/dev/null` and `:memory:` are always allowed. A path is
 compared after symlinks are resolved — a `..` after a symlink climbs out of the
 link's target, as the kernel would — and a `..` that leaves a root, or that
 follows a directory which does not exist yet, is refused. A path field that
-holds a remote URL (`s3://…`) is checked as a URL. A URL host is compared in
+holds a remote location (`s3://`, `s3a://`, `gs://`, `gcs://`, `az://`,
+`abfss://`, `http(s)://`, `sftp://`, …) is checked as a URL, and may not
+contain a `..` segment. Anything else is a local path: a relative path whose
+first segment contains `:` (`zz:/x`, `zz://x`) reads as a URL scheme to some
+readers and as a directory to others, so it is refused — write `./zz:/x` or an
+absolute path — and so is a path starting with `~`, which some engines expand
+to a home directory. `sqlite:` and `duckdb:` locations are read the way their
+drivers read them, percent-decoding included (`sqlite://%2Fdata%2Fx.db` is
+`/data/x.db`), and a SQLite name that is itself a `file:` URI is refused. The
+server's own files — its environment files, input files, run-history database
+and default-config state directory — are refused whatever the roots allow. A URL host is compared in
 the form a URL parser reads it, so `2852039166`, `0xa9fea9fe`, `0251.0376.0251.0376`
 or a trailing dot (`169.254.169.254.`, `metadata.google.internal.`) name the
 metadata address they spell, and an `http(s)` URL's authority ends at a `\` as

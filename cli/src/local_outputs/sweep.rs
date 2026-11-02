@@ -288,7 +288,13 @@ async fn apply(store: &dyn RunHistory, sel: Selection, opts: &SweepOptions) -> S
     // Size first, so the report can say how much was reclaimed. A stat failure
     // that is not "missing" (a permission problem) is not fatal: the delete is
     // still attempted and its own error is what gets reported.
-    let bytes = match tokio::fs::metadata(rec.fs_path()).await {
+    let mut seen = None;
+    let bytes = match tokio::fs::symlink_metadata(rec.fs_path()).await {
+        Ok(meta) if !meta.is_file() => {
+            // A symlink (or a directory) where faucet wrote a file.
+            outcome.skipped = Some(SkipReason::Changed);
+            return outcome;
+        }
         Ok(meta) => {
             // Last gate before the unlink, and the only one that asks about the
             // *path* rather than about a run: a file touched moments ago may have
@@ -303,6 +309,7 @@ async fn apply(store: &dyn RunHistory, sel: Selection, opts: &SweepOptions) -> S
                 outcome.skipped = Some(SkipReason::Changed);
                 return outcome;
             }
+            seen = super::ledger::FileIdentity::of(&meta);
             meta.len()
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -324,8 +331,17 @@ async fn apply(store: &dyn RunHistory, sel: Selection, opts: &SweepOptions) -> S
         return outcome;
     }
 
-    // The only deletion in this subsystem: one recorded file, by path.
-    match tokio::fs::remove_file(rec.fs_path()).await {
+    // The only deletion in this subsystem: one recorded file, through its
+    // directory as it resolves now, and only while it is the file just checked.
+    let target = match resolved_target(rec.fs_path(), seen).await {
+        Ok(Some(target)) => target,
+        Ok(None) => {
+            outcome.skipped = Some(SkipReason::Changed);
+            return outcome;
+        }
+        Err(_) => rec.fs_path().to_path_buf(),
+    };
+    match tokio::fs::remove_file(&target).await {
         Ok(()) => {
             outcome.deleted = true;
             outcome.bytes = bytes;
@@ -348,6 +364,24 @@ async fn apply(store: &dyn RunHistory, sel: Selection, opts: &SweepOptions) -> S
         }
     }
     outcome
+}
+
+/// `path` with its directory resolved, when the file there is still the one
+/// whose identity was `seen` (`None` when it is not). Without an identity the
+/// resolved path is returned as is.
+async fn resolved_target(
+    path: &std::path::Path,
+    seen: Option<super::ledger::FileIdentity>,
+) -> std::io::Result<Option<std::path::PathBuf>> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Ok(Some(path.to_path_buf()));
+    };
+    let target = tokio::fs::canonicalize(parent).await?.join(name);
+    let Some(seen) = seen else {
+        return Ok(Some(target));
+    };
+    let now = tokio::fs::symlink_metadata(&target).await?;
+    Ok((now.is_file() && super::ledger::FileIdentity::of(&now) == Some(seen)).then_some(target))
 }
 
 /// Whether `meta`'s mtime falls inside the in-flight grace window.
@@ -683,6 +717,48 @@ mod tests {
             store.local_output_record(o).await.unwrap();
         }
         store
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_where_the_output_was_is_left_with_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"keep").unwrap();
+        let path = dir.path().join("out.jsonl");
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+        let store = store_with(&[obs(path.to_str().unwrap(), "2026-08-01T00:00:00Z")]).await;
+        let report = run(&store, &SweepScope::Expired, &opts()).await.unwrap();
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.skipped_for(SkipReason::Changed), 1);
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_unlink_names_the_file_that_was_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("out.jsonl"), b"x").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let path = link.join("out.jsonl");
+        let id = super::super::ledger::FileIdentity::of(&std::fs::metadata(&path).unwrap());
+        let target = resolved_target(&path, id).await.unwrap().unwrap();
+        assert_eq!(
+            target,
+            std::fs::canonicalize(&real).unwrap().join("out.jsonl")
+        );
+        let other = super::super::ledger::FileIdentity { dev: 0, ino: 0 };
+        assert!(resolved_target(&path, Some(other)).await.unwrap().is_none());
+        assert!(resolved_target(&path, None).await.unwrap().is_some());
+        assert_eq!(
+            resolved_target(std::path::Path::new("/"), None)
+                .await
+                .unwrap(),
+            Some(std::path::PathBuf::from("/"))
+        );
     }
 
     #[tokio::test]

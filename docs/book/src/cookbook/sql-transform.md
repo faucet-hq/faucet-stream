@@ -58,7 +58,10 @@ Once the reference relations are loaded, the DuckDB connection is closed to the
 host: no `read_text` / `read_csv` / `COPY … TO` / `ATTACH` / network reads (only the
 files of `reload_on_change` relations stay readable), no extension install or
 autoload, and the configuration is locked, so a query cannot raise its own
-`memory_limit` or `threads`.
+`memory_limit` or `threads`. Unset, they default to `1GB` and the machine's
+parallelism up to 4 threads. A relation `path` is opened by its canonical
+absolute path, and one starting with `~` is refused (DuckDB would expand it to
+the home directory).
 
 ## Per-page semantics and `batch_size: 0`
 

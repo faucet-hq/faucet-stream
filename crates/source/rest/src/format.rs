@@ -485,6 +485,35 @@ where
     }
 }
 
+/// Refuse a worksheet whose used range is too large to hold densely, before
+/// it is read whole.
+#[cfg(feature = "excel")]
+fn check_sheet_extent<RS: std::io::Read + std::io::Seek>(
+    wb: &mut calamine::Xlsx<RS>,
+    name: &str,
+    what: &str,
+) -> Result<(), FaucetError> {
+    let mut cells = match wb.worksheet_cells_reader(name) {
+        Ok(cells) => cells,
+        Err(calamine::XlsxError::NotAWorksheet(_)) => return Ok(()),
+        Err(e) => {
+            return Err(FaucetError::Source(format!(
+                "{what}: reading sheet '{name}': {e}"
+            )));
+        }
+    };
+    let mut extent = faucet_core::file_format::SheetExtent::default();
+    while let Some(cell) = cells
+        .next_cell()
+        .map_err(|e| FaucetError::Source(format!("{what}: reading sheet '{name}': {e}")))?
+    {
+        if !matches!(cell.get_value(), calamine::DataRef::Empty) {
+            extent.add(cell.get_position());
+        }
+    }
+    extent.check(what)
+}
+
 /// Parse Excel bytes into records. Requires the `excel` feature.
 #[cfg(feature = "excel")]
 pub fn parse_excel(
@@ -518,6 +547,7 @@ pub fn parse_excel(
             .cloned()
             .ok_or_else(|| FaucetError::Source("rest: Excel workbook has no worksheets".into()))?,
     };
+    check_sheet_extent(&mut wb, &name, "rest: Excel")?;
     let range = wb
         .worksheet_range(&name)
         .map_err(|e| FaucetError::Source(format!("rest: reading Excel sheet '{name}': {e}")))?;
@@ -809,6 +839,19 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "excel")]
+    #[test]
+    fn a_sheet_whose_cells_span_too_large_a_range_is_refused() {
+        let mut book = rust_xlsxwriter::Workbook::new();
+        let ws = book.add_worksheet();
+        ws.write_string(0, 0, "id").unwrap();
+        ws.write_string(1_048_575, 16_383, "far").unwrap();
+        let err = super::parse_excel(&book.save_to_buffer().unwrap(), None, 0)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("used range spans"), "{err}");
+    }
+
     #[test]
     fn empty_csv_headers_are_named_only_when_they_would_collide() {
         let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -879,6 +922,7 @@ mod tests {
     /// #626 — the bounded-memory CSV page decoder.
     mod value_pages {
         use super::*;
+
         use futures::StreamExt as _;
 
         async fn pages(body: &'static str, page_size: usize) -> Vec<Vec<Value>> {

@@ -269,7 +269,14 @@ fn source_spec(record: &LocalOutputRecord, rows: RowCap) -> Result<PreviewReques
         "csv" => json!({ "path": record.path, "batch_size": page }),
         // The file sink's output is read back by the file source, which
         // resolves the format from the extension exactly as the sink did.
-        "file" => json!({ "path": record.path, "batch_size": page, "strict": true }),
+        // A whole-read format (JSON array, XML, a compressed file) is buffered
+        // before its first page, so it is bounded by the preview's own budget.
+        "file" => json!({
+            "path": record.path,
+            "batch_size": page,
+            "strict": true,
+            "max_object_bytes": crate::serve::preview::engine::PREVIEW_MAX_BYTES,
+        }),
         // `local_path` is `ParquetLocation`'s snake_case tag; a rolled parquet
         // run records each part as its own ledger row, so this is always one
         // concrete file, never a glob.
