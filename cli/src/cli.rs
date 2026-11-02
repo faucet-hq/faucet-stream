@@ -1315,9 +1315,10 @@ pub struct HubPairArgs {
     #[arg(long)]
     pub overlay_hub: Option<String>,
     /// Trust hub templates from this owner (or this exact template id) to
-    /// read the environment, files and secrets on this machine. Templates
-    /// outside `faucet-hq` are refused when they do, unless trusted;
-    /// `--trust '*'` trusts every one. Repeatable.
+    /// read the environment, files and secrets on this machine, the other
+    /// template's config and to run a program. Templates outside `faucet-hq`
+    /// are refused when they do, unless trusted; the owner is the template's
+    /// namespace directory. `--trust '*'` trusts every one. Repeatable.
     #[arg(long = "trust", value_name = "OWNER|ID")]
     pub trust: Vec<String>,
 }
@@ -2669,9 +2670,10 @@ pub struct RunArgs {
     #[arg(long)]
     pub overlay_hub: Option<String>,
     /// Trust hub templates from this owner (or this exact template id) to
-    /// read the environment, files and secrets on this machine. Templates
-    /// outside `faucet-hq` are refused when they do, unless trusted;
-    /// `--trust '*'` trusts every one. Repeatable.
+    /// read the environment, files and secrets on this machine, the other
+    /// template's config and to run a program. Templates outside `faucet-hq`
+    /// are refused when they do, unless trusted; the owner is the template's
+    /// namespace directory. `--trust '*'` trusts every one. Repeatable.
     #[arg(long = "trust", value_name = "OWNER|ID")]
     pub trust: Vec<String>,
 }
@@ -2946,9 +2948,10 @@ pub struct ValidateArgs {
     #[arg(long)]
     pub overlay_hub: Option<String>,
     /// Trust hub templates from this owner (or this exact template id) to
-    /// read the environment, files and secrets on this machine. Templates
-    /// outside `faucet-hq` are refused when they do, unless trusted;
-    /// `--trust '*'` trusts every one. Repeatable.
+    /// read the environment, files and secrets on this machine, the other
+    /// template's config and to run a program. Templates outside `faucet-hq`
+    /// are refused when they do, unless trusted; the owner is the template's
+    /// namespace directory. `--trust '*'` trusts every one. Repeatable.
     #[arg(long = "trust", value_name = "OWNER|ID")]
     pub trust: Vec<String>,
 }

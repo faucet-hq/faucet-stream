@@ -333,6 +333,26 @@ fn secret_is_protected(scheme: &str, reference: &str) -> bool {
         .unwrap_or(true)
 }
 
+/// The check a secret-manager reference passes right before it is fetched:
+/// never one of the server's own, and allowed by `policy` unless the
+/// operator's `--default-config` base wrote it as is.
+fn secret_screen(
+    policy: &ReferencePolicy,
+    operator_tokens: &std::collections::BTreeSet<String>,
+) -> impl Fn(&str, &str) -> Result<(), String> + Send + Sync + use<> {
+    let policy = policy.clone();
+    let operator_tokens = operator_tokens.clone();
+    move |scheme: &str, reference: &str| {
+        if secret_is_protected(scheme, reference) {
+            return Err("it is one of the server's own credentials".into());
+        }
+        if operator_tokens.contains(&format!("${{{scheme}:{reference}}}")) {
+            return Ok(());
+        }
+        policy.check_secret(scheme, reference).map_err(|e| e.reason)
+    }
+}
+
 fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
     let absolute;
     let path = if path.is_relative() {
@@ -1182,63 +1202,7 @@ fn propagate_caller_fields(
     doc: &Value,
     fields: &crate::params::CallerFields,
 ) -> crate::params::CallerFields {
-    use crate::interpolate::{Directive, iter_directives};
-    use crate::params::caller::{child, escape};
-    fn strings(v: &Value, ptr: &str, out: &mut Vec<(String, String)>) {
-        match v {
-            Value::String(s) if s.contains("${") => out.push((ptr.to_string(), s.clone())),
-            Value::Array(a) => a
-                .iter()
-                .enumerate()
-                .for_each(|(i, x)| strings(x, &format!("{ptr}/{i}"), out)),
-            Value::Object(o) => o.iter().for_each(|(k, x)| strings(x, &child(ptr, k), out)),
-            _ => {}
-        }
-    }
-    let mut leaves = Vec::new();
-    strings(doc, "", &mut leaves);
-    let targets = |id: &str, path: &str| -> Vec<String> {
-        let mut segs = path.split('.');
-        let rest = |segs: std::str::Split<'_, char>| {
-            segs.map(|s| format!("/{}", escape(s))).collect::<String>()
-        };
-        match id {
-            "vars" => vec![format!("/vars{}", rest(segs))],
-            "sources" | "sinks" => {
-                let Some(name) = segs.next() else {
-                    return Vec::new();
-                };
-                let rest = rest(segs);
-                let mut out = vec![format!("/pipeline/{id}/{}{rest}", escape(name))];
-                if name == "default" {
-                    let legacy = if id == "sources" { "source" } else { "sink" };
-                    out.push(format!("/pipeline/{legacy}{rest}"));
-                }
-                out
-            }
-            _ => Vec::new(),
-        }
-    };
-    let mut out = fields.clone();
-    loop {
-        let before = out.clone();
-        for (ptr, s) in &leaves {
-            for (_, d) in iter_directives(s) {
-                let Directive::Deferred { id, path } = d else {
-                    continue;
-                };
-                for t in targets(id, path) {
-                    let params = out.params_at(&t);
-                    if !params.is_empty() {
-                        out.insert_all(ptr, &params);
-                    }
-                }
-            }
-        }
-        if out == before {
-            break;
-        }
-    }
+    let out = crate::params::caller::through_refs(doc, fields);
     let mut out = out.with_alias(0, "replication", "mirror");
     for (ptr, params) in out.clone().iter() {
         let segs: Vec<&str> = ptr.split('/').skip(1).collect();
@@ -1917,6 +1881,7 @@ fn resolution_error(e: crate::error::CliError) -> ServeError {
         CliError::ReadInterpolatedFile { .. }
         | CliError::SecretFetchFailed { .. }
         | CliError::SecretAuthFailed { .. } => ServeError::Unavailable(e.to_string()),
+        CliError::SecretRefused { .. } => ServeError::Forbidden(e.to_string()),
         other => ServeError::BadConfig(other.to_string()),
     }
 }
@@ -2237,7 +2202,11 @@ pub async fn load_submission_inputs(
     #[cfg(not(feature = "policy"))]
     let _ = policy;
 
-    crate::secrets::resolve_secrets(&mut cfg)
+    // Each reference is held to the policy again as it is about to be read:
+    // it may have taken its final form only after `${vars.*}` / template
+    // references were substituted.
+    let screen = secret_screen(&refs, &operator_tokens);
+    crate::secrets::resolve_secrets_screened(&mut cfg, &screen)
         .await
         .map_err(resolution_error)?;
 

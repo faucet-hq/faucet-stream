@@ -339,6 +339,79 @@ impl Cursor {
     }
 }
 
+/// The values a config reference (`${vars.X}`, `${sources.N.PATH}`,
+/// `${sinks.N.PATH}`) reads: the JSON pointers it names, the legacy singular
+/// `pipeline.source` / `pipeline.sink` too for the template `default`.
+pub fn ref_targets(id: &str, path: &str) -> Vec<String> {
+    let mut segs = path.split('.');
+    let rest = |segs: std::str::Split<'_, char>| {
+        segs.map(|s| format!("/{}", escape(s))).collect::<String>()
+    };
+    match id {
+        "vars" => vec![format!("/vars{}", rest(segs))],
+        "sources" | "sinks" => {
+            let Some(name) = segs.next() else {
+                return Vec::new();
+            };
+            let rest = rest(segs);
+            let mut out = vec![format!("/pipeline/{id}/{}{rest}", escape(name))];
+            if name == "default" {
+                let legacy = if id == "sources" { "source" } else { "sink" };
+                out.push(format!("/pipeline/{legacy}{rest}"));
+            }
+            out
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Every string of `doc` that may hold a `${…}` reference, with its pointer.
+pub fn reference_leaves(doc: &Value) -> Vec<(String, String)> {
+    fn strings(v: &Value, ptr: &str, out: &mut Vec<(String, String)>) {
+        match v {
+            Value::String(s) if s.contains("${") => out.push((ptr.to_string(), s.clone())),
+            Value::Array(a) => a
+                .iter()
+                .enumerate()
+                .for_each(|(i, x)| strings(x, &format!("{ptr}/{i}"), out)),
+            Value::Object(o) => o.iter().for_each(|(k, x)| strings(x, &child(ptr, k), out)),
+            _ => {}
+        }
+    }
+    let mut leaves = Vec::new();
+    strings(doc, "", &mut leaves);
+    leaves
+}
+
+/// `fields` extended through `doc`'s own references: a string holding
+/// `${vars.X}` / `${sources.N.PATH}` / `${sinks.N.PATH}` that names a value
+/// holding caller text holds it too.
+pub fn through_refs(doc: &Value, fields: &CallerFields) -> CallerFields {
+    use crate::interpolate::{Directive, iter_directives};
+    let leaves = reference_leaves(doc);
+    let mut out = fields.clone();
+    loop {
+        let before = out.clone();
+        for (ptr, s) in &leaves {
+            for (_, d) in iter_directives(s) {
+                let Directive::Deferred { id, path } = d else {
+                    continue;
+                };
+                for t in ref_targets(id, path) {
+                    let params = out.params_at(&t);
+                    if !params.is_empty() {
+                        out.insert_all(ptr, &params);
+                    }
+                }
+            }
+        }
+        if out == before {
+            break;
+        }
+    }
+    out
+}
+
 /// Whether a rewritten key holds text registered as secret (a `secret: true`
 /// param, an `${env:}` / `${file:}` value).
 pub fn key_is_secret(new_key: &str) -> bool {

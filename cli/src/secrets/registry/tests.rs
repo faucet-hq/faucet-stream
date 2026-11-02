@@ -251,3 +251,40 @@ fn redact_message_masks_secrets_and_url_credentials() {
     assert_eq!(redact_message("at end url=s3://b/k"), "at end url=s3://b/k");
     unregister("s3cr3t-874-value");
 }
+
+#[test]
+fn caller_values_never_displace_a_server_secret() {
+    let mut reg = Registry {
+        max_forms: 4,
+        max_caller_forms: 4,
+        ..Registry::default()
+    };
+    reg.insert(forms_of("server-resolved-secret"));
+    for i in 0..10 {
+        reg.insert_caller(forms_of(&format!("caller-flood-{i}")));
+    }
+    assert!(reg.forms.contains_key("server-resolved-secret"));
+    assert!(reg.caller.len() <= 4, "{}", reg.caller.len());
+    assert!(reg.caller.contains_key("caller-flood-9"));
+    reg.insert_caller(forms_of("server-resolved-secret"));
+    assert!(!reg.caller.contains_key("server-resolved-secret"));
+    let patterns = reg.compile().patterns;
+    assert!(patterns.iter().any(|p| p == "caller-flood-9"));
+    assert_eq!(
+        patterns
+            .iter()
+            .filter(|p| *p == "server-resolved-secret")
+            .count(),
+        1
+    );
+}
+
+#[test]
+#[serial]
+fn a_caller_value_is_redacted_until_unregistered() {
+    register_caller("caller-param-value");
+    register_caller("abc");
+    assert_eq!(redact("v=caller-param-value abc"), "v=*** abc");
+    unregister("caller-param-value");
+    assert_eq!(redact("caller-param-value"), "caller-param-value");
+}

@@ -79,13 +79,18 @@ A param spliced into a longer string becomes plain text of that string — it is
 for a param without a `values:` set may not carry a quote (`'`, `"`, `` ` ``),
 `;`, a backslash or a control character when it is spliced into a longer string
 (`query: "… WHERE account = '${param.account}'"`); such a trigger is refused.
-In a SQL field (`query`, `sql`, `statement`, `*_query`) a splice that is not
+In a SQL field (`query`, `sql`, `statement`, `*_query`, and any field a
+connector's schema marks as SQL) a splice that is not
 enclosed in quotes (`WHERE id = ${param.id}`) takes only a number (`42`,
 `-7`, `3.5`) — text that could name a column or form an expression is refused,
 so quote the splice (`'${param.id}'`) or declare the param `int` / `float` — and
 in a URL field (`url`, `*_url`,
 `path`, `endpoint`) a spliced value may not carry `?`, `#`, `&`, whitespace or
 a `..` segment.
+The same rules follow a value that reaches the longer string through a
+reference — `vars: { acct: "${param.account}" }` spliced as `'${vars.acct}'`,
+or a template field read with `${sources.NAME.config.FIELD}` — judged by the
+field the text finally lands in.
 For a param a lower-trust caller fills into a query, declare a closed `values:`
 set. A whole-value reference (`table: ${param.table}`) and a `default` are not
 restricted.
@@ -1127,6 +1132,15 @@ origins:
       config: { bucket: acme-templates, prefix: shared/, region: us-east-1 }
     prefix: partner-
 ```
+
+A template under an `<owner>/` directory of an origin (a Template Hub
+catalog's layout) is its owner's: it registers only when it reads nothing of
+the server's (`${env:}`, `${file:}`, secret directives), references no other
+part of the composed config (`${sources.*}`, `${sinks.*}`, `${vars.*}`) and
+names no connector that runs a program — otherwise the pull reports and skips
+it. List the owners (or `owner/name` ids, or `"*"`) you have reviewed under the
+origin's `trust:`. The `faucet-hq` namespace of `faucet-hq/template-hub` at
+`main` needs no entry.
 
 ```bash
 faucet serve --history sqlite:./faucet.db --templates-sync sync.yaml

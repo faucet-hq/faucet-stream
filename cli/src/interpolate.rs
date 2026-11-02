@@ -421,7 +421,83 @@ fn now_token(path: &str, clock: DateTime<FixedOffset>) -> CliResult<String> {
 
 /// Walk `input` byte-by-byte, calling `resolve` on each `${...}` body.
 /// `resolve` returns `Some(s)` to substitute, or `None` to keep verbatim.
-pub(crate) fn rewrite<F>(input: &str, mut resolve: F) -> CliResult<String>
+pub(crate) fn rewrite<F>(input: &str, resolve: F) -> CliResult<String>
+where
+    F: FnMut(&str) -> CliResult<Option<String>>,
+{
+    rewrite_tracked(input, resolve, None)
+}
+
+/// [`rewrite`] for substituted text that is data (a `vars:` value, another
+/// template's field): no `${…}` directive may start in it or span it and the
+/// text around it. Such a `${` is written as the `$${` escape, so it stays
+/// literal. A directive whole inside one substituted value was whole in that
+/// value already and is kept.
+pub(crate) fn rewrite_spliced<F>(input: &str, resolve: F) -> CliResult<String>
+where
+    F: FnMut(&str) -> CliResult<Option<String>>,
+{
+    let mut spans = Vec::new();
+    let out = rewrite_tracked(input, resolve, Some(&mut spans))?;
+    Ok(escape_formed(&out, &spans))
+}
+
+/// Escape every `${` in `out` whose directive does not lie within one
+/// segment — the text between the substituted byte ranges `spans`, or one
+/// of them.
+fn escape_formed(out: &str, spans: &[(usize, usize)]) -> String {
+    if spans.is_empty() || !out.contains("${") {
+        return out.to_string();
+    }
+    let segment = |pos: usize| -> usize {
+        let mut id = 0;
+        for &(start, end) in spans {
+            if pos >= end {
+                id += 2;
+            } else {
+                if pos >= start {
+                    id += 1;
+                }
+                break;
+            }
+        }
+        id
+    };
+    let bytes = out.as_bytes();
+    let mut res = String::with_capacity(out.len() + 4);
+    let mut last = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 2 < bytes.len() && bytes[i + 1] == b'$' && bytes[i + 2] == b'{' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            let Some(rel) = out[i + 2..].find('}') else {
+                break;
+            };
+            let end = i + 2 + rel;
+            if segment(i) == segment(end) {
+                i = end + 1;
+            } else {
+                res.push_str(&out[last..i]);
+                res.push('$');
+                last = i;
+                i += 2;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    res.push_str(&out[last..]);
+    res
+}
+
+fn rewrite_tracked<F>(
+    input: &str,
+    mut resolve: F,
+    mut spans: Option<&mut Vec<(usize, usize)>>,
+) -> CliResult<String>
 where
     F: FnMut(&str) -> CliResult<Option<String>>,
 {
@@ -446,7 +522,13 @@ where
             let end = start + rel_end;
             let body = &input[start..end];
             match resolve(body)? {
-                Some(s) => out.push_str(&s),
+                Some(s) => {
+                    let start = out.len();
+                    out.push_str(&s);
+                    if let Some(spans) = spans.as_deref_mut() {
+                        spans.push((start, out.len()));
+                    }
+                }
                 None => out.push_str(&input[i..=end]),
             }
             i = end + 1;
@@ -480,6 +562,43 @@ pub fn unescape_value(v: &mut Value) {
         }
         _ => {}
     }
+}
+
+/// [`unescape_value`] everywhere in `v` except below the paths `skip`
+/// (`"*"` matches any key or index) — locations unescaped later, when built.
+pub fn unescape_value_except(v: &mut Value, skip: &[&[&str]]) {
+    fn walk(v: &mut Value, path: &mut Vec<String>, skip: &[&[&str]]) {
+        let skipped = skip.iter().any(|p| {
+            p.len() == path.len()
+                && p.iter()
+                    .zip(path.iter())
+                    .all(|(want, got)| *want == "*" || want == got)
+        });
+        if skipped {
+            return;
+        }
+        match v {
+            Value::String(s) if s.contains("$${") => *s = unescape(s),
+            Value::Array(a) => {
+                for (i, item) in a.iter_mut().enumerate() {
+                    path.push(i.to_string());
+                    walk(item, path, skip);
+                    path.pop();
+                }
+            }
+            Value::Object(m) => {
+                let entries: Vec<(String, Value)> = std::mem::take(m).into_iter().collect();
+                for (k, mut val) in entries {
+                    path.push(k.clone());
+                    walk(&mut val, path, skip);
+                    path.pop();
+                    m.insert(unescape(&k), val);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(v, &mut Vec::new(), skip);
 }
 
 /// [`unescape_value`] on an owned value.
@@ -523,8 +642,7 @@ pub(crate) fn unescape_document(doc: &mut Value) {
                 | ["observability" | "verify" | "reconcile" | "lineage" | "catalog"]
                 | ["notifications" | "notify"]
                 | ["pipeline", "masking"]
-                | ["pipeline", "nodes", _, "config"]
-                | ["pipeline", "nodes", _, "transforms", _, "config"]
+                | ["pipeline", "nodes"]
                 | ["pipeline", "source" | "sink", "config"]
                 | ["pipeline", "sources" | "sinks", _, "config"]
                 | ["pipeline", "source", "transforms", _, "config"]
@@ -537,15 +655,7 @@ pub(crate) fn unescape_document(doc: &mut Value) {
                 | ["matrix", _, "transforms", _, "config"]
                 | ["matrix", _, "state", "config"]
                 | ["matrix", _, "dlq", "sink", "config"]
-                | ["mirror" | "replication", "snapshot", "source", "config"]
-                | [
-                    "mirror" | "replication",
-                    "snapshot",
-                    "source",
-                    "transforms",
-                    _,
-                    "config"
-                ]
+                | ["mirror" | "replication"]
         )
     }
     fn walk(v: &mut Value, path: &mut Vec<String>) {
@@ -925,7 +1035,7 @@ fn resolve_vars_recursive(
 ) -> CliResult<()> {
     match v {
         Value::String(s) => {
-            let new_s = rewrite(s, |body| {
+            let new_s = rewrite_spliced(s, |body| {
                 let Some(name) = body.strip_prefix("vars.") else {
                     return Ok(None); // not a vars ref — leave verbatim
                 };
@@ -962,7 +1072,7 @@ fn resolve_vars_recursive(
 fn resolve_vars_only(v: &mut Value, vars: &HashMap<String, Value>) -> CliResult<()> {
     match v {
         Value::String(s) => {
-            let new_s = rewrite(s, |body| {
+            let new_s = rewrite_spliced(s, |body| {
                 let Some(name) = body.strip_prefix("vars.") else {
                     return Ok(None);
                 };
@@ -998,7 +1108,7 @@ fn resolve_value_full(
 ) -> CliResult<()> {
     match v {
         Value::String(s) => {
-            let new_s = rewrite(s, |body| {
+            let new_s = rewrite_spliced(s, |body| {
                 if let Some(name) = body.strip_prefix("vars.") {
                     let val = vars.get(name).ok_or_else(|| CliError::UnknownVarsRef {
                         name: name.to_string(),
@@ -1090,7 +1200,7 @@ fn lookup_template_path(
     // pass through verbatim.
     let resolved_str = value_to_string(&resolved);
     visiting.push(key);
-    let out = rewrite(&resolved_str, |body| {
+    let out = rewrite_spliced(&resolved_str, |body| {
         if let Some(rest) = body.strip_prefix("sources.") {
             return Ok(Some(lookup_template_path(
                 sources, sinks, "sources", rest, visiting,
@@ -1959,6 +2069,125 @@ matrix:
         assert_eq!(
             resolve_lineage_job_name("static", "orders", "users"),
             "static"
+        );
+    }
+
+    fn spliced_header(yaml: &str) -> (Value, usize) {
+        let cfg = parse_with_extension(yaml, "yaml").unwrap();
+        let refs = crate::secrets::scan_config(&cfg).len();
+        let config = cfg.pipeline.source.as_ref().unwrap().config.clone();
+        (unescaped(config), refs)
+    }
+
+    #[test]
+    fn a_vars_fragment_cannot_close_into_a_secret_directive() {
+        let (config, refs) = spliced_header(
+            r#"
+version: 1
+vars: { p: "${vault:secret/data/app#token" }
+pipeline:
+  source: { type: rest, config: { base_url: "https://api.example.com", header: "${vars.p}}" } }
+  sink:   { type: stdout }
+"#,
+        );
+        assert_eq!(refs, 0);
+        assert_eq!(config["header"], "${vault:secret/data/app#token}");
+    }
+
+    #[test]
+    fn a_dollar_var_before_a_brace_cannot_open_a_directive() {
+        let (config, refs) = spliced_header(
+            r#"
+version: 1
+vars: { o: "$" }
+pipeline:
+  source: { type: rest, config: { base_url: "https://hooks.example/?k=${vars.o}{aws-sm:prod/db#password}" } }
+  sink:   { type: stdout }
+"#,
+        );
+        assert_eq!(refs, 0);
+        assert_eq!(
+            config["base_url"],
+            "https://hooks.example/?k=${aws-sm:prod/db#password}"
+        );
+    }
+
+    #[test]
+    fn vars_joined_in_vars_cannot_form_a_directive() {
+        let (config, refs) = spliced_header(
+            r#"
+version: 1
+vars: { a: "${vau", b: "${vars.a}lt:secret/x}" }
+pipeline:
+  source: { type: rest, config: { base_url: "https://api.example.com", header: "${vars.b}", pair: "${vars.a}x}" } }
+  sink:   { type: stdout }
+"#,
+        );
+        assert_eq!(refs, 0);
+        assert_eq!(config["header"], "${vault:secret/x}");
+        assert_eq!(config["pair"], "${vaux}");
+    }
+
+    #[test]
+    fn a_template_field_fragment_cannot_form_a_directive() {
+        let yaml = r#"
+version: 1
+pipeline:
+  source: { type: rest, config: { base_url: "https://api.example.com", frag: "${vault:x" } }
+  sink:   { type: stdout, config: { label: "${sources.default.config.frag}}" } }
+"#;
+        let cfg = parse_with_extension(yaml, "yaml").unwrap();
+        assert!(crate::secrets::scan_config(&cfg).is_empty());
+        let sink = unescaped(cfg.pipeline.sink.as_ref().unwrap().config.clone());
+        assert_eq!(sink["label"], "${vault:x}");
+    }
+
+    #[test]
+    fn a_directive_written_whole_in_a_var_still_resolves() {
+        let (config, refs) = spliced_header(
+            r#"
+version: 1
+vars: { tok: "${vault:secret/x}" }
+pipeline:
+  source: { type: rest, config: { base_url: "https://api.example.com", header: "Bearer ${vars.tok}", whole: "${vars.tok}" } }
+  sink:   { type: stdout }
+"#,
+        );
+        assert_eq!(refs, 1);
+        assert_eq!(config["header"], "Bearer ${vault:secret/x}");
+        assert_eq!(config["whole"], "${vault:secret/x}");
+    }
+
+    #[test]
+    fn escape_formed_keeps_unclosed_and_whole_tokens() {
+        assert_eq!(escape_formed("plain", &[(0, 2)]), "plain");
+        assert_eq!(escape_formed("${a", &[(0, 3)]), "${a");
+        assert_eq!(escape_formed("x${a}", &[(1, 5)]), "x${a}");
+        assert_eq!(escape_formed("${a}", &[(0, 2)]), "$${a}");
+        assert_eq!(escape_formed("$${a}", &[(0, 1)]), "$${a}");
+        assert_eq!(escape_formed("${a}", &[(0, 0)]), "${a}");
+        assert_eq!(escape_formed("${a}${b}", &[(4, 5)]), "${a}$${b}");
+        assert_eq!(escape_formed("${a${v:x}", &[(0, 3), (4, 9)]), "$${a$${v:x}");
+    }
+
+    #[test]
+    fn escaped_text_outside_connector_configs_of_a_mirror_stays_literal() {
+        let mut v = serde_json::json!({
+            "tables": { "include": ["$${x}"] },
+            "snapshot": { "source": { "config": { "q": "$${y}" }, "transforms": [ { "config": { "z": "$${z}" } } ] } }
+        });
+        unescape_value_except(
+            &mut v,
+            &[
+                &["snapshot", "source", "config"],
+                &["snapshot", "source", "transforms", "*", "config"],
+            ],
+        );
+        assert_eq!(v["tables"]["include"][0], "${x}");
+        assert_eq!(v["snapshot"]["source"]["config"]["q"], "$${y}");
+        assert_eq!(
+            v["snapshot"]["source"]["transforms"][0]["config"]["z"],
+            "$${z}"
         );
     }
 }
