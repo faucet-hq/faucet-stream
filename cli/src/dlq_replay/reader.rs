@@ -135,6 +135,13 @@ impl DlqDecryptor {
         #[cfg(feature = "encryption")]
         if let Some(enc) = &self.inner {
             if !starts_sealed(file)? {
+                if has_sealed_line(file)? {
+                    return Err(FaucetError::Source(format!(
+                        "DLQ file '{}' starts with a plaintext line but holds sealed lines, so \
+                         its integrity cannot be checked; it is not read",
+                        file.display()
+                    )));
+                }
                 return Ok(None);
             }
             use faucet_common_file::sealed_lines::{Verdict, Verifier};
@@ -175,6 +182,76 @@ impl DlqDecryptor {
         #[cfg(not(feature = "encryption"))]
         let _ = file;
         Ok(None)
+    }
+
+    /// Whether `file` is sealed with whole-file integrity under a loaded key:
+    /// its discard list is then authenticated with that key.
+    pub fn seals(&self, file: &Path) -> Result<bool, FaucetError> {
+        #[cfg(feature = "encryption")]
+        if let Some(enc) = &self.inner {
+            use base64::Engine as _;
+            return Ok(first_nonblank_line(file)?.is_some_and(|first| {
+                first.trim().starts_with(SEALED_LINE_PREFIX)
+                    && base64::engine::general_purpose::STANDARD
+                        .decode(first.trim())
+                        .is_ok_and(|b| enc.open_line(&b).is_ok())
+            }));
+        }
+        let _ = file;
+        Ok(false)
+    }
+
+    /// The discard-list entry recording `id` for `file`: the id itself, or —
+    /// when `sealed` ([`seals`](Self::seals)) — the id sealed with the key and
+    /// bound to the file's name, so an entry nobody holding the key wrote is
+    /// ignored.
+    pub fn discard_entry(&self, file: &Path, id: &str, sealed: bool) -> String {
+        #[cfg(feature = "encryption")]
+        if let (true, Some(enc)) = (sealed, &self.inner) {
+            use base64::Engine as _;
+            let entry = enc.encrypt_bound(id.as_bytes(), &discard_context(file));
+            return format!(
+                "{SEALED_DISCARD_PREFIX}{}",
+                base64::engine::general_purpose::STANDARD.encode(entry)
+            );
+        }
+        let _ = (file, sealed);
+        id.to_string()
+    }
+
+    /// The ids of the lines discarded from `file`. For a file
+    /// [`seals`](Self::seals) reports, only entries sealed with the key for
+    /// this file count.
+    pub fn discarded_ids(
+        &self,
+        file: &Path,
+    ) -> Result<std::collections::HashSet<String>, FaucetError> {
+        let entries = discarded_lines(file)?;
+        if !self.seals(file)? {
+            return Ok(entries);
+        }
+        #[cfg(feature = "encryption")]
+        if let Some(enc) = &self.inner {
+            use base64::Engine as _;
+            let context = discard_context(file);
+            let ids: std::collections::HashSet<String> = entries
+                .iter()
+                .filter_map(|e| e.strip_prefix(SEALED_DISCARD_PREFIX))
+                .filter_map(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+                .filter_map(|b| enc.decrypt_bound(&b, &context).ok())
+                .filter_map(|b| String::from_utf8(b).ok())
+                .collect();
+            if ids.len() < entries.len() {
+                tracing::warn!(
+                    file = %file.display(),
+                    ignored = entries.len() - ids.len(),
+                    "DLQ discard list holds entries not sealed with the key for this file; \
+                     they are ignored"
+                );
+            }
+            return Ok(ids);
+        }
+        Ok(entries)
     }
 
     /// Whether any key is loaded.
@@ -705,6 +782,33 @@ pub fn scan_files(files: &[PathBuf], dec: &DlqDecryptor) -> Result<ScanResult, F
     })
 }
 
+/// Prefix of a discard-list entry sealed with the DLQ's key.
+#[cfg(feature = "encryption")]
+const SEALED_DISCARD_PREFIX: &str = "sealed:";
+
+#[cfg(feature = "encryption")]
+fn discard_context(file: &Path) -> Vec<u8> {
+    let name = file.file_name().map(|n| n.to_string_lossy().into_owned());
+    format!("faucet-dlq-discard\0{}", name.unwrap_or_default()).into_bytes()
+}
+
+/// Whether any line of `file` is a sealed line.
+#[cfg(feature = "encryption")]
+fn has_sealed_line(file: &Path) -> Result<bool, FaucetError> {
+    use base64::Engine as _;
+    let mut found = false;
+    for_each_line(file, |line| {
+        let t = line.trim();
+        found = found
+            || (t.starts_with(SEALED_LINE_PREFIX)
+                && base64::engine::general_purpose::STANDARD
+                    .decode(t)
+                    .is_ok_and(|b| faucet_core::encryption::is_encrypted(&b)));
+        Ok(())
+    })?;
+    Ok(found)
+}
+
 /// Whether `file`'s first non-blank line is sealed by the jsonl sink's
 /// `encryption:` block (reads one line).
 pub fn starts_sealed(file: &Path) -> Result<bool, FaucetError> {
@@ -793,7 +897,7 @@ pub fn scan_each(
     let mut out = ScanTally::default();
     for file in files {
         let limit = dec.verify_file(file)?;
-        let discarded = discarded_lines(file)?;
+        let discarded = dec.discarded_ids(file)?;
         for_each_verified_line(file, limit, |line| {
             if !discarded.is_empty() && discarded.contains(&line_id(line)) {
                 return Ok(());
