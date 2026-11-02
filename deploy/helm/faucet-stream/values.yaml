@@ -393,6 +393,13 @@ serve:
     enabled: false
     allowMutations: false
 
+  # Host names clients reach the server by (--allowed-host); a request naming
+  # another Host is refused. Empty = no Host check (an authenticated server).
+  allowedHosts: []
+  # Browser origins besides the server's own that may send POST/PUT/PATCH/DELETE
+  # (--allowed-origin), e.g. a console behind an ingress that rewrites Host.
+  allowedOrigins: []
+
   # Extra raw args appended to `faucet serve`.
   extraArgs: []
   # - --cors-origin=https://app.example.com

@@ -460,6 +460,8 @@ See [`values.yaml`](./values.yaml) — every key is commented. Common ones:
 | `serve.approvals.require` | `[]` | change kinds needing approval: `run`, `template_register`, `template_launch` |
 | `serve.approvals.expirySecs` | `null` | `--approval-expiry-secs` (server default 86400) |
 | `serve.mcp.enabled` / `.allowMutations` | `false` / `false` | `/mcp` endpoint / its mutating tools |
+| `serve.allowedHosts` | `[]` | `--allowed-host`: host names the server answers; a request naming another `Host` is refused |
+| `serve.allowedOrigins` | `[]` | `--allowed-origin`: extra browser origins that may send state-changing requests |
 | `serve.autoscaling.enabled` | `false` | HPA on the Deployment |
 | `serve.persistence.enabled` | `false` | PVC for sqlite history / bookmarks |
 | `serve.strategy` | `{}` | Deployment update strategy; empty = `Recreate` for one replica with a volume, else `RollingUpdate` |
