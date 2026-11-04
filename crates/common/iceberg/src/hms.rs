@@ -1,6 +1,6 @@
 //! A Hive Metastore catalog that can commit.
 //!
-//! `iceberg-catalog-hms` 0.11 creates, loads and drops tables but its
+//! `iceberg-catalog-hms` 0.10 creates, loads and drops tables but its
 //! `update_table` returns `FeatureUnsupported`, so no snapshot can be
 //! committed through it. [`HmsCommitCatalog`] wraps it, delegates every other
 //! operation, and commits the way Iceberg's Java `HiveTableOperations` does on
@@ -538,7 +538,6 @@ fn hive_type(t: &Type) -> String {
             hive_type(&m.key_field.field_type),
             hive_type(&m.value_field.field_type)
         ),
-        Type::Variant(_) => "string".into(),
     }
 }
 
@@ -589,7 +588,7 @@ mod tests {
             .build()
             .unwrap()
             .metadata;
-        let location = MetadataLocation::try_new_with_metadata(&metadata).unwrap();
+        let location = MetadataLocation::new_with_metadata(metadata.location(), &metadata);
         let io = FileIOBuilder::new(Arc::new(LocalFsStorageFactory)).build();
         metadata.write_to(&io, &location).await.unwrap();
         Table::builder()
@@ -871,14 +870,6 @@ mod tests {
         );
         assert_eq!(cols[0].comment.as_deref(), Some("flag"));
         assert_eq!(cols[1].comment, None);
-    }
-
-    #[test]
-    fn a_variant_column_renders_as_a_hive_string() {
-        assert_eq!(
-            hive_type(&Type::Variant(iceberg::spec::VariantType)),
-            "string"
-        );
     }
 
     #[test]

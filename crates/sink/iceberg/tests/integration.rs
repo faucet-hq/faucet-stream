@@ -440,7 +440,7 @@ async fn check_probes_the_catalog_and_calls_are_metered() {
 }
 
 /// #255: additive schema evolution — `evolve_schema` adds a new optional column
-/// to an existing table via iceberg-rust 0.11's `update_schema` action, and
+/// to an existing table via iceberg-rust 0.10.0's `update_schema` action, and
 /// rejects (non-applicable) widenings.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn evolve_schema_adds_optional_column() {
@@ -487,7 +487,7 @@ async fn evolve_schema_adds_optional_column() {
     );
     assert_eq!(props["email"]["type"], json!(["string", "null"]));
 
-    // A widening is not applicable via iceberg-rust 0.11 → typed error.
+    // A widening is not applicable via iceberg-rust 0.10.0 → typed error.
     let widen = SchemaEvolution {
         additions: vec![],
         widenings: vec![ColumnChange {

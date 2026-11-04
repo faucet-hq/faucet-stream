@@ -137,7 +137,7 @@ individual tap — pair it with a keyed/upsert sink for clean, effectively-once
 > backend (the emulator is REST-only); the **GCS** sink cannot be durably counted
 > against the emulator; the **webhook** source is buffer-shaped (no bounded-memory
 > page check); and the **Iceberg** sink is append-only with a terminal `flush`
-> that does not fit the effectively-once replay check on iceberg-rust 0.11. The
+> that does not fit the effectively-once replay check on iceberg-rust 0.10.0. The
 > **Singer bridge ⚠️** source passes the battery but is additionally **experimental
 > (v0, single-stream)**; the Singer bridge **sink** is experimental too — its
 > guarantees are only as strong as the target it runs (upsert is handed to the
@@ -464,7 +464,7 @@ sinks can actually *act* on it varies:
 | `spanner` | **✓ evolve** — additive columns + NOT NULL relax; base-type widening is not supported by Spanner (use `allow_type_widening: false`) |
 | `oracle` | **✓ evolve** — `ADD` columns, widen integer `NUMBER`s to decimals, relax `NOT NULL` |
 | `databricks` | **✓ evolve** — `ALTER TABLE … ADD COLUMNS`, numeric widening to `DOUBLE` via Delta type widening (tinyint/smallint/int/float), and `DROP NOT NULL`; other widenings are incompatible |
-| `iceberg` | **✓ evolve** — adds new columns as optional fields; a widening or `NOT NULL` relax is refused with a typed error (`iceberg-rust` 0.11 has no type promotion), so pair it with `allow_type_widening: false` |
+| `iceberg` | **✓ evolve** — adds new columns as optional fields; a widening or `NOT NULL` relax is refused with a typed error (`iceberg-rust` 0.10.0 has no type promotion), so pair it with `allow_type_widening: false` |
 | `jsonl`, `csv`, `stdout`, `mongodb`, `redis`, `http`, `kafka`, `s3`, `gcs`, `snowflake`, `parquet`, `dynamodb` | — (schemaless; the `schema:` policy is inert) |
 
 `on_drift: evolve` against a schemaless sink is rejected at
