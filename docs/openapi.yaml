@@ -318,10 +318,13 @@ paths:
         "401": { description: Missing or invalid bearer token }
   /v1/schemas/{kind}/{name}:
     get:
-      summary: Get the JSON Schema for one connector, transform, or pipeline block
+      summary: Get the JSON Schema for one connector, transform, pipeline block, or state store
+      description: >
+        `state` returns the schema of that backend's `state.config` (memory,
+        file, and redis / postgres when compiled in).
       security: [{ bearerAuth: [] }]
       parameters:
-        - { name: kind, in: path, required: true, schema: { type: string, enum: [source, sink, transform, block] } }
+        - { name: kind, in: path, required: true, schema: { type: string, enum: [source, sink, transform, block, state] } }
         - { name: name, in: path, required: true, schema: { type: string } }
       responses:
         "200":

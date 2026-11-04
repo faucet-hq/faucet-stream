@@ -88,9 +88,10 @@ With `--full`, the embedded DuckDB **SQL transform** step is included too.
 
 When the battery finishes, the script submits a handful of demo runs through
 the HTTP API and then keeps the server up, so the console arrives already
-populated — you can open it and immediately browse **Runs**, **Datasets**,
-**Lineage**, **Templates** (with a versions page you can launch and roll back
-from), and the per-run **dead-letter-queue** panel. See
+populated — it opens on the **Overview** (today's runs, success rate, what needs
+attention), and you can browse **Runs** (each with its **Dead-letter queue**
+tab), **Datasets**, **Lineage**, **Templates** (with a versions page you can
+launch and roll back from), **Usage** and **Schemas**. See
 [Web console](../cookbook/web-console.md) for a screenshot tour.
 
 The run-history database (`faucet-local-demo/faucet-meta.db`) is **not** wiped

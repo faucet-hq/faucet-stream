@@ -158,59 +158,33 @@ fn to_schema_value(s: faucet_core::schemars::Schema) -> serde_json::Value {
     serde_json::to_value(s).unwrap_or_else(|_| serde_json::json!({"type": "object"}))
 }
 
-/// The `state:` block as a discriminated union over the compiled backends, so
-/// a form can offer each backend's own fields (the Rust type keeps `config`
-/// untyped because the backends are feature-gated).
+/// The `state:` block as a discriminated union over the compiled backends,
+/// each variant carrying that backend's own `config` schema.
 fn state_block_schema() -> serde_json::Value {
     use serde_json::json;
-    let variant = |kind: &str, config: serde_json::Value| {
-        json!({
+    let mut defs = serde_json::Map::new();
+    let mut variants = Vec::new();
+    for kind in ["file", "memory", "redis", "postgres"] {
+        let Some(mut config) = crate::state::state_store_schema(kind) else {
+            continue;
+        };
+        if let Some(obj) = config.as_object_mut() {
+            obj.remove("$schema");
+            if let Some(serde_json::Value::Object(d)) = obj.remove("$defs") {
+                defs.extend(d);
+            }
+        }
+        variants.push(json!({
             "type": "object",
             "properties": { "type": { "const": kind }, "config": config },
             "required": ["type"],
-        })
-    };
-    let mut variants = vec![
-        variant(
-            "file",
-            json!({
-                "type": "object",
-                "properties": { "path": { "type": "string", "description": "Directory holding one JSON file per bookmark" } },
-                "required": ["path"],
-            }),
-        ),
-        variant(
-            "memory",
-            json!({ "type": "object", "properties": {}, "description": "Kept in memory only; lost when the run ends" }),
-        ),
-    ];
-    #[cfg(feature = "state-redis")]
-    variants.push(variant(
-        "redis",
-        json!({
-            "type": "object",
-            "properties": {
-                "url": { "type": "string", "description": "Redis connection URL" },
-                "namespace": { "type": "string", "default": "faucet", "description": "Key prefix" },
-            },
-            "required": ["url"],
-        }),
-    ));
-    #[cfg(feature = "state-postgres")]
-    variants.push(variant(
-        "postgres",
-        json!({
-            "type": "object",
-            "properties": {
-                "url": { "type": "string", "description": "PostgreSQL connection URL" },
-                "table": { "type": "string", "default": "faucet_state", "description": "Bookmark table" },
-                "ensure_table": { "type": "boolean", "description": "Create the table if it does not exist" },
-                "max_connections": { "type": "integer", "description": "Connection pool size" },
-            },
-            "required": ["url"],
-        }),
-    ));
-    json!({ "title": "State store", "oneOf": variants })
+        }));
+    }
+    let mut schema = json!({ "title": "State store", "oneOf": variants });
+    if !defs.is_empty() {
+        schema["$defs"] = serde_json::Value::Object(defs);
+    }
+    schema
 }
 
 /// The JSON Schema for one [`PipelineBlock`], or `None` for an unknown or
@@ -454,6 +428,18 @@ mod tests {
             offered, compiled,
             "the form must offer exactly the compiled backends"
         );
+    }
+
+    #[test]
+    fn state_block_refs_resolve_at_the_root() {
+        let v = super::block_schema("state").unwrap();
+        let text = v.to_string();
+        let defs = v.get("$defs").and_then(|d| d.as_object());
+        for part in text.split("\"$ref\":\"#/$defs/").skip(1) {
+            let name = &part[..part.find('"').unwrap()];
+            assert!(defs.is_some_and(|d| d.contains_key(name)), "{name}");
+        }
+        assert!(!text.contains("\"$schema\""));
     }
 
     #[cfg(feature = "lineage")]

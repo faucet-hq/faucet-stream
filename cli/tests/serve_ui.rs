@@ -240,6 +240,39 @@ async fn schemas_catalog_and_one_schema() {
         assert_eq!(r.status(), 200, "block {name}");
         assert!(r.json::<serde_json::Value>().await.unwrap().is_object());
     }
+    let kinds: Vec<&str> = body["state"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k.as_str().unwrap())
+        .collect();
+    assert!(kinds.contains(&"file") && kinds.contains(&"memory"));
+    for kind in &kinds {
+        let r = client
+            .get(format!("{base}/v1/schemas/state/{kind}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "state {kind}");
+        let schema: serde_json::Value = r.json().await.unwrap();
+        assert!(schema["properties"].is_object(), "state {kind}");
+    }
+    let file: serde_json::Value = client
+        .get(format!("{base}/v1/schemas/state/file"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(file["required"], serde_json::json!(["path"]));
+    let r = client
+        .get(format!("{base}/v1/schemas/state/nope"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+
     let r = client
         .get(format!("{base}/v1/schemas/block/nope"))
         .send()
