@@ -1063,7 +1063,7 @@ version = "0.1.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.calamine]]
-version = "0.37.0"
+version = "0.38.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.cast]]
