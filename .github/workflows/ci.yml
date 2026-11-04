@@ -1344,20 +1344,34 @@ jobs:
           docker ps -aq | xargs -r docker rm -f >/dev/null
           docker system prune -af --volumes >/dev/null
           df -h /
-          retry cargo test --no-fail-fast -p faucet-cli --all-features --test '*' \
-            || failed+=("integration (faucet-cli)")
-          cargo llvm-cov report --lcov --output-path integration-cli.lcov --ignore-filename-regex "$IGNORE_RE" \
-            || echo "::warning::no coverage report for integration-cli.lcov"
+          # faucet-cli's ~170 instrumented test binaries fill the disk together, so run them in parts.
+          mapfile -t cli_tests < <(find cli/tests -maxdepth 1 -name '*.rs' -exec basename {} .rs \; | sort)
+          parts=3
+          per=$(( (${#cli_tests[@]} + parts - 1) / parts ))
+          for (( part = 0; part < parts; part++ )); do
+            args=()
+            for t in "${cli_tests[@]:part*per:per}"; do args+=(--test "$t"); done
+            [ ${#args[@]} -gt 0 ] || continue
+            retry cargo test --no-fail-fast -p faucet-cli --all-features "${args[@]}" \
+              || failed+=("integration (faucet-cli part $((part + 1)))")
+            cargo llvm-cov report --lcov --output-path "integration-cli-$part.lcov" --ignore-filename-regex "$IGNORE_RE" \
+              || echo "::warning::no coverage report for integration-cli-$part.lcov"
+            cargo test -p faucet-cli --all-features "${args[@]}" --no-run --message-format=json 2>/dev/null \
+              | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true) | .executable // empty' \
+              | while read -r exe; do rm -f "$exe" "${exe}.d"; done || true
+            rm -f target/*.profraw
+            docker ps -aq | xargs -r docker rm -f >/dev/null
+            docker system prune -af --volumes >/dev/null
+            df -h /
+          done
           # Both scripts merge a file's records across reports (a line hit in either counts).
           # One newline between reports, so a file without a trailing one
           # cannot run its `end_of_record` into the next report's `SF:`.
-          for f in integration-libs.lcov integration-cli.lcov; do cat "$f" 2>/dev/null; echo; done > integration.lcov
+          for f in integration-libs.lcov integration-cli-*.lcov; do cat "$f" 2>/dev/null; echo; done > integration.lcov
 
           echo "::group::teardown before the unit phase"
+          # The parts deleted their binaries; listing them with --no-run would rebuild every one.
           df -h /
-          cargo test -p faucet-cli --all-features --test '*' --no-run --message-format=json 2>/dev/null \
-            | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true) | .executable // empty' \
-            | while read -r exe; do rm -f "$exe" "${exe}.d"; done || true
           rm -f target/*.profraw
           docker ps -aq | xargs -r docker rm -f >/dev/null
           docker system prune -af --volumes >/dev/null
