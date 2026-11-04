@@ -579,7 +579,7 @@ async fn binary_keys_and_repeated_headers_keep_their_fidelity() {
 /// `auto.offset.reset: latest`, which would skip the backlog.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unbookmarked_partition_starts_at_the_group_committed_offset() {
-    use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer};
+    use rdkafka::consumer::BaseConsumer;
     use rdkafka::{Offset, TopicPartitionList};
 
     let (_container, brokers) = start_kafka().await;
@@ -600,7 +600,7 @@ async fn an_unbookmarked_partition_starts_at_the_group_committed_offset() {
         let mut tpl = TopicPartitionList::new();
         tpl.add_partition_offset(topic, 0, Offset::Offset(2))
             .unwrap();
-        committer.commit(&tpl, CommitMode::Sync).unwrap();
+        commit_when_coordinator_ready(&committer, &tpl);
     })
     .await
     .unwrap();
@@ -652,5 +652,26 @@ async fn reads_topics_written_with_every_compression_codec() {
             .collect();
         ids.sort_unstable();
         assert_eq!(ids, (0..10).collect::<Vec<_>>(), "{codec}");
+    }
+}
+
+/// Commits `tpl`, retrying while a freshly started broker has not yet elected
+/// the group's coordinator.
+fn commit_when_coordinator_ready(
+    consumer: &rdkafka::consumer::BaseConsumer,
+    tpl: &rdkafka::TopicPartitionList,
+) {
+    use rdkafka::consumer::{CommitMode, Consumer};
+    use rdkafka::error::{KafkaError, RDKafkaErrorCode};
+    for attempt in 1.. {
+        match consumer.commit(tpl, CommitMode::Sync) {
+            Ok(()) => return,
+            Err(KafkaError::ConsumerCommit(
+                RDKafkaErrorCode::NotCoordinator
+                | RDKafkaErrorCode::CoordinatorLoadInProgress
+                | RDKafkaErrorCode::CoordinatorNotAvailable,
+            )) if attempt < 30 => std::thread::sleep(Duration::from_secs(1)),
+            Err(e) => panic!("committing the group offset failed: {e}"),
+        }
     }
 }
