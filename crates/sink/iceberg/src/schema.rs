@@ -2,9 +2,9 @@
 //!
 //! ## Arrow version note
 //!
-//! This crate uses **arrow 58**, matching both iceberg-rust 0.10.0 and the
+//! This crate uses **arrow 58**, matching both iceberg-rust 0.11 and the
 //! workspace — so there is no longer a dual-arrow pin (it was 57 under
-//! iceberg-rust 0.10.0). The pipeline still hands the sink `serde_json::Value`
+//! iceberg-rust 0.11). The pipeline still hands the sink `serde_json::Value`
 //! records only.
 //!
 //! ## Function overview

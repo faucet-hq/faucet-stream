@@ -149,7 +149,7 @@ Not every sink can evolve, and a schemaless sink has no schema to diverge from.
 
 - **Evolvable** (ten sinks): postgres, mysql, mssql, sqlite, bigquery,
   elasticsearch, spanner, iceberg, databricks, oracle. They implement in-place additive DDL.
-- **Iceberg** adds new columns via iceberg-rust 0.10.0's `update_schema`
+- **Iceberg** adds new columns via iceberg-rust 0.11's `update_schema`
   action (issue #255). It is **additive-only**: `update_schema` exposes
   `add_column` but no in-place type promotion or nullability relaxation, so a
   drift that needs a *widening* (base-type change) or nullability relaxation is

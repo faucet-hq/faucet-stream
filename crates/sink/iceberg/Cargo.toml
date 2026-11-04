@@ -32,9 +32,9 @@ async-trait.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 futures.workspace = true
-iceberg = "0.10.0"
+iceberg = "0.11.0"
 uuid.workspace = true
-# arrow/arrow-json/parquet aligned to iceberg 0.10.0's arrow major (58, == workspace):
+# arrow/arrow-json/parquet aligned to iceberg 0.11's arrow major (58, == workspace):
 arrow = "58"
 arrow-json = "58"
 parquet = { version = "58", features = ["async"] }
@@ -43,8 +43,8 @@ parquet = { version = "58", features = ["async"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }
 tempfile = "3"
 bytes = "1"
-iceberg = "0.10.0"
-iceberg-catalog-sql = "0.10.0"
+iceberg = "0.11.0"
+iceberg-catalog-sql = "0.11.0"
 # sqlx runtime-tokio must be enabled explicitly here because iceberg-catalog-sql's
 # production dep only enables the `any` feature (no runtime).  Without this the
 # pool panics at runtime: "either the `runtime-async-std` or `runtime-tokio`
@@ -57,7 +57,7 @@ testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["minio"] }
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
-iceberg-storage-opendal = { version = "0.10.0", default-features = false, features = ["opendal-s3", "opendal-gcs", "opendal-fs"] }
+iceberg-storage-opendal = { version = "0.11.0", default-features = false, features = ["opendal-s3", "opendal-gcs", "opendal-fs"] }
 typetag = "0.2"
 
 [package.metadata.docs.rs]

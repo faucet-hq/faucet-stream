@@ -93,8 +93,8 @@ futures.workspace = true
 gcloud-gax.workspace = true
 gcloud-googleapis.workspace = true
 gcloud-spanner.workspace = true
-iceberg = "0.10.0"
-iceberg-catalog-sql = "0.10.0"
+iceberg = "0.11.0"
+iceberg-catalog-sql = "0.11.0"
 lapin.workspace = true
 object_store = { workspace = true, features = ["aws", "gcp", "azure"] }
 parquet.workspace = true

@@ -14,7 +14,7 @@
 //! ## Commit failure & conflict handling
 //!
 //! Iceberg commits use optimistic concurrency. `Transaction::commit` in
-//! iceberg-rust 0.10.0 already handles benign races: on a retryable conflict it
+//! iceberg-rust 0.11 already handles benign races: on a retryable conflict it
 //! reloads the table metadata and re-applies the `fast_append` against the
 //! latest snapshot **without re-uploading the data files**, retrying with
 //! exponential backoff. The retry budget is tunable via the standard
@@ -496,7 +496,7 @@ impl IcebergDriver {
 
     /// Commit all pending data files as a single `fast_append` snapshot.
     ///
-    /// `Transaction::commit` in iceberg-rust 0.10.0 already includes an internal
+    /// `Transaction::commit` in iceberg-rust 0.11 already includes an internal
     /// retry loop (reload metadata + re-apply the append against the latest
     /// snapshot, exponential back-off on retryable commit conflicts), so we do
     /// not add an outer retry. Returns `Ok(())` when the commit succeeds.
@@ -996,7 +996,7 @@ impl SchemaDriver for IcebergDriver {
         Ok(Some(arrow_to_json_schema(&arrow_schema)))
     }
 
-    /// Additive schema evolution (#255). iceberg-rust 0.10.0 exposes a
+    /// Additive schema evolution (#255). iceberg-rust 0.11 exposes a
     /// `Transaction::update_schema` action with `add_column`, so `on_drift:
     /// evolve` can add new (optional) columns to the destination table.
     fn evolvable(&self) -> bool {
@@ -1008,7 +1008,7 @@ impl SchemaDriver for IcebergDriver {
     /// The open writer is closed (its files stay pending for the next commit)
     /// and later writes decode against the evolved schema.
     ///
-    /// iceberg-rust 0.10.0's `UpdateSchemaAction` exposes `add_column` /
+    /// iceberg-rust 0.11's `UpdateSchemaAction` exposes `add_column` /
     /// `delete_column` but **no** in-place type-promotion or nullability
     /// relaxation, so `widenings` / `relax_nullability` are not applicable yet
     /// and are rejected with a typed error rather than silently ignored (which
@@ -1022,7 +1022,7 @@ impl SchemaDriver for IcebergDriver {
         if !evolution.widenings.is_empty() || !evolution.relax_nullability.is_empty() {
             return Err(FaucetError::Sink(format!(
                 "iceberg: additive schema evolution supports new columns only in iceberg-rust \
-                 0.10.0 (no in-place type promotion or nullability relaxation); requested \
+                 0.11 (no in-place type promotion or nullability relaxation); requested \
                  {} widening(s) + {} nullability relaxation(s)",
                 evolution.widenings.len(),
                 evolution.relax_nullability.len()

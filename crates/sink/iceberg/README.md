@@ -222,7 +222,7 @@ For high-throughput pipelines, use a large **upstream** `batch_size` (e.g. `1000
 
 ### Concurrent writers & commit-conflict retry
 
-Iceberg commits use optimistic concurrency. If a competing writer commits between this sink's table load and its commit, `Transaction::commit` (iceberg-rust 0.10.0) **transparently retries**: it reloads the table metadata and re-applies the `fast_append` against the latest snapshot — *without re-uploading the data files* — with exponential backoff. A benign concurrent write therefore does **not** abort the run. Tune the retry budget with the standard Iceberg `commit.retry.*` table properties, set via `snapshot_properties` at table creation:
+Iceberg commits use optimistic concurrency. If a competing writer commits between this sink's table load and its commit, `Transaction::commit` (iceberg-rust 0.11) **transparently retries**: it reloads the table metadata and re-applies the `fast_append` against the latest snapshot — *without re-uploading the data files* — with exponential backoff. A benign concurrent write therefore does **not** abort the run. Tune the retry budget with the standard Iceberg `commit.retry.*` table properties, set via `snapshot_properties` at table creation:
 
 ```yaml
 snapshot_properties:
@@ -288,7 +288,7 @@ See the [Effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-
 
 `IcebergSink` reports its live table schema via `current_schema()` (the table's current Iceberg schema converted through Arrow to the `infer_schema` JSON shape; a missing table → `None`), so the pipeline-level `schema:` policy can **detect** drift between an incoming page's top-level shape and the real table. The `warn` / `ignore` / `quarantine` / `fail` modes all work against this sink.
 
-**`on_drift: evolve` supports additive columns** ([#255](https://github.com/faucet-hq/faucet-stream/issues/255)). `supports_schema_evolution()` returns `true`: on drift, each **new** column is added as an optional field via `iceberg-rust` 0.10.0's `Transaction::update_schema` action, in a single schema-update commit. The sink's open writer is closed (its files are committed on the next flush) and every later page is written against the evolved schema, so the new column's values land. Only additions are applied — iceberg-rust 0.10.0's `update_schema` exposes `add_column` (+ `delete_column`) but **no** in-place type promotion or nullability relaxation, so a `widenings` / `relax_nullability` evolution is rejected with a typed error rather than silently ignored. Row-level overwrite/upsert remain separately blocked upstream (#179 / #225). See the [schema-drift cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift.html).
+**`on_drift: evolve` supports additive columns** ([#255](https://github.com/faucet-hq/faucet-stream/issues/255)). `supports_schema_evolution()` returns `true`: on drift, each **new** column is added as an optional field via `iceberg-rust` 0.11's `Transaction::update_schema` action, in a single schema-update commit. The sink's open writer is closed (its files are committed on the next flush) and every later page is written against the evolved schema, so the new column's values land. Only additions are applied — iceberg-rust 0.11's `update_schema` exposes `add_column` (+ `delete_column`) but **no** in-place type promotion or nullability relaxation, so a `widenings` / `relax_nullability` evolution is rejected with a typed error rather than silently ignored. Row-level overwrite/upsert remain separately blocked upstream (#179 / #225). See the [schema-drift cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift.html).
 
 ## Schema inference
 
@@ -347,7 +347,7 @@ sink.flush().await?;
 3. `flush()` closes the open data file and commits all buffered files as one snapshot via `Transaction::fast_append`; the catalog client is reused across all calls.
 4. In effectively-once mode the pending `(scope, token)` is merged into that snapshot's summary properties so it commits atomically with the data.
 
-**Arrow / Parquet version note:** this crate links Arrow / Parquet **58**, the major `iceberg-rust` 0.10 pins — the same major as the rest of the workspace.
+**Arrow / Parquet version note:** this crate links Arrow / Parquet **58**, the major `iceberg-rust` 0.11 pins — the same major as the rest of the workspace.
 
 ## Lineage dataset URI
 

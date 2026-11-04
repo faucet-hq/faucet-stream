@@ -52,6 +52,7 @@ impl UuidColumns {
                     walk(&m.key_field.field_type, m.key_field.id, out);
                     walk(&m.value_field.field_type, m.value_field.id, out);
                 }
+                Type::Variant(_) => {}
             }
         }
         let mut ids = HashSet::new();
@@ -269,6 +270,13 @@ pub fn type_to_json_schema(ty: &Type) -> Value {
             "type": "object",
             "additionalProperties": field_schema(m.value_field.required, &m.value_field.field_type),
         }),
+        Type::Variant(_) => json!({
+            "type": "object",
+            "properties": {
+                "metadata": { "type": "string", "contentEncoding": "base64" },
+                "value": { "type": "string", "contentEncoding": "base64" },
+            },
+        }),
     }
 }
 
@@ -311,7 +319,7 @@ pub fn descriptor(
 /// Refuse a scan task whose delete files iceberg-rust cannot apply, so a read
 /// never returns rows that were deleted.
 pub fn ensure_deletes_supported(task: &FileScanTask) -> Result<(), FaucetError> {
-    for d in &task.deletes {
+    for d in task.deletes() {
         let parquet = d.file_path.to_ascii_lowercase().ends_with(".parquet");
         let problem = match d.file_type {
             _ if !parquet => Some("is not a Parquet delete file (e.g. a deletion vector)"),
@@ -327,7 +335,8 @@ pub fn ensure_deletes_supported(task: &FileScanTask) -> Result<(), FaucetError> 
             return Err(FaucetError::Source(format!(
                 "iceberg: data file '{}' has delete file '{}' which {problem}; the source cannot \
                  apply it and refuses to read rather than return deleted rows",
-                task.data_file_path, d.file_path
+                task.data_file_path(),
+                d.file_path
             )));
         }
     }
@@ -343,10 +352,10 @@ pub fn select_tasks(
 ) -> Result<Vec<FileScanTask>, FaucetError> {
     let mut out = Vec::new();
     for task in tasks {
-        if added.is_some_and(|a| !a.contains(&task.data_file_path)) {
+        if added.is_some_and(|a| !a.contains(task.data_file_path())) {
             continue;
         }
-        if shard.is_some_and(|s| !s.contains(&task.data_file_path)) {
+        if shard.is_some_and(|s| !s.contains(task.data_file_path())) {
             continue;
         }
         ensure_deletes_supported(&task)?;
@@ -806,6 +815,24 @@ mod tests {
     }
 
     #[test]
+    fn a_variant_column_is_described_as_its_two_base64_parts() {
+        let variant = Type::Variant(iceberg::spec::VariantType);
+        let fragment = type_to_json_schema(&variant);
+        assert_eq!(fragment["type"], "object");
+        for part in ["metadata", "value"] {
+            assert_eq!(
+                fragment["properties"][part],
+                json!({"type": "string", "contentEncoding": "base64"})
+            );
+        }
+        let schema = Schema::builder()
+            .with_fields(vec![NestedField::optional(1, "v", variant).into()])
+            .build()
+            .unwrap();
+        assert!(UuidColumns::of(&schema).is_empty());
+    }
+
+    #[test]
     fn descriptor_carries_table_patch_and_rows() {
         let d = descriptor(
             &["lake".into(), "db".into()],
@@ -836,6 +863,7 @@ mod tests {
             .with_deletes(deletes)
             .with_case_sensitive(true)
             .build()
+            .unwrap()
     }
 
     fn del(path: &str, ty: DataContentType, ids: Option<Vec<i32>>) -> FileScanTaskDeleteFile {
@@ -843,6 +871,7 @@ mod tests {
             .with_file_path(path.to_string())
             .with_file_size_in_bytes(1)
             .with_file_type(ty)
+            .with_file_format(DataFileFormat::Parquet)
             .with_partition_spec_id(0)
             .with_equality_ids(ids)
             .build()

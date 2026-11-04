@@ -160,8 +160,9 @@ impl IcebergSource {
             {
                 continue;
             }
-            let loaded = manifest
-                .load_manifest(table.file_io())
+            let loaded = table
+                .manifest_reader()
+                .read(manifest)
                 .await
                 .map_err(|e| source_err("could not read manifest", e))?;
             for entry in loaded.entries() {
