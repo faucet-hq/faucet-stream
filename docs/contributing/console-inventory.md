@@ -350,9 +350,9 @@ Every capability of the console before the redesign, and the new ones, checked a
 - ✅ Catalogue of compiled sources / sinks / transforms / state stores (`GET /v1/schemas`) — Schemas list, sections with counts
 - ✅ "Showing N sources and M sinks built into this server; rebuild with `--features full`" — catalogue footnote
 - ✅ One connector's JSON Schema as a field table (field, type, default, description) + raw JSON — detail, raw schema in a collapsible card with copy
-- 🆕 Split pane with tabs (All / Sources / Sinks / Transforms), search (`/`), deep link `#/schemas/<kind>/<name>`
+- 🆕 Split pane with tabs (All / Sources / Sinks / Transforms / Blocks / State), search (`/`), deep link `#/schemas/<kind>/<name>`
 - 🆕 Stat strip (fields / required / with defaults / secret); required dot; type pill; default as code
 - 🆕 Example config (required fields and defaults, like `faucet init`) with copy; "Use in Submit" (`#/submit?source=<name>`)
 - 🆕 Selecting a field shows its full description, values, constraints and resource / SQL markers (`?field=`); filter fields
-- 🆕 "Most used here" from the connector kinds of recent runs; configuration blocks listed
+- 🆕 "Most used here" from the connector kinds of recent runs; pipeline blocks (`GET /v1/schemas/block/{name}`) and state stores (`GET /v1/schemas/state/{name}`) open like a connector
 - 🆕 Schedules and Policy: designed "soon" pages (what will live there, how to do it today) instead of disabled nav entries

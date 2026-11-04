@@ -180,11 +180,14 @@ Schemas' **Use in Submit** starts from one connector.
 
 ### Schemas
 
-**Schemas** lists every source, sink, transform and state store compiled into
-the server, with search and tabs. A connector (`#/schemas/<kind>/<name>`) shows
-its fields with type, default and description — click a field for its full
-description, values and constraints — an example config like `faucet init`, the
-raw JSON Schema, and **Use in Submit**.
+**Schemas** lists every source, sink, transform, pipeline block (masking,
+quality, contract, policy, schema drift, DLQ, SLA, …) and state store compiled
+into the server, with search and tabs. Each one (`#/schemas/<kind>/<name>`,
+`kind` = `source` / `sink` / `transform` / `block` / `state`) shows its fields
+with type, default and description — click a field for its full description,
+values and constraints — an example config like `faucet init` (a block in the
+place it goes in a config, a state store as its `state:` block), the raw JSON
+Schema, and **Use in Submit**.
 
 ### Usage
 
@@ -387,7 +390,7 @@ The console calls these bearer-gated endpoints (any other client can too):
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/v1/schemas` | Catalog of all compiled sources, sinks, transforms, and state-store kinds. |
-| `GET` | `/v1/schemas/{kind}/{name}` | JSON Schema for one connector, transform, or pipeline block (`kind` ∈ `source`/`sink`/`transform`/`block`). Returns 404 for unknown kind or name. |
+| `GET` | `/v1/schemas/{kind}/{name}` | JSON Schema for one connector, transform, pipeline block, or state store's `config` (`kind` ∈ `source`/`sink`/`transform`/`block`/`state`). Returns 404 for unknown kind or name. |
 | `GET` | `/v1/whoami` | The caller's principal, role and permissions; the console uses it to hide controls the role cannot use. |
 | `GET` | `/v1/overview` | Fleet trends over the run history, behind the Overview page. |
 | `GET` | `/v1/runs/{id}/config` | A run's stored config, credentials masked, behind the run's Config tab. |

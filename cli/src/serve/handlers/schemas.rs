@@ -51,7 +51,8 @@ pub async fn list_schemas(State(_state): State<ServerState>) -> Json<SchemasResp
 }
 
 /// `GET /v1/schemas/{kind}/{name}` → the JSON Schema for one connector,
-/// transform, or pipeline block (`kind` = `source` | `sink` | `transform` | `block`).
+/// transform, pipeline block, or state store's `config`
+/// (`kind` = `source` | `sink` | `transform` | `block` | `state`).
 /// Unknown kind or name → 404.
 pub async fn get_schema(
     State(_state): State<ServerState>,
@@ -63,6 +64,11 @@ pub async fn get_schema(
         "transform" => crate::transforms::transform_schema(&name),
         "block" => {
             return crate::commands::schema::block_schema(&name)
+                .map(Json)
+                .ok_or(ServeError::NotFound);
+        }
+        "state" => {
+            return crate::state::state_store_schema(&name)
                 .map(Json)
                 .ok_or(ServeError::NotFound);
         }

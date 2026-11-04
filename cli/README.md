@@ -480,9 +480,10 @@ cargo install faucet-cli --features "serve,serve-history-postgres,serve-history-
 #### Optional embedded web console (`serve-ui`)
 
 Build with `serve-ui` to serve a browser-based web console at `/` alongside the
-REST API. The console gives you a Runs dashboard, Run detail with live SSE logs,
-a Submit view (raw YAML/JSON editor + schema-driven wizard), and a Schemas
-explorer — all backed by the same bearer-gated `/v1` API.
+REST API, all backed by the same bearer-gated `/v1` API. Its pages are grouped
+as **Operate** (Overview, Runs with live SSE logs, Changes, Triggers,
+Schedules), **Data** (Datasets, Lineage), **Build** (Templates, Schemas, Submit),
+**Govern** (Policy, Usage, Tenants) and **Admin** (Audit log, Settings).
 
 ```bash
 cargo install faucet-cli --features serve-ui    # serve-ui implies serve
@@ -492,7 +493,8 @@ FAUCET_SERVE_AUTH_TOKEN=s3cret faucet serve --listen 127.0.0.1:8080
 
 Pass `--no-ui` to disable the console at runtime without rebuilding. The `serve-ui`
 feature also adds three bearer-gated endpoints: `GET /v1/schemas` (connector
-catalog), `GET /v1/schemas/{kind}/{name}` (one JSON Schema), and `POST /v1/doctor`
+catalog), `GET /v1/schemas/{kind}/{name}` (one JSON Schema: `source`, `sink`, `transform`,
+`block` or `state`), and `POST /v1/doctor`
 (validate + probe a config without running it). These endpoints are available
 regardless of `--no-ui`.
 

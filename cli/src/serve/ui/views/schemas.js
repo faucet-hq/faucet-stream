@@ -1,5 +1,6 @@
-// Schemas (#998): split pane — every compiled source, sink, transform and state
-// store, and the config schema of the one selected (#/schemas/<kind>/<name>).
+// Schemas (#998): split pane — every compiled source, sink, transform, pipeline
+// block and state store, and the config schema of the one selected
+// (#/schemas/<kind>/<name>).
 // This is the reference split-pane page: list (tabs · search · sections · rows)
 // beside a detail (dhead · head · stats · cards); `update()` keeps the list.
 import { api } from "../api.js";
@@ -10,8 +11,10 @@ import { fmtInt, mdInline } from "../utils.js";
 import { href } from "../links.js";
 import { withTenant } from "../tenant.js";
 
-const KINDS = [["source", "Sources", "db"], ["sink", "Sinks", "db"], ["transform", "Transforms", "code"], ["state", "State stores", "key"]];
-const TAB_KIND = { Sources: "source", Sinks: "sink", Transforms: "transform", State: "state" };
+const KINDS = [["source", "Sources", "db"], ["sink", "Sinks", "db"], ["transform", "Transforms", "code"], ["block", "Pipeline blocks", "sliders"], ["state", "State stores", "key"]];
+const TAB_KIND = { Sources: "source", Sinks: "sink", Transforms: "transform", Blocks: "block", State: "state" };
+const TABS = ["Sources", "Sinks", "Transforms", "Blocks", "State"];
+const KIND_LABEL = { block: "pipeline block", state: "state store" };
 const STATE_DESC = {
   memory: "In-process only: nothing survives a restart",
   file: "One JSON file per key, fsync and atomic rename",
@@ -53,9 +56,18 @@ function fieldsOf(schema) {
 }
 
 /** An example config like `faucet init`: required fields, then defaults. */
-function exampleYaml(kind, name, fields) {
-  const top = kind === "transform" ? `transforms:\n  - type: ${name}\n    config:` : `${kind}:\n  type: ${name}\n  config:`;
-  const ind = kind === "transform" ? "      " : "    ";
+function exampleYaml(kind, name, fields, schema, placement) {
+  if (kind === "block") {
+    const nested = placement === "pipeline";
+    if (!fields.length) {
+      const vals = schema.enum || (schema.oneOf || schema.anyOf || []).flatMap((a) => (a.const != null ? [a.const] : a.enum || []));
+      const val = vals.length ? String(vals[0]) : "{}";
+      return nested ? `pipeline:\n  ${name}: ${val}` : `${name}: ${val}`;
+    }
+  }
+  const blockTop = kind === "block" && placement === "pipeline" ? `pipeline:\n  ${name}:` : `${name}:`;
+  const top = kind === "transform" ? `transforms:\n  - type: ${name}\n    config:` : kind === "block" ? blockTop : `${kind}:\n  type: ${name}\n  config:`;
+  const ind = kind === "transform" ? "      " : kind === "block" ? (placement === "pipeline" ? "    " : "  ") : "    ";
   const lines = [];
   for (const f of fields.filter((x) => x.required)) {
     const val = f.secret ? `\${env:${f.name.toUpperCase()}}` : f.enumVals.length ? String(f.enumVals[0]) : f.type === "integer" || f.type === "number" ? "0" : f.type === "boolean" ? "false" : f.type === "array" ? "[]" : f.type === "object" || f.type === "one of" ? "{}" : '"…"';
@@ -78,13 +90,14 @@ export async function renderSchemas(host, params) {
     ...catalog.sources.map((s) => ({ kind: "source", ...s })),
     ...catalog.sinks.map((s) => ({ kind: "sink", ...s })),
     ...catalog.transforms.map((s) => ({ kind: "transform", ...s })),
+    ...(catalog.blocks || []).filter((b) => b.name !== "state").map((b) => ({ kind: "block", name: b.name, description: b.description, placement: b.placement })),
     ...(catalog.state || []).map((s) => ({ kind: "state", name: s, description: STATE_DESC[s] || "" })),
   ] : []);
   const listHref = () => hashFor(href.schemas(), { tab: state.tab !== "All" ? state.tab : "", q: state.q });
 
   function renderList() {
     if (!catalog) {
-      L.list.innerHTML = v(html`${tabs([["All"], "Sources", "Sinks", "Transforms", "State"], "All")}${input("", { ph: "Search connectors and fields", icon: "search", type: "search", name: "q" })}${skelRows(9)}`);
+      L.list.innerHTML = v(html`${tabs([["All"], ...TABS], "All")}${input("", { ph: "Search connectors and fields", icon: "search", type: "search", name: "q" })}${skelRows(9)}`);
       return;
     }
     const all = items();
@@ -98,11 +111,11 @@ export async function renderSchemas(host, params) {
           return html`${sect(label, rows.length, { id: kind })}<div class="sect-rows rows">${rows.map((x) =>
             row(html`<span class="ri">${ic(i)}</span>`, x.name, "", firstSentence(x.description).replace(/\.$/, ""), {
               mono: true, on: sel === `${kind}:${x.name}`, id: `${kind}:${x.name}`, tip: x.description,
-              href: kind === "state" ? "" : hashFor(href.schema(kind, x.name), { tab: state.tab !== "All" ? state.tab : "", q: state.q }),
+              href: hashFor(href.schema(kind, x.name), { tab: state.tab !== "All" ? state.tab : "", q: state.q }),
             }))}</div>`;
         }))
       : empty(`No connector matches “${state.q}”`, html`Check the spelling, or the connector may not be compiled into this server. <a class="lnk" href="${href.schemas()}">Clear the search</a>`, { icon: "search" });
-    const top = tabs([["All", all.length], "Sources", "Sinks", "Transforms", "State"], state.tab, ibtn("refresh", { title: "Reload the catalogue", data: { reload: "1" } }));
+    const top = tabs([["All", all.length], ...TABS], state.tab, ibtn("refresh", { title: "Reload the catalogue", data: { reload: "1" } }));
     if (!L.list.querySelector(".list-body")) {
       L.list.innerHTML = v(html`<div class="list-top" style="display:contents"></div>${input(state.q, { ph: "Search connectors and fields", icon: "search", type: "search", name: "q" })}<div class="list-body" style="display:flex;flex-direction:column;gap:10px"></div>`);
       const qi = L.list.querySelector("input[name=q]");
@@ -122,10 +135,21 @@ export async function renderSchemas(host, params) {
     const used = usageCounts && usageCounts.length
       ? card({ title: "Most used here", aside: "by recent runs on this server", body: tbl(["Connector", "Kind", ["Runs", "num"]], usageCounts.slice(0, 6).map(([k, n]) => { const [kind, name] = k.split(":"); return [lnk(name, href.schema(kind, name), true), kind, fmtInt(n)]; })) })
       : card({ title: "Most used here", aside: "by recent runs on this server", body: html`<div class="empty-line">No runs yet to count.</div>` });
-    return html`${head("Connector schemas", [], "Every source, sink, transform and state store compiled into this server, with the config each one accepts. Pick one to see its fields, an example config and the raw JSON Schema.")}
-      ${stats([["Sources", c.sources.length], ["Sinks", c.sinks.length], ["Transforms", c.transforms.length], ["State stores", (c.state || []).length]])}
-      <div class="two">${used}${card({ title: "Configuration blocks", aside: "pipeline-level", body: html`<div class="pad" style="display:flex;flex-wrap:wrap;gap:6px">${(c.blocks || []).map((b) => html`<span class="chip mono" title="${b.description}">${b.name}</span>`)}</div>` })}</div>
+    const blocks = (c.blocks || []).filter((b) => b.name !== "state");
+    return html`${head("Schemas", [], "Every source, sink, transform, pipeline block and state store compiled into this server, with the config each one accepts. Pick one to see its fields, an example config and the raw JSON Schema.")}
+      ${stats([["Sources", c.sources.length], ["Sinks", c.sinks.length], ["Transforms", c.transforms.length], ["Pipeline blocks", blocks.length], ["State stores", (c.state || []).length]])}
+      <div class="two">${used}${card({ title: "Pipeline blocks", aside: "masking, quality, contracts, policy…", body: html`<div class="pad" style="display:flex;flex-wrap:wrap;gap:6px">${blocks.map((b) => html`<a class="chip mono" title="${b.description}" href="${href.schema("block", b.name)}">${b.name}</a>`)}</div>` })}</div>
       <div class="note" style="border:0;padding:0 2px">Showing the <b>${c.sources.length} sources</b> and <b>${c.sinks.length} sinks</b> built into this server. Rebuild with more Cargo features (<code>--features full</code>) to enable the rest.</div>`;
+  }
+
+  const blockPlacement = () => ((catalog && catalog.blocks) || []).find((b) => b.name === state.name)?.placement;
+
+  // A schema that is a single value (an enum, like `delivery`) has values, not fields.
+  function valuesCard() {
+    const alts = (schema.oneOf || schema.anyOf || []).map((x) => deref(schema, x));
+    const vals = schema.enum ? schema.enum.map((x) => ({ value: x, desc: "" })) : alts.flatMap((x) => (x.const != null ? [{ value: x.const, desc: x.description || "" }] : (x.enum || []).map((e) => ({ value: e, desc: x.description || "" }))));
+    if (!vals.length) return card({ title: "Fields", body: html`<div class="empty-line">This schema has no fields.</div>` });
+    return card({ title: "Values", aside: "one of", body: html`<div class="tbl-wrap">${tbl(["Value", "Description"], vals.map((x) => [html`<code>${String(x.value)}</code>`, raw(mdInline(x.desc))]))}</div>` });
   }
 
   function connectorDetail() {
@@ -135,7 +159,7 @@ export async function renderSchemas(host, params) {
     const rows = [];
     for (const f of shownFields) {
       const open = state.field === f.name;
-      rows.push({ cls: open ? "sel" : "", id: f.name, cells: [html`<span class="sc-name"><span class="mono">${f.name}</span> ${f.required ? html`<span class="req" title="required"></span>` : ""}</span>`, pill(f.type), f.def !== undefined && f.def !== null ? html`<code>${typeof f.def === "object" ? JSON.stringify(f.def) : String(f.def)}</code>` : html`<span class="faint">—</span>`, raw(mdInline(firstSentence(f.desc)))] });
+      rows.push({ cls: open ? "sel" : "", id: f.name, cells: [html`<span class="sc-name"><span class="mono">${f.name}</span> ${f.required ? html`<span class="req" title="required"></span>` : ""}</span>`, pill(f.type), f.def !== undefined && f.def !== null ? (typeof f.def === "object" ? html`<code title="${JSON.stringify(f.def)}">${Array.isArray(f.def) ? "[…]" : "{…}"}</code>` : html`<code>${String(f.def)}</code>`) : html`<span class="faint">—</span>`, raw(mdInline(firstSentence(f.desc)))] });
       if (open) {
         const p = f.p;
         const cons = [p.minimum != null && `≥ ${p.minimum}`, p.maximum != null && `≤ ${p.maximum}`, p.minLength != null && `min length ${p.minLength}`, p.pattern && `pattern ${p.pattern}`].filter(Boolean);
@@ -149,10 +173,10 @@ export async function renderSchemas(host, params) {
     const filter = html`<label class="input" style="height:26px;width:190px">${ic("search")}<input type="search" name="ff" placeholder="Filter fields" value="${state.ff}" autocomplete="off"></label>`;
     const submitHref = state.kind === "source" || state.kind === "sink" ? href.submit({ [state.kind]: state.name }) : href.submit();
     return html`${dhead("", html`${btn("Copy link", { icon: "link", kind: "quiet", data: { copy: location.href } })}${btn("Use in Submit", { icon: "submit", kind: "primary", href: submitHref, perm: "config_submit" })}`, { href: listHref(), label: "Schemas" })}
-      ${head(`${state.name} · ${state.kind}`, [pill("Built in", "ok", "check"), schema.title ? html`<span class="mono">${schema.title}</span>` : "", html`<span>${fields.length} fields · ${req} required</span>`], raw(mdInline(firstSentence(schema.description || ""))))}
+      ${head(`${state.name} · ${KIND_LABEL[state.kind] || state.kind}`, [pill("Built in", "ok", "check"), schema.title ? html`<span class="mono">${schema.title}</span>` : "", html`<span>${fields.length} fields · ${req} required</span>`], raw(mdInline(firstSentence(schema.description || ""))))}
       ${stats([["Fields", fields.length], ["Required", req], ["With defaults", defs], ["Secret", secrets]])}
-      ${card({ title: "Fields", aside: "click a field for its full description", right: filter, body: shownFields.length ? html`<div class="tbl-wrap sc-field">${tbl(["Field", "Type", "Default", "Description"], rows)}</div>` : html`<div class="empty-line">No field matches “${state.ff}”.</div>` })}
-      ${card({ icon: "code", title: "Example config", aside: "required fields and defaults, like faucet init", body: code(exampleYaml(state.kind, state.name, fields), { box: false }) })}
+      ${fields.length ? card({ title: "Fields", aside: "click a field for its full description", right: filter, body: shownFields.length ? html`<div class="tbl-wrap sc-field">${tbl(["Field", "Type", "Default", "Description"], rows)}</div>` : html`<div class="empty-line">No field matches “${state.ff}”.</div>` }) : valuesCard()}
+      ${card({ icon: "code", title: "Example config", aside: "required fields and defaults, like faucet init", body: code(exampleYaml(state.kind, state.name, fields, schema, blockPlacement()), { box: false }) })}
       <details class="card fold"><summary class="h">${ic("chev")}<b>Raw JSON Schema</b><span class="muted">draft 2020-12 · ${(json.length / 1024).toFixed(1)} KB</span><span class="r">${btn("Copy", { icon: "copy", cls: "sm", data: { copy: json } })}</span></summary>${code(json, { box: false, lang: "json", copy: false })}</details>`;
   }
 
@@ -164,7 +188,7 @@ export async function renderSchemas(host, params) {
       patch(L.detail, catalogueDetail());
       return;
     }
-    setCrumbs(["Build", { label: "Schemas", href: href.schemas() }, `${state.name} · ${state.kind}`]);
+    setCrumbs(["Build", { label: "Schemas", href: href.schemas() }, `${state.name} · ${KIND_LABEL[state.kind] || state.kind}`]);
     const key = `${state.kind}/${state.name}`;
     if (schemaKey !== key) {
       schemaKey = key;
@@ -175,7 +199,7 @@ export async function renderSchemas(host, params) {
         schema = await api(`/v1/schemas/${encodeURIComponent(state.kind)}/${encodeURIComponent(state.name)}`);
       } catch (e) {
         if (schemaKey !== key) return;
-        L.detail.innerHTML = v(e.status === 404 ? empty(`No ${state.kind} named “${state.name}”`, "It is not compiled into this server.", { icon: "schema", btns: btn("All schemas", { href: href.schemas() }) }) : errorAlert(`the ${state.name} schema`, e));
+        L.detail.innerHTML = v(e.status === 404 ? empty(`No ${KIND_LABEL[state.kind] || state.kind} named “${state.name}”`, "It is not compiled into this server.", { icon: "schema", btns: btn("All schemas", { href: href.schemas() }) }) : errorAlert(`the ${state.name} schema`, e));
         L.detail.querySelector("[data-retry]")?.addEventListener("click", () => { schemaKey = ""; renderDetail(); });
         return;
       }

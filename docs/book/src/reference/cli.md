@@ -1479,7 +1479,7 @@ three additional bearer-gated endpoints:
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/v1/schemas` | Catalog of compiled sources, sinks, transforms, and state-store kinds. |
-| `GET` | `/v1/schemas/{kind}/{name}` | JSON Schema for one connector or transform (`kind` ∈ `source`/`sink`/`transform`). 404 for unknown. |
+| `GET` | `/v1/schemas/{kind}/{name}` | JSON Schema for one connector, transform, pipeline block, or state store's `config` (`kind` ∈ `source`/`sink`/`transform`/`block`/`state`). 404 for unknown. |
 | `POST` | `/v1/doctor` | Validate + probe a submitted config without running it. 200 (pass) / 422 (fail). Body: `{ "config": "…", "config_format": "yaml" }`. |
 
 These endpoints require `serve` and are available regardless of `--no-ui`. See
