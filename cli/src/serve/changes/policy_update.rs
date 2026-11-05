@@ -288,10 +288,11 @@ mod tests {
                 message: "worse".into(),
             },
         ]);
-        let ServeError::Unprocessable { message, details } = e else {
-            panic!("not a 422");
-        };
-        assert!(message.contains("line 3: bad; worse"));
-        assert_eq!(details.unwrap()["problems"].as_array().unwrap().len(), 2);
+        assert!(matches!(
+            &e,
+            ServeError::Unprocessable { message, details: Some(d) }
+                if message.contains("line 3: bad; worse")
+                    && d["problems"].as_array().map(Vec::len) == Some(2)
+        ));
     }
 }

@@ -167,13 +167,18 @@ pub async fn effective(
         None => None,
     };
     let merged = match (server, tenant_spec) {
-        (Some(s), Some(t)) => Some(s.merge(t).map_err(|e| ServeError::Unprocessable {
-            message: format!("policy: the server and tenant policies conflict: {e}"),
-            details: None,
-        })?),
+        (Some(s), Some(t)) => Some(s.merge(t).map_err(layers_conflict)?),
         (s, t) => s.or(t),
     };
     Ok((merged, used))
+}
+
+/// The server and tenant layers declare the same rule.
+fn layers_conflict(e: String) -> ServeError {
+    ServeError::Unprocessable {
+        message: format!("policy: the server and tenant policies conflict: {e}"),
+        details: None,
+    }
 }
 
 // ── Drafts ───────────────────────────────────────────────────────────────────
@@ -377,9 +382,8 @@ pub async fn check_draft(
     let mut problems = Vec::new();
     match layer {
         Layer::Server => {
-            if let Err(e) = draft.validate() {
-                problems.push(Problem::at(text, e));
-            } else if let Err(e) = CompiledPolicy::compile(draft) {
+            // `compile` validates first, so one call reports either defect.
+            if let Err(e) = CompiledPolicy::compile(draft) {
                 problems.push(Problem::at(text, e));
             }
             for (tenant, spec) in tenant_policies(state).await? {
@@ -414,19 +418,14 @@ pub async fn check_draft(
                 }
             }
             if problems.is_empty() {
+                // With no shared rule name the merge cannot fail; `compile`
+                // validates the merged policy.
                 let merged = match server {
-                    Some(s) => s.merge(draft.clone()).map_err(|e| vec![e]),
+                    Some(s) => s.merge(draft.clone()),
                     None => Ok(draft.clone()),
                 };
-                match merged {
-                    Ok(m) => {
-                        if let Err(e) = m.validate() {
-                            problems.push(Problem::at(text, e));
-                        } else if let Err(e) = CompiledPolicy::compile(&m) {
-                            problems.push(Problem::at(text, e));
-                        }
-                    }
-                    Err(es) => problems.extend(es.into_iter().map(|e| Problem::at(text, e))),
+                if let Err(e) = merged.and_then(|m| CompiledPolicy::compile(&m).map(drop)) {
+                    problems.push(Problem::at(text, e));
                 }
             }
         }
@@ -665,10 +664,7 @@ pub async fn draft_impact(
         Layer::Tenant(t) => {
             let (in_force, _) = effective(state, Some(t), None).await?;
             let after = match server_spec {
-                Some(server) => server.merge(draft).map_err(|e| ServeError::Unprocessable {
-                    message: format!("policy: {e}"),
-                    details: None,
-                })?,
+                Some(server) => server.merge(draft).map_err(layers_conflict)?,
                 None => draft,
             };
             (in_force, after)

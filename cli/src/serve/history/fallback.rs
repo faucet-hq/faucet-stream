@@ -1304,6 +1304,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn policy_versions_reach_the_primary_and_never_the_fallback() {
+        let rec = crate::serve::history::policies::PolicyVersionRecord {
+            scope: "server".into(),
+            version: 1,
+            spec: serde_json::json!({ "rules": [] }),
+            created_at: chrono::Utc::now(),
+            created_by: "alice".into(),
+            approved_by: None,
+            reason: None,
+            change_id: None,
+            restores: None,
+        };
+        let healthy = FallbackHistory::healthy(
+            Box::new(MemoryHistory::new(Duration::from_secs(60))),
+            Duration::from_secs(60),
+            "test",
+        );
+        assert!(healthy.policy_version_insert(&rec).await.unwrap());
+        assert_eq!(healthy.policy_versions("server", 0).await.unwrap().len(), 1);
+        assert!(
+            healthy
+                .policy_version_get("server", 1)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(healthy.policy_versions_delete("server").await.unwrap(), 1);
+
+        healthy.degraded.store(true, Ordering::Release);
+        assert!(healthy.policy_version_insert(&rec).await.is_err());
+        assert!(healthy.policy_version_get("server", 1).await.is_err());
+    }
+
+    #[tokio::test]
     async fn run_secrets_reach_the_primary_and_wait_for_a_degraded_one() {
         let healthy = FallbackHistory::healthy(
             Box::new(MemoryHistory::new(Duration::from_secs(60))),

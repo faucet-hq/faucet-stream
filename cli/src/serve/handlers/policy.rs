@@ -616,3 +616,21 @@ pub async fn rollback_tenant(
     tenant_in_scope(&state, &actor, &tenant).await?;
     rollback_layer(&state, &actor, Layer::Tenant(tenant), req).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_policy_routes_refuse_a_tenant_principal() {
+        let mut actor = AuthContext {
+            principal: "a".into(),
+            role: Role::Admin,
+            source_ip: None,
+            tenant: None,
+        };
+        assert!(unscoped(&actor).is_ok());
+        actor.tenant = Some("acme".into());
+        assert!(matches!(unscoped(&actor), Err(ServeError::Forbidden(_))));
+    }
+}

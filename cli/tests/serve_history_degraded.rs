@@ -286,6 +286,12 @@ async fn an_unreachable_backend_degrades_runs_refuses_the_registry_fences_and_re
         "the registry is never served from the empty in-memory store"
     );
     assert_eq!(status("/readyz").await, 503);
+    // Nor is the policy in force.
+    #[cfg(feature = "policy")]
+    {
+        assert_eq!(status("/v1/policy").await, 503);
+        assert_eq!(status("/v1/policy/versions").await, 503);
+    }
 
     let token = CancellationToken::new();
     state.registry().register("local-run".into(), token.clone());

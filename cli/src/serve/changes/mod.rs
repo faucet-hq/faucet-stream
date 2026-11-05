@@ -1595,13 +1595,12 @@ async fn execute(
         }),
         #[cfg(feature = "policy")]
         ChangeKind::PolicyUpdate | ChangeKind::TenantPolicyUpdate => {
-            match policy_update::execute(state, &change, &fresh, actor).await {
-                Ok(v) => {
+            policy_update::execute(state, &change, &fresh, actor)
+                .await
+                .map(|v| {
                     created_version = Some(v);
-                    Ok((None, None))
-                }
-                Err(e) => Err(e),
-            }
+                    (None, None)
+                })
         }
         #[cfg(not(feature = "policy"))]
         ChangeKind::PolicyUpdate | ChangeKind::TenantPolicyUpdate => {
@@ -2866,6 +2865,101 @@ mod tests {
         assert!(matches!(
             template_err(crate::error::CliError::Internal("x".into())),
             ServeError::Internal(_)
+        ));
+    }
+
+    #[cfg(feature = "policy")]
+    fn policy_version(
+        scope: String,
+        change_id: Option<String>,
+    ) -> crate::serve::history::policies::PolicyVersionRecord {
+        crate::serve::history::policies::PolicyVersionRecord {
+            scope,
+            version: 1,
+            spec: json!({ "version": 1 }),
+            created_at: Utc::now(),
+            created_by: "bob".into(),
+            approved_by: None,
+            reason: None,
+            change_id,
+            restores: None,
+        }
+    }
+
+    #[cfg(feature = "policy")]
+    #[tokio::test]
+    async fn a_policy_change_checks_the_approvers_tenant_and_finishes_an_applied_version() {
+        use crate::serve::history::policies::tenant_scope;
+        let state = crate::serve::test_support::test_state();
+        let mut c = stored(
+            ChangeKind::TenantPolicyUpdate,
+            json!({ "tenant": "acme", "policy": "version: 1\n" }),
+            "m",
+            1,
+        );
+        c.tenant = Some("acme".into());
+        save(&state, &c).await.unwrap();
+
+        let mut globex = actor("gina");
+        globex.tenant = Some("globex".into());
+        assert!(matches!(
+            approve(&state, &globex, &c.id, None).await,
+            Err(ServeError::Forbidden(_))
+        ));
+        assert!(matches!(
+            reject(&state, &globex, &c.id, "no".into()).await,
+            Err(ServeError::Forbidden(_))
+        ));
+
+        // The version was stored before the execution was interrupted.
+        let applied = policy_version(tenant_scope("acme"), Some(c.id.clone()));
+        assert!(
+            state
+                .history()
+                .policy_version_insert(&applied)
+                .await
+                .unwrap()
+        );
+        let done = approve(&state, &actor("alice"), &c.id, None).await.unwrap();
+        assert_eq!(done.status, ChangeStatus::Executed);
+        assert_eq!(done.plan.unwrap().summary["version"], 1);
+    }
+
+    #[cfg(feature = "policy")]
+    #[tokio::test]
+    async fn a_policy_change_that_lost_the_race_or_does_not_parse() {
+        use crate::serve::history::policies::SERVER_SCOPE;
+        let state = crate::serve::test_support::test_state();
+        let garbled = stored(ChangeKind::PolicyUpdate, json!("not a payload"), "m", 1);
+        assert_eq!(
+            policy_update::already_applied(&state, &garbled)
+                .await
+                .unwrap(),
+            None
+        );
+        let bad_draft = json!({ "policy": "version: 1\nclassifications:\n  - label: a\n    field_pattern: \"(\"\n" });
+        assert!(matches!(
+            policy_update::plan(&state, ChangeKind::PolicyUpdate, &bad_draft).await,
+            Err(ServeError::Unprocessable { .. })
+        ));
+
+        // Another change stored the version this one planned to write.
+        let c = stored(
+            ChangeKind::PolicyUpdate,
+            json!({ "policy": "version: 1\n" }),
+            "m",
+            1,
+        );
+        let first = policy_version(SERVER_SCOPE.into(), None);
+        assert!(state.history().policy_version_insert(&first).await.unwrap());
+        let fresh = ChangePlan {
+            material: "m".into(),
+            rows: Vec::new(),
+            summary: json!({ "next_version": 1 }),
+        };
+        assert!(matches!(
+            policy_update::execute(&state, &c, &fresh, &actor("alice")).await,
+            Err(ServeError::Conflict(_))
         ));
     }
 }

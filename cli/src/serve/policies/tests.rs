@@ -365,3 +365,311 @@ async fn refusals_read_back_from_the_audit_log() {
     );
     assert_eq!(refusal_counts(&state, Some("acme")).await["submit"], 1);
 }
+
+/// A pipeline whose contract sends `email` to a `residency: us` sink.
+const US: &str = r#"
+version: 1
+name: us
+pipeline:
+  source: { type: csv, config: { path: in.csv } }
+  contract: { version: "1", fields: [ { name: email, type: string } ] }
+  sink: { type: jsonl, attributes: { residency: us }, config: { path: out.jsonl } }
+"#;
+
+/// The same pipeline carrying its own copy of the server rule: merging it
+/// with the server layer is a conflict.
+fn own_policy() -> String {
+    format!("{US}policy:{}", SERVER.replace('\n', "\n  "))
+}
+
+/// A matrix row naming a source template nobody declared: it loads but does
+/// not expand.
+const UNEXPANDABLE: &str = r#"
+version: 1
+name: broken
+pipeline:
+  source: { type: csv, config: { path: in.csv } }
+  sink: { type: jsonl, config: { path: out.jsonl } }
+matrix:
+  - id: a
+    source: { ref: missing }
+"#;
+
+const TOPOLOGY: &str = r#"
+version: 1
+name: topo
+pipeline:
+  contract: { version: "1", fields: [ { name: email, type: string } ] }
+  sources:
+    src: { type: csv, config: { path: in.csv } }
+  sinks:
+    out: { type: jsonl, attributes: { residency: us }, config: { path: out.jsonl } }
+  nodes:
+    read: { kind: source, ref: src }
+    write: { kind: sink, ref: out }
+  edges:
+    - { from: read, to: write }
+"#;
+
+async fn stored_run(
+    state: &ServerState,
+    id: &str,
+    body: Option<String>,
+    format: crate::serve::load::ConfigFormat,
+) {
+    let mut rec = crate::serve::history::RunRecord::queued(
+        id.into(),
+        None,
+        Default::default(),
+        None,
+        Utc::now(),
+    );
+    rec.config_body = body;
+    rec.config_format = Some(format);
+    state.history().upsert(&rec).await.unwrap();
+}
+
+#[tokio::test]
+async fn impact_compares_runs_and_templates_before_and_after() {
+    use crate::serve::load::ConfigFormat;
+    let state = test_state();
+    let server: PolicySpec = crate::yaml::from_str(SERVER).unwrap();
+    let us_json = serde_json::to_string(&crate::yaml::from_str::<Value>(US).unwrap()).unwrap();
+    stored_run(&state, "us", Some(US.into()), ConfigFormat::Yaml).await;
+    stored_run(&state, "us-json", Some(us_json), ConfigFormat::Json).await;
+    stored_run(&state, "own", Some(own_policy()), ConfigFormat::Yaml).await;
+    stored_run(
+        &state,
+        "broken",
+        Some(UNEXPANDABLE.into()),
+        ConfigFormat::Yaml,
+    )
+    .await;
+    stored_run(&state, "topo", Some(TOPOLOGY.into()), ConfigFormat::Yaml).await;
+    stored_run(&state, "garbled", Some(": [".into()), ConfigFormat::Yaml).await;
+    stored_run(&state, "no-body", None, ConfigFormat::Yaml).await;
+    #[cfg(feature = "templates")]
+    for (id, body) in [("tpl-us", US), ("tpl-plain", UNEXPANDABLE)] {
+        state
+            .history()
+            .template_register(&crate::serve::history::templates::TemplateDraft {
+                id: crate::serve::history::templates::TemplateId::parse(id).unwrap(),
+                kind: crate::hub::TemplateKind::Pipeline,
+                name: None,
+                description: None,
+                body: body.into(),
+                format: ConfigFormat::Yaml,
+                params: Default::default(),
+                created_by: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    // No policy before, the server's after.
+    let first = impact(&state, None, None, &server).await.unwrap();
+    assert_eq!(
+        first.runs_checked, 5,
+        "the garbled and bodiless runs are skipped"
+    );
+    let refused: Vec<&str> = first.newly_refused.iter().map(|e| e.id.as_str()).collect();
+    assert!(
+        refused.contains(&"us") && refused.contains(&"us-json"),
+        "{refused:?}"
+    );
+    let us = first.newly_refused.iter().find(|e| e.id == "us").unwrap();
+    assert_eq!(us.rule.as_deref(), Some("pii-to-eu-only"));
+    assert_eq!(us.column.as_deref(), Some("email"));
+    assert!(
+        first.unchanged >= 1,
+        "the run with its own conflicting copy"
+    );
+    #[cfg(feature = "templates")]
+    {
+        assert_eq!(first.templates_checked, 2);
+        assert_eq!(
+            first.templates_runtime_only, 1,
+            "no contract: run time only"
+        );
+        assert!(first.newly_refused.iter().any(|e| e.kind == "template"));
+    }
+
+    // Allowing `us` residency lifts the refusals.
+    let wider: PolicySpec = crate::yaml::from_str(&SERVER.replace("[eu]", "[eu, us]")).unwrap();
+    let second = impact(&state, None, Some(&server), &wider).await.unwrap();
+    assert!(second.newly_allowed.iter().any(|e| e.id == "us"));
+    assert!(second.newly_refused.is_empty());
+}
+
+#[tokio::test]
+async fn conflicting_layers_and_unreadable_versions_fail_closed() {
+    let state = test_state();
+    state
+        .history()
+        .policy_version_insert(&record(SERVER_SCOPE, 1, SERVER))
+        .await
+        .unwrap();
+    state
+        .history()
+        .policy_version_insert(&record(&tenant_scope("acme"), 1, SERVER))
+        .await
+        .unwrap();
+    assert!(matches!(
+        effective(&state, Some("acme"), None).await,
+        Err(ServeError::Unprocessable { .. })
+    ));
+    let clash: PolicySpec = crate::yaml::from_str(SERVER).unwrap();
+    assert!(matches!(
+        draft_impact(&state, &Layer::Tenant("globex".into()), clash).await,
+        Err(ServeError::Unprocessable { .. })
+    ));
+
+    let mut unreadable = record(SERVER_SCOPE, 2, SERVER);
+    unreadable.spec = serde_json::json!("not a policy");
+    state
+        .history()
+        .policy_version_insert(&unreadable)
+        .await
+        .unwrap();
+    assert!(matches!(
+        server_layer(&state).await,
+        Err(ServeError::Internal(_))
+    ));
+}
+
+#[cfg(feature = "templates")]
+async fn register(state: &ServerState, id: &str, kind: crate::hub::TemplateKind, body: &str) {
+    state
+        .history()
+        .template_register(&crate::serve::history::templates::TemplateDraft {
+            id: crate::serve::history::templates::TemplateId::parse(id).unwrap(),
+            kind,
+            name: None,
+            description: None,
+            body: body.into(),
+            format: crate::serve::load::ConfigFormat::Yaml,
+            params: Default::default(),
+            created_by: None,
+        })
+        .await
+        .unwrap();
+}
+
+#[cfg(feature = "templates")]
+#[tokio::test]
+async fn templates_are_checked_statically() {
+    use crate::hub::TemplateKind;
+    let state = test_state();
+    register(&state, "us", TemplateKind::Pipeline, US).await;
+    register(&state, "own", TemplateKind::Pipeline, &own_policy()).await;
+    register(&state, "topo", TemplateKind::Pipeline, TOPOLOGY).await;
+    register(&state, "garbled", TemplateKind::Pipeline, ": [").await;
+    register(
+        &state,
+        "src",
+        TemplateKind::SourceTemplate,
+        "kind: source-template\n",
+    )
+    .await;
+
+    // Nothing in force and no policy of its own: nothing to check against.
+    let none = check_template(&state, None, "us", None).await.unwrap();
+    assert_eq!(none["loaded"], false);
+    assert!(matches!(
+        check_template(&state, None, "nope", None).await,
+        Err(ServeError::Unprocessable { .. } | ServeError::NotFound)
+    ));
+    assert!(matches!(
+        check_template(&state, None, "src", None).await,
+        Err(ServeError::Unprocessable { .. })
+    ));
+    assert!(matches!(
+        check_template(&state, None, "garbled", None).await,
+        Err(ServeError::Unprocessable { .. })
+    ));
+
+    state
+        .history()
+        .policy_version_insert(&record(SERVER_SCOPE, 1, SERVER))
+        .await
+        .unwrap();
+    let report = check_template(&state, None, "us", Some(1)).await.unwrap();
+    assert_eq!(report["template"], "us");
+    assert_eq!(report["version"], 1);
+    assert!(check_template(&state, None, "topo", None).await.is_ok());
+    assert!(matches!(
+        check_template(&state, None, "own", None).await,
+        Err(ServeError::Unprocessable { .. })
+    ));
+
+    // The source template and the template that does not load are skipped.
+    let server: PolicySpec = crate::yaml::from_str(SERVER).unwrap();
+    let impact = impact(&state, None, None, &server).await.unwrap();
+    assert_eq!(impact.templates_checked, 3);
+    // Sink attributes are read from the templates that parse.
+    assert_eq!(sink_attributes(&state).await["sinks"], 3);
+}
+
+#[tokio::test]
+async fn own_policies_merge_and_tenant_drafts_stand_alone() {
+    use crate::serve::load::ConfigFormat;
+    let state = test_state();
+    // A pipeline policy that adds its own rule merges with the layer.
+    let own = format!(
+        "{US}policy:\n  version: 1\n  rules:\n    - name: own-rule\n      when: {{ label: pii.email }}\n      deny: true\n"
+    );
+    stored_run(&state, "own", Some(own), ConfigFormat::Yaml).await;
+    let server: PolicySpec = crate::yaml::from_str(SERVER).unwrap();
+    let out = impact(&state, None, Some(&server), &server).await.unwrap();
+    assert_eq!(out.runs_checked, 1);
+    assert_eq!(out.unchanged, 1);
+    // No server policy: a tenant draft is its own effective policy.
+    let draft: PolicySpec = crate::yaml::from_str(SERVER).unwrap();
+    assert!(
+        draft_impact(&state, &Layer::Tenant("acme".into()), draft)
+            .await
+            .is_ok()
+    );
+    // A policy that does not compile labels nothing.
+    let broken: PolicySpec = crate::yaml::from_str(
+        "version: 1\nclassifications:\n  - label: a\n    field_pattern: \"(\"\n",
+    )
+    .unwrap();
+    assert!(columns_seen(&state, &broken).await.is_empty());
+}
+
+#[tokio::test]
+async fn drafts_are_compiled_on_every_layer() {
+    let state = test_state();
+    let bad_regex = "version: 1\nclassifications:\n  - label: a\n    field_pattern: \"(\"\n";
+    let draft = parse_draft(bad_regex).unwrap();
+    assert_eq!(
+        check_draft(&state, &Layer::Server, &draft, bad_regex)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    // A tenant draft with no server policy stands alone.
+    let tenant = Layer::Tenant("acme".into());
+    assert_eq!(
+        check_draft(&state, &tenant, &draft, bad_regex)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let fine = "version: 1\nclassifications:\n  - label: a\n    fields: [a]\nrules:\n  - name: r\n    when: { label: a }\n    deny: true\n";
+    let draft = parse_draft(fine).unwrap();
+    assert!(
+        check_draft(&state, &tenant, &draft, fine)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let disabled = parse_draft("version: 1\ndisable: [r]\n").unwrap_err();
+    assert!(
+        disabled[0].message.contains("cannot disable"),
+        "{disabled:?}"
+    );
+}

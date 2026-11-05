@@ -62,6 +62,62 @@ async fn insert_new_claims_an_id_once() {
     assert_eq!(got.records_written, 0);
 }
 
+/// Policy versions append once per (scope, version), list newest first, and
+/// delete per scope.
+#[tokio::test]
+async fn policy_versions_append_once_list_and_delete() {
+    use faucet_cli::serve::history::policies::PolicyVersionRecord;
+    let dir = tempfile::tempdir().unwrap();
+    let h = store(&dir, "p.db").await;
+    let version = |scope: &str, version: u32| PolicyVersionRecord {
+        scope: scope.into(),
+        version,
+        spec: serde_json::json!({ "rules": [] }),
+        created_at: Utc::now(),
+        created_by: "alice".into(),
+        approved_by: Some("bob".into()),
+        reason: Some(format!("v{version}")),
+        change_id: None,
+        restores: None,
+    };
+    assert!(
+        h.policy_version_insert(&version("server", 1))
+            .await
+            .unwrap()
+    );
+    assert!(
+        h.policy_version_insert(&version("server", 2))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !h.policy_version_insert(&version("server", 2))
+            .await
+            .unwrap(),
+        "a version is written once"
+    );
+    assert!(
+        h.policy_version_insert(&version("tenant:acme", 1))
+            .await
+            .unwrap()
+    );
+    let all: Vec<u32> = h
+        .policy_versions("server", 0)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.version)
+        .collect();
+    assert_eq!(all, vec![2, 1]);
+    assert_eq!(h.policy_versions("server", 1).await.unwrap().len(), 1);
+    let one = h.policy_version_get("server", 1).await.unwrap().unwrap();
+    assert_eq!(one.reason.as_deref(), Some("v1"));
+    assert!(h.policy_version_get("server", 9).await.unwrap().is_none());
+    assert_eq!(h.policy_versions_delete("server").await.unwrap(), 2);
+    assert!(h.policy_versions("server", 0).await.unwrap().is_empty());
+    assert_eq!(h.policy_versions("tenant:acme", 0).await.unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn upsert_get_and_missing() {
     let dir = tempfile::tempdir().unwrap();

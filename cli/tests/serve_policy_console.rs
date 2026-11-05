@@ -366,6 +366,44 @@ async fn server_managed_policy_is_changed_only_through_a_second_admins_approval(
             .0,
         403
     );
+    assert_eq!(
+        api.post("oscar-tok", "/v1/policy/check", json!({})).await.0,
+        400,
+        "neither a config nor a template"
+    );
+    // A registered pipeline template is checked by id.
+    #[cfg(feature = "templates")]
+    {
+        let (s, t) = api
+            .post(
+                "alice-tok",
+                "/v1/templates",
+                json!({ "id": "us-export", "config": config(dir.path(), "us-export", "us") }),
+            )
+            .await;
+        assert!(s == 200 || s == 201, "{s} {t}");
+        let (s, report) = api
+            .post(
+                "oscar-tok",
+                "/v1/policy/check",
+                json!({ "template": "us-export" }),
+            )
+            .await;
+        assert_eq!(s, 200, "{report}");
+        assert_eq!(report["template"], "us-export");
+        assert_eq!(report["violations"], 1);
+    }
+    // A draft that does not parse is reported and goes no further.
+    let (s, unparsed) = api
+        .post(
+            "alice-tok",
+            "/v1/policy/preview",
+            json!({ "policy": "version: [" }),
+        )
+        .await;
+    assert_eq!(s, 200);
+    assert_eq!(unparsed["valid"], false);
+    assert_eq!(unparsed["diff"], json!([]));
 
     // Two proposals on v1: the first approved wins, the second is invalidated.
     let v2 = POLICY_V1.replace("[eu]", "[eu, uk]");
@@ -535,6 +573,39 @@ async fn tenant_policies_only_add_and_apply_to_that_tenants_runs() {
         json!([])
     );
 
+    // acme's rules change and roll back through acme's own route.
+    let wider = acme.replace("[internal]", "[internal, partner]");
+    let cid = api
+        .propose(
+            "acme-admin-tok",
+            "/v1/tenants/acme/policy",
+            &wider,
+            json!(1),
+        )
+        .await;
+    assert_eq!(
+        api.approve("acme-sec-tok", &cid).await.1["status"],
+        "executed"
+    );
+    let (s, rb) = api
+        .post(
+            "acme-admin-tok",
+            "/v1/tenants/acme/policy/rollback",
+            json!({ "version": 1, "reason": "partners again" }),
+        )
+        .await;
+    assert_eq!(s, 201, "{rb}");
+    assert_eq!(rb["plan"]["summary"]["restores"], 1);
+    assert_eq!(
+        api.approve("acme-sec-tok", rb["id"].as_str().unwrap())
+            .await
+            .1["status"],
+        "executed"
+    );
+    let (_, tp) = api.get("acme-ops-tok", "/v1/tenants/acme/policy").await;
+    assert_eq!(tp["version"]["version"], 3);
+    assert_eq!(tp["version"]["restores"], 1);
+
     // A server admin may change acme's rules too (and a server change that
     // reuses acme's rule name is refused).
     let reuse = POLICY_V1.replace("pii-to-eu-only", "acme-no-partner");
@@ -555,7 +626,7 @@ async fn tenant_policies_only_add_and_apply_to_that_tenants_runs() {
     // Deleting the tenant deletes its policy versions.
     let (s, report) = api.delete("alice-tok", "/v1/tenants/acme").await;
     assert_eq!(s, 200, "{report}");
-    assert_eq!(report["policy_versions"], 1);
+    assert_eq!(report["policy_versions"], 3);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -592,4 +663,13 @@ async fn a_policy_file_is_read_only() {
         .0,
         409
     );
+    // A tenant's view names the file as the server layer.
+    let (s, b) = api
+        .post("alice-tok", "/v1/tenants", json!({ "id": "acme" }))
+        .await;
+    assert_eq!(s, 201, "{b}");
+    let (s, tp) = api.get("acme-ops-tok", "/v1/tenants/acme/policy").await;
+    assert_eq!(s, 200, "{tp}");
+    assert_eq!(tp["server"]["source"], "file");
+    assert_eq!(tp["server"]["loaded"], true);
 }

@@ -469,3 +469,58 @@ async fn postgres_list_filters_match_name_pool_and_usage_dataset() {
     };
     assert_eq!(ids(ds).await, ["a"]);
 }
+
+/// Policy versions append once per (scope, version), list newest first, and
+/// delete per scope — on Postgres's own statements.
+#[tokio::test]
+async fn postgres_policy_versions_append_once_list_and_delete() {
+    use faucet_cli::serve::history::policies::PolicyVersionRecord;
+    let Some((_pg, url)) = postgres().await else {
+        return;
+    };
+    let h = PostgresHistory::connect(
+        &url,
+        Duration::from_secs(3600),
+        Duration::from_secs(3600),
+        "pg-policy".into(),
+    )
+    .await
+    .expect("connect postgres history");
+    // A scope of its own, so a shared database does not collide.
+    let scope = format!("tenant:p{}", Utc::now().timestamp_nanos_opt().unwrap_or(0));
+    let version = |version: u32| PolicyVersionRecord {
+        scope: scope.clone(),
+        version,
+        spec: serde_json::json!({ "rules": [] }),
+        created_at: Utc::now(),
+        created_by: "alice".into(),
+        approved_by: None,
+        reason: Some(format!("v{version}")),
+        change_id: None,
+        restores: None,
+    };
+    assert!(h.policy_version_insert(&version(1)).await.unwrap());
+    assert!(h.policy_version_insert(&version(2)).await.unwrap());
+    assert!(!h.policy_version_insert(&version(2)).await.unwrap());
+    let all: Vec<u32> = h
+        .policy_versions(&scope, 0)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.version)
+        .collect();
+    assert_eq!(all, vec![2, 1]);
+    assert_eq!(h.policy_versions(&scope, 1).await.unwrap().len(), 1);
+    assert_eq!(
+        h.policy_version_get(&scope, 1)
+            .await
+            .unwrap()
+            .unwrap()
+            .reason
+            .as_deref(),
+        Some("v1")
+    );
+    assert!(h.policy_version_get(&scope, 9).await.unwrap().is_none());
+    assert_eq!(h.policy_versions_delete(&scope).await.unwrap(), 2);
+    assert!(h.policy_versions(&scope, 0).await.unwrap().is_empty());
+}
