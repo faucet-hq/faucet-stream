@@ -9,13 +9,20 @@ import { html, head, card, tbl, pill, kv, grid, btn, dhead, dtabs, lnk, alert, s
 import { layout, setQuery, errorAlert, ago, dialog, toast, patch } from "../page.js";
 import { setCrumbs, setDelta, setContext, refreshBadges } from "../shell.js";
 import { fmtInt, fmtAge } from "../utils.js";
-import { formatTs } from "../tz.js";
+import { formatTs, formatTsSplit } from "../tz.js";
 import { href } from "../links.js";
 import { whoami, can } from "../access.js";
-import { currentTenant, tenantList } from "../tenant.js";
+import { currentTenant, setTenant, tenantList } from "../tenant.js";
 
 const nw = (t) => html`<span class="mono" style="white-space:nowrap">${t}</span>`;
 const mono = (t) => html`<span class="mono">${t}</span>`;
+// A problem message: the first sentence in red, `names` as code, wrapping.
+function problemText(msg) {
+  const at = msg.indexOf(". ");
+  const [lead, rest] = at === -1 ? [msg, ""] : [msg.slice(0, at + 1), msg.slice(at + 2)];
+  const fmt = (s) => s.split("`").map((part, i) => (i % 2 ? html`<code>${part}</code>` : part));
+  return html`<span style="white-space:normal"><span class="bad">${fmt(lead)}</span>${rest ? html` ${fmt(rest)}` : ""}</span>`;
+}
 const who = (p) => (p ? (can("audit_read") ? lnk(p, href.audit({ principal: p })) : html`<b>${p}</b>`) : html`<span class="muted">—</span>`);
 const enc = encodeURIComponent;
 const tenantBase = (t) => `/v1/tenants/${enc(t)}/policy`;
@@ -48,7 +55,7 @@ function when(iso) {
   const d = new Date(iso);
   if (isNaN(d)) return "";
   const days = Math.floor((Date.now() - d.getTime()) / 86400000);
-  const hm = formatTs(iso).slice(-8, -3);
+  const hm = ((formatTsSplit(iso) || {}).time || "").replace(/:\d\d(?= )/, "");
   return html`<time datetime="${iso}" title="${formatTs(iso)}">${days <= 0 ? "today" : days === 1 ? "yesterday" : fmtAge(iso) + " ago"} ${days <= 1 ? hm : ""}</time>`;
 }
 
@@ -97,7 +104,7 @@ function whyText(x) {
 export function renderPolicy(host, params) {
   const L = layout(host, "canvas");
   const me = whoami();
-  const scoped = me && me.tenant ? me.tenant : "";
+  let scoped = me && me.tenant ? me.tenant : "";
   let st = read(params);
   let sp = null; // GET /v1/policy
   let tp = null; // GET /v1/tenants/{t}/policy
@@ -110,6 +117,14 @@ export function renderPolicy(host, params) {
   const ed = { text: null, problems: [], preview: null, checking: false, step: "edit", reason: "", busy: false, error: null, timer: null, seq: 0 };
 
   function read(p) {
+    // A deep link `?tenant=` moves the topbar switcher, so the page and the
+    // switcher always name the same tenant.
+    const linked = p.query.get("tenant");
+    if (linked != null && !scoped) {
+      if (linked !== currentTenant()) setTenant(linked);
+      // Consumed: later switcher changes win over the link.
+      queueMicrotask(() => setQuery({ tenant: "" }, { replace: true }));
+    }
     const tenant = scoped || currentTenant() || "";
     return { tab: p.query.get("tab") || "Rules", edit: p.query.get("edit") === "1", tenant };
   }
@@ -126,7 +141,14 @@ export function renderPolicy(host, params) {
       if (g !== gen) return;
       sp = s;
       tp = t;
-      if (!t && !scoped) st.tenant = "";
+      if (s && s.scoped_tenant && !t) {
+        // The identity said nothing about a tenant but the server scopes this
+        // caller: show the tenant view rather than a server view it cannot read.
+        scoped = s.scoped_tenant;
+        st.tenant = scoped;
+        return load();
+      }
+      if (!t && !scoped && st.tenant) { st.tenant = ""; setTenant(""); }
       versions = !st.tenant && sp && sp.source === "server" ? await api("/v1/policy/versions").catch(() => []) : null;
       if (g !== gen) return;
       refusals = null;
@@ -159,13 +181,14 @@ export function renderPolicy(host, params) {
       return [pill("Enforced", "ok", "shield"), html`<span>${(f.path || "").split("/").pop()}</span>`, html`<span>loaded from <span class="mono">--policy</span> file · sha <span class="mono">${(f.sha256 || "").slice(0, 4)}…${(f.sha256 || "").slice(-2)}</span></span>`, html`<span>since server start ${f.loaded_at ? `${fmtAge(f.loaded_at)} ago` : ""}</span>`];
     }
     const ver = sp.version || {};
+    if (ver.version == null) return [pill("Enforced", "ok", "shield"), html`<span>${desc} · no stored version yet</span>`, html`<span>managed by the server</span>`];
     return [pill("Enforced", "ok", "shield"), html`<span>${desc} · version ${ver.version}</span>`, ver.approved_by ? html`<span>approved by ${who(ver.approved_by)} ${fmtAge(ver.created_at)} ago</span>` : "", html`<span>managed by the server</span>`];
   }
   function pendingBanner(pending, what, inForce) {
     if (!pending) return "";
     const mine = me && me.principal === pending.requester;
     const link = lnk(`change ${String(pending.id).slice(0, 8)}`, href.change(pending.id));
-    return alert(mine ? `Your change to ${what} v${pending.next_version} waits for approval.` : `A change to ${what} v${pending.next_version} by ${pending.requester} waits for approval.`, html`It takes effect on every replica once ${layer() === "tenant" ? `another ${st.tenant} admin or a server admin` : "another admin"} approves ${link}. ${inForce} stays enforced until then.`, "warn", btn("Open in Changes", { icon: "changes", href: href.change(pending.id) }));
+    return alert(mine ? `Your change to ${what} v${pending.next_version} waits for approval.` : `A change to ${what} v${pending.next_version} by ${pending.requester} waits for approval.`, layer() === "tenant" ? html`Another ${st.tenant} admin or a server admin must approve ${link}. ${inForce} stays in force until then.` : html`It takes effect on every replica once another admin approves ${link}. ${inForce} stays enforced until then.`, "warn", btn("Open in Changes", { icon: "changes", href: href.change(pending.id) }));
   }
 
   // ---- server rules ---------------------------------------------------------------------
@@ -292,9 +315,9 @@ export function renderPolicy(host, params) {
       i === 0 || !editable ? "" : btn(`Roll back to v${x.version}`, { icon: "undo", cls: "sm", perm: "policy_admin", data: { rollback: String(x.version), "rb-tenant": tenantOf } }),
     ]);
     return card({
-      icon: "clock", title, right: tenantOf ? "approved by another tenant admin or a server admin" : "every change was approved by a second admin",
+      icon: "clock", title, right: tenantOf ? `approved by another ${tenantOf} admin or a server admin` : "every change was approved by a second admin",
       body: rows.length ? tbl(["Version", "Changed by", "Approved by", "Reason", "When", ""], rows) : html`<div class="empty-line">No versions yet.</div>`,
-      note: "A rollback is a change request too: it takes effect when another admin approves it.",
+      note: tenantOf && !scoped ? "Server admins can edit and roll back any tenant’s rules; the change still needs a second person." : "A rollback is a change request too: it takes effect when another admin approves it.",
     });
   }
 
@@ -342,7 +365,7 @@ export function renderPolicy(host, params) {
   }
   function tenantHead(opView) {
     const sv = tp.server || {};
-    const server = sv.loaded ? `server ${sv.source === "file" ? "file policy" : `v${sv.version}`}` : "no server policy";
+    const server = sv.loaded ? `server ${sv.source === "file" ? "file policy" : sv.version != null ? `v${sv.version}` : "policy"}` : "no server policy";
     const mine = tp.loaded ? `${st.tenant} rules v${tp.version.version}` : `no ${st.tenant} rules`;
     const sub = [pill("Enforced", "ok", "shield"), html`<span>${server} + ${mine}</span>`, opView ? html`<span>tenant switcher set to ${st.tenant}</span>` : tp.version && tp.version.approved_by ? html`<span>${st.tenant} rules approved by ${who(tp.version.approved_by)} ${fmtAge(tp.version.created_at)} ago</span>` : ""];
     return head(opView ? `Policy · ${st.tenant}` : "Policy", sub, opView ? `What ${st.tenant}’s runs are checked against: the server policy plus ${st.tenant}’s add-only rules. Pick “All tenants” above for the server policy alone.` : `${st.tenant}’s runs are checked against the server’s rules and ${st.tenant}’s own. ${st.tenant}’s rules can only add: they never remove or loosen a server rule.`);
@@ -383,7 +406,7 @@ export function renderPolicy(host, params) {
     const tab = tabNames.some((t) => (Array.isArray(t) ? t[2] : t) === st.tab) ? st.tab : "Rules";
     const banner = file
       ? alert("Managed by the --policy file.", html`This server loaded <code>${(sp.file || {}).path || "the policy file"}</code> at start. Change the file and restart to update it; the console shows it read-only.`, "")
-      : pendingBanner(sp.pending_change, "the policy", `Version ${(sp.version || {}).version}`);
+      : pendingBanner(sp.pending_change, "the policy", sp.version ? `Version ${sp.version.version}` : "The current policy");
     const editBtn = !file && sp.editable && can("policy_admin") ? btn("Edit policy", { icon: "edit", kind: "primary", perm: "policy_admin", data: { edit: "1" }, disabled: !!sp.pending_change }) : "";
     let body;
     if (tab === "Refusals") body = refusalsPane();
@@ -409,7 +432,7 @@ export function renderPolicy(host, params) {
     if (!review) {
       const n = ed.problems.length;
       const problems = n
-        ? card({ icon: "alert", title: "Problems", body: tbl(["Line", "Problem"], ed.problems.map((p) => [p.line ? String(p.line) : "—", html`<span class="bad">${p.message}</span>`])), note: "Checked as you type, with the same validation the server runs on submit." })
+        ? card({ icon: "alert", title: "Problems", body: tbl(["Line", "Problem"], ed.problems.map((p) => [p.line ? String(p.line) : "—", problemText(p.message)])), note: tenantEdit ? `Server rules ${t} sees: ${(((tp && tp.server) || {}).rules || []).map((r) => r.name).join(", ") || "none"}.` : "Checked as you type, with the same validation the server runs on submit." })
         : card({ icon: ed.checking ? "refresh" : "check", title: ed.checking ? "Checking…" : ed.preview && ed.preview.valid ? "No problems" : "Problems", body: html`<div class="empty-line">${ed.checking ? "Validating the draft." : ed.preview && ed.preview.valid ? "The draft validates. Preview its impact next." : "Edit the draft to check it."}</div>`, note: tenantEdit ? `Tenant rules can only add: they may not reuse a server rule’s name.` : "Checked as you type, with the same validation the server runs on submit." });
       return html`${top}${n ? alert(`${n} problem${n === 1 ? "" : "s"} in the draft.`, tenantEdit ? "Tenant rules can only add. Fix them to preview the impact." : "Fix them to preview the impact.", "bad") : ""}
         <div class="pair">${card({ icon: "code", title: tenantEdit ? `${t}-policy.yaml` : "policy.yaml", aside: "draft", body: html`<div class="pad"><textarea class="area mono${n ? " err" : ""}" name="draft" rows="22" spellcheck="false">${ed.text}</textarea></div>` })}${problems}</div>`;

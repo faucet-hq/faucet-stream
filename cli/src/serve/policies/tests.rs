@@ -37,6 +37,37 @@ fn locate_finds_the_quoted_name() {
 }
 
 #[test]
+fn parse_draft_all_reports_subtractive_keys_and_keeps_parsing() {
+    let text = "version: 1\nrules:\n  - name: r\n    when: { label: a }\n    deny: true\ndisable: [x, y]\n";
+    let tenant = Layer::Tenant("acme".into());
+    let (spec, problems) = parse_draft_all(text, &tenant);
+    assert_eq!(spec.unwrap().rules[0].name, "r");
+    assert_eq!(problems.len(), 1);
+    assert_eq!(problems[0].line, Some(6));
+    assert_eq!(
+        problems[0].message,
+        "A tenant policy cannot disable a server rule. Remove `disable`; ask the server operator about `x`, `y`."
+    );
+    let (_, p) = parse_draft_all("version: 1\nremove: r\n", &tenant);
+    assert!(p[0].message.ends_with("about `r`."));
+    let (_, p) = parse_draft_all("version: 1\noverride: 3\n", &tenant);
+    assert!(p[0].message.ends_with("Remove `override`."));
+    let (_, p) = parse_draft_all("version: 1\ndisable: [r]\n", &Layer::Server);
+    assert!(p[0].message.contains("layers only add"));
+    // The rest still fails to parse: both problems are reported.
+    let (spec, p) = parse_draft_all("version: 1\nbogus: 1\ndisable: [r]\n", &tenant);
+    assert!(spec.is_none());
+    assert_eq!(p.len(), 2);
+    // No subtractive key: the same as parse_draft.
+    let (spec, p) = parse_draft_all(SERVER, &tenant);
+    assert!(spec.is_some() && p.is_empty());
+    let (spec, p) = parse_draft_all("version: [", &tenant);
+    assert!(spec.is_none() && !p.is_empty());
+    let (spec, p) = parse_draft_all("- a\n", &tenant);
+    assert!(spec.is_none() && !p.is_empty());
+}
+
+#[test]
 fn parse_draft_reports_the_line() {
     let problems = parse_draft("version: 1\nrules:\n  - name: x\n    bogus: 1\n").unwrap_err();
     assert_eq!(problems.len(), 1);
@@ -250,7 +281,7 @@ async fn tenant_drafts_may_only_add() {
     );
     let draft = parse_draft(&clash).unwrap();
     let problems = check_draft(&state, &layer, &draft, &clash).await.unwrap();
-    assert!(problems[0].message.contains("tenant rules can only add"));
+    assert!(problems[0].message.contains("Tenant rules can only add"));
     // A tenant rule over a server label is fine (the merge classifies it).
     let ok = "version: 1\nrules:\n  - name: acme-email\n    when: { label: pii.email }\n    deny: true\n";
     let draft = parse_draft(ok).unwrap();

@@ -244,6 +244,74 @@ pub fn parse_draft(text: &str) -> Result<PolicySpec, Vec<Problem>> {
     Ok(spec)
 }
 
+/// Keys that would take something away from another layer. Layers only add.
+const SUBTRACTIVE_KEYS: [&str; 3] = ["disable", "remove", "override"];
+
+/// Parse a draft for a preview: like [`parse_draft`], but a subtractive key
+/// (`disable` / `remove` / `override`) is reported on its line and the rest of
+/// the draft is still parsed, so every problem shows at once.
+pub fn parse_draft_all(text: &str, layer: &Layer) -> (Option<PolicySpec>, Vec<Problem>) {
+    let doc: crate::yaml::Value = match crate::yaml::from_str(text) {
+        Ok(v) => v,
+        Err(_) => return split(parse_draft(text)),
+    };
+    let crate::yaml::Value::Mapping(mut map) = doc else {
+        return split(parse_draft(text));
+    };
+    let mut problems = Vec::new();
+    for key in SUBTRACTIVE_KEYS {
+        let Some(value) = map.remove(crate::yaml::Value::String(key.into())) else {
+            continue;
+        };
+        let names = match &value {
+            crate::yaml::Value::Sequence(items) => items
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| format!("`{s}`")))
+                .collect::<Vec<_>>()
+                .join(", "),
+            crate::yaml::Value::String(s) => format!("`{s}`"),
+            _ => String::new(),
+        };
+        let message = match (layer, names.is_empty()) {
+            (Layer::Tenant(_), false) => format!(
+                "A tenant policy cannot {key} a server rule. Remove `{key}`; ask the server \
+                 operator about {names}."
+            ),
+            (Layer::Tenant(_), true) => {
+                format!("A tenant policy cannot {key} a server rule. Remove `{key}`.")
+            }
+            (Layer::Server, _) => {
+                format!("A policy cannot {key} a rule: layers only add. Remove `{key}`.")
+            }
+        };
+        let line = text
+            .lines()
+            .position(|l| l.starts_with(&format!("{key}:")))
+            .map(|i| i + 1);
+        problems.push(Problem { line, message });
+    }
+    if problems.is_empty() {
+        return split(parse_draft(text));
+    }
+    match crate::yaml::from_value::<PolicySpec>(crate::yaml::Value::Mapping(map)) {
+        Ok(spec) => (Some(spec), problems),
+        Err(e) => {
+            problems.push(Problem {
+                line: None,
+                message: e.to_string(),
+            });
+            (None, problems)
+        }
+    }
+}
+
+fn split(r: Result<PolicySpec, Vec<Problem>>) -> (Option<PolicySpec>, Vec<Problem>) {
+    match r {
+        Ok(s) => (Some(s), Vec::new()),
+        Err(p) => (None, p),
+    }
+}
+
 /// Which layer a draft is for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Layer {
@@ -337,8 +405,8 @@ pub async fn check_draft(
                         problems.push(Problem::at(
                             text,
                             format!(
-                                "rule '{}' is a server rule; tenant rules can only add, so give \
-                                 yours another name",
+                                "`{}` is a server rule. Tenant rules can only add: pick a new \
+                                 name.",
                                 rule.name
                             ),
                         ));
@@ -936,6 +1004,7 @@ pub fn outline(spec: &PolicySpec) -> Vec<RuleOutline> {
 /// Columns the catalog has seen in the last 30 days that a classification
 /// labels by name, per label: `{label: {columns, datasets}}`.
 pub async fn columns_seen(state: &ServerState, spec: &PolicySpec) -> BTreeMap<String, Value> {
+    #[cfg_attr(not(feature = "catalog"), allow(unused_mut))]
     let mut out = BTreeMap::new();
     let Ok(compiled) = CompiledPolicy::compile(spec) else {
         return out;

@@ -26,7 +26,7 @@ export const href = {
   trigger: (name) => `#/triggers/${enc(name)}`,
   overview: () => "#/overview",
   schedules: () => "#/schedules",
-  policy: () => "#/policy",
+  policy: (tenant) => (tenant ? `#/policy?tenant=${encodeURIComponent(tenant)}` : "#/policy"),
   settings: () => "#/settings",
 };
 

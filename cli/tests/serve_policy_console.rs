@@ -464,7 +464,7 @@ async fn tenant_policies_only_add_and_apply_to_that_tenants_runs() {
         pv["problems"][0]["message"]
             .as_str()
             .unwrap()
-            .contains("tenant rules can only add")
+            .contains("Tenant rules can only add")
     );
     let disable = "version: 1\ndisable: [pii-to-eu-only]\n";
     let (_, pv) = api

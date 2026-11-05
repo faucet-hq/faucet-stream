@@ -314,20 +314,21 @@ async fn preview_layer(
     let current = policies::latest(state, &scope).await?;
     let current_version = current.as_ref().map(|r| r.version);
     let next_version = current_version.unwrap_or(0) + 1;
-    let draft = match policies::parse_draft(text) {
-        Ok(d) => d,
-        Err(problems) => {
-            return Ok(PreviewResponse {
-                valid: false,
-                problems,
-                current_version,
-                next_version,
-                diff: Vec::new(),
-                impact: None,
-            });
-        }
+    let (draft, mut problems) = policies::parse_draft_all(text, &layer);
+    let Some(draft) = draft else {
+        return Ok(PreviewResponse {
+            valid: false,
+            problems,
+            current_version,
+            next_version,
+            diff: Vec::new(),
+            impact: None,
+        });
     };
-    let problems = policies::check_draft(state, &layer, &draft, text).await?;
+    let mut checked = policies::check_draft(state, &layer, &draft, text).await?;
+    checked.append(&mut problems);
+    let mut problems = checked;
+    problems.sort_by_key(|p| p.line.unwrap_or(usize::MAX));
     let before_text = match &current {
         Some(r) => policies::canonical_yaml(&policies::spec_of(r)?),
         None => String::new(),
