@@ -1077,6 +1077,12 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check advisories
+      # The fuzz crate is its own workspace with its own lockfile.
+      - name: Advisories (fuzz workspace)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: fuzz/Cargo.toml
+          command: check advisories
 
   # Every third-party crate in Cargo.lock is audited (imported from the
   # audit sets in supply-chain/config.toml) or listed as an exemption. A new

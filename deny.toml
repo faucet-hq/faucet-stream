@@ -75,6 +75,10 @@ ignore = [
     { id = "RUSTSEC-2026-0404", reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; affected APIs unused (2026-10-28)" },
     { id = "RUSTSEC-2026-0405", reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; affected APIs unused (2026-10-28)" },
     { id = "RUSTSEC-2026-0406", reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; affected APIs unused (2026-10-28)" },
+    # 2026-11-05 — astral-tokio-tar is unmaintained (Astral ended it on
+    # 2026-11-03). Only testcontainers uses it, a test-only dependency, and its
+    # newest release (0.28) still does. Drop when testcontainers moves off it.
+    { id = "RUSTSEC-2026-0440", reason = "astral-tokio-tar via testcontainers (tests only); no release without it (2026-11-05)" },
 ]
 
 [licenses]
@@ -113,3 +117,7 @@ deny = []
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[graph]
+# Check every optional connector and feature, not only default features.
+all-features = true

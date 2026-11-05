@@ -80,3 +80,7 @@ reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; affected APIs unused (2026
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0406"
 reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; affected APIs unused (2026-10-28)"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0440"
+reason = "astral-tokio-tar via testcontainers (tests only); no release without it (2026-11-05)"

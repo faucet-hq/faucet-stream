@@ -499,7 +499,7 @@ version = "58.4.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow]]
-version = "59.3.0"
+version = "59.3.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow-arith]]
@@ -507,7 +507,7 @@ version = "58.4.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow-arith]]
-version = "59.3.0"
+version = "59.3.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow-array]]
@@ -515,7 +515,7 @@ version = "58.4.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow-array]]
-version = "59.3.0"
+version = "59.3.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow-buffer]]
@@ -523,7 +523,7 @@ version = "58.4.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow-buffer]]
-version = "59.3.0"
+version = "59.3.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow-cast]]
@@ -531,7 +531,7 @@ version = "58.4.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow-cast]]
-version = "59.3.0"
+version = "59.3.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow-csv]]
@@ -539,7 +539,7 @@ version = "58.4.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow-csv]]
-version = "59.3.0"
+version = "59.3.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow-data]]
@@ -547,7 +547,7 @@ version = "58.4.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow-data]]
-version = "59.3.0"
+version = "59.3.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow-ipc]]
@@ -555,7 +555,7 @@ version = "58.4.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow-ipc]]
-version = "59.3.0"
+version = "59.3.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow-json]]
@@ -563,7 +563,7 @@ version = "58.4.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow-json]]
-version = "59.3.0"
+version = "59.3.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow-ord]]
@@ -571,7 +571,7 @@ version = "58.4.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow-ord]]
-version = "59.3.0"
+version = "59.3.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow-row]]
@@ -579,7 +579,7 @@ version = "58.4.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow-row]]
-version = "59.3.0"
+version = "59.3.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow-schema]]
@@ -587,7 +587,7 @@ version = "58.4.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow-schema]]
-version = "59.3.0"
+version = "59.3.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow-select]]
@@ -595,7 +595,7 @@ version = "58.4.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow-select]]
-version = "59.3.0"
+version = "59.3.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow-string]]
@@ -603,7 +603,7 @@ version = "58.4.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow-string]]
-version = "59.3.0"
+version = "59.3.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.as-any]]
@@ -703,83 +703,83 @@ version = "0.6.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-config]]
-version = "1.8.16"
+version = "1.13.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-credential-types]]
-version = "1.3.0"
+version = "1.3.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-lc-rs]]
-version = "1.18.1"
+version = "1.19.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-lc-sys]]
-version = "0.45.0"
+version = "0.47.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-runtime]]
-version = "1.10.0"
+version = "1.10.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-sdk-dynamodb]]
-version = "1.117.0"
+version = "1.134.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-sdk-dynamodbstreams]]
-version = "1.105.0"
+version = "1.120.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-sdk-glue]]
-version = "1.145.1"
+version = "1.180.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-sdk-kinesis]]
-version = "1.125.0"
+version = "1.128.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-sdk-redshift]]
-version = "1.123.0"
+version = "1.126.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-sdk-redshiftdata]]
-version = "1.121.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.aws-sdk-redshiftserverless]]
 version = "1.124.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.aws-sdk-redshiftserverless]]
+version = "1.127.0"
+criteria = "safe-to-deploy"
+
 [[exemptions.aws-sdk-s3]]
-version = "1.152.0"
+version = "1.155.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-sdk-secretsmanager]]
-version = "1.104.0"
+version = "1.123.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-sdk-sqs]]
-version = "1.103.0"
+version = "1.117.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-sdk-sso]]
-version = "1.98.0"
+version = "1.117.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-sdk-ssooidc]]
-version = "1.100.0"
+version = "1.119.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-sdk-sts]]
-version = "1.103.0"
+version = "1.122.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-sigv4]]
-version = "1.6.0"
+version = "1.6.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-smithy-async]]
-version = "1.3.0"
+version = "1.3.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-smithy-checksums]]
@@ -787,31 +787,19 @@ version = "0.65.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-smithy-eventstream]]
-version = "0.61.4"
+version = "0.61.6"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-smithy-http]]
-version = "0.63.6"
-criteria = "safe-to-deploy"
-
-[[exemptions.aws-smithy-http]]
-version = "0.64.1"
+version = "0.64.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-smithy-http-client]]
-version = "1.5.0"
+version = "1.5.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-smithy-json]]
-version = "0.62.7"
-criteria = "safe-to-deploy"
-
-[[exemptions.aws-smithy-json]]
-version = "0.63.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.aws-smithy-observability]]
-version = "0.2.6"
+version = "0.65.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-smithy-observability]]
@@ -819,47 +807,35 @@ version = "0.3.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-smithy-query]]
-version = "0.60.15"
-criteria = "safe-to-deploy"
-
-[[exemptions.aws-smithy-query]]
-version = "0.62.1"
+version = "0.64.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-smithy-runtime]]
-version = "1.16.0"
+version = "1.16.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-smithy-runtime-api]]
-version = "1.19.0"
+version = "1.19.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-smithy-runtime-api-macros]]
+version = "1.2.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.aws-smithy-schema]]
 version = "1.1.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.aws-smithy-schema]]
-version = "0.1.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.aws-smithy-schema]]
-version = "0.2.1"
-criteria = "safe-to-deploy"
-
 [[exemptions.aws-smithy-types]]
-version = "1.8.1"
+version = "1.9.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-smithy-xml]]
-version = "0.60.15"
-criteria = "safe-to-deploy"
-
-[[exemptions.aws-smithy-xml]]
-version = "0.62.1"
+version = "0.64.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-types]]
-version = "1.6.0"
+version = "1.7.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.axum]]
@@ -883,15 +859,11 @@ version = "1.0.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.azure_security_keyvault_secrets]]
-version = "1.0.0"
+version = "1.0.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.backon]]
 version = "1.6.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.base16ct]]
-version = "0.2.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.base16ct]]
@@ -1559,10 +1531,6 @@ version = "1.0.20"
 criteria = "safe-to-deploy"
 
 [[exemptions.ecdsa]]
-version = "0.16.9"
-criteria = "safe-to-deploy"
-
-[[exemptions.ecdsa]]
 version = "0.17.0"
 criteria = "safe-to-deploy"
 
@@ -1585,10 +1553,6 @@ criteria = "safe-to-deploy"
 [[exemptions.either-or-both]]
 version = "0.3.1"
 criteria = "safe-to-run"
-
-[[exemptions.elliptic-curve]]
-version = "0.13.8"
-criteria = "safe-to-deploy"
 
 [[exemptions.elliptic-curve]]
 version = "0.14.1"
@@ -1676,10 +1640,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.ferroid]]
 version = "2.0.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.ff]]
-version = "0.13.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.ff]]
@@ -1896,10 +1856,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.google-cloud-wkt]]
 version = "1.10.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.group]]
-version = "0.13.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.group]]
@@ -2819,10 +2775,6 @@ version = "0.2.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.p256]]
-version = "0.13.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.p256]]
 version = "0.14.0"
 criteria = "safe-to-deploy"
 
@@ -2859,7 +2811,7 @@ version = "58.4.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.parquet]]
-version = "59.3.0"
+version = "59.3.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.parse-display]]
@@ -3060,10 +3012,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.primefield]]
 version = "0.14.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.primeorder]]
-version = "0.13.6"
 criteria = "safe-to-deploy"
 
 [[exemptions.primeorder]]
@@ -3387,10 +3335,6 @@ version = "0.7.6"
 criteria = "safe-to-deploy"
 
 [[exemptions.rfc6979]]
-version = "0.4.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.rfc6979]]
 version = "0.6.0"
 criteria = "safe-to-deploy"
 
@@ -3564,10 +3508,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.scrypt]]
 version = "0.12.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.sec1]]
-version = "0.7.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.sec1]]
@@ -4224,10 +4164,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.walkdir]]
 version = "2.5.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.want]]
-version = "0.3.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.wasi]]
