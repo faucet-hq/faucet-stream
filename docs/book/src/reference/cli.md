@@ -443,6 +443,10 @@ that needs to understand the interpolation syntax without reading the docs.
 (the `TriggersFile` / `TriggerSpec` / `TriggerKind` types). Requires the
 `triggers` Cargo feature.
 
+`faucet schema schedules` prints the JSON Schema for the `--schedules` file
+format (`SchedulesFile` / `ScheduleSpec`). Requires the `schedule` and
+`templates` Cargo features. See [Schedules](../cookbook/schedules.md).
+
 `faucet schema catalog` prints the JSON Schema for the top-level `catalog:`
 (Data Movement Catalog store) block — see
 [the catalog cookbook](../cookbook/catalog.md). Requires the `catalog` Cargo
@@ -1450,6 +1454,8 @@ Selected flags (`faucet serve --help` for the full list):
 | `--log-link-template <url>` | Link to a run's logs in the log service, shown in the console and returned by the log endpoint once the local copy aged out. Placeholders `{run_id} {pipeline} {row} {tenant} {started_at} {ended_at}` (env `FAUCET_SERVE_LOG_LINK_TEMPLATE`). |
 | `--log-export-notify-after-secs <n>` | Emit `log_export_failed` once a run's log export has been failing this long (default `300`). |
 | `--triggers <path>` | Path to a YAML triggers file that defines event-driven watchers (object-arrival / webhook / queue-depth). Requires the `triggers` Cargo feature. See [Triggers reference](./triggers.md). |
+| `--schedules <path>` | Path to a YAML/JSON schedules file: registered templates to run on a cron, read-only in the console (schedules made through the API or console live in the run history). Requires the `schedule` and `templates` Cargo features. See [Schedules](../cookbook/schedules.md). |
+| `--tenant-schedule-min-interval-secs <n>` | Shortest gap allowed between the ticks of a schedule a tenant owns (default `300`; `0` = no limit). |
 | `--require-approval <kind>` | Require an approved [change request](../cookbook/approvals.md) before these actions happen: `run` (`POST /v1/runs` and template triggers answer with a pending request; backfills are refused), `template_register`, `template_launch`, `template_delete`, `template_deprecate` (the last two are also gated by `template_launch`). Repeatable or comma-separated. Who may approve is the `approvals:` block of `--auth-config`. The template kinds gate the lifecycle routes and MCP tools (`409`); `template_register`, `template_launch` and `template_deprecate` cannot be combined with `--templates-sync`. |
 | `--approval-expiry-secs <n>` | How long a pending change request stays approvable when `approvals.expire_secs` does not say. Default `86400`. |
 | `--vault-key <key>` | Key that seals secrets at rest (AES-256-GCM; env `FAUCET_VAULT_KEY`): [tenant connection](../cookbook/embedded-integrations.md) credentials, and on a `--cluster` server the `secret: true` params a [template trigger](../cookbook/cluster.md#3-per-run-secret-template-params-need-a-vault-key) supplies. At least 32 bytes of random key material (`openssl rand -hex 32`); a shorter key is refused at startup. Each sealed value is bound to its owner (tenant + connection, or the run id), so a row copied onto another record does not open. On a `--cluster` server it also seals each pending run's stored config whole before it is written to the shared history. Every cluster member needs the same key. Without it the server refuses to store or open tenant connections, a clustered server refuses template triggers that supply a `secret: true` param, and stored configs are kept as submitted. Requires the `encryption` feature (tenants also need `tenants`). |

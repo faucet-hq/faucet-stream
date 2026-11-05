@@ -77,7 +77,7 @@ The sidebar groups the pages: **Operate** (Overview, Runs, Changes, Triggers,
 Schedules), **Data** (Datasets, Lineage), **Build** (Templates, Schemas,
 Submit), **Govern** (Policy, Usage, Tenants) and **Admin** (Audit log,
 Settings). Badges count running runs, pending change requests, datasets,
-templates and tenants. Schedules and Policy are marked *soon*: their pages say
+templates, tenants and schedules. Policy is marked *soon*: its page says
 what will live there and how to do it today.
 
 - **Go to… / ⌘K** (Ctrl+K) opens a palette over pages, recent runs, datasets,
@@ -160,10 +160,25 @@ do), its impact on downstream datasets, the approvals so far and its history;
 ### Triggers
 
 **Triggers** lists the event triggers loaded from `--triggers`
-(`GET /v1/triggers`): type, schedule or webhook methods, health, last fire and
-fire / error counts. A webhook trigger shows a ready-to-paste `curl` and a
+(`GET /v1/triggers`): type, store or webhook methods, health, last fire and
+fire / error counts. Cron schedules have their own page. A webhook trigger shows a ready-to-paste `curl` and a
 **Fire** button; a trigger in error backoff shows its last error. Without a
 triggers file the page says how to add one.
+
+### Schedules
+
+**Schedules** lists every schedule with its next tick, grouped into *Needs
+attention*, *Active* and *Paused*, with counts of ticks today and missed
+ticks (`GET /v1/schedules`). A schedule's page shows its next ticks in its
+timezone and in UTC, what it runs (template, version, params — secret ones
+as *sealed*), its tenants, recent ticks with their runs, missed ticks and its
+change history, with **Run now**, **Pause**/**Resume**, **Edit** and
+**Delete**. **New** opens a form that builds the params from the template,
+previews the next ticks as you type the cron, and becomes **Request
+approval** under `--require-approval schedule`. Schedules from the
+`--schedules` file are read-only. With a tenant picked in the switcher the
+page shows the schedules that run for it, and its runs only. See
+[Schedules](./schedules.md).
 
 ### Submit
 
@@ -395,6 +410,8 @@ The console calls these bearer-gated endpoints (any other client can too):
 | `GET` | `/v1/overview` | Fleet trends over the run history, behind the Overview page. |
 | `GET` | `/v1/runs/{id}/config` | A run's stored config, credentials masked, behind the run's Config tab. |
 | `GET` | `/v1/triggers` | The loaded triggers with health and fire counts, behind the Triggers page. |
+| `GET` | `/v1/schedules`, `/v1/schedules/{name}` | Schedules with their status, ticks and history, behind the Schedules page. |
+| `POST` | `/v1/schedules/preview` | The next ticks of a cron, for the schedule form. |
 | `GET` | `/v1/audit/{id}` | One audit entry, behind the Audit log's entry links. |
 | `POST` | `/v1/doctor` | Validate and probe a submitted config without running it. Returns 200 (all probes pass) or 422 (any probe fails) with a probe report. Request body: `{ "config": "<yaml-or-json>", "config_format": "yaml" }`. |
 

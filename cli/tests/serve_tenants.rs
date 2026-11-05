@@ -126,6 +126,12 @@ impl Api {
     async fn get(&self, token: &str, p: &str) -> (u16, Value) {
         self.send(reqwest::Method::GET, token, p, None).await
     }
+    async fn put(&self, token: &str, p: &str, body: Value) -> (u16, Value) {
+        self.send(reqwest::Method::PUT, token, p, Some(body)).await
+    }
+    async fn delete(&self, token: &str, p: &str) -> (u16, Value) {
+        self.send(reqwest::Method::DELETE, token, p, None).await
+    }
     async fn wait_run(&self, run_id: &str) -> Value {
         for _ in 0..800 {
             let (_, rec) = self.get("admin-tok", &format!("/v1/runs/{run_id}")).await;
@@ -158,6 +164,17 @@ async fn spawn_full(
     triggers: Option<std::path::PathBuf>,
     require_approval: Vec<String>,
 ) -> Api {
+    spawn_tuned(dir, history, idp, triggers, require_approval, |_| {}).await
+}
+
+async fn spawn_tuned(
+    dir: &std::path::Path,
+    history: Option<String>,
+    idp: &str,
+    triggers: Option<std::path::PathBuf>,
+    require_approval: Vec<String>,
+    tune: impl FnOnce(&mut faucet_cli::serve::ServeConfig),
+) -> Api {
     let providers = dir.join("providers.yaml");
     std::fs::write(
         &providers,
@@ -177,6 +194,7 @@ async fn spawn_full(
     ))
     .unwrap();
     config.log_level = "warn".into();
+    tune(&mut config);
     tokio::spawn(async move {
         let _ = faucet_cli::serve::run_server(
             config,
@@ -1481,4 +1499,373 @@ async fn a_tenant_run_sends_an_escaped_auth_value_unescaped() {
     let rec = api.wait_run(run["run_id"].as_str().unwrap()).await;
     assert_eq!(rec["status"], "completed", "{rec}");
     assert_eq!(lines(&out), 1);
+}
+
+/// A pipeline template that reads one page from `base` and appends it to `out`.
+#[cfg(feature = "schedule")]
+fn plain_template(base: &str, out: &std::path::Path) -> String {
+    format!(
+        "version: 1\nkind: pipeline\nname: plain-sync\npipeline:\n  source:\n    type: rest\n    config:\n      base_url: \"{base}\"\n      path: /rows\n  sink:\n    type: jsonl\n    config:\n      path: \"{}\"\ntests:\n  suite:\n    auto: {{ defaults_baseline: true }}\n",
+        out.display()
+    )
+}
+
+#[cfg(feature = "schedule")]
+async fn rows_mock() -> MockServer {
+    let m = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rows"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{"id": 1}])))
+        .mount(&m)
+        .await;
+    m
+}
+
+#[cfg(feature = "schedule")]
+fn names(v: &Value) -> Vec<String> {
+    v["schedules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// #1044: create, read, edit, pause, resume, run now and delete a schedule
+/// over HTTP; a viewer reads but cannot write; a schedule from the
+/// `--schedules` file is read-only but can be run now.
+#[cfg(feature = "schedule")]
+#[tokio::test(flavor = "multi_thread")]
+async fn schedules_are_managed_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let rows = rows_mock().await;
+    let out = dir.path().join("out.jsonl");
+    let file = dir.path().join("schedules.yaml");
+    std::fs::write(
+        &file,
+        "version: 1\nschedules:\n  - name: from-file\n    cron: \"0 3 * * *\"\n    template: { id: plain-sync }\n",
+    )
+    .unwrap();
+    let f = file.clone();
+    let api = spawn_tuned(dir.path(), None, &rows.uri(), None, Vec::new(), move |c| {
+        c.schedules.path = Some(f);
+    })
+    .await;
+    let (code, reg) = api
+        .post(
+            "admin-tok",
+            "/v1/templates",
+            json!({"config": plain_template(&rows.uri(), &out), "launch": true}),
+        )
+        .await;
+    assert_eq!(code, 201, "{reg}");
+
+    let (code, prev) = api
+        .post(
+            "view-tok",
+            "/v1/schedules/preview",
+            json!({"cron": "0 2 * * *", "timezone": "Europe/Berlin"}),
+        )
+        .await;
+    assert_eq!(code, 200, "{prev}");
+    assert_eq!(prev["valid"], true, "{prev}");
+    assert!(!prev["next_ticks"].as_array().unwrap().is_empty(), "{prev}");
+    let (_, bad) = api
+        .post("view-tok", "/v1/schedules/preview", json!({"cron": "nope"}))
+        .await;
+    assert_eq!(bad["valid"], false, "{bad}");
+
+    let spec = json!({"name": "nightly", "cron": "0 2 * * *", "timezone": "Europe/Berlin",
+                      "template": {"id": "plain-sync"}, "run": {"labels": {"team": "finance"}}});
+    let (code, _) = api.post("view-tok", "/v1/schedules", spec.clone()).await;
+    assert_eq!(code, 403);
+    let (code, made) = api.post("op-tok", "/v1/schedules", spec.clone()).await;
+    assert_eq!(code, 201, "{made}");
+    assert_eq!(made["source"], "console", "{made}");
+    assert_eq!(made["created_by"], "bob", "{made}");
+    let (code, dup) = api.post("op-tok", "/v1/schedules", spec.clone()).await;
+    assert_eq!(code, 409, "{dup}");
+    let (code, unknown) = api
+        .post(
+            "op-tok",
+            "/v1/schedules",
+            json!({"name": "ghost", "cron": "0 2 * * *", "template": {"id": "nope"}}),
+        )
+        .await;
+    assert!(code == 404 || code == 422, "{code} {unknown}");
+
+    let (code, list) = api.get("view-tok", "/v1/schedules").await;
+    assert_eq!(code, 200, "{list}");
+    let n = names(&list);
+    assert_eq!(n.len(), 2, "{list}");
+    assert!(n.contains(&"nightly".to_string()) && n.contains(&"from-file".to_string()));
+
+    let mut edited = spec.clone();
+    edited["cron"] = json!("0 3 * * *");
+    let (code, upd) = api.put("op-tok", "/v1/schedules/nightly", edited).await;
+    assert_eq!(code, 200, "{upd}");
+    assert_eq!(upd["cron"], "0 3 * * *");
+    assert_eq!(upd["revision"], 2, "{upd}");
+
+    let (code, p) = api
+        .post(
+            "op-tok",
+            "/v1/schedules/nightly/pause",
+            json!({"reason": "maintenance"}),
+        )
+        .await;
+    assert_eq!(code, 200, "{p}");
+    assert_eq!(p["paused"], true);
+    assert_eq!(p["pause_reason"], "maintenance");
+    let (code, r) = api
+        .post("op-tok", "/v1/schedules/nightly/resume", json!({}))
+        .await;
+    assert_eq!(code, 200, "{r}");
+    assert_eq!(r["paused"], false);
+
+    let (code, ran) = api
+        .post("op-tok", "/v1/schedules/nightly/run", json!({}))
+        .await;
+    assert_eq!(code, 202, "{ran}");
+    let run_id = ran["runs"][0].as_str().unwrap().to_string();
+    let rec = api.wait_run(&run_id).await;
+    assert_eq!(rec["status"], "completed", "{rec}");
+    assert_eq!(rec["labels"]["schedule"], "nightly", "{rec}");
+    assert_eq!(rec["labels"]["team"], "finance", "{rec}");
+    assert!(rec["labels"]["schedule_manual"].is_string(), "{rec}");
+
+    let (code, d) = api.get("view-tok", "/v1/schedules/nightly").await;
+    assert_eq!(code, 200, "{d}");
+    assert!(!d["next_ticks"].as_array().unwrap().is_empty(), "{d}");
+    let actions: Vec<&str> = d["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["action"].as_str().unwrap())
+        .collect();
+    for a in ["created", "updated", "paused", "resumed", "run_now"] {
+        assert!(actions.contains(&a), "{a} missing from {actions:?}");
+    }
+
+    // The file schedule: read-only, but it can be run now.
+    let (code, ro) = api
+        .put("op-tok", "/v1/schedules/from-file", spec.clone())
+        .await;
+    assert_eq!(code, 409, "{ro}");
+    let (code, _) = api
+        .post("op-tok", "/v1/schedules/from-file/pause", json!({}))
+        .await;
+    assert_eq!(code, 409);
+    let (code, _) = api.delete("op-tok", "/v1/schedules/from-file").await;
+    assert_eq!(code, 409);
+    let (code, ran) = api
+        .post("op-tok", "/v1/schedules/from-file/run", json!({}))
+        .await;
+    assert_eq!(code, 202, "{ran}");
+
+    let (code, _) = api.delete("op-tok", "/v1/schedules/nightly").await;
+    assert_eq!(code, 204);
+    let (code, _) = api.get("view-tok", "/v1/schedules/nightly").await;
+    assert_eq!(code, 404);
+
+    let (code, audit) = api
+        .get("admin-tok", "/v1/audit?action=schedule.create")
+        .await;
+    assert_eq!(code, 200, "{audit}");
+    assert!(audit.to_string().contains("schedule.create"), "{audit}");
+}
+
+/// #1044: a tenant principal manages only its own tenant's schedules, within
+/// its `max_schedules` and the server's minimum tick interval, and never
+/// fans out; another tenant's schedule is a 404.
+#[cfg(feature = "schedule")]
+#[tokio::test(flavor = "multi_thread")]
+async fn tenant_schedules_keep_to_their_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let rows = rows_mock().await;
+    let out = dir.path().join("out.jsonl");
+    let api = spawn(dir.path(), None, &rows.uri()).await;
+    let (code, t) = api
+        .post(
+            "admin-tok",
+            "/v1/tenants",
+            json!({"id": "acme", "limits": {"max_schedules": 1}}),
+        )
+        .await;
+    assert_eq!(code, 201, "{t}");
+    let (code, _) = api
+        .post("admin-tok", "/v1/tenants", json!({"id": "globex"}))
+        .await;
+    assert_eq!(code, 201);
+    let (code, reg) = api
+        .post(
+            "admin-tok",
+            "/v1/templates",
+            json!({"config": plain_template(&rows.uri(), &out), "launch": true}),
+        )
+        .await;
+    assert_eq!(code, 201, "{reg}");
+
+    let fan = json!({"name": "acme-all", "cron": "0 2 * * *", "template": {"id": "plain-sync"}, "tenants": "all"});
+    let (code, e) = api.post("acme-tok", "/v1/schedules", fan).await;
+    assert_eq!(code, 403, "{e}");
+    let fast = json!({"name": "acme-fast", "cron": "*/2 * * * *", "template": {"id": "plain-sync"}});
+    let (code, e) = api.post("acme-tok", "/v1/schedules", fast).await;
+    assert_eq!(code, 422, "{e}");
+    assert!(e.to_string().contains("every 5 minutes"), "{e}");
+    let ok = json!({"name": "acme-nightly", "cron": "0 2 * * *", "template": {"id": "plain-sync"}});
+    let (code, made) = api.post("acme-tok", "/v1/schedules", ok).await;
+    assert_eq!(code, 201, "{made}");
+    assert_eq!(made["tenant"], "acme", "{made}");
+    let second = json!({"name": "acme-second", "cron": "0 4 * * *", "template": {"id": "plain-sync"}});
+    let (code, e) = api.post("acme-tok", "/v1/schedules", second).await;
+    assert_eq!(code, 422, "{e}");
+    assert!(e.to_string().contains("max_schedules"), "{e}");
+
+    // Pausing does not free a slot.
+    let (code, _) = api
+        .post("acme-tok", "/v1/schedules/acme-nightly/pause", json!({}))
+        .await;
+    assert_eq!(code, 200);
+    let again = json!({"name": "acme-third", "cron": "0 5 * * *", "template": {"id": "plain-sync"}});
+    let (code, _) = api.post("acme-tok", "/v1/schedules", again).await;
+    assert_eq!(code, 422);
+
+    let (code, g) = api
+        .post(
+            "op-tok",
+            "/v1/schedules",
+            json!({"name": "globex-only", "cron": "0 2 * * *", "template": {"id": "plain-sync"}, "tenants": ["globex"]}),
+        )
+        .await;
+    assert_eq!(code, 201, "{g}");
+    let (code, _) = api.get("acme-tok", "/v1/schedules/globex-only").await;
+    assert_eq!(code, 404);
+    let (code, list) = api.get("acme-tok", "/v1/schedules").await;
+    assert_eq!(code, 200, "{list}");
+    assert_eq!(names(&list), vec!["acme-nightly".to_string()], "{list}");
+    assert_eq!(list["max_schedules"], 1, "{list}");
+
+    // An operator scoped to globex sees the shared schedule, not acme's.
+    let (_, scoped) = api.get("op-tok", "/v1/schedules?tenant=globex").await;
+    assert_eq!(names(&scoped), vec!["globex-only".to_string()], "{scoped}");
+}
+
+/// #1044: under `--require-approval schedule`, a create becomes a change
+/// request; approving it creates the schedule.
+#[cfg(feature = "schedule")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gated_schedule_change_waits_for_approval() {
+    let dir = tempfile::tempdir().unwrap();
+    let rows = rows_mock().await;
+    let out = dir.path().join("out.jsonl");
+    let api = spawn_full(
+        dir.path(),
+        None,
+        &rows.uri(),
+        None,
+        vec!["schedule".to_string()],
+    )
+    .await;
+    let (code, reg) = api
+        .post(
+            "admin-tok",
+            "/v1/templates",
+            json!({"config": plain_template(&rows.uri(), &out), "launch": true}),
+        )
+        .await;
+    assert_eq!(code, 201, "{reg}");
+    let (code, pending) = api
+        .post(
+            "op-tok",
+            "/v1/schedules?reason=nightly",
+            json!({"name": "gated", "cron": "0 2 * * *", "template": {"id": "plain-sync"}}),
+        )
+        .await;
+    assert_eq!(code, 202, "{pending}");
+    assert_eq!(pending["status"], "pending_approval", "{pending}");
+    let (code, list) = api.get("op-tok", "/v1/schedules").await;
+    assert_eq!(code, 200);
+    assert_eq!(list["requires_approval"], true, "{list}");
+    assert!(names(&list).is_empty(), "{list}");
+    let id = pending["change_id"].as_str().unwrap().to_string();
+    let (code, done) = api
+        .post("admin-tok", &format!("/v1/changes/{id}/approve"), json!({}))
+        .await;
+    assert_eq!(code, 200, "{done}");
+    assert_eq!(done["status"], "executed", "{done}");
+    let (code, s) = api.get("op-tok", "/v1/schedules/gated").await;
+    assert_eq!(code, 200, "{s}");
+    assert_eq!(s["schedule"]["created_by"], "bob", "{s}");
+}
+
+/// #1044: two servers on one history fire each tick of a schedule once.
+#[cfg(feature = "schedule")]
+#[tokio::test(flavor = "multi_thread")]
+async fn two_servers_on_one_history_fire_each_tick_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let rows = rows_mock().await;
+    let out = dir.path().join("out.jsonl");
+    let db = format!("sqlite:{}", dir.path().join("history.db").display());
+    let a = spawn(dir.path(), Some(db.clone()), &rows.uri()).await;
+    let b_dir = dir.path().join("b");
+    std::fs::create_dir_all(&b_dir).unwrap();
+    let _b = spawn(&b_dir, Some(db), &rows.uri()).await;
+    let (code, reg) = a
+        .post(
+            "admin-tok",
+            "/v1/templates",
+            json!({"config": plain_template(&rows.uri(), &out), "launch": true}),
+        )
+        .await;
+    assert_eq!(code, 201, "{reg}");
+    let (code, made) = a
+        .post(
+            "op-tok",
+            "/v1/schedules",
+            json!({"name": "every-second", "cron": "* * * * * *", "template": {"id": "plain-sync"}, "overlap": "queue"}),
+        )
+        .await;
+    assert_eq!(code, 201, "{made}");
+    let mut per_tick = std::collections::BTreeMap::<String, usize>::new();
+    for _ in 0..600 {
+        per_tick.clear();
+        let (_, page) = a
+            .get("admin-tok", "/v1/runs?label=schedule:every-second&limit=200")
+            .await;
+        for r in page["runs"].as_array().unwrap() {
+            *per_tick
+                .entry(r["labels"]["schedule_tick"].as_str().unwrap().to_string())
+                .or_default() += 1;
+        }
+        if per_tick.len() >= 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(per_tick.len() >= 4, "{per_tick:?}");
+    assert!(
+        per_tick.values().all(|n| *n == 1),
+        "a tick fired twice: {per_tick:?}"
+    );
+}
+
+/// #1044: a `type: schedule` trigger is refused with a pointer to
+/// `--schedules`.
+#[cfg(feature = "triggers")]
+#[tokio::test]
+async fn a_schedule_in_a_triggers_file_points_to_schedules() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("triggers.yaml");
+    std::fs::write(
+        &p,
+        "version: 1\ntriggers:\n  - name: hourly\n    type: schedule\n    cron: \"0 * * * *\"\n    config: { version: 1 }\n",
+    )
+    .unwrap();
+    let err = faucet_cli::serve::triggers::load_triggers(&p)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("--schedules"), "{err}");
+    assert!(err.contains("hourly"), "{err}");
 }

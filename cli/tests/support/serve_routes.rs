@@ -124,6 +124,21 @@ const ROUTES_TENANTS: &[(&str, &str)] = &[
     ("GET", "/v1/connect/callback"),
 ];
 
+/// Schedules (#1044). Without the features only `GET /v1/schedules` is
+/// wired, answering `available: false`.
+#[cfg(all(feature = "schedule", feature = "templates"))]
+const ROUTES_SCHEDULES: &[(&str, &str)] = &[
+    ("GET", "/v1/schedules"),
+    ("POST", "/v1/schedules"),
+    ("POST", "/v1/schedules/preview"),
+    ("GET", "/v1/schedules/{name}"),
+    ("PUT", "/v1/schedules/{name}"),
+    ("DELETE", "/v1/schedules/{name}"),
+    ("POST", "/v1/schedules/{name}/pause"),
+    ("POST", "/v1/schedules/{name}/resume"),
+    ("POST", "/v1/schedules/{name}/run"),
+];
+
 #[cfg(feature = "mcp")]
 const ROUTES_MCP: &[(&str, &str)] = &[("POST", "/mcp")];
 
@@ -154,6 +169,10 @@ pub fn canonical_routes() -> BTreeSet<(String, String)> {
     for (m, p) in ROUTES_TENANTS {
         set.insert((m.to_string(), p.to_string()));
     }
+    #[cfg(all(feature = "schedule", feature = "templates"))]
+    for (m, p) in ROUTES_SCHEDULES {
+        set.insert((m.to_string(), p.to_string()));
+    }
     #[cfg(feature = "mcp")]
     for (m, p) in ROUTES_MCP {
         set.insert((m.to_string(), p.to_string()));
@@ -175,6 +194,8 @@ pub fn authenticated_routes() -> Vec<(&'static str, &'static str)> {
     all.extend_from_slice(ROUTES_TEMPLATES_SYNC);
     #[cfg(feature = "tenants")]
     all.extend_from_slice(ROUTES_TENANTS);
+    #[cfg(all(feature = "schedule", feature = "templates"))]
+    all.extend_from_slice(ROUTES_SCHEDULES);
     #[cfg(feature = "mcp")]
     all.extend_from_slice(ROUTES_MCP);
     all.into_iter()

@@ -237,6 +237,7 @@ existingSecret, fileName }.
 */}}
 {{- define "faucet-stream.serveFileFeatures" -}}
 triggers: { flag: triggers, volume: serve-triggers, dir: /etc/faucet-triggers }
+schedules: { flag: schedules, volume: serve-schedules, dir: /etc/faucet-schedules }
 templatesSync: { flag: templates-sync, volume: serve-templates-sync, dir: /etc/faucet-templates-sync }
 policy: { flag: policy, volume: serve-policy, dir: /etc/faucet-policy }
 connectProviders: { flag: connect-providers, volume: serve-connect-providers, dir: /etc/faucet-connect-providers }

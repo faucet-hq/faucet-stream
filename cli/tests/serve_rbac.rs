@@ -333,10 +333,17 @@ fn is_mutating(method: &axum::http::Method, path: &str) -> bool {
     //   DLQ; the POST form only carries the config in a body. `--probe` builds
     //   the sink for its read-only watermark read, nothing more. A viewer may
     //   name a registered template; an inline config needs `Doctor`.
+    // - `/v1/schedules/preview` — computes the next ticks of a cron (#1044).
     // - `/v1/mirror/{name}` — reads a mirror's state store (#731); the POST
     //   form only carries the config in a body, gated like `/v1/status`.
     const READ_ONLY_POSTS: &[&str] =
-        &["/mcp", "/v1/dlq/inspect", "/v1/status", "/v1/mirror/{name}"];
+        &[
+        "/mcp",
+        "/v1/dlq/inspect",
+        "/v1/status",
+        "/v1/mirror/{name}",
+        "/v1/schedules/preview",
+    ];
     if READ_ONLY_POSTS.contains(&path) {
         return false;
     }

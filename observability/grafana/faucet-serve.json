@@ -700,7 +700,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (trigger) (increase(faucet_serve_trigger_missed_ticks_total[1h]))",
+          "expr": "sum by (schedule) (increase(faucet_serve_schedule_missed_ticks_total[1h]))",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"

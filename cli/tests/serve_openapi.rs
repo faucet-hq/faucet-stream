@@ -58,6 +58,12 @@ fn openapi_routes() -> BTreeSet<(String, String)> {
         {
             continue;
         }
+        // …and the schedule routes (#1044); without them only the `GET`
+        // that answers `available: false` is wired.
+        #[cfg(not(all(feature = "schedule", feature = "templates")))]
+        if path.starts_with("/v1/schedules") {
+            continue;
+        }
         // …and the `mcp` feature's transport (#420).
         #[cfg(not(feature = "mcp"))]
         if path == "/mcp" {

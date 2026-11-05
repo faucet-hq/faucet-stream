@@ -217,28 +217,13 @@ redis-cli RPUSH jobs '{"id":"1","task":"import"}'
 Within `poll_interval_secs` the watcher fires, the pipeline drains the list
 into SQLite, and `/v1/runs` shows the completed run.
 
-## Walkthrough 4 — A nightly template for every tenant
+## Running on a cron
 
-A `schedule` trigger (needs the `schedule` feature) runs a registered
-template on a cron, and `tenants: all` fans each tick out to one run per
-[tenant](./embedded-integrations.md):
-
-```yaml
-version: 1
-triggers:
-  - name: nightly-crm
-    type: schedule
-    cron: "0 2 * * *"
-    timezone: Europe/Berlin
-    template:
-      id: crm-contacts
-      params: { since: "${trigger.tick}" }
-    tenants: all
-```
-
-Each run carries the tenant's connections, `${tenant.*}` values, state
-namespace and limits. Keys are `trig:nightly-crm:<tick>:<tenant>`, so a
-cluster running the same file starts exactly one run per tenant per tick.
+Triggers react to events. To run a template on a cron — nightly, hourly, on
+the first of the month — use a [schedule](./schedules.md) instead: create it
+in the console's **Schedules** page, through `POST /v1/schedules`, or in a
+file passed to `faucet serve --schedules`. A `type: schedule` entry in a
+triggers file is refused with a pointer there.
 
 ## Monitoring
 

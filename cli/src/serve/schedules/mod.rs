@@ -209,4 +209,14 @@ mod tests {
             crate::serve::config::DEFAULT_TENANT_SCHEDULE_MIN_INTERVAL
         );
     }
+
+    #[cfg(feature = "tenants")]
+    #[tokio::test]
+    async fn the_shipped_example_loads() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples/schedules/schedules.yaml");
+        let f = load_file(&p).await.unwrap();
+        assert_eq!(f.schedules.len(), 3);
+        assert!(f.schedules[2].tenants.is_some());
+    }
 }
