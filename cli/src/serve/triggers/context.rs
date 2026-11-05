@@ -34,12 +34,6 @@ pub enum TriggerEvent {
         /// Rising-edge ordinal (so re-arm + re-cross → distinct run).
         edge: u64,
     },
-    /// A cron tick (#709).
-    Schedule {
-        /// The scheduled instant (RFC 3339) — not the wall-clock fire time,
-        /// so every cluster instance derives the same idempotency key.
-        tick: String,
-    },
 }
 
 impl TriggerEvent {
@@ -48,7 +42,6 @@ impl TriggerEvent {
             TriggerEvent::Object { .. } | TriggerEvent::ObjectBatch { .. } => "object_arrival",
             TriggerEvent::Webhook { .. } => "webhook",
             TriggerEvent::QueueDepth { .. } => "queue_depth",
-            TriggerEvent::Schedule { .. } => "schedule",
         }
     }
 
@@ -103,10 +96,6 @@ impl TriggerEvent {
             TriggerEvent::QueueDepth { queue, depth, .. } => match token {
                 "queue" => Some(queue.clone()),
                 "depth" => Some(depth.to_string()),
-                _ => None,
-            },
-            TriggerEvent::Schedule { tick } => match token {
-                "tick" => Some(tick.clone()),
                 _ => None,
             },
         }
@@ -654,7 +643,6 @@ pub fn idempotency_key(name: &str, event: &TriggerEvent) -> String {
         TriggerEvent::ObjectBatch { watermark, .. } => format!("trig:{name}:{watermark}"),
         TriggerEvent::Webhook { idem, .. } => format!("trig:{name}:{idem}"),
         TriggerEvent::QueueDepth { edge, .. } => format!("trig:{name}:edge:{edge}"),
-        TriggerEvent::Schedule { tick } => format!("trig:{name}:{tick}"),
     }
 }
 
@@ -681,9 +669,6 @@ pub fn labels(name: &str, event: &TriggerEvent) -> BTreeMap<String, String> {
         }
         TriggerEvent::Webhook { method, .. } => {
             m.insert("faucet.trigger.method".into(), method.clone());
-        }
-        TriggerEvent::Schedule { tick } => {
-            m.insert("faucet.trigger.tick".into(), tick.clone());
         }
     }
     m
@@ -877,28 +862,6 @@ mod tests {
         assert_eq!(
             substitute_plain("${trigger.object_key}", &e, "n", "f").unwrap(),
             "incoming/${env:HOME}/x$${env:HOME}.csv"
-        );
-    }
-
-    #[test]
-    fn schedule_events_substitute_label_and_key_by_tick() {
-        let e = TriggerEvent::Schedule {
-            tick: "2026-09-26T02:00:00Z".into(),
-        };
-        assert_eq!(e.type_label(), "schedule");
-        assert_eq!(
-            substitute_plain("since=${trigger.tick}", &e, "n", "f").unwrap(),
-            "since=2026-09-26T02:00:00Z"
-        );
-        assert_eq!(
-            parsed(&substitute("t: ${trigger.tick}", &e, "n", "f").unwrap())["t"],
-            "2026-09-26T02:00:00Z"
-        );
-        assert!(substitute_plain("${trigger.depth}", &e, "n", "f").is_err());
-        assert_eq!(idempotency_key("n", &e), "trig:n:2026-09-26T02:00:00Z");
-        assert_eq!(
-            labels("n", &e)["faucet.trigger.tick"],
-            "2026-09-26T02:00:00Z"
         );
     }
 

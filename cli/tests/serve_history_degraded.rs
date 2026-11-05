@@ -165,6 +165,7 @@ fn config() -> ServeConfig {
             pool_wait_timeout: None,
         },
         triggers_path: None,
+        schedules: Default::default(),
         templates_sync_path: None,
         policy_path: None,
         otel: None,

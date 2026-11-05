@@ -2071,6 +2071,32 @@ pub struct ScheduleArgs {
     pub profile: Option<String>,
 }
 
+/// `faucet serve` schedules (#1044).
+#[cfg(feature = "serve")]
+#[derive(Debug, Clone, clap::Args)]
+pub struct ServeScheduleArgs {
+    /// Path to a schedules file (YAML/JSON): registered templates to run on a
+    /// cron schedule, read-only at runtime (schedules made through the API or
+    /// the console are stored in the run history). Requires a build with the
+    /// `schedule` and `templates` features. See `faucet schema schedules`.
+    #[arg(long, value_name = "PATH")]
+    pub schedules: Option<std::path::PathBuf>,
+    /// The shortest gap allowed between the ticks of a schedule a tenant owns
+    /// (seconds), so one tenant cannot flood the server. `0` = no limit.
+    #[arg(long, default_value_t = 300)]
+    pub tenant_schedule_min_interval_secs: u64,
+}
+
+#[cfg(feature = "serve")]
+impl Default for ServeScheduleArgs {
+    fn default() -> Self {
+        Self {
+            schedules: None,
+            tenant_schedule_min_interval_secs: 300,
+        }
+    }
+}
+
 /// `faucet serve` log-shipping buffer bounds (#806).
 #[cfg(feature = "serve")]
 #[derive(Debug, Clone, clap::Args)]
@@ -2431,9 +2457,12 @@ pub struct ServeArgs {
     pub cluster_max_attempts: u32,
     /// Path to a triggers file (YAML/JSON) defining event-driven pipeline
     /// triggers (object-arrival / webhook / queue-depth). Requires a build with
-    /// the `triggers` feature. See `faucet schema triggers`.
+    /// the `triggers` feature. See `faucet schema triggers`. Cron schedules
+    /// are `--schedules`.
     #[arg(long)]
     pub triggers: Option<std::path::PathBuf>,
+    #[command(flatten)]
+    pub schedules: ServeScheduleArgs,
     /// Path to a template-sync file (YAML/JSON) listing remote origins to pull
     /// pipeline templates from (GitHub / S3 / GCS / Azure Blob). Pulled on
     /// start, on `POST /v1/templates/sync`, and on each origin's
@@ -3105,6 +3134,10 @@ pub enum SchemaTarget {
     /// JSON Schema for the `--triggers` file (event-driven pipeline triggers).
     #[cfg(feature = "triggers")]
     Triggers,
+    /// JSON Schema for the `faucet serve --schedules` file (registered
+    /// templates run on a cron schedule).
+    #[cfg(all(feature = "schedule", feature = "templates"))]
+    Schedules,
     /// JSON Schema for the `notifications:` (incident-routing) block.
     #[cfg(feature = "notify")]
     Notifications,

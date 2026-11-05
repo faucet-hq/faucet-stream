@@ -72,6 +72,7 @@ fn serve_args(
         cluster_poll_secs: 2,
         cluster_max_attempts: 3,
         triggers,
+        schedules: Default::default(),
         templates_sync: None,
         policy: None,
         otel_config: None,
@@ -1071,11 +1072,11 @@ async fn tenants_end_to_end_on_sqlite() {
     scenario(|dir| Some(format!("sqlite:{}", dir.join("history.db").display()))).await;
 }
 
-/// A `schedule` trigger with `tenants: all` runs a template once per tenant
-/// per tick, each run keyed by the tick and the tenant.
-#[cfg(all(feature = "triggers", feature = "schedule"))]
+/// A schedule with `tenants: all` runs a template once per tenant per tick,
+/// each run keyed by the tick and the tenant.
+#[cfg(feature = "schedule")]
 #[tokio::test(flavor = "multi_thread")]
-async fn a_schedule_trigger_fans_a_template_out_to_every_tenant() {
+async fn a_schedule_fans_a_template_out_to_every_tenant() {
     let dir = tempfile::tempdir().unwrap();
     let data = MockServer::start().await;
     Mock::given(method("GET"))
@@ -1086,13 +1087,7 @@ async fn a_schedule_trigger_fans_a_template_out_to_every_tenant() {
     let out = dir.path().join("out");
     let state_dir = dir.path().join("state");
     std::fs::create_dir_all(&out).unwrap();
-    let triggers = dir.path().join("triggers.yaml");
-    std::fs::write(
-        &triggers,
-        "version: 1\ntriggers:\n  - name: every-second\n    type: schedule\n    cron: \"* * * * * *\"\n    template: { id: tenant-sync }\n    tenants: all\n",
-    )
-    .unwrap();
-    let api = spawn_with(dir.path(), None, "http://127.0.0.1:9", Some(triggers)).await;
+    let api = spawn_with(dir.path(), None, "http://127.0.0.1:9", None).await;
     for t in ["acme", "globex"] {
         let (code, _) = api.post("admin-tok", "/v1/tenants", json!({"id": t})).await;
         assert_eq!(code, 201);
@@ -1113,14 +1108,22 @@ async fn a_schedule_trigger_fans_a_template_out_to_every_tenant() {
         )
         .await;
     assert_eq!(code, 201, "{reg}");
+    let (code, sched) = api
+        .post(
+            "op-tok",
+            "/v1/schedules",
+            json!({"name": "every-second", "cron": "* * * * * *", "template": {"id": "tenant-sync"}, "tenants": "all"}),
+        )
+        .await;
+    assert_eq!(code, 201, "{sched}");
     for t in ["acme", "globex"] {
         let mut done = false;
         for _ in 0..400 {
             let (_, page) = api.get("admin-tok", &format!("/v1/runs?tenant={t}")).await;
             if page["runs"].as_array().unwrap().iter().any(|r| {
                 r["status"] == "completed"
-                    && r["labels"]["faucet.trigger.name"] == "every-second"
-                    && r["labels"]["faucet.trigger.tick"].is_string()
+                    && r["labels"]["schedule"] == "every-second"
+                    && r["labels"]["schedule_tick"].is_string()
             }) {
                 done = true;
                 break;
@@ -1135,7 +1138,7 @@ async fn a_schedule_trigger_fans_a_template_out_to_every_tenant() {
 /// SERVE-10: one tenant whose fire fails deterministically (a missing label
 /// its `${tenant.labels.*}` routing needs) must not stop the schedule for the
 /// other tenants — the schedule advances tick after tick.
-#[cfg(all(feature = "triggers", feature = "schedule"))]
+#[cfg(feature = "schedule")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failing_tenant_does_not_stop_a_scheduled_fan_out() {
     let dir = tempfile::tempdir().unwrap();
@@ -1148,13 +1151,7 @@ async fn a_failing_tenant_does_not_stop_a_scheduled_fan_out() {
     let out = dir.path().join("out");
     let state_dir = dir.path().join("state");
     std::fs::create_dir_all(&out).unwrap();
-    let triggers = dir.path().join("triggers.yaml");
-    std::fs::write(
-        &triggers,
-        "version: 1\ntriggers:\n  - name: every-second\n    type: schedule\n    cron: \"* * * * * *\"\n    template: { id: tenant-sync }\n    tenants: all\n",
-    )
-    .unwrap();
-    let api = spawn_with(dir.path(), None, "http://127.0.0.1:9", Some(triggers)).await;
+    let api = spawn_with(dir.path(), None, "http://127.0.0.1:9", None).await;
     for (t, labels) in [
         ("acme", json!({"region": "eu"})),
         ("broken", json!({})),
@@ -1189,13 +1186,21 @@ async fn a_failing_tenant_does_not_stop_a_scheduled_fan_out() {
         )
         .await;
     assert_eq!(code, 201, "{reg}");
+    let (code, sched) = api
+        .post(
+            "op-tok",
+            "/v1/schedules",
+            json!({"name": "every-second", "cron": "* * * * * *", "template": {"id": "tenant-sync"}, "tenants": "all"}),
+        )
+        .await;
+    assert_eq!(code, 201, "{sched}");
     for t in ["acme", "globex"] {
         let mut ticks = std::collections::BTreeSet::new();
         for _ in 0..400 {
             let (_, page) = api.get("admin-tok", &format!("/v1/runs?tenant={t}")).await;
             for r in page["runs"].as_array().unwrap() {
-                if r["labels"]["faucet.trigger.name"] == "every-second" {
-                    ticks.insert(r["labels"]["faucet.trigger.tick"].to_string());
+                if r["labels"]["schedule"] == "every-second" {
+                    ticks.insert(r["labels"]["schedule_tick"].to_string());
                 }
             }
             if ticks.len() >= 2 {

@@ -145,6 +145,7 @@ async fn every_documented_route_is_wired_on_the_live_server() {
         cluster_poll_secs: 2,
         cluster_max_attempts: 3,
         triggers: None,
+        schedules: Default::default(),
         templates_sync: None,
         policy: None,
         otel_config: None,

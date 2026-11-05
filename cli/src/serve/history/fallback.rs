@@ -944,6 +944,31 @@ impl RunHistory for FallbackHistory {
     async fn meta_put(&self, key: &str, value: &str) -> Result<(), HistoryError> {
         strict!(self, p => p.meta_put(key, value), f => f.meta_put(key, value))
     }
+    async fn schedule_insert(
+        &self,
+        schedule: &super::schedules::ScheduleRecord,
+    ) -> Result<bool, HistoryError> {
+        strict!(self, p => p.schedule_insert(schedule), f => f.schedule_insert(schedule))
+    }
+    async fn schedule_replace(
+        &self,
+        expected: &super::schedules::ScheduleRecord,
+        new: &super::schedules::ScheduleRecord,
+    ) -> Result<bool, HistoryError> {
+        strict!(self, p => p.schedule_replace(expected, new), f => f.schedule_replace(expected, new))
+    }
+    async fn schedule_get(
+        &self,
+        name: &str,
+    ) -> Result<Option<super::schedules::ScheduleRecord>, HistoryError> {
+        strict!(self, p => p.schedule_get(name), f => f.schedule_get(name))
+    }
+    async fn schedule_list(&self) -> Result<Vec<super::schedules::ScheduleRecord>, HistoryError> {
+        strict!(self, p => p.schedule_list(), f => f.schedule_list())
+    }
+    async fn schedule_delete(&self, name: &str) -> Result<bool, HistoryError> {
+        strict!(self, p => p.schedule_delete(name), f => f.schedule_delete(name))
+    }
     async fn template_tags(
         &self,
         id: &str,

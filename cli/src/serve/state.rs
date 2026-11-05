@@ -59,6 +59,10 @@ struct Inner {
     templates_sync: RwLock<Option<Arc<crate::templates::sync::SyncFile>>>,
     #[cfg(feature = "templates")]
     test_policy: RwLock<Option<crate::template_tests::trust::ServerTestPolicy>>,
+    /// The schedules runtime (#1044): the `--schedules` file, the tenant
+    /// guardrail and the loop's wake-up signal. Replaced once at startup.
+    #[cfg(all(feature = "schedule", feature = "templates"))]
+    schedules: RwLock<Arc<crate::serve::schedules::SchedulesRuntime>>,
     /// The server-wide data-flow policy (`--policy`, #702), when one was given.
     #[cfg(feature = "policy")]
     policy: RwLock<Option<Arc<faucet_core::PolicySpec>>>,
@@ -133,6 +137,11 @@ impl ServerState {
                 templates_sync: RwLock::new(None),
                 #[cfg(feature = "templates")]
                 test_policy: RwLock::new(None),
+                #[cfg(all(feature = "schedule", feature = "templates"))]
+                schedules: RwLock::new(Arc::new(crate::serve::schedules::SchedulesRuntime::new(
+                    Vec::new(),
+                    config.schedules.tenant_min_interval,
+                ))),
                 #[cfg(feature = "policy")]
                 policy: RwLock::new(None),
                 #[cfg(feature = "tenants")]
@@ -449,6 +458,26 @@ impl ServerState {
     pub fn triggers(&self) -> &crate::serve::triggers::health::TriggersHandle {
         &self.inner.triggers
     }
+
+    /// The schedules runtime (#1044).
+    #[cfg(all(feature = "schedule", feature = "templates"))]
+    pub fn schedules(&self) -> Arc<crate::serve::schedules::SchedulesRuntime> {
+        self.inner
+            .schedules
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Install the schedules runtime (the loaded `--schedules` file).
+    #[cfg(all(feature = "schedule", feature = "templates"))]
+    pub fn set_schedules(&self, runtime: crate::serve::schedules::SchedulesRuntime) {
+        *self
+            .inner
+            .schedules
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(runtime);
+    }
 }
 
 #[cfg(test)]
@@ -485,6 +514,7 @@ mod tests {
             ui_enabled: true,
             cluster: crate::serve::cluster::ClusterConfig::disabled(),
             triggers_path: None,
+            schedules: Default::default(),
             templates_sync_path: None,
             policy_path: None,
             otel: None,

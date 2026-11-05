@@ -10,6 +10,7 @@ pub mod fallback;
 pub mod labels;
 pub mod memory;
 pub mod overview;
+pub mod schedules;
 #[cfg(feature = "serve-history-postgres")]
 pub mod postgres;
 #[cfg(any(feature = "serve-history-postgres", feature = "serve-history-sqlite"))]
@@ -2171,6 +2172,52 @@ pub trait RunHistory: Send + Sync {
         Err(HistoryError::Backend(
             "this run-history backend does not store server settings".into(),
         ))
+    }
+
+    /// Store a new schedule (#1044); `false` when one with its name already
+    /// exists (nothing is written). Default: unsupported.
+    async fn schedule_insert(
+        &self,
+        schedule: &schedules::ScheduleRecord,
+    ) -> Result<bool, HistoryError> {
+        let _ = schedule;
+        Err(HistoryError::Backend(
+            "this run-history backend does not store schedules".into(),
+        ))
+    }
+
+    /// Replace schedule `expected` with `new` only while the stored record is
+    /// still exactly `expected`; returns whether it was replaced. The default
+    /// is unsupported; the built-in backends compare and write in one step.
+    async fn schedule_replace(
+        &self,
+        expected: &schedules::ScheduleRecord,
+        new: &schedules::ScheduleRecord,
+    ) -> Result<bool, HistoryError> {
+        let _ = (expected, new);
+        Err(HistoryError::Backend(
+            "this run-history backend does not store schedules".into(),
+        ))
+    }
+
+    /// One schedule by name. Default: `None`.
+    async fn schedule_get(
+        &self,
+        name: &str,
+    ) -> Result<Option<schedules::ScheduleRecord>, HistoryError> {
+        let _ = name;
+        Ok(None)
+    }
+
+    /// Every stored schedule, ordered by name. Default: empty.
+    async fn schedule_list(&self) -> Result<Vec<schedules::ScheduleRecord>, HistoryError> {
+        Ok(Vec::new())
+    }
+
+    /// Delete a schedule; returns whether it existed. Default: `false`.
+    async fn schedule_delete(&self, name: &str) -> Result<bool, HistoryError> {
+        let _ = name;
+        Ok(false)
     }
 
     /// Every stored version of a template, newest first — one read for the

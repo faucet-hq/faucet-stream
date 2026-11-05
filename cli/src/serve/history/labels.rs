@@ -22,6 +22,10 @@ pub const RESERVED_LABELS: &[&str] = &[
     "overlay_version",
     crate::select::LABEL_SELECTION,
     crate::run_deps::LABEL_DEPENDS_ON,
+    // The schedule that started a run, its tick and who ran it by hand (#1044).
+    "schedule",
+    "schedule_tick",
+    "schedule_manual",
 ];
 
 /// Refuse a caller-supplied label set: a reserved provenance key (unless the

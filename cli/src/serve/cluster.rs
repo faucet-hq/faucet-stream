@@ -425,6 +425,7 @@ mod tests {
                 ..ClusterConfig::disabled()
             },
             triggers_path: None,
+            schedules: Default::default(),
             templates_sync_path: None,
             policy_path: None,
             otel: None,

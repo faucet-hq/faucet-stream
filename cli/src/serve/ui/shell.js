@@ -16,7 +16,7 @@ export const NAV = [
     ["runs", "runs", "Runs", "#/runs"],
     ["changes", "changes", "Changes", "#/changes"],
     ["triggers", "trig", "Triggers", "#/triggers"],
-    ["schedules", "sched", "Schedules", "#/schedules", "", true],
+    ["schedules", "sched", "Schedules", "#/schedules"],
   ]],
   ["Data", [
     ["datasets", "db", "Datasets", "#/catalog"],
@@ -157,7 +157,7 @@ function setBadge(key, n, { hot = false } = {}) {
 
 let badgeTimer = null;
 let badgeAt = 0;
-/** Sidebar counts: active runs, pending changes, datasets, templates, tenants.
+/** Sidebar counts: active runs, pending changes, schedules, datasets, templates, tenants.
  *  One cheap request each; a failure hides its badge. */
 export function refreshBadges(force = false) {
   if (!force && Date.now() - badgeAt < 5000) return;
@@ -171,6 +171,9 @@ export function refreshBadges(force = false) {
   api(`/v1/changes/counts?${withTenant(new URLSearchParams())}`)
     .then((c) => setBadge("changes", c && c.counts ? c.counts.pending || 0 : 0, { hot: true }))
     .catch(() => setBadge("changes", 0));
+  api(`/v1/schedules?${withTenant(new URLSearchParams())}`)
+    .then((s) => setBadge("schedules", s && s.available !== false ? (s.schedules || []).length : 0))
+    .catch(() => setBadge("schedules", 0));
   if (scoped) return;
   api("/v1/catalog/datasets?limit=1")
     .then((d) => (d && d.total != null ? d : api("/v1/catalog/datasets?limit=1000")))
