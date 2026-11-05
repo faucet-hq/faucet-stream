@@ -15,7 +15,7 @@
 //! through `/v1/changes/{id}/approve`. A server started with `--policy
 //! <file>` shows that file read-only and refuses edits with a 409.
 
-use crate::serve::changes::policy_update::{PolicyPayload, problems_error, require_server_managed};
+use crate::serve::changes::policy_update::{PolicyPayload, require_server_managed};
 use crate::serve::changes::{self, ChangeKind, ChangeListFilter, ChangeRequest, ChangeStatus};
 use crate::serve::error::ServeError;
 use crate::serve::history::policies::{
