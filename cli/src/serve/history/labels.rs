@@ -28,6 +28,10 @@ pub const RESERVED_LABELS: &[&str] = &[
     "schedule_manual",
 ];
 
+/// The reserved labels a schedule tick stamps (#1044); a trusted caller (the
+/// schedule runner) keeps them through a template trigger.
+pub const SCHEDULE_LABELS: &[&str] = &["schedule", "schedule_tick", "schedule_manual"];
+
 /// Refuse a caller-supplied label set: a reserved provenance key (unless the
 /// server wrote the request) or a key/value past the limits.
 pub fn check_submitted(labels: &BTreeMap<String, String>, trusted: bool) -> Result<(), String> {
