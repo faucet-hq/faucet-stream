@@ -97,7 +97,10 @@ pub struct SchedulesRuntime {
 
 impl Default for SchedulesRuntime {
     fn default() -> Self {
-        Self::new(Vec::new(), crate::serve::config::DEFAULT_TENANT_SCHEDULE_MIN_INTERVAL)
+        Self::new(
+            Vec::new(),
+            crate::serve::config::DEFAULT_TENANT_SCHEDULE_MIN_INTERVAL,
+        )
     }
 }
 
@@ -165,7 +168,10 @@ mod tests {
 
         let cases = [
             ("version: 2\nschedules: []\n", "unsupported version 2"),
-            ("version: 1\nschedules:\n  - {name: a, cron: 'x', template: {id: t}}\n", "'a'"),
+            (
+                "version: 1\nschedules:\n  - {name: a, cron: 'x', template: {id: t}}\n",
+                "'a'",
+            ),
             (
                 "version: 1\nschedules:\n  - {name: a, cron: '0 * * * *', template: {id: t}}\n  - {name: a, cron: '0 * * * *', template: {id: t}}\n",
                 "duplicate schedule name 'a'",
@@ -180,7 +186,13 @@ mod tests {
         }
         let bad_json = dir.path().join("bad.json");
         std::fs::write(&bad_json, "{").unwrap();
-        assert!(load_file(&bad_json).await.unwrap_err().to_string().contains("parsing schedules JSON"));
+        assert!(
+            load_file(&bad_json)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("parsing schedules JSON")
+        );
         assert!(
             load_file(&dir.path().join("missing.yaml"))
                 .await

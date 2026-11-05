@@ -317,10 +317,17 @@ mod tests {
         )
         .unwrap();
         let msg = load_triggers(&path).await.unwrap_err().to_string();
-        assert!(msg.contains("'nightly'") && msg.contains("--schedules"), "{msg}");
+        assert!(
+            msg.contains("'nightly'") && msg.contains("--schedules"),
+            "{msg}"
+        );
 
         let json = dir.path().join("triggers.json");
-        std::fs::write(&json, r#"{"version": 1, "triggers": [{"type": "schedule"}]}"#).unwrap();
+        std::fs::write(
+            &json,
+            r#"{"version": 1, "triggers": [{"type": "schedule"}]}"#,
+        )
+        .unwrap();
         let msg = load_triggers(&json).await.unwrap_err().to_string();
         assert!(msg.contains("'#0'"), "{msg}");
 

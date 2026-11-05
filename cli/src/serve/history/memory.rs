@@ -1772,9 +1772,7 @@ impl RunHistory for MemoryHistory {
         Ok(self.schedule_map()?.get(name).cloned())
     }
 
-    async fn schedule_list(
-        &self,
-    ) -> Result<Vec<super::schedules::ScheduleRecord>, HistoryError> {
+    async fn schedule_list(&self) -> Result<Vec<super::schedules::ScheduleRecord>, HistoryError> {
         Ok(self.schedule_map()?.values().cloned().collect())
     }
 

@@ -285,7 +285,13 @@ pub async fn record_tick(history: &dyn RunHistory, name: &str, value: &LastTick)
 
 /// Start a schedule's tick record over at `now` (created, resumed after a
 /// pause): ticks before it are not missed.
-pub async fn reset_tick(history: &dyn RunHistory, name: &str, cron: &str, timezone: &str, now: DateTime<Utc>) {
+pub async fn reset_tick(
+    history: &dyn RunHistory,
+    name: &str,
+    cron: &str,
+    timezone: &str,
+    now: DateTime<Utc>,
+) {
     let value = LastTick {
         cron: cron.to_string(),
         timezone: timezone.to_string(),
@@ -335,7 +341,11 @@ mod tests {
         let t2 = at("2026-11-05T02:00:00Z");
         s.apply(t1, &Outcome::Failed(vec!["template gone".into()]), now);
         // A second member reports the same tick: merged, counted once.
-        s.apply(t1, &Outcome::Failed(vec!["template gone".into(), "acme: refused".into()]), now);
+        s.apply(
+            t1,
+            &Outcome::Failed(vec!["template gone".into(), "acme: refused".into()]),
+            now,
+        );
         assert_eq!(s.consecutive_failures, 1);
         assert_eq!(s.failures.len(), 1);
         assert_eq!(s.failures[0].errors.len(), 2);
@@ -353,8 +363,16 @@ mod tests {
         assert_eq!(s.consecutive_failures, 0);
         assert_eq!(s.last_error, None);
         let t3 = at("2026-11-05T03:00:00Z");
-        s.apply(t3, &Outcome::Skipped("previous run still going".into()), now);
-        s.apply(t3, &Outcome::Skipped("previous run still going".into()), now);
+        s.apply(
+            t3,
+            &Outcome::Skipped("previous run still going".into()),
+            now,
+        );
+        s.apply(
+            t3,
+            &Outcome::Skipped("previous run still going".into()),
+            now,
+        );
         assert_eq!(s.skipped.len(), 1);
         assert_eq!(s.last_outcome.as_deref(), Some("skipped"));
         assert_eq!(s.last_tick, Some(t3));
@@ -402,9 +420,15 @@ mod tests {
         };
         record_tick(&h, "n", &tick("2026-11-05T02:00:00Z")).await;
         record_tick(&h, "n", &tick("2026-11-05T01:00:00Z")).await;
-        assert_eq!(read_tick(&h, "n").await.unwrap().unwrap().tick, at("2026-11-05T02:00:00Z"));
+        assert_eq!(
+            read_tick(&h, "n").await.unwrap().unwrap().tick,
+            at("2026-11-05T02:00:00Z")
+        );
         reset_tick(&h, "n", "0 * * * *", "UTC", at("2026-11-05T05:30:00Z")).await;
-        assert_eq!(read_tick(&h, "n").await.unwrap().unwrap().tick, at("2026-11-05T05:30:00Z"));
+        assert_eq!(
+            read_tick(&h, "n").await.unwrap().unwrap().tick,
+            at("2026-11-05T05:30:00Z")
+        );
         forget(&h, "n").await;
         assert_eq!(read_tick(&h, "n").await.unwrap(), None);
         assert_eq!(read(&h, "n").await, ScheduleStatus::default());
@@ -455,7 +479,10 @@ mod tests {
         {
             Ok(crate::serve::history::DeleteOutcome::NotFound)
         }
-        async fn purge_expired(&self, _: Duration) -> Result<usize, crate::serve::history::HistoryError> {
+        async fn purge_expired(
+            &self,
+            _: Duration,
+        ) -> Result<usize, crate::serve::history::HistoryError> {
             Ok(0)
         }
         async fn recover_orphans(&self) -> Result<usize, crate::serve::history::HistoryError> {
@@ -464,7 +491,10 @@ mod tests {
         fn degraded(&self) -> bool {
             false
         }
-        async fn meta_get(&self, _: &str) -> Result<Option<String>, crate::serve::history::HistoryError> {
+        async fn meta_get(
+            &self,
+            _: &str,
+        ) -> Result<Option<String>, crate::serve::history::HistoryError> {
             if self.cas_loses {
                 Ok(None)
             } else {
@@ -487,7 +517,11 @@ mod tests {
         let losing = Broken { cas_loses: true };
         let now = at("2026-11-05T01:00:00Z");
         assert!(update(&down, "n", |_| {}).await.is_err());
-        assert!(update(&losing, "n", |d| d.consecutive_failures = 9).await.is_err());
+        assert!(
+            update(&losing, "n", |d| d.consecutive_failures = 9)
+                .await
+                .is_err()
+        );
         assert!(read_tick(&down, "n").await.is_err());
         assert_eq!(read(&down, "n").await, ScheduleStatus::default());
         record(&down, "n", now, Outcome::Started).await;
@@ -503,13 +537,27 @@ mod tests {
         forget(&down, "n").await;
         // The stub answers the calls it must.
         assert!(matches!(
-            down.claim_idempotency("k", "f", "r", Duration::from_secs(1)).await.unwrap(),
+            down.claim_idempotency("k", "f", "r", Duration::from_secs(1))
+                .await
+                .unwrap(),
             crate::serve::history::Claim::Fresh
         ));
-        let rec = crate::serve::history::RunRecord::queued("r".into(), None, Default::default(), None, now);
+        let rec = crate::serve::history::RunRecord::queued(
+            "r".into(),
+            None,
+            Default::default(),
+            None,
+            now,
+        );
         down.upsert(&rec).await.unwrap();
         assert!(down.get("r").await.unwrap().is_none());
-        assert!(down.list(&Default::default()).await.unwrap().runs.is_empty());
+        assert!(
+            down.list(&Default::default())
+                .await
+                .unwrap()
+                .runs
+                .is_empty()
+        );
         assert!(matches!(
             down.delete("r").await.unwrap(),
             crate::serve::history::DeleteOutcome::NotFound

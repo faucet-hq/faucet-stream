@@ -435,7 +435,12 @@ pub struct Detail {
 }
 
 /// The ticks the schedule's runs and status record tell about, newest first.
-fn ticks(runs: Vec<RunRef>, labels: &[BTreeMap<String, String>], st: &ScheduleStatus, scope: Option<&str>) -> Vec<TickView> {
+fn ticks(
+    runs: Vec<RunRef>,
+    labels: &[BTreeMap<String, String>],
+    st: &ScheduleStatus,
+    scope: Option<&str>,
+) -> Vec<TickView> {
     let mut by_tick: BTreeMap<(DateTime<Utc>, bool), Vec<RunRef>> = BTreeMap::new();
     for (run, l) in runs.into_iter().zip(labels) {
         let Some(tick) = l
@@ -540,7 +545,8 @@ pub async fn get(
     };
     let page = history.list(&filter).await.map_err(store_err)?;
     let runs_total = page.runs.len();
-    let labels: Vec<BTreeMap<String, String>> = page.runs.iter().map(|r| r.labels.clone()).collect();
+    let labels: Vec<BTreeMap<String, String>> =
+        page.runs.iter().map(|r| r.labels.clone()).collect();
     let runs: Vec<RunRef> = page
         .runs
         .into_iter()
@@ -662,8 +668,16 @@ async fn check_spec(
     let mut secret = Vec::new();
     for (what, id, version) in [
         ("template", Some(&spec.template.id), &spec.template.version),
-        ("sink template", spec.template.sink.as_ref(), &spec.template.sink_version),
-        ("overlay", spec.template.overlay.as_ref(), &spec.template.overlay_version),
+        (
+            "sink template",
+            spec.template.sink.as_ref(),
+            &spec.template.sink_version,
+        ),
+        (
+            "overlay",
+            spec.template.overlay.as_ref(),
+            &spec.template.overlay_version,
+        ),
     ] {
         let Some(id) = id else { continue };
         let selector = version
@@ -723,9 +737,15 @@ async fn plan_inner(
     let stored = match p.action {
         ChangeAction::Create => {
             if existing.is_some() {
-                return Err(ServeError::Conflict(format!("schedule '{}' already exists", p.name)));
+                return Err(ServeError::Conflict(format!(
+                    "schedule '{}' already exists",
+                    p.name
+                )));
             }
-            let spec = p.spec.as_ref().ok_or_else(|| unprocessable("create needs `spec`"))?;
+            let spec = p
+                .spec
+                .as_ref()
+                .ok_or_else(|| unprocessable("create needs `spec`"))?;
             if spec.name != p.name {
                 return Err(unprocessable("spec.name must equal name"));
             }
@@ -738,7 +758,10 @@ async fn plan_inner(
                 return Err(ServeError::NotFound);
             }
             check_edit(actor, f)?;
-            let spec = p.spec.as_ref().ok_or_else(|| unprocessable("update needs `spec`"))?;
+            let spec = p
+                .spec
+                .as_ref()
+                .ok_or_else(|| unprocessable("update needs `spec`"))?;
             if spec.name != p.name {
                 return Err(unprocessable("a schedule's name cannot change"));
             }
@@ -825,10 +848,20 @@ pub async fn apply(
             let spec = planned.spec.expect("planned");
             let record = ScheduleRecord::new(spec, actor.tenant.clone(), by, now);
             if !history.schedule_insert(&record).await.map_err(store_err)? {
-                return Err(ServeError::Conflict(format!("schedule '{}' already exists", p.name)));
+                return Err(ServeError::Conflict(format!(
+                    "schedule '{}' already exists",
+                    p.name
+                )));
             }
             status::forget(&*history, &p.name).await;
-            status::reset_tick(&*history, &p.name, &record.spec.cron, &record.spec.timezone, now).await;
+            status::reset_tick(
+                &*history,
+                &p.name,
+                &record.spec.cron,
+                &record.spec.timezone,
+                now,
+            )
+            .await;
             Some(record)
         }
         ChangeAction::Update => {
@@ -897,7 +930,13 @@ async fn revise(
             &secrets::masked(&edited.spec),
         );
         detail.extend(extra);
-        let mut next = current.revised(edited.spec.clone(), &actor.principal, Utc::now(), action, detail);
+        let mut next = current.revised(
+            edited.spec.clone(),
+            &actor.principal,
+            Utc::now(),
+            action,
+            detail,
+        );
         next.paused_at = edited.paused_at;
         next.paused_by = edited.paused_by;
         next.pause_reason = edited.pause_reason;
@@ -995,13 +1034,24 @@ pub async fn set_paused(
     .await?;
     if !paused {
         // Ticks while paused are not missed.
-        status::reset_tick(&*state.history(), name, &r.spec.cron, &r.spec.timezone, Utc::now()).await;
+        status::reset_tick(
+            &*state.history(),
+            name,
+            &r.spec.cron,
+            &r.spec.timezone,
+            Utc::now(),
+        )
+        .await;
     }
     state.schedules().notify();
     crate::serve::audit::write_target_detail(
         state,
         actor,
-        if paused { "schedule.pause" } else { "schedule.resume" },
+        if paused {
+            "schedule.pause"
+        } else {
+            "schedule.resume"
+        },
         format!("schedule:{name}"),
         String::new(),
         "ok",
@@ -1067,7 +1117,11 @@ pub async fn run_now(
         "schedule.run",
         format!("schedule:{name}"),
         result.run_ids().join(","),
-        if result.failures().is_empty() { "ok" } else { "error" },
+        if result.failures().is_empty() {
+            "ok"
+        } else {
+            "error"
+        },
     )
     .await;
     let runs = result.run_ids();
@@ -1160,15 +1214,27 @@ mod tests {
         let viewer = actor(Role::Viewer, None);
         let acme = actor(Role::Operator, Some("acme"));
         let mine = found(Some("acme"), None, Source::Console);
-        let shared = found(None, Some(TenantSelector::All("all".into())), Source::Console);
+        let shared = found(
+            None,
+            Some(TenantSelector::All("all".into())),
+            Source::Console,
+        );
         let file = found(None, None, Source::File);
         assert!(can_edit(&op, &mine) && can_edit(&op, &shared));
         assert!(!can_edit(&op, &file) && can_run(&op, &file));
         assert!(!can_edit(&viewer, &mine) && !can_run(&viewer, &mine));
         assert!(can_edit(&acme, &mine) && can_run(&acme, &mine));
         assert!(!can_edit(&acme, &shared) && !can_run(&acme, &shared));
-        assert!(check_edit(&op, &file).unwrap_err().to_string().contains("--schedules file"));
-        assert!(matches!(check_edit(&acme, &shared), Err(ServeError::Forbidden(_))));
+        assert!(
+            check_edit(&op, &file)
+                .unwrap_err()
+                .to_string()
+                .contains("--schedules file")
+        );
+        assert!(matches!(
+            check_edit(&acme, &shared),
+            Err(ServeError::Forbidden(_))
+        ));
         assert!(check_edit(&acme, &mine).is_ok());
     }
 
@@ -1181,7 +1247,11 @@ mod tests {
         assert_eq!(scope(&acme, Some("globex")).as_deref(), Some("acme"));
         let mine = found(Some("acme"), None, Source::Console);
         let theirs = found(Some("globex"), None, Source::Console);
-        let shared = found(None, Some(TenantSelector::Named(vec!["acme".into()])), Source::Console);
+        let shared = found(
+            None,
+            Some(TenantSelector::Named(vec!["acme".into()])),
+            Source::Console,
+        );
         let server = found(None, None, Source::File);
         assert!(visible(&mine, Some("acme")) && visible(&shared, Some("acme")));
         assert!(!visible(&theirs, Some("acme")) && !visible(&server, Some("acme")));
@@ -1239,7 +1309,11 @@ mod tests {
         });
         let ticks_all = ticks(
             vec![run("a"), run("b"), run("x")],
-            &[label("2026-11-05T02:00:00Z", false), label("2026-11-05T09:00:00Z", true), BTreeMap::new()],
+            &[
+                label("2026-11-05T02:00:00Z", false),
+                label("2026-11-05T09:00:00Z", true),
+                BTreeMap::new(),
+            ],
             &st,
             None,
         );

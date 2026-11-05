@@ -336,8 +336,7 @@ fn is_mutating(method: &axum::http::Method, path: &str) -> bool {
     // - `/v1/schedules/preview` — computes the next ticks of a cron (#1044).
     // - `/v1/mirror/{name}` — reads a mirror's state store (#731); the POST
     //   form only carries the config in a body, gated like `/v1/status`.
-    const READ_ONLY_POSTS: &[&str] =
-        &[
+    const READ_ONLY_POSTS: &[&str] = &[
         "/mcp",
         "/v1/dlq/inspect",
         "/v1/status",

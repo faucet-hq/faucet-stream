@@ -10,9 +10,9 @@ pub mod fallback;
 pub mod labels;
 pub mod memory;
 pub mod overview;
-pub mod schedules;
 #[cfg(feature = "serve-history-postgres")]
 pub mod postgres;
+pub mod schedules;
 #[cfg(any(feature = "serve-history-postgres", feature = "serve-history-sqlite"))]
 pub mod sql;
 #[cfg(feature = "serve-history-sqlite")]

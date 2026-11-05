@@ -180,7 +180,9 @@ impl Entry {
     /// Back off before retrying the same tick.
     fn back_off(&mut self, now: DateTime<Utc>) {
         self.attempts += 1;
-        let secs = 2u64.saturating_pow(self.attempts.min(6)).min(MAX_BACKOFF_SECS);
+        let secs = 2u64
+            .saturating_pow(self.attempts.min(6))
+            .min(MAX_BACKOFF_SECS);
         self.retry_at = Some(now + chrono::Duration::seconds(secs as i64));
     }
 
@@ -226,12 +228,20 @@ pub struct Scheduler {
 impl Scheduler {
     /// Bring the set in line with `wanted` (name → definition): new and
     /// changed definitions get a fresh entry, removed ones are dropped.
-    pub fn reconcile(&mut self, wanted: Vec<(ScheduleSpec, Option<String>, Source)>, now: DateTime<Utc>) {
+    pub fn reconcile(
+        &mut self,
+        wanted: Vec<(ScheduleSpec, Option<String>, Source)>,
+        now: DateTime<Utc>,
+    ) {
         let mut keep = std::collections::BTreeSet::new();
         for (spec, owner, source) in wanted {
             keep.insert(spec.name.clone());
             let fp = fingerprint(&spec, owner.as_deref());
-            if self.entries.get(&spec.name).is_some_and(|e| e.fingerprint == fp) {
+            if self
+                .entries
+                .get(&spec.name)
+                .is_some_and(|e| e.fingerprint == fp)
+            {
                 continue;
             }
             match super::validate::validate(&spec) {
@@ -262,7 +272,9 @@ impl Scheduler {
 
 /// Every schedule this server should tick: the file's, then the stored ones.
 /// A stored schedule never shadows a file one (the API refuses the name).
-pub async fn wanted(state: &ServerState) -> Result<Vec<(ScheduleSpec, Option<String>, Source)>, String> {
+pub async fn wanted(
+    state: &ServerState,
+) -> Result<Vec<(ScheduleSpec, Option<String>, Source)>, String> {
     let rt = state.schedules();
     let mut out: Vec<(ScheduleSpec, Option<String>, Source)> = rt
         .file()
@@ -293,7 +305,9 @@ pub async fn step(state: &ServerState, entry: &mut Entry, now: DateTime<Utc>) {
                 entry.resumed = true;
                 if let Some(range) = missed {
                     let name = entry.spec.name.clone();
-                    if let Err(e) = status::update(&*history, &name, |d| d.add_missed(range.clone())).await {
+                    if let Err(e) =
+                        status::update(&*history, &name, |d| d.add_missed(range.clone())).await
+                    {
                         tracing::warn!(schedule = %name, error = %e, "could not record missed ticks");
                     }
                 }
@@ -332,7 +346,8 @@ pub async fn step(state: &ServerState, entry: &mut Entry, now: DateTime<Utc>) {
         Outcome::Waiting(why) => {
             // `overlap: queue`: hold the tick and look again shortly.
             tracing::debug!(schedule = %name, %tick, reason = %why, "tick held for an earlier run");
-            entry.retry_at = Some(Utc::now() + chrono::Duration::from_std(WAIT_POLL).unwrap_or_default());
+            entry.retry_at =
+                Some(Utc::now() + chrono::Duration::from_std(WAIT_POLL).unwrap_or_default());
             status::record(&*history, &name, tick, outcome).await;
             return;
         }
@@ -373,7 +388,9 @@ pub async fn run(state: ServerState, shutdown: CancellationToken) {
         if now >= reload_at {
             match wanted(&state).await {
                 Ok(w) => scheduler.reconcile(w, now),
-                Err(e) => tracing::warn!(error = %e, "could not reload schedules; keeping the current set"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not reload schedules; keeping the current set")
+                }
             }
             metrics::active(scheduler.active());
             reload_at = now + chrono::Duration::from_std(RELOAD_INTERVAL).unwrap_or_default();
@@ -446,7 +463,10 @@ mod tests {
         for _ in 0..10 {
             e.back_off(now);
         }
-        assert_eq!(e.retry_at, Some(now + chrono::Duration::seconds(MAX_BACKOFF_SECS as i64)));
+        assert_eq!(
+            e.retry_at,
+            Some(now + chrono::Duration::seconds(MAX_BACKOFF_SECS as i64))
+        );
         e.advance(now, now);
         assert_eq!((e.retry_at, e.attempts), (None, 0));
     }
@@ -454,20 +474,30 @@ mod tests {
     #[test]
     fn one_late_tick_runs_late_and_is_not_counted_missed() {
         let mut e = entry("0 * * * *", at("2026-09-26T10:00:30Z"));
-        assert!(e.advance(at("2026-09-26T11:00:00Z"), at("2026-09-26T12:00:05Z")).is_none());
+        assert!(
+            e.advance(at("2026-09-26T11:00:00Z"), at("2026-09-26T12:00:05Z"))
+                .is_none()
+        );
         assert_eq!(e.next, Some(at("2026-09-26T12:00:00Z")));
     }
 
     #[test]
     fn a_long_outage_collapses_to_one_catch_up() {
         let mut e = entry("0 * * * *", at("2026-09-26T10:00:30Z"));
-        let range = e.advance(at("2026-09-26T11:00:00Z"), at("2026-09-26T15:30:00Z")).unwrap();
+        let range = e
+            .advance(at("2026-09-26T11:00:00Z"), at("2026-09-26T15:30:00Z"))
+            .unwrap();
         assert_eq!(e.next, Some(at("2026-09-26T15:00:00Z")));
-        assert_eq!((range.from, range.to, range.count), (at("2026-09-26T12:00:00Z"), at("2026-09-26T15:00:00Z"), 4));
+        assert_eq!(
+            (range.from, range.to, range.count),
+            (at("2026-09-26T12:00:00Z"), at("2026-09-26T15:00:00Z"), 4)
+        );
         assert!(range.caught_up);
 
         let mut off = entry_with("0 * * * *", false, at("2026-09-26T10:00:30Z"));
-        let range = off.advance(at("2026-09-26T11:00:00Z"), at("2026-09-26T15:30:00Z")).unwrap();
+        let range = off
+            .advance(at("2026-09-26T11:00:00Z"), at("2026-09-26T15:30:00Z"))
+            .unwrap();
         assert_eq!(off.next, Some(at("2026-09-26T16:00:00Z")));
         assert!(!range.caught_up);
     }
@@ -529,12 +559,24 @@ mod tests {
         let a = spec("0 * * * *", true);
         let mut b = spec("0 2 * * *", true);
         b.name = "b".into();
-        s.reconcile(vec![(a.clone(), None, Source::File), (b.clone(), Some("acme".into()), Source::Console)], now);
+        s.reconcile(
+            vec![
+                (a.clone(), None, Source::File),
+                (b.clone(), Some("acme".into()), Source::Console),
+            ],
+            now,
+        );
         assert_eq!(s.entries.len(), 2);
         assert_eq!(s.active(), 2);
         // Unchanged: the entry (and its progress) is kept.
         s.entries.get_mut("nightly").unwrap().resumed = true;
-        s.reconcile(vec![(a.clone(), None, Source::File), (b.clone(), Some("acme".into()), Source::Console)], now);
+        s.reconcile(
+            vec![
+                (a.clone(), None, Source::File),
+                (b.clone(), Some("acme".into()), Source::Console),
+            ],
+            now,
+        );
         assert!(s.entries["nightly"].resumed);
         // Changed: rebuilt. Paused: kept but not active.
         let mut paused = a.clone();

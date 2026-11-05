@@ -150,7 +150,12 @@ pub fn tick_text(tick: DateTime<Utc>) -> String {
 }
 
 /// The idempotency key for one target of a tick.
-pub fn idempotency_key(name: &str, tick: &str, manual: Option<&str>, tenant: Option<&str>) -> String {
+pub fn idempotency_key(
+    name: &str,
+    tick: &str,
+    manual: Option<&str>,
+    tenant: Option<&str>,
+) -> String {
     let base = match manual {
         Some(m) => format!("sched:{name}:manual:{m}"),
         None => format!("sched:{name}:{tick}"),
@@ -258,9 +263,9 @@ pub fn classify(e: ServeError, tenant: Option<&str>) -> TargetResult {
         // Any other conflict (a tenant connection missing or needing
         // re-authorization) is the target's own refusal.
         ServeError::Conflict(m) => TargetResult::Failed(m),
-        ServeError::TooManyRequests(m) if tenant.is_some() => TargetResult::Skipped(format!(
-            "tenant at its max_concurrent_runs limit ({m})"
-        )),
+        ServeError::TooManyRequests(m) if tenant.is_some() => {
+            TargetResult::Skipped(format!("tenant at its max_concurrent_runs limit ({m})"))
+        }
         ServeError::QueueFull { .. } => TargetResult::Retry("the run queue is full".into()),
         ServeError::Draining => TargetResult::Retry("the server is shutting down".into()),
         e @ (ServeError::BadConfig(_)
@@ -382,7 +387,9 @@ async fn fire_target(
                 return match spec.overlap {
                     OverlapMode::Skip => TargetResult::Skipped(going),
                     OverlapMode::Queue => TargetResult::Wait(going),
-                    OverlapMode::Forbid => TargetResult::Failed(format!("{going} (overlap: forbid)")),
+                    OverlapMode::Forbid => {
+                        TargetResult::Failed(format!("{going} (overlap: forbid)"))
+                    }
                 };
             }
             Ok(None) => {}
@@ -397,10 +404,8 @@ async fn fire_target(
         Ok(b) => b,
         Err(e) => return TargetResult::Failed(e),
     };
-    let principal = crate::runtime::Principal::new(
-        actor(&spec.name, tenant),
-        crate::runtime::Origin::Trusted,
-    );
+    let principal =
+        crate::runtime::Principal::new(actor(&spec.name, tenant), crate::runtime::Origin::Trusted);
     use crate::runtime::server::{TriggerOutcome, trigger_template};
     match trigger_template(state.clone(), principal, spec.template.id.clone(), body).await {
         Ok(TriggerOutcome::Run(r)) => TargetResult::Started(r.run.run_id),
@@ -411,8 +416,8 @@ async fn fire_target(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::status::Outcome;
+    use super::*;
     use serde_json::json;
 
     fn spec() -> ScheduleSpec {
@@ -440,28 +445,53 @@ mod tests {
     #[test]
     fn the_body_carries_the_tick_params_labels_and_key() {
         let tick = at("2026-11-05T02:00:00Z");
-        let b = body(&spec(), tick, at("2026-11-05T02:00:01Z"), &FireOptions::default(), Some("acme")).unwrap();
+        let b = body(
+            &spec(),
+            tick,
+            at("2026-11-05T02:00:01Z"),
+            &FireOptions::default(),
+            Some("acme"),
+        )
+        .unwrap();
         assert_eq!(b.params["since"], json!("2026-11-05T02:00:00Z"));
         assert_eq!(b.params["n"], json!(3));
         assert_eq!(b.labels[LABEL_SCHEDULE], "nightly");
         assert_eq!(b.labels[LABEL_TICK], "2026-11-05T02:00:00Z");
         assert_eq!(b.labels["team"], "billing");
         assert_eq!(b.name.as_deref(), Some("nightly at 2026-11-05T02:00:00Z"));
-        assert_eq!(b.idempotency_key.as_deref(), Some("sched:nightly:2026-11-05T02:00:00Z:acme"));
+        assert_eq!(
+            b.idempotency_key.as_deref(),
+            Some("sched:nightly:2026-11-05T02:00:00Z:acme")
+        );
         assert_eq!(b.timeout_secs, Some(60));
         assert_eq!(b.pool.as_deref(), Some("big"));
         assert!(b.standing_approval);
         assert_eq!(b.sink.as_deref(), Some("pg"));
         assert!(b.version.is_some() && b.sink_version.is_some() && b.overlay_version.is_some());
-        let manual = FireOptions { manual: Some("u1".into()) };
+        let manual = FireOptions {
+            manual: Some("u1".into()),
+        };
         let m = body(&spec(), tick, tick, &manual, None).unwrap();
-        assert_eq!(m.idempotency_key.as_deref(), Some("sched:nightly:manual:u1"));
+        assert_eq!(
+            m.idempotency_key.as_deref(),
+            Some("sched:nightly:manual:u1")
+        );
         let mut plain = spec();
         plain.run.name = None;
-        assert_eq!(body(&plain, tick, tick, &manual, None).unwrap().name.as_deref(), Some("nightly"));
+        assert_eq!(
+            body(&plain, tick, tick, &manual, None)
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("nightly")
+        );
         let mut bad = spec();
         bad.template.version = Some("latest".into());
-        assert!(body(&bad, tick, tick, &manual, None).unwrap_err().contains("template version"));
+        assert!(
+            body(&bad, tick, tick, &manual, None)
+                .unwrap_err()
+                .contains("template version")
+        );
     }
 
     #[test]
@@ -474,7 +504,10 @@ mod tests {
             TargetResult::Started(_)
         ));
         assert!(matches!(
-            classify(ServeError::Conflict("connection needs re-auth".into()), Some("acme")),
+            classify(
+                ServeError::Conflict("connection needs re-auth".into()),
+                Some("acme")
+            ),
             TargetResult::Failed(_)
         ));
         assert!(matches!(
@@ -486,24 +519,44 @@ mod tests {
             TargetResult::Retry(_)
         ));
         assert!(matches!(
-            classify(ServeError::QueueFull { retry_after_secs: 1 }, None),
+            classify(
+                ServeError::QueueFull {
+                    retry_after_secs: 1
+                },
+                None
+            ),
             TargetResult::Retry(_)
         ));
-        assert!(matches!(classify(ServeError::Draining, None), TargetResult::Retry(_)));
+        assert!(matches!(
+            classify(ServeError::Draining, None),
+            TargetResult::Retry(_)
+        ));
         assert_eq!(
             classify(ServeError::NotFound, None),
             TargetResult::Failed("the template was not found".into())
         );
-        assert!(matches!(classify(ServeError::BadConfig("x".into()), None), TargetResult::Failed(_)));
-        assert!(matches!(classify(ServeError::Internal("x".into()), None), TargetResult::Retry(_)));
+        assert!(matches!(
+            classify(ServeError::BadConfig("x".into()), None),
+            TargetResult::Failed(_)
+        ));
+        assert!(matches!(
+            classify(ServeError::Internal("x".into()), None),
+            TargetResult::Retry(_)
+        ));
     }
 
     #[test]
     fn a_tick_result_folds_into_one_outcome() {
         let r = |targets: Vec<(Option<&str>, TargetResult)>| TickResult {
-            targets: targets.into_iter().map(|(t, r)| (t.map(str::to_string), r)).collect(),
+            targets: targets
+                .into_iter()
+                .map(|(t, r)| (t.map(str::to_string), r))
+                .collect(),
         };
-        assert_eq!(r(vec![(None, TargetResult::Started("a".into()))]).outcome(), Outcome::Started);
+        assert_eq!(
+            r(vec![(None, TargetResult::Started("a".into()))]).outcome(),
+            Outcome::Started
+        );
         assert_eq!(
             r(vec![(Some("acme"), TargetResult::Retry("q".into()))]).outcome(),
             Outcome::Retrying("acme: q".into())
@@ -512,7 +565,10 @@ mod tests {
             (Some("acme"), TargetResult::Started("a".into())),
             (Some("globex"), TargetResult::Failed("gone".into())),
         ]);
-        assert_eq!(mixed.outcome(), Outcome::Failed(vec!["globex: gone".into()]));
+        assert_eq!(
+            mixed.outcome(),
+            Outcome::Failed(vec!["globex: gone".into()])
+        );
         assert_eq!(mixed.run_ids(), vec!["a".to_string()]);
         assert_eq!(
             r(vec![(None, TargetResult::Failed("gone".into()))]).outcome(),
@@ -522,7 +578,10 @@ mod tests {
             r(vec![(None, TargetResult::Skipped("still going".into()))]).outcome(),
             Outcome::Skipped("still going".into())
         );
-        assert_eq!(r(vec![]).outcome(), Outcome::Skipped("no tenants to run for".into()));
+        assert_eq!(
+            r(vec![]).outcome(),
+            Outcome::Skipped("no tenants to run for".into())
+        );
         assert_eq!(
             r(vec![(None, TargetResult::Wait("run r still going".into()))]).outcome(),
             Outcome::Waiting("run r still going".into())

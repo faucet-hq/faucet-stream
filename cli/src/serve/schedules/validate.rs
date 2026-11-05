@@ -29,7 +29,11 @@ pub fn compile(cron: &str, timezone: &str) -> Result<CompiledSchedule, String> {
 }
 
 /// The next `n` ticks strictly after `after`.
-pub fn next_ticks(schedule: &CompiledSchedule, after: DateTime<Utc>, n: usize) -> Vec<DateTime<Utc>> {
+pub fn next_ticks(
+    schedule: &CompiledSchedule,
+    after: DateTime<Utc>,
+    n: usize,
+) -> Vec<DateTime<Utc>> {
     std::iter::successors(schedule.next_after(after), |t| schedule.next_after(*t))
         .take(n)
         .collect()
@@ -206,8 +210,10 @@ mod tests {
     fn a_valid_schedule_compiles() {
         assert!(validate(&spec(json!({}))).is_ok());
         assert!(
-            validate(&spec(json!({"template": {"params": {"since": "${schedule.tick}", "n": 3}}})))
-                .is_ok()
+            validate(&spec(
+                json!({"template": {"params": {"since": "${schedule.tick}", "n": 3}}})
+            ))
+            .is_ok()
         );
     }
 
@@ -228,7 +234,9 @@ mod tests {
             err(json!({"template": {"params": {"x": "${schedule.nope}"}}}))
                 .contains("unknown token `${schedule.nope}`")
         );
-        assert!(err(json!({"template": {"params": {"x": "${schedule.tick"}}})).contains("unterminated"));
+        assert!(
+            err(json!({"template": {"params": {"x": "${schedule.tick"}}})).contains("unterminated")
+        );
         assert!(err(json!({"run": {"labels": {"template": "x"}}})).contains("run.labels"));
         assert!(err(json!({"run": {"timeout_secs": 0}})).contains("timeout_secs"));
         assert!(err(json!({"run": {"name": "${schedule.when}"}})).contains("run.name"));
@@ -239,7 +247,12 @@ mod tests {
     #[test]
     fn substitution_replaces_every_token() {
         assert_eq!(
-            substitute("${schedule.name}@${schedule.tick} (${schedule.fired_at})", "n", "T", "F"),
+            substitute(
+                "${schedule.name}@${schedule.tick} (${schedule.fired_at})",
+                "n",
+                "T",
+                "F"
+            ),
             "n@T (F)"
         );
     }
@@ -250,12 +263,21 @@ mod tests {
         let every_two = compile("*/2 * * * *", "UTC").unwrap();
         let ticks = next_ticks(&every_two, now, 3);
         assert_eq!(ticks.len(), 3);
-        assert_eq!(ticks[0], "2026-11-05T00:02:00Z".parse::<DateTime<Utc>>().unwrap());
-        assert_eq!(shortest_gap(&every_two, now), Some(Duration::from_secs(120)));
+        assert_eq!(
+            ticks[0],
+            "2026-11-05T00:02:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+        assert_eq!(
+            shortest_gap(&every_two, now),
+            Some(Duration::from_secs(120))
+        );
         let s = spec(json!({"cron": "*/2 * * * *"}));
-        let e = check_min_interval(&s, &every_two, Duration::from_secs(300), "acme", now)
-            .unwrap_err();
-        assert!(e.contains("ticks every 2 minutes; acme's schedules may tick at most every 5 minutes"), "{e}");
+        let e =
+            check_min_interval(&s, &every_two, Duration::from_secs(300), "acme", now).unwrap_err();
+        assert!(
+            e.contains("ticks every 2 minutes; acme's schedules may tick at most every 5 minutes"),
+            "{e}"
+        );
         let daily = compile("0 2 * * *", "UTC").unwrap();
         assert!(check_min_interval(&s, &daily, Duration::from_secs(300), "acme", now).is_ok());
     }

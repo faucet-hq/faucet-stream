@@ -68,8 +68,11 @@ pub fn tenant_failed(schedule: &str, tenant: &str) {
 }
 
 pub fn healthy(schedule: &str, ok: bool) {
-    gauge!("faucet_serve_schedule_healthy", "schedule" => schedule.to_string())
-        .set(if ok { 1.0 } else { 0.0 });
+    gauge!("faucet_serve_schedule_healthy", "schedule" => schedule.to_string()).set(if ok {
+        1.0
+    } else {
+        0.0
+    });
 }
 
 pub fn last_tick(schedule: &str, unix_secs: i64) {

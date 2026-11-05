@@ -1709,7 +1709,8 @@ async fn tenant_schedules_keep_to_their_limits() {
     let fan = json!({"name": "acme-all", "cron": "0 2 * * *", "template": {"id": "plain-sync"}, "tenants": "all"});
     let (code, e) = api.post("acme-tok", "/v1/schedules", fan).await;
     assert_eq!(code, 403, "{e}");
-    let fast = json!({"name": "acme-fast", "cron": "*/2 * * * *", "template": {"id": "plain-sync"}});
+    let fast =
+        json!({"name": "acme-fast", "cron": "*/2 * * * *", "template": {"id": "plain-sync"}});
     let (code, e) = api.post("acme-tok", "/v1/schedules", fast).await;
     assert_eq!(code, 422, "{e}");
     assert!(e.to_string().contains("every 5 minutes"), "{e}");
@@ -1717,7 +1718,8 @@ async fn tenant_schedules_keep_to_their_limits() {
     let (code, made) = api.post("acme-tok", "/v1/schedules", ok).await;
     assert_eq!(code, 201, "{made}");
     assert_eq!(made["tenant"], "acme", "{made}");
-    let second = json!({"name": "acme-second", "cron": "0 4 * * *", "template": {"id": "plain-sync"}});
+    let second =
+        json!({"name": "acme-second", "cron": "0 4 * * *", "template": {"id": "plain-sync"}});
     let (code, e) = api.post("acme-tok", "/v1/schedules", second).await;
     assert_eq!(code, 422, "{e}");
     assert!(e.to_string().contains("max_schedules"), "{e}");
@@ -1727,7 +1729,8 @@ async fn tenant_schedules_keep_to_their_limits() {
         .post("acme-tok", "/v1/schedules/acme-nightly/pause", json!({}))
         .await;
     assert_eq!(code, 200);
-    let again = json!({"name": "acme-third", "cron": "0 5 * * *", "template": {"id": "plain-sync"}});
+    let again =
+        json!({"name": "acme-third", "cron": "0 5 * * *", "template": {"id": "plain-sync"}});
     let (code, _) = api.post("acme-tok", "/v1/schedules", again).await;
     assert_eq!(code, 422);
 
@@ -1831,7 +1834,10 @@ async fn two_servers_on_one_history_fire_each_tick_once() {
     for _ in 0..600 {
         per_tick.clear();
         let (_, page) = a
-            .get("admin-tok", "/v1/runs?label=schedule:every-second&limit=200")
+            .get(
+                "admin-tok",
+                "/v1/runs?label=schedule:every-second&limit=200",
+            )
             .await;
         for r in page["runs"].as_array().unwrap() {
             *per_tick

@@ -154,7 +154,8 @@ export async function renderSchedules(host, params) {
     const paused = all.filter((s) => s.paused);
     const top = tabs([["All", all.length], ["Paused", paused.length]], state.tab, tools(all));
     if (!all.length) return html`${top}${empty(scope() && !tenantPrincipal() ? `No schedules run for ${scope()}` : "No schedules yet", "A schedule runs a registered template on a cron.", { icon: "sched" })}`;
-    const shown = state.tab === "Paused" ? paused : all;
+    const byNext = (a, b) => (a.next_tick || "~").localeCompare(b.next_tick || "~") || a.name.localeCompare(b.name);
+    const shown = (state.tab === "Paused" ? paused : all).slice().sort(byNext);
     const next = all.map((s) => s.next_tick).filter(Boolean).sort()[0];
     const missed24 = all.reduce((n, s) => n + (s.missed_24h || 0), 0);
     const today = all.reduce((n, s) => n + (s.ticks_today || 0), 0);
@@ -290,7 +291,7 @@ schedules:
 
   function targetCard(s) {
     const params = Object.entries(s.template.params || {});
-    const facts = [kv("Template", lnk(s.template.id, href.template(s.template.id)), s.template.sink ? `into ${s.template.sink}` : ""), kv("Version", html`<span class="mono">${version(s)}</span>`, verLabel(version(s)).startsWith("pin") ? "never moves" : "resolved at each tick"), kv("Pool", s.run.pool || "default"), kv("Timeout", s.run.timeout_secs ? `${Math.round(s.run.timeout_secs / 60) || 1}m` : "none")];
+    const facts = [kv("Template", lnk(s.template.id, href.template(s.template.id)), s.template.sink ? `into ${s.template.sink}` : ""), kv("Version", html`<span class="mono">${version(s)}</span>`, verLabel(version(s)).startsWith("pin") ? "never moves" : "resolved at each tick"), kv("Pool", (s.run || {}).pool || "default"), kv("Timeout", (s.run || {}).timeout_secs ? `${Math.round((s.run || {}).timeout_secs / 60) || 1}m` : "none")];
     if (s.template.overlay) facts.push(kv("Deployment", s.template.overlay, s.template.overlay_version || "stable"));
     return card({ icon: "tpl", title: "What it runs", right: lnk("open template", href.template(s.template.id)),
       body: html`${grid(2, facts)}${params.length ? html`<div class="pad" style="padding-top:0">${tbl(["Param", "Value"], params.map(([k, v]) => [html`<span class="mono">${k}</span>`, paramValue(v)]))}</div>` : ""}` });
@@ -415,15 +416,15 @@ schedules:
       declared: null,
       declaredErr: null,
       streams: null,
-      picked: s && s.run.selection && s.run.selection.select ? new Set(s.run.selection.select) : null,
+      picked: s && (s.run || {}).selection && (s.run || {}).selection.select ? new Set((s.run || {}).selection.select) : null,
       cron: s ? s.cron : "0 2 * * *",
       timezone: tz,
       overlap: s ? s.overlap : "skip",
       runFor: s ? (s.tenants === "all" ? "all tenants" : Array.isArray(s.tenants) ? "selected" : "this server") : "this server",
       tenants: s && Array.isArray(s.tenants) ? [...s.tenants] : [],
-      pool: s ? s.run.pool || "" : "",
-      timeout: s && s.run.timeout_secs ? `${Math.round(s.run.timeout_secs / 60)}m` : "",
-      labels: s ? Object.entries(s.run.labels || {}).map(([k, v]) => `${k}=${v}`).join(", ") : "",
+      pool: s ? (s.run || {}).pool || "" : "",
+      timeout: s && (s.run || {}).timeout_secs ? `${Math.round((s.run || {}).timeout_secs / 60)}m` : "",
+      labels: s ? Object.entries((s.run || {}).labels || {}).map(([k, v]) => `${k}=${v}`).join(", ") : "",
       preview: null,
       tried: false,
       busy: false,
@@ -624,7 +625,7 @@ schedules:
       body: html`<div class="form one">${field("Run for", seg("runfor", ["this server", "all tenants", "selected"], form.runFor))}${form.runFor === "selected" ? html`<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">${form.tenants.map((t) => chip(html`${t} ${ic("x")}`, "x", { "data-untenant": t }))}${input("", { name: "f-addtenant", ph: "add a tenant id", mono: true })}</div>` : ""}</div>`,
       note: "One run per tenant each tick, each admitted against that tenant’s limits." });
     void allTenants;
-    const opts = card({ title: "Run options", body: html`<div class="form three">${field("Pool", input(form.pool, { name: "f-pool", ph: "default" }))}${field("Timeout", input(form.timeout, { name: "f-timeout", ph: "45m" }))}${field("Labels", input(form.labels, { name: "f-labels", mono: true, ph: "team=finance" }))}</div>` });
+    const opts = card({ title: "Run options", body: html`<div class="form three">${field("Pool", input(form.pool, { name: "f-pool", ph: "default" }))}${field("Timeout", input(form.timeout, { name: "f-timeout", ph: "45m" }))}${field("Labels", input(form.labels, { name: "f-labels", mono: true, ph: "team=data" }))}</div>` });
     const owner = tenantPrincipal() ? me().tenant : "";
     const limitAlert = owner && data ? alert(data.max_schedules != null ? `${owner} can have ${data.max_schedules} schedules; ${data.owned ?? 0} are in use.` : `${owner}’s schedules run only for ${owner}.`, `Ticks fire at most every ${Math.round((data.tenant_min_interval_secs || 300) / 60)} minutes, and each run counts against ${owner}’s run limits.`, "") : "";
     let editNote = "";

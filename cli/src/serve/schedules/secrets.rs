@@ -82,13 +82,23 @@ pub fn seal(
 }
 
 #[cfg(feature = "encryption")]
-fn seal_value(state: &ServerState, schedule: &str, param: &str, v: &Value) -> Result<Value, String> {
+fn seal_value(
+    state: &ServerState,
+    schedule: &str,
+    param: &str,
+    v: &Value,
+) -> Result<Value, String> {
     let vault = state.vault().ok_or_else(|| no_vault(param))?;
     Ok(json!({ SEALED: vault.seal_for(v, &context(schedule, param)) }))
 }
 
 #[cfg(not(feature = "encryption"))]
-fn seal_value(state: &ServerState, schedule: &str, param: &str, v: &Value) -> Result<Value, String> {
+fn seal_value(
+    state: &ServerState,
+    schedule: &str,
+    param: &str,
+    v: &Value,
+) -> Result<Value, String> {
     let _ = (state, schedule, v, context(schedule, param));
     Err(no_vault(param))
 }
@@ -115,17 +125,27 @@ pub fn opened(state: &ServerState, spec: &ScheduleSpec) -> Result<ScheduleSpec, 
 }
 
 #[cfg(feature = "encryption")]
-fn open_value(state: &ServerState, schedule: &str, param: &str, text: &str) -> Result<Value, String> {
-    let vault = state
-        .vault()
-        .ok_or_else(|| format!("template.params.{param} is sealed and this server has no vault key"))?;
+fn open_value(
+    state: &ServerState,
+    schedule: &str,
+    param: &str,
+    text: &str,
+) -> Result<Value, String> {
+    let vault = state.vault().ok_or_else(|| {
+        format!("template.params.{param} is sealed and this server has no vault key")
+    })?;
     vault
         .open_for(text, &context(schedule, param))
         .map_err(|e| format!("template.params.{param} could not be opened: {e}"))
 }
 
 #[cfg(not(feature = "encryption"))]
-fn open_value(state: &ServerState, schedule: &str, param: &str, text: &str) -> Result<Value, String> {
+fn open_value(
+    state: &ServerState,
+    schedule: &str,
+    param: &str,
+    text: &str,
+) -> Result<Value, String> {
     let _ = (state, schedule, text);
     Err(format!(
         "template.params.{param} is sealed and this build has no `encryption` feature"
@@ -191,7 +211,10 @@ mod tests {
         seal(&state, &mut s, &["token".into()], None).unwrap();
         assert!(is_sealed(&s.template.params["token"]));
         assert!(!s.template.params["token"].to_string().contains("secret"));
-        assert_eq!(opened(&state, &s).unwrap().template.params["token"], json!("secret"));
+        assert_eq!(
+            opened(&state, &s).unwrap().template.params["token"],
+            json!("secret")
+        );
         // Sealed for another schedule: refused.
         let mut other = s.clone();
         other.name = "other".into();
