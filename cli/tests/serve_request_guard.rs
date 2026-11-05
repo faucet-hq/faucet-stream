@@ -27,6 +27,9 @@ async fn spawn(extra: &[&str]) -> String {
     let listen = format!("127.0.0.1:{port}");
     let mut argv = vec!["faucet", "serve", "--listen", &listen, "--no-env-file"];
     argv.extend_from_slice(extra);
+    if !extra.contains(&"--history") {
+        argv.extend_from_slice(&["--history", "memory"]);
+    }
     let cli = Cli::try_parse_from(argv).unwrap();
     let Command::Serve(args) = cli.command else {
         panic!("serve args");

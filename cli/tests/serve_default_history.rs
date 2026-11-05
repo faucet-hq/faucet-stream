@@ -206,7 +206,7 @@ async fn the_default_history_survives_a_restart() {
         .post(
             "alice-tok",
             "/v1/templates",
-            json!({ "id": "kept-template", "config": pipeline(dir.path(), "tpl"), "launch": true }),
+            json!({ "id": "kept-template", "config": pipeline(dir.path(), "tpl") }),
         )
         .await;
     assert_eq!(s, 201, "{t}");
@@ -214,7 +214,7 @@ async fn the_default_history_survives_a_restart() {
         .post(
             "alice-tok",
             "/v1/schedules",
-            json!({ "name": "nightly", "cron": "0 3 * * *", "template": { "id": "kept-template" } }),
+            json!({ "name": "nightly", "cron": "0 3 * * *", "template": { "id": "kept-template", "version": "1" } }),
         )
         .await;
     assert_eq!(s, 201, "{sched}");
