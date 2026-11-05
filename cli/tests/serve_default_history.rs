@@ -247,7 +247,8 @@ async fn the_default_history_survives_a_restart() {
     let (s, r) = api.get(&format!("/v1/runs/{run_id}")).await;
     assert_eq!(s, 200, "{r}");
     assert_eq!(r["status"], "completed", "{r}");
-    assert_eq!(api.get("/v1/templates/kept-template").await.0, 200);
+    let (s, tpl) = api.get("/v1/templates/kept-template?version=1").await;
+    assert_eq!(s, 200, "{tpl}");
     let (s, sched) = api.get("/v1/schedules/nightly").await;
     assert_eq!(s, 200, "{sched}");
     let (_, p) = api.get("/v1/policy").await;
