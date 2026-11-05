@@ -795,6 +795,268 @@ paths:
         "401": { $ref: "#/components/responses/Error" }
         "403": { description: Principal's role lacks the required permission }
         "422": { $ref: "#/components/responses/Error" }
+  /v1/policy:
+    get:
+      summary: The data-flow policy in force
+      description: >
+        The server policy (#1043): from the `--policy` file (`source: file`,
+        read-only) or the newest stored version (`source: server`). An
+        unscoped principal gets the policy, its canonical YAML, a summary
+        (rules, labels, sinks with attributes, columns the catalog has seen
+        per label), the refusals of the last 7 days, whether it may edit, and
+        any pending change. A tenant-scoped principal gets only the server
+        rules as outlines (name, label, what they require) and its own
+        refusal counts. `PolicyRead` (viewer+).
+      operationId: getPolicy
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: The policy view.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PolicyView" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+    post:
+      summary: Propose a change to the server-managed policy
+      description: >
+        Creates a `policy_update` change request; the policy changes only when
+        another admin approves it (`POST /v1/changes/{id}/approve`), which
+        re-checks it and stores it as the next version. 409 when the server
+        uses a `--policy` file, or when `base_version` is no longer the
+        version in force. 422 with `details.problems` (line + message) when
+        the draft does not validate. `PolicyAdmin` (admin, unscoped).
+      operationId: proposePolicy
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PolicyProposal" }
+      responses:
+        "201":
+          description: The pending change request.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChangeRequest" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+  /v1/policy/versions:
+    get:
+      summary: Versions of the server-managed policy
+      description: Newest first, each with who requested and approved it, the reason and its canonical YAML. Unscoped principals; `PolicyRead`.
+      operationId: listPolicyVersions
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 100 } }
+      responses:
+        "200":
+          description: The versions.
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/PolicyVersion" } }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+  /v1/policy/refusals:
+    get:
+      summary: Submissions and runs the policy refused
+      description: >
+        From the audit log (`policy.denied`): submit-time refusals by the
+        static gate and run-time ones by the backstop, newest first, with the
+        rule, column, label, sink and the layer (`server` or `tenant`) whose
+        rule refused it. A tenant-scoped principal sees its own only.
+        `PolicyRead`.
+      operationId: listPolicyRefusals
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: since, in: query, required: false, schema: { type: string, format: date-time } }
+        - { name: tenant, in: query, required: false, schema: { type: string } }
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 200 } }
+      responses:
+        "200":
+          description: The refusals.
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/PolicyRefusal" } }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+  /v1/policy/check:
+    post:
+      summary: Dry-run a config against the policy in force
+      description: >
+        The static pass a submission takes, without running anything: over
+        every row (or `row`), with `sample` records for one row (their values
+        label columns), or over a registered pipeline `template` (params bound
+        to placeholders). Returns the policy report (`{loaded: false}` when no
+        policy applies). The config is loaded like `/v1/plan`, so `Plan`
+        (operator+); not for tenant-scoped principals.
+      operationId: checkPolicy
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                config: { type: string }
+                config_format: { type: string, enum: [yaml, json], default: yaml }
+                template: { type: string, nullable: true }
+                version: { type: integer, nullable: true }
+                row: { type: string, nullable: true }
+                sample: { type: array, nullable: true, items: { type: object } }
+      responses:
+        "200":
+          description: The policy report.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+  /v1/policy/preview:
+    post:
+      summary: Validate a draft of the server policy and show its impact
+      description: >
+        Never stores anything. Answers the draft's problems (with lines), or
+        its diff against the version in force and its impact: the registered
+        pipeline templates and recent runs (stored configs) it would newly
+        refuse or allow. 409 for a `--policy` file server. `PolicyAdmin`.
+      operationId: previewPolicy
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [policy], properties: { policy: { type: string } } }
+      responses:
+        "200":
+          description: The preview.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PolicyPreview" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+  /v1/policy/rollback:
+    post:
+      summary: Propose re-enacting an earlier version
+      description: A `policy_update` change request whose draft is the earlier version (`plan.summary.restores`). 409 when that version is already in force. `PolicyAdmin`.
+      operationId: rollbackPolicy
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PolicyRollback" }
+      responses:
+        "201":
+          description: The pending change request.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChangeRequest" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+  /v1/tenants/{tenant}/policy:
+    parameters:
+      - { name: tenant, in: path, required: true, schema: { type: string } }
+    get:
+      summary: A tenant's add-only policy
+      description: >
+        The server rules that apply to the tenant (outlines), the tenant's own
+        policy (classifications and rules it adds), its versions, refusal
+        counts and any pending change. Another tenant's is a 404 for a
+        tenant-scoped principal. `PolicyRead`.
+      operationId: getTenantPolicy
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: The tenant policy view.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+    post:
+      summary: Propose a change to a tenant's policy
+      description: >
+        A `tenant_policy_update` change request, approved by another admin of
+        the tenant or a server admin (never the requester). The draft may only
+        add: reusing a server rule's name is refused. Enforced on the tenant's
+        runs only, on top of the server policy. `PolicyAdmin` (the tenant's
+        admins and server admins).
+      operationId: proposeTenantPolicy
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PolicyProposal" }
+      responses:
+        "201":
+          description: The pending change request.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChangeRequest" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+  /v1/tenants/{tenant}/policy/preview:
+    parameters:
+      - { name: tenant, in: path, required: true, schema: { type: string } }
+    post:
+      summary: Validate a draft of a tenant's policy and show its impact
+      description: As `POST /v1/policy/preview`, measured on the tenant's merged policy and its own runs.
+      operationId: previewTenantPolicy
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [policy], properties: { policy: { type: string } } }
+      responses:
+        "200":
+          description: The preview.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PolicyPreview" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+  /v1/tenants/{tenant}/policy/rollback:
+    parameters:
+      - { name: tenant, in: path, required: true, schema: { type: string } }
+    post:
+      summary: Propose re-enacting an earlier version of a tenant's policy
+      operationId: rollbackTenantPolicy
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PolicyRollback" }
+      responses:
+        "201":
+          description: The pending change request.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChangeRequest" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
   /v1/backfill:
     post:
       summary: Submit a windowed backfill as tracked runs (one per window unit)
@@ -1156,7 +1418,7 @@ paths:
       security: [{ bearerAuth: [] }]
       parameters:
         - { name: status, in: query, required: false, schema: { type: string, enum: [pending, approved, rejected, executed, expired, invalidated, failed] } }
-        - { name: kind, in: query, required: false, schema: { type: string, enum: [run, template_register, template_launch, template_delete, template_deprecate] } }
+        - { name: kind, in: query, required: false, schema: { type: string, enum: [run, template_register, template_launch, template_delete, template_deprecate, policy_update, tenant_policy_update] } }
         - { name: requester, in: query, required: false, schema: { type: string } }
         - { name: tenant, in: query, required: false, schema: { type: string }, description: "Only requests for this tenant (#709); forced for a tenant-scoped principal." }
         - { name: limit, in: query, required: false, schema: { type: integer, default: 200, maximum: 2000 } }
@@ -1180,7 +1442,7 @@ paths:
       operationId: countChanges
       security: [{ bearerAuth: [] }]
       parameters:
-        - { name: kind, in: query, required: false, schema: { type: string, enum: [run, template_register, template_launch, template_delete, template_deprecate] } }
+        - { name: kind, in: query, required: false, schema: { type: string, enum: [run, template_register, template_launch, template_delete, template_deprecate, policy_update, tenant_policy_update] } }
         - { name: requester, in: query, required: false, schema: { type: string } }
         - { name: tenant, in: query, required: false, schema: { type: string }, description: "Only requests for this tenant (#709); forced for a tenant-scoped principal." }
       responses:
@@ -2969,6 +3231,95 @@ components:
         connections: { type: array, items: { $ref: "#/components/schemas/Connection" } }
         active_runs: { type: integer }
         notifications_error: { type: string, description: "Why the sealed notifications list could not be opened; the list then reads as empty." }
+    PolicyVersion:
+      type: object
+      required: [version, created_at, created_by, rules, classifications, yaml]
+      properties:
+        version: { type: integer }
+        created_at: { type: string, format: date-time }
+        created_by: { type: string, description: "Who requested the change." }
+        approved_by: { type: string, description: "Who completed the approval." }
+        reason: { type: string }
+        change_id: { type: string }
+        restores: { type: integer, description: "Set on a rollback: the version re-enacted." }
+        rules: { type: integer }
+        classifications: { type: integer }
+        yaml: { type: string, description: "The version's document as canonical YAML." }
+    PolicyView:
+      type: object
+      required: [source, loaded, rules, editable]
+      properties:
+        source: { type: string, enum: [file, server] }
+        loaded: { type: boolean }
+        scoped_tenant: { type: string, description: "Set for a tenant-scoped principal, which gets outlines only." }
+        file: { type: object, nullable: true, properties: { path: { type: string }, sha256: { type: string }, loaded_at: { type: string, format: date-time } } }
+        version: { allOf: [{ $ref: "#/components/schemas/PolicyVersion" }], nullable: true }
+        policy: { type: object, nullable: true, additionalProperties: true, description: "The PolicySpec (see `faucet schema policy`)." }
+        yaml: { type: string, nullable: true }
+        rules:
+          type: array
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              label: { type: string }
+              sink_kind: { type: array, items: { type: string } }
+              requires: { type: string }
+              on_runtime: { type: string, enum: [fail, quarantine] }
+        summary: { type: object, nullable: true, additionalProperties: true }
+        refusals_7d: { type: object, properties: { total: { type: integer }, submit: { type: integer }, runtime: { type: integer } } }
+        editable: { type: boolean }
+        pending_change: { type: object, nullable: true, additionalProperties: true }
+    PolicyProposal:
+      type: object
+      required: [policy, reason]
+      properties:
+        policy: { type: string, description: "The policy document (YAML or JSON)." }
+        reason: { type: string, description: "Shown to the approver and kept with the version." }
+        base_version: { type: integer, nullable: true, description: "The version the draft was edited from (null when there was none)." }
+    PolicyRollback:
+      type: object
+      required: [version, reason]
+      properties:
+        version: { type: integer }
+        reason: { type: string }
+    PolicyPreview:
+      type: object
+      required: [valid, problems, next_version, diff]
+      properties:
+        valid: { type: boolean }
+        problems: { type: array, items: { type: object, properties: { line: { type: integer }, message: { type: string } } } }
+        current_version: { type: integer, nullable: true }
+        next_version: { type: integer }
+        diff: { type: array, items: { type: object, properties: { op: { type: string, enum: [" ", "-", "+"] }, text: { type: string } } } }
+        impact:
+          type: object
+          nullable: true
+          properties:
+            templates_checked: { type: integer }
+            templates_runtime_only: { type: integer }
+            runs_checked: { type: integer }
+            newly_refused: { type: array, items: { type: object, additionalProperties: true } }
+            newly_allowed: { type: array, items: { type: object, additionalProperties: true } }
+            unchanged: { type: integer }
+    PolicyRefusal:
+      type: object
+      required: [id, at, phase, principal, outcome]
+      properties:
+        id: { type: string }
+        at: { type: string, format: date-time }
+        phase: { type: string, enum: [submit, runtime] }
+        run_id: { type: string }
+        target: { type: string }
+        tenant: { type: string }
+        principal: { type: string }
+        rule: { type: string }
+        column: { type: string }
+        label: { type: string }
+        sink: { type: string }
+        sink_kind: { type: string }
+        layer: { type: string, enum: [server, tenant] }
+        outcome: { type: string, enum: [refused, failed, quarantined] }
     TenantDeleteReport:
       type: object
       required: [runs, usage_records, change_requests, state_keys_deleted, catalog_datasets, catalog_edges, catalog_config_snapshots]
@@ -2980,6 +3331,7 @@ components:
         catalog_datasets: { type: integer, description: "Catalog datasets only this tenant's runs touched." }
         catalog_edges: { type: integer, description: "Catalog lineage edges this tenant's runs recorded." }
         catalog_config_snapshots: { type: integer }
+        policy_versions: { type: integer, description: "Versions of the tenant's own data-flow policy (#1043)." }
         state_keys_not_deleted: { type: array, items: { type: string }, description: "Keys left in place, with why." }
     FanoutResponse:
       type: object
@@ -3253,6 +3605,12 @@ components:
         pool: { type: string, default: default, description: "The execution pool the run belongs to (#957): only a replica serving it claims the run, its shards and its re-claims. Runs recorded before pools existed read as `default`." }
         submitted_by: { type: string, description: "Who submitted the run (#998): the authenticated principal the `run.submit` audit entry names — `trigger:<name>` for a trigger, the requester for an approved change request, `anonymous` under `--no-auth`, `token` for the single `--auth-token`. Set by the server; a request cannot supply it. Absent on runs recorded before the field existed." }
         dlq_location: { type: string, description: "Where the run's dead-letter queue writes (#998): the `path` of its `dlq:` sink as configured at submit, when that sink writes local files (`file`, `jsonl`) — the `location` `POST /v1/dlq/inspect` takes. Set by the server; absent without a file DLQ." }
+        policy_pin:
+          type: object
+          description: "The stored data-flow policy versions the run was admitted under (#1043); a claim, shard or resume on another replica enforces these, not a newer version. Absent when no stored version applied (no policy, or a `--policy` file)."
+          properties:
+            server: { type: integer }
+            tenant: { type: integer }
         invocations:
           type: array
           items: { $ref: "#/components/schemas/InvocationRecord" }
@@ -3615,7 +3973,16 @@ components:
       required: [id, kind, status, requester, requester_role, payload, required_approvals, created_at, updated_at, expires_at]
       properties:
         id: { type: string }
-        kind: { type: string, enum: [run, template_register, template_launch, template_delete, template_deprecate] }
+        kind:
+          type: string
+          enum: [run, template_register, template_launch, template_delete, template_deprecate, policy_update, tenant_policy_update]
+          description: >
+            `policy_update` / `tenant_policy_update` (#1043) are created by
+            `POST /v1/policy` and `POST /v1/tenants/{tenant}/policy` (and
+            their `/rollback`), never by `POST /v1/changes`. Their
+            `plan.summary` carries `scope`, `tenant`, `current_version`,
+            `next_version`, `restores`, `diff` and `impact`, and — once
+            executed — the `version` stored.
         status: { type: string, enum: [pending, approved, rejected, executed, expired, invalidated, failed] }
         requester: { type: string }
         tenant: { type: string, description: "The tenant the proposed run is for (#709)." }

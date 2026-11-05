@@ -716,6 +716,31 @@ impl RunHistory for FallbackHistory {
     async fn run_secrets_delete(&self, run_id: &str) -> Result<(), HistoryError> {
         strict!(self, p => p.run_secrets_delete(run_id), f => f.run_secrets_delete(run_id))
     }
+    // The policy in force is shared state: never read it from, or write it
+    // to, the empty in-memory fallback.
+    async fn policy_version_insert(
+        &self,
+        record: &super::policies::PolicyVersionRecord,
+    ) -> Result<bool, HistoryError> {
+        strict!(self, p => p.policy_version_insert(record), f => f.policy_version_insert(record))
+    }
+    async fn policy_versions(
+        &self,
+        scope: &str,
+        limit: usize,
+    ) -> Result<Vec<super::policies::PolicyVersionRecord>, HistoryError> {
+        strict!(self, p => p.policy_versions(scope, limit), f => f.policy_versions(scope, limit))
+    }
+    async fn policy_version_get(
+        &self,
+        scope: &str,
+        version: u32,
+    ) -> Result<Option<super::policies::PolicyVersionRecord>, HistoryError> {
+        strict!(self, p => p.policy_version_get(scope, version), f => f.policy_version_get(scope, version))
+    }
+    async fn policy_versions_delete(&self, scope: &str) -> Result<u64, HistoryError> {
+        strict!(self, p => p.policy_versions_delete(scope), f => f.policy_versions_delete(scope))
+    }
     async fn run_secrets_purge_terminal(&self) -> Result<usize, HistoryError> {
         strict!(self, p => p.run_secrets_purge_terminal(), f => f.run_secrets_purge_terminal())
     }

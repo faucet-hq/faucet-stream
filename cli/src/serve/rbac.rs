@@ -110,11 +110,21 @@ pub enum Permission {
     /// Store, replace and delete a tenant's connections and start hosted
     /// OAuth connect flows (#709) — operator+.
     ConnectionManage,
+    /// Read the data-flow policy in force, its versions and its refusals
+    /// (`GET /v1/policy*`, `GET /v1/tenants/{tenant}/policy`, #1043) —
+    /// viewer+. A tenant principal sees the server rules that apply to it,
+    /// not the rest of the server policy.
+    PolicyRead,
+    /// Propose a policy change or rollback and preview a draft
+    /// (`POST /v1/policy[/preview|/rollback]` and the tenant equivalents,
+    /// #1043) — admin-only. Every change still needs a second admin's
+    /// approval before it is enforced.
+    PolicyAdmin,
 }
 
 impl Permission {
     /// Every permission, in declaration order.
-    pub const ALL: [Permission; 27] = [
+    pub const ALL: [Permission; 29] = [
         Permission::RunRead,
         Permission::RunWrite,
         Permission::SchemaRead,
@@ -142,6 +152,8 @@ impl Permission {
         Permission::TenantRead,
         Permission::TenantAdmin,
         Permission::ConnectionManage,
+        Permission::PolicyRead,
+        Permission::PolicyAdmin,
     ];
 }
 
@@ -179,6 +191,7 @@ impl Role {
                         | ChangeRead
                         | StatusRead
                         | TenantRead
+                        | PolicyRead
                 )
             }
             Role::Operator => {
@@ -205,6 +218,7 @@ impl Role {
                         | StatusRead
                         | TenantRead
                         | ConnectionManage
+                        | PolicyRead
                 )
             }
             Role::Admin => true,
@@ -678,6 +692,20 @@ pub fn required_permission(method: &Method, matched_path: &str) -> Option<Permis
         (&Method::POST, "/v1/tenants/{tenant}/templates/{id}/runs") => Some(RunWrite),
         (&Method::POST, "/v1/templates/{id}/fanout") => Some(RunWrite),
         (&Method::GET, "/v1/connect/providers") => Some(TenantRead),
+        // The data-flow policy (#1043). Reading is viewer+; a dry run loads
+        // the submitted config like `/v1/plan`, so operator+; proposing a
+        // change (which another admin must approve) is admin-only.
+        (&Method::GET, "/v1/policy") => Some(PolicyRead),
+        (&Method::GET, "/v1/policy/versions") => Some(PolicyRead),
+        (&Method::GET, "/v1/policy/refusals") => Some(PolicyRead),
+        (&Method::POST, "/v1/policy/check") => Some(Plan),
+        (&Method::POST, "/v1/policy") => Some(PolicyAdmin),
+        (&Method::POST, "/v1/policy/preview") => Some(PolicyAdmin),
+        (&Method::POST, "/v1/policy/rollback") => Some(PolicyAdmin),
+        (&Method::GET, "/v1/tenants/{tenant}/policy") => Some(PolicyRead),
+        (&Method::POST, "/v1/tenants/{tenant}/policy") => Some(PolicyAdmin),
+        (&Method::POST, "/v1/tenants/{tenant}/policy/preview") => Some(PolicyAdmin),
+        (&Method::POST, "/v1/tenants/{tenant}/policy/rollback") => Some(PolicyAdmin),
         // MCP endpoint (#420): baseline access needs only a read scope (Viewer+);
         // the mutating `run_pipeline` tool is separately gated on RunWrite inside
         // the handler.
@@ -745,7 +773,11 @@ pub fn tenant_scope_decision(
         | (_, "/v1/changes/{id}/reject")
         | (&Method::GET, "/v1/usage")
         | (&Method::GET, "/v1/tenants")
-        | (&Method::GET, "/v1/connect/providers") => Allow,
+        | (&Method::GET, "/v1/connect/providers")
+        // The server rules that apply to the tenant and its own refusals;
+        // the handlers narrow both (#1043).
+        | (&Method::GET, "/v1/policy")
+        | (&Method::GET, "/v1/policy/refusals") => Allow,
         _ => Deny,
     }
 }
@@ -830,6 +862,17 @@ pub fn audit_action(method: &Method, matched_path: &str) -> &'static str {
         (&Method::POST, "/v1/tenants/{tenant}/templates/{id}/runs") => "template.run",
         (&Method::POST, "/v1/templates/{id}/fanout") => "template.fanout",
         (&Method::GET, "/v1/connect/providers") => "connect.providers",
+        (&Method::GET, "/v1/policy") => "policy.get",
+        (&Method::GET, "/v1/policy/versions") => "policy.versions",
+        (&Method::GET, "/v1/policy/refusals") => "policy.refusals",
+        (&Method::POST, "/v1/policy/check") => "policy.check",
+        (&Method::POST, "/v1/policy") => "policy.request",
+        (&Method::POST, "/v1/policy/preview") => "policy.preview",
+        (&Method::POST, "/v1/policy/rollback") => "policy.rollback",
+        (&Method::GET, "/v1/tenants/{tenant}/policy") => "policy.get",
+        (&Method::POST, "/v1/tenants/{tenant}/policy") => "policy.request",
+        (&Method::POST, "/v1/tenants/{tenant}/policy/preview") => "policy.preview",
+        (&Method::POST, "/v1/tenants/{tenant}/policy/rollback") => "policy.rollback",
         (&Method::POST, "/mcp") => "mcp",
         _ => "unknown",
     }

@@ -238,6 +238,38 @@ pub fn build_router(
                 get(tenants::list_connect_providers),
             );
     }
+    // The data-flow policy in the console (#1043).
+    #[cfg(feature = "policy")]
+    {
+        use crate::serve::handlers::policy;
+        api = api
+            .route(
+                "/v1/policy",
+                get(policy::get_policy).post(policy::propose_server),
+            )
+            .route("/v1/policy/versions", get(policy::list_versions))
+            .route("/v1/policy/refusals", get(policy::list_refusals))
+            .route("/v1/policy/check", post(policy::check))
+            .route("/v1/policy/preview", post(policy::preview))
+            .route("/v1/policy/rollback", post(policy::rollback_server));
+    }
+    #[cfg(all(feature = "policy", feature = "tenants"))]
+    {
+        use crate::serve::handlers::policy;
+        api = api
+            .route(
+                "/v1/tenants/{tenant}/policy",
+                get(policy::get_tenant_policy).post(policy::propose_tenant),
+            )
+            .route(
+                "/v1/tenants/{tenant}/policy/preview",
+                post(policy::preview_tenant),
+            )
+            .route(
+                "/v1/tenants/{tenant}/policy/rollback",
+                post(policy::rollback_tenant),
+            );
+    }
     // MCP endpoint (#420): mounted only with `--mcp`. Placed on `api` so it
     // inherits the bearer-auth + RBAC route-layer below; the per-request
     // mutation gate additionally requires the caller's `RunWrite` scope.
@@ -999,6 +1031,9 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
     if let Some(p) = policy {
         tracing::info!(rules = p.rules.len(), "data-flow policy loaded");
         state.set_policy(p);
+        if let Some(path) = &config.policy_path {
+            state.set_policy_file(crate::serve::policies::PolicyFile::read(path));
+        }
     }
     #[cfg(feature = "encryption")]
     state.set_vault(vault);

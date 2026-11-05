@@ -77,8 +77,8 @@ The sidebar groups the pages: **Operate** (Overview, Runs, Changes, Triggers,
 Schedules), **Data** (Datasets, Lineage), **Build** (Templates, Schemas,
 Submit), **Govern** (Policy, Usage, Tenants) and **Admin** (Audit log,
 Settings). Badges count running runs, pending change requests, datasets,
-templates and tenants. Schedules and Policy are marked *soon*: their pages say
-what will live there and how to do it today.
+templates and tenants. Schedules is marked *soon*: its page says what will
+live there and how to do it today.
 
 - **Go to… / ⌘K** (Ctrl+K) opens a palette over pages, recent runs, datasets,
   templates, change requests, tenants and actions (submit a run, switch theme,
@@ -156,6 +156,39 @@ requests (`#/changes/<id>`): **Needs me** and **All** tabs, a stat strip from
 requests. A request shows its plan (what the run, registration or launch will
 do), its impact on downstream datasets, the approvals so far and its history;
 **Approve** and **Reject** (with a reason) follow the server's approval policy.
+A data-flow policy change shows the YAML diff and, under **Impact**, the
+templates and recent runs it would newly refuse or allow; its requester sees
+**Withdraw** instead of **Approve**.
+
+### Policy
+
+**Policy** (`#/policy`) shows the [data-flow policy](./policies.md) the server
+enforces:
+
+- **Rules** — what is in effect (rules, labels, sinks that declare attributes,
+  refusals in the last 7 days), the classifications with how many catalogued
+  columns each label matched in the last 30 days, and the rules: what each
+  covers, what satisfies it, and what happens at run time.
+- **Refusals** — the submissions and runs the policy stopped, with the rule,
+  column and sink, filterable by tenant.
+- **Dry run** (operator) — paste a config, or pick a pipeline template, and
+  check it without running it; violations come with how to fix them.
+- **History** — the versions of a server-managed policy, who requested and
+  approved each, and **Roll back to vN** (a change request too).
+
+On a server started with `--policy FILE` the page says so and is read-only. On a
+server-managed policy an admin's **Edit policy** opens an editor that validates
+as you type (problems with their line), then **Preview impact** shows the diff
+and the templates and recent runs the draft would newly refuse or allow, and
+**Request change** — with a required reason — creates the change request a
+second admin approves. A pending change shows as a banner until then. With no
+policy at all, **Write a policy** starts from an example.
+
+With the tenant switcher set to a tenant, the page shows the server rules beside
+that tenant's add-only rules and their history, with **Edit acme rules** for
+admins. A tenant principal sees the server rules that apply to it (names and
+what they require), its own rules, its refusals and their history; its admins
+edit its rules, its viewers and operators read them.
 
 ### Triggers
 

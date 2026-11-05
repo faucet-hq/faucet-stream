@@ -46,6 +46,17 @@ curl -X POST http://127.0.0.1:8080/v1/changes \
 | `template_launch` | `{ "id": "...", "version": 3 }` (version optional, default `newest`) | the launch |
 | `template_delete` | `{ "id": "...", "version": 3 }` (no `version` = every version) | the delete |
 | `template_deprecate` | `{ "id": "...", "version": 3, "reason": "...", "undo": false }` | retiring (or with `undo`, reviving) the version |
+| `policy_update` | made by `POST /v1/policy` / `/v1/policy/rollback`, never by `POST /v1/changes` | storing the next version of the server-managed [data-flow policy](./policies.md#under-faucet-serve) |
+| `tenant_policy_update` | made by `POST /v1/tenants/{tenant}/policy` (and `/rollback`) | storing the next version of that tenant's add-only policy |
+
+**Policy changes always need approval**, whatever `--require-approval` says:
+by default an admin other than the requester approves a `policy_update`, and
+another admin of the tenant — or a server admin — a `tenant_policy_update`. A
+tenant-scoped principal never approves the server's policy, nor another
+tenant's. The plan holds the version the draft was based on, so a request
+approved after another policy change landed is `invalidated` rather than
+overwriting it. (On a server with a single principal — `--auth-token`,
+`--no-auth` — that principal may approve its own request, as for every kind.)
 
 The response is the stored request: `status: pending`, the plan (one
 [`faucet plan`](../reference/cli.md#plan) report per root row — source, sink,
@@ -227,4 +238,5 @@ decides; a refused approval shows its reason.
 |---|---|
 | `faucet_serve_changes_total{kind,outcome}` | `requested`, `approved`, `denied`, `rejected`, `executed`, `invalidated`, `expired`, `failed`. |
 | `faucet_serve_changes_pending` | Requests awaiting approval. |
+| `faucet_serve_policy_versions_total{layer}` | Policy versions stored by approved changes (`layer` = `server` / `tenant`). |
 | `faucet_budget_exceeded_total{pipeline,row,budget}` | Runs stopped by a budget ceiling. |

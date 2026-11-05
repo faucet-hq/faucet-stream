@@ -62,6 +62,9 @@ struct Inner {
     /// The server-wide data-flow policy (`--policy`, #702), when one was given.
     #[cfg(feature = "policy")]
     policy: RwLock<Option<Arc<faucet_core::PolicySpec>>>,
+    /// Where that `--policy` policy was read from (#1043), for the console.
+    #[cfg(feature = "policy")]
+    policy_file: RwLock<Option<crate::serve::policies::PolicyFile>>,
     /// The tenant runtime (#709): vault key, hosted-OAuth providers,
     /// admission locks. Replaced once at startup.
     #[cfg(feature = "tenants")]
@@ -135,6 +138,8 @@ impl ServerState {
                 test_policy: RwLock::new(None),
                 #[cfg(feature = "policy")]
                 policy: RwLock::new(None),
+                #[cfg(feature = "policy")]
+                policy_file: RwLock::new(None),
                 #[cfg(feature = "tenants")]
                 tenants: RwLock::new(Arc::new(Default::default())),
                 #[cfg(feature = "encryption")]
@@ -255,6 +260,28 @@ impl ServerState {
     pub fn policy(&self) -> Option<Arc<faucet_core::PolicySpec>> {
         self.inner
             .policy
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Record where the `--policy` policy came from (server startup, #1043).
+    /// A server with a policy file manages its policy by that file: the
+    /// console and API show it read-only.
+    #[cfg(feature = "policy")]
+    pub fn set_policy_file(&self, file: crate::serve::policies::PolicyFile) {
+        *self
+            .inner
+            .policy_file
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(file);
+    }
+
+    /// The `--policy` file, when the server was started with one.
+    #[cfg(feature = "policy")]
+    pub fn policy_file(&self) -> Option<crate::serve::policies::PolicyFile> {
+        self.inner
+            .policy_file
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()

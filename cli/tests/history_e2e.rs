@@ -68,6 +68,7 @@ fn record(id: &str, row_id: &str) -> RunRecord {
         pool: "default".into(),
         submitted_by: None,
         dlq_location: None,
+        policy_pin: Default::default(),
     }
 }
 

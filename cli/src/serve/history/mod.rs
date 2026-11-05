@@ -10,6 +10,7 @@ pub mod fallback;
 pub mod labels;
 pub mod memory;
 pub mod overview;
+pub mod policies;
 #[cfg(feature = "serve-history-postgres")]
 pub mod postgres;
 #[cfg(any(feature = "serve-history-postgres", feature = "serve-history-sqlite"))]
@@ -277,6 +278,10 @@ pub struct RunRecord {
     /// field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dlq_location: Option<String>,
+    /// The stored data-flow policy versions the run was admitted under
+    /// (#1043): a claim, shard or resume enforces these, not a newer one.
+    #[serde(default, skip_serializing_if = "policies::PolicyPin::is_empty")]
+    pub policy_pin: policies::PolicyPin,
 }
 
 impl RunRecord {
@@ -319,6 +324,7 @@ impl RunRecord {
             pool: crate::serve::pools::default_pool(),
             submitted_by: None,
             dlq_location: None,
+            policy_pin: Default::default(),
         }
     }
 
@@ -1243,6 +1249,48 @@ pub trait RunHistory: Send + Sync {
         Err(HistoryError::Backend(
             "this run-history backend does not store sealed secret params".into(),
         ))
+    }
+
+    /// Append policy `record` (#1043) as version `record.version` of
+    /// `record.scope`. Returns `false` — and stores nothing — when that
+    /// version already exists: another change landed first, so a caller
+    /// built on an older base must re-plan. Default: unsupported.
+    async fn policy_version_insert(
+        &self,
+        record: &policies::PolicyVersionRecord,
+    ) -> Result<bool, HistoryError> {
+        let _ = record;
+        Err(HistoryError::Backend(
+            "this run-history backend does not store policy versions".into(),
+        ))
+    }
+
+    /// The newest `limit` versions of `scope`, newest first (`0` = every
+    /// version). Default: none.
+    async fn policy_versions(
+        &self,
+        scope: &str,
+        limit: usize,
+    ) -> Result<Vec<policies::PolicyVersionRecord>, HistoryError> {
+        let _ = (scope, limit);
+        Ok(Vec::new())
+    }
+
+    /// One version of `scope`. Default: none.
+    async fn policy_version_get(
+        &self,
+        scope: &str,
+        version: u32,
+    ) -> Result<Option<policies::PolicyVersionRecord>, HistoryError> {
+        let _ = (scope, version);
+        Ok(None)
+    }
+
+    /// Delete every version of `scope` (a deleted tenant). Returns how many.
+    /// Default: none stored, none deleted.
+    async fn policy_versions_delete(&self, scope: &str) -> Result<u64, HistoryError> {
+        let _ = scope;
+        Ok(0)
     }
 
     /// The sealed secret params of `run_id`, if still stored. Default: none.

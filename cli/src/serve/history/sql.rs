@@ -756,6 +756,14 @@ pub const DDL: &[&str] = &[
         run_id TEXT PRIMARY KEY,\
         stored_at TEXT NOT NULL,\
         sealed TEXT NOT NULL)",
+    // Data-flow policy versions (#1043): the server-managed policy and each
+    // tenant's, append-only; the newest version of a scope is in force.
+    "CREATE TABLE IF NOT EXISTS faucet_policy_versions (\
+        scope TEXT NOT NULL,\
+        version TEXT NOT NULL,\
+        created_at TEXT NOT NULL,\
+        body TEXT NOT NULL,\
+        PRIMARY KEY (scope, version))",
 ];
 
 /// The usage-listing cap for `filter`.
@@ -1024,6 +1032,15 @@ pub struct Stmts {
     pub run_secrets_put: String,
     pub run_secrets_get: String,
     pub run_secrets_delete: String,
+    /// Store one policy version unless it exists (#1043). Params: scope,
+    /// padded version, created_at, body.
+    pub policy_version_insert: String,
+    /// A scope's versions, newest first. Params: scope, limit.
+    pub policy_versions: String,
+    /// One version. Params: scope, padded version.
+    pub policy_version_get: String,
+    /// Every version of a scope. Param: scope.
+    pub policy_versions_delete: String,
     /// Delete the sealed params of terminal runs and of runs with no record
     /// stored before the param (an orphan threshold).
     pub run_secrets_purge: String,
@@ -1912,6 +1929,17 @@ impl Stmts {
                 .into(),
             run_secrets_get: "SELECT sealed FROM faucet_serve_run_secrets WHERE run_id=$1".into(),
             run_secrets_delete: "DELETE FROM faucet_serve_run_secrets WHERE run_id=$1".into(),
+            policy_version_insert: "INSERT INTO faucet_policy_versions \
+                (scope, version, created_at, body) VALUES ($1,$2,$3,$4) \
+                ON CONFLICT (scope, version) DO NOTHING"
+                .into(),
+            policy_versions: "SELECT body FROM faucet_policy_versions WHERE scope=$1 \
+                ORDER BY version DESC LIMIT $2"
+                .into(),
+            policy_version_get: "SELECT body FROM faucet_policy_versions \
+                WHERE scope=$1 AND version=$2"
+                .into(),
+            policy_versions_delete: "DELETE FROM faucet_policy_versions WHERE scope=$1".into(),
             run_secrets_purge: "DELETE FROM faucet_serve_run_secrets WHERE run_id IN \
                 (SELECT run_id FROM faucet_serve_runs \
                     WHERE status IN ('completed','failed','cancelled')) \
@@ -2531,6 +2559,17 @@ impl Stmts {
                 .into(),
             run_secrets_get: "SELECT sealed FROM faucet_serve_run_secrets WHERE run_id=?".into(),
             run_secrets_delete: "DELETE FROM faucet_serve_run_secrets WHERE run_id=?".into(),
+            policy_version_insert: "INSERT INTO faucet_policy_versions \
+                (scope, version, created_at, body) VALUES (?,?,?,?) \
+                ON CONFLICT (scope, version) DO NOTHING"
+                .into(),
+            policy_versions: "SELECT body FROM faucet_policy_versions WHERE scope=? \
+                ORDER BY version DESC LIMIT ?"
+                .into(),
+            policy_version_get: "SELECT body FROM faucet_policy_versions \
+                WHERE scope=? AND version=?"
+                .into(),
+            policy_versions_delete: "DELETE FROM faucet_policy_versions WHERE scope=?".into(),
             run_secrets_purge: "DELETE FROM faucet_serve_run_secrets WHERE run_id IN \
                 (SELECT run_id FROM faucet_serve_runs \
                     WHERE status IN ('completed','failed','cancelled')) \
@@ -5955,6 +5994,85 @@ macro_rules! impl_sql_history {
                     .map_err(backend)?;
                 row.map(|r| r.try_get::<String, _>("sealed").map_err(backend))
                     .transpose()
+            }
+
+            async fn policy_version_insert(
+                &self,
+                record: &$crate::serve::history::policies::PolicyVersionRecord,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let body = serde_json::to_string(record)
+                    .map_err(|e| $crate::serve::history::HistoryError::Backend(e.to_string()))?;
+                let done = sqlx::query(&self.stmts.policy_version_insert)
+                    .bind(&record.scope)
+                    .bind($crate::serve::history::policies::padded(record.version))
+                    .bind($crate::serve::history::sql::fmt_ts(record.created_at))
+                    .bind(body)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                Ok(done.rows_affected() == 1)
+            }
+
+            async fn policy_versions(
+                &self,
+                scope: &str,
+                limit: usize,
+            ) -> Result<
+                Vec<$crate::serve::history::policies::PolicyVersionRecord>,
+                $crate::serve::history::HistoryError,
+            > {
+                use sqlx::Row as _;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let cap = if limit == 0 { usize::MAX } else { limit };
+                let rows = sqlx::query(&self.stmts.policy_versions)
+                    .bind(scope)
+                    .bind($crate::serve::history::sql::sql_limit(cap))
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                rows.iter()
+                    .map(|r| {
+                        let body: String = r.try_get("body").map_err(backend)?;
+                        $crate::serve::history::sql::decode_json(&body, "policy version")
+                    })
+                    .collect()
+            }
+
+            async fn policy_version_get(
+                &self,
+                scope: &str,
+                version: u32,
+            ) -> Result<
+                Option<$crate::serve::history::policies::PolicyVersionRecord>,
+                $crate::serve::history::HistoryError,
+            > {
+                use sqlx::Row as _;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let row = sqlx::query(&self.stmts.policy_version_get)
+                    .bind(scope)
+                    .bind($crate::serve::history::policies::padded(version))
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                row.map(|r| {
+                    let body: String = r.try_get("body").map_err(backend)?;
+                    $crate::serve::history::sql::decode_json(&body, "policy version")
+                })
+                .transpose()
+            }
+
+            async fn policy_versions_delete(
+                &self,
+                scope: &str,
+            ) -> Result<u64, $crate::serve::history::HistoryError> {
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let done = sqlx::query(&self.stmts.policy_versions_delete)
+                    .bind(scope)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                Ok(done.rows_affected())
             }
 
             async fn run_secrets_delete(

@@ -21,6 +21,8 @@ pub mod logs;
 pub mod mcp_route;
 pub mod metrics;
 pub mod observability;
+#[cfg(feature = "policy")]
+pub mod policies;
 pub mod pools;
 pub mod preview;
 pub mod rbac;
