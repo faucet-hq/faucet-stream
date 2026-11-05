@@ -609,8 +609,12 @@ jobs:
   feature-check:
     name: Feature isolation
     runs-on: ubuntu-latest
-    needs: changes
-    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+    # GitHub has no job priority: started together, these 145 short jobs took
+    # every free-plan runner and the required checks queued behind them
+    # (Coverage started 52 min late). They start once the coverage shards
+    # finish, pass or fail, so the required checks get the runners first.
+    needs: [changes, coverage-shard]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true') }}
     strategy:
       fail-fast: false
       matrix:
@@ -1077,6 +1081,12 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check advisories
+      # The fuzz crate is its own workspace with its own lockfile.
+      - name: Advisories (fuzz workspace)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: fuzz/Cargo.toml
+          command: check advisories
 
   # Every third-party crate in Cargo.lock is audited (imported from the
   # audit sets in supply-chain/config.toml) or listed as an exemption. A new
@@ -1185,12 +1195,22 @@ jobs:
           feature-group: default-features
           rust-toolchain: manual
 
-  coverage:
-    name: Coverage
+  # Coverage runs in parallel shards that each write an lcov report; the
+  # `Coverage` job below (the required check) merges them and runs the gates.
+  # Library shards split the workspace packages, CLI shards split faucet-cli's
+  # test targets (scripts/coverage_shards.py), and the unit shard runs every
+  # crate's `cfg(test)` tests. A line counts as covered when any report hits it.
+  coverage-shard:
+    name: Coverage shard (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    # ~120 min warm, ~200 min after a lockfile change (cold cache); a hung test still fails here.
-    timeout-minutes: 240
+    # ~40 min warm; a hung test still fails here.
+    timeout-minutes: 120
     needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [libs-1, libs-2, libs-3, libs-4, cli-1, cli-2, cli-3, unit]
     env:
       # Same backends as `test`: a skipped integration suite must fail (#789 SUPPLY-09).
       FAUCET_REQUIRE_BACKENDS: "1"
@@ -1201,9 +1221,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          # Full history so the patch-coverage gate below can resolve a merge
-          # base against origin/main.
-          fetch-depth: 0
       - name: Free runner disk space
         # The all-features instrumented build (bundled DuckDB + the full
         # connector tree) plus the coverage profraw data and testcontainer
@@ -1275,12 +1292,14 @@ jobs:
       - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: cargo-llvm-cov
+      # One cache for every shard (the repo's cache budget has no room for
+      # one per shard), saved by the unit shard, which builds every library.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: coverage
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.shard == 'unit' }}
       - name: Pull Docker Hub images through a mirror
         # Avoids Docker Hub's anonymous pull rate limit on shared runners.
-        if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -1288,114 +1307,125 @@ jobs:
       - name: Clear Docker before the container-backed tests
         # Testcontainer images and volumes left by earlier steps count against
         # the runner disk the tests (MinIO's free-space check among them) need.
-        if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
         run: |
           docker ps -aq | xargs -r docker rm -f >/dev/null
           docker system prune -af --volumes >/dev/null
           df -h /
-      # Cover unit + integration tests, and keep the integration-only share
-      # separately (#695). One build, two phases:
-      #   1. integration — compiles every library once, plus each crate's
-      #      `tests/` binaries, runs them, writes integration.lcov;
-      #   2. teardown — deletes what only phase 1 needed (the integration test
-      #      binaries, their profiles, every testcontainer image/volume), which
-      #      is what ran the runner out of disk when phase 2 started compiling;
-      #   3. unit — reuses the compiled libraries and builds only each crate's
-      #      `cfg(test)` harness, runs it, writes unit.lcov.
-      # lcov.info is the two reports concatenated: codecov and
-      # scripts/patch-coverage.py both treat a line as covered when any record
-      # of it is, so no merged profile (and no kept integration binary) is
-      # needed. The integration tests boot Docker testcontainers whose image
-      # pulls intermittently flake, so each phase is retried like `test` is.
-      - name: Collect coverage (integration, then unit)
-        if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+      - name: Collect coverage
         env:
+          SHARD: ${{ matrix.shard }}
           # Coverage mapping does not need DWARF; dropping debuginfo keeps the
-          # instrumented all-features build within the runner's disk.
+          # instrumented build within the runner's disk.
           CARGO_PROFILE_DEV_DEBUG: "0"
           CARGO_PROFILE_TEST_DEBUG: "0"
-          IGNORE_RE: '(/tests?/|/examples?/|/benches?/|build\.rs$|crates/sink/clickhouse/src/staged_exec\.rs$|crates/sink/mssql/src/staged_exec\.rs$)'
-          # Every phase runs with --no-fail-fast and the step only fails at the
-          # end, so one red run names every failing test (#948).
-          RETRY_LOG_KEEP: ${{ runner.temp }}/coverage-tests.log
-        run: |
-          retry() { scripts/retry-on-image-pull.sh "$@"; }
-          failed=()
-          : > "$RETRY_LOG_KEEP"
-          cargo llvm-cov clean --workspace
-          rm -f target/*.profraw
-          eval "$(cargo llvm-cov show-env --sh)"
-          # Libraries and connectors first, then faucet-cli, with the first
-          # batch's test executables and containers dropped in between: all of
-          # them at once (plus the instrumented build) exhausts the runner disk.
           # The staged-load execution shims need a live warehouse that can reach
           # a live bucket, so they are excluded here, in codecov.yml, and in
           # scripts/patch-coverage.py (all three kept in sync).
-          retry cargo test --no-fail-fast --workspace --exclude faucet-cli --all-features --test '*' \
-            || failed+=("integration (libraries)")
-          # Report this batch before deleting its executables: llvm-cov maps the
-          # profile data through the binaries, so a deleted binary's counts are lost.
-          cargo llvm-cov report --lcov --output-path integration-libs.lcov --ignore-filename-regex "$IGNORE_RE" \
-            || echo "::warning::no coverage report for integration-libs.lcov"
-          cargo test --workspace --exclude faucet-cli --all-features --test '*' --no-run --message-format=json 2>/dev/null \
-            | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true) | .executable // empty' \
-            | while read -r exe; do rm -f "$exe" "${exe}.d"; done || true
-          rm -f target/*.profraw
-          docker ps -aq | xargs -r docker rm -f >/dev/null
-          docker system prune -af --volumes >/dev/null
-          df -h /
-          # faucet-cli's ~170 instrumented test binaries fill the disk together, so run them in parts.
-          mapfile -t cli_tests < <(find cli/tests -maxdepth 1 -name '*.rs' -exec basename {} .rs \; | sort)
-          parts=3
-          per=$(( (${#cli_tests[@]} + parts - 1) / parts ))
-          for (( part = 0; part < parts; part++ )); do
-            args=()
-            for t in "${cli_tests[@]:part*per:per}"; do args+=(--test "$t"); done
-            [ ${#args[@]} -gt 0 ] || continue
-            retry cargo test --no-fail-fast -p faucet-cli --all-features "${args[@]}" \
-              || failed+=("integration (faucet-cli part $((part + 1)))")
-            cargo llvm-cov report --lcov --output-path "integration-cli-$part.lcov" --ignore-filename-regex "$IGNORE_RE" \
-              || echo "::warning::no coverage report for integration-cli-$part.lcov"
-            cargo test -p faucet-cli --all-features "${args[@]}" --no-run --message-format=json 2>/dev/null \
-              | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true) | .executable // empty' \
-              | while read -r exe; do rm -f "$exe" "${exe}.d"; done || true
-            rm -f target/*.profraw
-            docker ps -aq | xargs -r docker rm -f >/dev/null
-            docker system prune -af --volumes >/dev/null
-            df -h /
-          done
-          # Both scripts merge a file's records across reports (a line hit in either counts).
-          # One newline between reports, so a file without a trailing one
-          # cannot run its `end_of_record` into the next report's `SF:`.
-          for f in integration-libs.lcov integration-cli-*.lcov; do cat "$f" 2>/dev/null; echo; done > integration.lcov
-
-          echo "::group::teardown before the unit phase"
-          # The parts deleted their binaries; listing them with --no-run would rebuild every one.
-          df -h /
-          rm -f target/*.profraw
-          docker ps -aq | xargs -r docker rm -f >/dev/null
-          docker system prune -af --volumes >/dev/null
-          df -h /
-          echo "::endgroup::"
-
-          retry cargo test --no-fail-fast --workspace --all-features --lib --bins \
-            || failed+=("unit")
-          cargo llvm-cov report --lcov --output-path unit.lcov --ignore-filename-regex "$IGNORE_RE" \
-            || echo "::warning::no coverage report for unit.lcov"
-          for f in integration.lcov unit.lcov; do cat "$f" 2>/dev/null; echo; done > lcov.info
-          if [ ${#failed[@]} -gt 0 ]; then
-            echo "::error::failing test phases: ${failed[*]} (every failing test is listed by the next step and in the job summary)"
-            exit 1
+          IGNORE_RE: '(/tests?/|/examples?/|/benches?/|build\.rs$|crates/sink/clickhouse/src/staged_exec\.rs$|crates/sink/mssql/src/staged_exec\.rs$)'
+          RETRY_LOG_KEEP: ${{ runner.temp }}/coverage-tests.log
+        run: |
+          set -euo pipefail
+          : > "$RETRY_LOG_KEEP"
+          mkdir -p coverage-shard
+          cargo llvm-cov clean --workspace
+          eval "$(cargo llvm-cov show-env --sh)"
+          # Every shard runs with --no-fail-fast and fails only after writing its
+          # report, so one red run names every failing test and still reports coverage (#948).
+          status=0
+          case "$SHARD" in
+            libs-*)
+              plan=$(python3 scripts/coverage_shards.py libs "${SHARD#libs-}" 4)
+              read -ra args <<< "$plan"
+              scripts/retry-on-image-pull.sh cargo test --no-fail-fast "${args[@]}" --all-features --test '*' || status=$?
+              kind=integration ;;
+            cli-*)
+              plan=$(python3 scripts/coverage_shards.py cli "${SHARD#cli-}" 3)
+              read -ra args <<< "$plan"
+              scripts/retry-on-image-pull.sh cargo test --no-fail-fast "${args[@]}" --all-features || status=$?
+              kind=integration ;;
+            unit)
+              scripts/retry-on-image-pull.sh cargo test --no-fail-fast --workspace --all-features --lib --bins || status=$?
+              kind=unit ;;
+            *) echo "::error::unknown coverage shard $SHARD"; exit 1 ;;
+          esac
+          cargo llvm-cov report --lcov --output-path "coverage-shard/$kind-$SHARD.lcov" --ignore-filename-regex "$IGNORE_RE" \
+            || echo "::warning::no coverage report for shard $SHARD"
+          cp "$RETRY_LOG_KEEP" "coverage-shard/tests-$SHARD.log"
+          if [ "$status" -ne 0 ]; then
+            echo "::error::coverage shard $SHARD has failing tests (listed by the next step and in the Coverage job summary)"
+            exit "$status"
           fi
       - name: List every failing test
-        if: ${{ failure() && (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true') }}
+        if: ${{ failure() }}
         env:
           RETRY_LOG_KEEP: ${{ runner.temp }}/coverage-tests.log
         run: python3 scripts/failing_tests.py --summary "$GITHUB_STEP_SUMMARY" "$RETRY_LOG_KEEP"
+      - name: Keep the shard report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-shard-${{ matrix.shard }}
+          path: coverage-shard/
+          if-no-files-found: ignore
+          retention-days: 3
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [changes, coverage-shard]
+    # Runs after failing shards too, so one red run reports test failures and
+    # coverage gaps together.
+    if: ${{ !cancelled() }}
+    steps:
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
+      - name: Shards ran
+        id: shards
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          SHARDS: ${{ needs.coverage-shard.result }}
+          CODE: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+        run: |
+          echo "changes=$CHANGES shards=$SHARDS code=$CODE"
+          if [ "$CHANGES" != success ]; then
+            echo "::error::change detection did not succeed ($CHANGES)"; exit 1
+          fi
+          if [ "$CODE" != true ]; then
+            echo "No code changes: coverage not collected."; echo "collect=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "collect=true" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ steps.shards.outputs.collect == 'true' }}
+        with:
+          persist-credentials: false
+          # Full history so the patch-coverage gate can resolve a merge base
+          # against origin/main.
+          fetch-depth: 0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: ${{ steps.shards.outputs.collect == 'true' }}
+        with:
+          pattern: coverage-shard-*
+          path: shards
+          merge-multiple: true
+      - name: Merge the shard reports
+        if: ${{ steps.shards.outputs.collect == 'true' }}
+        run: |
+          ls -l shards
+          # One newline between reports, so a file without a trailing one cannot
+          # run its `end_of_record` into the next report's `SF:`.
+          for f in shards/integration-*.lcov; do cat "$f" 2>/dev/null; echo; done > integration.lcov
+          for f in shards/unit-*.lcov; do cat "$f" 2>/dev/null; echo; done > unit.lcov
+          for f in integration.lcov unit.lcov; do cat "$f"; echo; done > lcov.info
+          cat shards/tests-*.log > coverage-tests.log 2>/dev/null || : > coverage-tests.log
+      - name: List every failing test
+        if: ${{ steps.shards.outputs.collect == 'true' && needs.coverage-shard.result != 'success' }}
+        run: python3 scripts/failing_tests.py --summary "$GITHUB_STEP_SUMMARY" coverage-tests.log
       - name: Keep the coverage reports
         # So a failing coverage gate can be read line by line (Codecov only
         # receives the report after the gates pass).
-        if: ${{ always() && (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true') }}
+        if: ${{ steps.shards.outputs.collect == 'true' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-lcov
@@ -1406,7 +1436,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
       - name: Test the coverage gate scripts
-        if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.changes.outputs.code == 'true' }}
+        if: ${{ !cancelled() && steps.shards.outputs.collect == 'true' && github.event_name == 'pull_request' }}
         run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - name: Enforce >=95% patch coverage
         # Runs after failing tests too (the reports are written either way), so
@@ -1418,7 +1448,7 @@ jobs:
         # required check without blocking PRs on "Expected — waiting for status".
         # This runs inside the already-required Coverage job instead, where the
         # result is deterministic.
-        if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.changes.outputs.code == 'true' }}
+        if: ${{ !cancelled() && steps.shards.outputs.collect == 'true' && github.event_name == 'pull_request' }}
         env:
           BASE_REF: ${{ github.base_ref }}
         run: |
@@ -1437,7 +1467,7 @@ jobs:
         # an integration test, not only a unit test (#695). A PR description
         # line `no-integration-test: <reason>` downgrades a failure to a
         # warning; the job summary shows the per-file table either way.
-        if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.changes.outputs.code == 'true' }}
+        if: ${{ !cancelled() && steps.shards.outputs.collect == 'true' && github.event_name == 'pull_request' }}
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
           BASE_REF: ${{ github.base_ref }}
@@ -1448,7 +1478,7 @@ jobs:
             --base "origin/$BASE_REF" \
             --min 60
       - name: Upload unit coverage to Codecov
-        if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+        if: ${{ steps.shards.outputs.collect == 'true' }}
         # Codecov merges the two flagged uploads into the total, so no unflagged
         # combined upload: one counted inside every flag and made `integration`
         # report the overall number (#967).
@@ -1466,7 +1496,7 @@ jobs:
           flags: unit
           fail_ci_if_error: true
       - name: Upload integration coverage to Codecov
-        if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+        if: ${{ steps.shards.outputs.collect == 'true' }}
         continue-on-error: true
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
@@ -1474,3 +1504,11 @@ jobs:
           files: integration.lcov
           flags: integration
           fail_ci_if_error: true
+      - name: Every shard passed
+        if: ${{ steps.shards.outputs.collect == 'true' }}
+        env:
+          SHARDS: ${{ needs.coverage-shard.result }}
+        run: |
+          if [ "$SHARDS" != success ]; then
+            echo "::error::coverage shards: $SHARDS (failing tests are listed above and in the job summary)"; exit 1
+          fi

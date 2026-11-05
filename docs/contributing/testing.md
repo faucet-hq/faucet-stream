@@ -122,12 +122,16 @@ their data directory, and Azurite runs with `--inMemoryPersistence`.
 The **required `Coverage` job** runs every test in the workspace under
 `cargo-llvm-cov` — unit tests *and* the Docker-backed integration tests in each
 crate's `tests/` directory — and enforces two gates on the lines a PR changes.
-It runs every test binary in all three phases (library integration tests,
-`faucet-cli` integration tests, unit tests) with `--no-fail-fast` and fails
-only at the end, so one red run reports every failure: the **List every
-failing test** step and the job summary name each failing test with its
-binary, panic location and the `cargo test` target to rerun
-(`scripts/failing_tests.py`, which also works on a downloaded job log).
+The tests run in eight parallel **`Coverage shard (…)`** jobs: four split the
+workspace's library and connector integration tests by package, three split
+`faucet-cli`'s integration test targets, and one runs every crate's unit tests
+(`scripts/coverage_shards.py` plans the split, so a new crate needs no workflow
+edit). Each shard runs with `--no-fail-fast`, writes its own lcov report even
+when tests fail, and only then fails, so one red run reports every failure: the
+**List every failing test** step and the job summary name each failing test
+with its binary, panic location and the `cargo test` target to rerun
+(`scripts/failing_tests.py`, which also works on a downloaded job log). The
+`Coverage` job then merges the shard reports and runs the gates.
 
 
 | Gate | Script | Measures | Floor |
@@ -135,12 +139,10 @@ binary, panic location and the `cargo test` target to rerun
 | Patch coverage | `scripts/patch-coverage.py` | changed lines hit by **any** test | 95% |
 | Integration coverage (#695) | `scripts/integration-coverage.py` | changed **I/O** lines hit by an **integration** test | 60%, and every changed I/O file ≥ 1 line |
 
-The job builds once and runs the integration binaries first, reporting them on
-their own; it then deletes what only that phase needed (the integration test
-binaries and every testcontainer image) so the runner keeps its disk, runs the
-unit tests, and concatenates the two reports — every test still runs once. The unit-only and
-integration-only halves are uploaded to Codecov under the `unit` and
-`integration` flags. Both gates print the uncovered lines when they fail; the
+Every test still runs once, in exactly one shard. The integration shards'
+reports form the integration-only half and the unit shard's report the
+unit-only half (a line counts as covered when any report hits it); they are
+uploaded to Codecov under the `integration` and `unit` flags. Both gates print the uncovered lines when they fail; the
 integration gate also writes a per-file table to the job summary.
 
 **Why two gates.** Patch coverage alone lets a new sink method pass with a unit
