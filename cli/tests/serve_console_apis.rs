@@ -199,7 +199,6 @@ async fn runs_and_audit(history: Option<String>, cluster: bool) {
             history,
             cluster,
             triggers: None,
-            schedules: Default::default(),
             default_config: None,
         },
     )
@@ -434,7 +433,6 @@ async fn a_template_lists_its_runs_and_reload_names_the_load_time() {
             history: None,
             cluster: false,
             triggers: None,
-            schedules: Default::default(),
             default_config: Some(default),
         },
     )

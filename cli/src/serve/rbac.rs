@@ -129,7 +129,7 @@ pub enum Permission {
 
 impl Permission {
     /// Every permission, in declaration order.
-    pub const ALL: [Permission; 29] = [
+    pub const ALL: [Permission; 31] = [
         Permission::RunRead,
         Permission::RunWrite,
         Permission::SchemaRead,
