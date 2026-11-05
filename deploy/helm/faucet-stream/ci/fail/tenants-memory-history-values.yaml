@@ -1,5 +1,7 @@
 # expect-error: serve.tenants.enabled=true requires a persistent history backend
 serve:
+  history:
+    backend: memory
   tenants:
     enabled: true
     vaultKey:

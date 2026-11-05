@@ -40,6 +40,13 @@ pub async fn create_change(
     if actor.tenant.is_some() {
         return Err(ServeError::Forbidden(TENANT_PROPOSAL.to_string()));
     }
+    if body.kind.is_policy() {
+        return Err(ServeError::BadConfig(
+            "a policy change is proposed through POST /v1/policy (or \
+             /v1/tenants/{tenant}/policy), which checks the draft against the policy in force"
+                .into(),
+        ));
+    }
     let change = changes::create(&state, &actor, body).await?;
     Ok((StatusCode::CREATED, Json(change.redacted_for(&actor))))
 }

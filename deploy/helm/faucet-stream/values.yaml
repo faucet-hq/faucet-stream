@@ -192,9 +192,13 @@ serve:
     # a new salt and rolls the pods.
     checksumSalt: ""
 
-  # Run-history backend: "memory" | "sqlite" | "postgres"
+  # Run-history backend: "" | "sqlite" | "postgres" | "memory".
+  # Unset (the default, #1049): the server keeps its history in
+  # $FAUCET_DATA_DIR/history.db, on the data volume (see persistence). Use
+  # postgres for several replicas or --cluster. `memory` keeps nothing across
+  # a restart (runs, audit, templates, schedules, policy) — an explicit opt-in.
   history:
-    backend: memory
+    backend: ""
     # sqlite: defaults to a file on the mounted volume (see persistence).
     # postgres: a DSN. The URL reaches the pod as FAUCET_SERVE_HISTORY, never
     # on the command line; a postgres DSN is stored in a chart-managed Secret.
@@ -312,6 +316,19 @@ serve:
     existingSecret: ""
     fileName: triggers.yaml
 
+  # Schedules (#1044): --schedules. Image features `schedule` + `templates`.
+  # Registered templates to run on a cron, read-only in the console;
+  # schedules made in the console or API live in the run history, so pair
+  # them with a persistent history backend.
+  schedules:
+    enabled: false
+    content: null
+    existingConfigMap: ""
+    existingSecret: ""
+    fileName: schedules.yaml
+  # The shortest gap between the ticks of a schedule a tenant owns (seconds).
+  tenantScheduleMinIntervalSecs: 300
+
   # Template hosting + sync (#589): --templates-sync. Image feature
   # `templates-sync` (+ `templates-sync-object-store` for S3/GCS/Azure). Pair
   # it with a persistent history backend: with `memory` the registry, versions
@@ -331,6 +348,12 @@ serve:
     existingConfigMap: ""
     existingSecret: ""
     fileName: policy.yaml
+    # Where the policy lives (#1043): --policy-store. `server` (the server's
+    # default): the newest approved version in the history store is in force,
+    # and the file above only seeds an empty store (edits need a persistent
+    # serve.history). `file`: the file is the policy, re-read on every start,
+    # read-only in the console (needs enabled: true).
+    store: server
 
   # Hosted OAuth connect providers (#709): --connect-providers. Requires
   # tenants.enabled (connections are sealed with the vault key). Keep client
@@ -421,10 +444,11 @@ serve:
   #   type: RollingUpdate
   #   rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
 
-  # A writable scratch dir (root fs is read-only). Also backs sqlite history
-  # when persistence.enabled=false (emptyDir) — use persistence for durability.
+  # The data dir (root fs is read-only): the default SQLite run history lives
+  # here (#1049), on a PVC by default. `enabled: false` uses an emptyDir
+  # instead, which loses the history on every pod restart.
   persistence:
-    enabled: false
+    enabled: true
     size: 1Gi
     storageClass: ""
     accessModes: [ReadWriteOnce]

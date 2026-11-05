@@ -103,6 +103,7 @@
 - [MCP server (agent tools)](./cookbook/mcp.md)
 - [Scheduling](./cookbook/scheduling.md)
 - [Event-driven triggers](./cookbook/triggers.md)
+- [Schedules](./cookbook/schedules.md)
 - [Orchestration (Airflow / Dagster + dbt)](./cookbook/orchestration.md)
 - [Running a cluster](./cookbook/cluster.md)
 - [Observability](./operations/observability.md)

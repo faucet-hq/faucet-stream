@@ -31,7 +31,7 @@ fn args(port: u16) -> ServeArgs {
         max_concurrent_runs: Some(2),
         max_queued_runs: Some(16),
         default_config: None,
-        history: None,
+        history: Some("memory".into()),
         cors_origin: vec![],
         body_limit_bytes: 1_048_576,
         shutdown_grace_secs: 5,
@@ -54,8 +54,10 @@ fn args(port: u16) -> ServeArgs {
         cluster_poll_secs: 1,
         cluster_max_attempts: 3,
         triggers: None,
+        schedules: Default::default(),
         templates_sync: None,
         policy: None,
+        policy_store: Default::default(),
         otel_config: None,
         callback_allow_host: Vec::new(),
         origins: Default::default(),
@@ -704,21 +706,21 @@ async fn a_clustered_run_applies_the_stored_selection() {
     assert!(exists(&out, "accounts") && !exists(&out, "deals"));
 }
 
-#[cfg(all(feature = "triggers", feature = "schedule"))]
+#[cfg(feature = "schedule")]
 #[tokio::test(flavor = "multi_thread")]
-async fn a_schedule_trigger_runs_its_selection() {
+async fn a_schedule_runs_its_selection() {
     let dir = tempfile::tempdir().unwrap();
     let d = data(dir.path());
     let out = dir.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
-    let triggers = dir.path().join("triggers.yaml");
+    let schedules = dir.path().join("schedules.yaml");
     std::fs::write(
-        &triggers,
-        "version: 1\ntriggers:\n  - name: hourly-cheap\n    type: schedule\n    cron: \"* * * * * *\"\n    template: { id: crm, sink: files }\n    run:\n      selection: { select: [accounts] }\n",
+        &schedules,
+        "version: 1\nschedules:\n  - name: hourly-cheap\n    cron: \"* * * * * *\"\n    template: { id: crm, sink: files }\n    run:\n      selection: { select: [accounts] }\n",
     )
     .unwrap();
     let mut a = args(free_port());
-    a.triggers = Some(triggers);
+    a.schedules.schedules = Some(schedules);
     let api = start(a).await;
     api.register(source_template(&d)).await;
     api.register(sink_template(&out)).await;
@@ -728,7 +730,7 @@ async fn a_schedule_trigger_runs_its_selection() {
         let (_, page) = api.get("/v1/runs").await;
         if page["runs"].as_array().unwrap().iter().any(|r| {
             r["status"] == "completed"
-                && r["labels"]["faucet.trigger.name"] == "hourly-cheap"
+                && r["labels"]["schedule"] == "hourly-cheap"
                 && r["labels"]["selection"] == "select=accounts"
         }) {
             done = true;

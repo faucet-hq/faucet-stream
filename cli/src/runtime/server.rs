@@ -25,6 +25,9 @@ pub struct Submission<'a> {
     /// Where a trusted template body holds values a caller supplied for its
     /// params (#989): held to the caller reference policy.
     pub caller_fields: Option<&'a crate::params::CallerFields>,
+    /// The stored data-flow policy versions to load under (#1043): a stored
+    /// run keeps the versions it was admitted with. `None` = the newest.
+    pub policy_pin: Option<&'a crate::serve::history::policies::PolicyPin>,
 }
 
 impl<'a> Submission<'a> {
@@ -35,7 +38,14 @@ impl<'a> Submission<'a> {
             format,
             selection: None,
             caller_fields: None,
+            policy_pin: None,
         }
+    }
+
+    /// Under the policy versions a stored run was admitted with (#1043).
+    pub fn pinned(mut self, pin: &'a crate::serve::history::policies::PolicyPin) -> Self {
+        self.policy_pin = Some(pin);
+        self
     }
 
     /// Narrowed to `selection`'s rows.
@@ -129,11 +139,19 @@ pub async fn load(
             fields,
             origin: state.caller_origin(),
         });
+    // The server's policy, the tenant's on top, at the versions a stored run
+    // was admitted with (#1043).
+    #[cfg(feature = "policy")]
+    let (policy, policy_pin) =
+        crate::serve::policies::effective(state, principal.tenant(), sub.policy_pin).await?;
+    #[cfg(not(feature = "policy"))]
+    let (policy, policy_pin): (Option<()>, crate::serve::history::policies::PolicyPin) =
+        (None, Default::default());
     let loaded = crate::serve::load::load_submission_inputs(
         sub.body,
         sub.format,
         state.default_base().as_ref(),
-        server_policy(state).as_deref(),
+        policy.as_ref(),
         principal.body_origin(),
         scope,
         &state.references(),
@@ -157,6 +175,7 @@ pub async fn load(
         }
         other => other?,
     };
+    loaded.policy_pin = policy_pin;
     if let Some(sel) = sub.selection {
         let nodes = std::mem::take(&mut loaded.nodes);
         let bad = |e: crate::error::CliError| {
@@ -190,7 +209,12 @@ pub async fn admit(
 ) -> Result<Admitted, ServeError> {
     let mut loaded = load(state, principal, sub).await?;
     if gates.policy {
-        policy_gate(state, &principal.actor(), &loaded).await?;
+        // A refusal is the run's tenant's, whoever submitted it.
+        let mut actor = principal.actor();
+        if actor.tenant.is_none() {
+            actor.tenant = principal.tenant().map(str::to_string);
+        }
+        policy_gate(state, &actor, &loaded).await?;
     }
     let mut budget = gates.budget;
     if let Some(b) = &budget {
@@ -298,9 +322,23 @@ async fn policy_gate(
         if report.violated() {
             let merged = serde_json::to_value(&loaded.cfg).unwrap_or(Value::Null);
             let fp = crate::serve::idempotency::fingerprint(&merged, loaded.cfg.name.as_deref());
-            crate::policy::record_metrics(loaded.cfg.name.as_deref().unwrap_or("serve"), &report);
-            crate::serve::audit::write(state, actor, "policy.denied", None, Some(fp), "denied")
-                .await;
+            let pipeline = loaded.cfg.name.as_deref().unwrap_or("serve");
+            crate::policy::record_metrics(pipeline, &report);
+            crate::serve::audit::record_detail(
+                state,
+                actor,
+                "policy.denied",
+                None,
+                Some(fp),
+                Some(format!("pipeline:{pipeline}")),
+                crate::serve::policies::refusal_detail(
+                    "submit",
+                    report.all_violations().next(),
+                    "refused",
+                ),
+                "denied",
+            )
+            .await;
             return Err(ServeError::Unprocessable {
                 message: format!(
                     "policy: {} violation(s) — {}",
@@ -320,16 +358,6 @@ async fn policy_gate(
     Ok(())
 }
 
-/// The server-wide data-flow policy handed to the loader (#702).
-#[cfg(feature = "policy")]
-fn server_policy(state: &ServerState) -> Option<std::sync::Arc<faucet_core::PolicySpec>> {
-    state.policy()
-}
-#[cfg(not(feature = "policy"))]
-fn server_policy(_state: &ServerState) -> Option<std::sync::Arc<()>> {
-    None
-}
-
 /// The config a stored run re-executes (a cluster claim, a shard): its own
 /// body, tenant and selection, trusted, with no gate — it passed them when
 /// it was submitted.
@@ -346,7 +374,8 @@ pub async fn reload(
         &principal,
         Submission::new(&body, rec.config_format.unwrap_or_default())
             .selected(rec.selection.as_ref())
-            .with_caller_fields(&rec.caller_params),
+            .with_caller_fields(&rec.caller_params)
+            .pinned(&rec.policy_pin),
     )
     .await
 }
@@ -773,6 +802,65 @@ pub async fn plan(
     let value = serde_json::to_value(&report).map_err(|e| ServeError::Internal(e.to_string()))?;
     crate::serve::audit::write(state, &principal.actor(), "plan", None, None, "ok").await;
     Ok(value)
+}
+
+/// Check a config against the data-flow policy in force for `principal`
+/// without running it (#1043): the static pass a submission takes, over every
+/// row (or one), optionally with sample records for one row. Returns the
+/// policy report; `{ "loaded": false }` when no policy applies.
+#[cfg(feature = "policy")]
+pub async fn policy_check(
+    state: &ServerState,
+    principal: &Principal,
+    req: crate::serve::handlers::policy::CheckRequest,
+) -> Result<Value, ServeError> {
+    if req.sample.is_some() {
+        let plan_req = crate::serve::handlers::plan::PlanRequest {
+            config: req.config,
+            config_format: req.config_format,
+            row: req.row,
+            sample: req.sample,
+            impact: false,
+            depth: None,
+        };
+        let report = plan(state, principal, plan_req).await?;
+        return Ok(match report.get("policy") {
+            Some(p) if !p.is_null() => p.clone(),
+            _ => serde_json::json!({ "loaded": false }),
+        });
+    }
+    let loaded = load(
+        state,
+        principal,
+        Submission::new(&req.config, req.config_format.into()),
+    )
+    .await?;
+    let Some(spec) = loaded.cfg.policy.as_ref() else {
+        return Ok(serde_json::json!({ "loaded": false }));
+    };
+    let report = if loaded.is_topology() {
+        crate::policy::evaluate_topology(spec, &loaded.cfg)
+    } else {
+        let nodes: Vec<_> = match req.row.as_deref() {
+            Some(row) => loaded
+                .nodes
+                .iter()
+                .filter(|n| n.id == row)
+                .cloned()
+                .collect(),
+            None => loaded.nodes.clone(),
+        };
+        if nodes.is_empty() {
+            return Err(ServeError::Unprocessable {
+                message: format!("the config has no row '{}'", req.row.unwrap_or_default()),
+                details: None,
+            });
+        }
+        crate::policy::evaluate_nodes(spec, &nodes, &Default::default())
+    }
+    .map_err(|e| ServeError::BadConfig(e.to_string()))?;
+    crate::serve::audit::write(state, &principal.actor(), "policy.check", None, None, "ok").await;
+    serde_json::to_value(&report).map_err(|e| ServeError::Internal(e.to_string()))
 }
 
 /// Validate and probe a config without running it: 200 with the report when
@@ -1625,7 +1713,14 @@ mod templates {
 
         let mut labels = body.labels;
         // Provenance labels are the server's to set.
-        labels.retain(|k, _| !RESERVED_LABELS.contains(&k.as_str()));
+        let trusted = matches!(
+            principal.body_origin(),
+            crate::serve::load::BodyOrigin::Trusted
+        );
+        labels.retain(|k, _| {
+            !RESERVED_LABELS.contains(&k.as_str())
+                || (trusted && crate::serve::history::labels::SCHEDULE_LABELS.contains(&k.as_str()))
+        });
         labels.insert(LABEL_TEMPLATE.into(), materialized.template_id.clone());
         if let Some(status) = materialized.untested {
             labels.insert(LABEL_ALLOW_UNTESTED.into(), "true".into());

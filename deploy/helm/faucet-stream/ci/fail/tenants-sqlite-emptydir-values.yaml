@@ -1,5 +1,7 @@
 # expect-error: or sqlite on an emptyDir) every restart deletes them
 serve:
+  persistence:
+    enabled: false
   history:
     backend: sqlite
   tenants:

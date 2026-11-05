@@ -716,6 +716,31 @@ impl RunHistory for FallbackHistory {
     async fn run_secrets_delete(&self, run_id: &str) -> Result<(), HistoryError> {
         strict!(self, p => p.run_secrets_delete(run_id), f => f.run_secrets_delete(run_id))
     }
+    // The policy in force is shared state: never read it from, or write it
+    // to, the empty in-memory fallback.
+    async fn policy_version_insert(
+        &self,
+        record: &super::policies::PolicyVersionRecord,
+    ) -> Result<bool, HistoryError> {
+        strict!(self, p => p.policy_version_insert(record), f => f.policy_version_insert(record))
+    }
+    async fn policy_versions(
+        &self,
+        scope: &str,
+        limit: usize,
+    ) -> Result<Vec<super::policies::PolicyVersionRecord>, HistoryError> {
+        strict!(self, p => p.policy_versions(scope, limit), f => f.policy_versions(scope, limit))
+    }
+    async fn policy_version_get(
+        &self,
+        scope: &str,
+        version: u32,
+    ) -> Result<Option<super::policies::PolicyVersionRecord>, HistoryError> {
+        strict!(self, p => p.policy_version_get(scope, version), f => f.policy_version_get(scope, version))
+    }
+    async fn policy_versions_delete(&self, scope: &str) -> Result<u64, HistoryError> {
+        strict!(self, p => p.policy_versions_delete(scope), f => f.policy_versions_delete(scope))
+    }
     async fn run_secrets_purge_terminal(&self) -> Result<usize, HistoryError> {
         strict!(self, p => p.run_secrets_purge_terminal(), f => f.run_secrets_purge_terminal())
     }
@@ -943,6 +968,31 @@ impl RunHistory for FallbackHistory {
     }
     async fn meta_put(&self, key: &str, value: &str) -> Result<(), HistoryError> {
         strict!(self, p => p.meta_put(key, value), f => f.meta_put(key, value))
+    }
+    async fn schedule_insert(
+        &self,
+        schedule: &super::schedules::ScheduleRecord,
+    ) -> Result<bool, HistoryError> {
+        strict!(self, p => p.schedule_insert(schedule), f => f.schedule_insert(schedule))
+    }
+    async fn schedule_replace(
+        &self,
+        expected: &super::schedules::ScheduleRecord,
+        new: &super::schedules::ScheduleRecord,
+    ) -> Result<bool, HistoryError> {
+        strict!(self, p => p.schedule_replace(expected, new), f => f.schedule_replace(expected, new))
+    }
+    async fn schedule_get(
+        &self,
+        name: &str,
+    ) -> Result<Option<super::schedules::ScheduleRecord>, HistoryError> {
+        strict!(self, p => p.schedule_get(name), f => f.schedule_get(name))
+    }
+    async fn schedule_list(&self) -> Result<Vec<super::schedules::ScheduleRecord>, HistoryError> {
+        strict!(self, p => p.schedule_list(), f => f.schedule_list())
+    }
+    async fn schedule_delete(&self, name: &str) -> Result<bool, HistoryError> {
+        strict!(self, p => p.schedule_delete(name), f => f.schedule_delete(name))
     }
     async fn template_tags(
         &self,
@@ -1251,6 +1301,74 @@ mod tests {
         let startup = FallbackHistory::degraded_at_startup(Duration::from_secs(60), "test");
         assert!(!startup.try_recover().await, "no primary to recover to");
         assert!(startup.trigger_edge_rise("q").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn policy_versions_reach_the_primary_and_never_the_fallback() {
+        let rec = crate::serve::history::policies::PolicyVersionRecord {
+            scope: "server".into(),
+            version: 1,
+            spec: serde_json::json!({ "rules": [] }),
+            created_at: chrono::Utc::now(),
+            created_by: "alice".into(),
+            approved_by: None,
+            reason: None,
+            change_id: None,
+            restores: None,
+        };
+        let healthy = FallbackHistory::healthy(
+            Box::new(MemoryHistory::new(Duration::from_secs(60))),
+            Duration::from_secs(60),
+            "test",
+        );
+        assert!(healthy.policy_version_insert(&rec).await.unwrap());
+        assert_eq!(healthy.policy_versions("server", 0).await.unwrap().len(), 1);
+        assert!(
+            healthy
+                .policy_version_get("server", 1)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(healthy.policy_versions_delete("server").await.unwrap(), 1);
+
+        healthy.degraded.store(true, Ordering::Release);
+        assert!(healthy.policy_version_insert(&rec).await.is_err());
+        assert!(healthy.policy_version_get("server", 1).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn schedules_reach_the_primary_and_wait_for_a_degraded_one() {
+        let spec: crate::serve::history::schedules::ScheduleSpec =
+            serde_json::from_value(serde_json::json!({
+                "name": "n", "cron": "0 2 * * *", "template": {"id": "t"}
+            }))
+            .unwrap();
+        let rec = crate::serve::history::schedules::ScheduleRecord::new(
+            spec,
+            None,
+            "alice",
+            chrono::Utc::now(),
+        );
+        let healthy = FallbackHistory::healthy(
+            Box::new(MemoryHistory::new(Duration::from_secs(60))),
+            Duration::from_secs(60),
+            "test",
+        );
+        assert!(healthy.schedule_insert(&rec).await.unwrap());
+        let mut next = rec.clone();
+        next.spec.cron = "0 3 * * *".into();
+        assert!(healthy.schedule_replace(&rec, &next).await.unwrap());
+        assert_eq!(
+            healthy.schedule_get("n").await.unwrap().unwrap().spec.cron,
+            "0 3 * * *"
+        );
+        assert_eq!(healthy.schedule_list().await.unwrap().len(), 1);
+        assert!(healthy.schedule_delete("n").await.unwrap());
+
+        healthy.degraded.store(true, Ordering::Release);
+        assert!(healthy.schedule_insert(&rec).await.is_err());
+        assert!(healthy.schedule_list().await.is_err());
     }
 
     #[tokio::test]

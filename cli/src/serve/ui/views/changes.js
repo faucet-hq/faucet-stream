@@ -17,7 +17,32 @@ const DECIDED = ["executed", "rejected", "failed", "invalidated", "expired"];
 const RING = { pending: ["warn", "hollow"], approved: ["info", "half"], executed: ["ok", ""], rejected: ["bad", ""], failed: ["bad", ""], invalidated: ["bad", ""], expired: ["", "hollow"] };
 const TONE = { pending: "warn", approved: "info", executed: "ok", rejected: "bad", failed: "bad", invalidated: "bad", expired: "" };
 const PILL_ICON = { executed: "check", rejected: "x", failed: "x", invalidated: "x", approved: "play" };
-const KIND = { run: "run", template_register: "template register", template_launch: "template launch", template_delete: "template delete", template_deprecate: "template deprecate" };
+const KIND = { run: "run", template_register: "template register", template_launch: "template launch", template_delete: "template delete", template_deprecate: "template deprecate", policy_update: "policy update", tenant_policy_update: "tenant policy" };
+const isPolicy = (c) => c.kind === "policy_update" || c.kind === "tenant_policy_update";
+
+/** A policy diff, unchanged stretches folded to one marker line. */
+function foldDiff(lines, context = 1) {
+  const keep = lines.map((l, i) => l.op !== " " || lines.slice(Math.max(0, i - context), i + context + 1).some((x) => x.op !== " "));
+  const out = [];
+  let folded = false;
+  lines.forEach((l, i) => {
+    if (keep[i]) { out.push([l.op === " " ? " " : l.op, l.text]); folded = false; }
+    else if (!folded) { out.push(["@", "…"]); folded = true; }
+  });
+  return out;
+}
+
+/** One line on what a policy change would refuse, from its plan's impact. */
+function policyImpactNote(c) {
+  const im = (c.plan && c.plan.summary && c.plan.summary.impact) || null;
+  if (!im) return "";
+  const refused = im.newly_refused || [];
+  const tpl = refused.filter((x) => x.kind === "template");
+  const runs = refused.filter((x) => x.kind === "run");
+  if (!refused.length) return html`<span class="ok">Nothing newly refused</span> · ${fmtInt(im.templates_checked || 0)} templates and ${fmtInt(im.runs_checked || 0)} recent runs checked.`;
+  const names = tpl.slice(0, 2).map((x) => lnk(x.id, href.template(x.id)));
+  return html`<span class="warn">${fmtInt(tpl.length)} template${tpl.length === 1 ? "" : "s"} would be refused</span>${names.length ? html` · ${join(names, " and ")}${tpl.length > 2 ? "…" : ""}` : ""}${runs.length ? html`, and ${fmtInt(runs.length)} run${runs.length === 1 ? "" : "s"} from the last 7 days` : ""}. <a class="lnk" href="#" data-dtab="Impact">See impact</a>`;
+}
 /** "today 07:12", "tomorrow 07:12" or "28 Oct 07:12" in the display timezone. */
 function shortTime(iso) {
   const d = new Date(iso);
@@ -42,6 +67,11 @@ export function summaryText(c) {
   if (c.kind === "template_launch") return `Launch ${s.template || "?"} v${s.target_version ?? "?"}`;
   if (c.kind === "template_delete") return `Delete ${s.delete === "all" ? "every version of" : `v${s.delete ?? "?"} of`} ${s.template || "?"}`;
   if (c.kind === "template_deprecate") return `${s.action === "revive" ? "Revive" : "Deprecate"} ${s.template || "?"} v${s.target_version ?? "?"}`;
+  if (isPolicy(c)) {
+    const who = s.tenant ? `${s.tenant} policy` : "policy";
+    const v = s.version ?? s.next_version ?? "?";
+    return s.restores != null ? `Roll back ${who} to v${s.restores} (as v${v})` : `Update ${who} to v${v}`;
+  }
   return c.kind;
 }
 
@@ -87,6 +117,9 @@ function planDiff(c) {
   } else if (c.kind === "template_register") {
     lines.push([" ", `template ${s.template || "?"} (${s.template_kind || "template"})`]);
     lines.push(["+", `v${s.previous_version != null ? s.previous_version + 1 : 1}${s.launch ? " · launched as stable" : ""}`]);
+  } else if (isPolicy(c)) {
+    lines.push(...foldDiff(s.diff || []));
+    return { lines, note: policyImpactNote(c) };
   }
   for (const r of plan.rows || []) {
     lines.push([" ", `row ${r.row || "?"} · ${r.source || "?"} → ${r.sink || "?"}`]);
@@ -235,7 +268,10 @@ export async function renderChanges(host, params) {
     const waitN = c.status === "pending" ? Math.max(0, (c.required_approvals || 1) - (c.approvals || []).length) : 0;
     const waiting = Array.from({ length: waitN }, (_, i) => html`<div class="vote"${raw(!votes.length && i === 0 ? ' style="border-top:0"' : "")}><span class="avatar vacant"></span><span class="muted">waiting for ${votes.length || i ? "another" : "an"} approver</span></div>`);
     const body = votes.length || waiting.length ? html`${votes}${waiting}` : html`<div class="empty-line">No approvals.</div>`;
-    return card({ title: "Approvals", right: `${(c.approvals || []).length} of ${c.required_approvals} needed`, body });
+    const right = isPolicy(c) && c.status === "pending"
+      ? c.kind === "tenant_policy_update" ? `another ${c.tenant} admin or a server admin` : "an admin other than the requester"
+      : `${(c.approvals || []).length} of ${c.required_approvals} needed`;
+    return card({ title: "Approvals", right, body });
   }
   function budgetCard(c) {
     const b = c.budget || {};
@@ -253,14 +289,18 @@ export async function renderChanges(host, params) {
     const pipe = c.plan && c.plan.summary && c.plan.summary.pipeline;
     if (c.run_id) alerts.push(alert("Started run", html`${lnk(pipe || c.run_id, href.run(c.run_id), true, c.run_id)}${cpi(c.run_id)}${(c.plan && c.plan.summary && c.plan.summary.sinks || []).length ? html` · it wrote to ${c.plan.summary.sinks.join(", ")}` : ""}.`, "ok"));
     else if (c.template) alerts.push(alert("Applied to template", html`${lnk(c.template.id, href.template(c.template.id))} v${c.template.version}.`, "ok"));
+    else if (isPolicy(c) && c.status === "executed") alerts.push(alert(`Version ${plan.summary && plan.summary.version} is in force`, html`New runs are checked against it on every replica; runs admitted before keep the version they were checked against. ${lnk("Open Policy", href.policy())}`, "ok"));
+    const me = whoami();
+    if (isPolicy(c) && pending && me && me.principal === c.requester) alerts.push(alert("You requested this change.", c.kind === "tenant_policy_update" ? `Another ${c.tenant} admin or a server admin must approve it; you cannot approve your own request. You can withdraw it.` : "Another admin must approve it: self-approval is off for policy updates. You can withdraw it.", ""));
     if (c.status === "invalidated") alerts.push(alert("Approval invalidated.", html`The plan was re-built on approve and its material no longer matched what was reviewed${c.error ? html`: ${c.error}` : ""}. Nothing ran; propose it again to review the new plan.`, "bad", c.kind === "run" ? btn("Propose again", { icon: "refresh", cls: "sm", href: href.submit(), perm: "change_request" }) : ""));
     else if (c.error) alerts.push(alert("Execution failed.", c.error, "bad"));
     if (c.rejection) alerts.push(alert(`Rejected by ${c.rejection.principal}`, html`${fmtAge(c.rejection.at)} ago · “${c.rejection.reason}”`, "bad"));
+    const s = plan.summary || {};
     const planCard = card({
-      icon: "changes",
-      title: c.status === "executed" ? (c.kind === "run" ? "What it ran" : "What it changed") : c.kind === "run" ? "What changes if this runs" : "What this changes",
-      tag: pending ? "re-planned on approve" : c.status === "executed" ? "material matched on approve" : "",
-      right: plan.material ? html`material fingerprint <span class="mono">${plan.material.slice(0, 4)}…</span>${cpi(plan.material)}` : "",
+      icon: isPolicy(c) ? "policy" : "changes",
+      title: isPolicy(c) ? (c.kind === "tenant_policy_update" ? `What changes in ${c.tenant}’s rules` : "What changes") : c.status === "executed" ? (c.kind === "run" ? "What it ran" : "What it changed") : c.kind === "run" ? "What changes if this runs" : "What this changes",
+      tag: c.kind === "tenant_policy_update" ? "tenant layer · add only" : pending ? (isPolicy(c) ? "re-checked on approve" : "re-planned on approve") : c.status === "executed" ? "material matched on approve" : "",
+      right: isPolicy(c) ? (s.current_version != null ? `based on ${s.tenant ? `${s.tenant} ` : ""}v${s.current_version}` : "first version") : plan.material ? html`material fingerprint <span class="mono">${plan.material.slice(0, 4)}…</span>${cpi(plan.material)}` : "",
       body: lines.length ? diff(lines) : html`<div class="empty-line">No row plan for this kind.</div>`,
       note: note || "",
     });
@@ -269,7 +309,15 @@ export async function renderChanges(host, params) {
     return html`${alerts}${planCard}${quote}${pending || hasBudget ? html`<div class="two">${approvalsCard(c)}${budgetCard(c)}</div>` : approvalsCard(c)}`;
   }
 
+  function policyImpactPane(c) {
+    const im = (c.plan && c.plan.summary && c.plan.summary.impact) || {};
+    const entry = (x) => [x.kind === "template" ? html`${lnk(x.id, href.template(x.id))}${x.version != null ? html` <span class="mono">v${x.version}</span>` : ""}` : lnk(x.id, href.run(x.id), true), x.rule ? html`<span class="mono" style="white-space:nowrap">${x.rule}</span>` : "—", x.why];
+    const list = (title, xs, tone) => card({ icon: tone === "bad" ? "alert" : "check", title: `${title} · ${fmtInt(xs.length)}`, body: xs.length ? tbl(["Template or run", "Rule", "Why"], xs.map(entry)) : html`<div class="empty-line">None.</div>` });
+    return html`${card({ title: "Checked", body: grid(4, [kv("Templates", fmtInt(im.templates_checked || 0), im.templates_runtime_only ? `${fmtInt(im.templates_runtime_only)} checked at run time only` : ""), kv("Recent runs", fmtInt(im.runs_checked || 0), "last 7 days, configs stored"), kv("Newly refused", html`<span class="${(im.newly_refused || []).length ? "bad" : ""}">${fmtInt((im.newly_refused || []).length)}</span>`), kv("Unchanged", fmtInt(im.unchanged || 0))]) })}${list("Newly refused", im.newly_refused || [], "bad")}${list("Newly allowed", im.newly_allowed || [], "ok")}`;
+  }
+
   function impactPane(c) {
+    if (isPolicy(c)) return policyImpactPane(c);
     const rows = ((c.plan && c.plan.rows) || []).filter((r) => r.impact || r.policy);
     if (!rows.length) return card({ body: empty("No impact or policy analysis", html`Impact analysis needs a <code>catalog:</code> block and a recorded run of the row; a policy verdict needs a <code>policy:</code> in force.`, { icon: "lineage" }) });
     const sevTone = (s) => (s === "breaking" ? "bad" : s === "additive" ? "ok" : "muted");
@@ -319,7 +367,7 @@ export async function renderChanges(host, params) {
   function changeDetail(c) {
     const pending = c.status === "pending";
     const n = (c.approvals || []).length;
-    const impactN = ((c.plan && c.plan.rows) || []).filter((r) => r.impact || r.policy).length;
+    const impactN = isPolicy(c) ? ((c.plan && c.plan.summary && c.plan.summary.impact && c.plan.summary.impact.newly_refused) || []).length || null : ((c.plan && c.plan.rows) || []).filter((r) => r.impact || r.policy).length;
     const title = summaryText(c);
     setCrumbs(["Operate", { label: "Changes", href: listHref() }, title]);
     const left = (c.required_approvals || 1) - n;
@@ -333,7 +381,11 @@ export async function renderChanges(host, params) {
       pending ? html`<span title="${formatTs(c.expires_at)}">expires in ${fmtIn(c.expires_at)}</span>` : html`<span title="${formatTs(c.updated_at)}">decided ${fmtAge(c.updated_at)} ago</span>`,
       c.tenant ? html`<span>tenant ${lnk(c.tenant, href.tenant(c.tenant))}</span>` : "",
     ];
-    const actions = pending ? html`${btn("Reject", { kind: "danger", icon: "x", perm: "change_approve", data: { decide: "reject" } })}${btn(quorumLabel(c), { kind: "primary", icon: "check", perm: "change_approve", data: { decide: "approve" } })}` : "";
+    const me = whoami();
+    const mine = isPolicy(c) && me && me.principal === c.requester;
+    const actions = !pending ? "" : mine
+      ? html`${btn("Withdraw", { kind: "danger", icon: "x", data: { decide: "reject" } })}${btn("Approve", { kind: "primary", icon: "check", disabled: true, title: "You cannot approve your own request" })}`
+      : html`${btn("Reject", { kind: "danger", icon: "x", perm: "change_approve", data: { decide: "reject" } })}${btn(quorumLabel(c), { kind: "primary", icon: "check", perm: "change_approve", data: { decide: "approve" } })}`;
     const tabsHtml = dtabs([["Plan", null, "Plan"], ["Impact", impactN || null, "Impact"], ["History", null, "History"]], state.dtab);
     const body = state.dtab === "Impact" ? impactPane(c) : state.dtab === "History" ? historyPane(c) : planPane(c);
     return html`${dhead(tabsHtml, actions, { href: listHref(), label: "Changes" })}${head(title, sub)}${body}`;

@@ -977,6 +977,8 @@ pub struct DeleteReport {
     pub catalog_datasets: usize,
     pub catalog_edges: usize,
     pub catalog_config_snapshots: usize,
+    /// Versions of the tenant's own data-flow policy (#1043).
+    pub policy_versions: u64,
     /// State keys that could not be deleted, with why. The tenant is deleted
     /// anyway; these keys are left for the operator.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1114,6 +1116,10 @@ pub async fn delete_tenant(state: &ServerState, tenant: &str) -> Result<DeleteRe
             report.change_requests += 1;
         }
     }
+    report.policy_versions = history
+        .policy_versions_delete(&crate::serve::history::policies::tenant_scope(tenant))
+        .await
+        .map_err(store_err)?;
 
     let rt = state.tenants();
     for r in history.tenant_state_refs(tenant).await.map_err(store_err)? {

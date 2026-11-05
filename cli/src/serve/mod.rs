@@ -21,12 +21,16 @@ pub mod logs;
 pub mod mcp_route;
 pub mod metrics;
 pub mod observability;
+#[cfg(feature = "policy")]
+pub mod policies;
 pub mod pools;
 pub mod preview;
 pub mod rbac;
 pub mod references;
 pub mod registry;
 pub mod runner;
+#[cfg(all(feature = "schedule", feature = "templates"))]
+pub mod schedules;
 pub mod sealed;
 pub mod server;
 pub mod state;

@@ -12,6 +12,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Where the server-wide data-flow policy lives (`--policy-store`, #1043).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PolicyStore {
+    /// The newest approved version in the run-history store is in force; a
+    /// `--policy` file only seeds an empty store.
+    #[default]
+    Server,
+    /// The `--policy` file is in force, re-read on every start; the console
+    /// shows it read-only.
+    File,
+}
+
 /// How `/v1/*` requests are authenticated.
 #[derive(Clone)]
 pub enum AuthMode {
@@ -66,14 +79,94 @@ impl AuthMode {
 /// Run-history storage backend selection (parsed from `--history`).
 #[derive(Debug, Clone)]
 pub enum HistoryBackendSpec {
-    /// In-process `DashMap`; lost on restart (default).
+    /// In-process `DashMap`; lost on restart (`--history memory`, an explicit
+    /// opt-in since #1049).
     Memory,
     /// Postgres connection URL (stored verbatim, e.g. `postgres://host/db`).
     Postgres(String),
     /// SQLite connection URL, stored verbatim including the `sqlite:` scheme
     /// (e.g. `sqlite:runs.db`, `sqlite::memory:`) so the backend can hand it
-    /// straight to `sqlx` without re-deriving the form.
+    /// straight to `sqlx` without re-deriving the form. The default:
+    /// `<data dir>/history.db` ([`default_data_dir`]).
     Sqlite(String),
+}
+
+impl HistoryBackendSpec {
+    /// `memory`, `sqlite` or `postgres`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            HistoryBackendSpec::Memory => "memory",
+            HistoryBackendSpec::Postgres(_) => "postgres",
+            HistoryBackendSpec::Sqlite(_) => "sqlite",
+        }
+    }
+}
+
+/// Where `faucet serve` keeps its default run history (#1049):
+/// `$FAUCET_DATA_DIR`, else `~/.faucet` (`./.faucet` with no home directory).
+pub fn default_data_dir() -> PathBuf {
+    match std::env::var_os("FAUCET_DATA_DIR") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => std::env::home_dir().unwrap_or_default().join(".faucet"),
+    }
+}
+
+/// The SQLite history file in `dir`.
+pub fn default_history_url(dir: &std::path::Path) -> String {
+    format!("sqlite:{}", dir.join("history.db").display())
+}
+
+/// What `--history memory` gives up on every restart.
+pub const MEMORY_HISTORY_LOSES: &str = "runs and their logs, the audit log, idempotency keys, the \
+     catalog, usage records, templates, change requests, tenants and their connections, \
+     schedules and policy versions";
+
+/// Claim the default data directory before the history opens (#1049):
+/// create it (0700), then hold `history.db.lock` for the life of the server
+/// so a second server on the same file refuses to start instead of sharing
+/// it. A directory that cannot be written refuses to start; the server never
+/// falls back to memory on its own. `Ok(None)` when `--history` named a
+/// backend explicitly.
+pub fn claim_default_history(history: &HistoryBackendSpec) -> CliResult<Option<std::fs::File>> {
+    let HistoryBackendSpec::Sqlite(url) = history else {
+        return Ok(None);
+    };
+    let dir = default_data_dir();
+    if default_history_url(&dir) != *url {
+        return Ok(None);
+    }
+    let unwritable = |e: std::io::Error| {
+        CliError::Serve(format!(
+            "cannot keep the run history in {}: {e}. Point $FAUCET_DATA_DIR at a writable \
+             directory, pass --history sqlite:<path> or postgres://…, or run with --history \
+             memory to keep nothing across restarts",
+            dir.display()
+        ))
+    };
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir).map_err(unwritable)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(unwritable)?;
+        }
+    }
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("history.db.lock"))
+        .map_err(unwritable)?;
+    match lock.try_lock() {
+        Ok(()) => Ok(Some(lock)),
+        Err(std::fs::TryLockError::WouldBlock) => Err(CliError::Serve(format!(
+            "another faucet server is using the run history in {}; stop it, or give this one \
+             its own $FAUCET_DATA_DIR or --history",
+            dir.display()
+        ))),
+        Err(std::fs::TryLockError::Error(e)) => Err(unwritable(e)),
+    }
 }
 
 /// Validated server configuration.
@@ -129,12 +222,16 @@ pub struct ServeConfig {
     /// Path to a `--triggers` file. `None` = no event-driven triggers. The file
     /// is loaded + validated at startup (gated on the `triggers` feature).
     pub triggers_path: Option<PathBuf>,
+    /// Schedules (#1044): the `--schedules` file and the tenant guardrail.
+    pub schedules: ScheduleSettings,
     /// Path to a `--templates-sync` file. `None` = no remote template origins.
     /// Loaded + validated at startup (gated on the `templates-sync` feature).
     pub templates_sync_path: Option<PathBuf>,
     /// Path to a `--policy` file (#702). Loaded + validated at startup; every
     /// submission is checked against it (gated on the `policy` feature).
     pub policy_path: Option<PathBuf>,
+    /// Where the policy lives (`--policy-store`, #1043).
+    pub policy_store: PolicyStore,
     /// OTLP export settings from `--otel-config`. `None` = no OTLP export.
     pub otel: Option<faucet_core::OtelConfig>,
     /// Allowlist of hosts a per-run completion callback may target (#481).
@@ -158,6 +255,37 @@ pub struct ServeConfig {
     pub references: crate::serve::references::ServeReferencePolicy,
     /// Grafana base URL the console's Overview links to (`--grafana-url`).
     pub grafana_url: Option<String>,
+}
+
+/// The default shortest gap between a tenant-owned schedule's ticks.
+pub const DEFAULT_TENANT_SCHEDULE_MIN_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Schedule settings (#1044): `--schedules` and
+/// `--tenant-schedule-min-interval-secs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleSettings {
+    /// The `--schedules` file. `None` = only schedules made through the API.
+    pub path: Option<PathBuf>,
+    /// The shortest gap allowed between a tenant-owned schedule's ticks.
+    pub tenant_min_interval: Duration,
+}
+
+impl Default for ScheduleSettings {
+    fn default() -> Self {
+        Self {
+            path: None,
+            tenant_min_interval: DEFAULT_TENANT_SCHEDULE_MIN_INTERVAL,
+        }
+    }
+}
+
+impl From<&crate::cli::ServeScheduleArgs> for ScheduleSettings {
+    fn from(a: &crate::cli::ServeScheduleArgs) -> Self {
+        Self {
+            path: a.schedules.clone(),
+            tenant_min_interval: Duration::from_secs(a.tenant_schedule_min_interval_secs),
+        }
+    }
 }
 
 /// Log-shipping buffer bounds and the console's log link (#806).
@@ -335,14 +463,15 @@ impl ServeConfig {
         }
 
         let history = match args.history {
-            None => HistoryBackendSpec::Memory,
+            None => HistoryBackendSpec::Sqlite(default_history_url(&default_data_dir())),
+            Some(u) if u == "memory" => HistoryBackendSpec::Memory,
             Some(u) if u.starts_with("postgres://") || u.starts_with("postgresql://") => {
                 HistoryBackendSpec::Postgres(u)
             }
             Some(u) if u.starts_with("sqlite:") => HistoryBackendSpec::Sqlite(u),
             Some(u) => {
                 return Err(CliError::Serve(format!(
-                    "unrecognised --history '{u}': use a postgres:// URL or sqlite:<path>"
+                    "unrecognised --history '{u}': use a postgres:// URL, sqlite:<path> or memory"
                 )));
             }
         };
@@ -490,8 +619,10 @@ impl ServeConfig {
             ui_enabled: !args.no_ui,
             cluster,
             triggers_path: args.triggers,
+            schedules: ScheduleSettings::from(&args.schedules),
             templates_sync_path: args.templates_sync,
             policy_path: args.policy,
+            policy_store: args.policy_store,
             otel,
             callback_allow_hosts: args.callback_allow_host,
             request_guard,
@@ -676,7 +807,7 @@ mod tests {
             max_concurrent_runs: None,
             max_queued_runs: None,
             default_config: None,
-            history: None,
+            history: Some("memory".into()),
             cors_origin: vec![],
             body_limit_bytes: 1_048_576,
             shutdown_grace_secs: 60,
@@ -699,8 +830,10 @@ mod tests {
             cluster_poll_secs: 2,
             cluster_max_attempts: 3,
             triggers: None,
+            schedules: Default::default(),
             templates_sync: None,
             policy: None,
+            policy_store: Default::default(),
             otel_config: None,
             callback_allow_host: Vec::new(),
             origins: Default::default(),
@@ -914,6 +1047,30 @@ mod tests {
         a.auth_token = Some("t".into());
         a.listen = "0.0.0.0:8080".into();
         assert!(ServeConfig::from_args(a).is_ok());
+    }
+
+    #[test]
+    fn history_defaults_to_a_file_in_the_data_dir_and_memory_is_explicit() {
+        let mut a = base_args();
+        a.no_auth = true;
+        a.history = None;
+        let expected = default_history_url(&default_data_dir());
+        assert!(expected.ends_with("history.db"));
+        let history = ServeConfig::from_args(a.clone()).unwrap().history;
+        assert!(matches!(&history, HistoryBackendSpec::Sqlite(u) if *u == expected));
+        assert_eq!(history.kind(), "sqlite");
+        a.history = Some("memory".into());
+        let memory = ServeConfig::from_args(a).unwrap().history;
+        assert!(matches!(memory, HistoryBackendSpec::Memory));
+        assert_eq!(memory.kind(), "memory");
+        assert_eq!(
+            HistoryBackendSpec::Postgres("postgres://h/db".into()).kind(),
+            "postgres"
+        );
+        // Only the default file is claimed.
+        assert!(claim_default_history(&memory).unwrap().is_none());
+        let elsewhere = HistoryBackendSpec::Sqlite("sqlite:elsewhere.db".into());
+        assert!(claim_default_history(&elsewhere).unwrap().is_none());
     }
 
     #[test]

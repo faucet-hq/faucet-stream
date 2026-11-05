@@ -12,7 +12,8 @@ fn faucet() -> Command {
     cmd.timeout(Duration::from_secs(60))
         .env_remove("FAUCET_SERVE_LISTEN")
         .env_remove("FAUCET_SERVE_AUTH_TOKEN")
-        .env_remove("FAUCET_SERVE_ALLOW_UNAUTHENTICATED_NETWORK");
+        .env_remove("FAUCET_SERVE_ALLOW_UNAUTHENTICATED_NETWORK")
+        .env("FAUCET_SERVE_HISTORY", "memory");
     cmd
 }
 

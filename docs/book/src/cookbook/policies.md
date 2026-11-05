@@ -187,14 +187,148 @@ phases (`phase` = `static` | `runtime`, `action` = `refuse` | `fail` |
 
 ## Under `faucet serve`
 
-`faucet serve --policy FILE` checks every submission (`POST /v1/runs`, a
-template trigger, a backfill, a trigger fire) against the policy merged with
-the config's own block: a violation is a `422` whose `details` carry the
-report, and a `policy.denied` audit entry. Registering a violating
-**pipeline template** warns (`warnings[]` on the summary) rather than
-refusing — a source template may still be composed with a compliant sink —
-and triggering it hits the submit gate. `POST /v1/plan` reports the verdict
-under `policy` (viewer-readable).
+A server checks every submission (`POST /v1/runs`, a template trigger, a
+backfill, a trigger fire) against its policy merged with the config's own
+block: a violation is a `422` whose `details` carry the report, and a
+`policy.denied` audit entry naming the rule, column and sink. Registering a
+violating **pipeline template** warns (`warnings[]` on the summary) rather
+than refusing — a source template may still be composed with a compliant sink
+— and triggering it hits the submit gate. `POST /v1/plan` reports the verdict
+under `policy`.
+
+### Where the policy lives
+
+`faucet serve --policy-store server|file` (default `server`) decides where the
+server policy is kept.
+
+- **`server`** (the default): the policy in force is the newest approved
+  version in the server's store, the run-history backend (so a SQLite or
+  Postgres `--history` keeps it across restarts and shares it between
+  replicas). A `--policy FILE` only **seeds** it: when the store holds no
+  version, the file is imported as version 1, recorded as imported from the
+  file by `system` (audit `policy.imported`). After that the stored version
+  wins on every start. A file that later differs from the version in force is
+  **not applied**: the server logs a warning at start, `GET /v1/policy` reports
+  `file_drift: {path, differs: true}`, the console shows a banner with **Import
+  the file as a new version** (a `policy_update` change request, approved like
+  any edit), and `faucet_serve_policy_file_drift` is `1` (alert
+  `FaucetServePolicyFileDrift`).
+- **`file`**: the file is the policy, re-read on every start. The console and
+  API show it **read-only**; every change endpoint answers `409`. It needs
+  `--policy`.
+
+With the **in-memory** history (no `--history`) nothing approved survives a
+restart, so every policy edit — server or tenant, propose or rollback — is
+refused with `409` ("set a persistent --history to edit the policy here"). A
+`--policy` file still loads and is enforced, and the console shows it
+read-only with that hint.
+
+What a restart does:
+
+| `--policy-store` | `--history` | `--policy FILE` | On start |
+|---|---|---|---|
+| `server` | persistent | none | the newest stored version is in force (none stored: nothing enforced) |
+| `server` | persistent | given, store empty | the file is imported as version 1 |
+| `server` | persistent | given, store has a version | the stored version stays in force; a differing file is reported (`file_drift`), not applied |
+| `server` | in memory | given | the file is enforced, read-only; edits answer `409` |
+| `server` | in memory | none | nothing is enforced; edits answer `409` |
+| `file` | any | given | the file is re-read and enforced, read-only; edits answer `409` |
+| `file` | any | none | the server refuses to start |
+
+A server-managed policy is never edited in place. An admin proposes a new
+version (`POST /v1/policy`, or **Policy → Edit policy** in the console); the
+request is a `policy_update` change that **always** needs approval, by default
+from an admin other than the requester (the `approvals:` block of
+`--auth-config` can name other approvers for `policy_update`). On approval the
+draft is checked again and stored as the next version only if the version it
+was based on is still the one in force — a second change approved after the
+first is `invalidated` instead of overwriting it. Every replica reads the
+version in force at admission, so an approved change reaches all of them for
+the next submission.
+
+```bash
+# Preview a draft: its problems (with lines), or its diff and impact
+curl -s -X POST localhost:8899/v1/policy/preview -H "Authorization: Bearer $ADMIN" \
+  -H 'Content-Type: application/json' -d "$(jq -Rs '{policy: .}' eu-pii.yaml)"
+
+# Propose it (base_version: the version you edited; null for the first)
+curl -s -X POST localhost:8899/v1/policy -H "Authorization: Bearer $ADMIN" \
+  -H 'Content-Type: application/json' \
+  -d "$(jq -Rs '{policy: ., reason: "Hash-only for email", base_version: 7}' eu-pii.yaml)"
+
+# Another admin approves it
+curl -s -X POST localhost:8899/v1/changes/$ID/approve -H "Authorization: Bearer $OTHER_ADMIN"
+```
+
+The **preview** checks the draft with the same validation as a submission and
+measures its impact: every registered pipeline template (its stable version,
+params bound to placeholders) and the stored configs of the last 7 days of runs
+are checked against the policy in force and the draft, and the ones the draft
+would newly refuse or newly allow are listed. A template whose columns are
+unknown before a run (no `contract:`) is counted as checked at run time only —
+the runtime backstop still applies to it. The approver sees the same diff and
+impact on the change request.
+
+Versions are append-only (`GET /v1/policy/versions`): each names who requested
+it, who approved it and why. A **rollback** (`POST /v1/policy/rollback {version,
+reason}`) is a change request too; approved, it stores a new version with the
+earlier document (`restores: N`).
+
+**Runs keep the version they were admitted under.** The stored versions a run
+was checked against are recorded on its record (`policy_pin`), and a claim,
+shard or resume on another replica enforces those versions rather than a newer
+one.
+
+### Refusals and the dry run
+
+`GET /v1/policy/refusals` lists what the policy stopped — submissions the
+static gate refused and runs the backstop failed or quarantined — with the
+rule, column, label, sink and the layer (`server` or `tenant`) whose rule it
+was. `POST /v1/policy/check` (operator) dry-runs a config, or a registered
+pipeline template, against the policy in force without running anything; with
+`sample` records for one row, their values label the columns too.
+
+### Tenant policies
+
+Each [tenant](./embedded-integrations.md) can add its own classifications and
+rules on top of the server policy. A tenant policy is **add-only**: it is merged
+with the server's (`server ⊕ tenant ⊕ pipeline`), so it can tighten what the
+server allows but never remove, rename or loosen a server rule — a draft that
+reuses a server rule's name, or tries to `disable` one, is refused. Its rules
+may govern labels the server classifies. It applies to that tenant's runs only.
+
+```yaml
+# acme's policy: personal data never reaches a partner-tier sink
+version: 1
+rules:
+  - name: acme-no-partner
+    when: { label: pii }          # a server classification
+    require: { tier: [internal] }
+```
+
+The tenant's own admin principals (`--auth-config` entries with `tenant:` and
+`role: admin`) and server admins propose changes (`POST
+/v1/tenants/{tenant}/policy`, preview and rollback alongside); the
+`tenant_policy_update` request is approved by **another admin of that tenant or
+a server admin**, never the requester. A tenant's viewers and operators read it;
+another tenant's is a `404`. A tenant principal sees the server rules that
+apply to it as outlines (name, label, what they require) — not the rest of the
+server policy — and its own refusals. A server policy change that would reuse a
+tenant rule's name is refused, so the layers can always be merged. Deleting the
+tenant deletes its policy versions.
+
+### In the console
+
+**Govern → Policy** shows the policy in force (classifications, rules, and how
+many columns the catalog has seen per label), its refusals, a dry run and the
+version history, with **Edit policy** for admins on a server-managed policy. The
+editor validates as you type, then previews the diff and impact and asks for a
+reason before it creates the change request; pending changes show as a banner
+until approved. A `--policy` file that differs from the version in force shows
+as a banner with **Import the file as a new version**; on the in-memory history
+the page is read-only and says to set a persistent `--history`. With the tenant switcher set to a tenant, the page shows the
+server rules beside that tenant's rules and history; a tenant principal sees its
+own tenant's view. See [the web console](./web-console.md#policy).
 
 ## Worked example
 
@@ -211,4 +345,6 @@ remove the masking rule and `finance-hashed-or-nothing` fires.
   `run` / `validate` / `plan` / `doctor`, `serve --policy`
 - [`POST /v1/plan`](../reference/http-api.md#post-v1plan) and the `422`
   submit refusal
+- [The policy endpoints](../reference/http-api.md#policy) (`/v1/policy*`,
+  `/v1/tenants/{tenant}/policy*`) and [change requests](./approvals.md)
 - [RFC 0010](https://github.com/faucet-hq/faucet-stream/blob/main/rfcs/0010-policies-and-impact.md)

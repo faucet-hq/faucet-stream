@@ -2,7 +2,7 @@
 // delta, page chips, tenant, timezone, theme, link, expand) and the status line.
 // Pages render into `#view` (the body); see page.js.
 import { api } from "./api.js";
-import { html, raw, ic, v, join } from "./components.js";
+import { html, raw, ic, v, join, alert } from "./components.js";
 import { fmtInt, copyText } from "./utils.js";
 import { tenantList, withTenant } from "./tenant.js";
 import { whoami, can } from "./access.js";
@@ -16,7 +16,7 @@ export const NAV = [
     ["runs", "runs", "Runs", "#/runs"],
     ["changes", "changes", "Changes", "#/changes"],
     ["triggers", "trig", "Triggers", "#/triggers"],
-    ["schedules", "sched", "Schedules", "#/schedules", "", true],
+    ["schedules", "sched", "Schedules", "#/schedules"],
     ["feeds", "feed", "Feeds", "#/feeds", "", true],
   ]],
   ["Data", [
@@ -29,7 +29,7 @@ export const NAV = [
     ["submit", "submit", "Submit", "#/submit", "config_submit"],
   ]],
   ["Govern", [
-    ["policy", "policy", "Policy", "#/policy", "", true],
+    ["policy", "policy", "Policy", "#/policy"],
     ["usage", "usage", "Usage", "#/usage"],
     ["tenants", "tenants", "Tenants", "#/tenants"],
   ]],
@@ -158,7 +158,7 @@ function setBadge(key, n, { hot = false } = {}) {
 
 let badgeTimer = null;
 let badgeAt = 0;
-/** Sidebar counts: active runs, pending changes, datasets, templates, tenants.
+/** Sidebar counts: active runs, pending changes, schedules, datasets, templates, tenants.
  *  One cheap request each; a failure hides its badge. */
 export function refreshBadges(force = false) {
   if (!force && Date.now() - badgeAt < 5000) return;
@@ -172,6 +172,9 @@ export function refreshBadges(force = false) {
   api(`/v1/changes/counts?${withTenant(new URLSearchParams())}`)
     .then((c) => setBadge("changes", c && c.counts ? c.counts.pending || 0 : 0, { hot: true }))
     .catch(() => setBadge("changes", 0));
+  api(`/v1/schedules?${withTenant(new URLSearchParams())}`)
+    .then((s) => setBadge("schedules", s && s.available !== false ? (s.schedules || []).length : 0))
+    .catch(() => setBadge("schedules", 0));
   if (scoped) return;
   api("/v1/catalog/datasets?limit=1")
     .then((d) => (d && d.total != null ? d : api("/v1/catalog/datasets?limit=1000")))
@@ -203,7 +206,8 @@ async function refreshStatus() {
   try { ready = await (await fetch("/readyz")).json(); } catch { ready = null; }
   const parts = [];
   if (ready) {
-    const backend = ready.history_backend ? `history ${ready.history_backend}` : "history";
+    const kind = (ready.history || {}).kind || ready.history_backend;
+    const backend = kind ? `history ${kind}` : "history";
     parts.push(ready.history_ok ? html`<span><span class="dot"></span>${backend} · healthy</span>` : html`<span><span class="dot bad"></span>${backend} · degraded</span>`);
     if (ready.queue_ok === false) parts.push(html`<span><span class="dot warn"></span>run queue full</span>`);
     if (ready.draining) parts.push(html`<span><span class="dot warn"></span>draining</span>`);
@@ -217,6 +221,17 @@ async function refreshStatus() {
   }
   if (version) parts.push(html`<span>faucet serve ${version}</span>`);
   document.getElementById("status").innerHTML = v(join(parts));
+  renderSysBanner();
+}
+
+// An admin sees, on every page, that this server keeps nothing across a restart.
+function renderSysBanner() {
+  const el = document.getElementById("sys-banner");
+  if (!el) return;
+  const me = whoami();
+  const memory = ready && ready.history && ready.history.persistent === false;
+  el.hidden = !(memory && me && me.role === "admin");
+  el.innerHTML = el.hidden ? "" : v(alert("History is in memory: runs, audit and settings are lost on restart.", html`This server was started with <code>--history memory</code>. Start it without that flag to keep its history in <code>~/.faucet/history.db</code> (or <code>$FAUCET_DATA_DIR</code>), or pass <code>--history sqlite:PATH</code> or a <code>postgres://</code> URL.`, "warn"));
 }
 
 function wireTop() {

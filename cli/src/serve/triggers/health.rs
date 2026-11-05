@@ -45,11 +45,6 @@ pub struct TriggerInfo {
     /// Webhook: the leading-edge debounce window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debounce_secs: Option<u64>,
-    /// Schedule: the cron expression and its timezone.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cron: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub timezone: Option<String>,
     /// Object arrival / queue depth: seconds between polls.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub poll_interval_secs: Option<u64>,
@@ -81,8 +76,6 @@ impl TriggerInfo {
             errors_total: 0,
             methods: None,
             debounce_secs: None,
-            cron: None,
-            timezone: None,
             poll_interval_secs: None,
             threshold: None,
             template: t.spec.template.as_ref().map(|tt| match &tt.version {
@@ -106,10 +99,6 @@ impl TriggerInfo {
             } => {
                 info.methods = Some(methods.clone());
                 info.debounce_secs = Some(*debounce_secs);
-            }
-            TriggerKind::Schedule { cron, timezone, .. } => {
-                info.cron = Some(cron.clone());
-                info.timezone = Some(timezone.clone());
             }
             TriggerKind::ObjectArrival {
                 poll_interval_secs, ..

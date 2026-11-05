@@ -215,8 +215,12 @@ USER 65532:65532
 WORKDIR /var/lib/faucet
 
 # Bind on all interfaces inside the container (k8s Service/probes reach it).
+# `faucet serve` keeps its run history in $FAUCET_DATA_DIR/history.db unless
+# --history says otherwise (#1049): mount a volume there to keep it.
 ENV FAUCET_SERVE_LISTEN=0.0.0.0:8080 \
-    FAUCET_LOG=info
+    FAUCET_LOG=info \
+    FAUCET_DATA_DIR=/var/lib/faucet
+VOLUME ["/var/lib/faucet"]
 EXPOSE 8080
 
 # Probes /healthz when the container runs `faucet serve`; any other command

@@ -76,7 +76,8 @@ function registerRoutes() {
   route("#/changes/:id", renderChanges, { group: "changes" });
   route("#/triggers", renderTriggers, { group: "triggers" });
   route("#/triggers/:id", renderTriggers, { group: "triggers" });
-  route("#/schedules", renderSchedules);
+  route("#/schedules", renderSchedules, { group: "schedules" });
+  route("#/schedules/:id", renderSchedules, { group: "schedules" });
   route("#/feeds", renderFeeds);
   route("#/catalog", renderDatasets, { group: "catalog" });
   route("#/catalog/:id", renderDatasets, { group: "catalog" });
@@ -87,7 +88,7 @@ function registerRoutes() {
   route("#/schemas", renderSchemas, { group: "schemas" });
   route("#/schemas/:kind/:name", renderSchemas, { group: "schemas" });
   route("#/submit", renderSubmit, { group: "submit" });
-  route("#/policy", renderPolicy);
+  route("#/policy", renderPolicy, { group: "policy" });
   route("#/usage", renderUsage, { group: "usage" });
   route("#/tenants", renderTenants, { group: "tenants" });
   route("#/tenants/:id", renderTenants, { group: "tenants" });

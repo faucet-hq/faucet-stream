@@ -57,6 +57,9 @@ struct TenantState {
     state_refs: BTreeMap<(String, String), tenants::TenantStateRef>,
 }
 
+/// Schedules made through the API (#1044), by name.
+type ScheduleMap = BTreeMap<String, super::schedules::ScheduleRecord>;
+
 pub struct MemoryHistory {
     runs: DashMap<String, RunRecord>,
     idem: DashMap<String, IdemEntry>,
@@ -106,13 +109,21 @@ pub struct MemoryHistory {
     changes: Mutex<BTreeMap<String, crate::serve::changes::ChangeRequest>>,
     /// Tenants, connections, connect sessions and the state ledger (#709).
     tenants: Mutex<TenantState>,
+    /// Schedules made through the API (#1044), by name.
+    schedules: Mutex<ScheduleMap>,
     /// queue_depth trigger edges: trigger → (last ordinal, armed).
     trigger_edges: Mutex<std::collections::HashMap<String, (u64, bool)>>,
     /// Sealed secret params of clustered runs (#956): run id → sealed text.
     run_secrets: Mutex<RunSecrets>,
+    /// Data-flow policy versions (#1043): scope → version → record.
+    policy_versions: Mutex<PolicyVersions>,
     /// Retention window for idempotency claims (separate from run retention).
     idem_retention: Duration,
 }
+
+/// Scope → version → stored policy version (#1043).
+type PolicyVersions =
+    std::collections::HashMap<String, BTreeMap<u32, super::policies::PolicyVersionRecord>>;
 
 /// Run id → (sealed secret params, when they were stored).
 type RunSecrets = std::collections::HashMap<String, (String, DateTime<Utc>)>;
@@ -155,10 +166,22 @@ impl MemoryHistory {
             .map_err(|_| HistoryError::Backend("run secrets lock poisoned".into()))
     }
 
+    fn policies(&self) -> Result<std::sync::MutexGuard<'_, PolicyVersions>, HistoryError> {
+        self.policy_versions
+            .lock()
+            .map_err(|_| HistoryError::Backend("policy versions lock poisoned".into()))
+    }
+
     fn tenant_state(&self) -> Result<std::sync::MutexGuard<'_, TenantState>, HistoryError> {
         self.tenants
             .lock()
             .map_err(|_| HistoryError::Backend("tenants lock poisoned".into()))
+    }
+
+    fn schedule_map(&self) -> Result<std::sync::MutexGuard<'_, ScheduleMap>, HistoryError> {
+        self.schedules
+            .lock()
+            .map_err(|_| HistoryError::Backend("schedules lock poisoned".into()))
     }
 
     pub fn new(idem_retention: Duration) -> Self {
@@ -183,8 +206,10 @@ impl MemoryHistory {
             usage: Mutex::new(VecDeque::new()),
             changes: Mutex::new(BTreeMap::new()),
             tenants: Mutex::new(TenantState::default()),
+            schedules: Mutex::new(BTreeMap::new()),
             trigger_edges: Mutex::new(std::collections::HashMap::new()),
             run_secrets: Mutex::new(std::collections::HashMap::new()),
+            policy_versions: Mutex::new(std::collections::HashMap::new()),
             idem_retention,
         }
     }
@@ -957,6 +982,9 @@ impl RunHistory for MemoryHistory {
         st.connections.retain(|(t, _), _| t != id);
         st.sessions.retain(|_, s| s.tenant != id);
         st.state_refs.retain(|(t, _), _| t != id);
+        drop(st);
+        self.schedule_map()?
+            .retain(|_, r| r.tenant.as_deref() != Some(id));
         Ok(existed)
     }
 
@@ -1391,6 +1419,52 @@ impl RunHistory for MemoryHistory {
         Ok(self.secrets()?.get(run_id).map(|(s, _)| s.clone()))
     }
 
+    async fn policy_version_insert(
+        &self,
+        record: &super::policies::PolicyVersionRecord,
+    ) -> Result<bool, HistoryError> {
+        let mut all = self.policies()?;
+        let versions = all.entry(record.scope.clone()).or_default();
+        if versions.contains_key(&record.version) {
+            return Ok(false);
+        }
+        versions.insert(record.version, record.clone());
+        Ok(true)
+    }
+
+    async fn policy_versions(
+        &self,
+        scope: &str,
+        limit: usize,
+    ) -> Result<Vec<super::policies::PolicyVersionRecord>, HistoryError> {
+        let all = self.policies()?;
+        let take = if limit == 0 { usize::MAX } else { limit };
+        Ok(all
+            .get(scope)
+            .map(|v| v.values().rev().take(take).cloned().collect())
+            .unwrap_or_default())
+    }
+
+    async fn policy_version_get(
+        &self,
+        scope: &str,
+        version: u32,
+    ) -> Result<Option<super::policies::PolicyVersionRecord>, HistoryError> {
+        Ok(self
+            .policies()?
+            .get(scope)
+            .and_then(|v| v.get(&version))
+            .cloned())
+    }
+
+    async fn policy_versions_delete(&self, scope: &str) -> Result<u64, HistoryError> {
+        Ok(self
+            .policies()?
+            .remove(scope)
+            .map(|v| v.len() as u64)
+            .unwrap_or(0))
+    }
+
     async fn run_secrets_delete(&self, run_id: &str) -> Result<(), HistoryError> {
         self.secrets()?.remove(run_id);
         Ok(())
@@ -1721,6 +1795,48 @@ impl RunHistory for MemoryHistory {
             .map_err(|_| HistoryError::Backend("meta lock poisoned".into()))?;
         meta.insert(key.to_string(), value.to_string());
         Ok(())
+    }
+
+    async fn schedule_insert(
+        &self,
+        schedule: &super::schedules::ScheduleRecord,
+    ) -> Result<bool, HistoryError> {
+        let mut map = self.schedule_map()?;
+        if map.contains_key(schedule.name()) {
+            return Ok(false);
+        }
+        map.insert(schedule.name().to_string(), schedule.clone());
+        Ok(true)
+    }
+
+    async fn schedule_replace(
+        &self,
+        expected: &super::schedules::ScheduleRecord,
+        new: &super::schedules::ScheduleRecord,
+    ) -> Result<bool, HistoryError> {
+        let mut map = self.schedule_map()?;
+        match map.get(expected.name()) {
+            Some(current) if current == expected => {
+                map.insert(new.name().to_string(), new.clone());
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn schedule_get(
+        &self,
+        name: &str,
+    ) -> Result<Option<super::schedules::ScheduleRecord>, HistoryError> {
+        Ok(self.schedule_map()?.get(name).cloned())
+    }
+
+    async fn schedule_list(&self) -> Result<Vec<super::schedules::ScheduleRecord>, HistoryError> {
+        Ok(self.schedule_map()?.values().cloned().collect())
+    }
+
+    async fn schedule_delete(&self, name: &str) -> Result<bool, HistoryError> {
+        Ok(self.schedule_map()?.remove(name).is_some())
     }
 
     async fn template_tags(&self, id: &str) -> Result<BTreeMap<String, u32>, HistoryError> {

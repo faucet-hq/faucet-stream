@@ -124,6 +124,42 @@ const ROUTES_TENANTS: &[(&str, &str)] = &[
     ("GET", "/v1/connect/callback"),
 ];
 
+/// Schedules (#1044). Without the features only `GET /v1/schedules` is
+/// wired, answering `available: false`.
+#[cfg(all(feature = "schedule", feature = "templates"))]
+const ROUTES_SCHEDULES: &[(&str, &str)] = &[
+    ("GET", "/v1/schedules"),
+    ("POST", "/v1/schedules"),
+    ("POST", "/v1/schedules/preview"),
+    ("GET", "/v1/schedules/{name}"),
+    ("PUT", "/v1/schedules/{name}"),
+    ("DELETE", "/v1/schedules/{name}"),
+    ("POST", "/v1/schedules/{name}/pause"),
+    ("POST", "/v1/schedules/{name}/resume"),
+    ("POST", "/v1/schedules/{name}/run"),
+];
+
+/// The data-flow policy in the console (#1043).
+#[cfg(feature = "policy")]
+const ROUTES_POLICY: &[(&str, &str)] = &[
+    ("GET", "/v1/policy"),
+    ("POST", "/v1/policy"),
+    ("GET", "/v1/policy/versions"),
+    ("GET", "/v1/policy/refusals"),
+    ("POST", "/v1/policy/check"),
+    ("POST", "/v1/policy/preview"),
+    ("POST", "/v1/policy/rollback"),
+];
+
+/// Tenant policies (#1043): `policy` and `tenants` both compiled.
+#[cfg(all(feature = "policy", feature = "tenants"))]
+const ROUTES_TENANT_POLICY: &[(&str, &str)] = &[
+    ("GET", "/v1/tenants/{tenant}/policy"),
+    ("POST", "/v1/tenants/{tenant}/policy"),
+    ("POST", "/v1/tenants/{tenant}/policy/preview"),
+    ("POST", "/v1/tenants/{tenant}/policy/rollback"),
+];
+
 #[cfg(feature = "mcp")]
 const ROUTES_MCP: &[(&str, &str)] = &[("POST", "/mcp")];
 
@@ -154,6 +190,18 @@ pub fn canonical_routes() -> BTreeSet<(String, String)> {
     for (m, p) in ROUTES_TENANTS {
         set.insert((m.to_string(), p.to_string()));
     }
+    #[cfg(all(feature = "schedule", feature = "templates"))]
+    for (m, p) in ROUTES_SCHEDULES {
+        set.insert((m.to_string(), p.to_string()));
+    }
+    #[cfg(feature = "policy")]
+    for (m, p) in ROUTES_POLICY {
+        set.insert((m.to_string(), p.to_string()));
+    }
+    #[cfg(all(feature = "policy", feature = "tenants"))]
+    for (m, p) in ROUTES_TENANT_POLICY {
+        set.insert((m.to_string(), p.to_string()));
+    }
     #[cfg(feature = "mcp")]
     for (m, p) in ROUTES_MCP {
         set.insert((m.to_string(), p.to_string()));
@@ -175,6 +223,12 @@ pub fn authenticated_routes() -> Vec<(&'static str, &'static str)> {
     all.extend_from_slice(ROUTES_TEMPLATES_SYNC);
     #[cfg(feature = "tenants")]
     all.extend_from_slice(ROUTES_TENANTS);
+    #[cfg(all(feature = "schedule", feature = "templates"))]
+    all.extend_from_slice(ROUTES_SCHEDULES);
+    #[cfg(feature = "policy")]
+    all.extend_from_slice(ROUTES_POLICY);
+    #[cfg(all(feature = "policy", feature = "tenants"))]
+    all.extend_from_slice(ROUTES_TENANT_POLICY);
     #[cfg(feature = "mcp")]
     all.extend_from_slice(ROUTES_MCP);
     all.into_iter()

@@ -49,6 +49,8 @@ struct Inner {
     callback_allow_hosts: Vec<String>,
     /// Whether `--history` names a SQL backend (run records outlive the process).
     persistent_history: bool,
+    /// The run-history backend: `memory`, `sqlite` or `postgres` (#1049).
+    history_kind: &'static str,
     cluster: crate::serve::cluster::ClusterHandle,
     #[cfg(feature = "triggers")]
     triggers: crate::serve::triggers::health::TriggersHandle,
@@ -59,9 +61,23 @@ struct Inner {
     templates_sync: RwLock<Option<Arc<crate::templates::sync::SyncFile>>>,
     #[cfg(feature = "templates")]
     test_policy: RwLock<Option<crate::template_tests::trust::ServerTestPolicy>>,
+    /// The schedules runtime (#1044): the `--schedules` file, the tenant
+    /// guardrail and the loop's wake-up signal. Replaced once at startup.
+    #[cfg(all(feature = "schedule", feature = "templates"))]
+    schedules: RwLock<Arc<crate::serve::schedules::SchedulesRuntime>>,
     /// The server-wide data-flow policy (`--policy`, #702), when one was given.
     #[cfg(feature = "policy")]
     policy: RwLock<Option<Arc<faucet_core::PolicySpec>>>,
+    /// Where that `--policy` policy was read from (#1043), for the console.
+    #[cfg(feature = "policy")]
+    policy_file: RwLock<Option<crate::serve::policies::PolicyFile>>,
+    /// Where the policy lives (`--policy-store`, #1043).
+    #[cfg(feature = "policy")]
+    policy_store: crate::serve::config::PolicyStore,
+    /// The `--policy` file a server-store server was started with: it only
+    /// seeded the store, and is kept to report when it drifts (#1043).
+    #[cfg(feature = "policy")]
+    policy_seed: RwLock<Option<crate::serve::policies::PolicySeed>>,
     /// The tenant runtime (#709): vault key, hosted-OAuth providers,
     /// admission locks. Replaced once at startup.
     #[cfg(feature = "tenants")]
@@ -126,6 +142,7 @@ impl ServerState {
                     config.history,
                     crate::serve::config::HistoryBackendSpec::Memory
                 ),
+                history_kind: config.history.kind(),
                 cluster: crate::serve::cluster::ClusterHandle::from_config(config),
                 #[cfg(feature = "triggers")]
                 triggers,
@@ -133,8 +150,19 @@ impl ServerState {
                 templates_sync: RwLock::new(None),
                 #[cfg(feature = "templates")]
                 test_policy: RwLock::new(None),
+                #[cfg(all(feature = "schedule", feature = "templates"))]
+                schedules: RwLock::new(Arc::new(crate::serve::schedules::SchedulesRuntime::new(
+                    Vec::new(),
+                    config.schedules.tenant_min_interval,
+                ))),
                 #[cfg(feature = "policy")]
                 policy: RwLock::new(None),
+                #[cfg(feature = "policy")]
+                policy_file: RwLock::new(None),
+                #[cfg(feature = "policy")]
+                policy_store: config.policy_store,
+                #[cfg(feature = "policy")]
+                policy_seed: RwLock::new(None),
                 #[cfg(feature = "tenants")]
                 tenants: RwLock::new(Arc::new(Default::default())),
                 #[cfg(feature = "encryption")]
@@ -255,6 +283,54 @@ impl ServerState {
     pub fn policy(&self) -> Option<Arc<faucet_core::PolicySpec>> {
         self.inner
             .policy
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Record where the `--policy` policy came from (server startup, #1043).
+    /// A server with a policy file manages its policy by that file: the
+    /// console and API show it read-only.
+    #[cfg(feature = "policy")]
+    pub fn set_policy_file(&self, file: crate::serve::policies::PolicyFile) {
+        *self
+            .inner
+            .policy_file
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(file);
+    }
+
+    /// The `--policy` file, when the server was started with one.
+    #[cfg(feature = "policy")]
+    pub fn policy_file(&self) -> Option<crate::serve::policies::PolicyFile> {
+        self.inner
+            .policy_file
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Where the policy lives (`--policy-store`, #1043).
+    #[cfg(feature = "policy")]
+    pub fn policy_store(&self) -> crate::serve::config::PolicyStore {
+        self.inner.policy_store
+    }
+
+    /// Keep the `--policy` file a server-store server was started with.
+    #[cfg(feature = "policy")]
+    pub fn set_policy_seed(&self, seed: crate::serve::policies::PolicySeed) {
+        *self
+            .inner
+            .policy_seed
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(seed);
+    }
+
+    /// The `--policy` file that seeded a server-store server, if any.
+    #[cfg(feature = "policy")]
+    pub fn policy_seed(&self) -> Option<crate::serve::policies::PolicySeed> {
+        self.inner
+            .policy_seed
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -384,6 +460,11 @@ impl ServerState {
         self.inner.default_base.read().unwrap().clone()
     }
 
+    /// The run-history backend: `memory`, `sqlite` or `postgres` (#1049).
+    pub fn history_kind(&self) -> &'static str {
+        self.inner.history_kind
+    }
+
     /// Path the default-config was loaded from (`None` when `--default-config`
     /// was not passed).
     pub fn default_config_path(&self) -> Option<&PathBuf> {
@@ -449,6 +530,26 @@ impl ServerState {
     pub fn triggers(&self) -> &crate::serve::triggers::health::TriggersHandle {
         &self.inner.triggers
     }
+
+    /// The schedules runtime (#1044).
+    #[cfg(all(feature = "schedule", feature = "templates"))]
+    pub fn schedules(&self) -> Arc<crate::serve::schedules::SchedulesRuntime> {
+        self.inner
+            .schedules
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Install the schedules runtime (the loaded `--schedules` file).
+    #[cfg(all(feature = "schedule", feature = "templates"))]
+    pub fn set_schedules(&self, runtime: crate::serve::schedules::SchedulesRuntime) {
+        *self
+            .inner
+            .schedules
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(runtime);
+    }
 }
 
 #[cfg(test)]
@@ -485,8 +586,10 @@ mod tests {
             ui_enabled: true,
             cluster: crate::serve::cluster::ClusterConfig::disabled(),
             triggers_path: None,
+            schedules: Default::default(),
             templates_sync_path: None,
             policy_path: None,
+            policy_store: Default::default(),
             otel: None,
             callback_allow_hosts: Vec::new(),
             request_guard: Default::default(),

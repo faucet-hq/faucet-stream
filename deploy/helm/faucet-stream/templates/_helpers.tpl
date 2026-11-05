@@ -237,6 +237,7 @@ existingSecret, fileName }.
 */}}
 {{- define "faucet-stream.serveFileFeatures" -}}
 triggers: { flag: triggers, volume: serve-triggers, dir: /etc/faucet-triggers }
+schedules: { flag: schedules, volume: serve-schedules, dir: /etc/faucet-schedules }
 templatesSync: { flag: templates-sync, volume: serve-templates-sync, dir: /etc/faucet-templates-sync }
 policy: { flag: policy, volume: serve-policy, dir: /etc/faucet-policy }
 connectProviders: { flag: connect-providers, volume: serve-connect-providers, dir: /etc/faucet-connect-providers }
@@ -310,7 +311,8 @@ true
 
 {{/*
 serve.history.backend, lower-cased (validation.yaml refuses any other value).
+Unset is the server's own default (#1049): a SQLite file in the data dir.
 */}}
 {{- define "faucet-stream.historyBackend" -}}
-{{- .Values.serve.history.backend | toString | lower | trim -}}
+{{- .Values.serve.history.backend | default "sqlite" | toString | lower | trim -}}
 {{- end -}}

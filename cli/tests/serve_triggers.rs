@@ -43,8 +43,10 @@ fn test_config() -> ServeConfig {
         ui_enabled: false,
         cluster: faucet_cli::serve::cluster::ClusterConfig::disabled(),
         triggers_path: None,
+        schedules: Default::default(),
         templates_sync_path: None,
         policy_path: None,
+        policy_store: Default::default(),
         otel: None,
         callback_allow_hosts: Vec::new(),
         request_guard: Default::default(),
@@ -804,115 +806,6 @@ async fn queue_depth_fires_once_on_rising_edge() {
     }
 }
 
-/// #916: a schedule trigger that missed ticks while no server ran fires the
-/// latest one once on start, then records it so the next start does not.
-#[cfg(feature = "schedule")]
-#[tokio::test]
-async fn a_schedule_trigger_runs_one_catch_up_for_ticks_missed_while_down() {
-    use chrono::{Duration as Delta, DurationRound, Utc};
-    use faucet_cli::serve::triggers::compiled::compile_schedule;
-    use faucet_cli::serve::triggers::schedule::{Resume, ScheduleWatcher};
-    use faucet_cli::serve::triggers::watcher::Watcher;
-
-    let dir = tempfile::tempdir().unwrap();
-    let csv = dir.path().join("in.csv");
-    std::fs::write(&csv, "a\n1\n").unwrap();
-    let out = dir.path().join("out.jsonl");
-    let inline = inline_pipeline(csv.to_str().unwrap(), out.to_str().unwrap());
-    let file: faucet_cli::serve::triggers::spec::TriggersFile = faucet_cli::yaml::from_str(&format!(
-        "version: 1\ntriggers:\n  - name: hourly\n    type: schedule\n    cron: \"0 * * * *\"\n    config: {}\n",
-        serde_json::to_string(&inline).unwrap()
-    ))
-    .unwrap();
-    let compiled = CompiledTriggers::compile(file).unwrap();
-    let state = build_state(&compiled);
-
-    let latest = Utc::now().duration_trunc(Delta::hours(1)).unwrap();
-    let last = latest - Delta::hours(3);
-    state
-        .history()
-        .meta_put(
-            "trigger_tick:hourly",
-            &serde_json::json!({"cron": "0 * * * *", "timezone": "UTC", "tick": last}).to_string(),
-        )
-        .await
-        .unwrap();
-
-    let watcher = |now| {
-        ScheduleWatcher::new(
-            Arc::new(compiled.triggers[0].clone()),
-            compile_schedule("hourly", "0 * * * *", "UTC").unwrap(),
-            Resume {
-                cron: "0 * * * *".into(),
-                timezone: "UTC".into(),
-                catch_up: true,
-            },
-            now,
-        )
-    };
-    let mut w = watcher(Utc::now());
-    assert!(
-        w.poll(&state).await.unwrap(),
-        "the missed tick fires on start"
-    );
-    assert!(!w.poll(&state).await.unwrap(), "only once");
-    wait_for_runs(&state, 1).await;
-    let runs = state
-        .history()
-        .list(&ListFilter {
-            limit: 10,
-            ..Default::default()
-        })
-        .await
-        .unwrap()
-        .runs;
-    assert_eq!(runs.len(), 1);
-    assert_eq!(
-        runs[0].labels["faucet.trigger.tick"],
-        latest.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-    );
-
-    // The fire was recorded: a second start has nothing to catch up.
-    let mut again = watcher(Utc::now());
-    assert!(!again.poll(&state).await.unwrap());
-    let stored = state
-        .history()
-        .meta_get("trigger_tick:hourly")
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        stored.contains(&latest.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
-        "{stored}"
-    );
-}
-
-/// A schedule that fails to compile at spawn time marks its watcher
-/// unhealthy instead of running it.
-#[cfg(feature = "schedule")]
-#[tokio::test]
-async fn a_schedule_that_does_not_compile_at_spawn_is_reported_unhealthy() {
-    use faucet_cli::serve::triggers::spec::TriggerKind;
-    let file: faucet_cli::serve::triggers::spec::TriggersFile = faucet_cli::yaml::from_str(
-        "version: 1\ntriggers:\n  - name: hourly\n    type: schedule\n    cron: \"0 * * * *\"\n    config: { version: 1 }\n",
-    )
-    .unwrap();
-    let mut compiled = CompiledTriggers::compile(file).unwrap();
-    let state = build_state(&compiled);
-    if let TriggerKind::Schedule { cron, .. } = &mut compiled.triggers[0].spec.kind {
-        *cron = "not a cron".into();
-    }
-    let handles = faucet_cli::serve::triggers::spawn_watchers(
-        state.clone(),
-        &compiled,
-        CancellationToken::new(),
-    );
-    assert!(handles.is_empty());
-    let row = state.triggers().snapshot().remove(0);
-    assert!(!row.healthy, "{row:?}");
-    assert!(row.last_error.unwrap_or_default().starts_with("schedule:"));
-}
-
 /// A queue_depth fire whose config cannot be built (here an unknown trigger
 /// token) runs nothing and reports a poll error, so the watcher backs off
 /// instead of reporting healthy.
@@ -1134,7 +1027,7 @@ async fn spawn_serve_with_triggers(
         max_concurrent_runs: Some(4),
         max_queued_runs: Some(16),
         default_config: None,
-        history: None,
+        history: Some("memory".into()),
         cors_origin: vec![],
         body_limit_bytes: 1_048_576,
         shutdown_grace_secs: 5,
@@ -1157,8 +1050,10 @@ async fn spawn_serve_with_triggers(
         cluster_poll_secs: 2,
         cluster_max_attempts: 3,
         triggers: Some(triggers_path.to_path_buf()),
+        schedules: Default::default(),
         templates_sync: None,
         policy: None,
+        policy_store: Default::default(),
         otel_config: None,
         callback_allow_host: Vec::new(),
         origins: Default::default(),

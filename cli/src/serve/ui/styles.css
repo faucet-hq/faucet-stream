@@ -159,8 +159,12 @@ svg.i { width: 15px; height: 15px; stroke: currentColor; fill: none; stroke-widt
 .avatar.vacant { background: transparent; border: 1px dashed var(--line-strong); }
 
 /* ---- main shell ---- */
-.main { background: var(--chrome); border: 1px solid var(--line-soft); border-radius: var(--r-lg); display: grid; grid-template-rows: 50px 1fr 28px; min-height: 0; overflow: hidden; position: relative; }
-.top { display: flex; align-items: center; gap: 14px; padding: 0 18px; border-bottom: 1px solid var(--line-soft); min-width: 0; }
+.main { background: var(--chrome); border: 1px solid var(--line-soft); border-radius: var(--r-lg); display: grid; grid-template-rows: 50px auto 1fr 28px; min-height: 0; overflow: hidden; position: relative; }
+.top { grid-row: 1; display: flex; align-items: center; gap: 14px; padding: 0 18px; border-bottom: 1px solid var(--line-soft); min-width: 0; }
+/* A server-wide notice above every page (#1049), e.g. an in-memory history. */
+.sys-banner { grid-row: 2; padding: 12px 18px 0; }
+.main > .body { grid-row: 3; }
+.main > .status { grid-row: 4; }
 .crumb { display: flex; gap: 8px; align-items: center; font-size: 14.5px; color: var(--muted); white-space: nowrap; min-width: 0; overflow: hidden; }
 .crumb b { color: var(--text); font-weight: 500; overflow: hidden; text-overflow: ellipsis; }
 .top .delta { font-size: 12.5px; white-space: nowrap; }
@@ -197,6 +201,8 @@ svg.i { width: 15px; height: 15px; stroke: currentColor; fill: none; stroke-widt
 .input svg.i { width: 14px; height: 14px; color: var(--faint); }
 .input.mono, .area.mono { font-family: var(--mono); font-size: var(--fs-sm); }
 .select { padding-right: 8px; justify-content: space-between; }
+#tenant-wrap.on { background: var(--teal-fill); color: var(--teal-ink); border-color: var(--teal-line); }
+#tenant-wrap.on select { color: var(--teal-ink); }
 .select::after { content: ""; width: 6px; height: 6px; border-right: 1.5px solid var(--muted); border-bottom: 1.5px solid var(--muted); transform: rotate(45deg) translateY(-2px); flex: none; }
 .area { padding: 8px 10px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-sm); font: var(--fs-sm)/1.6 var(--mono); color: var(--text-2); white-space: pre; overflow: hidden; }
 .area.sans { font: var(--fs)/1.5 var(--sans); white-space: normal; }

@@ -59,7 +59,26 @@ helm install faucet ./deploy/helm/faucet-stream \
 
 See the [chart README](./helm/faucet-stream/README.md) for serve/job/cronjob
 config, auth modes, history backends, credentials, and the full values
-reference. Every `faucet serve` feature (triggers, template sync, policy,
+reference.
+
+### Run history
+
+`faucet serve` keeps its run history (runs, audit, templates, schedules,
+policy versions, tenants…) in a SQLite file, `$FAUCET_DATA_DIR/history.db`,
+unless `--history` names another store (#1049). The image sets
+`FAUCET_DATA_DIR=/var/lib/faucet` and declares that directory a volume (owned
+by the runtime user), so mount one there:
+
+```bash
+docker run -v faucet-data:/var/lib/faucet -e FAUCET_SERVE_AUTH_TOKEN=… -p 8080:8080 faucet:full
+```
+
+The chart mounts its PVC there by default (`serve.persistence.enabled: true`,
+`serve.history` unset). For several replicas or `--cluster`, use a shared
+Postgres: `serve.history.backend: postgres` with the DSN in a Secret.
+`--history memory` (`serve.history.backend: memory`) keeps nothing across a
+restart. Back the file up with SQLite's online backup — see
+[Backing up the server database](../docs/book/src/operations/backup.md). Every `faucet serve` feature (triggers, template sync, policy,
 tenants and hosted OAuth connect, OTLP export, approvals, MCP) has its own
 values block; [`examples/everything.yaml`](./helm/faucet-stream/examples/everything.yaml)
 turns them all on.

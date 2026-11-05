@@ -98,5 +98,10 @@ The run-history database (`faucet-local-demo/faucet-meta.db`) is **not** wiped
 between invocations, so run history accumulates over time. Use `--clean` to
 reset the whole workspace.
 
+The demo passes its own `--history`. A plain `faucet serve` keeps its history
+in `~/.faucet/history.db` (or `$FAUCET_DATA_DIR/history.db`), so runs,
+templates, schedules and the policy survive a restart; `--history memory`
+keeps nothing and says so in the log and the console.
+
 > The `faucet-local-demo/` workspace is disposable — delete it any time with
 > `rm -rf faucet-local-demo`. It is git-ignored.

@@ -110,9 +110,20 @@ serve:
   cluster:
     enabled: true
   history:
-    backend: postgres     # memory | sqlite | postgres
+    backend: postgres     # "" (default) | sqlite | postgres | memory
     existingSecret: faucet-history   # key FAUCET_SERVE_HISTORY = postgres://…
 ```
+
+- **History** (#1049): with `serve.history` unset the server keeps its run
+  history — runs, audit, templates, schedules, policy versions, tenants — in
+  `$FAUCET_DATA_DIR/history.db`; the chart sets `FAUCET_DATA_DIR` to
+  `serve.persistence.mountPath` and mounts a PVC there
+  (`serve.persistence.enabled: true`, the default), so it survives pod
+  restarts and upgrades. `serve.persistence.enabled: false` uses an emptyDir
+  (lost on every restart). For more than one replica or `cluster.enabled`, use
+  a shared Postgres (`history.backend: postgres`, the DSN in a Secret, as
+  above). `history.backend: memory` keeps nothing across a restart: the pod
+  warns at start and the console shows a banner.
 
 - **Auth**: `token` (bearer; the chart mints a stable random token into a Secret,
   or use `auth.token` / `auth.existingSecret`), `none` (`--no-auth --allow-unauthenticated-network`:
@@ -269,6 +280,14 @@ serve:
     enabled: true
     existingSecret: faucet-policy     # key: policy.yaml
 ```
+
+`serve.policy.store` sets `--policy-store`. With `server` (the default) the
+newest approved version in the history store is in force, and the policy file
+only seeds an empty store as version 1; a file that later differs is reported
+in the console and by `faucet_serve_policy_file_drift`, not applied. Edits need
+a persistent `serve.history` (postgres, or sqlite on a volume). With `file` the
+file is the policy, re-read on every start and read-only in the console; it
+needs `serve.policy.enabled: true`.
 
 Template-sync, connect-provider and OTLP files resolve `${env:VAR}` when the
 server loads them, so keep tokens and client secrets in a Secret exposed through
@@ -447,13 +466,14 @@ See [`values.yaml`](./values.yaml) — every key is commented. Common ones:
 | `connectors.verify.enabled` | `true` | fail pod start if a declared connector is absent |
 | `serve.enabled` | `true` | deploy the control plane |
 | `serve.auth.mode` | `token` | `token` \| `none` \| `rbac` |
-| `serve.history.backend` | `memory` | `memory` \| `sqlite` \| `postgres` (any other value fails rendering) |
+| `serve.history.backend` | `""` | unset: the server default, `$FAUCET_DATA_DIR/history.db` on the data volume; `sqlite` \| `postgres` \| `memory` (any other value fails rendering) |
 | `serve.localOutputs.retentionDays` | `7` | days before local sink output files (jsonl/csv/parquet) are reclaimed; `0` disables the sweep |
 | `serve.localOutputs.inFlightGraceSeconds` | `60` | never delete an output touched within this window (guards against unlinking a file a run is writing); `0` disables |
 | `serve.preview.enabled` | `false` | serve dataset previews of local sink outputs — the console reads a tracked jsonl/csv/parquet file's first rows back over HTTP. Off by default: it exposes file *contents* to anyone with the `LocalOutputRead` scope (viewer and up) |
 | `serve.preview.rows` | `500` | rows a preview loads when the request omits `row_count_to_load` (soft cap); `0` = the whole dataset |
 | `serve.preview.maxRows` | `5000` | ceiling on one preview's rows (hard cap); a larger request — including `row_count_to_load=all` — is clamped to it. `0` lifts the ceiling, letting one request read an entire output file (still bounded by a 64 MiB response budget and a 30s deadline) |
 | `serve.triggers` / `.templatesSync` / `.policy` / `.connectProviders` / `.otel` | disabled | file-backed serve features: `enabled` + one of `content` / `existingConfigMap` / `existingSecret`, and `fileName` (see [Serve features](#serve-features)) |
+| `serve.policy.store` | `server` | `--policy-store`: `server` keeps approved versions in the history store (the file only seeds an empty store); `file` makes the file the policy, read-only in the console (needs `serve.policy.enabled`) |
 | `serve.cluster.vaultKey.existingSecret` | `""` | vault key (`FAUCET_VAULT_KEY`) that seals clustered template runs' `secret: true` params; `cluster.previousKeys` open values sealed under an earlier key |
 | `serve.tenants.enabled` | `false` | tenants; needs `vaultKey.existingSecret` (+ `existingSecretKey`, default `FAUCET_VAULT_KEY`) and persistent history |
 | `serve.tenants.previousKeys` | `[]` | `{existingSecret, existingSecretKey}` entries → `FAUCET_VAULT_PREVIOUS_KEYS` |
@@ -463,7 +483,7 @@ See [`values.yaml`](./values.yaml) — every key is commented. Common ones:
 | `serve.allowedHosts` | `[]` | `--allowed-host`: host names the server answers; a request naming another `Host` is refused |
 | `serve.allowedOrigins` | `[]` | `--allowed-origin`: extra browser origins that may send state-changing requests |
 | `serve.autoscaling.enabled` | `false` | HPA on the Deployment |
-| `serve.persistence.enabled` | `false` | PVC for sqlite history / bookmarks |
+| `serve.persistence.enabled` | `true` | PVC for the data dir (the default SQLite history, bookmarks); `false` = emptyDir |
 | `serve.strategy` | `{}` | Deployment update strategy; empty = `Recreate` for one replica with a volume, else `RollingUpdate` |
 | `job.enabled` | `false` | one-shot `faucet run` |
 | `cronjob.enabled` | `false` | scheduled `faucet run` |

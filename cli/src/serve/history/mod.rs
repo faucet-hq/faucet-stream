@@ -5,16 +5,18 @@
 //! See spec §11 + §20.
 
 pub mod catalog;
-#[cfg(any(feature = "serve-history-postgres", feature = "serve-history-sqlite"))]
+#[cfg(feature = "serve")]
 pub mod fallback;
 pub mod labels;
 pub mod memory;
 pub mod overview;
+pub mod policies;
 #[cfg(feature = "serve-history-postgres")]
 pub mod postgres;
-#[cfg(any(feature = "serve-history-postgres", feature = "serve-history-sqlite"))]
+pub mod schedules;
+#[cfg(feature = "serve")]
 pub mod sql;
-#[cfg(feature = "serve-history-sqlite")]
+#[cfg(feature = "serve")]
 pub mod sqlite;
 pub mod templates;
 pub mod tenants;
@@ -277,6 +279,10 @@ pub struct RunRecord {
     /// field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dlq_location: Option<String>,
+    /// The stored data-flow policy versions the run was admitted under
+    /// (#1043): a claim, shard or resume enforces these, not a newer one.
+    #[serde(default, skip_serializing_if = "policies::PolicyPin::is_empty")]
+    pub policy_pin: policies::PolicyPin,
 }
 
 impl RunRecord {
@@ -319,6 +325,7 @@ impl RunRecord {
             pool: crate::serve::pools::default_pool(),
             submitted_by: None,
             dlq_location: None,
+            policy_pin: Default::default(),
         }
     }
 
@@ -1243,6 +1250,48 @@ pub trait RunHistory: Send + Sync {
         Err(HistoryError::Backend(
             "this run-history backend does not store sealed secret params".into(),
         ))
+    }
+
+    /// Append policy `record` (#1043) as version `record.version` of
+    /// `record.scope`. Returns `false` — and stores nothing — when that
+    /// version already exists: another change landed first, so a caller
+    /// built on an older base must re-plan. Default: unsupported.
+    async fn policy_version_insert(
+        &self,
+        record: &policies::PolicyVersionRecord,
+    ) -> Result<bool, HistoryError> {
+        let _ = record;
+        Err(HistoryError::Backend(
+            "this run-history backend does not store policy versions".into(),
+        ))
+    }
+
+    /// The newest `limit` versions of `scope`, newest first (`0` = every
+    /// version). Default: none.
+    async fn policy_versions(
+        &self,
+        scope: &str,
+        limit: usize,
+    ) -> Result<Vec<policies::PolicyVersionRecord>, HistoryError> {
+        let _ = (scope, limit);
+        Ok(Vec::new())
+    }
+
+    /// One version of `scope`. Default: none.
+    async fn policy_version_get(
+        &self,
+        scope: &str,
+        version: u32,
+    ) -> Result<Option<policies::PolicyVersionRecord>, HistoryError> {
+        let _ = (scope, version);
+        Ok(None)
+    }
+
+    /// Delete every version of `scope` (a deleted tenant). Returns how many.
+    /// Default: none stored, none deleted.
+    async fn policy_versions_delete(&self, scope: &str) -> Result<u64, HistoryError> {
+        let _ = scope;
+        Ok(0)
     }
 
     /// The sealed secret params of `run_id`, if still stored. Default: none.
@@ -2173,6 +2222,52 @@ pub trait RunHistory: Send + Sync {
         ))
     }
 
+    /// Store a new schedule (#1044); `false` when one with its name already
+    /// exists (nothing is written). Default: unsupported.
+    async fn schedule_insert(
+        &self,
+        schedule: &schedules::ScheduleRecord,
+    ) -> Result<bool, HistoryError> {
+        let _ = schedule;
+        Err(HistoryError::Backend(
+            "this run-history backend does not store schedules".into(),
+        ))
+    }
+
+    /// Replace schedule `expected` with `new` only while the stored record is
+    /// still exactly `expected`; returns whether it was replaced. The default
+    /// is unsupported; the built-in backends compare and write in one step.
+    async fn schedule_replace(
+        &self,
+        expected: &schedules::ScheduleRecord,
+        new: &schedules::ScheduleRecord,
+    ) -> Result<bool, HistoryError> {
+        let _ = (expected, new);
+        Err(HistoryError::Backend(
+            "this run-history backend does not store schedules".into(),
+        ))
+    }
+
+    /// One schedule by name. Default: `None`.
+    async fn schedule_get(
+        &self,
+        name: &str,
+    ) -> Result<Option<schedules::ScheduleRecord>, HistoryError> {
+        let _ = name;
+        Ok(None)
+    }
+
+    /// Every stored schedule, ordered by name. Default: empty.
+    async fn schedule_list(&self) -> Result<Vec<schedules::ScheduleRecord>, HistoryError> {
+        Ok(Vec::new())
+    }
+
+    /// Delete a schedule; returns whether it existed. Default: `false`.
+    async fn schedule_delete(&self, name: &str) -> Result<bool, HistoryError> {
+        let _ = name;
+        Ok(false)
+    }
+
     /// Every stored version of a template, newest first — one read for the
     /// whole template. Default: one [`template_get`](Self::template_get) per
     /// version.
@@ -2366,7 +2461,7 @@ async fn connect_postgres(
     ))
 }
 
-#[cfg(feature = "serve-history-sqlite")]
+#[cfg(feature = "serve")]
 async fn connect_sqlite(
     url: &str,
     idem: Duration,
@@ -2394,26 +2489,12 @@ async fn connect_sqlite(
     Ok(into_history(result, idem, "sqlite", connector))
 }
 
-#[cfg(not(feature = "serve-history-sqlite"))]
-async fn connect_sqlite(
-    _url: &str,
-    _idem: Duration,
-    _lease_ttl: Duration,
-    _instance_id: &str,
-) -> CliResult<Arc<dyn RunHistory>> {
-    Err(crate::error::CliError::Serve(
-        "persistent SQLite run history requires building faucet with the \
-         `serve-history-sqlite` feature"
-            .into(),
-    ))
-}
-
 /// How many times `connect_with_retry` attempts a transient backend connect
 /// before giving up and degrading. Eight attempts with capped exponential
 /// backoff span a few seconds — long enough for two clustered instances to get
 /// past the WAL/DDL startup race on a shared SQLite file, short enough not to
 /// stall startup against a genuinely-down backend.
-#[cfg(any(feature = "serve-history-postgres", feature = "serve-history-sqlite"))]
+#[cfg(feature = "serve")]
 const CONNECT_ATTEMPTS: usize = 8;
 
 /// Retry a *retriable* backend-connect failure before falling back to degraded
@@ -2430,7 +2511,7 @@ const CONNECT_ATTEMPTS: usize = 8;
 /// degrade (#654 M1). Only a *typed-permanent* failure short-circuits; an
 /// unclassified one costs at most the (bounded) attempt budget before
 /// degrading with the same message it would have degraded with immediately.
-#[cfg(any(feature = "serve-history-postgres", feature = "serve-history-sqlite"))]
+#[cfg(feature = "serve")]
 #[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
 async fn connect_with_retry<H, F, Fut>(label: &str, mut make: F) -> Result<H, HistoryError>
 where
@@ -2459,7 +2540,7 @@ where
 
 /// Wrap a SQL backend in `FallbackHistory`: healthy on success; degraded-on-
 /// in-memory (server stays up, `/readyz` reports 503) on a connect failure.
-#[cfg(any(feature = "serve-history-postgres", feature = "serve-history-sqlite"))]
+#[cfg(feature = "serve")]
 fn into_history<H: RunHistory + 'static>(
     result: Result<H, HistoryError>,
     idem: Duration,
@@ -2929,6 +3010,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schedule_and_policy_defaults_refuse_writes_and_read_empty() {
+        let h = Bare;
+        let spec: schedules::ScheduleSpec = serde_json::from_value(serde_json::json!({
+            "name": "n", "cron": "0 2 * * *", "template": {"id": "t"}
+        }))
+        .unwrap();
+        let s = schedules::ScheduleRecord::new(spec, None, "x", Utc::now());
+        assert!(h.schedule_insert(&s).await.is_err());
+        assert!(h.schedule_replace(&s, &s).await.is_err());
+        assert!(h.schedule_get("n").await.unwrap().is_none());
+        assert!(h.schedule_list().await.unwrap().is_empty());
+        assert!(!h.schedule_delete("n").await.unwrap());
+
+        let v: policies::PolicyVersionRecord = serde_json::from_value(serde_json::json!({
+            "scope": "server", "version": 1, "spec": {"version": 1},
+            "created_at": "2026-11-05T00:00:00Z", "created_by": "x"
+        }))
+        .unwrap();
+        assert!(h.policy_version_insert(&v).await.is_err());
+        assert!(h.policy_versions("server", 0).await.unwrap().is_empty());
+        assert!(h.policy_version_get("server", 1).await.unwrap().is_none());
+        assert_eq!(h.policy_versions_delete("server").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn tenant_defaults_refuse_writes_and_read_empty() {
         let h = Bare;
         let now = Utc::now();
@@ -3201,10 +3307,7 @@ mod tests {
     }
 }
 
-#[cfg(all(
-    test,
-    any(feature = "serve-history-postgres", feature = "serve-history-sqlite")
-))]
+#[cfg(all(test, feature = "serve"))]
 mod connect_retry_tests {
     use super::*;
     use std::cell::Cell;

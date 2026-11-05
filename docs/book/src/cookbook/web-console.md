@@ -77,8 +77,8 @@ The sidebar groups the pages: **Operate** (Overview, Runs, Changes, Triggers,
 Schedules, Feeds), **Data** (Datasets, Lineage), **Build** (Templates, Schemas,
 Submit), **Govern** (Policy, Usage, Tenants) and **Admin** (Audit log,
 Settings). Badges count running runs, pending change requests, datasets,
-templates and tenants. Schedules, Feeds and Policy are marked *soon*: their pages say
-what will live there and how to do it today.
+templates, tenants and schedules. Feeds is marked *soon*: its page says what will
+live there and how to do it today.
 
 - **Go to… / ⌘K** (Ctrl+K) opens a palette over pages, recent runs, datasets,
   templates, change requests, tenants and actions (submit a run, switch theme,
@@ -93,7 +93,13 @@ what will live there and how to do it today.
 - The **top bar** holds the tenant switcher (Runs, Usage and Changes follow
   it), the display time zone (every time and date input follows it), the light
   / dark switch and a button that hides the sidebar. The **status line** shows
-  the run-history backend's health, cluster size and the server version.
+  the run-history backend (`sqlite`, `postgres` or `memory`) and its health,
+  cluster size and the server version.
+- On a server started with `--history memory`, admins see a banner on every
+  page: **History is in memory: runs, audit and settings are lost on
+  restart.** Start the server without that flag to keep its history in
+  `~/.faucet/history.db` (or `$FAUCET_DATA_DIR`), or pass a `sqlite:` path or
+  a `postgres://` URL.
 - Below 1100px the sidebar shrinks to icons and list pages show the selected
   item in place of the list, with a back link.
 
@@ -156,14 +162,62 @@ requests (`#/changes/<id>`): **Needs me** and **All** tabs, a stat strip from
 requests. A request shows its plan (what the run, registration or launch will
 do), its impact on downstream datasets, the approvals so far and its history;
 **Approve** and **Reject** (with a reason) follow the server's approval policy.
+A data-flow policy change shows the YAML diff and, under **Impact**, the
+templates and recent runs it would newly refuse or allow; its requester sees
+**Withdraw** instead of **Approve**.
+
+### Policy
+
+**Policy** (`#/policy`) shows the [data-flow policy](./policies.md) the server
+enforces:
+
+- **Rules** — what is in effect (rules, labels, sinks that declare attributes,
+  refusals in the last 7 days), the classifications with how many catalogued
+  columns each label matched in the last 30 days, and the rules: what each
+  covers, what satisfies it, and what happens at run time.
+- **Refusals** — the submissions and runs the policy stopped, with the rule,
+  column and sink, filterable by tenant.
+- **Dry run** (operator) — paste a config, or pick a pipeline template, and
+  check it without running it; violations come with how to fix them.
+- **History** — the versions of a server-managed policy, who requested and
+  approved each, and **Roll back to vN** (a change request too).
+
+On a server started with `--policy FILE` the page says so and is read-only. On a
+server-managed policy an admin's **Edit policy** opens an editor that validates
+as you type (problems with their line), then **Preview impact** shows the diff
+and the templates and recent runs the draft would newly refuse or allow, and
+**Request change** — with a required reason — creates the change request a
+second admin approves. A pending change shows as a banner until then. With no
+policy at all, **Write a policy** starts from an example.
+
+With the tenant switcher set to a tenant, the page shows the server rules beside
+that tenant's add-only rules and their history, with **Edit acme rules** for
+admins. A tenant principal sees the server rules that apply to it (names and
+what they require), its own rules, its refusals and their history; its admins
+edit its rules, its viewers and operators read them.
 
 ### Triggers
 
 **Triggers** lists the event triggers loaded from `--triggers`
-(`GET /v1/triggers`): type, schedule or webhook methods, health, last fire and
-fire / error counts. A webhook trigger shows a ready-to-paste `curl` and a
+(`GET /v1/triggers`): type, store or webhook methods, health, last fire and
+fire / error counts. Cron schedules have their own page. A webhook trigger shows a ready-to-paste `curl` and a
 **Fire** button; a trigger in error backoff shows its last error. Without a
 triggers file the page says how to add one.
+
+### Schedules
+
+**Schedules** lists every schedule with its next tick, grouped into *Needs
+attention*, *Active* and *Paused*, with counts of ticks today and missed
+ticks (`GET /v1/schedules`). A schedule's page shows its next ticks in its
+timezone and in UTC, what it runs (template, version, params — secret ones
+as *sealed*), its tenants, recent ticks with their runs, missed ticks and its
+change history, with **Run now**, **Pause**/**Resume**, **Edit** and
+**Delete**. **New** opens a form that builds the params from the template,
+previews the next ticks as you type the cron, and becomes **Request
+approval** under `--require-approval schedule`. Schedules from the
+`--schedules` file are read-only. With a tenant picked in the switcher the
+page shows the schedules that run for it, and its runs only. See
+[Schedules](./schedules.md).
 
 ### Submit
 
@@ -395,6 +449,8 @@ The console calls these bearer-gated endpoints (any other client can too):
 | `GET` | `/v1/overview` | Fleet trends over the run history, behind the Overview page. |
 | `GET` | `/v1/runs/{id}/config` | A run's stored config, credentials masked, behind the run's Config tab. |
 | `GET` | `/v1/triggers` | The loaded triggers with health and fire counts, behind the Triggers page. |
+| `GET` | `/v1/schedules`, `/v1/schedules/{name}` | Schedules with their status, ticks and history, behind the Schedules page. |
+| `POST` | `/v1/schedules/preview` | The next ticks of a cron, for the schedule form. |
 | `GET` | `/v1/audit/{id}` | One audit entry, behind the Audit log's entry links. |
 | `POST` | `/v1/doctor` | Validate and probe a submitted config without running it. Returns 200 (all probes pass) or 422 (any probe fails) with a probe report. Request body: `{ "config": "<yaml-or-json>", "config_format": "yaml" }`. |
 

@@ -36,7 +36,7 @@ triggers:
       timeout_secs: null    # per-run timeout in seconds
       selection: null       # optional: run only some rows / streams (see below)
       pool: null            # optional: execution pool for the fired runs (#957); wins over the config's `pool:`
-    type: <trigger type>    # required; one of object_arrival, webhook, queue_depth, schedule
+    type: <trigger type>    # required; one of object_arrival, webhook, queue_depth
     # … type-specific fields below
 ```
 
@@ -59,7 +59,7 @@ retry cannot fix (a missing `${tenant.labels.*}` label, a config that fails
 validation) is reported for that tenant only — a WARN log,
 `faucet_serve_trigger_tenant_failures_total` and a `run_failure` event through
 the tenant's own `notifications:` — and the fire still counts for every other
-tenant, so a schedule keeps advancing. Only a transient failure (the run
+tenant. Only a transient failure (the run
 history unavailable, a full queue) retries the whole fire.
 
 The triggers file is **validated strictly at load time**: an unknown or
@@ -341,46 +341,12 @@ replay. After the idempotency window has passed, that re-fire starts a second
 run for the crossing. With the in-memory history the edge is
 per-process, like the idempotency claims it pairs with.
 
-### `schedule`
+### Schedules moved
 
-Fires on a cron schedule, evaluated with the same compiler as
-[`faucet schedule`](../cookbook/scheduling.md) (5 or 6 fields,
-timezone- and DST-correct). Needs the `schedule` feature.
-
-```yaml
-type: schedule
-cron: "0 2 * * *"           # 5 fields, or 6 with seconds first
-timezone: Europe/Berlin     # IANA name; default UTC
-catch_up: true              # run the latest missed tick after an outage; default true
-```
-
-A tick whose fire fails (queue full, a store error) is retried with the
-watcher's backoff until it commits.
-
-**Missed ticks.** The last committed tick of each trigger is kept in the run
-history, so a tick that passed while no server was running is noticed when one
-starts. With `catch_up: true` the most recent missed tick runs once, not a
-backlog; with `catch_up: false` missed ticks are skipped (use it for jobs where
-a late run is worse than none). Either way the server logs a warning, and every
-tick that never runs counts in `faucet_serve_trigger_missed_ticks_total`. The
-same rule applies when a running server falls more than one tick behind. A
-first deploy, or a changed `cron` or `timezone`, starts from the next tick and
-never fires a past one. Keeping the record across restarts needs a persistent
-`--history` (SQLite or Postgres); with the in-memory history a restart starts
-from the next tick.
-
-**`${trigger.*}` tokens:**
-
-| Token | Value |
-|-------|-------|
-| `${trigger.name}` | The trigger's `name` field |
-| `${trigger.type}` | `schedule` |
-| `${trigger.fired_at}` | ISO 8601 timestamp when the trigger fired |
-| `${trigger.tick}` | The scheduled instant (RFC 3339, UTC) |
-
-**Idempotency key:** `trig:<name>:<tick>` (`…:<tick>:<tenant>` with
-`tenants:`) — derived from the scheduled tick, so every cluster instance
-computes the same key and one run goes through per tick.
+Cron schedules are their own concept: see [Schedules](../cookbook/schedules.md)
+(`faucet serve --schedules`, `/v1/schedules`, the console's **Schedules**
+page). A `type: schedule` entry in a triggers file fails to load with a
+message naming the entry and pointing there.
 
 ## Labels on enqueued runs
 
@@ -390,8 +356,7 @@ Every trigger-fired run receives these automatic labels (visible in
 | Label | Value |
 |-------|-------|
 | `faucet.trigger.name` | Trigger name |
-| `faucet.trigger.type` | Trigger type (`object_arrival`, `webhook`, `queue_depth`, `schedule`) |
-| `faucet.trigger.tick` | The scheduled tick (`schedule` only) |
+| `faucet.trigger.type` | Trigger type (`object_arrival`, `webhook`, `queue_depth`) |
 
 Additional labels can be added per trigger via `run.labels:`.
 
@@ -399,23 +364,17 @@ Additional labels can be added per trigger via `run.labels:`.
 
 `run.selection` runs only some of the pipeline's matrix rows (or a template's
 streams) on every fire — the same object `POST /v1/runs` takes (`select`,
-`only`, `skip`, `tags`, `status`, `include_parents`). Two triggers over one
-template can then run the cheap streams hourly and the heavy one nightly:
+`only`, `skip`, `tags`, `status`, `include_parents`). A schedule takes the same `run.selection`, so the cheap streams can run
+hourly and the heavy one nightly:
 
 ```yaml
 triggers:
-  - name: crm-hourly
-    type: schedule
-    cron: "0 * * * *"
+  - name: crm-landed
+    type: object_arrival
+    store: { type: s3, bucket: exports, prefix: crm/ }
     template: { id: acme/crm, sink: faucet-hq/bigquery }
     run:
       selection: { skip: [activities] }
-  - name: crm-nightly
-    type: schedule
-    cron: "0 2 * * *"
-    template: { id: acme/crm, sink: faucet-hq/bigquery }
-    run:
-      selection: { select: [activities] }
 ```
 
 The selection is validated when the trigger fires (an unknown row fails that
@@ -465,7 +424,6 @@ faucet schema triggers     # print the JSON Schema for the triggers file
 | `faucet_serve_trigger_runs_coalesced_total` | Counter | `trigger` | Fires coalesced — webhook debounce, or an idempotency-conflict no-op |
 | `faucet_serve_trigger_runs_dropped_total` | Counter | `trigger`, `reason` | Fires dropped because the run queue was full (`reason="queue_full"`) |
 | `faucet_serve_trigger_errors_total` | Counter | `trigger`, `type` | Watcher errors (poll failures, etc.) |
-| `faucet_serve_trigger_missed_ticks_total` | Counter | `trigger` | `schedule` ticks that never ran: passed while no server was up, or collapsed into one catch-up |
 | `faucet_serve_trigger_tenant_failures_total` | Counter | `trigger`, `tenant` | Fan-out fires refused for one tenant, or skipped at its `max_concurrent_runs` limit, while the other tenants ran |
 
 ## Cluster note
@@ -486,7 +444,6 @@ No additional coordination is required.
 | `triggers-object-store` | `object_arrival` watcher (S3/GCS listing) |
 | `triggers-redis` | `queue_depth` watcher backed by Redis |
 | `triggers-kafka` | `queue_depth` watcher backed by Kafka consumer-group lag |
-| `schedule` (with `triggers`) | the `schedule` trigger type |
 | `templates` (with `triggers`) | `template:` on a trigger |
 | `tenants` (with `triggers`) | `tenants:` on a trigger |
 

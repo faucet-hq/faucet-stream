@@ -1,0 +1,659 @@
+//! Firing one tick of one schedule (#1044): one run of the schedule's
+//! template — or one per tenant for a fan-out — submitted through the same
+//! template path as `POST /v1/templates/{id}/runs`, so loading, policy,
+//! budgets, tenant admission and governance all apply.
+//!
+//! The idempotency key is the *scheduled* tick (`sched:<name>:<tick>`, plus
+//! `:<tenant>` for a fan-out), so every cluster member firing the same tick
+//! derives the same key and the shared idempotency claim lets exactly one run
+//! through.
+
+use crate::serve::error::ServeError;
+use crate::serve::history::schedules::{OverlapMode, ScheduleSpec};
+use crate::serve::history::{ListFilter, RunStatus, labels::LabelFilter};
+use crate::serve::state::ServerState;
+use chrono::{DateTime, SecondsFormat, Utc};
+use std::collections::BTreeMap;
+
+/// The run label naming the schedule that started a run.
+pub const LABEL_SCHEDULE: &str = "schedule";
+/// The run label carrying the tick (RFC 3339 UTC) that started a run.
+pub const LABEL_TICK: &str = "schedule_tick";
+
+/// What firing a tick should do beyond the schedule's own definition.
+#[derive(Debug, Clone, Default)]
+pub struct FireOptions {
+    /// A run started by hand (`POST /v1/schedules/{name}/run`): its own
+    /// idempotency key, and the overlap rule does not apply.
+    pub manual: Option<String>,
+}
+
+/// One target's result.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TargetResult {
+    /// A run started (or another member already started it for this key).
+    Started(String),
+    /// Nothing started on purpose (an earlier run still going, a tenant at
+    /// its concurrency limit).
+    Skipped(String),
+    /// Refused for a reason a retry cannot fix.
+    Failed(String),
+    /// A transient error (queue full, the store unreachable): retry the tick.
+    Retry(String),
+    /// `overlap: queue`: an earlier run is still going; start once it ends.
+    Wait(String),
+}
+
+/// The result of one tick, per target (`None` = the server itself).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TickResult {
+    pub targets: Vec<(Option<String>, TargetResult)>,
+}
+
+impl TickResult {
+    /// Whether the tick must be retried: some target hit a transient error.
+    /// Retrying is replay-safe (per-target idempotency keys).
+    pub fn retry(&self) -> Option<String> {
+        let errors: Vec<String> = self
+            .targets
+            .iter()
+            .filter_map(|(t, r)| match r {
+                TargetResult::Retry(e) => Some(prefixed(t, e)),
+                _ => None,
+            })
+            .collect();
+        (!errors.is_empty()).then(|| errors.join("; "))
+    }
+
+    /// Whether the tick is held for an earlier run (`overlap: queue`).
+    pub fn waiting(&self) -> Option<String> {
+        let waits: Vec<String> = self
+            .targets
+            .iter()
+            .filter_map(|(t, r)| match r {
+                TargetResult::Wait(e) => Some(prefixed(t, e)),
+                _ => None,
+            })
+            .collect();
+        (!waits.is_empty()).then(|| waits.join("; "))
+    }
+
+    pub fn run_ids(&self) -> Vec<String> {
+        self.targets
+            .iter()
+            .filter_map(|(_, r)| match r {
+                TargetResult::Started(id) => Some(id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn failures(&self) -> Vec<String> {
+        self.targets
+            .iter()
+            .filter_map(|(t, r)| match r {
+                TargetResult::Failed(e) => Some(prefixed(t, e)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn skipped(&self) -> Vec<String> {
+        self.targets
+            .iter()
+            .filter_map(|(t, r)| match r {
+                TargetResult::Skipped(e) => Some(prefixed(t, e)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The outcome the status record and metrics count: started when any
+    /// run started, else failed when any target failed, else skipped.
+    pub fn outcome(&self) -> super::status::Outcome {
+        use super::status::Outcome;
+        if let Some(e) = self.retry() {
+            return Outcome::Retrying(e);
+        }
+        if let Some(w) = self.waiting() {
+            return Outcome::Waiting(w);
+        }
+        let failures = self.failures();
+        if !self.run_ids().is_empty() {
+            if failures.is_empty() {
+                Outcome::Started
+            } else {
+                // Some tenants ran and some were refused: the refusals are
+                // the tick's story.
+                Outcome::Failed(failures)
+            }
+        } else if !failures.is_empty() {
+            Outcome::Failed(failures)
+        } else if self.targets.is_empty() {
+            Outcome::Skipped("no tenants to run for".into())
+        } else {
+            Outcome::Skipped(self.skipped().join("; "))
+        }
+    }
+}
+
+fn prefixed(tenant: &Option<String>, e: &str) -> String {
+    match tenant {
+        Some(t) => format!("{t}: {e}"),
+        None => e.to_string(),
+    }
+}
+
+/// RFC 3339 with whole seconds and `Z`.
+pub fn tick_text(tick: DateTime<Utc>) -> String {
+    tick.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+/// The idempotency key for one target of a tick.
+pub fn idempotency_key(
+    name: &str,
+    tick: &str,
+    manual: Option<&str>,
+    tenant: Option<&str>,
+) -> String {
+    let base = match manual {
+        Some(m) => format!("sched:{name}:manual:{m}"),
+        None => format!("sched:{name}:{tick}"),
+    };
+    match tenant {
+        Some(t) => format!("{base}:{t}"),
+        None => base,
+    }
+}
+
+/// The template run body for one target. Pure.
+pub fn body(
+    spec: &ScheduleSpec,
+    tick: DateTime<Utc>,
+    fired_at: DateTime<Utc>,
+    opts: &FireOptions,
+    tenant: Option<&str>,
+) -> Result<crate::serve::handlers::templates::TriggerBody, String> {
+    use crate::serve::history::templates::VersionSelector;
+    let selector = |field: &str, v: &Option<String>| -> Result<Option<VersionSelector>, String> {
+        v.as_ref()
+            .map(|s| {
+                serde_json::from_value(serde_json::Value::String(s.clone()))
+                    .map_err(|e| format!("template {field} '{s}': {e}"))
+            })
+            .transpose()
+    };
+    let name = spec.name.as_str();
+    let tick_s = tick_text(tick);
+    let fired_s = tick_text(fired_at);
+    let params: BTreeMap<String, serde_json::Value> = spec
+        .template
+        .params
+        .iter()
+        .map(|(k, v)| {
+            let v = match v {
+                serde_json::Value::String(s) => serde_json::Value::String(
+                    super::validate::substitute(s, name, &tick_s, &fired_s),
+                ),
+                other => other.clone(),
+            };
+            (k.clone(), v)
+        })
+        .collect();
+    let mut labels = spec.run.labels.clone();
+    labels.insert(LABEL_SCHEDULE.into(), name.to_string());
+    labels.insert(LABEL_TICK.into(), tick_s.clone());
+    let run_name = spec
+        .run
+        .name
+        .as_deref()
+        .map(|n| {
+            super::validate::substitute(n, name, &tick_s, &fired_s)
+                .replace("{name}", name)
+                .replace("{tick}", &tick_s)
+        })
+        .unwrap_or_else(|| name.to_string());
+    Ok(crate::serve::handlers::templates::TriggerBody {
+        params,
+        version: selector("version", &spec.template.version)?,
+        sink: spec.template.sink.clone(),
+        sink_version: selector("sink_version", &spec.template.sink_version)?,
+        overlay: spec
+            .template
+            .overlay
+            .as_ref()
+            .map(|o| crate::serve::handlers::templates::OverlayRef::Id(o.clone())),
+        overlay_version: selector("overlay_version", &spec.template.overlay_version)?,
+        name: Some(run_name),
+        labels,
+        timeout_secs: spec.run.timeout_secs,
+        idempotency_key: Some(idempotency_key(
+            name,
+            &tick_s,
+            opts.manual.as_deref(),
+            tenant,
+        )),
+        selection: spec.run.selection.clone(),
+        pool: spec.run.pool.clone(),
+        // A schedule is a standing approval: it was created (and, under
+        // `--require-approval schedule`, approved) once.
+        standing_approval: true,
+        ..Default::default()
+    })
+}
+
+/// Who a target's run is made as: the schedule, scoped to the tenant.
+pub fn actor(name: &str, tenant: Option<&str>) -> crate::serve::rbac::AuthContext {
+    crate::serve::rbac::AuthContext {
+        principal: format!("schedule:{name}"),
+        role: crate::serve::rbac::Role::Operator,
+        source_ip: None,
+        tenant: tenant.map(str::to_string),
+    }
+}
+
+/// Map a submission error to a target result.
+pub fn classify(e: ServeError, tenant: Option<&str>) -> TargetResult {
+    match e {
+        // The idempotency key already started a run for another payload:
+        // another member fired this tick with an older definition.
+        ServeError::Conflict(m) if m == crate::serve::runner::IDEMPOTENCY_CONFLICT => {
+            TargetResult::Started("(already fired by another server)".into())
+        }
+        // Any other conflict (a tenant connection missing or needing
+        // re-authorization) is the target's own refusal.
+        ServeError::Conflict(m) => TargetResult::Failed(m),
+        ServeError::TooManyRequests(m) if tenant.is_some() => {
+            TargetResult::Skipped(format!("tenant at its max_concurrent_runs limit ({m})"))
+        }
+        ServeError::QueueFull { .. } => TargetResult::Retry("the run queue is full".into()),
+        ServeError::Draining => TargetResult::Retry("the server is shutting down".into()),
+        e @ (ServeError::BadConfig(_)
+        | ServeError::Unprocessable { .. }
+        | ServeError::Forbidden(_)
+        | ServeError::NotFound
+        | ServeError::Unauthorized) => TargetResult::Failed(match e {
+            ServeError::NotFound => "the template was not found".to_string(),
+            other => other.api_error().error.message,
+        }),
+        other => TargetResult::Retry(other.api_error().error.message),
+    }
+}
+
+/// The targets of a tick: the owner, the fan-out's tenants, or the server.
+async fn targets(
+    state: &ServerState,
+    spec: &ScheduleSpec,
+    owner: Option<&str>,
+) -> Result<Vec<Option<String>>, String> {
+    if let Some(t) = owner {
+        return Ok(vec![Some(t.to_string())]);
+    }
+    let Some(selector) = &spec.tenants else {
+        return Ok(vec![None]);
+    };
+    #[cfg(feature = "tenants")]
+    {
+        let (run, skipped) = crate::serve::handlers::tenants::resolve_tenants(state, selector)
+            .await
+            .map_err(|e| e.api_error().error.message)?;
+        for s in skipped {
+            tracing::info!(
+                schedule = %spec.name,
+                tenant = %s.tenant,
+                reason = s.reason.as_deref().unwrap_or(""),
+                "tenant skipped"
+            );
+        }
+        Ok(run.into_iter().map(Some).collect())
+    }
+    #[cfg(not(feature = "tenants"))]
+    {
+        let _ = (state, selector);
+        Err("`tenants:` needs a build with the `tenants` feature".into())
+    }
+}
+
+/// Whether a run an earlier tick of this schedule started for `tenant` is
+/// still queued or running.
+pub async fn earlier_run_going(
+    state: &ServerState,
+    name: &str,
+    tenant: Option<&str>,
+) -> Result<Option<String>, String> {
+    let filter = ListFilter {
+        status: vec![
+            RunStatus::Queued,
+            RunStatus::Pending,
+            RunStatus::Running,
+            RunStatus::Sharded,
+        ],
+        tenant: tenant.map(str::to_string),
+        labels: vec![LabelFilter {
+            key: LABEL_SCHEDULE.into(),
+            value: Some(name.to_string()),
+        }],
+        limit: 1,
+        ..Default::default()
+    };
+    let page = state
+        .history()
+        .list(&filter)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(page.runs.into_iter().next().map(|r| r.run_id))
+}
+
+/// Fire one tick. `owner` is the tenant that owns the schedule, if any.
+pub async fn fire_tick(
+    state: &ServerState,
+    spec: &ScheduleSpec,
+    owner: Option<&str>,
+    tick: DateTime<Utc>,
+    fired_at: DateTime<Utc>,
+    opts: &FireOptions,
+) -> TickResult {
+    let targets = match targets(state, spec, owner).await {
+        Ok(t) => t,
+        Err(e) => {
+            return TickResult {
+                targets: vec![(None, TargetResult::Retry(e))],
+            };
+        }
+    };
+    let mut out = TickResult::default();
+    for tenant in targets {
+        let result = fire_target(state, spec, tenant.as_deref(), tick, fired_at, opts).await;
+        if let (Some(t), TargetResult::Failed(_) | TargetResult::Skipped(_)) = (&tenant, &result) {
+            super::metrics::tenant_failed(&spec.name, t);
+        }
+        out.targets.push((tenant, result));
+    }
+    out
+}
+
+async fn fire_target(
+    state: &ServerState,
+    spec: &ScheduleSpec,
+    tenant: Option<&str>,
+    tick: DateTime<Utc>,
+    fired_at: DateTime<Utc>,
+    opts: &FireOptions,
+) -> TargetResult {
+    if opts.manual.is_none() {
+        match earlier_run_going(state, &spec.name, tenant).await {
+            Ok(Some(run)) => {
+                let going = format!("run {run} from an earlier tick is still going");
+                return match spec.overlap {
+                    OverlapMode::Skip => TargetResult::Skipped(going),
+                    OverlapMode::Queue => TargetResult::Wait(going),
+                    OverlapMode::Forbid => {
+                        TargetResult::Failed(format!("{going} (overlap: forbid)"))
+                    }
+                };
+            }
+            Ok(None) => {}
+            Err(e) => return TargetResult::Retry(format!("checking for an earlier run: {e}")),
+        }
+    }
+    let spec = match super::secrets::opened(state, spec) {
+        Ok(s) => s,
+        Err(e) => return TargetResult::Failed(e),
+    };
+    let body = match body(&spec, tick, fired_at, opts, tenant) {
+        Ok(b) => b,
+        Err(e) => return TargetResult::Failed(e),
+    };
+    let principal =
+        crate::runtime::Principal::new(actor(&spec.name, tenant), crate::runtime::Origin::Trusted);
+    use crate::runtime::server::{TriggerOutcome, trigger_template};
+    match trigger_template(state.clone(), principal, spec.template.id.clone(), body).await {
+        Ok(TriggerOutcome::Run(r)) => TargetResult::Started(r.run.run_id),
+        Ok(TriggerOutcome::PendingApproval(c)) => TargetResult::Started(format!("change:{}", c.id)),
+        Err(e) => classify(e, tenant),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::status::Outcome;
+    use super::*;
+    use serde_json::json;
+
+    fn spec() -> ScheduleSpec {
+        serde_json::from_value(json!({
+            "name": "nightly",
+            "cron": "0 2 * * *",
+            "template": {
+                "id": "acme/billing",
+                "version": "prod",
+                "sink": "pg",
+                "sink_version": "3",
+                "overlay": "eu",
+                "overlay_version": "stable",
+                "params": {"since": "${schedule.tick}", "n": 3}
+            },
+            "run": {"name": "{name} at ${schedule.tick}", "labels": {"team": "billing"}, "timeout_secs": 60, "pool": "big"}
+        }))
+        .unwrap()
+    }
+
+    fn at(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn the_body_carries_the_tick_params_labels_and_key() {
+        let tick = at("2026-11-05T02:00:00Z");
+        let b = body(
+            &spec(),
+            tick,
+            at("2026-11-05T02:00:01Z"),
+            &FireOptions::default(),
+            Some("acme"),
+        )
+        .unwrap();
+        assert_eq!(b.params["since"], json!("2026-11-05T02:00:00Z"));
+        assert_eq!(b.params["n"], json!(3));
+        assert_eq!(b.labels[LABEL_SCHEDULE], "nightly");
+        assert_eq!(b.labels[LABEL_TICK], "2026-11-05T02:00:00Z");
+        assert_eq!(b.labels["team"], "billing");
+        assert_eq!(b.name.as_deref(), Some("nightly at 2026-11-05T02:00:00Z"));
+        assert_eq!(
+            b.idempotency_key.as_deref(),
+            Some("sched:nightly:2026-11-05T02:00:00Z:acme")
+        );
+        assert_eq!(b.timeout_secs, Some(60));
+        assert_eq!(b.pool.as_deref(), Some("big"));
+        assert!(b.standing_approval);
+        assert_eq!(b.sink.as_deref(), Some("pg"));
+        assert!(b.version.is_some() && b.sink_version.is_some() && b.overlay_version.is_some());
+        let manual = FireOptions {
+            manual: Some("u1".into()),
+        };
+        let m = body(&spec(), tick, tick, &manual, None).unwrap();
+        assert_eq!(
+            m.idempotency_key.as_deref(),
+            Some("sched:nightly:manual:u1")
+        );
+        let mut plain = spec();
+        plain.run.name = None;
+        assert_eq!(
+            body(&plain, tick, tick, &manual, None)
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("nightly")
+        );
+        let mut bad = spec();
+        bad.template.version = Some("latest".into());
+        assert!(
+            body(&bad, tick, tick, &manual, None)
+                .unwrap_err()
+                .contains("template version")
+        );
+    }
+
+    #[test]
+    fn errors_map_to_retry_skip_or_fail() {
+        assert!(matches!(
+            classify(
+                ServeError::Conflict(crate::serve::runner::IDEMPOTENCY_CONFLICT.into()),
+                None
+            ),
+            TargetResult::Started(_)
+        ));
+        assert!(matches!(
+            classify(
+                ServeError::Conflict("connection needs re-auth".into()),
+                Some("acme")
+            ),
+            TargetResult::Failed(_)
+        ));
+        assert!(matches!(
+            classify(ServeError::TooManyRequests("limit".into()), Some("acme")),
+            TargetResult::Skipped(_)
+        ));
+        assert!(matches!(
+            classify(ServeError::TooManyRequests("limit".into()), None),
+            TargetResult::Retry(_)
+        ));
+        assert!(matches!(
+            classify(
+                ServeError::QueueFull {
+                    retry_after_secs: 1
+                },
+                None
+            ),
+            TargetResult::Retry(_)
+        ));
+        assert!(matches!(
+            classify(ServeError::Draining, None),
+            TargetResult::Retry(_)
+        ));
+        assert_eq!(
+            classify(ServeError::NotFound, None),
+            TargetResult::Failed("the template was not found".into())
+        );
+        assert!(matches!(
+            classify(ServeError::BadConfig("x".into()), None),
+            TargetResult::Failed(_)
+        ));
+        assert!(matches!(
+            classify(ServeError::Internal("x".into()), None),
+            TargetResult::Retry(_)
+        ));
+    }
+
+    #[test]
+    fn a_tick_result_folds_into_one_outcome() {
+        let r = |targets: Vec<(Option<&str>, TargetResult)>| TickResult {
+            targets: targets
+                .into_iter()
+                .map(|(t, r)| (t.map(str::to_string), r))
+                .collect(),
+        };
+        assert_eq!(
+            r(vec![(None, TargetResult::Started("a".into()))]).outcome(),
+            Outcome::Started
+        );
+        assert_eq!(
+            r(vec![(Some("acme"), TargetResult::Retry("q".into()))]).outcome(),
+            Outcome::Retrying("acme: q".into())
+        );
+        let mixed = r(vec![
+            (Some("acme"), TargetResult::Started("a".into())),
+            (Some("globex"), TargetResult::Failed("gone".into())),
+        ]);
+        assert_eq!(
+            mixed.outcome(),
+            Outcome::Failed(vec!["globex: gone".into()])
+        );
+        assert_eq!(mixed.run_ids(), vec!["a".to_string()]);
+        assert_eq!(
+            r(vec![(None, TargetResult::Failed("gone".into()))]).outcome(),
+            Outcome::Failed(vec!["gone".into()])
+        );
+        assert_eq!(
+            r(vec![(None, TargetResult::Skipped("still going".into()))]).outcome(),
+            Outcome::Skipped("still going".into())
+        );
+        assert_eq!(
+            r(vec![]).outcome(),
+            Outcome::Skipped("no tenants to run for".into())
+        );
+        assert_eq!(
+            r(vec![(None, TargetResult::Wait("run r still going".into()))]).outcome(),
+            Outcome::Waiting("run r still going".into())
+        );
+        assert_eq!(idempotency_key("n", "t", None, None), "sched:n:t");
+        assert_eq!(actor("n", Some("acme")).principal, "schedule:n");
+    }
+
+    fn plain() -> ScheduleSpec {
+        serde_json::from_value(json!({
+            "name": "plain", "cron": "0 2 * * *", "template": {"id": "nope"}
+        }))
+        .unwrap()
+    }
+
+    fn failed(r: &TickResult) -> &str {
+        match &r.targets[0].1 {
+            TargetResult::Failed(e) => e,
+            other => panic!("expected a failed target, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn each_target_reports_why_it_did_not_start() {
+        let state = crate::serve::test_support::test_state();
+        let tick = at("2026-11-05T02:00:00Z");
+        let opts = FireOptions::default();
+
+        // An owned schedule targets its owner only.
+        let r = fire_tick(&state, &plain(), Some("acme"), tick, tick, &opts).await;
+        assert_eq!(r.targets.len(), 1);
+        assert_eq!(r.targets[0].0.as_deref(), Some("acme"));
+
+        // A definition whose body cannot be built.
+        let mut bad = plain();
+        bad.template.version = Some("latest".into());
+        let r = fire_tick(&state, &bad, None, tick, tick, &opts).await;
+        assert!(failed(&r).contains("template version"), "{r:?}");
+
+        // A sealed param this server has no key for.
+        let mut sealed = plain();
+        sealed.template.params.insert(
+            "token".into(),
+            json!({ super::super::secrets::SEALED: "x" }),
+        );
+        let r = fire_tick(&state, &sealed, None, tick, tick, &opts).await;
+        assert!(failed(&r).contains("template.params.token"), "{r:?}");
+    }
+
+    #[cfg(feature = "tenants")]
+    #[tokio::test]
+    async fn a_fan_out_runs_for_active_tenants_and_skips_suspended_ones() {
+        let state = crate::serve::test_support::test_state();
+        for (id, suspended) in [("acme", false), ("globex", true)] {
+            let t: crate::serve::history::tenants::TenantRecord = serde_json::from_value(json!({
+                "id": id, "suspended": suspended, "created_by": "ops",
+                "created_at": "2026-11-05T00:00:00Z", "updated_at": "2026-11-05T00:00:00Z"
+            }))
+            .unwrap();
+            state.history().tenant_upsert(&t).await.unwrap();
+        }
+        use crate::serve::history::tenants::TenantSelector;
+        let tick = at("2026-11-05T02:00:00Z");
+        for selector in [
+            TenantSelector::All("all".into()),
+            TenantSelector::Named(vec!["acme".into(), "globex".into(), "ghost".into()]),
+        ] {
+            let mut fan = plain();
+            fan.tenants = Some(selector);
+            let r = fire_tick(&state, &fan, None, tick, tick, &FireOptions::default()).await;
+            let tenants: Vec<_> = r.targets.iter().map(|(t, _)| t.as_deref()).collect();
+            assert_eq!(tenants, vec![Some("acme")], "{r:?}");
+        }
+    }
+}

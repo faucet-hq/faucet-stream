@@ -217,7 +217,8 @@ pub async fn register_template(
     // server policy is warned about — it may be composed with a compliant sink
     // later — and refused at trigger time by the submit gate.
     #[cfg(feature = "policy")]
-    if let Some(policy) = state.policy()
+    if let Ok(layer) = crate::serve::policies::server_layer(&state).await
+        && let Some(policy) = layer.spec
         && record.kind == crate::hub::TemplateKind::Pipeline
     {
         let parsed: Result<serde_json::Value, String> = match record.format {
@@ -1527,10 +1528,13 @@ mod tests {
             super::LABEL_OVERLAY_VERSION,
             crate::select::LABEL_SELECTION,
             crate::run_deps::LABEL_DEPENDS_ON,
+            "schedule",
+            "schedule_tick",
+            "schedule_manual",
         ] {
             assert!(super::RESERVED_LABELS.contains(&k), "{k}");
         }
-        assert_eq!(super::RESERVED_LABELS.len(), 9);
+        assert_eq!(super::RESERVED_LABELS.len(), 12);
     }
 
     /// The pre-#703 handler shape the tests were written against: a run, as

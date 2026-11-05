@@ -1,7 +1,25 @@
 # Backing up the server database
 
-`faucet serve --history <url>` keeps everything the control plane knows in one
-database (SQLite file or Postgres):
+`faucet serve` keeps everything the control plane knows in one database. By
+default (#1049) that is a SQLite file, **`$FAUCET_DATA_DIR/history.db`**:
+`~/.faucet/history.db` when `FAUCET_DATA_DIR` is unset, and
+`/var/lib/faucet/history.db` in the container image (declared as a volume) and
+the Helm chart (on its PVC). `--history sqlite:<path>` or a `postgres://…` URL
+chooses another store; use Postgres for several replicas or `--cluster`.
+
+| Started with | The history | After a restart |
+|---|---|---|
+| no `--history` | `$FAUCET_DATA_DIR/history.db`, created (`0700`) on first start | everything below is still there |
+| `--history sqlite:<path>` / `postgres://…` | that file / database | everything below is still there |
+| `--history memory` | this process only | **gone** — the server warns at start, `/readyz` reports `history.persistent: false`, the console shows a banner, and policy edits are refused |
+
+A default directory that cannot be created or written refuses to start, naming
+`$FAUCET_DATA_DIR` and `--history memory`; the server never falls back to
+memory on its own. Two servers on one machine need their own
+`FAUCET_DATA_DIR` (or `--history`): the second one refuses to share the
+default file.
+
+What the database holds:
 
 | Table family | What it holds | Lost without a backup |
 |---|---|---|
@@ -12,6 +30,8 @@ database (SQLite file or Postgres):
 | `faucet_serve_changes` | Change requests and their approvals | The approval record |
 | `faucet_usage` | Cost & usage records | Usage reports |
 | `faucet_tenants`, `_tenant_connections`, `_connect_sessions`, `_tenant_runs`, `_tenant_state_refs` | Tenants and their **sealed** connections | Every customer's connection (they would have to reconnect) |
+| `faucet_serve_schedules` | Schedules | Every schedule made in the console or API |
+| `faucet_policy_versions` | Server and tenant policy versions | The policy in force and its history |
 | `faucet_serve_schema` | The schema version (see below) | — |
 
 Pipeline **bookmarks are not here** — they live in each pipeline's `state:`

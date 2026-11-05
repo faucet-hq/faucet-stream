@@ -165,8 +165,10 @@ fn config() -> ServeConfig {
             pool_wait_timeout: None,
         },
         triggers_path: None,
+        schedules: Default::default(),
         templates_sync_path: None,
         policy_path: None,
+        policy_store: Default::default(),
         otel: None,
         callback_allow_hosts: Vec::new(),
         request_guard: Default::default(),
@@ -285,6 +287,12 @@ async fn an_unreachable_backend_degrades_runs_refuses_the_registry_fences_and_re
         "the registry is never served from the empty in-memory store"
     );
     assert_eq!(status("/readyz").await, 503);
+    // Nor is the policy in force.
+    #[cfg(feature = "policy")]
+    {
+        assert_eq!(status("/v1/policy").await, 503);
+        assert_eq!(status("/v1/policy/versions").await, 503);
+    }
 
     let token = CancellationToken::new();
     state.registry().register("local-run".into(), token.clone());
@@ -318,6 +326,43 @@ async fn an_unreachable_backend_degrades_runs_refuses_the_registry_fences_and_re
         "the recovery probe leaves degraded mode"
     );
     assert_eq!(status("/v1/templates").await, 200);
+}
+
+/// #1043: a `--policy` file never stands in for a policy store that cannot
+/// be read; the stored version (once readable) stays the one in force.
+#[cfg(feature = "policy")]
+#[tokio::test]
+async fn an_unreadable_policy_store_is_not_replaced_by_the_file() {
+    let (fb, mode) = flaky();
+    let history: Arc<dyn RunHistory> = Arc::new(fb);
+    let mut cfg = config();
+    cfg.history = HistoryBackendSpec::Sqlite("sqlite:unused.db".into());
+    let state = ServerState::new(
+        &cfg,
+        None,
+        CancellationToken::new(),
+        history.clone(),
+        LogHub::new(),
+        None,
+        TriggersHandle::from_compiled(&[]),
+    );
+    mode.store(UNREACHABLE, Ordering::SeqCst);
+    history.upsert(&run("r1")).await.unwrap();
+    assert!(history.degraded());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("policy.yaml");
+    let text = "version: 1\nrules: []\n";
+    std::fs::write(&path, text).unwrap();
+    let spec: faucet_core::PolicySpec = faucet_cli::yaml::from_str(text).unwrap();
+    faucet_cli::serve::server::apply_policy_file(
+        &state,
+        faucet_cli::serve::config::PolicyStore::Server,
+        Arc::new(spec),
+        &path,
+    )
+    .await;
+    assert!(state.policy_file().is_none(), "the file is not the policy");
+    assert!(state.policy_seed().is_some(), "it is kept to compare later");
 }
 
 /// #905: a clustered server's backend is strict (it never falls back to

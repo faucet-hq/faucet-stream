@@ -15,6 +15,12 @@
 {{- if and .Values.serve.enabled (not (has (include "faucet-stream.historyBackend" .) (list "memory" "sqlite" "postgres"))) -}}
 {{- fail (printf "serve.history.backend must be one of memory|sqlite|postgres (got %q)." (toString .Values.serve.history.backend)) -}}
 {{- end -}}
+{{- if and .Values.serve.enabled .Values.serve.policy.store (not (has (toString .Values.serve.policy.store) (list "server" "file"))) -}}
+{{- fail (printf "serve.policy.store must be server or file (got %q)." (toString .Values.serve.policy.store)) -}}
+{{- end -}}
+{{- if and .Values.serve.enabled (eq (toString .Values.serve.policy.store) "file") (not .Values.serve.policy.enabled) -}}
+{{- fail "serve.policy.store=file needs serve.policy.enabled=true with the policy file: the file is the policy." -}}
+{{- end -}}
 {{- if and .Values.serve.enabled .Values.serve.cluster.enabled (not (include "faucet-stream.durableHistory" .)) -}}
 {{- fail "serve.cluster.enabled=true requires a persistent history backend: set serve.history.backend to postgres, or sqlite with serve.persistence.enabled (or serve.persistence.existingClaim) — without a volume the sqlite file is on an emptyDir and is lost on every restart." -}}
 {{- end -}}

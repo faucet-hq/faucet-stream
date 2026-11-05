@@ -1205,7 +1205,7 @@ pipeline:
         }
     }
 
-    #[cfg(feature = "serve-history-sqlite")]
+    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn source_and_sink_templates_register_list_and_run_from_the_cli() {
         let dir = tempfile::tempdir().unwrap();
@@ -1444,7 +1444,7 @@ pipeline:
     /// A registered template needs a *persistent* store to be visible to a
     /// second command, so the CLI round-trip test uses a temp SQLite file.
     /// Without the SQL backend feature the whole test is skipped.
-    #[cfg(feature = "serve-history-sqlite")]
+    #[cfg(feature = "serve")]
     #[tokio::test]
     #[serial_test::serial(env)]
     async fn register_launch_promote_run_round_trip() {
@@ -2035,7 +2035,7 @@ suite:
     /// fresh store per call, so a template registered in the test would be
     /// invisible to `test_suite`'s own connection. A sqlite file is the
     /// smallest store that actually persists between the two.
-    #[cfg(feature = "serve-history-sqlite")]
+    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn a_registered_template_is_resolved_and_its_suite_runs() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2086,7 +2086,7 @@ pipeline:
         test_suite(args).await.expect("registered suite passes");
     }
 
-    #[cfg(feature = "serve-history-sqlite")]
+    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn a_registered_suite_resolves_its_overlay_through_the_store() {
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

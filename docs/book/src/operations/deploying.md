@@ -113,7 +113,14 @@ config file in the image
 | `faucet run` on a timer | CronJob | `concurrencyPolicy: Forbid`, `restartPolicy: Never`, `activeDeadlineSeconds` under the period, a small `backoffLimit`, redis or postgres state |
 | `faucet run` once (migration, backfill) | Job | the same, plus `ttlSecondsAfterFinished` |
 | `faucet schedule` | Deployment, `replicas: 1`, `strategy: Recreate` | `terminationGracePeriodSeconds` above the schedule's shutdown grace |
-| `faucet serve` | Deployment + Service | auth, a persistent history backend, readiness on `/readyz`, liveness on `/healthz`, `--cluster` for more than one replica |
+| `faucet serve` | Deployment + Service | auth, a persistent history (the default SQLite file needs a volume at its data dir; Postgres for more than one replica), readiness on `/readyz`, liveness on `/healthz`, `--cluster` for more than one replica |
+
+`faucet serve` keeps its run history in `$FAUCET_DATA_DIR/history.db` unless
+`--history` says otherwise; the image sets `FAUCET_DATA_DIR=/var/lib/faucet`
+and declares it a volume, and the chart mounts its PVC there when
+`serve.history` is unset. A root filesystem that cannot be written refuses to
+start rather than running on memory. See
+[Backing up the server database](./backup.md).
 
 The [Helm chart](https://github.com/faucet-hq/faucet-stream/tree/main/deploy/helm/faucet-stream)
 renders all of these, verifies at startup that the image holds the connectors

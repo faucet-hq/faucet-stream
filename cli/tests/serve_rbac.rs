@@ -42,7 +42,7 @@ fn args_with_auth_config(port: u16, auth_config: std::path::PathBuf) -> ServeArg
         max_concurrent_runs: Some(4),
         max_queued_runs: Some(16),
         default_config: None,
-        history: None,
+        history: Some("memory".into()),
         cors_origin: vec![],
         body_limit_bytes: 1_048_576,
         shutdown_grace_secs: 5,
@@ -65,8 +65,10 @@ fn args_with_auth_config(port: u16, auth_config: std::path::PathBuf) -> ServeArg
         cluster_poll_secs: 2,
         cluster_max_attempts: 3,
         triggers: None,
+        schedules: Default::default(),
         templates_sync: None,
         policy: None,
+        policy_store: Default::default(),
         otel_config: None,
         callback_allow_host: Vec::new(),
         origins: Default::default(),
@@ -332,10 +334,16 @@ fn is_mutating(method: &axum::http::Method, path: &str) -> bool {
     //   DLQ; the POST form only carries the config in a body. `--probe` builds
     //   the sink for its read-only watermark read, nothing more. A viewer may
     //   name a registered template; an inline config needs `Doctor`.
+    // - `/v1/schedules/preview` — computes the next ticks of a cron (#1044).
     // - `/v1/mirror/{name}` — reads a mirror's state store (#731); the POST
     //   form only carries the config in a body, gated like `/v1/status`.
-    const READ_ONLY_POSTS: &[&str] =
-        &["/mcp", "/v1/dlq/inspect", "/v1/status", "/v1/mirror/{name}"];
+    const READ_ONLY_POSTS: &[&str] = &[
+        "/mcp",
+        "/v1/dlq/inspect",
+        "/v1/status",
+        "/v1/mirror/{name}",
+        "/v1/schedules/preview",
+    ];
     if READ_ONLY_POSTS.contains(&path) {
         return false;
     }

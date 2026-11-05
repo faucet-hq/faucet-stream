@@ -1,7 +1,7 @@
 // Triggers (#998): split pane — the event triggers this server watches
-// (webhooks, object arrival, queue depth, schedules), their health and the runs
-// they started. Reads GET /v1/triggers; an older server reports only each
-// trigger's name and health in /readyz, and the page says so.
+// (webhooks, object arrival, queue depth), their health and the runs they
+// started. Cron schedules are their own page (#1044). Reads GET /v1/triggers;
+// an older server reports only each trigger's name and health in /readyz.
 import { api } from "../api.js";
 import { html, v, ic, row, ring, sect, tabs, ibtn, stats, empty, skelRows, skelCards, head, card, grid, kv, tbl, pill, code, btn, dhead, dtabs, lnk, alert, field, input, join } from "../components.js";
 import { layout, setQuery, patch, poll, errorAlert, hashFor, ago, dialog, toast, sections } from "../page.js";
@@ -10,8 +10,8 @@ import { fmtInt } from "../utils.js";
 import { href } from "../links.js";
 import { can } from "../access.js";
 
-const TYPES = [["webhook", "Webhooks", "webhook"], ["object_arrival", "Object arrival", "object arrival"], ["queue_depth", "Queue depth", "queue depth"], ["schedule", "Schedules", "schedule"], ["", "Other", "trigger"]];
-const typeLabel = (t) => (TYPES.find(([k]) => k === (t || "")) || TYPES[4])[2];
+const TYPES = [["webhook", "Webhooks", "webhook"], ["object_arrival", "Object arrival", "object arrival"], ["queue_depth", "Queue depth", "queue depth"], ["", "Other", "trigger"]];
+const typeLabel = (t) => (TYPES.find(([k]) => k === (t || "")) || TYPES[3])[2];
 const RUN_LABEL = "faucet.trigger.name";
 const TERMINAL_TONE = { completed: "ok", failed: "bad", cancelled: "", running: "info", sharded: "info", queued: "", pending: "" };
 
@@ -23,8 +23,6 @@ function norm(t) {
     enabled: t.enabled !== false,
     healthy: t.healthy !== false,
     methods: t.methods || [],
-    cron: t.cron || "",
-    timezone: t.timezone || "",
     last_fire: t.last_fire || t.last_fired_at || null,
     fired: t.fired_total ?? null,
     errors: t.errors_total ?? null,
@@ -41,11 +39,11 @@ function norm(t) {
 function what(t, legacy = false) {
   const d = t.detail || {};
   if (t.type === "webhook") return [t.methods.length ? t.methods.join(", ") : legacy ? "" : "POST, PUT", t.fired != null ? `${fmtInt(t.fired)} fired` : ""];
-  if (t.type === "schedule") return [[t.cron, t.timezone].filter(Boolean).join(" "), Array.isArray(t.tenants) ? `${t.tenants.length} tenants` : t.tenants === "all" ? "all tenants" : ""];
   if (t.type === "object_arrival") return [[d.store_kind || d.store || "", d.prefix || d.bucket || ""].filter(Boolean).join(" "), d.mode ? `${d.mode} mode` : ""];
   if (t.type === "queue_depth") return [[d.queue_kind || "", d.queue || d.key || d.topic || ""].filter(Boolean).join(" "), !t.healthy ? "error backoff" : d.threshold != null ? `threshold ${fmtInt(d.threshold)}` : ""];
   return [t.healthy ? "healthy" : "unhealthy"];
 }
+const movedHint = html`<div class="muted" style="font-size:12px;padding:10px 14px">Looking for cron schedules? They moved to ${lnk("Schedules", href.schedules())}.</div>`;
 const tplParts = (x) => (typeof x === "string" ? x.split("@") : [x.id, x.version]);
 const runsTarget = (t) => (t.template ? html`template ${lnk(tplParts(t.template)[0], href.template(tplParts(t.template)[0]))}${tplParts(t.template)[1] ? html` <span class="mono">${tplParts(t.template)[1]}</span>` : ""}` : t.config ? html`config <span class="mono">${typeof t.config === "string" ? t.config : "inline"}</span>` : "");
 
@@ -75,7 +73,7 @@ export async function renderTriggers(host, params) {
     if (loadErr) return errorAlert("the triggers", loadErr);
     if (!triggers) return html`${tabs([["All"], ["Unhealthy"]], "All")}${skelRows(8)}`;
     const top = tabs([["All", triggers.length], ["Unhealthy", triggers.filter((t) => !t.healthy).length]], state.tab, ibtn("refresh", { title: "Refresh", data: { reload: "1" } }));
-    if (!triggers.length) return html`${top}${empty("No triggers on this server", "Triggers start runs when a webhook is called, a file lands, a queue backs up or a schedule ticks.", { icon: "trig" })}`;
+    if (!triggers.length) return html`${top}${empty("No triggers on this server", "Triggers start runs when a webhook is called, a file lands or a queue backs up. Cron schedules live on the Schedules page.", { icon: "trig" })}`;
     const shown = triggers.filter((t) => state.tab !== "Unhealthy" || !t.healthy);
     const fired = triggers.reduce((n, t) => n + (t.fired || 0), 0);
     const body = shown.length ? join(TYPES.map(([k, label]) => {
@@ -87,7 +85,7 @@ export async function renderTriggers(host, params) {
         return row(ring(!t.enabled ? "" : t.healthy ? "ok" : "bad", t.enabled ? "" : "hollow"), t.name, t.last_fire ? ago(t.last_fire) : "", html`<b>${typeLabel(t.type)}</b>${first ? html` · ${first}` : ""}${rest.length ? html` · ${rest.join(" · ")}` : ""}${!t.enabled ? " · disabled" : ""}`, { on: t.name === state.name, id: t.name, href: hashFor(href.trigger(t.name), { tab: state.tab !== "All" ? state.tab : "" }) });
       })}</div>`;
     })) : empty("Every trigger is healthy", "", { icon: "check" });
-    return html`${top}${stats([["Triggers", triggers.length], ["Healthy", triggers.filter((t) => t.healthy).length, "ok"], ["Unhealthy", triggers.filter((t) => !t.healthy).length, triggers.some((t) => !t.healthy) ? "bad" : ""], ["Fired", legacy ? "—" : fmtInt(fired)]])}${body}`;
+    return html`${top}${stats([["Triggers", triggers.length], ["Healthy", triggers.filter((t) => t.healthy).length, "ok"], ["Unhealthy", triggers.filter((t) => !t.healthy).length, triggers.some((t) => !t.healthy) ? "bad" : ""], ["Fired", legacy ? "—" : fmtInt(fired)]])}${body}${movedHint}`;
   }
 
   const curl = (t) => {
@@ -103,17 +101,16 @@ export async function renderTriggers(host, params) {
 
   function emptyDetail() {
     return html`${head("Start runs from events", [], html`This server was started without a triggers file. Add one and restart <code>faucet serve</code> with <code>--triggers</code>.`)}
-      ${card({ icon: "code", title: "triggers.yaml", aside: "one webhook, one schedule", body: code(`version: 1
+      ${card({ icon: "code", title: "triggers.yaml", aside: "one webhook, one file drop", body: code(`version: 1
 triggers:
   - name: orders-ingest
     type: webhook
     methods: [POST]
     dedupe_header: X-Delivery-Id
     config: pipelines/orders.yaml
-  - name: nightly-rollup
-    type: schedule
-    cron: "0 2 * * *"
-    timezone: Europe/Berlin
+  - name: partner-files
+    type: object_arrival
+    store: { type: s3, bucket: landing, prefix: partner/ }
     template: { id: acme/billing-api }`, { box: false }) })}
       ${card({ title: "Then", body: code("faucet serve --triggers triggers.yaml", { box: false, lang: "text" }), note: html`Read the <a class="lnk" href="https://faucet-hq.github.io/faucet-stream/reference/triggers.html" target="_blank" rel="noopener">triggers reference</a> for object arrival and queue depth.` })}`;
   }
@@ -123,7 +120,7 @@ triggers:
     if (!triggers) return html`<span class="skel t"></span><span class="skel w30"></span>${skelCards(3)}`;
     if (!state.name) {
       if (!triggers.length) return emptyDetail();
-      return html`${head("Triggers", [], "Pick a trigger to see what starts it, its health and the runs it started.")}${legacy ? alert("This server reports only each trigger’s name, type and health.", "Upgrade the server for methods, schedules and fire counts.", "") : ""}`;
+      return html`${head("Triggers", [], "Pick a trigger to see what starts it, its health and the runs it started.")}${legacy ? alert("This server reports only each trigger’s name, type and health.", "Upgrade the server for methods and fire counts.", "") : ""}`;
     }
     const t = triggers.find((x) => x.name === state.name);
     const back = { href: hashFor(href.triggers(), { tab: state.tab !== "All" ? state.tab : "" }), label: "Triggers" };
@@ -158,9 +155,6 @@ triggers:
       if (!legacy) facts.push(kv("Errors", fmtInt(t.errors ?? 0), "since the server started"));
       facts.push( kv("Fired", n(t.fired), legacy ? "" : "since the server started"));
       note = html`Runs are labelled <code>${RUN_LABEL}=${t.name}</code> and audited as <b>trigger:${t.name}</b>. The request body is available to the config as <code>\${trigger.body}</code>.`;
-    } else if (t.type === "schedule") {
-      title = "Schedule"; aside = "ticks on a cron in the server";
-      facts = [kv("Cron", html`<span class="mono">${t.cron || "—"}</span>`), kv("Timezone", t.timezone || "UTC"), kv("Tenants", t.tenants === "all" ? "all" : Array.isArray(t.tenants) ? fmtInt(t.tenants.length) : "—"), kv("Fired", n(t.fired), t.errors != null ? `${fmtInt(t.errors)} errors` : "")];
     } else if (t.type === "object_arrival") {
       title = "Object arrival"; aside = "fires when new objects land under a prefix";
       facts = [kv("Polls every", d.poll_interval_secs ? `${d.poll_interval_secs}s` : "—"), kv("Errors", n(t.errors)), kv("Health", t.healthy ? "watching" : "in backoff"), kv("Fired", n(t.fired), t.errors != null ? `${fmtInt(t.errors)} errors` : "")];

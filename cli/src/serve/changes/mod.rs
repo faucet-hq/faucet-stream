@@ -29,6 +29,8 @@
 //! `executed` / `invalidated` / `expired` / `failed`).
 
 pub mod policy;
+#[cfg(feature = "policy")]
+pub mod policy_update;
 
 pub use policy::{ApprovalPolicy, ApprovalRule, EffectiveRule};
 
@@ -60,15 +62,27 @@ pub enum ChangeKind {
     /// Retire or revive one template version
     /// (`POST /v1/templates/{id}/versions/{version}/deprecate`).
     TemplateDeprecate,
+    /// Create, edit or delete a schedule (#1044): payload
+    /// `{action: create|update|delete, name, spec?}`.
+    Schedule,
+    /// Put a new version of the server-managed data-flow policy in force
+    /// (`POST /v1/policy`, `POST /v1/policy/rollback`, #1043).
+    PolicyUpdate,
+    /// Put a new version of one tenant's add-only policy in force
+    /// (`POST /v1/tenants/{tenant}/policy[/rollback]`, #1043).
+    TenantPolicyUpdate,
 }
 
 impl ChangeKind {
-    pub const ALL: [ChangeKind; 5] = [
+    pub const ALL: [ChangeKind; 8] = [
         ChangeKind::Run,
         ChangeKind::TemplateRegister,
         ChangeKind::TemplateLaunch,
         ChangeKind::TemplateDelete,
         ChangeKind::TemplateDeprecate,
+        ChangeKind::Schedule,
+        ChangeKind::PolicyUpdate,
+        ChangeKind::TenantPolicyUpdate,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -78,7 +92,19 @@ impl ChangeKind {
             ChangeKind::TemplateLaunch => "template_launch",
             ChangeKind::TemplateDelete => "template_delete",
             ChangeKind::TemplateDeprecate => "template_deprecate",
+            ChangeKind::Schedule => "schedule",
+            ChangeKind::PolicyUpdate => "policy_update",
+            ChangeKind::TenantPolicyUpdate => "tenant_policy_update",
         }
+    }
+
+    /// A data-flow policy change (#1043): proposed only through the policy
+    /// routes, never through `POST /v1/changes`.
+    pub fn is_policy(self) -> bool {
+        matches!(
+            self,
+            ChangeKind::PolicyUpdate | ChangeKind::TenantPolicyUpdate
+        )
     }
 
     /// The kind whose `--require-approval` and approval rule also govern this
@@ -102,9 +128,13 @@ impl FromStr for ChangeKind {
             "template_launch" | "template-launch" => Ok(ChangeKind::TemplateLaunch),
             "template_delete" | "template-delete" => Ok(ChangeKind::TemplateDelete),
             "template_deprecate" | "template-deprecate" => Ok(ChangeKind::TemplateDeprecate),
+            "schedule" => Ok(ChangeKind::Schedule),
+            "policy_update" | "policy-update" => Ok(ChangeKind::PolicyUpdate),
+            "tenant_policy_update" | "tenant-policy-update" => Ok(ChangeKind::TenantPolicyUpdate),
             other => Err(format!(
                 "unknown change kind `{other}` (expected run, template_register, \
-                 template_launch, template_delete or template_deprecate)"
+                 template_launch, template_delete, template_deprecate, schedule, policy_update \
+                 or tenant_policy_update)"
             )),
         }
     }
@@ -863,7 +893,54 @@ async fn plan_for(
                 details: None,
             })
         }
+        ChangeKind::Schedule => plan_schedule(state, actor, payload).await,
+        #[cfg(feature = "policy")]
+        ChangeKind::PolicyUpdate | ChangeKind::TenantPolicyUpdate => {
+            policy_update::plan(state, kind, payload).await
+        }
+        #[cfg(not(feature = "policy"))]
+        ChangeKind::PolicyUpdate | ChangeKind::TenantPolicyUpdate => {
+            Err(ServeError::Unprocessable {
+                message: "policy changes require a server built with the `policy` feature".into(),
+                details: None,
+            })
+        }
     }
+}
+
+/// Plan a schedule change (#1044): validate it as the requester; the rows
+/// (which carry the stored revision it edits) are the material, so an edit
+/// made meanwhile invalidates the approval.
+#[cfg(all(feature = "schedule", feature = "templates"))]
+async fn plan_schedule(
+    state: &ServerState,
+    actor: &AuthContext,
+    payload: &Value,
+) -> Result<ChangePlan, ServeError> {
+    let p: crate::serve::schedules::service::ChangePayload =
+        serde_json::from_value(payload.clone())
+            .map_err(|e| ServeError::BadConfig(format!("schedule payload: {e}")))?;
+    let rows = crate::serve::schedules::service::plan(state, actor, &p).await?;
+    Ok(ChangePlan {
+        material: material_of_rows(&rows),
+        summary: json!({"schedule": p.name, "action": p.action.as_str()}),
+        rows,
+    })
+}
+
+#[cfg(not(all(feature = "schedule", feature = "templates")))]
+async fn plan_schedule(
+    state: &ServerState,
+    actor: &AuthContext,
+    payload: &Value,
+) -> Result<ChangePlan, ServeError> {
+    let _ = (state, actor, payload);
+    Err(ServeError::Unprocessable {
+        message: "schedule changes require a server built with the `schedule` and `templates` \
+                  features"
+            .into(),
+        details: None,
+    })
 }
 
 fn record_metric(kind: ChangeKind, outcome: &'static str) {
@@ -1026,6 +1103,16 @@ pub async fn create(
         .max()
         .unwrap_or(1);
     let now = Utc::now();
+    // A tenant policy change belongs to the tenant whose policy it changes,
+    // whoever proposed it (a server admin through the tenant's route).
+    let tenant = if new.kind == ChangeKind::TenantPolicyUpdate {
+        payload
+            .get("tenant")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    } else {
+        actor.tenant.clone()
+    };
     let change = ChangeRequest {
         id: uuid::Uuid::now_v7().to_string(),
         kind: new.kind,
@@ -1045,7 +1132,7 @@ pub async fn create(
         run_id: None,
         template: None,
         error: None,
-        tenant: actor.tenant.clone(),
+        tenant,
         trusted_config: new.trusted_config,
         caller_params: new.caller_params,
     };
@@ -1192,6 +1279,13 @@ pub async fn approve(
                 ServeError::Forbidden(reason)
             })?;
     }
+    #[cfg(feature = "policy")]
+    if change.kind.is_policy() {
+        policy_update::approver_in_scope(actor, change.tenant.as_deref()).map_err(|reason| {
+            record_metric(change.kind, "denied");
+            ServeError::Forbidden(reason)
+        })?;
+    }
     if change
         .approvals
         .iter()
@@ -1255,6 +1349,11 @@ pub async fn reject(
                 .may_approve(kind, actor, "")
                 .map_err(ServeError::Forbidden)?;
         }
+        #[cfg(feature = "policy")]
+        if change.kind.is_policy() {
+            policy_update::approver_in_scope(actor, change.tenant.as_deref())
+                .map_err(ServeError::Forbidden)?;
+        }
     }
     change.status = ChangeStatus::Rejected;
     change.rejection = Some(Rejection {
@@ -1295,6 +1394,22 @@ async fn execute(
         source_ip: None,
         tenant: change.tenant.clone(),
     };
+    // A policy change whose version was stored before its execution was
+    // interrupted is done: re-planning would see its own version and call it
+    // invalidated.
+    #[cfg(feature = "policy")]
+    if change.kind.is_policy()
+        && let Some(version) = policy_update::already_applied(state, &change).await?
+    {
+        if let Some(plan) = &mut change.plan {
+            plan.summary["version"] = json!(version);
+        }
+        change.status = ChangeStatus::Executed;
+        change.touch();
+        save(state, &change).await?;
+        record_metric(change.kind, "executed");
+        return Ok(change);
+    }
     // Re-plan against the world as it is now. A planning failure (the
     // template is gone, the config no longer loads) fails the request.
     let fresh = match plan_for(
@@ -1340,6 +1455,9 @@ async fn execute(
         .await;
         return Ok(change);
     }
+    // The policy version a policy change stored (#1043), kept in the plan.
+    #[allow(unused_mut)]
+    let mut created_version: Option<u32> = None;
     let outcome: Result<(Option<String>, Option<TemplateOutcome>), ServeError> = match change.kind {
         ChangeKind::Run => {
             let mut req: SubmitRequest = match serde_json::from_value(change.payload.clone()) {
@@ -1459,9 +1577,45 @@ async fn execute(
             message: "template changes require the `templates` feature".into(),
             details: None,
         }),
+        #[cfg(all(feature = "schedule", feature = "templates"))]
+        ChangeKind::Schedule => {
+            let p: crate::serve::schedules::service::ChangePayload =
+                match serde_json::from_value(change.payload.clone()) {
+                    Ok(p) => p,
+                    Err(e) => return finish_failed(state, actor, change, e.to_string()).await,
+                };
+            crate::serve::schedules::service::apply(state, &requester, p)
+                .await
+                .map(|_| (None, None))
+        }
+        #[cfg(not(all(feature = "schedule", feature = "templates")))]
+        ChangeKind::Schedule => Err(ServeError::Unprocessable {
+            message: "schedule changes require the `schedule` and `templates` features".into(),
+            details: None,
+        }),
+        #[cfg(feature = "policy")]
+        ChangeKind::PolicyUpdate | ChangeKind::TenantPolicyUpdate => {
+            policy_update::execute(state, &change, &fresh, actor)
+                .await
+                .map(|v| {
+                    created_version = Some(v);
+                    (None, None)
+                })
+        }
+        #[cfg(not(feature = "policy"))]
+        ChangeKind::PolicyUpdate | ChangeKind::TenantPolicyUpdate => {
+            Err(ServeError::Unprocessable {
+                message: "policy changes require the `policy` feature".into(),
+                details: None,
+            })
+        }
     };
     match outcome {
         Ok((run_id, template)) => {
+            let mut fresh = fresh;
+            if let Some(v) = created_version {
+                fresh.summary["version"] = json!(v);
+            }
             change.status = ChangeStatus::Executed;
             change.run_id = run_id.clone();
             change.template = template;
@@ -2711,6 +2865,101 @@ mod tests {
         assert!(matches!(
             template_err(crate::error::CliError::Internal("x".into())),
             ServeError::Internal(_)
+        ));
+    }
+
+    #[cfg(feature = "policy")]
+    fn policy_version(
+        scope: String,
+        change_id: Option<String>,
+    ) -> crate::serve::history::policies::PolicyVersionRecord {
+        crate::serve::history::policies::PolicyVersionRecord {
+            scope,
+            version: 1,
+            spec: json!({ "version": 1 }),
+            created_at: Utc::now(),
+            created_by: "bob".into(),
+            approved_by: None,
+            reason: None,
+            change_id,
+            restores: None,
+        }
+    }
+
+    #[cfg(feature = "policy")]
+    #[tokio::test]
+    async fn a_policy_change_checks_the_approvers_tenant_and_finishes_an_applied_version() {
+        use crate::serve::history::policies::tenant_scope;
+        let state = crate::serve::test_support::test_state();
+        let mut c = stored(
+            ChangeKind::TenantPolicyUpdate,
+            json!({ "tenant": "acme", "policy": "version: 1\n" }),
+            "m",
+            1,
+        );
+        c.tenant = Some("acme".into());
+        save(&state, &c).await.unwrap();
+
+        let mut globex = actor("gina");
+        globex.tenant = Some("globex".into());
+        assert!(matches!(
+            approve(&state, &globex, &c.id, None).await,
+            Err(ServeError::Forbidden(_))
+        ));
+        assert!(matches!(
+            reject(&state, &globex, &c.id, "no".into()).await,
+            Err(ServeError::Forbidden(_))
+        ));
+
+        // The version was stored before the execution was interrupted.
+        let applied = policy_version(tenant_scope("acme"), Some(c.id.clone()));
+        assert!(
+            state
+                .history()
+                .policy_version_insert(&applied)
+                .await
+                .unwrap()
+        );
+        let done = approve(&state, &actor("alice"), &c.id, None).await.unwrap();
+        assert_eq!(done.status, ChangeStatus::Executed);
+        assert_eq!(done.plan.unwrap().summary["version"], 1);
+    }
+
+    #[cfg(feature = "policy")]
+    #[tokio::test]
+    async fn a_policy_change_that_lost_the_race_or_does_not_parse() {
+        use crate::serve::history::policies::SERVER_SCOPE;
+        let state = crate::serve::test_support::test_state();
+        let garbled = stored(ChangeKind::PolicyUpdate, json!("not a payload"), "m", 1);
+        assert_eq!(
+            policy_update::already_applied(&state, &garbled)
+                .await
+                .unwrap(),
+            None
+        );
+        let bad_draft = json!({ "policy": "version: 1\nclassifications:\n  - label: a\n    field_pattern: \"(\"\n" });
+        assert!(matches!(
+            policy_update::plan(&state, ChangeKind::PolicyUpdate, &bad_draft).await,
+            Err(ServeError::Unprocessable { .. })
+        ));
+
+        // Another change stored the version this one planned to write.
+        let c = stored(
+            ChangeKind::PolicyUpdate,
+            json!({ "policy": "version: 1\n" }),
+            "m",
+            1,
+        );
+        let first = policy_version(SERVER_SCOPE.into(), None);
+        assert!(state.history().policy_version_insert(&first).await.unwrap());
+        let fresh = ChangePlan {
+            material: "m".into(),
+            rows: Vec::new(),
+            summary: json!({ "next_version": 1 }),
+        };
+        assert!(matches!(
+            policy_update::execute(&state, &c, &fresh, &actor("alice")).await,
+            Err(ServeError::Conflict(_))
         ));
     }
 }

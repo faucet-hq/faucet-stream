@@ -2,6 +2,8 @@
 # expect: restart (serve.history.backend=memory). Synced
 # expect: Note: serve.triggers runs with serve.history.backend=memory
 serve:
+  history:
+    backend: memory
   templatesSync:
     enabled: true
     existingConfigMap: my-sync

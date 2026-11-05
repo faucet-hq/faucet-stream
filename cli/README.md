@@ -65,7 +65,7 @@ Claude Code: `/plugin marketplace add faucet-hq/faucet-stream`, then
 | `faucet conformance [name] [--kind K] [--json] [--min-tier T]` | Score connectors against the SDK contract, print a scorecard + maturity tier (Stable/Experimental/Beta/Draft) and capability badges. `--min-tier` exits non-zero as an opt-in CI gate. `--export [--require-all]` prints the Connector Hub feed: every registry connector with derived capabilities, conformance, config schema and a `faucet init` snippet. |
 | `faucet preview <config> --limit N` | Run only the source side and emit the first N records to stdout as JSONL. |
 | `faucet plan <config> [--sample F\|--live] [--diff] [--impact [--depth N]] [--policy F] [--json]` | Read-only "what would this do" preview (resolved pipeline, output schema, sink delta — never writes). `--diff` shows a `terraform plan`-style per-row config diff against the last recorded run (needs a `catalog:` block + `catalog` feature; secrets stored only as stable `<secret:hmac:…>` tokens). `--impact` (#707) walks the catalog's lineage graph downstream of the row's sink and reports the datasets, contracts, owners and declared consumers the planned schema affects, with a severity each (`breaking` / `additive` / `unknown`). A `policy:` block / `--policy` adds the row's data-flow-policy verdict. |
-| `faucet policy <config> [--policy F] [--row R] [--json]` | Evaluate a data-flow policy (#702) — classifications that label columns + rules about which sinks a label may reach — against a config: per row, the labelled columns heading into each sink (by name, through a rename, or conservatively past an opaque transform; whether masking provably masks them) and every violated rule. Exit code = violations. The same verdict is reported by `validate` / `plan` / `doctor` (`--policy`), refuses `run`, and is enforced by `faucet serve --policy`. `faucet schema policy` prints the schema. |
+| `faucet policy <config> [--policy F] [--row R] [--json]` | Evaluate a data-flow policy (#702) — classifications that label columns + rules about which sinks a label may reach — against a config: per row, the labelled columns heading into each sink (by name, through a rename, or conservatively past an opaque transform; whether masking provably masks them) and every violated rule. Exit code = violations. The same verdict is reported by `validate` / `plan` / `doctor` (`--policy`), refuses `run`, and is enforced by `faucet serve` — by default as a server-managed policy whose versions live in the run-history store and change only through approved change requests (`/v1/policy*`, the console's **Policy** page, #1043; a `--policy` file only seeds an empty store, and one that later differs is reported, not applied; edits need a persistent `--history`), or with `--policy-store file` from the `--policy` file (re-read on every start, read-only), with per-tenant add-only policies on top. `faucet schema policy` prints the schema. |
 | `faucet init [name] [--source X] [--sink Y]` | Scaffold a pipeline.yaml from each connector's JSON Schema, with `requires_faucet` set to this binary's minor version and the exact version pinned in the project's `mise.toml`. |
 | `faucet doctor <config> [--timeout-secs N] [--json]` | Probe every connector (auth/network/permissions/reachability) and print a checklist. Exits with the failed-probe count. |
 | `faucet test <specs…> [--filter S] [--json] [--clock C]` | Run fixture-based **offline** pipeline tests: stream sample records through a config's transforms/quality/contract with in-memory source/sink/DLQ and assert the output. Exits with the failed-case count. `faucet schema test` prints the spec-file JSON Schema. |
@@ -335,7 +335,7 @@ Auth is mandatory: without `--auth-token`/`FAUCET_SERVE_AUTH_TOKEN` **and** with
 | `--allow-secret-scheme <scheme>` | Secret-manager scheme (`vault`, `aws-sm`, `gcp-sm`, `azure-kv`) a submitted config may resolve with the server's credentials. Default: none. |
 | `--tenant-path-root <dir>` | Confine the local paths of a config submitted for a tenant to `<dir>/<tenant id>`. |
 | `--max-concurrent-runs` / `--max-queued-runs` | Concurrency + queue caps (submit past the queue → 429 + `Retry-After`). |
-| `--history <url>` | `postgres://…` / `sqlite:…` for durable history (`serve-history-postgres` / `serve-history-sqlite`; default in-memory). |
+| `--history <url>` | Where the run history lives. Default: a SQLite file, `$FAUCET_DATA_DIR/history.db` (`~/.faucet/history.db`), created on first start; an unusable directory refuses to start, and a second server on the same file refuses too (#1049). `sqlite:<path>`, or `postgres://…` (`serve-history-postgres`; for several replicas / `--cluster`). `memory` keeps nothing across a restart: it warns at start, shows in `/readyz` and as a console banner, and refuses policy edits. |
 | `--default-config <path>` | Workspace defaults merged **under** every submitted run. |
 | `--cors-origin <o>` | Allow-list a browser origin (repeatable; CORS off by default). |
 | `--allowed-host <host>` | A host name clients reach the server by (repeatable or comma-separated; `*` for any; env `FAUCET_SERVE_ALLOWED_HOSTS`). Set, any other `Host` gets `403`. Unset, only a `--no-auth` server on loopback checks `Host` (allowing `localhost`, `127.0.0.1`, `[::1]` and its listen address). Health and metrics probes are exempt. |
@@ -347,9 +347,35 @@ Auth is mandatory: without `--auth-token`/`FAUCET_SERVE_AUTH_TOKEN` **and** with
 | `--pool <name>` | Execution pool this replica serves (repeatable, comma-separated, or `FAUCET_SERVE_POOLS`; default `default`). A run's pool is its request's `pool`, else its config's `pool:`, else `default`; only replicas serving it claim it, and a pool nobody serves is a `422`. |
 | `--pool-wait-timeout-secs <n>` | Fail a pending run whose pool no live cluster member has served for `n` seconds (`pool_unavailable`). |
 | `--triggers <path>` | Path to a triggers file (YAML) defining event-driven watchers. Requires the `triggers` Cargo feature. See [Event-driven triggers](#event-driven-triggers-triggers). |
+| `--schedules <path>` | Path to a schedules file: registered templates to run on a cron, read-only in the console. Requires the `schedule` and `templates` features. See [Schedules](#schedules---schedules). |
+| `--tenant-schedule-min-interval-secs <n>` | Shortest gap between the ticks of a tenant-owned schedule (default 300; 0 = none). |
 | `--local-output-retention-days <n>` / `--local-output-in-flight-grace-secs <n>` | Retention GC for the local files a run's sinks wrote (jsonl/csv/parquet): the window (default `7`; `0` disables the sweep) and the mid-write guard (default `60`). Only files faucet recorded as its own sink outputs are ever deleted. Requires the `catalog` feature. |
 | `--preview-local-outputs` | Serve **dataset previews** of those local files — the console reads a tracked output's first N rows back (`FAUCET_SERVE_PREVIEW_LOCAL_OUTPUTS`). **Off by default**: it returns file contents over HTTP, so it is a local-testing convenience. Caps: `--preview-default-rows` (soft, default `500`) and `--preview-max-rows` (hard, default `5000`; a larger `row_count_to_load` — including `all` — is clamped to it). `--preview-max-rows 0` lifts the ceiling so `row_count_to_load=all` reads a whole dataset; the read is still bounded by a response-size budget and a deadline, and a partial answer names the bound that stopped it. |
 | `--body-limit-bytes`, `--shutdown-grace-secs`, `--retain-terminal-runs-secs`, `--idempotency-retention-secs`, `--probe-timeout-secs` | Tuning knobs. |
+
+#### Schedules (`--schedules`)
+
+A schedule runs a registered template on a cron inside `faucet serve`
+(#1044). Create them on the console's **Schedules** page or through
+`/v1/schedules` (stored in the run history; every replica picks them up), or
+list them in a file passed to `--schedules` (read-only in the console):
+
+```yaml
+version: 1
+schedules:
+  - name: nightly-rollup
+    cron: "0 2 * * *"
+    timezone: Europe/Berlin
+    template: { id: billing-rollup, params: { region: eu } }
+```
+
+Runs are labelled `schedule` and `schedule_tick`; each tick has its own
+idempotency key, so replicas start one run per tick. Tenants can own schedules
+within `max_schedules` and `--tenant-schedule-min-interval-secs`;
+`--require-approval schedule` gates changes. `faucet schema schedules` prints
+the file schema. See the
+[schedules cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/schedules.html)
+and `cli/examples/schedules/schedules.yaml`.
 
 #### Event-driven triggers (`--triggers`)
 

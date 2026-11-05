@@ -31,6 +31,13 @@ impl fmt::Display for Error {
     }
 }
 
+impl Error {
+    /// The 1-based line the parser stopped at, when it reports one.
+    pub fn line(&self) -> Option<usize> {
+        self.0.location().map(|l| l.line())
+    }
+}
+
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         self.0.source()

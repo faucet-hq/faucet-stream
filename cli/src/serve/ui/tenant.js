@@ -31,6 +31,13 @@ export function setTenant(id) {
   }
   const sel = document.getElementById("tenant-select");
   if (sel && !sel.disabled) sel.value = id || "";
+  mark();
+}
+
+// The switcher is highlighted while it scopes the views to one tenant.
+function mark() {
+  const wrap = document.getElementById("tenant-wrap");
+  if (wrap) wrap.classList.toggle("on", !!currentTenant());
 }
 
 /** Add the current tenant to a query. */
@@ -73,6 +80,7 @@ export async function loadTenants(onChange) {
     tenants.map((t) => `<option value="${escapeAttr(t.id)}">${escapeAttr(t.name || t.id)}</option>`).join("");
   sel.value = currentTenant();
   wrap.hidden = false;
+  mark();
   sel.onchange = () => {
     setTenant(sel.value);
     onChange();

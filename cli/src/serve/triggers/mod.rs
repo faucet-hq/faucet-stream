@@ -5,6 +5,9 @@
 //! — reusing the whole queue/executor/idempotency pipeline. Pure decision logic
 //! (spec validation, `${trigger.*}` substitution, cursors, edge detection) is
 //! separated from the IO shell (watchers, fire path, webhook route).
+//!
+//! Triggers react to events outside faucet; cron schedules are their own
+//! feature (`crate::serve::schedules`, #1044).
 
 pub mod compiled;
 pub mod context;
@@ -20,8 +23,6 @@ pub mod webhook;
 pub mod object_arrival;
 #[cfg(any(feature = "triggers-redis", feature = "triggers-kafka"))]
 pub mod queue_depth;
-#[cfg(feature = "schedule")]
-pub mod schedule;
 
 use crate::error::{CliError, CliResult};
 use crate::serve::state::ServerState;
@@ -57,18 +58,6 @@ pub async fn load_triggers(path: &std::path::Path) -> CliResult<CompiledTriggers
         .extension()
         .map(|e| e.eq_ignore_ascii_case("json"))
         .unwrap_or(false);
-    let mut file: spec::TriggersFile = if is_json {
-        serde_json::from_str(&text)
-            .map_err(|e| CliError::Serve(format!("parsing triggers JSON: {e}")))?
-    } else {
-        crate::yaml::from_str(&text)
-            .map_err(|e| CliError::Serve(format!("parsing triggers YAML: {e}")))?
-    };
-
-    // Reject unknown fields on a trigger entry. `TriggerSpec` cannot use
-    // `deny_unknown_fields` because it carries a `#[serde(flatten)]` kind, so a
-    // typo like `debounce_sec` (for `debounce_secs`) would otherwise be silently
-    // dropped (#232). Diff the raw document against the typed re-serialization.
     let raw: serde_json::Value = if is_json {
         serde_json::from_str(&text)
             .map_err(|e| CliError::Serve(format!("parsing triggers JSON: {e}")))?
@@ -76,6 +65,20 @@ pub async fn load_triggers(path: &std::path::Path) -> CliResult<CompiledTriggers
         crate::yaml::from_str(&text)
             .map_err(|e| CliError::Serve(format!("parsing triggers YAML: {e}")))?
     };
+    // A cron schedule is not a trigger any more (#1044): say where it went
+    // rather than "unknown variant".
+    if let Some(name) = spec::schedule_entry(&raw) {
+        return Err(CliError::Serve(spec::schedule_moved(&name)));
+    }
+    let mut file: spec::TriggersFile = serde_json::from_value(raw.clone()).map_err(|e| {
+        let format = if is_json { "JSON" } else { "YAML" };
+        CliError::Serve(format!("parsing triggers {format}: {e}"))
+    })?;
+
+    // Reject unknown fields on a trigger entry. `TriggerSpec` cannot use
+    // `deny_unknown_fields` because it carries a `#[serde(flatten)]` kind, so a
+    // typo like `debounce_sec` (for `debounce_secs`) would otherwise be silently
+    // dropped (#232). Diff the raw document against the typed re-serialization.
     if let Some((trigger, field)) = spec::unknown_trigger_fields(&raw, &file).into_iter().next() {
         return Err(CliError::Serve(format!(
             "triggers: unknown field `{field}` in trigger `{trigger}` \
@@ -113,8 +116,7 @@ pub fn spawn_watchers(
         not(any(
             feature = "triggers-object-store",
             feature = "triggers-redis",
-            feature = "triggers-kafka",
-            feature = "schedule"
+            feature = "triggers-kafka"
         )),
         allow(unused_variables)
     )]
@@ -124,8 +126,7 @@ pub fn spawn_watchers(
         not(any(
             feature = "triggers-object-store",
             feature = "triggers-redis",
-            feature = "triggers-kafka",
-            feature = "schedule"
+            feature = "triggers-kafka"
         )),
         allow(unused_mut)
     )]
@@ -134,8 +135,7 @@ pub fn spawn_watchers(
         not(any(
             feature = "triggers-object-store",
             feature = "triggers-redis",
-            feature = "triggers-kafka",
-            feature = "schedule"
+            feature = "triggers-kafka"
         )),
         allow(unused_variables)
     )]
@@ -223,38 +223,6 @@ pub fn spawn_watchers(
             spec::TriggerKind::ObjectArrival { .. } => {}
             #[cfg(not(any(feature = "triggers-redis", feature = "triggers-kafka")))]
             spec::TriggerKind::QueueDepth { .. } => {}
-            #[cfg(feature = "schedule")]
-            spec::TriggerKind::Schedule {
-                cron,
-                timezone,
-                catch_up,
-            } => match compiled::compile_schedule(t.name(), cron, timezone) {
-                Ok(sched) => {
-                    let w = schedule::ScheduleWatcher::new(
-                        std::sync::Arc::new(t.clone()),
-                        sched,
-                        schedule::Resume {
-                            cron: cron.clone(),
-                            timezone: timezone.clone(),
-                            catch_up: *catch_up,
-                        },
-                        chrono::Utc::now(),
-                    );
-                    handles.push(tokio::spawn(watcher::run_supervised(
-                        w,
-                        state.clone(),
-                        health.clone(),
-                        shutdown.clone(),
-                    )));
-                    active += 1;
-                }
-                Err(e) => {
-                    tracing::error!(trigger = t.name(), error = %e, "invalid schedule; skipping watcher");
-                    mark_unbuildable(&health, t.name(), format!("schedule: {e}"));
-                }
-            },
-            #[cfg(not(feature = "schedule"))]
-            spec::TriggerKind::Schedule { .. } => {}
         }
     }
     metrics::active(active);
@@ -337,5 +305,34 @@ mod tests {
             "error must name the field: {msg}"
         );
         assert!(msg.contains("hook"), "error must name the trigger: {msg}");
+    }
+
+    #[tokio::test]
+    async fn a_schedule_entry_points_to_the_schedules_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("triggers.yaml");
+        std::fs::write(
+            &path,
+            "version: 1\ntriggers:\n  - name: nightly\n    type: schedule\n    cron: '0 2 * * *'\n    config: ./x.yaml\n",
+        )
+        .unwrap();
+        let msg = load_triggers(&path).await.unwrap_err().to_string();
+        assert!(
+            msg.contains("'nightly'") && msg.contains("--schedules"),
+            "{msg}"
+        );
+
+        let json = dir.path().join("triggers.json");
+        std::fs::write(
+            &json,
+            r#"{"version": 1, "triggers": [{"type": "schedule"}]}"#,
+        )
+        .unwrap();
+        let msg = load_triggers(&json).await.unwrap_err().to_string();
+        assert!(msg.contains("'#0'"), "{msg}");
+
+        std::fs::write(&json, r#"{"version": 1, "triggers": [{"name": 3}]}"#).unwrap();
+        let msg = load_triggers(&json).await.unwrap_err().to_string();
+        assert!(msg.contains("parsing triggers JSON"), "{msg}");
     }
 }

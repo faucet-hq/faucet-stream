@@ -107,6 +107,29 @@ pub fn build_router(
                     .put(crate::serve::triggers::webhook::handle),
             );
     }
+    // Schedules (#1044): a build without them still answers the list, with
+    // `available: false`.
+    #[cfg(not(all(feature = "schedule", feature = "templates")))]
+    {
+        api = api.route(
+            "/v1/schedules",
+            get(crate::serve::handlers::schedules::list),
+        );
+    }
+    #[cfg(all(feature = "schedule", feature = "templates"))]
+    {
+        use crate::serve::handlers::schedules as s;
+        api = api
+            .route("/v1/schedules", get(s::list).post(s::create))
+            .route("/v1/schedules/preview", post(s::preview))
+            .route(
+                "/v1/schedules/{name}",
+                get(s::get).put(s::update).delete(s::delete),
+            )
+            .route("/v1/schedules/{name}/pause", post(s::pause))
+            .route("/v1/schedules/{name}/resume", post(s::resume))
+            .route("/v1/schedules/{name}/run", post(s::run));
+    }
     #[cfg(feature = "catalog")]
     {
         use crate::serve::handlers::{catalog, local_outputs, preview, usage};
@@ -236,6 +259,38 @@ pub fn build_router(
             .route(
                 "/v1/connect/providers",
                 get(tenants::list_connect_providers),
+            );
+    }
+    // The data-flow policy in the console (#1043).
+    #[cfg(feature = "policy")]
+    {
+        use crate::serve::handlers::policy;
+        api = api
+            .route(
+                "/v1/policy",
+                get(policy::get_policy).post(policy::propose_server),
+            )
+            .route("/v1/policy/versions", get(policy::list_versions))
+            .route("/v1/policy/refusals", get(policy::list_refusals))
+            .route("/v1/policy/check", post(policy::check))
+            .route("/v1/policy/preview", post(policy::preview))
+            .route("/v1/policy/rollback", post(policy::rollback_server));
+    }
+    #[cfg(all(feature = "policy", feature = "tenants"))]
+    {
+        use crate::serve::handlers::policy;
+        api = api
+            .route(
+                "/v1/tenants/{tenant}/policy",
+                get(policy::get_tenant_policy).post(policy::propose_tenant),
+            )
+            .route(
+                "/v1/tenants/{tenant}/policy/preview",
+                post(policy::preview_tenant),
+            )
+            .route(
+                "/v1/tenants/{tenant}/policy/rollback",
+                post(policy::rollback_tenant),
             );
     }
     // MCP endpoint (#420): mounted only with `--mcp`. Placed on `api` so it
@@ -753,6 +808,52 @@ pub(crate) async fn lease_loop(state: ServerState, period: Duration, shutdown: C
     }
 }
 
+/// Put the `--policy` file in its place (#1043). With `--policy-store file`,
+/// or with nowhere to keep versions (in-memory history), the file is the
+/// policy. Otherwise it only seeds an empty store; a store that already holds
+/// a version keeps it, and a file that differs is reported, not applied.
+#[cfg(feature = "policy")]
+pub async fn apply_policy_file(
+    state: &ServerState,
+    store: crate::serve::config::PolicyStore,
+    policy: std::sync::Arc<faucet_core::PolicySpec>,
+    path: &std::path::Path,
+) {
+    use crate::serve::policies::{self, PolicyFile, PolicySeed, SeedOutcome};
+    let file = PolicyFile::read(path);
+    if store == crate::serve::config::PolicyStore::File || !state.persistent_history() {
+        tracing::info!(rules = policy.rules.len(), path = %file.path, "data-flow policy loaded from file");
+        state.set_policy(policy);
+        state.set_policy_file(file);
+        return;
+    }
+    let seed = PolicySeed {
+        file,
+        spec: (*policy).clone(),
+    };
+    state.set_policy_seed(seed.clone());
+    match policies::seed_store(state, &seed).await {
+        Ok(SeedOutcome::Imported) => tracing::info!(
+            path = %seed.file.path,
+            "the policy store was empty: imported the --policy file as version 1"
+        ),
+        Ok(SeedOutcome::Kept { differs: false }) => tracing::info!(
+            path = %seed.file.path,
+            "the stored policy version is in force; the --policy file matches it"
+        ),
+        Ok(SeedOutcome::Kept { differs: true }) => tracing::warn!(
+            path = %seed.file.path,
+            "the --policy file differs from the policy version in force; it was not applied \
+             (import it as a new version from the console, or start with --policy-store file)"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "could not seed the policy store from the --policy file; the stored version, if \
+             any, stays in force"
+        ),
+    }
+}
+
 /// Boot the server: install observability, build state + router, bind, serve
 /// until SIGTERM/SIGINT, then drain in-flight runs up to the grace window.
 pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> CliResult<()> {
@@ -809,6 +910,19 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
     if let Some(key) = crate::catalog::snapshot::key_file_path() {
         crate::serve::load::protect_file(&key);
     }
+    // The default history file (#1049): claim its directory first, and hold
+    // the lock until this server stops.
+    let history_lock = crate::serve::config::claim_default_history(&config.history)?;
+    if matches!(
+        config.history,
+        crate::serve::config::HistoryBackendSpec::Memory
+    ) {
+        tracing::warn!(
+            "--history memory: the run history is kept in this process only; on restart it \
+             loses {}",
+            crate::serve::config::MEMORY_HISTORY_LOSES
+        );
+    }
     let history = crate::serve::history::connect(
         &config.history,
         config.idempotency_retention,
@@ -816,6 +930,16 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         &instance_id,
     )
     .await?;
+    if history_lock.is_some() && history.degraded() {
+        // The default file could not be opened: refuse rather than run on
+        // memory without being asked to.
+        return Err(CliError::Serve(format!(
+            "could not open the default run history in {}; set $FAUCET_DATA_DIR or --history, \
+             or --history memory to keep nothing across restarts",
+            crate::serve::config::default_data_dir().display()
+        )));
+    }
+    let _history_lock = history_lock;
     if config.cluster.enabled {
         // Cluster mode: a restarting instance re-queues its prior incarnation's
         // in-flight runs (capped) rather than failing them.
@@ -902,6 +1026,18 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
             "--triggers requires a build with the `triggers` feature".into(),
         ));
     }
+    // Schedules (#1044): load + validate the file fail-fast.
+    #[cfg(all(feature = "schedule", feature = "templates"))]
+    let schedules_file = match &config.schedules.path {
+        Some(path) => crate::serve::schedules::load_file(path).await?.schedules,
+        None => Vec::new(),
+    };
+    #[cfg(not(all(feature = "schedule", feature = "templates")))]
+    if config.schedules.path.is_some() {
+        return Err(CliError::Serve(
+            "--schedules requires a build with the `schedule` and `templates` features".into(),
+        ));
+    }
     // Template origins (RFC 0006 / #589): load + validate the sync file
     // fail-fast; the pull itself runs after the state exists.
     #[cfg(feature = "templates-sync")]
@@ -932,6 +1068,13 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
     if config.policy_path.is_some() {
         return Err(CliError::Serve(
             "--policy requires a build with the `policy` feature".into(),
+        ));
+    }
+    if config.policy_store == crate::serve::config::PolicyStore::File
+        && config.policy_path.is_none()
+    {
+        return Err(CliError::Serve(
+            "--policy-store file needs --policy <file>: the file is the policy".into(),
         ));
     }
 
@@ -996,9 +1139,8 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         crate::templates::metrics::describe();
     }
     #[cfg(feature = "policy")]
-    if let Some(p) = policy {
-        tracing::info!(rules = p.rules.len(), "data-flow policy loaded");
-        state.set_policy(p);
+    if let (Some(p), Some(path)) = (policy, &config.policy_path) {
+        apply_policy_file(&state, config.policy_store, p, path).await;
     }
     #[cfg(feature = "encryption")]
     state.set_vault(vault);
@@ -1191,6 +1333,19 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         None => Vec::new(),
     };
 
+    // Schedules (#1044): one loop ticks the file's schedules and the stored
+    // ones; every cluster member runs it and the per-tick idempotency key lets
+    // one run through.
+    #[cfg(all(feature = "schedule", feature = "templates"))]
+    let schedule_loop = {
+        tracing::info!(file = schedules_file.len(), "starting the schedule loop");
+        state.set_schedules(crate::serve::schedules::SchedulesRuntime::new(
+            schedules_file,
+            config.schedules.tenant_min_interval,
+        ));
+        crate::serve::schedules::spawn(state.clone(), shutdown.clone())
+    };
+
     // The HTTP graceful-shutdown future resolves on signal, then drives the run
     // drain *inside itself* — this is load-bearing: `axum::serve(...).await` does
     // not return until every open connection closes, and an open SSE
@@ -1252,6 +1407,8 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
     for h in trigger_handles {
         h.abort();
     }
+    #[cfg(all(feature = "schedule", feature = "templates"))]
+    schedule_loop.abort();
     #[cfg(feature = "templates-sync")]
     for h in sync_handles {
         h.abort();

@@ -1,0 +1,4 @@
+# expect-error: serve.policy.store=file needs serve.policy.enabled=true
+serve:
+  policy:
+    store: file
