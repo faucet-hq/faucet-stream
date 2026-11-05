@@ -67,6 +67,31 @@ pub async fn write_detail(
     persist(state, ctx, action, run_id, None, None, Some(detail), result).await;
 }
 
+/// [`record()`] with a detail line too.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_detail(
+    state: &ServerState,
+    ctx: &AuthContext,
+    action: &str,
+    run_id: Option<String>,
+    config_fingerprint: Option<String>,
+    target: Option<String>,
+    detail: String,
+    result: &str,
+) {
+    persist(
+        state,
+        ctx,
+        action,
+        run_id,
+        config_fingerprint,
+        target,
+        Some(detail),
+        result,
+    )
+    .await;
+}
+
 /// [`write()`] with every field (run id, fingerprint and target).
 pub async fn record(
     state: &ServerState,

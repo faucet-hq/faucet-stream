@@ -29,7 +29,7 @@ export const NAV = [
     ["submit", "submit", "Submit", "#/submit", "config_submit"],
   ]],
   ["Govern", [
-    ["policy", "policy", "Policy", "#/policy", "", true],
+    ["policy", "policy", "Policy", "#/policy"],
     ["usage", "usage", "Usage", "#/usage"],
     ["tenants", "tenants", "Tenants", "#/tenants"],
   ]],

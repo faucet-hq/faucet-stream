@@ -69,6 +69,10 @@ fn openapi_routes() -> BTreeSet<(String, String)> {
         if path == "/mcp" {
             continue;
         }
+        #[cfg(not(feature = "policy"))]
+        if path.starts_with("/v1/policy") || path.contains("/policy") {
+            continue;
+        }
         // …and the `templates` feature's routes (#444).
         #[cfg(not(feature = "templates"))]
         if path.starts_with("/v1/templates") {

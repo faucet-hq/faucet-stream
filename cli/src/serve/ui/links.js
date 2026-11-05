@@ -28,7 +28,7 @@ export const href = {
   schedules: (query = {}) => hashFor("#/schedules", query),
   schedule: (name, query = {}) => hashFor(`#/schedules/${enc(name)}`, query),
   feeds: () => "#/feeds",
-  policy: () => "#/policy",
+  policy: (tenant) => (tenant ? `#/policy?tenant=${encodeURIComponent(tenant)}` : "#/policy"),
   settings: () => "#/settings",
 };
 

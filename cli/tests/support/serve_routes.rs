@@ -139,6 +139,27 @@ const ROUTES_SCHEDULES: &[(&str, &str)] = &[
     ("POST", "/v1/schedules/{name}/run"),
 ];
 
+/// The data-flow policy in the console (#1043).
+#[cfg(feature = "policy")]
+const ROUTES_POLICY: &[(&str, &str)] = &[
+    ("GET", "/v1/policy"),
+    ("POST", "/v1/policy"),
+    ("GET", "/v1/policy/versions"),
+    ("GET", "/v1/policy/refusals"),
+    ("POST", "/v1/policy/check"),
+    ("POST", "/v1/policy/preview"),
+    ("POST", "/v1/policy/rollback"),
+];
+
+/// Tenant policies (#1043): `policy` and `tenants` both compiled.
+#[cfg(all(feature = "policy", feature = "tenants"))]
+const ROUTES_TENANT_POLICY: &[(&str, &str)] = &[
+    ("GET", "/v1/tenants/{tenant}/policy"),
+    ("POST", "/v1/tenants/{tenant}/policy"),
+    ("POST", "/v1/tenants/{tenant}/policy/preview"),
+    ("POST", "/v1/tenants/{tenant}/policy/rollback"),
+];
+
 #[cfg(feature = "mcp")]
 const ROUTES_MCP: &[(&str, &str)] = &[("POST", "/mcp")];
 
@@ -173,6 +194,14 @@ pub fn canonical_routes() -> BTreeSet<(String, String)> {
     for (m, p) in ROUTES_SCHEDULES {
         set.insert((m.to_string(), p.to_string()));
     }
+    #[cfg(feature = "policy")]
+    for (m, p) in ROUTES_POLICY {
+        set.insert((m.to_string(), p.to_string()));
+    }
+    #[cfg(all(feature = "policy", feature = "tenants"))]
+    for (m, p) in ROUTES_TENANT_POLICY {
+        set.insert((m.to_string(), p.to_string()));
+    }
     #[cfg(feature = "mcp")]
     for (m, p) in ROUTES_MCP {
         set.insert((m.to_string(), p.to_string()));
@@ -196,6 +225,10 @@ pub fn authenticated_routes() -> Vec<(&'static str, &'static str)> {
     all.extend_from_slice(ROUTES_TENANTS);
     #[cfg(all(feature = "schedule", feature = "templates"))]
     all.extend_from_slice(ROUTES_SCHEDULES);
+    #[cfg(feature = "policy")]
+    all.extend_from_slice(ROUTES_POLICY);
+    #[cfg(all(feature = "policy", feature = "tenants"))]
+    all.extend_from_slice(ROUTES_TENANT_POLICY);
     #[cfg(feature = "mcp")]
     all.extend_from_slice(ROUTES_MCP);
     all.into_iter()

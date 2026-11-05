@@ -276,15 +276,35 @@ admin registers the pipelines; each customer's backend triggers them.
 Idempotency keys are scoped to the tenant, so `nightly-2026-10-01` sent for two
 tenants starts two runs, and a key never reveals another tenant's run.
 
+## Tenant policies
+
+A tenant can add its own [data-flow policy](./policies.md#tenant-policies) on
+top of the server's: classifications and rules for its data, enforced on its
+runs only. It is add-only — it never removes or loosens a server rule — and
+every change is a `tenant_policy_update` change request that another admin of
+the tenant, or a server admin, approves:
+
+```bash
+curl -s -X POST localhost:8080/v1/tenants/acme/policy -H "Authorization: Bearer $ACME_ADMIN" \
+  -H 'Content-Type: application/json' \
+  -d "$(jq -Rs '{policy: ., reason: "Keep contract values internal", base_version: null}' acme-policy.yaml)"
+```
+
+`GET /v1/tenants/acme/policy` shows the server rules that apply to acme beside
+its own; its refusals are under `GET /v1/policy/refusals` with the layer that
+refused each.
+
 ## Deleting a tenant
 
 ```bash
 curl -X DELETE localhost:8080/v1/tenants/acme -H "Authorization: Bearer $ADMIN"
 # → {"runs": 42, "usage_records": 42, "change_requests": 1, "state_keys_deleted": 3,
-#    "catalog_datasets": 2, "catalog_edges": 1, "catalog_config_snapshots": 1}
+#    "catalog_datasets": 2, "catalog_edges": 1, "catalog_config_snapshots": 1,
+#    "policy_versions": 2}
 ```
 
-Deletes the tenant's run records, usage records, change requests, its
+Deletes the tenant's run records, usage records, change requests, its policy
+versions, its
 Data Movement Catalog rows (a tenant run records its datasets, lineage and
 config snapshot under the `<tenant>::<pipeline>` name, like its state keys;
 a dataset another pipeline also reads or writes is kept), every

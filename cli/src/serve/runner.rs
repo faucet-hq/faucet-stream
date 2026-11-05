@@ -729,7 +729,9 @@ async fn execute_shard(
             return (ShardOutcome::Failed, ShardExit::Finished);
         }
     };
-    let LoadedSubmission { cfg, nodes, tenant } = loaded;
+    let LoadedSubmission {
+        cfg, nodes, tenant, ..
+    } = loaded;
     let clock = match resolve_clock(clock_flag.as_deref(), submitted_at) {
         Ok(c) => c,
         Err(e) => {
@@ -776,7 +778,8 @@ async fn execute_shard(
     let principal = principal.clone();
     let work = async move {
         let result = crate::runtime::run(&principal, nodes, opts).await;
-        audit_runtime_policy_denials(&audit_state, &audit_run_id, &result).await;
+        audit_runtime_policy_denials(&audit_state, &audit_run_id, principal.tenant(), &result)
+            .await;
         classify_run(result)
     }
     .instrument(span);
@@ -1184,6 +1187,7 @@ pub(crate) async fn enqueue(
         .unwrap_or_else(crate::serve::pools::default_pool);
     rec.submitted_by = Some(actor.principal.clone());
     rec.dlq_location = dlq_location(&loaded);
+    rec.policy_pin = loaded.policy_pin.clone();
 
     if state.cluster().enabled() {
         // A degraded (DB-unreachable) backend can't coordinate a cluster: the
@@ -1637,9 +1641,10 @@ impl Terminal {
 async fn audit_runtime_policy_denials(
     state: &ServerState,
     run_id: &str,
+    tenant: Option<&str>,
     result: &crate::error::CliResult<RunSummary>,
 ) {
-    let denied: Vec<String> = match result {
+    let denied: Vec<(String, String)> = match result {
         Ok(summary) => summary
             .invocations
             .iter()
@@ -1649,29 +1654,58 @@ async fn audit_runtime_policy_denials(
                     Some(crate::executor::InvocationErrorKind::Policy)
                 )
             })
-            .map(|i| i.row_id.clone())
+            .map(|i| (i.row_id.clone(), i.error.clone().unwrap_or_default()))
             .collect(),
-        Err(crate::error::CliError::Faucet(faucet_core::FaucetError::PolicyViolation {
-            ..
-        }))
-        | Err(crate::error::CliError::PolicyViolations { .. }) => vec![String::new()],
+        Err(
+            e @ (crate::error::CliError::Faucet(faucet_core::FaucetError::PolicyViolation {
+                ..
+            })
+            | crate::error::CliError::PolicyViolations { .. }),
+        ) => vec![(String::new(), e.to_string())],
         Err(_) => Vec::new(),
     };
-    for row in denied {
+    let mut actor = AuthContext::runtime();
+    actor.tenant = tenant.map(str::to_string);
+    for (row, error) in denied {
         let result = if row.is_empty() {
             "denied".to_string()
         } else {
             format!("denied:{row}")
         };
-        crate::serve::audit::write(
-            state,
-            &AuthContext::runtime(),
-            "policy.denied",
-            Some(run_id.to_string()),
-            None,
-            &result,
-        )
-        .await;
+        #[cfg(feature = "policy")]
+        {
+            let mut detail = crate::serve::policies::parse_violation_text(&error);
+            detail["phase"] = serde_json::json!("runtime");
+            detail["outcome"] = serde_json::json!(if error.contains("quarantine") {
+                "quarantined"
+            } else {
+                "failed"
+            });
+            crate::serve::audit::record_detail(
+                state,
+                &actor,
+                "policy.denied",
+                Some(run_id.to_string()),
+                None,
+                (!row.is_empty()).then(|| format!("row:{row}")),
+                detail.to_string(),
+                &result,
+            )
+            .await;
+        }
+        #[cfg(not(feature = "policy"))]
+        {
+            let _ = error;
+            crate::serve::audit::write(
+                state,
+                &actor,
+                "policy.denied",
+                Some(run_id.to_string()),
+                None,
+                &result,
+            )
+            .await;
+        }
     }
 }
 
@@ -1838,7 +1872,9 @@ async fn execute_run(
 ) {
     let server_shutdown = state.shutdown_token();
     let auth_result = loaded.auth_catalog();
-    let LoadedSubmission { cfg, nodes, tenant } = loaded;
+    let LoadedSubmission {
+        cfg, nodes, tenant, ..
+    } = loaded;
     #[cfg(feature = "catalog")]
     let catalog_tenant = tenant.as_ref().map(|t| t.values.id.clone());
 
@@ -1999,7 +2035,8 @@ async fn execute_run(
             Some((cfg, auth, run)) => crate::topology::run_topology(cfg, auth, run.clone()).await,
             None => crate::runtime::run(&principal, nodes, opts).await,
         };
-        audit_runtime_policy_denials(&audit_state, &audit_run_id, &result).await;
+        audit_runtime_policy_denials(&audit_state, &audit_run_id, principal.tenant(), &result)
+            .await;
         #[cfg(feature = "catalog")]
         {
             let (handle, pipeline, on_error, nodes) = &snapshot_inputs;

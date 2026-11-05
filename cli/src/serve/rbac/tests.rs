@@ -574,3 +574,82 @@ fn a_tenant_principal_reads_its_run_configs_and_template_runs_but_not_triggers_o
         );
     }
 }
+
+/// #1043: reading the policy is viewer+, a dry run operator+, and every
+/// change admin-only; a tenant principal reads the server rules and its own
+/// refusals, edits only its own tenant's policy, and never the server's.
+#[test]
+fn policy_routes_are_classified_and_tenant_scoped() {
+    use TenantScopeDecision::*;
+    let perm = |m: &Method, p: &str| required_permission(m, p);
+    for p in ["/v1/policy", "/v1/policy/versions", "/v1/policy/refusals"] {
+        assert_eq!(perm(&Method::GET, p), Some(Permission::PolicyRead), "{p}");
+        assert!(Role::Viewer.grants(Permission::PolicyRead));
+    }
+    assert_eq!(
+        perm(&Method::POST, "/v1/policy/check"),
+        Some(Permission::Plan)
+    );
+    for p in ["/v1/policy", "/v1/policy/preview", "/v1/policy/rollback"] {
+        assert_eq!(perm(&Method::POST, p), Some(Permission::PolicyAdmin), "{p}");
+    }
+    assert!(!Role::Operator.grants(Permission::PolicyAdmin));
+    assert!(Role::Admin.grants(Permission::PolicyAdmin));
+    assert_eq!(
+        perm(&Method::GET, "/v1/tenants/{tenant}/policy"),
+        Some(Permission::PolicyRead)
+    );
+    for p in [
+        "/v1/tenants/{tenant}/policy",
+        "/v1/tenants/{tenant}/policy/preview",
+        "/v1/tenants/{tenant}/policy/rollback",
+    ] {
+        assert_eq!(perm(&Method::POST, p), Some(Permission::PolicyAdmin), "{p}");
+    }
+    for (method, path, matched, want) in [
+        (Method::GET, "/v1/policy", "/v1/policy", Allow),
+        (
+            Method::GET,
+            "/v1/policy/refusals",
+            "/v1/policy/refusals",
+            Allow,
+        ),
+        (
+            Method::GET,
+            "/v1/policy/versions",
+            "/v1/policy/versions",
+            Deny,
+        ),
+        (Method::POST, "/v1/policy", "/v1/policy", Deny),
+        (Method::POST, "/v1/policy/check", "/v1/policy/check", Deny),
+        (
+            Method::POST,
+            "/v1/policy/preview",
+            "/v1/policy/preview",
+            Deny,
+        ),
+        (
+            Method::POST,
+            "/v1/tenants/acme/policy",
+            "/v1/tenants/{tenant}/policy",
+            Allow,
+        ),
+        (
+            Method::GET,
+            "/v1/tenants/globex/policy",
+            "/v1/tenants/{tenant}/policy",
+            NotFound,
+        ),
+    ] {
+        assert_eq!(
+            tenant_scope_decision(&method, matched, path, "acme"),
+            want,
+            "{method} {path}"
+        );
+    }
+    assert_eq!(audit_action(&Method::POST, "/v1/policy"), "policy.request");
+    assert_eq!(
+        audit_action(&Method::POST, "/v1/tenants/{tenant}/policy/rollback"),
+        "policy.rollback"
+    );
+}

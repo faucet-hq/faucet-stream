@@ -88,7 +88,7 @@ function registerRoutes() {
   route("#/schemas", renderSchemas, { group: "schemas" });
   route("#/schemas/:kind/:name", renderSchemas, { group: "schemas" });
   route("#/submit", renderSubmit, { group: "submit" });
-  route("#/policy", renderPolicy);
+  route("#/policy", renderPolicy, { group: "policy" });
   route("#/usage", renderUsage, { group: "usage" });
   route("#/tenants", renderTenants, { group: "tenants" });
   route("#/tenants/:id", renderTenants, { group: "tenants" });
