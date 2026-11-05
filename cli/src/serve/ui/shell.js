@@ -17,6 +17,7 @@ export const NAV = [
     ["changes", "changes", "Changes", "#/changes"],
     ["triggers", "trig", "Triggers", "#/triggers"],
     ["schedules", "sched", "Schedules", "#/schedules", "", true],
+    ["feeds", "feed", "Feeds", "#/feeds", "", true],
   ]],
   ["Data", [
     ["datasets", "db", "Datasets", "#/catalog"],
