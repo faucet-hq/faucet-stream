@@ -1411,4 +1411,264 @@ mod tests {
         assert!(!bad.valid && bad.error.unwrap().contains("invalid cron"));
         assert_eq!(ChangeAction::Delete.as_str(), "delete");
     }
+
+    fn spec_of(v: serde_json::Value) -> ScheduleSpec {
+        serde_json::from_value(v).unwrap()
+    }
+
+    async fn store(state: &ServerState, spec: ScheduleSpec, tenant: Option<&str>) {
+        let r = ScheduleRecord::new(spec, tenant.map(str::to_string), "ops", Utc::now());
+        assert!(state.history().schedule_insert(&r).await.unwrap());
+    }
+
+    #[test]
+    fn the_approval_gate_refuses_only_gated_kinds() {
+        let mut config = crate::serve::test_support::test_config();
+        config.require_approval = vec![ChangeKind::Schedule];
+        let state = crate::serve::test_support::state_from(&config);
+        let e = approval_gate(&state, ChangeKind::Schedule).unwrap_err();
+        assert!(matches!(&e, ServeError::Conflict(m) if m.contains("--require-approval")));
+        assert!(approval_gate(&state, ChangeKind::Run).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_stored_copy_of_a_file_schedule_is_listed_once() {
+        let state = crate::serve::test_support::test_state();
+        let dup = spec_of(json!({"name": "dup", "cron": "0 2 * * *", "template": {"id": "t"}}));
+        state.set_schedules(super::super::SchedulesRuntime::new(
+            vec![dup.clone()],
+            std::time::Duration::from_secs(300),
+        ));
+        store(&state, dup, None).await;
+        let found = all(&state).await.unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].source, Source::File);
+    }
+
+    #[tokio::test]
+    async fn detail_of_a_paused_fan_out_with_an_unresolvable_template() {
+        let state = crate::serve::test_support::test_state();
+        let op = actor(Role::Operator, None);
+        let mut fan = spec_of(json!({
+            "name": "fan", "cron": "0 2 * * *",
+            "template": {"id": "t", "version": "latest"},
+            "tenants": ["acme", "globex"]
+        }));
+        fan.paused = true;
+        store(&state, fan, None).await;
+        let d = get(&state, &op, "fan", None).await.unwrap();
+        assert!(
+            d.next_ticks.is_empty(),
+            "a paused schedule has no next ticks"
+        );
+        assert_eq!((d.resolved_version, d.template_kind), (None, None));
+
+        let missing = spec_of(
+            json!({"name": "missing", "cron": "0 2 * * *", "template": {"id": "nope", "version": "stable"}}),
+        );
+        store(&state, missing, None).await;
+        let d = get(&state, &op, "missing", None).await.unwrap();
+        assert_eq!(d.resolved_version, None);
+        assert!(!d.next_ticks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn planned_changes_refuse_bad_names_and_other_tenants_schedules() {
+        let state = crate::serve::test_support::test_state();
+        let op = actor(Role::Operator, None);
+        let acme = actor(Role::Operator, Some("acme"));
+        let n = || spec_of(json!({"name": "n", "cron": "0 2 * * *", "template": {"id": "t"}}));
+        store(&state, n(), Some("globex")).await;
+        let payload = |action, name: &str, spec: Option<ScheduleSpec>| ChangePayload {
+            action,
+            name: name.into(),
+            spec,
+        };
+        let msg = |e: ServeError| e.to_string();
+
+        let e = plan(
+            &state,
+            &op,
+            &payload(ChangeAction::Create, "other", Some(n())),
+        )
+        .await
+        .unwrap_err();
+        assert!(msg(e).contains("spec.name must equal name"));
+        assert!(matches!(
+            plan(
+                &state,
+                &acme,
+                &payload(ChangeAction::Update, "n", Some(n()))
+            )
+            .await,
+            Err(ServeError::NotFound)
+        ));
+        let mut renamed = n();
+        renamed.name = "renamed".into();
+        let e = plan(
+            &state,
+            &op,
+            &payload(ChangeAction::Update, "n", Some(renamed)),
+        )
+        .await
+        .unwrap_err();
+        assert!(msg(e).contains("name cannot change"));
+        assert!(matches!(
+            plan(&state, &acme, &payload(ChangeAction::Delete, "n", None)).await,
+            Err(ServeError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn spec_checks_for_tenants_and_fan_outs() {
+        let state = crate::serve::test_support::test_state();
+        let tenant: crate::serve::history::tenants::TenantRecord = serde_json::from_value(json!({
+            "id": "acme", "limits": {"max_schedules": 5}, "created_by": "ops",
+            "created_at": "2026-11-05T00:00:00Z", "updated_at": "2026-11-05T00:00:00Z"
+        }))
+        .unwrap();
+        state.history().tenant_upsert(&tenant).await.unwrap();
+        let acme = actor(Role::Admin, Some("acme"));
+        let plain = spec_of(json!({"name": "n", "cron": "0 2 * * *", "template": {"id": "nope"}}));
+        // Under the limit, so the template check runs (and fails: none is registered).
+        let e = check_spec(&state, &acme, &plain, Some("acme"), None)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("nope"), "{e}");
+        // A tenant principal never stores a fan-out, whatever the owner.
+        let mut fan = plain.clone();
+        fan.tenants = Some(TenantSelector::All("all".into()));
+        assert!(matches!(
+            check_spec(&state, &acme, &fan, None, None).await,
+            Err(ServeError::Forbidden(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn deleting_a_tenant_deletes_its_schedules() {
+        let state = crate::serve::test_support::test_state();
+        let tenant: crate::serve::history::tenants::TenantRecord = serde_json::from_value(json!({
+            "id": "acme", "created_by": "ops",
+            "created_at": "2026-11-05T00:00:00Z", "updated_at": "2026-11-05T00:00:00Z"
+        }))
+        .unwrap();
+        state.history().tenant_upsert(&tenant).await.unwrap();
+        store(
+            &state,
+            spec_of(json!({"name": "mine", "cron": "0 2 * * *", "template": {"id": "t"}})),
+            Some("acme"),
+        )
+        .await;
+        assert!(state.history().tenant_delete("acme").await.unwrap());
+        assert!(find(&state, "mine").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn pause_reasons_are_bounded() {
+        let state = crate::serve::test_support::test_state();
+        let op = actor(Role::Operator, None);
+        store(
+            &state,
+            spec_of(json!({"name": "n", "cron": "0 2 * * *", "template": {"id": "t"}})),
+            None,
+        )
+        .await;
+        let e = set_paused(&state, &op, "n", true, Some("x".repeat(501)))
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("at most 500"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn run_now_refuses_shared_schedules_to_tenants_and_reports_a_failed_start() {
+        let state = crate::serve::test_support::test_state();
+        let acme = actor(Role::Operator, Some("acme"));
+        let op = actor(Role::Operator, None);
+        store(
+            &state,
+            spec_of(json!({"name": "shared", "cron": "0 2 * * *", "template": {"id": "t"}, "tenants": ["acme"]})),
+            None,
+        )
+        .await;
+        let e = run_now(&state, &acme, "shared").await.unwrap_err();
+        assert!(matches!(&e, ServeError::Forbidden(m) if m.contains("server operator")));
+
+        store(
+            &state,
+            spec_of(json!({"name": "broken", "cron": "0 2 * * *", "template": {"id": "nope"}})),
+            None,
+        )
+        .await;
+        let e = run_now(&state, &op, "broken").await.unwrap_err();
+        assert!(
+            matches!(
+                &e,
+                ServeError::Unprocessable { .. } | ServeError::Unavailable(_)
+            ),
+            "{e}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_now_while_shutting_down_is_unavailable() {
+        let state = crate::serve::test_support::test_state();
+        crate::templates::register(
+            &state.history(),
+            crate::templates::store::RegisterRequest {
+                id: Some("t".into()),
+                body: "version: 1\nkind: pipeline\nname: t\npipeline:\n  source: { type: csv, config: { path: in.csv } }\n  sink: { type: stdout }\ntests:\n  suite:\n    auto: { defaults_baseline: true }\n".into(),
+                format: crate::serve::load::ConfigFormat::Yaml,
+                description: None,
+                tags: Vec::new(),
+                launch: true,
+                created_by: None,
+            },
+        )
+        .await
+        .unwrap();
+        store(
+            &state,
+            spec_of(json!({"name": "n", "cron": "0 2 * * *", "template": {"id": "t"}})),
+            None,
+        )
+        .await;
+        state.set_draining();
+        let e = run_now(&state, &actor(Role::Operator, None), "n")
+            .await
+            .unwrap_err();
+        assert!(matches!(e, ServeError::Unavailable(_)), "{e}");
+    }
+
+    #[test]
+    fn a_tick_already_listed_is_not_listed_again_as_failed_or_skipped() {
+        let at = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        let tick = at("2026-11-05T02:00:00Z");
+        let run = RunRef {
+            run_id: "a".into(),
+            name: None,
+            records_written: 0,
+            status: RunStatus::Completed,
+            tenant: None,
+            submitted_at: tick,
+            finished_at: None,
+            elapsed_secs: None,
+        };
+        let mut st = ScheduleStatus::default();
+        st.failures.push(FailedTick {
+            tick,
+            at: tick,
+            errors: vec!["refused".into()],
+        });
+        st.skipped.push(SkippedTick {
+            tick,
+            reason: "still going".into(),
+        });
+        let label = BTreeMap::from([(
+            fire::LABEL_TICK.to_string(),
+            "2026-11-05T02:00:00Z".to_string(),
+        )]);
+        let out = ticks(vec![run], &[label], &st, None);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].runs.len(), 1);
+    }
 }

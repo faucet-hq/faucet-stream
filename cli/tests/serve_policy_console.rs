@@ -673,3 +673,81 @@ async fn a_policy_file_is_read_only() {
     assert_eq!(tp["server"]["source"], "file");
     assert_eq!(tp["server"]["loaded"], true);
 }
+
+/// The dry run (`POST /v1/policy/check`): one row or every row, with sample
+/// records, an unknown row, and a server with no policy.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_policy_dry_run_checks_one_row_samples_and_no_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    spawn_server(port, dir.path(), true).await;
+    let api = Api::new(port);
+    let out = |row: &str| {
+        dir.path()
+            .join(format!("{row}.jsonl"))
+            .display()
+            .to_string()
+    };
+    let rows = format!(
+        "{}matrix:\n  - {{ id: eu, sink: {{ config: {{ path: {} }} }} }}\n  - {{ id: us, sink: {{ config: {{ path: {} }} }} }}\n",
+        config(dir.path(), "rows", "us"),
+        out("eu"),
+        out("us")
+    );
+
+    let (s, one) = api
+        .post(
+            "oscar-tok",
+            "/v1/policy/check",
+            json!({ "config": rows, "row": "eu" }),
+        )
+        .await;
+    assert_eq!(s, 200, "{one}");
+    assert_eq!(one["rows"].as_array().unwrap().len(), 1, "{one}");
+
+    let (s, e) = api
+        .post(
+            "oscar-tok",
+            "/v1/policy/check",
+            json!({ "config": rows, "row": "nope" }),
+        )
+        .await;
+    assert_eq!(s, 422, "{e}");
+    assert!(e.to_string().contains("no row 'nope'"), "{e}");
+
+    let (s, sampled) = api
+        .post(
+            "oscar-tok",
+            "/v1/policy/check",
+            json!({ "config": rows, "row": "eu", "sample": [{ "id": "1", "email": "a@example.com" }] }),
+        )
+        .await;
+    assert_eq!(s, 200, "{sampled}");
+    assert!(
+        sampled.get("loaded").is_none() || sampled["loaded"] == true,
+        "{sampled}"
+    );
+
+    // A server with no policy has nothing to check against.
+    let bare = tempfile::tempdir().unwrap();
+    let port = free_port();
+    spawn_server(port, bare.path(), false).await;
+    let (s, none) = Api::new(port)
+        .post(
+            "oscar-tok",
+            "/v1/policy/check",
+            json!({ "config": config(bare.path(), "plain", "us") }),
+        )
+        .await;
+    assert_eq!(s, 200, "{none}");
+    assert_eq!(none["loaded"], false, "{none}");
+    let (s, none) = Api::new(port)
+        .post(
+            "oscar-tok",
+            "/v1/policy/check",
+            json!({ "config": config(bare.path(), "plain", "us"), "sample": [{ "id": "1" }] }),
+        )
+        .await;
+    assert_eq!(s, 200, "{none}");
+    assert_eq!(none["loaded"], false, "{none}");
+}

@@ -589,4 +589,71 @@ mod tests {
         assert_eq!(idempotency_key("n", "t", None, None), "sched:n:t");
         assert_eq!(actor("n", Some("acme")).principal, "schedule:n");
     }
+
+    fn plain() -> ScheduleSpec {
+        serde_json::from_value(json!({
+            "name": "plain", "cron": "0 2 * * *", "template": {"id": "nope"}
+        }))
+        .unwrap()
+    }
+
+    fn failed(r: &TickResult) -> &str {
+        match &r.targets[0].1 {
+            TargetResult::Failed(e) => e,
+            other => panic!("expected a failed target, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn each_target_reports_why_it_did_not_start() {
+        let state = crate::serve::test_support::test_state();
+        let tick = at("2026-11-05T02:00:00Z");
+        let opts = FireOptions::default();
+
+        // An owned schedule targets its owner only.
+        let r = fire_tick(&state, &plain(), Some("acme"), tick, tick, &opts).await;
+        assert_eq!(r.targets.len(), 1);
+        assert_eq!(r.targets[0].0.as_deref(), Some("acme"));
+
+        // A definition whose body cannot be built.
+        let mut bad = plain();
+        bad.template.version = Some("latest".into());
+        let r = fire_tick(&state, &bad, None, tick, tick, &opts).await;
+        assert!(failed(&r).contains("template version"), "{r:?}");
+
+        // A sealed param this server has no key for.
+        let mut sealed = plain();
+        sealed.template.params.insert(
+            "token".into(),
+            json!({ super::super::secrets::SEALED: "x" }),
+        );
+        let r = fire_tick(&state, &sealed, None, tick, tick, &opts).await;
+        assert!(failed(&r).contains("template.params.token"), "{r:?}");
+    }
+
+    #[cfg(feature = "tenants")]
+    #[tokio::test]
+    async fn a_fan_out_runs_for_active_tenants_and_skips_suspended_ones() {
+        let state = crate::serve::test_support::test_state();
+        for (id, suspended) in [("acme", false), ("globex", true)] {
+            let t: crate::serve::history::tenants::TenantRecord = serde_json::from_value(json!({
+                "id": id, "suspended": suspended, "created_by": "ops",
+                "created_at": "2026-11-05T00:00:00Z", "updated_at": "2026-11-05T00:00:00Z"
+            }))
+            .unwrap();
+            state.history().tenant_upsert(&t).await.unwrap();
+        }
+        use crate::serve::history::tenants::TenantSelector;
+        let tick = at("2026-11-05T02:00:00Z");
+        for selector in [
+            TenantSelector::All("all".into()),
+            TenantSelector::Named(vec!["acme".into(), "globex".into(), "ghost".into()]),
+        ] {
+            let mut fan = plain();
+            fan.tenants = Some(selector);
+            let r = fire_tick(&state, &fan, None, tick, tick, &FireOptions::default()).await;
+            let tenants: Vec<_> = r.targets.iter().map(|(t, _)| t.as_deref()).collect();
+            assert_eq!(tenants, vec![Some("acme")], "{r:?}");
+        }
+    }
 }

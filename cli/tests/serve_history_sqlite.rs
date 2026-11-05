@@ -2587,3 +2587,53 @@ impl RunHistory for DefaultTenantReplace {
         self.0.tenant_get(id).await
     }
 }
+
+/// #1044: schedules are stored, replaced only while unchanged, listed,
+/// deleted, and deleted with their tenant.
+#[tokio::test]
+async fn schedules_round_trip_through_sqlite() {
+    use faucet_cli::serve::history::schedules::{ScheduleRecord, ScheduleSpec};
+    let dir = tempfile::tempdir().unwrap();
+    let h = store(&dir, "schedules.db").await;
+    let spec = |name: &str| -> ScheduleSpec {
+        serde_json::from_value(serde_json::json!({
+            "name": name, "cron": "0 2 * * *", "template": {"id": "t"}
+        }))
+        .unwrap()
+    };
+    let rec = ScheduleRecord::new(spec("nightly"), None, "alice", Utc::now());
+    assert!(h.schedule_insert(&rec).await.unwrap());
+    assert!(!h.schedule_insert(&rec).await.unwrap(), "the name is taken");
+
+    let mut next = rec.clone();
+    next.spec.cron = "0 3 * * *".into();
+    assert!(h.schedule_replace(&rec, &next).await.unwrap());
+    assert!(
+        !h.schedule_replace(&rec, &next).await.unwrap(),
+        "a stale expected record replaces nothing"
+    );
+    assert_eq!(
+        h.schedule_get("nightly").await.unwrap().unwrap().spec.cron,
+        "0 3 * * *"
+    );
+    assert_eq!(h.schedule_list().await.unwrap().len(), 1);
+    assert!(h.schedule_delete("nightly").await.unwrap());
+    assert!(!h.schedule_delete("nightly").await.unwrap());
+
+    let owned = ScheduleRecord::new(
+        spec("acme-nightly"),
+        Some("acme".into()),
+        "acme",
+        Utc::now(),
+    );
+    assert!(h.schedule_insert(&owned).await.unwrap());
+    let tenant: faucet_cli::serve::history::tenants::TenantRecord =
+        serde_json::from_value(serde_json::json!({
+            "id": "acme", "created_by": "ops",
+            "created_at": "2026-11-05T00:00:00Z", "updated_at": "2026-11-05T00:00:00Z"
+        }))
+        .unwrap();
+    h.tenant_upsert(&tenant).await.unwrap();
+    assert!(h.tenant_delete("acme").await.unwrap());
+    assert!(h.schedule_get("acme-nightly").await.unwrap().is_none());
+}

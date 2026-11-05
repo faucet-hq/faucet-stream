@@ -3024,6 +3024,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schedule_and_policy_defaults_refuse_writes_and_read_empty() {
+        let h = Bare;
+        let spec: schedules::ScheduleSpec = serde_json::from_value(serde_json::json!({
+            "name": "n", "cron": "0 2 * * *", "template": {"id": "t"}
+        }))
+        .unwrap();
+        let s = schedules::ScheduleRecord::new(spec, None, "x", Utc::now());
+        assert!(h.schedule_insert(&s).await.is_err());
+        assert!(h.schedule_replace(&s, &s).await.is_err());
+        assert!(h.schedule_get("n").await.unwrap().is_none());
+        assert!(h.schedule_list().await.unwrap().is_empty());
+        assert!(!h.schedule_delete("n").await.unwrap());
+
+        let v: policies::PolicyVersionRecord = serde_json::from_value(serde_json::json!({
+            "scope": "server", "version": 1, "spec": {"version": 1},
+            "created_at": "2026-11-05T00:00:00Z", "created_by": "x"
+        }))
+        .unwrap();
+        assert!(h.policy_version_insert(&v).await.is_err());
+        assert!(h.policy_versions("server", 0).await.unwrap().is_empty());
+        assert!(h.policy_version_get("server", 1).await.unwrap().is_none());
+        assert_eq!(h.policy_versions_delete("server").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn tenant_defaults_refuse_writes_and_read_empty() {
         let h = Bare;
         let now = Utc::now();

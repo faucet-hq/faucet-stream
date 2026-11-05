@@ -505,6 +505,17 @@ mod tests {
         assert!(r.is_ok(), "{r:?}");
     }
 
+    #[cfg(all(feature = "schedule", feature = "templates"))]
+    #[tokio::test]
+    async fn schema_prints_the_schedules_file() {
+        let r = super::run(SchemaArgs {
+            target: Some(SchemaTarget::Schedules),
+            list: false,
+        })
+        .await;
+        assert!(r.is_ok(), "{r:?}");
+    }
+
     #[tokio::test]
     async fn schema_no_target_without_list_errors() {
         let r = super::run(SchemaArgs {

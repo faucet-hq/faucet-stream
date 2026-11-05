@@ -592,4 +592,125 @@ mod tests {
         s.reconcile(vec![(bad, None, Source::File)], now);
         assert!(s.entries.is_empty());
     }
+
+    fn overlapping(mode: &str) -> Entry {
+        let mut s = spec("0 * * * *", true);
+        s.overlap = serde_json::from_value(json!(mode)).unwrap();
+        let compiled = super::super::validate::validate(&s).unwrap();
+        let mut e = Entry::new(s, None, Source::File, compiled, at("2026-09-26T10:00:30Z"));
+        e.resumed = true;
+        e
+    }
+
+    async fn outcome(state: &ServerState, name: &str) -> Option<String> {
+        status::read(&*state.history(), name).await.last_outcome
+    }
+
+    #[tokio::test]
+    async fn an_overlapping_tick_is_skipped_held_or_refused() {
+        let state = crate::serve::test_support::test_state();
+        let labels = BTreeMap::from([(fire::LABEL_SCHEDULE.to_string(), "nightly".to_string())]);
+        let earlier = crate::serve::history::RunRecord::queued(
+            "earlier".into(),
+            None,
+            labels,
+            None,
+            Utc::now(),
+        );
+        state.history().upsert(&earlier).await.unwrap();
+        let tick = at("2026-09-26T11:00:00Z");
+        for (mode, want) in [
+            ("skip", "skipped"),
+            ("queue", "waiting"),
+            ("forbid", "failed"),
+        ] {
+            let mut e = overlapping(mode);
+            step(&state, &mut e, tick).await;
+            assert_eq!(
+                outcome(&state, "nightly").await.as_deref(),
+                Some(want),
+                "{mode}"
+            );
+            if mode == "queue" {
+                assert!(e.retry_at.is_some(), "a held tick is looked at again");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tick_that_cannot_start_is_retried() {
+        let state = crate::serve::test_support::test_state();
+        crate::templates::register(
+            &state.history(),
+            crate::templates::store::RegisterRequest {
+                id: Some("t".into()),
+                body: "version: 1\nkind: pipeline\nname: t\npipeline:\n  source: { type: csv, config: { path: in.csv } }\n  sink: { type: stdout }\ntests:\n  suite:\n    auto: { defaults_baseline: true }\n".into(),
+                format: crate::serve::load::ConfigFormat::Yaml,
+                description: None,
+                tags: Vec::new(),
+                launch: true,
+                created_by: None,
+            },
+        )
+        .await
+        .unwrap();
+        state.set_draining();
+        let mut s = spec("0 * * * *", true);
+        s.name = "drained".into();
+        let compiled = super::super::validate::validate(&s).unwrap();
+        let mut e = Entry::new(s, None, Source::File, compiled, at("2026-09-26T10:00:30Z"));
+        e.resumed = true;
+        step(&state, &mut e, at("2026-09-26T11:00:00Z")).await;
+        assert_eq!(
+            outcome(&state, "drained").await.as_deref(),
+            Some("retrying")
+        );
+        assert_eq!(e.attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn missed_ticks_found_on_resume_are_recorded() {
+        let state = crate::serve::test_support::test_state();
+        let h = state.history();
+        let old = entry("0 * * * *", at("2026-09-26T10:30:00Z"));
+        status::record_tick(&*h, "nightly", &old.last_tick(at("2026-09-26T11:00:00Z"))).await;
+        let now = at("2026-09-26T15:30:00Z");
+        let mut back = entry("0 * * * *", now);
+        step(&state, &mut back, now).await;
+        assert!(back.resumed);
+        assert!(!status::read(&*h, "nightly").await.missed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_stored_schedule_never_shadows_a_file_one() {
+        let state = crate::serve::test_support::test_state();
+        let s = spec("0 * * * *", true);
+        state.set_schedules(super::super::SchedulesRuntime::new(
+            vec![s.clone()],
+            Duration::from_secs(300),
+        ));
+        let r = crate::serve::history::schedules::ScheduleRecord::new(s, None, "ops", Utc::now());
+        assert!(state.history().schedule_insert(&r).await.unwrap());
+        let w = wanted(&state).await.unwrap();
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].2, Source::File);
+    }
+
+    #[tokio::test]
+    async fn the_loop_stops_on_shutdown() {
+        let state = crate::serve::test_support::test_state();
+        state.set_schedules(super::super::SchedulesRuntime::new(
+            vec![spec("* * * * * *", true)],
+            Duration::from_secs(300),
+        ));
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(run(state, shutdown.clone()));
+        #[allow(clippy::disallowed_methods)] // let the loop go round before stopping it
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the loop returns once shut down")
+            .unwrap();
+    }
 }

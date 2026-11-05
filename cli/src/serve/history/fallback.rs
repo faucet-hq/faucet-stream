@@ -1338,6 +1338,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schedules_reach_the_primary_and_wait_for_a_degraded_one() {
+        let spec: crate::serve::history::schedules::ScheduleSpec =
+            serde_json::from_value(serde_json::json!({
+                "name": "n", "cron": "0 2 * * *", "template": {"id": "t"}
+            }))
+            .unwrap();
+        let rec = crate::serve::history::schedules::ScheduleRecord::new(
+            spec,
+            None,
+            "alice",
+            chrono::Utc::now(),
+        );
+        let healthy = FallbackHistory::healthy(
+            Box::new(MemoryHistory::new(Duration::from_secs(60))),
+            Duration::from_secs(60),
+            "test",
+        );
+        assert!(healthy.schedule_insert(&rec).await.unwrap());
+        let mut next = rec.clone();
+        next.spec.cron = "0 3 * * *".into();
+        assert!(healthy.schedule_replace(&rec, &next).await.unwrap());
+        assert_eq!(
+            healthy.schedule_get("n").await.unwrap().unwrap().spec.cron,
+            "0 3 * * *"
+        );
+        assert_eq!(healthy.schedule_list().await.unwrap().len(), 1);
+        assert!(healthy.schedule_delete("n").await.unwrap());
+
+        healthy.degraded.store(true, Ordering::Release);
+        assert!(healthy.schedule_insert(&rec).await.is_err());
+        assert!(healthy.schedule_list().await.is_err());
+    }
+
+    #[tokio::test]
     async fn run_secrets_reach_the_primary_and_wait_for_a_degraded_one() {
         let healthy = FallbackHistory::healthy(
             Box::new(MemoryHistory::new(Duration::from_secs(60))),
