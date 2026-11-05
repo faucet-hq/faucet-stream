@@ -507,7 +507,7 @@ async fn the_memory_backend_and_the_listing_default_agree() {
     assert!(direct.freshness.is_none());
 }
 
-#[cfg(feature = "serve-history-sqlite")]
+#[cfg(feature = "serve")]
 #[tokio::test]
 async fn sqlite_groups_to_the_same_aggregates_as_memory() {
     let dir = tempfile::tempdir().unwrap();
@@ -563,7 +563,7 @@ async fn sqlite_groups_to_the_same_aggregates_as_memory() {
     }
 }
 
-#[cfg(any(feature = "serve-history-postgres", feature = "serve-history-sqlite"))]
+#[cfg(feature = "serve")]
 #[test]
 fn postgres_statements_number_their_binds_in_order() {
     use crate::serve::history::sql::Dialect;
@@ -660,7 +660,7 @@ fn runs_group_and_filter_by_their_pipeline_label() {
     assert_eq!(bare.pipeline_key(), "");
 }
 
-#[cfg(feature = "serve-history-sqlite")]
+#[cfg(feature = "serve")]
 #[tokio::test]
 async fn sqlite_groups_by_the_pipeline_label_like_memory() {
     let dir = tempfile::tempdir().unwrap();

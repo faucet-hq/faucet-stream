@@ -1,5 +1,7 @@
 # expect-error: without a volume the sqlite file is on an emptyDir
 serve:
+  persistence:
+    enabled: false
   cluster:
     enabled: true
   history:

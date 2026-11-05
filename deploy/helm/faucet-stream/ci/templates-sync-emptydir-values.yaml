@@ -4,6 +4,8 @@
 # expect: token: "${env:GITHUB_TOKEN}"
 # expect: WARNING: serve.templatesSync is on with a run history that does not survive
 serve:
+  persistence:
+    enabled: false
   history:
     backend: sqlite
   templatesSync:

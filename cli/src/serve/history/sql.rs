@@ -404,7 +404,7 @@ impl BindMark for sqlx::PgPool {
     }
 }
 
-#[cfg(feature = "serve-history-sqlite")]
+#[cfg(feature = "serve")]
 impl BindMark for sqlx::SqlitePool {
     fn mark(&self, _n: usize) -> String {
         "?".to_string()

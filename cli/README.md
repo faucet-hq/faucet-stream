@@ -335,7 +335,7 @@ Auth is mandatory: without `--auth-token`/`FAUCET_SERVE_AUTH_TOKEN` **and** with
 | `--allow-secret-scheme <scheme>` | Secret-manager scheme (`vault`, `aws-sm`, `gcp-sm`, `azure-kv`) a submitted config may resolve with the server's credentials. Default: none. |
 | `--tenant-path-root <dir>` | Confine the local paths of a config submitted for a tenant to `<dir>/<tenant id>`. |
 | `--max-concurrent-runs` / `--max-queued-runs` | Concurrency + queue caps (submit past the queue → 429 + `Retry-After`). |
-| `--history <url>` | `postgres://…` / `sqlite:…` for durable history (`serve-history-postgres` / `serve-history-sqlite`; default in-memory). |
+| `--history <url>` | Where the run history lives. Default: a SQLite file, `$FAUCET_DATA_DIR/history.db` (`~/.faucet/history.db`), created on first start; an unusable directory refuses to start, and a second server on the same file refuses too (#1049). `sqlite:<path>`, or `postgres://…` (`serve-history-postgres`; for several replicas / `--cluster`). `memory` keeps nothing across a restart: it warns at start, shows in `/readyz` and as a console banner, and refuses policy edits. |
 | `--default-config <path>` | Workspace defaults merged **under** every submitted run. |
 | `--cors-origin <o>` | Allow-list a browser origin (repeatable; CORS off by default). |
 | `--allowed-host <host>` | A host name clients reach the server by (repeatable or comma-separated; `*` for any; env `FAUCET_SERVE_ALLOWED_HOSTS`). Set, any other `Host` gets `403`. Unset, only a `--no-auth` server on loopback checks `Host` (allowing `localhost`, `127.0.0.1`, `[::1]` and its listen address). Health and metrics probes are exempt. |

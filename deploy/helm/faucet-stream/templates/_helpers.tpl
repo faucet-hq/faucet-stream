@@ -311,7 +311,8 @@ true
 
 {{/*
 serve.history.backend, lower-cased (validation.yaml refuses any other value).
+Unset is the server's own default (#1049): a SQLite file in the data dir.
 */}}
 {{- define "faucet-stream.historyBackend" -}}
-{{- .Values.serve.history.backend | toString | lower | trim -}}
+{{- .Values.serve.history.backend | default "sqlite" | toString | lower | trim -}}
 {{- end -}}

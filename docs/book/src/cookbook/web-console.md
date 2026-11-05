@@ -93,7 +93,13 @@ live there and how to do it today.
 - The **top bar** holds the tenant switcher (Runs, Usage and Changes follow
   it), the display time zone (every time and date input follows it), the light
   / dark switch and a button that hides the sidebar. The **status line** shows
-  the run-history backend's health, cluster size and the server version.
+  the run-history backend (`sqlite`, `postgres` or `memory`) and its health,
+  cluster size and the server version.
+- On a server started with `--history memory`, admins see a banner on every
+  page: **History is in memory: runs, audit and settings are lost on
+  restart.** Start the server without that flag to keep its history in
+  `~/.faucet/history.db` (or `$FAUCET_DATA_DIR`), or pass a `sqlite:` path or
+  a `postgres://` URL.
 - Below 1100px the sidebar shrinks to icons and list pages show the selected
   item in place of the list, with a back link.
 

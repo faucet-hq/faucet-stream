@@ -48,7 +48,7 @@ fn serve_args(port: u16, auth_config: std::path::PathBuf, s: Setup) -> faucet_cl
         max_concurrent_runs: Some(4),
         max_queued_runs: Some(16),
         default_config: s.default_config,
-        history: s.history,
+        history: s.history.or_else(|| Some("memory".into())),
         cors_origin: vec![],
         body_limit_bytes: 1_048_576,
         shutdown_grace_secs: 5,
@@ -395,7 +395,7 @@ async fn the_trigger_list_shows_every_trigger_with_its_fires() {
     let api = spawn_server(
         dir.path(),
         Setup {
-            history: None,
+            history: Some("memory".into()),
             cluster: false,
             triggers: Some(triggers),
             default_config: None,
@@ -431,7 +431,7 @@ async fn a_template_lists_its_runs_and_reload_names_the_load_time() {
     let api = spawn_server(
         dir.path(),
         Setup {
-            history: None,
+            history: Some("memory".into()),
             cluster: false,
             triggers: None,
             default_config: Some(default),

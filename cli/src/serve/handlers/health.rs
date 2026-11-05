@@ -33,6 +33,10 @@ pub async fn readyz(State(state): State<ServerState>) -> impl IntoResponse {
     let body = json!({
         "status": if code == StatusCode::OK { "ready" } else { "not_ready" },
         "history_ok": history_ok,
+        "history": {
+            "kind": state.history_kind(),
+            "persistent": state.persistent_history(),
+        },
         "queue_ok": queue_ok,
         "draining": draining,
         "cluster": {

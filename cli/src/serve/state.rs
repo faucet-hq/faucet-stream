@@ -49,6 +49,8 @@ struct Inner {
     callback_allow_hosts: Vec<String>,
     /// Whether `--history` names a SQL backend (run records outlive the process).
     persistent_history: bool,
+    /// The run-history backend: `memory`, `sqlite` or `postgres` (#1049).
+    history_kind: &'static str,
     cluster: crate::serve::cluster::ClusterHandle,
     #[cfg(feature = "triggers")]
     triggers: crate::serve::triggers::health::TriggersHandle,
@@ -140,6 +142,7 @@ impl ServerState {
                     config.history,
                     crate::serve::config::HistoryBackendSpec::Memory
                 ),
+                history_kind: config.history.kind(),
                 cluster: crate::serve::cluster::ClusterHandle::from_config(config),
                 #[cfg(feature = "triggers")]
                 triggers,
@@ -455,6 +458,11 @@ impl ServerState {
     /// lock, so a concurrent hot reload can't tear it).
     pub fn default_base(&self) -> Option<Value> {
         self.inner.default_base.read().unwrap().clone()
+    }
+
+    /// The run-history backend: `memory`, `sqlite` or `postgres` (#1049).
+    pub fn history_kind(&self) -> &'static str {
+        self.inner.history_kind
     }
 
     /// Path the default-config was loaded from (`None` when `--default-config`

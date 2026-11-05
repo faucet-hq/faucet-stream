@@ -192,9 +192,13 @@ serve:
     # a new salt and rolls the pods.
     checksumSalt: ""
 
-  # Run-history backend: "memory" | "sqlite" | "postgres"
+  # Run-history backend: "" | "sqlite" | "postgres" | "memory".
+  # Unset (the default, #1049): the server keeps its history in
+  # $FAUCET_DATA_DIR/history.db, on the data volume (see persistence). Use
+  # postgres for several replicas or --cluster. `memory` keeps nothing across
+  # a restart (runs, audit, templates, schedules, policy) — an explicit opt-in.
   history:
-    backend: memory
+    backend: ""
     # sqlite: defaults to a file on the mounted volume (see persistence).
     # postgres: a DSN. The URL reaches the pod as FAUCET_SERVE_HISTORY, never
     # on the command line; a postgres DSN is stored in a chart-managed Secret.
@@ -440,10 +444,11 @@ serve:
   #   type: RollingUpdate
   #   rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
 
-  # A writable scratch dir (root fs is read-only). Also backs sqlite history
-  # when persistence.enabled=false (emptyDir) — use persistence for durability.
+  # The data dir (root fs is read-only): the default SQLite run history lives
+  # here (#1049), on a PVC by default. `enabled: false` uses an emptyDir
+  # instead, which loses the history on every pod restart.
   persistence:
-    enabled: false
+    enabled: true
     size: 1Gi
     storageClass: ""
     accessModes: [ReadWriteOnce]

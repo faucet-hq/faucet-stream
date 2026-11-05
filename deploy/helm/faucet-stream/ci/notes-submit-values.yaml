@@ -4,5 +4,7 @@
 # expect-not: Content-Type: application/yaml
 # expect-not: type: Recreate
 serve:
+  persistence:
+    enabled: false
   auth:
     mode: token

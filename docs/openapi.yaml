@@ -3322,9 +3322,11 @@ paths:
         503 when the history backend is degraded or did not answer the last
         lease heartbeat, the run queue is full, or the server is shutting down
         (`draining`). Always returns a JSON body with
-        `status`, `history_ok`, `queue_ok`, `draining`, and a `cluster` object
-        (`enabled` bool, `instances` live-member count, this replica's
-        `pools`, and the live `members` with the pools each serves).
+        `status`, `history_ok`, `history` (`kind`: `sqlite` / `postgres` /
+        `memory`, and whether it is `persistent`), `queue_ok`, `draining`, and
+        a `cluster` object (`enabled` bool, `instances` live-member count,
+        this replica's `pools`, and the live `members` with the pools each
+        serves).
       operationId: readyz
       security: []
       responses:
@@ -3337,6 +3339,12 @@ paths:
                 properties:
                   status: { type: string, example: ready }
                   history_ok: { type: boolean }
+                  history:
+                    type: object
+                    description: "The run-history backend. `persistent: false` (`--history memory`) loses runs, audit and settings on restart."
+                    properties:
+                      kind: { type: string, enum: [sqlite, postgres, memory] }
+                      persistent: { type: boolean }
                   queue_ok: { type: boolean }
                   draining: { type: boolean, description: "true once shutdown began; new work is refused." }
                   cluster:

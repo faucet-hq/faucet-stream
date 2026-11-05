@@ -906,7 +906,7 @@ mod tests {
     /// `plan --diff` end-to-end over a real sqlite catalog: first run reports
     /// first-run (nothing recorded), then after a snapshot is recorded the diff
     /// compares against it. Exercises `run_diff` both branches.
-    #[cfg(all(feature = "catalog", feature = "serve-history-sqlite"))]
+    #[cfg(all(feature = "catalog", feature = "serve"))]
     #[tokio::test]
     async fn plan_diff_first_run_then_against_recorded_snapshot() {
         let dir = tempfile::tempdir().unwrap();

@@ -5,7 +5,7 @@
 //! See spec §11 + §20.
 
 pub mod catalog;
-#[cfg(any(feature = "serve-history-postgres", feature = "serve-history-sqlite"))]
+#[cfg(feature = "serve")]
 pub mod fallback;
 pub mod labels;
 pub mod memory;
@@ -14,9 +14,9 @@ pub mod policies;
 #[cfg(feature = "serve-history-postgres")]
 pub mod postgres;
 pub mod schedules;
-#[cfg(any(feature = "serve-history-postgres", feature = "serve-history-sqlite"))]
+#[cfg(feature = "serve")]
 pub mod sql;
-#[cfg(feature = "serve-history-sqlite")]
+#[cfg(feature = "serve")]
 pub mod sqlite;
 pub mod templates;
 pub mod tenants;
@@ -2461,7 +2461,7 @@ async fn connect_postgres(
     ))
 }
 
-#[cfg(feature = "serve-history-sqlite")]
+#[cfg(feature = "serve")]
 async fn connect_sqlite(
     url: &str,
     idem: Duration,
@@ -2489,26 +2489,12 @@ async fn connect_sqlite(
     Ok(into_history(result, idem, "sqlite", connector))
 }
 
-#[cfg(not(feature = "serve-history-sqlite"))]
-async fn connect_sqlite(
-    _url: &str,
-    _idem: Duration,
-    _lease_ttl: Duration,
-    _instance_id: &str,
-) -> CliResult<Arc<dyn RunHistory>> {
-    Err(crate::error::CliError::Serve(
-        "persistent SQLite run history requires building faucet with the \
-         `serve-history-sqlite` feature"
-            .into(),
-    ))
-}
-
 /// How many times `connect_with_retry` attempts a transient backend connect
 /// before giving up and degrading. Eight attempts with capped exponential
 /// backoff span a few seconds — long enough for two clustered instances to get
 /// past the WAL/DDL startup race on a shared SQLite file, short enough not to
 /// stall startup against a genuinely-down backend.
-#[cfg(any(feature = "serve-history-postgres", feature = "serve-history-sqlite"))]
+#[cfg(feature = "serve")]
 const CONNECT_ATTEMPTS: usize = 8;
 
 /// Retry a *retriable* backend-connect failure before falling back to degraded
@@ -2525,7 +2511,7 @@ const CONNECT_ATTEMPTS: usize = 8;
 /// degrade (#654 M1). Only a *typed-permanent* failure short-circuits; an
 /// unclassified one costs at most the (bounded) attempt budget before
 /// degrading with the same message it would have degraded with immediately.
-#[cfg(any(feature = "serve-history-postgres", feature = "serve-history-sqlite"))]
+#[cfg(feature = "serve")]
 #[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
 async fn connect_with_retry<H, F, Fut>(label: &str, mut make: F) -> Result<H, HistoryError>
 where
@@ -2554,7 +2540,7 @@ where
 
 /// Wrap a SQL backend in `FallbackHistory`: healthy on success; degraded-on-
 /// in-memory (server stays up, `/readyz` reports 503) on a connect failure.
-#[cfg(any(feature = "serve-history-postgres", feature = "serve-history-sqlite"))]
+#[cfg(feature = "serve")]
 fn into_history<H: RunHistory + 'static>(
     result: Result<H, HistoryError>,
     idem: Duration,
@@ -3321,10 +3307,7 @@ mod tests {
     }
 }
 
-#[cfg(all(
-    test,
-    any(feature = "serve-history-postgres", feature = "serve-history-sqlite")
-))]
+#[cfg(all(test, feature = "serve"))]
 mod connect_retry_tests {
     use super::*;
     use std::cell::Cell;

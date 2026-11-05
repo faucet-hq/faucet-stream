@@ -1,4 +1,6 @@
 # expect-error: serve.cluster.enabled=true requires a persistent history backend
 serve:
+  history:
+    backend: memory
   cluster:
     enabled: true

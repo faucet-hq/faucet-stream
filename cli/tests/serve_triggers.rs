@@ -1027,7 +1027,7 @@ async fn spawn_serve_with_triggers(
         max_concurrent_runs: Some(4),
         max_queued_runs: Some(16),
         default_config: None,
-        history: None,
+        history: Some("memory".into()),
         cors_origin: vec![],
         body_limit_bytes: 1_048_576,
         shutdown_grace_secs: 5,

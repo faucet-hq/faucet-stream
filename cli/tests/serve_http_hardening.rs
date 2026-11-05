@@ -20,7 +20,7 @@ fn config(listen: &str) -> ServeConfig {
         max_concurrent_runs: Some(2),
         max_queued_runs: Some(8),
         default_config: None,
-        history: None,
+        history: Some("memory".into()),
         cors_origin: vec!["https://app.example".into()],
         body_limit_bytes: 8 * 1024 * 1024,
         shutdown_grace_secs: 5,

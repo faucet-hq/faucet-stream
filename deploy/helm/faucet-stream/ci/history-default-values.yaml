@@ -1,0 +1,9 @@
+# #1049: with serve.history unset the server keeps its history in
+# $FAUCET_DATA_DIR/history.db, on the chart's PVC.
+# expect: - name: FAUCET_DATA_DIR
+# expect: value: "/var/lib/faucet"
+# expect: claimName: t-faucet-stream-data
+# expect: type: Recreate
+# expect-not: name: FAUCET_SERVE_HISTORY
+serve:
+  enabled: true

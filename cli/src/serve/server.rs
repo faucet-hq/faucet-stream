@@ -910,6 +910,19 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
     if let Some(key) = crate::catalog::snapshot::key_file_path() {
         crate::serve::load::protect_file(&key);
     }
+    // The default history file (#1049): claim its directory first, and hold
+    // the lock until this server stops.
+    let history_lock = crate::serve::config::claim_default_history(&config.history)?;
+    if matches!(
+        config.history,
+        crate::serve::config::HistoryBackendSpec::Memory
+    ) {
+        tracing::warn!(
+            "--history memory: the run history is kept in this process only; on restart it \
+             loses {}",
+            crate::serve::config::MEMORY_HISTORY_LOSES
+        );
+    }
     let history = crate::serve::history::connect(
         &config.history,
         config.idempotency_retention,
@@ -917,6 +930,16 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         &instance_id,
     )
     .await?;
+    if history_lock.is_some() && history.degraded() {
+        // The default file could not be opened: refuse rather than run on
+        // memory without being asked to.
+        return Err(CliError::Serve(format!(
+            "could not open the default run history in {}; set $FAUCET_DATA_DIR or --history, \
+             or --history memory to keep nothing across restarts",
+            crate::serve::config::default_data_dir().display()
+        )));
+    }
+    let _history_lock = history_lock;
     if config.cluster.enabled {
         // Cluster mode: a restarting instance re-queues its prior incarnation's
         // in-flight runs (capped) rather than failing them.

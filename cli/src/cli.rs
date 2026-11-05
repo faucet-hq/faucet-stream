@@ -2322,8 +2322,10 @@ pub struct ServeArgs {
     /// Workspace-default config merged under every submitted run.
     #[arg(long)]
     pub default_config: Option<std::path::PathBuf>,
-    /// Run-history backend URL: omitted = in-memory; postgres://… ; sqlite:… .
-    /// Prefer the env var for a URL with a password (keeps it out of `ps`).
+    /// Run-history backend: omitted = a SQLite file, $FAUCET_DATA_DIR/history.db
+    /// (~/.faucet/history.db); sqlite:<path>; postgres://…; `memory` keeps
+    /// nothing across a restart. Prefer the env var for a URL with a password
+    /// (keeps it out of `ps`).
     #[arg(long, env = "FAUCET_SERVE_HISTORY", hide_env_values = true)]
     pub history: Option<String>,
     /// CORS allow-list origin (repeatable). Omitted = CORS disabled.

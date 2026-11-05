@@ -165,7 +165,16 @@ spec:
               value: {{ .Values.serve.preview.maxRows | quote }}
             {{- /* The history URL travels as FAUCET_SERVE_HISTORY, never on the
                    command line: a postgres DSN carries a password (#789 SUPPLY-07). */}}
-            {{- if ne (include "faucet-stream.historyBackend" $) "memory" }}
+            {{- if eq (include "faucet-stream.historyBackend" $) "memory" }}
+            # The run history is lost on every restart: an explicit opt-in (#1049).
+            - name: FAUCET_SERVE_HISTORY
+              value: "memory"
+            {{- else if and (not .Values.serve.history.backend) (not .Values.serve.history.existingSecret) (not .Values.serve.history.url) }}
+            # The server's default history, $FAUCET_DATA_DIR/history.db, on the
+            # data volume (#1049).
+            - name: FAUCET_DATA_DIR
+              value: {{ $mountPath | quote }}
+            {{- else }}
             {{- if or .Values.serve.history.existingSecret .Values.serve.history.url }}
             {{- if or .Values.serve.history.existingSecret (eq (include "faucet-stream.historyBackend" $) "postgres") }}
             - name: FAUCET_SERVE_HISTORY

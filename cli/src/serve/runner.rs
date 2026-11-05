@@ -3494,7 +3494,7 @@ mod tests {
         assert_eq!(got.idempotency_key.as_deref(), Some("idem-k"));
     }
 
-    #[cfg(any(feature = "serve-history-sqlite", feature = "serve-history-postgres"))]
+    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn cluster_submit_503s_when_history_degraded() {
         // #197 spec §9: a degraded backend can't coordinate a cluster, so submit
@@ -3604,7 +3604,7 @@ mod tests {
     // is inert for shards). No Docker: the S3 source builds offline and its
     // enumerate_shards is pure (hash-modulo); csv→jsonl runs entirely on temp
     // files.
-    #[cfg(feature = "serve-history-sqlite")]
+    #[cfg(feature = "serve")]
     mod shards {
         use super::*;
         use crate::serve::config::{AuthMode, HistoryBackendSpec, ServeConfig};

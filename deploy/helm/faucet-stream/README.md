@@ -110,9 +110,20 @@ serve:
   cluster:
     enabled: true
   history:
-    backend: postgres     # memory | sqlite | postgres
+    backend: postgres     # "" (default) | sqlite | postgres | memory
     existingSecret: faucet-history   # key FAUCET_SERVE_HISTORY = postgres://…
 ```
+
+- **History** (#1049): with `serve.history` unset the server keeps its run
+  history — runs, audit, templates, schedules, policy versions, tenants — in
+  `$FAUCET_DATA_DIR/history.db`; the chart sets `FAUCET_DATA_DIR` to
+  `serve.persistence.mountPath` and mounts a PVC there
+  (`serve.persistence.enabled: true`, the default), so it survives pod
+  restarts and upgrades. `serve.persistence.enabled: false` uses an emptyDir
+  (lost on every restart). For more than one replica or `cluster.enabled`, use
+  a shared Postgres (`history.backend: postgres`, the DSN in a Secret, as
+  above). `history.backend: memory` keeps nothing across a restart: the pod
+  warns at start and the console shows a banner.
 
 - **Auth**: `token` (bearer; the chart mints a stable random token into a Secret,
   or use `auth.token` / `auth.existingSecret`), `none` (`--no-auth --allow-unauthenticated-network`:
@@ -455,7 +466,7 @@ See [`values.yaml`](./values.yaml) — every key is commented. Common ones:
 | `connectors.verify.enabled` | `true` | fail pod start if a declared connector is absent |
 | `serve.enabled` | `true` | deploy the control plane |
 | `serve.auth.mode` | `token` | `token` \| `none` \| `rbac` |
-| `serve.history.backend` | `memory` | `memory` \| `sqlite` \| `postgres` (any other value fails rendering) |
+| `serve.history.backend` | `""` | unset: the server default, `$FAUCET_DATA_DIR/history.db` on the data volume; `sqlite` \| `postgres` \| `memory` (any other value fails rendering) |
 | `serve.localOutputs.retentionDays` | `7` | days before local sink output files (jsonl/csv/parquet) are reclaimed; `0` disables the sweep |
 | `serve.localOutputs.inFlightGraceSeconds` | `60` | never delete an output touched within this window (guards against unlinking a file a run is writing); `0` disables |
 | `serve.preview.enabled` | `false` | serve dataset previews of local sink outputs — the console reads a tracked jsonl/csv/parquet file's first rows back over HTTP. Off by default: it exposes file *contents* to anyone with the `LocalOutputRead` scope (viewer and up) |
@@ -472,7 +483,7 @@ See [`values.yaml`](./values.yaml) — every key is commented. Common ones:
 | `serve.allowedHosts` | `[]` | `--allowed-host`: host names the server answers; a request naming another `Host` is refused |
 | `serve.allowedOrigins` | `[]` | `--allowed-origin`: extra browser origins that may send state-changing requests |
 | `serve.autoscaling.enabled` | `false` | HPA on the Deployment |
-| `serve.persistence.enabled` | `false` | PVC for sqlite history / bookmarks |
+| `serve.persistence.enabled` | `true` | PVC for the data dir (the default SQLite history, bookmarks); `false` = emptyDir |
 | `serve.strategy` | `{}` | Deployment update strategy; empty = `Recreate` for one replica with a volume, else `RollingUpdate` |
 | `job.enabled` | `false` | one-shot `faucet run` |
 | `cronjob.enabled` | `false` | scheduled `faucet run` |

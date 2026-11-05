@@ -950,7 +950,7 @@ pub fn filters_by_run(q: &OverviewQuery) -> bool {
 /// SQL text for the `overview_sql!` queries, per dialect. Every value is a
 /// bind; the queries read the fixed-width RFC 3339 text columns and the JSON
 /// bodies.
-#[cfg(any(feature = "serve-history-postgres", feature = "serve-history-sqlite"))]
+#[cfg(feature = "serve")]
 pub mod sql {
     use super::{DURATION_SAMPLE_CAP, OverviewQuery};
     use crate::serve::history::sql::{Dialect, fmt_ts};
@@ -1397,7 +1397,7 @@ pub mod sql {
 
 /// `RunHistory::overview_aggregates` for the SQL backends: the queries of
 /// [`sql`] fed through [`Aggregator`] / [`CostAggregator`].
-#[cfg(any(feature = "serve-history-postgres", feature = "serve-history-sqlite"))]
+#[cfg(feature = "serve")]
 macro_rules! overview_sql {
     () => {
         /// `RunHistory::overview_aggregates`, grouped in the database.
@@ -1565,7 +1565,7 @@ macro_rules! overview_sql {
         }
     };
 }
-#[cfg(any(feature = "serve-history-postgres", feature = "serve-history-sqlite"))]
+#[cfg(feature = "serve")]
 pub(crate) use overview_sql;
 
 #[cfg(test)]

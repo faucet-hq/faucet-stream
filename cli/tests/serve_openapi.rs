@@ -130,7 +130,7 @@ async fn every_documented_route_is_wired_on_the_live_server() {
         max_concurrent_runs: Some(2),
         max_queued_runs: Some(8),
         default_config: None,
-        history: None,
+        history: Some("memory".into()),
         cors_origin: vec![],
         body_limit_bytes: 1_048_576,
         shutdown_grace_secs: 5,

@@ -1,0 +1,8 @@
+# #1049: an in-memory history is an explicit opt-in, passed to the server.
+# expect: - name: FAUCET_SERVE_HISTORY
+# expect: value: "memory"
+# expect-not: name: FAUCET_DATA_DIR
+serve:
+  enabled: true
+  history:
+    backend: memory

@@ -137,9 +137,10 @@ fn start_config(port: u16, dir: &std::path::Path, store: Store) -> faucet_cli::s
         std::fs::write(&p, text).unwrap();
         p
     });
-    let history = store
-        .db
-        .map(|db| format!("sqlite:{}", dir.join(db).display()));
+    let history = Some(store.db.map_or_else(
+        || "memory".to_string(),
+        |db| format!("sqlite:{}", dir.join(db).display()),
+    ));
     let mut config = faucet_cli::serve::ServeConfig::from_args(serve_args(
         port,
         auth_path,
