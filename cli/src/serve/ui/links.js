@@ -26,6 +26,7 @@ export const href = {
   trigger: (name) => `#/triggers/${enc(name)}`,
   overview: () => "#/overview",
   schedules: () => "#/schedules",
+  feeds: () => "#/feeds",
   policy: () => "#/policy",
   settings: () => "#/settings",
 };

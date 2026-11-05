@@ -74,10 +74,10 @@ re-read it and redraw.
 ## Finding your way around
 
 The sidebar groups the pages: **Operate** (Overview, Runs, Changes, Triggers,
-Schedules), **Data** (Datasets, Lineage), **Build** (Templates, Schemas,
+Schedules, Feeds), **Data** (Datasets, Lineage), **Build** (Templates, Schemas,
 Submit), **Govern** (Policy, Usage, Tenants) and **Admin** (Audit log,
 Settings). Badges count running runs, pending change requests, datasets,
-templates and tenants. Schedules and Policy are marked *soon*: their pages say
+templates and tenants. Schedules, Feeds and Policy are marked *soon*: their pages say
 what will live there and how to do it today.
 
 - **Go to… / ⌘K** (Ctrl+K) opens a palette over pages, recent runs, datasets,

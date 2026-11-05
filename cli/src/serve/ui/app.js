@@ -13,6 +13,7 @@ import { renderRuns } from "./views/runs.js";
 import { renderChanges } from "./views/changes.js";
 import { renderTriggers } from "./views/triggers.js";
 import { renderSchedules } from "./views/schedules.js";
+import { renderFeeds } from "./views/feeds.js";
 import { renderDatasets } from "./views/datasets.js";
 import { renderLineage } from "./views/lineage.js";
 import { renderTemplates } from "./views/templates.js";
@@ -76,6 +77,7 @@ function registerRoutes() {
   route("#/triggers", renderTriggers, { group: "triggers" });
   route("#/triggers/:id", renderTriggers, { group: "triggers" });
   route("#/schedules", renderSchedules);
+  route("#/feeds", renderFeeds);
   route("#/catalog", renderDatasets, { group: "catalog" });
   route("#/catalog/:id", renderDatasets, { group: "catalog" });
   route("#/lineage", renderLineage, { group: "lineage" });
