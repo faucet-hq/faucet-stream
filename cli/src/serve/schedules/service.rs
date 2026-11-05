@@ -284,13 +284,26 @@ fn view(actor: &AuthContext, f: &Found, st: &ScheduleStatus, now: DateTime<Utc>)
         }
     };
     let r = f.record.as_ref();
-    let shown = secrets::masked(&f.spec);
+    let mut shown = secrets::masked(&f.spec);
+    // A tenant sees an operator's fan-out as running for itself only: never
+    // the other tenants, nor the operator's params.
+    let outsider = actor
+        .tenant
+        .as_deref()
+        .filter(|t| f.owner.as_deref() != Some(*t));
+    let tenants = match outsider {
+        Some(t) if f.spec.tenants.is_some() => Some(TenantSelector::Named(vec![t.to_string()])),
+        _ => f.spec.tenants.clone(),
+    };
+    if outsider.is_some() {
+        shown.template.params.clear();
+    }
     ScheduleView {
         name: f.spec.name.clone(),
         description: f.spec.description.clone(),
         source: f.source,
         tenant: f.owner.clone(),
-        tenants: f.spec.tenants.clone(),
+        tenants,
         shared: f.spec.tenants.is_some(),
         cron: f.spec.cron.clone(),
         timezone: f.spec.timezone.clone(),
@@ -340,6 +353,9 @@ pub struct ListResponse {
     pub max_schedules: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owned: Option<usize>,
+    /// For an operator's tenant-scoped view: every schedule on the server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<usize>,
     pub schedules: Vec<ScheduleView>,
 }
 
@@ -352,7 +368,9 @@ pub async fn list(
     let now = Utc::now();
     let mut out = Vec::new();
     let mut owned = 0;
-    for f in all(state).await? {
+    let found = all(state).await?;
+    let total = (actor.tenant.is_none() && scope.is_some()).then_some(found.len());
+    for f in found {
         if !visible(&f, scope.as_deref()) {
             continue;
         }
@@ -379,6 +397,7 @@ pub async fn list(
         requires_approval: state.requires_approval(ChangeKind::Schedule),
         max_schedules,
         owned: scope.map(|_| owned),
+        total,
         schedules: out,
     })
 }
@@ -432,6 +451,39 @@ pub struct Detail {
     /// For a fan-out: the tenants it runs for now (edits apply to all).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub applies_to: Option<Vec<String>>,
+    /// The template version the selector resolves to now (`None` when it
+    /// does not resolve).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_version: Option<u32>,
+    /// The template's kind (`pipeline`, `source-template`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template_kind: Option<String>,
+}
+
+/// What the schedule's template selector resolves to now, and the kind of
+/// that template; `(None, None)` when it does not resolve.
+async fn resolved_target(
+    state: &ServerState,
+    spec: &ScheduleSpec,
+) -> (Option<u32>, Option<String>) {
+    let s = state.history();
+    let selector = match spec.template.version.as_ref() {
+        Some(v) => match serde_json::from_value(serde_json::Value::String(v.clone())) {
+            Ok(sel) => sel,
+            Err(_) => return (None, None),
+        },
+        None => Default::default(),
+    };
+    let Ok(v) = crate::templates::resolve_version(&s, &spec.template.id, selector).await else {
+        return (None, None);
+    };
+    let kind = match s.template_get(&spec.template.id, Some(v)).await {
+        Ok(Some(r)) => serde_json::to_value(r.kind)
+            .ok()
+            .and_then(|k| k.as_str().map(str::to_string)),
+        _ => None,
+    };
+    (Some(v), kind)
 }
 
 /// The ticks the schedule's runs and status record tell about, newest first.
@@ -498,7 +550,7 @@ fn ticks(
             manual: false,
         });
     }
-    out.sort_by(|a, b| b.tick.cmp(&a.tick));
+    out.sort_by_key(|a| std::cmp::Reverse(a.tick));
     out.truncate(RECENT_TICKS);
     out
 }
@@ -568,6 +620,7 @@ pub async fn get(
             .map(|c| validate::next_ticks(&c, now, NEXT_TICKS))
             .unwrap_or_default()
     };
+    let (resolved_version, template_kind) = resolved_target(state, &f.spec).await;
     Ok(Detail {
         schedule: view(actor, &f, &st, now),
         next_ticks,
@@ -581,7 +634,13 @@ pub async fn get(
             .as_ref()
             .map(|r| r.changes.iter().rev().cloned().collect())
             .unwrap_or_default(),
-        applies_to: applies_to(state, &f.spec).await,
+        applies_to: if actor.tenant.is_some() {
+            None
+        } else {
+            applies_to(state, &f.spec).await
+        },
+        resolved_version,
+        template_kind,
     })
 }
 
@@ -956,7 +1015,7 @@ async fn revise(
 /// What a create / update / delete did.
 pub enum Changed {
     /// Applied now (`None` for a delete).
-    Applied(Option<ScheduleView>),
+    Applied(Option<Box<ScheduleView>>),
     /// `--require-approval schedule`: proposed as a change request instead.
     Pending(Box<crate::serve::changes::ChangeRequest>),
 }
@@ -987,7 +1046,9 @@ pub async fn change(
         .await?;
         return Ok(Changed::Pending(Box::new(change)));
     }
-    apply(state, actor, p).await.map(Changed::Applied)
+    apply(state, actor, p)
+        .await
+        .map(|v| Changed::Applied(v.map(Box::new)))
 }
 
 /// Pause or resume.

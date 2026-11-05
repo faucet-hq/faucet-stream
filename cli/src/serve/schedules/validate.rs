@@ -181,9 +181,9 @@ pub fn check_min_interval(
 /// `90 seconds`, `5 minutes`, `2 hours`.
 pub fn human(d: Duration) -> String {
     let s = d.as_secs();
-    let (n, unit) = if s % 3600 == 0 && s >= 3600 {
+    let (n, unit) = if s.is_multiple_of(3600) && s >= 3600 {
         (s / 3600, "hour")
-    } else if s % 60 == 0 && s >= 60 {
+    } else if s.is_multiple_of(60) && s >= 60 {
         (s / 60, "minute")
     } else {
         (s, "second")
@@ -203,7 +203,10 @@ mod tests {
     }
 
     fn err(v: serde_json::Value) -> String {
-        validate(&spec(v)).err().expect("expected an error")
+        match validate(&spec(v)) {
+            Err(e) => e,
+            Ok(_) => panic!("expected an error"),
+        }
     }
 
     #[test]

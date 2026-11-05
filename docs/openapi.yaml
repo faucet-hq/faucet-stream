@@ -3246,6 +3246,7 @@ components:
         requires_approval: { type: boolean }
         max_schedules: { type: integer, nullable: true, description: "A tenant principal's limit." }
         owned: { type: integer, nullable: true, description: "Schedules the tenant owns, paused ones included." }
+        total: { type: integer, nullable: true, description: "For an operator scoped with ?tenant=: every schedule on the server." }
         schedules: { type: array, items: { $ref: "#/components/schemas/ScheduleView" } }
     ScheduleDetail:
       type: object
@@ -3287,6 +3288,8 @@ components:
               action: { type: string, enum: [created, updated, paused, resumed, run_now] }
               detail: { type: array, items: { type: string } }
         applies_to: { type: array, items: { type: string }, nullable: true }
+        resolved_version: { type: integer, nullable: true, description: "The template version the selector resolves to now." }
+        template_kind: { type: string, nullable: true, description: "pipeline or source-template." }
     TenantLimits:
       type: object
       additionalProperties: false

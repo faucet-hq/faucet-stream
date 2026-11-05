@@ -9,9 +9,10 @@ import { html, raw, ic, row, ring, sect, tabs, ibtn, stats, empty, skelRows, ske
 import { layout, setQuery, patch, poll, errorAlert, hashFor, ago, dialog, toast } from "../page.js";
 import { setCrumbs, refreshBadges } from "../shell.js";
 import { fmtInt } from "../utils.js";
+import { shortId } from "../components.js";
 import { href } from "../links.js";
 import { can, whoami } from "../access.js";
-import { currentTenant } from "../tenant.js";
+import { currentTenant, tenantList } from "../tenant.js";
 import { navigate } from "../router.js";
 
 const enc = encodeURIComponent;
@@ -19,6 +20,9 @@ const SEALED = "$sealed";
 const TZS = ["UTC", "Europe/London", "Europe/Berlin", "Europe/Paris", "America/New_York", "America/Chicago", "America/Los_Angeles", "Asia/Kolkata", "Asia/Singapore", "Asia/Tokyo", "Australia/Sydney"];
 const RUN_TONE = { completed: "ok", failed: "bad", cancelled: "", running: "info", sharded: "info", queued: "", pending: "" };
 const plural = (n, w, ws = `${w}s`) => `${fmtInt(n)} ${n === 1 ? w : ws}`;
+const andList = (xs) => (xs.length < 2 ? xs.join("") : `${xs.slice(0, -1).join(", ")} and ${xs[xs.length - 1]}`);
+const NUM_WORDS = ["", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"];
+const allOf = (n) => (n === 2 ? "both" : `all ${NUM_WORDS[n] || fmtInt(n)}`);
 
 // ── Time ─────────────────────────────────────────────────────────────────────
 const fmt = (iso, tz, opts) => new Intl.DateTimeFormat("en-GB", { timeZone: tz || "UTC", ...opts }).format(new Date(iso));
@@ -176,7 +180,7 @@ export async function renderSchedules(host, params) {
       const sharedRows = shown.filter((s) => s.tenant !== t);
       statsHtml = stats([[`For ${t}`, fmtInt(all.length)], ["Ticks today", fmtInt(today)], ["Missed", fmtInt(missed24), missed24 ? "bad" : ""], ["Next tick", until(next)]]);
       body = html`${own.length ? html`${sect(`${t}’s own`, own.length)}${own.map(listRow)}` : ""}${sharedRows.length ? html`${sect(`Shared · include ${t}`, sharedRows.length)}${sharedRows.map(listRow)}` : ""}
-        <div class="muted" style="font-size:12px;padding:10px 14px">Showing schedules that run for ${t}. Pick “All tenants” above to see every schedule.</div>`;
+        <div class="muted" style="font-size:12px;padding:10px 14px">Showing schedules that run for ${t}. Pick “All tenants” above to see ${data.total != null ? `all ${fmtInt(data.total)}` : "every schedule"}.</div>`;
     } else {
       statsHtml = stats([["Schedules", fmtInt(all.length)], ["Ticks today", fmtInt(today)], ["Missed", fmtInt(missed24), missed24 ? "bad" : ""], ["Next tick", until(next)]]);
       const bad = shown.filter((s) => !s.paused && unhealthy(s));
@@ -193,7 +197,6 @@ export async function renderSchedules(host, params) {
   }
   function newButton() {
     if (!data || data.available === false) return "";
-    if (scope() && !tenantPrincipal()) return "";
     return btn("New", { icon: "plus", kind: "primary", perm: "schedule_write", disabled: atLimit(), title: atLimit() ? "This tenant has reached its schedule limit" : "", data: { act: "new" } });
   }
 
@@ -270,7 +273,9 @@ schedules:
     if (last.outcome === "skipped") return "skipped";
     const n = last.runs.length;
     const done = last.runs.filter((r) => r.status === "completed").length;
-    return `${plural(n, "run")} · ${done === n ? "all completed" : `${done} completed`}`;
+    const whose = scope() ? ` for ${scope()}` : "";
+    if (n === 1) return `1 run${whose} · ${done ? "completed" : last.runs[0].status}`;
+    return `${plural(n, "run")}${whose} · ${done === n ? "all completed" : `${done} completed`}`;
   }
 
   function ticksCard(d, s) {
@@ -289,9 +294,13 @@ schedules:
     return typeof v === "string" ? v : JSON.stringify(v);
   }
 
-  function targetCard(s) {
+  function targetCard(s, d) {
     const params = Object.entries(s.template.params || {});
-    const facts = [kv("Template", lnk(s.template.id, href.template(s.template.id)), s.template.sink ? `into ${s.template.sink}` : ""), kv("Version", html`<span class="mono">${version(s)}</span>`, verLabel(version(s)).startsWith("pin") ? "never moves" : "resolved at each tick"), kv("Pool", (s.run || {}).pool || "default"), kv("Timeout", (s.run || {}).timeout_secs ? `${Math.round((s.run || {}).timeout_secs / 60) || 1}m` : "none")];
+    const kindWord = { pipeline: "pipeline", "source-template": "source template" }[d.template_kind] || d.template_kind || "";
+    const pinned = verLabel(version(s)).startsWith("pin");
+    const verSub = d.resolved_version == null ? "does not resolve now" : pinned ? "never moves" : `resolves to v${d.resolved_version} now`;
+    const tplSub = [kindWord, s.template.sink ? `into ${s.template.sink}` : ""].filter(Boolean).join(" · ");
+    const facts = [kv("Template", lnk(s.template.id, href.template(s.template.id)), tplSub), kv("Version", html`<span class="mono">${version(s)}</span>`, verSub), kv("Pool", (s.run || {}).pool || "default"), kv("Timeout", (s.run || {}).timeout_secs ? `${Math.round((s.run || {}).timeout_secs / 60) || 1}m` : "none")];
     if (s.template.overlay) facts.push(kv("Deployment", s.template.overlay, s.template.overlay_version || "stable"));
     return card({ icon: "tpl", title: "What it runs", right: lnk("open template", href.template(s.template.id)),
       body: html`${grid(2, facts)}${params.length ? html`<div class="pad" style="padding-top:0">${tbl(["Param", "Value"], params.map(([k, v]) => [html`<span class="mono">${k}</span>`, paramValue(v)]))}</div>` : ""}` });
@@ -321,9 +330,12 @@ schedules:
 
   function ticksTable(d, title = "Recent ticks") {
     const rows = (d.recent_ticks || []).slice(0, 6);
-    const right = lnk(`all ${fmtInt(d.runs_total)} runs`, href.runs({ label: `schedule:${d.schedule.name}` }));
+    const tz = d.schedule.timezone;
+    const days = (d.next_ticks || []).map((t) => dayWord(t, tz));
+    const subDaily = new Set(days).size < days.length;
+    const right = lnk(scope() ? `all ${fmtInt(d.runs_total)} in Runs` : `all ${plural(d.runs_total, "run")}`, href.runs({ label: `schedule:${d.schedule.name}` }));
     if (!rows.length) return card({ icon: "runs", title, right, body: html`<div class="empty-line">No ticks yet.</div>` });
-    return card({ icon: "runs", title, right, body: tbl(["Tick", "Outcome", ["Took", "num"]], rows.map((t) => [html`${dayWord(t.tick, d.schedule.timezone)}${t.manual ? html` ${tag("run now")}` : ""}`, tickOutcome(t), t.runs.length ? took(t.runs.reduce((a, b) => ((a.elapsed_secs || 0) > (b.elapsed_secs || 0) ? a : b))) : "—"])) });
+    return card({ icon: "runs", title, right, body: tbl(["Tick", "Outcome", ["Took", "num"]], rows.map((t) => [html`${dayWord(t.tick, tz)}${subDaily || t.manual ? ` ${hm(t.tick, tz)}` : ""}${t.manual ? html` ${tag("run now")}` : ""}`, tickOutcome(t), t.runs.length ? took(t.runs.reduce((a, b) => ((a.elapsed_secs || 0) > (b.elapsed_secs || 0) ? a : b))) : "—"])) });
   }
 
   function failedTicksTable(d) {
@@ -376,13 +388,13 @@ schedules:
       html`<span>${cronLine(sch)} ${sch.timezone}</span>`,
       html`<span>runs ${tplLink(sch)}</span>`,
       sch.tenant && !tenantPrincipal() ? html`<span>tenant ${sch.tenant}</span>` : "",
-      sch.created_by ? html`<span>created by <b>${sch.created_by}</b></span>` : "",
+      sch.created_by && !sharedForTenant ? html`<span>created by <b>${sch.created_by}</b></span>` : "",
     ];
     const top = html`${dhead(tabsHtml, sharedForTenant ? "" : actionsFor(sch), back())}${head(sch.name, sub)}${sch.description ? html`<p class="lede">${sch.description}</p>` : ""}`;
     let banner = "";
     if (sch.source === "file") banner = alert("Defined in the server’s schedules file.", html`Change it in the file passed to <code>--schedules</code> and restart the server. The console can run it now but cannot edit, pause or delete it.`, "");
     else if (sharedForTenant) banner = alert("Managed by the server operator.", `It runs for ${me().tenant} and other tenants. You can see when it runs and ${me().tenant}’s runs from it; ask the operator to change or pause it.`, "");
-    else if (sch.shared && t) banner = alert(`Runs for ${(d.applies_to || []).join(", ") || "several tenants"}; changes apply to all of them.`, `Runs, missed ticks and recent ticks below are ${t}’s only, because the switcher is set to ${t}. Edit, Pause and Delete change the schedule for every tenant it runs for.`, "warn");
+    else if (sch.shared && t) banner = alert(`Runs for ${andList(d.applies_to || []) || "several tenants"}; changes apply to ${allOf((d.applies_to || []).length)}.`, `Runs, missed ticks and recent ticks below are ${t}’s only, because the switcher is set to ${t}. Edit, Pause and Delete change the schedule for every tenant it runs for.`, "warn");
     if (sch.paused) banner = html`${banner}${alert(html`Paused${sch.paused_by ? html` by <b>${sch.paused_by}</b>` : ""}${sch.paused_at ? html` ${ago(sch.paused_at, " ago")}` : ""}.`, html`${sch.pause_reason ? html`“${sch.pause_reason}” ` : ""}${sch.skipped_while_paused != null ? `${plural(sch.skipped_while_paused, "tick was", "ticks were")} skipped; they are not run later.` : ""}`, "")}`;
     else if (sch.status === "failing") banner = html`${banner}${alert("The last tick was refused.", html`${sch.last_error || ""} Each tick is recorded as failed with its reason; none are skipped silently.`, "bad", sch.can_edit ? html`${btn("Edit target", { icon: "edit", perm: "schedule_write", data: { act: "edit" } })}${btn("Pause", { icon: "pause", perm: "schedule_write", data: { act: "pause" } })}` : "")}`;
     else if (sch.status === "retrying") banner = html`${banner}${alert("The last tick has not started yet.", `${sch.last_error || ""} It is retried until it starts.`, "warn")}`;
@@ -390,8 +402,8 @@ schedules:
     if (state.dtab === "History") return html`${top}${historyCard(d)}`;
     if (state.dtab === "Missed ticks" || state.dtab.startsWith("Missed ·")) return html`${top}${missedCard(d)}`;
     if (sch.status === "failing") return html`${top}${banner}${failedTicksTable(d)}`;
-    const right = sch.source === "file" ? fileCard(sch) : html`${tenantsCard(d, sch)}${ticksTable(d, t && sch.shared ? `Recent ticks · ${t}` : sharedForTenant ? `${me().tenant}’s runs` : "Recent ticks")}`;
-    const left = sch.source === "file" || sharedForTenant || (sch.shared && t) ? ticksCard(d, sch) : html`${ticksCard(d, sch)}${targetCard(sch)}`;
+    const right = sch.source === "file" ? fileCard(sch) : html`${sharedForTenant ? "" : tenantsCard(d, sch)}${ticksTable(d, sharedForTenant ? `${me().tenant}’s runs` : t && sch.shared ? `Recent ticks · ${t}` : "Recent ticks")}`;
+    const left = sch.source === "file" || sharedForTenant || (sch.shared && t) ? ticksCard(d, sch) : html`${ticksCard(d, sch)}${targetCard(sch, d)}`;
     return html`${top}${banner}<div class="two"><div class="stack">${left}</div><div class="stack">${right}</div></div>`;
   }
 
@@ -468,6 +480,7 @@ schedules:
         } catch { /* the form still works without them */ }
       }
       form.declared = ps;
+      form.resolved = r.version ?? null;
       form.declaredErr = null;
     } catch (e) {
       form.declared = null;
@@ -512,7 +525,10 @@ schedules:
 
   function cronError() {
     const p = form.preview;
-    if (p && !p.valid) return `Not a valid cron: ${p.error}`;
+    if (p && !p.valid) {
+      const why = String(p.error || "").split(": ").pop().replace(/\.$/, "");
+      return `Not a valid cron: ${why ? why[0].toLowerCase() + why.slice(1) : "it does not parse"}.`;
+    }
     const min = data && data.tenant_min_interval_secs;
     const owner = form.edit ? form.orig.tenant : tenantPrincipal() ? me().tenant : "";
     if (owner && min && p && p.shortest_gap_secs != null && p.shortest_gap_secs < min) {
@@ -587,7 +603,7 @@ schedules:
     const tpl = tplOf(form.template);
     const source = kindOf(tpl) === "source-template";
     const seg = (name, items, on) => html`<span class="seg" data-seg="${name}">${items.map((x) => html`<span class="${x === on ? "on" : ""}" data-v="${x}">${x}</span>`)}</span>`;
-    const verField = field("Version", html`${seg("vmode", ["stable", "newest", "channel", "pin"], form.vmode)}${form.vmode === "channel" || form.vmode === "pin" ? html`<div style="margin-top:6px">${input(form.vtext, { name: "f-vtext", mono: true, ph: form.vmode === "pin" ? "3" : "prod" })}</div>` : ""}`, { help: form.vmode === "pin" ? "pin never moves" : "stable follows launches · resolved at each tick", err: show("version"), cls: source ? "wide" : "" });
+    const verField = field("Version", html`${seg("vmode", ["stable", "newest", "channel", "pin"], form.vmode)}${form.vmode === "channel" || form.vmode === "pin" ? html`<div style="margin-top:6px">${input(form.vtext, { name: "f-vtext", mono: true, ph: form.vmode === "pin" ? "3" : "prod" })}</div>` : ""}`, { help: form.vmode === "pin" ? "pin never moves" : form.resolved != null ? `${versionSel() || form.vmode} · resolves to v${form.resolved} now` : "stable follows launches · resolved at each tick", err: show("version"), cls: source ? "wide" : "" });
     const tplField = field("Template", select([["", "choose a template…"], ...runnable.map((t) => [t.id, `${t.id} · ${kindOf(t) === "source-template" ? "source template" : "pipeline template"}`])], form.template, { name: "f-template" }), { req: true, help: tenantPrincipal() ? `Only templates ${me().tenant} may run` : "Registered templates only", err: show("template"), cls: source ? "wide" : "" });
     const what = source
       ? html`<div class="form">${tplField}${verField}${field("Sink template", select([["", "choose a sink…"], ...sinks.map((t) => [t.id, t.id])], form.sink, { name: "f-sink" }), { req: true, help: "A source template runs paired with a sink", err: show("sink") })}${field("Sink version", select([["stable", "stable"], ["newest", "newest"]], form.sinkVersion, { name: "f-sinkv" }))}
@@ -604,10 +620,10 @@ schedules:
       const secret = !!(p.secret || (p.items && p.items.secret));
       const sealed = isSealed(v);
       let control;
-      if (p.values) control = select([["", p.default != null ? `default · ${p.default}` : "choose…"], ...p.values.map((x) => [String(x), String(x)])], v == null ? "" : String(v), { name: `p:${k}` });
+      if (p.values) control = select([...(p.default == null ? [["", "choose…"]] : []), ...p.values.map((x) => [String(x), String(x)])], v == null ? (p.default == null ? "" : String(p.default)) : String(v), { name: `p:${k}` });
       else if (p.type === "bool") control = select([["", p.default != null ? `default · ${p.default}` : "choose…"], ["true", "true"], ["false", "false"]], v == null ? "" : String(v), { name: `p:${k}` });
       else control = input(sealed ? "" : v == null ? "" : String(v), { name: `p:${k}`, type: secret ? "password" : "text", ph: sealed ? "•••••••• stored · leave blank to keep" : p.default != null ? String(p.default) : p.type || "string", cls: show(`p:${k}`) ? "err" : "" });
-      const help = secret ? "Secret · sealed with the server vault key, never shown again" : [p.type || "string", p.default != null ? `default ${p.default}` : "", p.description || ""].filter(Boolean).join(" · ");
+      const help = secret ? "Secret · sealed with the server vault key, never shown again" : p.values ? `One of ${p.values.join(", ")}` : [p.type || "string", p.default != null ? `default ${p.default}` : "", p.description || ""].filter(Boolean).join(" · ");
       return field(k, control, { code: true, req: !!p.required && p.default == null, help, err: show(`p:${k}`), cls: secret ? "wide" : "" });
     })}</div>`;
     const prev = form.preview;
@@ -622,12 +638,12 @@ schedules:
     const allTenants = (data && data.tenants_all) || null;
     const ownerLocked = tenantPrincipal() || (form.edit && form.orig.tenant);
     const tenantsCard2 = ownerLocked ? "" : card({ icon: "tenants", title: "Tenants", aside: "operators only",
-      body: html`<div class="form one">${field("Run for", seg("runfor", ["this server", "all tenants", "selected"], form.runFor))}${form.runFor === "selected" ? html`<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">${form.tenants.map((t) => chip(html`${t} ${ic("x")}`, "x", { "data-untenant": t }))}${input("", { name: "f-addtenant", ph: "add a tenant id", mono: true })}</div>` : ""}</div>`,
+      body: html`<div class="form one">${field("Run for", seg("runfor", ["this server", "all tenants", "selected"], form.runFor))}${form.runFor === "selected" ? html`<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">${form.tenants.map((t) => html`<button type="button" class="chip x" data-untenant="${t}" title="Remove ${t}">${t}</button>`)}${(() => { const rest = (tenantList() || []).map((t) => t.id).filter((id) => !form.tenants.includes(id)); return rest.length ? select([["", "+ add"], ...rest.map((id) => [id, id])], "", { name: "f-addtenant", cls: "chip-add" }) : ""; })()}</div>` : ""}</div>`,
       note: "One run per tenant each tick, each admitted against that tenant’s limits." });
     void allTenants;
     const opts = card({ title: "Run options", body: html`<div class="form three">${field("Pool", input(form.pool, { name: "f-pool", ph: "default" }))}${field("Timeout", input(form.timeout, { name: "f-timeout", ph: "45m" }))}${field("Labels", input(form.labels, { name: "f-labels", mono: true, ph: "team=data" }))}</div>` });
     const owner = tenantPrincipal() ? me().tenant : "";
-    const limitAlert = owner && data ? alert(data.max_schedules != null ? `${owner} can have ${data.max_schedules} schedules; ${data.owned ?? 0} are in use.` : `${owner}’s schedules run only for ${owner}.`, `Ticks fire at most every ${Math.round((data.tenant_min_interval_secs || 300) / 60)} minutes, and each run counts against ${owner}’s run limits.`, "") : "";
+    const limitAlert = owner && data ? alert(data.max_schedules != null ? `${owner} can have ${plural(data.max_schedules, "schedule")}; ${fmtInt(data.owned ?? 0)} ${(data.owned ?? 0) === 1 ? "is" : "are"} in use.` : `${owner}’s schedules run only for ${owner}.`, `Ticks fire at most every ${Math.round((data.tenant_min_interval_secs || 300) / 60)} minutes, and each run counts against ${owner}’s run limits.`, "") : "";
     let editNote = "";
     if (form.edit) {
       const before = form.orig;
@@ -646,7 +662,7 @@ schedules:
     const gated = data && data.requires_approval;
     const nErr = Object.keys(errs).length;
     const submitLabel = form.busy ? "Saving…" : gated ? "Request approval" : form.edit ? "Save changes" : "Create schedule";
-    const foot = html`<div class="actions" style="border:0;padding:4px 0 0">${gated ? html`<span class="muted">This server requires approval for schedule changes; this becomes a change request.</span>` : ""}${btn("Cancel", { kind: "quiet", data: { act: "cancel" } })}${btn(submitLabel, { kind: "primary", icon: gated ? "changes" : "check", perm: "schedule_write", disabled: form.busy || (form.tried && nErr > 0) || !!errs.cron, data: { act: "submit" } })}</div>`;
+    const foot = html`<div class="actions" style="border:0;padding:4px 0 0">${gated ? html`<span class="muted">This server requires approval for schedule changes; this becomes a change request.</span>` : ""}${btn("Cancel", { data: { act: "cancel" } })}${btn(submitLabel, { kind: "primary", icon: gated ? "changes" : "check", perm: "schedule_write", disabled: form.busy, data: { act: "submit" } })}</div>`;
     const title = form.edit ? `Edit ${form.orig.name}` : "New schedule";
     const errAlert = form.tried && nErr ? alert(`${plural(nErr, "field needs", "fields need")} attention.`, "Nothing is saved until they are fixed.", "bad") : "";
     const serverErr = form.err ? alert("The server refused the schedule.", form.err.message, "bad") : "";
@@ -658,11 +674,16 @@ schedules:
 
   function requestedHtml() {
     const c = requested;
-    const p = (c.change && c.change.payload) || {};
+    const ch = c.change || {};
+    const p = ch.payload || {};
     const spec = p.spec || {};
-    const lines = Object.entries({ name: spec.name, cron: `${spec.cron} · ${spec.timezone || "UTC"}`, template: spec.template ? `${spec.template.id} @ ${spec.template.version || "stable"}` : "", tenants: spec.tenants ? (Array.isArray(spec.tenants) ? spec.tenants.join(", ") : spec.tenants) : "" }).filter(([, v]) => v).map(([k, v]) => ["+", `${k}: ${v}`]);
-    return html`${dhead("", btn("Open in Changes", { icon: "changes", kind: "primary", href: href.change(c.change_id) }), back())}${head(p.name || "Schedule", [pill("Pending approval", "warn"), html`<span>change ${lnk(c.change_id, href.change(c.change_id), true)}</span>`])}
-      ${alert(`Change request ${c.change_id} created.`, "The schedule changes once an approver accepts it on the Changes page. Nothing changes until then.", "warn", btn("Open in Changes", { icon: "changes", href: href.change(c.change_id) }))}
+    const params = Object.entries((spec.template && spec.template.params) || {}).map(([k, v]) => `${k}=${v && typeof v === "object" ? "(sealed)" : v}`).join(", ");
+    const lines = Object.entries({ name: spec.name, cron: spec.cron ? `${spec.cron} · ${spec.timezone || "UTC"}` : "", template: spec.template ? `${spec.template.id} @ ${spec.template.version || "stable"}` : "", params, tenants: spec.tenants ? (Array.isArray(spec.tenants) ? spec.tenants.join(", ") : spec.tenants) : "" }).filter(([, v]) => v).map(([k, v]) => ["+", `${k}: ${v}`]);
+    const sid = shortId(c.change_id);
+    const effect = { create: "The schedule starts ticking once an approver accepts it on the Changes page. Nothing runs until then.", update: "The change applies once an approver accepts it on the Changes page. The schedule keeps ticking as it is until then.", delete: "The schedule is deleted once an approver accepts it on the Changes page. It keeps ticking until then." }[p.action] || "Nothing changes until an approver accepts it on the Changes page.";
+    const by = ch.requester || me().principal;
+    return html`${dhead("", btn("Open in Changes", { icon: "changes", kind: "primary", href: href.change(c.change_id) }), back())}${head(p.name || "Schedule", [pill("Pending approval", "warn"), by ? html`<span>requested by <b>${by}</b> · just now</span>` : "", html`<span>change ${lnk(sid, href.change(c.change_id), true)}</span>`])}
+      ${alert(`Change request ${sid} created.`, effect, "warn", btn("Open in Changes", { icon: "changes", href: href.change(c.change_id) }))}
       ${card({ icon: "diff", title: "What was requested", body: diff(lines.length ? lines : [[" ", p.action || ""]]) })}`;
   }
 
@@ -680,7 +701,7 @@ schedules:
     L.select(!!state.name || !!form);
     patch(L.list, listHtml());
     patch(L.detail, detailHtml());
-    const crumb = form ? (form.edit ? form.orig.name : "New schedule") : state.name;
+    const crumb = requested ? ((requested.change && requested.change.payload && requested.change.payload.name) || "Change request") : form ? (form.edit ? form.orig.name : "New schedule") : state.name;
     setCrumbs(crumb ? ["Operate", { label: "Schedules", href: href.schedules() }, crumb] : ["Operate", "Schedules"]);
   }
 
@@ -729,9 +750,12 @@ schedules:
     const d = detail && detail.schedule.name === s.name ? detail : null;
     const going = d && (d.recent_ticks || []).some((t) => t.runs.some((r) => ["queued", "running", "pending", "sharded"].includes(r.status)));
     const targets = s.tenant ? `for ${s.tenant}` : s.shared ? `for its ${plural(tenantCount(s, d && d.applies_to) ?? 0, "tenant")}` : "";
-    const r = await dialog(`Run ${s.name} now?`, html`<span>Starts one tick now${targets ? html` <b>${targets}</b>` : ""}, exactly as a scheduled tick would. The next scheduled tick is unchanged.</span>
-      ${going ? alert("A run from an earlier tick is still going.", "This run starts anyway; the overlap rule applies only to scheduled ticks.", "warn") : alert("Nothing from an earlier tick is still running.", "", "ok")}`,
-      html`${btn("Cancel", { kind: "quiet", data: { act: "no" } })}${btn("Run now", { kind: "primary", icon: "play", data: { act: "yes" } })}`, { icon: "play" });
+    const like = s.next_tick && !s.paused ? `the ${hm(s.next_tick, s.timezone)} tick` : "a scheduled tick";
+    const lastDone = d ? (d.recent_ticks || []).flatMap((t) => t.runs).map((r) => r.finished_at).filter(Boolean).sort().pop() : null;
+    const calm = lastDone ? `The last tick finished at ${hm(lastDone, s.timezone)}, so nothing overlaps.` : "Nothing from an earlier tick is still running.";
+    const r = await dialog(`Run ${s.name} now?`, html`<span>Starts one tick now${targets ? html` <b>${targets}</b>` : ""}, exactly as ${like} would. The next scheduled tick is unchanged.</span>
+      ${going ? alert("A run from an earlier tick is still going.", "This run starts anyway; the overlap rule applies only to scheduled ticks.", "warn") : alert(calm, "", "ok")}`,
+      html`${btn("Cancel", { data: { act: "no" } })}${btn("Run now", { kind: "primary", icon: "play", data: { act: "yes" } })}`, { icon: "play" });
     if (!r || r.act !== "yes") return;
     try {
       const res = await api(`/v1/schedules/${enc(s.name)}/run`, { method: "POST" });
@@ -749,10 +773,10 @@ schedules:
     let reason = "";
     if (paused) {
       const r = await dialog(scoped ? `Pause ${s.name} for every tenant?` : `Pause ${s.name}?`,
-        html`<span>${scoped ? html`This schedule runs for <b>${sharedNames.join(", ")}</b>. Pausing stops ticks for all of them, not only ${scope()}. ` : ""}No ticks fire while it is paused, and skipped ticks are not run later. Resume it at any time.</span>
+        html`<span>${scoped ? html`This schedule runs for <b>${andList(sharedNames)}</b>. Pausing stops ticks for all of them, not only ${scope()}. ` : ""}No ticks fire while it is paused, and skipped ticks are not run later. Resume it at any time.</span>
         ${scoped ? alert(`To stop it for ${scope()} only, edit the schedule and remove ${scope()} from its tenants.`, "", "") : ""}
-        ${field("Reason", html`<textarea class="area sans" name="reason" rows="3" placeholder="Warehouse maintenance tonight"></textarea>`, { help: "Optional · shown on the schedule and in its history" })}`,
-        html`${btn("Cancel", { kind: "quiet", data: { act: "no" } })}${btn(scoped ? `Pause for all ${sharedNames.length} tenants` : "Pause", { kind: "primary", icon: "pause", data: { act: "yes" } })}`, { icon: "pause" });
+        ${field("Reason", input("", { name: "reason", ph: "Warehouse maintenance tonight" }), { help: "Optional · shown on the schedule and in the audit log" })}`,
+        html`${btn("Cancel", { data: { act: "no" } })}${btn(scoped ? `Pause for all ${sharedNames.length} tenants` : "Pause", { kind: "primary", icon: "pause", data: { act: "yes" } })}`, { icon: "pause" });
       if (!r || r.act !== "yes") return;
       reason = (r.values.reason || "").trim();
     }
@@ -768,7 +792,7 @@ schedules:
 
   async function remove(s) {
     const r = await dialog(`Delete ${s.name}?`, html`<span>It stops ticking and leaves the list. Runs it already started stay in history.</span>${field(html`Type <code>${s.name}</code> to confirm`, input("", { name: "confirm", mono: true }))}<div class="help bad" data-err hidden></div>`,
-      html`${btn("Cancel", { kind: "quiet", data: { act: "no" } })}${btn("Delete schedule", { kind: "danger", icon: "trash", data: { act: "yes", keep: "1" } })}`, { icon: "trash", onOpen: (el) => {
+      html`${btn("Cancel", { data: { act: "no" } })}${btn("Delete schedule", { kind: "danger", icon: "trash", data: { act: "yes", keep: "1" } })}`, { icon: "trash", onOpen: (el) => {
         el.querySelector('[data-act="yes"]').addEventListener("click", async () => {
           const err = el.querySelector("[data-err]");
           if (el.querySelector("[name=confirm]").value.trim() !== s.name) { err.hidden = false; err.textContent = "The name does not match."; return; }

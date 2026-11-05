@@ -1636,6 +1636,8 @@ async fn schedules_are_managed_over_http() {
 
     let (code, d) = api.get("view-tok", "/v1/schedules/nightly").await;
     assert_eq!(code, 200, "{d}");
+    assert_eq!(d["resolved_version"], 1, "{d}");
+    assert_eq!(d["template_kind"], "pipeline", "{d}");
     assert!(!d["next_ticks"].as_array().unwrap().is_empty(), "{d}");
     let actions: Vec<&str> = d["changes"]
         .as_array()
@@ -1752,6 +1754,24 @@ async fn tenant_schedules_keep_to_their_limits() {
     // An operator scoped to globex sees the shared schedule, not acme's.
     let (_, scoped) = api.get("op-tok", "/v1/schedules?tenant=globex").await;
     assert_eq!(names(&scoped), vec!["globex-only".to_string()], "{scoped}");
+
+    // A shared schedule that includes acme never names the other tenants or
+    // shows the operator's params to acme.
+    let (code, _) = api
+        .post(
+            "op-tok",
+            "/v1/schedules",
+            json!({"name": "shared-both", "cron": "0 2 * * *", "template": {"id": "plain-sync", "params": {}}, "tenants": ["acme", "globex"]}),
+        )
+        .await;
+    assert_eq!(code, 201);
+    let (code, d) = api.get("acme-tok", "/v1/schedules/shared-both").await;
+    assert_eq!(code, 200, "{d}");
+    assert_eq!(d["schedule"]["tenants"], json!(["acme"]), "{d}");
+    assert!(d.get("applies_to").is_none(), "{d}");
+    assert!(!d.to_string().contains("globex"), "{d}");
+    let (_, list) = api.get("acme-tok", "/v1/schedules").await;
+    assert!(!list.to_string().contains("globex"), "{list}");
 }
 
 /// #1044: under `--require-approval schedule`, a create becomes a change

@@ -378,6 +378,7 @@ pub async fn step(state: &ServerState, entry: &mut Entry, now: DateTime<Utc>) {
 }
 
 /// Run the loop until `shutdown`.
+#[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
 pub async fn run(state: ServerState, shutdown: CancellationToken) {
     metrics::describe();
     let changed = state.schedules().changed();
