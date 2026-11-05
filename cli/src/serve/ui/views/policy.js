@@ -228,7 +228,7 @@ export function renderPolicy(host, params) {
     const sampleBox = dry.sample && dry.mode === "paste" ? html`<textarea class="area mono" name="dry-sample" rows="4" placeholder='[{"email": "a@example.com"}]'>${dry.sampleText}</textarea>` : "";
     const left = card({
       icon: "code", title: "Config to check", right: seg,
-      body: html`<div class="pad stack" style="gap:10px">${input1}${sampleBox}<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">${input(dry.row, { ph: "row: all rows", name: "dry-row", mono: true })}${dry.mode === "paste" ? check("Use a sample of rows (plan --sample)", dry.sample, { name: "dry-sample-on" }) : ""}<span style="margin-left:auto">${btn(dry.busy ? "Checking…" : "Check", { icon: "shield", kind: "primary", data: { dryRun: "1" }, disabled: dry.busy })}</span></div></div>`,
+      body: html`<div class="pad stack" style="gap:10px">${input1}${sampleBox}<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">${input(dry.row, { ph: "row: all rows", name: "dry-row", mono: true })}${dry.mode === "paste" ? check("Use a sample of rows (plan --sample)", dry.sample, { name: "dry-sample-on" }) : ""}<span style="margin-left:auto">${btn(dry.busy ? "Checking…" : "Check", { icon: "shield", kind: "primary", data: { "dry-run": "1" }, disabled: dry.busy })}</span></div></div>`,
       note: "Nothing runs. The config is checked the way a submit would be.",
     });
     let right = card({ icon: "shield", title: "Result", body: html`<div class="empty-line">Paste a config, or pick a template, and check it.</div>` });
@@ -289,7 +289,7 @@ export function renderPolicy(host, params) {
     const rows = (list || []).map((x, i) => [
       html`${i === 0 ? html`<b>v${x.version}</b> ${tag("active")}` : `v${x.version}`}${x.restores != null ? html` <span class="muted">(restores v${x.restores})</span>` : ""}`,
       who(x.created_by), who(x.approved_by), x.reason || html`<span class="muted">—</span>`, ago(x.created_at, " ago"),
-      i === 0 || !editable ? "" : btn(`Roll back to v${x.version}`, { icon: "undo", cls: "sm", perm: "policy_admin", data: { rollback: String(x.version), rbTenant: tenantOf } }),
+      i === 0 || !editable ? "" : btn(`Roll back to v${x.version}`, { icon: "undo", cls: "sm", perm: "policy_admin", data: { rollback: String(x.version), "rb-tenant": tenantOf } }),
     ]);
     return card({
       icon: "clock", title, right: tenantOf ? "approved by another tenant admin or a server admin" : "every change was approved by a second admin",
