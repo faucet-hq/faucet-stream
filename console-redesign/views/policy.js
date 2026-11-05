@@ -89,6 +89,88 @@ rules:
     note: 'A rollback is a change request too: it takes effect when another admin approves it.',
   });
 
+  // ---- tenant policies (#1043 part 3): add-only layer on top of the server policy ----
+  const T_POLICY = `version: 1
+description: acme's own data rules
+classifications:
+  - label: acme.contract_value
+    fields: [contract_value, deal_size]
+rules:
+  - name: acme-contracts-internal
+    when: { label: acme.contract_value }
+    require: { tier: [internal] }
+    on_runtime: fail`;
+  const T_BAD = T_POLICY.replace('  - name: acme-contracts-internal', '  - name: pii-to-eu-only').replace('    on_runtime: fail', '    on_runtime: fail\ndisable: [no-raw-cards]');
+  const nw = (t) => `<span class="mono" style="white-space:nowrap">${t}</span>`;
+  const serverForTenant = () => card({ icon: 'shield', title: 'Server rules that apply to acme', tag: 'server', aside: 'read only', right: '3 rules',
+    body: tbl(['Rule', 'Requires', 'Layer'], [
+      [nw('pii-to-eu-only'), '<span class="mono">pii.*</span> only to sinks with residency eu, or hashed', tag('server')],
+      [nw('no-raw-cards'), '<span class="mono">pii.card</span> only with a partial mask', tag('server')],
+      [nw('no-pii-to-stdout'), '<span class="mono">pii.*</span> never to stdout', tag('server')]]),
+    note: 'acme’s rules can add to these, never remove or loosen them.' });
+  const tenantRules = ({ edit = false, ver = 'v3' } = {}) => card({ icon: 'layers', title: 'acme’s rules', tag: 'tenant', aside: `${ver} · acme’s runs only`, right: edit ? btn('Edit acme rules', { icon: 'edit', kind: 'primary', act: true }) : '',
+    body: `${tbl(['Classification', 'Matches', 'Layer'], [[nw('acme.contract_value'), 'fields <span class="mono">contract_value</span>, <span class="mono">deal_size</span>', tag('tenant')], [nw('acme.health'), 'pattern <span class="mono">^diag_.*</span>', tag('tenant')]])}
+      ${tbl(['Rule', 'Requires', 'At run time', 'Layer'], [[nw('acme-contracts-internal'), '<span class="mono">acme.contract_value</span> only to sinks with tier internal', 'fail', tag('tenant')], [nw('acme-health-no-s3'), '<span class="mono">acme.health</span> never to s3', 'quarantine', tag('tenant')]])}` });
+  const tHistory = (server = false) => card({ icon: 'clock', title: 'acme policy versions', right: 'approved by another acme admin or a server admin',
+    body: tbl(['Version', 'Changed by', 'Approved by', 'Reason', 'When', ''], [
+      ['<b>v3</b> ' + tag('active'), lnk('acme-portal'), lnk('acme-sec'), 'Keep diagnostics out of object storage', '2d ago', ''],
+      ['v2', lnk('acme-sec'), `${lnk('ops-admin')} ${tag('server admin')}`, 'Contract values stay on internal sinks', '3w ago', btn('Roll back to v2', { icon: 'undo', act: true })],
+      ['v1', lnk('acme-sec'), lnk('acme-portal'), 'First acme rules', '2mo ago', btn('Roll back to v1', { icon: 'undo', act: true })]]),
+    note: server ? 'Server admins can edit and roll back any tenant’s rules; the change still needs a second person.' : 'A rollback is a change request too.' });
+  const tHead = () => head('Policy', [pill('Enforced', 'ok', 'shield'), '<span>server eu-pii v7 + acme rules v3</span>', `<span>acme rules approved by ${lnk('acme-sec')} 2d ago</span>`], 'acme’s runs are checked against the server’s rules and acme’s own. acme’s rules can only add: they never remove or loosen a server rule.');
+  const tTabs = (on) => dtabs(['Rules', ['Refusals', 3], ['History', 3]], on);
+  function tenantPolicy(state) {
+    const T = (c) => M.top(['Govern', 'Policy', ...(c ? [c] : [])]);
+    if (state === 'op-tenant') {
+      T('acme');
+      M.detail(`${head('Policy · acme', [pill('Enforced', 'ok', 'shield'), '<span>server eu-pii v7 + acme rules v3</span>', '<span>tenant switcher set to acme</span>'], 'What acme’s runs are checked against: the server policy plus acme’s add-only rules. Pick “All tenants” above for the server policy alone.')}
+        ${dhead(dtabs(['Rules', ['Refusals · acme', 3], ['acme history', 3]], 'Rules'), btn('Edit acme rules', { icon: 'edit', kind: 'primary', act: true }))}
+        <div class="pair">${rulesCard()}${tenantRules()}</div>${tHistory(true)}`);
+      return;
+    }
+    if (state === 't-none') {
+      T();
+      M.detail(`${head('Policy', [pill('Enforced', 'ok', 'shield'), '<span>server eu-pii v7</span>', '<span>no acme rules</span>'])}
+        ${alert('Only the server policy applies to acme.', 'acme can add its own classifications and rules on top. They can only tighten what the server allows, and the first version needs another acme admin or a server admin to approve it.', '', btn('Add rules', { icon: 'plus', kind: 'primary', act: true }))}
+        ${serverForTenant()}`);
+      return;
+    }
+    if (state === 't-edit' || state === 't-preview') {
+      const err = state === 't-edit';
+      T('Edit acme rules');
+      const right = `${btn('Discard', { kind: 'quiet' })}${err ? btn('Preview impact', { icon: 'diff', kind: 'primary', cls: 'dis' }) : btn('Back to editor', { icon: 'edit' })}`;
+      const top = `${dhead('', right, 'Policy')}${head(err ? 'Edit acme’s rules' : 'Review your change to acme’s rules', ['<span>draft of acme v4 · based on v3</span>', '<span>needs another acme admin or a server admin</span>'])}`;
+      if (err) {
+        M.detail(`${top}${alert('2 problems in the draft.', 'Tenant rules can only add. Fix them to preview the impact.', 'bad')}
+          <div class="pair">${card({ icon: 'code', title: 'acme-policy.yaml', aside: 'draft', body: `<div class="pad"><div class="area" style="border-color:var(--bad)">${T_BAD}</div></div>` })}
+          ${card({ icon: 'alert', title: 'Problems', body: tbl(['Line', 'Problem'], [
+            ['7', '<span class="bad"><code>pii-to-eu-only</code> is a server rule.</span> Tenant rules can only add: pick a new name.'],
+            ['11', '<span class="bad">A tenant policy cannot disable a server rule.</span> Remove <code>disable</code>; ask the server operator about <code>no-raw-cards</code>.']]),
+            note: 'Server rules acme sees: pii-to-eu-only, no-raw-cards, no-pii-to-stdout.' })}</div>`);
+        return;
+      }
+      M.detail(`${top}
+        <div class="pair">${card({ icon: 'diff', title: 'What changes', aside: 'acme v3 → draft', body: diff([['@', 'classifications'], ['+', '- label: acme.ssn_partial'], ['+', '  fields: [ssn_last4]'], ['@', 'rules'], ['+', '- name: acme-ssn-internal'], ['+', '  when: { label: acme.ssn_partial }'], ['+', '  require: { tier: [internal] }']]) })}
+        ${card({ icon: 'lineage', title: 'Impact on acme', aside: 'acme’s templates and its last 7 days of runs', body: `${grid(3, [kv('Newly refused', '<span class="bad">1 template</span>', '2 recent runs'), kv('Newly allowed', '0', 'tenant rules only add'), kv('Unchanged', '8 templates')])}<div class="pad" style="padding-top:0">${tbl(['Would be refused', 'Rule', 'Why'], [[lnk('acme/support-export') + ' <span class="mono">v5</span>', nw('acme-ssn-internal'), '<span class="mono">ssn_last4</span> reaches an s3 sink with tier partner']])}</div>` })}</div>
+        ${card({ title: 'Request the change', body: `<div class="form one">${field('Reason', '<div class="area sans">Partial SSNs are still personal data for our auditors.</div>', { req: true })}</div><div class="actions"><span class="muted">Another acme admin or a server admin must approve. Runs already admitted keep the rules they were checked against.</span>${btn('Request change', { icon: 'changes', kind: 'primary' })}</div>` })}`);
+      return;
+    }
+    T();
+    if (state === 't-refusals') {
+      M.detail(`${tHead()}${dhead(tTabs('Refusals'))}
+        ${stats([['Refusals (7d)', '3'], ['By server rules', '2'], ['By acme rules', '1']])}
+        ${card({ icon: 'alert', title: 'acme’s refused runs', body: tbl(['When', 'Run', 'Rule', 'Layer', 'Column', 'Where'], [
+          ['today 09:12', lnk('orders-export · 7f3c'), nw('pii-to-eu-only'), tag('server'), '<span class="mono">customer_email</span>', 'run time · quarantined 412 rows'],
+          ['today 07:40', lnk('deals-to-partner · 91aa'), nw('acme-contracts-internal'), tag('tenant'), '<span class="mono">deal_size</span>', 'submit · refused'],
+          ['yesterday 17:03', lnk('crm-debug · 2e81'), nw('no-raw-cards'), tag('server'), '<span class="mono">card_number</span>', 'run time · failed']]),
+          note: 'Server rules are set by the server operator; ask them if one blocks something you need.' })}`);
+      return;
+    }
+    const viewer = state === 't-viewer';
+    const banner = state === 't-submitted' ? alert('Your change to acme v4 waits for approval.', `Another acme admin or a server admin must approve ${lnk('change cr-0146')}. acme v3 stays in force until then.`, 'warn', btn('Open in Changes', { icon: 'changes' })) : '';
+    M.detail(`${tHead()}${banner}${dhead(tTabs('Rules'))}<div class="pair">${serverForTenant()}${tenantRules({ edit: !viewer && state !== 't-submitted' })}</div>${viewer ? '<div class="muted" style="font-size:12px">Only acme admins change acme’s rules.</div>' : ''}`);
+  }
+
   M.view('policy', {
     label: 'Policy', nav: 'policy', icon: 'policy', shape: 'canvas', summary: 'the data-flow policy the server enforces, and approved edits (#1043)',
     states: {
@@ -104,7 +186,14 @@ rules:
       submitted: { label: 'Change requested · pending approval', covers: ['POST /v1/policy → ChangeKind::PolicyUpdate', 'link to Changes'] },
       none: { label: 'No policy loaded', covers: ['empty state', 'write a policy (server-managed)'] },
       viewer: { label: 'Viewer · read only', params: { role: 'viewer' }, covers: ['no Edit / rollback'] },
-      tenant: { label: 'Tenant principal', params: { scope: 'tenant' }, covers: ['policy hidden', 'own refusals only'] },
+      't-admin': { label: 'Tenant admin · effective policy (server + acme)', params: { scope: 'tenant' }, covers: ['GET /v1/tenants/{t}/policy', 'server rules read only (names + requirements)', 'acme rules editable'], new: ['tenant policies (#1043 part 3)'] },
+      't-refusals': { label: 'Tenant · refusals with the layer that refused', params: { scope: 'tenant' }, covers: ['own refusals only', 'server or tenant layer'] },
+      't-edit': { label: 'Tenant admin · edit · add-only errors', params: { scope: 'tenant' }, covers: ['tenant rules can only add', 'server rule name reused', 'disabling a server rule refused'] },
+      't-preview': { label: 'Tenant admin · preview on acme only', params: { scope: 'tenant' }, covers: ['POST /v1/tenants/{t}/policy/preview', 'impact on acme’s templates and runs only'] },
+      't-submitted': { label: 'Tenant admin · change requested', params: { scope: 'tenant' }, covers: ['POST /v1/tenants/{t}/policy → ChangeKind::TenantPolicyUpdate', 'another acme admin or a server admin approves'] },
+      't-viewer': { label: 'Tenant viewer / operator · read only', params: { scope: 'tenant', role: 'viewer' }, covers: ['acme rules read only', 'no edit'] },
+      't-none': { label: 'Tenant · no tenant policy yet', params: { scope: 'tenant' }, covers: ['only the server policy applies', 'Add rules through approval'] },
+      'op-tenant': { label: 'Server admin · switcher set to acme', params: { tenant: 'acme' }, covers: ['server rules + acme rules', 'acme version history', 'server admin can edit acme rules'] },
       loading: { label: 'Loading', covers: ['skeleton'] },
       error: { label: 'Could not load', covers: ['error with retry'] },
     },
@@ -118,11 +207,7 @@ rules:
           ${card({ icon: 'code', title: 'Or load a file at start', body: code('faucet serve --policy policies/eu-pii.yaml', { box: false, lang: 'plain' }), note: 'A file-loaded policy is shown here read-only.' })}</div>`);
         return;
       }
-      if (state === 'tenant') {
-        M.detail(`${head('Policy', [pill('Enforced', 'ok', 'shield'), '<span>set by the server operator</span>'], 'The server’s data-flow policy decides which sinks labelled columns may reach. Its rules are not shown to tenants; refusals of acme’s runs are listed here.')}
-          ${dhead(dtabs([['Refusals', 3]], 'Refusals'))}${refusals(true)}`);
-        return;
-      }
+      if (state.startsWith('t-') || state === 'op-tenant') { tenantPolicy(state); return; }
       if (state === 'edit' || state === 'preview') {
         const err = state === 'edit';
         M.top(['Govern', 'Policy', 'Edit']);

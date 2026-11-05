@@ -136,7 +136,7 @@
 
   // ---- shell ----
   const NAV = [
-    ['Operate', [['home', 'Overview', 'overview'], ['runs', 'Runs', 'runs', '3'], ['changes', 'Changes', 'changes', '2', true], ['trig', 'Triggers', 'triggers'], ['sched', 'Schedules', 'schedules', '7'], ['feed', 'Feeds', 'feeds', null, false, true]]],
+    ['Operate', [['home', 'Overview', 'overview'], ['runs', 'Runs', 'runs', '3'], ['changes', 'Changes', 'changes', '2', true], ['trig', 'Triggers', 'triggers'], ['sched', 'Schedules', 'schedules', '8'], ['feed', 'Feeds', 'feeds', null, false, true]]],
     ['Data', [['db', 'Datasets', 'datasets', '48'], ['lineage', 'Lineage', 'lineage']]],
     ['Build', [['tpl', 'Templates', 'templates', '17'], ['schema', 'Schemas', 'schemas'], ['submit', 'Submit', 'submit']]],
     ['Govern', [['policy', 'Policy', 'policy'], ['usage', 'Usage', 'usage'], ['tenants', 'Tenants', 'tenants', '6']]],
@@ -149,6 +149,8 @@
     state: params.get('state') || '',
     role: params.get('role') || 'admin',
     scope: params.get('scope') || '',
+    tenant: params.get('tenant') || '',
+    who: params.get('who') || '',
   };
 
   function shell(navKey, st = {}) {
@@ -164,14 +166,14 @@
         return shown.length ? `<div class="grp"><h6>${g} ${ic('chev')}</h6>${shown.map(([k, l, key, n, hot, soon]) =>
           { const bn = st.badges === false ? null : st.badges && key in st.badges ? st.badges[key] : tenantScoped && key !== 'runs' && key !== 'changes' ? null : n; return `<div class="nav ${key === navKey ? 'on' : ''} ${soon ? 'soon' : ''}">${ic(k)}<span class="lbl">${l}</span>${soon ? '<span class="tag">soon</span>' : bn ? `<span class="n ${hot ? 'hot' : ''}">${bn}</span>` : ''}</div>`; }).join('')}</div>` : '';
       }).join('')}
-      <div class="foot"><div class="who"><span class="avatar">${tenantScoped ? 'AC' : viewer ? 'VI' : 'OA'}</span><span class="nm">${tenantScoped ? 'acme-portal' : viewer ? 'analyst-vi' : 'ops-admin'}</span></div><span class="tag">${tenantScoped ? 'tenant acme' : viewer ? 'read-only' : 'admin'}</span></div>`;
+      <div class="foot"><div class="who"><span class="avatar">${ctx.who ? ctx.who.slice(0, 2).toUpperCase() : tenantScoped ? 'AC' : viewer ? 'VI' : 'OA'}</span><span class="nm">${ctx.who || (tenantScoped ? 'acme-portal' : viewer ? 'analyst-vi' : 'ops-admin')}</span></div><span class="tag">${tenantScoped ? `acme · ${viewer ? 'viewer' : ctx.role}` : viewer ? 'read-only' : 'admin'}</span></div>`;
     document.getElementById('status').innerHTML = `<span><span class="dot"></span>history postgres · healthy</span><span>cluster · 3 live</span><span>faucet serve 2.4.0</span><span>Design mockup · sample data</span>`;
   }
 
   /** The top bar: crumbs (last is bold), an optional delta, and right-side chips. */
   function top(crumbs, { delta = '', right = '' } = {}) {
     const tenantScoped = ctx.scope === 'tenant';
-    const tenantSel = tenantScoped ? `<span class="chip">${ic('tenants')}acme</span>` : `<span class="select" style="height:28px">All tenants</span>`;
+    const tenantSel = tenantScoped ? `<span class="chip">${ic('tenants')}acme</span>` : `<span class="select ${ctx.tenant ? 'on' : ''}" style="height:28px">${ctx.tenant ? `${ic('tenants')}${ctx.tenant}` : 'All tenants'}</span>`;
     document.getElementById('top').innerHTML = `<div class="crumb">${crumbs.map((c, i) => (i === crumbs.length - 1 ? `<b>${c}</b>` : `${c}<span class="faint">/</span>`)).join(' ')}</div>${delta ? `<span class="delta">${delta}</span>` : ''}<div class="right">${right}${tenantSel}<span class="select" style="height:28px">UTC</span>${ic('theme')}${ic('link')}${ic('expand')}</div>`;
   }
   const list = (h) => (document.getElementById('list').innerHTML = h);

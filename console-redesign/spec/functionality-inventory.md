@@ -26,6 +26,8 @@ Legend once the build lands: ✅ kept (where) · ⚠️ changed (how) · ❌ dro
 - 🆕 Every id/URI/config with a copy button; relative times with the absolute time on hover; every name links to its page → client
 - 🆕 Audit log, Triggers and Settings become real pages (APIs exist); Feeds stays "soon" with a designed placeholder
 - 🆕 Schedules (#1044) and Policy (#1043) become real pages: see `views/schedules.js` and `views/policy.js` and api-proposals #9 / #10
+- 🆕 The top tenant switcher also scopes Schedules (own + shared schedules that include the tenant, runs filtered to it) and Policy (server policy + that tenant's add-only rules and their history) → api-proposals #11 / #12
+- 🆕 Tenant principals: Schedules shows their own schedules (editable within `max_schedules` and the minimum interval) and the operator's shared ones read-only; Policy shows the server rules that apply to them (names + requirements, read-only) and their tenant's rules (editable by tenant admins through approval) → api-proposals #11 / #12
 
 ## Schemas (old views/schemas.js)
 - Catalogue of compiled sources / sinks / transforms / state stores → `GET /v1/schemas`

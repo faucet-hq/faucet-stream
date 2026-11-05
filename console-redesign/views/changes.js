@@ -88,6 +88,8 @@
       viewer: { label: 'Viewer · read only', params: { role: 'viewer' }, covers: ['permission gate change_approve'] },
       toast: { label: 'After approving · toast', covers: ['toast result', 'badge refresh'] },
       policy: { badges: { changes: '4' }, label: 'Policy update · second admin approves', covers: ['ChangeKind::PolicyUpdate (#1043)', 'YAML diff', 'impact on templates and recent runs', 'self-approval refused'], new: ['policy updates as change requests'] },
+      'tpolicy-approve': { badges: { changes: '1' }, label: 'Tenant policy update · second acme admin approves', params: { scope: 'tenant', who: 'acme-sec' }, covers: ['ChangeKind::TenantPolicyUpdate (#1043 part 3)', 'approver: another acme admin or a server admin'] },
+      'tpolicy-requester': { badges: { changes: '1' }, label: 'Tenant policy update · requester cannot approve', params: { scope: 'tenant' }, covers: ['self-approval refused', 'withdraw'] },
       selfapprove: { badges: { changes: '4' }, label: 'Policy update · requester cannot approve', covers: ['self_approve off for policy updates', 'withdraw'] },
     },
     render(state) {
@@ -110,6 +112,27 @@
           ${card({ icon: 'changes', title: 'What it ran', tag: 'material matched on approve', right: 'fingerprint <span class="mono">4c02…</span>', body: diff([[' ', 'backfill · pipeline payments_events'], ['+', 'window: 2026-09-01 → 2026-10-01 · unit 1d · 30 units'], ['+', 'into: sink postgres · finance.payments'], [' ', 'delivery at-least-once · state namespaced']]), note: '<span class="ok">Additive only</span> · no schema change downstream.' })}
           ${approvals.replace('waiting for a second admin', 'second approval by finance-lead').replace('<span class="avatar vacant"></span><span class="muted">', '<span class="avatar">FL</span><span>').replace('self-approval off for the requester', '5d ago')}`);
         if (state === 'toast') M.overlay(toast(`${ic('check')}<span>Approved · run <span class="mono">payments_events_backfill</span> started · <span class="lnk">open run</span></span>`, 'done'));
+        return;
+      }
+      if (state === 'tpolicy-approve' || state === 'tpolicy-requester') {
+        const mine = state === 'tpolicy-requester';
+        M.top(crumbs('Update acme policy to v4'), { delta: '<span class="warn">awaiting 1 approval</span>' });
+        const rows = [
+          ['cr146', ring('warn', 'hollow'), 'Update acme policy to v4', '8m', '<b>tenant policy</b> · 1 template newly refused · 0 of 1 · by acme-portal'],
+          ['cr131', ring('ok'), 'Run acme-backfill-2026-09', '6d', '<b>executed</b> · approved by acme-sec'],
+          ['cr120', ring('ok'), 'Update acme policy to v3', '2d', '<b>executed</b> · approved by acme-sec'],
+        ];
+        const rr = ([id, ...a]) => row(...a.slice(0, 4), { on: id === 'cr146' });
+        M.list(`${tabs([['Needs me', mine ? 0 : 1], 'All'], mine ? 'All' : 'Needs me', ibtn('refresh'))}
+          ${stats([['Pending', '1', 'warn'], ['Executed', '6', 'ok'], ['Rejected', '0'], ['Failed', '0']])}
+          ${sect('Pending', 1)}${rr(rows[0])}${sect('Recently decided', 6)}${rows.slice(1).map(rr).join('')}`);
+        const acts = mine ? `${btn('Withdraw', { kind: 'danger', icon: 'x', act: true })}${btn('Approve', { kind: 'primary', icon: 'check', cls: 'dis' })}` : `${btn('Reject', { kind: 'danger', icon: 'x', act: true })}${btn('Approve and apply', { kind: 'primary', icon: 'check', act: true })}`;
+        M.detail(`${dhead(dtabs(['Plan', 'Impact', 'History'], 'Plan'), acts, 'Changes')}${head('Update acme policy to v4', [pill('Pending · 0 of 1 approvals', 'warn'), `<span>requested by ${lnk('acme-portal')} · acme admin</span>`, '<span>8m ago</span>', '<span>expires in 71h</span>'])}
+          ${mine ? alert('You requested this change.', 'Another acme admin or a server admin must approve it; you cannot approve your own request. You can withdraw it.', '') : ''}
+          ${card({ icon: 'policy', title: 'What changes in acme’s rules', tag: 'tenant layer · add only', right: 'based on acme v3', body: diff([['@', 'classifications'], ['+', '- label: acme.ssn_partial'], ['+', '  fields: [ssn_last4]'], ['@', 'rules'], ['+', '- name: acme-ssn-internal'], ['+', '  when: { label: acme.ssn_partial }'], ['+', '  require: { tier: [internal] }']]),
+            note: '<span class="warn">1 acme template would be refused</span> · ' + lnk('acme/support-export') + ', and 2 of acme’s runs from the last 7 days. Server rules are unchanged. <span class="lnk">See impact</span>' })}
+          <div class="card"><div class="pad" style="color:var(--text-2)"><small class="muted" style="display:block;margin-bottom:4px">Reason from the requester</small>Partial SSNs are still personal data for our auditors.</div></div>
+          ${card({ title: 'Approvals', right: 'another acme admin or a server admin', body: `<div class="vote" style="border-top:0"><span class="avatar vacant"></span><span class="muted">waiting for an approver</span><span class="r">${mine ? 'you cannot approve your own request' : 'acme-portal cannot approve their own request'}</span></div>` })}`);
         return;
       }
       if (state === 'policy' || state === 'selfapprove') {

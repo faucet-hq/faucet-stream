@@ -21,6 +21,19 @@
     acmecrm: ['acmecrm', ring('ok'), 'acme-crm-contacts', 'in 2h', '<b>0 */4 * * *</b> · UTC · by acme-portal'],
   };
   const r = (sel) => ([id, ...a]) => row(...a, { on: id === sel });
+  const SH = {
+    billing: ['billing', ring('ok'), 'billing-sync', 'in 2h', '<b>shared</b> · runs for 3 tenants · 0 */6 * * *'],
+    nightly: ['nightly', ring('ok'), 'nightly-rollup', 'in 6h', '<b>shared</b> · runs for 6 tenants · 0 2 * * *'],
+  };
+  const SHT = {
+    billing: ['billing', ring('ok'), 'billing-sync', 'in 2h', '<b>shared</b> · by the operator · read only'],
+    nightly: ['nightly', ring('ok'), 'nightly-rollup', 'in 6h', '<b>shared</b> · by the operator · read only'],
+  };
+  const scopedPane = (sel) => `${tabs([['All', 4], ['Paused', 0]], 'All', ibtn('refresh') + btn('New', { icon: 'plus', kind: 'primary', act: true }))}
+      ${stats([['For acme', '4'], ['Ticks today', '19'], ['Missed', '0'], ['Next tick', 'in 14m']])}
+      ${sect('acme’s own', 2)}${[S.hourly, S.acmeorders].map(r(sel)).join('')}
+      ${sect('Shared · include acme', 2)}${[SH.billing, SH.nightly].map(r(sel)).join('')}
+      <div class="muted" style="font-size:12px;padding:10px 14px">Showing schedules that run for acme. Pick “All tenants” above to see all 8.</div>`;
   const newBtn = (dis) => btn('New', { icon: 'plus', kind: 'primary', act: true, cls: dis ? 'dis' : '' });
   const listPane = (sel, { tenant = false, limit = false } = {}) => {
     if (tenant) {
@@ -28,12 +41,14 @@
       const active = rows.filter((x) => x !== TEN.acmeweekly);
       return `${tabs([['All', rows.length], ['Paused', 1]], 'All', ibtn('refresh') + newBtn(limit))}
         ${stats([['Schedules', `${rows.length} of 5`, limit ? 'warn' : ''], ['Ticks today', '31'], ['Missed', '0'], ['Next tick', 'in 14m']])}
-        ${sect('Active', active.length)}${active.map(r(sel)).join('')}${sect('Paused', 1)}${r(sel)(TEN.acmeweekly)}`;
+        ${sect('Active', active.length)}${active.map(r(sel)).join('')}${sect('Paused', 1)}${r(sel)(TEN.acmeweekly)}
+        ${sect('From the operator', 2)}${[SHT.billing, SHT.nightly].map(r(sel)).join('')}
+        <div class="muted" style="font-size:12px;padding:10px 14px">Shared schedules are managed by the server operator and do not count toward acme’s limit.</div>`;
     }
-    return `${tabs([['All', 7], ['Paused', 1]], 'All', ibtn('refresh') + newBtn())}
-      ${stats([['Schedules', '7'], ['Ticks today', '128'], ['Missed', '3', 'bad'], ['Next tick', 'in 14m']])}
+    return `${tabs([['All', 8], ['Paused', 1]], 'All', ibtn('refresh') + newBtn())}
+      ${stats([['Schedules', '8'], ['Ticks today', '128'], ['Missed', '3', 'bad'], ['Next tick', 'in 14m']])}
       ${sect('Needs attention', 1)}${r(sel)(S.broken)}
-      ${sect('Active', 5)}${[S.hourly, S.usage, S.acmeorders, S.nightly, S.weekly].map(r(sel)).join('')}
+      ${sect('Active', 6)}${[S.hourly, S.usage, SH.billing, S.acmeorders, S.nightly, S.weekly].map(r(sel)).join('')}
       ${sect('Paused', 1)}${r(sel)(S.partner)}`;
   };
 
@@ -148,6 +163,10 @@
       tenant: { label: 'Tenant principal · own schedule', params: { scope: 'tenant' }, covers: ['tenant-scoped list', 'no fan-out', 'limit shown'] },
       'tenant-create': { label: 'Tenant · tick interval below the minimum', params: { scope: 'tenant' }, covers: ['min interval guardrail', 'only templates the tenant may run', 'no tenants selector'] },
       'tenant-limit': { label: 'Tenant · max_schedules reached', params: { scope: 'tenant' }, sel: false, covers: ['max_schedules guardrail'] },
+      'scoped-list': { label: 'Operator · switcher set to acme', params: { tenant: 'acme' }, sel: false, covers: ['GET /v1/schedules?tenant=acme', 'acme-owned + shared schedules that include acme'], new: ['shared tag with tenant count'] },
+      scoped: { label: 'Operator · shared schedule seen as acme', params: { tenant: 'acme' }, covers: ['runs, missed and recent ticks filtered to acme', 'edits apply to every tenant (warning)'] },
+      'scoped-pause': { label: 'Operator · pause a shared schedule while scoped', params: { tenant: 'acme' }, covers: ['pause affects all three tenants'] },
+      'tenant-shared': { label: 'Tenant principal · operator’s shared schedule', params: { scope: 'tenant' }, covers: ['read only, managed by the server operator', 'own runs only', 'other tenants not named'] },
     },
     render(state) {
       const crumbs = (t) => (t ? ['Operate', 'Schedules', t] : ['Operate', 'Schedules']);
@@ -180,6 +199,41 @@ schedules:
     params: { region: eu }`, { box: false }), note: 'Then start the server with <code>faucet serve --schedules schedules.yaml</code>.' })}</div>`);
         return;
       }
+      const billingTicks = (lastS) => ticksCard({ cron: '0 */6 * * *', words: 'every 6 hours', next: 'today 18:00', nextS: 'in 2h · UTC', last: 'today 12:00', lastS,
+        rows: tbl(['Next 5 ticks', 'UTC'], [['today', '18:00'], ['tomorrow', '00:00'], ['tomorrow', '06:00'], ['tomorrow', '12:00'], ['tomorrow', '18:00']]) });
+      const acmeTicks = (title) => card({ icon: 'runs', title, right: lnk('all 31 in Runs'), body: tbl(['Tick', 'Outcome', ['Took', 'num']], [
+        ['today 12:00', '<span class="ok">● 1 of 1 completed</span>', '4m'], ['today 06:00', '<span class="ok">● 1 of 1 completed</span>', '4m'], ['today 00:00', '<span class="ok">● 1 of 1 completed</span>', '5m'], ['yesterday 18:00', '<span class="ok">● 1 of 1 completed</span>', '4m']]) });
+      if (state === 'scoped-list') {
+        M.top(crumbs());
+        M.list(scopedPane(''));
+        M.detail(`${head('4 schedules run for acme', ['<span>2 of its own · 2 shared</span>', '<span>next tick in 14m</span>'])}
+          ${card({ title: 'Coming up for acme', right: 'next 12 hours · UTC', body: tbl(['When', 'Schedule', 'Owner', 'Template'], [
+            ['in 14m · 14:15', lnk('hourly-crm-sync'), 'acme', 'acme/crm-sync'], ['in 2h · 18:00', lnk('billing-sync'), `shared ${tag('3 tenants')}`, 'faucet-hq/billing-export'],
+            ['in 3h · 17:00', lnk('acme-daily-orders'), 'acme', 'acme/orders'], ['in 6h · 01:00', lnk('nightly-rollup'), `shared ${tag('6 tenants')}`, 'acme/billing-api']]) })}`);
+        return;
+      }
+      if (state === 'scoped' || state === 'scoped-pause') {
+        M.top(crumbs('billing-sync'));
+        M.list(scopedPane('billing'));
+        M.detail(`${dhead(dtabs(['Overview', ['Runs · acme', 31], ['Missed · acme', 0], 'History'], 'Overview'), actions(), 'Schedules')}
+          ${head('billing-sync', [pill('Active', 'ok', 'check'), chip('shared · runs for 3 tenants'), '<span>every 6 hours · UTC</span>', `<span>runs ${lnk('faucet-hq/billing-export')} <span class="mono">stable</span></span>`])}
+          ${alert('Runs for acme, globex and initech; changes apply to all three.', 'Runs, missed ticks and recent ticks below are acme’s only, because the switcher is set to acme. Edit, Pause and Delete change the schedule for every tenant it runs for.', 'warn')}
+          <div class="two"><div class="stack">${billingTicks('acme: 1 of 1 completed')}</div>
+          <div class="stack">${card({ icon: 'tenants', title: 'Tenants', tag: 'fan-out', aside: 'operators only', body: `<div class="pad" style="display:flex;gap:6px;flex-wrap:wrap">${chip(`${ic('check')}acme`, 'on')}${chip('globex')}${chip('initech')}</div>`, note: 'acme is the tenant you are looking at.' })}${acmeTicks('Recent ticks · acme')}</div></div>`);
+        if (state === 'scoped-pause') M.overlay(dialog('Pause billing-sync for every tenant?', `<span>This schedule runs for <b>acme, globex and initech</b>. Pausing stops ticks for all three, not only acme. Skipped ticks are not run later.</span>
+          ${alert('To stop it for acme only, edit the schedule and remove acme from its tenants.', '', '')}
+          ${field('Reason', '<div class="area sans">Billing API maintenance window</div>', { help: 'Optional · shown on the schedule and in the audit log' })}`, `${btn('Cancel')}${btn('Pause for all 3 tenants', { kind: 'primary', icon: 'pause' })}`, 'pause'));
+        return;
+      }
+      if (state === 'tenant-shared') {
+        M.top(crumbs('billing-sync'));
+        M.list(listPane('billing', { tenant: true }));
+        M.detail(`${dhead(dtabs(['Overview', ['Your runs', 31]], 'Overview'), '', 'Schedules')}
+          ${head('billing-sync', [pill('Active', 'ok', 'check'), chip('managed by the server operator'), '<span>every 6 hours · UTC</span>', `<span>runs ${lnk('faucet-hq/billing-export')} <span class="mono">stable</span></span>`])}
+          ${alert('Managed by the server operator.', 'It runs for acme and other tenants. You can see when it runs and acme’s runs from it; ask the operator to change or pause it.', '')}
+          <div class="two"><div class="stack">${billingTicks('1 run for acme · completed')}</div><div class="stack">${acmeTicks('acme’s runs')}</div></div>`);
+        return;
+      }
       if (state === 'tenant-limit') {
         M.top(crumbs());
         M.list(listPane('', { tenant: true, limit: true }));
@@ -206,7 +260,7 @@ schedules:
       M.list(listPane(state === 'list' ? '' : selected));
 
       if (state === 'list') {
-        M.detail(`${head('7 schedules', ['<span>next tick in 14m</span>', '<span class="bad">3 missed in the last 24h</span>'])}
+        M.detail(`${head('8 schedules', ['<span>next tick in 14m</span>', '<span class="bad">3 missed in the last 24h</span>'])}
           ${alert('invoice-digest failed its last 3 ticks.', 'Its template channel no longer resolves.', 'bad', btn('Open', { icon: 'right' }))}
           ${card({ title: 'Coming up', right: 'next 12 hours · UTC', body: tbl(['When', 'Schedule', 'Runs', 'Template'], [
             ['in 14m · 14:15', lnk('hourly-crm-sync'), '1 · acme', 'acme/crm-sync'], ['in 41m · 14:30', lnk('usage-snapshot'), '1', 'faucet-hq/usage-export'],

@@ -162,6 +162,8 @@ svg.i { width: 15px; height: 15px; stroke: currentColor; fill: none; stroke-widt
 .input svg.i { width: 14px; height: 14px; color: var(--faint); }
 .input.mono, .area.mono { font-family: var(--mono); font-size: var(--fs-sm); }
 .select { padding-right: 8px; justify-content: space-between; }
+.select.on { background: var(--teal-fill); border-color: var(--teal-line); color: var(--teal-ink); justify-content: flex-start; }
+.select.on::after { margin-left: auto; border-color: var(--teal-ink); }
 .select::after { content: ""; width: 6px; height: 6px; border-right: 1.5px solid var(--muted); border-bottom: 1.5px solid var(--muted); transform: rotate(45deg) translateY(-2px); flex: none; }
 .area { padding: 8px 10px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-sm); font: var(--fs-sm)/1.6 var(--mono); color: var(--text-2); white-space: pre; overflow: hidden; }
 .area.sans { font: var(--fs)/1.5 var(--sans); white-space: normal; }
