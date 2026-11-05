@@ -1,0 +1,9 @@
+# The file is the policy (--policy-store file): the flag is rendered only
+# when it is not the server default.
+# expect: - --policy=/etc/faucet-policy/policy.yaml
+# expect: - --policy-store=file
+serve:
+  policy:
+    enabled: true
+    existingSecret: my-policy
+    store: file

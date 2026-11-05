@@ -3628,6 +3628,17 @@ components:
         summary: { type: object, nullable: true, additionalProperties: true }
         refusals_7d: { type: object, properties: { total: { type: integer }, submit: { type: integer }, runtime: { type: integer } } }
         editable: { type: boolean }
+        store: { type: string, enum: [server, file], description: "`--policy-store`: where the server policy lives." }
+        persistent_history: { type: boolean, description: "False on the in-memory history: every policy edit is refused (409)." }
+        file_drift:
+          type: object
+          nullable: true
+          description: "Set on a server-store server started with `--policy`: whether that file differs from the version in force (a differing file was not applied)."
+          required: [path, differs]
+          properties:
+            path: { type: string }
+            differs: { type: boolean }
+            yaml: { type: string, description: "The file as canonical YAML, when it differs: propose it with `POST /v1/policy` to import it." }
         pending_change: { type: object, nullable: true, additionalProperties: true }
     PolicyProposal:
       type: object

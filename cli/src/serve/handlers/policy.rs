@@ -15,7 +15,9 @@
 //! through `/v1/changes/{id}/approve`. A server started with `--policy
 //! <file>` shows that file read-only and refuses edits with a 409.
 
-use crate::serve::changes::policy_update::{PolicyPayload, require_server_managed};
+use crate::serve::changes::policy_update::{
+    PolicyPayload, require_persistent, require_server_managed,
+};
 use crate::serve::changes::{self, ChangeKind, ChangeListFilter, ChangeRequest, ChangeStatus};
 use crate::serve::error::ServeError;
 use crate::serve::history::policies::{
@@ -144,7 +146,8 @@ pub async fn get_policy(
             "editable": false,
         })));
     }
-    let editable = actor.role == Role::Admin && layer.source == PolicySource::Server;
+    let persistent = state.persistent_history();
+    let editable = actor.role == Role::Admin && layer.source == PolicySource::Server && persistent;
     let summary = match &layer.spec {
         Some(spec) => json!({
             "rules": spec.rules.len(),
@@ -166,6 +169,9 @@ pub async fn get_policy(
         "summary": summary,
         "refusals_7d": refusals,
         "editable": editable,
+        "store": state.policy_store(),
+        "persistent_history": persistent,
+        "file_drift": policies::file_drift(&state).await?,
         "pending_change": pending_change(&state, ChangeKind::PolicyUpdate, None).await?,
     })))
 }
@@ -399,6 +405,7 @@ async fn propose(
     base_version: Option<u32>,
     restores: Option<u32>,
 ) -> Result<(StatusCode, Json<ChangeRequest>), ServeError> {
+    require_persistent(state)?;
     require_server_managed(state, &layer)?;
     if reason.trim().is_empty() {
         return Err(ServeError::BadConfig(
@@ -469,6 +476,7 @@ async fn rollback_layer(
     layer: Layer,
     req: RollbackRequest,
 ) -> Result<(StatusCode, Json<ChangeRequest>), ServeError> {
+    require_persistent(state)?;
     require_server_managed(state, &layer)?;
     let scope = layer.scope();
     let target = state
@@ -564,7 +572,8 @@ pub async fn get_tenant_policy(
         "version": current.map(VersionView::from),
         "versions": versions.iter().map(VersionView::from).collect::<Vec<_>>(),
         "refusals_7d": policies::refusal_counts(&state, Some(&tenant)).await,
-        "editable": actor.role == Role::Admin,
+        "editable": actor.role == Role::Admin && state.persistent_history(),
+        "persistent_history": state.persistent_history(),
         "pending_change": pending_change(&state, ChangeKind::TenantPolicyUpdate, Some(&tenant)).await?,
     })))
 }

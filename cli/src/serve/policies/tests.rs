@@ -1,6 +1,83 @@
 use super::*;
 use crate::serve::test_support::test_state;
 
+#[test]
+fn same_policy_compares_canonical_content() {
+    let a: PolicySpec = crate::yaml::from_str(SERVER).unwrap();
+    let relaid = "# a comment\nversion: 1\nrules:\n- name: pii-to-eu-only\n  mask: [hash]\n  \
+                  require: {residency: [eu]}\n  when: {label: pii.email}\nclassifications:\n- \
+                  {label: pii.email, fields: [email]}\n";
+    let b: PolicySpec = crate::yaml::from_str(relaid).unwrap();
+    assert!(same_policy(&a, &b), "layout and comments are not a change");
+    let c: PolicySpec = crate::yaml::from_str(&SERVER.replace("[eu]", "[eu, us]")).unwrap();
+    assert!(!same_policy(&a, &c));
+}
+
+#[tokio::test]
+async fn a_policy_file_seeds_an_empty_store_and_then_only_reports_drift() {
+    use crate::serve::config::{HistoryBackendSpec, PolicyStore};
+    use crate::serve::server::apply_policy_file;
+    use crate::serve::test_support::{state_from, test_config};
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("policy.yaml");
+    std::fs::write(&path, SERVER).unwrap();
+    let spec: Arc<PolicySpec> = Arc::new(crate::yaml::from_str(SERVER).unwrap());
+    let mut config = test_config();
+    config.history = HistoryBackendSpec::Sqlite("sqlite:persistent.db".into());
+
+    // An empty store: the file becomes version 1, imported by `system`.
+    let state = state_from(&config);
+    apply_policy_file(&state, PolicyStore::Server, spec.clone(), &path).await;
+    let layer = server_layer(&state).await.unwrap();
+    assert_eq!(layer.source, PolicySource::Server);
+    let v1 = layer.version.unwrap();
+    assert_eq!((v1.version, v1.created_by.as_str()), (1, SYSTEM_ACTOR));
+    assert!(v1.reason.unwrap().contains("imported from --policy file"));
+    let drift = file_drift(&state).await.unwrap().unwrap();
+    assert!(!drift.differs && drift.yaml.is_none());
+
+    // The same file again: the stored version stays, nothing is imported.
+    apply_policy_file(&state, PolicyStore::Server, spec, &path).await;
+    assert_eq!(
+        state
+            .history()
+            .policy_versions(SERVER_SCOPE, 0)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // A file that differs is reported, not applied.
+    let wider = SERVER.replace("[eu]", "[eu, us]");
+    std::fs::write(&path, &wider).unwrap();
+    let wider_spec: Arc<PolicySpec> = Arc::new(crate::yaml::from_str(&wider).unwrap());
+    apply_policy_file(&state, PolicyStore::Server, wider_spec.clone(), &path).await;
+    assert_eq!(
+        server_layer(&state).await.unwrap().version.unwrap().version,
+        1
+    );
+    let drift = file_drift(&state).await.unwrap().unwrap();
+    assert!(drift.differs);
+    assert!(drift.yaml.unwrap().contains("us"));
+
+    // `--policy-store file`, or nowhere to keep versions: the file is the policy.
+    let file_store = state_from(&config);
+    apply_policy_file(&file_store, PolicyStore::File, wider_spec.clone(), &path).await;
+    assert_eq!(
+        server_layer(&file_store).await.unwrap().source,
+        PolicySource::File
+    );
+    assert!(file_drift(&file_store).await.unwrap().is_none());
+    let memory = test_state();
+    apply_policy_file(&memory, PolicyStore::Server, wider_spec, &path).await;
+    assert_eq!(
+        server_layer(&memory).await.unwrap().source,
+        PolicySource::File
+    );
+}
+
 const SERVER: &str = r#"
 version: 1
 classifications:

@@ -46,6 +46,109 @@ impl PolicyFile {
     }
 }
 
+/// The `--policy` file a server-store server was started with (#1043): it
+/// seeds an empty store and is otherwise only compared with the version in
+/// force.
+#[derive(Debug, Clone)]
+pub struct PolicySeed {
+    pub file: PolicyFile,
+    pub spec: PolicySpec,
+}
+
+/// Whether the `--policy` file differs from the version in force.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FileDrift {
+    pub path: String,
+    pub differs: bool,
+    /// The file as canonical YAML, so the console can propose it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub yaml: Option<String>,
+}
+
+/// What starting with a `--policy` file did to the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedOutcome {
+    /// The store was empty: the file is now version 1.
+    Imported,
+    /// The store already had a version, which stays in force.
+    Kept { differs: bool },
+}
+
+/// Who imports the `--policy` file.
+pub const SYSTEM_ACTOR: &str = "system";
+
+/// Whether two policies say the same thing: their canonical YAML is equal,
+/// so formatting and comments in a file never count as a change.
+pub fn same_policy(a: &PolicySpec, b: &PolicySpec) -> bool {
+    canonical_yaml(a) == canonical_yaml(b)
+}
+
+/// Seed an empty server store from the `--policy` file, or compare the file
+/// with the stored version in force. The stored version always wins.
+pub async fn seed_store(state: &ServerState, seed: &PolicySeed) -> Result<SeedOutcome, ServeError> {
+    if let Some(current) = latest(state, SERVER_SCOPE).await? {
+        let differs = !same_policy(&spec_of(&current)?, &seed.spec);
+        record_drift(differs);
+        return Ok(SeedOutcome::Kept { differs });
+    }
+    let record = PolicyVersionRecord {
+        scope: SERVER_SCOPE.into(),
+        version: 1,
+        spec: serde_json::to_value(&seed.spec).map_err(|e| ServeError::Internal(e.to_string()))?,
+        created_at: Utc::now(),
+        created_by: SYSTEM_ACTOR.into(),
+        approved_by: None,
+        reason: Some(format!("imported from --policy file {}", seed.file.path)),
+        change_id: None,
+        restores: None,
+    };
+    if !state
+        .history()
+        .policy_version_insert(&record)
+        .await
+        .map_err(store_err)?
+    {
+        // Another replica seeded it first: compare with what it stored.
+        return Box::pin(seed_store(state, seed)).await;
+    }
+    crate::serve::audit::write_target_detail(
+        state,
+        &crate::serve::rbac::AuthContext {
+            principal: SYSTEM_ACTOR.into(),
+            role: crate::serve::rbac::Role::Admin,
+            source_ip: None,
+            tenant: None,
+        },
+        "policy.imported",
+        format!("policy:{SERVER_SCOPE}@1"),
+        json!({ "version": 1, "file": seed.file.path, "sha256": seed.file.sha256 }).to_string(),
+        "ok",
+    )
+    .await;
+    record_drift(false);
+    Ok(SeedOutcome::Imported)
+}
+
+fn record_drift(differs: bool) {
+    metrics::gauge!("faucet_serve_policy_file_drift").set(if differs { 1.0 } else { 0.0 });
+}
+
+/// The `--policy` file of a server-store server against the version in force
+/// now; `None` without a seed file.
+pub async fn file_drift(state: &ServerState) -> Result<Option<FileDrift>, ServeError> {
+    let Some(seed) = state.policy_seed() else {
+        return Ok(None);
+    };
+    let current = server_layer(state).await?.spec;
+    let differs = current.is_none_or(|c| !same_policy(&c, &seed.spec));
+    record_drift(differs);
+    Ok(Some(FileDrift {
+        path: seed.file.path.clone(),
+        differs,
+        yaml: differs.then(|| canonical_yaml(&seed.spec)),
+    }))
+}
+
 /// Where the server layer of the policy comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]

@@ -2476,6 +2476,12 @@ pub struct ServeArgs {
     /// build with the `policy` feature.
     #[arg(long, value_name = "PATH")]
     pub policy: Option<std::path::PathBuf>,
+    /// Where the policy lives (#1043). `server` (default): the newest approved
+    /// version in the run-history store is in force and a `--policy` file
+    /// only seeds an empty store. `file`: the `--policy` file is in force,
+    /// re-read on every start, and the console shows it read-only.
+    #[arg(long, value_enum, default_value_t = crate::serve::config::PolicyStore::Server)]
+    pub policy_store: crate::serve::config::PolicyStore,
     /// OTLP export for the server (a YAML/JSON file in the shape of a
     /// pipeline config's `observability.otel` block): traces of every run and
     /// request, and — with `export: [metrics]` — the metrics `/metrics` serves.

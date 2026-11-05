@@ -47,6 +47,7 @@ fn test_config_with(listen: &str, concurrent: usize, queued: usize) -> ServeConf
         schedules: Default::default(),
         templates_sync: None,
         policy: None,
+        policy_store: Default::default(),
         otel_config: None,
         callback_allow_host: Vec::new(),
         origins: Default::default(),

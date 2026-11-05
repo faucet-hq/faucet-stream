@@ -1638,12 +1638,12 @@ The data-flow policy a server enforces (#1043). See
 
 | Method | Path | Answers | Who |
 |---|---|---|---|
-| `GET` | `/v1/policy` | The server policy in force: `source` (`file` / `server`), `loaded`, `file` (path, sha256), `version` (who requested and approved it), `policy` + `yaml`, `rules` (outlines), `summary` (rules, labels, sinks with attributes, catalog columns seen per label), `refusals_7d`, `editable`, `pending_change`. A tenant principal gets `rules` outlines and its own counts only. | viewer / `PolicyRead` |
+| `GET` | `/v1/policy` | The server policy in force: `source` (`file` / `server`), `store` (`--policy-store`: `server` / `file`), `persistent_history` (`false`: edits are refused), `loaded`, `file` (path, sha256), `version` (who requested and approved it), `policy` + `yaml`, `rules` (outlines), `summary` (rules, labels, sinks with attributes, catalog columns seen per label), `refusals_7d`, `editable`, `file_drift`, `pending_change`. `file_drift` is set on a server-store server started with `--policy`: `{path, differs}`, plus the file as canonical `yaml` when it `differs` from the version in force (it was not applied; propose it with `POST /v1/policy` to import it). A tenant principal gets `rules` outlines and its own counts only. | viewer / `PolicyRead` |
 | `GET` | `/v1/policy/versions` | The server-managed versions, newest first, each with its YAML. | viewer / `PolicyRead` (unscoped) |
 | `GET` | `/v1/policy/refusals` | `since`, `tenant`, `limit`: what the policy refused (`phase` submit / runtime, `rule`, `column`, `label`, `sink`, `layer`, `outcome`). A tenant principal sees its own. | viewer / `PolicyRead` |
 | `POST` | `/v1/policy/check` | Dry run: `config` (or `template` + `version`), `row`, `sample` → the policy report, without running anything. Not for tenant principals. | operator / `Plan` |
 | `POST` | `/v1/policy/preview` | `{policy}` → `valid`, `problems` (line + message), `diff`, `impact` (templates and recent runs newly refused / allowed). Stores nothing. | admin / `PolicyAdmin` |
-| `POST` | `/v1/policy` | `{policy, reason, base_version}` → `201` with a `policy_update` change request. `409` with a `--policy` file or a stale `base_version`; `422` with `details.problems` for a draft that does not validate. | admin / `PolicyAdmin` |
+| `POST` | `/v1/policy` | `{policy, reason, base_version}` → `201` with a `policy_update` change request. `409` on the in-memory history ("set a persistent --history to edit the policy here"), with `--policy-store file`, or with a stale `base_version`; `422` with `details.problems` for a draft that does not validate. | admin / `PolicyAdmin` |
 | `POST` | `/v1/policy/rollback` | `{version, reason}` → `201` with a `policy_update` change re-enacting that version. | admin / `PolicyAdmin` |
 | `GET` | `/v1/tenants/{tenant}/policy` | The server rules that apply to the tenant (outlines), its add-only policy, versions, refusal counts, pending change. | viewer / `PolicyRead` |
 | `POST` | `/v1/tenants/{tenant}/policy` (`/preview`, `/rollback`) | As the server routes, for the tenant's policy: a `tenant_policy_update` change, approved by another admin of the tenant or a server admin. | the tenant's admins and server admins / `PolicyAdmin` |
@@ -1652,8 +1652,9 @@ A change is never applied by these routes: approving the change request
 (`POST /v1/changes/{id}/approve`) re-checks it and stores the next version,
 or marks it `invalidated` when another version landed first. Audited as
 `policy.get`, `policy.versions`, `policy.refusals`, `policy.check`,
-`policy.preview`, `policy.request`, `policy.rollback`, and `policy.updated`
-(by the approver, with the version) when a change is applied.
+`policy.preview`, `policy.request`, `policy.rollback`, `policy.updated`
+(by the approver, with the version) when a change is applied, and
+`policy.imported` (by `system`) when a `--policy` file seeds an empty store.
 
 ### `POST /v1/runs/{id}/rollback`
 

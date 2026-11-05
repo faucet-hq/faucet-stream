@@ -355,6 +355,22 @@ groups:
             no longer matches it. Check the origin's credentials and
             reachability; `faucet template sync --dry-run` shows the error.
 
+      - alert: FaucetServePolicyFileDrift
+        expr: max by (instance) (faucet_serve_policy_file_drift) > 0
+        for: 15m
+        labels:
+          severity: info
+        annotations:
+          summary: "The --policy file on {{ $labels.instance }} differs from the policy in force"
+          description: >
+            This server keeps its policy in its store (`--policy-store
+            server`), and the `--policy` file it was started with no longer
+            matches the approved version in force, so the file was not
+            applied. Import the file as a new version from the console's
+            Policy page (a change request, approved like any edit), update
+            the file to match, or start with `--policy-store file` to make
+            the file authoritative.
+
       - alert: FaucetNotificationsFailing
         expr: increase(faucet_notifications_sent_total{outcome="error"}[1h]) > 0
         labels:

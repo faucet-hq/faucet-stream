@@ -115,6 +115,7 @@ mod tests {
             schedules: Default::default(),
             templates_sync_path: None,
             policy_path: None,
+            policy_store: Default::default(),
             otel: None,
             callback_allow_hosts: Vec::new(),
             request_guard: Default::default(),

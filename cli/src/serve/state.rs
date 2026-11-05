@@ -69,6 +69,13 @@ struct Inner {
     /// Where that `--policy` policy was read from (#1043), for the console.
     #[cfg(feature = "policy")]
     policy_file: RwLock<Option<crate::serve::policies::PolicyFile>>,
+    /// Where the policy lives (`--policy-store`, #1043).
+    #[cfg(feature = "policy")]
+    policy_store: crate::serve::config::PolicyStore,
+    /// The `--policy` file a server-store server was started with: it only
+    /// seeded the store, and is kept to report when it drifts (#1043).
+    #[cfg(feature = "policy")]
+    policy_seed: RwLock<Option<crate::serve::policies::PolicySeed>>,
     /// The tenant runtime (#709): vault key, hosted-OAuth providers,
     /// admission locks. Replaced once at startup.
     #[cfg(feature = "tenants")]
@@ -149,6 +156,10 @@ impl ServerState {
                 policy: RwLock::new(None),
                 #[cfg(feature = "policy")]
                 policy_file: RwLock::new(None),
+                #[cfg(feature = "policy")]
+                policy_store: config.policy_store,
+                #[cfg(feature = "policy")]
+                policy_seed: RwLock::new(None),
                 #[cfg(feature = "tenants")]
                 tenants: RwLock::new(Arc::new(Default::default())),
                 #[cfg(feature = "encryption")]
@@ -291,6 +302,32 @@ impl ServerState {
     pub fn policy_file(&self) -> Option<crate::serve::policies::PolicyFile> {
         self.inner
             .policy_file
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Where the policy lives (`--policy-store`, #1043).
+    #[cfg(feature = "policy")]
+    pub fn policy_store(&self) -> crate::serve::config::PolicyStore {
+        self.inner.policy_store
+    }
+
+    /// Keep the `--policy` file a server-store server was started with.
+    #[cfg(feature = "policy")]
+    pub fn set_policy_seed(&self, seed: crate::serve::policies::PolicySeed) {
+        *self
+            .inner
+            .policy_seed
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(seed);
+    }
+
+    /// The `--policy` file that seeded a server-store server, if any.
+    #[cfg(feature = "policy")]
+    pub fn policy_seed(&self) -> Option<crate::serve::policies::PolicySeed> {
+        self.inner
+            .policy_seed
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -544,6 +581,7 @@ mod tests {
             schedules: Default::default(),
             templates_sync_path: None,
             policy_path: None,
+            policy_store: Default::default(),
             otel: None,
             callback_allow_hosts: Vec::new(),
             request_guard: Default::default(),

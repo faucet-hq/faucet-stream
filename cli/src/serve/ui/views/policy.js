@@ -321,6 +321,31 @@ export function renderPolicy(host, params) {
     });
   }
 
+  // Propose the --policy file as the next version: a change request like any edit.
+  async function importFile() {
+    const d = sp.file_drift;
+    if (!d || !d.yaml) return;
+    let preview = null;
+    try {
+      preview = await api("/v1/policy/preview", { method: "POST", body: { policy: d.yaml } });
+    } catch (e) {
+      return toast(e.message, "bad");
+    }
+    const lines = (preview.diff || []).filter((l) => l.op !== " ").map((l) => [l.op, l.text]);
+    const current = sp.version ? sp.version.version : null;
+    const r = await dialog("Import the --policy file as a new version?", html`<span>This creates a change request with the content of <code>${d.path}</code>. Version ${current ?? "?"} stays enforced until another admin approves it.</span>${lines.length ? diff(lines) : ""}${preview.valid ? "" : alert("The file does not validate against this server.", (preview.problems || []).map((p) => p.message).join("; "), "bad")}${field("Reason", html`<input class="input" name="reason" required value="Import the --policy file">`, { req: true })}`, html`${btn("Cancel", { data: { act: "cancel" } })}${btn("Request change", { kind: "primary", icon: "changes", data: { act: "go" } })}`, { icon: "changes" });
+    if (!r || r.act !== "go") return;
+    if (!(r.values.reason || "").trim()) return toast("A policy change needs a reason", "bad");
+    try {
+      const c = await api("/v1/policy", { method: "POST", body: { policy: d.yaml, reason: r.values.reason.trim(), base_version: current } });
+      toast("Import requested", "ok", { href: href.change(c.id), label: "open change" });
+      refreshBadges(true);
+      load();
+    } catch (e) {
+      toast(e.message, "bad");
+    }
+  }
+
   async function rollback(version, tenantOf) {
     const list = tenantOf ? (tp && tp.versions) || [] : versions || [];
     const target = list.find((x) => String(x.version) === String(version));
@@ -378,7 +403,9 @@ export function renderPolicy(host, params) {
     const refN = (tp.refusals_7d || {}).total || 0;
     const tabNames = opView ? ["Rules", [`Refusals · ${st.tenant}`, refN, "Refusals"], [`${st.tenant} history`, (tp.versions || []).length, "History"]] : ["Rules", ["Refusals", refN, "Refusals"], ["History", (tp.versions || []).length, "History"]];
     const tab = ["Refusals", "History"].includes(st.tab) ? st.tab : "Rules";
-    const banner = pendingBanner(tp.pending_change, `${st.tenant} rules`, tp.version ? `${st.tenant} v${tp.version.version}` : "The server policy");
+    const banner = tp.persistent_history === false
+      ? alert("Read only: this server keeps its history in memory.", html`Set a persistent <code>--history</code> to edit ${st.tenant}’s rules here; an approved change would be lost on restart.`, "")
+      : pendingBanner(tp.pending_change, `${st.tenant} rules`, tp.version ? `${st.tenant} v${tp.version.version}` : "The server policy");
     if (!tp.loaded && tab === "Rules") {
       return html`${tenantHead(opView)}${banner}${dhead(dtabs(tabNames, tab))}${alert(`Only the server policy applies to ${st.tenant}.`, `${st.tenant} can add its own classifications and rules on top. They can only tighten what the server allows, and the first version needs another ${st.tenant} admin or a server admin to approve it.`, "", editable && !tp.pending_change ? btn("Add rules", { icon: "plus", kind: "primary", perm: "policy_admin", data: { edit: "1" } }) : "")}${serverForTenant((tp.server || {}).rules || [])}`;
     }
@@ -392,21 +419,37 @@ export function renderPolicy(host, params) {
   }
 
   // ---- server view ------------------------------------------------------------------------
+  // The in-memory history keeps nothing across a restart, so edits are refused.
+  const inMemory = () => sp && sp.persistent_history === false;
+  function memoryBanner() {
+    const fromFile = sp.source === "file" ? html` It enforces <code>${(sp.file || {}).path || "the --policy file"}</code>, read at start.` : "";
+    return alert("Read only: this server keeps its history in memory.", html`Set a persistent <code>--history</code> to edit the policy here; an approved change would be lost on restart.${fromFile}`, "");
+  }
+  function driftBanner() {
+    const d = sp.file_drift;
+    if (!d || !d.differs) return "";
+    const can_import = sp.editable && can("policy_admin") && !sp.pending_change;
+    return alert("The --policy file differs from the version in force; it was not applied.", html`<code>${d.path}</code> only seeded this server’s policy store. Version ${sp.version ? sp.version.version : "?"} stays in force until another admin approves the file as a new version.`, "warn", can_import ? btn("Import the file as a new version", { icon: "changes", perm: "policy_admin", data: { "import-file": "1" } }) : "");
+  }
+
   function serverView() {
     setCrumbs(["Govern", "Policy"]);
     if (!sp.loaded) {
       const canWrite = sp.source === "server" && sp.editable && can("policy_admin");
-      return html`${head("Policy", [pill("None loaded", "")], "No data-flow policy is enforced: any column may reach any sink.")}${pendingBanner(sp.pending_change, "the policy", "No policy")}
-        <div class="two">${card({ icon: "edit", title: "Write one here", body: html`<div class="pad stack" style="gap:10px"><span>Start from a template. Like every policy change, the first version needs a second admin’s approval before it is enforced.</span><div>${canWrite && !sp.pending_change ? btn("Write a policy", { icon: "plus", kind: "primary", perm: "policy_admin", data: { edit: "1" } }) : html`<span class="muted">${sp.pending_change ? "A first version waits for approval." : "Admins can write one."}</span>`}</div></div>` })}
-        ${card({ icon: "code", title: "Or load a file at start", body: code("faucet serve --policy policies/eu-pii.yaml", { box: false, lang: "text" }), note: "A file-loaded policy is shown here read-only." })}</div>`;
+      const writeHint = inMemory() ? "Set a persistent --history to write one here." : sp.pending_change ? "A first version waits for approval." : "Admins can write one.";
+      return html`${head("Policy", [pill("None loaded", "")], "No data-flow policy is enforced: any column may reach any sink.")}${inMemory() ? memoryBanner() : pendingBanner(sp.pending_change, "the policy", "No policy")}
+        <div class="two">${card({ icon: "edit", title: "Write one here", body: html`<div class="pad stack" style="gap:10px"><span>Start from a template. Like every policy change, the first version needs a second admin’s approval before it is enforced.</span><div>${canWrite && !sp.pending_change ? btn("Write a policy", { icon: "plus", kind: "primary", perm: "policy_admin", data: { edit: "1" } }) : html`<span class="muted">${writeHint}</span>`}</div></div>` })}
+        ${card({ icon: "code", title: "Or load a file at start", body: code("faucet serve --policy policies/eu-pii.yaml", { box: false, lang: "text" }), note: "On an empty store the file becomes version 1; with --policy-store file it stays the policy, read-only here." })}</div>`;
     }
     const file = sp.source === "file";
     const refN = (sp.refusals_7d || {}).total || 0;
     const tabNames = ["Rules", ["Refusals", refN, "Refusals"], can("plan") ? "Dry run" : null, file ? null : ["History", (versions || []).length, "History"]].filter(Boolean);
     const tab = tabNames.some((t) => (Array.isArray(t) ? t[2] : t) === st.tab) ? st.tab : "Rules";
-    const banner = file
-      ? alert("Managed by the --policy file.", html`This server loaded <code>${(sp.file || {}).path || "the policy file"}</code> at start. Change the file and restart to update it; the console shows it read-only.`, "")
-      : pendingBanner(sp.pending_change, "the policy", sp.version ? `Version ${sp.version.version}` : "The current policy");
+    const banner = inMemory()
+      ? memoryBanner()
+      : file
+        ? alert("Managed by the --policy file.", html`This server loaded <code>${(sp.file || {}).path || "the policy file"}</code> at start (<code>--policy-store file</code>). Change the file and restart to update it; the console shows it read-only.`, "")
+        : html`${driftBanner()}${pendingBanner(sp.pending_change, "the policy", sp.version ? `Version ${sp.version.version}` : "The current policy")}`;
     const editBtn = !file && sp.editable && can("policy_admin") ? btn("Edit policy", { icon: "edit", kind: "primary", perm: "policy_admin", data: { edit: "1" }, disabled: !!sp.pending_change }) : "";
     let body;
     if (tab === "Refusals") body = refusalsPane();
@@ -540,6 +583,7 @@ export function renderPolicy(host, params) {
       return render();
     }
     if (e.target.closest("[data-dry-run]")) return runDry();
+    if (e.target.closest("[data-import-file]")) return importFile();
     const rb = e.target.closest("[data-rollback]");
     if (rb) return rollback(rb.dataset.rollback, rb.dataset.rbTenant || "");
   });

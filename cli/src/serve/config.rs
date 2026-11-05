@@ -12,6 +12,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Where the server-wide data-flow policy lives (`--policy-store`, #1043).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PolicyStore {
+    /// The newest approved version in the run-history store is in force; a
+    /// `--policy` file only seeds an empty store.
+    #[default]
+    Server,
+    /// The `--policy` file is in force, re-read on every start; the console
+    /// shows it read-only.
+    File,
+}
+
 /// How `/v1/*` requests are authenticated.
 #[derive(Clone)]
 pub enum AuthMode {
@@ -137,6 +150,8 @@ pub struct ServeConfig {
     /// Path to a `--policy` file (#702). Loaded + validated at startup; every
     /// submission is checked against it (gated on the `policy` feature).
     pub policy_path: Option<PathBuf>,
+    /// Where the policy lives (`--policy-store`, #1043).
+    pub policy_store: PolicyStore,
     /// OTLP export settings from `--otel-config`. `None` = no OTLP export.
     pub otel: Option<faucet_core::OtelConfig>,
     /// Allowlist of hosts a per-run completion callback may target (#481).
@@ -526,6 +541,7 @@ impl ServeConfig {
             schedules: ScheduleSettings::from(&args.schedules),
             templates_sync_path: args.templates_sync,
             policy_path: args.policy,
+            policy_store: args.policy_store,
             otel,
             callback_allow_hosts: args.callback_allow_host,
             request_guard,
@@ -736,6 +752,7 @@ mod tests {
             schedules: Default::default(),
             templates_sync: None,
             policy: None,
+            policy_store: Default::default(),
             otel_config: None,
             callback_allow_host: Vec::new(),
             origins: Default::default(),

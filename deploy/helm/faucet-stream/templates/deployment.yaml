@@ -118,6 +118,9 @@ spec:
             - --{{ $f.flag }}={{ $f.dir }}/{{ $block.fileName }}
             {{- end }}
             {{- end }}
+            {{- if and .Values.serve.policy.store (ne (toString .Values.serve.policy.store) "server") }}
+            - --policy-store={{ .Values.serve.policy.store }}
+            {{- end }}
             {{- with .Values.serve.approvals.require }}
             - --require-approval={{ join "," . }}
             {{- end }}

@@ -1332,7 +1332,7 @@
       "gridPos": {
         "x": 0,
         "y": 101,
-        "w": 24,
+        "w": 16,
         "h": 8
       },
       "datasource": {
@@ -1353,6 +1353,52 @@
       "fieldConfig": {
         "defaults": {
           "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "stat",
+      "title": "Instances whose --policy file differs from the policy in force",
+      "description": "faucet_serve_policy_file_drift is 1 on a server-store instance whose --policy file was not applied because a stored version is in force. Import it from the Policy page, or update the file.",
+      "gridPos": {
+        "x": 16,
+        "y": 101,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(max_over_time(faucet_serve_policy_file_drift[5m]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "differing"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          }
         },
         "overrides": []
       },

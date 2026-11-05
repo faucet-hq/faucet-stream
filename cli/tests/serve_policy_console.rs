@@ -13,6 +13,7 @@
 ))]
 #![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
+use faucet_cli::serve::config::PolicyStore;
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -41,10 +42,36 @@ rules:
     require: { residency: [eu] }
 ";
 
+/// How a test server keeps its policy.
+#[derive(Clone, Copy)]
+struct Store<'a> {
+    /// `--policy` file content, if any.
+    file: Option<&'a str>,
+    store: PolicyStore,
+    /// A SQLite history database in the test directory; `None` = in memory.
+    db: Option<&'a str>,
+}
+
+/// A server-managed policy on a persistent history (the default store).
+const PERSISTENT: Store<'static> = Store {
+    file: None,
+    store: PolicyStore::Server,
+    db: Some("history.db"),
+};
+
+/// The in-memory history: the policy can be read but not edited.
+const IN_MEMORY: Store<'static> = Store {
+    file: None,
+    store: PolicyStore::Server,
+    db: None,
+};
+
 fn serve_args(
     port: u16,
     auth_config: std::path::PathBuf,
     policy: Option<std::path::PathBuf>,
+    policy_store: PolicyStore,
+    history: Option<String>,
 ) -> faucet_cli::cli::ServeArgs {
     faucet_cli::cli::ServeArgs {
         listen: format!("127.0.0.1:{port}"),
@@ -58,7 +85,7 @@ fn serve_args(
         max_concurrent_runs: Some(4),
         max_queued_runs: Some(16),
         default_config: None,
-        history: None,
+        history,
         cors_origin: vec![],
         body_limit_bytes: 1_048_576,
         shutdown_grace_secs: 5,
@@ -84,6 +111,7 @@ fn serve_args(
         schedules: Default::default(),
         templates_sync: None,
         policy,
+        policy_store,
         otel_config: None,
         callback_allow_host: Vec::new(),
         origins: Default::default(),
@@ -101,17 +129,31 @@ fn serve_args(
     }
 }
 
-async fn spawn_server(port: u16, dir: &std::path::Path, policy_file: bool) {
+fn start_config(port: u16, dir: &std::path::Path, store: Store) -> faucet_cli::serve::ServeConfig {
     let auth_path = dir.join("auth.yaml");
     std::fs::write(&auth_path, AUTH_CONFIG).unwrap();
-    let policy = policy_file.then(|| {
+    let policy = store.file.map(|text| {
         let p = dir.join("policy.yaml");
-        std::fs::write(&p, POLICY_V1).unwrap();
+        std::fs::write(&p, text).unwrap();
         p
     });
-    let mut config =
-        faucet_cli::serve::ServeConfig::from_args(serve_args(port, auth_path, policy)).unwrap();
+    let history = store
+        .db
+        .map(|db| format!("sqlite:{}", dir.join(db).display()));
+    let mut config = faucet_cli::serve::ServeConfig::from_args(serve_args(
+        port,
+        auth_path,
+        policy,
+        store.store,
+        history,
+    ))
+    .unwrap();
     config.log_level = "warn".into();
+    config
+}
+
+async fn spawn_server(port: u16, dir: &std::path::Path, store: Store<'_>) {
+    let config = start_config(port, dir, store);
     tokio::spawn(async move {
         let _ = faucet_cli::serve::run_server(config, Default::default()).await;
     });
@@ -219,7 +261,7 @@ fn config(dir: &std::path::Path, name: &str, residency: &str) -> String {
 async fn server_managed_policy_is_changed_only_through_a_second_admins_approval() {
     let dir = tempfile::tempdir().unwrap();
     let port = free_port();
-    spawn_server(port, dir.path(), false).await;
+    spawn_server(port, dir.path(), PERSISTENT).await;
     let api = Api::new(port);
 
     // Nothing loaded; only an admin may edit.
@@ -456,7 +498,7 @@ async fn server_managed_policy_is_changed_only_through_a_second_admins_approval(
 async fn tenant_policies_only_add_and_apply_to_that_tenants_runs() {
     let dir = tempfile::tempdir().unwrap();
     let port = free_port();
-    spawn_server(port, dir.path(), false).await;
+    spawn_server(port, dir.path(), PERSISTENT).await;
     let api = Api::new(port);
     for t in ["acme", "globex"] {
         let (s, b) = api
@@ -633,10 +675,22 @@ async fn tenant_policies_only_add_and_apply_to_that_tenants_runs() {
 async fn a_policy_file_is_read_only() {
     let dir = tempfile::tempdir().unwrap();
     let port = free_port();
-    spawn_server(port, dir.path(), true).await;
+    spawn_server(
+        port,
+        dir.path(),
+        Store {
+            file: Some(POLICY_V1),
+            store: PolicyStore::File,
+            db: Some("history.db"),
+        },
+    )
+    .await;
     let api = Api::new(port);
     let (_, p) = api.get("vera-tok", "/v1/policy").await;
     assert_eq!(p["source"], "file");
+    assert_eq!(p["store"], "file");
+    assert_eq!(p["persistent_history"], true);
+    assert_eq!(p["file_drift"], Value::Null, "the file is the policy");
     assert_eq!(p["loaded"], true);
     assert_eq!(p["editable"], false);
     assert!(p["file"]["path"].as_str().unwrap().ends_with("policy.yaml"));
@@ -680,7 +734,15 @@ async fn a_policy_file_is_read_only() {
 async fn the_policy_dry_run_checks_one_row_samples_and_no_policy() {
     let dir = tempfile::tempdir().unwrap();
     let port = free_port();
-    spawn_server(port, dir.path(), true).await;
+    spawn_server(
+        port,
+        dir.path(),
+        Store {
+            file: Some(POLICY_V1),
+            ..IN_MEMORY
+        },
+    )
+    .await;
     let api = Api::new(port);
     let out = |row: &str| {
         dir.path()
@@ -731,7 +793,7 @@ async fn the_policy_dry_run_checks_one_row_samples_and_no_policy() {
     // A server with no policy has nothing to check against.
     let bare = tempfile::tempdir().unwrap();
     let port = free_port();
-    spawn_server(port, bare.path(), false).await;
+    spawn_server(port, bare.path(), IN_MEMORY).await;
     let (s, none) = Api::new(port)
         .post(
             "oscar-tok",
@@ -750,4 +812,171 @@ async fn the_policy_dry_run_checks_one_row_samples_and_no_policy() {
         .await;
     assert_eq!(s, 200, "{none}");
     assert_eq!(none["loaded"], false, "{none}");
+}
+
+/// The audit entries of `action`, whichever shape the listing takes.
+async fn audit_entries(api: &Api, action: &str) -> Vec<Value> {
+    let (_, audit) = api
+        .get("alice-tok", &format!("/v1/audit?action={action}"))
+        .await;
+    audit["entries"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| audit.as_array().cloned().unwrap_or_default())
+}
+
+/// `--policy-store server` (the default) on a persistent history: the file
+/// seeds an empty store once; after that the stored version wins on every
+/// start, a file that differs is reported, and importing it is a change
+/// request like any edit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_policy_file_seeds_the_store_once_and_then_only_drifts() {
+    let dir = tempfile::tempdir().unwrap();
+    let seeded = Store {
+        file: Some(POLICY_V1),
+        ..PERSISTENT
+    };
+    let port = free_port();
+    spawn_server(port, dir.path(), seeded).await;
+    let api = Api::new(port);
+    let (_, p) = api.get("vera-tok", "/v1/policy").await;
+    assert_eq!(p["source"], "server", "{p}");
+    assert_eq!(p["store"], "server");
+    assert_eq!(p["version"]["version"], 1);
+    assert_eq!(p["version"]["created_by"], "system");
+    assert!(
+        p["version"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("imported from --policy file")
+    );
+    assert_eq!(p["file_drift"]["differs"], false);
+    assert_eq!(audit_entries(&api, "policy.imported").await.len(), 1);
+
+    // An approved change replaces it: the file now differs.
+    let v2 = POLICY_V1.replace("[eu]", "[eu, uk]");
+    let id = api.propose("alice-tok", "/v1/policy", &v2, json!(1)).await;
+    assert_eq!(api.approve("ann-tok", &id).await.1["status"], "executed");
+    assert_eq!(
+        api.get("vera-tok", "/v1/policy").await.1["file_drift"]["differs"],
+        true
+    );
+
+    // A restart on the same store with the same file keeps version 2.
+    let port = free_port();
+    spawn_server(port, dir.path(), seeded).await;
+    let api = Api::new(port);
+    let (_, p) = api.get("alice-tok", "/v1/policy").await;
+    assert_eq!(p["version"]["version"], 2, "{p}");
+    assert_eq!(p["file_drift"]["differs"], true);
+    assert!(
+        p["file_drift"]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("policy.yaml")
+    );
+    assert_eq!(
+        api.get("alice-tok", "/v1/policy/versions")
+            .await
+            .1
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(audit_entries(&api, "policy.imported").await.len(), 1);
+
+    // Importing the file is a change request, approved like any edit.
+    let file = p["file_drift"]["yaml"].as_str().unwrap().to_string();
+    let id = api
+        .propose("alice-tok", "/v1/policy", &file, json!(2))
+        .await;
+    assert_eq!(api.approve("ann-tok", &id).await.1["status"], "executed");
+    let (_, p) = api.get("vera-tok", "/v1/policy").await;
+    assert_eq!(p["version"]["version"], 3);
+    assert_eq!(p["file_drift"]["differs"], false);
+    assert!(p["file_drift"].get("yaml").is_none());
+}
+
+/// With the in-memory history nothing approved survives a restart: the
+/// policy (a `--policy` file here) is enforced and shown, every edit refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_in_memory_history_enforces_the_policy_but_refuses_edits() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    spawn_server(
+        port,
+        dir.path(),
+        Store {
+            file: Some(POLICY_V1),
+            ..IN_MEMORY
+        },
+    )
+    .await;
+    let api = Api::new(port);
+    let (_, p) = api.get("alice-tok", "/v1/policy").await;
+    assert_eq!(p["source"], "file", "{p}");
+    assert_eq!(p["store"], "server");
+    assert_eq!(p["persistent_history"], false);
+    assert_eq!(p["editable"], false);
+
+    let body = json!({ "policy": POLICY_V1, "reason": "x", "base_version": null });
+    let (s, refused) = api.post("alice-tok", "/v1/policy", body).await;
+    assert_eq!(s, 409);
+    assert!(
+        refused.to_string().contains("set a persistent --history"),
+        "{refused}"
+    );
+    let rollback = json!({ "version": 1, "reason": "x" });
+    assert_eq!(
+        api.post("alice-tok", "/v1/policy/rollback", rollback)
+            .await
+            .0,
+        409
+    );
+    let (s, b) = api
+        .post("alice-tok", "/v1/tenants", json!({ "id": "acme" }))
+        .await;
+    assert_eq!(s, 201, "{b}");
+    let (_, tp) = api.get("acme-admin-tok", "/v1/tenants/acme/policy").await;
+    assert_eq!(tp["editable"], false);
+    assert_eq!(tp["persistent_history"], false);
+    let tenant_rule =
+        "version: 1\nrules:\n  - name: acme-x\n    when: { label: pii.email }\n    deny: true\n";
+    let (s, _) = api
+        .post(
+            "acme-admin-tok",
+            "/v1/tenants/acme/policy",
+            json!({ "policy": tenant_rule, "reason": "x", "base_version": null }),
+        )
+        .await;
+    assert_eq!(s, 409);
+
+    // The file is still enforced.
+    let (s, b) = api
+        .post(
+            "alice-tok",
+            "/v1/runs",
+            json!({ "config": config(dir.path(), "us", "us") }),
+        )
+        .await;
+    assert_eq!(s, 422, "{b}");
+}
+
+/// `--policy-store file` has nothing to read without `--policy`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_file_store_needs_a_policy_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = start_config(
+        free_port(),
+        dir.path(),
+        Store {
+            store: PolicyStore::File,
+            ..IN_MEMORY
+        },
+    );
+    let err = faucet_cli::serve::run_server(config, Default::default())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("--policy-store file"), "{err}");
 }

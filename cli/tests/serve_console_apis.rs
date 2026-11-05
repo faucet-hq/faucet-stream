@@ -74,6 +74,7 @@ fn serve_args(port: u16, auth_config: std::path::PathBuf, s: Setup) -> faucet_cl
         schedules: Default::default(),
         templates_sync: None,
         policy: None,
+        policy_store: Default::default(),
         otel_config: None,
         callback_allow_host: Vec::new(),
         origins: Default::default(),

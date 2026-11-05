@@ -196,12 +196,44 @@ than refusing — a source template may still be composed with a compliant sink
 — and triggering it hits the submit gate. `POST /v1/plan` reports the verdict
 under `policy`.
 
-### Where the server policy comes from
+### Where the policy lives
 
-| Started with | The policy is | Changed by |
-|---|---|---|
-| `--policy FILE` | the file, read once at start | editing the file and restarting. The console and API show it **read-only**; every change endpoint answers `409`. |
-| no `--policy` | the newest **stored version**, kept in the run-history store (so a SQLite / Postgres history keeps it across restarts and shares it between replicas) | an approved change request — see below. With no version stored yet, nothing is enforced, as before. |
+`faucet serve --policy-store server|file` (default `server`) decides where the
+server policy is kept.
+
+- **`server`** (the default): the policy in force is the newest approved
+  version in the server's store, the run-history backend (so a SQLite or
+  Postgres `--history` keeps it across restarts and shares it between
+  replicas). A `--policy FILE` only **seeds** it: when the store holds no
+  version, the file is imported as version 1, recorded as imported from the
+  file by `system` (audit `policy.imported`). After that the stored version
+  wins on every start. A file that later differs from the version in force is
+  **not applied**: the server logs a warning at start, `GET /v1/policy` reports
+  `file_drift: {path, differs: true}`, the console shows a banner with **Import
+  the file as a new version** (a `policy_update` change request, approved like
+  any edit), and `faucet_serve_policy_file_drift` is `1` (alert
+  `FaucetServePolicyFileDrift`).
+- **`file`**: the file is the policy, re-read on every start. The console and
+  API show it **read-only**; every change endpoint answers `409`. It needs
+  `--policy`.
+
+With the **in-memory** history (no `--history`) nothing approved survives a
+restart, so every policy edit — server or tenant, propose or rollback — is
+refused with `409` ("set a persistent --history to edit the policy here"). A
+`--policy` file still loads and is enforced, and the console shows it
+read-only with that hint.
+
+What a restart does:
+
+| `--policy-store` | `--history` | `--policy FILE` | On start |
+|---|---|---|---|
+| `server` | persistent | none | the newest stored version is in force (none stored: nothing enforced) |
+| `server` | persistent | given, store empty | the file is imported as version 1 |
+| `server` | persistent | given, store has a version | the stored version stays in force; a differing file is reported (`file_drift`), not applied |
+| `server` | in memory | given | the file is enforced, read-only; edits answer `409` |
+| `server` | in memory | none | nothing is enforced; edits answer `409` |
+| `file` | any | given | the file is re-read and enforced, read-only; edits answer `409` |
+| `file` | any | none | the server refuses to start |
 
 A server-managed policy is never edited in place. An admin proposes a new
 version (`POST /v1/policy`, or **Policy → Edit policy** in the console); the
@@ -292,7 +324,9 @@ many columns the catalog has seen per label), its refusals, a dry run and the
 version history, with **Edit policy** for admins on a server-managed policy. The
 editor validates as you type, then previews the diff and impact and asks for a
 reason before it creates the change request; pending changes show as a banner
-until approved. With the tenant switcher set to a tenant, the page shows the
+until approved. A `--policy` file that differs from the version in force shows
+as a banner with **Import the file as a new version**; on the in-memory history
+the page is read-only and says to set a persistent `--history`. With the tenant switcher set to a tenant, the page shows the
 server rules beside that tenant's rules and history; a tenant principal sees its
 own tenant's view. See [the web console](./web-console.md#policy).
 

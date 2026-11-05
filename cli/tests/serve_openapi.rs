@@ -158,6 +158,7 @@ async fn every_documented_route_is_wired_on_the_live_server() {
         schedules: Default::default(),
         templates_sync: None,
         policy: None,
+        policy_store: Default::default(),
         otel_config: None,
         callback_allow_host: Vec::new(),
         origins: Default::default(),

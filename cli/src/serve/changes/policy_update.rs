@@ -83,6 +83,20 @@ pub fn require_server_managed(state: &ServerState, layer: &Layer) -> Result<(), 
     Ok(())
 }
 
+/// The refusal of a policy edit on a server whose history is in memory.
+pub const MEMORY_HISTORY: &str = "set a persistent --history to edit the policy here: an approved change on the in-memory \
+     history would be lost on restart";
+
+/// Refuse to propose a policy change a restart would lose: with the
+/// in-memory history backend nothing approved survives.
+pub fn require_persistent(state: &ServerState) -> Result<(), ServeError> {
+    if state.persistent_history() {
+        Ok(())
+    } else {
+        Err(ServeError::Conflict(MEMORY_HISTORY.into()))
+    }
+}
+
 /// Validate a policy change and compute its plan.
 pub async fn plan(
     state: &ServerState,
@@ -213,6 +227,10 @@ pub async fn execute(
         "layer" => if layer.tenant().is_some() { "tenant" } else { "server" }
     )
     .increment(1);
+    if layer == Layer::Server {
+        // The new version may now match (or no longer match) the --policy file.
+        let _ = policies::file_drift(state).await;
+    }
     Ok(version)
 }
 

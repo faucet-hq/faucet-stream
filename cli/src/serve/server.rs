@@ -808,6 +808,52 @@ pub(crate) async fn lease_loop(state: ServerState, period: Duration, shutdown: C
     }
 }
 
+/// Put the `--policy` file in its place (#1043). With `--policy-store file`,
+/// or with nowhere to keep versions (in-memory history), the file is the
+/// policy. Otherwise it only seeds an empty store; a store that already holds
+/// a version keeps it, and a file that differs is reported, not applied.
+#[cfg(feature = "policy")]
+pub async fn apply_policy_file(
+    state: &ServerState,
+    store: crate::serve::config::PolicyStore,
+    policy: std::sync::Arc<faucet_core::PolicySpec>,
+    path: &std::path::Path,
+) {
+    use crate::serve::policies::{self, PolicyFile, PolicySeed, SeedOutcome};
+    let file = PolicyFile::read(path);
+    if store == crate::serve::config::PolicyStore::File || !state.persistent_history() {
+        tracing::info!(rules = policy.rules.len(), path = %file.path, "data-flow policy loaded from file");
+        state.set_policy(policy);
+        state.set_policy_file(file);
+        return;
+    }
+    let seed = PolicySeed {
+        file,
+        spec: (*policy).clone(),
+    };
+    state.set_policy_seed(seed.clone());
+    match policies::seed_store(state, &seed).await {
+        Ok(SeedOutcome::Imported) => tracing::info!(
+            path = %seed.file.path,
+            "the policy store was empty: imported the --policy file as version 1"
+        ),
+        Ok(SeedOutcome::Kept { differs: false }) => tracing::info!(
+            path = %seed.file.path,
+            "the stored policy version is in force; the --policy file matches it"
+        ),
+        Ok(SeedOutcome::Kept { differs: true }) => tracing::warn!(
+            path = %seed.file.path,
+            "the --policy file differs from the policy version in force; it was not applied \
+             (import it as a new version from the console, or start with --policy-store file)"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "could not seed the policy store from the --policy file; the stored version, if \
+             any, stays in force"
+        ),
+    }
+}
+
 /// Boot the server: install observability, build state + router, bind, serve
 /// until SIGTERM/SIGINT, then drain in-flight runs up to the grace window.
 pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> CliResult<()> {
@@ -1001,6 +1047,13 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
             "--policy requires a build with the `policy` feature".into(),
         ));
     }
+    if config.policy_store == crate::serve::config::PolicyStore::File
+        && config.policy_path.is_none()
+    {
+        return Err(CliError::Serve(
+            "--policy-store file needs --policy <file>: the file is the policy".into(),
+        ));
+    }
 
     // The vault key (#709, #956), validated before the listener opens.
     #[cfg(feature = "encryption")]
@@ -1063,12 +1116,8 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         crate::templates::metrics::describe();
     }
     #[cfg(feature = "policy")]
-    if let Some(p) = policy {
-        tracing::info!(rules = p.rules.len(), "data-flow policy loaded");
-        state.set_policy(p);
-        if let Some(path) = &config.policy_path {
-            state.set_policy_file(crate::serve::policies::PolicyFile::read(path));
-        }
+    if let (Some(p), Some(path)) = (policy, &config.policy_path) {
+        apply_policy_file(&state, config.policy_store, p, path).await;
     }
     #[cfg(feature = "encryption")]
     state.set_vault(vault);

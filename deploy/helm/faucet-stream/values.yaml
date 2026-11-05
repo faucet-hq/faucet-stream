@@ -344,6 +344,12 @@ serve:
     existingConfigMap: ""
     existingSecret: ""
     fileName: policy.yaml
+    # Where the policy lives (#1043): --policy-store. `server` (the server's
+    # default): the newest approved version in the history store is in force,
+    # and the file above only seeds an empty store (edits need a persistent
+    # serve.history). `file`: the file is the policy, re-read on every start,
+    # read-only in the console (needs enabled: true).
+    store: server
 
   # Hosted OAuth connect providers (#709): --connect-providers. Requires
   # tenants.enabled (connections are sealed with the vault key). Keep client

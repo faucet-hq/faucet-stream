@@ -270,6 +270,14 @@ serve:
     existingSecret: faucet-policy     # key: policy.yaml
 ```
 
+`serve.policy.store` sets `--policy-store`. With `server` (the default) the
+newest approved version in the history store is in force, and the policy file
+only seeds an empty store as version 1; a file that later differs is reported
+in the console and by `faucet_serve_policy_file_drift`, not applied. Edits need
+a persistent `serve.history` (postgres, or sqlite on a volume). With `file` the
+file is the policy, re-read on every start and read-only in the console; it
+needs `serve.policy.enabled: true`.
+
 Template-sync, connect-provider and OTLP files resolve `${env:VAR}` when the
 server loads them, so keep tokens and client secrets in a Secret exposed through
 `envFrom` (or `secret.data`) and write `token: "${env:GITHUB_TOKEN}"` in the
@@ -454,6 +462,7 @@ See [`values.yaml`](./values.yaml) — every key is commented. Common ones:
 | `serve.preview.rows` | `500` | rows a preview loads when the request omits `row_count_to_load` (soft cap); `0` = the whole dataset |
 | `serve.preview.maxRows` | `5000` | ceiling on one preview's rows (hard cap); a larger request — including `row_count_to_load=all` — is clamped to it. `0` lifts the ceiling, letting one request read an entire output file (still bounded by a 64 MiB response budget and a 30s deadline) |
 | `serve.triggers` / `.templatesSync` / `.policy` / `.connectProviders` / `.otel` | disabled | file-backed serve features: `enabled` + one of `content` / `existingConfigMap` / `existingSecret`, and `fileName` (see [Serve features](#serve-features)) |
+| `serve.policy.store` | `server` | `--policy-store`: `server` keeps approved versions in the history store (the file only seeds an empty store); `file` makes the file the policy, read-only in the console (needs `serve.policy.enabled`) |
 | `serve.cluster.vaultKey.existingSecret` | `""` | vault key (`FAUCET_VAULT_KEY`) that seals clustered template runs' `secret: true` params; `cluster.previousKeys` open values sealed under an earlier key |
 | `serve.tenants.enabled` | `false` | tenants; needs `vaultKey.existingSecret` (+ `existingSecretKey`, default `FAUCET_VAULT_KEY`) and persistent history |
 | `serve.tenants.previousKeys` | `[]` | `{existingSecret, existingSecretKey}` entries → `FAUCET_VAULT_PREVIOUS_KEYS` |

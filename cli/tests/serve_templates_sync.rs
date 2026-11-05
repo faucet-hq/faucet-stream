@@ -61,6 +61,7 @@ fn args(port: u16, sync: Option<std::path::PathBuf>) -> ServeArgs {
         schedules: Default::default(),
         templates_sync: sync,
         policy: None,
+        policy_store: Default::default(),
         otel_config: None,
         callback_allow_host: Vec::new(),
         origins: Default::default(),
