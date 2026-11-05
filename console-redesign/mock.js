@@ -62,6 +62,7 @@
     user: '<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>',
     layers: '<path d="M12 3l9 5-9 5-9-5z"/><path d="M3 13l9 5 9-5"/>',
     clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+    feed: '<path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.5 5.1L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.5-6.9A2 2 0 0 0 16.8 4H7.2a2 2 0 0 0-1.7 1.1z"/>',
   };
   const ic = (n, cls = 'i') => (P[n] ? `<svg class="${cls}" viewBox="0 0 24 24">${P[n]}</svg>` : '');
 
@@ -135,10 +136,10 @@
 
   // ---- shell ----
   const NAV = [
-    ['Operate', [['home', 'Overview', 'overview'], ['runs', 'Runs', 'runs', '3'], ['changes', 'Changes', 'changes', '2', true], ['trig', 'Triggers', 'triggers'], ['sched', 'Schedules', 'schedules', null, false, true]]],
+    ['Operate', [['home', 'Overview', 'overview'], ['runs', 'Runs', 'runs', '3'], ['changes', 'Changes', 'changes', '2', true], ['trig', 'Triggers', 'triggers'], ['sched', 'Schedules', 'schedules', '7'], ['feed', 'Feeds', 'feeds', null, false, true]]],
     ['Data', [['db', 'Datasets', 'datasets', '48'], ['lineage', 'Lineage', 'lineage']]],
     ['Build', [['tpl', 'Templates', 'templates', '17'], ['schema', 'Schemas', 'schemas'], ['submit', 'Submit', 'submit']]],
-    ['Govern', [['policy', 'Policy', 'policy', null, false, true], ['usage', 'Usage', 'usage'], ['tenants', 'Tenants', 'tenants', '6']]],
+    ['Govern', [['policy', 'Policy', 'policy'], ['usage', 'Usage', 'usage'], ['tenants', 'Tenants', 'tenants', '6']]],
     ['Admin', [['audit', 'Audit log', 'audit'], ['settings', 'Settings', 'settings']]],
   ];
   const VIEWS = {};

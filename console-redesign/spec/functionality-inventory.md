@@ -7,7 +7,7 @@ Legend once the build lands: ✅ kept (where) · ⚠️ changed (how) · ❌ dro
 ## Shell (index.html, shell.js, app.js, access.js, tenant.js, tz.js)
 - Grouped sidebar Operate / Data / Build / Govern / Admin, groups collapsible (localStorage `faucet.nav.collapsed`) → client
 - Nav badges: running runs, pending changes (warn), tenants → `GET /v1/runs?status=running&limit=100`, `GET /v1/changes?status=pending&limit=100`, `GET /v1/tenants`
-- Disabled "soon" entries for pages without an API (Schedules, Policy) → client
+- Disabled "soon" entries for pages without an API (Feeds; Schedules and Policy until #1044 / #1043) → client
 - Breadcrumb group / page / item; item replaced by the view's own title (`setCrumbTitle`) → client
 - Context chip (short run id on a run page) → client
 - Tenant switcher (hidden without tenants API; pinned for a tenant-scoped principal) → `GET /v1/tenants`, `GET /v1/whoami`
@@ -24,7 +24,8 @@ Legend once the build lands: ✅ kept (where) · ⚠️ changed (how) · ❌ dro
 - 🆕 Command palette ⌘K / Ctrl+K: pages, recent runs, templates, datasets, changes, tenants, console actions → existing list endpoints
 - 🆕 Keyboard: j/k move in any list, Enter opens, Esc back to the list / closes menus, `/` focuses the list search → client
 - 🆕 Every id/URI/config with a copy button; relative times with the absolute time on hover; every name links to its page → client
-- 🆕 Audit log, Triggers and Settings become real pages (APIs exist); Schedules and Policy stay "soon" with a designed placeholder
+- 🆕 Audit log, Triggers and Settings become real pages (APIs exist); Feeds stays "soon" with a designed placeholder
+- 🆕 Schedules (#1044) and Policy (#1043) become real pages: see `views/schedules.js` and `views/policy.js` and api-proposals #9 / #10
 
 ## Schemas (old views/schemas.js)
 - Catalogue of compiled sources / sinks / transforms / state stores → `GET /v1/schemas`

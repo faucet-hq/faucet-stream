@@ -14,8 +14,17 @@
       ['cr134', ring('', 'hollow'), 'Deprecate octo/scratch-sqlite', '9d', '<b>expired</b> · nobody approved in 72h'],
     ],
   };
-  const listPane = (sel, { tab = 'Needs me', empty: none = false } = {}) => {
+  const POLICY_ROWS = [
+    ['cr144', ring('warn', 'hollow'), 'Update policy eu-pii to v8', '12m', '<b>policy update</b> · 2 templates newly refused · 0 of 1 · by sec-raj'],
+    ['cr145', ring('warn', 'hollow'), 'Create schedule weekly-export', '1m', '<b>schedule</b> · 0 6 * * MON · 0 of 1 · by ops-raj'],
+  ];
+  const listPane = (sel, { tab = 'Needs me', empty: none = false, policy = false } = {}) => {
     const r = ([id, ...a]) => row(...a.slice(0, 4), { on: id === sel });
+    if (policy) {
+      return `${tabs([['Needs me', 4], 'All'], tab, ibtn('filter') + ibtn('refresh'))}
+      ${stats([['Pending', '4', 'warn'], ['Executed', '18', 'ok'], ['Rejected', '3'], ['Failed', '2', 'bad']])}
+      ${sect('Pending', 4)}${[...POLICY_ROWS, ...LIST.pending].map(r).join('')}${sect('Approved · executing', 1)}${LIST.approved.map(r).join('')}${sect('Recently decided', 22)}${LIST.decided.slice(0, 3).map(r).join('')}`;
+    }
     const body = none
       ? `${sect('Pending', 0)}${empty('Nothing needs you', 'Every pending change already has your vote, or you requested it yourself. <span class="lnk">Show all changes</span>', { icon: 'check' })}${sect('Recently decided', 22)}${LIST.decided.slice(0, 3).map(r).join('')}`
       : `${sect('Pending', 2)}${LIST.pending.map(r).join('')}${sect('Approved · executing', 1)}${LIST.approved.map(r).join('')}${sect('Recently decided', 22)}${LIST.decided.map(r).join('')}`;
@@ -78,6 +87,8 @@
       none: { label: 'Nothing needs you (empty)', sel: false, covers: ['empty “nothing needs your approval”'] },
       viewer: { label: 'Viewer · read only', params: { role: 'viewer' }, covers: ['permission gate change_approve'] },
       toast: { label: 'After approving · toast', covers: ['toast result', 'badge refresh'] },
+      policy: { badges: { changes: '4' }, label: 'Policy update · second admin approves', covers: ['ChangeKind::PolicyUpdate (#1043)', 'YAML diff', 'impact on templates and recent runs', 'self-approval refused'], new: ['policy updates as change requests'] },
+      selfapprove: { badges: { changes: '4' }, label: 'Policy update · requester cannot approve', covers: ['self_approve off for policy updates', 'withdraw'] },
     },
     render(state) {
       const right = { right: chip('expires in 21h') };
@@ -99,6 +110,19 @@
           ${card({ icon: 'changes', title: 'What it ran', tag: 'material matched on approve', right: 'fingerprint <span class="mono">4c02…</span>', body: diff([[' ', 'backfill · pipeline payments_events'], ['+', 'window: 2026-09-01 → 2026-10-01 · unit 1d · 30 units'], ['+', 'into: sink postgres · finance.payments'], [' ', 'delivery at-least-once · state namespaced']]), note: '<span class="ok">Additive only</span> · no schema change downstream.' })}
           ${approvals.replace('waiting for a second admin', 'second approval by finance-lead').replace('<span class="avatar vacant"></span><span class="muted">', '<span class="avatar">FL</span><span>').replace('self-approval off for the requester', '5d ago')}`);
         if (state === 'toast') M.overlay(toast(`${ic('check')}<span>Approved · run <span class="mono">payments_events_backfill</span> started · <span class="lnk">open run</span></span>`, 'done'));
+        return;
+      }
+      if (state === 'policy' || state === 'selfapprove') {
+        const mine = state === 'selfapprove';
+        M.top(crumbs('Update policy eu-pii to v8'), { delta: '<span class="warn">awaiting 1 approval</span>' });
+        M.list(listPane('cr144', { policy: true }));
+        const acts = mine ? `${btn('Withdraw', { kind: 'danger', icon: 'x', act: true })}${btn('Approve', { kind: 'primary', icon: 'check', cls: 'dis' })}` : actions.replace('Approve and run', 'Approve and apply');
+        M.detail(`${dhead(dtabs(['Plan', 'Impact', 'History'], 'Plan'), acts, 'Changes')}${head('Update policy eu-pii to v8', [pill('Pending · 0 of 1 approvals', 'warn'), `<span>requested by ${lnk(mine ? 'ops-admin' : 'sec-raj')} · admin</span>`, '<span>12m ago</span>', '<span>expires in 71h</span>'])}
+          ${mine ? alert('You requested this change.', 'Another admin must approve it: self-approval is off for policy updates. You can withdraw it.', '') : ''}
+          ${card({ icon: 'policy', title: 'What changes', tag: 're-checked on approve', right: 'based on v7', body: diff([['@', 'rules · pii-to-eu-only'], [' ', 'require: { residency: [eu] }'], ['-', 'mask: [hash, tokenize]'], ['+', 'mask: [hash]'], ['@', 'classifications'], ['+', '- label: pii.phone'], ['+', '  value_detector: phone']]),
+            note: '<span class="warn">2 templates would be refused</span> · ' + lnk('acme/leads') + ' and ' + lnk('globex/support-tickets') + ', and 5 runs from the last 7 days. <span class="lnk">See impact</span>' })}
+          <div class="card"><div class="pad" style="color:var(--text-2)"><small class="muted" style="display:block;margin-bottom:4px">Reason from the requester</small>Tokens are reversible with the vault key; legal asked for hashing only. Adds phone numbers as personal data.</div></div>
+          ${card({ title: 'Approvals', right: 'rule policy-updates · 1 admin other than the requester', body: `<div class="vote" style="border-top:0"><span class="avatar vacant"></span><span class="muted">waiting for an admin</span><span class="r">${mine ? 'you cannot approve your own request' : 'the requester cannot approve it'}</span></div>` })}`);
         return;
       }
       if (state === 'failed') {

@@ -1,6 +1,7 @@
 // Triggers — split pane: event triggers the server watches (webhooks, object
-// arrival, queue depth, schedules), their health and the runs they started.
-// Type, schedule and last fire come from the proposed GET /v1/triggers (#6);
+// arrival, queue depth), their health and the runs they started. Schedules are
+// their own page (#1044); a triggers file has no `type: schedule`.
+// Type and last fire come from the proposed GET /v1/triggers (#6);
 // today the server reports only each trigger's name and health.
 (function () {
   const L = {
@@ -8,17 +9,15 @@
     partner: (o) => row(ring('ok'), 'partner-files', '11m', '<b>object arrival</b> · s3 prefix landing/partner/', o),
     lake: (o) => row(ring('ok'), 'lake-invoices', '1h', '<b>object arrival</b> · batch mode · gcs', o),
     queue: (o) => row(ring('bad'), 'events-backlog', '3h', '<b>queue depth</b> · redis stream · error backoff', o),
-    nightly: (o) => row(ring('ok'), 'nightly-rollup', '9h', '<b>schedule</b> · 02:00 Europe/Berlin · 6 tenants', o),
-    hourly: (o) => row(ring('ok'), 'hourly-crm', '42m', '<b>schedule</b> · every hour at :15', o),
   };
   const listPane = (sel) => {
     const o = (k) => ({ on: k === sel });
-    return `${tabs([['All', 6], ['Unhealthy', 1]], 'All', ibtn('refresh'))}
-      ${stats([['Triggers', '6'], ['Healthy', '5', 'ok'], ['Unhealthy', '1', 'bad'], ['Fired today', '214']])}
+    return `${tabs([['All', 4], ['Unhealthy', 1]], 'All', ibtn('refresh'))}
+      ${stats([['Triggers', '4'], ['Healthy', '3', 'ok'], ['Unhealthy', '1', 'bad'], ['Fired today', '86']])}
       ${sect('Webhooks', 1)}${L.ingest(o('ingest'))}
       ${sect('Object arrival', 2)}${L.partner(o('partner'))}${L.lake(o('lake'))}
       ${sect('Queue depth', 1)}${L.queue(o('queue'))}
-      ${sect('Schedules', 2)}${L.nightly(o('nightly'))}${L.hourly(o('hourly'))}`;
+      <div class="muted" style="font-size:12px;padding:10px 14px">Looking for cron schedules? They moved to ${lnk('Schedules')}.</div>`;
   };
   const CURL = `curl -X POST https://faucet.example.internal/v1/triggers/orders-ingest \\
   -H "Authorization: Bearer $FAUCET_TOKEN" \\
@@ -52,19 +51,18 @@
     render(state) {
       if (state === 'empty') {
         M.top(['Operate', 'Triggers']);
-        M.list(`${tabs([['All', 0]], 'All', ibtn('refresh'))}${empty('No triggers on this server', 'Triggers start runs when a webhook is called, a file lands, a queue backs up or a schedule ticks.', { icon: 'trig' })}`);
+        M.list(`${tabs([['All', 0]], 'All', ibtn('refresh'))}${empty('No triggers on this server', 'Triggers start runs when a webhook is called, a file lands or a queue backs up. Cron schedules live on the Schedules page.', { icon: 'trig' })}`);
         M.detail(`${head('Start runs from events', [], 'This server was started without a triggers file. Add one and restart <code>faucet serve</code> with <code>--triggers</code>.')}
-          ${card({ icon: 'code', title: 'triggers.yaml', aside: 'one webhook, one schedule', body: code(`version: 1
+          ${card({ icon: 'code', title: 'triggers.yaml', aside: 'one webhook, one file drop', body: code(`version: 1
 triggers:
   - name: orders-ingest
     type: webhook
     methods: [POST]
     dedupe_header: X-Delivery-Id
     config: pipelines/orders.yaml
-  - name: nightly-rollup
-    type: schedule
-    cron: "0 2 * * *"
-    timezone: Europe/Berlin
+  - name: partner-files
+    type: object_arrival
+    store: { type: s3, bucket: landing, prefix: partner/ }
     template: { id: acme/billing-api }`, { box: false }) })}
           ${card({ title: 'Then', body: code('faucet serve --triggers triggers.yaml', { box: false, lang: 'plain' }), note: `Read the ${lnk('triggers reference')} for object arrival and queue depth.` })}`);
         return;
