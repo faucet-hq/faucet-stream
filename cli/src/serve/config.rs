@@ -129,6 +129,8 @@ pub struct ServeConfig {
     /// Path to a `--triggers` file. `None` = no event-driven triggers. The file
     /// is loaded + validated at startup (gated on the `triggers` feature).
     pub triggers_path: Option<PathBuf>,
+    /// Schedules (#1044): the `--schedules` file and the tenant guardrail.
+    pub schedules: ScheduleSettings,
     /// Path to a `--templates-sync` file. `None` = no remote template origins.
     /// Loaded + validated at startup (gated on the `templates-sync` feature).
     pub templates_sync_path: Option<PathBuf>,
@@ -158,6 +160,37 @@ pub struct ServeConfig {
     pub references: crate::serve::references::ServeReferencePolicy,
     /// Grafana base URL the console's Overview links to (`--grafana-url`).
     pub grafana_url: Option<String>,
+}
+
+/// The default shortest gap between a tenant-owned schedule's ticks.
+pub const DEFAULT_TENANT_SCHEDULE_MIN_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Schedule settings (#1044): `--schedules` and
+/// `--tenant-schedule-min-interval-secs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleSettings {
+    /// The `--schedules` file. `None` = only schedules made through the API.
+    pub path: Option<PathBuf>,
+    /// The shortest gap allowed between a tenant-owned schedule's ticks.
+    pub tenant_min_interval: Duration,
+}
+
+impl Default for ScheduleSettings {
+    fn default() -> Self {
+        Self {
+            path: None,
+            tenant_min_interval: DEFAULT_TENANT_SCHEDULE_MIN_INTERVAL,
+        }
+    }
+}
+
+impl From<&crate::cli::ServeScheduleArgs> for ScheduleSettings {
+    fn from(a: &crate::cli::ServeScheduleArgs) -> Self {
+        Self {
+            path: a.schedules.clone(),
+            tenant_min_interval: Duration::from_secs(a.tenant_schedule_min_interval_secs),
+        }
+    }
 }
 
 /// Log-shipping buffer bounds and the console's log link (#806).
@@ -490,6 +523,7 @@ impl ServeConfig {
             ui_enabled: !args.no_ui,
             cluster,
             triggers_path: args.triggers,
+            schedules: ScheduleSettings::from(&args.schedules),
             templates_sync_path: args.templates_sync,
             policy_path: args.policy,
             otel,
@@ -699,6 +733,7 @@ mod tests {
             cluster_poll_secs: 2,
             cluster_max_attempts: 3,
             triggers: None,
+            schedules: Default::default(),
             templates_sync: None,
             policy: None,
             otel_config: None,

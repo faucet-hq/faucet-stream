@@ -1527,10 +1527,13 @@ mod tests {
             super::LABEL_OVERLAY_VERSION,
             crate::select::LABEL_SELECTION,
             crate::run_deps::LABEL_DEPENDS_ON,
+            "schedule",
+            "schedule_tick",
+            "schedule_manual",
         ] {
             assert!(super::RESERVED_LABELS.contains(&k), "{k}");
         }
-        assert_eq!(super::RESERVED_LABELS.len(), 9);
+        assert_eq!(super::RESERVED_LABELS.len(), 12);
     }
 
     /// The pre-#703 handler shape the tests were written against: a run, as

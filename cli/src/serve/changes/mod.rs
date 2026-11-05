@@ -60,15 +60,19 @@ pub enum ChangeKind {
     /// Retire or revive one template version
     /// (`POST /v1/templates/{id}/versions/{version}/deprecate`).
     TemplateDeprecate,
+    /// Create, edit or delete a schedule (#1044): payload
+    /// `{action: create|update|delete, name, spec?}`.
+    Schedule,
 }
 
 impl ChangeKind {
-    pub const ALL: [ChangeKind; 5] = [
+    pub const ALL: [ChangeKind; 6] = [
         ChangeKind::Run,
         ChangeKind::TemplateRegister,
         ChangeKind::TemplateLaunch,
         ChangeKind::TemplateDelete,
         ChangeKind::TemplateDeprecate,
+        ChangeKind::Schedule,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -78,6 +82,7 @@ impl ChangeKind {
             ChangeKind::TemplateLaunch => "template_launch",
             ChangeKind::TemplateDelete => "template_delete",
             ChangeKind::TemplateDeprecate => "template_deprecate",
+            ChangeKind::Schedule => "schedule",
         }
     }
 
@@ -102,9 +107,10 @@ impl FromStr for ChangeKind {
             "template_launch" | "template-launch" => Ok(ChangeKind::TemplateLaunch),
             "template_delete" | "template-delete" => Ok(ChangeKind::TemplateDelete),
             "template_deprecate" | "template-deprecate" => Ok(ChangeKind::TemplateDeprecate),
+            "schedule" => Ok(ChangeKind::Schedule),
             other => Err(format!(
                 "unknown change kind `{other}` (expected run, template_register, \
-                 template_launch, template_delete or template_deprecate)"
+                 template_launch, template_delete, template_deprecate or schedule)"
             )),
         }
     }
@@ -863,7 +869,43 @@ async fn plan_for(
                 details: None,
             })
         }
+        ChangeKind::Schedule => plan_schedule(state, actor, payload).await,
     }
+}
+
+/// Plan a schedule change (#1044): validate it as the requester; the rows
+/// (which carry the stored revision it edits) are the material, so an edit
+/// made meanwhile invalidates the approval.
+#[cfg(all(feature = "schedule", feature = "templates"))]
+async fn plan_schedule(
+    state: &ServerState,
+    actor: &AuthContext,
+    payload: &Value,
+) -> Result<ChangePlan, ServeError> {
+    let p: crate::serve::schedules::service::ChangePayload =
+        serde_json::from_value(payload.clone())
+            .map_err(|e| ServeError::BadConfig(format!("schedule payload: {e}")))?;
+    let rows = crate::serve::schedules::service::plan(state, actor, &p).await?;
+    Ok(ChangePlan {
+        material: material_of_rows(&rows),
+        summary: json!({"schedule": p.name, "action": p.action.as_str()}),
+        rows,
+    })
+}
+
+#[cfg(not(all(feature = "schedule", feature = "templates")))]
+async fn plan_schedule(
+    state: &ServerState,
+    actor: &AuthContext,
+    payload: &Value,
+) -> Result<ChangePlan, ServeError> {
+    let _ = (state, actor, payload);
+    Err(ServeError::Unprocessable {
+        message: "schedule changes require a server built with the `schedule` and `templates` \
+                  features"
+            .into(),
+        details: None,
+    })
 }
 
 fn record_metric(kind: ChangeKind, outcome: &'static str) {
@@ -1457,6 +1499,22 @@ async fn execute(
         | ChangeKind::TemplateDelete
         | ChangeKind::TemplateDeprecate => Err(ServeError::Unprocessable {
             message: "template changes require the `templates` feature".into(),
+            details: None,
+        }),
+        #[cfg(all(feature = "schedule", feature = "templates"))]
+        ChangeKind::Schedule => {
+            let p: crate::serve::schedules::service::ChangePayload =
+                match serde_json::from_value(change.payload.clone()) {
+                    Ok(p) => p,
+                    Err(e) => return finish_failed(state, actor, change, e.to_string()).await,
+                };
+            crate::serve::schedules::service::apply(state, &requester, p)
+                .await
+                .map(|_| (None, None))
+        }
+        #[cfg(not(all(feature = "schedule", feature = "templates")))]
+        ChangeKind::Schedule => Err(ServeError::Unprocessable {
+            message: "schedule changes require the `schedule` and `templates` features".into(),
             details: None,
         }),
     };

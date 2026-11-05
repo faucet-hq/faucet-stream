@@ -107,6 +107,29 @@ pub fn build_router(
                     .put(crate::serve::triggers::webhook::handle),
             );
     }
+    // Schedules (#1044): a build without them still answers the list, with
+    // `available: false`.
+    #[cfg(not(all(feature = "schedule", feature = "templates")))]
+    {
+        api = api.route(
+            "/v1/schedules",
+            get(crate::serve::handlers::schedules::list),
+        );
+    }
+    #[cfg(all(feature = "schedule", feature = "templates"))]
+    {
+        use crate::serve::handlers::schedules as s;
+        api = api
+            .route("/v1/schedules", get(s::list).post(s::create))
+            .route("/v1/schedules/preview", post(s::preview))
+            .route(
+                "/v1/schedules/{name}",
+                get(s::get).put(s::update).delete(s::delete),
+            )
+            .route("/v1/schedules/{name}/pause", post(s::pause))
+            .route("/v1/schedules/{name}/resume", post(s::resume))
+            .route("/v1/schedules/{name}/run", post(s::run));
+    }
     #[cfg(feature = "catalog")]
     {
         use crate::serve::handlers::{catalog, local_outputs, preview, usage};
@@ -902,6 +925,18 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
             "--triggers requires a build with the `triggers` feature".into(),
         ));
     }
+    // Schedules (#1044): load + validate the file fail-fast.
+    #[cfg(all(feature = "schedule", feature = "templates"))]
+    let schedules_file = match &config.schedules.path {
+        Some(path) => crate::serve::schedules::load_file(path).await?.schedules,
+        None => Vec::new(),
+    };
+    #[cfg(not(all(feature = "schedule", feature = "templates")))]
+    if config.schedules.path.is_some() {
+        return Err(CliError::Serve(
+            "--schedules requires a build with the `schedule` and `templates` features".into(),
+        ));
+    }
     // Template origins (RFC 0006 / #589): load + validate the sync file
     // fail-fast; the pull itself runs after the state exists.
     #[cfg(feature = "templates-sync")]
@@ -1191,6 +1226,19 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         None => Vec::new(),
     };
 
+    // Schedules (#1044): one loop ticks the file's schedules and the stored
+    // ones; every cluster member runs it and the per-tick idempotency key lets
+    // one run through.
+    #[cfg(all(feature = "schedule", feature = "templates"))]
+    let schedule_loop = {
+        tracing::info!(file = schedules_file.len(), "starting the schedule loop");
+        state.set_schedules(crate::serve::schedules::SchedulesRuntime::new(
+            schedules_file,
+            config.schedules.tenant_min_interval,
+        ));
+        crate::serve::schedules::spawn(state.clone(), shutdown.clone())
+    };
+
     // The HTTP graceful-shutdown future resolves on signal, then drives the run
     // drain *inside itself* — this is load-bearing: `axum::serve(...).await` does
     // not return until every open connection closes, and an open SSE
@@ -1252,6 +1300,8 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
     for h in trigger_handles {
         h.abort();
     }
+    #[cfg(all(feature = "schedule", feature = "templates"))]
+    schedule_loop.abort();
     #[cfg(feature = "templates-sync")]
     for h in sync_handles {
         h.abort();

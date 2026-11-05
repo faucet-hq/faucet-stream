@@ -332,6 +332,232 @@ paths:
           content: { application/json: { schema: { type: object } } }
         "401": { description: Missing or invalid bearer token }
         "404": { description: Unknown kind or name }
+  /v1/schedules:
+    get:
+      summary: List schedules
+      description: >
+        Every schedule this principal may see (#1044): schedules made through
+        the API or console (kept in the run history, never purged) and those
+        from the `--schedules` file (read-only). A tenant principal sees its
+        own tenant's schedules plus the operator's fan-out schedules that
+        include it; an operator can scope the list with `?tenant=`. A build
+        without the `schedule` and `templates` features answers
+        `available: false`. Requires `ScheduleRead` (viewer+); audited as
+        `schedule.list`.
+      operationId: listSchedules
+      parameters:
+        - { name: tenant, in: query, required: false, schema: { type: string }, description: "Only schedules that run for this tenant (operators)." }
+      responses:
+        "200":
+          description: The schedules.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ScheduleList" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+    post:
+      summary: Create a schedule
+      description: >
+        Creates a schedule that runs a registered template on a cron. A
+        tenant principal's schedule runs only for its tenant, within its
+        `max_schedules` and `--tenant-schedule-min-interval-secs`; only
+        operators may fan out (`tenants`). Secret params are sealed with the
+        server vault key. Under `--require-approval schedule` the answer is
+        202 with a pending change request. Requires `ScheduleWrite`
+        (operator+); audited as `schedule.create`.
+      operationId: createSchedule
+      parameters:
+        - { name: reason, in: query, required: false, schema: { type: string }, description: "Kept on the change request when changes need approval." }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ScheduleSpec" }
+      responses:
+        "201":
+          description: The schedule.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ScheduleView" }
+        "202": { description: "A change request now waits for approval (`status: pending_approval`, `change_id`, `change`)." }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { description: "Lacks `ScheduleWrite`, or a tenant principal set `tenants`." }
+        "404": { description: "The template (or sink / overlay template) is not registered." }
+        "409": { description: "A schedule with that name exists." }
+        "422": { description: "Invalid cron, timezone, params or labels; or a tenant limit (`max_schedules`, minimum interval), named in the message." }
+  /v1/schedules/preview:
+    post:
+      summary: Preview a cron's next ticks
+      description: >
+        The next ticks of a cron in a timezone, and the shortest gap between
+        ticks, for the console's form. Changes nothing. Requires
+        `ScheduleRead` (viewer+).
+      operationId: previewSchedule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [cron]
+              properties:
+                cron: { type: string }
+                timezone: { type: string, default: UTC }
+      responses:
+        "200":
+          description: "The preview; `valid` is false, with `error`, for a bad cron or timezone."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [valid, next_ticks]
+                properties:
+                  valid: { type: boolean }
+                  error: { type: string, nullable: true }
+                  next_ticks: { type: array, items: { type: string, format: date-time } }
+                  shortest_gap_secs: { type: integer, nullable: true }
+        "401": { $ref: "#/components/responses/Error" }
+  /v1/schedules/{name}:
+    parameters:
+      - { name: name, in: path, required: true, schema: { type: string } }
+    get:
+      summary: Get a schedule
+      description: >
+        One schedule with its next ticks, recent ticks and their runs, missed
+        and failed ticks and its change history. With `?tenant=` (or for a
+        tenant principal) runs and missed ticks are that tenant's only.
+        Another tenant's schedule is a 404. Requires `ScheduleRead`; audited
+        as `schedule.get`.
+      operationId: getSchedule
+      parameters:
+        - { name: tenant, in: query, required: false, schema: { type: string } }
+      responses:
+        "200":
+          description: The schedule.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ScheduleDetail" }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+    put:
+      summary: Replace a schedule
+      description: >
+        Replaces a console schedule's spec (its name cannot change; a paused
+        schedule stays paused). Takes effect from the next tick. A schedule
+        from the `--schedules` file is a 409. Requires `ScheduleWrite`;
+        audited as `schedule.update`; gated like create.
+      operationId: updateSchedule
+      parameters:
+        - { name: reason, in: query, required: false, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ScheduleSpec" }
+      responses:
+        "200":
+          description: The schedule.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ScheduleView" }
+        "202": { description: A change request now waits for approval. }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { description: The schedule comes from the `--schedules` file. }
+        "422": { $ref: "#/components/responses/Error" }
+    delete:
+      summary: Delete a schedule
+      description: >
+        Stops it ticking. Runs it started stay in history. Requires
+        `ScheduleWrite`; audited as `schedule.delete`; gated like create.
+      operationId: deleteSchedule
+      parameters:
+        - { name: reason, in: query, required: false, schema: { type: string } }
+      responses:
+        "204": { description: Deleted. }
+        "202": { description: A change request now waits for approval. }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { description: The schedule comes from the `--schedules` file. }
+  /v1/schedules/{name}/pause:
+    parameters:
+      - { name: name, in: path, required: true, schema: { type: string } }
+    post:
+      summary: Pause a schedule
+      description: >
+        No ticks fire while paused; skipped ticks are not run later. A paused
+        schedule still counts toward a tenant's `max_schedules`. Requires
+        `ScheduleWrite`; audited as `schedule.pause`.
+      operationId: pauseSchedule
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string, maxLength: 500 }
+      responses:
+        "200":
+          description: The schedule.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ScheduleView" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { description: The schedule comes from the `--schedules` file. }
+  /v1/schedules/{name}/resume:
+    parameters:
+      - { name: name, in: path, required: true, schema: { type: string } }
+    post:
+      summary: Resume a schedule
+      description: >
+        Ticks resume from the next one; the ticks skipped while paused are
+        logged in its history. Requires `ScheduleWrite`; audited as
+        `schedule.resume`.
+      operationId: resumeSchedule
+      responses:
+        "200":
+          description: The schedule.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ScheduleView" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { description: The schedule comes from the `--schedules` file. }
+  /v1/schedules/{name}/run:
+    parameters:
+      - { name: name, in: path, required: true, schema: { type: string } }
+    post:
+      summary: Run a schedule now
+      description: >
+        Starts one tick now, exactly as a scheduled tick would (one run per
+        tenant for a fan-out); the overlap rule does not apply and the next
+        scheduled tick is unchanged. Allowed on file schedules. Gated by
+        `--require-approval run`. Requires `ScheduleWrite`; audited as
+        `schedule.run`.
+      operationId: runScheduleNow
+      responses:
+        "202":
+          description: The runs started.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [runs, errors]
+                properties:
+                  runs: { type: array, items: { type: string } }
+                  errors: { type: array, items: { type: string } }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "422": { description: Every target was refused; the reasons are in the message. }
+        "503": { description: The run queue is full or the server is draining. }
   /v1/triggers:
     get:
       summary: List the configured triggers
@@ -2931,6 +3157,139 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/ApiError" }
   schemas:
+    ScheduleSpec:
+      type: object
+      description: A schedule (#1044); also one entry of a `--schedules` file (`faucet schema schedules`).
+      required: [name, cron, template]
+      additionalProperties: false
+      properties:
+        name: { type: string, pattern: "^[A-Za-z0-9_-]{1,64}$" }
+        description: { type: string, maxLength: 1000 }
+        cron: { type: string, description: "5- or 6-field cron." }
+        timezone: { type: string, default: UTC }
+        catch_up: { type: boolean, default: true, description: "Run the latest missed tick once after a gap." }
+        overlap: { type: string, enum: [skip, queue, forbid], default: skip }
+        paused: { type: boolean, default: false }
+        template:
+          type: object
+          required: [id]
+          additionalProperties: false
+          properties:
+            id: { type: string }
+            version: { type: string, description: "A channel (`stable`, `newest`, …) or a version number; default `stable`." }
+            params: { type: object, additionalProperties: true, description: "Secret params are stored sealed and shown as `{\"$sealed\": true}`; send that marker back to keep a stored value." }
+            sink: { type: string }
+            sink_version: { type: string }
+            overlay: { type: string }
+            overlay_version: { type: string }
+        tenants:
+          description: Operators only. `all` or a list of tenant ids; one run per tenant each tick.
+          oneOf:
+            - { type: string, enum: [all] }
+            - { type: array, items: { type: string } }
+        run:
+          type: object
+          additionalProperties: false
+          properties:
+            name: { type: string }
+            labels: { type: object, additionalProperties: { type: string } }
+            timeout_secs: { type: integer, minimum: 1 }
+            selection: { type: object }
+            pool: { type: string }
+    ScheduleView:
+      type: object
+      description: A schedule with its live status.
+      required: [name, source, cron, timezone, overlap, paused, template, status, can_edit, can_run]
+      properties:
+        name: { type: string }
+        description: { type: string, nullable: true }
+        source: { type: string, enum: [console, file] }
+        tenant: { type: string, nullable: true, description: "The owning tenant (a tenant principal's schedule)." }
+        tenants: { description: "A fan-out's tenants (`all` or ids)." }
+        shared: { type: boolean }
+        cron: { type: string }
+        timezone: { type: string }
+        catch_up: { type: boolean }
+        overlap: { type: string, enum: [skip, queue, forbid] }
+        paused: { type: boolean }
+        template: { type: object }
+        run: { type: object }
+        status: { type: string, enum: [active, paused, failing, retrying] }
+        next_tick: { type: string, format: date-time, nullable: true }
+        last_tick: { type: string, format: date-time, nullable: true }
+        last_outcome: { type: string, nullable: true }
+        last_error: { type: string, nullable: true }
+        consecutive_failures: { type: integer }
+        missed_30d: { type: integer }
+        missed_24h: { type: integer }
+        ticks_today: { type: integer }
+        upcoming: { type: array, items: { type: string, format: date-time } }
+        created_at: { type: string, format: date-time, nullable: true }
+        created_by: { type: string, nullable: true }
+        updated_at: { type: string, format: date-time, nullable: true }
+        updated_by: { type: string, nullable: true }
+        revision: { type: integer }
+        paused_at: { type: string, format: date-time, nullable: true }
+        paused_by: { type: string, nullable: true }
+        pause_reason: { type: string, nullable: true }
+        skipped_while_paused: { type: integer, nullable: true }
+        can_edit: { type: boolean }
+        can_run: { type: boolean }
+    ScheduleList:
+      type: object
+      required: [available, schedules]
+      properties:
+        available: { type: boolean, description: "`false` on a build without the `schedule` and `templates` features." }
+        reason: { type: string }
+        tenant: { type: string, nullable: true }
+        tenant_min_interval_secs: { type: integer }
+        requires_approval: { type: boolean }
+        max_schedules: { type: integer, nullable: true, description: "A tenant principal's limit." }
+        owned: { type: integer, nullable: true, description: "Schedules the tenant owns, paused ones included." }
+        total: { type: integer, nullable: true, description: "For an operator scoped with ?tenant=: every schedule on the server." }
+        schedules: { type: array, items: { $ref: "#/components/schemas/ScheduleView" } }
+    ScheduleDetail:
+      type: object
+      required: [schedule, next_ticks, recent_ticks, runs_total, missed, failures, skipped, changes]
+      properties:
+        schedule: { $ref: "#/components/schemas/ScheduleView" }
+        next_ticks: { type: array, items: { type: string, format: date-time } }
+        recent_ticks:
+          type: array
+          items:
+            type: object
+            properties:
+              tick: { type: string, format: date-time }
+              outcome: { type: string, enum: [started, skipped, failed] }
+              runs: { type: array, items: { type: object } }
+              errors: { type: array, items: { type: string } }
+              reason: { type: string, nullable: true }
+              manual: { type: boolean }
+        runs_total: { type: integer }
+        missed:
+          type: array
+          items:
+            type: object
+            properties:
+              from: { type: string, format: date-time }
+              to: { type: string, format: date-time }
+              count: { type: integer }
+              reason: { type: string }
+              caught_up: { type: boolean }
+        failures: { type: array, items: { type: object } }
+        skipped: { type: array, items: { type: object } }
+        changes:
+          type: array
+          items:
+            type: object
+            properties:
+              at: { type: string, format: date-time }
+              by: { type: string }
+              action: { type: string, enum: [created, updated, paused, resumed, run_now] }
+              detail: { type: array, items: { type: string } }
+        applies_to: { type: array, items: { type: string }, nullable: true }
+        resolved_version: { type: integer, nullable: true, description: "The template version the selector resolves to now." }
+        template_kind: { type: string, nullable: true, description: "pipeline or source-template." }
     TenantLimits:
       type: object
       additionalProperties: false
@@ -3337,8 +3696,6 @@ components:
         errors_total: { type: integer, description: Failed polls and fires since the server started. }
         methods: { type: array, items: { type: string }, description: "Webhook: the accepted HTTP methods." }
         debounce_secs: { type: integer, description: "Webhook: the leading-edge debounce window." }
-        cron: { type: string, description: "Schedule: the cron expression." }
-        timezone: { type: string, description: "Schedule: the cron's timezone." }
         poll_interval_secs: { type: integer, description: "Object arrival / queue depth: seconds between polls." }
         threshold: { type: integer, description: "Queue depth: the depth that fires." }
         template: { type: string, description: "The template it triggers, `id` or `id@version`." }

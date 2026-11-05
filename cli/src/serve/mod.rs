@@ -27,6 +27,8 @@ pub mod rbac;
 pub mod references;
 pub mod registry;
 pub mod runner;
+#[cfg(all(feature = "schedule", feature = "templates"))]
+pub mod schedules;
 pub mod sealed;
 pub mod server;
 pub mod state;

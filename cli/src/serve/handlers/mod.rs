@@ -16,6 +16,7 @@ pub mod plan;
 pub mod preview;
 pub mod reload;
 pub mod runs;
+pub mod schedules;
 pub mod schemas;
 pub mod state;
 #[cfg(feature = "templates")]

@@ -58,6 +58,12 @@ fn openapi_routes() -> BTreeSet<(String, String)> {
         {
             continue;
         }
+        // …and the schedule routes (#1044); without them only the `GET`
+        // that answers `available: false` is wired.
+        #[cfg(not(all(feature = "schedule", feature = "templates")))]
+        if path.starts_with("/v1/schedules") {
+            continue;
+        }
         // …and the `mcp` feature's transport (#420).
         #[cfg(not(feature = "mcp"))]
         if path == "/mcp" {
@@ -145,6 +151,7 @@ async fn every_documented_route_is_wired_on_the_live_server() {
         cluster_poll_secs: 2,
         cluster_max_attempts: 3,
         triggers: None,
+        schedules: Default::default(),
         templates_sync: None,
         policy: None,
         otel_config: None,

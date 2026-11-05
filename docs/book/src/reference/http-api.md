@@ -1026,6 +1026,33 @@ curl -s -H "Authorization: Bearer $TOKEN" --get \
   | jq '.tables[] | {table, phase, lag_secs, last_error}'
 ```
 
+### `/v1/schedules` (schedules)
+
+Registered templates run on a cron (#1044); see the
+[Schedules cookbook](../cookbook/schedules.md).
+
+| Method | Path | Permission | Audit |
+|---|---|---|---|
+| `GET` | `/v1/schedules[?tenant=]` | `ScheduleRead` | `schedule.list` |
+| `POST` | `/v1/schedules/preview` | `ScheduleRead` | `schedule.preview` |
+| `GET` | `/v1/schedules/{name}[?tenant=]` | `ScheduleRead` | `schedule.get` |
+| `POST` | `/v1/schedules[?reason=]` | `ScheduleWrite` | `schedule.create` |
+| `PUT` | `/v1/schedules/{name}[?reason=]` | `ScheduleWrite` | `schedule.update` |
+| `DELETE` | `/v1/schedules/{name}[?reason=]` | `ScheduleWrite` | `schedule.delete` |
+| `POST` | `/v1/schedules/{name}/pause` (`{"reason"}`) | `ScheduleWrite` | `schedule.pause` |
+| `POST` | `/v1/schedules/{name}/resume` | `ScheduleWrite` | `schedule.resume` |
+| `POST` | `/v1/schedules/{name}/run` | `ScheduleWrite` | `schedule.run` |
+
+`ScheduleRead` is granted to viewers and up, `ScheduleWrite` to operators and
+up. A create, edit or delete answers `202` with a pending change request
+under `--require-approval schedule`; run now follows `--require-approval run`.
+A schedule from the `--schedules` file answers `409` to edit, pause and
+delete. A tenant principal sees and changes only its own tenant's schedules
+(another tenant's is a `404`), never fans out (`403`), and is held to
+`max_schedules` and the minimum tick interval (`422` naming the limit).
+Without the `schedule` and `templates` features `GET /v1/schedules` answers
+`{"available": false}` and no other route exists.
+
 ### `/v1/tenants*` (multi-tenant embedded integrations)
 
 See the [embedded integrations cookbook](../cookbook/embedded-integrations.md).

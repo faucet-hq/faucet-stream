@@ -75,6 +75,9 @@ pub struct TenantLimits {
     /// Longest one invocation may run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_duration_secs: Option<u64>,
+    /// Most schedules the tenant may own, paused ones included (#1044).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_schedules: Option<u32>,
 }
 
 impl TenantLimits {
@@ -93,6 +96,9 @@ impl TenantLimits {
         }
         if self.max_duration_secs == Some(0) {
             return zero("max_duration_secs");
+        }
+        if self.max_schedules == Some(0) {
+            return zero("max_schedules");
         }
         Ok(())
     }
@@ -347,6 +353,13 @@ mod tests {
                     ..Default::default()
                 },
                 "max_duration_secs",
+            ),
+            (
+                TenantLimits {
+                    max_schedules: Some(0),
+                    ..Default::default()
+                },
+                "max_schedules",
             ),
         ] {
             assert!(limits.validate().unwrap_err().contains(field));

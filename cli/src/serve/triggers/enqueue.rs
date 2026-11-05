@@ -657,15 +657,15 @@ mod tests {
 
     #[cfg(feature = "templates")]
     #[test]
-    fn template_bodies_carry_params_labels_and_the_tick_key() {
+    fn template_bodies_carry_params_labels_and_the_event_key() {
         use crate::serve::triggers::spec::TemplateTrigger;
         let mut c = compiled_webhook();
-        c.spec.run.name = Some("{name}@{tick}".into());
+        c.spec.run.name = Some("{name}@{depth}".into());
         let tpl = TemplateTrigger {
             id: "crm".into(),
             version: Some("3".into()),
             params: std::collections::BTreeMap::from([
-                ("since".to_string(), serde_json::json!("${trigger.tick}")),
+                ("backlog".to_string(), serde_json::json!("${trigger.depth}")),
                 ("n".to_string(), serde_json::json!(5)),
             ]),
             sink: Some("wh".into()),
@@ -674,18 +674,17 @@ mod tests {
             overlay_version: None,
             allow_untested: false,
         };
-        let e = TriggerEvent::Schedule {
-            tick: "2026-01-01T00:00:00Z".into(),
+        let e = TriggerEvent::QueueDepth {
+            queue: "jobs".into(),
+            depth: 42,
+            edge: 3,
         };
         let b = template_body(&c, &tpl, &e, "now").unwrap();
-        assert_eq!(b.params["since"], "2026-01-01T00:00:00Z");
+        assert_eq!(b.params["backlog"], "42");
         assert_eq!(b.params["n"], 5);
-        assert_eq!(b.name.as_deref(), Some("hook@2026-01-01T00:00:00Z"));
-        assert_eq!(
-            b.idempotency_key.as_deref(),
-            Some("trig:hook:2026-01-01T00:00:00Z")
-        );
-        assert_eq!(b.labels["faucet.trigger.type"], "schedule");
+        assert_eq!(b.name.as_deref(), Some("hook@42"));
+        assert_eq!(b.idempotency_key.as_deref(), Some("trig:hook:edge:3"));
+        assert_eq!(b.labels["faucet.trigger.type"], "queue_depth");
         assert_eq!(b.sink.as_deref(), Some("wh"));
         assert!(b.version.is_some() && b.sink_version.is_some() && b.overlay.is_some());
         let bad = TemplateTrigger {
@@ -805,7 +804,11 @@ mod tests {
         c.spec.tenants = Some(crate::serve::history::tenants::TenantSelector::All(
             "all".into(),
         ));
-        let event = TriggerEvent::Schedule { tick: "t".into() };
+        let event = TriggerEvent::QueueDepth {
+            queue: "q".into(),
+            depth: 1,
+            edge: 1,
+        };
         let out = fire(&state, &c, event.clone(), "now").await;
         assert!(
             matches!(out, FireOutcome::Error(ref e) if e.contains("missing.yaml")),

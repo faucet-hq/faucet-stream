@@ -1625,7 +1625,14 @@ mod templates {
 
         let mut labels = body.labels;
         // Provenance labels are the server's to set.
-        labels.retain(|k, _| !RESERVED_LABELS.contains(&k.as_str()));
+        let trusted = matches!(
+            principal.body_origin(),
+            crate::serve::load::BodyOrigin::Trusted
+        );
+        labels.retain(|k, _| {
+            !RESERVED_LABELS.contains(&k.as_str())
+                || (trusted && crate::serve::history::labels::SCHEDULE_LABELS.contains(&k.as_str()))
+        });
         labels.insert(LABEL_TEMPLATE.into(), materialized.template_id.clone());
         if let Some(status) = materialized.untested {
             labels.insert(LABEL_ALLOW_UNTESTED.into(), "true".into());

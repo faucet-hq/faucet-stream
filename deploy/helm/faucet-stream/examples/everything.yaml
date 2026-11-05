@@ -54,8 +54,13 @@ serve:
           template: { id: platform-nightly }
           methods: [POST]
           dedupe_header: Idempotency-Key
+
+  schedules:
+    enabled: true
+    content:
+      version: 1
+      schedules:
         - name: nightly
-          type: schedule
           cron: "0 2 * * *"
           timezone: Etc/UTC
           template: { id: platform-nightly }

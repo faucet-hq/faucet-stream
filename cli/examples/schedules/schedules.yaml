@@ -1,0 +1,42 @@
+# Schedules for `faucet serve --schedules` (#1044).
+#
+# Each schedule runs a registered template on a cron. Register and launch the
+# templates first (`faucet template register … --launch`, or the console's
+# Templates page). Schedules in this file are read-only in the console: change
+# them here and restart the server. Schedules made in the console or through
+# POST /v1/schedules live in the run history instead, and every replica picks
+# them up without a restart.
+#
+#   faucet serve --history sqlite:./faucet.db --schedules schedules.yaml
+#   faucet schema schedules          # every field
+version: 1
+schedules:
+  - name: nightly-rollup
+    description: Rebuild the daily revenue rollup after the warehouse load.
+    cron: "0 2 * * *"            # 5 fields, or 6 with seconds first
+    timezone: Europe/Berlin      # IANA name; DST-correct; default UTC
+    catch_up: true               # after an outage, run the latest missed tick once
+    overlap: skip                # skip | queue | forbid while the last tick still runs
+    template:
+      id: billing-rollup
+      version: stable            # a channel or a version number
+      params:
+        region: eu
+        day: "${schedule.tick}"  # the scheduled instant, RFC 3339
+    run:
+      name: "nightly-rollup-{tick}"
+      labels: { team: finance }
+      timeout_secs: 2700
+
+  - name: crm-hourly
+    cron: "0 * * * *"
+    template:
+      id: acme/crm               # a source template, paired with a sink
+      sink: faucet-hq/bigquery
+    run:
+      selection: { skip: [activities] }
+
+  - name: crm-nightly-every-tenant
+    cron: "30 1 * * *"
+    template: { id: crm-contacts }
+    tenants: all                 # one run per tenant each tick (operators only)

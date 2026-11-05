@@ -521,6 +521,7 @@ mod serve {
             cluster_poll_secs: 2,
             cluster_max_attempts: 3,
             triggers: None,
+            schedules: Default::default(),
             templates_sync: None,
             policy: None,
             otel_config: None,

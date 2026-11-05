@@ -57,6 +57,9 @@ struct TenantState {
     state_refs: BTreeMap<(String, String), tenants::TenantStateRef>,
 }
 
+/// Schedules made through the API (#1044), by name.
+type ScheduleMap = BTreeMap<String, super::schedules::ScheduleRecord>;
+
 pub struct MemoryHistory {
     runs: DashMap<String, RunRecord>,
     idem: DashMap<String, IdemEntry>,
@@ -106,6 +109,8 @@ pub struct MemoryHistory {
     changes: Mutex<BTreeMap<String, crate::serve::changes::ChangeRequest>>,
     /// Tenants, connections, connect sessions and the state ledger (#709).
     tenants: Mutex<TenantState>,
+    /// Schedules made through the API (#1044), by name.
+    schedules: Mutex<ScheduleMap>,
     /// queue_depth trigger edges: trigger → (last ordinal, armed).
     trigger_edges: Mutex<std::collections::HashMap<String, (u64, bool)>>,
     /// Sealed secret params of clustered runs (#956): run id → sealed text.
@@ -161,6 +166,12 @@ impl MemoryHistory {
             .map_err(|_| HistoryError::Backend("tenants lock poisoned".into()))
     }
 
+    fn schedule_map(&self) -> Result<std::sync::MutexGuard<'_, ScheduleMap>, HistoryError> {
+        self.schedules
+            .lock()
+            .map_err(|_| HistoryError::Backend("schedules lock poisoned".into()))
+    }
+
     pub fn new(idem_retention: Duration) -> Self {
         Self {
             runs: DashMap::new(),
@@ -183,6 +194,7 @@ impl MemoryHistory {
             usage: Mutex::new(VecDeque::new()),
             changes: Mutex::new(BTreeMap::new()),
             tenants: Mutex::new(TenantState::default()),
+            schedules: Mutex::new(BTreeMap::new()),
             trigger_edges: Mutex::new(std::collections::HashMap::new()),
             run_secrets: Mutex::new(std::collections::HashMap::new()),
             idem_retention,
@@ -957,6 +969,9 @@ impl RunHistory for MemoryHistory {
         st.connections.retain(|(t, _), _| t != id);
         st.sessions.retain(|_, s| s.tenant != id);
         st.state_refs.retain(|(t, _), _| t != id);
+        drop(st);
+        self.schedule_map()?
+            .retain(|_, r| r.tenant.as_deref() != Some(id));
         Ok(existed)
     }
 
@@ -1721,6 +1736,48 @@ impl RunHistory for MemoryHistory {
             .map_err(|_| HistoryError::Backend("meta lock poisoned".into()))?;
         meta.insert(key.to_string(), value.to_string());
         Ok(())
+    }
+
+    async fn schedule_insert(
+        &self,
+        schedule: &super::schedules::ScheduleRecord,
+    ) -> Result<bool, HistoryError> {
+        let mut map = self.schedule_map()?;
+        if map.contains_key(schedule.name()) {
+            return Ok(false);
+        }
+        map.insert(schedule.name().to_string(), schedule.clone());
+        Ok(true)
+    }
+
+    async fn schedule_replace(
+        &self,
+        expected: &super::schedules::ScheduleRecord,
+        new: &super::schedules::ScheduleRecord,
+    ) -> Result<bool, HistoryError> {
+        let mut map = self.schedule_map()?;
+        match map.get(expected.name()) {
+            Some(current) if current == expected => {
+                map.insert(new.name().to_string(), new.clone());
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn schedule_get(
+        &self,
+        name: &str,
+    ) -> Result<Option<super::schedules::ScheduleRecord>, HistoryError> {
+        Ok(self.schedule_map()?.get(name).cloned())
+    }
+
+    async fn schedule_list(&self) -> Result<Vec<super::schedules::ScheduleRecord>, HistoryError> {
+        Ok(self.schedule_map()?.values().cloned().collect())
+    }
+
+    async fn schedule_delete(&self, name: &str) -> Result<bool, HistoryError> {
+        Ok(self.schedule_map()?.remove(name).is_some())
     }
 
     async fn template_tags(&self, id: &str) -> Result<BTreeMap<String, u32>, HistoryError> {

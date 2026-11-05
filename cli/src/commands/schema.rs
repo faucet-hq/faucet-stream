@@ -53,6 +53,8 @@ pub fn schema_targets() -> Vec<&'static str> {
     targets.push("lineage");
     #[cfg(feature = "triggers")]
     targets.push("triggers");
+    #[cfg(all(feature = "schedule", feature = "templates"))]
+    targets.push("schedules");
     #[cfg(feature = "notify")]
     targets.push("notifications");
     #[cfg(feature = "catalog")]
@@ -312,6 +314,11 @@ pub async fn run(args: SchemaArgs) -> CliResult<()> {
         #[cfg(feature = "triggers")]
         SchemaTarget::Triggers => {
             let s = faucet_core::schema_for!(crate::serve::triggers::spec::TriggersFile);
+            serde_json::to_value(s).unwrap_or_else(|_| serde_json::json!({"type": "object"}))
+        }
+        #[cfg(all(feature = "schedule", feature = "templates"))]
+        SchemaTarget::Schedules => {
+            let s = faucet_core::schema_for!(crate::serve::schedules::SchedulesFile);
             serde_json::to_value(s).unwrap_or_else(|_| serde_json::json!({"type": "object"}))
         }
         SchemaTarget::SourceTemplate => {

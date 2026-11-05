@@ -110,11 +110,16 @@ pub enum Permission {
     /// Store, replace and delete a tenant's connections and start hosted
     /// OAuth connect flows (#709) — operator+.
     ConnectionManage,
+    /// List and read schedules (`GET /v1/schedules*`, #1044) — viewer+.
+    ScheduleRead,
+    /// Create, edit, pause, resume, delete and run a schedule now (#1044) —
+    /// operator+. A tenant-scoped principal reaches only its tenant's own.
+    ScheduleWrite,
 }
 
 impl Permission {
     /// Every permission, in declaration order.
-    pub const ALL: [Permission; 27] = [
+    pub const ALL: [Permission; 29] = [
         Permission::RunRead,
         Permission::RunWrite,
         Permission::SchemaRead,
@@ -142,6 +147,8 @@ impl Permission {
         Permission::TenantRead,
         Permission::TenantAdmin,
         Permission::ConnectionManage,
+        Permission::ScheduleRead,
+        Permission::ScheduleWrite,
     ];
 }
 
@@ -179,6 +186,7 @@ impl Role {
                         | ChangeRead
                         | StatusRead
                         | TenantRead
+                        | ScheduleRead
                 )
             }
             Role::Operator => {
@@ -205,6 +213,8 @@ impl Role {
                         | StatusRead
                         | TenantRead
                         | ConnectionManage
+                        | ScheduleRead
+                        | ScheduleWrite
                 )
             }
             Role::Admin => true,
@@ -595,6 +605,16 @@ pub fn required_permission(method: &Method, matched_path: &str) -> Option<Permis
         (&Method::GET, "/v1/audit/{id}") => Some(AuditRead),
         // The configured triggers and their health (#998): a read, viewer+.
         (&Method::GET, "/v1/triggers") => Some(StatusRead),
+        // Schedules (#1044).
+        (&Method::GET, "/v1/schedules") => Some(ScheduleRead),
+        (&Method::POST, "/v1/schedules/preview") => Some(ScheduleRead),
+        (&Method::GET, "/v1/schedules/{name}") => Some(ScheduleRead),
+        (&Method::POST, "/v1/schedules") => Some(ScheduleWrite),
+        (&Method::PUT, "/v1/schedules/{name}") => Some(ScheduleWrite),
+        (&Method::DELETE, "/v1/schedules/{name}") => Some(ScheduleWrite),
+        (&Method::POST, "/v1/schedules/{name}/pause") => Some(ScheduleWrite),
+        (&Method::POST, "/v1/schedules/{name}/resume") => Some(ScheduleWrite),
+        (&Method::POST, "/v1/schedules/{name}/run") => Some(ScheduleWrite),
         (&Method::POST, "/v1/triggers/{name}") => Some(TriggerFire),
         (&Method::PUT, "/v1/triggers/{name}") => Some(TriggerFire),
         (&Method::GET, "/v1/catalog/datasets") => Some(CatalogRead),
@@ -745,7 +765,15 @@ pub fn tenant_scope_decision(
         | (_, "/v1/changes/{id}/reject")
         | (&Method::GET, "/v1/usage")
         | (&Method::GET, "/v1/tenants")
-        | (&Method::GET, "/v1/connect/providers") => Allow,
+        | (&Method::GET, "/v1/connect/providers")
+        // Schedules (#1044): the handlers confine a tenant principal to its
+        // tenant's schedules (and the fan-outs that include it, read-only).
+        | (_, "/v1/schedules")
+        | (_, "/v1/schedules/preview")
+        | (_, "/v1/schedules/{name}")
+        | (_, "/v1/schedules/{name}/pause")
+        | (_, "/v1/schedules/{name}/resume")
+        | (_, "/v1/schedules/{name}/run") => Allow,
         _ => Deny,
     }
 }
@@ -774,6 +802,15 @@ pub fn audit_action(method: &Method, matched_path: &str) -> &'static str {
         (&Method::GET, "/v1/audit") => "audit.list",
         (&Method::GET, "/v1/audit/{id}") => "audit.get",
         (&Method::GET, "/v1/triggers") => "trigger.list",
+        (&Method::GET, "/v1/schedules") => "schedule.list",
+        (&Method::POST, "/v1/schedules/preview") => "schedule.preview",
+        (&Method::GET, "/v1/schedules/{name}") => "schedule.get",
+        (&Method::POST, "/v1/schedules") => "schedule.create",
+        (&Method::PUT, "/v1/schedules/{name}") => "schedule.update",
+        (&Method::DELETE, "/v1/schedules/{name}") => "schedule.delete",
+        (&Method::POST, "/v1/schedules/{name}/pause") => "schedule.pause",
+        (&Method::POST, "/v1/schedules/{name}/resume") => "schedule.resume",
+        (&Method::POST, "/v1/schedules/{name}/run") => "schedule.run",
         (&Method::POST | &Method::PUT, "/v1/triggers/{name}") => "trigger.fire",
         (&Method::GET, "/v1/catalog/datasets") => "catalog.list",
         (&Method::GET, "/v1/catalog/datasets/{id}") => "catalog.get",

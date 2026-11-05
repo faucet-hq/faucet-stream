@@ -116,27 +116,32 @@ pub enum TriggerKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         poll_timeout_secs: Option<u64>,
     },
-    /// Fire on a cron schedule (#709; needs the `schedule` feature). With
-    /// `tenants`, each tick fans out one run per tenant.
-    Schedule {
-        /// Cron expression (5 or 6 fields).
-        cron: String,
-        /// IANA timezone the cron is evaluated in. Default `UTC`.
-        #[serde(default = "default_timezone")]
-        timezone: String,
-        /// After an outage, run the most recent missed tick once when the
-        /// server comes back. `false` skips missed ticks. Default `true`.
-        #[serde(default = "default_catch_up")]
-        catch_up: bool,
-    },
 }
 
-fn default_catch_up() -> bool {
-    true
+/// The error for a `type: schedule` entry: cron schedules are their own
+/// feature now (#1044), defined in `faucet serve --schedules <file>` or
+/// through `/v1/schedules`.
+pub fn schedule_moved(trigger: &str) -> String {
+    format!(
+        "triggers: '{trigger}' has `type: schedule`, which triggers no longer support — cron \
+         schedules moved to `faucet serve --schedules <file>` (or the console's Schedules page / \
+         `POST /v1/schedules`), and run a registered template; see `faucet schema schedules`"
+    )
 }
 
-fn default_timezone() -> String {
-    "UTC".to_string()
+/// The first trigger in a raw triggers document whose `type` is `schedule`.
+pub fn schedule_entry(raw: &serde_json::Value) -> Option<String> {
+    raw.get("triggers")?
+        .as_array()?
+        .iter()
+        .enumerate()
+        .find(|(_, t)| t.get("type").and_then(|v| v.as_str()) == Some("schedule"))
+        .map(|(i, t)| {
+            t.get("name")
+                .and_then(|n| n.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("#{i}"))
+        })
 }
 
 /// A registered template a trigger runs (`template:` on a trigger).

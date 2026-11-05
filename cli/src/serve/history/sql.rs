@@ -715,6 +715,15 @@ pub const DDL: &[&str] = &[
         id TEXT PRIMARY KEY,\
         updated_at TEXT NOT NULL,\
         body TEXT NOT NULL)",
+    // Schedules made through the API (#1044): the record lives in `body`;
+    // `tenant` (the owning tenant, NULL for a server-wide schedule) is a
+    // column so deleting a tenant drops its schedules. Never purged by run
+    // retention.
+    "CREATE TABLE IF NOT EXISTS faucet_serve_schedules (\
+        name TEXT PRIMARY KEY,\
+        tenant TEXT,\
+        updated_at TEXT NOT NULL,\
+        body TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS faucet_tenant_connections (\
         tenant TEXT NOT NULL,\
         name TEXT NOT NULL,\
@@ -1009,6 +1018,17 @@ pub struct Stmts {
     pub tenant_delete_sessions: String,
     pub tenant_delete_runs: String,
     pub tenant_delete_state_refs: String,
+    /// Delete the schedules a tenant owns (#1044). Param: tenant.
+    pub tenant_delete_schedules: String,
+    /// Insert a schedule unless one has its name. Params: name, tenant,
+    /// updated_at, body.
+    pub schedule_insert: String,
+    /// Replace a schedule's body only while it still equals the expected one.
+    /// Params: tenant, updated_at, new body, name, expected body.
+    pub schedule_replace: String,
+    pub schedule_select: String,
+    pub schedule_list: String,
+    pub schedule_delete: String,
     pub connection_upsert: String,
     /// Compare-and-set a connection on its stored `updated_at`. Params:
     /// status, updated_at, body, tenant, name, expected updated_at.
@@ -1880,6 +1900,16 @@ impl Stmts {
             tenant_delete_runs: "DELETE FROM faucet_tenant_runs WHERE tenant=$1".into(),
             tenant_delete_state_refs: "DELETE FROM faucet_tenant_state_refs WHERE tenant=$1"
                 .into(),
+            tenant_delete_schedules: "DELETE FROM faucet_serve_schedules WHERE tenant=$1".into(),
+            schedule_insert: "INSERT INTO faucet_serve_schedules (name, tenant, updated_at, body) \
+                VALUES ($1,$2,$3,$4) ON CONFLICT (name) DO NOTHING"
+                .into(),
+            schedule_replace: "UPDATE faucet_serve_schedules SET tenant=$1, updated_at=$2, \
+                body=$3 WHERE name=$4 AND body=$5"
+                .into(),
+            schedule_select: "SELECT body FROM faucet_serve_schedules WHERE name=$1".into(),
+            schedule_list: "SELECT body FROM faucet_serve_schedules ORDER BY name".into(),
+            schedule_delete: "DELETE FROM faucet_serve_schedules WHERE name=$1".into(),
             connection_replace: "UPDATE faucet_tenant_connections SET status=$1, updated_at=$2, \
                 body=$3 WHERE tenant=$4 AND name=$5 AND updated_at=$6"
                 .into(),
@@ -2499,6 +2529,16 @@ impl Stmts {
             tenant_delete_runs: "DELETE FROM faucet_tenant_runs WHERE tenant=?".into(),
             tenant_delete_state_refs: "DELETE FROM faucet_tenant_state_refs WHERE tenant=?"
                 .into(),
+            tenant_delete_schedules: "DELETE FROM faucet_serve_schedules WHERE tenant=?".into(),
+            schedule_insert: "INSERT INTO faucet_serve_schedules (name, tenant, updated_at, body) \
+                VALUES (?,?,?,?) ON CONFLICT (name) DO NOTHING"
+                .into(),
+            schedule_replace: "UPDATE faucet_serve_schedules SET tenant=?, updated_at=?, \
+                body=? WHERE name=? AND body=?"
+                .into(),
+            schedule_select: "SELECT body FROM faucet_serve_schedules WHERE name=?".into(),
+            schedule_list: "SELECT body FROM faucet_serve_schedules ORDER BY name".into(),
+            schedule_delete: "DELETE FROM faucet_serve_schedules WHERE name=?".into(),
             connection_replace: "UPDATE faucet_tenant_connections SET status=?, updated_at=?, \
                 body=? WHERE tenant=? AND name=? AND updated_at=?"
                 .into(),
@@ -5804,6 +5844,67 @@ macro_rules! impl_sql_history {
                 self.select_bodies(&self.stmts.tenant_list, &[], "tenant").await
             }
 
+            async fn schedule_insert(
+                &self,
+                schedule: &$crate::serve::history::schedules::ScheduleRecord,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let n = sqlx::query(&self.stmts.schedule_insert)
+                    .bind(schedule.name())
+                    .bind(schedule.tenant.as_deref())
+                    .bind(sql::fmt_ts(schedule.updated_at))
+                    .bind(sql::encode_json(schedule, "schedule")?)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?
+                    .rows_affected();
+                Ok(n > 0)
+            }
+
+            async fn schedule_replace(
+                &self,
+                expected: &$crate::serve::history::schedules::ScheduleRecord,
+                new: &$crate::serve::history::schedules::ScheduleRecord,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let n = sqlx::query(&self.stmts.schedule_replace)
+                    .bind(new.tenant.as_deref())
+                    .bind(sql::fmt_ts(new.updated_at))
+                    .bind(sql::encode_json(new, "schedule")?)
+                    .bind(expected.name())
+                    .bind(sql::encode_json(expected, "schedule")?)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?
+                    .rows_affected();
+                Ok(n > 0)
+            }
+
+            async fn schedule_get(
+                &self,
+                name: &str,
+            ) -> Result<Option<$crate::serve::history::schedules::ScheduleRecord>, $crate::serve::history::HistoryError> {
+                self.select_one_body(&self.stmts.schedule_select, &[name], "schedule")
+                    .await
+            }
+
+            async fn schedule_list(&self) -> Result<Vec<$crate::serve::history::schedules::ScheduleRecord>, $crate::serve::history::HistoryError> {
+                self.select_bodies(&self.stmts.schedule_list, &[], "schedule").await
+            }
+
+            async fn schedule_delete(&self, name: &str) -> Result<bool, $crate::serve::history::HistoryError> {
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let n = sqlx::query(&self.stmts.schedule_delete)
+                    .bind(name)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?
+                    .rows_affected();
+                Ok(n > 0)
+            }
+
             async fn tenant_delete(&self, id: &str) -> Result<bool, $crate::serve::history::HistoryError> {
                 let backend = $crate::serve::history::sql::classify_backend_error;
                 let mut tx = self.pool.begin_with($begin_write).await.map_err(backend)?;
@@ -5812,6 +5913,7 @@ macro_rules! impl_sql_history {
                     &self.stmts.tenant_delete_sessions,
                     &self.stmts.tenant_delete_runs,
                     &self.stmts.tenant_delete_state_refs,
+                    &self.stmts.tenant_delete_schedules,
                 ] {
                     sqlx::query(stmt)
                         .bind(id)

@@ -60,6 +60,7 @@ fn args(port: u16, history: String, cluster: bool, pools: &[&str]) -> faucet_cli
         cluster_poll_secs: 1,
         cluster_max_attempts: 3,
         triggers: None,
+        schedules: Default::default(),
         templates_sync: None,
         policy: None,
         otel_config: None,

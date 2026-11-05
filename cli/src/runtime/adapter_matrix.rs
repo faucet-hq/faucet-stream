@@ -288,8 +288,12 @@ async fn submit(
                 },
                 webhook_path: Some("/v1/triggers/hook".into()),
             };
-            let event = crate::serve::triggers::context::TriggerEvent::Schedule {
-                tick: uuid::Uuid::now_v7().to_string(),
+            let event = crate::serve::triggers::context::TriggerEvent::Webhook {
+                method: "POST".into(),
+                body: String::new(),
+                headers: Default::default(),
+                query: Default::default(),
+                idem: uuid::Uuid::now_v7().to_string(),
             };
             use crate::serve::triggers::enqueue::FireOutcome;
             match crate::serve::triggers::enqueue::fire(state, &compiled, event, "now").await {
@@ -919,8 +923,12 @@ async fn trigger_params(adapter: ParamAdapter, state: &ServerState, out: &str) -
                 },
                 webhook_path: Some("/v1/triggers/hook".into()),
             };
-            let event = crate::serve::triggers::context::TriggerEvent::Schedule {
-                tick: uuid::Uuid::now_v7().to_string(),
+            let event = crate::serve::triggers::context::TriggerEvent::Webhook {
+                method: "POST".into(),
+                body: String::new(),
+                headers: Default::default(),
+                query: Default::default(),
+                idem: uuid::Uuid::now_v7().to_string(),
             };
             use crate::serve::triggers::enqueue::FireOutcome;
             match crate::serve::triggers::enqueue::fire(state, &compiled, event, "now").await {

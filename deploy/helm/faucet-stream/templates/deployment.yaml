@@ -103,6 +103,9 @@ spec:
             {{- range .Values.serve.cluster.pools }}
             - --pool={{ . }}
             {{- end }}
+            {{- if ne (toString .Values.serve.tenantScheduleMinIntervalSecs) "300" }}
+            - --tenant-schedule-min-interval-secs={{ .Values.serve.tenantScheduleMinIntervalSecs }}
+            {{- end }}
             {{- with .Values.serve.cluster.poolWaitTimeoutSecs }}
             - --pool-wait-timeout-secs={{ . }}
             {{- end }}

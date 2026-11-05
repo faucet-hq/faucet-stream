@@ -312,6 +312,19 @@ serve:
     existingSecret: ""
     fileName: triggers.yaml
 
+  # Schedules (#1044): --schedules. Image features `schedule` + `templates`.
+  # Registered templates to run on a cron, read-only in the console;
+  # schedules made in the console or API live in the run history, so pair
+  # them with a persistent history backend.
+  schedules:
+    enabled: false
+    content: null
+    existingConfigMap: ""
+    existingSecret: ""
+    fileName: schedules.yaml
+  # The shortest gap between the ticks of a schedule a tenant owns (seconds).
+  tenantScheduleMinIntervalSecs: 300
+
   # Template hosting + sync (#589): --templates-sync. Image feature
   # `templates-sync` (+ `templates-sync-object-store` for S3/GCS/Azure). Pair
   # it with a persistent history backend: with `memory` the registry, versions

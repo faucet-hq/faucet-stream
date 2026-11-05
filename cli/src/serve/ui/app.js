@@ -76,7 +76,8 @@ function registerRoutes() {
   route("#/changes/:id", renderChanges, { group: "changes" });
   route("#/triggers", renderTriggers, { group: "triggers" });
   route("#/triggers/:id", renderTriggers, { group: "triggers" });
-  route("#/schedules", renderSchedules);
+  route("#/schedules", renderSchedules, { group: "schedules" });
+  route("#/schedules/:id", renderSchedules, { group: "schedules" });
   route("#/feeds", renderFeeds);
   route("#/catalog", renderDatasets, { group: "catalog" });
   route("#/catalog/:id", renderDatasets, { group: "catalog" });

@@ -19,7 +19,7 @@ does that with **tenants**:
 Build with the `tenants` feature (included in `full`):
 
 ```bash
-cargo install faucet-cli --features "tenants,serve-history-sqlite,schedule,triggers"
+cargo install faucet-cli --features "tenants,serve-history-sqlite,schedule"
 ```
 
 ## Start a server with a vault key
@@ -64,6 +64,7 @@ curl -X POST localhost:8080/v1/tenants -H "Authorization: Bearer $ADMIN" \
 | `id` | A slug: `^[a-z0-9][a-z0-9_-]{0,62}$`. The first segment of the tenant's state keys. |
 | `name`, `labels` | What `${tenant.name}` and `${tenant.labels.<key>}` read. |
 | `limits.max_concurrent_runs` | Runs queued or running at once — a tenant's DLQ replay counts while it runs; the next submission (or replay) is a `429`. In a cluster the count is re-checked against the shared history once the run is recorded, so two instances admitting the last slot at once both back out (`429`, retry) rather than exceed it. |
+| `limits.max_schedules` | [Schedules](./schedules.md) the tenant's own principal may own, paused ones included; the next create is a `422`. Unset = no limit. |
 | `limits.max_records_per_run`, `max_bytes_per_run`, `max_duration_secs` | Joined into every run's [budget](./usage.md#run-budgets): a noisy tenant stops at the page boundary. |
 | `notifications` | The config `notifications:` shape, for tenant-level events (`connection_needs_reauth`). Webhook URLs, routing keys and HMAC secrets are credentials: the list is sealed under the vault key (a non-empty list needs `--vault-key`), and responses show every value under a rule's `channel.config` as `***`. A list stored in clear by an earlier release is sealed when the server starts with a vault key; on a server that cannot open a sealed list the response carries `notifications_error` and the list reads as empty. |
 
@@ -233,23 +234,22 @@ that tenant's choice with its own run (`POST /v1/tenants/{t}/templates/{id}/runs
 with a `selection`), and lists the choices from `GET /v1/templates/{id}/rows`
 ([Running a subset of streams](./templates.md#running-a-subset-of-streams)).
 
-On a schedule, add a `schedule` trigger to the `--triggers` file (needs the
-`triggers` and `schedule` features):
+On a schedule, create a [schedule](./schedules.md) with `tenants: all`
+(operators only):
 
-```yaml
-version: 1
-triggers:
-  - name: nightly-crm
-    type: schedule
-    cron: "0 2 * * *"
-    timezone: Europe/Berlin
-    template: { id: crm-contacts }
-    tenants: all
+```bash
+curl -X POST $FAUCET/v1/schedules -H "Authorization: Bearer $OP_TOKEN" \
+  -H 'Content-Type: application/json' -d '{
+    "name": "nightly-crm", "cron": "0 2 * * *", "timezone": "Europe/Berlin",
+    "template": {"id": "crm-contacts"}, "tenants": "all"}'
 ```
 
-Each tick submits one run per tenant, keyed `trig:nightly-crm:<tick>:<tenant>`,
-so cluster instances running the same triggers file let exactly one run
-through per tick and tenant.
+Each tick submits one run per tenant, keyed `sched:nightly-crm:<tick>:<tenant>`,
+so every replica sharing the run history lets exactly one run through per
+tick and tenant. A tenant's own backend can also create schedules for its
+tenant (never a fan-out), up to its `max_schedules` limit and no more often
+than `--tenant-schedule-min-interval-secs` (default 300) allows; every tick
+is admitted against the tenant's run limits like any other run.
 
 ## Tenant-scoped principals
 

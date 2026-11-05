@@ -101,6 +101,7 @@ impl CompiledSchedule {
             .find_next_occurrence(&local, false)
             .ok()
             .map(|dt| dt.with_timezone(&Utc))
+            .and_then(|t| chrono::Timelike::with_nanosecond(&t, 0))
     }
 
     /// The next due tick after firing the tick scheduled for `fired`, given the
@@ -196,6 +197,15 @@ mod tests {
         // Feb 30 never exists.
         let err = CompiledSchedule::compile(&spec("0 0 30 2 *", "UTC")).unwrap_err();
         assert!(err.to_string().contains("no upcoming occurrence"));
+    }
+
+    #[test]
+    fn next_after_lands_on_whole_seconds() {
+        let c = CompiledSchedule::compile(&spec("30 1 * * *", "UTC")).unwrap();
+        let after = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
+            + chrono::Duration::nanoseconds(174_794_000);
+        let next = c.next_after(after).unwrap();
+        assert_eq!(next, Utc.with_ymd_and_hms(2026, 1, 1, 1, 30, 0).unwrap());
     }
 
     #[test]
