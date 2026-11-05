@@ -609,13 +609,14 @@ jobs:
   feature-check:
     name: Feature isolation
     runs-on: ubuntu-latest
-    needs: changes
-    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+    # GitHub has no job priority: started together, these 145 short jobs took
+    # every free-plan runner and the required checks queued behind them
+    # (Coverage started 52 min late). They start once the coverage shards
+    # finish, pass or fail, so the required checks get the runners first.
+    needs: [changes, coverage-shard]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true') }}
     strategy:
       fail-fast: false
-      # 145 short jobs; without a cap they take every free-plan runner and the
-      # required checks queue behind them (Coverage started 52 min late).
-      max-parallel: 6
       matrix:
         feature:
           # Sources
