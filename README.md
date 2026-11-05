@@ -1,6 +1,6 @@
 # faucet design mockups
 
-Static design mockups for faucet's user interfaces, kept on this `design` branch so every mockup lives in one place. They use sample data only and are not product code: the shipped console is `cli/src/serve/ui/` on `main`, built to match the approved screens here.
+Static design mockups for faucet's user interfaces, kept on this `designs` branch so every mockup lives in one place. They use sample data only and are not product code: the shipped console is `cli/src/serve/ui/` on `main`, built to match the approved screens here.
 
 UI work follows "mockups first, then build": every page and every state after a click is drawn here in both themes, the owner approves it, and only then is the console code written.
 
@@ -23,7 +23,7 @@ UI work follows "mockups first, then build": every page and every state after a 
 The pages load their scripts as ES modules, which browsers refuse to load from `file://`, so serve the folder over HTTP. Python 3 is all you need:
 
 ```bash
-git clone --branch design --single-branch https://github.com/faucet-hq/faucet-stream.git faucet-design
+git clone --branch designs --single-branch https://github.com/faucet-hq/faucet-stream.git faucet-design
 cd faucet-design/console-redesign
 python3 -m http.server 8765 --bind 127.0.0.1
 ```
@@ -38,8 +38,8 @@ Then open:
 If you already have the repository checked out, a worktree avoids switching branches:
 
 ```bash
-git fetch origin design
-git worktree add ../faucet-design origin/design
+git fetch origin designs
+git worktree add ../faucet-design origin/designs
 cd ../faucet-design/console-redesign
 python3 -m http.server 8765 --bind 127.0.0.1
 ```
