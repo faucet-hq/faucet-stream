@@ -333,7 +333,7 @@ export function renderPolicy(host, params) {
     }
     const lines = (preview.diff || []).filter((l) => l.op !== " ").map((l) => [l.op, l.text]);
     const current = sp.version ? sp.version.version : null;
-    const r = await dialog("Import the --policy file as a new version?", html`<span>This creates a change request with the content of <code>${d.path}</code>. Version ${current ?? "?"} stays enforced until another admin approves it.</span>${lines.length ? diff(lines) : ""}${preview.valid ? "" : alert("The file does not validate against this server.", (preview.problems || []).map((p) => p.message).join("; "), "bad")}${field("Reason", html`<input class="input" name="reason" required value="Import the --policy file">`, { req: true })}`, html`${btn("Cancel", { data: { act: "cancel" } })}${btn("Request change", { kind: "primary", icon: "changes", data: { act: "go" } })}`, { icon: "changes" });
+    const r = await dialog("Import the --policy file as a new version?", html`<span>This creates a change request with the content of ${fileRef(d.path)}. Version ${current ?? "?"} stays enforced until another admin approves it.</span>${lines.length ? diff(lines) : ""}${preview.valid ? "" : alert("The file does not validate against this server.", (preview.problems || []).map((p) => p.message).join("; "), "bad")}${field("Reason", html`<input class="input" name="reason" required value="Import the --policy file">`, { req: true })}`, html`${btn("Cancel", { data: { act: "cancel" } })}${btn("Request change", { kind: "primary", icon: "changes", data: { act: "go" } })}`, { icon: "changes" });
     if (!r || r.act !== "go") return;
     if (!(r.values.reason || "").trim()) return toast("A policy change needs a reason", "bad");
     try {
@@ -421,15 +421,17 @@ export function renderPolicy(host, params) {
   // ---- server view ------------------------------------------------------------------------
   // The in-memory history keeps nothing across a restart, so edits are refused.
   const inMemory = () => sp && sp.persistent_history === false;
+  // A file by name, its full path on hover (as the header shows it).
+  const fileRef = (p) => (p ? html`<code title="${p}">${p.split("/").pop()}</code>` : "the --policy file");
   function memoryBanner() {
-    const fromFile = sp.source === "file" ? html` It enforces <code>${(sp.file || {}).path || "the --policy file"}</code>, read at start.` : "";
+    const fromFile = sp.source === "file" ? html` It enforces ${fileRef((sp.file || {}).path)}, read at start.` : "";
     return alert("Read only: this server keeps its history in memory.", html`Set a persistent <code>--history</code> to edit the policy here; an approved change would be lost on restart.${fromFile}`, "");
   }
   function driftBanner() {
     const d = sp.file_drift;
     if (!d || !d.differs) return "";
     const can_import = sp.editable && can("policy_admin") && !sp.pending_change;
-    return alert("The --policy file differs from the version in force; it was not applied.", html`<code>${d.path}</code> only seeded this server’s policy store. Version ${sp.version ? sp.version.version : "?"} stays in force until another admin approves the file as a new version.`, "warn", can_import ? btn("Import the file as a new version", { icon: "changes", perm: "policy_admin", data: { "import-file": "1" } }) : "");
+    return alert("The --policy file differs from the version in force; it was not applied.", html`${fileRef(d.path)} only seeded this server’s policy store. Version ${sp.version ? sp.version.version : "?"} stays in force until another admin approves the file as a new version.`, "warn", can_import ? btn("Import the file as a new version", { icon: "changes", perm: "policy_admin", data: { "import-file": "1" } }) : "");
   }
 
   function serverView() {
