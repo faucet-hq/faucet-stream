@@ -1807,7 +1807,7 @@ re-export it), without the CLI's dependencies, and it follows semver. See
 
 Licensed under either of
 
-- Apache License, Version 2.0 ([LICENSE-Apache-2.0](../LICENSE-Apache-2.0) or <https://www.apache.org/licenses/LICENSE-2.0>)
+- Apache License, Version 2.0 ([LICENSE-APACHE](../LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
 - MIT license ([LICENSE-MIT](../LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
 
 at your option.

@@ -152,6 +152,10 @@ jobs:
         run: |
           python3 scripts/test_connector_deps.py
           python3 scripts/connector-deps.py
+      - name: Check every published crate ships the license texts
+        run: |
+          python3 scripts/test_license_files.py
+          python3 scripts/license-files.py
       - name: Check version-blind advisory ignores cover only triaged versions, and fuzz osv-scanner entries are in the root config
         run: |
           python3 scripts/test_advisory_scope.py
