@@ -90,7 +90,7 @@ pub(crate) async fn ensure_visible(
         .history()
         .get(id)
         .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?
+        .map_err(ServeError::from)?
         .ok_or(ServeError::NotFound)?;
     if actor.sees_tenant(rec.tenant.as_deref()) {
         Ok(())
@@ -121,7 +121,7 @@ pub async fn get_run_detail(
         .history()
         .get(&id)
         .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?
+        .map_err(ServeError::from)?
         .ok_or(ServeError::NotFound)?;
     if !actor.sees_tenant(rec.tenant.as_deref()) {
         return Err(ServeError::NotFound);
@@ -182,7 +182,7 @@ pub async fn delete_run(
         .history()
         .delete(&id)
         .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?
+        .map_err(ServeError::from)?
     {
         DeleteOutcome::Deleted => {
             crate::serve::audit::write(&state, &actor, "run.delete", Some(id.clone()), None, "ok")
@@ -312,7 +312,7 @@ pub(crate) async fn list_page(
             Ok(None)
         }
     };
-    tokio::try_join!(history.list(filter), counts).map_err(|e| ServeError::Internal(e.to_string()))
+    tokio::try_join!(history.list(filter), counts).map_err(ServeError::from)
 }
 
 const DEFAULT_LIMIT: usize = 50;
@@ -478,7 +478,7 @@ pub async fn get_run_config(
         .history()
         .get(&id)
         .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?
+        .map_err(ServeError::from)?
         .ok_or(ServeError::NotFound)?;
     if !actor.sees_tenant(rec.tenant.as_deref()) {
         return Err(ServeError::NotFound);

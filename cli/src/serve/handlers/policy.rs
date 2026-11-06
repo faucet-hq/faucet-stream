@@ -38,7 +38,7 @@ const TENANT_SERVER_POLICY: &str = "a tenant-scoped principal cannot change or d
      server's policy; its own tenant policy is at /v1/tenants/{tenant}/policy";
 
 fn store_err(e: crate::serve::history::HistoryError) -> ServeError {
-    ServeError::from_history("policy store", e)
+    ServeError::from(e)
 }
 
 fn unscoped(actor: &AuthContext) -> Result<(), ServeError> {
@@ -531,7 +531,7 @@ async fn tenant_in_scope(
         .history()
         .tenant_get(tenant)
         .await
-        .map_err(|e| ServeError::from_history("tenant store", e))?
+        .map_err(ServeError::from)?
         .ok_or(ServeError::NotFound)?;
     Ok(())
 }

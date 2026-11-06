@@ -28,7 +28,9 @@ async fn a_policy_file_seeds_an_empty_store_and_then_only_reports_drift() {
 
     // An empty store: the file becomes version 1, imported by `system`.
     let state = state_from(&config);
-    apply_policy_file(&state, PolicyStore::Server, spec.clone(), &path).await;
+    apply_policy_file(&state, PolicyStore::Server, spec.clone(), &path)
+        .await
+        .unwrap();
     let layer = server_layer(&state).await.unwrap();
     assert_eq!(layer.source, PolicySource::Server);
     let v1 = layer.version.unwrap();
@@ -38,7 +40,9 @@ async fn a_policy_file_seeds_an_empty_store_and_then_only_reports_drift() {
     assert!(!drift.differs && drift.yaml.is_none());
 
     // The same file again: the stored version stays, nothing is imported.
-    apply_policy_file(&state, PolicyStore::Server, spec, &path).await;
+    apply_policy_file(&state, PolicyStore::Server, spec, &path)
+        .await
+        .unwrap();
     assert_eq!(
         state
             .history()
@@ -53,7 +57,9 @@ async fn a_policy_file_seeds_an_empty_store_and_then_only_reports_drift() {
     let wider = SERVER.replace("[eu]", "[eu, us]");
     std::fs::write(&path, &wider).unwrap();
     let wider_spec: Arc<PolicySpec> = Arc::new(crate::yaml::from_str(&wider).unwrap());
-    apply_policy_file(&state, PolicyStore::Server, wider_spec.clone(), &path).await;
+    apply_policy_file(&state, PolicyStore::Server, wider_spec.clone(), &path)
+        .await
+        .unwrap();
     assert_eq!(
         server_layer(&state).await.unwrap().version.unwrap().version,
         1
@@ -64,14 +70,18 @@ async fn a_policy_file_seeds_an_empty_store_and_then_only_reports_drift() {
 
     // `--policy-store file`, or nowhere to keep versions: the file is the policy.
     let file_store = state_from(&config);
-    apply_policy_file(&file_store, PolicyStore::File, wider_spec.clone(), &path).await;
+    apply_policy_file(&file_store, PolicyStore::File, wider_spec.clone(), &path)
+        .await
+        .unwrap();
     assert_eq!(
         server_layer(&file_store).await.unwrap().source,
         PolicySource::File
     );
     assert!(file_drift(&file_store).await.unwrap().is_none());
     let memory = test_state();
-    apply_policy_file(&memory, PolicyStore::Server, wider_spec, &path).await;
+    apply_policy_file(&memory, PolicyStore::Server, wider_spec, &path)
+        .await
+        .unwrap();
     assert_eq!(
         server_layer(&memory).await.unwrap().source,
         PolicySource::File
@@ -749,26 +759,21 @@ async fn a_run_admitted_without_a_policy_stays_unchecked_on_reload() {
 }
 
 #[tokio::test]
-async fn a_degraded_history_enforces_the_policy_last_read() {
+async fn a_degraded_history_refuses_rather_than_running_unchecked() {
     let (state, down) = crate::serve::test_support::flaky_state();
     state
         .history()
         .policy_version_insert(&record(SERVER_SCOPE, 1, SERVER))
         .await
         .unwrap();
-    // A healthy read is remembered…
     let (spec, pin) = effective(&state, None, None).await.unwrap();
     assert!(spec.is_some());
     down.store(true, std::sync::atomic::Ordering::Release);
-    // …and enforced while the store is unreachable, pinned or not (#1051 #4).
-    let (spec, _) = effective(&state, None, None).await.unwrap();
-    assert_eq!(spec.unwrap().rules[0].name, "pii-to-eu-only");
-    let (spec, _) = effective(&state, None, Some(&pin)).await.unwrap();
-    assert!(spec.is_some());
+    for pinned in [None, Some(&pin)] {
+        let err = effective(&state, None, pinned).await.unwrap_err();
+        assert!(matches!(err, ServeError::Unavailable(_)), "{err:?}");
+    }
     assert!(state.history().degraded());
-    // A scope never read fails closed rather than running unchecked.
-    assert!(effective(&state, Some("acme"), None).await.is_err());
-    // Editing the policy is refused while degraded.
     assert!(
         state
             .history()
@@ -776,15 +781,6 @@ async fn a_degraded_history_enforces_the_policy_last_read() {
             .await
             .is_err()
     );
-    // A server with no stored policy keeps accepting runs.
-    let (empty, down) = crate::serve::test_support::flaky_state();
-    assert_eq!(effective(&empty, None, None).await.unwrap().0, None);
-    down.store(true, std::sync::atomic::Ordering::Release);
-    assert_eq!(effective(&empty, None, None).await.unwrap().0, None);
-    // The reads survive a restart through a snapshot.
-    let restored = PolicyReads::default();
-    restored.restore(state.policy_reads().snapshot());
-    assert!(restored.recall(SERVER_SCOPE, None).unwrap().is_some());
 }
 
 #[cfg(feature = "tenants")]

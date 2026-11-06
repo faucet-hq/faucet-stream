@@ -291,7 +291,7 @@ pub async fn admit(state: &crate::serve::state::ServerState, pool: &str) -> Resu
         .history()
         .live_instances(cluster.member_ttl())
         .await
-        .map_err(|e| ServeError::from_history("reading cluster members", e))?;
+        .map_err(ServeError::from)?;
     match cluster_refusal(&members, cluster.pools(), pool) {
         None => {
             cluster.set_live_members(members);

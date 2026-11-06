@@ -440,7 +440,7 @@ pub struct DeprecatePayload {
 }
 
 fn store_err(e: HistoryError) -> ServeError {
-    ServeError::from_history("change store", e)
+    ServeError::from(e)
 }
 
 fn sha_hex(canonical: &str) -> String {
@@ -710,7 +710,7 @@ async fn plan_template_launch(
     let body = store
         .template_get(&payload.id, Some(version))
         .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?
+        .map_err(ServeError::from)?
         .map(|r| sha_hex(&r.body))
         .unwrap_or_default();
     Ok(ChangePlan {
@@ -1423,7 +1423,7 @@ async fn execute(
     .await
     {
         Ok(p) => p,
-        Err(e) => return finish_failed(state, actor, change, e.to_string()).await,
+        Err(e) => return finish_refused(state, actor, change, e).await,
     };
     if let Some(before) = &change.plan
         && before.material != fresh.material
@@ -1634,8 +1634,52 @@ async fn execute(
             .await;
             Ok(change)
         }
-        Err(e) => finish_failed(state, actor, change, e.to_string()).await,
+        Err(e) => finish_refused(state, actor, change, e).await,
     }
+}
+
+/// Whether an execution refusal may pass on its own: the server could not
+/// take the work now, nothing about the change is wrong (#1050).
+fn temporary_refusal(e: &ServeError) -> bool {
+    matches!(
+        e,
+        ServeError::Unavailable(_)
+            | ServeError::QueueFull { .. }
+            | ServeError::TooManyRequests(_)
+            | ServeError::Draining
+    )
+}
+
+/// An execution the server refused: a temporary refusal keeps the change
+/// `approved`, and [`reconcile_stale_approved`] runs it again later; any
+/// other refusal fails it.
+async fn finish_refused(
+    state: &ServerState,
+    actor: &AuthContext,
+    mut change: ChangeRequest,
+    e: ServeError,
+) -> Result<ChangeRequest, ServeError> {
+    if !temporary_refusal(&e) {
+        return finish_failed(state, actor, change, e.to_string()).await;
+    }
+    change.error = Some(crate::secrets::registry::redact_message(&format!(
+        "{e}; the approved change runs again once the server can take it"
+    )));
+    change.touch();
+    if let Err(save_err) = save(state, &change).await {
+        tracing::warn!(change = %change.id, error = %save_err, "could not record a deferred change execution");
+    }
+    record_metric(change.kind, "deferred");
+    crate::serve::audit::write(
+        state,
+        actor,
+        "change.deferred",
+        None,
+        Some(change.id.clone()),
+        "error",
+    )
+    .await;
+    Ok(change)
 }
 
 /// The version a planned `template_*` change targets, from its summary.
@@ -1658,7 +1702,7 @@ async fn execute_template_delete(
         .history()
         .template_delete(&body.id, target)
         .await
-        .map_err(|e| ServeError::from_history("deleting template", e))?;
+        .map_err(ServeError::from)?;
     if removed == 0 {
         return Err(ServeError::NotFound);
     }
@@ -2678,6 +2722,44 @@ mod tests {
         assert!(reg.error.unwrap().contains("interrupted"));
     }
 
+    #[tokio::test]
+    async fn a_temporary_refusal_keeps_an_approved_change_for_the_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::serve::test_support::test_state();
+        let created = create(
+            &state,
+            &actor("bob"),
+            NewChange {
+                kind: ChangeKind::Run,
+                payload: json!({ "config": csv_yaml(dir.path(), "later", "") }),
+                reason: None,
+                budget: None,
+                trusted_config: false,
+                caller_params: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+        state.set_draining();
+        let deferred = approve(&state, &actor("alice"), &created.id, None)
+            .await
+            .unwrap();
+        assert_eq!(deferred.status, ChangeStatus::Approved);
+        assert!(deferred.error.unwrap().contains("runs again"));
+        assert!(deferred.run_id.is_none());
+        assert!(!temporary_refusal(&ServeError::BadConfig("x".into())));
+        for e in [
+            ServeError::Unavailable("down".into()),
+            ServeError::QueueFull {
+                retry_after_secs: 1,
+            },
+            ServeError::TooManyRequests("limit".into()),
+            ServeError::Draining,
+        ] {
+            assert!(temporary_refusal(&e), "{e}");
+        }
+    }
+
     #[cfg(feature = "notify")]
     #[tokio::test]
     async fn requested_notifications_skip_what_they_cannot_read() {
@@ -2698,7 +2780,9 @@ mod tests {
     #[test]
     fn store_errors_are_internal() {
         let e = store_err(HistoryError::Backend("down".into()));
-        assert!(matches!(e, ServeError::Internal(m) if m.contains("change store")));
+        assert!(matches!(e, ServeError::Internal(_)));
+        let e = store_err(HistoryError::Unreachable("refused".into()));
+        assert!(matches!(e, ServeError::Unavailable(_)));
     }
 
     #[cfg(feature = "templates")]

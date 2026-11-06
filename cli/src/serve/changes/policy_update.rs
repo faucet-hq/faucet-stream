@@ -195,7 +195,7 @@ pub async fn execute(
         .history()
         .policy_version_insert(&record)
         .await
-        .map_err(|e| ServeError::from_history("policy store", e))?;
+        .map_err(ServeError::from)?;
     if !stored {
         return Err(ServeError::Conflict(format!(
             "another change stored {} policy version {version} first; propose this one again",

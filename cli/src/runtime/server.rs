@@ -207,6 +207,9 @@ pub async fn admit(
     sub: Submission<'_>,
     gates: Gates,
 ) -> Result<Admitted, ServeError> {
+    if gates.policy {
+        refuse_while_unavailable(state)?;
+    }
     let mut loaded = load(state, principal, sub).await?;
     if gates.policy {
         // A refusal is the run's tenant's, whoever submitted it.
@@ -239,6 +242,28 @@ pub async fn admit(
         admission,
         budget,
     })
+}
+
+/// The refusal of new work while the run history is unreachable (#1050).
+pub const HISTORY_UNAVAILABLE: &str = "history unavailable: the run history is unreachable, so \
+     this server admits no new work until it recovers; retry later";
+
+/// Refuse new work that writes while the run history is unreachable, or
+/// before the `--policy` file has seeded the policy store (#1050): nothing is
+/// admitted that the server could not record or check.
+pub fn refuse_while_unavailable(state: &ServerState) -> Result<(), ServeError> {
+    if state.history().degraded() {
+        return Err(ServeError::Unavailable(HISTORY_UNAVAILABLE.into()));
+    }
+    #[cfg(feature = "policy")]
+    if state.policy_seed_pending() {
+        return Err(ServeError::Unavailable(
+            "policy unavailable: the --policy file has not seeded the policy store yet (the run \
+             history was unreachable at startup); retry later"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// The stricter of the config's `budget:` and `extra`.
@@ -650,13 +675,21 @@ pub async fn cancel(
 ) -> Result<CancelOutcome, ServeError> {
     let actor = principal.actor();
     if actor.tenant.is_some() {
-        let rec = state
-            .history()
-            .get(id)
-            .await
-            .map_err(|e| ServeError::Internal(e.to_string()))?
-            .ok_or(ServeError::NotFound)?;
-        if !actor.sees_tenant(rec.tenant.as_deref()) {
+        // A run this instance executes is checked from its own registration,
+        // so its tenant can cancel it while the history is unreachable (#1050).
+        let tenant = match state.registry().tenant_of(id) {
+            Some(t) => t,
+            None => {
+                state
+                    .history()
+                    .get(id)
+                    .await
+                    .map_err(ServeError::from)?
+                    .ok_or(ServeError::NotFound)?
+                    .tenant
+            }
+        };
+        if !actor.sees_tenant(tenant.as_deref()) {
             return Err(ServeError::NotFound);
         }
     }
@@ -676,7 +709,7 @@ pub async fn cancel(
         .history()
         .get(id)
         .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?
+        .map_err(ServeError::from)?
         .ok_or(ServeError::NotFound)?;
     if rec.status.is_terminal() {
         return Ok(CancelOutcome::Finished);
@@ -686,7 +719,7 @@ pub async fn cancel(
             .history()
             .cancel_pending(id)
             .await
-            .map_err(|e| ServeError::Internal(e.to_string()))?
+            .map_err(ServeError::from)?
         {
             crate::serve::audit::write(
                 state,
@@ -715,7 +748,7 @@ pub async fn cancel(
             .history()
             .request_cancel(id)
             .await
-            .map_err(|e| ServeError::Internal(e.to_string()))?;
+            .map_err(ServeError::from)?;
         if rec.status == crate::serve::history::RunStatus::Sharded {
             runner::maybe_finalize_parent(state, id).await;
         }
@@ -970,7 +1003,7 @@ pub async fn rollback(
         .history()
         .get(id)
         .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?
+        .map_err(ServeError::from)?
         .ok_or(ServeError::NotFound)?;
     if !rec.status.is_terminal() {
         return Err(ServeError::Conflict(format!(
@@ -1356,6 +1389,7 @@ pub(crate) mod replay {
         submitted_by: &str,
         admission: Option<Admission>,
     ) -> Result<Record, ServeError> {
+        super::refuse_while_unavailable(state)?;
         let history = state.history();
         let now = Utc::now();
         let mut labels = std::collections::BTreeMap::new();
@@ -1369,11 +1403,7 @@ pub(crate) mod replay {
         rec.replay_of = Some(from.to_string());
         rec.tenant = tenant.map(str::to_string);
         rec.submitted_by = Some(submitted_by.to_string());
-        if !history
-            .insert_new(&rec)
-            .await
-            .map_err(|e| ServeError::from_history("run history", e))?
-        {
+        if !history.insert_new(&rec).await.map_err(ServeError::from)? {
             return Err(ServeError::Conflict(format!(
                 "a run with id '{id}' already exists"
             )));
@@ -1386,7 +1416,7 @@ pub(crate) mod replay {
             history
                 .tenant_run_link(id, t)
                 .await
-                .map_err(|e| ServeError::Internal(format!("recording the replay's tenant: {e}")))?;
+                .map_err(ServeError::from)?;
         }
         drop(admission);
         #[cfg(feature = "tenants")]

@@ -7,7 +7,6 @@
 pub mod catalog;
 #[cfg(feature = "serve")]
 pub mod fallback;
-pub mod journal;
 pub mod labels;
 pub mod memory;
 pub mod overview;
@@ -646,6 +645,11 @@ impl HistoryError {
     /// Whether retrying the failed call could plausibly succeed. Everything but
     /// a *typed-permanent* failure qualifies — see [`Transience::Unknown`] for
     /// why the unclassified case errs toward retrying.
+    pub fn is_transient(&self) -> bool {
+        self.transience() == Transience::Transient
+    }
+
+    /// Whether retrying the failed call could plausibly succeed (see below).
     pub fn is_retriable(&self) -> bool {
         self.transience() != Transience::Permanent
     }
@@ -973,6 +977,52 @@ pub trait RunHistory: Send + Sync {
     /// unshared) is a no-op returning 0.
     async fn renew_leases(&self) -> Result<usize, HistoryError> {
         Ok(0)
+    }
+
+    /// [`renew_leases`](Self::renew_leases), leaving out `skip`: runs whose
+    /// terminal record was dropped, so orphan recovery can clear them (#1050).
+    async fn renew_leases_except(&self, skip: &[String]) -> Result<usize, HistoryError> {
+        let _ = skip;
+        self.renew_leases().await
+    }
+
+    /// The single-server orphan sweep (#1050): [`recover_orphans`](Self::recover_orphans)
+    /// without this instance's own runs, which are live or held for a retry,
+    /// except those in `forgotten` (their terminal record was dropped).
+    async fn recover_orphans_of_peers(&self, forgotten: &[String]) -> Result<usize, HistoryError> {
+        let _ = forgotten;
+        self.recover_orphans().await
+    }
+
+    /// Write only a run's terminal status, finish time and error over its
+    /// stored record, fenced like [`finalize_owned`](Self::finalize_owned).
+    /// Returns the record as written; `None` when the run is not stored, is
+    /// already terminal, or is another instance's (#1050).
+    async fn finalize_status_owned(
+        &self,
+        run_id: &str,
+        status: RunStatus,
+        finished_at: DateTime<Utc>,
+        error: Option<String>,
+    ) -> Result<Option<RunRecord>, HistoryError> {
+        let Some(mut rec) = self.get(run_id).await? else {
+            return Ok(None);
+        };
+        if rec.status.is_terminal() {
+            return Ok(None);
+        }
+        rec.status = status;
+        rec.finished_at = Some(finished_at);
+        rec.error = error;
+        if rec.elapsed_secs.is_none()
+            && let Some(started) = rec.started_at
+        {
+            rec.elapsed_secs = (finished_at - started)
+                .to_std()
+                .ok()
+                .map(|d| d.as_secs_f64());
+        }
+        Ok(self.finalize_owned(&rec).await?.then_some(rec))
     }
 
     /// Atomically claim up to `limit` oldest `Pending` runs for *this* instance,
@@ -2397,31 +2447,23 @@ pub trait RunHistory: Send + Sync {
 
     /// While degraded, probe the persistent backend and leave degraded mode
     /// if it answers. Returns whether it recovered. Default: nothing to recover.
+    /// The recovery probe: a write the backend must accept to count as
+    /// healthy again, so a primary that answers reads but refuses writes (a
+    /// read-only standby after failover) stays degraded (#1050). Default: a
+    /// read, for backends with nothing to write to.
+    async fn probe_write(&self) -> Result<(), HistoryError> {
+        self.get("__faucet_history_recovery_probe__")
+            .await
+            .map(|_| ())
+    }
+
     async fn recover_degraded(&self) -> bool {
         false
-    }
-
-    /// Keep what is written while degraded in `journal` (#1050). `false`
-    /// when this backend has no persistent store to replay into.
-    fn attach_journal(&self, journal: Arc<journal::Journal>) -> bool {
-        let _ = journal;
-        false
-    }
-
-    /// The local history journal, when one is attached.
-    fn journal(&self) -> Option<Arc<journal::Journal>> {
-        None
     }
 
     /// When the persistent backend was found unreachable, while it still is.
     fn degraded_since(&self) -> Option<DateTime<Utc>> {
         None
-    }
-
-    /// Replay a journal an earlier process left, when the backend is healthy
-    /// (at startup, before serving).
-    async fn replay_journal(&self) -> Result<(), HistoryError> {
-        Ok(())
     }
 
     /// True when the backend is in fallback mode (drives `/readyz`). Always false

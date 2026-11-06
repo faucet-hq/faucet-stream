@@ -61,15 +61,6 @@ pub enum ServeError {
 }
 
 impl ServeError {
-    /// A run-history failure: a degraded backend is a retryable `503`, any
-    /// other failure a `500` prefixed with `context`.
-    pub fn from_history(context: &str, e: crate::serve::history::HistoryError) -> Self {
-        match e {
-            crate::serve::history::HistoryError::Degraded(m) => ServeError::Unavailable(m),
-            other => ServeError::Internal(format!("{context}: {other}")),
-        }
-    }
-
     pub fn status(&self) -> StatusCode {
         match self {
             ServeError::Unauthorized => StatusCode::UNAUTHORIZED,
@@ -170,6 +161,31 @@ fn redact_strings(v: &mut serde_json::Value) {
     }
 }
 
+/// The one mapping of a run-history failure to an HTTP outcome: the error's
+/// type, never its text, decides whether a caller may retry.
+impl From<crate::serve::history::HistoryError> for ServeError {
+    fn from(e: crate::serve::history::HistoryError) -> Self {
+        use crate::serve::history::{HistoryError, Transience};
+        match e {
+            HistoryError::Degraded(m) => ServeError::Unavailable(m),
+            HistoryError::Unreachable(_) | HistoryError::PoolTimedOut(_) => {
+                ServeError::Unavailable(format!("history unavailable: {e}; retry shortly"))
+            }
+            HistoryError::BackendClassified {
+                transience: Transience::Transient,
+                ..
+            } => ServeError::Unavailable(format!("history unavailable: {e}; retry shortly")),
+            HistoryError::VersionNotFound { .. } => ServeError::NotFound,
+            HistoryError::TemplateKindConflict { .. } | HistoryError::StaleEvidence(_) => {
+                ServeError::Conflict(e.to_string())
+            }
+            HistoryError::Backend(_) | HistoryError::BackendClassified { .. } => {
+                ServeError::Internal(e.to_string())
+            }
+        }
+    }
+}
+
 impl std::fmt::Display for ServeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}: {}", self.code(), self.message())
@@ -201,12 +217,46 @@ mod tests {
     use axum::http::StatusCode;
 
     #[test]
-    fn a_degraded_history_is_a_retryable_503() {
-        use crate::serve::history::HistoryError;
-        let e = ServeError::from_history("tenant store", HistoryError::Degraded("down".into()));
-        assert_eq!(e.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let e = ServeError::from_history("tenant store", HistoryError::Backend("bad".into()));
-        assert!(matches!(e, ServeError::Internal(m) if m.starts_with("tenant store:")));
+    fn a_history_error_maps_by_type() {
+        use crate::serve::history::{HistoryError, Transience};
+        let unavailable = [
+            HistoryError::Degraded("down".into()),
+            HistoryError::Unreachable("refused".into()),
+            HistoryError::PoolTimedOut("pool".into()),
+            HistoryError::BackendClassified {
+                message: "deadlock".into(),
+                transience: Transience::Transient,
+            },
+        ];
+        for e in unavailable {
+            assert_eq!(
+                ServeError::from(e).status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+        for e in [
+            HistoryError::Backend("bad".into()),
+            HistoryError::BackendClassified {
+                message: "constraint".into(),
+                transience: Transience::Permanent,
+            },
+            HistoryError::BackendClassified {
+                message: "?".into(),
+                transience: Transience::Unknown,
+            },
+        ] {
+            assert_eq!(
+                ServeError::from(e).status(),
+                StatusCode::INTERNAL_SERVER_ERROR
+            );
+        }
+        let e = HistoryError::VersionNotFound {
+            id: "t".into(),
+            version: 3,
+        };
+        assert_eq!(ServeError::from(e).status(), StatusCode::NOT_FOUND);
+        let e = HistoryError::StaleEvidence("moved".into());
+        assert_eq!(ServeError::from(e).status(), StatusCode::CONFLICT);
     }
 
     #[test]

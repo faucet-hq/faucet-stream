@@ -20,8 +20,15 @@ impl PostgresHistory {
     ) -> Result<Self, HistoryError> {
         let pool = PgPoolOptions::new()
             .max_connections(super::sql::POOL_MAX_CONNECTIONS)
-            .before_acquire(|conn, _| {
-                Box::pin(async move { Ok(super::sql::usable_connection(conn)) })
+            .max_lifetime(super::sql::POOL_MAX_LIFETIME)
+            .before_acquire(|conn, meta| {
+                Box::pin(async move {
+                    Ok(super::sql::usable_connection(conn)
+                        && !super::sql::opened_before_demotion(meta.age))
+                })
+            })
+            .after_release(|_, meta| {
+                Box::pin(async move { Ok(!super::sql::opened_before_demotion(meta.age)) })
             })
             .connect(url)
             .await

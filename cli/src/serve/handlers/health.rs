@@ -30,17 +30,8 @@ pub async fn readyz(State(state): State<ServerState>) -> impl IntoResponse {
         serde_json::to_value(state.triggers().snapshot()).unwrap_or(serde_json::Value::Null);
     #[cfg(not(feature = "triggers"))]
     let triggers = serde_json::Value::Array(vec![]);
-    // While degraded: since when, and what waits in the local journal (#1050).
     let degraded = if state.history().degraded() {
-        let journal = match state.history().journal() {
-            Some(j) => Some(j.status().await),
-            None => None,
-        };
-        json!({
-            "since": state.history().degraded_since(),
-            "journaled": journal.as_ref().map_or(0, |s| s.journaled),
-            "journal": journal,
-        })
+        json!({ "since": state.history().degraded_since() })
     } else {
         serde_json::Value::Null
     };

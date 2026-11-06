@@ -367,10 +367,7 @@ pub fn vault_configured(state: &ServerState) -> bool {
 }
 
 fn history_error(e: crate::serve::history::HistoryError) -> ServeError {
-    match e {
-        crate::serve::history::HistoryError::Degraded(m) => ServeError::Unavailable(m),
-        e => ServeError::Internal(e.to_string()),
-    }
+    ServeError::from(e)
 }
 
 /// Seal `sealed`'s values for `run_id` and store them, before the run record

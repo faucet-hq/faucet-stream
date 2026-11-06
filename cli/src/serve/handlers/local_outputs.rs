@@ -114,7 +114,7 @@ pub async fn list_outputs(
         .history()
         .local_output_list(&filter)
         .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?
+        .map_err(ServeError::from)?
         .into_iter()
         .map(|record| LocalOutputView {
             state: record.state().as_str(),
@@ -152,7 +152,7 @@ pub async fn delete_output(
         .history()
         .local_output_get(&id)
         .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?
+        .map_err(ServeError::from)?
         .is_none()
     {
         return Err(ServeError::NotFound);
@@ -163,7 +163,7 @@ pub async fn delete_output(
         &options(&state, false),
     )
     .await
-    .map_err(|e| ServeError::Internal(e.to_string()))?;
+    .map_err(ServeError::from)?;
     audit(&state, &actor, "local_output.delete", &report).await;
     Ok(Json(report))
 }
@@ -277,7 +277,7 @@ pub async fn cleanup(
         &options(&state, req.dry_run),
     )
     .await
-    .map_err(|e| ServeError::Internal(e.to_string()))?;
+    .map_err(ServeError::from)?;
     audit(&state, &actor, "local_output.cleanup", &report).await;
     Ok(Json(report))
 }

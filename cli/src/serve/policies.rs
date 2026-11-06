@@ -170,7 +170,7 @@ pub struct ServerLayer {
 }
 
 fn store_err(e: crate::serve::history::HistoryError) -> ServeError {
-    ServeError::from_history("policy store", e)
+    ServeError::from(e)
 }
 
 /// The spec a stored version carries. A stored version always validated
@@ -184,99 +184,18 @@ pub fn spec_of(record: &PolicyVersionRecord) -> Result<PolicySpec, ServeError> {
     })
 }
 
-/// The policy versions a server read while its history was healthy, keyed by
-/// scope and pinned version (`None` = the newest). While the history is
-/// degraded the server keeps enforcing these rather than refusing every run
-/// or running unchecked (#1051); a scope never read fails closed.
-/// One remembered read: scope and pin, and what was stored.
-pub type PolicyRead = ((String, Option<u32>), Option<PolicyVersionRecord>);
-
-type ReadMap = BTreeMap<(String, Option<u32>), Option<PolicyVersionRecord>>;
-
-#[derive(Debug, Default)]
-pub struct PolicyReads {
-    reads: std::sync::Mutex<ReadMap>,
-}
-
-impl PolicyReads {
-    fn lock(&self) -> std::sync::MutexGuard<'_, ReadMap> {
-        self.reads.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Remember a read.
-    pub fn remember(&self, scope: &str, pin: Option<u32>, read: Option<PolicyVersionRecord>) {
-        let mut map = self.lock();
-        // The newest version is also that version: a run pinned to it
-        // reloads while degraded.
-        if let Some(r) = &read {
-            map.insert((scope.to_string(), Some(r.version)), Some(r.clone()));
-        }
-        map.insert((scope.to_string(), pin), read);
-    }
-
-    /// The remembered read, when there is one.
-    pub fn recall(&self, scope: &str, pin: Option<u32>) -> Option<Option<PolicyVersionRecord>> {
-        self.lock().get(&(scope.to_string(), pin)).cloned()
-    }
-
-    /// Every remembered read (persisted beside the history journal, #1050).
-    pub fn snapshot(&self) -> Vec<PolicyRead> {
-        self.lock()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
-    }
-
-    /// Load reads persisted by an earlier process; a fresher read wins.
-    pub fn restore(&self, reads: Vec<PolicyRead>) {
-        let mut map = self.lock();
-        for (k, v) in reads {
-            map.entry(k).or_insert(v);
-        }
-    }
-}
-
-/// Read a policy version through `state`'s cache: a healthy read refreshes
-/// it; a read that fails while the history is degraded answers from it.
-async fn cached_read<F, Fut>(
-    state: &ServerState,
-    scope: &str,
-    pin: Option<u32>,
-    read: F,
-) -> Result<Option<PolicyVersionRecord>, ServeError>
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<
-            Output = Result<Option<PolicyVersionRecord>, crate::serve::history::HistoryError>,
-        >,
-{
-    match read().await {
-        Ok(v) => {
-            state.policy_reads().remember(scope, pin, v.clone());
-            Ok(v)
-        }
-        Err(e) => {
-            if state.history().degraded()
-                && let Some(v) = state.policy_reads().recall(scope, pin)
-            {
-                tracing::debug!(scope, "history degraded: enforcing the policy last read");
-                return Ok(v);
-            }
-            Err(store_err(e))
-        }
-    }
-}
-
 /// The newest stored version of `scope`.
 pub async fn latest(
     state: &ServerState,
     scope: &str,
 ) -> Result<Option<PolicyVersionRecord>, ServeError> {
-    let history = state.history();
-    cached_read(state, scope, None, || async {
-        Ok(history.policy_versions(scope, 1).await?.into_iter().next())
-    })
-    .await
+    Ok(state
+        .history()
+        .policy_versions(scope, 1)
+        .await
+        .map_err(store_err)?
+        .into_iter()
+        .next())
 }
 
 /// The server layer: the `--policy` file, else the newest stored version.
@@ -311,11 +230,11 @@ async fn pinned_or_latest(
     match pin {
         Some(None) => Ok(None),
         Some(Some(v)) => {
-            let history = state.history();
-            match cached_read(state, scope, Some(v), || {
-                history.policy_version_get(scope, v)
-            })
-            .await?
+            match state
+                .history()
+                .policy_version_get(scope, v)
+                .await
+                .map_err(store_err)?
             {
                 Some(r) => Ok(Some(r)),
                 None => Err(ServeError::Unprocessable {

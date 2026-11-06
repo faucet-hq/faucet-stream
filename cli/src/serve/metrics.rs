@@ -75,21 +75,24 @@ pub fn set_history_unreachable(unreachable: bool) {
     metrics::gauge!("faucet_serve_history_unreachable").set(if unreachable { 1.0 } else { 0.0 });
 }
 
-/// Records waiting in the local history journal (#1050), by kind.
-pub fn set_history_journal_records(kind: &str, n: u64) {
-    metrics::gauge!("faucet_serve_history_journal_records", "kind" => kind.to_string())
-        .set(n as f64);
+/// 1 while the `--policy` file waits to seed the policy store (#1050).
+pub fn set_policy_seed_pending(pending: bool) {
+    metrics::gauge!("faucet_serve_policy_seed_pending").set(if pending { 1.0 } else { 0.0 });
 }
 
-/// One journaled record replayed into the recovered backend (#1050):
-/// `outcome` is `applied` or `skipped` (already there, or a peer's).
-pub fn history_journal_replayed(kind: &str, outcome: &str) {
-    metrics::counter!(
-        "faucet_serve_history_journal_replayed_total",
-        "kind" => kind.to_string(),
-        "outcome" => outcome.to_string(),
-    )
-    .increment(1);
+/// Terminal run records waiting to be written (#1050).
+pub fn set_pending_finalize(n: usize) {
+    metrics::gauge!("faucet_serve_pending_finalize").set(n as f64);
+}
+
+/// A terminal record dropped after the backend kept refusing it (#1050).
+pub fn record_pending_finalize_dropped() {
+    metrics::counter!("faucet_serve_pending_finalize_dropped_total").increment(1);
+}
+
+/// A claimed run whose config could not be re-loaded yet (#1051).
+pub fn record_run_reload_retry() {
+    metrics::counter!("faucet_serve_run_reload_retries_total").increment(1);
 }
 
 /// Count runs claimed by this instance's claim loop.

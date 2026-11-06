@@ -189,6 +189,23 @@ impl RunHistory for Flaky {
         self.check()?;
         self.inner.usage_record(r).await
     }
+    async fn meta_get(&self, key: &str) -> Result<Option<String>, HErr> {
+        self.check()?;
+        self.inner.meta_get(key).await
+    }
+    async fn meta_put(&self, key: &str, value: &str) -> Result<(), HErr> {
+        self.check()?;
+        self.inner.meta_put(key, value).await
+    }
+    async fn meta_compare_and_set(
+        &self,
+        key: &str,
+        expected: Option<&str>,
+        value: &str,
+    ) -> Result<bool, HErr> {
+        self.check()?;
+        self.inner.meta_compare_and_set(key, expected, value).await
+    }
     async fn policy_version_insert(&self, record: &PolicyRecord) -> Result<bool, HErr> {
         self.check()?;
         self.inner.policy_version_insert(record).await
