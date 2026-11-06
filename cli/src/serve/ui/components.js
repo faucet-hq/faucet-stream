@@ -163,7 +163,10 @@ export function tbl(cols, rows, foot = null) {
   })}</tbody>${foot ? html`<tfoot><tr>${foot.map((c, i) => html`<td class="${cc(i)}">${c}</td>`)}</tr></tfoot>` : ""}</table>`;
 }
 
-export const pill = (text, tone = "", i = "") => html`<span class="${cls("pill", tone)}">${i ? ic(i) : ""}${text}</span>`;
+export const pill = (text, tone = "", i = "") => {
+  const icon = i || (/^pending\b/i.test(String(text)) ? "clock" : "");
+  return html`<span class="${cls("pill", tone)}">${icon ? ic(icon) : ""}${text}</span>`;
+};
 /** A chip; pass `{ "data-remove": value }` with class `x` for a removable filter chip. */
 export const chip = (text, c = "", a = {}) => html`<span class="${cls("chip", c)}"${raw(attrs(a))}>${text}</span>`;
 export const ch = (text, stable = false) => html`<span class="${cls("ch", stable && "stable")}">${text}</span>`;
