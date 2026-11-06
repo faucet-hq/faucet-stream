@@ -48,7 +48,7 @@ pub struct Found {
 }
 
 fn store_err(e: crate::serve::history::HistoryError) -> ServeError {
-    ServeError::from_history("schedules", e)
+    ServeError::from(e)
 }
 
 fn unprocessable(message: impl Into<String>) -> ServeError {
@@ -259,36 +259,7 @@ fn outsider<'a>(actor: &'a AuthContext, f: &Found) -> Option<&'a str> {
 /// `st` as tenant `t` may see it: only the errors and skip reasons of its own
 /// target (each is prefixed `t: `), never another tenant's (#1051).
 fn status_for(st: &ScheduleStatus, t: &str) -> ScheduleStatus {
-    let prefix = format!("{t}: ");
-    let mine = |e: &str| e.starts_with(&prefix);
-    let mut out = st.clone();
-    out.last_error = st.last_error.as_deref().and_then(|e| {
-        let kept: Vec<&str> = e.split("; ").filter(|p| mine(p)).collect();
-        (!kept.is_empty()).then(|| kept.join("; "))
-    });
-    out.failures = st
-        .failures
-        .iter()
-        .filter_map(|f| {
-            let errors: Vec<String> = f.errors.iter().filter(|e| mine(e)).cloned().collect();
-            (!errors.is_empty()).then(|| FailedTick {
-                errors,
-                ..f.clone()
-            })
-        })
-        .collect();
-    out.skipped = st
-        .skipped
-        .iter()
-        .filter_map(|s| {
-            let kept: Vec<&str> = s.reason.split("; ").filter(|p| mine(p)).collect();
-            (!kept.is_empty()).then(|| SkippedTick {
-                tick: s.tick,
-                reason: kept.join("; "),
-            })
-        })
-        .collect();
-    out
+    st.for_tenant(t)
 }
 
 fn view(actor: &AuthContext, f: &Found, st: &ScheduleStatus, now: DateTime<Utc>) -> ScheduleView {
@@ -332,6 +303,7 @@ fn view(actor: &AuthContext, f: &Found, st: &ScheduleStatus, now: DateTime<Utc>)
         match st.last_outcome.as_deref() {
             Some("failed") => "failing",
             Some("retrying") => "retrying",
+            Some("needs_approval") => "needs_approval",
             _ => "active",
         }
     };
@@ -1448,10 +1420,21 @@ mod tests {
                 tick: t("2026-01-03T02:00:00Z"),
                 reason: "globex: still going".into(),
             }],
+            last_tick: Some(t("2026-01-01T02:00:00Z")),
+            targets: [(
+                "acme".to_string(),
+                status::TargetStatus {
+                    outcome: "failed".into(),
+                    error: Some("refused".into()),
+                    consecutive_failures: 1,
+                    last_tick: t("2026-01-01T02:00:00Z"),
+                },
+            )]
+            .into(),
             ..Default::default()
         };
         let mine = status_for(&st, "acme");
-        assert_eq!(mine.last_error.as_deref(), Some("acme: refused"));
+        assert_eq!(mine.last_error.as_deref(), Some("refused"));
         assert_eq!(mine.failures.len(), 1);
         assert_eq!(mine.failures[0].errors, vec!["acme: refused".to_string()]);
         assert!(mine.skipped.is_empty());

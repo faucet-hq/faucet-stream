@@ -291,17 +291,49 @@ pub fn classify(e: ServeError, tenant: Option<&str>) -> TargetResult {
 
 /// The refusal of a tick that would start runs without an approval this
 /// server requires (#1051): `--require-approval run` covers schedules made
-/// through the API unless an approved change request made them.
-pub fn approval_missing(state: &ServerState, opts: &FireOptions) -> Option<String> {
-    (state.requires_approval(crate::serve::changes::ChangeKind::Run)
-        && !opts.from_file
-        && !opts.approved)
-        .then(|| {
+/// through the API unless an approved change request made them, and then
+/// only while they name pinned template versions, so an approved schedule
+/// runs exactly what was approved.
+pub fn approval_missing(
+    state: &ServerState,
+    spec: &ScheduleSpec,
+    opts: &FireOptions,
+) -> Option<String> {
+    if !state.requires_approval(crate::serve::changes::ChangeKind::Run) || opts.from_file {
+        return None;
+    }
+    if !opts.approved {
+        return Some(
             "this server requires approval for runs (--require-approval run), and this schedule \
              was not made through an approved change request; propose an update of it with \
              POST /v1/changes (kind `schedule`) to approve it"
-                .to_string()
-        })
+                .to_string(),
+        );
+    }
+    follows_a_channel(spec).map(|field| {
+        format!(
+            "this server requires approval for runs (--require-approval run), and this schedule \
+             follows a channel ({field}) that a later launch can move without an approval; \
+             pin a version and approve the change"
+        )
+    })
+}
+
+/// The first template selector of `spec` that names a channel, not a
+/// numbered version: what a launch can change under an approved schedule.
+pub fn follows_a_channel(spec: &ScheduleSpec) -> Option<&'static str> {
+    let pinned = |v: &Option<String>| v.as_deref().is_some_and(|s| s.parse::<u32>().is_ok());
+    let t = &spec.template;
+    if !pinned(&t.version) {
+        return Some("template.version");
+    }
+    if t.sink.is_some() && !pinned(&t.sink_version) {
+        return Some("template.sink_version");
+    }
+    if t.overlay.is_some() && !pinned(&t.overlay_version) {
+        return Some("template.overlay_version");
+    }
+    None
 }
 
 /// The targets of a tick: the owner, the fan-out's tenants, or the server.
@@ -420,7 +452,7 @@ async fn fire_target(
     fired_at: DateTime<Utc>,
     opts: &FireOptions,
 ) -> TargetResult {
-    if let Some(why) = approval_missing(state, opts) {
+    if let Some(why) = approval_missing(state, spec, opts) {
         return TargetResult::Failed(why);
     }
     if opts.manual.is_none() {
@@ -609,27 +641,45 @@ mod tests {
         ));
     }
 
+    fn pinned() -> ScheduleSpec {
+        let mut s = spec();
+        s.template.version = Some("4".into());
+        s.template.overlay_version = Some("2".into());
+        s
+    }
+
     #[test]
     fn a_schedule_needs_an_approval_when_runs_do() {
         let state = crate::serve::test_support::test_state();
-        assert!(approval_missing(&state, &FireOptions::default()).is_none());
+        assert!(approval_missing(&state, &spec(), &FireOptions::default()).is_none());
         let mut config = crate::serve::test_support::test_config();
         config.require_approval = vec![crate::serve::changes::ChangeKind::Run];
         let gated = crate::serve::test_support::state_from(&config);
-        let why = approval_missing(&gated, &FireOptions::default()).unwrap();
+        let why = approval_missing(&gated, &pinned(), &FireOptions::default()).unwrap();
         assert!(why.contains("--require-approval run"), "{why}");
-        for ok in [
-            FireOptions {
-                from_file: true,
-                ..Default::default()
-            },
-            FireOptions {
-                approved: true,
-                ..Default::default()
-            },
-        ] {
-            assert!(approval_missing(&gated, &ok).is_none());
-        }
+        let approved = FireOptions {
+            approved: true,
+            ..Default::default()
+        };
+        let from_file = FireOptions {
+            from_file: true,
+            ..Default::default()
+        };
+        assert!(approval_missing(&gated, &spec(), &from_file).is_none());
+        assert!(approval_missing(&gated, &pinned(), &approved).is_none());
+        // Approved, but a launch could move what it runs.
+        let why = approval_missing(&gated, &spec(), &approved).unwrap();
+        assert!(why.contains("template.version"), "{why}");
+        let mut sink = pinned();
+        sink.template.sink_version = None;
+        assert_eq!(follows_a_channel(&sink), Some("template.sink_version"));
+        let mut overlay = pinned();
+        overlay.template.overlay_version = Some("stable".into());
+        assert_eq!(
+            follows_a_channel(&overlay),
+            Some("template.overlay_version")
+        );
+        assert_eq!(follows_a_channel(&pinned()), None);
     }
 
     #[tokio::test]

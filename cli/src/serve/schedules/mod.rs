@@ -152,6 +152,15 @@ pub fn spawn(
     ))
 }
 
+/// Aborts a task when dropped.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Run `make()`'s task until it returns; restart it after `pause` when it
 /// panics (counted in `faucet_serve_schedule_runner_restarts_total`).
 #[allow(clippy::disallowed_methods)] // a restart back-off, not a connector backend call
@@ -164,7 +173,11 @@ pub async fn supervise<F, Fut>(
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
     loop {
-        match tokio::spawn(make()).await {
+        let task = tokio::spawn(make());
+        // Aborting the supervisor aborts the loop it runs, and any tick in
+        // flight with it (#1051).
+        let _guard = AbortOnDrop(task.abort_handle());
+        match task.await {
             Err(e) if e.is_panic() && !shutdown.is_cancelled() => {
                 tracing::error!("the schedule loop panicked; restarting it");
                 metrics::runner_restarted();
@@ -292,6 +305,42 @@ mod tests {
         )
         .await;
         assert_eq!(once.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn aborting_the_supervisor_stops_the_loop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let beats = Arc::new(AtomicUsize::new(0));
+        let n = beats.clone();
+        let task = tokio::spawn(supervise(
+            move || {
+                let n = n.clone();
+                // A loop that never looks at the shutdown token.
+                async move {
+                    loop {
+                        n.fetch_add(1, Ordering::SeqCst);
+                        #[allow(clippy::disallowed_methods)] // a test loop's pacing
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                }
+            },
+            tokio_util::sync::CancellationToken::new(),
+            Duration::from_millis(1),
+        ));
+        #[allow(clippy::disallowed_methods)] // let the loop run a little
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        task.abort();
+        let _ = task.await;
+        #[allow(clippy::disallowed_methods)] // settle the abort
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let stopped = beats.load(Ordering::SeqCst);
+        #[allow(clippy::disallowed_methods)] // the loop must stay stopped
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            beats.load(Ordering::SeqCst),
+            stopped,
+            "the loop kept running"
+        );
     }
 
     #[cfg(feature = "tenants")]

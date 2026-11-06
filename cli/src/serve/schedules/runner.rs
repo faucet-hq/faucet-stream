@@ -60,6 +60,8 @@ pub struct Entry {
     resumed: bool,
     retry_at: Option<DateTime<Utc>>,
     attempts: u32,
+    /// The tick waits out a run-history outage (#1050).
+    held: bool,
 }
 
 /// What identifies a definition: a change rebuilds the entry.
@@ -89,6 +91,7 @@ impl Entry {
             resumed: false,
             retry_at: None,
             attempts: 0,
+            held: false,
         }
     }
 
@@ -187,6 +190,28 @@ impl Entry {
         }
     }
 
+    /// A tick held through a run-history outage, once the history answers:
+    /// with `catch_up` the ticks due since collapse into one run of the
+    /// latest, without it a tick that is no longer the latest is dropped.
+    /// Returns the range of ticks that never ran (#1050).
+    fn settle_held(&mut self, now: DateTime<Utc>) -> Option<MissedRange> {
+        if !std::mem::take(&mut self.held) {
+            return None;
+        }
+        let tick = self.next?;
+        let (latest, later) = self.latest_due(tick, now);
+        let latest = latest?;
+        self.retry_at = None;
+        self.attempts = 0;
+        Some(self.settle_missed(
+            tick - chrono::Duration::seconds(1),
+            latest,
+            later + 1,
+            now,
+            "while the run history was unreachable",
+        ))
+    }
+
     /// Back off before retrying the same tick.
     fn back_off(&mut self, now: DateTime<Utc>) {
         self.attempts += 1;
@@ -233,6 +258,13 @@ impl Entry {
 #[derive(Default)]
 pub struct Scheduler {
     pub entries: BTreeMap<String, Entry>,
+    /// Wanted schedules that do not validate: left out, reported unhealthy,
+    /// and forgotten once they are no longer wanted.
+    invalid: std::collections::BTreeSet<String>,
+    /// Schedules whose step runs now: their entry is out of `entries`.
+    busy: std::collections::BTreeSet<String>,
+    /// The schedule started last, so starts take turns.
+    last_started: Option<String>,
 }
 
 impl Scheduler {
@@ -242,6 +274,10 @@ impl Scheduler {
         let mut keep = std::collections::BTreeSet::new();
         for (spec, owner, source, approved) in wanted {
             keep.insert(spec.name.clone());
+            // A step in flight keeps its entry; the next reload applies an edit.
+            if self.busy.contains(&spec.name) {
+                continue;
+            }
             let fp = fingerprint(&spec, owner.as_deref(), approved);
             if self
                 .entries
@@ -252,6 +288,7 @@ impl Scheduler {
             }
             match super::validate::validate(&spec) {
                 Ok(compiled) => {
+                    self.invalid.remove(&spec.name);
                     metrics::preinit(&spec.name);
                     let mut entry = Entry::new(spec, owner, source, compiled, now);
                     entry.approved = approved;
@@ -263,6 +300,7 @@ impl Scheduler {
                     // or older binary wrote. Report it and leave it out.
                     tracing::error!(schedule = %spec.name, error = %e, "invalid schedule; not ticking it");
                     metrics::healthy(&spec.name, false);
+                    self.invalid.insert(spec.name.clone());
                     self.entries.remove(&spec.name);
                 }
             }
@@ -275,6 +313,49 @@ impl Scheduler {
             }
             kept
         });
+        self.invalid.retain(|name| {
+            let kept = keep.contains(name);
+            if !kept {
+                metrics::forget(name);
+            }
+            kept
+        });
+    }
+
+    /// Names of the entries due at `now`, in turn order: those after the
+    /// schedule started last first, so no schedule waits behind the rest.
+    fn due_in_turn(&self, now: DateTime<Utc>) -> Vec<String> {
+        let due: Vec<&String> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| !e.spec.paused && (e.due(now).is_some() || !e.resumed))
+            .map(|(n, _)| n)
+            .collect();
+        let split = match &self.last_started {
+            Some(last) => due.partition_point(|n| *n <= last),
+            None => 0,
+        };
+        due[split..]
+            .iter()
+            .chain(due[..split].iter())
+            .map(|n| (*n).clone())
+            .collect()
+    }
+
+    /// Take an entry out to step it.
+    fn take(&mut self, name: &str) -> Option<Entry> {
+        let e = self.entries.remove(name)?;
+        self.busy.insert(name.to_string());
+        self.last_started = Some(name.to_string());
+        Some(e)
+    }
+
+    /// Put a stepped entry back (or, after a panic, leave it to the next reload).
+    fn finish(&mut self, name: &str, entry: Option<Entry>) {
+        self.busy.remove(name);
+        if let Some(e) = entry {
+            self.entries.insert(name.to_string(), e);
+        }
     }
 
     /// Schedules that tick (not paused).
@@ -307,9 +388,50 @@ pub async fn wanted(state: &ServerState) -> Result<Vec<Wanted>, String> {
     Ok(out)
 }
 
+/// Each tenant's result in a tick, for the per-target record (#1051).
+fn target_outcomes(result: &fire::TickResult) -> Vec<status::TargetOutcome> {
+    use fire::TargetResult as R;
+    result
+        .targets
+        .iter()
+        .filter_map(|(tenant, r)| {
+            let (outcome, error) = match r {
+                R::Started(_) => ("started", None),
+                R::Skipped(e) => ("skipped", Some(e)),
+                R::Failed(e) => ("failed", Some(e)),
+                R::Retry(e) => ("retrying", Some(e)),
+                R::Wait(e) => ("waiting", Some(e)),
+            };
+            tenant.as_ref().map(|t| status::TargetOutcome {
+                tenant: t.clone(),
+                outcome,
+                error: error.cloned(),
+            })
+        })
+        .collect()
+}
+
+/// Hold `entry`'s tick through a run-history outage (#1050): nothing is
+/// recorded (the status lives in the history) and the health gauge is left
+/// alone; the outage shows through `faucet_serve_history_degraded`.
+fn hold(entry: &mut Entry, now: DateTime<Utc>) {
+    if !entry.held {
+        tracing::warn!(schedule = %entry.spec.name, "the run history is unreachable; holding the schedule's tick until it recovers");
+        metrics::tick(&entry.spec.name, "paused");
+    }
+    entry.held = true;
+    entry.back_off(now);
+}
+
 /// Fire `entry`'s due tick (if any) and fold the outcome in.
 pub async fn step(state: &ServerState, entry: &mut Entry, now: DateTime<Utc>) {
     let history = state.history();
+    if history.degraded() {
+        if !entry.resumed || entry.due(now).is_some() {
+            hold(entry, now);
+        }
+        return;
+    }
     if !entry.resumed {
         match entry.resume_from(&*history, now).await {
             Ok(missed) => {
@@ -323,12 +445,25 @@ pub async fn step(state: &ServerState, entry: &mut Entry, now: DateTime<Utc>) {
                     }
                 }
             }
+            Err(_) if history.degraded() => {
+                hold(entry, now);
+                return;
+            }
             Err(e) => {
                 tracing::warn!(schedule = %entry.spec.name, error = %e, "could not resume; retrying");
                 entry.back_off(now);
                 metrics::healthy(&entry.spec.name, false);
                 return;
             }
+        }
+    }
+    if entry.due(now).is_none() {
+        return;
+    }
+    if let Some(range) = entry.settle_held(now) {
+        let name = entry.spec.name.clone();
+        if let Err(e) = status::update(&*history, &name, |d| d.add_missed(range.clone())).await {
+            tracing::warn!(schedule = %name, error = %e, "could not record missed ticks");
         }
     }
     let Some(tick) = entry.due(now) else {
@@ -339,17 +474,32 @@ pub async fn step(state: &ServerState, entry: &mut Entry, now: DateTime<Utc>) {
         from_file: entry.source == Source::File,
         approved: entry.approved,
     };
+    let name = entry.spec.name.clone();
+    // Not ticked while it lacks an approval this server requires (#1051).
+    if let Some(why) = fire::approval_missing(state, &entry.spec, &opts) {
+        metrics::tick(&name, "needs_approval");
+        metrics::healthy(&name, false);
+        tracing::warn!(schedule = %name, %tick, reason = %why, "schedule not ticked: it needs approval");
+        status::record_tick(&*history, &name, &entry.last_tick(tick)).await;
+        status::record(&*history, &name, tick, Outcome::NeedsApproval(why)).await;
+        entry.advance(tick, now);
+        return;
+    }
     let result =
         fire::fire_tick(state, &entry.spec, entry.owner.as_deref(), tick, now, &opts).await;
     let outcome = result.outcome();
-    let name = entry.spec.name.clone();
+    let targets = target_outcomes(&result);
     match &outcome {
+        Outcome::Retrying(_) if history.degraded() => {
+            hold(entry, Utc::now());
+            return;
+        }
         Outcome::Retrying(e) => {
             tracing::warn!(schedule = %name, %tick, error = %e, "tick did not start; retrying");
             metrics::tick(&name, "retried");
             metrics::healthy(&name, false);
             entry.back_off(Utc::now());
-            status::record(&*history, &name, tick, outcome).await;
+            status::record_with_targets(&*history, &name, tick, outcome, &targets).await;
             return;
         }
         Outcome::Waiting(why) => {
@@ -357,7 +507,7 @@ pub async fn step(state: &ServerState, entry: &mut Entry, now: DateTime<Utc>) {
             tracing::debug!(schedule = %name, %tick, reason = %why, "tick held for an earlier run");
             entry.retry_at =
                 Some(Utc::now() + chrono::Duration::from_std(WAIT_POLL).unwrap_or_default());
-            status::record(&*history, &name, tick, outcome).await;
+            status::record_with_targets(&*history, &name, tick, outcome, &targets).await;
             return;
         }
         Outcome::Started => {
@@ -376,9 +526,10 @@ pub async fn step(state: &ServerState, entry: &mut Entry, now: DateTime<Utc>) {
             metrics::healthy(&name, false);
             tracing::warn!(schedule = %name, %tick, errors = ?errors, "schedule tick refused; moving on to the next tick");
         }
+        Outcome::NeedsApproval(_) => {}
     }
     status::record_tick(&*history, &name, &entry.last_tick(tick)).await;
-    status::record(&*history, &name, tick, outcome).await;
+    status::record_with_targets(&*history, &name, tick, outcome, &targets).await;
     if let Some(range) = entry.advance(tick, Utc::now())
         && let Err(e) = status::update(&*history, &name, |d| d.add_missed(range.clone())).await
     {
@@ -386,12 +537,65 @@ pub async fn step(state: &ServerState, entry: &mut Entry, now: DateTime<Utc>) {
     }
 }
 
+/// The longest one schedule's step may take before it is cut off and its
+/// tick retried (#1051).
+pub const STEP_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How a stepped entry came back.
+enum Stepped {
+    Done(Entry),
+    TimedOut(Entry),
+    Panicked,
+}
+
+/// Step one entry on its own task, bounded by `limit`.
+async fn step_task(state: ServerState, mut entry: Entry, limit: Duration) -> (String, Stepped) {
+    use futures::FutureExt as _;
+    let name = entry.spec.name.clone();
+    let now = Utc::now();
+    let stepped = tokio::time::timeout(
+        limit,
+        std::panic::AssertUnwindSafe(step(&state, &mut entry, now)).catch_unwind(),
+    )
+    .await;
+    let out = match stepped {
+        Ok(Ok(())) => Stepped::Done(entry),
+        Ok(Err(_)) => Stepped::Panicked,
+        Err(_) => {
+            // Its targets dedupe on the tick's idempotency key when it fires again.
+            entry.back_off(Utc::now());
+            metrics::step_timed_out(&name);
+            tracing::error!(schedule = %name, "a schedule step timed out; retrying its tick");
+            if let Some(tick) = entry.next {
+                let history = state.history();
+                let record = status::record(
+                    &*history,
+                    &name,
+                    tick,
+                    Outcome::Retrying("step timed out".into()),
+                );
+                // Best effort: the status write goes through the history too.
+                let _ = tokio::time::timeout(limit, record).await;
+            }
+            Stepped::TimedOut(entry)
+        }
+    };
+    (name, out)
+}
+
 /// Run the loop until `shutdown`.
 #[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
 pub async fn run(state: ServerState, shutdown: CancellationToken) {
+    run_with(state, shutdown, STEP_TIMEOUT).await;
+}
+
+/// [`run`] with the step timeout given.
+#[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
+pub async fn run_with(state: ServerState, shutdown: CancellationToken, step_limit: Duration) {
     metrics::describe();
     let changed = state.schedules().changed();
     let mut scheduler = Scheduler::default();
+    let mut steps: tokio::task::JoinSet<(String, Stepped)> = tokio::task::JoinSet::new();
     let mut reload_at = Utc::now();
     loop {
         let now = Utc::now();
@@ -402,22 +606,39 @@ pub async fn run(state: ServerState, shutdown: CancellationToken) {
                     tracing::warn!(error = %e, "could not reload schedules; keeping the current set")
                 }
             }
-            metrics::active(scheduler.active());
+            metrics::active(scheduler.active() + scheduler.busy.len());
             reload_at = now + chrono::Duration::from_std(RELOAD_INTERVAL).unwrap_or_default();
         }
         if shutdown.is_cancelled() {
+            steps.abort_all();
             return;
         }
-        // Due ticks fire side by side (bounded), so one slow schedule does
-        // not hold up the others.
-        use futures::StreamExt;
-        futures::stream::iter(scheduler.entries.values_mut().filter(|e| !e.spec.paused))
-            .for_each_concurrent(CONCURRENT_TICKS, |entry| step(&state, entry, Utc::now()))
-            .await;
-        // Sleep to the next check; a local change reloads at once.
+        // Each due schedule steps on its own task (at most CONCURRENT_TICKS),
+        // so one slow schedule does not hold up the others.
+        for name in scheduler.due_in_turn(now) {
+            if steps.len() >= CONCURRENT_TICKS {
+                break;
+            }
+            if let Some(entry) = scheduler.take(&name) {
+                steps.spawn(step_task(state.clone(), entry, step_limit));
+            }
+        }
+        // Sleep to the next check; a finished step or a local change wakes it.
         tokio::select! {
-            _ = shutdown.cancelled() => return,
+            _ = shutdown.cancelled() => {
+                steps.abort_all();
+                return;
+            }
             _ = changed.notified() => reload_at = Utc::now(),
+            Some(done) = steps.join_next(), if !steps.is_empty() => match done {
+                Ok((name, Stepped::Done(e) | Stepped::TimedOut(e))) => scheduler.finish(&name, Some(e)),
+                Ok((name, Stepped::Panicked)) => {
+                    tracing::error!(schedule = %name, "a schedule step panicked; rebuilding it at the next reload");
+                    metrics::runner_restarted();
+                    scheduler.finish(&name, None);
+                }
+                Err(e) => tracing::error!(error = %e, "a schedule step task failed"),
+            },
             _ = tokio::time::sleep(CHECK_INTERVAL) => {}
         }
     }
@@ -731,6 +952,243 @@ mod tests {
             w[0].3,
             "a file schedule is the operator's standing approval"
         );
+    }
+
+    /// Trip a flaky state's history into degraded mode.
+    async fn take_down(state: &ServerState, down: &std::sync::atomic::AtomicBool) {
+        down.store(true, std::sync::atomic::Ordering::Release);
+        let _ = state.history().meta_get("trip").await;
+        assert!(state.history().degraded());
+    }
+
+    #[tokio::test]
+    async fn a_tick_waits_out_a_history_outage_and_then_catches_up_once() {
+        let (state, down) = crate::serve::test_support::flaky_state();
+        let mut e = entry("0 * * * *", at("2026-09-26T10:30:00Z"));
+        take_down(&state, &down).await;
+        step(&state, &mut e, at("2026-09-26T11:00:00Z")).await;
+        assert!(e.held && !e.resumed, "held, not failed");
+        assert_eq!(e.attempts, 1);
+        down.store(false, std::sync::atomic::Ordering::Release);
+        assert!(state.history().recover_degraded().await);
+        // Back four hours later: the latest due tick runs once.
+        let later = at("2026-09-26T15:10:00Z");
+        e.retry_at = None;
+        e.resumed = true;
+        assert!(e.settle_held(later).is_some());
+        assert_eq!(e.next, Some(at("2026-09-26T15:00:00Z")));
+        assert!(!e.held);
+        // Without catch-up a stale held tick is dropped.
+        let mut off = entry_with("0 * * * *", false, at("2026-09-26T10:30:00Z"));
+        off.next = Some(at("2026-09-26T11:00:00Z"));
+        off.held = true;
+        let range = off.settle_held(later).unwrap();
+        assert!(!range.caught_up);
+        assert_eq!(off.next, Some(at("2026-09-26T16:00:00Z")));
+        // A held tick with nothing due since fires as it is.
+        let mut on_time = entry("0 * * * *", at("2026-09-26T10:30:00Z"));
+        on_time.next = Some(at("2026-09-26T11:00:00Z"));
+        on_time.held = true;
+        assert!(on_time.settle_held(at("2026-09-26T11:00:30Z")).is_none());
+        assert_eq!(on_time.next, Some(at("2026-09-26T11:00:00Z")));
+    }
+
+    #[tokio::test]
+    async fn a_held_tick_records_nothing_and_leaves_the_gauge_alone() {
+        use ::metrics::with_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let (state, down) = crate::serve::test_support::flaky_state();
+        let mut e = entry("0 * * * *", at("2026-09-26T10:30:00Z"));
+        e.resumed = true;
+        take_down(&state, &down).await;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let fut = step(&state, &mut e, at("2026-09-26T11:00:00Z"));
+        with_local_recorder(&recorder, || futures::executor::block_on(fut));
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert!(
+            !snapshot
+                .iter()
+                .any(|(k, _, _, _)| k.key().name() == "faucet_serve_schedule_healthy"),
+            "the health gauge is left alone"
+        );
+        assert!(snapshot.iter().any(|(k, _, _, v)| {
+            k.key().name() == "faucet_serve_schedule_ticks_total"
+                && k.key().labels().any(|l| l.value() == "paused")
+                && *v == DebugValue::Counter(1)
+        }));
+        down.store(false, std::sync::atomic::Ordering::Release);
+        assert!(state.history().recover_degraded().await);
+        assert_eq!(
+            status::read(&*state.history(), "nightly")
+                .await
+                .consecutive_failures,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unapproved_or_channel_schedule_needs_approval_under_run_approval() {
+        let mut config = crate::serve::test_support::test_config();
+        config.require_approval = vec![crate::serve::changes::ChangeKind::Run];
+        let state = crate::serve::test_support::state_from(&config);
+        let s = spec("0 * * * *", true);
+        let compiled = super::super::validate::validate(&s).unwrap();
+        let mut e = Entry::new(
+            s,
+            None,
+            Source::Console,
+            compiled,
+            at("2026-09-26T10:30:00Z"),
+        );
+        e.resumed = true;
+        e.approved = true;
+        let tick = at("2026-09-26T11:00:00Z");
+        step(&state, &mut e, tick).await;
+        let st = status::read(&*state.history(), "nightly").await;
+        assert_eq!(st.last_outcome.as_deref(), Some("needs_approval"));
+        assert!(st.last_error.unwrap().contains("template.version"));
+        assert_eq!(st.consecutive_failures, 0);
+        assert_eq!(
+            e.next,
+            Some(at("2026-09-26T12:00:00Z")),
+            "moves on, fires nothing"
+        );
+    }
+
+    #[test]
+    fn an_invalid_schedule_is_forgotten_once_it_is_no_longer_wanted() {
+        let now = at("2026-09-26T10:00:00Z");
+        let mut s = Scheduler::default();
+        let mut bad = spec("0 * * * *", true);
+        bad.cron = "nope".into();
+        s.reconcile(vec![(bad.clone(), None, Source::Console, false)], now);
+        assert!(s.invalid.contains("nightly"));
+        s.reconcile(
+            vec![(spec("0 * * * *", true), None, Source::Console, false)],
+            now,
+        );
+        assert!(!s.invalid.contains("nightly"), "valid again");
+        s.reconcile(vec![(bad, None, Source::Console, false)], now);
+        s.reconcile(Vec::new(), now);
+        assert!(s.invalid.is_empty());
+    }
+
+    #[test]
+    fn starts_take_turns_and_a_busy_entry_is_left_alone() {
+        let now = at("2026-09-26T11:00:00Z");
+        let mut s = Scheduler::default();
+        let names = ["a", "b", "c"];
+        let wanted: Vec<Wanted> = names
+            .iter()
+            .map(|n| {
+                let mut x = spec("0 * * * *", true);
+                x.name = (*n).into();
+                (x, None, Source::File, true)
+            })
+            .collect();
+        s.reconcile(wanted.clone(), at("2026-09-26T10:30:00Z"));
+        assert_eq!(s.due_in_turn(now), vec!["a", "b", "c"]);
+        let b = s.take("b").unwrap();
+        assert_eq!(s.due_in_turn(now), vec!["c", "a"]);
+        // A reload while `b` steps neither rebuilds nor forgets it.
+        let mut changed = wanted.clone();
+        changed[1].0.cron = "30 * * * *".into();
+        s.reconcile(changed, now);
+        assert!(!s.entries.contains_key("b") && s.busy.contains("b"));
+        s.finish("b", Some(b));
+        assert!(s.entries.contains_key("b") && s.busy.is_empty());
+        s.take("a");
+        s.finish("a", None);
+        assert!(
+            !s.entries.contains_key("a"),
+            "a panicked step is rebuilt at the next reload"
+        );
+    }
+
+    /// A history whose server settings never answer: a step that reads them hangs.
+    struct Hang;
+
+    #[async_trait::async_trait]
+    impl RunHistory for Hang {
+        async fn claim_idempotency(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: Duration,
+        ) -> Result<crate::serve::history::Claim, crate::serve::history::HistoryError> {
+            std::future::pending().await
+        }
+        async fn upsert(
+            &self,
+            _: &crate::serve::history::RunRecord,
+        ) -> Result<(), crate::serve::history::HistoryError> {
+            Ok(())
+        }
+        async fn get(
+            &self,
+            _: &str,
+        ) -> Result<Option<crate::serve::history::RunRecord>, crate::serve::history::HistoryError>
+        {
+            Ok(None)
+        }
+        async fn list(
+            &self,
+            _: &crate::serve::history::ListFilter,
+        ) -> Result<crate::serve::history::ListPage, crate::serve::history::HistoryError> {
+            Ok(crate::serve::history::ListPage {
+                runs: Vec::new(),
+                next_cursor: None,
+            })
+        }
+        async fn delete(
+            &self,
+            _: &str,
+        ) -> Result<crate::serve::history::DeleteOutcome, crate::serve::history::HistoryError>
+        {
+            Ok(crate::serve::history::DeleteOutcome::NotFound)
+        }
+        async fn purge_expired(
+            &self,
+            _: Duration,
+        ) -> Result<usize, crate::serve::history::HistoryError> {
+            Ok(0)
+        }
+        async fn recover_orphans(&self) -> Result<usize, crate::serve::history::HistoryError> {
+            Ok(0)
+        }
+        async fn meta_get(
+            &self,
+            _: &str,
+        ) -> Result<Option<String>, crate::serve::history::HistoryError> {
+            std::future::pending().await
+        }
+        fn degraded(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn a_step_that_hangs_is_cut_off_and_its_tick_retried() {
+        let config = crate::serve::test_support::test_config();
+        let state = ServerState::new(
+            &config,
+            None,
+            CancellationToken::new(),
+            std::sync::Arc::new(Hang),
+            crate::serve::logs::LogHub::new(),
+            None,
+            #[cfg(feature = "triggers")]
+            crate::serve::triggers::health::TriggersHandle::empty(),
+        );
+        let e = entry("0 * * * *", at("2026-09-26T10:30:00Z"));
+        let (name, out) = step_task(state, e, Duration::from_millis(20)).await;
+        assert_eq!(name, "nightly");
+        match out {
+            Stepped::TimedOut(e) => assert_eq!(e.attempts, 1),
+            _ => panic!("expected a timeout"),
+        }
     }
 
     #[tokio::test]

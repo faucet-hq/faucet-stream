@@ -4,7 +4,14 @@
 use metrics::{counter, describe_counter, describe_gauge, gauge};
 
 /// The closed set of tick outcomes.
-pub const OUTCOMES: &[&str] = &["started", "skipped", "failed", "retried"];
+pub const OUTCOMES: &[&str] = &[
+    "started",
+    "skipped",
+    "failed",
+    "retried",
+    "paused",
+    "needs_approval",
+];
 
 pub fn describe() {
     describe_gauge!(
@@ -21,7 +28,12 @@ pub fn describe() {
     );
     describe_counter!(
         "faucet_serve_schedule_ticks_total",
-        "Schedule ticks by outcome: started, skipped (overlap), failed (refused), retried"
+        "Schedule ticks by outcome: started, skipped (overlap), failed (refused), retried, \
+         paused (the run history unreachable), needs_approval"
+    );
+    describe_counter!(
+        "faucet_serve_schedule_step_timeouts_total",
+        "Schedule ticks cut off after the step timeout"
     );
     describe_counter!(
         "faucet_serve_schedule_missed_ticks_total",
@@ -41,6 +53,11 @@ pub fn describe() {
 /// unhealthy, so its alert clears.
 pub fn forget(schedule: &str) {
     healthy(schedule, true);
+}
+
+pub fn step_timed_out(schedule: &str) {
+    counter!("faucet_serve_schedule_step_timeouts_total", "schedule" => schedule.to_string())
+        .increment(1);
 }
 
 pub fn runner_restarted() {
@@ -114,6 +131,7 @@ mod tests {
             healthy("nightly", false);
             last_tick("nightly", 1_700_000_000);
             runner_restarted();
+            step_timed_out("nightly");
         });
         let names: Vec<String> = snapshotter
             .snapshot()
@@ -129,6 +147,7 @@ mod tests {
             "faucet_serve_schedule_missed_ticks_total",
             "faucet_serve_schedule_tenant_failures_total",
             "faucet_serve_schedule_runner_restarts_total",
+            "faucet_serve_schedule_step_timeouts_total",
         ] {
             assert!(names.iter().any(|n| n == want), "missing {want}: {names:?}");
         }
