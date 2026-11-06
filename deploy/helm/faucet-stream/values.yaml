@@ -264,7 +264,8 @@ serve:
     # leave open on a shared deployment.
     maxRows: 5000
 
-  # Multi-instance clustered execution (requires history.backend != memory).
+  # Multi-instance clustered execution: requires an explicit shared history
+  # (history.backend: postgres with history.url or history.existingSecret).
   cluster:
     enabled: false
     # The vault key that lets a clustered server accept template triggers

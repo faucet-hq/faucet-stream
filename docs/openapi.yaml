@@ -3328,8 +3328,11 @@ paths:
         (`draining`). Always returns a JSON body with
         `status`, `history_ok`, `history` (`kind`: `sqlite` / `postgres` /
         `memory`, and whether it is `persistent`), `queue_ok`, `degraded`
-        (while the backend is unreachable: `since`, `journaled` and the local
-        `journal` — null otherwise), `draining`, and
+        (while the backend is unreachable, so no new work is admitted: `since`
+        — null otherwise), `pending_finalize` (finished runs whose terminal
+        record waits for the history), `policy_seed` (`pending` while the
+        `--policy` file has not seeded the policy store — new work waits for
+        it — null otherwise), `draining`, and
         a `cluster` object (`enabled` bool, `instances` live-member count,
         this replica's `pools`, and the live `members` with the pools each
         serves).
@@ -3355,18 +3358,11 @@ paths:
                   degraded:
                     type: object
                     nullable: true
-                    description: "While the history backend is unreachable (#1050): since when, and the records waiting in the local journal to be replayed. Null otherwise."
+                    description: "While the history backend is unreachable (#1050): since when. Every admission answers 503 meanwhile. Null otherwise."
                     properties:
                       since: { type: string, format: date-time, nullable: true }
-                      journaled: { type: integer }
-                      journal:
-                        type: object
-                        nullable: true
-                        properties:
-                          journaled: { type: integer }
-                          by_kind: { type: object, additionalProperties: { type: integer } }
-                          bytes: { type: integer }
-                          full: { type: boolean, description: "The size cap is reached: new runs are refused." }
+                  pending_finalize: { type: integer, description: "Finished runs whose terminal record waits for the history; retried from every lease tick (#1050)." }
+                  policy_seed: { type: string, nullable: true, enum: [pending], description: "`pending` while the --policy file has not seeded the policy store; new work answers 503 until it has (#1050)." }
                   draining: { type: boolean, description: "true once shutdown began; new work is refused." }
                   cluster:
                     type: object
@@ -3383,6 +3379,7 @@ paths:
                             instance_id: { type: string }
                             listen: { type: string, nullable: true }
                             pools: { type: array, nullable: true, items: { type: string }, description: "null for a member that predates execution pools: it claims any pending run, so a non-default pool is refused while it is live." }
+                            capabilities: { type: array, nullable: true, items: { type: string }, description: "What the member enforces that older releases do not (`policy_pin`, #1051); null for a member that predates them. Runs under a policy, and policy changes, wait while any live member lacks `policy_pin`." }
                             in_flight: { type: integer }
                             max_concurrent: { type: integer }
                   triggers:
@@ -3505,10 +3502,10 @@ components:
         paused: { type: boolean }
         template: { type: object }
         run: { type: object }
-        status: { type: string, enum: [active, paused, failing, retrying] }
+        status: { type: string, enum: [active, paused, failing, retrying, needs_approval], description: "`needs_approval`: under --require-approval run the schedule is not ticked until an approved change makes it, with pinned template versions (#1051)." }
         next_tick: { type: string, format: date-time, nullable: true }
         last_tick: { type: string, format: date-time, nullable: true }
-        last_outcome: { type: string, nullable: true }
+        last_outcome: { type: string, nullable: true, description: "`started` / `skipped` / `failed` / `retrying` / `waiting` / `needs_approval`. A tenant viewing a fan-out sees its own result only (`unknown` when the latest tick did not include it)." }
         last_error: { type: string, nullable: true }
         consecutive_failures: { type: integer }
         missed_30d: { type: integer }
@@ -3698,6 +3695,7 @@ components:
             templates_checked: { type: integer }
             templates_runtime_only: { type: integer }
             runs_checked: { type: integer }
+            runs_runtime_only: { type: integer, description: "Recent runs only the run-time check can judge (a topology config)." }
             newly_refused: { type: array, items: { type: object, additionalProperties: true } }
             newly_allowed: { type: array, items: { type: object, additionalProperties: true } }
             unchanged: { type: integer }
@@ -4006,10 +4004,11 @@ components:
         dlq_location: { type: string, description: "Where the run's dead-letter queue writes (#998): the `path` of its `dlq:` sink as configured at submit, when that sink writes local files (`file`, `jsonl`) — the `location` `POST /v1/dlq/inspect` takes. Set by the server; absent without a file DLQ." }
         policy_pin:
           type: object
-          description: "The stored data-flow policy versions the run was admitted under (#1043); a claim, shard or resume on another replica enforces these, not a newer version. Absent when no stored version applied (no policy, or a `--policy` file)."
+          description: "The data-flow policy the run was admitted under (#1043, #1051); a claim, shard or resume on another replica enforces exactly this. `{}` = admitted with no policy. Absent = not recorded (a run from 1.17.0, or a server without the `policy` feature): the newest policy applies."
           properties:
-            server: { type: integer }
-            tenant: { type: integer }
+            server: { type: integer, description: "The stored server policy version; absent = none on that layer." }
+            tenant: { type: integer, description: "The stored tenant policy version; absent = none on that layer." }
+            file_sha256: { type: string, description: "A run admitted under a --policy file: the SHA-256 of its canonical policy, stored by the server so every replica enforces that content." }
         invocations:
           type: array
           items: { $ref: "#/components/schemas/InvocationRecord" }

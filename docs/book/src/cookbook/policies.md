@@ -271,9 +271,13 @@ The **preview** checks the draft with the same validation as a submission and
 measures its impact: every registered pipeline template (its stable version,
 params bound to placeholders) and the stored configs of the last 7 days of runs
 are checked against the policy in force and the draft, and the ones the draft
-would newly refuse or newly allow are listed (a single server keeps each run's
-config for this, sealed with the vault key when it has one; a cluster reads
-the config it already stores). A template whose columns are
+would newly refuse or newly allow are listed. For this the server keeps, on
+each run, a projection of its config: connector kinds and `attributes`, the
+DLQ's kind and attributes, transforms, contracts, masking rules (never their
+keys) and the config's own `policy:` block — no connector settings and no
+value from a secret reference. It is kept only while the policy lives in the
+store, never shown by the API or `faucet history --json`; a topology config is
+counted as checked at run time only. A template whose columns are
 unknown before a run (no `contract:`) is counted as checked at run time only —
 the runtime backstop still applies to it. The approver sees the same diff and
 impact on the change request.
@@ -287,14 +291,24 @@ earlier document (`restores: N`).
 was checked against are recorded on its record (`policy_pin`), and a claim,
 shard or resume on another replica enforces those versions rather than a newer
 one. A run admitted while a layer had no stored policy stays unchecked on that
-layer when it is reloaded, rather than meeting a version approved after it.
+layer when it is reloaded, rather than meeting a version approved after it. A
+run admitted under a `--policy` file (`--policy-store file`) records the
+SHA-256 of the file's canonical policy and the server stores that content, so
+every replica enforces it, whatever file it was started with. A record from
+1.17.0 has no pin: the newest policy applies to it.
 
-**When the history is unreachable** (the server is degraded), each replica
-keeps enforcing the policy versions it last read while the store answered:
-runs are checked against them, not run unchecked and not all refused. A
-tenant or layer the replica never read refuses its runs until the store is
-back. A server that had no stored policy keeps accepting runs. Policy edits
-and approvals are refused with `503` until the store recovers.
+**Upgrading a cluster.** A replica from before 1.18 does not enforce pinned
+versions. While one is a live member, runs under a policy and policy changes
+answer `503` ("finish the rolling upgrade") on upgraded replicas; runs with no
+policy in force are admitted as before. Finish the rolling upgrade promptly,
+and do not roll back below this release while pinned runs are pending.
+
+**When the history is unreachable** (the server is degraded), the server
+admits no new work at all, so no run is checked against a policy it could not
+read. Policy edits and approvals answer `503` until the store recovers. A
+`--policy` file that should seed an empty store waits for it the same way:
+`/readyz` shows `policy_seed: "pending"` and admissions answer `503` until it
+has.
 
 ### Refusals and the dry run
 
@@ -315,7 +329,13 @@ reuses a server rule's name, or tries to `disable` one, is refused. Its rules
 may govern labels the server classifies. It applies to that tenant's runs only.
 A server draft is checked against every tenant policy too: one that would
 leave a tenant's merged policy invalid (a tenant rule governing a label the
-draft no longer classifies) is refused, naming the tenant.
+draft no longer classifies) is refused, naming the tenant. The check runs
+again when an approved change executes, so a server change and a tenant
+change approved together cannot leave a broken pair: the second is
+`invalidated`. If the two land at the very same moment, the tenant's runs are
+refused (never run without policy) until either change is rolled back;
+`faucet_serve_policy_merge_failures_total{tenant}` counts it and
+`FaucetServePolicyMergeBroken` alerts.
 
 ```yaml
 # acme's policy: personal data never reaches a partner-tier sink

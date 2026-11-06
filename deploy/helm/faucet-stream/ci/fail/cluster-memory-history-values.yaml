@@ -1,4 +1,4 @@
-# expect-error: serve.cluster.enabled=true requires a persistent history backend
+# expect-error: serve.cluster.enabled=true requires an explicit history shared by every replica
 serve:
   history:
     backend: memory

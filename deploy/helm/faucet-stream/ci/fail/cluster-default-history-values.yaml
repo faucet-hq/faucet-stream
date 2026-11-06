@@ -1,0 +1,4 @@
+# expect-error: serve.cluster.enabled=true requires an explicit history shared by every replica
+serve:
+  cluster:
+    enabled: true

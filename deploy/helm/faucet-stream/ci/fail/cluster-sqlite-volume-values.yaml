@@ -1,0 +1,8 @@
+# expect-error: serve.cluster.enabled=true requires an explicit history shared by every replica
+serve:
+  persistence:
+    enabled: true
+  history:
+    backend: sqlite
+  cluster:
+    enabled: true

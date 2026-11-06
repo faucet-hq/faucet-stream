@@ -21,8 +21,11 @@
 {{- if and .Values.serve.enabled (eq (toString .Values.serve.policy.store) "file") (not .Values.serve.policy.enabled) -}}
 {{- fail "serve.policy.store=file needs serve.policy.enabled=true with the policy file: the file is the policy." -}}
 {{- end -}}
-{{- if and .Values.serve.enabled .Values.serve.cluster.enabled (not (include "faucet-stream.durableHistory" .)) -}}
-{{- fail "serve.cluster.enabled=true requires a persistent history backend: set serve.history.backend to postgres, or sqlite with serve.persistence.enabled (or serve.persistence.existingClaim) — without a volume the sqlite file is on an emptyDir and is lost on every restart." -}}
+{{- /* #1051: `faucet serve --cluster` refuses a history that is not given
+       explicitly, so the chart refuses it too rather than crash-looping. */ -}}
+{{- $explicitHistory := or (eq (include "faucet-stream.historyBackend" .) "postgres") (and (not .Values.serve.history.backend) (or .Values.serve.history.url .Values.serve.history.existingSecret)) -}}
+{{- if and .Values.serve.enabled .Values.serve.cluster.enabled (not $explicitHistory) -}}
+{{- fail "serve.cluster.enabled=true requires an explicit history shared by every replica: set serve.history.backend=postgres with serve.history.url or serve.history.existingSecret. The default history and serve.history.backend=sqlite are a file on a ReadWriteOnce volume that replicas cannot share, and memory keeps nothing." -}}
 {{- end -}}
 {{- if .Values.serve.enabled -}}
 {{- range .Values.serve.cluster.pools -}}

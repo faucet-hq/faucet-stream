@@ -1810,11 +1810,16 @@ series: `faucet_serve_requests_total{method,path,status}`,
 `faucet_serve_runs_pending{pool}` (cluster mode: unclaimed runs per execution
 pool),
 `faucet_serve_idempotency_hits_total`, `faucet_serve_history_degraded` (the
-backend fell back to memory), `faucet_serve_history_journal_records{kind}`
-(records waiting in the local history journal while degraded, by
-`run` / `log` / `audit` / `usage`) and
-`faucet_serve_history_journal_replayed_total{kind,outcome}` (journaled records
-replayed into the recovered backend, `applied` or `skipped`) and `faucet_serve_history_unreachable` (the last
+backend is unreachable and the server admits no new work),
+`faucet_serve_pending_finalize` (finished runs' terminal records waiting for
+the history to take them), `faucet_serve_pending_finalize_dropped_total`
+(terminal records dropped after the history kept refusing them),
+`faucet_serve_policy_seed_pending` (the `--policy` file has not seeded the
+policy store yet), `faucet_serve_run_reload_retries_total` (claimed runs whose
+config could not be re-loaded yet and is retried in place),
+`faucet_serve_policy_merge_failures_total{tenant}` (a tenant's policy no
+longer merges with the server's; its runs are refused) and
+`faucet_serve_history_unreachable` (the last
 lease heartbeat did not reach the history database; `/readyz` is `503` while
 it is `1`), and `faucet_serve_history_connections_discarded_total` (pooled
 history connections dropped because a failed commit left them inside a
