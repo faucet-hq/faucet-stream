@@ -76,8 +76,8 @@ fn record(id: &str, status: RunStatus, rows: u64, elapsed: Option<f64>) -> RunRe
         pool: "default".into(),
         submitted_by: None,
         dlq_location: None,
-        policy_pin: Default::default(),
-        policy_probe: None,
+        policy_pin: None,
+        policy_projection: None,
     }
 }
 
@@ -189,4 +189,17 @@ async fn run_errors_without_a_catalog_block() {
     .await
     .unwrap_err();
     assert!(err.to_string().contains("empty key"), "{err}");
+}
+
+/// The export never carries the policy projection a server keeps (#1051).
+#[test]
+fn the_json_export_drops_the_policy_projection() {
+    let mut r = record("r1", RunStatus::Completed, 1, Some(1.0));
+    r.policy_projection = Some(crate::serve::history::PolicyProjection {
+        config: Some(serde_json::json!({"pipeline": {"sink": {"type": "jsonl"}}})),
+        opaque: false,
+    });
+    let out = export_json(vec![r]).unwrap();
+    assert!(!out.contains("policy_projection"), "{out}");
+    assert!(out.contains("\"r1\""), "{out}");
 }

@@ -244,6 +244,22 @@ impl Api {
 }
 
 /// A csv → jsonl config whose contract declares `email`, with sink `attrs`.
+/// The run record as stored in the test server's SQLite history.
+async fn stored_body(dir: &std::path::Path, run_id: &str) -> String {
+    let pool = sqlx::SqlitePool::connect(&format!(
+        "sqlite:{}?mode=ro",
+        dir.join("history.db").display()
+    ))
+    .await
+    .unwrap();
+    let (body,): (String,) = sqlx::query_as("SELECT body FROM faucet_serve_runs WHERE run_id = ?")
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    body
+}
+
 fn config(dir: &std::path::Path, name: &str, residency: &str) -> String {
     let input = dir.join("in.csv");
     std::fs::write(&input, "id,email\n1,a@example.com\n").unwrap();
@@ -392,8 +408,12 @@ async fn server_managed_policy_is_changed_only_through_a_second_admins_approval(
     let run_id = ok["run_id"].as_str().unwrap();
     let (_, rec) = api.get("alice-tok", &format!("/v1/runs/{run_id}")).await;
     assert_eq!(rec["policy_pin"]["server"], 1, "{rec}");
-    // The config it keeps for impact is never shown…
-    assert!(rec.get("policy_probe").is_none(), "{rec}");
+    // What it keeps for impact is never shown…
+    assert!(rec.get("policy_projection").is_none(), "{rec}");
+    // …and holds no connector settings: not even the input path.
+    let stored = stored_body(dir.path(), run_id).await;
+    assert!(stored.contains("policy_projection"), "{stored}");
+    assert!(!stored.contains("in.csv"), "{stored}");
     // …but a single server's runs count in a draft's impact (#1051 #9): the
     // eu run would be refused by a uk-only draft.
     let (_, preview) = api

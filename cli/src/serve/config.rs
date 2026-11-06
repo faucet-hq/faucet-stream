@@ -433,6 +433,19 @@ impl ServeConfig {
             }
         };
 
+        // A schedule change under run approval needs approvers for both rules
+        // (#1051): refuse a configuration where no one could approve one.
+        {
+            use crate::serve::changes::ChangeKind;
+            if require_approval.contains(&ChangeKind::Run)
+                && require_approval.contains(&ChangeKind::Schedule)
+                && let AuthMode::Rbac(rbac) = &auth
+            {
+                rbac.check_approvers(&[ChangeKind::Schedule, ChangeKind::Run])
+                    .map_err(CliError::Serve)?;
+            }
+        }
+
         let request_guard = crate::serve::guard::GuardSettings::from_args(
             &args.origins.allowed_host,
             &args.origins.allowed_origin,

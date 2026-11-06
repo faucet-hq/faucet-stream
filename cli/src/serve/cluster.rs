@@ -460,6 +460,7 @@ mod tests {
             in_flight: 0,
             state_format: 0,
             pools: Some(vec!["a".into()]),
+            capabilities: None,
         };
         h.set_live_members(vec![m]);
         assert_eq!(

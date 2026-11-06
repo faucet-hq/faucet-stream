@@ -154,11 +154,10 @@ impl PolicySink {
     /// Screen an exactly-once page, which commits whole: any violation fails it.
     fn screen_idempotent(&self, records: &[Value]) -> Result<(), FaucetError> {
         match self.screen(records)?.first() {
-            Some((_, v)) => Err(FaucetError::PolicyViolation {
-                rule: v.rule.clone(),
-                column: v.column.clone(),
-                message: format!("{v} (exactly-once pages cannot be partially quarantined)"),
-            }),
+            Some((_, v)) => Err(violation_error(
+                v,
+                format!("{v} (exactly-once pages cannot be partially quarantined)"),
+            )),
             None => Ok(()),
         }
     }
@@ -207,15 +206,14 @@ impl PolicySink {
             match action {
                 RuntimeAction::Fail => {
                     let first = &violations[0];
-                    return Err(FaucetError::PolicyViolation {
-                        rule: first.rule.clone(),
-                        column: first.column.clone(),
-                        message: violations
+                    return Err(violation_error(
+                        first,
+                        violations
                             .iter()
                             .map(ToString::to_string)
                             .collect::<Vec<_>>()
                             .join("; "),
-                    });
+                    ));
                 }
                 RuntimeAction::Quarantine => offending.push((i, violations.swap_remove(0))),
             }
@@ -349,11 +347,10 @@ impl Sink for PolicySink {
     ) -> Result<crate::accounting::WriteReport, FaucetError> {
         let offending = self.screen(records)?;
         if let Some((_, v)) = offending.first() {
-            return Err(FaucetError::PolicyViolation {
-                rule: v.rule.clone(),
-                column: v.column.clone(),
-                message: format!("{v} (quarantine needs a `dlq:` block; none is attached)"),
-            });
+            return Err(violation_error(
+                v,
+                format!("{v} (quarantine needs a `dlq:` block; none is attached)"),
+            ));
         }
         self.inner.write_batch_reported(records).await
     }
@@ -364,11 +361,10 @@ impl Sink for PolicySink {
     ) -> Result<crate::accounting::WriteReport, FaucetError> {
         let offending = self.screen(page.records())?;
         if let Some((_, v)) = offending.first() {
-            return Err(FaucetError::PolicyViolation {
-                rule: v.rule.clone(),
-                column: v.column.clone(),
-                message: format!("{v} (quarantine needs a `dlq:` block; none is attached)"),
-            });
+            return Err(violation_error(
+                v,
+                format!("{v} (quarantine needs a `dlq:` block; none is attached)"),
+            ));
         }
         self.inner.write_governed(page).await
     }
@@ -381,11 +377,10 @@ impl Sink for PolicySink {
         // No per-row channel here: a quarantine verdict with no DLQ attached
         // cannot route anywhere, so it is a failure rather than a silent drop.
         let (_, v) = &offending[0];
-        Err(FaucetError::PolicyViolation {
-            rule: v.rule.clone(),
-            column: v.column.clone(),
-            message: format!("{v} (quarantine needs a `dlq:` block; none is attached)"),
-        })
+        Err(violation_error(
+            v,
+            format!("{v} (quarantine needs a `dlq:` block; none is attached)"),
+        ))
     }
 
     async fn write_batch_partial(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
@@ -415,11 +410,7 @@ impl Sink for PolicySink {
         let mut inner_outcomes = inner_outcomes.into_iter();
         let outcomes = (0..records.len())
             .map(|i| match quarantined.get(&i) {
-                Some(v) => Err(FaucetError::PolicyViolation {
-                    rule: v.rule.clone(),
-                    column: v.column.clone(),
-                    message: v.to_string(),
-                }),
+                Some(v) => Err(violation_error(v, v.to_string())),
                 None => inner_outcomes.next().expect("length checked above"),
             })
             .collect();
@@ -460,13 +451,26 @@ impl Sink for PolicySink {
         let values = crate::columnar::record_batch_to_values(batch)?;
         let offending = self.screen(&values)?;
         if let Some((_, v)) = offending.first() {
-            return Err(FaucetError::PolicyViolation {
-                rule: v.rule.clone(),
-                column: v.column.clone(),
-                message: format!("{v} (columnar pages cannot be partially quarantined)"),
-            });
+            return Err(violation_error(
+                v,
+                format!("{v} (columnar pages cannot be partially quarantined)"),
+            ));
         }
         self.inner.write_batch_columnar(batch).await
+    }
+}
+
+/// The error of one violation, carrying the facts it was decided on (#1051).
+fn violation_error(v: &Violation, message: String) -> FaucetError {
+    FaucetError::PolicyViolation {
+        rule: v.rule.clone(),
+        column: v.column.clone(),
+        message,
+        facts: Some(Box::new(crate::error::ViolationFacts {
+            label: Some(v.label.clone()),
+            sink: Some(v.sink.clone()),
+            sink_kind: Some(v.sink_kind.clone()),
+        })),
     }
 }
 
@@ -738,6 +742,56 @@ mod tests {
             "{err}"
         );
         assert!(cap.0.lock().unwrap().is_empty());
+    }
+
+    /// The error names the label, sink and kind the verdict was decided on
+    /// (#1051): a value-detector hit carries its label, a two-label column
+    /// the label of the rule that fired, and a DLQ refusal the DLQ.
+    #[tokio::test]
+    async fn the_error_carries_the_facts_of_the_violation() {
+        let fields = |e: &FaucetError| match e {
+            FaucetError::PolicyViolation { facts, .. } => {
+                let f = facts.as_deref().cloned().unwrap_or_default();
+                (f.label, f.sink, f.sink_kind)
+            }
+            other => panic!("{other}"),
+        };
+        let (s, _) = sink(policy("fail"), "us");
+        let err = s
+            .write_batch(&[json!({"contact": "a@b.io"})])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            fields(&err),
+            (
+                Some("pii".into()),
+                Some("default".into()),
+                Some("jsonl".into())
+            )
+        );
+        let spec: PolicySpec = serde_json::from_value(json!({
+            "classifications": [
+                {"label": "a.contact", "fields": ["email"]},
+                {"label": "b.pii", "fields": ["email"]}
+            ],
+            "rules": [{"name": "only-b", "when": {"label": "b.pii"}, "deny": true, "on_runtime": "fail"}]
+        }))
+        .unwrap();
+        let (s, _) = sink(Arc::new(CompiledPolicy::compile(&spec).unwrap()), "us");
+        let err = s.write_batch(&[json!({"email": "x"})]).await.unwrap_err();
+        assert_eq!(fields(&err).0.as_deref(), Some("b.pii"));
+        let (s, _) = sink(policy("quarantine"), "us");
+        let s = s.with_dlq_destination(SinkFacts {
+            id: "dlq".into(),
+            kind: "s3".into(),
+            attributes: [("residency".to_string(), "us".to_string())].into(),
+        });
+        let err = s
+            .write_batch_partial(&[json!({"email": "a@b.io"})])
+            .await
+            .unwrap_err();
+        assert_eq!(fields(&err).1.as_deref(), Some("dlq"));
+        assert_eq!(fields(&err).2.as_deref(), Some("s3"));
     }
 
     #[tokio::test]

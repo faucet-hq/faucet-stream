@@ -3,6 +3,17 @@
 use std::time::Duration;
 use thiserror::Error;
 
+/// What a [`FaucetError::PolicyViolation`] was decided on (#1051).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ViolationFacts {
+    /// The label the rule matched on the column.
+    pub label: Option<String>,
+    /// The sink id the value was headed for (`dlq` for the dead-letter queue).
+    pub sink: Option<String>,
+    /// That sink's connector kind.
+    pub sink_kind: Option<String>,
+}
+
 /// All possible errors returned by faucet-stream.
 ///
 /// `#[non_exhaustive]`: this enum demonstrably grows (`QualityFailure`,
@@ -83,6 +94,9 @@ pub enum FaucetError {
         rule: String,
         column: String,
         message: String,
+        /// The label, sink and sink kind the verdict was decided on, when
+        /// known (#1051).
+        facts: Option<Box<ViolationFacts>>,
     },
 
     /// A run budget ceiling was crossed (#703): `budget` names the ceiling

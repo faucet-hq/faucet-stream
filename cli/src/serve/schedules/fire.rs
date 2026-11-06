@@ -32,6 +32,9 @@ pub struct FireOptions {
     pub from_file: bool,
     /// Made (or last changed) through an approved change request.
     pub approved: bool,
+    /// The stored schedule's id and owner, which its sealed params open
+    /// under; looked up when unset.
+    pub schedule_id: Option<String>,
 }
 
 /// Fan-out targets submitted side by side.
@@ -409,6 +412,37 @@ pub async fn earlier_run_going(
         .map(|r| r.run_id))
 }
 
+/// `spec` with its sealed params opened under the stored schedule's id and
+/// owner (#1051).
+async fn open_params(
+    state: &ServerState,
+    spec: &ScheduleSpec,
+    opts: &FireOptions,
+) -> Result<ScheduleSpec, TargetResult> {
+    if !spec.template.params.values().any(super::secrets::is_sealed) {
+        return Ok(spec.clone());
+    }
+    let record = match state.history().schedule_get(&spec.name).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return Err(TargetResult::Failed(
+                "the schedule is no longer stored".into(),
+            ));
+        }
+        Err(e) => return Err(classify(ServeError::from(e), None)),
+    };
+    if opts.schedule_id.as_ref().is_some_and(|id| *id != record.id) {
+        return Err(TargetResult::Failed(
+            "the schedule was replaced since this tick was planned".into(),
+        ));
+    }
+    let scope = super::secrets::Scope {
+        id: &record.id,
+        tenant: record.tenant.as_deref(),
+    };
+    super::secrets::opened(state, spec, scope).map_err(TargetResult::Failed)
+}
+
 /// Fire one tick. `owner` is the tenant that owns the schedule, if any.
 pub async fn fire_tick(
     state: &ServerState,
@@ -471,9 +505,9 @@ async fn fire_target(
             Err(e) => return TargetResult::Retry(format!("checking for an earlier run: {e}")),
         }
     }
-    let spec = match super::secrets::opened(state, spec) {
+    let spec = match open_params(state, spec, opts).await {
         Ok(s) => s,
-        Err(e) => return TargetResult::Failed(e),
+        Err(e) => return e,
     };
     let body = match body(&spec, tick, fired_at, opts, tenant) {
         Ok(b) => b,
@@ -806,8 +840,25 @@ mod tests {
             "token".into(),
             json!({ super::super::secrets::SEALED: "x" }),
         );
+        // Not stored: there is no id to open it under (#1051).
+        let r = fire_tick(&state, &sealed, None, tick, tick, &opts).await;
+        assert!(failed(&r).contains("no longer stored"), "{r:?}");
+        let record = crate::serve::history::schedules::ScheduleRecord::new(
+            sealed.clone(),
+            None,
+            "ops",
+            tick,
+        );
+        assert!(state.history().schedule_insert(&record).await.unwrap());
         let r = fire_tick(&state, &sealed, None, tick, tick, &opts).await;
         assert!(failed(&r).contains("template.params.token"), "{r:?}");
+        // A tick planned for a schedule since replaced does not open it.
+        let replaced = FireOptions {
+            schedule_id: Some("another".into()),
+            ..Default::default()
+        };
+        let r = fire_tick(&state, &sealed, None, tick, tick, &replaced).await;
+        assert!(failed(&r).contains("replaced"), "{r:?}");
     }
 
     #[cfg(feature = "tenants")]

@@ -1,0 +1,20 @@
+{
+  "run_id": "0193a6f2-5c1e-7b2a-9c4d-2f1e0a9b8c7d",
+  "name": "nightly",
+  "status": "pending",
+  "labels": {
+    "pipeline": "nightly"
+  },
+  "idempotency_key": null,
+  "submitted_at": "2026-10-30T02:00:00Z",
+  "started_at": null,
+  "finished_at": null,
+  "elapsed_secs": null,
+  "records_written": 0,
+  "error": null,
+  "invocations": [],
+  "config_body": "version: 1\nname: nightly\npipeline:\n  source: { type: csv, config: { path: in.csv } }\n  sink: { type: jsonl, config: { path: out.jsonl } }\n",
+  "config_format": "yaml",
+  "tenant": "acme",
+  "pool": "default"
+}

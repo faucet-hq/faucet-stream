@@ -371,26 +371,44 @@ pub struct PolicyDenial {
 
 impl PolicyDenial {
     /// The denial `err` carries for `node`, when a policy refused it.
+    /// The facts the error names win; an error built without them (older
+    /// code) falls back to the row's main sink and the column's name labels.
     pub fn from_error(err: &CliError, node: &ExpandedNode) -> Option<Self> {
-        let CliError::Faucet(FaucetError::PolicyViolation { rule, column, .. }) = err else {
+        let CliError::Faucet(FaucetError::PolicyViolation {
+            rule,
+            column,
+            facts,
+            ..
+        }) = err
+        else {
             return None;
         };
-        #[cfg(feature = "policy")]
-        let labels = node
-            .policy
-            .as_ref()
-            .and_then(|p| faucet_core::CompiledPolicy::compile(p).ok())
-            .map(|c| c.labels_for_name(column).into_iter().collect())
-            .unwrap_or_default();
-        #[cfg(not(feature = "policy"))]
-        let labels = Vec::new();
+        let f = facts.as_deref().cloned().unwrap_or_default();
+        let labels = match f.label {
+            Some(l) => vec![l],
+            None => Self::name_labels(node, column),
+        };
         Some(Self {
             rule: rule.clone(),
             column: column.clone(),
             labels,
-            sink: node.sink_ref.clone(),
-            sink_kind: node.sink.kind.clone(),
+            sink: f.sink.unwrap_or_else(|| node.sink_ref.clone()),
+            sink_kind: f.sink_kind.unwrap_or_else(|| node.sink.kind.clone()),
         })
+    }
+
+    #[cfg(feature = "policy")]
+    fn name_labels(node: &ExpandedNode, column: &str) -> Vec<String> {
+        node.policy
+            .as_ref()
+            .and_then(|p| faucet_core::CompiledPolicy::compile(p).ok())
+            .map(|c| c.labels_for_name(column).into_iter().collect())
+            .unwrap_or_default()
+    }
+
+    #[cfg(not(feature = "policy"))]
+    fn name_labels(_node: &ExpandedNode, _column: &str) -> Vec<String> {
+        Vec::new()
     }
 }
 
@@ -5139,6 +5157,7 @@ mod tests {
             rule: "eu".into(),
             column: "user.email".into(),
             message: "requires sink `residency` in [eu]".into(),
+            facts: None,
         });
         let d = PolicyDenial::from_error(&err, &node).unwrap();
         assert_eq!(d.rule, "eu");
@@ -5146,6 +5165,20 @@ mod tests {
         assert_eq!(d.labels, vec!["pii.email".to_string()]);
         assert_eq!(d.sink, "default");
         assert_eq!(d.sink_kind, "jsonl");
+        // The facts the error carries win over the row's (#1051).
+        let err = CliError::Faucet(FaucetError::PolicyViolation {
+            rule: "eu".into(),
+            column: "contact".into(),
+            message: "m".into(),
+            facts: Some(Box::new(faucet_core::ViolationFacts {
+                label: Some("pii.phone".into()),
+                sink: Some("dlq".into()),
+                sink_kind: Some("s3".into()),
+            })),
+        });
+        let d = PolicyDenial::from_error(&err, &node).unwrap();
+        assert_eq!(d.labels, vec!["pii.phone".to_string()]);
+        assert_eq!((d.sink.as_str(), d.sink_kind.as_str()), ("dlq", "s3"));
         assert!(PolicyDenial::from_error(&CliError::Config("x".into()), &node).is_none());
     }
 
@@ -8626,6 +8659,7 @@ matrix:
                     rule: "r".into(),
                     column: "c".into(),
                     message: "m".into(),
+                    facts: None,
                 },
                 "policy",
             ),

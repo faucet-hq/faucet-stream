@@ -407,6 +407,14 @@ async fn propose(
 ) -> Result<(StatusCode, Json<ChangeRequest>), ServeError> {
     require_persistent(state)?;
     require_server_managed(state, &layer)?;
+    // A replica that predates policy pins would not enforce the stored
+    // versions (#1051).
+    crate::runtime::server::require_member_capability(
+        state,
+        crate::serve::history::CAP_POLICY_PIN,
+        crate::runtime::server::POLICY_PIN_REFUSAL,
+    )
+    .await?;
     if reason.trim().is_empty() {
         return Err(ServeError::BadConfig(
             "a policy change needs a reason; it is shown to the approver and kept with the \

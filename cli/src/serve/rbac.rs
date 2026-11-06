@@ -438,6 +438,41 @@ impl RbacConfig {
         &self.approvals
     }
 
+    /// Refuse a policy under which no change of one of `kinds` could ever be
+    /// approved: each rule needs at least its `min_approvers` principals that
+    /// may approve it (#1051).
+    pub fn check_approvers(
+        &self,
+        kinds: &[crate::serve::changes::ChangeKind],
+    ) -> Result<(), String> {
+        for kind in kinds {
+            let min = self.approvals.effective(*kind).min_approvers as usize;
+            let able = self
+                .principals
+                .iter()
+                .filter(|p| {
+                    let who = AuthContext {
+                        principal: p.name.clone(),
+                        role: p.role,
+                        source_ip: None,
+                        tenant: p.tenant.clone(),
+                    };
+                    self.approvals.may_approve(*kind, &who, "").is_ok()
+                })
+                .count();
+            if able < min {
+                return Err(format!(
+                    "--require-approval run,schedule: a schedule change needs approvals under \
+                     both rules, and only {able} principal(s) in --auth-config may approve a \
+                     {kind} change (its rule needs {min}); add approvers or change the \
+                     `approvals:` rules",
+                    kind = kind.as_str()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Build an in-memory config from the `--read-token` / `--write-token` /
     /// `--admin-token` trio (#608).
     ///

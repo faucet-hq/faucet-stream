@@ -653,3 +653,24 @@ fn policy_routes_are_classified_and_tenant_scoped() {
         "policy.rollback"
     );
 }
+
+#[test]
+fn a_schedule_change_under_run_approval_must_be_approvable() {
+    use crate::serve::changes::ChangeKind;
+    let kinds = [ChangeKind::Schedule, ChangeKind::Run];
+    let mut cfg = RbacConfig::new(vec![
+        spec("ann", "t-ann", Role::Admin),
+        spec("oscar", "t-oscar", Role::Operator),
+    ])
+    .unwrap();
+    assert!(cfg.check_approvers(&kinds).is_ok());
+    cfg.approvals = serde_json::from_value(serde_json::json!({"rules": [
+        {"kinds": ["run"], "roles": ["admin"], "min_approvers": 2}
+    ]}))
+    .unwrap();
+    let err = cfg.check_approvers(&kinds).unwrap_err();
+    assert!(
+        err.contains("run change") && err.contains("needs 2"),
+        "{err}"
+    );
+}

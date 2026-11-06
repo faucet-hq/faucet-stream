@@ -473,6 +473,7 @@ pub async fn step(state: &ServerState, entry: &mut Entry, now: DateTime<Utc>) {
         manual: None,
         from_file: entry.source == Source::File,
         approved: entry.approved,
+        schedule_id: None,
     };
     let name = entry.spec.name.clone();
     // Not ticked while it lacks an approval this server requires (#1051).
