@@ -13,7 +13,7 @@ version: 1
 schedules:
   - name: nightly-rollup
     description: Rebuild the daily revenue rollup after the warehouse load.
-    cron: "0 2 * * *"            # 5 fields, or 6 with seconds first
+    cron: "0 2 * * *"            # 5 fields; ticks at most every 5 minutes
     timezone: Europe/Berlin      # IANA name; DST-correct; default UTC
     catch_up: true               # after an outage, run the latest missed tick once
     overlap: skip                # skip | queue | forbid while the last tick still runs

@@ -352,6 +352,46 @@ pub struct InvocationOutcome {
     /// consumed before it failed still cost something); absent for discovery
     /// rows and synthetic placeholder outcomes.
     pub usage: Option<crate::usage::UsageRecord>,
+    /// The policy rule that refused this invocation at run time, typed, so
+    /// serve's `policy.denied` audit entry never parses `error` (#1051).
+    pub policy_denial: Option<PolicyDenial>,
+}
+
+/// A data-flow policy's run-time refusal of one invocation (#702, #1051).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyDenial {
+    pub rule: String,
+    pub column: String,
+    /// The labels the policy gives the column (by name), sorted.
+    pub labels: Vec<String>,
+    /// The sink template the row writes to, and its connector kind.
+    pub sink: String,
+    pub sink_kind: String,
+}
+
+impl PolicyDenial {
+    /// The denial `err` carries for `node`, when a policy refused it.
+    pub fn from_error(err: &CliError, node: &ExpandedNode) -> Option<Self> {
+        let CliError::Faucet(FaucetError::PolicyViolation { rule, column, .. }) = err else {
+            return None;
+        };
+        #[cfg(feature = "policy")]
+        let labels = node
+            .policy
+            .as_ref()
+            .and_then(|p| faucet_core::CompiledPolicy::compile(p).ok())
+            .map(|c| c.labels_for_name(column).into_iter().collect())
+            .unwrap_or_default();
+        #[cfg(not(feature = "policy"))]
+        let labels = Vec::new();
+        Some(Self {
+            rule: rule.clone(),
+            column: column.clone(),
+            labels,
+            sink: node.sink_ref.clone(),
+            sink_kind: node.sink.kind.clone(),
+        })
+    }
 }
 
 /// Classify a failed invocation's typed error (#654 M2).
@@ -1211,6 +1251,7 @@ async fn run_expanded_unredacted(
                         error_kind: None,
                         metrics: None,
                         usage: None,
+                        policy_denial: None,
                     }
                 }
             };
@@ -1988,6 +2029,7 @@ async fn run_unit(
                     ..base_metrics()
                 }),
                 usage: Some(usage),
+                policy_denial: None,
             }
         }
         Err(e) => {
@@ -2009,6 +2051,7 @@ async fn run_unit(
                 error_kind: Some(classify_error(&e)),
                 metrics: Some(base_metrics()),
                 usage: Some(usage),
+                policy_denial: PolicyDenial::from_error(&e, &unit.node),
             }
         }
     }
@@ -2310,6 +2353,7 @@ async fn run_discovery(
                 error_kind: None,
                 metrics: Some(metrics(n)),
                 usage: None,
+                policy_denial: None,
             }
         }
         Err(e) => {
@@ -2330,6 +2374,7 @@ async fn run_discovery(
                 }),
                 metrics: Some(metrics(0)),
                 usage: None,
+                policy_denial: None,
             }
         }
     }
@@ -2415,6 +2460,7 @@ fn synthetic_outcome(
         error_kind: Some(kind),
         metrics: None,
         usage: None,
+        policy_denial: None,
     }
 }
 
@@ -5079,6 +5125,29 @@ mod tests {
     use crate::config::{ConnectorSpec, PipelineConfig, PipelineSpec};
     use crate::expand::expand;
     use serde_json::json;
+
+    #[cfg(feature = "policy")]
+    #[test]
+    fn a_policy_denial_is_read_from_the_typed_error() {
+        let cfg = crate::config::PipelineConfig::from_text(
+            "version: 1\npolicy:\n  version: 1\n  classifications:\n    - { label: pii.email, fields: [email] }\n  rules:\n    - name: eu\n      when: { label: pii.email }\n      require: { residency: [eu] }\npipeline:\n  source: { type: csv, config: { path: in.csv } }\n  sink: { type: jsonl, config: { path: out.jsonl } }\n",
+            std::path::Path::new("p.yaml"),
+        )
+        .unwrap();
+        let node = crate::expand::expand(&cfg).unwrap().remove(0);
+        let err = CliError::Faucet(FaucetError::PolicyViolation {
+            rule: "eu".into(),
+            column: "user.email".into(),
+            message: "requires sink `residency` in [eu]".into(),
+        });
+        let d = PolicyDenial::from_error(&err, &node).unwrap();
+        assert_eq!(d.rule, "eu");
+        assert_eq!(d.column, "user.email");
+        assert_eq!(d.labels, vec!["pii.email".to_string()]);
+        assert_eq!(d.sink, "default");
+        assert_eq!(d.sink_kind, "jsonl");
+        assert!(PolicyDenial::from_error(&CliError::Config("x".into()), &node).is_none());
+    }
 
     #[test]
     fn classify_error_picks_out_a_circuit_open_trip() {

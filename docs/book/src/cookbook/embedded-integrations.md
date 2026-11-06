@@ -248,7 +248,7 @@ Each tick submits one run per tenant, keyed `sched:nightly-crm:<tick>:<tenant>`,
 so every replica sharing the run history lets exactly one run through per
 tick and tenant. A tenant's own backend can also create schedules for its
 tenant (never a fan-out), up to its `max_schedules` limit and no more often
-than `--tenant-schedule-min-interval-secs` (default 300) allows; every tick
+than `--tenant-schedule-min-interval-secs` (default and minimum 300) allows; every tick
 is admitted against the tenant's run limits like any other run.
 
 ## Tenant-scoped principals

@@ -257,8 +257,11 @@ pub struct ServeConfig {
     pub grafana_url: Option<String>,
 }
 
+/// The shortest gap between any schedule's ticks: no schedule ticks more
+/// often than every 5 minutes.
+pub const MIN_SCHEDULE_INTERVAL: Duration = Duration::from_secs(300);
 /// The default shortest gap between a tenant-owned schedule's ticks.
-pub const DEFAULT_TENANT_SCHEDULE_MIN_INTERVAL: Duration = Duration::from_secs(300);
+pub const DEFAULT_TENANT_SCHEDULE_MIN_INTERVAL: Duration = MIN_SCHEDULE_INTERVAL;
 
 /// Schedule settings (#1044): `--schedules` and
 /// `--tenant-schedule-min-interval-secs`.
@@ -462,6 +465,18 @@ impl ServeConfig {
             );
         }
 
+        if args.schedules.tenant_schedule_min_interval_secs
+            < crate::serve::config::MIN_SCHEDULE_INTERVAL.as_secs()
+        {
+            return Err(CliError::Serve(format!(
+                "--tenant-schedule-min-interval-secs must be at least {} (no schedule ticks more \
+                 often than every 5 minutes; the flag can only raise that floor for tenants)",
+                MIN_SCHEDULE_INTERVAL.as_secs()
+            )));
+        }
+        // A cluster's replicas must share one history; the default is a file
+        // private to each replica's data directory.
+        let explicit_history = args.history.is_some();
         let history = match args.history {
             None => HistoryBackendSpec::Sqlite(default_history_url(&default_data_dir())),
             Some(u) if u == "memory" => HistoryBackendSpec::Memory,
@@ -516,6 +531,14 @@ impl ServeConfig {
             ));
         }
         let cluster = if args.cluster {
+            if !explicit_history {
+                return Err(CliError::Serve(
+                    "--cluster requires an explicit --history shared by every replica \
+                     (postgres://…; sqlite:<path> only when every replica runs on one host): the \
+                     default history is a file private to each replica's data directory"
+                        .into(),
+                ));
+            }
             if matches!(history, HistoryBackendSpec::Memory) {
                 return Err(CliError::Serve(
                     "--cluster requires a persistent --history backend \
@@ -1176,9 +1199,26 @@ mod tests {
     fn cluster_requires_persistent_history() {
         let mut a = base_args();
         a.no_auth = true;
-        a.cluster = true; // history defaults to memory
-        let err = ServeConfig::from_args(a).unwrap_err();
+        a.cluster = true;
+        a.history = Some("memory".into());
+        let err = ServeConfig::from_args(a.clone()).unwrap_err();
         assert!(err.to_string().contains("--cluster requires"), "{err}");
+        // The default history is a file private to each replica: refused too.
+        a.history = None;
+        let err = ServeConfig::from_args(a).unwrap_err().to_string();
+        assert!(err.contains("explicit --history shared by every replica"), "{err}");
+    }
+
+    #[test]
+    fn the_tenant_schedule_floor_can_only_rise_above_five_minutes() {
+        let mut a = base_args();
+        a.no_auth = true;
+        a.schedules.tenant_schedule_min_interval_secs = 60;
+        let err = ServeConfig::from_args(a.clone()).unwrap_err().to_string();
+        assert!(err.contains("at least 300"), "{err}");
+        a.schedules.tenant_schedule_min_interval_secs = 900;
+        let cfg = ServeConfig::from_args(a).unwrap();
+        assert_eq!(cfg.schedules.tenant_min_interval, Duration::from_secs(900));
     }
 
     #[test]

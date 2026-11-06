@@ -283,6 +283,20 @@ pub struct RunRecord {
     /// (#1043): a claim, shard or resume enforces these, not a newer one.
     #[serde(default, skip_serializing_if = "policies::PolicyPin::is_empty")]
     pub policy_pin: policies::PolicyPin,
+    /// The submitted config of a single-server run (a cluster run keeps it in
+    /// `config_body`), kept so a policy change's impact can check the runs
+    /// it would have refused (#1051). Sealed with the vault key when the
+    /// server has one; never re-run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_probe: Option<PolicyProbe>,
+}
+
+/// A run's config as the policy impact reads it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PolicyProbe {
+    pub body: String,
+    #[serde(default)]
+    pub format: crate::serve::load::ConfigFormat,
 }
 
 impl RunRecord {
@@ -326,6 +340,7 @@ impl RunRecord {
             submitted_by: None,
             dlq_location: None,
             policy_pin: Default::default(),
+            policy_probe: None,
         }
     }
 
@@ -3165,6 +3180,7 @@ mod tests {
                 ..Default::default()
             }),
             usage: None,
+            policy_denial: None,
         };
         assert_eq!(InvocationRecord::from(&o).duration_ms, 1_910_000);
         // A record serialized before `duration_ms` existed must still deserialize

@@ -1468,11 +1468,13 @@ pub(crate) mod replay {
 // ── trigger_template ─────────────────────────────────────────────────────────
 
 #[cfg(feature = "templates")]
-pub use templates::{TriggerOutcome, screen_template_inputs, trigger_template};
+pub use templates::{
+    TriggerOutcome, screen_template_inputs, screen_template_params, trigger_template,
+};
 
 #[cfg(feature = "templates")]
 mod templates {
-    use super::{Approval, Origin, Principal};
+    use super::{Approval, Origin, Principal, Submission, load};
     use crate::params::SuppliedParams;
     use crate::serve::error::ServeError;
     use crate::serve::handlers::templates::{
@@ -1577,6 +1579,60 @@ mod templates {
             screen_inline_overlay(state, &actor, id, tenant.as_deref(), doc).await?;
         }
         Ok(())
+    }
+
+    /// Check that `principal` may supply `body`'s params to template `id`
+    /// (#1051): materialize it as a run would and load it under the caller
+    /// reference policy, without running anything. Only a refusal (403) is
+    /// returned; anything else (a tenant connection set up later, a missing
+    /// input) is left for the run to report.
+    pub async fn screen_template_params(
+        state: &ServerState,
+        principal: &Principal,
+        id: &str,
+        mut body: TriggerBody,
+    ) -> Result<(), ServeError> {
+        let supplied: SuppliedParams = std::mem::take(&mut body.params).into_iter().collect();
+        let s = state.history();
+        let Ok(want) =
+            crate::templates::resolve_version(&s, id, body.version.unwrap_or_default()).await
+        else {
+            return Ok(());
+        };
+        let sink = crate::templates::SinkChoice {
+            id: body.sink.clone(),
+            version: body.sink_version.unwrap_or_default(),
+            overlay: body.overlay_choice(),
+            allow_untested: body.allow_untested,
+        };
+        let Ok(materialized) = crate::templates::materialize_for_run_selected(
+            &s,
+            id,
+            want,
+            &sink,
+            &supplied,
+            &body.env,
+            crate::templates::Materialize::Persisted,
+            body.selection.as_ref(),
+            body.depends_on.as_ref(),
+        )
+        .await
+        else {
+            return Ok(());
+        };
+        let run_as = Principal::new(principal.actor(), Origin::Trusted)
+            .on_behalf_of(principal.tenant().map(str::to_string));
+        match load(
+            state,
+            &run_as,
+            Submission::new(&materialized.body, crate::serve::load::ConfigFormat::Json)
+                .with_caller_fields(&materialized.caller_fields),
+        )
+        .await
+        {
+            Err(e @ ServeError::Forbidden(_)) => Err(e),
+            _ => Ok(()),
+        }
     }
 
     /// Run a registered template (#444): resolve the version, materialize it
@@ -1783,9 +1839,10 @@ mod templates {
             trusted_config: true,
             server_file: false,
             sealed_params,
-            // A trigger declared in the server's triggers file passes the
-            // operator's params, not a caller's.
-            caller_fields: if body.standing_approval {
+            // A trigger or schedule declared in the server's own file passes
+            // the operator's params; any other (a schedule made through the
+            // API, even with a standing approval) passes a caller's (#1051).
+            caller_fields: if body.operator_params {
                 Default::default()
             } else {
                 materialized.caller_fields.clone()

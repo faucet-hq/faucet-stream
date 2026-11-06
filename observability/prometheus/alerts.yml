@@ -327,10 +327,24 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "schedule {{ $labels.schedule }} cannot start its tick"
+          summary: "schedule {{ $labels.schedule }} has not started its runs for 15 minutes"
           description: >-
-            The last tick has been retrying for 15 minutes (a full run queue,
-            an unavailable run history or a draining server).
+            The schedule's latest tick either was refused (a template or param
+            the server rejects, a missing approval, a tenant at a limit — it
+            moves on to the next tick) or keeps retrying (a full run queue, an
+            unavailable run history, a draining server), or its definition is
+            invalid. Open the schedule in the console for the reason.
+
+      - alert: FaucetServeScheduleRunnerRestarted
+        expr: increase(faucet_serve_schedule_runner_restarts_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "the schedule runner restarted after a panic"
+          description: >-
+            The loop that ticks schedules panicked and was restarted; ticks due
+            during the restart run on catch-up. Look for the panic in the
+            server log and report it.
 
       - alert: FaucetServeConnectionsNeedReauth
         expr: max(faucet_serve_connections{status="needs_reauth"}) > 0

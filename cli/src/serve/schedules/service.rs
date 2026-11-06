@@ -27,6 +27,7 @@ use crate::serve::history::{ListFilter, RunStatus, labels::LabelFilter};
 use crate::serve::rbac::{AuthContext, Permission};
 use crate::serve::state::ServerState;
 use chrono::{DateTime, Utc};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -247,7 +248,58 @@ fn skipped_while_paused(r: &ScheduleRecord, now: DateTime<Utc>) -> Option<u64> {
     )
 }
 
+/// The tenant `actor` sees a fan-out schedule for, when it does not own it.
+fn outsider<'a>(actor: &'a AuthContext, f: &Found) -> Option<&'a str> {
+    actor
+        .tenant
+        .as_deref()
+        .filter(|t| f.owner.as_deref() != Some(*t))
+}
+
+/// `st` as tenant `t` may see it: only the errors and skip reasons of its own
+/// target (each is prefixed `t: `), never another tenant's (#1051).
+fn status_for(st: &ScheduleStatus, t: &str) -> ScheduleStatus {
+    let prefix = format!("{t}: ");
+    let mine = |e: &str| e.starts_with(&prefix);
+    let mut out = st.clone();
+    out.last_error = st.last_error.as_deref().and_then(|e| {
+        let kept: Vec<&str> = e.split("; ").filter(|p| mine(p)).collect();
+        (!kept.is_empty()).then(|| kept.join("; "))
+    });
+    out.failures = st
+        .failures
+        .iter()
+        .filter_map(|f| {
+            let errors: Vec<String> = f.errors.iter().filter(|e| mine(e)).cloned().collect();
+            (!errors.is_empty()).then(|| FailedTick {
+                errors,
+                ..f.clone()
+            })
+        })
+        .collect();
+    out.skipped = st
+        .skipped
+        .iter()
+        .filter_map(|s| {
+            let kept: Vec<&str> = s.reason.split("; ").filter(|p| mine(p)).collect();
+            (!kept.is_empty()).then(|| SkippedTick {
+                tick: s.tick,
+                reason: kept.join("; "),
+            })
+        })
+        .collect();
+    out
+}
+
 fn view(actor: &AuthContext, f: &Found, st: &ScheduleStatus, now: DateTime<Utc>) -> ScheduleView {
+    let scoped;
+    let st = match outsider(actor, f) {
+        Some(t) => {
+            scoped = status_for(st, t);
+            &scoped
+        }
+        None => st,
+    };
     let compiled = validate::compile(&f.spec.cron, &f.spec.timezone).ok();
     let next_tick = if f.spec.paused {
         None
@@ -287,10 +339,7 @@ fn view(actor: &AuthContext, f: &Found, st: &ScheduleStatus, now: DateTime<Utc>)
     let mut shown = secrets::masked(&f.spec);
     // A tenant sees an operator's fan-out as running for itself only: never
     // the other tenants, nor the operator's params.
-    let outsider = actor
-        .tenant
-        .as_deref()
-        .filter(|t| f.owner.as_deref() != Some(*t));
+    let outsider = outsider(actor, f);
     let tenants = match outsider {
         Some(t) if f.spec.tenants.is_some() => Some(TenantSelector::Named(vec![t.to_string()])),
         _ => f.spec.tenants.clone(),
@@ -359,6 +408,9 @@ pub struct ListResponse {
     pub schedules: Vec<ScheduleView>,
 }
 
+/// Status reads `list` keeps in flight.
+const STATUS_READS: usize = 16;
+
 pub async fn list(
     state: &ServerState,
     actor: &AuthContext,
@@ -370,15 +422,27 @@ pub async fn list(
     let mut owned = 0;
     let found = all(state).await?;
     let total = (actor.tenant.is_none() && scope.is_some()).then_some(found.len());
-    for f in found {
-        if !visible(&f, scope.as_deref()) {
-            continue;
-        }
-        if scope.is_some() && f.owner == scope {
-            owned += 1;
-        }
-        let st = status::read(&*state.history(), &f.spec.name).await;
-        out.push(view(actor, &f, &st, now));
+    let shown: Vec<Found> = found
+        .into_iter()
+        .filter(|f| visible(f, scope.as_deref()))
+        .collect();
+    owned += shown
+        .iter()
+        .filter(|f| scope.is_some() && f.owner == scope)
+        .count();
+    // One status read per schedule, several at a time (#1051).
+    let history = state.history();
+    let names: Vec<String> = shown.iter().map(|f| f.spec.name.clone()).collect();
+    let statuses: Vec<ScheduleStatus> = futures::stream::iter(names)
+        .map(|name| {
+            let history = history.clone();
+            async move { status::read(&*history, &name).await }
+        })
+        .buffered(STATUS_READS)
+        .collect()
+        .await;
+    for (f, st) in shown.iter().zip(&statuses) {
+        out.push(view(actor, f, st, now));
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     let max_schedules = match &scope {
@@ -585,7 +649,12 @@ pub async fn get(
         .ok_or(ServeError::NotFound)?;
     let now = Utc::now();
     let history = state.history();
-    let st = status::read(&*history, name).await;
+    let raw = status::read(&*history, name).await;
+    // A tenant viewing an operator's fan-out sees only its own target.
+    let st = match outsider(actor, &f) {
+        Some(t) => status_for(&raw, t),
+        None => raw.clone(),
+    };
     let filter = ListFilter {
         tenant: scope.clone(),
         labels: vec![LabelFilter {
@@ -622,18 +691,19 @@ pub async fn get(
     };
     let (resolved_version, template_kind) = resolved_target(state, &f.spec).await;
     Ok(Detail {
-        schedule: view(actor, &f, &st, now),
+        schedule: view(actor, &f, &raw, now),
         next_ticks,
         recent_ticks: ticks(runs, &labels, &st, scope.as_deref()),
         runs_total,
         missed: st.missed.clone(),
         failures: st.failures.clone(),
         skipped: st.skipped.clone(),
-        changes: f
-            .record
-            .as_ref()
-            .map(|r| r.changes.iter().rev().cloned().collect())
-            .unwrap_or_default(),
+        // The change log names the operator's edits and params: not for a
+        // tenant looking at a fan-out it does not own.
+        changes: match (outsider(actor, &f), f.record.as_ref()) {
+            (None, Some(r)) => r.changes.iter().rev().cloned().collect(),
+            _ => Vec::new(),
+        },
         applies_to: if actor.tenant.is_some() {
             None
         } else {
@@ -693,7 +763,8 @@ async fn check_spec(
             ));
         }
         let min = state.schedules().tenant_min_interval();
-        validate::check_min_interval(spec, &compiled, min, t, Utc::now()).map_err(unprocessable)?;
+        validate::check_min_interval(spec, &compiled, min, Some(t), Utc::now())
+            .map_err(unprocessable)?;
         let limit = state
             .history()
             .tenant_get(t)
@@ -760,6 +831,25 @@ async fn check_spec(
                 .filter(|(_, p)| p.is_secret())
                 .map(|(k, _)| k.clone()),
         );
+    }
+    // The params are the creator's: refuse ones a caller may not supply
+    // (a server file, an internal URL) now, not at the first tick (#1051).
+    let now = Utc::now();
+    if let Ok(body) = fire::body(spec, now, now, &fire::FireOptions::default(), owner) {
+        let principal = crate::runtime::Principal::new(
+            AuthContext {
+                tenant: owner.map(str::to_string),
+                ..actor.clone()
+            },
+            crate::runtime::Origin::Trusted,
+        );
+        crate::runtime::server::screen_template_params(
+            state,
+            &principal,
+            &spec.template.id,
+            body,
+        )
+        .await?;
     }
     Ok(secret)
 }
@@ -893,10 +983,14 @@ pub async fn plan(
 
 /// Apply a change as `actor` (already planned / approved, or ungated).
 /// Returns the schedule's view after the change (`None` for a delete).
+///
+/// `approved` is true when an approved change request applies it: such a
+/// schedule's runs need no further approval under `--require-approval run`.
 pub async fn apply(
     state: &ServerState,
     actor: &AuthContext,
     p: ChangePayload,
+    approved: bool,
 ) -> Result<Option<ScheduleView>, ServeError> {
     let planned = plan_inner(state, actor, &p).await?;
     let history = state.history();
@@ -905,7 +999,8 @@ pub async fn apply(
     let out = match p.action {
         ChangeAction::Create => {
             let spec = planned.spec.expect("planned");
-            let record = ScheduleRecord::new(spec, actor.tenant.clone(), by, now);
+            let mut record = ScheduleRecord::new(spec, actor.tenant.clone(), by, now);
+            record.approved = approved;
             if !history.schedule_insert(&record).await.map_err(store_err)? {
                 return Err(ServeError::Conflict(format!(
                     "schedule '{}' already exists",
@@ -931,6 +1026,7 @@ pub async fn apply(
                         paused: r.spec.paused,
                         ..spec.clone()
                     };
+                    r.approved = approved;
                     Vec::new()
                 })
                 .await?,
@@ -999,6 +1095,7 @@ async fn revise(
         next.paused_at = edited.paused_at;
         next.paused_by = edited.paused_by;
         next.pause_reason = edited.pause_reason;
+        next.approved = edited.approved;
         if history
             .schedule_replace(&current, &next)
             .await
@@ -1029,7 +1126,11 @@ pub async fn change(
     p: ChangePayload,
     reason: Option<String>,
 ) -> Result<Changed, ServeError> {
-    if state.requires_approval(ChangeKind::Schedule) {
+    // Under `--require-approval run` a schedule starts runs with standing
+    // approval, so creating or editing one needs an approved change (#1051).
+    let gated = state.requires_approval(ChangeKind::Schedule)
+        || (state.requires_approval(ChangeKind::Run) && p.action != ChangeAction::Delete);
+    if gated {
         let payload = serde_json::to_value(&p).map_err(|e| ServeError::Internal(e.to_string()))?;
         let change = crate::serve::changes::create(
             state,
@@ -1046,7 +1147,7 @@ pub async fn change(
         .await?;
         return Ok(Changed::Pending(Box::new(change)));
     }
-    apply(state, actor, p)
+    apply(state, actor, p, false)
         .await
         .map(|v| Changed::Applied(v.map(Box::new)))
 }
@@ -1064,6 +1165,16 @@ pub async fn set_paused(
         .filter(|f| visible(f, actor.tenant.as_deref()))
         .ok_or(ServeError::NotFound)?;
     check_edit(actor, &f)?;
+    if !paused
+        && state.requires_approval(ChangeKind::Run)
+        && !f.record.as_ref().is_some_and(|r| r.approved)
+    {
+        return Err(ServeError::Conflict(format!(
+            "this server requires approval for runs (--require-approval run) and schedule '{name}' \
+             was not approved: propose an update to it with POST /v1/changes (kind `schedule`) \
+             and resume it once approved"
+        )));
+    }
     let reason = reason
         .map(|r| r.trim().to_string())
         .filter(|r| !r.is_empty());
@@ -1159,6 +1270,8 @@ pub async fn run_now(
     let now = Utc::now();
     let opts = fire::FireOptions {
         manual: Some(uuid::Uuid::new_v4().to_string()),
+        from_file: f.source == Source::File,
+        approved: f.record.as_ref().is_some_and(|r| r.approved),
     };
     let mut spec = f.spec.clone();
     spec.run
@@ -1317,6 +1430,39 @@ mod tests {
         assert!(visible(&mine, Some("acme")) && visible(&shared, Some("acme")));
         assert!(!visible(&theirs, Some("acme")) && !visible(&server, Some("acme")));
         assert!(visible(&theirs, None));
+    }
+
+    #[test]
+    fn a_tenant_sees_only_its_own_target_in_a_fan_outs_status() {
+        let t = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        let st = ScheduleStatus {
+            last_error: Some("acme: refused; globex: over its limit".into()),
+            failures: vec![
+                FailedTick {
+                    tick: t("2026-01-01T02:00:00Z"),
+                    at: t("2026-01-01T02:00:01Z"),
+                    errors: vec!["acme: refused".into(), "globex: over its limit".into()],
+                },
+                FailedTick {
+                    tick: t("2026-01-02T02:00:00Z"),
+                    at: t("2026-01-02T02:00:01Z"),
+                    errors: vec!["globex: over its limit".into()],
+                },
+            ],
+            skipped: vec![SkippedTick {
+                tick: t("2026-01-03T02:00:00Z"),
+                reason: "globex: still going".into(),
+            }],
+            ..Default::default()
+        };
+        let mine = status_for(&st, "acme");
+        assert_eq!(mine.last_error.as_deref(), Some("acme: refused"));
+        assert_eq!(mine.failures.len(), 1);
+        assert_eq!(mine.failures[0].errors, vec!["acme: refused".to_string()]);
+        assert!(mine.skipped.is_empty());
+        let none = status_for(&st, "initech");
+        assert_eq!(none.last_error, None);
+        assert!(none.failures.is_empty());
     }
 
     #[test]

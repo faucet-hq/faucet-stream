@@ -77,6 +77,7 @@ fn record(id: &str, status: RunStatus, rows: u64, elapsed: Option<f64>) -> RunRe
         submitted_by: None,
         dlq_location: None,
         policy_pin: Default::default(),
+        policy_probe: None,
     }
 }
 

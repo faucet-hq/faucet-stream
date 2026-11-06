@@ -392,6 +392,21 @@ async fn server_managed_policy_is_changed_only_through_a_second_admins_approval(
     let run_id = ok["run_id"].as_str().unwrap();
     let (_, rec) = api.get("alice-tok", &format!("/v1/runs/{run_id}")).await;
     assert_eq!(rec["policy_pin"]["server"], 1, "{rec}");
+    // The config it keeps for impact is never shown…
+    assert!(rec.get("policy_probe").is_none(), "{rec}");
+    // …but a single server's runs count in a draft's impact (#1051 #9): the
+    // eu run would be refused by a uk-only draft.
+    let (_, preview) = api
+        .post(
+            "alice-tok",
+            "/v1/policy/preview",
+            json!({ "policy": POLICY_V1.replace("[eu]", "[uk]") }),
+        )
+        .await;
+    assert!(
+        preview["impact"]["runs_checked"].as_u64().unwrap_or(0) >= 1,
+        "{preview}"
+    );
 
     // The dry run reports the violation without running anything.
     let (s, report) = api

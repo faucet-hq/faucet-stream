@@ -311,3 +311,43 @@ fn an_unusable_data_directory_refuses_to_start() {
         "{err}"
     );
 }
+
+/// #1051: no schedule ticks more often than every 5 minutes, and a
+/// seconds field is refused — over the API and in a `--schedules` file.
+#[tokio::test(flavor = "multi_thread")]
+async fn schedules_tick_at_most_every_five_minutes() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let port = free_port();
+    let server = start(serve(port, dir.path(), Some(&data), &[]), port).await;
+    let api = Api::new(port);
+    for (cron, says) in [
+        ("*/2 * * * *", "at most every 5 minutes"),
+        ("*/30 * * * * *", "seconds field"),
+    ] {
+        let (code, body) = api
+            .post(
+                "alice-tok",
+                "/v1/schedules",
+                json!({"name": "fast", "cron": cron, "template": {"id": "t"}}),
+            )
+            .await;
+        assert_eq!(code, 422, "{cron}: {body}");
+        assert!(body.to_string().contains(says), "{cron}: {body}");
+    }
+    stop(server);
+
+    let file = dir.path().join("schedules.yaml");
+    std::fs::write(
+        &file,
+        "version: 1\nschedules:\n  - name: fast\n    cron: \"* * * * *\"\n    template: { id: t }\n",
+    )
+    .unwrap();
+    let err = refused(serve(
+        free_port(),
+        dir.path(),
+        Some(&dir.path().join("data2")),
+        &["--schedules", file.to_str().unwrap()],
+    ));
+    assert!(err.contains("at most every 5 minutes"), "{err}");
+}

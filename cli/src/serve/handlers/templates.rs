@@ -1394,6 +1394,12 @@ pub struct TriggerBody {
     /// so the fire runs without a change request.
     #[serde(skip)]
     pub standing_approval: bool,
+    /// Set (never from the wire) when the params are the operator's own: a
+    /// `--triggers` or `--schedules` file entry. Otherwise the param values
+    /// are a caller's and are held to the caller reference policy (#989),
+    /// even when the run itself carries a standing approval (#1051).
+    #[serde(skip)]
+    pub operator_params: bool,
 }
 
 /// A trigger's `overlay`: a registered deployment id, or an inline document.
@@ -2292,6 +2298,7 @@ tests:
             TriggerBody {
                 params: [("tag".to_string(), json!("gamma"))].into(),
                 standing_approval: true,
+                operator_params: true,
                 ..Default::default()
             },
         )

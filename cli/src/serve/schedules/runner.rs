@@ -39,12 +39,21 @@ const MAX_SCAN: u64 = 100_000;
 const MAX_BACKOFF_SECS: u64 = 60;
 /// How often a tick held by `overlap: queue` looks for the earlier run's end.
 pub const WAIT_POLL: Duration = Duration::from_secs(5);
+/// Schedules whose due ticks fire at the same time; a slow one (a large
+/// fan-out) no longer holds up the rest.
+pub const CONCURRENT_TICKS: usize = 16;
+
+/// A schedule the loop should tick: its definition, owning tenant, where it
+/// is defined, and whether an approved change request made it (#1051).
+pub type Wanted = (ScheduleSpec, Option<String>, Source, bool);
 
 /// One schedule as the loop tracks it.
 pub struct Entry {
     pub spec: ScheduleSpec,
     pub owner: Option<String>,
     pub source: Source,
+    /// Created or last changed through an approved change request.
+    pub approved: bool,
     fingerprint: String,
     schedule: CompiledSchedule,
     next: Option<DateTime<Utc>>,
@@ -54,8 +63,8 @@ pub struct Entry {
 }
 
 /// What identifies a definition: a change rebuilds the entry.
-fn fingerprint(spec: &ScheduleSpec, owner: Option<&str>) -> String {
-    serde_json::json!({ "spec": spec, "owner": owner }).to_string()
+fn fingerprint(spec: &ScheduleSpec, owner: Option<&str>, approved: bool) -> String {
+    serde_json::json!({ "spec": spec, "owner": owner, "approved": approved }).to_string()
 }
 
 impl Entry {
@@ -70,10 +79,11 @@ impl Entry {
     ) -> Self {
         let next = schedule.next_after(now);
         Self {
-            fingerprint: fingerprint(&spec, owner.as_deref()),
+            fingerprint: fingerprint(&spec, owner.as_deref(), false),
             spec,
             owner,
             source,
+            approved: false,
             schedule,
             next,
             resumed: false,
@@ -228,15 +238,11 @@ pub struct Scheduler {
 impl Scheduler {
     /// Bring the set in line with `wanted` (name → definition): new and
     /// changed definitions get a fresh entry, removed ones are dropped.
-    pub fn reconcile(
-        &mut self,
-        wanted: Vec<(ScheduleSpec, Option<String>, Source)>,
-        now: DateTime<Utc>,
-    ) {
+    pub fn reconcile(&mut self, wanted: Vec<Wanted>, now: DateTime<Utc>) {
         let mut keep = std::collections::BTreeSet::new();
-        for (spec, owner, source) in wanted {
+        for (spec, owner, source, approved) in wanted {
             keep.insert(spec.name.clone());
-            let fp = fingerprint(&spec, owner.as_deref());
+            let fp = fingerprint(&spec, owner.as_deref(), approved);
             if self
                 .entries
                 .get(&spec.name)
@@ -247,10 +253,10 @@ impl Scheduler {
             match super::validate::validate(&spec) {
                 Ok(compiled) => {
                     metrics::preinit(&spec.name);
-                    self.entries.insert(
-                        spec.name.clone(),
-                        Entry::new(spec, owner, source, compiled, now),
-                    );
+                    let mut entry = Entry::new(spec, owner, source, compiled, now);
+                    entry.approved = approved;
+                    entry.fingerprint = fp;
+                    self.entries.insert(entry.spec.name.clone(), entry);
                 }
                 Err(e) => {
                     // The API validates before storing; this is a record a newer
@@ -261,7 +267,14 @@ impl Scheduler {
                 }
             }
         }
-        self.entries.retain(|name, _| keep.contains(name));
+        self.entries.retain(|name, _| {
+            let kept = keep.contains(name);
+            if !kept {
+                // Deleted: its health series must not keep an alert firing.
+                metrics::forget(name);
+            }
+            kept
+        });
     }
 
     /// Schedules that tick (not paused).
@@ -272,15 +285,13 @@ impl Scheduler {
 
 /// Every schedule this server should tick: the file's, then the stored ones.
 /// A stored schedule never shadows a file one (the API refuses the name).
-pub async fn wanted(
-    state: &ServerState,
-) -> Result<Vec<(ScheduleSpec, Option<String>, Source)>, String> {
+pub async fn wanted(state: &ServerState) -> Result<Vec<Wanted>, String> {
     let rt = state.schedules();
-    let mut out: Vec<(ScheduleSpec, Option<String>, Source)> = rt
+    let mut out: Vec<Wanted> = rt
         .file()
         .iter()
         .cloned()
-        .map(|s| (s, None, Source::File))
+        .map(|s| (s, None, Source::File, true))
         .collect();
     let stored = state
         .history()
@@ -288,10 +299,10 @@ pub async fn wanted(
         .await
         .map_err(|e| e.to_string())?;
     for r in stored {
-        if out.iter().any(|(s, _, _)| s.name == r.spec.name) {
+        if out.iter().any(|(s, _, _, _)| s.name == r.spec.name) {
             continue;
         }
-        out.push((r.spec, r.tenant, Source::Console));
+        out.push((r.spec, r.tenant, Source::Console, r.approved));
     }
     Ok(out)
 }
@@ -323,15 +334,12 @@ pub async fn step(state: &ServerState, entry: &mut Entry, now: DateTime<Utc>) {
     let Some(tick) = entry.due(now) else {
         return;
     };
-    let result = fire::fire_tick(
-        state,
-        &entry.spec,
-        entry.owner.as_deref(),
-        tick,
-        now,
-        &fire::FireOptions::default(),
-    )
-    .await;
+    let opts = fire::FireOptions {
+        manual: None,
+        from_file: entry.source == Source::File,
+        approved: entry.approved,
+    };
+    let result = fire::fire_tick(state, &entry.spec, entry.owner.as_deref(), tick, now, &opts).await;
     let outcome = result.outcome();
     let name = entry.spec.name.clone();
     match &outcome {
@@ -396,12 +404,15 @@ pub async fn run(state: ServerState, shutdown: CancellationToken) {
             metrics::active(scheduler.active());
             reload_at = now + chrono::Duration::from_std(RELOAD_INTERVAL).unwrap_or_default();
         }
-        for entry in scheduler.entries.values_mut().filter(|e| !e.spec.paused) {
-            if shutdown.is_cancelled() {
-                return;
-            }
-            step(&state, entry, Utc::now()).await;
+        if shutdown.is_cancelled() {
+            return;
         }
+        // Due ticks fire side by side (bounded), so one slow schedule does
+        // not hold up the others.
+        use futures::StreamExt;
+        futures::stream::iter(scheduler.entries.values_mut().filter(|e| !e.spec.paused))
+            .for_each_concurrent(CONCURRENT_TICKS, |entry| step(&state, entry, Utc::now()))
+            .await;
         // Sleep to the next check; a local change reloads at once.
         tokio::select! {
             _ = shutdown.cancelled() => return,
@@ -503,16 +514,23 @@ mod tests {
         assert!(!range.caught_up);
     }
 
+    /// An entry over any cron, past the 5-minute rule (the scan bounds).
+    fn dense(cron: &str, now: DateTime<Utc>) -> Entry {
+        let s = spec(cron, true);
+        let compiled = super::super::validate::compile(cron, "UTC").unwrap();
+        Entry::new(s, None, Source::File, compiled, now)
+    }
+
     #[test]
     fn a_dense_schedule_over_a_long_outage_finds_the_latest_tick() {
-        let e = entry("* * * * * *", at("2026-09-26T00:00:00Z"));
+        let e = dense("* * * * * *", at("2026-09-26T00:00:00Z"));
         let now = at("2026-09-28T00:00:00Z");
         let (latest, missed) = e.latest_due(at("2026-09-26T00:00:00Z"), now);
         assert_eq!(latest, Some(at("2026-09-28T00:00:00Z")));
         assert_eq!(missed, MAX_SCAN);
         let yearly = entry("0 0 29 2 *", at("2026-09-26T00:00:00Z"));
         assert!(yearly.latest_before(at("2026-09-26T00:00:00Z")).is_some());
-        let mut big = entry("* * * * * *", at("2026-09-26T00:00:00Z"));
+        let mut big = dense("* * * * * *", at("2026-09-26T00:00:00Z"));
         let r = big.settle_missed(at("2026-09-26T00:00:00Z"), now, MAX_SCAN, now, "while down");
         assert_eq!(r.count, MAX_SCAN);
     }
@@ -562,34 +580,48 @@ mod tests {
         b.name = "b".into();
         s.reconcile(
             vec![
-                (a.clone(), None, Source::File),
-                (b.clone(), Some("acme".into()), Source::Console),
+                (a.clone(), None, Source::File, true),
+                (b.clone(), Some("acme".into()), Source::Console, false),
             ],
             now,
         );
         assert_eq!(s.entries.len(), 2);
         assert_eq!(s.active(), 2);
+        assert!(s.entries["nightly"].approved && !s.entries["b"].approved);
         // Unchanged: the entry (and its progress) is kept.
         s.entries.get_mut("nightly").unwrap().resumed = true;
         s.reconcile(
             vec![
-                (a.clone(), None, Source::File),
-                (b.clone(), Some("acme".into()), Source::Console),
+                (a.clone(), None, Source::File, true),
+                (b.clone(), Some("acme".into()), Source::Console, false),
             ],
             now,
         );
         assert!(s.entries["nightly"].resumed);
-        // Changed: rebuilt. Paused: kept but not active.
+        // An approval rebuilds the entry so its ticks carry it.
+        s.reconcile(
+            vec![
+                (a.clone(), None, Source::File, true),
+                (b.clone(), Some("acme".into()), Source::Console, true),
+            ],
+            now,
+        );
+        assert!(s.entries["b"].approved);
+        // Changed: rebuilt. Paused: kept but not active. `b` deleted.
         let mut paused = a.clone();
         paused.paused = true;
-        s.reconcile(vec![(paused, None, Source::File)], now);
+        s.reconcile(vec![(paused, None, Source::File, true)], now);
         assert!(!s.entries["nightly"].resumed);
         assert_eq!(s.entries.len(), 1);
         assert_eq!(s.active(), 0);
-        // Invalid: left out.
-        let mut bad = a;
+        // Invalid (or now too frequent): left out.
+        let mut bad = a.clone();
         bad.cron = "nope".into();
-        s.reconcile(vec![(bad, None, Source::File)], now);
+        s.reconcile(vec![(bad, None, Source::File, true)], now);
+        assert!(s.entries.is_empty());
+        let mut fast = a;
+        fast.cron = "* * * * *".into();
+        s.reconcile(vec![(fast, None, Source::File, true)], now);
         assert!(s.entries.is_empty());
     }
 
@@ -694,13 +726,14 @@ mod tests {
         let w = wanted(&state).await.unwrap();
         assert_eq!(w.len(), 1);
         assert_eq!(w[0].2, Source::File);
+        assert!(w[0].3, "a file schedule is the operator's standing approval");
     }
 
     #[tokio::test]
     async fn the_loop_stops_on_shutdown() {
         let state = crate::serve::test_support::test_state();
         state.set_schedules(super::super::SchedulesRuntime::new(
-            vec![spec("* * * * * *", true)],
+            vec![spec("*/5 * * * *", true)],
             Duration::from_secs(300),
         ));
         let shutdown = CancellationToken::new();

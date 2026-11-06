@@ -31,6 +31,20 @@ pub fn describe() {
         "faucet_serve_schedule_tenant_failures_total",
         "Fan-out ticks refused for one tenant while the others ran"
     );
+    describe_counter!(
+        "faucet_serve_schedule_runner_restarts_total",
+        "Times the schedule loop panicked and was restarted"
+    );
+}
+
+/// A deleted (or no longer valid) schedule: its health series stops saying
+/// unhealthy, so its alert clears.
+pub fn forget(schedule: &str) {
+    healthy(schedule, true);
+}
+
+pub fn runner_restarted() {
+    counter!("faucet_serve_schedule_runner_restarts_total").increment(1);
 }
 
 /// Pre-emit a schedule's series at zero so they exist from startup.
@@ -99,6 +113,7 @@ mod tests {
             tenant_failed("nightly", "acme");
             healthy("nightly", false);
             last_tick("nightly", 1_700_000_000);
+            runner_restarted();
         });
         let names: Vec<String> = snapshotter
             .snapshot()
@@ -113,8 +128,27 @@ mod tests {
             "faucet_serve_schedule_ticks_total",
             "faucet_serve_schedule_missed_ticks_total",
             "faucet_serve_schedule_tenant_failures_total",
+            "faucet_serve_schedule_runner_restarts_total",
         ] {
             assert!(names.iter().any(|n| n == want), "missing {want}: {names:?}");
         }
+    }
+
+    #[test]
+    fn a_forgotten_schedule_reads_healthy() {
+        use metrics_util::debugging::DebugValue;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        with_local_recorder(&recorder, || {
+            healthy("gone", false);
+            forget("gone");
+        });
+        let v = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find(|(k, _, _, _)| k.key().name() == "faucet_serve_schedule_healthy")
+            .map(|(_, _, _, v)| v);
+        assert_eq!(v, Some(DebugValue::Gauge(1.0.into())));
     }
 }

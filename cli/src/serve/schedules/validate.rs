@@ -13,6 +13,8 @@ pub const MAX_NAME_LEN: usize = 64;
 const GAP_SCAN: usize = 64;
 /// The `${schedule.*}` tokens a template param may use.
 pub const TOKENS: &[&str] = &["tick", "name", "fired_at"];
+/// The shortest gap allowed between any schedule's ticks.
+pub const MIN_INTERVAL: Duration = crate::serve::config::MIN_SCHEDULE_INTERVAL;
 
 /// Compile a cron + timezone the way `faucet schedule` does, so both
 /// runtimes accept exactly the same expressions.
@@ -132,10 +134,45 @@ fn check_template(t: &ScheduleTemplate) -> Result<(), String> {
     Ok(())
 }
 
+/// The floor in force: [`MIN_INTERVAL`]. Debug builds (the test suite) may
+/// lower it with `FAUCET_SCHEDULE_TEST_MIN_INTERVAL_SECS` so integration tests
+/// see ticks in seconds; release binaries never read it.
+pub fn min_interval() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(secs) = std::env::var(TEST_MIN_INTERVAL_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        return Duration::from_secs(secs);
+    }
+    MIN_INTERVAL
+}
+
+/// The debug-build override of [`min_interval`] (tests only).
+pub const TEST_MIN_INTERVAL_ENV: &str = "FAUCET_SCHEDULE_TEST_MIN_INTERVAL_SECS";
+
+/// Refuse a cron with a seconds field: schedules use five-field crons.
+pub fn check_no_seconds(cron: &str) -> Result<(), String> {
+    if min_interval() >= Duration::from_secs(60)
+        && !cron.trim_start().starts_with('@')
+        && cron.split_whitespace().count() > 5
+    {
+        return Err(format!(
+            "`{cron}` has a seconds field; schedules use five-field crons (minute hour day month \
+             weekday) and tick at most every {}",
+            human(MIN_INTERVAL)
+        ));
+    }
+    Ok(())
+}
+
 /// Validate a definition; returns its compiled cron. `Err` is user-facing.
+/// No schedule ticks more often than every [`MIN_INTERVAL`].
 pub fn validate(spec: &ScheduleSpec) -> Result<CompiledSchedule, String> {
     check_name(&spec.name)?;
+    check_no_seconds(&spec.cron)?;
     let compiled = compile(&spec.cron, &spec.timezone)?;
+    check_min_interval(spec, &compiled, min_interval(), None, Utc::now())?;
     check_template(&spec.template)?;
     if let Some(sel) = &spec.tenants {
         if !cfg!(feature = "tenants") {
@@ -159,19 +196,24 @@ pub fn validate(spec: &ScheduleSpec) -> Result<CompiledSchedule, String> {
     Ok(compiled)
 }
 
-/// Refuse a schedule that ticks more often than `min` (a tenant's guardrail).
+/// Refuse a schedule that ticks more often than `min`: every schedule's rule
+/// (`who` = `None`), or a tenant's guardrail.
 pub fn check_min_interval(
     spec: &ScheduleSpec,
     schedule: &CompiledSchedule,
     min: Duration,
-    who: &str,
+    who: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<(), String> {
     match shortest_gap(schedule, now) {
         Some(gap) if gap < min => Err(format!(
-            "`{}` ticks every {}; {who}'s schedules may tick at most every {}",
+            "`{}` ticks every {}; {} at most every {}",
             spec.cron,
             human(gap),
+            match who {
+                Some(t) => format!("{t}'s schedules may tick"),
+                None => "a schedule may tick".to_string(),
+            },
             human(min)
         )),
         _ => Ok(()),
@@ -245,6 +287,19 @@ mod tests {
         assert!(err(json!({"run": {"name": "${schedule.when}"}})).contains("run.name"));
         assert!(err(json!({"description": "d".repeat(1001)})).contains("1000"));
         assert!(err(json!({"tenants": []})).contains("tenant"));
+        assert!(
+            err(json!({"cron": "*/2 * * * *"}))
+                .contains("ticks every 2 minutes; a schedule may tick at most every 5 minutes")
+        );
+        assert!(err(json!({"cron": "0 */5 * * * *"})).contains("seconds field"));
+        assert!(err(json!({"cron": "* * * * * *"})).contains("seconds field"));
+    }
+
+    #[test]
+    fn five_minutes_and_aliases_are_allowed() {
+        assert!(validate(&spec(json!({"cron": "*/5 * * * *"}))).is_ok());
+        assert!(validate(&spec(json!({"cron": "@hourly"}))).is_ok());
+        assert!(check_no_seconds("@daily").is_ok());
     }
 
     #[test]
@@ -275,14 +330,16 @@ mod tests {
             Some(Duration::from_secs(120))
         );
         let s = spec(json!({"cron": "*/2 * * * *"}));
-        let e =
-            check_min_interval(&s, &every_two, Duration::from_secs(300), "acme", now).unwrap_err();
+        let e = check_min_interval(&s, &every_two, Duration::from_secs(300), Some("acme"), now)
+            .unwrap_err();
         assert!(
             e.contains("ticks every 2 minutes; acme's schedules may tick at most every 5 minutes"),
             "{e}"
         );
         let daily = compile("0 2 * * *", "UTC").unwrap();
-        assert!(check_min_interval(&s, &daily, Duration::from_secs(300), "acme", now).is_ok());
+        assert!(
+            check_min_interval(&s, &daily, Duration::from_secs(300), Some("acme"), now).is_ok()
+        );
     }
 
     #[test]

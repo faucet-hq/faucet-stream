@@ -849,7 +849,7 @@
     },
     {
       "type": "timeseries",
-      "title": "Missed ticks & tenant fan-out failures (per hour)",
+      "title": "Missed ticks, tenant fan-out failures & runner restarts (per hour)",
       "gridPos": {
         "x": 0,
         "y": 59,
@@ -878,6 +878,15 @@
             "uid": "${datasource}"
           },
           "legendFormat": "{{schedule}} {{tenant}} failed"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(increase(faucet_serve_schedule_runner_restarts_total[1h]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "runner restarts"
         }
       ],
       "fieldConfig": {

@@ -1088,6 +1088,7 @@ mod tests {
                 error_kind: (i < failures).then_some(InvocationErrorKind::Other),
                 metrics: None,
                 usage: None,
+                policy_denial: None,
             });
         }
         RunSummary { invocations }
@@ -1149,6 +1150,7 @@ mod tests {
             error_kind: kind,
             metrics: None,
             usage: None,
+            policy_denial: None,
         }]
     }
 
