@@ -59,7 +59,7 @@ pub fn dataset_like(id: &str) -> String {
 /// in `faucet_serve_schema`. A database stamped with a newer version is
 /// refused at startup instead of being written by code that does not know
 /// its columns.
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// The oldest binary schema version that can still read a database this
 /// binary writes, kept as the `min_readable` row of `faucet_serve_schema`.
@@ -83,6 +83,7 @@ pub const ADDED_COLUMNS: &[(u32, &str, &str)] = &[
     (7, "faucet_serve_runs", "pool"),
     (7, "faucet_serve_instance_caps", "pools"),
     (8, "faucet_serve_runs", "submitted_by"),
+    (9, "faucet_serve_instance_caps", "capabilities"),
 ];
 
 /// The columns of a `faucet_serve_log_ship` row, in [`decode_log_ship`] order.
@@ -1719,12 +1720,14 @@ impl Stmts {
                 last_heartbeat = excluded.last_heartbeat, listen = excluded.listen, \
                 max_concurrent = excluded.max_concurrent, in_flight = excluded.in_flight"
                 .into(),
-            heartbeat_caps: "INSERT INTO faucet_serve_instance_caps (instance_id, state_format, pools) \
-                VALUES ($1,$2,$3) ON CONFLICT (instance_id) DO UPDATE SET \
-                state_format = excluded.state_format, pools = excluded.pools"
+            heartbeat_caps: "INSERT INTO faucet_serve_instance_caps (instance_id, state_format, pools, capabilities) \
+                VALUES ($1,$2,$3,$4) ON CONFLICT (instance_id) DO UPDATE SET \
+                state_format = excluded.state_format, pools = excluded.pools, \
+                capabilities = excluded.capabilities"
                 .into(),
             live_instances: "SELECT i.instance_id, i.started_at, i.last_heartbeat, i.listen, \
-                i.max_concurrent, i.in_flight, c.state_format, c.pools FROM faucet_serve_instances i \
+                i.max_concurrent, i.in_flight, c.state_format, c.pools, c.capabilities \
+                FROM faucet_serve_instances i \
                 LEFT JOIN faucet_serve_instance_caps c ON c.instance_id = i.instance_id \
                 WHERE i.last_heartbeat >= $1"
                 .into(),
@@ -2359,12 +2362,14 @@ impl Stmts {
                 last_heartbeat = excluded.last_heartbeat, listen = excluded.listen, \
                 max_concurrent = excluded.max_concurrent, in_flight = excluded.in_flight"
                 .into(),
-            heartbeat_caps: "INSERT INTO faucet_serve_instance_caps (instance_id, state_format, pools) \
-                VALUES (?,?,?) ON CONFLICT (instance_id) DO UPDATE SET \
-                state_format = excluded.state_format, pools = excluded.pools"
+            heartbeat_caps: "INSERT INTO faucet_serve_instance_caps (instance_id, state_format, pools, capabilities) \
+                VALUES (?,?,?,?) ON CONFLICT (instance_id) DO UPDATE SET \
+                state_format = excluded.state_format, pools = excluded.pools, \
+                capabilities = excluded.capabilities"
                 .into(),
             live_instances: "SELECT i.instance_id, i.started_at, i.last_heartbeat, i.listen, \
-                i.max_concurrent, i.in_flight, c.state_format, c.pools FROM faucet_serve_instances i \
+                i.max_concurrent, i.in_flight, c.state_format, c.pools, c.capabilities \
+                FROM faucet_serve_instances i \
                 LEFT JOIN faucet_serve_instance_caps c ON c.instance_id = i.instance_id \
                 WHERE i.last_heartbeat >= ?"
                 .into(),
@@ -4404,6 +4409,7 @@ macro_rules! impl_sql_history {
                     .bind(&self.instance_id)
                     .bind(beat.state_format.to_string())
                     .bind($crate::serve::pools::encode(&beat.pools))
+                    .bind(beat.capabilities.join(","))
                     .execute(&self.pool)
                     .await
                     .map_err(backend)?;
@@ -4438,6 +4444,7 @@ macro_rules! impl_sql_history {
                     let inf: Option<String> = r.try_get("in_flight").map_err(backend)?;
                     let fmt: Option<String> = r.try_get("state_format").map_err(backend)?;
                     let pools: Option<String> = r.try_get("pools").map_err(backend)?;
+                    let caps: Option<String> = r.try_get("capabilities").map_err(backend)?;
                     out.push(InstanceRecord {
                         instance_id: r.try_get("instance_id").map_err(backend)?,
                         started_at: parse_dt(&started),
@@ -4447,6 +4454,12 @@ macro_rules! impl_sql_history {
                         in_flight: inf.and_then(|s| s.parse().ok()).unwrap_or(0),
                         state_format: fmt.and_then(|s| s.parse().ok()).unwrap_or(0),
                         pools: $crate::serve::pools::decode(pools.as_deref()),
+                        capabilities: caps.map(|c| {
+                            c.split(',')
+                                .filter(|x| !x.is_empty())
+                                .map(str::to_string)
+                                .collect()
+                        }),
                     });
                 }
                 Ok(out)
@@ -7926,6 +7939,7 @@ mod tests {
         let young = std::time::Duration::from_millis(1);
         let err = classify_backend_error(db("25006"));
         assert!(err.is_unreachable());
+        #[allow(clippy::disallowed_methods)] // the report time must be strictly after `young`
         std::thread::sleep(std::time::Duration::from_millis(5));
         assert!(
             opened_before_demotion(std::time::Duration::from_secs(3600)),

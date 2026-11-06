@@ -37,7 +37,7 @@ pub(crate) fn redact_record(rec: &mut RunRecord, actor: &AuthContext) {
         rec.config_body = None;
     }
     // Kept only for a policy change's impact (#1051); never shown.
-    rec.policy_probe = None;
+    rec.policy_projection = None;
 }
 
 /// Why a tenant-scoped principal may not submit a config of its own: loading

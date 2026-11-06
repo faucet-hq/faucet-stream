@@ -139,6 +139,8 @@ pub async fn submit_backfill(
     Extension(actor): Extension<AuthContext>,
     Json(req): Json<BackfillSubmitRequest>,
 ) -> Result<(StatusCode, Json<BackfillSubmitResponse>), ServeError> {
+    // Nothing is admitted while the history is unreachable (#1050).
+    crate::runtime::server::refuse_while_unavailable(&state)?;
     // A backfill is N runs; under `--require-approval run` each window is a
     // change request of its own, proposed through POST /v1/changes (#703).
     if state.requires_approval(crate::serve::changes::ChangeKind::Run) {

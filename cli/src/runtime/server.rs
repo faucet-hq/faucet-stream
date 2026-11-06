@@ -43,8 +43,9 @@ impl<'a> Submission<'a> {
     }
 
     /// Under the policy versions a stored run was admitted with (#1043).
-    pub fn pinned(mut self, pin: &'a crate::serve::history::policies::PolicyPin) -> Self {
-        self.policy_pin = Some(pin);
+    /// `None` = not recorded: the newest versions apply.
+    pub fn pinned(mut self, pin: Option<&'a crate::serve::history::policies::PolicyPin>) -> Self {
+        self.policy_pin = pin;
         self
     }
 
@@ -142,11 +143,16 @@ pub async fn load(
     // The server's policy, the tenant's on top, at the versions a stored run
     // was admitted with (#1043).
     #[cfg(feature = "policy")]
-    let (policy, policy_pin) =
-        crate::serve::policies::effective(state, principal.tenant(), sub.policy_pin).await?;
+    let (policy, policy_pin) = {
+        let (spec, pin) =
+            crate::serve::policies::effective(state, principal.tenant(), sub.policy_pin).await?;
+        (spec, Some(pin))
+    };
     #[cfg(not(feature = "policy"))]
-    let (policy, policy_pin): (Option<()>, crate::serve::history::policies::PolicyPin) =
-        (None, Default::default());
+    let (policy, policy_pin): (
+        Option<()>,
+        Option<crate::serve::history::policies::PolicyPin>,
+    ) = (None, None);
     let loaded = crate::serve::load::load_submission_inputs(
         sub.body,
         sub.format,
@@ -400,7 +406,7 @@ pub async fn reload(
         Submission::new(&body, rec.config_format.unwrap_or_default())
             .selected(rec.selection.as_ref())
             .with_caller_fields(&rec.caller_params)
-            .pinned(&rec.policy_pin),
+            .pinned(rec.policy_pin.as_ref()),
     )
     .await
 }
@@ -611,6 +617,21 @@ pub async fn submit(
     let pool =
         crate::serve::pools::resolve(req.pool.as_deref(), admitted.loaded.cfg.pool.as_deref())?;
     crate::serve::pools::admit(state, &pool).await?;
+    // A run under a policy waits until every cluster member enforces the
+    // versions it is pinned to (#1051).
+    if admitted
+        .loaded
+        .policy_pin
+        .as_ref()
+        .is_some_and(|p| !p.is_empty())
+    {
+        require_member_capability(
+            state,
+            crate::serve::history::CAP_POLICY_PIN,
+            POLICY_PIN_REFUSAL,
+        )
+        .await?;
+    }
     req.pool = Some(pool);
     // The stored body (what a cluster peer re-runs) carries the ceilings too.
     req.budget = admitted.budget.clone();
@@ -618,6 +639,34 @@ pub async fn submit(
     runner::enqueue(state, principal, admitted, req)
         .await
         .map(SubmitOutcome::Accepted)
+}
+
+/// The refusal while a cluster member does not enforce policy pins (#1051).
+pub const POLICY_PIN_REFUSAL: &str = "policy unavailable: a cluster member does not enforce the \
+     policy versions a run is admitted under; finish the rolling upgrade, then retry";
+
+/// Refuse with `refusal` (503) while any live cluster member lacks `cap`. A
+/// member that advertises nothing counts as lacking it; the membership is
+/// re-read before refusing.
+pub async fn require_member_capability(
+    state: &ServerState,
+    cap: &str,
+    refusal: &str,
+) -> Result<(), ServeError> {
+    let cluster = state.cluster();
+    if !cluster.enabled() || cluster.live_members().iter().all(|m| m.has(cap)) {
+        return Ok(());
+    }
+    let members = state
+        .history()
+        .live_instances(cluster.member_ttl())
+        .await
+        .map_err(ServeError::from)?;
+    if members.iter().all(|m| m.has(cap)) {
+        cluster.set_live_members(members);
+        return Ok(());
+    }
+    Err(ServeError::Unavailable(refusal.to_string()))
 }
 
 /// Fold a request's `depends_on` (#960) into its config text. A body that
@@ -999,6 +1048,9 @@ pub async fn rollback(
     id: &str,
     req: crate::serve::handlers::runs::RollbackRequest,
 ) -> Result<crate::rollback::RollbackReport, ServeError> {
+    if !req.dry_run {
+        refuse_while_unavailable(state)?;
+    }
     let rec = state
         .history()
         .get(id)
@@ -1504,7 +1556,7 @@ pub use templates::{
 
 #[cfg(feature = "templates")]
 mod templates {
-    use super::{Approval, Origin, Principal, Submission, load};
+    use super::{Approval, Origin, Principal};
     use crate::params::SuppliedParams;
     use crate::serve::error::ServeError;
     use crate::serve::handlers::templates::{
@@ -1612,28 +1664,44 @@ mod templates {
     }
 
     /// Check that `principal` may supply `body`'s params to template `id`
-    /// (#1051): materialize it as a run would and load it under the caller
-    /// reference policy, without running anything. Only a refusal (403) is
-    /// returned; anything else (a tenant connection set up later, a missing
-    /// input) is left for the run to report.
+    /// (#1051): materialize it with references kept as tokens and a sealed
+    /// or kept secret as a typed placeholder, then hold only the fields a
+    /// caller can set to the caller reference policy. Nothing is resolved,
+    /// fetched or recorded. Only a refusal (403) is returned; anything else
+    /// (a template that does not compose yet, a tenant connection set up
+    /// later) is left for the run to report.
     pub async fn screen_template_params(
         state: &ServerState,
         principal: &Principal,
         id: &str,
         mut body: TriggerBody,
     ) -> Result<(), ServeError> {
-        let supplied: SuppliedParams = std::mem::take(&mut body.params).into_iter().collect();
         let s = state.history();
         let Ok(want) =
             crate::templates::resolve_version(&s, id, body.version.unwrap_or_default()).await
         else {
             return Ok(());
         };
+        let declared = match s.template_get(id, Some(want)).await {
+            Ok(Some(r)) => r.params,
+            _ => return Ok(()),
+        };
+        let supplied: SuppliedParams = std::mem::take(&mut body.params)
+            .into_iter()
+            .map(|(k, v)| {
+                let hidden = crate::serve::schedules::secrets::is_sealed(&v)
+                    || crate::serve::schedules::secrets::is_keep_marker(&v);
+                match declared.get(&k).filter(|_| hidden) {
+                    Some(spec) => (k, spec.placeholder()),
+                    None => (k, v),
+                }
+            })
+            .collect();
         let sink = crate::templates::SinkChoice {
             id: body.sink.clone(),
             version: body.sink_version.unwrap_or_default(),
             overlay: body.overlay_choice(),
-            allow_untested: body.allow_untested,
+            allow_untested: true,
         };
         let Ok(materialized) = crate::templates::materialize_for_run_selected(
             &s,
@@ -1650,19 +1718,21 @@ mod templates {
         else {
             return Ok(());
         };
-        let run_as = Principal::new(principal.actor(), Origin::Trusted)
-            .on_behalf_of(principal.tenant().map(str::to_string));
-        match load(
-            state,
-            &run_as,
-            Submission::new(&materialized.body, crate::serve::load::ConfigFormat::Json)
-                .with_caller_fields(&materialized.caller_fields),
+        let Ok(doc) = serde_json::from_str::<serde_json::Value>(&materialized.body) else {
+            return Ok(());
+        };
+        let Ok(cfg) = crate::config::PipelineConfig::from_value(doc.clone()) else {
+            return Ok(());
+        };
+        let tenant = principal.tenant();
+        let refs = state.references().for_origin(state.caller_origin(), tenant);
+        crate::serve::load::refuse_caller_params(
+            &doc,
+            &cfg,
+            &materialized.caller_fields,
+            &refs,
+            tenant.is_some(),
         )
-        .await
-        {
-            Err(e @ ServeError::Forbidden(_)) => Err(e),
-            _ => Ok(()),
-        }
     }
 
     /// Run a registered template (#444): resolve the version, materialize it
@@ -1923,6 +1993,161 @@ mod templates {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every writing operation passes `admit` and the replay start: while the
+    /// history is unreachable both refuse before loading anything (#1050).
+    #[tokio::test]
+    async fn nothing_that_writes_is_admitted_while_the_history_is_unreachable() {
+        let (state, down) = crate::serve::test_support::flaky_state();
+        assert!(refuse_while_unavailable(&state).is_ok());
+        down.store(true, std::sync::atomic::Ordering::Release);
+        let _ = state.history().get("trip").await;
+        assert!(state.history().degraded());
+        let principal = Principal::local();
+        let err = admit(
+            &state,
+            &principal,
+            Submission::new("not even yaml: [", ConfigFormat::Yaml),
+            Gates::writing(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, ServeError::Unavailable(m) if m.contains("history unavailable")),
+            "{err:?}"
+        );
+        let replay = replay::start(&state, "r", "dlq", None, "ops", None)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(replay, ServeError::Unavailable(_)));
+    }
+
+    #[cfg(feature = "policy")]
+    #[tokio::test]
+    async fn admission_waits_for_a_pending_policy_seed() {
+        let state = crate::serve::test_support::test_state();
+        state.set_policy_seed_pending(true);
+        let err = refuse_while_unavailable(&state).unwrap_err();
+        assert!(matches!(&err, ServeError::Unavailable(m) if m.contains("--policy")));
+        state.set_policy_seed_pending(false);
+        assert!(refuse_while_unavailable(&state).is_ok());
+    }
+
+    /// A pinned run waits until every cluster member enforces pins (#1051);
+    /// a member that advertises nothing counts as lacking them.
+    #[tokio::test]
+    async fn a_member_without_policy_pins_holds_pinned_runs() {
+        use crate::serve::history::{CAP_POLICY_PIN, InstanceRecord};
+        let single = crate::serve::test_support::test_state();
+        assert!(
+            require_member_capability(&single, CAP_POLICY_PIN, POLICY_PIN_REFUSAL)
+                .await
+                .is_ok()
+        );
+        let state = crate::serve::test_support::test_state_clustered();
+        let member = |caps: Option<Vec<String>>| InstanceRecord {
+            instance_id: "peer".into(),
+            started_at: chrono::Utc::now(),
+            last_heartbeat: chrono::Utc::now(),
+            listen: None,
+            max_concurrent: 1,
+            in_flight: 0,
+            state_format: 0,
+            pools: None,
+            capabilities: caps,
+        };
+        state
+            .cluster()
+            .set_live_members(vec![member(Some(vec![CAP_POLICY_PIN.into()]))]);
+        assert!(
+            require_member_capability(&state, CAP_POLICY_PIN, POLICY_PIN_REFUSAL)
+                .await
+                .is_ok()
+        );
+        // An older member: the cached view is re-read (memory has no
+        // members), and a member that is gone no longer holds anything.
+        state.cluster().set_live_members(vec![member(None)]);
+        assert!(
+            require_member_capability(&state, CAP_POLICY_PIN, POLICY_PIN_REFUSAL)
+                .await
+                .is_ok()
+        );
+        assert!(state.cluster().live_members().is_empty());
+        // A live 1.17 member in the shared history: refused, 503.
+        let dir = tempfile::tempdir().unwrap();
+        let history = crate::serve::history::sqlite::SqliteHistory::connect(
+            &format!("sqlite:{}", dir.path().join("h.db").display()),
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(30),
+            "old".into(),
+        )
+        .await
+        .unwrap();
+        use crate::serve::history::RunHistory as _;
+        history
+            .heartbeat_instance(&crate::serve::history::InstanceHeartbeat {
+                started_at: chrono::Utc::now(),
+                listen: None,
+                max_concurrent: 1,
+                in_flight: 0,
+                state_format: 0,
+                pools: Vec::new(),
+                capabilities: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let mut config = crate::serve::test_support::test_config();
+        config.cluster.enabled = true;
+        let mixed = ServerState::new(
+            &config,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            std::sync::Arc::new(history),
+            crate::serve::logs::LogHub::new(),
+            None,
+            #[cfg(feature = "triggers")]
+            crate::serve::triggers::health::TriggersHandle::empty(),
+        );
+        mixed.cluster().set_live_members(vec![member(None)]);
+        let err = require_member_capability(&mixed, CAP_POLICY_PIN, POLICY_PIN_REFUSAL)
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, ServeError::Unavailable(m) if m.contains("rolling upgrade")));
+    }
+
+    /// A tenant can cancel its own run on this replica from the registry,
+    /// without reading the history (#1050); another tenant's run is hidden.
+    #[tokio::test]
+    async fn a_tenant_cancels_its_own_run_without_the_history() {
+        let (state, down) = crate::serve::test_support::flaky_state();
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .registry()
+            .register_run("r1".into(), token.clone(), Some("acme".into()));
+        down.store(true, std::sync::atomic::Ordering::Release);
+        let tenant = |t: &str| {
+            Principal::new(
+                AuthContext {
+                    principal: "p".into(),
+                    role: crate::serve::rbac::Role::Operator,
+                    source_ip: None,
+                    tenant: Some(t.into()),
+                },
+                Origin::Trusted,
+            )
+        };
+        assert!(matches!(
+            cancel(&state, &tenant("globex"), "r1").await,
+            Err(ServeError::NotFound)
+        ));
+        assert!(!token.is_cancelled());
+        assert_eq!(
+            cancel(&state, &tenant("acme"), "r1").await.unwrap(),
+            CancelOutcome::Requested
+        );
+        assert!(token.is_cancelled());
+    }
 
     /// A panic in rollback, verify or replay work becomes an error inside its
     /// task, so the audit written after it in the same task still lands.

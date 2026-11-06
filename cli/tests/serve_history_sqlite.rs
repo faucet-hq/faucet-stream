@@ -863,6 +863,7 @@ async fn membership_heartbeat_and_liveness() {
         in_flight: n,
         state_format: faucet_core::state_version::STATE_FORMAT,
         pools: faucet_cli::serve::pools::default_only(),
+        capabilities: vec!["policy_pin".into()],
     };
     a.heartbeat_instance(&beat(1)).await.unwrap();
     b.heartbeat_instance(&beat(0)).await.unwrap();
@@ -871,6 +872,10 @@ async fn membership_heartbeat_and_liveness() {
         .await
         .unwrap();
     assert_eq!(live.len(), 2);
+    assert!(
+        live.iter().all(|m| m.has("policy_pin")),
+        "capabilities round-trip"
+    );
     // A zero-window liveness query sees nobody (all heartbeats are "old").
     let none = a.live_instances(std::time::Duration::ZERO).await.unwrap();
     assert_eq!(none.len(), 0);

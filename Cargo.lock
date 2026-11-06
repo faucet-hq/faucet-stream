@@ -4809,6 +4809,7 @@ dependencies = [
  "sha2 0.10.9",
  "sqlx",
  "subtle",
+ "syn 3.0.6",
  "tempfile",
  "testcontainers",
  "testcontainers-modules",

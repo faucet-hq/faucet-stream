@@ -206,6 +206,8 @@ pub(crate) const IDEMPOTENCY_CONFLICT: &str = "idempotency key reused with a dif
 /// outside the run queue, and no change-request kind expresses them, so under
 /// approval they are disabled (a dry run still works).
 pub(crate) fn refuse_unapproved_write(state: &ServerState, what: &str) -> Result<(), ServeError> {
+    // Nothing that writes starts while the history is unreachable (#1050).
+    crate::runtime::server::refuse_while_unavailable(state)?;
     if state.requires_approval(crate::serve::changes::ChangeKind::Run) {
         return Err(ServeError::Forbidden(format!(
             "this server requires an approved change request for runs (--require-approval run); \
@@ -1300,6 +1302,23 @@ pub(crate) async fn enqueue(
     rec.submitted_by = Some(actor.principal.clone());
     rec.dlq_location = dlq_location(&loaded);
     rec.policy_pin = loaded.policy_pin.clone();
+    // What a policy change's impact checks this run against (#1051).
+    #[cfg(feature = "policy")]
+    if state.policy_file().is_none() {
+        rec.policy_projection = Some(crate::serve::policies::projection(
+            &req.config,
+            req.config_format.into(),
+        ));
+    }
+    // The `--policy` content a run is admitted under is stored before the
+    // record, so whichever replica runs it enforces the same (#1051).
+    #[cfg(feature = "policy")]
+    if let Some(pin) = &rec.policy_pin
+        && let Err(e) = crate::serve::policies::store_file_pin(&state, pin).await
+    {
+        release_orphaned_claim(&state, &req, &run_id).await;
+        return Err(e);
+    }
 
     if state.cluster().enabled() {
         // Cluster mode: persist the RAW config so any instance can re-resolve +
@@ -1379,16 +1398,6 @@ pub(crate) async fn enqueue(
         });
     }
 
-    // Kept (sealed when the server has a vault key) so a policy change's
-    // impact can check this run (#1051).
-    rec.policy_probe = Some(crate::serve::history::PolicyProbe {
-        body: crate::serve::sealed::persisted_body(
-            &state,
-            &run_id,
-            crate::secrets::registry::redact_message(&req.config),
-        ),
-        format: req.config_format.into(),
-    });
     if let Err(e) = link_tenant_run(&state, &rec).await {
         release_orphaned_claim(&state, &req, &run_id).await;
         return Err(e);
@@ -1783,17 +1792,21 @@ async fn audit_runtime_policy_denials(
         Err(crate::error::CliError::Faucet(faucet_core::FaucetError::PolicyViolation {
             rule,
             column,
+            facts,
             ..
-        })) => vec![(
-            String::new(),
-            Some(crate::executor::PolicyDenial {
-                rule: rule.clone(),
-                column: column.clone(),
-                labels: Vec::new(),
-                sink: String::new(),
-                sink_kind: String::new(),
-            }),
-        )],
+        })) => {
+            let f = facts.as_deref().cloned().unwrap_or_default();
+            vec![(
+                String::new(),
+                Some(crate::executor::PolicyDenial {
+                    rule: rule.clone(),
+                    column: column.clone(),
+                    labels: f.label.into_iter().collect(),
+                    sink: f.sink.unwrap_or_default(),
+                    sink_kind: f.sink_kind.unwrap_or_default(),
+                }),
+            )]
+        }
         Err(crate::error::CliError::PolicyViolations { .. }) => vec![(String::new(), None)],
         Err(_) => Vec::new(),
     };
@@ -1942,6 +1955,7 @@ pub(crate) fn resolve_clock(
 
 /// Spawn the detached run task: acquire a permit, run under the 3-arm select,
 /// finalize the terminal status.
+#[allow(clippy::too_many_arguments)]
 fn spawn_run(
     state: ServerState,
     principal: crate::runtime::Principal,
@@ -3018,6 +3032,98 @@ mod tests {
         assert_eq!(done.status, RunStatus::Completed);
         assert_eq!(done.records_written, 3);
         assert_eq!(retry_pending_finalize(&state).await, 0);
+    }
+
+    /// A single server holds a finished run's own record, not a skeleton,
+    /// until the history takes it (#1050).
+    #[tokio::test]
+    async fn a_single_server_holds_the_runs_own_record_until_it_lands() {
+        let (_, history) = flaky_state(true);
+        let mut config = crate::serve::test_support::test_config();
+        config.cluster.enabled = false;
+        let state = ServerState::new(
+            &config,
+            None,
+            CancellationToken::new(),
+            history.clone(),
+            crate::serve::logs::LogHub::new(),
+            None,
+            #[cfg(feature = "triggers")]
+            crate::serve::triggers::health::TriggersHandle::empty(),
+        );
+        let started = Utc::now();
+        let mut rec = RunRecord::queued(
+            "r1".into(),
+            Some("nightly".into()),
+            BTreeMap::from([("team".to_string(), "data".to_string())]),
+            None,
+            started,
+        );
+        rec.tenant = Some("acme".into());
+        rec.status = RunStatus::Running;
+        state.history().upsert(&rec).await.unwrap();
+        finalize(
+            &state,
+            Some(rec.clone()),
+            "r1",
+            started,
+            Terminal::Completed {
+                records: 7,
+                invs: Vec::new(),
+            },
+        )
+        .await;
+        assert_eq!(state.pending_finalize_len(), 1, "held, not dropped");
+        let now = state.history().get("r1").await.unwrap().unwrap();
+        assert_eq!(now.status, RunStatus::Running, "nothing landed yet");
+        history
+            .down
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(retry_pending_finalize(&state).await, 1);
+        let done = state.history().get("r1").await.unwrap().unwrap();
+        assert_eq!(done.status, RunStatus::Completed);
+        assert_eq!(done.records_written, 7);
+        assert_eq!(done.name.as_deref(), Some("nightly"));
+        assert_eq!(done.labels.get("team").map(String::as_str), Some("data"));
+        assert_eq!(done.tenant.as_deref(), Some("acme"));
+        assert_eq!(state.pending_finalize_len(), 0);
+    }
+
+    /// A record the backend keeps refusing for good falls back to its status
+    /// alone, then is dropped and its lease left to lapse (#1050).
+    #[tokio::test]
+    async fn a_record_refused_for_good_is_dropped_after_its_status() {
+        let (state, _history) = flaky_state(true);
+        let started = Utc::now();
+        let mut rec = RunRecord::queued("r1".into(), None, BTreeMap::new(), None, started);
+        rec.status = RunStatus::Running;
+        state.history().upsert(&rec).await.unwrap();
+        finalize(&state, Some(rec), "r1", started, Terminal::cancelled()).await;
+        for _ in 0..FINALIZE_ATTEMPTS {
+            assert_eq!(state.pending_finalize_len(), 1);
+            retry_pending_finalize(&state).await;
+        }
+        assert_eq!(state.pending_finalize_len(), 0, "dropped");
+        assert_eq!(state.forgotten_runs(), vec!["r1".to_string()]);
+        state.clear_forgotten_run("r1");
+        assert!(state.forgotten_runs().is_empty());
+        // A transient refusal is never counted.
+        let e = crate::serve::history::HistoryError::Unreachable("x".into());
+        let p = PendingFinalize::Run {
+            rec: Box::new(RunRecord::queued(
+                "r2".into(),
+                None,
+                BTreeMap::new(),
+                None,
+                started,
+            )),
+            reason: "ok",
+            failures: 0,
+        };
+        assert!(matches!(
+            p.failed_once(&e),
+            PendingFinalize::Run { failures: 0, .. }
+        ));
     }
 
     /// A shard's terminal write the backend refuses is retried by the lease

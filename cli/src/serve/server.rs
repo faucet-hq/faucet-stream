@@ -586,6 +586,10 @@ pub(crate) async fn refresh_membership(state: &ServerState, member_ttl: Duration
         in_flight: state.registry().in_flight() as u32,
         state_format: faucet_core::state_version::STATE_FORMAT,
         pools: cluster.pools().to_vec(),
+        capabilities: crate::serve::history::INSTANCE_CAPABILITIES
+            .iter()
+            .map(|c| (*c).to_string())
+            .collect(),
     };
     if let Err(e) = state.history().heartbeat_instance(&beat).await {
         tracing::warn!(error = %e, "cluster: heartbeat_instance failed");

@@ -645,6 +645,7 @@ async fn history_claims_filter_on_pool() {
         in_flight: 0,
         state_format: faucet_core::state_version::STATE_FORMAT,
         pools: vec!["a".into(), "gpu".into()],
+        capabilities: Vec::new(),
     })
     .await
     .unwrap();

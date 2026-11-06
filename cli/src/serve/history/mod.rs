@@ -281,22 +281,29 @@ pub struct RunRecord {
     pub dlq_location: Option<String>,
     /// The stored data-flow policy versions the run was admitted under
     /// (#1043): a claim, shard or resume enforces these, not a newer one.
-    #[serde(default, skip_serializing_if = "policies::PolicyPin::is_empty")]
-    pub policy_pin: policies::PolicyPin,
-    /// The submitted config of a single-server run (a cluster run keeps it in
-    /// `config_body`), kept so a policy change's impact can check the runs
-    /// it would have refused (#1051). Sealed with the vault key when the
-    /// server has one; never re-run.
+    /// `None` = not recorded (a record from 1.17, or a build without the
+    /// `policy` feature): the newest versions apply (#1051).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub policy_probe: Option<PolicyProbe>,
+    pub policy_pin: Option<policies::PolicyPin>,
+    /// What a policy change's impact needs of the run's config, and nothing
+    /// else (#1051): no connector settings, no masking keys, no values from
+    /// secret references. Stored only while the server keeps its policy in
+    /// the store; never shown, never re-run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_projection: Option<PolicyProjection>,
 }
 
-/// A run's config as the policy impact reads it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PolicyProbe {
-    pub body: String,
-    #[serde(default)]
-    pub format: crate::serve::load::ConfigFormat,
+/// A run's config reduced to what a data-flow policy reasons about (#1051):
+/// connector kinds and `attributes`, transforms, contracts, masking rules
+/// (without keys), the DLQ's kind and attributes, and the config's own
+/// `policy:` block. `opaque` when it cannot be checked statically (a
+/// topology, or more rows than a projection keeps).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PolicyProjection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub opaque: bool,
 }
 
 impl RunRecord {
@@ -339,8 +346,8 @@ impl RunRecord {
             pool: crate::serve::pools::default_pool(),
             submitted_by: None,
             dlq_location: None,
-            policy_pin: Default::default(),
-            policy_probe: None,
+            policy_pin: None,
+            policy_projection: None,
         }
     }
 
@@ -410,7 +417,15 @@ pub struct InstanceHeartbeat {
     pub state_format: u32,
     /// The execution pools this instance serves (#957).
     pub pools: Vec<String>,
+    /// What this instance enforces that older releases do not
+    /// ([`INSTANCE_CAPABILITIES`]).
+    pub capabilities: Vec<String>,
 }
+
+/// A member enforces the policy versions a run was admitted under (#1051).
+pub const CAP_POLICY_PIN: &str = "policy_pin";
+/// What this build advertises in its heartbeat.
+pub const INSTANCE_CAPABILITIES: &[&str] = &[CAP_POLICY_PIN];
 
 /// One live cluster member (for `/readyz` + metrics).
 #[derive(Debug, Clone, Serialize)]
@@ -427,6 +442,19 @@ pub struct InstanceRecord {
     /// The execution pools the member serves (#957); `None` for a member that
     /// predates pools — it claims every pending run.
     pub pools: Option<Vec<String>>,
+    /// What the member advertises; `None` for a member that predates
+    /// capabilities, which counts as having none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Vec<String>>,
+}
+
+impl InstanceRecord {
+    /// Whether the member advertises `cap`.
+    pub fn has(&self, cap: &str) -> bool {
+        self.capabilities
+            .as_ref()
+            .is_some_and(|c| c.iter().any(|x| x == cap))
+    }
 }
 
 /// The state format every live member reads (#736): the lowest any of them

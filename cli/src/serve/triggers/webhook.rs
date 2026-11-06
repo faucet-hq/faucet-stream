@@ -54,6 +54,9 @@ pub async fn handle(
             "method {m} not allowed for webhook trigger '{name}'"
         )));
     }
+    // Nothing is admitted while the run history is unreachable (#1050): the
+    // sender retries, and the trigger stays healthy.
+    crate::runtime::server::refuse_while_unavailable(&state)?;
 
     // Leading-edge debounce: coalesce fires that arrive within `debounce_secs` of
     // the last accepted fire for this trigger. The first fire (and any after the
