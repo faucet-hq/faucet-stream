@@ -389,6 +389,7 @@ jobs:
     runs-on: "ubuntu-22.04"
     outputs:
       val: ${{ steps.host.outputs.manifest }}
+      hashes: ${{ steps.hashes.outputs.hashes }}
     steps:
       - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
@@ -438,6 +439,13 @@ jobs:
         run: |
           # Remove the granular manifests
           rm -f artifacts/*-dist-manifest.json
+      # The release assets the SLSA provenance job below signs.
+      - name: Hash release assets
+        id: hashes
+        run: |
+          set -euo pipefail
+          cd artifacts
+          echo "hashes=$(sha256sum -- * | base64 -w0)" >> "$GITHUB_OUTPUT"
       - name: Attest build provenance
         id: attest
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
@@ -502,6 +510,24 @@ jobs:
           upload_assets artifacts/*
 
           gh release edit "${TAG}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --draft=false
+
+  # SLSA level 3 provenance for every release asset, attached as
+  # faucet-cli.intoto.jsonl (verify with `slsa-verifier verify-artifact`).
+  provenance:
+    needs:
+      - plan
+      - host
+    if: ${{ always() && needs.host.result == 'success' }}
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0 # zizmor: ignore[unpinned-uses] -- the generator must be referenced by tag; it verifies its own ref
+    with:
+      base64-subjects: ${{ needs.host.outputs.hashes }}
+      provenance-name: faucet-cli.intoto.jsonl
+      upload-assets: true
+      upload-tag-name: ${{ needs.plan.outputs.tag }}
 
   # The Connector Hub feed (#572): attached to the release so the website
   # picks up every released connector without a manual snapshot.

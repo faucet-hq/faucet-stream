@@ -47,6 +47,17 @@ gh attestation verify faucet-cli-aarch64-apple-darwin.tar.xz \
   --repo faucet-hq/faucet-stream
 ```
 
+Every release also carries [SLSA](https://slsa.dev) level 3 provenance for all
+of its assets, `faucet-cli.intoto.jsonl`, which
+[`slsa-verifier`](https://github.com/slsa-framework/slsa-verifier) checks:
+
+```bash
+slsa-verifier verify-artifact faucet-cli-aarch64-apple-darwin.tar.xz \
+  --provenance-path faucet-cli.intoto.jsonl \
+  --source-uri github.com/faucet-hq/faucet-stream \
+  --source-tag faucet-cli-vX.Y.Z
+```
+
 **Dependency inventory.** The binaries are built with
 [`cargo-auditable`](https://github.com/rust-secure-code/cargo-auditable), so
 each one carries its exact dependency list: `cargo audit bin faucet` checks
