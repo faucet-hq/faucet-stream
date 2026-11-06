@@ -4663,7 +4663,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-cli"
-version = "1.17.0"
+version = "1.18.0"
 dependencies = [
  "aho-corasick",
  "arrow 58.4.1",
