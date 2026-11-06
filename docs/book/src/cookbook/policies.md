@@ -213,6 +213,13 @@ server policy is kept.
   the file as a new version** (a `policy_update` change request, approved like
   any edit), and `faucet_serve_policy_file_drift` is `1` (alert
   `FaucetServePolicyFileDrift`).
+
+  **The store is the only authority.** Under `--policy-store server` the
+  file is a seed and nothing more: editing it never changes what is
+  enforced, on this replica or any other. The drift warning, banner and
+  gauge only tell you the two differ; the policy changes when someone
+  imports the file (or proposes any other version) and an admin approves
+  it. To make a file the policy, run with `--policy-store file`.
 - **`file`**: the file is the policy, re-read on every start. The console and
   API show it **read-only**; every change endpoint answers `409`. It needs
   `--policy`.
@@ -264,7 +271,9 @@ The **preview** checks the draft with the same validation as a submission and
 measures its impact: every registered pipeline template (its stable version,
 params bound to placeholders) and the stored configs of the last 7 days of runs
 are checked against the policy in force and the draft, and the ones the draft
-would newly refuse or newly allow are listed. A template whose columns are
+would newly refuse or newly allow are listed (a single server keeps each run's
+config for this, sealed with the vault key when it has one; a cluster reads
+the config it already stores). A template whose columns are
 unknown before a run (no `contract:`) is counted as checked at run time only —
 the runtime backstop still applies to it. The approver sees the same diff and
 impact on the change request.
@@ -277,7 +286,15 @@ earlier document (`restores: N`).
 **Runs keep the version they were admitted under.** The stored versions a run
 was checked against are recorded on its record (`policy_pin`), and a claim,
 shard or resume on another replica enforces those versions rather than a newer
-one.
+one. A run admitted while a layer had no stored policy stays unchecked on that
+layer when it is reloaded, rather than meeting a version approved after it.
+
+**When the history is unreachable** (the server is degraded), each replica
+keeps enforcing the policy versions it last read while the store answered:
+runs are checked against them, not run unchecked and not all refused. A
+tenant or layer the replica never read refuses its runs until the store is
+back. A server that had no stored policy keeps accepting runs. Policy edits
+and approvals are refused with `503` until the store recovers.
 
 ### Refusals and the dry run
 
@@ -296,6 +313,9 @@ with the server's (`server ⊕ tenant ⊕ pipeline`), so it can tighten what the
 server allows but never remove, rename or loosen a server rule — a draft that
 reuses a server rule's name, or tries to `disable` one, is refused. Its rules
 may govern labels the server classifies. It applies to that tenant's runs only.
+A server draft is checked against every tenant policy too: one that would
+leave a tenant's merged policy invalid (a tenant rule governing a label the
+draft no longer classifies) is refused, naming the tenant.
 
 ```yaml
 # acme's policy: personal data never reaches a partner-tier sink

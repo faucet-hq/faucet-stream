@@ -1584,7 +1584,7 @@ async fn execute(
                     Ok(p) => p,
                     Err(e) => return finish_failed(state, actor, change, e.to_string()).await,
                 };
-            crate::serve::schedules::service::apply(state, &requester, p)
+            crate::serve::schedules::service::apply(state, &requester, p, true)
                 .await
                 .map(|_| (None, None))
         }

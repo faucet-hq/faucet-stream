@@ -164,27 +164,6 @@ fn line_diff_marks_changes() {
 }
 
 #[test]
-fn violation_text_round_trip() {
-    let text = "Policy `pii-to-eu-only` violated on column `email`: rule `pii-to-eu-only`: \
-                column `email` — label `pii.email` requires sink `residency` in [eu]; sink \
-                `backup` (s3) has `us`";
-    let d = parse_violation_text(text);
-    assert_eq!(d["rule"], "pii-to-eu-only");
-    assert_eq!(d["column"], "email");
-    assert_eq!(d["label"], "pii.email");
-    assert_eq!(d["sink"], "residency");
-    assert_eq!(
-        parse_violation_text("nothing").as_object().unwrap().len(),
-        0
-    );
-    let denied = "Policy `no-stdout` violated on column `email`: rule `no-stdout`: column \
-                  `email` — label `pii.email` may not reach sink `out` (stdout)";
-    let d = parse_violation_text(denied);
-    assert_eq!(d["sink"], "out");
-    assert_eq!(d["sink_kind"], "stdout");
-}
-
-#[test]
 fn requires_and_outline() {
     let spec = parse_draft(SERVER).unwrap();
     let o = outline(&spec);
@@ -748,5 +727,112 @@ async fn drafts_are_compiled_on_every_layer() {
     assert!(
         disabled[0].message.contains("cannot disable"),
         "{disabled:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_run_admitted_without_a_policy_stays_unchecked_on_reload() {
+    let state = test_state();
+    // Admitted while no policy was stored: its pin names no version.
+    let (_, pin) = effective(&state, Some("acme"), None).await.unwrap();
+    assert!(pin.is_empty());
+    // A policy stored meanwhile does not reach it (#1051 #8)…
+    state
+        .history()
+        .policy_version_insert(&record(SERVER_SCOPE, 1, SERVER))
+        .await
+        .unwrap();
+    let (spec, _) = effective(&state, Some("acme"), Some(&pin)).await.unwrap();
+    assert_eq!(spec, None);
+    // …while an unpinned run gets the newest.
+    assert!(effective(&state, None, None).await.unwrap().0.is_some());
+}
+
+#[tokio::test]
+async fn a_degraded_history_enforces_the_policy_last_read() {
+    let (state, down) = crate::serve::test_support::flaky_state();
+    state
+        .history()
+        .policy_version_insert(&record(SERVER_SCOPE, 1, SERVER))
+        .await
+        .unwrap();
+    // A healthy read is remembered…
+    let (spec, pin) = effective(&state, None, None).await.unwrap();
+    assert!(spec.is_some());
+    down.store(true, std::sync::atomic::Ordering::Release);
+    // …and enforced while the store is unreachable, pinned or not (#1051 #4).
+    let (spec, _) = effective(&state, None, None).await.unwrap();
+    assert_eq!(spec.unwrap().rules[0].name, "pii-to-eu-only");
+    let (spec, _) = effective(&state, None, Some(&pin)).await.unwrap();
+    assert!(spec.is_some());
+    assert!(state.history().degraded());
+    // A scope never read fails closed rather than running unchecked.
+    assert!(effective(&state, Some("acme"), None).await.is_err());
+    // Editing the policy is refused while degraded.
+    assert!(
+        state
+            .history()
+            .policy_version_insert(&record(SERVER_SCOPE, 2, SERVER))
+            .await
+            .is_err()
+    );
+    // A server with no stored policy keeps accepting runs.
+    let (empty, down) = crate::serve::test_support::flaky_state();
+    assert_eq!(effective(&empty, None, None).await.unwrap().0, None);
+    down.store(true, std::sync::atomic::Ordering::Release);
+    assert_eq!(effective(&empty, None, None).await.unwrap().0, None);
+    // The reads survive a restart through a snapshot.
+    let restored = PolicyReads::default();
+    restored.restore(state.policy_reads().snapshot());
+    assert!(restored.recall(SERVER_SCOPE, None).unwrap().is_some());
+}
+
+#[cfg(feature = "tenants")]
+#[tokio::test]
+async fn a_server_draft_must_keep_each_tenant_merge_valid() {
+    let state = test_state();
+    let now = Utc::now();
+    state
+        .history()
+        .tenant_upsert(&crate::serve::history::tenants::TenantRecord {
+            id: "acme".into(),
+            name: None,
+            labels: Default::default(),
+            limits: Default::default(),
+            notifications: Vec::new(),
+            notifications_sealed: None,
+            suspended: false,
+            created_at: now,
+            updated_at: now,
+            created_by: "t".into(),
+        })
+        .await
+        .unwrap();
+    // acme's rule governs a label only the server classifies.
+    let tenant = "version: 1\nrules:\n  - name: acme-email\n    when: { label: pii.email }\n    deny: true\n";
+    state
+        .history()
+        .policy_version_insert(&record(&tenant_scope("acme"), 1, tenant))
+        .await
+        .unwrap();
+    // A server draft that drops the classification breaks acme's merge.
+    let dropped = "version: 1\nclassifications:\n  - label: pii.phone\n    fields: [phone]\nrules:\n  - name: phones\n    when: { label: pii.phone }\n    deny: true\n";
+    let draft = parse_draft(dropped).unwrap();
+    let problems = check_draft(&state, &Layer::Server, &draft, dropped)
+        .await
+        .unwrap();
+    assert!(
+        problems.iter().any(|p| p
+            .message
+            .contains("tenant acme's policy would no longer validate")),
+        "{problems:?}"
+    );
+    // Keeping it passes.
+    let draft = parse_draft(SERVER).unwrap();
+    assert!(
+        check_draft(&state, &Layer::Server, &draft, SERVER)
+            .await
+            .unwrap()
+            .is_empty()
     );
 }

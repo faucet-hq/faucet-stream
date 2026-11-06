@@ -64,6 +64,10 @@ pub struct FallbackHistory {
     last_ok_ms: std::sync::atomic::AtomicU64,
     /// See [`SATURATION_GRACE`].
     saturation_grace: Duration,
+    /// The local journal of what was written while degraded (#1050).
+    journal: std::sync::OnceLock<std::sync::Arc<super::journal::Journal>>,
+    /// When this process found the backend unreachable.
+    since: std::sync::Mutex<Option<DateTime<Utc>>>,
 }
 
 impl FallbackHistory {
@@ -84,6 +88,8 @@ impl FallbackHistory {
             epoch: std::time::Instant::now(),
             last_ok_ms: std::sync::atomic::AtomicU64::new(0),
             saturation_grace: SATURATION_GRACE,
+            journal: std::sync::OnceLock::new(),
+            since: std::sync::Mutex::new(None),
         }
     }
 
@@ -120,6 +126,8 @@ impl FallbackHistory {
             epoch: std::time::Instant::now(),
             last_ok_ms: std::sync::atomic::AtomicU64::new(0),
             saturation_grace: SATURATION_GRACE,
+            journal: std::sync::OnceLock::new(),
+            since: std::sync::Mutex::new(None),
         }
     }
 
@@ -142,6 +150,8 @@ impl FallbackHistory {
             epoch: std::time::Instant::now(),
             last_ok_ms: std::sync::atomic::AtomicU64::new(0),
             saturation_grace: SATURATION_GRACE,
+            journal: std::sync::OnceLock::new(),
+            since: std::sync::Mutex::new(None),
         }
     }
 
@@ -182,15 +192,53 @@ impl FallbackHistory {
             return false;
         }
         self.note_ok();
+        if let Some(j) = self.journal.get() {
+            // Replay what was journaled, then leave degraded mode under the
+            // journal's lock so no record is left behind (#1050).
+            match j.replay(p.as_ref(), || self.leave_degraded()).await {
+                Ok(r) => tracing::warn!(
+                    backend = self.label,
+                    applied = ?r.applied,
+                    skipped = ?r.skipped,
+                    "replayed the local history journal into the recovered backend"
+                ),
+                Err(e) => {
+                    tracing::error!(backend = self.label, error = %e, "replaying the history journal failed; staying degraded and retrying");
+                    return false;
+                }
+            }
+        } else {
+            self.leave_degraded();
+        }
+        true
+    }
+
+    fn leave_degraded(&self) {
         if self.degraded.swap(false, Ordering::AcqRel) {
             tracing::warn!(
                 backend = self.label,
-                "run-history backend reachable again; leaving degraded mode (records \
-                 written while degraded stay in memory only)"
+                "run-history backend reachable again; leaving degraded mode"
             );
             crate::serve::metrics::set_history_degraded(false);
         }
-        true
+        *self.since.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    fn mark_since(&self) {
+        let mut since = self.since.lock().unwrap_or_else(|e| e.into_inner());
+        since.get_or_insert_with(Utc::now);
+    }
+
+    /// Journal `entry` while degraded (#1050). `Ok(false)`: no journal, or
+    /// the backend recovered meanwhile (the caller writes to it instead).
+    async fn keep(
+        &self,
+        entry: impl FnOnce() -> super::journal::Entry,
+    ) -> Result<bool, HistoryError> {
+        match self.journal.get() {
+            Some(j) if !self.memory_only() => j.append_if(|| self.is_degraded(), &entry()).await,
+            _ => Ok(false),
+        }
     }
 
     /// Whether `err` means the primary is down. An acquire timeout while every
@@ -212,6 +260,7 @@ impl FallbackHistory {
 
     /// Record a primary-backend failure and flip to degraded (log + metric once).
     fn trip(&self, err: &HistoryError) {
+        self.mark_since();
         if !self.degraded.swap(true, Ordering::AcqRel) {
             tracing::error!(
                 backend = self.label,
@@ -264,6 +313,31 @@ macro_rules! via {
         }
         let $fb = &$self.fallback;
         $fcall.await
+    }};
+}
+
+/// [`via!`] for the records a server must not lose (#1050): while degraded
+/// they are journaled locally as well as written to memory, and replayed into
+/// the backend once it answers. A journal that cannot be written refuses the
+/// write rather than dropping the record.
+macro_rules! kept {
+    ($self:ident, $entry:expr, $primary:ident => $pcall:expr, $fb:ident => $fcall:expr) => {{
+        loop {
+            if !$self.is_degraded() && $self.primary.get().is_some() {
+                match primary!($self, $primary => $pcall) {
+                    Ok(v) => return Ok(v),
+                    Err(e) if $self.should_trip(&e) => $self.trip(&e),
+                    Err(e) => return Err(e),
+                }
+            }
+            let journaled = $self.keep(|| $entry).await?;
+            if !journaled && $self.journal.get().is_some() && !$self.is_degraded() {
+                // Recovered while waiting for the journal: write through.
+                continue;
+            }
+            let $fb = &$self.fallback;
+            break $fcall.await;
+        }
     }};
 }
 
@@ -334,7 +408,7 @@ impl RunHistory for FallbackHistory {
     }
 
     async fn upsert(&self, rec: &RunRecord) -> Result<(), HistoryError> {
-        via!(self, p => p.upsert(rec), f => f.upsert(rec))
+        kept!(self, super::journal::Entry::Run(Box::new(rec.clone())), p => p.upsert(rec), f => f.upsert(rec))
     }
 
     async fn lease_lost(&self, run_id: &str) -> Result<bool, HistoryError> {
@@ -350,7 +424,7 @@ impl RunHistory for FallbackHistory {
     }
 
     async fn insert_new(&self, rec: &RunRecord) -> Result<bool, HistoryError> {
-        via!(self, p => p.insert_new(rec), f => f.insert_new(rec))
+        kept!(self, super::journal::Entry::Run(Box::new(rec.clone())), p => p.insert_new(rec), f => f.insert_new(rec))
     }
 
     async fn get(&self, id: &str) -> Result<Option<RunRecord>, HistoryError> {
@@ -415,6 +489,16 @@ impl RunHistory for FallbackHistory {
         strict!(self, p => p.release_owned(rec), f => f.release_owned(rec))
     }
     async fn finalize_owned(&self, rec: &RunRecord) -> Result<bool, HistoryError> {
+        // The status of a run this instance owns is journaled while degraded
+        // and replayed owner-fenced (#1050).
+        if self.is_degraded()
+            && !self.memory_only()
+            && self
+                .keep(|| super::journal::Entry::Run(Box::new(rec.clone())))
+                .await?
+        {
+            return self.fallback.upsert(rec).await.map(|()| true);
+        }
         strict!(self, p => p.finalize_owned(rec), f => f.finalize_owned(rec))
     }
     async fn finalize_sharded_parent(
@@ -511,7 +595,7 @@ impl RunHistory for FallbackHistory {
     }
 
     async fn record_audit(&self, entry: &AuditEntry) -> Result<(), HistoryError> {
-        via!(self, p => p.record_audit(entry), f => f.record_audit(entry))
+        kept!(self, super::journal::Entry::Audit(Box::new(entry.clone())), p => p.record_audit(entry), f => f.record_audit(entry))
     }
     async fn list_audit(&self, filter: &AuditFilter) -> Result<Vec<AuditEntry>, HistoryError> {
         via!(self, p => p.list_audit(filter), f => f.list_audit(filter))
@@ -527,7 +611,12 @@ impl RunHistory for FallbackHistory {
         run_id: &str,
         lines: &[crate::serve::history::RunLogLine],
     ) -> Result<(), HistoryError> {
-        via!(self, p => p.record_run_logs(run_id, lines), f => f.record_run_logs(run_id, lines))
+        kept!(
+            self,
+            super::journal::Entry::Log { run_id: run_id.to_string(), lines: lines.to_vec() },
+            p => p.record_run_logs(run_id, lines),
+            f => f.record_run_logs(run_id, lines)
+        )
     }
     async fn list_run_logs(
         &self,
@@ -814,7 +903,7 @@ impl RunHistory for FallbackHistory {
         strict!(self, p => p.change_counts(filter), f => f.change_counts(filter))
     }
     async fn usage_record(&self, record: &crate::usage::UsageRecord) -> Result<(), HistoryError> {
-        via!(self, p => p.usage_record(record), f => f.usage_record(record))
+        kept!(self, super::journal::Entry::Usage(Box::new(record.clone())), p => p.usage_record(record), f => f.usage_record(record))
     }
     async fn usage_list(
         &self,
@@ -1088,6 +1177,41 @@ impl RunHistory for FallbackHistory {
 
     async fn recover_degraded(&self) -> bool {
         self.try_recover().await
+    }
+
+    fn attach_journal(&self, journal: std::sync::Arc<super::journal::Journal>) -> bool {
+        if self.memory_only() {
+            return false;
+        }
+        if self.is_degraded() {
+            self.mark_since();
+        }
+        self.journal.set(journal).is_ok()
+    }
+
+    fn journal(&self) -> Option<std::sync::Arc<super::journal::Journal>> {
+        self.journal.get().cloned()
+    }
+
+    fn degraded_since(&self) -> Option<DateTime<Utc>> {
+        *self.since.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    async fn replay_journal(&self) -> Result<(), HistoryError> {
+        let (Some(j), Some(p)) = (self.journal.get(), self.primary.get()) else {
+            return Ok(());
+        };
+        if self.is_degraded() || j.status().await.journaled == 0 {
+            return Ok(());
+        }
+        let r = j.replay(p.as_ref(), || {}).await?;
+        tracing::warn!(
+            backend = self.label,
+            applied = ?r.applied,
+            skipped = ?r.skipped,
+            "replayed the history journal an earlier process left"
+        );
+        Ok(())
     }
 }
 

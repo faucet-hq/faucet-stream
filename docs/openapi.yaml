@@ -361,10 +361,14 @@ paths:
         Creates a schedule that runs a registered template on a cron. A
         tenant principal's schedule runs only for its tenant, within its
         `max_schedules` and `--tenant-schedule-min-interval-secs`; only
-        operators may fan out (`tenants`). Secret params are sealed with the
-        server vault key. Under `--require-approval schedule` the answer is
-        202 with a pending change request. Requires `ScheduleWrite`
-        (operator+); audited as `schedule.create`.
+        operators may fan out (`tenants`). Every schedule ticks at most every
+        5 minutes (422 otherwise; a seconds field is refused). Its params are
+        the creator's and meet the caller reference policy (403 when one
+        names a server file or an internal URL). Secret params are sealed
+        with the server vault key. Under `--require-approval schedule` or
+        `--require-approval run` the answer is 202 with a pending change
+        request. Requires `ScheduleWrite` (operator+); audited as
+        `schedule.create`.
       operationId: createSchedule
       parameters:
         - { name: reason, in: query, required: false, schema: { type: string }, description: "Kept on the change request when changes need approval." }
@@ -529,7 +533,7 @@ paths:
         "401": { $ref: "#/components/responses/Error" }
         "403": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
-        "409": { description: The schedule comes from the `--schedules` file. }
+        "409": { description: "The schedule comes from the `--schedules` file, or runs need approval (`--require-approval run`) and the schedule was not stored through an approved change." }
   /v1/schedules/{name}/run:
     parameters:
       - { name: name, in: path, required: true, schema: { type: string } }
@@ -3323,7 +3327,9 @@ paths:
         lease heartbeat, the run queue is full, or the server is shutting down
         (`draining`). Always returns a JSON body with
         `status`, `history_ok`, `history` (`kind`: `sqlite` / `postgres` /
-        `memory`, and whether it is `persistent`), `queue_ok`, `draining`, and
+        `memory`, and whether it is `persistent`), `queue_ok`, `degraded`
+        (while the backend is unreachable: `since`, `journaled` and the local
+        `journal` — null otherwise), `draining`, and
         a `cluster` object (`enabled` bool, `instances` live-member count,
         this replica's `pools`, and the live `members` with the pools each
         serves).
@@ -3346,6 +3352,21 @@ paths:
                       kind: { type: string, enum: [sqlite, postgres, memory] }
                       persistent: { type: boolean }
                   queue_ok: { type: boolean }
+                  degraded:
+                    type: object
+                    nullable: true
+                    description: "While the history backend is unreachable (#1050): since when, and the records waiting in the local journal to be replayed. Null otherwise."
+                    properties:
+                      since: { type: string, format: date-time, nullable: true }
+                      journaled: { type: integer }
+                      journal:
+                        type: object
+                        nullable: true
+                        properties:
+                          journaled: { type: integer }
+                          by_kind: { type: object, additionalProperties: { type: integer } }
+                          bytes: { type: integer }
+                          full: { type: boolean, description: "The size cap is reached: new runs are refused." }
                   draining: { type: boolean, description: "true once shutdown began; new work is refused." }
                   cluster:
                     type: object
@@ -3435,7 +3456,7 @@ components:
       properties:
         name: { type: string, pattern: "^[A-Za-z0-9_-]{1,64}$" }
         description: { type: string, maxLength: 1000 }
-        cron: { type: string, description: "5- or 6-field cron." }
+        cron: { type: string, description: "A five-field cron or an alias (`@hourly`); ticks at most every 5 minutes." }
         timezone: { type: string, default: UTC }
         catch_up: { type: boolean, default: true, description: "Run the latest missed tick once after a gap." }
         overlap: { type: string, enum: [skip, queue, forbid], default: skip }

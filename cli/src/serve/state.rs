@@ -78,6 +78,11 @@ struct Inner {
     /// seeded the store, and is kept to report when it drifts (#1043).
     #[cfg(feature = "policy")]
     policy_seed: RwLock<Option<crate::serve::policies::PolicySeed>>,
+    /// The policy versions last read while the history was healthy, by
+    /// scope and pinned version (`None` = the newest): enforced while it is
+    /// degraded (#1051).
+    #[cfg(feature = "policy")]
+    policy_reads: crate::serve::policies::PolicyReads,
     /// The tenant runtime (#709): vault key, hosted-OAuth providers,
     /// admission locks. Replaced once at startup.
     #[cfg(feature = "tenants")]
@@ -163,6 +168,8 @@ impl ServerState {
                 policy_store: config.policy_store,
                 #[cfg(feature = "policy")]
                 policy_seed: RwLock::new(None),
+                #[cfg(feature = "policy")]
+                policy_reads: Default::default(),
                 #[cfg(feature = "tenants")]
                 tenants: RwLock::new(Arc::new(Default::default())),
                 #[cfg(feature = "encryption")]
@@ -334,6 +341,12 @@ impl ServerState {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// The policy versions last read while the history was healthy.
+    #[cfg(feature = "policy")]
+    pub fn policy_reads(&self) -> &crate::serve::policies::PolicyReads {
+        &self.inner.policy_reads
     }
 
     /// Set the policy template tests run under on this server (#856).

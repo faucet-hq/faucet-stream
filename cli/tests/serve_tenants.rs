@@ -4,6 +4,7 @@
 //! tenant-scoped principals, the hosted OAuth connect flow, re-auth
 //! detection, the audit trail and the delete cascade — over a real server,
 //! once on the in-memory history and once on SQLite.
+#![allow(unsafe_code)] // tests set process environment variables
 #![cfg(all(
     feature = "tenants",
     feature = "source-rest",
@@ -35,6 +36,9 @@ fn serve_args(
     triggers: Option<std::path::PathBuf>,
     require_approval: Vec<String>,
 ) -> faucet_cli::cli::ServeArgs {
+    // Debug builds only: schedules may tick every second instead of every 5
+    // minutes, so these tests see ticks without waiting.
+    unsafe { std::env::set_var("FAUCET_SCHEDULE_TEST_MIN_INTERVAL_SECS", "0") };
     let auth_path = dir.join("auth.yaml");
     std::fs::write(&auth_path, AUTH_CONFIG).unwrap();
     faucet_cli::cli::ServeArgs {
@@ -1895,4 +1899,184 @@ async fn a_schedule_in_a_triggers_file_points_to_schedules() {
         .to_string();
     assert!(err.contains("--schedules"), "{err}");
     assert!(err.contains("hourly"), "{err}");
+}
+
+/// #1051 #1: a schedule made over the API carries its creator's params, so
+/// they meet the caller reference policy when it is created, not as the
+/// server's own at every tick.
+#[cfg(feature = "schedule")]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_api_schedule_is_held_to_its_creators_reference_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let rows = rows_mock().await;
+    let api = spawn(dir.path(), None, &rows.uri()).await;
+    let body = format!(
+        "version: 1\nkind: pipeline\nname: param-sink\nparams:\n  out:\n    type: string\n    default: \"{}\"\npipeline:\n  source:\n    type: rest\n    config:\n      base_url: \"{}\"\n      path: /rows\n  sink:\n    type: jsonl\n    config:\n      path: \"${{param.out}}\"\ntests:\n  suite:\n    auto: {{ defaults_baseline: true }}\n",
+        dir.path().join("out.jsonl").display(),
+        rows.uri()
+    );
+    let (code, reg) = api
+        .post(
+            "admin-tok",
+            "/v1/templates",
+            json!({"config": body, "launch": true}),
+        )
+        .await;
+    assert_eq!(code, 201, "{reg}");
+    let (code, refused) = api
+        .post(
+            "op-tok",
+            "/v1/schedules",
+            json!({
+                "name": "exfil",
+                "cron": "0 2 * * *",
+                "template": {"id": "param-sink", "params": {"out": "/etc/faucet-x.jsonl"}}
+            }),
+        )
+        .await;
+    assert_eq!(code, 403, "{refused}");
+    assert!(
+        refused.to_string().contains("a value a caller supplied"),
+        "{refused}"
+    );
+    let (_, list) = api.get("op-tok", "/v1/schedules").await;
+    assert!(names(&list).is_empty(), "{list}");
+}
+
+/// #1051 #2: under `--require-approval run` a schedule starts runs with
+/// standing approval, so creating one needs an approved change, and a
+/// schedule stored before the gate cannot be resumed without one.
+#[cfg(feature = "schedule")]
+#[tokio::test(flavor = "multi_thread")]
+async fn under_run_approval_a_schedule_needs_an_approved_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let rows = rows_mock().await;
+    let out = dir.path().join("out.jsonl");
+    let history = format!("sqlite:{}", dir.path().join("h.db").display());
+    // Stored and paused on an ungated server.
+    let open = spawn(dir.path(), Some(history.clone()), &rows.uri()).await;
+    let (code, reg) = open
+        .post(
+            "admin-tok",
+            "/v1/templates",
+            json!({"config": plain_template(&rows.uri(), &out), "launch": true}),
+        )
+        .await;
+    assert_eq!(code, 201, "{reg}");
+    let (code, made) = open
+        .post(
+            "op-tok",
+            "/v1/schedules",
+            json!({"name": "old", "cron": "0 2 * * *", "template": {"id": "plain-sync"}, "paused": true}),
+        )
+        .await;
+    assert_eq!(code, 201, "{made}");
+
+    let gated = spawn_full(
+        dir.path(),
+        Some(history),
+        &rows.uri(),
+        None,
+        vec!["run".to_string()],
+    )
+    .await;
+    // Resuming the unapproved schedule is refused.
+    let (code, refused) = gated
+        .post("op-tok", "/v1/schedules/old/resume", json!({}))
+        .await;
+    assert_eq!(code, 409, "{refused}");
+    assert!(
+        refused.to_string().contains("was not approved"),
+        "{refused}"
+    );
+    // Creating one becomes a change request; once approved it is stored as
+    // approved and may be resumed.
+    let (code, pending) = gated
+        .post(
+            "op-tok",
+            "/v1/schedules",
+            json!({"name": "fresh", "cron": "0 3 * * *", "template": {"id": "plain-sync"}, "paused": true}),
+        )
+        .await;
+    assert_eq!(code, 202, "{pending}");
+    assert_eq!(pending["status"], "pending_approval", "{pending}");
+    let id = pending["change_id"].as_str().unwrap().to_string();
+    let (code, done) = gated
+        .post("admin-tok", &format!("/v1/changes/{id}/approve"), json!({}))
+        .await;
+    assert_eq!(code, 200, "{done}");
+    assert_eq!(done["status"], "executed", "{done}");
+    let (code, resumed) = gated
+        .post("op-tok", "/v1/schedules/fresh/resume", json!({}))
+        .await;
+    assert_eq!(code, 200, "{resumed}");
+    assert_eq!(resumed["paused"], false, "{resumed}");
+}
+
+/// #1051 #3: a tenant looking at an operator's fan-out sees its own
+/// target's errors only, and none of the operator's change log.
+#[cfg(feature = "schedule")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tenant_sees_only_its_own_errors_of_a_fan_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/items"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items": [{"id": 1}]})))
+        .mount(&data)
+        .await;
+    let out = dir.path().join("out");
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&out).unwrap();
+    let api = spawn_with(dir.path(), None, "http://127.0.0.1:9", None).await;
+    for t in ["acme", "broken"] {
+        let (code, _) = api.post("admin-tok", "/v1/tenants", json!({"id": t})).await;
+        assert_eq!(code, 201);
+    }
+    // acme has the connection the template references; broken does not.
+    let (code, _) = api
+        .post(
+            "op-tok",
+            "/v1/tenants/acme/connections",
+            json!({"name": "api", "provider": {"type": "static", "config": {"token": "t"}}}),
+        )
+        .await;
+    assert_eq!(code, 201);
+    let (code, reg) = api
+        .post(
+            "admin-tok",
+            "/v1/templates",
+            json!({"config": template(&data.uri(), &out, &state_dir), "launch": true}),
+        )
+        .await;
+    assert_eq!(code, 201, "{reg}");
+    let (code, sched) = api
+        .post(
+            "op-tok",
+            "/v1/schedules",
+            json!({"name": "fan", "cron": "* * * * * *", "template": {"id": "tenant-sync"}, "tenants": "all"}),
+        )
+        .await;
+    assert_eq!(code, 201, "{sched}");
+    let mut operator = Value::Null;
+    for _ in 0..400 {
+        let (_, d) = api.get("op-tok", "/v1/schedules/fan").await;
+        if d["schedule"]["last_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("broken"))
+        {
+            operator = d;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(!operator.is_null(), "broken's refusal never showed");
+    assert!(!operator["changes"].as_array().unwrap().is_empty());
+    let (code, mine) = api.get("acme-tok", "/v1/schedules/fan").await;
+    assert_eq!(code, 200, "{mine}");
+    let text = mine.to_string();
+    assert!(!text.contains("broken"), "{mine}");
+    assert!(mine["changes"].as_array().unwrap().is_empty(), "{mine}");
+    let (_, list) = api.get("acme-tok", "/v1/schedules").await;
+    assert!(!list.to_string().contains("broken"), "{list}");
 }

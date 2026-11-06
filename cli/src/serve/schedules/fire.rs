@@ -26,7 +26,16 @@ pub struct FireOptions {
     /// A run started by hand (`POST /v1/schedules/{name}/run`): its own
     /// idempotency key, and the overlap rule does not apply.
     pub manual: Option<String>,
+    /// Defined in the `--schedules` file: its params are the operator's. A
+    /// schedule made through the API carries its creator's params, held to
+    /// the caller reference policy like a template run (#1051).
+    pub from_file: bool,
+    /// Made (or last changed) through an approved change request.
+    pub approved: bool,
 }
+
+/// Fan-out targets submitted side by side.
+const CONCURRENT_TARGETS: usize = 8;
 
 /// One target's result.
 #[derive(Debug, Clone, PartialEq)]
@@ -236,8 +245,10 @@ pub fn body(
         selection: spec.run.selection.clone(),
         pool: spec.run.pool.clone(),
         // A schedule is a standing approval: it was created (and, under
-        // `--require-approval schedule`, approved) once.
+        // `--require-approval`, approved) once; `fire_target` refuses one
+        // that needs an approval it does not have.
         standing_approval: true,
+        operator_params: opts.from_file,
         ..Default::default()
     })
 }
@@ -266,18 +277,31 @@ pub fn classify(e: ServeError, tenant: Option<&str>) -> TargetResult {
         ServeError::TooManyRequests(m) if tenant.is_some() => {
             TargetResult::Skipped(format!("tenant at its max_concurrent_runs limit ({m})"))
         }
+        // Only what passes with time is retried: a full queue, a shutdown,
+        // an unreachable store. Anything else fails this tick and the
+        // schedule moves on (a retry would hit the same error forever).
         ServeError::QueueFull { .. } => TargetResult::Retry("the run queue is full".into()),
         ServeError::Draining => TargetResult::Retry("the server is shutting down".into()),
-        e @ (ServeError::BadConfig(_)
-        | ServeError::Unprocessable { .. }
-        | ServeError::Forbidden(_)
-        | ServeError::NotFound
-        | ServeError::Unauthorized) => TargetResult::Failed(match e {
-            ServeError::NotFound => "the template was not found".to_string(),
-            other => other.api_error().error.message,
-        }),
-        other => TargetResult::Retry(other.api_error().error.message),
+        ServeError::TooManyRequests(m) => TargetResult::Retry(m),
+        e @ ServeError::Unavailable(_) => TargetResult::Retry(e.api_error().error.message),
+        ServeError::NotFound => TargetResult::Failed("the template was not found".to_string()),
+        other => TargetResult::Failed(other.api_error().error.message),
     }
+}
+
+/// The refusal of a tick that would start runs without an approval this
+/// server requires (#1051): `--require-approval run` covers schedules made
+/// through the API unless an approved change request made them.
+pub fn approval_missing(state: &ServerState, opts: &FireOptions) -> Option<String> {
+    (state.requires_approval(crate::serve::changes::ChangeKind::Run)
+        && !opts.from_file
+        && !opts.approved)
+        .then(|| {
+            "this server requires approval for runs (--require-approval run), and this schedule \
+             was not made through an approved change request; propose an update of it with \
+             POST /v1/changes (kind `schedule`) to approve it"
+                .to_string()
+        })
 }
 
 /// The targets of a tick: the owner, the fan-out's tenants, or the server.
@@ -314,12 +338,17 @@ async fn targets(
     }
 }
 
-/// Whether a run an earlier tick of this schedule started for `tenant` is
-/// still queued or running.
+/// Runs of one schedule looked at for an earlier one still going.
+const OVERLAP_SCAN: usize = 50;
+
+/// Whether a run an *earlier* tick of this schedule started for `tenant` is
+/// still queued or running. A run of `tick` itself (started by another
+/// cluster member, or by this tick before a retry) is not an earlier run.
 pub async fn earlier_run_going(
     state: &ServerState,
     name: &str,
     tenant: Option<&str>,
+    tick: &str,
 ) -> Result<Option<String>, String> {
     let filter = ListFilter {
         status: vec![
@@ -333,7 +362,7 @@ pub async fn earlier_run_going(
             key: LABEL_SCHEDULE.into(),
             value: Some(name.to_string()),
         }],
-        limit: 1,
+        limit: OVERLAP_SCAN,
         ..Default::default()
     };
     let page = state
@@ -341,7 +370,11 @@ pub async fn earlier_run_going(
         .list(&filter)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(page.runs.into_iter().next().map(|r| r.run_id))
+    Ok(page
+        .runs
+        .into_iter()
+        .find(|r| r.labels.get(LABEL_TICK).map(String::as_str) != Some(tick))
+        .map(|r| r.run_id))
 }
 
 /// Fire one tick. `owner` is the tenant that owns the schedule, if any.
@@ -361,15 +394,22 @@ pub async fn fire_tick(
             };
         }
     };
-    let mut out = TickResult::default();
-    for tenant in targets {
-        let result = fire_target(state, spec, tenant.as_deref(), tick, fired_at, opts).await;
-        if let (Some(t), TargetResult::Failed(_) | TargetResult::Skipped(_)) = (&tenant, &result) {
+    // A fan-out's tenants are submitted side by side (bounded), in order.
+    use futures::StreamExt;
+    let results: Vec<(Option<String>, TargetResult)> = futures::stream::iter(targets)
+        .map(|tenant| async move {
+            let result = fire_target(state, spec, tenant.as_deref(), tick, fired_at, opts).await;
+            (tenant, result)
+        })
+        .buffered(CONCURRENT_TARGETS)
+        .collect()
+        .await;
+    for (tenant, result) in &results {
+        if let (Some(t), TargetResult::Failed(_) | TargetResult::Skipped(_)) = (tenant, result) {
             super::metrics::tenant_failed(&spec.name, t);
         }
-        out.targets.push((tenant, result));
     }
-    out
+    TickResult { targets: results }
 }
 
 async fn fire_target(
@@ -380,8 +420,11 @@ async fn fire_target(
     fired_at: DateTime<Utc>,
     opts: &FireOptions,
 ) -> TargetResult {
+    if let Some(why) = approval_missing(state, opts) {
+        return TargetResult::Failed(why);
+    }
     if opts.manual.is_none() {
-        match earlier_run_going(state, &spec.name, tenant).await {
+        match earlier_run_going(state, &spec.name, tenant, &tick_text(tick)).await {
             Ok(Some(run)) => {
                 let going = format!("run {run} from an earlier tick is still going");
                 return match spec.overlap {
@@ -466,10 +509,22 @@ mod tests {
         assert_eq!(b.timeout_secs, Some(60));
         assert_eq!(b.pool.as_deref(), Some("big"));
         assert!(b.standing_approval);
+        // A schedule made through the API carries its creator's params.
+        assert!(!b.operator_params);
+        let file = FireOptions {
+            from_file: true,
+            ..Default::default()
+        };
+        assert!(
+            body(&spec(), tick, tick, &file, None)
+                .unwrap()
+                .operator_params
+        );
         assert_eq!(b.sink.as_deref(), Some("pg"));
         assert!(b.version.is_some() && b.sink_version.is_some() && b.overlay_version.is_some());
         let manual = FireOptions {
             manual: Some("u1".into()),
+            ..Default::default()
         };
         let m = body(&spec(), tick, tick, &manual, None).unwrap();
         assert_eq!(
@@ -539,10 +594,84 @@ mod tests {
             classify(ServeError::BadConfig("x".into()), None),
             TargetResult::Failed(_)
         ));
+        // Only transient errors retry; a deterministic one fails the tick.
         assert!(matches!(
             classify(ServeError::Internal("x".into()), None),
+            TargetResult::Failed(_)
+        ));
+        assert!(matches!(
+            classify(ServeError::Unavailable("store down".into()), None),
             TargetResult::Retry(_)
         ));
+        assert!(matches!(
+            classify(ServeError::Forbidden("no".into()), None),
+            TargetResult::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn a_schedule_needs_an_approval_when_runs_do() {
+        let state = crate::serve::test_support::test_state();
+        assert!(approval_missing(&state, &FireOptions::default()).is_none());
+        let mut config = crate::serve::test_support::test_config();
+        config.require_approval = vec![crate::serve::changes::ChangeKind::Run];
+        let gated = crate::serve::test_support::state_from(&config);
+        let why = approval_missing(&gated, &FireOptions::default()).unwrap();
+        assert!(why.contains("--require-approval run"), "{why}");
+        for ok in [
+            FireOptions {
+                from_file: true,
+                ..Default::default()
+            },
+            FireOptions {
+                approved: true,
+                ..Default::default()
+            },
+        ] {
+            assert!(approval_missing(&gated, &ok).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_run_of_the_same_tick_is_not_an_earlier_run() {
+        let state = crate::serve::test_support::test_state();
+        let labels = |tick: &str| {
+            BTreeMap::from([
+                (LABEL_SCHEDULE.to_string(), "nightly".to_string()),
+                (LABEL_TICK.to_string(), tick.to_string()),
+            ])
+        };
+        let same = crate::serve::history::RunRecord::queued(
+            "same".into(),
+            None,
+            labels("2026-11-05T02:00:00Z"),
+            None,
+            Utc::now(),
+        );
+        state.history().upsert(&same).await.unwrap();
+        let tick = "2026-11-05T02:00:00Z";
+        assert_eq!(
+            earlier_run_going(&state, "nightly", None, tick)
+                .await
+                .unwrap(),
+            None,
+            "another member already started this tick"
+        );
+        let earlier = crate::serve::history::RunRecord::queued(
+            "earlier".into(),
+            None,
+            labels("2026-11-05T01:55:00Z"),
+            None,
+            Utc::now(),
+        );
+        state.history().upsert(&earlier).await.unwrap();
+        assert_eq!(
+            earlier_run_going(&state, "nightly", None, tick)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("earlier")
+        );
     }
 
     #[test]

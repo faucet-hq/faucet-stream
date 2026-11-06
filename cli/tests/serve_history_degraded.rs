@@ -547,3 +547,75 @@ async fn a_claim_from_the_previous_release_still_replays() {
         "{err}"
     );
 }
+
+/// #1050: a single server whose backend is unreachable journals its runs,
+/// reports them on `/readyz`, and refuses new runs once the journal is full.
+#[cfg(all(feature = "source-csv", feature = "sink-jsonl"))]
+#[tokio::test]
+async fn a_degraded_server_journals_until_the_journal_is_full() {
+    let dir = tempfile::tempdir().unwrap();
+    let (history, mode) = flaky();
+    let history: Arc<dyn RunHistory> = Arc::new(history);
+    let journal =
+        Arc::new(faucet_cli::serve::history::journal::Journal::open(dir.path(), 1).unwrap());
+    assert!(history.attach_journal(journal.clone()));
+    let mut cfg = config();
+    cfg.cluster = faucet_cli::serve::cluster::ClusterConfig::disabled();
+    let state = ServerState::new(
+        &cfg,
+        None,
+        CancellationToken::new(),
+        history,
+        LogHub::new(),
+        None,
+        TriggersHandle::from_compiled(&[]),
+    );
+    let app = build_router(state.clone(), &cfg, &Default::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
+    });
+    let client = reqwest::Client::new();
+    let input = dir.path().join("in.csv");
+    std::fs::write(&input, "id\n1\n").unwrap();
+    let config = serde_json::json!({ "config": format!(
+        "version: 1\npipeline:\n  source: {{ type: csv, config: {{ path: {} }} }}\n  sink: {{ type: jsonl, config: {{ path: {} }} }}\n",
+        input.display(),
+        dir.path().join("out.jsonl").display()
+    )});
+    mode.store(UNREACHABLE, Ordering::SeqCst);
+    let first = client
+        .post(format!("{base}/v1/runs"))
+        .json(&config)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status().as_u16(), 202, "{:?}", first.text().await);
+    let ready: serde_json::Value = client
+        .get(format!("{base}/readyz"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(ready["degraded"]["since"].is_string(), "{ready}");
+    assert!(
+        ready["degraded"]["journaled"].as_u64().unwrap() >= 1,
+        "{ready}"
+    );
+    assert_eq!(ready["degraded"]["journal"]["full"], true, "{ready}");
+    let refused = client
+        .post(format!("{base}/v1/runs"))
+        .json(&config)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status().as_u16(), 503);
+    assert!(refused.text().await.unwrap().contains("journal"));
+}

@@ -184,18 +184,99 @@ pub fn spec_of(record: &PolicyVersionRecord) -> Result<PolicySpec, ServeError> {
     })
 }
 
+/// The policy versions a server read while its history was healthy, keyed by
+/// scope and pinned version (`None` = the newest). While the history is
+/// degraded the server keeps enforcing these rather than refusing every run
+/// or running unchecked (#1051); a scope never read fails closed.
+/// One remembered read: scope and pin, and what was stored.
+pub type PolicyRead = ((String, Option<u32>), Option<PolicyVersionRecord>);
+
+type ReadMap = BTreeMap<(String, Option<u32>), Option<PolicyVersionRecord>>;
+
+#[derive(Debug, Default)]
+pub struct PolicyReads {
+    reads: std::sync::Mutex<ReadMap>,
+}
+
+impl PolicyReads {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ReadMap> {
+        self.reads.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Remember a read.
+    pub fn remember(&self, scope: &str, pin: Option<u32>, read: Option<PolicyVersionRecord>) {
+        let mut map = self.lock();
+        // The newest version is also that version: a run pinned to it
+        // reloads while degraded.
+        if let Some(r) = &read {
+            map.insert((scope.to_string(), Some(r.version)), Some(r.clone()));
+        }
+        map.insert((scope.to_string(), pin), read);
+    }
+
+    /// The remembered read, when there is one.
+    pub fn recall(&self, scope: &str, pin: Option<u32>) -> Option<Option<PolicyVersionRecord>> {
+        self.lock().get(&(scope.to_string(), pin)).cloned()
+    }
+
+    /// Every remembered read (persisted beside the history journal, #1050).
+    pub fn snapshot(&self) -> Vec<PolicyRead> {
+        self.lock()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// Load reads persisted by an earlier process; a fresher read wins.
+    pub fn restore(&self, reads: Vec<PolicyRead>) {
+        let mut map = self.lock();
+        for (k, v) in reads {
+            map.entry(k).or_insert(v);
+        }
+    }
+}
+
+/// Read a policy version through `state`'s cache: a healthy read refreshes
+/// it; a read that fails while the history is degraded answers from it.
+async fn cached_read<F, Fut>(
+    state: &ServerState,
+    scope: &str,
+    pin: Option<u32>,
+    read: F,
+) -> Result<Option<PolicyVersionRecord>, ServeError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<
+            Output = Result<Option<PolicyVersionRecord>, crate::serve::history::HistoryError>,
+        >,
+{
+    match read().await {
+        Ok(v) => {
+            state.policy_reads().remember(scope, pin, v.clone());
+            Ok(v)
+        }
+        Err(e) => {
+            if state.history().degraded()
+                && let Some(v) = state.policy_reads().recall(scope, pin)
+            {
+                tracing::debug!(scope, "history degraded: enforcing the policy last read");
+                return Ok(v);
+            }
+            Err(store_err(e))
+        }
+    }
+}
+
 /// The newest stored version of `scope`.
 pub async fn latest(
     state: &ServerState,
     scope: &str,
 ) -> Result<Option<PolicyVersionRecord>, ServeError> {
-    Ok(state
-        .history()
-        .policy_versions(scope, 1)
-        .await
-        .map_err(store_err)?
-        .into_iter()
-        .next())
+    let history = state.history();
+    cached_read(state, scope, None, || async {
+        Ok(history.policy_versions(scope, 1).await?.into_iter().next())
+    })
+    .await
 }
 
 /// The server layer: the `--policy` file, else the newest stored version.
@@ -219,27 +300,33 @@ pub async fn server_layer(state: &ServerState) -> Result<ServerLayer, ServeError
 }
 
 /// The stored version of a layer a run is pinned to, else the newest one.
+/// `pin` is `None` for an unpinned run, `Some(None)` for a run admitted with
+/// no policy on that layer (it stays unchecked there, #1051), and
+/// `Some(Some(v))` for a run admitted under version `v`.
 async fn pinned_or_latest(
     state: &ServerState,
     scope: &str,
-    pin: Option<u32>,
+    pin: Option<Option<u32>>,
 ) -> Result<Option<PolicyVersionRecord>, ServeError> {
     match pin {
-        Some(v) => match state
-            .history()
-            .policy_version_get(scope, v)
-            .await
-            .map_err(store_err)?
-        {
-            Some(r) => Ok(Some(r)),
-            None => Err(ServeError::Unprocessable {
-                message: format!(
-                    "this run was admitted under {scope} policy version {v}, which is no \
+        Some(None) => Ok(None),
+        Some(Some(v)) => {
+            let history = state.history();
+            match cached_read(state, scope, Some(v), || {
+                history.policy_version_get(scope, v)
+            })
+            .await?
+            {
+                Some(r) => Ok(Some(r)),
+                None => Err(ServeError::Unprocessable {
+                    message: format!(
+                        "this run was admitted under {scope} policy version {v}, which is no \
                      longer stored; it cannot run under a policy it was not checked against"
-                ),
-                details: None,
-            }),
-        },
+                    ),
+                    details: None,
+                }),
+            }
+        }
         None => latest(state, scope).await,
     }
 }
@@ -256,14 +343,14 @@ pub async fn effective(
     let server = match state.policy_file() {
         Some(_) => state.policy().map(|p| (*p).clone()),
         None => {
-            let v = pinned_or_latest(state, SERVER_SCOPE, pin.and_then(|p| p.server)).await?;
+            let v = pinned_or_latest(state, SERVER_SCOPE, pin.map(|p| p.server)).await?;
             used.server = v.as_ref().map(|r| r.version);
             v.as_ref().map(spec_of).transpose()?
         }
     };
     let tenant_spec = match tenant {
         Some(t) => {
-            let v = pinned_or_latest(state, &tenant_scope(t), pin.and_then(|p| p.tenant)).await?;
+            let v = pinned_or_latest(state, &tenant_scope(t), pin.map(|p| p.tenant)).await?;
             used.tenant = v.as_ref().map(|r| r.version);
             v.as_ref().map(spec_of).transpose()?
         }
@@ -490,8 +577,10 @@ pub async fn check_draft(
                 problems.push(Problem::at(text, e));
             }
             for (tenant, spec) in tenant_policies(state).await? {
+                let mut clash = false;
                 for rule in &spec.rules {
                     if draft.rules.iter().any(|r| r.name == rule.name) {
+                        clash = true;
                         problems.push(Problem::at(
                             text,
                             format!(
@@ -501,6 +590,22 @@ pub async fn check_draft(
                             ),
                         ));
                     }
+                }
+                // Each tenant's runs are held to the merge: it must still
+                // validate (a tenant rule may govern a label this draft
+                // drops, #1051).
+                if !clash
+                    && let Err(e) = draft
+                        .clone()
+                        .merge(spec)
+                        .and_then(|m| CompiledPolicy::compile(&m).map(drop))
+                {
+                    problems.push(Problem::at(
+                        text,
+                        format!(
+                            "tenant {tenant}'s policy would no longer validate with this one: {e}"
+                        ),
+                    ));
                 }
             }
         }
@@ -733,10 +838,17 @@ pub async fn impact(
         .await
         .map_err(store_err)?;
     for rec in page.runs {
-        let Some(body) = rec.config_body.as_deref() else {
+        // A cluster run keeps its config in `config_body`, a single-server
+        // run in `policy_probe` (#1051); either may be sealed.
+        let (stored, format) = match (&rec.config_body, &rec.policy_probe) {
+            (Some(b), _) => (b.as_str(), rec.config_format.unwrap_or_default()),
+            (None, Some(p)) => (p.body.as_str(), p.format),
+            (None, None) => continue,
+        };
+        let Ok(body) = crate::serve::sealed::open_body(state, &rec.run_id, stored) else {
             continue;
         };
-        let Some(cfg) = probe_config(body, rec.config_format.unwrap_or_default()) else {
+        let Some(cfg) = probe_config(&body, format) else {
             continue;
         };
         out.runs_checked += 1;
@@ -949,39 +1061,6 @@ pub fn refusal_detail(phase: &str, v: Option<&faucet_core::Violation>, outcome: 
         d["sink_kind"] = json!(v.sink_kind);
     }
     d.to_string()
-}
-
-/// Read rule, column, sink and kind back out of a run-time violation's text
-/// (`Policy `r` violated on column `c`: rule `r`: column `c` — label `l` …
-/// sink `s` (kind) …`).
-pub fn parse_violation_text(text: &str) -> Value {
-    let between = |after: &str| -> Option<String> {
-        let start = text.find(after)? + after.len();
-        let rest = &text[start..];
-        let end = rest.find('`')?;
-        Some(rest[..end].to_string())
-    };
-    let mut d = json!({});
-    for (key, marker) in [
-        ("rule", "rule `"),
-        ("column", "column `"),
-        ("label", "label `"),
-        ("sink", "sink `"),
-    ] {
-        if let Some(v) = between(marker) {
-            d[key] = json!(v);
-        }
-    }
-    if let Some(sink) = d.get("sink").and_then(Value::as_str) {
-        let after = format!("sink `{sink}` (");
-        if let Some(i) = text.find(&after) {
-            let rest = &text[i + after.len()..];
-            if let Some(end) = rest.find(')') {
-                d["sink_kind"] = json!(rest[..end]);
-            }
-        }
-    }
-    d
 }
 
 /// Refusals newest first, `tenant`'s only when given.

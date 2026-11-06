@@ -1325,6 +1325,7 @@ pipeline:
                 error_kind: None,
                 metrics: None,
                 usage: None,
+                policy_denial: None,
             }],
         };
         assert_eq!(summary_rows(&ok), 4);

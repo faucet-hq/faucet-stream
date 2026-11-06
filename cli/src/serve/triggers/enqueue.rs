@@ -585,6 +585,7 @@ pub fn template_body_tracked(
         depends_on: compiled.spec.run.depends_on.clone(),
         pool: compiled.spec.run.pool.clone(),
         standing_approval: true,
+        operator_params: true,
         allow_untested: tpl.allow_untested,
         ..Default::default()
     };

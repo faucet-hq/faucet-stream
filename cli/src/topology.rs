@@ -1779,6 +1779,7 @@ fn build_summary(
             error_kind: None,
             metrics: None,
             usage: None,
+            policy_denial: None,
         })
         .collect();
     invocations.sort_by(|a, b| a.row_id.cmp(&b.row_id));
@@ -1808,6 +1809,7 @@ fn build_summary(
             error_kind,
             metrics: None,
             usage: None,
+            policy_denial: None,
         });
     }
 

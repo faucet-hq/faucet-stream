@@ -2082,7 +2082,8 @@ pub struct ServeScheduleArgs {
     #[arg(long, value_name = "PATH")]
     pub schedules: Option<std::path::PathBuf>,
     /// The shortest gap allowed between the ticks of a schedule a tenant owns
-    /// (seconds), so one tenant cannot flood the server. `0` = no limit.
+    /// (seconds), so one tenant cannot flood the server. At least `300`: no
+    /// schedule ticks more often than every 5 minutes.
     #[arg(long, default_value_t = 300)]
     pub tenant_schedule_min_interval_secs: u64,
 }

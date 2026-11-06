@@ -227,6 +227,24 @@
             "uid": "${datasource}"
           },
           "legendFormat": "degraded"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (kind) (faucet_serve_history_journal_records)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "journaled {{kind}}"
+        },
+        {
+          "refId": "C",
+          "expr": "sum by (kind, outcome) (increase(faucet_serve_history_journal_replayed_total[1h]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "replayed {{kind}} {{outcome}}"
         }
       ],
       "fieldConfig": {
@@ -849,7 +867,7 @@
     },
     {
       "type": "timeseries",
-      "title": "Missed ticks & tenant fan-out failures (per hour)",
+      "title": "Missed ticks, tenant fan-out failures & runner restarts (per hour)",
       "gridPos": {
         "x": 0,
         "y": 59,
@@ -878,6 +896,15 @@
             "uid": "${datasource}"
           },
           "legendFormat": "{{schedule}} {{tenant}} failed"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(increase(faucet_serve_schedule_runner_restarts_total[1h]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "runner restarts"
         }
       ],
       "fieldConfig": {

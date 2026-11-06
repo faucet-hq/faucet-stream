@@ -4,6 +4,7 @@
 //! trigger, `POST /v1/runs`, a clustered run, a schedule trigger, a change
 //! request, and the CLI.
 #![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
+#![allow(unsafe_code)] // tests set process environment variables
 #![cfg(feature = "templates")]
 
 use std::path::Path;
@@ -709,6 +710,8 @@ async fn a_clustered_run_applies_the_stored_selection() {
 #[cfg(feature = "schedule")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_schedule_runs_its_selection() {
+    // Debug builds only: tick every second instead of every 5 minutes.
+    unsafe { std::env::set_var("FAUCET_SCHEDULE_TEST_MIN_INTERVAL_SECS", "0") };
     let dir = tempfile::tempdir().unwrap();
     let d = data(dir.path());
     let out = dir.path().join("out");

@@ -187,6 +187,12 @@ pub struct ScheduleRecord {
     /// Newest last, at most [`CHANGE_LOG_RETAIN`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub changes: Vec<ScheduleChange>,
+    /// The current definition came through an approved change request
+    /// (#1051): under `--require-approval run`, only such a schedule (or a
+    /// `--schedules` file one) starts runs without a per-run approval. Set
+    /// by the server, never from the wire.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub approved: bool,
 }
 
 impl ScheduleRecord {
@@ -203,6 +209,7 @@ impl ScheduleRecord {
             paused_by: None,
             pause_reason: None,
             changes: Vec::new(),
+            approved: false,
         };
         r.log(now, by, "created", Vec::new());
         r

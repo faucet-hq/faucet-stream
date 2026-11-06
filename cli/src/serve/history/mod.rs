@@ -7,6 +7,7 @@
 pub mod catalog;
 #[cfg(feature = "serve")]
 pub mod fallback;
+pub mod journal;
 pub mod labels;
 pub mod memory;
 pub mod overview;
@@ -283,6 +284,20 @@ pub struct RunRecord {
     /// (#1043): a claim, shard or resume enforces these, not a newer one.
     #[serde(default, skip_serializing_if = "policies::PolicyPin::is_empty")]
     pub policy_pin: policies::PolicyPin,
+    /// The submitted config of a single-server run (a cluster run keeps it in
+    /// `config_body`), kept so a policy change's impact can check the runs
+    /// it would have refused (#1051). Sealed with the vault key when the
+    /// server has one; never re-run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_probe: Option<PolicyProbe>,
+}
+
+/// A run's config as the policy impact reads it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PolicyProbe {
+    pub body: String,
+    #[serde(default)]
+    pub format: crate::serve::load::ConfigFormat,
 }
 
 impl RunRecord {
@@ -326,6 +341,7 @@ impl RunRecord {
             submitted_by: None,
             dlq_location: None,
             policy_pin: Default::default(),
+            policy_probe: None,
         }
     }
 
@@ -2385,6 +2401,29 @@ pub trait RunHistory: Send + Sync {
         false
     }
 
+    /// Keep what is written while degraded in `journal` (#1050). `false`
+    /// when this backend has no persistent store to replay into.
+    fn attach_journal(&self, journal: Arc<journal::Journal>) -> bool {
+        let _ = journal;
+        false
+    }
+
+    /// The local history journal, when one is attached.
+    fn journal(&self) -> Option<Arc<journal::Journal>> {
+        None
+    }
+
+    /// When the persistent backend was found unreachable, while it still is.
+    fn degraded_since(&self) -> Option<DateTime<Utc>> {
+        None
+    }
+
+    /// Replay a journal an earlier process left, when the backend is healthy
+    /// (at startup, before serving).
+    async fn replay_journal(&self) -> Result<(), HistoryError> {
+        Ok(())
+    }
+
     /// True when the backend is in fallback mode (drives `/readyz`). Always false
     /// for memory.
     fn degraded(&self) -> bool;
@@ -3165,6 +3204,7 @@ mod tests {
                 ..Default::default()
             }),
             usage: None,
+            policy_denial: None,
         };
         assert_eq!(InvocationRecord::from(&o).duration_ms, 1_910_000);
         // A record serialized before `duration_ms` existed must still deserialize

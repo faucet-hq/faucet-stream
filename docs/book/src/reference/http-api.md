@@ -1049,11 +1049,19 @@ Registered templates run on a cron (#1044); see the
 
 `ScheduleRead` is granted to viewers and up, `ScheduleWrite` to operators and
 up. A create, edit or delete answers `202` with a pending change request
-under `--require-approval schedule`; run now follows `--require-approval run`.
+under `--require-approval schedule`. Under `--require-approval run` a create
+or edit answers `202` too, run now answers `409`, and resuming a schedule
+that was not stored through an approved change answers `409`.
 A schedule from the `--schedules` file answers `409` to edit, pause and
-delete. A tenant principal sees and changes only its own tenant's schedules
-(another tenant's is a `404`), never fans out (`403`), and is held to
-`max_schedules` and the minimum tick interval (`422` naming the limit).
+delete. Every schedule ticks at most every 5 minutes, and a cron with a
+seconds field is refused (`422`). A schedule's params are its creator's:
+one that names a server file or an internal URL the
+[caller reference policy](#reference-policy) does not allow is refused with
+`403` when the schedule is created or edited. A tenant principal sees and
+changes only its own tenant's schedules (another tenant's is a `404`), never
+fans out (`403`), and is held to `max_schedules` and the minimum tick
+interval (`422` naming the limit); on an operator's fan-out it sees only its
+own tick errors and none of the change history.
 Without the `schedule` and `templates` features `GET /v1/schedules` answers
 `{"available": false}` and no other route exists.
 
@@ -1802,7 +1810,11 @@ series: `faucet_serve_requests_total{method,path,status}`,
 `faucet_serve_runs_pending{pool}` (cluster mode: unclaimed runs per execution
 pool),
 `faucet_serve_idempotency_hits_total`, `faucet_serve_history_degraded` (the
-backend fell back to memory) and `faucet_serve_history_unreachable` (the last
+backend fell back to memory), `faucet_serve_history_journal_records{kind}`
+(records waiting in the local history journal while degraded, by
+`run` / `log` / `audit` / `usage`) and
+`faucet_serve_history_journal_replayed_total{kind,outcome}` (journaled records
+replayed into the recovered backend, `applied` or `skipped`) and `faucet_serve_history_unreachable` (the last
 lease heartbeat did not reach the history database; `/readyz` is `503` while
 it is `1`), and `faucet_serve_history_connections_discarded_total` (pooled
 history connections dropped because a failed commit left them inside a

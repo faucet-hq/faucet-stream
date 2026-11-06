@@ -270,13 +270,31 @@ while it cannot reach the database, `/readyz` returns `503` with
 on the first heartbeat that gets through.
 
 While degraded, run records, logs, audit, catalog and usage go to an in-memory
-store so runs keep going. Templates, tenants, connections, change requests and
-`queue_depth` trigger edges are **not** served from that empty store: those
-requests, and submissions with an idempotency key, fail with `503` until the
-backend is back. Every lease tick probes the backend — or, when it was
-unreachable at startup, tries to connect it again — and leaves degraded mode as
-soon as it answers; records written to
-memory meanwhile are not copied back. Terminal records are retained for
+store so runs keep going. Templates, schedules, policy versions, tenants,
+connections, change requests and approvals, and `queue_depth` trigger edges are
+**not** served from that empty store: those requests, and submissions with an
+idempotency key, fail with `503` ("history unavailable") until the backend is
+back. A degraded cluster replica stops claiming runs and refuses new
+submissions; a single server keeps accepting them.
+
+**The local journal.** What a server must not lose while degraded — the run
+records and status of the runs it owns (with their invocations), run log
+lines, audit entries and usage records — is also appended, fsynced, to
+`$FAUCET_DATA_DIR/history-journal/journal.jsonl`. Every lease tick probes the
+backend — or, when it was unreachable at startup, tries to connect it again —
+and once it answers, the journal is replayed into it before the server leaves
+degraded mode: runs by id (a terminal record owner-fenced, so a run a peer took
+over keeps the peer's record), audit entries by id, log lines by sequence and
+usage by `(run_id, row_id)`, so a replay that is interrupted and repeated
+writes nothing twice. The journal is then truncated. A server restarted while
+degraded keeps the file and replays it as soon as it reaches the backend —
+before it serves, when that is at startup. The journal is capped at 1 GiB
+(`FAUCET_HISTORY_JOURNAL_MAX_BYTES`); past it new runs are refused with `503`
+rather than a record dropped. `/readyz` reports `degraded: {since, journaled}`
+and `faucet_serve_history_journal_records{kind}` counts what waits (alert
+`FaucetServeHistoryJournalPending`). The policy versions the server last read
+are kept beside the journal too, so a server restarted while degraded keeps
+enforcing them. Terminal records are retained for
 `--retain-terminal-runs-secs` (default 7 days).
 
 ### Multi-instance orphan recovery (run-ownership leases)

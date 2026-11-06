@@ -1043,6 +1043,7 @@ mod tests {
                 rows: None,
             }),
             usage: None,
+            policy_denial: None,
         }
     }
 

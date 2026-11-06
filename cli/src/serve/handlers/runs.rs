@@ -36,6 +36,8 @@ pub(crate) fn redact_record(rec: &mut RunRecord, actor: &AuthContext) {
     if actor.role != crate::serve::rbac::Role::Admin || actor.tenant.is_some() {
         rec.config_body = None;
     }
+    // Kept only for a policy change's impact (#1051); never shown.
+    rec.policy_probe = None;
 }
 
 /// Why a tenant-scoped principal may not submit a config of its own: loading

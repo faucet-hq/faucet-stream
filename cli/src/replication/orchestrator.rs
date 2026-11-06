@@ -585,6 +585,7 @@ pipeline:
                 error_kind: None,
                 metrics: None,
                 usage: None,
+                policy_denial: None,
             }],
         };
         let err = phase_failure(&summary, "snapshot");
@@ -611,6 +612,7 @@ pipeline:
                 error_kind: None,
                 metrics: None,
                 usage: None,
+                policy_denial: None,
             }],
         };
         let err = phase_failure(&summary, "CDC");

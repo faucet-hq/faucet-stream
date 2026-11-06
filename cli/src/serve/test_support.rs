@@ -87,3 +87,149 @@ pub fn test_state_clustered() -> ServerState {
     config.cluster.enabled = true;
     state_from(&config)
 }
+
+type HErr = crate::serve::history::HistoryError;
+type PolicyRecord = crate::serve::history::policies::PolicyVersionRecord;
+
+/// An in-memory history that answers "unreachable" while `down` is set:
+/// wrapped in a `FallbackHistory` it drives the degraded paths without a
+/// database. It implements the run and policy calls the degraded tests make.
+pub struct Flaky {
+    pub inner: Arc<MemoryHistory>,
+    pub down: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Flaky {
+    fn check(&self) -> Result<(), HErr> {
+        if self.down.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(HErr::Unreachable("connection refused".into()));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl RunHistory for Flaky {
+    async fn claim_idempotency(
+        &self,
+        key: &str,
+        fingerprint: &str,
+        run_id: &str,
+        window: Duration,
+    ) -> Result<crate::serve::history::Claim, HErr> {
+        self.check()?;
+        self.inner
+            .claim_idempotency(key, fingerprint, run_id, window)
+            .await
+    }
+    async fn upsert(&self, rec: &crate::serve::history::RunRecord) -> Result<(), HErr> {
+        self.check()?;
+        self.inner.upsert(rec).await
+    }
+    async fn insert_new(&self, rec: &crate::serve::history::RunRecord) -> Result<bool, HErr> {
+        self.check()?;
+        self.inner.insert_new(rec).await
+    }
+    async fn get(&self, id: &str) -> Result<Option<crate::serve::history::RunRecord>, HErr> {
+        self.check()?;
+        self.inner.get(id).await
+    }
+    async fn list(
+        &self,
+        filter: &crate::serve::history::ListFilter,
+    ) -> Result<crate::serve::history::ListPage, HErr> {
+        self.check()?;
+        self.inner.list(filter).await
+    }
+    async fn delete(&self, id: &str) -> Result<crate::serve::history::DeleteOutcome, HErr> {
+        self.check()?;
+        self.inner.delete(id).await
+    }
+    async fn purge_expired(&self, retain_for: Duration) -> Result<usize, HErr> {
+        self.check()?;
+        self.inner.purge_expired(retain_for).await
+    }
+    async fn recover_orphans(&self) -> Result<usize, HErr> {
+        self.check()?;
+        self.inner.recover_orphans().await
+    }
+    fn degraded(&self) -> bool {
+        false
+    }
+    async fn finalize_owned(&self, rec: &crate::serve::history::RunRecord) -> Result<bool, HErr> {
+        self.check()?;
+        self.inner.finalize_owned(rec).await
+    }
+    async fn record_audit(&self, e: &crate::serve::history::AuditEntry) -> Result<(), HErr> {
+        self.check()?;
+        self.inner.record_audit(e).await
+    }
+    async fn get_audit(&self, id: &str) -> Result<Option<crate::serve::history::AuditEntry>, HErr> {
+        self.check()?;
+        self.inner.get_audit(id).await
+    }
+    async fn record_run_logs(
+        &self,
+        run_id: &str,
+        lines: &[crate::serve::history::RunLogLine],
+    ) -> Result<(), HErr> {
+        self.check()?;
+        self.inner.record_run_logs(run_id, lines).await
+    }
+    async fn list_run_logs(
+        &self,
+        run_id: &str,
+        after_seq: Option<u64>,
+        limit: usize,
+    ) -> Result<crate::serve::history::RunLogPage, HErr> {
+        self.check()?;
+        self.inner.list_run_logs(run_id, after_seq, limit).await
+    }
+    async fn usage_record(&self, r: &crate::usage::UsageRecord) -> Result<(), HErr> {
+        self.check()?;
+        self.inner.usage_record(r).await
+    }
+    async fn policy_version_insert(&self, record: &PolicyRecord) -> Result<bool, HErr> {
+        self.check()?;
+        self.inner.policy_version_insert(record).await
+    }
+    async fn policy_versions(&self, scope: &str, limit: usize) -> Result<Vec<PolicyRecord>, HErr> {
+        self.check()?;
+        self.inner.policy_versions(scope, limit).await
+    }
+    async fn policy_version_get(
+        &self,
+        scope: &str,
+        version: u32,
+    ) -> Result<Option<PolicyRecord>, HErr> {
+        self.check()?;
+        self.inner.policy_version_get(scope, version).await
+    }
+}
+
+/// A server over a [`Flaky`] history behind the degraded fallback; set the
+/// returned flag to take the "database" down.
+pub fn flaky_state() -> (ServerState, Arc<std::sync::atomic::AtomicBool>) {
+    let config = test_config();
+    let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flaky = Flaky {
+        inner: Arc::new(MemoryHistory::new(config.idempotency_retention)),
+        down: down.clone(),
+    };
+    let history = Arc::new(crate::serve::history::fallback::FallbackHistory::healthy(
+        Box::new(flaky),
+        config.idempotency_retention,
+        "postgres",
+    )) as Arc<dyn RunHistory>;
+    let state = ServerState::new(
+        &config,
+        None,
+        CancellationToken::new(),
+        history,
+        crate::serve::logs::LogHub::new(),
+        None,
+        #[cfg(feature = "triggers")]
+        crate::serve::triggers::health::TriggersHandle::empty(),
+    );
+    (state, down)
+}

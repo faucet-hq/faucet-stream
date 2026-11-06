@@ -1281,6 +1281,31 @@ pub(crate) async fn enqueue(
         });
     }
 
+    // A single server keeps accepting runs while the history is unreachable,
+    // journaling them; once the journal is full new runs are refused rather
+    // than a record dropped (#1050).
+    if state.history().degraded()
+        && let Some(j) = state.history().journal()
+        && j.status().await.full
+    {
+        release_orphaned_claim(&state, &req, &run_id).await;
+        return Err(ServeError::Unavailable(format!(
+            "history unavailable: the run history is unreachable and the local journal in {} is \
+             full ({}); retry once it recovers",
+            j.dir().display(),
+            crate::serve::history::journal::MAX_BYTES_ENV
+        )));
+    }
+    // Kept (sealed when the server has a vault key) so a policy change's
+    // impact can check this run (#1051).
+    rec.policy_probe = Some(crate::serve::history::PolicyProbe {
+        body: crate::serve::sealed::persisted_body(
+            &state,
+            &run_id,
+            crate::secrets::registry::redact_message(&req.config),
+        ),
+        format: req.config_format.into(),
+    });
     if let Err(e) = link_tenant_run(&state, &rec).await {
         release_orphaned_claim(&state, &req, &run_id).await;
         return Err(e);
@@ -1644,7 +1669,9 @@ async fn audit_runtime_policy_denials(
     tenant: Option<&str>,
     result: &crate::error::CliResult<RunSummary>,
 ) {
-    let denied: Vec<(String, String)> = match result {
+    // Each denial with what the typed error says about it (#1051): never
+    // parsed back out of the error text.
+    let denied: Vec<(String, Option<crate::executor::PolicyDenial>)> = match result {
         Ok(summary) => summary
             .invocations
             .iter()
@@ -1654,19 +1681,28 @@ async fn audit_runtime_policy_denials(
                     Some(crate::executor::InvocationErrorKind::Policy)
                 )
             })
-            .map(|i| (i.row_id.clone(), i.error.clone().unwrap_or_default()))
+            .map(|i| (i.row_id.clone(), i.policy_denial.clone()))
             .collect(),
-        Err(
-            e @ (crate::error::CliError::Faucet(faucet_core::FaucetError::PolicyViolation {
-                ..
-            })
-            | crate::error::CliError::PolicyViolations { .. }),
-        ) => vec![(String::new(), e.to_string())],
+        Err(crate::error::CliError::Faucet(faucet_core::FaucetError::PolicyViolation {
+            rule,
+            column,
+            ..
+        })) => vec![(
+            String::new(),
+            Some(crate::executor::PolicyDenial {
+                rule: rule.clone(),
+                column: column.clone(),
+                labels: Vec::new(),
+                sink: String::new(),
+                sink_kind: String::new(),
+            }),
+        )],
+        Err(crate::error::CliError::PolicyViolations { .. }) => vec![(String::new(), None)],
         Err(_) => Vec::new(),
     };
     let mut actor = AuthContext::runtime();
     actor.tenant = tenant.map(str::to_string);
-    for (row, error) in denied {
+    for (row, denial) in denied {
         let result = if row.is_empty() {
             "denied".to_string()
         } else {
@@ -1674,13 +1710,20 @@ async fn audit_runtime_policy_denials(
         };
         #[cfg(feature = "policy")]
         {
-            let mut detail = crate::serve::policies::parse_violation_text(&error);
-            detail["phase"] = serde_json::json!("runtime");
-            detail["outcome"] = serde_json::json!(if error.contains("quarantine") {
-                "quarantined"
-            } else {
-                "failed"
-            });
+            // A run-time refusal fails the run; a quarantining rule sends
+            // rows to the DLQ without one, so it never lands here.
+            let mut detail = serde_json::json!({ "phase": "runtime", "outcome": "failed" });
+            if let Some(d) = &denial {
+                detail["rule"] = serde_json::json!(d.rule);
+                detail["column"] = serde_json::json!(d.column);
+                if let Some(l) = d.labels.first() {
+                    detail["label"] = serde_json::json!(l);
+                }
+                if !d.sink.is_empty() {
+                    detail["sink"] = serde_json::json!(d.sink);
+                    detail["sink_kind"] = serde_json::json!(d.sink_kind);
+                }
+            }
             crate::serve::audit::record_detail(
                 state,
                 &actor,
@@ -1695,7 +1738,7 @@ async fn audit_runtime_policy_denials(
         }
         #[cfg(not(feature = "policy"))]
         {
-            let _ = error;
+            let _ = denial;
             crate::serve::audit::write(
                 state,
                 &actor,
@@ -2950,6 +2993,7 @@ mod tests {
                 error_kind: None,
                 metrics: None,
                 usage: None,
+                policy_denial: None,
             }],
         };
         let (status, reason, records, _, error) = classify_run(Ok(summary)).into_parts();
@@ -2971,6 +3015,7 @@ mod tests {
                 error_kind: None,
                 metrics: None,
                 usage: None,
+                policy_denial: None,
             }],
         };
         let (status, reason, _, _, error) = classify_run(Ok(summary)).into_parts();

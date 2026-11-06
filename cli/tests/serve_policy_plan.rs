@@ -269,6 +269,19 @@ async fn policy_refuses_submissions_warns_on_templates_and_audits_runtime_denial
         .expect("runtime denial audited");
     assert_eq!(runtime["run_id"], rec["run_id"]);
     assert!(runtime["result"].as_str().unwrap().starts_with("denied"));
+    // The entry names the rule, column and sink from the typed error, not
+    // from its text (whose `sink `residency`` once read as the sink, #1051).
+    let detail: Value = match &runtime["detail"] {
+        Value::String(s) => serde_json::from_str(s).unwrap(),
+        v => v.clone(),
+    };
+    assert_eq!(detail["rule"], "pii-eu", "{detail}");
+    assert_eq!(detail["column"], "mail", "{detail}");
+    assert_eq!(detail["sink"], "default", "{detail}");
+    assert!(
+        !detail["sink_kind"].as_str().unwrap_or("").is_empty(),
+        "{detail}"
+    );
 
     // Planning loads the config on the server, so a viewer is refused…
     let resp = client

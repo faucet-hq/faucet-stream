@@ -138,12 +138,44 @@ impl SchedulesRuntime {
     }
 }
 
-/// Start the tick loop.
+/// Start the tick loop, supervised: a panic restarts it instead of silently
+/// ending every schedule.
 pub fn spawn(
     state: crate::serve::state::ServerState,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(runner::run(state, shutdown))
+    let stop = shutdown.clone();
+    tokio::spawn(supervise(
+        move || runner::run(state.clone(), shutdown.clone()),
+        stop,
+        Duration::from_secs(1),
+    ))
+}
+
+/// Run `make()`'s task until it returns; restart it after `pause` when it
+/// panics (counted in `faucet_serve_schedule_runner_restarts_total`).
+#[allow(clippy::disallowed_methods)] // a restart back-off, not a connector backend call
+pub async fn supervise<F, Fut>(
+    mut make: F,
+    shutdown: tokio_util::sync::CancellationToken,
+    pause: Duration,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    loop {
+        match tokio::spawn(make()).await {
+            Err(e) if e.is_panic() && !shutdown.is_cancelled() => {
+                tracing::error!("the schedule loop panicked; restarting it");
+                metrics::runner_restarted();
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = tokio::time::sleep(pause) => {}
+                }
+            }
+            _ => return,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -220,6 +252,46 @@ mod tests {
             d.tenant_min_interval(),
             crate::serve::config::DEFAULT_TENANT_SCHEDULE_MIN_INTERVAL
         );
+    }
+
+    #[tokio::test]
+    async fn a_panicking_loop_is_restarted_and_a_clean_exit_ends_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let starts = Arc::new(AtomicUsize::new(0));
+        let n = starts.clone();
+        supervise(
+            move || {
+                let n = n.clone();
+                async move {
+                    if n.fetch_add(1, Ordering::SeqCst) == 0 {
+                        panic!("first run panics");
+                    }
+                }
+            },
+            tokio_util::sync::CancellationToken::new(),
+            Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+
+        // Shut down: a panic is not restarted.
+        let stop = tokio_util::sync::CancellationToken::new();
+        stop.cancel();
+        let once = Arc::new(AtomicUsize::new(0));
+        let m = once.clone();
+        supervise(
+            move || {
+                let m = m.clone();
+                async move {
+                    m.fetch_add(1, Ordering::SeqCst);
+                    panic!("panics while stopping");
+                }
+            },
+            stop,
+            Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(once.load(Ordering::SeqCst), 1);
     }
 
     #[cfg(feature = "tenants")]

@@ -75,6 +75,23 @@ pub fn set_history_unreachable(unreachable: bool) {
     metrics::gauge!("faucet_serve_history_unreachable").set(if unreachable { 1.0 } else { 0.0 });
 }
 
+/// Records waiting in the local history journal (#1050), by kind.
+pub fn set_history_journal_records(kind: &str, n: u64) {
+    metrics::gauge!("faucet_serve_history_journal_records", "kind" => kind.to_string())
+        .set(n as f64);
+}
+
+/// One journaled record replayed into the recovered backend (#1050):
+/// `outcome` is `applied` or `skipped` (already there, or a peer's).
+pub fn history_journal_replayed(kind: &str, outcome: &str) {
+    metrics::counter!(
+        "faucet_serve_history_journal_replayed_total",
+        "kind" => kind.to_string(),
+        "outcome" => outcome.to_string(),
+    )
+    .increment(1);
+}
+
 /// Count runs claimed by this instance's claim loop.
 pub fn record_runs_claimed(n: usize) {
     metrics::counter!("faucet_serve_runs_claimed_total").increment(n as u64);

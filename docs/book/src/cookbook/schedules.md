@@ -31,7 +31,7 @@ A name in the file wins over a stored schedule with the same name.
 version: 1
 schedules:
   - name: nightly-rollup
-    cron: "0 2 * * *"            # 5 fields, or 6 with seconds first
+    cron: "0 2 * * *"            # 5 fields; ticks at most every 5 minutes
     timezone: Europe/Berlin      # IANA name, DST-correct; default UTC
     overlap: skip                # skip | queue | forbid
     template:
@@ -52,7 +52,7 @@ The full example is
 |---|---|
 | `name` | Letters, digits, `-` and `_`, at most 64. Cannot change after creation. |
 | `description` | Free text shown in the console. |
-| `cron`, `timezone` | When it ticks. The console previews the next ticks in the timezone and in UTC. |
+| `cron`, `timezone` | When it ticks: a five-field cron (or an alias such as `@hourly`). A schedule ticks at most every 5 minutes. The console previews the next ticks in the timezone and in UTC. |
 | `catch_up` | Default `true`: after a gap (no server running, or the server fell behind), run the latest missed tick once. `false` skips missed ticks. Either way missed ticks are counted. |
 | `overlap` | What a tick does while a run from an earlier tick is still going: `skip` it (default), `queue` it until that run ends, or `forbid` (record the tick as failed). |
 | `paused` | Start paused. |
@@ -69,6 +69,15 @@ vault key (`--vault-key`) and never shown again: responses carry
 `{"$sealed": true}` in their place, and sending that marker back keeps the
 stored value. A server without a vault key refuses a schedule with a secret
 param.
+
+### At most every 5 minutes
+
+No schedule may tick more often than every 5 minutes, whoever made it: the
+operator, a tenant, or the `--schedules` file. A cron that would (`*/2 * * * *`)
+is refused with `422` naming the rule, a schedules file with one refuses to
+start, and a six-field cron (one with a seconds field) is refused outright.
+For anything more frequent, use a [trigger](./triggers.md) or a streaming
+source.
 
 ## Ticks, runs and failures
 
@@ -87,7 +96,7 @@ unreachable) is retried with backoff until it starts.
 
 **Run now** starts one tick immediately, exactly as a scheduled one (without
 the overlap rule). It leaves the next scheduled tick unchanged. Under
-`--require-approval run` it becomes a change request.
+`--require-approval run` it is refused (see [Trust and approvals](#trust-and-approvals)).
 
 **Pause** stops ticks until resumed; ticks skipped while paused are not run
 later, and the count is logged in the schedule's history.
@@ -101,19 +110,43 @@ schedules for its tenant only:
 - at most `max_schedules` of them (a [tenant limit](./embedded-integrations.md);
   paused schedules count), else `422` naming the limit;
 - ticking no more often than `--tenant-schedule-min-interval-secs` (default
-  300; `0` turns it off), else `422` naming the interval.
+  and minimum 300: the flag can only raise the floor), else `422` naming the
+  interval.
 
 Another tenant's schedule is a `404`. A tenant principal also sees the
-operator's fan-out schedules that include its tenant, read-only, with only its
-own runs.
+operator's fan-out schedules that include its tenant, read-only: only its own
+runs, only its own tick errors and skip reasons, and none of the operator's
+params or change history.
 
-## Approvals
+## Trust and approvals
+
+A schedule's params are its creator's. A schedule made in the console or
+over the API is held to the same rules as the creator triggering the template
+by hand: its params meet the server's caller
+[reference policy](../reference/http-api.md#reference-policy) (no server
+files, no internal URLs unless the operator allowed them) when it is created
+or edited, and again at every tick. Only schedules in the `--schedules` file
+run as the operator's own, the way a triggers file does.
 
 `faucet serve --require-approval schedule` turns every create, edit and delete
 into a [change request](./approvals.md) (`202` with `change_id`); the change
-applies once approved. Pause and resume are not gated. New secret param values
-cannot travel in a change request: create the schedule without them, then set
-them once it exists.
+applies once approved. New secret param values cannot travel in a change
+request: create the schedule without them, then set them once it exists.
+
+`--require-approval run` gates runs, and a schedule starts runs on its own,
+so under it:
+
+- creating or editing a schedule is a change request too (deleting is not);
+- a schedule's ticks run with standing approval only when the schedule was
+  stored through an approved change, or comes from the `--schedules` file;
+  a tick of any other schedule is recorded as failed, naming the missing
+  approval;
+- resuming a schedule that was not approved is refused with `409`: propose an
+  update to it, and resume it once approved;
+- **Run now** is refused with `409` (start the template through a change
+  request instead).
+
+Pausing is never gated.
 
 ## API
 
