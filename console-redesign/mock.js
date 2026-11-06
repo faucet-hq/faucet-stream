@@ -78,7 +78,7 @@
     grid: (n, items) => `<div class="grid${n}">${items.join('')}</div>`,
     card: ({ icon, title, tag, aside, right, body = '', note, cls = '' }) => `<div class="card ${cls}">${title || icon ? `<div class="h">${icon ? ic(icon) : ''}${title ? `<b>${title}</b>` : ''}${tag ? `<span class="tag">${tag}</span>` : ''}${aside ? `<span class="muted">${aside}</span>` : ''}${right ? `<span class="r">${right}</span>` : ''}</div>` : ''}${body}${note ? `<div class="note">${note}</div>` : ''}</div>`,
     tbl: (cols, rows, foot) => `<table><tr>${cols.map((c) => { const [l, cl] = Array.isArray(c) ? c : [c]; return `<th class="${cl || ''}">${l}</th>`; }).join('')}</tr>${rows.map((r) => { const cells = r.cells || r; return `<tr class="${r.cls || ''}">${cells.map((c, i) => { const cl = Array.isArray(cols[i]) ? cols[i][1] : ''; return `<td class="${cl || ''}">${c}</td>`; }).join('')}</tr>`; }).join('')}${foot ? `<tfoot><tr>${foot.map((c, i) => `<td class="${Array.isArray(cols[i]) ? cols[i][1] : ''}">${c}</td>`).join('')}</tr></tfoot>` : ''}</table>`,
-    pill: (text, tone = '', icon = '') => `<span class="pill ${tone}">${icon ? ic(icon) : ''}${text}</span>`,
+    pill: (text, tone = '', icon = '') => { const i = icon || (/^pending\b/i.test(text) ? 'clock' : ''); return `<span class="pill ${tone}">${i ? ic(i) : ''}${text}</span>`; },
     chip: (text, cls = '') => `<span class="chip ${cls}">${text}</span>`,
     ch: (text, stable) => `<span class="ch ${stable ? 'stable' : ''}">${text}</span>`,
     tag: (text, tone = '') => `<span class="tag ${tone}">${text}</span>`,
