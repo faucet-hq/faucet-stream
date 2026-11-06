@@ -278,7 +278,10 @@ async fn policy_refuses_submissions_warns_on_templates_and_audits_runtime_denial
     assert_eq!(detail["rule"], "pii-eu", "{detail}");
     assert_eq!(detail["column"], "mail", "{detail}");
     assert_eq!(detail["sink"], "default", "{detail}");
-    assert!(!detail["sink_kind"].as_str().unwrap_or("").is_empty(), "{detail}");
+    assert!(
+        !detail["sink_kind"].as_str().unwrap_or("").is_empty(),
+        "{detail}"
+    );
 
     // Planning loads the config on the server, so a viewer is refused…
     let resp = client

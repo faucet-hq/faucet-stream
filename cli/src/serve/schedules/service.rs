@@ -843,13 +843,8 @@ async fn check_spec(
             },
             crate::runtime::Origin::Trusted,
         );
-        crate::runtime::server::screen_template_params(
-            state,
-            &principal,
-            &spec.template.id,
-            body,
-        )
-        .await?;
+        crate::runtime::server::screen_template_params(state, &principal, &spec.template.id, body)
+            .await?;
     }
     Ok(secret)
 }

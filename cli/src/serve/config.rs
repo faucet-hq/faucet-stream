@@ -1206,7 +1206,10 @@ mod tests {
         // The default history is a file private to each replica: refused too.
         a.history = None;
         let err = ServeConfig::from_args(a).unwrap_err().to_string();
-        assert!(err.contains("explicit --history shared by every replica"), "{err}");
+        assert!(
+            err.contains("explicit --history shared by every replica"),
+            "{err}"
+        );
     }
 
     #[test]

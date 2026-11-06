@@ -822,9 +822,9 @@ async fn a_server_draft_must_keep_each_tenant_merge_valid() {
         .await
         .unwrap();
     assert!(
-        problems
-            .iter()
-            .any(|p| p.message.contains("tenant acme's policy would no longer validate")),
+        problems.iter().any(|p| p
+            .message
+            .contains("tenant acme's policy would no longer validate")),
         "{problems:?}"
     );
     // Keeping it passes.

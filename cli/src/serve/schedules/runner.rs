@@ -339,7 +339,8 @@ pub async fn step(state: &ServerState, entry: &mut Entry, now: DateTime<Utc>) {
         from_file: entry.source == Source::File,
         approved: entry.approved,
     };
-    let result = fire::fire_tick(state, &entry.spec, entry.owner.as_deref(), tick, now, &opts).await;
+    let result =
+        fire::fire_tick(state, &entry.spec, entry.owner.as_deref(), tick, now, &opts).await;
     let outcome = result.outcome();
     let name = entry.spec.name.clone();
     match &outcome {
@@ -726,7 +727,10 @@ mod tests {
         let w = wanted(&state).await.unwrap();
         assert_eq!(w.len(), 1);
         assert_eq!(w[0].2, Source::File);
-        assert!(w[0].3, "a file schedule is the operator's standing approval");
+        assert!(
+            w[0].3,
+            "a file schedule is the operator's standing approval"
+        );
     }
 
     #[tokio::test]

@@ -1985,7 +1985,10 @@ async fn under_run_approval_a_schedule_needs_an_approved_change() {
         .post("op-tok", "/v1/schedules/old/resume", json!({}))
         .await;
     assert_eq!(code, 409, "{refused}");
-    assert!(refused.to_string().contains("was not approved"), "{refused}");
+    assert!(
+        refused.to_string().contains("was not approved"),
+        "{refused}"
+    );
     // Creating one becomes a change request; once approved it is stored as
     // approved and may be resumed.
     let (code, pending) = gated

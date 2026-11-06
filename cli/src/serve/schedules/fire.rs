@@ -515,7 +515,11 @@ mod tests {
             from_file: true,
             ..Default::default()
         };
-        assert!(body(&spec(), tick, tick, &file, None).unwrap().operator_params);
+        assert!(
+            body(&spec(), tick, tick, &file, None)
+                .unwrap()
+                .operator_params
+        );
         assert_eq!(b.sink.as_deref(), Some("pg"));
         assert!(b.version.is_some() && b.sink_version.is_some() && b.overlay_version.is_some());
         let manual = FireOptions {
@@ -647,7 +651,9 @@ mod tests {
         state.history().upsert(&same).await.unwrap();
         let tick = "2026-11-05T02:00:00Z";
         assert_eq!(
-            earlier_run_going(&state, "nightly", None, tick).await.unwrap(),
+            earlier_run_going(&state, "nightly", None, tick)
+                .await
+                .unwrap(),
             None,
             "another member already started this tick"
         );

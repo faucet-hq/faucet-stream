@@ -188,16 +188,18 @@ pub fn spec_of(record: &PolicyVersionRecord) -> Result<PolicySpec, ServeError> {
 /// scope and pinned version (`None` = the newest). While the history is
 /// degraded the server keeps enforcing these rather than refusing every run
 /// or running unchecked (#1051); a scope never read fails closed.
+/// One remembered read: scope and pin, and what was stored.
+pub type PolicyRead = ((String, Option<u32>), Option<PolicyVersionRecord>);
+
+type ReadMap = BTreeMap<(String, Option<u32>), Option<PolicyVersionRecord>>;
+
 #[derive(Debug, Default)]
 pub struct PolicyReads {
-    reads: std::sync::Mutex<BTreeMap<(String, Option<u32>), Option<PolicyVersionRecord>>>,
+    reads: std::sync::Mutex<ReadMap>,
 }
 
 impl PolicyReads {
-    fn lock(
-        &self,
-    ) -> std::sync::MutexGuard<'_, BTreeMap<(String, Option<u32>), Option<PolicyVersionRecord>>>
-    {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ReadMap> {
         self.reads.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -218,7 +220,7 @@ impl PolicyReads {
     }
 
     /// Every remembered read (persisted beside the history journal, #1050).
-    pub fn snapshot(&self) -> Vec<((String, Option<u32>), Option<PolicyVersionRecord>)> {
+    pub fn snapshot(&self) -> Vec<PolicyRead> {
         self.lock()
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
@@ -226,7 +228,7 @@ impl PolicyReads {
     }
 
     /// Load reads persisted by an earlier process; a fresher read wins.
-    pub fn restore(&self, reads: Vec<((String, Option<u32>), Option<PolicyVersionRecord>)>) {
+    pub fn restore(&self, reads: Vec<PolicyRead>) {
         let mut map = self.lock();
         for (k, v) in reads {
             map.entry(k).or_insert(v);
@@ -310,18 +312,20 @@ async fn pinned_or_latest(
         Some(None) => Ok(None),
         Some(Some(v)) => {
             let history = state.history();
-            match cached_read(state, scope, Some(v), || history.policy_version_get(scope, v))
-                .await?
+            match cached_read(state, scope, Some(v), || {
+                history.policy_version_get(scope, v)
+            })
+            .await?
             {
-            Some(r) => Ok(Some(r)),
-            None => Err(ServeError::Unprocessable {
-                message: format!(
-                    "this run was admitted under {scope} policy version {v}, which is no \
+                Some(r) => Ok(Some(r)),
+                None => Err(ServeError::Unprocessable {
+                    message: format!(
+                        "this run was admitted under {scope} policy version {v}, which is no \
                      longer stored; it cannot run under a policy it was not checked against"
-                ),
-                details: None,
-            }),
-        }
+                    ),
+                    details: None,
+                }),
+            }
         }
         None => latest(state, scope).await,
     }
@@ -598,7 +602,9 @@ pub async fn check_draft(
                 {
                     problems.push(Problem::at(
                         text,
-                        format!("tenant {tenant}'s policy would no longer validate with this one: {e}"),
+                        format!(
+                            "tenant {tenant}'s policy would no longer validate with this one: {e}"
+                        ),
                     ));
                 }
             }
