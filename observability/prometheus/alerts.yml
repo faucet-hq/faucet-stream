@@ -257,6 +257,19 @@ groups:
             fallen back to in-memory records — run history and idempotency
             guarantees are not durable. /readyz is reporting 503.
 
+      - alert: FaucetServeHistoryJournalPending
+        expr: max(faucet_serve_history_journal_records) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "faucet serve is journaling history records locally"
+          description: >
+            The run-history backend has been unreachable long enough that
+            {{ $value }} records wait in the local journal
+            ($FAUCET_DATA_DIR/history-journal). They are replayed once the
+            backend answers; new runs are refused once the journal is full.
+
       - alert: FaucetServeHistoryUnreachable
         expr: faucet_serve_history_unreachable == 1
         for: 2m

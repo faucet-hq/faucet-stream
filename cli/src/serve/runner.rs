@@ -1281,6 +1281,21 @@ pub(crate) async fn enqueue(
         });
     }
 
+    // A single server keeps accepting runs while the history is unreachable,
+    // journaling them; once the journal is full new runs are refused rather
+    // than a record dropped (#1050).
+    if state.history().degraded()
+        && let Some(j) = state.history().journal()
+        && j.status().await.full
+    {
+        release_orphaned_claim(&state, &req, &run_id).await;
+        return Err(ServeError::Unavailable(format!(
+            "history unavailable: the run history is unreachable and the local journal in {} is \
+             full ({}); retry once it recovers",
+            j.dir().display(),
+            crate::serve::history::journal::MAX_BYTES_ENV
+        )));
+    }
     // Kept (sealed when the server has a vault key) so a policy change's
     // impact can check this run (#1051).
     rec.policy_probe = Some(crate::serve::history::PolicyProbe {

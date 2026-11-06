@@ -95,7 +95,7 @@ type PolicyRecord = crate::serve::history::policies::PolicyVersionRecord;
 /// wrapped in a `FallbackHistory` it drives the degraded paths without a
 /// database. It implements the run and policy calls the degraded tests make.
 pub struct Flaky {
-    pub inner: MemoryHistory,
+    pub inner: Arc<MemoryHistory>,
     pub down: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -156,6 +156,39 @@ impl RunHistory for Flaky {
     fn degraded(&self) -> bool {
         false
     }
+    async fn finalize_owned(&self, rec: &crate::serve::history::RunRecord) -> Result<bool, HErr> {
+        self.check()?;
+        self.inner.finalize_owned(rec).await
+    }
+    async fn record_audit(&self, e: &crate::serve::history::AuditEntry) -> Result<(), HErr> {
+        self.check()?;
+        self.inner.record_audit(e).await
+    }
+    async fn get_audit(&self, id: &str) -> Result<Option<crate::serve::history::AuditEntry>, HErr> {
+        self.check()?;
+        self.inner.get_audit(id).await
+    }
+    async fn record_run_logs(
+        &self,
+        run_id: &str,
+        lines: &[crate::serve::history::RunLogLine],
+    ) -> Result<(), HErr> {
+        self.check()?;
+        self.inner.record_run_logs(run_id, lines).await
+    }
+    async fn list_run_logs(
+        &self,
+        run_id: &str,
+        after_seq: Option<u64>,
+        limit: usize,
+    ) -> Result<crate::serve::history::RunLogPage, HErr> {
+        self.check()?;
+        self.inner.list_run_logs(run_id, after_seq, limit).await
+    }
+    async fn usage_record(&self, r: &crate::usage::UsageRecord) -> Result<(), HErr> {
+        self.check()?;
+        self.inner.usage_record(r).await
+    }
     async fn policy_version_insert(&self, record: &PolicyRecord) -> Result<bool, HErr> {
         self.check()?;
         self.inner.policy_version_insert(record).await
@@ -180,7 +213,7 @@ pub fn flaky_state() -> (ServerState, Arc<std::sync::atomic::AtomicBool>) {
     let config = test_config();
     let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flaky = Flaky {
-        inner: MemoryHistory::new(config.idempotency_retention),
+        inner: Arc::new(MemoryHistory::new(config.idempotency_retention)),
         down: down.clone(),
     };
     let history = Arc::new(crate::serve::history::fallback::FallbackHistory::healthy(

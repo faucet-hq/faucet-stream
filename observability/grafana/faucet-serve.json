@@ -227,6 +227,24 @@
             "uid": "${datasource}"
           },
           "legendFormat": "degraded"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (kind) (faucet_serve_history_journal_records)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "journaled {{kind}}"
+        },
+        {
+          "refId": "C",
+          "expr": "sum by (kind, outcome) (increase(faucet_serve_history_journal_replayed_total[1h]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "replayed {{kind}} {{outcome}}"
         }
       ],
       "fieldConfig": {

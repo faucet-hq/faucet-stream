@@ -3327,7 +3327,9 @@ paths:
         lease heartbeat, the run queue is full, or the server is shutting down
         (`draining`). Always returns a JSON body with
         `status`, `history_ok`, `history` (`kind`: `sqlite` / `postgres` /
-        `memory`, and whether it is `persistent`), `queue_ok`, `draining`, and
+        `memory`, and whether it is `persistent`), `queue_ok`, `degraded`
+        (while the backend is unreachable: `since`, `journaled` and the local
+        `journal` — null otherwise), `draining`, and
         a `cluster` object (`enabled` bool, `instances` live-member count,
         this replica's `pools`, and the live `members` with the pools each
         serves).
@@ -3350,6 +3352,21 @@ paths:
                       kind: { type: string, enum: [sqlite, postgres, memory] }
                       persistent: { type: boolean }
                   queue_ok: { type: boolean }
+                  degraded:
+                    type: object
+                    nullable: true
+                    description: "While the history backend is unreachable (#1050): since when, and the records waiting in the local journal to be replayed. Null otherwise."
+                    properties:
+                      since: { type: string, format: date-time, nullable: true }
+                      journaled: { type: integer }
+                      journal:
+                        type: object
+                        nullable: true
+                        properties:
+                          journaled: { type: integer }
+                          by_kind: { type: object, additionalProperties: { type: integer } }
+                          bytes: { type: integer }
+                          full: { type: boolean, description: "The size cap is reached: new runs are refused." }
                   draining: { type: boolean, description: "true once shutdown began; new work is refused." }
                   cluster:
                     type: object

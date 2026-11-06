@@ -1810,7 +1810,11 @@ series: `faucet_serve_requests_total{method,path,status}`,
 `faucet_serve_runs_pending{pool}` (cluster mode: unclaimed runs per execution
 pool),
 `faucet_serve_idempotency_hits_total`, `faucet_serve_history_degraded` (the
-backend fell back to memory) and `faucet_serve_history_unreachable` (the last
+backend fell back to memory), `faucet_serve_history_journal_records{kind}`
+(records waiting in the local history journal while degraded, by
+`run` / `log` / `audit` / `usage`) and
+`faucet_serve_history_journal_replayed_total{kind,outcome}` (journaled records
+replayed into the recovered backend, `applied` or `skipped`) and `faucet_serve_history_unreachable` (the last
 lease heartbeat did not reach the history database; `/readyz` is `503` while
 it is `1`), and `faucet_serve_history_connections_discarded_total` (pooled
 history connections dropped because a failed commit left them inside a

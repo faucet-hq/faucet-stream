@@ -7,6 +7,7 @@
 pub mod catalog;
 #[cfg(feature = "serve")]
 pub mod fallback;
+pub mod journal;
 pub mod labels;
 pub mod memory;
 pub mod overview;
@@ -2398,6 +2399,29 @@ pub trait RunHistory: Send + Sync {
     /// if it answers. Returns whether it recovered. Default: nothing to recover.
     async fn recover_degraded(&self) -> bool {
         false
+    }
+
+    /// Keep what is written while degraded in `journal` (#1050). `false`
+    /// when this backend has no persistent store to replay into.
+    fn attach_journal(&self, journal: Arc<journal::Journal>) -> bool {
+        let _ = journal;
+        false
+    }
+
+    /// The local history journal, when one is attached.
+    fn journal(&self) -> Option<Arc<journal::Journal>> {
+        None
+    }
+
+    /// When the persistent backend was found unreachable, while it still is.
+    fn degraded_since(&self) -> Option<DateTime<Utc>> {
+        None
+    }
+
+    /// Replay a journal an earlier process left, when the backend is healthy
+    /// (at startup, before serving).
+    async fn replay_journal(&self) -> Result<(), HistoryError> {
+        Ok(())
     }
 
     /// True when the backend is in fallback mode (drives `/readyz`). Always false

@@ -654,6 +654,13 @@ pub async fn maintain_leases(
     if state.history().recover_degraded().await {
         tracing::info!("run-history backend recovered");
     }
+    #[cfg(feature = "policy")]
+    if let Some(j) = state.history().journal()
+        && !state.history().degraded()
+        && let Ok(v) = serde_json::to_value(state.policy_reads().snapshot())
+    {
+        j.save_policy_reads(&v);
+    }
     // Terminal records whose write failed go first: until they land the rows
     // read `running`, and their lease is renewed below so no peer re-runs them.
     crate::serve::runner::retry_pending_finalize(state).await;
@@ -940,6 +947,30 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         )));
     }
     let _history_lock = history_lock;
+    // While the persistent backend is unreachable, what must not be lost is
+    // journaled locally and replayed once it answers (#1050). A journal an
+    // earlier process left is replayed now, before serving.
+    if !matches!(
+        config.history,
+        crate::serve::config::HistoryBackendSpec::Memory
+    ) {
+        match crate::serve::history::journal::Journal::open_default(
+            &crate::serve::config::default_data_dir(),
+        ) {
+            Ok(j) => {
+                history.attach_journal(Arc::new(j));
+                history
+                    .replay_journal()
+                    .await
+                    .map_err(|e| CliError::Serve(format!("history journal replay: {e}")))?;
+            }
+            Err(e) => tracing::error!(
+                error = %e,
+                "no local history journal: records written while the run history is \
+                 unreachable are kept in memory only"
+            ),
+        }
+    }
     if config.cluster.enabled {
         // Cluster mode: a restarting instance re-queues its prior incarnation's
         // in-flight runs (capped) rather than failing them.
@@ -1129,6 +1160,17 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         #[cfg(feature = "triggers")]
         triggers_handle,
     );
+    // The policy versions an earlier process last read, for a start while
+    // the history is unreachable (#1051).
+    #[cfg(feature = "policy")]
+    if let Some(reads) = state
+        .history()
+        .journal()
+        .and_then(|j| j.load_policy_reads())
+        .and_then(|v| serde_json::from_value(v).ok())
+    {
+        state.policy_reads().restore(reads);
+    }
     // Template tests this server runs screen for its credentials and record
     // this instance on their results (#856).
     #[cfg(feature = "templates")]
