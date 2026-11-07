@@ -2005,7 +2005,7 @@ async fn under_run_approval_a_schedule_needs_an_approved_change() {
         .post(
             "op-tok",
             "/v1/schedules",
-            json!({"name": "fresh", "cron": "0 3 * * *", "template": {"id": "plain-sync", "version": 1}, "paused": true}),
+            json!({"name": "fresh", "cron": "0 3 * * *", "template": {"id": "plain-sync", "version": "1"}, "paused": true}),
         )
         .await;
     assert_eq!(code, 202, "{pending}");
