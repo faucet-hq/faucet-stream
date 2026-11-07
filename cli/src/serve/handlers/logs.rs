@@ -75,14 +75,14 @@ async fn persisted_logs(
         .history()
         .get(&id)
         .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?
+        .map_err(ServeError::from)?
         .ok_or(ServeError::NotFound)?;
     let limit = q.limit.unwrap_or(DEFAULT_LOG_LIMIT).clamp(1, MAX_LOG_LIMIT);
     let page = state
         .history()
         .list_run_logs(&id, q.after, limit)
         .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?;
+        .map_err(ServeError::from)?;
     // The local copy aged out (#806): point at the log service instead of
     // answering with nothing.
     let aged_out_link = if page.lines.is_empty() && q.after.is_none() {
@@ -147,7 +147,7 @@ async fn stream_logs_sse(state: ServerState, id: String) -> Result<Response, Ser
                 .history()
                 .get(&id)
                 .await
-                .map_err(|e| ServeError::Internal(e.to_string()))?
+                .map_err(ServeError::from)?
                 .is_some();
             if !known {
                 return Err(ServeError::NotFound);

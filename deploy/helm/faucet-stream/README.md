@@ -146,7 +146,10 @@ serve:
   roll the pods.
 - **History**: `memory` (ephemeral), `sqlite` (needs `persistence.enabled` for
   durability), or `postgres` (required for `cluster.enabled` multi-instance
-  failover). The URL reaches the pod as the `FAUCET_SERVE_HISTORY` env var,
+  failover). With `cluster.enabled` the chart refuses to render unless the
+  history is explicit — `history.backend: postgres` with `history.url` or
+  `history.existingSecret` — since `faucet serve --cluster` refuses the default
+  history (and a SQLite file on a ReadWriteOnce volume cannot be shared). The URL reaches the pod as the `FAUCET_SERVE_HISTORY` env var,
   never on the command line: a postgres `url` is stored in a chart-managed
   Secret, or point `history.existingSecret` / `history.existingSecretKey` at
   your own Secret so the password never sits in Helm values.

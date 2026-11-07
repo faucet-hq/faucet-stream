@@ -38,7 +38,7 @@ const TENANT_SERVER_POLICY: &str = "a tenant-scoped principal cannot change or d
      server's policy; its own tenant policy is at /v1/tenants/{tenant}/policy";
 
 fn store_err(e: crate::serve::history::HistoryError) -> ServeError {
-    ServeError::from_history("policy store", e)
+    ServeError::from(e)
 }
 
 fn unscoped(actor: &AuthContext) -> Result<(), ServeError> {
@@ -407,6 +407,14 @@ async fn propose(
 ) -> Result<(StatusCode, Json<ChangeRequest>), ServeError> {
     require_persistent(state)?;
     require_server_managed(state, &layer)?;
+    // A replica that predates policy pins would not enforce the stored
+    // versions (#1051).
+    crate::runtime::server::require_member_capability(
+        state,
+        crate::serve::history::CAP_POLICY_PIN,
+        crate::runtime::server::POLICY_PIN_REFUSAL,
+    )
+    .await?;
     if reason.trim().is_empty() {
         return Err(ServeError::BadConfig(
             "a policy change needs a reason; it is shown to the approver and kept with the \
@@ -531,7 +539,7 @@ async fn tenant_in_scope(
         .history()
         .tenant_get(tenant)
         .await
-        .map_err(|e| ServeError::from_history("tenant store", e))?
+        .map_err(ServeError::from)?
         .ok_or(ServeError::NotFound)?;
     Ok(())
 }

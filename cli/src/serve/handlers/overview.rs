@@ -310,7 +310,7 @@ pub async fn overview(
         .history()
         .overview_aggregates(&q)
         .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?;
+        .map_err(ServeError::from)?;
     if !cfg!(feature = "catalog") {
         aggregates.cost = None;
     }
@@ -415,10 +415,7 @@ async fn failing_templates(
     state: &ServerState,
 ) -> Result<Option<AttentionGroup<FailingTemplate>>, ServeError> {
     let history = state.history();
-    let templates = history
-        .template_list()
-        .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?;
+    let templates = history.template_list().await.map_err(ServeError::from)?;
     if templates.is_empty() {
         return Ok(None);
     }
@@ -441,7 +438,7 @@ async fn failing_templates(
         .buffered(ATTENTION_READS)
         .try_collect()
         .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?;
+        .map_err(ServeError::from)?;
     let mut failing = Vec::new();
     for (t, results) in newest {
         if let Some(r) = results.into_iter().next().filter(|r| !r.passed) {
@@ -467,7 +464,7 @@ async fn reauth_connections(
     actor: &AuthContext,
 ) -> Result<Option<AttentionGroup<ReauthConnection>>, ServeError> {
     let history = state.history();
-    let internal = |e: crate::serve::history::HistoryError| ServeError::Internal(e.to_string());
+    let internal = |e: crate::serve::history::HistoryError| ServeError::from(e);
     let tenants: Vec<String> = match &actor.tenant {
         Some(t) => vec![t.clone()],
         None => history

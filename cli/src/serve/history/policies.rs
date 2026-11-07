@@ -9,6 +9,12 @@ use serde_json::Value;
 /// The scope of the server-wide policy.
 pub const SERVER_SCOPE: &str = "server";
 
+/// The scope a `--policy` file's canonical policy is stored under when a
+/// run is admitted under it (#1051): content-addressed, version 1.
+pub fn file_scope(sha256: &str) -> String {
+    format!("file:{sha256}")
+}
+
 /// The scope of `tenant`'s policy.
 pub fn tenant_scope(tenant: &str) -> String {
     format!("tenant:{tenant}")
@@ -47,18 +53,23 @@ pub struct PolicyVersionRecord {
 /// record so a claim, a shard or a resume on another replica enforces the
 /// same versions rather than whatever is newest when it starts. `None`
 /// means the run used no stored version on that layer (no policy, or the
-/// `--policy` file).
+/// `--policy` file). A run admitted under a `--policy` file names its
+/// canonical content instead (`file_sha256`), stored under [`file_scope`],
+/// so every replica enforces that content (#1051).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyPin {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_sha256: Option<String>,
 }
 
 impl PolicyPin {
+    /// Whether no policy was in force when the run was admitted.
     pub fn is_empty(&self) -> bool {
-        self.server.is_none() && self.tenant.is_none()
+        self.server.is_none() && self.tenant.is_none() && self.file_sha256.is_none()
     }
 }
 

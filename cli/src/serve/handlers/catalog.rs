@@ -46,7 +46,7 @@ pub async fn list_datasets(
         .history()
         .catalog_list_datasets(&filter)
         .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?;
+        .map_err(ServeError::from)?;
     Ok(Json(page))
 }
 
@@ -59,7 +59,7 @@ pub async fn get_dataset(
         .history()
         .catalog_get_dataset(&id)
         .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?
+        .map_err(ServeError::from)?
         .ok_or(ServeError::NotFound)?;
     Ok(Json(detail))
 }
@@ -140,7 +140,7 @@ pub async fn annotate_dataset(
         .history()
         .catalog_annotate(&id, &annotation)
         .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?;
+        .map_err(ServeError::from)?;
     if !found {
         return Err(ServeError::NotFound);
     }
@@ -149,7 +149,7 @@ pub async fn annotate_dataset(
         .history()
         .catalog_get_dataset(&id)
         .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?
+        .map_err(ServeError::from)?
         .ok_or(ServeError::NotFound)?;
     Ok(Json(detail))
 }
@@ -182,6 +182,6 @@ pub async fn lineage(
         .history()
         .catalog_lineage(query.root.as_deref(), depth)
         .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?;
+        .map_err(ServeError::from)?;
     Ok(Json(LineageResponse { edges }))
 }

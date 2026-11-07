@@ -65,9 +65,10 @@ struct Inner {
     /// guardrail and the loop's wake-up signal. Replaced once at startup.
     #[cfg(all(feature = "schedule", feature = "templates"))]
     schedules: RwLock<Arc<crate::serve::schedules::SchedulesRuntime>>,
-    /// The server-wide data-flow policy (`--policy`, #702), when one was given.
+    /// The server-wide data-flow policy (`--policy`, #702), when one was
+    /// given, and the content address of its canonical YAML.
     #[cfg(feature = "policy")]
-    policy: RwLock<Option<Arc<faucet_core::PolicySpec>>>,
+    policy: RwLock<Option<(Arc<faucet_core::PolicySpec>, String)>>,
     /// Where that `--policy` policy was read from (#1043), for the console.
     #[cfg(feature = "policy")]
     policy_file: RwLock<Option<crate::serve::policies::PolicyFile>>,
@@ -78,11 +79,9 @@ struct Inner {
     /// seeded the store, and is kept to report when it drifts (#1043).
     #[cfg(feature = "policy")]
     policy_seed: RwLock<Option<crate::serve::policies::PolicySeed>>,
-    /// The policy versions last read while the history was healthy, by
-    /// scope and pinned version (`None` = the newest): enforced while it is
-    /// degraded (#1051).
+    /// The `--policy` file has not seeded the store yet (#1050).
     #[cfg(feature = "policy")]
-    policy_reads: crate::serve::policies::PolicyReads,
+    policy_seed_pending: std::sync::atomic::AtomicBool,
     /// The tenant runtime (#709): vault key, hosted-OAuth providers,
     /// admission locks. Replaced once at startup.
     #[cfg(feature = "tenants")]
@@ -111,6 +110,9 @@ struct Inner {
     /// history backend was unreachable), retried by the lease loop so a run
     /// this instance finished never stays `running` in the shared store.
     pending_finalize: std::sync::Mutex<Vec<crate::serve::runner::PendingFinalize>>,
+    /// Runs whose terminal record was dropped (#1050): their lease is no
+    /// longer renewed, so orphan recovery clears them.
+    forgotten_runs: std::sync::Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl ServerState {
@@ -169,7 +171,7 @@ impl ServerState {
                 #[cfg(feature = "policy")]
                 policy_seed: RwLock::new(None),
                 #[cfg(feature = "policy")]
-                policy_reads: Default::default(),
+                policy_seed_pending: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "tenants")]
                 tenants: RwLock::new(Arc::new(Default::default())),
                 #[cfg(feature = "encryption")]
@@ -182,6 +184,7 @@ impl ServerState {
                 draining: std::sync::atomic::AtomicBool::new(false),
                 failed_auth: Default::default(),
                 pending_finalize: std::sync::Mutex::new(Vec::new()),
+                forgotten_runs: Default::default(),
             }),
         }
     }
@@ -282,7 +285,20 @@ impl ServerState {
     /// Attach the server-wide data-flow policy (server startup, #702).
     #[cfg(feature = "policy")]
     pub fn set_policy(&self, policy: Arc<faucet_core::PolicySpec>) {
-        *self.inner.policy.write().unwrap_or_else(|e| e.into_inner()) = Some(policy);
+        let sha = crate::serve::policies::file_sha256(&policy);
+        *self.inner.policy.write().unwrap_or_else(|e| e.into_inner()) = Some((policy, sha));
+    }
+
+    /// The content address of the server-wide policy (computed once, when
+    /// it is set), which a run admitted under the `--policy` file is pinned to.
+    #[cfg(feature = "policy")]
+    pub fn policy_sha256(&self) -> Option<String> {
+        self.inner
+            .policy
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|(_, sha)| sha.clone())
     }
 
     /// The server-wide data-flow policy, if the server was started with one.
@@ -292,7 +308,8 @@ impl ServerState {
             .policy
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
+            .as_ref()
+            .map(|(p, _)| p.clone())
     }
 
     /// Record where the `--policy` policy came from (server startup, #1043).
@@ -333,6 +350,23 @@ impl ServerState {
             .unwrap_or_else(|e| e.into_inner()) = Some(seed);
     }
 
+    /// Whether the `--policy` file still waits to seed the store (#1050).
+    #[cfg(feature = "policy")]
+    pub fn policy_seed_pending(&self) -> bool {
+        self.inner
+            .policy_seed_pending
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Mark the seed pending (the history was unreachable) or done.
+    #[cfg(feature = "policy")]
+    pub fn set_policy_seed_pending(&self, pending: bool) {
+        self.inner
+            .policy_seed_pending
+            .store(pending, std::sync::atomic::Ordering::Release);
+        crate::serve::metrics::set_policy_seed_pending(pending);
+    }
+
     /// The `--policy` file that seeded a server-store server, if any.
     #[cfg(feature = "policy")]
     pub fn policy_seed(&self) -> Option<crate::serve::policies::PolicySeed> {
@@ -341,12 +375,6 @@ impl ServerState {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
-    }
-
-    /// The policy versions last read while the history was healthy.
-    #[cfg(feature = "policy")]
-    pub fn policy_reads(&self) -> &crate::serve::policies::PolicyReads {
-        &self.inner.policy_reads
     }
 
     /// Set the policy template tests run under on this server (#856).
@@ -517,22 +545,64 @@ impl ServerState {
 
     /// Keep a terminal record whose owner-fenced write failed for a retry.
     pub(crate) fn queue_finalize(&self, pending: crate::serve::runner::PendingFinalize) {
+        let mut queue = self
+            .inner
+            .pending_finalize
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        queue.push(pending);
+        crate::serve::metrics::set_pending_finalize(queue.len());
+    }
+
+    /// How many terminal writes wait for the backend.
+    pub fn pending_finalize_len(&self) -> usize {
         self.inner
             .pending_finalize
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(pending);
+            .len()
+    }
+
+    /// Stop renewing a run's lease: its terminal record was dropped (#1050).
+    pub(crate) fn forget_run_lease(&self, run_id: &str) {
+        self.inner
+            .forgotten_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(run_id.to_string());
+    }
+
+    /// Runs whose terminal record was dropped.
+    pub(crate) fn forgotten_runs(&self) -> Vec<String> {
+        self.inner
+            .forgotten_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// A forgotten run that orphan recovery has now cleared.
+    pub(crate) fn clear_forgotten_run(&self, run_id: &str) {
+        self.inner
+            .forgotten_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(run_id);
     }
 
     /// Take every queued terminal record (the caller re-queues what fails).
     pub(crate) fn take_pending_finalize(&self) -> Vec<crate::serve::runner::PendingFinalize> {
-        std::mem::take(
+        let taken = std::mem::take(
             &mut *self
                 .inner
                 .pending_finalize
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
+        );
+        crate::serve::metrics::set_pending_finalize(0);
+        taken
     }
 
     pub fn cluster(&self) -> &crate::serve::cluster::ClusterHandle {

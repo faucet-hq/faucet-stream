@@ -206,6 +206,8 @@ pub(crate) const IDEMPOTENCY_CONFLICT: &str = "idempotency key reused with a dif
 /// outside the run queue, and no change-request kind expresses them, so under
 /// approval they are disabled (a dry run still works).
 pub(crate) fn refuse_unapproved_write(state: &ServerState, what: &str) -> Result<(), ServeError> {
+    // Nothing that writes starts while the history is unreachable (#1050).
+    crate::runtime::server::refuse_while_unavailable(state)?;
     if state.requires_approval(crate::serve::changes::ChangeKind::Run) {
         return Err(ServeError::Forbidden(format!(
             "this server requires an approved change request for runs (--require-approval run); \
@@ -379,6 +381,7 @@ fn resume_claimed(
             tracing::error!(run_id, "claimed run has no stored config; failing it");
             finalize(
                 &state,
+                Some(rec.clone()),
                 &run_id,
                 rec.submitted_at,
                 Terminal::Failed {
@@ -390,23 +393,17 @@ fn resume_claimed(
             .await;
             return;
         };
-        let loaded = match crate::runtime::server::reload(&state, &rec, body).await {
+        // Registered before the config is loaded, so a cancel reaches a run
+        // whose reload is waiting out an outage.
+        let run_token = CancellationToken::new();
+        state
+            .registry()
+            .register_run(run_id.clone(), run_token.clone(), rec.tenant.clone());
+        let deadline = retry_deadline(&rec);
+        let loaded = match reload_with_retry(&state, &rec, body, &run_token, deadline).await {
             Ok(l) => l,
-            Err(e) => {
-                finalize(
-                    &state,
-                    &run_id,
-                    rec.submitted_at,
-                    Terminal::Failed {
-                        reason: format!(
-                            "re-loading claimed config: {}",
-                            e.api_error().error.message
-                        ),
-                        records: 0,
-                        invs: Vec::new(),
-                    },
-                )
-                .await;
+            Err(term) => {
+                stop_claimed(&state, &rec, term).await;
                 return;
             }
         };
@@ -418,21 +415,11 @@ fn resume_claimed(
         if let Some(sh) = loaded.cfg.shard.clone()
             && sh.count >= 2
         {
-            match coordinate_sharded_run(&state, &run_id, &loaded, sh.count).await {
+            match shard_with_retry(&state, &rec, &loaded, sh.count, &run_token, deadline).await {
                 Ok(true) => return, // expanded into shards — shard loop runs them
                 Ok(false) => {}     // not shardable → fall through, run the whole run
-                Err(e) => {
-                    finalize(
-                        &state,
-                        &run_id,
-                        rec.submitted_at,
-                        Terminal::Failed {
-                            reason: format!("sharding: {e}"),
-                            records: 0,
-                            invs: Vec::new(),
-                        },
-                    )
-                    .await;
+                Err(term) => {
+                    stop_claimed(&state, &rec, term).await;
                     return;
                 }
             }
@@ -446,10 +433,6 @@ fn resume_claimed(
                 .await
                 .expect("semaphore not closed"),
         };
-        // Register a local cancel token so a cross-instance cancel (the claim loop
-        // calling registry.cancel) reaches this run.
-        let run_token = CancellationToken::new();
-        state.registry().register(run_id.clone(), run_token.clone());
         let principal = crate::runtime::Principal::stored(&state, AuthContext::runtime(), &rec);
         crate::runtime::under(
             &principal.clone(),
@@ -464,10 +447,141 @@ fn resume_claimed(
                 rec.clock.clone(),
                 rec.concurrency,
                 Some(guard),
+                rec.clone(),
             ),
         )
         .await;
     });
+}
+
+/// The first wait between reload attempts of a claimed run; it doubles up to
+/// [`RELOAD_RETRY_MAX`] (#1051).
+pub(crate) const RELOAD_RETRY_BASE: Duration = Duration::from_secs(5);
+/// The longest wait between reload attempts.
+pub(crate) const RELOAD_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// The instant a claimed run's own timeout ends its retries, if it has one.
+fn retry_deadline(rec: &RunRecord) -> Option<tokio::time::Instant> {
+    rec.timeout_secs
+        .map(|s| tokio::time::Instant::now() + Duration::from_secs(s))
+}
+
+/// End a claimed run that stopped before it executed: on shutdown a
+/// clustered run is handed back for a peer; anything else is finalized.
+async fn stop_claimed(state: &ServerState, rec: &RunRecord, term: Terminal) {
+    if matches!(term, Terminal::ShutdownFailed { .. })
+        && state.cluster().enabled()
+        && release_for_peer(state, &rec.run_id).await
+    {
+        return;
+    }
+    finalize(
+        state,
+        Some(rec.clone()),
+        &rec.run_id,
+        rec.submitted_at,
+        term,
+    )
+    .await;
+}
+
+/// Wait `wait` before the next attempt of a claimed run's step: a cancel,
+/// a shutdown or the run's own timeout ends it with that terminal state.
+#[allow(clippy::disallowed_methods)] // a runtime backoff timer, not a connector call
+async fn retry_pause(
+    state: &ServerState,
+    rec: &RunRecord,
+    cancel: &CancellationToken,
+    deadline: Option<tokio::time::Instant>,
+    wait: Duration,
+) -> Result<(), Terminal> {
+    let sleep = match deadline {
+        Some(d) => tokio::time::sleep_until(d.min(tokio::time::Instant::now() + wait)),
+        None => tokio::time::sleep(wait),
+    };
+    let shutdown = state.shutdown_token();
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err(Terminal::cancelled()),
+        _ = shutdown.cancelled() => return Err(Terminal::shutdown_failed()),
+        _ = sleep => {}
+    }
+    if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+        return Err(Terminal::timeout(rec.timeout_secs.unwrap_or(0)));
+    }
+    Ok(())
+}
+
+/// Re-load a claimed run's config. An error that may pass (the history or a
+/// secrets manager unavailable) is retried in place, with backoff, while this
+/// instance keeps the run's lease, until the run's own timeout or a cancel;
+/// any other error fails the run (#1051). `Err` is the run's terminal state.
+async fn reload_with_retry(
+    state: &ServerState,
+    rec: &RunRecord,
+    body: &str,
+    cancel: &CancellationToken,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<LoadedSubmission, Terminal> {
+    let mut wait = RELOAD_RETRY_BASE;
+    let mut attempt = 0u32;
+    loop {
+        let err = match crate::runtime::server::reload(state, rec, body).await {
+            Ok(l) => return Ok(l),
+            Err(e) => e,
+        };
+        let message = err.api_error().error.message;
+        if !matches!(err, ServeError::Unavailable(_)) {
+            return Err(Terminal::Failed {
+                reason: format!("re-loading claimed config: {message}"),
+                records: 0,
+                invs: Vec::new(),
+            });
+        }
+        attempt += 1;
+        metrics::record_run_reload_retry();
+        tracing::warn!(
+            run_id = %rec.run_id,
+            attempt,
+            retry_in_secs = wait.as_secs(),
+            error = %message,
+            "re-loading a claimed run's config failed for now; retrying"
+        );
+        retry_pause(state, rec, cancel, deadline, wait).await?;
+        wait = (wait * 2).min(RELOAD_RETRY_MAX);
+    }
+}
+
+/// Expand a claimed run into shards ([`coordinate_sharded_run`]), waiting
+/// out an unavailable history exactly as [`reload_with_retry`] does. `Ok` is
+/// whether it was sharded; `Err` is the run's terminal state.
+async fn shard_with_retry(
+    state: &ServerState,
+    rec: &RunRecord,
+    loaded: &LoadedSubmission,
+    count: usize,
+    cancel: &CancellationToken,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<bool, Terminal> {
+    let mut wait = RELOAD_RETRY_BASE;
+    loop {
+        match coordinate_sharded_run(state, &rec.run_id, loaded, count).await {
+            Ok(sharded) => return Ok(sharded),
+            Err(crate::error::CliError::HistoryUnavailable(m)) => {
+                metrics::record_run_reload_retry();
+                tracing::warn!(run_id = %rec.run_id, error = %m, "sharding a claimed run waits for the run history");
+                retry_pause(state, rec, cancel, deadline, wait).await?;
+                wait = (wait * 2).min(RELOAD_RETRY_MAX);
+            }
+            Err(e) => {
+                return Err(Terminal::Failed {
+                    reason: format!("sharding: {e}"),
+                    records: 0,
+                    invs: Vec::new(),
+                });
+            }
+        }
+    }
 }
 
 /// Coordinator step (Mode B): expand a sharded run into `faucet_serve_shards`
@@ -528,14 +642,14 @@ async fn coordinate_sharded_run(
             .history()
             .get(run_id)
             .await
-            .map_err(|e| CliError::Internal(e.to_string()))?
+            .map_err(history_cli_error)?
             .ok_or_else(|| CliError::Internal(format!("run {run_id} vanished before sharding")))?;
         r.status = RunStatus::Sharded;
         state
             .history()
             .upsert(&r)
             .await
-            .map_err(|e| CliError::Internal(e.to_string()))?;
+            .map_err(history_cli_error)?;
     }
 
     let shards = source
@@ -554,7 +668,7 @@ async fn coordinate_sharded_run(
         .history()
         .insert_shards(run_id, &inserts)
         .await
-        .map_err(|e| CliError::Internal(e.to_string()))?;
+        .map_err(history_cli_error)?;
     tracing::info!(
         run_id,
         shards = inserts.len(),
@@ -565,6 +679,17 @@ async fn coordinate_sharded_run(
     // Wake the local claim loop so it picks up the freshly-inserted shards.
     state.cluster().kick();
     Ok(true)
+}
+
+/// A history failure while coordinating: one that may pass is
+/// [`CliError::HistoryUnavailable`](crate::error::CliError::HistoryUnavailable),
+/// so the coordinator waits it out rather than failing the run (#1051).
+fn history_cli_error(e: crate::serve::history::HistoryError) -> crate::error::CliError {
+    if e.is_transient() {
+        crate::error::CliError::HistoryUnavailable(e.to_string())
+    } else {
+        crate::error::CliError::Internal(e.to_string())
+    }
 }
 
 /// Execute one claimed shard (Mode B): rebuild + narrow the source to the shard,
@@ -584,16 +709,38 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
             finalize_shard(&state, &run_id, &shard_id, ShardOutcome::Failed).await;
             return;
         };
-        let loaded = match crate::runtime::server::reload(&state, &run, &body).await {
+        // A retriable reload error is waited out in place (#1051).
+        let waiting = CancellationToken::new();
+        state
+            .registry()
+            .register_shard(&run_id, &shard_id, waiting.clone());
+        let loaded = reload_with_retry(&state, &run, &body, &waiting, retry_deadline(&run)).await;
+        state.registry().deregister_shard(&run_id, &shard_id);
+        let loaded = match loaded {
             Ok(l) => l,
-            Err(e) => {
+            Err(term) => {
+                let (outcome, reason) = match term {
+                    Terminal::Cancelled { .. } => (ShardOutcome::Cancelled, None),
+                    Terminal::ShutdownFailed { .. } => {
+                        hand_back(
+                            &state,
+                            PendingFinalize::ReleaseShard {
+                                run_id: run_id.clone(),
+                                shard_id: shard_id.clone(),
+                            },
+                        )
+                        .await;
+                        return;
+                    }
+                    other => (ShardOutcome::Failed, other.into_parts().4),
+                };
                 tracing::error!(
                     run_id,
                     shard_id,
-                    error = %e.api_error().error.message,
+                    error = reason.as_deref().unwrap_or("cancelled"),
                     "re-loading shard config failed"
                 );
-                finalize_shard(&state, &run_id, &shard_id, ShardOutcome::Failed).await;
+                finalize_shard(&state, &run_id, &shard_id, outcome).await;
                 return;
             }
         };
@@ -1077,6 +1224,10 @@ pub(crate) async fn enqueue(
     // Releases the reservation on ANY early return below (doctor_first 422 /
     // replay / conflict / claim or upsert error). Defused just before spawn.
     let reservation = ReservationGuard::new(state.clone());
+    // Nothing is admitted that could not be recorded (#1050): checked again
+    // here, before the preflight and the idempotency claim, since the
+    // history may have become unreachable after the admission gates.
+    crate::runtime::server::refuse_while_unavailable(&state)?;
 
     // doctor_first preflight — run BEHIND the reservation so concurrent preflight
     // probing is bounded by `max_queued_runs` rather than running unthrottled
@@ -1122,13 +1273,7 @@ pub(crate) async fn enqueue(
                     .history()
                     .claim_idempotency(&key, &fp, &run_id, state.idempotency_retention())
                     .await
-                    .map_err(|e| match e {
-                        // Degraded backend can't safely honor idempotency → 503, retry.
-                        crate::serve::history::HistoryError::Degraded(m) => {
-                            ServeError::Unavailable(m)
-                        }
-                        other => ServeError::Internal(other.to_string()),
-                    })
+                    .map_err(ServeError::from)
             }
         };
         let mut outcome = claim(fp).await?;
@@ -1188,19 +1333,16 @@ pub(crate) async fn enqueue(
     rec.submitted_by = Some(actor.principal.clone());
     rec.dlq_location = dlq_location(&loaded);
     rec.policy_pin = loaded.policy_pin.clone();
+    // What a policy change's impact checks this run against (#1051).
+    #[cfg(feature = "policy")]
+    if state.policy_file().is_none() {
+        rec.policy_projection = Some(crate::serve::policies::projection(
+            &req.config,
+            req.config_format.into(),
+        ));
+    }
 
     if state.cluster().enabled() {
-        // A degraded (DB-unreachable) backend can't coordinate a cluster: the
-        // claim loop's claim_pending is a no-op on the in-memory fallback, so a
-        // Pending run would never be claimed. Fail closed with a retryable 503
-        // rather than silently orphaning the run (#197 spec §9).
-        if state.history().degraded() {
-            return Err(ServeError::Unavailable(
-                "clustered run-history backend is degraded; runs cannot be claimed \
-                 by any instance — retry once it recovers"
-                    .into(),
-            ));
-        }
         // Cluster mode: persist the RAW config so any instance can re-resolve +
         // run it, mark the run Pending, and wake the local claim loop. No local
         // queue slot / spawn — the claim loop owns execution.
@@ -1243,10 +1385,7 @@ pub(crate) async fn enqueue(
             // the orphaned claim so a replay starts fresh instead of 404-ing for
             // the whole retention window (F21). Best-effort.
             release_orphaned_claim(&state, &req, &run_id).await;
-            return Err(match e {
-                crate::serve::history::HistoryError::Degraded(m) => ServeError::Unavailable(m),
-                e => ServeError::Internal(e.to_string()),
-            });
+            return Err(ServeError::from(e));
         }
         // The admission lock is per instance, so two instances can both have
         // admitted the last slot: re-count with the record in place and back
@@ -1281,43 +1420,31 @@ pub(crate) async fn enqueue(
         });
     }
 
-    // A single server keeps accepting runs while the history is unreachable,
-    // journaling them; once the journal is full new runs are refused rather
-    // than a record dropped (#1050).
-    if state.history().degraded()
-        && let Some(j) = state.history().journal()
-        && j.status().await.full
-    {
-        release_orphaned_claim(&state, &req, &run_id).await;
-        return Err(ServeError::Unavailable(format!(
-            "history unavailable: the run history is unreachable and the local journal in {} is \
-             full ({}); retry once it recovers",
-            j.dir().display(),
-            crate::serve::history::journal::MAX_BYTES_ENV
-        )));
-    }
-    // Kept (sealed when the server has a vault key) so a policy change's
-    // impact can check this run (#1051).
-    rec.policy_probe = Some(crate::serve::history::PolicyProbe {
-        body: crate::serve::sealed::persisted_body(
-            &state,
-            &run_id,
-            crate::secrets::registry::redact_message(&req.config),
-        ),
-        format: req.config_format.into(),
-    });
     if let Err(e) = link_tenant_run(&state, &rec).await {
         release_orphaned_claim(&state, &req, &run_id).await;
         return Err(e);
     }
-    if let Err(e) = state.history().upsert(&rec).await {
-        // See the cluster path above: release the orphaned claim (F21).
-        release_orphaned_claim(&state, &req, &run_id).await;
-        return Err(ServeError::Internal(e.to_string()));
+    // The admission write is never kept in memory only (#1050): a history
+    // that fails now refuses the run before anything has run.
+    match state.history().insert_new(&rec).await {
+        Ok(true) => {}
+        Ok(false) => {
+            release_orphaned_claim(&state, &req, &run_id).await;
+            return Err(ServeError::Internal(format!(
+                "run id {run_id} is already recorded"
+            )));
+        }
+        Err(e) => {
+            // See the cluster path above: release the orphaned claim (F21).
+            release_orphaned_claim(&state, &req, &run_id).await;
+            return Err(ServeError::from(e));
+        }
     }
 
     let run_token = CancellationToken::new();
-    state.registry().register(run_id.clone(), run_token.clone());
+    state
+        .registry()
+        .register_run(run_id.clone(), run_token.clone(), rec.tenant.clone());
     metrics::set_run_gauges(&state);
 
     // The spawned task now owns the queued→running→finished lifecycle.
@@ -1330,6 +1457,7 @@ pub(crate) async fn enqueue(
         run_id.clone(),
         run_token,
         submitted_at,
+        rec,
     );
 
     crate::serve::audit::write(
@@ -1358,7 +1486,7 @@ async fn link_tenant_run(state: &ServerState, rec: &RunRecord) -> Result<(), Ser
             .history()
             .tenant_run_link(&rec.run_id, t)
             .await
-            .map_err(|e| ServeError::Internal(format!("recording the run's tenant: {e}")))?;
+            .map_err(ServeError::from)?;
     }
     Ok(())
 }
@@ -1423,7 +1551,7 @@ async fn replay_response(
         .history()
         .get(run_id)
         .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?
+        .map_err(ServeError::from)?
         .ok_or(ServeError::NotFound)?;
     if !actor.sees_tenant(rec.tenant.as_deref()) {
         return Err(ServeError::Conflict(IDEMPOTENCY_CONFLICT.into()));
@@ -1686,17 +1814,21 @@ async fn audit_runtime_policy_denials(
         Err(crate::error::CliError::Faucet(faucet_core::FaucetError::PolicyViolation {
             rule,
             column,
+            facts,
             ..
-        })) => vec![(
-            String::new(),
-            Some(crate::executor::PolicyDenial {
-                rule: rule.clone(),
-                column: column.clone(),
-                labels: Vec::new(),
-                sink: String::new(),
-                sink_kind: String::new(),
-            }),
-        )],
+        })) => {
+            let f = facts.as_deref().cloned().unwrap_or_default();
+            vec![(
+                String::new(),
+                Some(crate::executor::PolicyDenial {
+                    rule: rule.clone(),
+                    column: column.clone(),
+                    labels: f.label.into_iter().collect(),
+                    sink: f.sink.unwrap_or_default(),
+                    sink_kind: f.sink_kind.unwrap_or_default(),
+                }),
+            )]
+        }
         Err(crate::error::CliError::PolicyViolations { .. }) => vec![(String::new(), None)],
         Err(_) => Vec::new(),
     };
@@ -1845,6 +1977,7 @@ pub(crate) fn resolve_clock(
 
 /// Spawn the detached run task: acquire a permit, run under the 3-arm select,
 /// finalize the terminal status.
+#[allow(clippy::too_many_arguments)]
 fn spawn_run(
     state: ServerState,
     principal: crate::runtime::Principal,
@@ -1853,6 +1986,7 @@ fn spawn_run(
     run_id: String,
     run_token: CancellationToken,
     submitted_at: DateTime<Utc>,
+    own: RunRecord,
 ) {
     let server_shutdown = state.shutdown_token();
     tokio::spawn(async move {
@@ -1864,11 +1998,11 @@ fn spawn_run(
         let _permit = tokio::select! {
             biased;
             _ = run_token.cancelled() => {
-                finalize_queued_cancel(&state, &run_id, submitted_at, Terminal::cancelled()).await;
+                finalize_queued_cancel(&state, own, submitted_at, Terminal::cancelled()).await;
                 return;
             }
             _ = server_shutdown.cancelled() => {
-                finalize_queued_cancel(&state, &run_id, submitted_at, Terminal::shutdown_failed())
+                finalize_queued_cancel(&state, own, submitted_at, Terminal::shutdown_failed())
                     .await;
                 return;
             }
@@ -1887,6 +2021,7 @@ fn spawn_run(
                 req.clock,
                 req.concurrency,
                 None,
+                own,
             ),
         )
         .await;
@@ -1912,6 +2047,7 @@ async fn execute_run(
     clock_flag: Option<String>,
     concurrency: Option<usize>,
     claimed: Option<InFlightGuard>,
+    mut own: RunRecord,
 ) {
     let server_shutdown = state.shutdown_token();
     let auth_result = loaded.auth_catalog();
@@ -1936,10 +2072,10 @@ async fn execute_run(
         }
     };
     let started = Utc::now();
-    if let Ok(Some(mut rec)) = state.history().get(&run_id).await {
-        rec.status = RunStatus::Running;
-        rec.started_at = Some(started);
-        let _ = state.history().upsert(&rec).await;
+    own.status = RunStatus::Running;
+    own.started_at = Some(started);
+    if let Err(e) = state.history().upsert(&own).await {
+        tracing::warn!(%run_id, error = %e, "could not record the run as running");
     }
     metrics::set_run_gauges(&state);
 
@@ -1949,6 +2085,7 @@ async fn execute_run(
         Err(e) => {
             finalize(
                 &state,
+                Some(own.clone()),
                 &run_id,
                 started,
                 Terminal::Failed {
@@ -1966,6 +2103,7 @@ async fn execute_run(
         Err(e) => {
             finalize(
                 &state,
+                Some(own.clone()),
                 &run_id,
                 started,
                 Terminal::Failed {
@@ -2020,6 +2158,7 @@ async fn execute_run(
         Err(reason) => {
             finalize(
                 &state,
+                Some(own.clone()),
                 &run_id,
                 started,
                 Terminal::Failed {
@@ -2178,7 +2317,7 @@ async fn execute_run(
         schedule_log_drop(state.clone(), run_id.clone());
         return;
     }
-    finalize(&state, &run_id, started, terminal).await;
+    finalize(&state, Some(own), &run_id, started, terminal).await;
     // Signal `/logs` readers the run is done, then drop the buffer after a
     // drain window so a late fetcher can still replay it (spec §12).
     state.log_hub().finish(&run_id);
@@ -2206,81 +2345,95 @@ async fn release_for_peer(state: &ServerState, run_id: &str) -> bool {
     }
 }
 
-/// Write the authoritative terminal record + the run-finished metric.
-async fn finalize(state: &ServerState, run_id: &str, started: DateTime<Utc>, term: Terminal) {
+/// After this many refusals that are not transient, a held terminal record
+/// falls back to a status-only update, then is dropped (#1050).
+pub(crate) const FINALIZE_ATTEMPTS: u32 = 5;
+
+/// Write a run's terminal state, built from the run's own record (`own`,
+/// the redacted copy written when it was admitted or claimed) so a held
+/// record is never a skeleton (#1050). The write is owner-fenced on every
+/// server; one the backend does not take is held and retried from the lease
+/// loop, and the completion side effects follow only a landed write.
+async fn finalize(
+    state: &ServerState,
+    own: Option<RunRecord>,
+    run_id: &str,
+    started: DateTime<Utc>,
+    term: Terminal,
+) {
     let finished = Utc::now();
     let elapsed = (finished - started).to_std().ok().map(|d| d.as_secs_f64());
     let (status, reason, records, invs, error) = term.into_parts();
-    // Read-modify-write the existing record to preserve its metadata
-    // (name / labels / idempotency_key / submitted_at). If it can't be read —
-    // the backend errored, or the record was purged / landed in another store
-    // under degraded fallback — DON'T silently drop the terminal status (#146
-    // M6): reconstruct a minimal terminal record and upsert it, so the run
-    // never lingers non-terminal while `record_run_finished` has already fired.
-    let mut rec = match state.history().get(run_id).await {
-        Ok(Some(rec)) => rec,
-        Ok(None) => {
-            tracing::warn!(
+    let error = error.map(|e| crate::secrets::registry::redact_message(&e));
+    let own = match own {
+        Some(rec) => Some(rec),
+        None => {
+            tracing::error!(
                 run_id,
-                "finalize: run record not found; writing a fresh terminal record"
+                "finalize: the run task holds no copy of its record; reading it from the history"
             );
-            RunRecord::queued(run_id.to_string(), None, BTreeMap::new(), None, started)
-        }
-        Err(e) => {
-            tracing::warn!(
-                run_id,
-                error = %e,
-                "finalize: failed to read run record; writing a fresh terminal record"
-            );
-            RunRecord::queued(run_id.to_string(), None, BTreeMap::new(), None, started)
+            state.history().get(run_id).await.ok().flatten()
         }
     };
-    rec.status = status;
-    rec.started_at.get_or_insert(started);
-    rec.finished_at = Some(finished);
-    rec.elapsed_secs = elapsed;
-    rec.records_written = records;
-    rec.invocations = invs;
-    rec.error = error.map(|e| crate::secrets::registry::redact_message(&e));
-    if state.cluster().enabled() {
-        // Owner-fenced: if another instance reclaimed this run (lease expired),
-        // our write is a no-op and we discard our result — the reclaimer is now
-        // authoritative (#197).
-        let pending = PendingFinalize::Run {
-            rec: Box::new(rec),
+    let pending = match own {
+        Some(mut rec) => {
+            rec.status = status;
+            rec.started_at.get_or_insert(started);
+            rec.finished_at = Some(finished);
+            rec.elapsed_secs = elapsed;
+            rec.records_written = records;
+            rec.invocations = invs;
+            rec.error = error;
+            PendingFinalize::Run {
+                rec: Box::new(rec),
+                reason,
+                failures: 0,
+            }
+        }
+        None => PendingFinalize::Status {
+            run_id: run_id.to_string(),
+            status,
+            finished_at: finished,
+            error,
             reason,
-        };
-        if let Err(e) = write_pending(state, &pending).await {
-            // The row still says `running` and this instance keeps renewing
-            // its lease, so no peer re-runs it; the lease loop retries the
-            // write until the backend takes it.
-            tracing::error!(
-                run_id,
-                error = %e,
-                "finalize: owner-fenced write failed; retrying from the lease loop"
-            );
-            state.queue_finalize(pending);
-        }
-    } else {
-        if let Err(e) = state.history().upsert(&rec).await {
-            tracing::error!(
-                run_id,
-                error = %e,
-                "finalize: failed to persist terminal run record"
-            );
-        }
-        metrics::record_run_finished(status, reason);
-        record_tenant_run(&rec);
-        crate::serve::callback::fire(&rec).await;
+            refusals: 0,
+            retry_at: None,
+        },
+    };
+    if let Err(e) = write_pending(state, &pending).await {
+        // The row still says `running` and this instance keeps renewing its
+        // lease, so nothing re-runs it; the lease loop retries the write.
+        tracing::error!(
+            run_id,
+            error = %e,
+            "finalize: the terminal write failed; holding it and retrying from the lease loop"
+        );
+        state.queue_finalize(pending.failed_once(&e));
     }
 }
 
-/// A clustered terminal write waiting for the backend to take it.
+/// A terminal write waiting for the backend to take it.
 pub(crate) enum PendingFinalize {
     /// A whole run's owner-fenced terminal record.
     Run {
         rec: Box<RunRecord>,
         reason: &'static str,
+        /// Refusals so far that were not transient.
+        failures: u32,
+    },
+    /// A run's terminal status alone, when no copy of its record is at hand
+    /// (or the full record kept being refused): the stored body keeps its
+    /// name, labels and tenant.
+    Status {
+        run_id: String,
+        status: RunStatus,
+        finished_at: DateTime<Utc>,
+        error: Option<String>,
+        reason: &'static str,
+        /// Refusals so far that were not transient (clustered only).
+        refusals: u32,
+        /// No retry before this instant (clustered backoff).
+        retry_at: Option<std::time::Instant>,
     },
     /// One shard's owner-fenced terminal state.
     Shard {
@@ -2295,12 +2448,29 @@ pub(crate) enum PendingFinalize {
 }
 
 impl PendingFinalize {
-    fn run_id(&self) -> &str {
+    pub(crate) fn run_id(&self) -> &str {
         match self {
             PendingFinalize::Run { rec, .. } => &rec.run_id,
-            PendingFinalize::Shard { run_id, .. }
+            PendingFinalize::Status { run_id, .. }
+            | PendingFinalize::Shard { run_id, .. }
             | PendingFinalize::ReleaseRun { run_id }
             | PendingFinalize::ReleaseShard { run_id, .. } => run_id,
+        }
+    }
+
+    /// Count a refusal that is not transient against a held run record.
+    fn failed_once(self, e: &crate::serve::history::HistoryError) -> Self {
+        match self {
+            PendingFinalize::Run {
+                rec,
+                reason,
+                failures,
+            } if !e.is_transient() => PendingFinalize::Run {
+                rec,
+                reason,
+                failures: failures + 1,
+            },
+            other => other,
         }
     }
 }
@@ -2327,7 +2497,29 @@ async fn write_pending(
     pending: &PendingFinalize,
 ) -> Result<(), crate::serve::history::HistoryError> {
     match pending {
-        PendingFinalize::Run { rec, reason } => finalize_owned(state, rec, reason).await,
+        PendingFinalize::Run { rec, reason, .. } => finalize_owned(state, rec, reason).await,
+        PendingFinalize::Status {
+            run_id,
+            status,
+            finished_at,
+            error,
+            reason,
+            ..
+        } => {
+            match state
+                .history()
+                .finalize_status_owned(run_id, *status, *finished_at, error.clone())
+                .await?
+            {
+                Some(rec) => completed(state, &rec, reason).await,
+                None => tracing::warn!(
+                    run_id,
+                    "finalize: the run is no longer this instance's, or no longer stored; \
+                     discarding its terminal status"
+                ),
+            }
+            Ok(())
+        }
         PendingFinalize::Shard {
             run_id,
             shard_id,
@@ -2372,9 +2564,19 @@ async fn write_pending(
     }
 }
 
-/// The owner-fenced terminal write of a clustered run and, when this instance
-/// won it, the completion side effects. `Err` means the backend did not take
-/// the write and it must be retried.
+/// The completion side effects of a terminal write this instance landed.
+async fn completed(state: &ServerState, rec: &RunRecord, reason: &'static str) {
+    crate::serve::sealed::forget(state, &rec.run_id).await;
+    metrics::record_run_finished(rec.status, reason);
+    record_tenant_run(rec);
+    // Only the instance that won the owner-fenced write fires the callback,
+    // so a reclaimed run cannot deliver twice (#481).
+    crate::serve::callback::fire(rec).await;
+}
+
+/// The owner-fenced terminal write of a run and, when this instance won it,
+/// the completion side effects. `Err` means the backend did not take the
+/// write and it must be retried.
 async fn finalize_owned(
     state: &ServerState,
     rec: &RunRecord,
@@ -2384,12 +2586,7 @@ async fn finalize_owned(
     // our write is a no-op and we discard our result — the reclaimer is now
     // authoritative (#197).
     if state.history().finalize_owned(rec).await? {
-        crate::serve::sealed::forget(state, &rec.run_id).await;
-        metrics::record_run_finished(rec.status, reason);
-        record_tenant_run(rec);
-        // Only the instance that won the owner-fenced write fires the
-        // callback, so a reclaimed run cannot deliver twice (#481).
-        crate::serve::callback::fire(rec).await;
+        completed(state, rec, reason).await;
     } else {
         tracing::warn!(
             run_id = %rec.run_id,
@@ -2399,20 +2596,109 @@ async fn finalize_owned(
     Ok(())
 }
 
+/// The longest wait between retries of a status the backend keeps refusing.
+const STATUS_RETRY_MAX: Duration = Duration::from_secs(600);
+
+/// The wait before the next retry after `refusals` non-transient refusals.
+fn status_retry_delay(refusals: u32) -> Duration {
+    Duration::from_secs(10)
+        .saturating_mul(1u32 << refusals.min(10))
+        .min(STATUS_RETRY_MAX)
+}
+
 /// Retry every terminal write (a run's or a shard's) that failed earlier; one
 /// that fails again stays queued. Returns how many were written.
 pub(crate) async fn retry_pending_finalize(state: &ServerState) -> usize {
     let mut written = 0;
     for pending in state.take_pending_finalize() {
+        if let PendingFinalize::Status {
+            retry_at: Some(at), ..
+        } = &pending
+            && *at > std::time::Instant::now()
+        {
+            state.queue_finalize(pending);
+            continue;
+        }
+        // A record the backend keeps refusing for good: its status alone,
+        // then nothing (#1050).
+        let pending = match pending {
+            PendingFinalize::Run {
+                rec,
+                reason,
+                failures,
+            } if failures >= FINALIZE_ATTEMPTS => {
+                tracing::error!(
+                    run_id = %rec.run_id,
+                    failures,
+                    "finalize: the backend keeps refusing the terminal record; writing its status alone"
+                );
+                PendingFinalize::Status {
+                    run_id: rec.run_id.clone(),
+                    status: rec.status,
+                    finished_at: rec.finished_at.unwrap_or_else(Utc::now),
+                    error: rec.error.clone(),
+                    reason,
+                    refusals: 0,
+                    retry_at: None,
+                }
+            }
+            other => other,
+        };
         match write_pending(state, &pending).await {
             Ok(()) => written += 1,
+            Err(e) if matches!(pending, PendingFinalize::Status { .. }) && !e.is_transient() => {
+                if state.cluster().enabled() {
+                    metrics::record_pending_finalize_refused();
+                    // Clustered, a run whose lease lapses is requeued and run
+                    // again by a peer: keep the lease and keep retrying.
+                    let PendingFinalize::Status {
+                        run_id,
+                        status,
+                        finished_at,
+                        error,
+                        reason,
+                        refusals,
+                        ..
+                    } = pending
+                    else {
+                        unreachable!("matched a status above")
+                    };
+                    let delay = status_retry_delay(refusals);
+                    tracing::error!(
+                        run_id,
+                        error = %e,
+                        refusals = refusals + 1,
+                        retry_in_secs = delay.as_secs(),
+                        "finalize: the backend refused the terminal status; keeping the run's \
+                         lease and retrying"
+                    );
+                    state.queue_finalize(PendingFinalize::Status {
+                        run_id,
+                        status,
+                        finished_at,
+                        error,
+                        reason,
+                        refusals: refusals + 1,
+                        retry_at: Some(std::time::Instant::now() + delay),
+                    });
+                } else {
+                    tracing::error!(
+                        run_id = %pending.run_id(),
+                        error = %e,
+                        "finalize: the backend refused the terminal status too; dropping it (orphan \
+                         recovery fails the run once its lease is no longer renewed)"
+                    );
+                    metrics::record_pending_finalize_dropped();
+                    state.forget_run_lease(pending.run_id());
+                }
+            }
             Err(e) => {
                 tracing::warn!(
                     run_id = %pending.run_id(),
                     error = %e,
-                    "finalize: owner-fenced write still failing; will retry"
+                    "finalize: terminal write still failing; will retry"
                 );
-                state.queue_finalize(pending);
+                state.queue_finalize(pending.failed_once(&e));
             }
         }
     }
@@ -2461,14 +2747,15 @@ fn record_tenant_run(rec: &RunRecord) {
 /// normal `finalize` + `InFlightGuard`-drop cleanup.
 async fn finalize_queued_cancel(
     state: &ServerState,
-    run_id: &str,
+    own: RunRecord,
     submitted_at: DateTime<Utc>,
     term: Terminal,
 ) {
-    state.registry().mark_queued_cancelled(run_id);
-    finalize(state, run_id, submitted_at, term).await;
-    state.log_hub().finish(run_id);
-    schedule_log_drop(state.clone(), run_id.to_string());
+    let run_id = own.run_id.clone();
+    state.registry().mark_queued_cancelled(&run_id);
+    finalize(state, Some(own), &run_id, submitted_at, term).await;
+    state.log_hub().finish(&run_id);
+    schedule_log_drop(state.clone(), run_id);
     metrics::set_run_gauges(state);
 }
 
@@ -2531,6 +2818,16 @@ fn recount_refusal(
 #[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
+
+    /// Records every event, so the fields of logged branches are evaluated.
+    fn log_everything() -> tracing::subscriber::DefaultGuard {
+        tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(std::io::sink)
+                .with_max_level(tracing::Level::TRACE)
+                .finish(),
+        )
+    }
 
     fn dlq(kind: &str, config: serde_json::Value) -> crate::config::DlqSpec {
         serde_json::from_value(serde_json::json!({ "sink": { "type": kind, "config": config } }))
@@ -2809,6 +3106,7 @@ mod tests {
         state.history().upsert(&rec).await.unwrap();
         finalize(
             &state,
+            Some(rec.clone()),
             "r1",
             started,
             Terminal::Completed {
@@ -2829,6 +3127,172 @@ mod tests {
         assert_eq!(done.status, RunStatus::Completed);
         assert_eq!(done.records_written, 3);
         assert_eq!(retry_pending_finalize(&state).await, 0);
+    }
+
+    /// A single server holds a finished run's own record, not a skeleton,
+    /// until the history takes it (#1050).
+    #[tokio::test]
+    async fn a_single_server_holds_the_runs_own_record_until_it_lands() {
+        let (_, history) = flaky_state(true);
+        let mut config = crate::serve::test_support::test_config();
+        config.cluster.enabled = false;
+        let state = ServerState::new(
+            &config,
+            None,
+            CancellationToken::new(),
+            history.clone(),
+            crate::serve::logs::LogHub::new(),
+            None,
+            #[cfg(feature = "triggers")]
+            crate::serve::triggers::health::TriggersHandle::empty(),
+        );
+        let started = Utc::now();
+        let mut rec = RunRecord::queued(
+            "r1".into(),
+            Some("nightly".into()),
+            BTreeMap::from([("team".to_string(), "data".to_string())]),
+            None,
+            started,
+        );
+        rec.tenant = Some("acme".into());
+        rec.status = RunStatus::Running;
+        state.history().upsert(&rec).await.unwrap();
+        finalize(
+            &state,
+            Some(rec.clone()),
+            "r1",
+            started,
+            Terminal::Completed {
+                records: 7,
+                invs: Vec::new(),
+            },
+        )
+        .await;
+        assert_eq!(state.pending_finalize_len(), 1, "held, not dropped");
+        let now = state.history().get("r1").await.unwrap().unwrap();
+        assert_eq!(now.status, RunStatus::Running, "nothing landed yet");
+        history
+            .down
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(retry_pending_finalize(&state).await, 1);
+        let done = state.history().get("r1").await.unwrap().unwrap();
+        assert_eq!(done.status, RunStatus::Completed);
+        assert_eq!(done.records_written, 7);
+        assert_eq!(done.name.as_deref(), Some("nightly"));
+        assert_eq!(done.labels.get("team").map(String::as_str), Some("data"));
+        assert_eq!(done.tenant.as_deref(), Some("acme"));
+        assert_eq!(state.pending_finalize_len(), 0);
+    }
+
+    fn single_flaky_state(down: bool) -> (ServerState, std::sync::Arc<FlakyFinalize>) {
+        let (_, history) = flaky_state(down);
+        let mut config = crate::serve::test_support::test_config();
+        config.cluster.enabled = false;
+        let state = ServerState::new(
+            &config,
+            None,
+            CancellationToken::new(),
+            history.clone(),
+            crate::serve::logs::LogHub::new(),
+            None,
+            #[cfg(feature = "triggers")]
+            crate::serve::triggers::health::TriggersHandle::empty(),
+        );
+        (state, history)
+    }
+
+    /// On a single server a record the backend keeps refusing for good falls
+    /// back to its status alone, then is dropped and its lease left to lapse
+    /// so orphan recovery fails it (#1050).
+    #[tokio::test]
+    async fn a_single_server_drops_a_record_refused_for_good_after_its_status() {
+        let _log = log_everything();
+        let (state, _history) = single_flaky_state(true);
+        let started = Utc::now();
+        let mut rec = RunRecord::queued("r1".into(), None, BTreeMap::new(), None, started);
+        rec.status = RunStatus::Running;
+        state.history().upsert(&rec).await.unwrap();
+        finalize(&state, Some(rec), "r1", started, Terminal::cancelled()).await;
+        for _ in 0..FINALIZE_ATTEMPTS {
+            assert_eq!(state.pending_finalize_len(), 1);
+            retry_pending_finalize(&state).await;
+        }
+        assert_eq!(state.pending_finalize_len(), 0, "dropped");
+        assert_eq!(state.forgotten_runs(), vec!["r1".to_string()]);
+        state.clear_forgotten_run("r1");
+        assert!(state.forgotten_runs().is_empty());
+    }
+
+    /// In a cluster a refused terminal status is never dropped: the run's
+    /// lease stays renewed (so no peer requeues and re-runs a finished run)
+    /// and the status is retried with a growing backoff (#1050).
+    #[tokio::test]
+    async fn a_cluster_keeps_a_refused_status_and_its_lease() {
+        let _log = log_everything();
+        let (state, history) = flaky_state(true);
+        let started = Utc::now();
+        let mut rec = RunRecord::queued("r1".into(), None, BTreeMap::new(), None, started);
+        rec.status = RunStatus::Running;
+        state.history().upsert(&rec).await.unwrap();
+        finalize(&state, Some(rec), "r1", started, Terminal::cancelled()).await;
+        for _ in 0..FINALIZE_ATTEMPTS + 1 {
+            retry_pending_finalize(&state).await;
+        }
+        assert_eq!(state.pending_finalize_len(), 1, "kept");
+        assert!(state.forgotten_runs().is_empty(), "lease still renewed");
+        // Backed off: a retry before the deadline does not write.
+        history
+            .down
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(retry_pending_finalize(&state).await, 0);
+        assert_eq!(state.pending_finalize_len(), 1);
+        let queued = state.take_pending_finalize();
+        let [
+            PendingFinalize::Status {
+                refusals, retry_at, ..
+            },
+        ] = queued.as_slice()
+        else {
+            panic!("a status is queued");
+        };
+        assert_eq!(*refusals, 1);
+        assert!(retry_at.is_some());
+        assert_eq!(status_retry_delay(0), Duration::from_secs(10));
+        assert_eq!(status_retry_delay(20), STATUS_RETRY_MAX);
+        // Once the deadline passes the status lands.
+        state.queue_finalize(PendingFinalize::Status {
+            run_id: "r1".into(),
+            status: RunStatus::Cancelled,
+            finished_at: started,
+            error: None,
+            reason: "cancelled",
+            refusals: 1,
+            retry_at: Some(std::time::Instant::now()),
+        });
+        assert_eq!(retry_pending_finalize(&state).await, 1);
+        let done = state.history().get("r1").await.unwrap().unwrap();
+        assert_eq!(done.status, RunStatus::Cancelled);
+    }
+
+    #[test]
+    fn a_transient_refusal_is_never_counted() {
+        let started = Utc::now();
+        let e = crate::serve::history::HistoryError::Unreachable("x".into());
+        let p = PendingFinalize::Run {
+            rec: Box::new(RunRecord::queued(
+                "r2".into(),
+                None,
+                BTreeMap::new(),
+                None,
+                started,
+            )),
+            reason: "ok",
+            failures: 0,
+        };
+        assert!(matches!(
+            p.failed_once(&e),
+            PendingFinalize::Run { failures: 0, .. }
+        ));
     }
 
     /// A shard's terminal write the backend refuses is retried by the lease
@@ -3475,16 +3939,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_writes_terminal_record_when_record_is_missing() {
-        // M6 (#146): if the run record can't be read at finalize time (purged,
-        // or split to another store under degraded fallback), the terminal
-        // status must NOT be silently dropped — a fresh terminal record is
-        // written so the run never lingers non-terminal while the run-finished
-        // metric has already fired.
+    async fn finalize_never_writes_a_skeleton_for_a_record_it_cannot_find() {
+        // With neither the run's own copy nor a stored record, nothing is
+        // invented: a skeleton would wipe the run's name, labels and tenant
+        // (#1050). The terminal status goes over a stored record only.
         let state = memory_state();
         let started = Utc::now();
         finalize(
             &state,
+            None,
             "ghost",
             started,
             Terminal::Failed {
@@ -3494,16 +3957,34 @@ mod tests {
             },
         )
         .await;
-        let rec = state
-            .history()
-            .get("ghost")
-            .await
-            .unwrap()
-            .expect("finalize must create a terminal record even when none existed");
-        assert_eq!(rec.status, RunStatus::Failed);
-        assert!(rec.finished_at.is_some());
-        assert!(rec.started_at.is_some());
-        assert_eq!(rec.error.as_deref(), Some("boom"));
+        assert!(state.history().get("ghost").await.unwrap().is_none());
+        let mut rec = RunRecord::queued(
+            "r2".into(),
+            Some("nightly".into()),
+            BTreeMap::from([("team".to_string(), "data".to_string())]),
+            None,
+            started,
+        );
+        rec.status = RunStatus::Running;
+        state.history().upsert(&rec).await.unwrap();
+        finalize(
+            &state,
+            None,
+            "r2",
+            started,
+            Terminal::Failed {
+                reason: "boom".into(),
+                records: 0,
+                invs: Vec::new(),
+            },
+        )
+        .await;
+        let got = state.history().get("r2").await.unwrap().unwrap();
+        assert_eq!(got.status, RunStatus::Failed);
+        assert_eq!(got.error.as_deref(), Some("boom"));
+        assert!(got.finished_at.is_some());
+        assert_eq!(got.name.as_deref(), Some("nightly"));
+        assert_eq!(got.labels.get("team").map(String::as_str), Some("data"));
     }
 
     #[tokio::test]
@@ -3524,6 +4005,7 @@ mod tests {
 
         finalize(
             &state,
+            Some(rec.clone()),
             "r1",
             started,
             Terminal::Completed {
@@ -3752,6 +4234,62 @@ mod tests {
             rec.status = status;
             rec.config_body = Some("version: 1".into());
             state.history().upsert(&rec).await.expect("seed run");
+        }
+
+        /// Sharding a claimed run waits out an unreachable history exactly
+        /// like re-loading its config: a cancel cancels it, a shutdown hands
+        /// it back, and its own timeout times it out.
+        #[tokio::test]
+        async fn sharding_waits_out_the_history_like_a_reload() {
+            let history = Arc::new(crate::serve::test_support::Flaky {
+                inner: Arc::new(crate::serve::history::memory::MemoryHistory::new(
+                    Duration::from_secs(60),
+                )),
+                down: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            });
+            let state = ServerState::new(
+                &crate::serve::test_support::test_config(),
+                None,
+                CancellationToken::new(),
+                history,
+                crate::serve::logs::LogHub::new(),
+                None,
+                #[cfg(feature = "triggers")]
+                crate::serve::triggers::health::TriggersHandle::empty(),
+            );
+            let l = loaded(
+                "version: 1\npipeline:\n  \
+                 source: { type: s3, config: { bucket: my-bucket, prefix: null, \
+                 region: null, endpoint_url: null, file_format: json_lines, \
+                 max_objects: null, concurrency: 10 } }\n  \
+                 sink: { type: stdout, config: {} }\n",
+            )
+            .await;
+            let mut rec = RunRecord::queued("r".into(), None, BTreeMap::new(), None, Utc::now());
+            rec.timeout_secs = Some(30);
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+            let r = shard_with_retry(&state, &rec, &l, 4, &cancel, None).await;
+            assert!(matches!(r, Err(Terminal::Cancelled { .. })), "cancelled");
+            let r = shard_with_retry(
+                &state,
+                &rec,
+                &l,
+                4,
+                &CancellationToken::new(),
+                Some(tokio::time::Instant::now()),
+            )
+            .await;
+            assert!(
+                matches!(r, Err(Terminal::Timeout { secs: 30, .. })),
+                "timed out"
+            );
+            state.shutdown_token().cancel();
+            let r = shard_with_retry(&state, &rec, &l, 4, &CancellationToken::new(), None).await;
+            assert!(
+                matches!(r, Err(Terminal::ShutdownFailed { .. })),
+                "handed back on shutdown"
+            );
         }
 
         #[tokio::test]
@@ -4678,6 +5216,271 @@ mod tests {
                 state.history().get("r").await.unwrap().unwrap().status,
                 RunStatus::Sharded
             );
+        }
+
+        /// A config whose `${file:}` reference cannot be read yet: its load
+        /// fails with a retriable 503 every time.
+        const UNREADABLE: &str = "version: 1\npipeline:\n  \
+             source: { type: csv, config: { path: \"${file:/nonexistent/faucet-1051/missing}\" } }\n  \
+             sink: { type: stdout, config: {} }\n";
+
+        #[allow(clippy::disallowed_methods)] // polls a spawned task's effect
+        async fn eventually(mut done: impl AsyncFnMut() -> bool) {
+            for _ in 0..500 {
+                if done().await {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("condition never held");
+        }
+
+        async fn status_of(state: &ServerState, id: &str) -> Option<RunStatus> {
+            state.history().get(id).await.unwrap().map(|r| r.status)
+        }
+
+        /// A reload that fails for now is retried with backoff until the
+        /// run's own timeout ends it.
+        #[tokio::test(start_paused = true)]
+        async fn an_unavailable_reload_is_retried_until_the_runs_timeout() {
+            let _log = super::log_everything();
+            let state = crate::serve::test_support::test_state();
+            let mut rec = RunRecord::queued("r".into(), None, BTreeMap::new(), None, Utc::now());
+            rec.timeout_secs = Some(12);
+            let started = tokio::time::Instant::now();
+            let r = reload_with_retry(
+                &state,
+                &rec,
+                UNREADABLE,
+                &CancellationToken::new(),
+                retry_deadline(&rec),
+            )
+            .await;
+            assert!(matches!(r, Err(Terminal::Timeout { secs: 12, .. })));
+            assert!(
+                started.elapsed() >= Duration::from_secs(12),
+                "it waited (5 s, then up to the deadline) between attempts"
+            );
+        }
+
+        /// A claimed run whose config cannot load yet is cancelled while it
+        /// waits, without ever running.
+        #[tokio::test]
+        async fn a_claimed_run_waiting_on_its_config_is_cancelled() {
+            let state = crate::serve::test_support::test_state();
+            let mut rec = RunRecord::queued("r".into(), None, BTreeMap::new(), None, Utc::now());
+            rec.status = RunStatus::Running;
+            rec.config_body = Some(UNREADABLE.into());
+            state.history().upsert(&rec).await.unwrap();
+            resume_claimed_run(state.clone(), rec);
+            eventually(async || state.registry().is_registered("r")).await;
+            assert!(state.registry().cancel("r"));
+            eventually(async || status_of(&state, "r").await == Some(RunStatus::Cancelled)).await;
+        }
+
+        /// On shutdown a clustered run still waiting on its config is handed
+        /// back to the cluster as pending, not failed.
+        #[tokio::test]
+        async fn a_claimed_run_waiting_on_its_config_is_handed_back_on_shutdown() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cluster = crate::serve::cluster::ClusterConfig::disabled();
+            cluster.enabled = true;
+            let state = sqlite_state_with(dir.path(), cluster).await;
+            let mut rec = RunRecord::queued("r".into(), None, BTreeMap::new(), None, Utc::now());
+            rec.status = RunStatus::Pending;
+            rec.config_body = Some(UNREADABLE.into());
+            state.history().upsert(&rec).await.unwrap();
+            let claimed = state
+                .history()
+                .claim_pending(1, &crate::serve::pools::default_only())
+                .await
+                .unwrap();
+            assert_eq!(claimed.len(), 1);
+            resume_claimed_run(state.clone(), claimed.into_iter().next().unwrap());
+            eventually(async || state.registry().is_registered("r")).await;
+            state.shutdown_token().cancel();
+            eventually(async || status_of(&state, "r").await == Some(RunStatus::Pending)).await;
+        }
+
+        /// A run that ends before it executed is finalized with its
+        /// terminal state; outside a cluster a shutdown is not handed back.
+        #[tokio::test]
+        async fn a_run_stopped_before_it_executed_is_finalized() {
+            let state = crate::serve::test_support::test_state();
+            let mut rec = RunRecord::queued("r".into(), None, BTreeMap::new(), None, Utc::now());
+            rec.status = RunStatus::Running;
+            state.history().upsert(&rec).await.unwrap();
+            stop_claimed(&state, &rec, Terminal::shutdown_failed()).await;
+            let stored = state.history().get("r").await.unwrap().unwrap();
+            assert_eq!(stored.status, RunStatus::Failed);
+            assert!(
+                stored.error.as_deref().unwrap_or("").contains("shutdown"),
+                "{:?}",
+                stored.error
+            );
+        }
+
+        fn s3_config() -> &'static str {
+            "version: 1\npipeline:\n  \
+             source: { type: s3, config: { bucket: my-bucket, prefix: null, \
+             region: null, endpoint_url: null, file_format: json_lines, \
+             max_objects: null, concurrency: 10 } }\n  \
+             sink: { type: stdout, config: {} }\n"
+        }
+
+        /// Sharding fails the run on an error that will not pass (its record
+        /// is gone), and waits out one that does.
+        #[tokio::test(start_paused = true)]
+        async fn sharding_fails_on_a_lasting_error_and_resumes_after_an_outage() {
+            let l = loaded(s3_config()).await;
+            let gone = crate::serve::test_support::test_state();
+            let rec = RunRecord::queued("ghost".into(), None, BTreeMap::new(), None, Utc::now());
+            let r = shard_with_retry(&gone, &rec, &l, 4, &CancellationToken::new(), None).await;
+            match r {
+                Err(Terminal::Failed { reason, .. }) => {
+                    assert!(reason.starts_with("sharding: "), "{reason}");
+                    assert!(reason.contains("vanished"), "{reason}");
+                }
+                _ => panic!("expected a failed run"),
+            }
+
+            let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flaky = Arc::new(crate::serve::test_support::Flaky {
+                inner: Arc::new(crate::serve::history::memory::MemoryHistory::new(
+                    Duration::from_secs(60),
+                )),
+                down: down.clone(),
+            });
+            let state = ServerState::new(
+                &crate::serve::test_support::test_config(),
+                None,
+                CancellationToken::new(),
+                flaky,
+                crate::serve::logs::LogHub::new(),
+                None,
+                #[cfg(feature = "triggers")]
+                crate::serve::triggers::health::TriggersHandle::empty(),
+            );
+            let mut rec = RunRecord::queued("r".into(), None, BTreeMap::new(), None, Utc::now());
+            rec.status = RunStatus::Running;
+            state.history().upsert(&rec).await.unwrap();
+            down.store(true, std::sync::atomic::Ordering::Release);
+            let back = down.clone();
+            #[allow(clippy::disallowed_methods)] // the outage ends on the paused clock
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                back.store(false, std::sync::atomic::Ordering::Release);
+            });
+            let r = shard_with_retry(&state, &rec, &l, 4, &CancellationToken::new(), None).await;
+            assert!(matches!(r, Ok(true)));
+            assert_eq!(status_of(&state, "r").await, Some(RunStatus::Sharded));
+        }
+
+        #[test]
+        fn only_a_passing_history_error_is_waited_out_while_coordinating() {
+            use crate::error::CliError;
+            use crate::serve::history::HistoryError;
+            assert!(matches!(
+                history_cli_error(HistoryError::Unreachable("refused".into())),
+                CliError::HistoryUnavailable(_)
+            ));
+            assert!(matches!(
+                history_cli_error(HistoryError::Backend("corrupt".into())),
+                CliError::Internal(m) if m.contains("corrupt")
+            ));
+        }
+
+        /// A claimed shard whose config cannot load is failed at its run's
+        /// timeout, cancelled with its run, and handed back on shutdown.
+        #[tokio::test]
+        async fn a_claimed_shard_that_cannot_reload_is_failed_cancelled_or_handed_back() {
+            let _log = super::log_everything();
+            let dir = tempfile::tempdir().unwrap();
+            let state = sqlite_state(dir.path()).await;
+            seed_sharded_with_shards(&state, "r", 3).await;
+            let mut run = RunRecord::queued("r".into(), None, BTreeMap::new(), None, Utc::now());
+            run.config_body = Some(UNREADABLE.into());
+            let claim = |shard: &str, run: &RunRecord| ClaimedShard {
+                run_id: "r".into(),
+                shard_id: shard.into(),
+                descriptor: serde_json::json!({}),
+                run: run.clone(),
+            };
+            let progress = async || state.history().shard_progress("r").await.unwrap();
+
+            let mut timed = run.clone();
+            timed.timeout_secs = Some(0);
+            resume_claimed_shard(state.clone(), claim("0", &timed));
+            eventually(async || progress().await.failed == 1).await;
+
+            resume_claimed_shard(state.clone(), claim("1", &run));
+            eventually(async || state.registry().has_run_shards("r")).await;
+            assert_eq!(state.registry().cancel_run_shards("r"), 1);
+            eventually(async || progress().await.cancelled == 1).await;
+
+            resume_claimed_shard(state.clone(), claim("2", &run));
+            eventually(async || state.registry().has_run_shards("r")).await;
+            state.shutdown_token().cancel();
+            eventually(async || progress().await.pending == 1).await;
+            let p = progress().await;
+            assert_eq!((p.failed, p.cancelled, p.running), (1, 1, 0), "{p:?}");
+        }
+
+        /// A runtime policy refusal is audited with what the typed error
+        /// says it was decided on; a static refusal count names no rule.
+        #[cfg(feature = "policy")]
+        #[tokio::test]
+        async fn runtime_policy_refusals_are_audited_with_their_facts() {
+            use crate::serve::history::AuditFilter;
+            let state = crate::serve::test_support::test_state();
+            let violation = Err(crate::error::CliError::Faucet(
+                faucet_core::FaucetError::PolicyViolation {
+                    rule: "pii-eu".into(),
+                    column: "email".into(),
+                    message: "denied".into(),
+                    facts: Some(Box::new(faucet_core::ViolationFacts {
+                        label: Some("pii.email".into()),
+                        sink: Some("out".into()),
+                        sink_kind: Some("jsonl".into()),
+                    })),
+                },
+            ));
+            audit_runtime_policy_denials(&state, "r1", None, &violation).await;
+            let counted = Err(crate::error::CliError::PolicyViolations { violations: 2 });
+            audit_runtime_policy_denials(&state, "r2", None, &counted).await;
+            audit_runtime_policy_denials(
+                &state,
+                "r3",
+                None,
+                &Err(crate::error::CliError::Internal("x".into())),
+            )
+            .await;
+            let entries = state
+                .history()
+                .list_audit(&AuditFilter {
+                    action: Some("policy.denied".into()),
+                    limit: 10,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(entries.len(), 2, "{entries:?}");
+            let by = |run: &str| {
+                let e = entries
+                    .iter()
+                    .find(|e| e.run_id.as_deref() == Some(run))
+                    .unwrap();
+                serde_json::from_str::<serde_json::Value>(e.detail.as_deref().unwrap()).unwrap()
+            };
+            let d = by("r1");
+            assert_eq!(d["rule"], "pii-eu");
+            assert_eq!(d["column"], "email");
+            assert_eq!(d["label"], "pii.email");
+            assert_eq!(d["sink"], "out");
+            assert_eq!(d["sink_kind"], "jsonl");
+            let d = by("r2");
+            assert_eq!(d["phase"], "runtime");
+            assert!(d.get("rule").is_none());
         }
     }
 

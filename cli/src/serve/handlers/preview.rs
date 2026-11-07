@@ -143,7 +143,7 @@ pub async fn preview_output(
         .history()
         .local_output_get(&id)
         .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?
+        .map_err(ServeError::from)?
         .ok_or(ServeError::NotFound)?;
 
     let rows = policy.resolve_rows(query.requested()?);

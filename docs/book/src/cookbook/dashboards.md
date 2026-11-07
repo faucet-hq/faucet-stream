@@ -43,7 +43,9 @@ Alert rules (`observability/prometheus/alerts.yml`):
 | `FaucetScheduleRunLateness` | tick lateness p95 > 60 s for 15 m | warning |
 | `FaucetConsecutiveScheduleFailures` | ≥3 consecutive failed scheduled runs | critical |
 | `FaucetServeHistoryDegraded` | serve's history backend degraded 5 m | critical |
-| `FaucetServeHistoryJournalPending` | records have waited in the local history journal for 15 m | warning |
+| `FaucetServePendingFinalize` | finished runs' terminal records have waited for the history for 15 m | warning |
+| `FaucetServePolicyMergeBroken` | a tenant's policy no longer merges with the server's; its runs are refused | critical |
+| `FaucetServeScheduleStepTimeouts` | a schedule's tick was cut off after the step timeout | warning |
 | `FaucetServeHistoryUnreachable` | a clustered server cannot reach its history database, for 2 m | critical |
 | `FaucetServePoolStarved` | runs in an execution pool stay unclaimed for 15 m | warning |
 | `FaucetServePoolRunsFailed` | runs failed because no replica served their pool, in the last hour | warning |

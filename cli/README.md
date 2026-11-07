@@ -348,7 +348,7 @@ Auth is mandatory: without `--auth-token`/`FAUCET_SERVE_AUTH_TOKEN` **and** with
 | `--pool-wait-timeout-secs <n>` | Fail a pending run whose pool no live cluster member has served for `n` seconds (`pool_unavailable`). |
 | `--triggers <path>` | Path to a triggers file (YAML) defining event-driven watchers. Requires the `triggers` Cargo feature. See [Event-driven triggers](#event-driven-triggers-triggers). |
 | `--schedules <path>` | Path to a schedules file: registered templates to run on a cron, read-only in the console. Requires the `schedule` and `templates` features. See [Schedules](#schedules---schedules). |
-| `--tenant-schedule-min-interval-secs <n>` | Shortest gap between the ticks of a tenant-owned schedule (default 300; 0 = none). |
+| `--tenant-schedule-min-interval-secs <n>` | Shortest gap between the ticks of a tenant-owned schedule (default and minimum 300: every schedule ticks at most every 5 minutes, and this flag can only raise the floor). |
 | `--local-output-retention-days <n>` / `--local-output-in-flight-grace-secs <n>` | Retention GC for the local files a run's sinks wrote (jsonl/csv/parquet): the window (default `7`; `0` disables the sweep) and the mid-write guard (default `60`). Only files faucet recorded as its own sink outputs are ever deleted. Requires the `catalog` feature. |
 | `--preview-local-outputs` | Serve **dataset previews** of those local files — the console reads a tracked output's first N rows back (`FAUCET_SERVE_PREVIEW_LOCAL_OUTPUTS`). **Off by default**: it returns file contents over HTTP, so it is a local-testing convenience. Caps: `--preview-default-rows` (soft, default `500`) and `--preview-max-rows` (hard, default `5000`; a larger `row_count_to_load` — including `all` — is clamped to it). `--preview-max-rows 0` lifts the ceiling so `row_count_to_load=all` reads a whole dataset; the read is still bounded by a response-size budget and a deadline, and a partial answer names the bound that stopped it. |
 | `--body-limit-bytes`, `--shutdown-grace-secs`, `--retain-terminal-runs-secs`, `--idempotency-retention-secs`, `--probe-timeout-secs` | Tuning knobs. |
@@ -1807,7 +1807,7 @@ re-export it), without the CLI's dependencies, and it follows semver. See
 
 Licensed under either of
 
-- Apache License, Version 2.0 ([LICENSE-Apache-2.0](../LICENSE-Apache-2.0) or <https://www.apache.org/licenses/LICENSE-2.0>)
+- Apache License, Version 2.0 ([LICENSE-APACHE](../LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
 - MIT license ([LICENSE-MIT](../LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
 
 at your option.

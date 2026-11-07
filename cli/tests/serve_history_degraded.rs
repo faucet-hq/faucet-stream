@@ -293,6 +293,20 @@ async fn an_unreachable_backend_degrades_runs_refuses_the_registry_fences_and_re
         assert_eq!(status("/v1/policy").await, 503);
         assert_eq!(status("/v1/policy/versions").await, 503);
     }
+    // Nor are tenants, which answer 503 rather than an internal error.
+    #[cfg(feature = "tenants")]
+    {
+        assert_eq!(status("/v1/tenants").await, 503);
+        assert_eq!(status("/v1/tenants/acme").await, 503);
+    }
+    // A sealed run's values cannot be opened now: retry later, not a failure.
+    let sealed = faucet_cli::serve::sealed::unseal(&state, "r1", "token: ${sealed:0}")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(sealed, faucet_cli::serve::error::ServeError::Unavailable(_)),
+        "{sealed:?}"
+    );
 
     let token = CancellationToken::new();
     state.registry().register("local-run".into(), token.clone());
@@ -360,9 +374,11 @@ async fn an_unreadable_policy_store_is_not_replaced_by_the_file() {
         Arc::new(spec),
         &path,
     )
-    .await;
+    .await
+    .expect("an unreachable history keeps the seed pending, it does not fail the start");
     assert!(state.policy_file().is_none(), "the file is not the policy");
     assert!(state.policy_seed().is_some(), "it is kept to compare later");
+    assert!(state.policy_seed_pending(), "admission waits for the seed");
 }
 
 /// #905: a clustered server's backend is strict (it never falls back to
@@ -548,24 +564,21 @@ async fn a_claim_from_the_previous_release_still_replays() {
     );
 }
 
-/// #1050: a single server whose backend is unreachable journals its runs,
-/// reports them on `/readyz`, and refuses new runs once the journal is full.
+/// #1050: while its history is unreachable a single server admits nothing:
+/// a submission answers 503, nothing runs, and `/readyz` says since when.
 #[cfg(all(feature = "source-csv", feature = "sink-jsonl"))]
 #[tokio::test]
-async fn a_degraded_server_journals_until_the_journal_is_full() {
+async fn a_degraded_single_server_admits_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let (history, mode) = flaky();
     let history: Arc<dyn RunHistory> = Arc::new(history);
-    let journal =
-        Arc::new(faucet_cli::serve::history::journal::Journal::open(dir.path(), 1).unwrap());
-    assert!(history.attach_journal(journal.clone()));
     let mut cfg = config();
     cfg.cluster = faucet_cli::serve::cluster::ClusterConfig::disabled();
     let state = ServerState::new(
         &cfg,
         None,
         CancellationToken::new(),
-        history,
+        history.clone(),
         LogHub::new(),
         None,
         TriggersHandle::from_compiled(&[]),
@@ -589,13 +602,24 @@ async fn a_degraded_server_journals_until_the_journal_is_full() {
         dir.path().join("out.jsonl").display()
     )});
     mode.store(UNREACHABLE, Ordering::SeqCst);
-    let first = client
+    // The first call trips the history; from then on nothing is admitted.
+    let _ = history.upsert(&run("trip")).await;
+    assert!(history.degraded());
+    let refused = client
         .post(format!("{base}/v1/runs"))
         .json(&config)
         .send()
         .await
         .unwrap();
-    assert_eq!(first.status().as_u16(), 202, "{:?}", first.text().await);
+    assert_eq!(refused.status().as_u16(), 503);
+    assert!(
+        refused
+            .text()
+            .await
+            .unwrap()
+            .contains("history unavailable")
+    );
+    assert!(!dir.path().join("out.jsonl").exists(), "nothing ran");
     let ready: serde_json::Value = client
         .get(format!("{base}/readyz"))
         .send()
@@ -605,17 +629,5 @@ async fn a_degraded_server_journals_until_the_journal_is_full() {
         .await
         .unwrap();
     assert!(ready["degraded"]["since"].is_string(), "{ready}");
-    assert!(
-        ready["degraded"]["journaled"].as_u64().unwrap() >= 1,
-        "{ready}"
-    );
-    assert_eq!(ready["degraded"]["journal"]["full"], true, "{ready}");
-    let refused = client
-        .post(format!("{base}/v1/runs"))
-        .json(&config)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(refused.status().as_u16(), 503);
-    assert!(refused.text().await.unwrap().contains("journal"));
+    assert!(ready["degraded"].get("journal").is_none(), "{ready}");
 }

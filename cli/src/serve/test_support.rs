@@ -189,6 +189,23 @@ impl RunHistory for Flaky {
         self.check()?;
         self.inner.usage_record(r).await
     }
+    async fn meta_get(&self, key: &str) -> Result<Option<String>, HErr> {
+        self.check()?;
+        self.inner.meta_get(key).await
+    }
+    async fn meta_put(&self, key: &str, value: &str) -> Result<(), HErr> {
+        self.check()?;
+        self.inner.meta_put(key, value).await
+    }
+    async fn meta_compare_and_set(
+        &self,
+        key: &str,
+        expected: Option<&str>,
+        value: &str,
+    ) -> Result<bool, HErr> {
+        self.check()?;
+        self.inner.meta_compare_and_set(key, expected, value).await
+    }
     async fn policy_version_insert(&self, record: &PolicyRecord) -> Result<bool, HErr> {
         self.check()?;
         self.inner.policy_version_insert(record).await
@@ -232,4 +249,21 @@ pub fn flaky_state() -> (ServerState, Arc<std::sync::atomic::AtomicBool>) {
         crate::serve::triggers::health::TriggersHandle::empty(),
     );
     (state, down)
+}
+
+/// The flaky double passes settings writes through while up and refuses
+/// them while down.
+#[tokio::test]
+async fn the_flaky_history_writes_settings_only_while_up() {
+    let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let h = Flaky {
+        inner: Arc::new(MemoryHistory::new(Duration::from_secs(60))),
+        down: down.clone(),
+    };
+    h.meta_put("k", "1").await.unwrap();
+    assert!(h.meta_compare_and_set("k", Some("1"), "2").await.unwrap());
+    assert_eq!(h.meta_get("k").await.unwrap().as_deref(), Some("2"));
+    down.store(true, std::sync::atomic::Ordering::Release);
+    assert!(h.meta_put("k", "3").await.is_err());
+    assert!(h.meta_compare_and_set("k", Some("2"), "3").await.is_err());
 }

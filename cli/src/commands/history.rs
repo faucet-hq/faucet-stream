@@ -23,11 +23,7 @@ pub async fn run(args: HistoryArgs) -> CliResult<()> {
     let runs = load(args).await?;
 
     if json {
-        // The RunRecord's `Serialize` already omits secret-bearing fields
-        // (config bodies are only present for cluster runs); scrub as a backstop.
-        let json = serde_json::to_string_pretty(&runs)
-            .map_err(|e| CliError::Internal(format!("rendering history JSON: {e}")))?;
-        println!("{}", crate::secrets::registry::redact(&json));
+        println!("{}", export_json(runs)?);
         return Ok(());
     }
 
@@ -41,6 +37,17 @@ pub async fn run(args: HistoryArgs) -> CliResult<()> {
 
     print!("{}", render_table(&runs));
     Ok(())
+}
+
+/// The `--json` export: the policy projection is the server's, never the
+/// run's story (#1051); resolved secrets are scrubbed as a backstop.
+pub fn export_json(mut runs: Vec<RunRecord>) -> CliResult<String> {
+    for r in &mut runs {
+        r.policy_projection = None;
+    }
+    let json = serde_json::to_string_pretty(&runs)
+        .map_err(|e| CliError::Internal(format!("rendering history JSON: {e}")))?;
+    Ok(crate::secrets::registry::redact(&json).into_owned())
 }
 
 /// The runs `faucet history` shows for `args`, newest first.

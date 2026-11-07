@@ -180,6 +180,20 @@ pub async fn execute(
         .and_then(Value::as_u64)
         .and_then(|v| u32::try_from(v).ok())
         .ok_or_else(|| ServeError::Internal("policy plan carries no next version".into()))?;
+    // Another approved change may have landed since this one was planned:
+    // the layers must still merge for every tenant, or this one is
+    // invalidated rather than leaving a tenant whose runs all refuse (#1051).
+    let problems = policies::check_draft(state, &layer, &draft, &payload.policy).await?;
+    if !problems.is_empty() {
+        return Err(ServeError::Conflict(format!(
+            "the policy no longer merges with the versions in force: {}",
+            problems
+                .iter()
+                .map(|p| p.message.clone())
+                .collect::<Vec<_>>()
+                .join("; ")
+        )));
+    }
     let record = PolicyVersionRecord {
         scope: layer.scope(),
         version,
@@ -195,7 +209,7 @@ pub async fn execute(
         .history()
         .policy_version_insert(&record)
         .await
-        .map_err(|e| ServeError::from_history("policy store", e))?;
+        .map_err(ServeError::from)?;
     if !stored {
         return Err(ServeError::Conflict(format!(
             "another change stored {} policy version {version} first; propose this one again",

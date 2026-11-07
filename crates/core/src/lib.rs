@@ -155,7 +155,7 @@ pub use drift::{
 };
 #[cfg(feature = "encryption")]
 pub use encryption::{CompiledEncryption, EncryptionAlgorithm, EncryptionSpec, SealedLine};
-pub use error::FaucetError;
+pub use error::{FaucetError, ViolationFacts};
 pub use fidelity::{FidelityError, NonFiniteCounter, TimePrecision};
 pub use file_format::parquet_io::ParquetReadOptions;
 pub use file_format::{

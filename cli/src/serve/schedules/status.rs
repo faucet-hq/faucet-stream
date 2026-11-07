@@ -15,9 +15,12 @@
 use crate::serve::history::RunHistory;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Entries kept per list in a status document.
 pub const RETAIN: usize = 20;
+/// Targets kept in a fan-out's per-target record (#1051).
+pub const MAX_TARGETS: usize = 1000;
 /// Compare-and-set attempts per write.
 const ATTEMPTS: usize = 5;
 
@@ -87,6 +90,38 @@ pub struct ScheduleStatus {
     pub skipped: Vec<SkippedTick>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missed: Vec<MissedRange>,
+    /// A fan-out's latest result per tenant (#1051): a tenant's view is built
+    /// from its own entry only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub targets: BTreeMap<String, TargetStatus>,
+    /// Tenants left out of `targets` to keep the record bounded.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub targets_truncated: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+/// One fan-out tenant's latest tick (#1051).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TargetStatus {
+    /// `started` / `skipped` / `failed` / `retrying` / `waiting`.
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// This tenant's ticks in a row that failed, counted once per tick.
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    pub last_tick: DateTime<Utc>,
+}
+
+/// One tenant's result in a tick, as [`ScheduleStatus::apply_targets`] takes it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TargetOutcome {
+    pub tenant: String,
+    pub outcome: &'static str,
+    pub error: Option<String>,
 }
 
 /// How a tick went, as [`record`] folds it in.
@@ -98,6 +133,8 @@ pub enum Outcome {
     Retrying(String),
     /// `overlap: queue`: held until an earlier run finishes.
     Waiting(String),
+    /// Not ticked: it needs an approval this server requires (#1051).
+    NeedsApproval(String),
 }
 
 impl ScheduleStatus {
@@ -179,10 +216,117 @@ impl ScheduleStatus {
                     self.last_error = Some(why.clone());
                 }
             }
+            Outcome::NeedsApproval(why) => {
+                if latest {
+                    self.last_outcome = Some("needs_approval".into());
+                    self.last_error = Some(why.clone());
+                }
+            }
         }
         if latest {
             self.last_tick = Some(tick);
         }
+    }
+
+    /// Fold a fan-out tick's per-tenant results in (#1051). Each tenant's
+    /// streak moves once per tick; the map keeps the latest tick's tenants,
+    /// at most [`MAX_TARGETS`] (most recent failure first, then by name).
+    pub fn apply_targets(&mut self, tick: DateTime<Utc>, targets: &[TargetOutcome]) {
+        if targets.is_empty() || self.last_tick.is_some_and(|t| tick < t) {
+            return;
+        }
+        // Another member's report of the same tick adds to it.
+        let mut next: BTreeMap<String, TargetStatus> = self
+            .targets
+            .iter()
+            .filter(|(_, t)| t.last_tick == tick)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for t in targets {
+            let prior = self.targets.get(&t.tenant);
+            let new_tick = prior.is_none_or(|p| tick > p.last_tick);
+            let was_failed = prior.is_some_and(|p| p.outcome == "failed");
+            let streak = prior.map_or(0, |p| p.consecutive_failures);
+            let consecutive_failures = match t.outcome {
+                "failed" if new_tick || !was_failed => streak + 1,
+                "started" => 0,
+                _ => streak,
+            };
+            next.insert(
+                t.tenant.clone(),
+                TargetStatus {
+                    outcome: t.outcome.to_string(),
+                    error: t.error.clone(),
+                    consecutive_failures,
+                    last_tick: tick,
+                },
+            );
+        }
+        self.targets_truncated = next.len().saturating_sub(MAX_TARGETS);
+        if self.targets_truncated > 0 {
+            let mut order: Vec<(String, TargetStatus)> = next.into_iter().collect();
+            order.sort_by(|(a, x), (b, y)| {
+                (y.outcome == "failed")
+                    .cmp(&(x.outcome == "failed"))
+                    .then(a.cmp(b))
+            });
+            order.truncate(MAX_TARGETS);
+            next = order.into_iter().collect();
+        }
+        self.targets = next;
+    }
+
+    /// What one tenant sees of a fan-out: its own entry only, never the
+    /// combined fields other tenants' results went into (#1051).
+    pub fn for_tenant(&self, tenant: &str) -> ScheduleStatus {
+        let prefix = format!("{tenant}: ");
+        let mut out = ScheduleStatus {
+            missed: self.missed.clone(),
+            ..Default::default()
+        };
+        match self.targets.get(tenant) {
+            Some(t) => {
+                out.last_tick = Some(t.last_tick);
+                out.last_outcome = Some(t.outcome.clone());
+                out.last_error = t.error.clone();
+                out.consecutive_failures = t.consecutive_failures;
+            }
+            None if self.last_tick.is_some() => out.last_outcome = Some("unknown".into()),
+            None => {}
+        }
+        out.failures = self
+            .failures
+            .iter()
+            .filter_map(|f| {
+                let errors: Vec<String> = f
+                    .errors
+                    .iter()
+                    .filter(|e| e.starts_with(&prefix))
+                    .cloned()
+                    .collect();
+                (!errors.is_empty()).then(|| FailedTick {
+                    errors,
+                    ..f.clone()
+                })
+            })
+            .collect();
+        // Skip reasons are written by the server and never hold "; ".
+        out.skipped = self
+            .skipped
+            .iter()
+            .filter_map(|s| {
+                let kept: Vec<&str> = s
+                    .reason
+                    .split("; ")
+                    .filter(|p| p.starts_with(&prefix))
+                    .collect();
+                (!kept.is_empty()).then(|| SkippedTick {
+                    tick: s.tick,
+                    reason: kept.join("; "),
+                })
+            })
+            .collect();
+        out
     }
 
     /// Record a missed range once (two members noticing the same outage).
@@ -247,8 +391,24 @@ pub async fn update(
 
 /// Record a tick's outcome; failures are logged, never fatal.
 pub async fn record(history: &dyn RunHistory, name: &str, tick: DateTime<Utc>, outcome: Outcome) {
+    record_with_targets(history, name, tick, outcome, &[]).await;
+}
+
+/// [`record`] with a fan-out's per-tenant results (#1051).
+pub async fn record_with_targets(
+    history: &dyn RunHistory,
+    name: &str,
+    tick: DateTime<Utc>,
+    outcome: Outcome,
+    targets: &[TargetOutcome],
+) {
     let now = Utc::now();
-    if let Err(e) = update(history, name, |doc| doc.apply(tick, &outcome, now)).await {
+    if let Err(e) = update(history, name, |doc| {
+        doc.apply_targets(tick, targets);
+        doc.apply(tick, &outcome, now);
+    })
+    .await
+    {
         tracing::warn!(schedule = name, %tick, error = %e, "could not record the tick's outcome");
     }
 }
@@ -376,6 +536,98 @@ mod tests {
         assert_eq!(s.skipped.len(), 1);
         assert_eq!(s.last_outcome.as_deref(), Some("skipped"));
         assert_eq!(s.last_tick, Some(t3));
+    }
+
+    fn target(tenant: &str, outcome: &'static str, error: Option<&str>) -> TargetOutcome {
+        TargetOutcome {
+            tenant: tenant.into(),
+            outcome,
+            error: error.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_tenant_sees_only_its_own_result_of_a_fan_out() {
+        let now = at("2026-11-05T12:00:00Z");
+        let t1 = at("2026-11-05T01:00:00Z");
+        let t2 = at("2026-11-05T02:00:00Z");
+        let mut s = ScheduleStatus::default();
+        let refusal = "globex: policy: a; b";
+        for t in [t1, t2] {
+            s.apply_targets(
+                t,
+                &[
+                    target("acme", "started", None),
+                    target("globex", "failed", Some("policy: a; b")),
+                ],
+            );
+            s.apply(t, &Outcome::Failed(vec![refusal.into()]), now);
+        }
+        // A second member's report of the same tick does not count again.
+        s.apply_targets(t2, &[target("globex", "failed", Some("policy: a; b"))]);
+        let acme = s.for_tenant("acme");
+        assert_eq!(acme.last_outcome.as_deref(), Some("started"));
+        assert_eq!(acme.consecutive_failures, 0);
+        assert!(acme.last_error.is_none() && acme.failures.is_empty());
+        let globex = s.for_tenant("globex");
+        assert_eq!(globex.last_outcome.as_deref(), Some("failed"));
+        assert_eq!(globex.consecutive_failures, 2);
+        assert_eq!(globex.last_error.as_deref(), Some("policy: a; b"));
+        assert_eq!(globex.failures[0].errors, vec![refusal.to_string()]);
+        // A tenant the latest tick left out reads as unknown.
+        s.apply_targets(
+            at("2026-11-05T03:00:00Z"),
+            &[target("acme", "started", None)],
+        );
+        assert_eq!(
+            s.for_tenant("globex").last_outcome.as_deref(),
+            Some("unknown")
+        );
+        assert!(
+            ScheduleStatus::default()
+                .for_tenant("x")
+                .last_outcome
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_tenant_sees_only_its_own_skip_reasons() {
+        let s = ScheduleStatus {
+            skipped: vec![
+                SkippedTick {
+                    tick: at("2026-11-05T01:00:00Z"),
+                    reason: "acme: still going; globex: busy".into(),
+                },
+                SkippedTick {
+                    tick: at("2026-11-05T02:00:00Z"),
+                    reason: "globex: busy".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let acme = s.for_tenant("acme");
+        assert_eq!(acme.skipped.len(), 1);
+        assert_eq!(acme.skipped[0].reason, "acme: still going");
+        assert_eq!(acme.skipped[0].tick, at("2026-11-05T01:00:00Z"));
+        assert_eq!(s.for_tenant("globex").skipped.len(), 2);
+    }
+
+    #[test]
+    fn the_per_target_record_is_bounded() {
+        let mut s = ScheduleStatus::default();
+        let tick = at("2026-11-05T01:00:00Z");
+        let mut many: Vec<TargetOutcome> = (0..MAX_TARGETS + 5)
+            .map(|i| target(&format!("t{i:05}"), "started", None))
+            .collect();
+        many.push(target("zz-failing", "failed", Some("refused")));
+        s.apply_targets(tick, &many);
+        assert_eq!(s.targets.len(), MAX_TARGETS);
+        assert_eq!(s.targets_truncated, 6);
+        assert!(
+            s.targets.contains_key("zz-failing"),
+            "failures are kept first"
+        );
     }
 
     #[test]

@@ -586,6 +586,10 @@ pub(crate) async fn refresh_membership(state: &ServerState, member_ttl: Duration
         in_flight: state.registry().in_flight() as u32,
         state_format: faucet_core::state_version::STATE_FORMAT,
         pools: cluster.pools().to_vec(),
+        capabilities: crate::serve::history::INSTANCE_CAPABILITIES
+            .iter()
+            .map(|c| (*c).to_string())
+            .collect(),
     };
     if let Err(e) = state.history().heartbeat_instance(&beat).await {
         tracing::warn!(error = %e, "cluster: heartbeat_instance failed");
@@ -655,17 +659,15 @@ pub async fn maintain_leases(
         tracing::info!("run-history backend recovered");
     }
     #[cfg(feature = "policy")]
-    if let Some(j) = state.history().journal()
-        && !state.history().degraded()
-        && let Ok(v) = serde_json::to_value(state.policy_reads().snapshot())
-    {
-        j.save_policy_reads(&v);
+    if let Err(e) = retry_policy_seed(state).await {
+        tracing::error!(error = %e, "seeding the policy store from the --policy file failed; new work waits for it");
     }
     // Terminal records whose write failed go first: until they land the rows
     // read `running`, and their lease is renewed below so no peer re-runs them.
     crate::serve::runner::retry_pending_finalize(state).await;
     let mut renewed = true;
-    if let Err(e) = state.history().renew_leases().await {
+    let forgotten = state.forgotten_runs();
+    if let Err(e) = state.history().renew_leases_except(&forgotten).await {
         tracing::warn!(error = %e, "lease heartbeat (renew_leases) failed");
         renewed = false;
     }
@@ -800,8 +802,11 @@ pub(crate) async fn lease_loop(state: ServerState, period: Duration, shutdown: C
                         }
                     }
                 } else {
-                    // Single-instance: mark orphans failed (today's behavior).
-                    match state.history().recover_orphans().await {
+                    // Single-instance: mark orphans failed. This instance's own
+                    // runs are live or held for a retry, never orphans, unless
+                    // their terminal record was dropped (#1050).
+                    let forgotten = state.forgotten_runs();
+                    match state.history().recover_orphans_of_peers(&forgotten).await {
                         Ok(n) if n > 0 => tracing::warn!(
                             recovered = n,
                             "recovered orphaned runs from an expired-lease instance"
@@ -810,54 +815,116 @@ pub(crate) async fn lease_loop(state: ServerState, period: Duration, shutdown: C
                         Err(e) => tracing::warn!(error = %e, "orphan recovery failed"),
                     }
                 }
+                clear_settled_forgotten(&state).await;
             }
+        }
+    }
+}
+
+/// Drop from the forgotten set every run whose record is now terminal, or
+/// gone, so the set stays bounded (#1050).
+async fn clear_settled_forgotten(state: &ServerState) {
+    for id in state.forgotten_runs() {
+        match state.history().get(&id).await {
+            Ok(Some(rec)) if !rec.status.is_terminal() => {}
+            Ok(_) => state.clear_forgotten_run(&id),
+            Err(_) => {}
         }
     }
 }
 
 /// Put the `--policy` file in its place (#1043). With `--policy-store file`,
 /// or with nowhere to keep versions (in-memory history), the file is the
-/// policy. Otherwise it only seeds an empty store; a store that already holds
+/// policy, and its content is stored once under its content address for the
+/// runs pinned to it (#1051). Otherwise it only seeds an empty store; a store that already holds
 /// a version keeps it, and a file that differs is reported, not applied.
+/// While the history is unreachable the seed stays pending and admission
+/// waits for it (#1050); any other failure is the caller's.
 #[cfg(feature = "policy")]
 pub async fn apply_policy_file(
     state: &ServerState,
     store: crate::serve::config::PolicyStore,
     policy: std::sync::Arc<faucet_core::PolicySpec>,
     path: &std::path::Path,
-) {
-    use crate::serve::policies::{self, PolicyFile, PolicySeed, SeedOutcome};
+) -> Result<(), crate::serve::error::ServeError> {
+    use crate::serve::policies::{PolicyFile, PolicySeed};
     let file = PolicyFile::read(path);
     if store == crate::serve::config::PolicyStore::File || !state.persistent_history() {
         tracing::info!(rules = policy.rules.len(), path = %file.path, "data-flow policy loaded from file");
         state.set_policy(policy);
         state.set_policy_file(file);
-        return;
+        // Runs are pinned to its content, stored once here; until it is,
+        // nothing is admitted (#1051).
+        state.set_policy_seed_pending(true);
+        return retry_policy_seed(state).await;
     }
-    let seed = PolicySeed {
+    state.set_policy_seed(PolicySeed {
         file,
         spec: (*policy).clone(),
+    });
+    state.set_policy_seed_pending(true);
+    retry_policy_seed(state).await
+}
+
+/// Seed the policy store from the `--policy` file while the seed is pending
+/// (at startup, then from every lease tick). An unreachable history keeps it
+/// pending; any other failure is returned and the seed stays pending.
+#[cfg(feature = "policy")]
+pub async fn retry_policy_seed(state: &ServerState) -> Result<(), crate::serve::error::ServeError> {
+    use crate::serve::policies::{self, SeedOutcome};
+    if !state.policy_seed_pending() {
+        return Ok(());
+    }
+    if state.policy_file().is_some() {
+        return match policies::store_file_scope(state).await {
+            Ok(()) => {
+                state.set_policy_seed_pending(false);
+                Ok(())
+            }
+            Err(crate::serve::error::ServeError::Unavailable(m)) => {
+                tracing::warn!(
+                    error = %m,
+                    "the run history is unreachable: the --policy file is stored once it \
+                     answers, and new work waits until then"
+                );
+                Ok(())
+            }
+            Err(e) => Err(e),
+        };
+    }
+    let Some(seed) = state.policy_seed() else {
+        return Ok(());
     };
-    state.set_policy_seed(seed.clone());
     match policies::seed_store(state, &seed).await {
-        Ok(SeedOutcome::Imported) => tracing::info!(
-            path = %seed.file.path,
-            "the policy store was empty: imported the --policy file as version 1"
-        ),
-        Ok(SeedOutcome::Kept { differs: false }) => tracing::info!(
-            path = %seed.file.path,
-            "the stored policy version is in force; the --policy file matches it"
-        ),
-        Ok(SeedOutcome::Kept { differs: true }) => tracing::warn!(
-            path = %seed.file.path,
-            "the --policy file differs from the policy version in force; it was not applied \
-             (import it as a new version from the console, or start with --policy-store file)"
-        ),
-        Err(e) => tracing::warn!(
-            error = %e,
-            "could not seed the policy store from the --policy file; the stored version, if \
-             any, stays in force"
-        ),
+        Ok(outcome) => {
+            state.set_policy_seed_pending(false);
+            match outcome {
+                SeedOutcome::Imported => tracing::info!(
+                    path = %seed.file.path,
+                    "the policy store was empty: imported the --policy file as version 1"
+                ),
+                SeedOutcome::Kept { differs: false } => tracing::info!(
+                    path = %seed.file.path,
+                    "the stored policy version is in force; the --policy file matches it"
+                ),
+                SeedOutcome::Kept { differs: true } => tracing::warn!(
+                    path = %seed.file.path,
+                    "the --policy file differs from the policy version in force; it was not \
+                     applied (import it as a new version from the console, or start with \
+                     --policy-store file)"
+                ),
+            }
+            Ok(())
+        }
+        Err(crate::serve::error::ServeError::Unavailable(m)) => {
+            tracing::warn!(
+                error = %m,
+                "the run history is unreachable: the --policy file seeds the policy store once \
+                 it answers, and new work waits until then"
+            );
+            Ok(())
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -947,30 +1014,6 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         )));
     }
     let _history_lock = history_lock;
-    // While the persistent backend is unreachable, what must not be lost is
-    // journaled locally and replayed once it answers (#1050). A journal an
-    // earlier process left is replayed now, before serving.
-    if !matches!(
-        config.history,
-        crate::serve::config::HistoryBackendSpec::Memory
-    ) {
-        match crate::serve::history::journal::Journal::open_default(
-            &crate::serve::config::default_data_dir(),
-        ) {
-            Ok(j) => {
-                history.attach_journal(Arc::new(j));
-                history
-                    .replay_journal()
-                    .await
-                    .map_err(|e| CliError::Serve(format!("history journal replay: {e}")))?;
-            }
-            Err(e) => tracing::error!(
-                error = %e,
-                "no local history journal: records written while the run history is \
-                 unreachable are kept in memory only"
-            ),
-        }
-    }
     if config.cluster.enabled {
         // Cluster mode: a restarting instance re-queues its prior incarnation's
         // in-flight runs (capped) rather than failing them.
@@ -1160,17 +1203,6 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         #[cfg(feature = "triggers")]
         triggers_handle,
     );
-    // The policy versions an earlier process last read, for a start while
-    // the history is unreachable (#1051).
-    #[cfg(feature = "policy")]
-    if let Some(reads) = state
-        .history()
-        .journal()
-        .and_then(|j| j.load_policy_reads())
-        .and_then(|v| serde_json::from_value(v).ok())
-    {
-        state.policy_reads().restore(reads);
-    }
     // Template tests this server runs screen for its credentials and record
     // this instance on their results (#856).
     #[cfg(feature = "templates")]
@@ -1182,7 +1214,9 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
     }
     #[cfg(feature = "policy")]
     if let (Some(p), Some(path)) = (policy, &config.policy_path) {
-        apply_policy_file(&state, config.policy_store, p, path).await;
+        apply_policy_file(&state, config.policy_store, p, path)
+            .await
+            .map_err(|e| CliError::Serve(format!("seeding the policy store from --policy: {e}")))?;
     }
     #[cfg(feature = "encryption")]
     state.set_vault(vault);
@@ -1488,6 +1522,51 @@ mod tests {
     use crate::serve::history::{RunRecord, RunStatus};
     use chrono::Utc;
     use std::collections::BTreeMap;
+
+    /// A forgotten run is dropped from the set once its record is terminal
+    /// or gone, kept while it is live, and kept while the history is down.
+    #[tokio::test]
+    async fn settled_forgotten_runs_are_cleared() {
+        let down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let history = std::sync::Arc::new(crate::serve::test_support::Flaky {
+            inner: std::sync::Arc::new(MemoryHistory::new(Duration::from_secs(60))),
+            down: down.clone(),
+        });
+        let state = ServerState::new(
+            &crate::serve::test_support::test_config(),
+            None,
+            CancellationToken::new(),
+            history,
+            crate::serve::logs::LogHub::new(),
+            None,
+            #[cfg(feature = "triggers")]
+            crate::serve::triggers::health::TriggersHandle::empty(),
+        );
+        for (id, status) in [("done", RunStatus::Completed), ("live", RunStatus::Running)] {
+            let mut rec = RunRecord::queued(id.into(), None, BTreeMap::new(), None, Utc::now());
+            rec.status = status;
+            state.history().upsert(&rec).await.unwrap();
+        }
+        for id in ["done", "live", "gone"] {
+            state.forget_run_lease(id);
+        }
+        down.store(true, std::sync::atomic::Ordering::Release);
+        clear_settled_forgotten(&state).await;
+        assert_eq!(state.forgotten_runs().len(), 3, "nothing is cleared blind");
+        down.store(false, std::sync::atomic::Ordering::Release);
+        clear_settled_forgotten(&state).await;
+        assert_eq!(state.forgotten_runs(), vec!["live".to_string()]);
+    }
+
+    /// A pending seed with neither a file nor a seed to apply stays pending.
+    #[cfg(feature = "policy")]
+    #[tokio::test]
+    async fn a_pending_seed_with_nothing_to_seed_stays_pending() {
+        let state = crate::serve::test_support::test_state();
+        state.set_policy_seed_pending(true);
+        retry_policy_seed(&state).await.unwrap();
+        assert!(state.policy_seed_pending());
+    }
 
     #[tokio::test]
     async fn metrics_upkeep_drains_histograms_on_its_own() {

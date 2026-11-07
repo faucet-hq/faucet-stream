@@ -7,7 +7,6 @@
 pub mod catalog;
 #[cfg(feature = "serve")]
 pub mod fallback;
-pub mod journal;
 pub mod labels;
 pub mod memory;
 pub mod overview;
@@ -282,22 +281,29 @@ pub struct RunRecord {
     pub dlq_location: Option<String>,
     /// The stored data-flow policy versions the run was admitted under
     /// (#1043): a claim, shard or resume enforces these, not a newer one.
-    #[serde(default, skip_serializing_if = "policies::PolicyPin::is_empty")]
-    pub policy_pin: policies::PolicyPin,
-    /// The submitted config of a single-server run (a cluster run keeps it in
-    /// `config_body`), kept so a policy change's impact can check the runs
-    /// it would have refused (#1051). Sealed with the vault key when the
-    /// server has one; never re-run.
+    /// `None` = not recorded (a record from 1.17, or a build without the
+    /// `policy` feature): the newest versions apply (#1051).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub policy_probe: Option<PolicyProbe>,
+    pub policy_pin: Option<policies::PolicyPin>,
+    /// What a policy change's impact needs of the run's config, and nothing
+    /// else (#1051): no connector settings, no masking keys, no values from
+    /// secret references. Stored only while the server keeps its policy in
+    /// the store; never shown, never re-run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_projection: Option<PolicyProjection>,
 }
 
-/// A run's config as the policy impact reads it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PolicyProbe {
-    pub body: String,
-    #[serde(default)]
-    pub format: crate::serve::load::ConfigFormat,
+/// A run's config reduced to what a data-flow policy reasons about (#1051):
+/// connector kinds and `attributes`, transforms, contracts, masking rules
+/// (without keys), the DLQ's kind and attributes, and the config's own
+/// `policy:` block. `opaque` when it cannot be checked statically (a
+/// topology, or more rows than a projection keeps).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PolicyProjection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub opaque: bool,
 }
 
 impl RunRecord {
@@ -340,8 +346,8 @@ impl RunRecord {
             pool: crate::serve::pools::default_pool(),
             submitted_by: None,
             dlq_location: None,
-            policy_pin: Default::default(),
-            policy_probe: None,
+            policy_pin: None,
+            policy_projection: None,
         }
     }
 
@@ -411,7 +417,15 @@ pub struct InstanceHeartbeat {
     pub state_format: u32,
     /// The execution pools this instance serves (#957).
     pub pools: Vec<String>,
+    /// What this instance enforces that older releases do not
+    /// ([`INSTANCE_CAPABILITIES`]).
+    pub capabilities: Vec<String>,
 }
+
+/// A member enforces the policy versions a run was admitted under (#1051).
+pub const CAP_POLICY_PIN: &str = "policy_pin";
+/// What this build advertises in its heartbeat.
+pub const INSTANCE_CAPABILITIES: &[&str] = &[CAP_POLICY_PIN];
 
 /// One live cluster member (for `/readyz` + metrics).
 #[derive(Debug, Clone, Serialize)]
@@ -428,6 +442,19 @@ pub struct InstanceRecord {
     /// The execution pools the member serves (#957); `None` for a member that
     /// predates pools — it claims every pending run.
     pub pools: Option<Vec<String>>,
+    /// What the member advertises; `None` for a member that predates
+    /// capabilities, which counts as having none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Vec<String>>,
+}
+
+impl InstanceRecord {
+    /// Whether the member advertises `cap`.
+    pub fn has(&self, cap: &str) -> bool {
+        self.capabilities
+            .as_ref()
+            .is_some_and(|c| c.iter().any(|x| x == cap))
+    }
 }
 
 /// The state format every live member reads (#736): the lowest any of them
@@ -641,6 +668,13 @@ impl HistoryError {
     /// [`PoolTimedOut`](Self::PoolTimedOut)).
     pub fn is_pool_timeout(&self) -> bool {
         matches!(self, Self::PoolTimedOut(_))
+    }
+
+    /// Whether the failure is known to resolve itself ([`Transience::Transient`]):
+    /// an unreachable or degraded backend, a pool timeout. Unclassified
+    /// failures are not.
+    pub fn is_transient(&self) -> bool {
+        self.transience() == Transience::Transient
     }
 
     /// Whether retrying the failed call could plausibly succeed. Everything but
@@ -973,6 +1007,52 @@ pub trait RunHistory: Send + Sync {
     /// unshared) is a no-op returning 0.
     async fn renew_leases(&self) -> Result<usize, HistoryError> {
         Ok(0)
+    }
+
+    /// [`renew_leases`](Self::renew_leases), leaving out `skip`: runs whose
+    /// terminal record was dropped, so orphan recovery can clear them (#1050).
+    async fn renew_leases_except(&self, skip: &[String]) -> Result<usize, HistoryError> {
+        let _ = skip;
+        self.renew_leases().await
+    }
+
+    /// The single-server orphan sweep (#1050): [`recover_orphans`](Self::recover_orphans)
+    /// without this instance's own runs, which are live or held for a retry,
+    /// except those in `forgotten` (their terminal record was dropped).
+    async fn recover_orphans_of_peers(&self, forgotten: &[String]) -> Result<usize, HistoryError> {
+        let _ = forgotten;
+        self.recover_orphans().await
+    }
+
+    /// Write only a run's terminal status, finish time and error over its
+    /// stored record, fenced like [`finalize_owned`](Self::finalize_owned).
+    /// Returns the record as written; `None` when the run is not stored, is
+    /// already terminal, or is another instance's (#1050).
+    async fn finalize_status_owned(
+        &self,
+        run_id: &str,
+        status: RunStatus,
+        finished_at: DateTime<Utc>,
+        error: Option<String>,
+    ) -> Result<Option<RunRecord>, HistoryError> {
+        let Some(mut rec) = self.get(run_id).await? else {
+            return Ok(None);
+        };
+        if rec.status.is_terminal() {
+            return Ok(None);
+        }
+        rec.status = status;
+        rec.finished_at = Some(finished_at);
+        rec.error = error;
+        if rec.elapsed_secs.is_none()
+            && let Some(started) = rec.started_at
+        {
+            rec.elapsed_secs = (finished_at - started)
+                .to_std()
+                .ok()
+                .map(|d| d.as_secs_f64());
+        }
+        Ok(self.finalize_owned(&rec).await?.then_some(rec))
     }
 
     /// Atomically claim up to `limit` oldest `Pending` runs for *this* instance,
@@ -2395,33 +2475,25 @@ pub trait RunHistory: Send + Sync {
         Ok(())
     }
 
+    /// The recovery probe: a write the backend must accept to count as
+    /// healthy again, so a primary that answers reads but refuses writes (a
+    /// read-only standby after failover) stays degraded (#1050). Default: a
+    /// read, for backends with nothing to write to.
+    async fn probe_write(&self) -> Result<(), HistoryError> {
+        self.get("__faucet_history_recovery_probe__")
+            .await
+            .map(|_| ())
+    }
+
     /// While degraded, probe the persistent backend and leave degraded mode
     /// if it answers. Returns whether it recovered. Default: nothing to recover.
     async fn recover_degraded(&self) -> bool {
         false
     }
 
-    /// Keep what is written while degraded in `journal` (#1050). `false`
-    /// when this backend has no persistent store to replay into.
-    fn attach_journal(&self, journal: Arc<journal::Journal>) -> bool {
-        let _ = journal;
-        false
-    }
-
-    /// The local history journal, when one is attached.
-    fn journal(&self) -> Option<Arc<journal::Journal>> {
-        None
-    }
-
     /// When the persistent backend was found unreachable, while it still is.
     fn degraded_since(&self) -> Option<DateTime<Utc>> {
         None
-    }
-
-    /// Replay a journal an earlier process left, when the backend is healthy
-    /// (at startup, before serving).
-    async fn replay_journal(&self) -> Result<(), HistoryError> {
-        Ok(())
     }
 
     /// True when the backend is in fallback mode (drives `/readyz`). Always false

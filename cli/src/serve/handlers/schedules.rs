@@ -119,6 +119,7 @@ mod enabled {
             action: ChangeAction::Create,
             name: spec.name.clone(),
             spec: Some(spec),
+            schedule_id: None,
         };
         let changed = service::change(&state, &actor, p, q.reason).await?;
         Ok(respond(changed, StatusCode::CREATED))
@@ -135,6 +136,7 @@ mod enabled {
             action: ChangeAction::Update,
             name,
             spec: Some(spec),
+            schedule_id: None,
         };
         let changed = service::change(&state, &actor, p, q.reason).await?;
         Ok(respond(changed, StatusCode::OK))
@@ -150,6 +152,7 @@ mod enabled {
             action: ChangeAction::Delete,
             name,
             spec: None,
+            schedule_id: None,
         };
         let changed = service::change(&state, &actor, p, q.reason).await?;
         Ok(respond(changed, StatusCode::NO_CONTENT))

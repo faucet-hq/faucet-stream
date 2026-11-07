@@ -743,6 +743,9 @@ rdkafka = { workspace = true, optional = true, features = ["sasl"] }
 
 [dev-dependencies]
 faucet-conformance = { workspace = true, features = ["containers"] }
+# The run-history error mapping scan (#1051) parses the CLI's source.
+syn = { version = "3", default-features = false, features = ["full", "parsing", "visit", "clone-impls"] }
+
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 # `faucet schema config` composed-schema tests (#213): validate the shipped

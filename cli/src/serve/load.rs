@@ -2018,7 +2018,8 @@ pub struct LoadedSubmission {
     pub tenant: Option<std::sync::Arc<TenantScope>>,
     /// The stored data-flow policy versions merged into `cfg.policy`
     /// (#1043); recorded on the run so every replica enforces the same ones.
-    pub policy_pin: crate::serve::history::policies::PolicyPin,
+    /// `None` in a build without the `policy` feature.
+    pub policy_pin: Option<crate::serve::history::policies::PolicyPin>,
 }
 
 impl LoadedSubmission {
@@ -2443,7 +2444,7 @@ pub async fn load_submission_inputs(
             cfg,
             nodes: Vec::new(),
             tenant,
-            policy_pin: Default::default(),
+            policy_pin: None,
         });
     }
 
@@ -2466,7 +2467,7 @@ pub async fn load_submission_inputs(
         cfg,
         nodes,
         tenant,
-        policy_pin: Default::default(),
+        policy_pin: None,
     })
 }
 

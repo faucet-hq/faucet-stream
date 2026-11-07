@@ -18,6 +18,9 @@ fn shard_key(run_id: &str, shard_id: &str) -> String {
 
 pub struct Registry {
     tokens: DashMap<String, CancellationToken>,
+    /// The tenant of each registered run, so a cancel can check who may see
+    /// it without the run history (#1050).
+    tenants: DashMap<String, Option<String>>,
     /// Claims taken with [`Registry::try_register`], by id.
     claims: DashMap<String, u64>,
     next_claim: AtomicU64,
@@ -31,6 +34,7 @@ impl Registry {
     pub fn new(max_queued: usize) -> Self {
         Self {
             tokens: DashMap::new(),
+            tenants: DashMap::new(),
             claims: DashMap::new(),
             next_claim: AtomicU64::new(1),
             queued: AtomicUsize::new(0),
@@ -61,6 +65,17 @@ impl Registry {
         self.tokens.insert(run_id, token);
     }
 
+    /// [`register`](Self::register) a run with the tenant it belongs to.
+    pub fn register_run(&self, run_id: String, token: CancellationToken, tenant: Option<String>) {
+        self.tenants.insert(run_id.clone(), tenant);
+        self.tokens.insert(run_id, token);
+    }
+
+    /// The tenant of a run this instance runs: `None` when it is not here.
+    pub fn tenant_of(&self, run_id: &str) -> Option<Option<String>> {
+        self.tenants.get(run_id).map(|t| t.clone())
+    }
+
     /// Queued → running: the run acquired its execution permit.
     pub fn mark_running(&self) {
         self.dec_queued();
@@ -78,6 +93,7 @@ impl Registry {
     pub fn mark_finished(&self, run_id: &str) {
         self.dec_in_flight();
         self.tokens.remove(run_id);
+        self.tenants.remove(run_id);
         self.drained.notify_waiters();
     }
 
@@ -89,6 +105,7 @@ impl Registry {
     pub fn mark_queued_cancelled(&self, run_id: &str) {
         self.dec_queued();
         self.tokens.remove(run_id);
+        self.tenants.remove(run_id);
         self.drained.notify_waiters();
     }
 

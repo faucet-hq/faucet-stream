@@ -207,7 +207,7 @@
     },
     {
       "type": "stat",
-      "title": "History backend degraded (1 = degraded)",
+      "title": "History backend health (degraded: 1 = yes)",
       "gridPos": {
         "x": 0,
         "y": 16,
@@ -230,21 +230,57 @@
         },
         {
           "refId": "B",
-          "expr": "sum by (kind) (faucet_serve_history_journal_records)",
+          "expr": "sum(faucet_serve_pending_finalize)",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "legendFormat": "journaled {{kind}}"
+          "legendFormat": "terminal records waiting"
         },
         {
           "refId": "C",
-          "expr": "sum by (kind, outcome) (increase(faucet_serve_history_journal_replayed_total[1h]))",
+          "expr": "sum(increase(faucet_serve_pending_finalize_dropped_total[1h]))",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "legendFormat": "replayed {{kind}} {{outcome}}"
+          "legendFormat": "terminal records dropped (per hour)"
+        },
+        {
+          "refId": "D",
+          "expr": "sum(increase(faucet_serve_pending_finalize_refused_total[1h]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "terminal statuses refused (per hour)"
+        },
+        {
+          "refId": "E",
+          "expr": "max(faucet_serve_policy_seed_pending)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "policy seed pending"
+        },
+        {
+          "refId": "F",
+          "expr": "sum(increase(faucet_serve_run_reload_retries_total[1h]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "run reload retries (per hour)"
+        },
+        {
+          "refId": "G",
+          "expr": "sum(increase(faucet_serve_policy_merge_failures_total[1h]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "tenant policy merge failures (per hour)"
         }
       ],
       "fieldConfig": {
@@ -867,7 +903,7 @@
     },
     {
       "type": "timeseries",
-      "title": "Missed ticks, tenant fan-out failures & runner restarts (per hour)",
+      "title": "Missed ticks, tenant fan-out failures, runner restarts & step timeouts (per hour)",
       "gridPos": {
         "x": 0,
         "y": 59,
@@ -905,6 +941,15 @@
             "uid": "${datasource}"
           },
           "legendFormat": "runner restarts"
+        },
+        {
+          "refId": "D",
+          "expr": "sum by (schedule) (increase(faucet_serve_schedule_step_timeouts_total[1h]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "{{schedule}} step timeouts"
         }
       ],
       "fieldConfig": {

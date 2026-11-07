@@ -46,6 +46,8 @@ fn label_write_err(
 pub(crate) fn registry_err(what: &str, e: history::HistoryError) -> CliError {
     match e {
         history::HistoryError::Degraded(m) => CliError::HistoryUnavailable(m),
+        // As `ServeError::from` decides (#1051): one that may pass is retryable.
+        e if e.is_transient() => CliError::HistoryUnavailable(e.to_string()),
         e @ history::HistoryError::TemplateKindConflict { .. } => CliError::Config(e.to_string()),
         other => CliError::Internal(format!("{what}: {other}")),
     }

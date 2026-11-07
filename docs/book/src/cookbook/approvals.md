@@ -100,7 +100,11 @@ scoped to a different tenant, the request becomes `failed` and nothing runs.
 
 Otherwise the request executes and becomes `executed` (with `run_id` or the
 template id and version) or, if execution itself errors, `failed` with the
-reason. A run carries the label `change: <id>` and, unless the requester set
+reason. A refusal that passes on its own — the run history is unreachable,
+the run queue is full, a tenant is at its limit, the server is draining —
+leaves the request `approved` with the reason in `error`; the sweep below
+runs it again later. A policy change that another landed change has made
+stale is `invalidated`. A run carries the label `change: <id>` and, unless the requester set
 one, the idempotency key `change:<id>`.
 
 `POST /v1/changes/{id}/reject` with `{ "reason": "..." }` rejects; the
@@ -155,6 +159,13 @@ one approval, no self-approval**. A refusal is a `403` that names the rule.
 
 A server with a single principal (`--auth-token`, `--no-auth`) uses admin-only
 with self-approval allowed — otherwise nothing could ever be approved there.
+
+A [schedule](./schedules.md) change under `--require-approval run` is governed
+by two rules, `schedule` and `run`: an approver counts when one of them allows
+them, and the change executes once each rule has its own `min_approvers`.
+Whenever schedule changes are gated (`run`, `schedule` or both), the server
+refuses to start when the principals in `--auth-config` could not meet one of
+the rules they need.
 
 ## Making it mandatory
 

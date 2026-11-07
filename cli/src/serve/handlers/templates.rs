@@ -365,7 +365,7 @@ pub async fn template_matrix(State(state): State<ServerState>) -> Result<Json<Va
         let Some(rec) = store
             .template_get(&t.id, Some(version))
             .await
-            .map_err(|e| ServeError::Internal(format!("template registry read: {e}")))?
+            .map_err(ServeError::from)?
         else {
             continue;
         };
@@ -528,7 +528,7 @@ pub async fn list_template_runs(
     let s = store(&server);
     if s.template_get(&id, None)
         .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?
+        .map_err(ServeError::from)?
         .is_none()
     {
         return Err(ServeError::NotFound);
@@ -571,7 +571,7 @@ pub async fn get_template(
     let mut template = s
         .template_get(&id, Some(want))
         .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?
+        .map_err(ServeError::from)?
         .ok_or(ServeError::NotFound)?;
     crate::params::hide_secret_defaults(&mut template.params);
     let body_withheld = !reads_template_body(&actor);
@@ -583,10 +583,7 @@ pub async fn get_template(
     let state = crate::templates::template_state(&s, &id)
         .await
         .map_err(map_err)?;
-    let launches = s
-        .template_launches(&id)
-        .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?;
+    let launches = s.template_launches(&id).await.map_err(ServeError::from)?;
     let is_stable = state.stable == Some(template.version);
     // Every version's registration metadata and test history, read a few at
     // a time (a template keeps at most `VERSION_RETAIN` versions).
@@ -620,7 +617,7 @@ pub async fn get_template(
         .try_filter_map(|r| async move { Ok(r) })
         .try_collect()
         .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?;
+        .map_err(ServeError::from)?;
     let tests: Vec<_> =
         state
             .versions
@@ -843,10 +840,7 @@ pub async fn delete_template(
         let st = crate::templates::template_state(&s, &id)
             .await
             .map_err(map_err)?;
-        let launches = s
-            .template_launches(&id)
-            .await
-            .map_err(|e| ServeError::from_history("reading template launches", e))?;
+        let launches = s.template_launches(&id).await.map_err(ServeError::from)?;
         let moves_a_pointer = match target {
             None => !st.versions.is_empty(),
             Some(v) => {
@@ -862,7 +856,7 @@ pub async fn delete_template(
     let removed = s
         .template_delete(&id, target)
         .await
-        .map_err(|e| ServeError::from_history("deleting template", e))?;
+        .map_err(ServeError::from)?;
     if removed == 0 {
         return Err(ServeError::NotFound);
     }

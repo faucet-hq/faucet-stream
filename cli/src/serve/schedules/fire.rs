@@ -32,6 +32,9 @@ pub struct FireOptions {
     pub from_file: bool,
     /// Made (or last changed) through an approved change request.
     pub approved: bool,
+    /// The stored schedule's id and owner, which its sealed params open
+    /// under; looked up when unset.
+    pub schedule_id: Option<String>,
 }
 
 /// Fan-out targets submitted side by side.
@@ -291,17 +294,49 @@ pub fn classify(e: ServeError, tenant: Option<&str>) -> TargetResult {
 
 /// The refusal of a tick that would start runs without an approval this
 /// server requires (#1051): `--require-approval run` covers schedules made
-/// through the API unless an approved change request made them.
-pub fn approval_missing(state: &ServerState, opts: &FireOptions) -> Option<String> {
-    (state.requires_approval(crate::serve::changes::ChangeKind::Run)
-        && !opts.from_file
-        && !opts.approved)
-        .then(|| {
+/// through the API unless an approved change request made them, and then
+/// only while they name pinned template versions, so an approved schedule
+/// runs exactly what was approved.
+pub fn approval_missing(
+    state: &ServerState,
+    spec: &ScheduleSpec,
+    opts: &FireOptions,
+) -> Option<String> {
+    if !state.requires_approval(crate::serve::changes::ChangeKind::Run) || opts.from_file {
+        return None;
+    }
+    if !opts.approved {
+        return Some(
             "this server requires approval for runs (--require-approval run), and this schedule \
              was not made through an approved change request; propose an update of it with \
              POST /v1/changes (kind `schedule`) to approve it"
-                .to_string()
-        })
+                .to_string(),
+        );
+    }
+    follows_a_channel(spec).map(|field| {
+        format!(
+            "this server requires approval for runs (--require-approval run), and this schedule \
+             follows a channel ({field}) that a later launch can move without an approval; \
+             pin a version and approve the change"
+        )
+    })
+}
+
+/// The first template selector of `spec` that names a channel, not a
+/// numbered version: what a launch can change under an approved schedule.
+pub fn follows_a_channel(spec: &ScheduleSpec) -> Option<&'static str> {
+    let pinned = |v: &Option<String>| v.as_deref().is_some_and(|s| s.parse::<u32>().is_ok());
+    let t = &spec.template;
+    if !pinned(&t.version) {
+        return Some("template.version");
+    }
+    if t.sink.is_some() && !pinned(&t.sink_version) {
+        return Some("template.sink_version");
+    }
+    if t.overlay.is_some() && !pinned(&t.overlay_version) {
+        return Some("template.overlay_version");
+    }
+    None
 }
 
 /// The targets of a tick: the owner, the fan-out's tenants, or the server.
@@ -377,6 +412,37 @@ pub async fn earlier_run_going(
         .map(|r| r.run_id))
 }
 
+/// `spec` with its sealed params opened under the stored schedule's id and
+/// owner (#1051).
+async fn open_params(
+    state: &ServerState,
+    spec: &ScheduleSpec,
+    opts: &FireOptions,
+) -> Result<ScheduleSpec, TargetResult> {
+    if !spec.template.params.values().any(super::secrets::is_sealed) {
+        return Ok(spec.clone());
+    }
+    let record = match state.history().schedule_get(&spec.name).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return Err(TargetResult::Failed(
+                "the schedule is no longer stored".into(),
+            ));
+        }
+        Err(e) => return Err(classify(ServeError::from(e), None)),
+    };
+    if opts.schedule_id.as_ref().is_some_and(|id| *id != record.id) {
+        return Err(TargetResult::Failed(
+            "the schedule was replaced since this tick was planned".into(),
+        ));
+    }
+    let scope = super::secrets::Scope {
+        id: &record.id,
+        tenant: record.tenant.as_deref(),
+    };
+    super::secrets::opened(state, spec, scope).map_err(TargetResult::Failed)
+}
+
 /// Fire one tick. `owner` is the tenant that owns the schedule, if any.
 pub async fn fire_tick(
     state: &ServerState,
@@ -394,6 +460,16 @@ pub async fn fire_tick(
             };
         }
     };
+    // Sealed params are opened once per tick, for every target.
+    let spec = match open_params(state, spec, opts).await {
+        Ok(s) => s,
+        Err(e) => {
+            return TickResult {
+                targets: targets.into_iter().map(|t| (t, e.clone())).collect(),
+            };
+        }
+    };
+    let spec = &spec;
     // A fan-out's tenants are submitted side by side (bounded), in order.
     use futures::StreamExt;
     let results: Vec<(Option<String>, TargetResult)> = futures::stream::iter(targets)
@@ -420,7 +496,7 @@ async fn fire_target(
     fired_at: DateTime<Utc>,
     opts: &FireOptions,
 ) -> TargetResult {
-    if let Some(why) = approval_missing(state, opts) {
+    if let Some(why) = approval_missing(state, spec, opts) {
         return TargetResult::Failed(why);
     }
     if opts.manual.is_none() {
@@ -439,11 +515,7 @@ async fn fire_target(
             Err(e) => return TargetResult::Retry(format!("checking for an earlier run: {e}")),
         }
     }
-    let spec = match super::secrets::opened(state, spec) {
-        Ok(s) => s,
-        Err(e) => return TargetResult::Failed(e),
-    };
-    let body = match body(&spec, tick, fired_at, opts, tenant) {
+    let body = match body(spec, tick, fired_at, opts, tenant) {
         Ok(b) => b,
         Err(e) => return TargetResult::Failed(e),
     };
@@ -609,27 +681,45 @@ mod tests {
         ));
     }
 
+    fn pinned() -> ScheduleSpec {
+        let mut s = spec();
+        s.template.version = Some("4".into());
+        s.template.overlay_version = Some("2".into());
+        s
+    }
+
     #[test]
     fn a_schedule_needs_an_approval_when_runs_do() {
         let state = crate::serve::test_support::test_state();
-        assert!(approval_missing(&state, &FireOptions::default()).is_none());
+        assert!(approval_missing(&state, &spec(), &FireOptions::default()).is_none());
         let mut config = crate::serve::test_support::test_config();
         config.require_approval = vec![crate::serve::changes::ChangeKind::Run];
         let gated = crate::serve::test_support::state_from(&config);
-        let why = approval_missing(&gated, &FireOptions::default()).unwrap();
+        let why = approval_missing(&gated, &pinned(), &FireOptions::default()).unwrap();
         assert!(why.contains("--require-approval run"), "{why}");
-        for ok in [
-            FireOptions {
-                from_file: true,
-                ..Default::default()
-            },
-            FireOptions {
-                approved: true,
-                ..Default::default()
-            },
-        ] {
-            assert!(approval_missing(&gated, &ok).is_none());
-        }
+        let approved = FireOptions {
+            approved: true,
+            ..Default::default()
+        };
+        let from_file = FireOptions {
+            from_file: true,
+            ..Default::default()
+        };
+        assert!(approval_missing(&gated, &spec(), &from_file).is_none());
+        assert!(approval_missing(&gated, &pinned(), &approved).is_none());
+        // Approved, but a launch could move what it runs.
+        let why = approval_missing(&gated, &spec(), &approved).unwrap();
+        assert!(why.contains("template.version"), "{why}");
+        let mut sink = pinned();
+        sink.template.sink_version = None;
+        assert_eq!(follows_a_channel(&sink), Some("template.sink_version"));
+        let mut overlay = pinned();
+        overlay.template.overlay_version = Some("stable".into());
+        assert_eq!(
+            follows_a_channel(&overlay),
+            Some("template.overlay_version")
+        );
+        assert_eq!(follows_a_channel(&pinned()), None);
     }
 
     #[tokio::test]
@@ -756,8 +846,25 @@ mod tests {
             "token".into(),
             json!({ super::super::secrets::SEALED: "x" }),
         );
+        // Not stored: there is no id to open it under (#1051).
+        let r = fire_tick(&state, &sealed, None, tick, tick, &opts).await;
+        assert!(failed(&r).contains("no longer stored"), "{r:?}");
+        let record = crate::serve::history::schedules::ScheduleRecord::new(
+            sealed.clone(),
+            None,
+            "ops",
+            tick,
+        );
+        assert!(state.history().schedule_insert(&record).await.unwrap());
         let r = fire_tick(&state, &sealed, None, tick, tick, &opts).await;
         assert!(failed(&r).contains("template.params.token"), "{r:?}");
+        // A tick planned for a schedule since replaced does not open it.
+        let replaced = FireOptions {
+            schedule_id: Some("another".into()),
+            ..Default::default()
+        };
+        let r = fire_tick(&state, &sealed, None, tick, tick, &replaced).await;
+        assert!(failed(&r).contains("replaced"), "{r:?}");
     }
 
     #[cfg(feature = "tenants")]
@@ -783,6 +890,200 @@ mod tests {
             let r = fire_tick(&state, &fan, None, tick, tick, &FireOptions::default()).await;
             let tenants: Vec<_> = r.targets.iter().map(|(t, _)| t.as_deref()).collect();
             assert_eq!(tenants, vec![Some("acme")], "{r:?}");
+        }
+    }
+
+    /// An in-memory history that counts schedule reads.
+    #[cfg(feature = "tenants")]
+    struct CountingGets {
+        inner: crate::serve::history::memory::MemoryHistory,
+        gets: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(feature = "tenants")]
+    #[async_trait::async_trait]
+    impl crate::serve::history::RunHistory for CountingGets {
+        async fn claim_idempotency(
+            &self,
+            key: &str,
+            fingerprint: &str,
+            run_id: &str,
+            window: std::time::Duration,
+        ) -> Result<crate::serve::history::Claim, crate::serve::history::HistoryError> {
+            self.inner
+                .claim_idempotency(key, fingerprint, run_id, window)
+                .await
+        }
+        async fn upsert(
+            &self,
+            rec: &crate::serve::history::RunRecord,
+        ) -> Result<(), crate::serve::history::HistoryError> {
+            self.inner.upsert(rec).await
+        }
+        async fn get(
+            &self,
+            id: &str,
+        ) -> Result<Option<crate::serve::history::RunRecord>, crate::serve::history::HistoryError>
+        {
+            self.inner.get(id).await
+        }
+        async fn list(
+            &self,
+            filter: &ListFilter,
+        ) -> Result<crate::serve::history::ListPage, crate::serve::history::HistoryError> {
+            self.inner.list(filter).await
+        }
+        async fn delete(
+            &self,
+            id: &str,
+        ) -> Result<crate::serve::history::DeleteOutcome, crate::serve::history::HistoryError>
+        {
+            self.inner.delete(id).await
+        }
+        async fn purge_expired(
+            &self,
+            retain_for: std::time::Duration,
+        ) -> Result<usize, crate::serve::history::HistoryError> {
+            self.inner.purge_expired(retain_for).await
+        }
+        async fn recover_orphans(&self) -> Result<usize, crate::serve::history::HistoryError> {
+            self.inner.recover_orphans().await
+        }
+        fn degraded(&self) -> bool {
+            false
+        }
+        async fn schedule_insert(
+            &self,
+            r: &crate::serve::history::schedules::ScheduleRecord,
+        ) -> Result<bool, crate::serve::history::HistoryError> {
+            self.inner.schedule_insert(r).await
+        }
+        async fn schedule_get(
+            &self,
+            name: &str,
+        ) -> Result<
+            Option<crate::serve::history::schedules::ScheduleRecord>,
+            crate::serve::history::HistoryError,
+        > {
+            self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.schedule_get(name).await
+        }
+        async fn tenant_upsert(
+            &self,
+            t: &crate::serve::history::tenants::TenantRecord,
+        ) -> Result<(), crate::serve::history::HistoryError> {
+            self.inner.tenant_upsert(t).await
+        }
+        async fn tenant_get(
+            &self,
+            id: &str,
+        ) -> Result<
+            Option<crate::serve::history::tenants::TenantRecord>,
+            crate::serve::history::HistoryError,
+        > {
+            self.inner.tenant_get(id).await
+        }
+        async fn tenant_list(
+            &self,
+        ) -> Result<
+            Vec<crate::serve::history::tenants::TenantRecord>,
+            crate::serve::history::HistoryError,
+        > {
+            self.inner.tenant_list().await
+        }
+    }
+
+    /// The counting double passes every call through and counts only the
+    /// schedule reads.
+    #[cfg(feature = "tenants")]
+    #[tokio::test]
+    async fn the_counting_history_passes_calls_through() {
+        use crate::serve::history::RunHistory as _;
+        let h = CountingGets {
+            inner: crate::serve::history::memory::MemoryHistory::new(
+                std::time::Duration::from_secs(60),
+            ),
+            gets: Default::default(),
+        };
+        let window = std::time::Duration::from_secs(60);
+        assert!(matches!(
+            h.claim_idempotency("k", "f", "r", window).await.unwrap(),
+            crate::serve::history::Claim::Fresh
+        ));
+        let rec = crate::serve::history::RunRecord::queued(
+            "r".into(),
+            None,
+            Default::default(),
+            None,
+            Utc::now(),
+        );
+        h.upsert(&rec).await.unwrap();
+        assert!(h.get("r").await.unwrap().is_some());
+        assert_eq!(h.list(&ListFilter::default()).await.unwrap().runs.len(), 1);
+        assert!(!matches!(
+            h.delete("r").await.unwrap(),
+            crate::serve::history::DeleteOutcome::NotFound
+        ));
+        assert_eq!(h.purge_expired(window).await.unwrap(), 0);
+        assert_eq!(h.recover_orphans().await.unwrap(), 0);
+        assert!(h.tenant_get("acme").await.unwrap().is_none());
+        assert_eq!(h.gets.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A fan-out tick reads the stored schedule and opens its sealed params
+    /// once, not once per tenant.
+    #[cfg(feature = "tenants")]
+    #[tokio::test]
+    async fn a_fan_out_tick_reads_the_schedule_once() {
+        let history = std::sync::Arc::new(CountingGets {
+            inner: crate::serve::history::memory::MemoryHistory::new(
+                std::time::Duration::from_secs(60),
+            ),
+            gets: Default::default(),
+        });
+        let state = ServerState::new(
+            &crate::serve::test_support::test_config(),
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            history.clone(),
+            crate::serve::logs::LogHub::new(),
+            None,
+            #[cfg(feature = "triggers")]
+            crate::serve::triggers::health::TriggersHandle::empty(),
+        );
+        for id in ["acme", "globex", "initech"] {
+            let t: crate::serve::history::tenants::TenantRecord = serde_json::from_value(json!({
+                "id": id, "created_by": "ops",
+                "created_at": "2026-11-05T00:00:00Z", "updated_at": "2026-11-05T00:00:00Z"
+            }))
+            .unwrap();
+            state.history().tenant_upsert(&t).await.unwrap();
+        }
+        let mut fan = plain();
+        fan.tenants = Some(crate::serve::history::tenants::TenantSelector::All(
+            "all".into(),
+        ));
+        fan.template.params.insert(
+            "token".into(),
+            json!({ super::super::secrets::SEALED: "x" }),
+        );
+        let record = crate::serve::history::schedules::ScheduleRecord::new(
+            fan.clone(),
+            None,
+            "ops",
+            Utc::now(),
+        );
+        assert!(state.history().schedule_insert(&record).await.unwrap());
+        let tick = at("2026-11-05T02:00:00Z");
+        let r = fire_tick(&state, &fan, None, tick, tick, &FireOptions::default()).await;
+        assert_eq!(r.targets.len(), 3, "{r:?}");
+        assert_eq!(history.gets.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Every tenant reports why its target did not start.
+        for (_, result) in &r.targets {
+            assert!(
+                matches!(result, TargetResult::Failed(e) if e.contains("template.params.token")),
+                "{result:?}"
+            );
         }
     }
 }

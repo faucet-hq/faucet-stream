@@ -69,7 +69,7 @@ fn record(id: &str, row_id: &str) -> RunRecord {
         submitted_by: None,
         dlq_location: None,
         policy_pin: Default::default(),
-        policy_probe: None,
+        policy_projection: None,
     }
 }
 

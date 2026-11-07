@@ -301,6 +301,11 @@ pub struct ChangeRequest {
     /// reference policy. Set by the server only.
     #[serde(default, skip_serializing_if = "crate::params::CallerFields::is_empty")]
     pub caller_params: crate::params::CallerFields,
+    /// Approved, and its execution was refused for a reason that passes on
+    /// its own (#1050): the reconcile sweep runs it again. Set by the server
+    /// only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deferred: bool,
 }
 
 impl ChangeRequest {
@@ -318,6 +323,22 @@ impl ChangeRequest {
     /// unscoped admin (the rule `GET /v1/templates/{id}` applies to the
     /// registered body).
     pub fn redacted_for(mut self, actor: &AuthContext) -> Self {
+        // Sealed schedule params never leave the server, not even as
+        // ciphertext (#1051).
+        if self.kind == ChangeKind::Schedule
+            && let Some(params) = self
+                .payload
+                .pointer_mut("/spec/template/params")
+                .and_then(Value::as_object_mut)
+        {
+            for v in params.values_mut() {
+                if v.as_object()
+                    .is_some_and(|m| m.len() == 1 && m.get("$sealed").is_some_and(Value::is_string))
+                {
+                    *v = serde_json::json!({ "$sealed": true });
+                }
+            }
+        }
         let template_body = self.kind == ChangeKind::TemplateRegister
             || (self.kind == ChangeKind::Run && self.trusted_config);
         if template_body
@@ -355,6 +376,36 @@ impl ChangeRequest {
 
     fn touch(&mut self) {
         self.updated_at = Utc::now();
+    }
+
+    /// A pending request of `kind` carrying `payload`, for tests elsewhere.
+    #[cfg(test)]
+    pub(crate) fn for_test(kind: ChangeKind, payload: Value) -> Self {
+        let now = Utc::now();
+        Self {
+            id: uuid::Uuid::now_v7().to_string(),
+            kind,
+            status: ChangeStatus::Pending,
+            requester: "bob".into(),
+            requester_role: Role::Admin,
+            reason: Some("test".into()),
+            payload,
+            plan: None,
+            budget: None,
+            required_approvals: 1,
+            approvals: Vec::new(),
+            rejection: None,
+            created_at: now,
+            updated_at: now,
+            expires_at: now + chrono::Duration::hours(1),
+            run_id: None,
+            template: None,
+            error: None,
+            tenant: None,
+            trusted_config: false,
+            caller_params: Default::default(),
+            deferred: false,
+        }
     }
 }
 
@@ -440,7 +491,7 @@ pub struct DeprecatePayload {
 }
 
 fn store_err(e: HistoryError) -> ServeError {
-    ServeError::from_history("change store", e)
+    ServeError::from(e)
 }
 
 fn sha_hex(canonical: &str) -> String {
@@ -710,7 +761,7 @@ async fn plan_template_launch(
     let body = store
         .template_get(&payload.id, Some(version))
         .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?
+        .map_err(ServeError::from)?
         .map(|r| sha_hex(&r.body))
         .unwrap_or_default();
     Ok(ChangePlan {
@@ -1017,7 +1068,7 @@ async fn transition_from(
 
 /// The change kinds whose approval rules a request must meet: its own, plus a
 /// launch's when a registration also launches the template or moves a channel.
-fn approval_kinds(kind: ChangeKind, payload: &Value) -> Vec<ChangeKind> {
+fn approval_kinds(state: &ServerState, kind: ChangeKind, payload: &Value) -> Vec<ChangeKind> {
     let launches = payload.get("launch").and_then(Value::as_bool) == Some(true)
         || payload
             .get("tags")
@@ -1025,9 +1076,22 @@ fn approval_kinds(kind: ChangeKind, payload: &Value) -> Vec<ChangeKind> {
             .is_some_and(|t| !t.is_empty());
     if kind == ChangeKind::TemplateRegister && launches {
         vec![kind, ChangeKind::TemplateLaunch]
+    } else if kind == ChangeKind::Schedule
+        && state.requires_approval(ChangeKind::Run)
+        && payload.get("action").and_then(Value::as_str) != Some("delete")
+    {
+        // A schedule starts runs: its change needs the run rule too (#1051).
+        vec![kind, ChangeKind::Run]
     } else {
         vec![kind]
     }
+}
+
+/// Whether each rule of a multi-rule change is met by its own approvers,
+/// rather than every approver meeting every rule (#1051): a schedule change
+/// under run approval.
+fn rules_met_independently(kind: ChangeKind) -> bool {
+    kind == ChangeKind::Schedule
 }
 
 /// Serializes every transition of one change request within this process.
@@ -1087,6 +1151,12 @@ pub async fn create(
                 })?;
         }
     }
+    // A schedule change names its schedule and carries its secrets sealed
+    // before it is stored (#1051).
+    #[cfg(all(feature = "schedule", feature = "templates"))]
+    if new.kind == ChangeKind::Schedule {
+        payload = crate::serve::schedules::service::prepare_change(state, actor, payload).await?;
+    }
     let plan = plan_for(
         state,
         actor,
@@ -1097,7 +1167,7 @@ pub async fn create(
     )
     .await?;
     let policy = state.approvals();
-    let required_approvals = approval_kinds(new.kind, &payload)
+    let required_approvals = approval_kinds(state, new.kind, &payload)
         .into_iter()
         .map(|k| policy.effective(k).min_approvers)
         .max()
@@ -1135,6 +1205,7 @@ pub async fn create(
         tenant,
         trusted_config: new.trusted_config,
         caller_params: new.caller_params,
+        deferred: false,
     };
     save(state, &change).await?;
     record_metric(change.kind, "requested");
@@ -1270,14 +1341,26 @@ pub async fn approve(
         )));
     }
     let before = change.clone();
-    for kind in approval_kinds(change.kind, &change.payload) {
-        state
-            .approvals()
-            .may_approve(kind, actor, &change.requester)
-            .map_err(|reason| {
-                record_metric(change.kind, "denied");
-                ServeError::Forbidden(reason)
-            })?;
+    let kinds = approval_kinds(state, change.kind, &change.payload);
+    let policy = state.approvals();
+    if rules_met_independently(change.kind) {
+        let reasons: Vec<String> = kinds
+            .iter()
+            .filter_map(|k| policy.may_approve(*k, actor, &change.requester).err())
+            .collect();
+        if reasons.len() == kinds.len() {
+            record_metric(change.kind, "denied");
+            return Err(ServeError::Forbidden(reasons.join("; ")));
+        }
+    } else {
+        for kind in &kinds {
+            policy
+                .may_approve(*kind, actor, &change.requester)
+                .map_err(|reason| {
+                    record_metric(change.kind, "denied");
+                    ServeError::Forbidden(reason)
+                })?;
+        }
     }
     #[cfg(feature = "policy")]
     if change.kind.is_policy() {
@@ -1303,7 +1386,26 @@ pub async fn approve(
         comment: comment.filter(|c| !c.trim().is_empty()),
     });
     change.touch();
-    let quorum = change.approvals.len() as u32 >= change.required_approvals;
+    let quorum = if rules_met_independently(change.kind) {
+        kinds.iter().all(|k| {
+            let met = change
+                .approvals
+                .iter()
+                .filter(|a| {
+                    let who = AuthContext {
+                        principal: a.principal.clone(),
+                        role: a.role,
+                        source_ip: None,
+                        tenant: None,
+                    };
+                    policy.may_approve(*k, &who, &change.requester).is_ok()
+                })
+                .count() as u32;
+            met >= policy.effective(*k).min_approvers
+        })
+    } else {
+        change.approvals.len() as u32 >= change.required_approvals
+    };
     if quorum {
         change.status = ChangeStatus::Approved;
     }
@@ -1343,11 +1445,19 @@ pub async fn reject(
         )));
     }
     if actor.principal != change.requester {
-        for kind in approval_kinds(change.kind, &change.payload) {
-            state
-                .approvals()
-                .may_approve(kind, actor, "")
-                .map_err(ServeError::Forbidden)?;
+        let kinds = approval_kinds(state, change.kind, &change.payload);
+        let policy = state.approvals();
+        let refusals: Vec<String> = kinds
+            .iter()
+            .filter_map(|k| policy.may_approve(*k, actor, "").err())
+            .collect();
+        let refused = if rules_met_independently(change.kind) {
+            refusals.len() == kinds.len()
+        } else {
+            !refusals.is_empty()
+        };
+        if refused {
+            return Err(ServeError::Forbidden(refusals.join("; ")));
         }
         #[cfg(feature = "policy")]
         if change.kind.is_policy() {
@@ -1423,7 +1533,7 @@ async fn execute(
     .await
     {
         Ok(p) => p,
-        Err(e) => return finish_failed(state, actor, change, e.to_string()).await,
+        Err(e) => return finish_refused(state, actor, change, e).await,
     };
     if let Some(before) = &change.plan
         && before.material != fresh.material
@@ -1438,22 +1548,7 @@ async fn execute(
         } else {
             format!("the plan changed since approval: {}", diff.join("; "))
         };
-        change.status = ChangeStatus::Invalidated;
-        change.error = Some(crate::secrets::registry::redact_message(&why));
-        change.plan = Some(fresh);
-        change.touch();
-        save(state, &change).await?;
-        record_metric(change.kind, "invalidated");
-        crate::serve::audit::write(
-            state,
-            actor,
-            "change.invalidated",
-            None,
-            Some(change.id.clone()),
-            "denied",
-        )
-        .await;
-        return Ok(change);
+        return finish_invalidated(state, actor, change, why, Some(fresh)).await;
     }
     // The policy version a policy change stored (#1043), kept in the plan.
     #[allow(unused_mut)]
@@ -1617,6 +1712,7 @@ async fn execute(
                 fresh.summary["version"] = json!(v);
             }
             change.status = ChangeStatus::Executed;
+            change.deferred = false;
             change.run_id = run_id.clone();
             change.template = template;
             change.plan = Some(fresh);
@@ -1634,8 +1730,101 @@ async fn execute(
             .await;
             Ok(change)
         }
-        Err(e) => finish_failed(state, actor, change, e.to_string()).await,
+        // A policy or schedule change that another landed change has made
+        // stale.
+        Err(ServeError::Conflict(why))
+            if change.kind.is_policy() || change.kind == ChangeKind::Schedule =>
+        {
+            finish_invalidated(state, actor, change, why, None).await
+        }
+        Err(e) => finish_refused(state, actor, change, e).await,
     }
+}
+
+/// Mark a change invalidated with `why` (and the plan it was checked
+/// against, when re-planned).
+async fn finish_invalidated(
+    state: &ServerState,
+    actor: &AuthContext,
+    mut change: ChangeRequest,
+    why: String,
+    plan: Option<ChangePlan>,
+) -> Result<ChangeRequest, ServeError> {
+    change.status = ChangeStatus::Invalidated;
+    change.deferred = false;
+    change.error = Some(crate::secrets::registry::redact_message(&why));
+    if plan.is_some() {
+        change.plan = plan;
+    }
+    change.touch();
+    save(state, &change).await?;
+    record_metric(change.kind, "invalidated");
+    crate::serve::audit::write(
+        state,
+        actor,
+        "change.invalidated",
+        None,
+        Some(change.id.clone()),
+        "denied",
+    )
+    .await;
+    Ok(change)
+}
+
+/// Whether an execution refusal may pass on its own: the server could not
+/// take the work now, nothing about the change is wrong (#1050).
+fn temporary_refusal(e: &ServeError) -> bool {
+    matches!(
+        e,
+        ServeError::Unavailable(_)
+            | ServeError::QueueFull { .. }
+            | ServeError::TooManyRequests(_)
+            | ServeError::Draining
+    )
+}
+
+/// An execution the server refused: a temporary refusal keeps the change
+/// `approved` and marks it deferred, and [`reconcile_stale_approved`] runs it
+/// again later; any other refusal fails it. A registration that already
+/// stored its version is never run again (it would add another version).
+async fn finish_refused(
+    state: &ServerState,
+    actor: &AuthContext,
+    mut change: ChangeRequest,
+    e: ServeError,
+) -> Result<ChangeRequest, ServeError> {
+    if !temporary_refusal(&e) {
+        return finish_failed(state, actor, change, e.to_string()).await;
+    }
+    if change.kind == ChangeKind::TemplateRegister
+        && let Some(t) = &change.template
+    {
+        let why = format!(
+            "version {} of '{}' was registered, then {e}; finish its launch or channels \
+             with a new change",
+            t.version, t.id
+        );
+        return finish_failed(state, actor, change, why).await;
+    }
+    change.deferred = true;
+    change.error = Some(crate::secrets::registry::redact_message(&format!(
+        "{e}; the approved change runs again once the server can take it"
+    )));
+    change.touch();
+    if let Err(save_err) = save(state, &change).await {
+        tracing::warn!(change = %change.id, error = %save_err, "could not record a deferred change execution");
+    }
+    record_metric(change.kind, "deferred");
+    crate::serve::audit::write(
+        state,
+        actor,
+        "change.deferred",
+        None,
+        Some(change.id.clone()),
+        "error",
+    )
+    .await;
+    Ok(change)
 }
 
 /// The version a planned `template_*` change targets, from its summary.
@@ -1658,7 +1847,7 @@ async fn execute_template_delete(
         .history()
         .template_delete(&body.id, target)
         .await
-        .map_err(|e| ServeError::from_history("deleting template", e))?;
+        .map_err(ServeError::from)?;
     if removed == 0 {
         return Err(ServeError::NotFound);
     }
@@ -1756,6 +1945,7 @@ async fn finish_failed(
     error: String,
 ) -> Result<ChangeRequest, ServeError> {
     change.status = ChangeStatus::Failed;
+    change.deferred = false;
     change.error = Some(crate::secrets::registry::redact_message(&error));
     change.touch();
     save(state, &change).await?;
@@ -1836,12 +2026,13 @@ pub async fn expire_due(state: &ServerState) -> usize {
     n
 }
 
-/// Finish requests left `approved` by an execution that never recorded its
-/// outcome (a crash or a failed save between approval and `executed`). A run
-/// or launch is executed again — the run's `change:<id>` idempotency key
-/// replays the original submission, a launch of the live version is a no-op —
-/// and a registration, which would add a second version, fails with an
-/// explanation instead.
+/// Finish requests left `approved`: one whose execution was deferred (a
+/// temporary refusal) is executed again, whatever its kind; one whose
+/// execution never recorded its outcome (a crash or a failed save between
+/// approval and `executed`) is executed again too — the run's `change:<id>`
+/// idempotency key replays the original submission, a launch of the live
+/// version is a no-op — except a registration, which would add a second
+/// version and fails with an explanation instead.
 pub async fn reconcile_stale_approved(state: &ServerState) -> usize {
     let approved = match state
         .history()
@@ -1870,7 +2061,17 @@ pub async fn reconcile_stale_approved(state: &ServerState) -> usize {
             continue;
         }
         let actor = AuthContext::system("reconcile");
-        let done = if c.kind == ChangeKind::TemplateRegister {
+        let done = if c.kind == ChangeKind::TemplateRegister && c.deferred {
+            // Cleared before the attempt: one interrupted from here on is
+            // not known to be safe to run again.
+            let mut c = c;
+            c.deferred = false;
+            c.touch();
+            match save(state, &c).await {
+                Ok(()) => execute(state, &actor, c).await,
+                Err(e) => Err(e),
+            }
+        } else if c.kind == ChangeKind::TemplateRegister {
             finish_failed(
                 state,
                 &actor,
@@ -2020,6 +2221,7 @@ mod tests {
             tenant: Some("acme".into()),
             trusted_config: false,
             caller_params: Default::default(),
+            deferred: false,
         };
         assert!(ChangeListFilter::default().matches(&c));
         assert!(
@@ -2109,6 +2311,7 @@ mod tests {
             tenant: None,
             trusted_config: false,
             caller_params: Default::default(),
+            deferred: false,
         }
     }
 
@@ -2262,6 +2465,8 @@ mod tests {
 
     #[test]
     fn a_registration_that_launches_needs_the_launch_rule_too() {
+        let state = crate::serve::test_support::test_state();
+        let approval_kinds = |k, p: &Value| approval_kinds(&state, k, p);
         assert_eq!(
             approval_kinds(ChangeKind::Run, &json!({})),
             vec![ChangeKind::Run]
@@ -2301,6 +2506,29 @@ mod tests {
             .map(|k| policy.effective(*k).min_approvers)
             .max();
         assert_eq!(quorum, Some(2));
+    }
+
+    #[test]
+    fn a_schedule_change_needs_the_run_rule_while_runs_need_approval() {
+        let state = crate::serve::test_support::test_state();
+        let update = json!({"action": "update", "name": "n"});
+        assert_eq!(
+            approval_kinds(&state, ChangeKind::Schedule, &update),
+            vec![ChangeKind::Schedule]
+        );
+        let mut config = crate::serve::test_support::test_config();
+        config.require_approval = vec![ChangeKind::Run, ChangeKind::Schedule];
+        let gated = crate::serve::test_support::state_from(&config);
+        assert_eq!(
+            approval_kinds(&gated, ChangeKind::Schedule, &update),
+            vec![ChangeKind::Schedule, ChangeKind::Run]
+        );
+        assert_eq!(
+            approval_kinds(&gated, ChangeKind::Schedule, &json!({"action": "delete"})),
+            vec![ChangeKind::Schedule]
+        );
+        assert!(rules_met_independently(ChangeKind::Schedule));
+        assert!(!rules_met_independently(ChangeKind::TemplateRegister));
     }
 
     #[tokio::test]
@@ -2611,6 +2839,7 @@ mod tests {
             tenant: None,
             trusted_config: false,
             caller_params: Default::default(),
+            deferred: false,
         };
         store.change_upsert(&c).await.unwrap();
         let read = c.clone();
@@ -2678,6 +2907,107 @@ mod tests {
         assert!(reg.error.unwrap().contains("interrupted"));
     }
 
+    #[tokio::test]
+    async fn a_temporary_refusal_keeps_an_approved_change_for_the_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::serve::test_support::test_state();
+        let created = create(
+            &state,
+            &actor("bob"),
+            NewChange {
+                kind: ChangeKind::Run,
+                payload: json!({ "config": csv_yaml(dir.path(), "later", "") }),
+                reason: None,
+                budget: None,
+                trusted_config: false,
+                caller_params: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+        state.set_draining();
+        let deferred = approve(&state, &actor("alice"), &created.id, None)
+            .await
+            .unwrap();
+        assert_eq!(deferred.status, ChangeStatus::Approved);
+        assert!(deferred.error.unwrap().contains("runs again"));
+        assert!(deferred.run_id.is_none());
+        assert!(!temporary_refusal(&ServeError::BadConfig("x".into())));
+        for e in [
+            ServeError::Unavailable("down".into()),
+            ServeError::QueueFull {
+                retry_after_secs: 1,
+            },
+            ServeError::TooManyRequests("limit".into()),
+            ServeError::Draining,
+        ] {
+            assert!(temporary_refusal(&e), "{e}");
+        }
+    }
+
+    /// A deferred registration is run again by the sweep like any deferred
+    /// change; one whose version was already stored is never run again.
+    #[cfg(feature = "templates")]
+    #[tokio::test]
+    async fn the_sweep_runs_a_deferred_registration_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::serve::test_support::test_state();
+        let created = create(
+            &state,
+            &actor("bob"),
+            NewChange {
+                kind: ChangeKind::TemplateRegister,
+                payload: json!({"id": "tpl", "config": crate::templates::bundle::smoke(&csv_yaml(dir.path(), "tpl", ""))}),
+                reason: None,
+                budget: None,
+                trusted_config: false,
+                caller_params: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+        let c = get(&state, &created.id).await.unwrap();
+        let deferred = finish_refused(
+            &state,
+            &actor("alice"),
+            c,
+            ServeError::Unavailable("down".into()),
+        )
+        .await
+        .unwrap();
+        assert!(deferred.deferred);
+        let mut c = get(&state, &created.id).await.unwrap();
+        assert!(c.deferred, "the deferral is recorded");
+        c.status = ChangeStatus::Approved;
+        c.updated_at = Utc::now() - chrono::TimeDelta::minutes(10);
+        save(&state, &c).await.unwrap();
+        assert_eq!(reconcile_stale_approved(&state).await, 1);
+        let done = get(&state, &c.id).await.unwrap();
+        assert_eq!(done.status, ChangeStatus::Executed, "{:?}", done.error);
+        assert_eq!(done.template.as_ref().unwrap().version, 1);
+        assert!(!done.deferred);
+
+        // Registered, then a later step refused: failed, never run again.
+        let mut again = stored(ChangeKind::TemplateRegister, json!({"config": "x"}), "m", 1);
+        again.status = ChangeStatus::Approved;
+        again.template = Some(TemplateOutcome {
+            id: "tpl".into(),
+            version: 2,
+        });
+        save(&state, &again).await.unwrap();
+        let failed = finish_refused(
+            &state,
+            &actor("alice"),
+            again,
+            ServeError::Unavailable("down".into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed.status, ChangeStatus::Failed);
+        assert!(!failed.deferred);
+        assert!(failed.error.unwrap().contains("version 2"));
+    }
+
     #[cfg(feature = "notify")]
     #[tokio::test]
     async fn requested_notifications_skip_what_they_cannot_read() {
@@ -2698,7 +3028,9 @@ mod tests {
     #[test]
     fn store_errors_are_internal() {
         let e = store_err(HistoryError::Backend("down".into()));
-        assert!(matches!(e, ServeError::Internal(m) if m.contains("change store")));
+        assert!(matches!(e, ServeError::Internal(_)));
+        let e = store_err(HistoryError::Unreachable("refused".into()));
+        assert!(matches!(e, ServeError::Unavailable(_)));
     }
 
     #[cfg(feature = "templates")]
@@ -2961,5 +3293,93 @@ mod tests {
             policy_update::execute(&state, &c, &fresh, &actor("alice")).await,
             Err(ServeError::Conflict(_))
         ));
+    }
+
+    /// Sealed schedule params never leave the server, not even as
+    /// ciphertext; plain values are left as they are.
+    #[test]
+    fn a_schedule_change_shows_its_sealed_params_masked() {
+        let c = stored(
+            ChangeKind::Schedule,
+            json!({"action": "create", "name": "n", "spec": {"template": {"params": {
+                "token": {"$sealed": "ciphertext"},
+                "region": "eu",
+                "odd": {"$sealed": "x", "other": 1}
+            }}}}),
+            "m",
+            1,
+        );
+        let shown = c.redacted_for(&actor("alice"));
+        let params = &shown.payload["spec"]["template"]["params"];
+        assert_eq!(params["token"], json!({"$sealed": true}));
+        assert_eq!(params["region"], "eu");
+        assert_eq!(params["odd"]["$sealed"], "x");
+    }
+
+    /// A schedule change one approver may meet by any of its rules: one
+    /// who meets none is refused, approving or rejecting.
+    #[tokio::test]
+    async fn a_schedule_change_refuses_an_approver_who_meets_no_rule() {
+        let state = crate::serve::test_support::test_state();
+        let c = stored(
+            ChangeKind::Schedule,
+            json!({"action": "delete", "name": "n"}),
+            "m",
+            1,
+        );
+        save(&state, &c).await.unwrap();
+        let operator = AuthContext {
+            principal: "olga".into(),
+            role: Role::Operator,
+            source_ip: None,
+            tenant: None,
+        };
+        let e = approve(&state, &operator, &c.id, None).await.unwrap_err();
+        assert!(matches!(e, ServeError::Forbidden(_)), "{e:?}");
+        let e = reject(&state, &operator, &c.id, "no".into())
+            .await
+            .unwrap_err();
+        assert!(matches!(e, ServeError::Forbidden(_)), "{e:?}");
+        assert_eq!(
+            get(&state, &c.id).await.unwrap().status,
+            ChangeStatus::Pending
+        );
+    }
+
+    /// An approved schedule change applies to the schedule it was proposed
+    /// for; one that names none is invalidated and changes nothing.
+    #[cfg(all(feature = "schedule", feature = "templates"))]
+    #[tokio::test]
+    async fn an_approved_schedule_change_that_names_no_schedule_is_invalidated() {
+        use crate::serve::history::schedules::{ScheduleRecord, ScheduleSpec};
+        let state = crate::serve::test_support::test_state();
+        let spec: ScheduleSpec = serde_json::from_value(
+            json!({"name": "n", "cron": "0 2 * * *", "template": {"id": "t"}}),
+        )
+        .unwrap();
+        let r = ScheduleRecord::new(spec, None, "ops", Utc::now());
+        assert!(state.history().schedule_insert(&r).await.unwrap());
+        let payload = json!({"action": "delete", "name": "n"});
+        let requester = AuthContext {
+            principal: "bob".into(),
+            role: Role::Operator,
+            source_ip: None,
+            tenant: None,
+        };
+        let plan = plan_schedule(&state, &requester, &payload).await.unwrap();
+        let mut c = stored(ChangeKind::Schedule, payload, &plan.material, 1);
+        c.plan = Some(plan);
+        save(&state, &c).await.unwrap();
+        let out = approve(&state, &actor("alice"), &c.id, None).await.unwrap();
+        assert_eq!(out.status, ChangeStatus::Invalidated);
+        assert!(
+            out.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("names no schedule"),
+            "{:?}",
+            out.error
+        );
+        assert!(state.history().schedule_get("n").await.unwrap().is_some());
     }
 }

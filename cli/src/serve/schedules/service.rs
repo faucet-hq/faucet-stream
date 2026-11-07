@@ -48,7 +48,7 @@ pub struct Found {
 }
 
 fn store_err(e: crate::serve::history::HistoryError) -> ServeError {
-    ServeError::from_history("schedules", e)
+    ServeError::from(e)
 }
 
 fn unprocessable(message: impl Into<String>) -> ServeError {
@@ -79,6 +79,57 @@ pub async fn find(state: &ServerState, name: &str) -> Result<Option<Found>, Serv
             source: Source::Console,
             record: Some(r),
         }))
+}
+
+/// Give a record stored before schedules had ids (#1051) a fresh one, and
+/// persist it. Values sealed under its old empty id no longer open, so its
+/// secret params must be supplied again.
+pub async fn ensure_id(
+    state: &ServerState,
+    record: ScheduleRecord,
+) -> Result<ScheduleRecord, ServeError> {
+    let history = state.history();
+    let mut current = record;
+    for _ in 0..5 {
+        if !current.id.is_empty() {
+            return Ok(current);
+        }
+        let mut next = current.clone();
+        next.id = uuid::Uuid::new_v4().to_string();
+        next.revision += 1;
+        if history
+            .schedule_replace(&current, &next)
+            .await
+            .map_err(store_err)?
+        {
+            tracing::warn!(
+                schedule = %next.spec.name,
+                "the schedule was stored before schedules had ids: gave it one; its secret params \
+                 must be supplied again"
+            );
+            return Ok(next);
+        }
+        current = history
+            .schedule_get(&current.spec.name)
+            .await
+            .map_err(store_err)?
+            .ok_or(ServeError::NotFound)?;
+    }
+    Err(ServeError::Conflict(format!(
+        "schedule '{}' kept changing; try again",
+        current.spec.name
+    )))
+}
+
+/// The stored record named `name`, with an id (see [`ensure_id`]).
+async fn stored_with_id(
+    state: &ServerState,
+    name: &str,
+) -> Result<Option<ScheduleRecord>, ServeError> {
+    match find(state, name).await?.and_then(|f| f.record) {
+        Some(r) => ensure_id(state, r).await.map(Some),
+        None => Ok(None),
+    }
 }
 
 /// Every schedule, the file's first.
@@ -259,36 +310,7 @@ fn outsider<'a>(actor: &'a AuthContext, f: &Found) -> Option<&'a str> {
 /// `st` as tenant `t` may see it: only the errors and skip reasons of its own
 /// target (each is prefixed `t: `), never another tenant's (#1051).
 fn status_for(st: &ScheduleStatus, t: &str) -> ScheduleStatus {
-    let prefix = format!("{t}: ");
-    let mine = |e: &str| e.starts_with(&prefix);
-    let mut out = st.clone();
-    out.last_error = st.last_error.as_deref().and_then(|e| {
-        let kept: Vec<&str> = e.split("; ").filter(|p| mine(p)).collect();
-        (!kept.is_empty()).then(|| kept.join("; "))
-    });
-    out.failures = st
-        .failures
-        .iter()
-        .filter_map(|f| {
-            let errors: Vec<String> = f.errors.iter().filter(|e| mine(e)).cloned().collect();
-            (!errors.is_empty()).then(|| FailedTick {
-                errors,
-                ..f.clone()
-            })
-        })
-        .collect();
-    out.skipped = st
-        .skipped
-        .iter()
-        .filter_map(|s| {
-            let kept: Vec<&str> = s.reason.split("; ").filter(|p| mine(p)).collect();
-            (!kept.is_empty()).then(|| SkippedTick {
-                tick: s.tick,
-                reason: kept.join("; "),
-            })
-        })
-        .collect();
-    out
+    st.for_tenant(t)
 }
 
 fn view(actor: &AuthContext, f: &Found, st: &ScheduleStatus, now: DateTime<Utc>) -> ScheduleView {
@@ -332,6 +354,7 @@ fn view(actor: &AuthContext, f: &Found, st: &ScheduleStatus, now: DateTime<Utc>)
         match st.last_outcome.as_deref() {
             Some("failed") => "failing",
             Some("retrying") => "retrying",
+            Some("needs_approval") => "needs_approval",
             _ => "active",
         }
     };
@@ -725,6 +748,11 @@ pub struct ChangePayload {
     /// The definition, for `create` and `update`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec: Option<ScheduleSpec>,
+    /// The schedule's stable id (#1051): set by the server when the change
+    /// is proposed, never taken from a client. Secret values in `spec` are
+    /// sealed to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -832,8 +860,19 @@ async fn check_spec(
                 .map(|(k, _)| k.clone()),
         );
     }
+    // While runs need approval, an approved schedule runs exactly what was
+    // approved: no channel a later launch could move (#1051).
+    if state.requires_approval(ChangeKind::Run)
+        && let Some(field) = fire::follows_a_channel(spec)
+    {
+        return Err(unprocessable(format!(
+            "pin a version while runs need approval: {field} names a channel (--require-approval \
+             run)"
+        )));
+    }
     // The params are the creator's: refuse ones a caller may not supply
     // (a server file, an internal URL) now, not at the first tick (#1051).
+    // Nothing is resolved or recorded while checking.
     let now = Utc::now();
     if let Ok(body) = fire::body(spec, now, now, &fire::FireOptions::default(), owner) {
         let principal = crate::runtime::Principal::new(
@@ -849,16 +888,19 @@ async fn check_spec(
     Ok(secret)
 }
 
-/// The definition as it will be stored: secret params sealed (a keep
-/// marker takes the stored value).
+/// The definition as it will be stored: secret params sealed to `scope` (a
+/// keep marker takes the stored value; with `presealed`, values this server
+/// already sealed to `scope` are kept).
 fn sealed(
     state: &ServerState,
     spec: &ScheduleSpec,
     secret: &[String],
     current: Option<&ScheduleSpec>,
+    scope: secrets::Scope<'_>,
+    presealed: bool,
 ) -> Result<ScheduleSpec, ServeError> {
     let mut out = spec.clone();
-    secrets::seal(state, &mut out, secret, current).map_err(unprocessable)?;
+    secrets::seal(state, &mut out, secret, current, scope, presealed).map_err(unprocessable)?;
     Ok(out)
 }
 
@@ -874,9 +916,21 @@ async fn plan_inner(
     state: &ServerState,
     actor: &AuthContext,
     p: &ChangePayload,
+    presealed: bool,
 ) -> Result<Planned, ServeError> {
     let existing = find(state, &p.name).await?;
     let current = existing.as_ref().and_then(|f| f.record.as_ref());
+    // A change names the schedule it was proposed for: one replaced since
+    // (deleted and made again) is not it.
+    if let (Some(want), Some(have)) = (p.schedule_id.as_deref(), current)
+        && want != have.id
+    {
+        return Err(ServeError::Conflict(format!(
+            "schedule '{}' was replaced since this change was proposed",
+            p.name
+        )));
+    }
+    let new_id = p.schedule_id.clone().unwrap_or_default();
     let mut secret = Vec::new();
     let stored = match p.action {
         ChangeAction::Create => {
@@ -894,7 +948,11 @@ async fn plan_inner(
                 return Err(unprocessable("spec.name must equal name"));
             }
             secret = check_spec(state, actor, spec, actor.tenant.as_deref(), None).await?;
-            Some(sealed(state, spec, &secret, None)?)
+            let scope = secrets::Scope {
+                id: &new_id,
+                tenant: actor.tenant.as_deref(),
+            };
+            Some(sealed(state, spec, &secret, None, scope, presealed)?)
         }
         ChangeAction::Update => {
             let f = existing.as_ref().ok_or(ServeError::NotFound)?;
@@ -910,7 +968,18 @@ async fn plan_inner(
                 return Err(unprocessable("a schedule's name cannot change"));
             }
             secret = check_spec(state, actor, spec, f.owner.as_deref(), Some(&p.name)).await?;
-            let mut out = sealed(state, spec, &secret, current.map(|r| &r.spec))?;
+            let scope = secrets::Scope {
+                id: current.map_or(new_id.as_str(), |r| r.id.as_str()),
+                tenant: f.owner.as_deref(),
+            };
+            let mut out = sealed(
+                state,
+                spec,
+                &secret,
+                current.map(|r| &r.spec),
+                scope,
+                presealed,
+            )?;
             // A pause is its own action; an edit keeps it.
             out.paused = f.spec.paused;
             Some(out)
@@ -951,29 +1020,49 @@ async fn plan_inner(
 }
 
 /// Plan a change: validate it as `actor`, return the rows a reviewer sees.
-/// A change request stores its payload as sent, so it may not carry a new
-/// secret param value (keeping the stored one is fine).
+/// The payload is the one [`prepare_change`] stored: its secret values are
+/// sealed to the schedule; a plain secret value is refused.
 pub async fn plan(
     state: &ServerState,
     actor: &AuthContext,
     p: &ChangePayload,
 ) -> Result<Vec<serde_json::Value>, ServeError> {
-    let planned = plan_inner(state, actor, p).await?;
+    let planned = plan_inner(state, actor, p, true).await?;
     if let Some(spec) = &p.spec
         && let Some(k) = planned.secret.iter().find(|k| {
-            spec.template
-                .params
-                .get(*k)
-                .is_some_and(|v| !v.is_null() && !secrets::is_keep_marker(v))
+            spec.template.params.get(*k).is_some_and(|v| {
+                !v.is_null() && !secrets::is_keep_marker(v) && !secrets::is_sealed(v)
+            })
         })
     {
         return Err(unprocessable(format!(
-            "template.params.{k}: a change request cannot carry a secret param value (it would be \
-             stored as sent); keep the stored value, or make the change on a server that does not \
-             gate schedules"
+            "template.params.{k}: a change request carries secret values sealed, never as sent"
         )));
     }
     Ok(planned.rows)
+}
+
+/// Prepare a schedule change request's payload before it is stored (#1051):
+/// the server names the schedule it changes (`schedule_id`, whatever the
+/// client sent) and seals its secret values to that schedule, so the stored
+/// request never holds a secret in the clear.
+pub async fn prepare_change(
+    state: &ServerState,
+    actor: &AuthContext,
+    payload: serde_json::Value,
+) -> Result<serde_json::Value, ServeError> {
+    let mut p: ChangePayload = serde_json::from_value(payload)
+        .map_err(|e| ServeError::BadConfig(format!("schedule change payload: {e}")))?;
+    p.schedule_id = match p.action {
+        ChangeAction::Create => Some(uuid::Uuid::new_v4().to_string()),
+        ChangeAction::Update | ChangeAction::Delete => {
+            stored_with_id(state, &p.name).await?.map(|r| r.id)
+        }
+    };
+    if p.spec.is_some() {
+        p.spec = plan_inner(state, actor, &p, false).await?.spec;
+    }
+    serde_json::to_value(&p).map_err(|e| ServeError::Internal(e.to_string()))
 }
 
 /// Apply a change as `actor` (already planned / approved, or ungated).
@@ -987,7 +1076,19 @@ pub async fn apply(
     p: ChangePayload,
     approved: bool,
 ) -> Result<Option<ScheduleView>, ServeError> {
-    let planned = plan_inner(state, actor, &p).await?;
+    if approved && p.schedule_id.is_none() {
+        return Err(ServeError::Conflict(
+            "the change names no schedule; propose it again".into(),
+        ));
+    }
+    let mut p = p;
+    if p.schedule_id.is_none() {
+        p.schedule_id = match p.action {
+            ChangeAction::Create => Some(uuid::Uuid::new_v4().to_string()),
+            _ => stored_with_id(state, &p.name).await?.map(|r| r.id),
+        };
+    }
+    let planned = plan_inner(state, actor, &p, approved).await?;
     let history = state.history();
     let now = Utc::now();
     let by = actor.principal.as_str();
@@ -995,6 +1096,9 @@ pub async fn apply(
         ChangeAction::Create => {
             let spec = planned.spec.expect("planned");
             let mut record = ScheduleRecord::new(spec, actor.tenant.clone(), by, now);
+            if let Some(id) = &p.schedule_id {
+                record.id = id.clone();
+            }
             record.approved = approved;
             if !history.schedule_insert(&record).await.map_err(store_err)? {
                 return Err(ServeError::Conflict(format!(
@@ -1126,6 +1230,7 @@ pub async fn change(
     let gated = state.requires_approval(ChangeKind::Schedule)
         || (state.requires_approval(ChangeKind::Run) && p.action != ChangeAction::Delete);
     if gated {
+        // `changes::create` prepares it: the id, and secret values sealed.
         let payload = serde_json::to_value(&p).map_err(|e| ServeError::Internal(e.to_string()))?;
         let change = crate::serve::changes::create(
             state,
@@ -1267,6 +1372,7 @@ pub async fn run_now(
         manual: Some(uuid::Uuid::new_v4().to_string()),
         from_file: f.source == Source::File,
         approved: f.record.as_ref().is_some_and(|r| r.approved),
+        schedule_id: f.record.as_ref().map(|r| r.id.clone()),
     };
     let mut spec = f.spec.clone();
     spec.run
@@ -1332,13 +1438,27 @@ pub struct PreviewResponse {
 }
 
 pub fn preview(req: &PreviewRequest, now: DateTime<Utc>) -> PreviewResponse {
-    match validate::compile(&req.cron, &req.timezone) {
-        Ok(c) => PreviewResponse {
-            valid: true,
-            error: None,
-            next_ticks: validate::next_ticks(&c, now, NEXT_TICKS),
-            shortest_gap_secs: validate::shortest_gap(&c, now).map(|d| d.as_secs()),
-        },
+    let compiled = validate::check_no_seconds(&req.cron)
+        .and_then(|()| validate::compile(&req.cron, &req.timezone));
+    match compiled {
+        Ok(c) => {
+            // What a create refuses, the preview reports (#1051); the next
+            // ticks are still shown.
+            let probe: Option<ScheduleSpec> = serde_json::from_value(serde_json::json!({
+                "name": "preview", "cron": req.cron, "timezone": req.timezone,
+                "template": {"id": "preview"}
+            }))
+            .ok();
+            let error = probe.and_then(|p| {
+                validate::check_min_interval(&p, &c, validate::min_interval(), None, now).err()
+            });
+            PreviewResponse {
+                valid: error.is_none(),
+                error,
+                next_ticks: validate::next_ticks(&c, now, NEXT_TICKS),
+                shortest_gap_secs: validate::shortest_gap(&c, now).map(|d| d.as_secs()),
+            }
+        }
         Err(e) => PreviewResponse {
             valid: false,
             error: Some(e),
@@ -1448,10 +1568,21 @@ mod tests {
                 tick: t("2026-01-03T02:00:00Z"),
                 reason: "globex: still going".into(),
             }],
+            last_tick: Some(t("2026-01-01T02:00:00Z")),
+            targets: [(
+                "acme".to_string(),
+                status::TargetStatus {
+                    outcome: "failed".into(),
+                    error: Some("refused".into()),
+                    consecutive_failures: 1,
+                    last_tick: t("2026-01-01T02:00:00Z"),
+                },
+            )]
+            .into(),
             ..Default::default()
         };
         let mine = status_for(&st, "acme");
-        assert_eq!(mine.last_error.as_deref(), Some("acme: refused"));
+        assert_eq!(mine.last_error.as_deref(), Some("refused"));
         assert_eq!(mine.failures.len(), 1);
         assert_eq!(mine.failures[0].errors, vec!["acme: refused".to_string()]);
         assert!(mine.skipped.is_empty());
@@ -1550,6 +1681,25 @@ mod tests {
             now,
         );
         assert!(!bad.valid && bad.error.unwrap().contains("invalid cron"));
+        // What a create refuses, the preview says is invalid.
+        let fast = preview(
+            &PreviewRequest {
+                cron: "*/2 * * * *".into(),
+                timezone: utc(),
+            },
+            now,
+        );
+        assert!(!fast.valid, "{fast:?}");
+        assert!(fast.error.unwrap().contains("at most every 5 minutes"));
+        assert_eq!(fast.next_ticks.len(), NEXT_TICKS);
+        let seconds = preview(
+            &PreviewRequest {
+                cron: "0 * * * * *".into(),
+                timezone: utc(),
+            },
+            now,
+        );
+        assert!(seconds.error.unwrap().contains("seconds field"));
         assert_eq!(ChangeAction::Delete.as_str(), "delete");
     }
 
@@ -1560,6 +1710,96 @@ mod tests {
     async fn store(state: &ServerState, spec: ScheduleSpec, tenant: Option<&str>) {
         let r = ScheduleRecord::new(spec, tenant.map(str::to_string), "ops", Utc::now());
         assert!(state.history().schedule_insert(&r).await.unwrap());
+    }
+
+    /// A record stored before schedules had ids gets a fresh one, persisted
+    /// once, and its old sealed values fail its ticks with a clear message.
+    #[tokio::test]
+    async fn a_record_without_an_id_gets_one_and_its_old_secrets_do_not_open() {
+        let state = crate::serve::test_support::test_state();
+        let spec = spec_of(json!({
+            "name": "legacy", "cron": "0 2 * * *",
+            "template": {"id": "t", "params": {"token": {"$sealed": "old"}}}
+        }));
+        let mut legacy = ScheduleRecord::new(spec.clone(), None, "ops", Utc::now());
+        legacy.id = String::new();
+        assert!(state.history().schedule_insert(&legacy).await.unwrap());
+        let wanted = super::super::runner::wanted(&state).await.unwrap();
+        assert_eq!(wanted.len(), 1);
+        let stored = state
+            .history()
+            .schedule_get("legacy")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!stored.id.is_empty());
+        assert_eq!(stored.revision, legacy.revision + 1);
+        // Already given one: kept as it is.
+        let again = ensure_id(&state, stored.clone()).await.unwrap();
+        assert_eq!(again, stored);
+        let tick = Utc::now();
+        let r = fire::fire_tick(&state, &spec, None, tick, tick, &Default::default()).await;
+        match &r.targets[0].1 {
+            fire::TargetResult::Failed(e) => {
+                assert!(e.contains("supply its secret params again"), "{e}")
+            }
+            other => panic!("expected a failed target, got {other:?}"),
+        }
+    }
+
+    /// A legacy record read before another writer touched it is given its
+    /// id from the stored copy; one that is gone is not found.
+    #[tokio::test]
+    async fn a_stale_legacy_record_gets_its_id_from_the_stored_copy() {
+        let state = crate::serve::test_support::test_state();
+        let spec = spec_of(json!({"name": "legacy", "cron": "0 2 * * *", "template": {"id": "t"}}));
+        let mut stored = ScheduleRecord::new(spec, None, "ops", Utc::now());
+        stored.id = String::new();
+        assert!(state.history().schedule_insert(&stored).await.unwrap());
+        let mut stale = stored.clone();
+        stale.revision += 7;
+        let given = ensure_id(&state, stale).await.unwrap();
+        assert!(!given.id.is_empty());
+        assert_eq!(given.revision, stored.revision + 1);
+        let mut gone = stored.clone();
+        gone.spec.name = "gone".into();
+        assert!(matches!(
+            ensure_id(&state, gone).await,
+            Err(ServeError::NotFound)
+        ));
+    }
+
+    /// The server names the schedule a change is for; an approved change
+    /// that names none is refused rather than applied to whatever holds
+    /// the name now.
+    #[tokio::test]
+    async fn a_change_is_bound_to_the_schedule_it_was_proposed_for() {
+        let state = crate::serve::test_support::test_state();
+        let op = actor(Role::Operator, None);
+        store(
+            &state,
+            spec_of(json!({"name": "n", "cron": "0 2 * * *", "template": {"id": "t"}})),
+            None,
+        )
+        .await;
+        let id = state.history().schedule_get("n").await.unwrap().unwrap().id;
+        let prepared = prepare_change(
+            &state,
+            &op,
+            json!({"action": "delete", "name": "n", "schedule_id": "forged"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(prepared["schedule_id"], id);
+        let unbound = ChangePayload {
+            action: ChangeAction::Delete,
+            name: "n".into(),
+            spec: None,
+            schedule_id: None,
+        };
+        let e = apply(&state, &op, unbound, true).await.unwrap_err();
+        assert!(matches!(&e, ServeError::Conflict(m) if m.contains("names no schedule")));
+        assert!(state.history().schedule_get("n").await.unwrap().is_some());
     }
 
     #[test]
@@ -1624,6 +1864,7 @@ mod tests {
             action,
             name: name.into(),
             spec,
+            schedule_id: None,
         };
         let msg = |e: ServeError| e.to_string();
 

@@ -59,7 +59,7 @@ pub fn dataset_like(id: &str) -> String {
 /// in `faucet_serve_schema`. A database stamped with a newer version is
 /// refused at startup instead of being written by code that does not know
 /// its columns.
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// The oldest binary schema version that can still read a database this
 /// binary writes, kept as the `min_readable` row of `faucet_serve_schema`.
@@ -83,6 +83,7 @@ pub const ADDED_COLUMNS: &[(u32, &str, &str)] = &[
     (7, "faucet_serve_runs", "pool"),
     (7, "faucet_serve_instance_caps", "pools"),
     (8, "faucet_serve_runs", "submitted_by"),
+    (9, "faucet_serve_instance_caps", "capabilities"),
 ];
 
 /// The columns of a `faucet_serve_log_ship` row, in [`decode_log_ship`] order.
@@ -1520,6 +1521,31 @@ impl Stmts {
         (format!("{head} GROUP BY status"), binds)
     }
 
+    /// `renew_leases` leaving out `skip` ids (binds: lease, owner, ids…).
+    pub fn renew_leases_except_query(&self, skip: usize) -> String {
+        if skip == 0 {
+            return self.renew_leases.clone();
+        }
+        let ids: Vec<String> = (0..skip).map(|i| self.placeholder(i + 3)).collect();
+        format!(
+            "{} AND run_id NOT IN ({})",
+            self.renew_leases,
+            ids.join(",")
+        )
+    }
+
+    /// `select_orphans` without this instance's own runs except `forgotten`
+    /// ids (binds: now, owner, ids…).
+    pub fn peer_orphans_query(&self, forgotten: usize) -> String {
+        let owner = self.placeholder(2);
+        let mut keep = format!("owner IS NULL OR owner <> {owner}");
+        if forgotten > 0 {
+            let ids: Vec<String> = (0..forgotten).map(|i| self.placeholder(i + 3)).collect();
+            keep.push_str(&format!(" OR run_id IN ({})", ids.join(",")));
+        }
+        format!("{} AND ({keep})", self.select_orphans)
+    }
+
     /// The dialect's positional placeholder for the `n`-th (1-based) bind.
     fn placeholder(&self, n: usize) -> String {
         match self.dialect {
@@ -1694,12 +1720,14 @@ impl Stmts {
                 last_heartbeat = excluded.last_heartbeat, listen = excluded.listen, \
                 max_concurrent = excluded.max_concurrent, in_flight = excluded.in_flight"
                 .into(),
-            heartbeat_caps: "INSERT INTO faucet_serve_instance_caps (instance_id, state_format, pools) \
-                VALUES ($1,$2,$3) ON CONFLICT (instance_id) DO UPDATE SET \
-                state_format = excluded.state_format, pools = excluded.pools"
+            heartbeat_caps: "INSERT INTO faucet_serve_instance_caps (instance_id, state_format, pools, capabilities) \
+                VALUES ($1,$2,$3,$4) ON CONFLICT (instance_id) DO UPDATE SET \
+                state_format = excluded.state_format, pools = excluded.pools, \
+                capabilities = excluded.capabilities"
                 .into(),
             live_instances: "SELECT i.instance_id, i.started_at, i.last_heartbeat, i.listen, \
-                i.max_concurrent, i.in_flight, c.state_format, c.pools FROM faucet_serve_instances i \
+                i.max_concurrent, i.in_flight, c.state_format, c.pools, c.capabilities \
+                FROM faucet_serve_instances i \
                 LEFT JOIN faucet_serve_instance_caps c ON c.instance_id = i.instance_id \
                 WHERE i.last_heartbeat >= $1"
                 .into(),
@@ -2334,12 +2362,14 @@ impl Stmts {
                 last_heartbeat = excluded.last_heartbeat, listen = excluded.listen, \
                 max_concurrent = excluded.max_concurrent, in_flight = excluded.in_flight"
                 .into(),
-            heartbeat_caps: "INSERT INTO faucet_serve_instance_caps (instance_id, state_format, pools) \
-                VALUES (?,?,?) ON CONFLICT (instance_id) DO UPDATE SET \
-                state_format = excluded.state_format, pools = excluded.pools"
+            heartbeat_caps: "INSERT INTO faucet_serve_instance_caps (instance_id, state_format, pools, capabilities) \
+                VALUES (?,?,?,?) ON CONFLICT (instance_id) DO UPDATE SET \
+                state_format = excluded.state_format, pools = excluded.pools, \
+                capabilities = excluded.capabilities"
                 .into(),
             live_instances: "SELECT i.instance_id, i.started_at, i.last_heartbeat, i.listen, \
-                i.max_concurrent, i.in_flight, c.state_format, c.pools FROM faucet_serve_instances i \
+                i.max_concurrent, i.in_flight, c.state_format, c.pools, c.capabilities \
+                FROM faucet_serve_instances i \
                 LEFT JOIN faucet_serve_instance_caps c ON c.instance_id = i.instance_id \
                 WHERE i.last_heartbeat >= ?"
                 .into(),
@@ -2929,6 +2959,11 @@ pub fn classify_backend_error(e: sqlx::Error) -> HistoryError {
 }
 
 fn classified(message: String, e: &sqlx::Error) -> HistoryError {
+    if let sqlx::Error::Database(db) = e
+        && demoted_code(db.code().as_deref())
+    {
+        note_demoted_node();
+    }
     if matches!(e, sqlx::Error::PoolTimedOut) {
         HistoryError::PoolTimedOut(message)
     } else if unreachable_of(e) {
@@ -2973,13 +3008,60 @@ pub fn unreachable_of(e: &sqlx::Error) -> bool {
 }
 
 /// Pure code → reachability: Postgres class `08` (connection exception),
-/// `57P01`–`57P03` (shutting down / cannot connect now) and `53300` (no free
-/// connection slot). A SQLite code never means "unreachable": the database is
-/// a local file, so a failure to open it is a configuration error.
+/// `57P01`–`57P03` (shutting down / cannot connect now), `53300` (no free
+/// connection slot), and a node that stopped being the primary: `25006`
+/// (`read_only_sql_transaction`, a standby after failover) and `57P04`
+/// (`database_dropped`) (#1050). Only `25006` of class `25`: `25P02` (in a
+/// failed transaction) is the caller's. A SQLite code never means
+/// "unreachable": the database is a local file, so a failure to open it is a
+/// configuration error.
 pub fn unreachable_code(code: Option<&str>) -> bool {
     matches!(code, Some(c) if c.len() == SQLSTATE_LEN
-        && (c.starts_with("08") || matches!(c, "57P01" | "57P02" | "57P03" | "53300")))
+        && (c.starts_with("08")
+            || matches!(c, "57P01" | "57P02" | "57P03" | "53300")
+            || demoted_code(Some(c))))
 }
+
+/// The codes of a node that is no longer the writable primary.
+pub fn demoted_code(code: Option<&str>) -> bool {
+    matches!(code, Some("25006" | "57P04"))
+}
+
+/// Milliseconds after [`process_epoch`] when a connection last reported a
+/// demoted node (0 = never).
+static DEMOTED_AT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn process_epoch() -> std::time::Instant {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(std::time::Instant::now)
+}
+
+/// Record that a connection reached a demoted node: every connection opened
+/// before now is closed rather than reused, so the pool reconnects to the new
+/// primary (#1050).
+pub fn note_demoted_node() {
+    let ms = u64::try_from(process_epoch().elapsed().as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    DEMOTED_AT_MS.fetch_max(ms, std::sync::atomic::Ordering::AcqRel);
+}
+
+/// Whether a pooled connection of `age` was opened before the last demoted
+/// node was reported, and must be closed.
+pub fn opened_before_demotion(age: std::time::Duration) -> bool {
+    let at = DEMOTED_AT_MS.load(std::sync::atomic::Ordering::Acquire);
+    if at == 0 {
+        return false;
+    }
+    let since = process_epoch()
+        .elapsed()
+        .saturating_sub(std::time::Duration::from_millis(at));
+    age > since
+}
+
+/// How long a pooled connection lives: connections reach a new primary
+/// within this after a failover (#1050).
+pub const POOL_MAX_LIFETIME: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// [`classify_backend_error`] with a phase prefix, for the connect / DDL steps
 /// whose message needs to name what was being attempted.
@@ -3034,7 +3116,9 @@ pub fn transience_of_code(code: Option<&str>) -> Transience {
             // 53300 too_many_connections: transient saturation.
             // 40001 / 40P01: serialization failure / deadlock — the canonical
             // "retry the transaction" codes.
-            "57P03" | "53300" | "40001" | "40P01" => Transience::Transient,
+            // 25006 / 57P04: a node demoted by failover; the new primary takes
+            // the write once the pool reconnects (#1050).
+            "57P03" | "53300" | "40001" | "40P01" | "25006" | "57P04" => Transience::Transient,
             // Class 08 — connection exception (08000/08001/08003/08004/08006…).
             _ if code.starts_with("08") => Transience::Transient,
             // The database answered with a deterministic condition (syntax,
@@ -3129,6 +3213,72 @@ macro_rules! impl_sql_history {
         }
 
         impl $name {
+            /// Fail non-terminal runs whose lease expired; with `peers`, not
+            /// this instance's own runs except the forgotten ones (#1050).
+            async fn recover_orphans_where(
+                &self,
+                peers: Option<&[String]>,
+            ) -> Result<usize, $crate::serve::history::HistoryError> {
+                use sqlx::Row as _;
+                use $crate::serve::history::RunStatus;
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let now = chrono::Utc::now();
+                // Only non-terminal runs whose lease has expired (the owning
+                // instance is presumed dead). A live instance heartbeats its
+                // runs' leases into the future, so this never fails another
+                // healthy instance's in-flight runs (#146 H7).
+                let stmt = match peers {
+                    Some(f) => self.stmts.peer_orphans_query(f.len()),
+                    None => self.stmts.select_orphans.clone(),
+                };
+                let mut q = sqlx::query(&stmt).bind(sql::fmt_ts(now));
+                if let Some(f) = peers {
+                    q = q.bind(&self.instance_id);
+                    for id in f {
+                        q = q.bind(id);
+                    }
+                }
+                let rows = q.fetch_all(&self.pool).await.map_err(backend)?;
+                let mut count = 0usize;
+                for r in &rows {
+                    let body: String = r.try_get("body").map_err(backend)?;
+                    let mut rec = match sql::decode_body(&body) {
+                        Ok(rec) => rec,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "orphan recovery: unreadable run record; skipped");
+                            continue;
+                        }
+                    };
+                    rec.status = RunStatus::Failed;
+                    rec.finished_at = Some(now);
+                    rec.error = Some(
+                        "owning serve instance's lease expired before the run finished".into(),
+                    );
+                    if rec.elapsed_secs.is_none()
+                        && let Some(started) = rec.started_at
+                    {
+                        rec.elapsed_secs = (now - started).to_std().ok().map(|d| d.as_secs_f64());
+                    }
+                    let lease = sql::fmt_ts(chrono::Utc::now() + self.lease_ttl);
+                    let failed = sqlx::query(&self.stmts.fail_orphan)
+                        .bind(rec.status.as_str())
+                        .bind(rec.finished_at.map(sql::fmt_ts))
+                        .bind(&self.instance_id)
+                        .bind(&lease)
+                        .bind(sql::encode_body(&rec)?)
+                        .bind(&rec.run_id)
+                        .bind(sql::fmt_ts(now))
+                        .execute(&self.pool)
+                        .await
+                        .map_err(backend)?
+                        .rows_affected();
+                    count += failed as usize;
+                }
+                Ok(count)
+            }
+
+
             /// Assemble from an already-connected pool (used by `connect`).
             pub fn from_parts(
                 pool: $pool,
@@ -3739,56 +3889,37 @@ macro_rules! impl_sql_history {
             }
 
             async fn recover_orphans(&self) -> Result<usize, $crate::serve::history::HistoryError> {
-                use sqlx::Row as _;
-                use $crate::serve::history::RunStatus;
+                self.recover_orphans_where(None).await
+            }
+
+            async fn recover_orphans_of_peers(
+                &self,
+                forgotten: &[String],
+            ) -> Result<usize, $crate::serve::history::HistoryError> {
+                self.recover_orphans_where(Some(forgotten)).await
+            }
+
+            async fn renew_leases_except(
+                &self,
+                skip: &[String],
+            ) -> Result<usize, $crate::serve::history::HistoryError> {
                 use $crate::serve::history::sql;
                 let backend = $crate::serve::history::sql::classify_backend_error;
-                let now = chrono::Utc::now();
-                // Only non-terminal runs whose lease has expired (the owning
-                // instance is presumed dead). A live instance heartbeats its
-                // runs' leases into the future, so this never fails another
-                // healthy instance's in-flight runs (#146 H7).
-                let rows = sqlx::query(&self.stmts.select_orphans)
-                    .bind(sql::fmt_ts(now))
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(backend)?;
-                let mut count = 0usize;
-                for r in &rows {
-                    let body: String = r.try_get("body").map_err(backend)?;
-                    let mut rec = match sql::decode_body(&body) {
-                        Ok(rec) => rec,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "orphan recovery: unreadable run record; skipped");
-                            continue;
-                        }
-                    };
-                    rec.status = RunStatus::Failed;
-                    rec.finished_at = Some(now);
-                    rec.error = Some(
-                        "owning serve instance's lease expired before the run finished".into(),
-                    );
-                    if rec.elapsed_secs.is_none()
-                        && let Some(started) = rec.started_at
-                    {
-                        rec.elapsed_secs = (now - started).to_std().ok().map(|d| d.as_secs_f64());
-                    }
-                    let lease = sql::fmt_ts(chrono::Utc::now() + self.lease_ttl);
-                    let failed = sqlx::query(&self.stmts.fail_orphan)
-                        .bind(rec.status.as_str())
-                        .bind(rec.finished_at.map(sql::fmt_ts))
-                        .bind(&self.instance_id)
-                        .bind(&lease)
-                        .bind(sql::encode_body(&rec)?)
-                        .bind(&rec.run_id)
-                        .bind(sql::fmt_ts(now))
-                        .execute(&self.pool)
-                        .await
-                        .map_err(backend)?
-                        .rows_affected();
-                    count += failed as usize;
+                let new_lease = sql::fmt_ts(chrono::Utc::now() + self.lease_ttl);
+                let stmt = self.stmts.renew_leases_except_query(skip.len());
+                let mut q = sqlx::query(&stmt).bind(new_lease).bind(&self.instance_id);
+                for id in skip {
+                    q = q.bind(id);
                 }
-                Ok(count)
+                Ok(q.execute(&self.pool).await.map_err(backend)?.rows_affected() as usize)
+            }
+
+            async fn probe_write(&self) -> Result<(), $crate::serve::history::HistoryError> {
+                sqlx::query("UPDATE faucet_serve_schema SET version = version WHERE id = 'schema'")
+                    .execute(&self.pool)
+                    .await
+                    .map_err($crate::serve::history::sql::classify_backend_error)?;
+                Ok(())
             }
 
             async fn lease_lost(
@@ -4278,6 +4409,7 @@ macro_rules! impl_sql_history {
                     .bind(&self.instance_id)
                     .bind(beat.state_format.to_string())
                     .bind($crate::serve::pools::encode(&beat.pools))
+                    .bind(beat.capabilities.join(","))
                     .execute(&self.pool)
                     .await
                     .map_err(backend)?;
@@ -4312,6 +4444,7 @@ macro_rules! impl_sql_history {
                     let inf: Option<String> = r.try_get("in_flight").map_err(backend)?;
                     let fmt: Option<String> = r.try_get("state_format").map_err(backend)?;
                     let pools: Option<String> = r.try_get("pools").map_err(backend)?;
+                    let caps: Option<String> = r.try_get("capabilities").map_err(backend)?;
                     out.push(InstanceRecord {
                         instance_id: r.try_get("instance_id").map_err(backend)?,
                         started_at: parse_dt(&started),
@@ -4321,6 +4454,12 @@ macro_rules! impl_sql_history {
                         in_flight: inf.and_then(|s| s.parse().ok()).unwrap_or(0),
                         state_format: fmt.and_then(|s| s.parse().ok()).unwrap_or(0),
                         pools: $crate::serve::pools::decode(pools.as_deref()),
+                        capabilities: caps.map(|c| {
+                            c.split(',')
+                                .filter(|x| !x.is_empty())
+                                .map(str::to_string)
+                                .collect()
+                        }),
                     });
                 }
                 Ok(out)
@@ -7786,6 +7925,44 @@ mod tests {
         let err = classify_backend_error(db("08006"));
         assert!(err.is_unreachable());
         assert!(!classify_backend_error(db("23505")).is_unreachable());
+    }
+
+    #[test]
+    fn a_demoted_node_trips_and_retires_older_connections() {
+        for code in ["25006", "57P04"] {
+            assert!(unreachable_code(Some(code)), "{code}");
+            assert_eq!(transience_of_code(Some(code)), Transience::Transient);
+            assert!(demoted_code(Some(code)));
+        }
+        assert!(!unreachable_code(Some("25P02")), "in a failed transaction");
+        assert!(!demoted_code(Some("25P02")));
+        let young = std::time::Duration::from_millis(1);
+        let err = classify_backend_error(db("25006"));
+        assert!(err.is_unreachable());
+        #[allow(clippy::disallowed_methods)] // the report time must be strictly after `young`
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(
+            opened_before_demotion(std::time::Duration::from_secs(3600)),
+            "a connection opened before the report is closed"
+        );
+        assert!(!opened_before_demotion(young), "one opened since is kept");
+    }
+
+    #[test]
+    fn the_sweep_and_renewal_queries_leave_out_what_they_are_told() {
+        for d in [Dialect::Postgres, Dialect::Sqlite] {
+            let s = Stmts::new(d);
+            assert_eq!(s.renew_leases_except_query(0), s.renew_leases);
+            let q = s.renew_leases_except_query(2);
+            assert!(q.contains("AND run_id NOT IN ("), "{q}");
+            let q = s.peer_orphans_query(0);
+            assert!(q.contains("owner IS NULL OR owner <>"), "{q}");
+            assert!(!q.contains("run_id IN"), "{q}");
+            let q = s.peer_orphans_query(1);
+            assert!(q.contains("OR run_id IN ("), "{q}");
+        }
+        let pg = Stmts::new(Dialect::Postgres).peer_orphans_query(2);
+        assert!(pg.contains("owner <> $2") && pg.contains("$3,$4"), "{pg}");
     }
 
     #[test]

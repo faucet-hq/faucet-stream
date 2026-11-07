@@ -28,7 +28,9 @@ async fn a_policy_file_seeds_an_empty_store_and_then_only_reports_drift() {
 
     // An empty store: the file becomes version 1, imported by `system`.
     let state = state_from(&config);
-    apply_policy_file(&state, PolicyStore::Server, spec.clone(), &path).await;
+    apply_policy_file(&state, PolicyStore::Server, spec.clone(), &path)
+        .await
+        .unwrap();
     let layer = server_layer(&state).await.unwrap();
     assert_eq!(layer.source, PolicySource::Server);
     let v1 = layer.version.unwrap();
@@ -38,7 +40,9 @@ async fn a_policy_file_seeds_an_empty_store_and_then_only_reports_drift() {
     assert!(!drift.differs && drift.yaml.is_none());
 
     // The same file again: the stored version stays, nothing is imported.
-    apply_policy_file(&state, PolicyStore::Server, spec, &path).await;
+    apply_policy_file(&state, PolicyStore::Server, spec, &path)
+        .await
+        .unwrap();
     assert_eq!(
         state
             .history()
@@ -53,7 +57,9 @@ async fn a_policy_file_seeds_an_empty_store_and_then_only_reports_drift() {
     let wider = SERVER.replace("[eu]", "[eu, us]");
     std::fs::write(&path, &wider).unwrap();
     let wider_spec: Arc<PolicySpec> = Arc::new(crate::yaml::from_str(&wider).unwrap());
-    apply_policy_file(&state, PolicyStore::Server, wider_spec.clone(), &path).await;
+    apply_policy_file(&state, PolicyStore::Server, wider_spec.clone(), &path)
+        .await
+        .unwrap();
     assert_eq!(
         server_layer(&state).await.unwrap().version.unwrap().version,
         1
@@ -64,14 +70,18 @@ async fn a_policy_file_seeds_an_empty_store_and_then_only_reports_drift() {
 
     // `--policy-store file`, or nowhere to keep versions: the file is the policy.
     let file_store = state_from(&config);
-    apply_policy_file(&file_store, PolicyStore::File, wider_spec.clone(), &path).await;
+    apply_policy_file(&file_store, PolicyStore::File, wider_spec.clone(), &path)
+        .await
+        .unwrap();
     assert_eq!(
         server_layer(&file_store).await.unwrap().source,
         PolicySource::File
     );
     assert!(file_drift(&file_store).await.unwrap().is_none());
     let memory = test_state();
-    apply_policy_file(&memory, PolicyStore::Server, wider_spec, &path).await;
+    apply_policy_file(&memory, PolicyStore::Server, wider_spec, &path)
+        .await
+        .unwrap();
     assert_eq!(
         server_layer(&memory).await.unwrap().source,
         PolicySource::File
@@ -252,7 +262,8 @@ rules:
         pin,
         PolicyPin {
             server: Some(1),
-            tenant: Some(1)
+            tenant: Some(1),
+            file_sha256: None,
         }
     );
     // A newer server version does not reach a run pinned to v1.
@@ -266,6 +277,7 @@ rules:
         Some(&PolicyPin {
             server: Some(1),
             tenant: None,
+            file_sha256: None,
         }),
     )
     .await
@@ -283,6 +295,7 @@ rules:
         Some(&PolicyPin {
             server: Some(9),
             tenant: None,
+            file_sha256: None,
         }),
     )
     .await;
@@ -294,30 +307,100 @@ rules:
 }
 
 #[tokio::test]
-async fn a_file_policy_wins_and_ignores_pins() {
+async fn a_run_keeps_the_file_policy_it_was_admitted_under() {
     let state = test_state();
     let spec = parse_draft(SERVER).unwrap();
-    state.set_policy(std::sync::Arc::new(spec));
+    state.set_policy(std::sync::Arc::new(spec.clone()));
     state.set_policy_file(PolicyFile {
         path: "p.yaml".into(),
         sha256: "x".into(),
         loaded_at: Utc::now(),
     });
-    let (eff, pin) = effective(
+    // Admitted on a file server: the file, pinned by its content.
+    let (eff, pin) = effective(&state, None, None).await.unwrap();
+    assert_eq!(eff.unwrap().rules.len(), 1);
+    assert_eq!(pin.server, None);
+    assert_eq!(
+        pin.file_sha256.as_deref(),
+        Some(file_sha256(&spec).as_str())
+    );
+    assert!(!pin.is_empty());
+    // Not stored yet: a replica cannot enforce it, so it refuses (#1051).
+    assert!(matches!(
+        effective(&state, None, Some(&pin)).await,
+        Err(ServeError::Unprocessable { .. })
+    ));
+    store_file_scope(&state).await.unwrap();
+    store_file_scope(&state).await.unwrap();
+    // A replica started with another file still enforces the pinned content.
+    let other = parse_draft(&SERVER.replace("[eu]", "[eu, us]")).unwrap();
+    state.set_policy(std::sync::Arc::new(other));
+    let (eff, again) = effective(&state, None, Some(&pin)).await.unwrap();
+    assert_eq!(eff.unwrap(), spec);
+    assert_eq!(again, pin);
+    // A run pinned to a stored version is held to it on a file server too.
+    let stored = effective(
         &state,
         None,
         Some(&PolicyPin {
             server: Some(4),
             tenant: None,
+            file_sha256: None,
         }),
     )
-    .await
-    .unwrap();
-    assert_eq!(eff.unwrap().rules.len(), 1);
-    assert_eq!(pin.server, None);
+    .await;
+    assert!(matches!(stored, Err(ServeError::Unprocessable { .. })));
     assert_eq!(
         server_layer(&state).await.unwrap().source,
         PolicySource::File
+    );
+}
+
+/// A `--policy-store file` server stores the file's content once, at
+/// startup, and admits nothing until it has; admissions then pin the cached
+/// address and write nothing (#1051).
+#[tokio::test]
+async fn a_policy_file_is_stored_once_at_startup_and_waits_for_the_history() {
+    use crate::serve::config::PolicyStore;
+    use crate::serve::server::{apply_policy_file, retry_policy_seed};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("policy.yaml");
+    std::fs::write(&path, SERVER).unwrap();
+    let spec: std::sync::Arc<PolicySpec> = std::sync::Arc::new(parse_draft(SERVER).unwrap());
+    let sha = file_sha256(&spec);
+    let scope = crate::serve::history::policies::file_scope(&sha);
+    let (state, down) = crate::serve::test_support::flaky_state();
+    down.store(true, std::sync::atomic::Ordering::Release);
+    apply_policy_file(&state, PolicyStore::File, spec.clone(), &path)
+        .await
+        .unwrap();
+    assert!(state.policy_seed_pending());
+    assert!(crate::runtime::server::refuse_while_unavailable(&state).is_err());
+    down.store(false, std::sync::atomic::Ordering::Release);
+    assert!(state.history().recover_degraded().await);
+    retry_policy_seed(&state).await.unwrap();
+    assert!(!state.policy_seed_pending());
+    assert!(crate::runtime::server::refuse_while_unavailable(&state).is_ok());
+    let stored = state.history().policy_version_get(&scope, 1).await.unwrap();
+    assert_eq!(spec_of(&stored.unwrap()).unwrap(), *spec);
+    // Admission pins the cached address and stores nothing more.
+    let before = state
+        .history()
+        .policy_versions(&scope, 0)
+        .await
+        .unwrap()
+        .len();
+    let (_, pin) = effective(&state, None, None).await.unwrap();
+    assert_eq!(pin.file_sha256.as_deref(), Some(sha.as_str()));
+    assert_eq!(state.policy_sha256().as_deref(), Some(sha.as_str()));
+    assert_eq!(
+        state
+            .history()
+            .policy_versions(&scope, 0)
+            .await
+            .unwrap()
+            .len(),
+        before
     );
 }
 
@@ -524,9 +607,10 @@ async fn impact_compares_runs_and_templates_before_and_after() {
 
     // No policy before, the server's after.
     let first = impact(&state, None, None, &server).await.unwrap();
+    assert_eq!(first.runs_checked, 5);
     assert_eq!(
-        first.runs_checked, 5,
-        "the garbled and bodiless runs are skipped"
+        first.runs_runtime_only, 2,
+        "the garbled and bodiless runs are counted, not skipped"
     );
     let refused: Vec<&str> = first.newly_refused.iter().map(|e| e.id.as_str()).collect();
     assert!(
@@ -730,6 +814,42 @@ async fn drafts_are_compiled_on_every_layer() {
     );
 }
 
+/// A run record a 1.17.0 replica wrote has no pin: "not recorded", so the
+/// newest policy applies when another replica re-loads it (#1051).
+#[tokio::test]
+async fn a_record_from_1_17_has_the_newest_policy_enforced() {
+    let rec: crate::serve::history::RunRecord = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/history/run-record-1.17.0.json"
+    ))
+    .unwrap();
+    assert_eq!(rec.policy_pin, None);
+    let state = test_state();
+    state
+        .history()
+        .policy_version_insert(&record(SERVER_SCOPE, 1, SERVER))
+        .await
+        .unwrap();
+    let (spec, pin) = effective(&state, None, rec.policy_pin.as_ref())
+        .await
+        .unwrap();
+    assert!(spec.is_some(), "the newest policy is enforced");
+    assert_eq!(pin.server, Some(1));
+    // A record from this release always says what it was admitted under.
+    let mut now = rec.clone();
+    now.policy_pin = Some(PolicyPin::default());
+    let back: crate::serve::history::RunRecord =
+        serde_json::from_str(&serde_json::to_string(&now).unwrap()).unwrap();
+    assert_eq!(back.policy_pin, Some(PolicyPin::default()));
+    assert_eq!(
+        effective(&state, None, back.policy_pin.as_ref())
+            .await
+            .unwrap()
+            .0,
+        None,
+        "admitted with no policy stays unchecked"
+    );
+}
+
 #[tokio::test]
 async fn a_run_admitted_without_a_policy_stays_unchecked_on_reload() {
     let state = test_state();
@@ -749,26 +869,21 @@ async fn a_run_admitted_without_a_policy_stays_unchecked_on_reload() {
 }
 
 #[tokio::test]
-async fn a_degraded_history_enforces_the_policy_last_read() {
+async fn a_degraded_history_refuses_rather_than_running_unchecked() {
     let (state, down) = crate::serve::test_support::flaky_state();
     state
         .history()
         .policy_version_insert(&record(SERVER_SCOPE, 1, SERVER))
         .await
         .unwrap();
-    // A healthy read is remembered…
     let (spec, pin) = effective(&state, None, None).await.unwrap();
     assert!(spec.is_some());
     down.store(true, std::sync::atomic::Ordering::Release);
-    // …and enforced while the store is unreachable, pinned or not (#1051 #4).
-    let (spec, _) = effective(&state, None, None).await.unwrap();
-    assert_eq!(spec.unwrap().rules[0].name, "pii-to-eu-only");
-    let (spec, _) = effective(&state, None, Some(&pin)).await.unwrap();
-    assert!(spec.is_some());
+    for pinned in [None, Some(&pin)] {
+        let err = effective(&state, None, pinned).await.unwrap_err();
+        assert!(matches!(err, ServeError::Unavailable(_)), "{err:?}");
+    }
     assert!(state.history().degraded());
-    // A scope never read fails closed rather than running unchecked.
-    assert!(effective(&state, Some("acme"), None).await.is_err());
-    // Editing the policy is refused while degraded.
     assert!(
         state
             .history()
@@ -776,15 +891,6 @@ async fn a_degraded_history_enforces_the_policy_last_read() {
             .await
             .is_err()
     );
-    // A server with no stored policy keeps accepting runs.
-    let (empty, down) = crate::serve::test_support::flaky_state();
-    assert_eq!(effective(&empty, None, None).await.unwrap().0, None);
-    down.store(true, std::sync::atomic::Ordering::Release);
-    assert_eq!(effective(&empty, None, None).await.unwrap().0, None);
-    // The reads survive a restart through a snapshot.
-    let restored = PolicyReads::default();
-    restored.restore(state.policy_reads().snapshot());
-    assert!(restored.recall(SERVER_SCOPE, None).unwrap().is_some());
 }
 
 #[cfg(feature = "tenants")]
@@ -827,6 +933,40 @@ async fn a_server_draft_must_keep_each_tenant_merge_valid() {
             .contains("tenant acme's policy would no longer validate")),
         "{problems:?}"
     );
+    // Approved once acme's tenant policy landed, it is invalidated at execute
+    // rather than leaving acme's runs all refused (#1051).
+    let change = crate::serve::changes::ChangeRequest::for_test(
+        crate::serve::changes::ChangeKind::PolicyUpdate,
+        serde_json::json!({ "policy": dropped }),
+    );
+    let fresh = crate::serve::changes::ChangePlan {
+        material: "m".into(),
+        rows: Vec::new(),
+        summary: serde_json::json!({ "next_version": 1 }),
+    };
+    let err = crate::serve::changes::policy_update::execute(
+        &state,
+        &change,
+        &fresh,
+        &crate::serve::rbac::AuthContext::system("t"),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&err, ServeError::Conflict(m) if m.contains("no longer merges")),
+        "{err:?}"
+    );
+    assert!(
+        latest(&state, SERVER_SCOPE).await.unwrap().is_none(),
+        "nothing stored"
+    );
+    // A stored server version that breaks the merge refuses acme's runs.
+    state
+        .history()
+        .policy_version_insert(&record(SERVER_SCOPE, 1, dropped))
+        .await
+        .unwrap();
+    assert!(effective(&state, Some("acme"), None).await.is_err());
     // Keeping it passes.
     let draft = parse_draft(SERVER).unwrap();
     assert!(
@@ -835,4 +975,106 @@ async fn a_server_draft_must_keep_each_tenant_merge_valid() {
             .unwrap()
             .is_empty()
     );
+}
+
+/// A projection keeps the `vars:` and `params:` entries its kept fields
+/// reference, so it still loads; a secret param keeps no value, and an
+/// unreferenced var is dropped.
+#[test]
+fn a_projection_keeps_the_vars_and_params_it_references() {
+    use crate::serve::load::ConfigFormat;
+    let body = "version: 1\nname: p\nvars:\n  region: '${vars.zone}'\n  zone: eu\n  token: hunter2\nparams:\n  tier: { type: string, default: gold }\n  api_key: { type: string, secret: true, default: hunter2 }\n  unused: { type: string, default: hunter2 }\npipeline:\n  source: { type: csv, config: { path: in.csv, key: '${param.api_key}' } }\n  contract: { version: \"1\", fields: [ { name: email, type: string } ] }\n  sink: { type: jsonl, attributes: { residency: '${vars.region}', tier: '${param.tier}', key: '${param.api_key}' }, config: { path: out.jsonl } }\n";
+    let p = projection(body, ConfigFormat::Yaml);
+    assert!(!p.opaque);
+    let text = serde_json::to_string(&p).unwrap();
+    assert!(!text.contains("hunter2"), "{text}");
+    let doc = p.config.unwrap();
+    assert_eq!(doc["vars"]["region"], "${vars.zone}");
+    assert_eq!(doc["vars"]["zone"], "eu");
+    assert!(doc["vars"].get("token").is_none());
+    assert_eq!(doc["params"]["tier"]["default"], "gold");
+    assert!(doc["params"]["api_key"].get("default").is_none());
+    assert!(doc["params"].get("unused").is_none());
+    let cfg = probe_config_value(doc).expect("the projection loads");
+    let full = probe_config(body, ConfigFormat::Yaml).expect("the config loads");
+    let sink = cfg.pipeline.sink.unwrap();
+    let full = full.pipeline.sink.unwrap();
+    for attr in ["residency", "tier"] {
+        assert_eq!(
+            sink.attributes.get(attr),
+            full.attributes.get(attr),
+            "{attr}"
+        );
+    }
+    // The secret param binds to a placeholder, never its value.
+    assert_ne!(
+        sink.attributes.get("key").map(String::as_str),
+        Some("hunter2")
+    );
+    assert_eq!(
+        sink.attributes.get("tier").map(String::as_str),
+        Some("gold")
+    );
+}
+
+/// A run's policy projection keeps what a policy decides on and nothing that
+/// could hold a secret (#1051).
+#[test]
+fn a_projection_holds_no_connector_settings_or_keys() {
+    use crate::serve::load::ConfigFormat;
+    let body = "version: 1\nname: p\nvars: { token: hunter2 }\npipeline:\n  source: { type: postgres, config: { url: 'postgres://u:hunter2@db/x', password: hunter2 } }\n  sink: { type: jsonl, attributes: { residency: eu }, config: { path: out.jsonl } }\n  masking:\n    key: hunter2\n    rules: [{ name: m, match: { fields: [email] }, action: { type: hash } }]\n  dlq: { sink: { type: s3, attributes: { residency: us }, config: { bucket: b, secret: hunter2 } } }\nmatrix:\n  - id: a\n    sink: { attributes: { tier: x }, config: { path: '${env:HUNTER2}' } }\n";
+    let p = projection(body, ConfigFormat::Yaml);
+    assert!(!p.opaque);
+    let text = serde_json::to_string(&p).unwrap();
+    for leaked in ["hunter2", "HUNTER2", "postgres://", "out.jsonl", "bucket"] {
+        assert!(!text.contains(leaked), "{leaked} in {text}");
+    }
+    let doc = p.config.unwrap();
+    assert_eq!(doc["pipeline"]["sink"]["attributes"]["residency"], "eu");
+    assert_eq!(doc["pipeline"]["dlq"]["sink"]["type"], "s3");
+    assert_eq!(doc["matrix"][0]["sink"]["attributes"]["tier"], "x");
+    assert!(doc["pipeline"]["masking"]["rules"].is_array());
+    // It still loads for the static check.
+    assert!(probe_config_value(doc).is_some());
+    // A topology, or too many rows, is checked at run time only.
+    let topo = "version: 1\npipeline:\n  nodes: { a: { type: source } }\n";
+    assert!(projection(topo, ConfigFormat::Yaml).opaque);
+    let rows: String = (0..=PROJECTION_MAX_ROWS)
+        .map(|i| format!("  - id: r{i}\n"))
+        .collect();
+    let many = format!("version: 1\npipeline:\n  source: {{ type: csv }}\nmatrix:\n{rows}");
+    assert!(projection(&many, ConfigFormat::Yaml).opaque);
+    assert!(projection("{", ConfigFormat::Json).opaque);
+}
+
+/// Without a `--policy` file there is nothing to store; a store whose
+/// history is unreachable reports it.
+#[tokio::test]
+async fn storing_the_file_scope_needs_a_file_and_a_history() {
+    let state = test_state();
+    store_file_scope(&state).await.unwrap();
+    let (flaky, down) = crate::serve::test_support::flaky_state();
+    flaky.set_policy(std::sync::Arc::new(parse_draft(SERVER).unwrap()));
+    down.store(true, std::sync::atomic::Ordering::Release);
+    assert!(store_file_scope(&flaky).await.is_err());
+}
+
+/// The projection's edge cases: a topology given as a list, matrix rows
+/// that are not objects or carry a masking key, a connector given as a
+/// bare string, and a reference to a var that does not exist.
+#[test]
+fn a_projection_handles_odd_shapes() {
+    use crate::serve::load::ConfigFormat;
+    let topo = "version: 1\npipeline:\n  nodes: [ { id: a } ]\n";
+    assert!(projection(topo, ConfigFormat::Yaml).opaque);
+    let body = "version: 1\nvars: { zone: eu }\npipeline:\n  source: csv-in\n  sink: { type: jsonl, attributes: { residency: '${vars.ghost}', zone: '${vars.zone}' }, config: { path: out.jsonl } }\nmatrix:\n  - 5\n  - id: a\n    masking: { key: hunter2, rules: [] }\n";
+    let p = projection(body, ConfigFormat::Yaml);
+    assert!(!p.opaque);
+    let doc = p.config.unwrap();
+    assert!(!doc.to_string().contains("hunter2"), "{doc}");
+    assert_eq!(doc["pipeline"]["source"], "csv-in");
+    assert_eq!(doc["matrix"][0], 5);
+    assert!(doc["matrix"][1]["masking"].get("key").is_none());
+    assert!(doc["matrix"][1]["masking"]["rules"].is_array());
+    assert_eq!(doc["vars"], serde_json::json!({ "zone": "eu" }));
 }

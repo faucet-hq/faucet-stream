@@ -166,6 +166,10 @@ pub struct ScheduleChange {
 /// A schedule made through the API or the console, as the run history keeps it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScheduleRecord {
+    /// A stable id, kept across edits (#1051): secret param values are
+    /// sealed to it. Set by the server, never from the wire.
+    #[serde(default)]
+    pub id: String,
     pub spec: ScheduleSpec,
     /// The tenant that owns the schedule (made by its own principal): it runs
     /// only for that tenant. `None` for a server-wide schedule.
@@ -198,6 +202,7 @@ pub struct ScheduleRecord {
 impl ScheduleRecord {
     pub fn new(spec: ScheduleSpec, tenant: Option<String>, by: &str, now: DateTime<Utc>) -> Self {
         let mut r = Self {
+            id: uuid::Uuid::new_v4().to_string(),
             spec,
             tenant,
             created_at: now,

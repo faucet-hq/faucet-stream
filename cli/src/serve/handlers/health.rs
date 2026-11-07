@@ -30,20 +30,15 @@ pub async fn readyz(State(state): State<ServerState>) -> impl IntoResponse {
         serde_json::to_value(state.triggers().snapshot()).unwrap_or(serde_json::Value::Null);
     #[cfg(not(feature = "triggers"))]
     let triggers = serde_json::Value::Array(vec![]);
-    // While degraded: since when, and what waits in the local journal (#1050).
     let degraded = if state.history().degraded() {
-        let journal = match state.history().journal() {
-            Some(j) => Some(j.status().await),
-            None => None,
-        };
-        json!({
-            "since": state.history().degraded_since(),
-            "journaled": journal.as_ref().map_or(0, |s| s.journaled),
-            "journal": journal,
-        })
+        json!({ "since": state.history().degraded_since() })
     } else {
         serde_json::Value::Null
     };
+    #[cfg(feature = "policy")]
+    let policy_seed = state.policy_seed_pending().then_some("pending");
+    #[cfg(not(feature = "policy"))]
+    let policy_seed: Option<&str> = None;
     let body = json!({
         "status": if code == StatusCode::OK { "ready" } else { "not_ready" },
         "history_ok": history_ok,
@@ -53,6 +48,8 @@ pub async fn readyz(State(state): State<ServerState>) -> impl IntoResponse {
         },
         "queue_ok": queue_ok,
         "degraded": degraded,
+        "pending_finalize": state.pending_finalize_len(),
+        "policy_seed": policy_seed,
         "draining": draining,
         "cluster": {
             "enabled": state.cluster().enabled(),
@@ -62,6 +59,7 @@ pub async fn readyz(State(state): State<ServerState>) -> impl IntoResponse {
                 "instance_id": m.instance_id,
                 "listen": m.listen,
                 "pools": m.pools,
+                "capabilities": m.capabilities,
                 "in_flight": m.in_flight,
                 "max_concurrent": m.max_concurrent,
             })).collect::<Vec<_>>(),
@@ -173,6 +171,7 @@ mod tests {
                 in_flight: 1,
                 state_format: 1,
                 pools: Some(vec!["private".into()]),
+                capabilities: Some(vec!["policy_pin".into()]),
             }]);
         let resp = readyz(axum::extract::State(st)).await.into_response();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -188,6 +187,9 @@ mod tests {
             serde_json::json!(["private"])
         );
         assert_eq!(v["cluster"]["members"][0]["listen"], "10.0.0.2:8080");
+        assert_eq!(v["cluster"]["members"][0]["capabilities"][0], "policy_pin");
+        assert_eq!(v["pending_finalize"], 0);
+        assert!(v["policy_seed"].is_null());
         assert_eq!(v["status"], "ready");
         assert_eq!(v["history_ok"], true);
         assert_eq!(v["queue_ok"], true);

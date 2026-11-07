@@ -269,33 +269,49 @@ while it cannot reach the database, `/readyz` returns `503` with
 `history_ok: false` and `faucet_serve_history_unreachable` is `1`. Both clear
 on the first heartbeat that gets through.
 
-While degraded, run records, logs, audit, catalog and usage go to an in-memory
-store so runs keep going. Templates, schedules, policy versions, tenants,
-connections, change requests and approvals, and `queue_depth` trigger edges are
-**not** served from that empty store: those requests, and submissions with an
-idempotency key, fail with `503` ("history unavailable") until the backend is
-back. A degraded cluster replica stops claiming runs and refuses new
-submissions; a single server keeps accepting them.
+A Postgres primary that fails over to a read-only standby counts as
+unreachable too: a write refused with SQLSTATE `25006`
+(`read_only_sql_transaction`) or `57P04` (`database_dropped`) degrades the
+server, every pooled connection opened before that answer is closed instead of
+reused, and pooled connections live at most five minutes, so the pool reaches
+the new primary soon after a failover.
 
-**The local journal.** What a server must not lose while degraded — the run
-records and status of the runs it owns (with their invocations), run log
-lines, audit entries and usage records — is also appended, fsynced, to
-`$FAUCET_DATA_DIR/history-journal/journal.jsonl`. Every lease tick probes the
-backend — or, when it was unreachable at startup, tries to connect it again —
-and once it answers, the journal is replayed into it before the server leaves
-degraded mode: runs by id (a terminal record owner-fenced, so a run a peer took
-over keeps the peer's record), audit entries by id, log lines by sequence and
-usage by `(run_id, row_id)`, so a replay that is interrupted and repeated
-writes nothing twice. The journal is then truncated. A server restarted while
-degraded keeps the file and replays it as soon as it reaches the backend —
-before it serves, when that is at startup. The journal is capped at 1 GiB
-(`FAUCET_HISTORY_JOURNAL_MAX_BYTES`); past it new runs are refused with `503`
-rather than a record dropped. `/readyz` reports `degraded: {since, journaled}`
-and `faucet_serve_history_journal_records{kind}` counts what waits (alert
-`FaucetServeHistoryJournalPending`). The policy versions the server last read
-are kept beside the journal too, so a server restarted while degraded keeps
-enforcing them. Terminal records are retained for
-`--retain-terminal-runs-secs` (default 7 days).
+**While degraded, the server admits nothing.** Every new run, template
+trigger, backfill, DLQ replay, verify repair, rollback, webhook trigger and
+schedule tick answers `503` ("history unavailable"), on a single server as in
+a cluster, so no work starts that the server could not record. The check runs
+again just before a run is recorded, and that write is never kept in memory
+only: a backend that fails at that moment refuses the run before anything has
+run. Templates, schedules, policy versions, tenants, connections, change
+requests and approvals, and submissions with an idempotency key fail with
+`503` too. Reads are served from memory meanwhile.
+
+Runs already in flight keep going. In a cluster, a replica that cannot renew
+its leases cancels its local runs and hands them back before a peer may claim
+them. When a run finishes, its terminal record — built from the run's own
+record, so its name, labels and tenant are kept — is written owner-fenced; one
+the backend does not take is held and retried from every lease tick until it
+lands. The completion callback, the run metrics and the tenant counters follow
+only a landed write. A record the backend keeps refusing for good falls back,
+after five refusals, to its status alone. On a single server a refused status
+is dropped (logged, counted in `faucet_serve_pending_finalize_dropped_total`)
+and orphan recovery marks the run `failed`. In a cluster it is never dropped:
+the replica keeps the run's lease, so no peer runs it again, and retries the
+status with a backoff of up to ten minutes (counted in
+`faucet_serve_pending_finalize_refused_total`). `faucet_serve_pending_finalize` counts what
+waits (alert `FaucetServePendingFinalize`). A server that stops while records
+are held loses them; orphan recovery then marks those runs `failed`. Re-running
+such a run is safe: bookmarks advance only after the sink confirms a write.
+
+Every lease tick probes a degraded backend with a no-op write — so a primary
+that answers reads but refuses writes stays degraded — or, when it was
+unreachable at startup, tries to connect again; the server leaves degraded
+mode once the write succeeds. `/readyz` reports `degraded: {since}` while it
+lasts. A `--policy` file that seeds the policy store (or, with
+`--policy-store file`, is stored for the runs pinned to it) waits for the
+history the same way: until it is stored, `/readyz` shows
+`policy_seed: "pending"` and new work answers `503`. Terminal records are
+retained for `--retain-terminal-runs-secs` (default 7 days).
 
 ### Multi-instance orphan recovery (run-ownership leases)
 

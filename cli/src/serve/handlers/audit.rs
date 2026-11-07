@@ -75,7 +75,7 @@ pub async fn list_audit(
         .history()
         .list_audit(&filter)
         .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?;
+        .map_err(ServeError::from)?;
     // A full page may have more behind it; a short one is the last.
     let next_before = (entries.len() == filter.limit)
         .then(|| entries.last().map(|e| e.id.clone()))
@@ -96,7 +96,7 @@ pub async fn get_audit(
         .history()
         .get_audit(&id)
         .await
-        .map_err(|e| ServeError::Internal(e.to_string()))?
+        .map_err(ServeError::from)?
         .map(Json)
         .ok_or(ServeError::NotFound)
 }
