@@ -207,7 +207,7 @@
     },
     {
       "type": "stat",
-      "title": "History backend degraded (1 = degraded)",
+      "title": "History backend health (degraded: 1 = yes)",
       "gridPos": {
         "x": 0,
         "y": 16,
@@ -245,6 +245,42 @@
             "uid": "${datasource}"
           },
           "legendFormat": "terminal records dropped (per hour)"
+        },
+        {
+          "refId": "D",
+          "expr": "sum(increase(faucet_serve_pending_finalize_refused_total[1h]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "terminal statuses refused (per hour)"
+        },
+        {
+          "refId": "E",
+          "expr": "max(faucet_serve_policy_seed_pending)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "policy seed pending"
+        },
+        {
+          "refId": "F",
+          "expr": "sum(increase(faucet_serve_run_reload_retries_total[1h]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "run reload retries (per hour)"
+        },
+        {
+          "refId": "G",
+          "expr": "sum(increase(faucet_serve_policy_merge_failures_total[1h]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "tenant policy merge failures (per hour)"
         }
       ],
       "fieldConfig": {

@@ -167,7 +167,9 @@ impl From<crate::serve::history::HistoryError> for ServeError {
     fn from(e: crate::serve::history::HistoryError) -> Self {
         use crate::serve::history::{HistoryError, Transience};
         match e {
-            HistoryError::Degraded(m) => ServeError::Unavailable(m),
+            HistoryError::Degraded(m) => {
+                ServeError::Unavailable(format!("history unavailable: {m}"))
+            }
             HistoryError::Unreachable(_) | HistoryError::PoolTimedOut(_) => {
                 ServeError::Unavailable(format!("history unavailable: {e}; retry shortly"))
             }
@@ -229,9 +231,11 @@ mod tests {
             },
         ];
         for e in unavailable {
-            assert_eq!(
-                ServeError::from(e).status(),
-                StatusCode::SERVICE_UNAVAILABLE
+            let err = ServeError::from(e);
+            assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(
+                matches!(&err, ServeError::Unavailable(m) if m.starts_with("history unavailable")),
+                "{err:?}"
             );
         }
         for e in [

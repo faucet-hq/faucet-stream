@@ -1989,13 +1989,23 @@ async fn under_run_approval_a_schedule_needs_an_approved_change() {
         refused.to_string().contains("was not approved"),
         "{refused}"
     );
-    // Creating one becomes a change request; once approved it is stored as
-    // approved and may be resumed.
-    let (code, pending) = gated
+    // A schedule that follows a channel is refused while runs need approval.
+    let (code, refused) = gated
         .post(
             "op-tok",
             "/v1/schedules",
             json!({"name": "fresh", "cron": "0 3 * * *", "template": {"id": "plain-sync"}, "paused": true}),
+        )
+        .await;
+    assert_eq!(code, 422, "{refused}");
+    assert!(refused.to_string().contains("pin a version"), "{refused}");
+    // Creating one with a pinned version becomes a change request; once
+    // approved it is stored as approved and may be resumed.
+    let (code, pending) = gated
+        .post(
+            "op-tok",
+            "/v1/schedules",
+            json!({"name": "fresh", "cron": "0 3 * * *", "template": {"id": "plain-sync", "version": 1}, "paused": true}),
         )
         .await;
     assert_eq!(code, 202, "{pending}");
