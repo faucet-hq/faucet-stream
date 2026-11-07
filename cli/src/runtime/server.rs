@@ -1549,10 +1549,10 @@ pub(crate) mod replay {
 
 // ── trigger_template ─────────────────────────────────────────────────────────
 
+#[cfg(all(feature = "templates", feature = "schedule"))]
+pub use templates::screen_template_params;
 #[cfg(feature = "templates")]
-pub use templates::{
-    TriggerOutcome, screen_template_inputs, screen_template_params, trigger_template,
-};
+pub use templates::{TriggerOutcome, screen_template_inputs, trigger_template};
 
 #[cfg(feature = "templates")]
 mod templates {
@@ -1670,6 +1670,7 @@ mod templates {
     /// fetched or recorded. Only a refusal (403) is returned; anything else
     /// (a template that does not compose yet, a tenant connection set up
     /// later) is left for the run to report.
+    #[cfg(feature = "schedule")]
     pub async fn screen_template_params(
         state: &ServerState,
         principal: &Principal,
