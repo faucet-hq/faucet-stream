@@ -1146,8 +1146,11 @@ mod tests {
         );
     }
 
-    /// A history whose server settings never answer: a step that reads them hangs.
-    struct Hang;
+    /// A history whose server settings never answer: a step that reads them
+    /// hangs. With `panic` set it panics on the step's first call instead.
+    struct Hang {
+        panic: bool,
+    }
 
     #[async_trait::async_trait]
     impl RunHistory for Hang {
@@ -1205,8 +1208,130 @@ mod tests {
             std::future::pending().await
         }
         fn degraded(&self) -> bool {
+            assert!(!self.panic, "a broken history");
             false
         }
+    }
+
+    fn hang_state(panic: bool) -> ServerState {
+        ServerState::new(
+            &crate::serve::test_support::test_config(),
+            None,
+            CancellationToken::new(),
+            std::sync::Arc::new(Hang { panic }),
+            crate::serve::logs::LogHub::new(),
+            None,
+            #[cfg(feature = "triggers")]
+            crate::serve::triggers::health::TriggersHandle::empty(),
+        )
+    }
+
+    /// The double answers every run call at once and hangs only on what a
+    /// step reads first.
+    #[tokio::test]
+    async fn the_hanging_history_hangs_only_on_settings_and_claims() {
+        let h = Hang { panic: false };
+        let rec = crate::serve::history::RunRecord::queued(
+            "r".into(),
+            None,
+            Default::default(),
+            None,
+            Utc::now(),
+        );
+        h.upsert(&rec).await.unwrap();
+        assert!(h.get("r").await.unwrap().is_none());
+        assert!(h.list(&Default::default()).await.unwrap().runs.is_empty());
+        assert!(matches!(
+            h.delete("r").await.unwrap(),
+            crate::serve::history::DeleteOutcome::NotFound
+        ));
+        assert_eq!(h.purge_expired(Duration::ZERO).await.unwrap(), 0);
+        assert_eq!(h.recover_orphans().await.unwrap(), 0);
+        let claim = h.claim_idempotency("k", "f", "r", Duration::ZERO);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), claim)
+                .await
+                .is_err()
+        );
+    }
+
+    /// A step that panics is dropped and rebuilt at the next reload; the
+    /// loop keeps going and still stops on shutdown.
+    #[tokio::test]
+    async fn a_panicking_step_does_not_stop_the_loop() {
+        let state = hang_state(true);
+        state.set_schedules(super::super::SchedulesRuntime::new(
+            vec![spec("*/5 * * * *", true)],
+            Duration::from_secs(300),
+        ));
+        let e = entry("0 * * * *", at("2026-09-26T10:30:00Z"));
+        let (_, out) = step_task(state.clone(), e, Duration::from_secs(5)).await;
+        assert!(matches!(out, Stepped::Panicked));
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(run(state, shutdown.clone()));
+        #[allow(clippy::disallowed_methods)] // let the loop step (and lose) the entry
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the loop returns once shut down")
+            .expect("the loop itself never panicked");
+    }
+
+    #[tokio::test]
+    async fn a_loop_started_after_shutdown_returns_at_once() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_with(
+                crate::serve::test_support::test_state(),
+                shutdown,
+                STEP_TIMEOUT,
+            ),
+        )
+        .await
+        .expect("returns without a step");
+    }
+
+    /// A resume whose read trips the history into degraded mode holds the
+    /// tick rather than counting a failure.
+    #[tokio::test]
+    async fn a_resume_that_trips_the_history_holds_the_tick() {
+        let (state, down) = crate::serve::test_support::flaky_state();
+        let mut e = entry("0 * * * *", at("2026-09-26T10:30:00Z"));
+        down.store(true, std::sync::atomic::Ordering::Release);
+        assert!(!state.history().degraded());
+        step(&state, &mut e, at("2026-09-26T11:00:00Z")).await;
+        assert!(state.history().degraded());
+        assert!(e.held && !e.resumed, "held, not failed");
+        assert_eq!(e.attempts, 1);
+    }
+
+    /// Once the history is back a held tick settles: the ticks it skipped
+    /// over are recorded missed and the latest due one fires.
+    #[tokio::test]
+    async fn a_held_tick_is_recorded_missed_when_the_history_recovers() {
+        let (state, down) = crate::serve::test_support::flaky_state();
+        let mut e = entry("0 * * * *", at("2026-09-26T10:30:00Z"));
+        e.resumed = true;
+        take_down(&state, &down).await;
+        step(&state, &mut e, at("2026-09-26T11:00:00Z")).await;
+        assert!(e.held);
+        down.store(false, std::sync::atomic::Ordering::Release);
+        assert!(state.history().recover_degraded().await);
+        e.retry_at = None;
+        step(&state, &mut e, at("2026-09-26T15:10:00Z")).await;
+        assert!(!e.held);
+        let st = status::read(&*state.history(), "nightly").await;
+        let outage = st
+            .missed
+            .iter()
+            .find(|m| m.reason == "while the run history was unreachable")
+            .expect("the outage's ticks are recorded");
+        assert_eq!(outage.count, 5);
+        assert!(outage.caught_up);
+        assert!(st.last_outcome.is_some(), "the latest tick fired");
     }
 
     #[tokio::test]
@@ -1216,7 +1341,7 @@ mod tests {
             &config,
             None,
             CancellationToken::new(),
-            std::sync::Arc::new(Hang),
+            std::sync::Arc::new(Hang { panic: false }),
             crate::serve::logs::LogHub::new(),
             None,
             #[cfg(feature = "triggers")]

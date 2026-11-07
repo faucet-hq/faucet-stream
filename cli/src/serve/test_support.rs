@@ -250,3 +250,20 @@ pub fn flaky_state() -> (ServerState, Arc<std::sync::atomic::AtomicBool>) {
     );
     (state, down)
 }
+
+/// The flaky double passes settings writes through while up and refuses
+/// them while down.
+#[tokio::test]
+async fn the_flaky_history_writes_settings_only_while_up() {
+    let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let h = Flaky {
+        inner: Arc::new(MemoryHistory::new(Duration::from_secs(60))),
+        down: down.clone(),
+    };
+    h.meta_put("k", "1").await.unwrap();
+    assert!(h.meta_compare_and_set("k", Some("1"), "2").await.unwrap());
+    assert_eq!(h.meta_get("k").await.unwrap().as_deref(), Some("2"));
+    down.store(true, std::sync::atomic::Ordering::Release);
+    assert!(h.meta_put("k", "3").await.is_err());
+    assert!(h.meta_compare_and_set("k", Some("2"), "3").await.is_err());
+}

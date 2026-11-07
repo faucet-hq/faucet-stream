@@ -683,3 +683,50 @@ mod shard_tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod orphan_tests {
+    use super::*;
+    use crate::serve::history::{RunHistory, RunRecord, RunStatus};
+    use std::collections::BTreeMap;
+
+    async fn instance(url: &str, id: &str) -> SqliteHistory {
+        SqliteHistory::connect(url, Duration::from_secs(60), Duration::ZERO, id.into())
+            .await
+            .unwrap()
+    }
+
+    async fn running(h: &SqliteHistory, id: &str) {
+        let mut rec = RunRecord::queued(id.into(), None, BTreeMap::new(), None, chrono::Utc::now());
+        rec.status = RunStatus::Running;
+        rec.started_at = Some(chrono::Utc::now());
+        h.upsert(&rec).await.unwrap();
+    }
+
+    /// The single-server sweep fails a peer's expired runs and this
+    /// instance's forgotten ones, never its own live runs.
+    #[tokio::test]
+    async fn the_peer_sweep_spares_this_instances_own_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}/h.db", dir.path().display());
+        let me = instance(&url, "me").await;
+        let peer = instance(&url, "peer").await;
+        running(&me, "mine").await;
+        running(&me, "forgotten").await;
+        running(&peer, "theirs").await;
+        #[allow(clippy::disallowed_methods)] // let the zero-length leases lapse
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let failed = me
+            .recover_orphans_of_peers(&["forgotten".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(failed, 2);
+        let status = async |id: &str| me.get(id).await.unwrap().unwrap();
+        assert_eq!(status("mine").await.status, RunStatus::Running);
+        for id in ["forgotten", "theirs"] {
+            let rec = status(id).await;
+            assert_eq!(rec.status, RunStatus::Failed, "{id}");
+            assert!(rec.elapsed_secs.is_some(), "{id}");
+        }
+    }
+}

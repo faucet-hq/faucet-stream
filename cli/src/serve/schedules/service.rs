@@ -1747,6 +1747,61 @@ mod tests {
         }
     }
 
+    /// A legacy record read before another writer touched it is given its
+    /// id from the stored copy; one that is gone is not found.
+    #[tokio::test]
+    async fn a_stale_legacy_record_gets_its_id_from_the_stored_copy() {
+        let state = crate::serve::test_support::test_state();
+        let spec = spec_of(json!({"name": "legacy", "cron": "0 2 * * *", "template": {"id": "t"}}));
+        let mut stored = ScheduleRecord::new(spec, None, "ops", Utc::now());
+        stored.id = String::new();
+        assert!(state.history().schedule_insert(&stored).await.unwrap());
+        let mut stale = stored.clone();
+        stale.revision += 7;
+        let given = ensure_id(&state, stale).await.unwrap();
+        assert!(!given.id.is_empty());
+        assert_eq!(given.revision, stored.revision + 1);
+        let mut gone = stored.clone();
+        gone.spec.name = "gone".into();
+        assert!(matches!(
+            ensure_id(&state, gone).await,
+            Err(ServeError::NotFound)
+        ));
+    }
+
+    /// The server names the schedule a change is for; an approved change
+    /// that names none is refused rather than applied to whatever holds
+    /// the name now.
+    #[tokio::test]
+    async fn a_change_is_bound_to_the_schedule_it_was_proposed_for() {
+        let state = crate::serve::test_support::test_state();
+        let op = actor(Role::Operator, None);
+        store(
+            &state,
+            spec_of(json!({"name": "n", "cron": "0 2 * * *", "template": {"id": "t"}})),
+            None,
+        )
+        .await;
+        let id = state.history().schedule_get("n").await.unwrap().unwrap().id;
+        let prepared = prepare_change(
+            &state,
+            &op,
+            json!({"action": "delete", "name": "n", "schedule_id": "forged"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(prepared["schedule_id"], id);
+        let unbound = ChangePayload {
+            action: ChangeAction::Delete,
+            name: "n".into(),
+            spec: None,
+            schedule_id: None,
+        };
+        let e = apply(&state, &op, unbound, true).await.unwrap_err();
+        assert!(matches!(&e, ServeError::Conflict(m) if m.contains("names no schedule")));
+        assert!(state.history().schedule_get("n").await.unwrap().is_some());
+    }
+
     #[test]
     fn the_approval_gate_refuses_only_gated_kinds() {
         let mut config = crate::serve::test_support::test_config();

@@ -993,6 +993,43 @@ mod tests {
         }
     }
 
+    /// The counting double passes every call through and counts only the
+    /// schedule reads.
+    #[cfg(feature = "tenants")]
+    #[tokio::test]
+    async fn the_counting_history_passes_calls_through() {
+        use crate::serve::history::RunHistory as _;
+        let h = CountingGets {
+            inner: crate::serve::history::memory::MemoryHistory::new(
+                std::time::Duration::from_secs(60),
+            ),
+            gets: Default::default(),
+        };
+        let window = std::time::Duration::from_secs(60);
+        assert!(matches!(
+            h.claim_idempotency("k", "f", "r", window).await.unwrap(),
+            crate::serve::history::Claim::Fresh
+        ));
+        let rec = crate::serve::history::RunRecord::queued(
+            "r".into(),
+            None,
+            Default::default(),
+            None,
+            Utc::now(),
+        );
+        h.upsert(&rec).await.unwrap();
+        assert!(h.get("r").await.unwrap().is_some());
+        assert_eq!(h.list(&ListFilter::default()).await.unwrap().runs.len(), 1);
+        assert!(!matches!(
+            h.delete("r").await.unwrap(),
+            crate::serve::history::DeleteOutcome::NotFound
+        ));
+        assert_eq!(h.purge_expired(window).await.unwrap(), 0);
+        assert_eq!(h.recover_orphans().await.unwrap(), 0);
+        assert!(h.tenant_get("acme").await.unwrap().is_none());
+        assert_eq!(h.gets.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
     /// A fan-out tick reads the stored schedule and opens its sealed params
     /// once, not once per tenant.
     #[cfg(feature = "tenants")]

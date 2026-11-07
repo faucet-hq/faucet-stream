@@ -592,6 +592,28 @@ mod tests {
     }
 
     #[test]
+    fn a_tenant_sees_only_its_own_skip_reasons() {
+        let s = ScheduleStatus {
+            skipped: vec![
+                SkippedTick {
+                    tick: at("2026-11-05T01:00:00Z"),
+                    reason: "acme: still going; globex: busy".into(),
+                },
+                SkippedTick {
+                    tick: at("2026-11-05T02:00:00Z"),
+                    reason: "globex: busy".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let acme = s.for_tenant("acme");
+        assert_eq!(acme.skipped.len(), 1);
+        assert_eq!(acme.skipped[0].reason, "acme: still going");
+        assert_eq!(acme.skipped[0].tick, at("2026-11-05T01:00:00Z"));
+        assert_eq!(s.for_tenant("globex").skipped.len(), 2);
+    }
+
+    #[test]
     fn the_per_target_record_is_bounded() {
         let mut s = ScheduleStatus::default();
         let tick = at("2026-11-05T01:00:00Z");

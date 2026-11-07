@@ -1046,3 +1046,35 @@ fn a_projection_holds_no_connector_settings_or_keys() {
     assert!(projection(&many, ConfigFormat::Yaml).opaque);
     assert!(projection("{", ConfigFormat::Json).opaque);
 }
+
+/// Without a `--policy` file there is nothing to store; a store whose
+/// history is unreachable reports it.
+#[tokio::test]
+async fn storing_the_file_scope_needs_a_file_and_a_history() {
+    let state = test_state();
+    store_file_scope(&state).await.unwrap();
+    let (flaky, down) = crate::serve::test_support::flaky_state();
+    flaky.set_policy(std::sync::Arc::new(parse_draft(SERVER).unwrap()));
+    down.store(true, std::sync::atomic::Ordering::Release);
+    assert!(store_file_scope(&flaky).await.is_err());
+}
+
+/// The projection's edge cases: a topology given as a list, matrix rows
+/// that are not objects or carry a masking key, a connector given as a
+/// bare string, and a reference to a var that does not exist.
+#[test]
+fn a_projection_handles_odd_shapes() {
+    use crate::serve::load::ConfigFormat;
+    let topo = "version: 1\npipeline:\n  nodes: [ { id: a } ]\n";
+    assert!(projection(topo, ConfigFormat::Yaml).opaque);
+    let body = "version: 1\nvars: { zone: eu }\npipeline:\n  source: csv-in\n  sink: { type: jsonl, attributes: { residency: '${vars.ghost}', zone: '${vars.zone}' }, config: { path: out.jsonl } }\nmatrix:\n  - 5\n  - id: a\n    masking: { key: hunter2, rules: [] }\n";
+    let p = projection(body, ConfigFormat::Yaml);
+    assert!(!p.opaque);
+    let doc = p.config.unwrap();
+    assert!(!doc.to_string().contains("hunter2"), "{doc}");
+    assert_eq!(doc["pipeline"]["source"], "csv-in");
+    assert_eq!(doc["matrix"][0], 5);
+    assert!(doc["matrix"][1]["masking"].get("key").is_none());
+    assert!(doc["matrix"][1]["masking"]["rules"].is_array());
+    assert_eq!(doc["vars"], serde_json::json!({ "zone": "eu" }));
+}

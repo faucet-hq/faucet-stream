@@ -1523,6 +1523,51 @@ mod tests {
     use chrono::Utc;
     use std::collections::BTreeMap;
 
+    /// A forgotten run is dropped from the set once its record is terminal
+    /// or gone, kept while it is live, and kept while the history is down.
+    #[tokio::test]
+    async fn settled_forgotten_runs_are_cleared() {
+        let down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let history = std::sync::Arc::new(crate::serve::test_support::Flaky {
+            inner: std::sync::Arc::new(MemoryHistory::new(Duration::from_secs(60))),
+            down: down.clone(),
+        });
+        let state = ServerState::new(
+            &crate::serve::test_support::test_config(),
+            None,
+            CancellationToken::new(),
+            history,
+            crate::serve::logs::LogHub::new(),
+            None,
+            #[cfg(feature = "triggers")]
+            crate::serve::triggers::health::TriggersHandle::empty(),
+        );
+        for (id, status) in [("done", RunStatus::Completed), ("live", RunStatus::Running)] {
+            let mut rec = RunRecord::queued(id.into(), None, BTreeMap::new(), None, Utc::now());
+            rec.status = status;
+            state.history().upsert(&rec).await.unwrap();
+        }
+        for id in ["done", "live", "gone"] {
+            state.forget_run_lease(id);
+        }
+        down.store(true, std::sync::atomic::Ordering::Release);
+        clear_settled_forgotten(&state).await;
+        assert_eq!(state.forgotten_runs().len(), 3, "nothing is cleared blind");
+        down.store(false, std::sync::atomic::Ordering::Release);
+        clear_settled_forgotten(&state).await;
+        assert_eq!(state.forgotten_runs(), vec!["live".to_string()]);
+    }
+
+    /// A pending seed with neither a file nor a seed to apply stays pending.
+    #[cfg(feature = "policy")]
+    #[tokio::test]
+    async fn a_pending_seed_with_nothing_to_seed_stays_pending() {
+        let state = crate::serve::test_support::test_state();
+        state.set_policy_seed_pending(true);
+        retry_policy_seed(&state).await.unwrap();
+        assert!(state.policy_seed_pending());
+    }
+
     #[tokio::test]
     async fn metrics_upkeep_drains_histograms_on_its_own() {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();

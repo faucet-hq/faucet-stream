@@ -3294,4 +3294,92 @@ mod tests {
             Err(ServeError::Conflict(_))
         ));
     }
+
+    /// Sealed schedule params never leave the server, not even as
+    /// ciphertext; plain values are left as they are.
+    #[test]
+    fn a_schedule_change_shows_its_sealed_params_masked() {
+        let c = stored(
+            ChangeKind::Schedule,
+            json!({"action": "create", "name": "n", "spec": {"template": {"params": {
+                "token": {"$sealed": "ciphertext"},
+                "region": "eu",
+                "odd": {"$sealed": "x", "other": 1}
+            }}}}),
+            "m",
+            1,
+        );
+        let shown = c.redacted_for(&actor("alice"));
+        let params = &shown.payload["spec"]["template"]["params"];
+        assert_eq!(params["token"], json!({"$sealed": true}));
+        assert_eq!(params["region"], "eu");
+        assert_eq!(params["odd"]["$sealed"], "x");
+    }
+
+    /// A schedule change one approver may meet by any of its rules: one
+    /// who meets none is refused, approving or rejecting.
+    #[tokio::test]
+    async fn a_schedule_change_refuses_an_approver_who_meets_no_rule() {
+        let state = crate::serve::test_support::test_state();
+        let c = stored(
+            ChangeKind::Schedule,
+            json!({"action": "delete", "name": "n"}),
+            "m",
+            1,
+        );
+        save(&state, &c).await.unwrap();
+        let operator = AuthContext {
+            principal: "olga".into(),
+            role: Role::Operator,
+            source_ip: None,
+            tenant: None,
+        };
+        let e = approve(&state, &operator, &c.id, None).await.unwrap_err();
+        assert!(matches!(e, ServeError::Forbidden(_)), "{e:?}");
+        let e = reject(&state, &operator, &c.id, "no".into())
+            .await
+            .unwrap_err();
+        assert!(matches!(e, ServeError::Forbidden(_)), "{e:?}");
+        assert_eq!(
+            get(&state, &c.id).await.unwrap().status,
+            ChangeStatus::Pending
+        );
+    }
+
+    /// An approved schedule change applies to the schedule it was proposed
+    /// for; one that names none is invalidated and changes nothing.
+    #[cfg(all(feature = "schedule", feature = "templates"))]
+    #[tokio::test]
+    async fn an_approved_schedule_change_that_names_no_schedule_is_invalidated() {
+        use crate::serve::history::schedules::{ScheduleRecord, ScheduleSpec};
+        let state = crate::serve::test_support::test_state();
+        let spec: ScheduleSpec = serde_json::from_value(
+            json!({"name": "n", "cron": "0 2 * * *", "template": {"id": "t"}}),
+        )
+        .unwrap();
+        let r = ScheduleRecord::new(spec, None, "ops", Utc::now());
+        assert!(state.history().schedule_insert(&r).await.unwrap());
+        let payload = json!({"action": "delete", "name": "n"});
+        let requester = AuthContext {
+            principal: "bob".into(),
+            role: Role::Operator,
+            source_ip: None,
+            tenant: None,
+        };
+        let plan = plan_schedule(&state, &requester, &payload).await.unwrap();
+        let mut c = stored(ChangeKind::Schedule, payload, &plan.material, 1);
+        c.plan = Some(plan);
+        save(&state, &c).await.unwrap();
+        let out = approve(&state, &actor("alice"), &c.id, None).await.unwrap();
+        assert_eq!(out.status, ChangeStatus::Invalidated);
+        assert!(
+            out.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("names no schedule"),
+            "{:?}",
+            out.error
+        );
+        assert!(state.history().schedule_get("n").await.unwrap().is_some());
+    }
 }

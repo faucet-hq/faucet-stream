@@ -293,6 +293,20 @@ async fn an_unreachable_backend_degrades_runs_refuses_the_registry_fences_and_re
         assert_eq!(status("/v1/policy").await, 503);
         assert_eq!(status("/v1/policy/versions").await, 503);
     }
+    // Nor are tenants, which answer 503 rather than an internal error.
+    #[cfg(feature = "tenants")]
+    {
+        assert_eq!(status("/v1/tenants").await, 503);
+        assert_eq!(status("/v1/tenants/acme").await, 503);
+    }
+    // A sealed run's values cannot be opened now: retry later, not a failure.
+    let sealed = faucet_cli::serve::sealed::unseal(&state, "r1", "token: ${sealed:0}")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(sealed, faucet_cli::serve::error::ServeError::Unavailable(_)),
+        "{sealed:?}"
+    );
 
     let token = CancellationToken::new();
     state.registry().register("local-run".into(), token.clone());

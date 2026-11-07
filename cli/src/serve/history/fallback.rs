@@ -1780,4 +1780,41 @@ mod tests {
         );
         assert!(!fb.degraded());
     }
+
+    /// The peer sweep and the status-only finalize go to the primary while
+    /// it is healthy; the status-only finalize fills in the elapsed time.
+    #[tokio::test]
+    async fn the_peer_sweep_and_status_finalize_reach_the_primary() {
+        let fb = FallbackHistory::healthy(
+            Box::new(MemoryHistory::new(Duration::from_secs(60))),
+            Duration::from_secs(60),
+            "sqlite",
+        );
+        assert_eq!(fb.recover_orphans_of_peers(&[]).await.unwrap(), 0);
+        let started = Utc::now() - chrono::Duration::seconds(3);
+        let mut rec = RunRecord::queued("r".into(), None, Default::default(), None, started);
+        rec.status = RunStatus::Running;
+        rec.started_at = Some(started);
+        fb.upsert(&rec).await.unwrap();
+        let written = fb
+            .finalize_status_owned("r", RunStatus::Failed, Utc::now(), Some("lost".into()))
+            .await
+            .unwrap()
+            .expect("written");
+        assert_eq!(written.status, RunStatus::Failed);
+        assert!(written.elapsed_secs.unwrap() >= 3.0);
+        assert!(
+            fb.finalize_status_owned("r", RunStatus::Completed, Utc::now(), None)
+                .await
+                .unwrap()
+                .is_none(),
+            "already terminal"
+        );
+        assert!(
+            fb.finalize_status_owned("nope", RunStatus::Failed, Utc::now(), None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 }
