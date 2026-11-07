@@ -293,8 +293,12 @@ shard or resume on another replica enforces those versions rather than a newer
 one. A run admitted while a layer had no stored policy stays unchecked on that
 layer when it is reloaded, rather than meeting a version approved after it. A
 run admitted under a `--policy` file (`--policy-store file`) records the
-SHA-256 of the file's canonical policy and the server stores that content, so
-every replica enforces it, whatever file it was started with. A record from
+SHA-256 of the file's canonical policy. The server stores that content once,
+at startup, under its address, and every replica loads a pinned run's policy
+from there, whatever file it was started with; only a run whose pinned content
+is not stored is refused. Until the content is stored (the history was
+unreachable at startup) `/readyz` shows `policy_seed: "pending"` and new work
+answers `503`. A record from
 1.17.0 has no pin: the newest policy applies to it.
 
 **Upgrading a cluster.** A replica from before 1.18 does not enforce pinned

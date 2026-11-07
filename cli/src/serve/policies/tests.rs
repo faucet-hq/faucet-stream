@@ -330,8 +330,8 @@ async fn a_run_keeps_the_file_policy_it_was_admitted_under() {
         effective(&state, None, Some(&pin)).await,
         Err(ServeError::Unprocessable { .. })
     ));
-    store_file_pin(&state, &pin).await.unwrap();
-    store_file_pin(&state, &pin).await.unwrap();
+    store_file_scope(&state).await.unwrap();
+    store_file_scope(&state).await.unwrap();
     // A replica started with another file still enforces the pinned content.
     let other = parse_draft(&SERVER.replace("[eu]", "[eu, us]")).unwrap();
     state.set_policy(std::sync::Arc::new(other));
@@ -353,6 +353,54 @@ async fn a_run_keeps_the_file_policy_it_was_admitted_under() {
     assert_eq!(
         server_layer(&state).await.unwrap().source,
         PolicySource::File
+    );
+}
+
+/// A `--policy-store file` server stores the file's content once, at
+/// startup, and admits nothing until it has; admissions then pin the cached
+/// address and write nothing (#1051).
+#[tokio::test]
+async fn a_policy_file_is_stored_once_at_startup_and_waits_for_the_history() {
+    use crate::serve::config::PolicyStore;
+    use crate::serve::server::{apply_policy_file, retry_policy_seed};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("policy.yaml");
+    std::fs::write(&path, SERVER).unwrap();
+    let spec: std::sync::Arc<PolicySpec> = std::sync::Arc::new(parse_draft(SERVER).unwrap());
+    let sha = file_sha256(&spec);
+    let scope = crate::serve::history::policies::file_scope(&sha);
+    let (state, down) = crate::serve::test_support::flaky_state();
+    down.store(true, std::sync::atomic::Ordering::Release);
+    apply_policy_file(&state, PolicyStore::File, spec.clone(), &path)
+        .await
+        .unwrap();
+    assert!(state.policy_seed_pending());
+    assert!(crate::runtime::server::refuse_while_unavailable(&state).is_err());
+    down.store(false, std::sync::atomic::Ordering::Release);
+    assert!(state.history().recover_degraded().await);
+    retry_policy_seed(&state).await.unwrap();
+    assert!(!state.policy_seed_pending());
+    assert!(crate::runtime::server::refuse_while_unavailable(&state).is_ok());
+    let stored = state.history().policy_version_get(&scope, 1).await.unwrap();
+    assert_eq!(spec_of(&stored.unwrap()).unwrap(), *spec);
+    // Admission pins the cached address and stores nothing more.
+    let before = state
+        .history()
+        .policy_versions(&scope, 0)
+        .await
+        .unwrap()
+        .len();
+    let (_, pin) = effective(&state, None, None).await.unwrap();
+    assert_eq!(pin.file_sha256.as_deref(), Some(sha.as_str()));
+    assert_eq!(state.policy_sha256().as_deref(), Some(sha.as_str()));
+    assert_eq!(
+        state
+            .history()
+            .policy_versions(&scope, 0)
+            .await
+            .unwrap()
+            .len(),
+        before
     );
 }
 
@@ -559,9 +607,10 @@ async fn impact_compares_runs_and_templates_before_and_after() {
 
     // No policy before, the server's after.
     let first = impact(&state, None, None, &server).await.unwrap();
+    assert_eq!(first.runs_checked, 5);
     assert_eq!(
-        first.runs_checked, 5,
-        "the garbled and bodiless runs are skipped"
+        first.runs_runtime_only, 2,
+        "the garbled and bodiless runs are counted, not skipped"
     );
     let refused: Vec<&str> = first.newly_refused.iter().map(|e| e.id.as_str()).collect();
     assert!(
@@ -925,6 +974,46 @@ async fn a_server_draft_must_keep_each_tenant_merge_valid() {
             .await
             .unwrap()
             .is_empty()
+    );
+}
+
+/// A projection keeps the `vars:` and `params:` entries its kept fields
+/// reference, so it still loads; a secret param keeps no value, and an
+/// unreferenced var is dropped.
+#[test]
+fn a_projection_keeps_the_vars_and_params_it_references() {
+    use crate::serve::load::ConfigFormat;
+    let body = "version: 1\nname: p\nvars:\n  region: '${vars.zone}'\n  zone: eu\n  token: hunter2\nparams:\n  tier: { type: string, default: gold }\n  api_key: { type: string, secret: true, default: hunter2 }\n  unused: { type: string, default: hunter2 }\npipeline:\n  source: { type: csv, config: { path: in.csv, key: '${param.api_key}' } }\n  contract: { version: \"1\", fields: [ { name: email, type: string } ] }\n  sink: { type: jsonl, attributes: { residency: '${vars.region}', tier: '${param.tier}', key: '${param.api_key}' }, config: { path: out.jsonl } }\n";
+    let p = projection(body, ConfigFormat::Yaml);
+    assert!(!p.opaque);
+    let text = serde_json::to_string(&p).unwrap();
+    assert!(!text.contains("hunter2"), "{text}");
+    let doc = p.config.unwrap();
+    assert_eq!(doc["vars"]["region"], "${vars.zone}");
+    assert_eq!(doc["vars"]["zone"], "eu");
+    assert!(doc["vars"].get("token").is_none());
+    assert_eq!(doc["params"]["tier"]["default"], "gold");
+    assert!(doc["params"]["api_key"].get("default").is_none());
+    assert!(doc["params"].get("unused").is_none());
+    let cfg = probe_config_value(doc).expect("the projection loads");
+    let full = probe_config(body, ConfigFormat::Yaml).expect("the config loads");
+    let sink = cfg.pipeline.sink.unwrap();
+    let full = full.pipeline.sink.unwrap();
+    for attr in ["residency", "tier"] {
+        assert_eq!(
+            sink.attributes.get(attr),
+            full.attributes.get(attr),
+            "{attr}"
+        );
+    }
+    // The secret param binds to a placeholder, never its value.
+    assert_ne!(
+        sink.attributes.get("key").map(String::as_str),
+        Some("hunter2")
+    );
+    assert_eq!(
+        sink.attributes.get("tier").map(String::as_str),
+        Some("gold")
     );
 }
 

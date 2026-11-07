@@ -81,6 +81,57 @@ pub async fn find(state: &ServerState, name: &str) -> Result<Option<Found>, Serv
         }))
 }
 
+/// Give a record stored before schedules had ids (#1051) a fresh one, and
+/// persist it. Values sealed under its old empty id no longer open, so its
+/// secret params must be supplied again.
+pub async fn ensure_id(
+    state: &ServerState,
+    record: ScheduleRecord,
+) -> Result<ScheduleRecord, ServeError> {
+    let history = state.history();
+    let mut current = record;
+    for _ in 0..5 {
+        if !current.id.is_empty() {
+            return Ok(current);
+        }
+        let mut next = current.clone();
+        next.id = uuid::Uuid::new_v4().to_string();
+        next.revision += 1;
+        if history
+            .schedule_replace(&current, &next)
+            .await
+            .map_err(store_err)?
+        {
+            tracing::warn!(
+                schedule = %next.spec.name,
+                "the schedule was stored before schedules had ids: gave it one; its secret params \
+                 must be supplied again"
+            );
+            return Ok(next);
+        }
+        current = history
+            .schedule_get(&current.spec.name)
+            .await
+            .map_err(store_err)?
+            .ok_or(ServeError::NotFound)?;
+    }
+    Err(ServeError::Conflict(format!(
+        "schedule '{}' kept changing; try again",
+        current.spec.name
+    )))
+}
+
+/// The stored record named `name`, with an id (see [`ensure_id`]).
+async fn stored_with_id(
+    state: &ServerState,
+    name: &str,
+) -> Result<Option<ScheduleRecord>, ServeError> {
+    match find(state, name).await?.and_then(|f| f.record) {
+        Some(r) => ensure_id(state, r).await.map(Some),
+        None => Ok(None),
+    }
+}
+
 /// Every schedule, the file's first.
 pub async fn all(state: &ServerState) -> Result<Vec<Found>, ServeError> {
     let mut out: Vec<Found> = state
@@ -1004,10 +1055,9 @@ pub async fn prepare_change(
         .map_err(|e| ServeError::BadConfig(format!("schedule change payload: {e}")))?;
     p.schedule_id = match p.action {
         ChangeAction::Create => Some(uuid::Uuid::new_v4().to_string()),
-        ChangeAction::Update | ChangeAction::Delete => find(state, &p.name)
-            .await?
-            .and_then(|f| f.record)
-            .map(|r| r.id),
+        ChangeAction::Update | ChangeAction::Delete => {
+            stored_with_id(state, &p.name).await?.map(|r| r.id)
+        }
     };
     if p.spec.is_some() {
         p.spec = plan_inner(state, actor, &p, false).await?.spec;
@@ -1035,10 +1085,7 @@ pub async fn apply(
     if p.schedule_id.is_none() {
         p.schedule_id = match p.action {
             ChangeAction::Create => Some(uuid::Uuid::new_v4().to_string()),
-            _ => find(state, &p.name)
-                .await?
-                .and_then(|f| f.record)
-                .map(|r| r.id),
+            _ => stored_with_id(state, &p.name).await?.map(|r| r.id),
         };
     }
     let planned = plan_inner(state, actor, &p, approved).await?;
@@ -1663,6 +1710,41 @@ mod tests {
     async fn store(state: &ServerState, spec: ScheduleSpec, tenant: Option<&str>) {
         let r = ScheduleRecord::new(spec, tenant.map(str::to_string), "ops", Utc::now());
         assert!(state.history().schedule_insert(&r).await.unwrap());
+    }
+
+    /// A record stored before schedules had ids gets a fresh one, persisted
+    /// once, and its old sealed values fail its ticks with a clear message.
+    #[tokio::test]
+    async fn a_record_without_an_id_gets_one_and_its_old_secrets_do_not_open() {
+        let state = crate::serve::test_support::test_state();
+        let spec = spec_of(json!({
+            "name": "legacy", "cron": "0 2 * * *",
+            "template": {"id": "t", "params": {"token": {"$sealed": "old"}}}
+        }));
+        let mut legacy = ScheduleRecord::new(spec.clone(), None, "ops", Utc::now());
+        legacy.id = String::new();
+        assert!(state.history().schedule_insert(&legacy).await.unwrap());
+        let wanted = super::super::runner::wanted(&state).await.unwrap();
+        assert_eq!(wanted.len(), 1);
+        let stored = state
+            .history()
+            .schedule_get("legacy")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!stored.id.is_empty());
+        assert_eq!(stored.revision, legacy.revision + 1);
+        // Already given one: kept as it is.
+        let again = ensure_id(&state, stored.clone()).await.unwrap();
+        assert_eq!(again, stored);
+        let tick = Utc::now();
+        let r = fire::fire_tick(&state, &spec, None, tick, tick, &Default::default()).await;
+        match &r.targets[0].1 {
+            fire::TargetResult::Failed(e) => {
+                assert!(e.contains("supply its secret params again"), "{e}")
+            }
+            other => panic!("expected a failed target, got {other:?}"),
+        }
     }
 
     #[test]

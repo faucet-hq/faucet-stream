@@ -1521,7 +1521,6 @@ impl Stmts {
         (format!("{head} GROUP BY status"), binds)
     }
 
-    /// The dialect's positional placeholder for the `n`-th (1-based) bind.
     /// `renew_leases` leaving out `skip` ids (binds: lease, owner, ids…).
     pub fn renew_leases_except_query(&self, skip: usize) -> String {
         if skip == 0 {
@@ -1547,6 +1546,7 @@ impl Stmts {
         format!("{} AND ({keep})", self.select_orphans)
     }
 
+    /// The dialect's positional placeholder for the `n`-th (1-based) bind.
     fn placeholder(&self, n: usize) -> String {
         match self.dialect {
             Dialect::Postgres => format!("${n}"),

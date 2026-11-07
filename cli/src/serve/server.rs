@@ -814,22 +814,29 @@ pub(crate) async fn lease_loop(state: ServerState, period: Duration, shutdown: C
                         Ok(_) => {}
                         Err(e) => tracing::warn!(error = %e, "orphan recovery failed"),
                     }
-                    for id in forgotten {
-                        if let Ok(Some(rec)) = state.history().get(&id).await
-                            && rec.status.is_terminal()
-                        {
-                            state.clear_forgotten_run(&id);
-                        }
-                    }
                 }
+                clear_settled_forgotten(&state).await;
             }
+        }
+    }
+}
+
+/// Drop from the forgotten set every run whose record is now terminal, or
+/// gone, so the set stays bounded (#1050).
+async fn clear_settled_forgotten(state: &ServerState) {
+    for id in state.forgotten_runs() {
+        match state.history().get(&id).await {
+            Ok(Some(rec)) if !rec.status.is_terminal() => {}
+            Ok(_) => state.clear_forgotten_run(&id),
+            Err(_) => {}
         }
     }
 }
 
 /// Put the `--policy` file in its place (#1043). With `--policy-store file`,
 /// or with nowhere to keep versions (in-memory history), the file is the
-/// policy. Otherwise it only seeds an empty store; a store that already holds
+/// policy, and its content is stored once under its content address for the
+/// runs pinned to it (#1051). Otherwise it only seeds an empty store; a store that already holds
 /// a version keeps it, and a file that differs is reported, not applied.
 /// While the history is unreachable the seed stays pending and admission
 /// waits for it (#1050); any other failure is the caller's.
@@ -846,7 +853,10 @@ pub async fn apply_policy_file(
         tracing::info!(rules = policy.rules.len(), path = %file.path, "data-flow policy loaded from file");
         state.set_policy(policy);
         state.set_policy_file(file);
-        return Ok(());
+        // Runs are pinned to its content, stored once here; until it is,
+        // nothing is admitted (#1051).
+        state.set_policy_seed_pending(true);
+        return retry_policy_seed(state).await;
     }
     state.set_policy_seed(PolicySeed {
         file,
@@ -862,7 +872,27 @@ pub async fn apply_policy_file(
 #[cfg(feature = "policy")]
 pub async fn retry_policy_seed(state: &ServerState) -> Result<(), crate::serve::error::ServeError> {
     use crate::serve::policies::{self, SeedOutcome};
-    let Some(seed) = state.policy_seed().filter(|_| state.policy_seed_pending()) else {
+    if !state.policy_seed_pending() {
+        return Ok(());
+    }
+    if state.policy_file().is_some() {
+        return match policies::store_file_scope(state).await {
+            Ok(()) => {
+                state.set_policy_seed_pending(false);
+                Ok(())
+            }
+            Err(crate::serve::error::ServeError::Unavailable(m)) => {
+                tracing::warn!(
+                    error = %m,
+                    "the run history is unreachable: the --policy file is stored once it \
+                     answers, and new work waits until then"
+                );
+                Ok(())
+            }
+            Err(e) => Err(e),
+        };
+    }
+    let Some(seed) = state.policy_seed() else {
         return Ok(());
     };
     match policies::seed_store(state, &seed).await {

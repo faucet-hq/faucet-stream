@@ -1814,8 +1814,10 @@ backend is unreachable and the server admits no new work),
 `faucet_serve_pending_finalize` (finished runs' terminal records waiting for
 the history to take them), `faucet_serve_pending_finalize_dropped_total`
 (terminal records dropped after the history kept refusing them),
-`faucet_serve_policy_seed_pending` (the `--policy` file has not seeded the
-policy store yet), `faucet_serve_run_reload_retries_total` (claimed runs whose
+`faucet_serve_pending_finalize_refused_total` (cluster mode: terminal statuses
+the history refused; kept and retried with a backoff),
+`faucet_serve_policy_seed_pending` (the `--policy` file is not in the policy
+store yet), `faucet_serve_run_reload_retries_total` (claimed runs whose
 config could not be re-loaded yet and is retried in place),
 `faucet_serve_policy_merge_failures_total{tenant}` (a tenant's policy no
 longer merges with the server's; its runs are refused) and

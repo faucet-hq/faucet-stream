@@ -264,7 +264,7 @@ pub fn refuse_while_unavailable(state: &ServerState) -> Result<(), ServeError> {
     #[cfg(feature = "policy")]
     if state.policy_seed_pending() {
         return Err(ServeError::Unavailable(
-            "policy unavailable: the --policy file has not seeded the policy store yet (the run \
+            "policy unavailable: the --policy file is not in the policy store yet (the run \
              history was unreachable at startup); retry later"
                 .into(),
         ));

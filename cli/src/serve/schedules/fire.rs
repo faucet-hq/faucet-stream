@@ -460,6 +460,16 @@ pub async fn fire_tick(
             };
         }
     };
+    // Sealed params are opened once per tick, for every target.
+    let spec = match open_params(state, spec, opts).await {
+        Ok(s) => s,
+        Err(e) => {
+            return TickResult {
+                targets: targets.into_iter().map(|t| (t, e.clone())).collect(),
+            };
+        }
+    };
+    let spec = &spec;
     // A fan-out's tenants are submitted side by side (bounded), in order.
     use futures::StreamExt;
     let results: Vec<(Option<String>, TargetResult)> = futures::stream::iter(targets)
@@ -505,11 +515,7 @@ async fn fire_target(
             Err(e) => return TargetResult::Retry(format!("checking for an earlier run: {e}")),
         }
     }
-    let spec = match open_params(state, spec, opts).await {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-    let body = match body(&spec, tick, fired_at, opts, tenant) {
+    let body = match body(spec, tick, fired_at, opts, tenant) {
         Ok(b) => b,
         Err(e) => return TargetResult::Failed(e),
     };
@@ -884,6 +890,163 @@ mod tests {
             let r = fire_tick(&state, &fan, None, tick, tick, &FireOptions::default()).await;
             let tenants: Vec<_> = r.targets.iter().map(|(t, _)| t.as_deref()).collect();
             assert_eq!(tenants, vec![Some("acme")], "{r:?}");
+        }
+    }
+
+    /// An in-memory history that counts schedule reads.
+    #[cfg(feature = "tenants")]
+    struct CountingGets {
+        inner: crate::serve::history::memory::MemoryHistory,
+        gets: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(feature = "tenants")]
+    #[async_trait::async_trait]
+    impl crate::serve::history::RunHistory for CountingGets {
+        async fn claim_idempotency(
+            &self,
+            key: &str,
+            fingerprint: &str,
+            run_id: &str,
+            window: std::time::Duration,
+        ) -> Result<crate::serve::history::Claim, crate::serve::history::HistoryError> {
+            self.inner
+                .claim_idempotency(key, fingerprint, run_id, window)
+                .await
+        }
+        async fn upsert(
+            &self,
+            rec: &crate::serve::history::RunRecord,
+        ) -> Result<(), crate::serve::history::HistoryError> {
+            self.inner.upsert(rec).await
+        }
+        async fn get(
+            &self,
+            id: &str,
+        ) -> Result<Option<crate::serve::history::RunRecord>, crate::serve::history::HistoryError>
+        {
+            self.inner.get(id).await
+        }
+        async fn list(
+            &self,
+            filter: &ListFilter,
+        ) -> Result<crate::serve::history::ListPage, crate::serve::history::HistoryError> {
+            self.inner.list(filter).await
+        }
+        async fn delete(
+            &self,
+            id: &str,
+        ) -> Result<crate::serve::history::DeleteOutcome, crate::serve::history::HistoryError>
+        {
+            self.inner.delete(id).await
+        }
+        async fn purge_expired(
+            &self,
+            retain_for: std::time::Duration,
+        ) -> Result<usize, crate::serve::history::HistoryError> {
+            self.inner.purge_expired(retain_for).await
+        }
+        async fn recover_orphans(&self) -> Result<usize, crate::serve::history::HistoryError> {
+            self.inner.recover_orphans().await
+        }
+        fn degraded(&self) -> bool {
+            false
+        }
+        async fn schedule_insert(
+            &self,
+            r: &crate::serve::history::schedules::ScheduleRecord,
+        ) -> Result<bool, crate::serve::history::HistoryError> {
+            self.inner.schedule_insert(r).await
+        }
+        async fn schedule_get(
+            &self,
+            name: &str,
+        ) -> Result<
+            Option<crate::serve::history::schedules::ScheduleRecord>,
+            crate::serve::history::HistoryError,
+        > {
+            self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.schedule_get(name).await
+        }
+        async fn tenant_upsert(
+            &self,
+            t: &crate::serve::history::tenants::TenantRecord,
+        ) -> Result<(), crate::serve::history::HistoryError> {
+            self.inner.tenant_upsert(t).await
+        }
+        async fn tenant_get(
+            &self,
+            id: &str,
+        ) -> Result<
+            Option<crate::serve::history::tenants::TenantRecord>,
+            crate::serve::history::HistoryError,
+        > {
+            self.inner.tenant_get(id).await
+        }
+        async fn tenant_list(
+            &self,
+        ) -> Result<
+            Vec<crate::serve::history::tenants::TenantRecord>,
+            crate::serve::history::HistoryError,
+        > {
+            self.inner.tenant_list().await
+        }
+    }
+
+    /// A fan-out tick reads the stored schedule and opens its sealed params
+    /// once, not once per tenant.
+    #[cfg(feature = "tenants")]
+    #[tokio::test]
+    async fn a_fan_out_tick_reads_the_schedule_once() {
+        let history = std::sync::Arc::new(CountingGets {
+            inner: crate::serve::history::memory::MemoryHistory::new(
+                std::time::Duration::from_secs(60),
+            ),
+            gets: Default::default(),
+        });
+        let state = ServerState::new(
+            &crate::serve::test_support::test_config(),
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            history.clone(),
+            crate::serve::logs::LogHub::new(),
+            None,
+            #[cfg(feature = "triggers")]
+            crate::serve::triggers::health::TriggersHandle::empty(),
+        );
+        for id in ["acme", "globex", "initech"] {
+            let t: crate::serve::history::tenants::TenantRecord = serde_json::from_value(json!({
+                "id": id, "created_by": "ops",
+                "created_at": "2026-11-05T00:00:00Z", "updated_at": "2026-11-05T00:00:00Z"
+            }))
+            .unwrap();
+            state.history().tenant_upsert(&t).await.unwrap();
+        }
+        let mut fan = plain();
+        fan.tenants = Some(crate::serve::history::tenants::TenantSelector::All(
+            "all".into(),
+        ));
+        fan.template.params.insert(
+            "token".into(),
+            json!({ super::super::secrets::SEALED: "x" }),
+        );
+        let record = crate::serve::history::schedules::ScheduleRecord::new(
+            fan.clone(),
+            None,
+            "ops",
+            Utc::now(),
+        );
+        assert!(state.history().schedule_insert(&record).await.unwrap());
+        let tick = at("2026-11-05T02:00:00Z");
+        let r = fire_tick(&state, &fan, None, tick, tick, &FireOptions::default()).await;
+        assert_eq!(r.targets.len(), 3, "{r:?}");
+        assert_eq!(history.gets.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Every tenant reports why its target did not start.
+        for (_, result) in &r.targets {
+            assert!(
+                matches!(result, TargetResult::Failed(e) if e.contains("template.params.token")),
+                "{result:?}"
+            );
         }
     }
 }

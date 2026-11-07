@@ -670,14 +670,16 @@ impl HistoryError {
         matches!(self, Self::PoolTimedOut(_))
     }
 
-    /// Whether retrying the failed call could plausibly succeed. Everything but
-    /// a *typed-permanent* failure qualifies — see [`Transience::Unknown`] for
-    /// why the unclassified case errs toward retrying.
+    /// Whether the failure is known to resolve itself ([`Transience::Transient`]):
+    /// an unreachable or degraded backend, a pool timeout. Unclassified
+    /// failures are not.
     pub fn is_transient(&self) -> bool {
         self.transience() == Transience::Transient
     }
 
-    /// Whether retrying the failed call could plausibly succeed (see below).
+    /// Whether retrying the failed call could plausibly succeed. Everything but
+    /// a *typed-permanent* failure qualifies — see [`Transience::Unknown`] for
+    /// why the unclassified case errs toward retrying.
     pub fn is_retriable(&self) -> bool {
         self.transience() != Transience::Permanent
     }
@@ -2473,8 +2475,6 @@ pub trait RunHistory: Send + Sync {
         Ok(())
     }
 
-    /// While degraded, probe the persistent backend and leave degraded mode
-    /// if it answers. Returns whether it recovered. Default: nothing to recover.
     /// The recovery probe: a write the backend must accept to count as
     /// healthy again, so a primary that answers reads but refuses writes (a
     /// read-only standby after failover) stays degraded (#1050). Default: a
@@ -2485,6 +2485,8 @@ pub trait RunHistory: Send + Sync {
             .map(|_| ())
     }
 
+    /// While degraded, probe the persistent backend and leave degraded mode
+    /// if it answers. Returns whether it recovered. Default: nothing to recover.
     async fn recover_degraded(&self) -> bool {
         false
     }

@@ -293,9 +293,12 @@ record, so its name, labels and tenant are kept — is written owner-fenced; one
 the backend does not take is held and retried from every lease tick until it
 lands. The completion callback, the run metrics and the tenant counters follow
 only a landed write. A record the backend keeps refusing for good falls back,
-after five refusals, to its status alone; if that is refused as well it is
-dropped (logged, counted in `faucet_serve_pending_finalize_dropped_total`) and
-the run is left to orphan recovery. `faucet_serve_pending_finalize` counts what
+after five refusals, to its status alone. On a single server a refused status
+is dropped (logged, counted in `faucet_serve_pending_finalize_dropped_total`)
+and orphan recovery marks the run `failed`. In a cluster it is never dropped:
+the replica keeps the run's lease, so no peer runs it again, and retries the
+status with a backoff of up to ten minutes (counted in
+`faucet_serve_pending_finalize_refused_total`). `faucet_serve_pending_finalize` counts what
 waits (alert `FaucetServePendingFinalize`). A server that stops while records
 are held loses them; orphan recovery then marks those runs `failed`. Re-running
 such a run is safe: bookmarks advance only after the sink confirms a write.
@@ -304,8 +307,9 @@ Every lease tick probes a degraded backend with a no-op write — so a primary
 that answers reads but refuses writes stays degraded — or, when it was
 unreachable at startup, tries to connect again; the server leaves degraded
 mode once the write succeeds. `/readyz` reports `degraded: {since}` while it
-lasts. A `--policy` file that should seed the policy store waits for the
-history the same way: until it has seeded the store, `/readyz` shows
+lasts. A `--policy` file that seeds the policy store (or, with
+`--policy-store file`, is stored for the runs pinned to it) waits for the
+history the same way: until it is stored, `/readyz` shows
 `policy_seed: "pending"` and new work answers `503`. Terminal records are
 retained for `--retain-terminal-runs-secs` (default 7 days).
 

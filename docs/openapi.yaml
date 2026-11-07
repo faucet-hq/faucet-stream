@@ -3331,7 +3331,7 @@ paths:
         (while the backend is unreachable, so no new work is admitted: `since`
         — null otherwise), `pending_finalize` (finished runs whose terminal
         record waits for the history), `policy_seed` (`pending` while the
-        `--policy` file has not seeded the policy store — new work waits for
+        `--policy` file is not in the policy store yet — new work waits for
         it — null otherwise), `draining`, and
         a `cluster` object (`enabled` bool, `instances` live-member count,
         this replica's `pools`, and the live `members` with the pools each
@@ -3362,7 +3362,7 @@ paths:
                     properties:
                       since: { type: string, format: date-time, nullable: true }
                   pending_finalize: { type: integer, description: "Finished runs whose terminal record waits for the history; retried from every lease tick (#1050)." }
-                  policy_seed: { type: string, nullable: true, enum: [pending], description: "`pending` while the --policy file has not seeded the policy store; new work answers 503 until it has (#1050)." }
+                  policy_seed: { type: string, nullable: true, enum: [pending], description: "`pending` while the --policy file is not in the policy store yet; new work answers 503 until it has (#1050)." }
                   draining: { type: boolean, description: "true once shutdown began; new work is refused." }
                   cluster:
                     type: object
@@ -4420,6 +4420,7 @@ components:
             id: { type: string }
             version: { type: integer }
         error: { type: string, description: "Why execution failed or the approval was invalidated." }
+        deferred: { type: boolean, description: "Approved, and its execution was refused for a reason that passes on its own (the history unreachable, a full queue): the server runs it again. Omitted when false." }
     CostSignal:
       type: object
       description: A backend-reported usage figure a connector learned during the run (BigQuery `bytes_billed`, a streaming insert's payload size, …).

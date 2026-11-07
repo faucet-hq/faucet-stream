@@ -28,6 +28,19 @@ pub struct Scope<'a> {
     pub tenant: Option<&'a str>,
 }
 
+/// A record stored before schedules had ids (#1051) has none: nothing is
+/// sealed or opened under an empty id, which every such record would share.
+fn check_scope(scope: Scope<'_>) -> Result<(), String> {
+    if scope.id.is_empty() {
+        return Err(
+            "the schedule has no id yet, so its secret params cannot be sealed or opened; \
+             edit the schedule and supply its secret params again"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn context(scope: Scope<'_>, template: &str, param: &str) -> String {
     format!(
         "schedule:{}:tenant:{}:template:{template}:param:{param}",
@@ -85,6 +98,13 @@ pub fn seal(
     presealed: bool,
 ) -> Result<(), String> {
     let template = spec.template.id.clone();
+    let touches_secrets =
+        spec.template.params.iter().any(|(k, v)| {
+            is_keep_marker(v) || is_sealed(v) || (!v.is_null() && secret.contains(k))
+        });
+    if touches_secrets {
+        check_scope(scope)?;
+    }
     let moved = current.is_some_and(|c| c.template.id != template);
     let resupply: Vec<String> = spec
         .template
@@ -106,6 +126,10 @@ pub fn seal(
                 .and_then(|c| c.template.params.get(k))
                 .filter(|s| is_sealed(s))
                 .ok_or_else(|| format!("template.params.{k}: there is no stored value to keep"))?;
+            let text = sealed_text(stored).unwrap_or_default();
+            open_value(state, scope, &template, k, text).map_err(|e| {
+                format!("{e}; the stored value can no longer be opened, so supply it again")
+            })?;
             *v = stored.clone();
             continue;
         }
@@ -165,10 +189,13 @@ pub fn opened(
     if !spec.template.params.values().any(is_sealed) {
         return Ok(spec.clone());
     }
+    check_scope(scope)?;
     let mut out = spec.clone();
     for (k, v) in out.template.params.iter_mut() {
         if let Some(text) = sealed_text(v) {
-            *v = open_value(state, scope, &spec.template.id, k, text)?;
+            *v = open_value(state, scope, &spec.template.id, k, text).map_err(|e| {
+                format!("{e}; edit the schedule and supply its secret params again")
+            })?;
         }
     }
     Ok(out)
@@ -242,10 +269,10 @@ mod tests {
         let mut plain = spec(json!({"region": "eu"}));
         seal(&state, &mut plain, &["token".into()], None, SCOPE, false).unwrap();
         assert_eq!(plain.template.params["region"], json!("eu"));
-        // Keep marker: taken from the stored definition.
+        // Keep marker: a stored value that cannot be opened is not kept.
         let stored = spec(json!({"token": {"$sealed": "cipher"}}));
         let mut edit = spec(json!({"token": {"$sealed": true}}));
-        seal(
+        let e = seal(
             &state,
             &mut edit,
             &["token".into()],
@@ -253,8 +280,8 @@ mod tests {
             SCOPE,
             false,
         )
-        .unwrap();
-        assert_eq!(edit.template.params["token"], json!({"$sealed": "cipher"}));
+        .unwrap_err();
+        assert!(e.contains("supply it again"), "{e}");
         let mut orphan = spec(json!({"token": {"$sealed": true}}));
         assert!(seal(&state, &mut orphan, &["token".into()], None, SCOPE, false).is_err());
         // A caller may not hand in ciphertext, presealed or not, unless it opens.
@@ -324,5 +351,54 @@ mod tests {
         moved.template.id = "u".into();
         assert!(opened(&state, &moved, SCOPE).is_err());
         assert!(seal(&state, &mut moved, &["token".into()], None, SCOPE, true).is_err());
+        // Keep marker: a stored value that opens is kept as it is.
+        let mut edit = spec(json!({"token": {"$sealed": true}}));
+        seal(&state, &mut edit, &["token".into()], Some(&s), SCOPE, false).unwrap();
+        assert_eq!(edit.template.params["token"], s.template.params["token"]);
+    }
+
+    /// A record stored before schedules had ids has an empty id: nothing is
+    /// sealed or opened under it, since every such record would share it.
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn nothing_is_sealed_or_opened_under_an_empty_id() {
+        let state = crate::serve::test_support::test_state();
+        state.set_vault(Some(std::sync::Arc::new(
+            crate::serve::vault::Vault::new(&"k".repeat(32), &[]).unwrap(),
+        )));
+        let legacy = Scope {
+            id: "",
+            tenant: None,
+        };
+        let mut s = spec(json!({"token": "secret"}));
+        let e = seal(&state, &mut s, &["token".into()], None, legacy, false).unwrap_err();
+        assert!(e.contains("supply its secret params again"), "{e}");
+        assert_eq!(s.template.params["token"], json!("secret"));
+        // A value sealed under an empty id (written before ids existed)
+        // does not open, there or under the id the record gets later.
+        let vault = state.vault().unwrap();
+        let old =
+            json!({ SEALED: vault.seal_for(&json!("secret"), &context(legacy, "t", "token")) });
+        let stored = spec(json!({ "token": old }));
+        let e = opened(&state, &stored, legacy).unwrap_err();
+        assert!(e.contains("supply its secret params again"), "{e}");
+        let e = opened(&state, &stored, SCOPE).unwrap_err();
+        assert!(e.contains("supply its secret params again"), "{e}");
+        let mut keep = spec(json!({"token": {"$sealed": true}}));
+        assert!(
+            seal(
+                &state,
+                &mut keep,
+                &["token".into()],
+                Some(&stored),
+                SCOPE,
+                false
+            )
+            .is_err()
+        );
+        // A plain spec needs no id.
+        let mut plain = spec(json!({"region": "eu"}));
+        seal(&state, &mut plain, &["token".into()], None, legacy, false).unwrap();
+        assert_eq!(opened(&state, &plain, legacy).unwrap(), plain);
     }
 }

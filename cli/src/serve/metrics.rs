@@ -90,6 +90,11 @@ pub fn record_pending_finalize_dropped() {
     metrics::counter!("faucet_serve_pending_finalize_dropped_total").increment(1);
 }
 
+/// A clustered run's terminal status the backend refused; kept and retried (#1050).
+pub fn record_pending_finalize_refused() {
+    metrics::counter!("faucet_serve_pending_finalize_refused_total").increment(1);
+}
+
 /// A claimed run whose config could not be re-loaded yet (#1051).
 pub fn record_run_reload_retry() {
     metrics::counter!("faucet_serve_run_reload_retries_total").increment(1);

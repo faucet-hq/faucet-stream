@@ -301,6 +301,11 @@ pub struct ChangeRequest {
     /// reference policy. Set by the server only.
     #[serde(default, skip_serializing_if = "crate::params::CallerFields::is_empty")]
     pub caller_params: crate::params::CallerFields,
+    /// Approved, and its execution was refused for a reason that passes on
+    /// its own (#1050): the reconcile sweep runs it again. Set by the server
+    /// only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deferred: bool,
 }
 
 impl ChangeRequest {
@@ -399,6 +404,7 @@ impl ChangeRequest {
             tenant: None,
             trusted_config: false,
             caller_params: Default::default(),
+            deferred: false,
         }
     }
 }
@@ -1199,6 +1205,7 @@ pub async fn create(
         tenant,
         trusted_config: new.trusted_config,
         caller_params: new.caller_params,
+        deferred: false,
     };
     save(state, &change).await?;
     record_metric(change.kind, "requested");
@@ -1705,6 +1712,7 @@ async fn execute(
                 fresh.summary["version"] = json!(v);
             }
             change.status = ChangeStatus::Executed;
+            change.deferred = false;
             change.run_id = run_id.clone();
             change.template = template;
             change.plan = Some(fresh);
@@ -1743,6 +1751,7 @@ async fn finish_invalidated(
     plan: Option<ChangePlan>,
 ) -> Result<ChangeRequest, ServeError> {
     change.status = ChangeStatus::Invalidated;
+    change.deferred = false;
     change.error = Some(crate::secrets::registry::redact_message(&why));
     if plan.is_some() {
         change.plan = plan;
@@ -1775,8 +1784,9 @@ fn temporary_refusal(e: &ServeError) -> bool {
 }
 
 /// An execution the server refused: a temporary refusal keeps the change
-/// `approved`, and [`reconcile_stale_approved`] runs it again later; any
-/// other refusal fails it.
+/// `approved` and marks it deferred, and [`reconcile_stale_approved`] runs it
+/// again later; any other refusal fails it. A registration that already
+/// stored its version is never run again (it would add another version).
 async fn finish_refused(
     state: &ServerState,
     actor: &AuthContext,
@@ -1786,6 +1796,17 @@ async fn finish_refused(
     if !temporary_refusal(&e) {
         return finish_failed(state, actor, change, e.to_string()).await;
     }
+    if change.kind == ChangeKind::TemplateRegister
+        && let Some(t) = &change.template
+    {
+        let why = format!(
+            "version {} of '{}' was registered, then {e}; finish its launch or channels \
+             with a new change",
+            t.version, t.id
+        );
+        return finish_failed(state, actor, change, why).await;
+    }
+    change.deferred = true;
     change.error = Some(crate::secrets::registry::redact_message(&format!(
         "{e}; the approved change runs again once the server can take it"
     )));
@@ -1924,6 +1945,7 @@ async fn finish_failed(
     error: String,
 ) -> Result<ChangeRequest, ServeError> {
     change.status = ChangeStatus::Failed;
+    change.deferred = false;
     change.error = Some(crate::secrets::registry::redact_message(&error));
     change.touch();
     save(state, &change).await?;
@@ -2004,12 +2026,13 @@ pub async fn expire_due(state: &ServerState) -> usize {
     n
 }
 
-/// Finish requests left `approved` by an execution that never recorded its
-/// outcome (a crash or a failed save between approval and `executed`). A run
-/// or launch is executed again — the run's `change:<id>` idempotency key
-/// replays the original submission, a launch of the live version is a no-op —
-/// and a registration, which would add a second version, fails with an
-/// explanation instead.
+/// Finish requests left `approved`: one whose execution was deferred (a
+/// temporary refusal) is executed again, whatever its kind; one whose
+/// execution never recorded its outcome (a crash or a failed save between
+/// approval and `executed`) is executed again too — the run's `change:<id>`
+/// idempotency key replays the original submission, a launch of the live
+/// version is a no-op — except a registration, which would add a second
+/// version and fails with an explanation instead.
 pub async fn reconcile_stale_approved(state: &ServerState) -> usize {
     let approved = match state
         .history()
@@ -2038,7 +2061,17 @@ pub async fn reconcile_stale_approved(state: &ServerState) -> usize {
             continue;
         }
         let actor = AuthContext::system("reconcile");
-        let done = if c.kind == ChangeKind::TemplateRegister {
+        let done = if c.kind == ChangeKind::TemplateRegister && c.deferred {
+            // Cleared before the attempt: one interrupted from here on is
+            // not known to be safe to run again.
+            let mut c = c;
+            c.deferred = false;
+            c.touch();
+            match save(state, &c).await {
+                Ok(()) => execute(state, &actor, c).await,
+                Err(e) => Err(e),
+            }
+        } else if c.kind == ChangeKind::TemplateRegister {
             finish_failed(
                 state,
                 &actor,
@@ -2188,6 +2221,7 @@ mod tests {
             tenant: Some("acme".into()),
             trusted_config: false,
             caller_params: Default::default(),
+            deferred: false,
         };
         assert!(ChangeListFilter::default().matches(&c));
         assert!(
@@ -2277,6 +2311,7 @@ mod tests {
             tenant: None,
             trusted_config: false,
             caller_params: Default::default(),
+            deferred: false,
         }
     }
 
@@ -2804,6 +2839,7 @@ mod tests {
             tenant: None,
             trusted_config: false,
             caller_params: Default::default(),
+            deferred: false,
         };
         store.change_upsert(&c).await.unwrap();
         let read = c.clone();
@@ -2907,6 +2943,69 @@ mod tests {
         ] {
             assert!(temporary_refusal(&e), "{e}");
         }
+    }
+
+    /// A deferred registration is run again by the sweep like any deferred
+    /// change; one whose version was already stored is never run again.
+    #[cfg(feature = "templates")]
+    #[tokio::test]
+    async fn the_sweep_runs_a_deferred_registration_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::serve::test_support::test_state();
+        let created = create(
+            &state,
+            &actor("bob"),
+            NewChange {
+                kind: ChangeKind::TemplateRegister,
+                payload: json!({"id": "tpl", "config": crate::templates::bundle::smoke(&csv_yaml(dir.path(), "tpl", ""))}),
+                reason: None,
+                budget: None,
+                trusted_config: false,
+                caller_params: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+        let c = get(&state, &created.id).await.unwrap();
+        let deferred = finish_refused(
+            &state,
+            &actor("alice"),
+            c,
+            ServeError::Unavailable("down".into()),
+        )
+        .await
+        .unwrap();
+        assert!(deferred.deferred);
+        let mut c = get(&state, &created.id).await.unwrap();
+        assert!(c.deferred, "the deferral is recorded");
+        c.status = ChangeStatus::Approved;
+        c.updated_at = Utc::now() - chrono::TimeDelta::minutes(10);
+        save(&state, &c).await.unwrap();
+        assert_eq!(reconcile_stale_approved(&state).await, 1);
+        let done = get(&state, &c.id).await.unwrap();
+        assert_eq!(done.status, ChangeStatus::Executed, "{:?}", done.error);
+        assert_eq!(done.template.as_ref().unwrap().version, 1);
+        assert!(!done.deferred);
+
+        // Registered, then a later step refused: failed, never run again.
+        let mut again = stored(ChangeKind::TemplateRegister, json!({"config": "x"}), "m", 1);
+        again.status = ChangeStatus::Approved;
+        again.template = Some(TemplateOutcome {
+            id: "tpl".into(),
+            version: 2,
+        });
+        save(&state, &again).await.unwrap();
+        let failed = finish_refused(
+            &state,
+            &actor("alice"),
+            again,
+            ServeError::Unavailable("down".into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed.status, ChangeStatus::Failed);
+        assert!(!failed.deferred);
+        assert!(failed.error.unwrap().contains("version 2"));
     }
 
     #[cfg(feature = "notify")]

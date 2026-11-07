@@ -341,6 +341,22 @@ fn default_max_concurrent() -> usize {
         .clamp(1, 16)
 }
 
+/// The approval rules a schedule change must meet under `require_approval`
+/// (#1051): `None` when schedule changes are not gated. Under `run`, a
+/// schedule change needs the run rule as well as its own.
+fn schedule_change_rules(
+    require_approval: &[crate::serve::changes::ChangeKind],
+) -> Option<Vec<crate::serve::changes::ChangeKind>> {
+    use crate::serve::changes::ChangeKind;
+    if require_approval.contains(&ChangeKind::Run) {
+        Some(vec![ChangeKind::Schedule, ChangeKind::Run])
+    } else if require_approval.contains(&ChangeKind::Schedule) {
+        Some(vec![ChangeKind::Schedule])
+    } else {
+        None
+    }
+}
+
 impl ServeConfig {
     /// Build + validate a `ServeConfig` from parsed CLI args. Enforces the
     /// no-auth gate: a server with neither a token nor `--no-auth` refuses to start.
@@ -433,17 +449,12 @@ impl ServeConfig {
             }
         };
 
-        // A schedule change under run approval needs approvers for both rules
-        // (#1051): refuse a configuration where no one could approve one.
+        // Refuse a configuration where no one could approve a schedule change
+        // (#1051).
+        if let Some(kinds) = schedule_change_rules(&require_approval)
+            && let AuthMode::Rbac(rbac) = &auth
         {
-            use crate::serve::changes::ChangeKind;
-            if require_approval.contains(&ChangeKind::Run)
-                && require_approval.contains(&ChangeKind::Schedule)
-                && let AuthMode::Rbac(rbac) = &auth
-            {
-                rbac.check_approvers(&[ChangeKind::Schedule, ChangeKind::Run])
-                    .map_err(CliError::Serve)?;
-            }
+            rbac.check_approvers(&kinds).map_err(CliError::Serve)?;
         }
 
         let request_guard = crate::serve::guard::GuardSettings::from_args(
@@ -959,6 +970,42 @@ mod tests {
         // Every principal token must be registered for log redaction.
         let scrubbed = crate::secrets::registry::redact("t=rbacsecret12345 end").into_owned();
         assert!(!scrubbed.contains("rbacsecret12345"), "{scrubbed}");
+    }
+
+    #[test]
+    fn schedule_changes_need_approvers_whenever_they_are_gated() {
+        use crate::serve::changes::ChangeKind;
+        assert_eq!(schedule_change_rules(&[ChangeKind::TemplateLaunch]), None);
+        assert_eq!(
+            schedule_change_rules(&[ChangeKind::Schedule]),
+            Some(vec![ChangeKind::Schedule])
+        );
+        for gated in [
+            vec![ChangeKind::Run],
+            vec![ChangeKind::Run, ChangeKind::Schedule],
+        ] {
+            assert_eq!(
+                schedule_change_rules(&gated),
+                Some(vec![ChangeKind::Schedule, ChangeKind::Run])
+            );
+        }
+        // `run` alone: a run rule nobody can meet refuses to start.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.yaml");
+        std::fs::write(
+            &path,
+            "principals:\n  - name: ann\n    token: approvetoken12345\n    role: admin\n\
+             approvals:\n  rules:\n    - kinds: [run]\n      roles: [admin]\n      min_approvers: 2\n",
+        )
+        .unwrap();
+        let mut a = base_args();
+        a.auth_config = Some(path);
+        a.require_approval = vec!["run".into()];
+        let err = ServeConfig::from_args(a).unwrap_err().to_string();
+        assert!(
+            err.contains("run change") && err.contains("needs 2"),
+            "{err}"
+        );
     }
 
     #[test]

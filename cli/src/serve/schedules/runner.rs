@@ -383,6 +383,17 @@ pub async fn wanted(state: &ServerState) -> Result<Vec<Wanted>, String> {
         if out.iter().any(|(s, _, _, _)| s.name == r.spec.name) {
             continue;
         }
+        let r = if r.id.is_empty() {
+            match super::service::ensure_id(state, r.clone()).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(schedule = %r.spec.name, error = %e, "could not give the schedule an id yet");
+                    r
+                }
+            }
+        } else {
+            r
+        };
         out.push((r.spec, r.tenant, Source::Console, r.approved));
     }
     Ok(out)
@@ -483,7 +494,11 @@ pub async fn step(state: &ServerState, entry: &mut Entry, now: DateTime<Utc>) {
         tracing::warn!(schedule = %name, %tick, reason = %why, "schedule not ticked: it needs approval");
         status::record_tick(&*history, &name, &entry.last_tick(tick)).await;
         status::record(&*history, &name, tick, Outcome::NeedsApproval(why)).await;
-        entry.advance(tick, now);
+        if let Some(range) = entry.advance(tick, now)
+            && let Err(e) = status::update(&*history, &name, |d| d.add_missed(range.clone())).await
+        {
+            tracing::warn!(schedule = %name, error = %e, "could not record missed ticks");
+        }
         return;
     }
     let result =
@@ -1055,6 +1070,30 @@ mod tests {
             Some(at("2026-09-26T12:00:00Z")),
             "moves on, fires nothing"
         );
+    }
+
+    /// Ticks skipped over while an unapproved schedule was behind are
+    /// recorded as missed, as on every other path.
+    #[tokio::test]
+    async fn a_tick_that_needs_approval_records_the_ticks_it_skips_over() {
+        let mut config = crate::serve::test_support::test_config();
+        config.require_approval = vec![crate::serve::changes::ChangeKind::Run];
+        let state = crate::serve::test_support::state_from(&config);
+        let s = spec("0 * * * *", false);
+        let compiled = super::super::validate::validate(&s).unwrap();
+        let mut e = Entry::new(
+            s,
+            None,
+            Source::Console,
+            compiled,
+            at("2026-09-26T10:30:00Z"),
+        );
+        e.resumed = true;
+        step(&state, &mut e, at("2026-09-26T14:30:00Z")).await;
+        let st = status::read(&*state.history(), "nightly").await;
+        assert_eq!(st.last_outcome.as_deref(), Some("needs_approval"));
+        assert_eq!(st.missed.len(), 1, "{:?}", st.missed);
+        assert!(st.missed_since(at("2026-09-26T00:00:00Z")) >= 2);
     }
 
     #[test]

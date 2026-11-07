@@ -163,8 +163,9 @@ with self-approval allowed — otherwise nothing could ever be approved there.
 A [schedule](./schedules.md) change under `--require-approval run` is governed
 by two rules, `schedule` and `run`: an approver counts when one of them allows
 them, and the change executes once each rule has its own `min_approvers`.
-With both kinds gated, the server refuses to start when the principals in
-`--auth-config` could not meet one of the rules.
+Whenever schedule changes are gated (`run`, `schedule` or both), the server
+refuses to start when the principals in `--auth-config` could not meet one of
+the rules they need.
 
 ## Making it mandatory
 

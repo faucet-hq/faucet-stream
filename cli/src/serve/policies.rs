@@ -21,7 +21,7 @@ use crate::serve::state::ServerState;
 use chrono::{DateTime, Utc};
 use faucet_core::{CompiledPolicy, PolicySpec};
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -279,9 +279,8 @@ pub async fn effective(
             v.as_ref().map(spec_of).transpose()?
         }
         (None, Some(_)) => {
-            let spec = state.policy().map(|p| (*p).clone());
-            used.file_sha256 = spec.as_ref().map(file_sha256);
-            spec
+            used.file_sha256 = state.policy_sha256();
+            state.policy().map(|p| (*p).clone())
         }
         (None, None) => {
             let v = latest(state, SERVER_SCOPE).await?;
@@ -341,26 +340,21 @@ async fn pinned_file(state: &ServerState, sha: &str) -> Result<PolicySpec, Serve
     }
 }
 
-/// Store the `--policy` content a run is admitted under, so any replica that
-/// runs it enforces the same (#1051). Idempotent: the scope is the content's
-/// address.
-pub async fn store_file_pin(state: &ServerState, pin: &PolicyPin) -> Result<(), ServeError> {
-    let (Some(sha), Some(spec)) = (pin.file_sha256.as_ref(), state.policy()) else {
+/// Store the `--policy` file's content under its content address, once at
+/// startup (#1051): a run admitted under it is pinned to that address, and
+/// any replica that runs it loads it from there. Idempotent.
+pub async fn store_file_scope(state: &ServerState) -> Result<(), ServeError> {
+    let (Some(sha), Some(spec)) = (state.policy_sha256(), state.policy()) else {
         return Ok(());
     };
-    if &file_sha256(&spec) != sha {
-        return Err(ServeError::Internal(
-            "the --policy file changed while the run was admitted".into(),
-        ));
-    }
     let record = PolicyVersionRecord {
-        scope: crate::serve::history::policies::file_scope(sha),
+        scope: crate::serve::history::policies::file_scope(&sha),
         version: 1,
         spec: serde_json::to_value(&*spec).map_err(|e| ServeError::Internal(e.to_string()))?,
         created_at: Utc::now(),
         created_by: SYSTEM_ACTOR.into(),
         approved_by: None,
-        reason: Some("the --policy file a run was admitted under".into()),
+        reason: Some("the --policy file runs are admitted under".into()),
         change_id: None,
         restores: None,
     };
@@ -864,17 +858,17 @@ pub async fn impact(
         // The run's policy projection (#1051); a run recorded without one
         // (a cluster run from before it) by its stored config.
         let cfg = match (&rec.policy_projection, &rec.config_body) {
-            (Some(p), _) if p.opaque => {
-                out.runs_runtime_only += 1;
-                continue;
-            }
+            (Some(p), _) if p.opaque => None,
             (Some(p), _) => p.config.clone().and_then(probe_config_value),
             (None, Some(stored)) => crate::serve::sealed::open_body(state, &rec.run_id, stored)
                 .ok()
                 .and_then(|body| probe_config(&body, rec.config_format.unwrap_or_default())),
-            (None, None) => continue,
+            (None, None) => None,
         };
+        // A run whose config cannot be checked statically is counted, never
+        // skipped.
         let Some(cfg) = cfg else {
+            out.runs_runtime_only += 1;
             continue;
         };
         out.runs_checked += 1;
@@ -906,9 +900,11 @@ const PROJECTED_CONNECTOR_KEYS: [&str; 6] = [
 
 /// Reduce a submitted config (as submitted: `${env:}`, `${file:}` and
 /// secret references unresolved) to what a policy change's impact checks
-/// (#1051). Connector settings, masking keys and `vars:` are dropped, and
-/// every remaining string goes through the secrets redactor. A topology, or
-/// a config with more than [`PROJECTION_MAX_ROWS`] rows, is opaque.
+/// (#1051). Connector settings and masking keys are dropped; of `vars:` and
+/// `params:` only the entries the kept fields reference stay (a secret
+/// param without its default, so it binds to a placeholder); every
+/// remaining string goes through the secrets redactor. A topology, or a
+/// config with more than [`PROJECTION_MAX_ROWS`] rows, is opaque.
 pub fn projection(
     body: &str,
     format: crate::serve::load::ConfigFormat,
@@ -939,6 +935,8 @@ pub fn projection(
     if topology || rows > PROJECTION_MAX_ROWS {
         return opaque;
     }
+    let vars = doc.remove("vars");
+    let params = doc.remove("params");
     doc.retain(|k, _| {
         matches!(
             k.as_str(),
@@ -1006,11 +1004,79 @@ pub fn projection(
             }
         }
     }
+    keep_referenced(&mut doc, vars, params);
     let mut config = Value::Object(doc);
     redact_strings(&mut config);
     PolicyProjection {
         config: Some(config),
         opaque: false,
+    }
+}
+
+/// Names `prefix` references (`${vars.NAME…}`, `${param.NAME}`) in `v`.
+fn references(v: &Value, prefix: &str, out: &mut BTreeSet<String>) {
+    match v {
+        Value::String(s) => {
+            let open = format!("${{{prefix}.");
+            let mut rest = s.as_str();
+            while let Some(at) = rest.find(&open) {
+                rest = &rest[at + open.len()..];
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                    .collect();
+                if !name.is_empty() {
+                    out.insert(name);
+                }
+            }
+        }
+        Value::Array(items) => items.iter().for_each(|i| references(i, prefix, out)),
+        Value::Object(map) => map.values().for_each(|i| references(i, prefix, out)),
+        _ => {}
+    }
+}
+
+/// Put back the `vars:` and `params:` entries the projected `doc` references
+/// (vars transitively); a secret param keeps no default.
+fn keep_referenced(doc: &mut Map<String, Value>, vars: Option<Value>, params: Option<Value>) {
+    let whole = Value::Object(doc.clone());
+    if let Some(Value::Object(all)) = vars {
+        let mut wanted = BTreeSet::new();
+        references(&whole, "vars", &mut wanted);
+        let mut kept = Map::new();
+        while let Some(name) = wanted.iter().find(|n| !kept.contains_key(*n)).cloned() {
+            match all.get(&name) {
+                Some(v) => {
+                    references(v, "vars", &mut wanted);
+                    kept.insert(name, v.clone());
+                }
+                None => {
+                    wanted.remove(&name);
+                }
+            }
+        }
+        if !kept.is_empty() {
+            doc.insert("vars".into(), Value::Object(kept));
+        }
+    }
+    if let Some(Value::Object(all)) = params {
+        let mut wanted = BTreeSet::new();
+        references(&Value::Object(doc.clone()), "param", &mut wanted);
+        let kept: Map<String, Value> = all
+            .into_iter()
+            .filter(|(k, _)| wanted.contains(k))
+            .map(|(k, mut decl)| {
+                if let Value::Object(d) = &mut decl
+                    && d.get("secret").and_then(Value::as_bool) == Some(true)
+                {
+                    d.remove("default");
+                }
+                (k, decl)
+            })
+            .collect();
+        if !kept.is_empty() {
+            doc.insert("params".into(), Value::Object(kept));
+        }
     }
 }
 

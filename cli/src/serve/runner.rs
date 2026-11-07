@@ -399,16 +399,11 @@ fn resume_claimed(
         state
             .registry()
             .register_run(run_id.clone(), run_token.clone(), rec.tenant.clone());
-        let loaded = match reload_with_retry(&state, &rec, body, &run_token).await {
+        let deadline = retry_deadline(&rec);
+        let loaded = match reload_with_retry(&state, &rec, body, &run_token, deadline).await {
             Ok(l) => l,
             Err(term) => {
-                if matches!(term, Terminal::ShutdownFailed { .. })
-                    && state.cluster().enabled()
-                    && release_for_peer(&state, &run_id).await
-                {
-                    return;
-                }
-                finalize(&state, Some(rec.clone()), &run_id, rec.submitted_at, term).await;
+                stop_claimed(&state, &rec, term).await;
                 return;
             }
         };
@@ -420,43 +415,11 @@ fn resume_claimed(
         if let Some(sh) = loaded.cfg.shard.clone()
             && sh.count >= 2
         {
-            let mut wait = RELOAD_RETRY_BASE;
-            let coordinated = loop {
-                match coordinate_sharded_run(&state, &run_id, &loaded, sh.count).await {
-                    Err(crate::error::CliError::HistoryUnavailable(m))
-                        if !run_token.is_cancelled() && !state.shutdown_token().is_cancelled() =>
-                    {
-                        metrics::record_run_reload_retry();
-                        tracing::warn!(%run_id, error = %m, "sharding a claimed run waits for the run history");
-                        #[allow(clippy::disallowed_methods)] // a runtime backoff timer
-                        let pause = tokio::time::sleep(wait);
-                        let shutdown = state.shutdown_token();
-                        tokio::select! {
-                            _ = run_token.cancelled() => {}
-                            _ = shutdown.cancelled() => {}
-                            _ = pause => {}
-                        }
-                        wait = (wait * 2).min(RELOAD_RETRY_MAX);
-                    }
-                    other => break other,
-                }
-            };
-            match coordinated {
+            match shard_with_retry(&state, &rec, &loaded, sh.count, &run_token, deadline).await {
                 Ok(true) => return, // expanded into shards — shard loop runs them
                 Ok(false) => {}     // not shardable → fall through, run the whole run
-                Err(e) => {
-                    finalize(
-                        &state,
-                        Some(rec.clone()),
-                        &run_id,
-                        rec.submitted_at,
-                        Terminal::Failed {
-                            reason: format!("sharding: {e}"),
-                            records: 0,
-                            invs: Vec::new(),
-                        },
-                    )
-                    .await;
+                Err(term) => {
+                    stop_claimed(&state, &rec, term).await;
                     return;
                 }
             }
@@ -497,20 +460,69 @@ pub(crate) const RELOAD_RETRY_BASE: Duration = Duration::from_secs(5);
 /// The longest wait between reload attempts.
 pub(crate) const RELOAD_RETRY_MAX: Duration = Duration::from_secs(60);
 
+/// The instant a claimed run's own timeout ends its retries, if it has one.
+fn retry_deadline(rec: &RunRecord) -> Option<tokio::time::Instant> {
+    rec.timeout_secs
+        .map(|s| tokio::time::Instant::now() + Duration::from_secs(s))
+}
+
+/// End a claimed run that stopped before it executed: on shutdown a
+/// clustered run is handed back for a peer; anything else is finalized.
+async fn stop_claimed(state: &ServerState, rec: &RunRecord, term: Terminal) {
+    if matches!(term, Terminal::ShutdownFailed { .. })
+        && state.cluster().enabled()
+        && release_for_peer(state, &rec.run_id).await
+    {
+        return;
+    }
+    finalize(
+        state,
+        Some(rec.clone()),
+        &rec.run_id,
+        rec.submitted_at,
+        term,
+    )
+    .await;
+}
+
+/// Wait `wait` before the next attempt of a claimed run's step: a cancel,
+/// a shutdown or the run's own timeout ends it with that terminal state.
+#[allow(clippy::disallowed_methods)] // a runtime backoff timer, not a connector call
+async fn retry_pause(
+    state: &ServerState,
+    rec: &RunRecord,
+    cancel: &CancellationToken,
+    deadline: Option<tokio::time::Instant>,
+    wait: Duration,
+) -> Result<(), Terminal> {
+    let sleep = match deadline {
+        Some(d) => tokio::time::sleep_until(d.min(tokio::time::Instant::now() + wait)),
+        None => tokio::time::sleep(wait),
+    };
+    let shutdown = state.shutdown_token();
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err(Terminal::cancelled()),
+        _ = shutdown.cancelled() => return Err(Terminal::shutdown_failed()),
+        _ = sleep => {}
+    }
+    if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+        return Err(Terminal::timeout(rec.timeout_secs.unwrap_or(0)));
+    }
+    Ok(())
+}
+
 /// Re-load a claimed run's config. An error that may pass (the history or a
 /// secrets manager unavailable) is retried in place, with backoff, while this
 /// instance keeps the run's lease, until the run's own timeout or a cancel;
 /// any other error fails the run (#1051). `Err` is the run's terminal state.
-#[allow(clippy::disallowed_methods)] // a runtime backoff timer, not a connector call
 async fn reload_with_retry(
     state: &ServerState,
     rec: &RunRecord,
     body: &str,
     cancel: &CancellationToken,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<LoadedSubmission, Terminal> {
-    let deadline = rec
-        .timeout_secs
-        .map(|s| tokio::time::Instant::now() + Duration::from_secs(s));
     let mut wait = RELOAD_RETRY_BASE;
     let mut attempt = 0u32;
     loop {
@@ -535,21 +547,40 @@ async fn reload_with_retry(
             error = %message,
             "re-loading a claimed run's config failed for now; retrying"
         );
-        let sleep = match deadline {
-            Some(d) => tokio::time::sleep_until(d.min(tokio::time::Instant::now() + wait)),
-            None => tokio::time::sleep(wait),
-        };
-        let shutdown = state.shutdown_token();
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err(Terminal::cancelled()),
-            _ = shutdown.cancelled() => return Err(Terminal::shutdown_failed()),
-            _ = sleep => {}
-        }
-        if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
-            return Err(Terminal::timeout(rec.timeout_secs.unwrap_or(0)));
-        }
+        retry_pause(state, rec, cancel, deadline, wait).await?;
         wait = (wait * 2).min(RELOAD_RETRY_MAX);
+    }
+}
+
+/// Expand a claimed run into shards ([`coordinate_sharded_run`]), waiting
+/// out an unavailable history exactly as [`reload_with_retry`] does. `Ok` is
+/// whether it was sharded; `Err` is the run's terminal state.
+async fn shard_with_retry(
+    state: &ServerState,
+    rec: &RunRecord,
+    loaded: &LoadedSubmission,
+    count: usize,
+    cancel: &CancellationToken,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<bool, Terminal> {
+    let mut wait = RELOAD_RETRY_BASE;
+    loop {
+        match coordinate_sharded_run(state, &rec.run_id, loaded, count).await {
+            Ok(sharded) => return Ok(sharded),
+            Err(crate::error::CliError::HistoryUnavailable(m)) => {
+                metrics::record_run_reload_retry();
+                tracing::warn!(run_id = %rec.run_id, error = %m, "sharding a claimed run waits for the run history");
+                retry_pause(state, rec, cancel, deadline, wait).await?;
+                wait = (wait * 2).min(RELOAD_RETRY_MAX);
+            }
+            Err(e) => {
+                return Err(Terminal::Failed {
+                    reason: format!("sharding: {e}"),
+                    records: 0,
+                    invs: Vec::new(),
+                });
+            }
+        }
     }
 }
 
@@ -683,7 +714,7 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
         state
             .registry()
             .register_shard(&run_id, &shard_id, waiting.clone());
-        let loaded = reload_with_retry(&state, &run, &body, &waiting).await;
+        let loaded = reload_with_retry(&state, &run, &body, &waiting, retry_deadline(&run)).await;
         state.registry().deregister_shard(&run_id, &shard_id);
         let loaded = match loaded {
             Ok(l) => l,
@@ -1309,15 +1340,6 @@ pub(crate) async fn enqueue(
             &req.config,
             req.config_format.into(),
         ));
-    }
-    // The `--policy` content a run is admitted under is stored before the
-    // record, so whichever replica runs it enforces the same (#1051).
-    #[cfg(feature = "policy")]
-    if let Some(pin) = &rec.policy_pin
-        && let Err(e) = crate::serve::policies::store_file_pin(&state, pin).await
-    {
-        release_orphaned_claim(&state, &req, &run_id).await;
-        return Err(e);
     }
 
     if state.cluster().enabled() {
@@ -2374,6 +2396,8 @@ async fn finalize(
             finished_at: finished,
             error,
             reason,
+            refusals: 0,
+            retry_at: None,
         },
     };
     if let Err(e) = write_pending(state, &pending).await {
@@ -2406,6 +2430,10 @@ pub(crate) enum PendingFinalize {
         finished_at: DateTime<Utc>,
         error: Option<String>,
         reason: &'static str,
+        /// Refusals so far that were not transient (clustered only).
+        refusals: u32,
+        /// No retry before this instant (clustered backoff).
+        retry_at: Option<std::time::Instant>,
     },
     /// One shard's owner-fenced terminal state.
     Shard {
@@ -2476,6 +2504,7 @@ async fn write_pending(
             finished_at,
             error,
             reason,
+            ..
         } => {
             match state
                 .history()
@@ -2567,11 +2596,29 @@ async fn finalize_owned(
     Ok(())
 }
 
+/// The longest wait between retries of a status the backend keeps refusing.
+const STATUS_RETRY_MAX: Duration = Duration::from_secs(600);
+
+/// The wait before the next retry after `refusals` non-transient refusals.
+fn status_retry_delay(refusals: u32) -> Duration {
+    Duration::from_secs(10)
+        .saturating_mul(1u32 << refusals.min(10))
+        .min(STATUS_RETRY_MAX)
+}
+
 /// Retry every terminal write (a run's or a shard's) that failed earlier; one
 /// that fails again stays queued. Returns how many were written.
 pub(crate) async fn retry_pending_finalize(state: &ServerState) -> usize {
     let mut written = 0;
     for pending in state.take_pending_finalize() {
+        if let PendingFinalize::Status {
+            retry_at: Some(at), ..
+        } = &pending
+            && *at > std::time::Instant::now()
+        {
+            state.queue_finalize(pending);
+            continue;
+        }
         // A record the backend keeps refusing for good: its status alone,
         // then nothing (#1050).
         let pending = match pending {
@@ -2591,6 +2638,8 @@ pub(crate) async fn retry_pending_finalize(state: &ServerState) -> usize {
                     finished_at: rec.finished_at.unwrap_or_else(Utc::now),
                     error: rec.error.clone(),
                     reason,
+                    refusals: 0,
+                    retry_at: None,
                 }
             }
             other => other,
@@ -2598,14 +2647,50 @@ pub(crate) async fn retry_pending_finalize(state: &ServerState) -> usize {
         match write_pending(state, &pending).await {
             Ok(()) => written += 1,
             Err(e) if matches!(pending, PendingFinalize::Status { .. }) && !e.is_transient() => {
-                tracing::error!(
-                    run_id = %pending.run_id(),
-                    error = %e,
-                    "finalize: the backend refused the terminal status too; dropping it (orphan \
-                     recovery fails the run once its lease is no longer renewed)"
-                );
-                metrics::record_pending_finalize_dropped();
-                state.forget_run_lease(pending.run_id());
+                if state.cluster().enabled() {
+                    metrics::record_pending_finalize_refused();
+                    // Clustered, a run whose lease lapses is requeued and run
+                    // again by a peer: keep the lease and keep retrying.
+                    let PendingFinalize::Status {
+                        run_id,
+                        status,
+                        finished_at,
+                        error,
+                        reason,
+                        refusals,
+                        ..
+                    } = pending
+                    else {
+                        unreachable!("matched a status above")
+                    };
+                    let delay = status_retry_delay(refusals);
+                    tracing::error!(
+                        run_id,
+                        error = %e,
+                        refusals = refusals + 1,
+                        retry_in_secs = delay.as_secs(),
+                        "finalize: the backend refused the terminal status; keeping the run's \
+                         lease and retrying"
+                    );
+                    state.queue_finalize(PendingFinalize::Status {
+                        run_id,
+                        status,
+                        finished_at,
+                        error,
+                        reason,
+                        refusals: refusals + 1,
+                        retry_at: Some(std::time::Instant::now() + delay),
+                    });
+                } else {
+                    tracing::error!(
+                        run_id = %pending.run_id(),
+                        error = %e,
+                        "finalize: the backend refused the terminal status too; dropping it (orphan \
+                         recovery fails the run once its lease is no longer renewed)"
+                    );
+                    metrics::record_pending_finalize_dropped();
+                    state.forget_run_lease(pending.run_id());
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -3089,11 +3174,29 @@ mod tests {
         assert_eq!(state.pending_finalize_len(), 0);
     }
 
-    /// A record the backend keeps refusing for good falls back to its status
-    /// alone, then is dropped and its lease left to lapse (#1050).
+    fn single_flaky_state(down: bool) -> (ServerState, std::sync::Arc<FlakyFinalize>) {
+        let (_, history) = flaky_state(down);
+        let mut config = crate::serve::test_support::test_config();
+        config.cluster.enabled = false;
+        let state = ServerState::new(
+            &config,
+            None,
+            CancellationToken::new(),
+            history.clone(),
+            crate::serve::logs::LogHub::new(),
+            None,
+            #[cfg(feature = "triggers")]
+            crate::serve::triggers::health::TriggersHandle::empty(),
+        );
+        (state, history)
+    }
+
+    /// On a single server a record the backend keeps refusing for good falls
+    /// back to its status alone, then is dropped and its lease left to lapse
+    /// so orphan recovery fails it (#1050).
     #[tokio::test]
-    async fn a_record_refused_for_good_is_dropped_after_its_status() {
-        let (state, _history) = flaky_state(true);
+    async fn a_single_server_drops_a_record_refused_for_good_after_its_status() {
+        let (state, _history) = single_flaky_state(true);
         let started = Utc::now();
         let mut rec = RunRecord::queued("r1".into(), None, BTreeMap::new(), None, started);
         rec.status = RunStatus::Running;
@@ -3107,7 +3210,61 @@ mod tests {
         assert_eq!(state.forgotten_runs(), vec!["r1".to_string()]);
         state.clear_forgotten_run("r1");
         assert!(state.forgotten_runs().is_empty());
-        // A transient refusal is never counted.
+    }
+
+    /// In a cluster a refused terminal status is never dropped: the run's
+    /// lease stays renewed (so no peer requeues and re-runs a finished run)
+    /// and the status is retried with a growing backoff (#1050).
+    #[tokio::test]
+    async fn a_cluster_keeps_a_refused_status_and_its_lease() {
+        let (state, history) = flaky_state(true);
+        let started = Utc::now();
+        let mut rec = RunRecord::queued("r1".into(), None, BTreeMap::new(), None, started);
+        rec.status = RunStatus::Running;
+        state.history().upsert(&rec).await.unwrap();
+        finalize(&state, Some(rec), "r1", started, Terminal::cancelled()).await;
+        for _ in 0..FINALIZE_ATTEMPTS + 1 {
+            retry_pending_finalize(&state).await;
+        }
+        assert_eq!(state.pending_finalize_len(), 1, "kept");
+        assert!(state.forgotten_runs().is_empty(), "lease still renewed");
+        // Backed off: a retry before the deadline does not write.
+        history
+            .down
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(retry_pending_finalize(&state).await, 0);
+        assert_eq!(state.pending_finalize_len(), 1);
+        let queued = state.take_pending_finalize();
+        let [
+            PendingFinalize::Status {
+                refusals, retry_at, ..
+            },
+        ] = queued.as_slice()
+        else {
+            panic!("a status is queued");
+        };
+        assert_eq!(*refusals, 1);
+        assert!(retry_at.is_some());
+        assert_eq!(status_retry_delay(0), Duration::from_secs(10));
+        assert_eq!(status_retry_delay(20), STATUS_RETRY_MAX);
+        // Once the deadline passes the status lands.
+        state.queue_finalize(PendingFinalize::Status {
+            run_id: "r1".into(),
+            status: RunStatus::Cancelled,
+            finished_at: started,
+            error: None,
+            reason: "cancelled",
+            refusals: 1,
+            retry_at: Some(std::time::Instant::now()),
+        });
+        assert_eq!(retry_pending_finalize(&state).await, 1);
+        let done = state.history().get("r1").await.unwrap().unwrap();
+        assert_eq!(done.status, RunStatus::Cancelled);
+    }
+
+    #[test]
+    fn a_transient_refusal_is_never_counted() {
+        let started = Utc::now();
         let e = crate::serve::history::HistoryError::Unreachable("x".into());
         let p = PendingFinalize::Run {
             rec: Box::new(RunRecord::queued(
@@ -4065,6 +4222,62 @@ mod tests {
             rec.status = status;
             rec.config_body = Some("version: 1".into());
             state.history().upsert(&rec).await.expect("seed run");
+        }
+
+        /// Sharding a claimed run waits out an unreachable history exactly
+        /// like re-loading its config: a cancel cancels it, a shutdown hands
+        /// it back, and its own timeout times it out.
+        #[tokio::test]
+        async fn sharding_waits_out_the_history_like_a_reload() {
+            let history = Arc::new(crate::serve::test_support::Flaky {
+                inner: Arc::new(crate::serve::history::memory::MemoryHistory::new(
+                    Duration::from_secs(60),
+                )),
+                down: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            });
+            let state = ServerState::new(
+                &crate::serve::test_support::test_config(),
+                None,
+                CancellationToken::new(),
+                history,
+                crate::serve::logs::LogHub::new(),
+                None,
+                #[cfg(feature = "triggers")]
+                crate::serve::triggers::health::TriggersHandle::empty(),
+            );
+            let l = loaded(
+                "version: 1\npipeline:\n  \
+                 source: { type: s3, config: { bucket: my-bucket, prefix: null, \
+                 region: null, endpoint_url: null, file_format: json_lines, \
+                 max_objects: null, concurrency: 10 } }\n  \
+                 sink: { type: stdout, config: {} }\n",
+            )
+            .await;
+            let mut rec = RunRecord::queued("r".into(), None, BTreeMap::new(), None, Utc::now());
+            rec.timeout_secs = Some(30);
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+            let r = shard_with_retry(&state, &rec, &l, 4, &cancel, None).await;
+            assert!(matches!(r, Err(Terminal::Cancelled { .. })), "cancelled");
+            let r = shard_with_retry(
+                &state,
+                &rec,
+                &l,
+                4,
+                &CancellationToken::new(),
+                Some(tokio::time::Instant::now()),
+            )
+            .await;
+            assert!(
+                matches!(r, Err(Terminal::Timeout { secs: 30, .. })),
+                "timed out"
+            );
+            state.shutdown_token().cancel();
+            let r = shard_with_retry(&state, &rec, &l, 4, &CancellationToken::new(), None).await;
+            assert!(
+                matches!(r, Err(Terminal::ShutdownFailed { .. })),
+                "handed back on shutdown"
+            );
         }
 
         #[tokio::test]

@@ -269,7 +269,10 @@ groups:
             {{ $value }} finished runs could not record their outcome; the
             server retries from every lease tick and fires their callbacks
             once the records land. A record the backend keeps refusing is
-            dropped after five tries (faucet_serve_pending_finalize_dropped_total).
+            dropped after five tries on a single server
+            (faucet_serve_pending_finalize_dropped_total); in a cluster it is
+            kept with its lease and retried
+            (faucet_serve_pending_finalize_refused_total).
 
       - alert: FaucetServePolicyMergeBroken
         expr: increase(faucet_serve_policy_merge_failures_total[15m]) > 0

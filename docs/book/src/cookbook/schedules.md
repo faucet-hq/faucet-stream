@@ -162,9 +162,10 @@ so under it:
   and it must pin numeric versions for its template, sink and overlay: a
   channel (`stable`, `prod`) answers `422` "pin a version while runs need
   approval", so an approved schedule runs exactly what was approved;
-- with both `schedule` and `run` gated, a schedule change needs approvals
-  that meet each rule on its own, and the server refuses to start when no
-  principal in `--auth-config` could meet one of them;
+- a schedule change needs approvals that meet the `schedule` and the `run`
+  rule each on its own, and the server refuses to start when no principal in
+  `--auth-config` could meet one of them (with only `schedule` gated, just
+  the `schedule` rule);
 - a schedule's ticks run with standing approval only when the schedule was
   stored through an approved change, or comes from the `--schedules` file;
   any other schedule — and one that still follows a channel when the gate is

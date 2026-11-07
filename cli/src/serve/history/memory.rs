@@ -2292,6 +2292,7 @@ mod tests {
                 tenant: None,
                 trusted_config: false,
                 caller_params: Default::default(),
+                deferred: false,
             })
             .await
             .unwrap();

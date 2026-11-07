@@ -65,9 +65,10 @@ struct Inner {
     /// guardrail and the loop's wake-up signal. Replaced once at startup.
     #[cfg(all(feature = "schedule", feature = "templates"))]
     schedules: RwLock<Arc<crate::serve::schedules::SchedulesRuntime>>,
-    /// The server-wide data-flow policy (`--policy`, #702), when one was given.
+    /// The server-wide data-flow policy (`--policy`, #702), when one was
+    /// given, and the content address of its canonical YAML.
     #[cfg(feature = "policy")]
-    policy: RwLock<Option<Arc<faucet_core::PolicySpec>>>,
+    policy: RwLock<Option<(Arc<faucet_core::PolicySpec>, String)>>,
     /// Where that `--policy` policy was read from (#1043), for the console.
     #[cfg(feature = "policy")]
     policy_file: RwLock<Option<crate::serve::policies::PolicyFile>>,
@@ -284,7 +285,20 @@ impl ServerState {
     /// Attach the server-wide data-flow policy (server startup, #702).
     #[cfg(feature = "policy")]
     pub fn set_policy(&self, policy: Arc<faucet_core::PolicySpec>) {
-        *self.inner.policy.write().unwrap_or_else(|e| e.into_inner()) = Some(policy);
+        let sha = crate::serve::policies::file_sha256(&policy);
+        *self.inner.policy.write().unwrap_or_else(|e| e.into_inner()) = Some((policy, sha));
+    }
+
+    /// The content address of the server-wide policy (computed once, when
+    /// it is set), which a run admitted under the `--policy` file is pinned to.
+    #[cfg(feature = "policy")]
+    pub fn policy_sha256(&self) -> Option<String> {
+        self.inner
+            .policy
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|(_, sha)| sha.clone())
     }
 
     /// The server-wide data-flow policy, if the server was started with one.
@@ -294,7 +308,8 @@ impl ServerState {
             .policy
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
+            .as_ref()
+            .map(|(p, _)| p.clone())
     }
 
     /// Record where the `--policy` policy came from (server startup, #1043).

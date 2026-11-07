@@ -462,11 +462,16 @@ impl RbacConfig {
                 .count();
             if able < min {
                 return Err(format!(
-                    "--require-approval run,schedule: a schedule change needs approvals under \
-                     both rules, and only {able} principal(s) in --auth-config may approve a \
-                     {kind} change (its rule needs {min}); add approvers or change the \
-                     `approvals:` rules",
-                    kind = kind.as_str()
+                    "a schedule change needs approvals under the {rules} rule(s) of \
+                     --require-approval, and only {able} principal(s) in --auth-config may \
+                     approve a {kind} change (its rule needs {min}); add approvers or change \
+                     the `approvals:` rules",
+                    kind = kind.as_str(),
+                    rules = kinds
+                        .iter()
+                        .map(|k| k.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" and ")
                 ));
             }
         }
