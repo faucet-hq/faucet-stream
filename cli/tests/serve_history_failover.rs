@@ -89,6 +89,7 @@ const READ_ONLY: &[&str] = &[
     "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND datname = 'postgres'",
 ];
 const WRITABLE: &[&str] = &[
+    "SET default_transaction_read_only = off",
     "ALTER DATABASE postgres SET default_transaction_read_only = off",
     "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND datname = 'postgres'",
 ];
