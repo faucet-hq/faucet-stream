@@ -24774,7 +24774,7 @@
                       }
                     },
                     "connect_timeout_secs": {
-                      "description": "Seconds the TCP connect, SSH handshake, authentication and the SFTP\nsubsystem start together may take (default 30). A server that accepts and then stalls fails the run\ninstead of hanging it.",
+                      "description": "Seconds the TCP connect, SSH handshake and authentication together may\ntake, and then each SFTP channel's start (default 30). A server that\naccepts and then stalls fails the run instead of hanging it.",
                       "type": [
                         "integer",
                         "string"
@@ -24873,7 +24873,7 @@
                       "default": {}
                     },
                     "max_object_bytes": {
-                      "description": "Largest file, in bytes, a format read whole into memory (JSON array,\nraw text, CSV, XML, Excel, Avro, ORC) may reach; a larger one fails\nwith an error naming it instead of exhausting memory. It also bounds one\nline of a streamed `jsonl` file, so a file with no newline fails the\nsame way; `parquet` streams and is not capped. Default 2 GiB.",
+                      "description": "Largest file, in bytes, a format read whole into memory (JSON array,\nraw text, CSV, XML, Excel, Avro, ORC) may reach; a larger one fails\nwith an error naming it instead of exhausting memory. It also bounds one\nline of a streamed `jsonl` file, so a file with no newline fails the\nsame way; `parquet` streams, and this caps one byte range it reads.\nDefault 2 GiB.",
                       "type": [
                         "integer",
                         "string"
@@ -24881,6 +24881,26 @@
                       "format": "uint64",
                       "minimum": 0,
                       "default": 2147483648
+                    },
+                    "max_listed_entries": {
+                      "description": "Entries one directory listing may scan (default 1,000,000). Every\nentry the server sends counts, whether or not it matches `glob`; a\ndirectory with more fails the run with an error naming this field.\nMust be at least 1.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 1000000
+                    },
+                    "list_timeout_secs": {
+                      "description": "Seconds the directory listing may take (default 300), including the\nstat of each symbolic link in it; a slower listing fails the run with\nan error naming this field. `0` is treated as `1`.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 300
                     }
                   }
                 },
@@ -32307,7 +32327,7 @@
                       }
                     },
                     "connect_timeout_secs": {
-                      "description": "Seconds the TCP connect, SSH handshake, authentication and the SFTP\nsubsystem start together may take (default 30). A server that accepts and then stalls fails the run\ninstead of hanging it.",
+                      "description": "Seconds the TCP connect, SSH handshake and authentication together may\ntake, and then each SFTP channel's start (default 30). A server that\naccepts and then stalls fails the run instead of hanging it.",
                       "type": [
                         "integer",
                         "string"
@@ -32466,6 +32486,16 @@
                         "null"
                       ],
                       "x-faucet-resource": "path"
+                    },
+                    "max_listed_entries": {
+                      "description": "Entries one directory listing may scan (default 1,000,000). The sink\nlists its output directory, for example to remove files of an earlier\nrun or finish an interrupted overwrite; every entry the server sends\ncounts, and a directory with more fails the call with an error naming\nthis field. Must be at least 1.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 1000000
                     }
                   },
                   "oneOf": [

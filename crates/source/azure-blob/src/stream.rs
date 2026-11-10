@@ -264,7 +264,8 @@ impl AzureBlobSource {
             },
             meta.size,
             key,
-        );
+        )
+        .with_max_range_bytes(self.config.max_object_bytes);
         faucet_core::file_format::parquet_io::open_ranged(reader, &self.config.parquet, batch_size)
             .await
     }

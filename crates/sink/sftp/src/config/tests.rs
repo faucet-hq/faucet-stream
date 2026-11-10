@@ -74,6 +74,20 @@ fn deserializes_flat_shape() {
 }
 
 #[test]
+fn max_listed_entries_defaults_and_refuses_zero() {
+    let c: SftpSinkConfig = serde_json::from_value(serde_json::json!({"host":"h","username":"u","type":"password","config":{"password":"p"},"path":"/o"})).unwrap();
+    assert_eq!(c.max_listed_entries, 1_000_000);
+    assert_eq!(
+        SftpSinkConfig::new(conn(), "/o").max_listed_entries,
+        1_000_000
+    );
+    let mut zero = c.clone();
+    zero.max_listed_entries = 0;
+    let e = zero.validate().unwrap_err().to_string();
+    assert!(e.contains("max_listed_entries"), "{e}");
+}
+
+#[test]
 fn batch_size_zero_is_valid_sentinel() {
     let cfg = SftpSinkConfig::new(conn(), "/o").with_batch_size(0);
     assert!(faucet_core::validate_batch_size(cfg.batch_size).is_ok());

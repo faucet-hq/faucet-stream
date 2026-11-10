@@ -36,6 +36,7 @@ impl SftpSink {
         };
         let backend = SftpBackend::builder(config.connection.clone())
             .concurrency(config.concurrency)
+            .max_listed_entries(config.max_listed_entries)
             .scratch_dir(config.scratch_dir.as_deref().map(std::path::Path::new))
             .build(base, &template)?;
         let identity = SftpIdentity {

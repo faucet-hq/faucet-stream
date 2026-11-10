@@ -73,3 +73,54 @@ fn config_schema_is_valid_object() {
     assert!(schema.is_object());
     assert!(schema.get("properties").is_some());
 }
+
+#[test]
+fn listing_limits_default_and_refuse_zero_entries() {
+    let mut doc = serde_json::to_value(cfg()).unwrap();
+    doc.as_object_mut().unwrap().remove("max_listed_entries");
+    doc.as_object_mut().unwrap().remove("list_timeout_secs");
+    let parsed: SftpSourceConfig = serde_json::from_value(doc).unwrap();
+    assert_eq!(parsed.max_listed_entries, 1_000_000);
+    assert_eq!(parsed.list_timeout_secs, 300);
+
+    let mut zero = cfg();
+    zero.max_listed_entries = 0;
+    match SftpSource::new(zero) {
+        Err(FaucetError::Config(m)) => assert!(m.contains("max_listed_entries"), "{m}"),
+        Err(e) => panic!("expected a Config error, got {e}"),
+        Ok(_) => panic!("a zero entry limit must be refused"),
+    }
+}
+
+#[test]
+fn a_listing_that_runs_out_of_time_names_list_timeout_secs() {
+    let limit = std::time::Duration::from_secs(7);
+    let timed_out = FaucetError::Timeout {
+        operation: "list call".into(),
+        after: limit,
+    };
+    let err = listing_timeout(timed_out, "/data", limit).to_string();
+    assert!(
+        err.contains("'/data'") && err.contains("7s") && err.contains("list_timeout_secs"),
+        "{err}"
+    );
+    let other = listing_timeout(FaucetError::Source("dummy".into()), "/data", limit);
+    assert!(matches!(other, FaucetError::Source(m) if m == "dummy"));
+}
+
+#[test]
+fn listing_errors_become_source_errors() {
+    let err = source_err(faucet_common_sftp::ListError::TooManyEntries {
+        path: "/data".into(),
+        limit: 2,
+    });
+    assert!(matches!(&err, FaucetError::Source(m) if m.contains("max_listed_entries")));
+}
+
+#[cfg(feature = "arrow")]
+#[test]
+fn ranged_reads_grow_with_the_bytes_received() {
+    assert_eq!(initial_range_capacity(0), 0);
+    assert_eq!(initial_range_capacity(1_000), 1_000);
+    assert_eq!(initial_range_capacity(u64::MAX), 8 * 1024 * 1024);
+}

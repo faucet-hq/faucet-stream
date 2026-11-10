@@ -7,7 +7,9 @@
 
 use crate::config::{SftpFormat, SftpSourceConfig, glob_match};
 use async_trait::async_trait;
-use faucet_common_sftp::{SftpFile, SftpSession, connect};
+use faucet_common_sftp::{
+    ChunkedReader, SftpFile, SftpHandle, SftpLister, SftpSession, authenticate,
+};
 #[cfg(feature = "arrow")]
 use faucet_core::CallExt as _;
 use faucet_core::{FaucetError, Stream, StreamPage};
@@ -80,17 +82,13 @@ impl faucet_core::file_format::parquet_io::RangeRead for FileRange {
                 file.seek(std::io::SeekFrom::Start(range.start))
                     .await
                     .map_err(failed)?;
-                let wanted = (range.end - range.start) as usize;
-                let mut buf = vec![0u8; wanted];
-                let mut filled = 0;
-                while filled < wanted {
-                    let n = file.read(&mut buf[filled..]).await.map_err(failed)?;
-                    if n == 0 {
-                        break;
-                    }
-                    filled += n;
-                }
-                buf.truncate(filled);
+                let wanted = range.end.saturating_sub(range.start);
+                let mut buf = Vec::with_capacity(initial_range_capacity(wanted));
+                ChunkedReader::new(file)
+                    .take(wanted)
+                    .read_to_end(&mut buf)
+                    .await
+                    .map_err(failed)?;
                 Ok(buf.into())
             };
             self.calls.call_once("get", read).await
@@ -117,6 +115,11 @@ impl SftpSource {
     /// The batch size is validated up front so a bad config fails fast.
     pub fn new(config: SftpSourceConfig) -> Result<Self, FaucetError> {
         faucet_core::validate_batch_size(config.batch_size)?;
+        if config.max_listed_entries == 0 {
+            return Err(FaucetError::Config(
+                "SFTP source: max_listed_entries must be at least 1".into(),
+            ));
+        }
         config.parquet.validate()?;
         Ok(Self {
             config,
@@ -134,58 +137,79 @@ impl SftpSource {
         }
     }
 
+    /// Authenticate, list the files to read for `path` on a listing channel
+    /// (closed before anything else opens), then open the read session.
+    async fn open_and_list(
+        &self,
+        calls: &faucet_core::CallContext,
+        path: &str,
+    ) -> Result<(SftpHandle, SftpSession, Vec<String>), FaucetError> {
+        let handle = calls
+            .call_once("connect", authenticate(&self.config.connection))
+            .await?;
+        let limit = std::time::Duration::from_secs(self.config.list_timeout_secs.max(1));
+        let files = calls
+            .clone()
+            .with_timeout(limit)
+            .call_once("list", self.resolve_files(&handle, path))
+            .await
+            .map_err(|e| listing_timeout(e, path, limit))?;
+        let sftp = calls
+            .clone()
+            .with_roundtrip_metering(false)
+            .call_once("connect", handle.open_session())
+            .await?;
+        Ok((handle, sftp, files))
+    }
+
     /// List the files to read for `path`: the directory's regular files
     /// (glob-filtered, sorted for a deterministic order) when `path` is a
-    /// directory, or `[path]` when it is a single file.
+    /// directory, or `[path]` when it is a single file. Runs on its own
+    /// channel, closed before returning.
     async fn resolve_files(
         &self,
-        sftp: &SftpSession,
+        handle: &SftpHandle,
         path: &str,
     ) -> Result<Vec<String>, FaucetError> {
-        let meta = sftp
-            .metadata(path)
-            .await
-            .map_err(|e| FaucetError::Source(format!("SFTP stat '{path}' failed: {e}")))?;
+        let lister = handle.lister().await.map_err(source_err)?;
+        let files = self.list_files(&lister, path).await;
+        lister.close().await;
+        files
+    }
 
+    async fn list_files(
+        &self,
+        lister: &SftpLister,
+        path: &str,
+    ) -> Result<Vec<String>, FaucetError> {
+        let meta = lister.metadata(path).await.map_err(source_err)?;
         if !meta.file_type().is_dir() {
             return Ok(vec![path.to_string()]);
         }
-
-        let entries = sftp
-            .read_dir(path)
+        let glob = self.config.glob.as_deref();
+        let entries = lister
+            .list_dir(path, self.config.max_listed_entries, |name, attrs| {
+                !attrs.file_type().is_dir()
+                    && !faucet_common_file::write::is_scratch_name(name)
+                    && glob.is_none_or(|pattern| glob_match(pattern, name))
+            })
             .await
-            .map_err(|e| FaucetError::Source(format!("SFTP read_dir '{path}' failed: {e}")))?;
-
-        let mut files = Vec::new();
+            .map_err(source_err)?;
+        let mut files = Vec::with_capacity(entries.len());
         for entry in entries {
-            let kind = entry.file_type();
-            if kind.is_dir() {
-                continue;
-            }
             // A symlink, or an entry whose READDIR omitted its permissions,
             // is stat'ed (following links) to learn what it really is.
-            if !kind.is_file() {
-                let target = sftp.metadata(entry.path()).await.map_err(|e| {
-                    FaucetError::Source(format!("SFTP stat '{}' failed: {e}", entry.path()))
-                })?;
+            if !entry.metadata.file_type().is_file() {
+                let target = lister.metadata(&entry.path).await.map_err(source_err)?;
                 if !target.file_type().is_file() {
                     tracing::debug!(
-                        path = %entry.path(),
+                        path = %entry.path,
                         "SFTP source: skipping an entry that is not a regular file"
                     );
                     continue;
                 }
             }
-            let name = entry.file_name();
-            if faucet_common_file::write::is_scratch_name(&name) {
-                continue;
-            }
-            if let Some(pattern) = &self.config.glob
-                && !glob_match(pattern, &name)
-            {
-                continue;
-            }
-            files.push(entry.path());
+            files.push(entry.path);
         }
         files.sort();
         Ok(files)
@@ -245,7 +269,7 @@ impl SftpSource {
             SftpFormat::Orc => Fetched::Container(Self::read_file(sftp, path, max).await?),
             #[cfg(feature = "arrow")]
             SftpFormat::Parquet => Fetched::Parquet(
-                Self::open_parquet(calls, sftp, path, &config.parquet, batch_size)
+                Self::open_parquet(calls, sftp, path, config, batch_size)
                     .await?
                     .1,
             ),
@@ -264,12 +288,12 @@ impl SftpSource {
         if let Some(size) = file.metadata().await.ok().and_then(|m| m.size) {
             check_file_size(size, max, path)?;
         }
-        faucet_core::file_format::read_to_end_capped(file, max, path)
+        faucet_core::file_format::read_to_end_capped(ChunkedReader::new(file), max, path)
             .await
             .map_err(|e| FaucetError::Source(format!("SFTP read '{path}' failed: {e}")))
     }
 
-    /// Open one Parquet file, projected by `parquet`, as its Arrow schema and
+    /// Open one Parquet file, projected by `parquet.columns`, as its Arrow schema and
     /// a stream of batches of at most `batch_size` rows, read over byte
     /// ranges one row group at a time so memory stays bounded by a row group
     /// rather than the file (#783).
@@ -278,7 +302,7 @@ impl SftpSource {
         calls: &faucet_core::CallContext,
         sftp: &SftpSession,
         path: &str,
-        parquet: &faucet_core::ParquetReadOptions,
+        config: &SftpSourceConfig,
         batch_size: usize,
     ) -> Result<
         (
@@ -310,8 +334,9 @@ impl SftpSource {
             },
             len,
             path,
-        );
-        faucet_core::file_format::parquet_io::open_ranged(reader, parquet, batch_size).await
+        )
+        .with_max_range_bytes(config.max_object_bytes);
+        faucet_core::file_format::parquet_io::open_ranged(reader, &config.parquet, batch_size).await
     }
 
     /// Avro / ORC files as Arrow batches, each resolved against the first
@@ -440,9 +465,8 @@ impl faucet_core::Source for SftpSource {
 
         Box::pin(async_stream::try_stream! {
             let calls = self.calls.get();
-            let sftp = calls.call_once("connect", connect(&self.config.connection)).await?;
             let path = self.effective_path(context);
-            let files = calls.call_once("list", self.resolve_files(&sftp, &path)).await?;
+            let (conn, sftp, files) = self.open_and_list(&calls, &path).await?;
             tracing::info!(path = %path, files = files.len(), "SFTP source listed files");
 
             let chunk = if batch_size == 0 { usize::MAX } else { batch_size };
@@ -481,7 +505,7 @@ impl faucet_core::Source for SftpSource {
 
             while let Some((file, payload)) = fetched.next().await {
                 let file = &file;
-                let payload = payload?;
+                let payload = payload.map_err(|e| explained(&conn, e))?;
                 #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
                 let payload = match payload {
                     Fetched::Container(bytes) => {
@@ -501,12 +525,15 @@ impl faucet_core::Source for SftpSource {
                         // file with no newline fails instead of being
                         // buffered whole.
                         let mut lines = faucet_core::file_format::capped_lines(
-                            reads.reader(handle),
+                            reads.reader(ChunkedReader::new(handle)),
                             self.config.max_object_bytes,
                         );
                         let mut line_num = 0usize;
                         while let Some(line) = lines.next_line().await.map_err(|e| {
-                            FaucetError::Source(format!("SFTP read '{file}' failed: {e}"))
+                            explained(
+                                &conn,
+                                FaucetError::Source(format!("SFTP read '{file}' failed: {e}")),
+                            )
                         })? {
                             line_num += 1;
                             let trimmed = line.trim();
@@ -702,15 +729,14 @@ impl faucet_core::Source for SftpSource {
     > {
         Box::pin(async_stream::try_stream! {
             let calls = self.calls.get();
-            let sftp = calls.call_once("connect", connect(&self.config.connection)).await?;
             let path = self.effective_path(context);
-            let files = calls.call_once("list", self.resolve_files(&sftp, &path)).await?;
+            let (conn, sftp, files) = self.open_and_list(&calls, &path).await?;
             let reads = calls.clone().with_roundtrip_metering(false);
             if matches!(self.config.format, SftpFormat::Parquet) {
                 let mut first: Option<arrow::datatypes::SchemaRef> = None;
                 // Prefetch the next files' footers while this one's row
                 // groups decode; bodies are never buffered (#783).
-                let parquet = &self.config.parquet;
+                let config = &self.config;
                 let batch_size = self.config.batch_size;
                 let calls = &calls;
                 let mut opened = futures::stream::iter(files)
@@ -720,7 +746,7 @@ impl faucet_core::Source for SftpSource {
                             let opened = calls
                                 .call_once(
                                     "get",
-                                    Self::open_parquet(calls, sftp, &file, parquet, batch_size),
+                                    Self::open_parquet(calls, sftp, &file, config, batch_size),
                                 )
                                 .await;
                             (file, opened)
@@ -728,7 +754,7 @@ impl faucet_core::Source for SftpSource {
                     })
                     .buffered(self.config.concurrency.max(1));
                 while let Some((file, opened)) = opened.next().await {
-                    let (schema, mut batches) = opened?;
+                    let (schema, mut batches) = opened.map_err(|e| explained(&conn, e))?;
                     match &first {
                         Some(f) if !faucet_core::columnar::schema_eq(f, &schema) => {
                             Err(FaucetError::Source(format!(
@@ -765,7 +791,36 @@ impl faucet_core::Source for SftpSource {
     }
 }
 
-/// Return a human-readable name for a JSON value type.
+/// A listing call that ran out of time, as an error naming the setting.
+fn listing_timeout(e: FaucetError, path: &str, limit: std::time::Duration) -> FaucetError {
+    match e {
+        FaucetError::Timeout { .. } => FaucetError::Source(format!(
+            "SFTP listing of '{path}' did not finish within {}s (list_timeout_secs)",
+            limit.as_secs()
+        )),
+        other => other,
+    }
+}
+
+/// A listing error as the source's error.
+fn source_err(e: faucet_common_sftp::ListError) -> FaucetError {
+    FaucetError::Source(e.to_string())
+}
+
+/// `e`, or the connection's refused-packet error when it refused one: a read
+/// that failed after it failed because of it.
+fn explained(conn: &SftpHandle, e: FaucetError) -> FaucetError {
+    conn.refusal().map(FaucetError::Source).unwrap_or(e)
+}
+
+/// The first allocation for a ranged read of `wanted` bytes: the buffer grows
+/// as bytes arrive rather than being sized up front from the request.
+#[cfg(feature = "arrow")]
+fn initial_range_capacity(wanted: u64) -> usize {
+    const MAX_INITIAL: u64 = 8 * 1024 * 1024;
+    usize::try_from(wanted.min(MAX_INITIAL)).unwrap_or(0)
+}
+
 /// The error for a remote file larger than `max_object_bytes`.
 fn check_file_size(size: u64, max: u64, path: &str) -> Result<(), FaucetError> {
     if size > max {
@@ -777,6 +832,7 @@ fn check_file_size(size: u64, max: u64, path: &str) -> Result<(), FaucetError> {
     Ok(())
 }
 
+/// Return a human-readable name for a JSON value type.
 fn value_type_name(v: &Value) -> &'static str {
     match v {
         Value::Null => "null",
