@@ -531,8 +531,9 @@ fn redact_secret_kv_values(s: &str) -> String {
                 };
                 let vstart = eq + 1;
                 let value = &rest[vstart..];
-                let scan_from = match value.chars().next() {
-                    Some(q @ ('"' | '\'')) => value[1..].find(q).map(|i| i + 2).unwrap_or(0),
+                let scan_from = match value.as_bytes().first() {
+                    Some(&q @ (b'"' | b'\'')) => quoted_value_len(value.as_bytes(), q),
+                    Some(b'{') => value.find('}').map_or(value.len(), |i| i + 1),
                     _ => 0,
                 };
                 let vend = value[scan_from..]
@@ -555,6 +556,23 @@ fn redact_secret_kv_values(s: &str) -> String {
         rest = chars.as_str();
     }
     out
+}
+
+/// The length of a value quoted with `q` at the start of `b`, through its
+/// closing quote (a doubled quote embeds one); all of `b` when unclosed.
+fn quoted_value_len(b: &[u8], q: u8) -> usize {
+    let mut i = 1;
+    while i < b.len() {
+        if b[i] == q {
+            if b.get(i + 1) == Some(&q) {
+                i += 2;
+                continue;
+            }
+            return i + 1;
+        }
+        i += 1;
+    }
+    b.len()
 }
 
 /// Whether a connection-string / query-string key names a credential whose

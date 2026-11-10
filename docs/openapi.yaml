@@ -2099,7 +2099,7 @@ paths:
         "403": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
         "422": { description: Unknown provider, or a redirect outside `allowed_redirects` }
-        "503": { description: The server has no vault key }
+        "503": { description: The server has no vault key, or the run history could not be read }
   /v1/connect/callback:
     get:
       summary: OAuth redirect target (public)
@@ -2108,7 +2108,11 @@ paths:
         the code at the provider's token endpoint and redirects to the
         caller's `redirect` with `connection=<name>&status=ok`, or
         `status=error&error=<code>` (`expired`, `access_denied`,
-        `exchange_failed`, …). An unknown or already-used `state` is a 400.
+        `missing_code`, `exchange_failed`, `store_unavailable`,
+        `connection_changed`). The callback writes only over the connection
+        its flow started from; `connection_changed` means the connection or
+        tenant was deleted or replaced during the flow and nothing was stored.
+        An unknown or already-used `state` is a 400.
       operationId: connectCallback
       parameters:
         - { name: state, in: query, required: true, schema: { type: string } }
@@ -4747,6 +4751,13 @@ components:
           type: object
           nullable: true
           description: Device and inode of the file faucet last wrote; a sweep leaves a file with a different identity alone.
+          properties:
+            dev: { type: integer }
+            ino: { type: integer }
+        parent_id:
+          type: object
+          nullable: true
+          description: Device and inode of the directory faucet last wrote the file in; a sweep leaves an output whose directory changed after it was recorded in place.
           properties:
             dev: { type: integer }
             ino: { type: integer }

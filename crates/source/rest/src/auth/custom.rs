@@ -8,9 +8,10 @@ pub fn apply(headers: &mut HeaderMap, custom: &HashMap<String, String>) -> Resul
     for (name, value) in custom {
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|e| FaucetError::Auth(format!("invalid custom header name {name:?}: {e}")))?;
-        let header_value = HeaderValue::from_str(value).map_err(|e| {
+        let mut header_value = HeaderValue::from_str(value).map_err(|e| {
             FaucetError::Auth(format!("invalid custom header value for {name:?}: {e}"))
         })?;
+        header_value.set_sensitive(true);
         headers.insert(header_name, header_value);
     }
     Ok(())
@@ -38,6 +39,8 @@ mod tests {
         assert_eq!(headers.get("existing").unwrap(), "keep");
         assert_eq!(headers.get("x-custom").unwrap(), "val1");
         assert_eq!(headers.get("x-another").unwrap(), "val2");
+        assert!(headers.get("x-custom").unwrap().is_sensitive());
+        assert!(!headers.get("existing").unwrap().is_sensitive());
     }
 
     #[test]

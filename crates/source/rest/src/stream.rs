@@ -613,6 +613,32 @@ fn insert_header(headers: &mut HeaderMap, name: &str, value: &str) -> Result<(),
     Ok(())
 }
 
+/// What one data-page attempt tells `execute_request` about how
+/// to react to its failure.
+#[derive(Default)]
+struct Attempt {
+    /// The shared-provider credential the request carried.
+    sent: Option<Credential>,
+    /// The request ended with a 4xx at another origin (a redirect) that is
+    /// not a credential host, so it went out without the credential.
+    rejected_elsewhere: bool,
+}
+
+/// [`insert_header`] for a value that may carry a credential: it is marked
+/// sensitive, so it is redacted from debug output and dropped on a redirect to
+/// another origin.
+fn insert_sensitive_header(
+    headers: &mut HeaderMap,
+    name: &str,
+    value: &str,
+) -> Result<(), FaucetError> {
+    insert_header(headers, name, value)?;
+    if let Some(v) = headers.get_mut(name) {
+        v.set_sensitive(true);
+    }
+    Ok(())
+}
+
 impl RestStream {
     /// Create a new stream from the given configuration.
     pub fn new(config: RestStreamConfig) -> Result<Self, FaucetError> {
@@ -811,9 +837,22 @@ impl RestDriver {
             }
             _ => {}
         }
+        // The base origin with its port written out, so it matches that port
+        // only (a bare host would match any port).
+        let credential_hosts: Vec<String> = reqwest::Url::parse(&config.base_url)
+            .ok()
+            .and_then(|u| {
+                let host = u.host_str()?.to_string();
+                let port = u.port_or_known_default()?;
+                Some(format!("{}://{host}:{port}", u.scheme()))
+            })
+            .into_iter()
+            .chain(config.trusted_hosts.iter().cloned())
+            .collect();
         let new_builder = || -> Result<faucet_core::http::ClientBuilder, FaucetError> {
-            let mut builder =
-                Client::builder().configure(|b| b.gzip(true).brotli(true).deflate(true));
+            let mut builder = Client::builder()
+                .configure(|b| b.gzip(true).brotli(true).deflate(true))
+                .credential_hosts(&credential_hosts);
             for name in &sensitive {
                 if reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_ok() {
                     builder = builder.sensitive_header(name);
@@ -1920,7 +1959,7 @@ impl RestDriver {
         body_params: &[(String, Value)],
         window_binds: &[ResolvedBind],
     ) -> Result<(Value, HeaderMap), FaucetError> {
-        let mut sent: Option<Credential> = None;
+        let mut attempt = Attempt::default();
         match self
             .execute_request_once(
                 params,
@@ -1929,10 +1968,20 @@ impl RestDriver {
                 is_first_page,
                 body_params,
                 window_binds,
-                &mut sent,
+                &mut attempt,
             )
             .await
         {
+            // A rejection by another origin, reached through a redirect, says
+            // nothing about this source's credential when it went out without
+            // it (the origin is not a credential host).
+            Err(e @ FaucetError::HttpStatus { .. }) if attempt.rejected_elsewhere => {
+                tracing::debug!(
+                    "a redirect target on another origin rejected the request; \
+                     keeping the current credential"
+                );
+                Err(e)
+            }
             Err(FaucetError::HttpStatus { status: 401, .. }) if self.uses_inline_cached_token() => {
                 tracing::warn!(
                     "401 Unauthorized with a cached inline OAuth2/TokenEndpoint token; \
@@ -1946,7 +1995,7 @@ impl RestDriver {
                     is_first_page,
                     body_params,
                     window_binds,
-                    &mut None,
+                    &mut Attempt::default(),
                 )
                 .await
             }
@@ -1960,7 +2009,10 @@ impl RestDriver {
                         "the server rejected the shared credential; \
                          re-authenticating and retrying once"
                     );
-                    let stale = sent.take().unwrap_or(Credential::Token(String::new()));
+                    let stale = attempt
+                        .sent
+                        .take()
+                        .unwrap_or(Credential::Token(String::new()));
                     let _ = provider.invalidate(&stale).await;
                 }
                 self.execute_request_once(
@@ -1970,7 +2022,7 @@ impl RestDriver {
                     is_first_page,
                     body_params,
                     window_binds,
-                    &mut None,
+                    &mut Attempt::default(),
                 )
                 .await
             }
@@ -2128,7 +2180,7 @@ impl RestDriver {
             crate::url_util::retain_cross_origin_safe(&mut hdrs);
         }
         for (k, v) in headers {
-            insert_header(&mut hdrs, k, v)?;
+            insert_sensitive_header(&mut hdrs, k, v)?;
         }
         let client = if streamed {
             &self.stream_client
@@ -2534,7 +2586,7 @@ impl RestDriver {
                 for p in ra.placements {
                     match p {
                         CredentialPlacement::Header { name, value } => {
-                            insert_header(&mut headers, &name, &value)?
+                            insert_sensitive_header(&mut headers, &name, &value)?
                         }
                         CredentialPlacement::Cookie { name, value } => {
                             insert_header(&mut headers, "Cookie", &format!("{name}={value}"))?
@@ -2615,7 +2667,7 @@ impl RestDriver {
         is_first_page: bool,
         body_params: &[(String, Value)],
         window_binds: &[ResolvedBind],
-        sent: &mut Option<Credential>,
+        attempt: &mut Attempt,
     ) -> Result<(Value, HeaderMap), FaucetError> {
         let use_override = url_override.is_some();
 
@@ -2650,7 +2702,7 @@ impl RestDriver {
             if !ra.is_empty() {
                 used_request_auth = true;
                 // What a flow provider's `invalidate` compares against (#789 API-21).
-                *sent = Some(Credential::Token(
+                attempt.sent = Some(Credential::Token(
                     ra.captured
                         .get(FLOW_SESSION_KEY)
                         .cloned()
@@ -2812,7 +2864,7 @@ impl RestDriver {
         }
         // #511 header + cookie placements from the flow provider.
         for (name, value) in &ra_headers {
-            insert_header(&mut headers, name, value)?;
+            insert_sensitive_header(&mut headers, name, value)?;
         }
         if !ra_cookies.is_empty() {
             let cookie = ra_cookies
@@ -2925,7 +2977,7 @@ impl RestDriver {
                 Some(cred) => cred,
                 None => provider.credential().await?,
             };
-            *sent = Some(cred.clone());
+            attempt.sent = Some(cred.clone());
             let mut auth_headers = HeaderMap::new();
             credential_to_auth(cred).apply(&mut auth_headers)?;
             req = req.headers(auth_headers);
@@ -3021,6 +3073,9 @@ impl RestDriver {
         self.roundtrip("page");
         let resp = self.client.send(req).await?;
         let status = resp.status();
+        attempt.rejected_elsewhere = status.is_client_error()
+            && reqwest::Url::parse(&url)
+                .is_ok_and(|u| !self.client.keeps_credentials(&u, resp.url()));
 
         // 429 Too Many Requests: honour Retry-After before retrying, unless a
         // `retry_on_response` rule says where the wait is (#771).

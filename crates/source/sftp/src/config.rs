@@ -143,9 +143,29 @@ pub struct SftpSourceConfig {
     /// raw text, CSV, XML, Excel, Avro, ORC) may reach; a larger one fails
     /// with an error naming it instead of exhausting memory. It also bounds one
     /// line of a streamed `jsonl` file, so a file with no newline fails the
-    /// same way; `parquet` streams and is not capped. Default 2 GiB.
+    /// same way; `parquet` streams, and this caps one byte range it reads.
+    /// Default 2 GiB.
     #[serde(default = "default_max_object_bytes")]
     pub max_object_bytes: u64,
+    /// Entries one directory listing may scan (default 1,000,000). Every
+    /// entry the server sends counts, whether or not it matches `glob`; a
+    /// directory with more fails the run with an error naming this field.
+    /// Must be at least 1.
+    #[serde(default = "default_max_listed_entries")]
+    pub max_listed_entries: usize,
+    /// Seconds the directory listing may take (default 300), including the
+    /// stat of each symbolic link in it; a slower listing fails the run with
+    /// an error naming this field. `0` is treated as `1`.
+    #[serde(default = "default_list_timeout_secs")]
+    pub list_timeout_secs: u64,
+}
+
+fn default_max_listed_entries() -> usize {
+    faucet_common_sftp::DEFAULT_MAX_LISTED_ENTRIES
+}
+
+fn default_list_timeout_secs() -> u64 {
+    faucet_core::DEFAULT_CALL_TIMEOUT.as_secs()
 }
 
 fn default_max_object_bytes() -> u64 {
@@ -178,6 +198,8 @@ impl SftpSourceConfig {
             orc: faucet_core::OrcOptions::default(),
             parquet: faucet_core::ParquetReadOptions::default(),
             max_object_bytes: default_max_object_bytes(),
+            max_listed_entries: default_max_listed_entries(),
+            list_timeout_secs: default_list_timeout_secs(),
         }
     }
 

@@ -715,6 +715,18 @@ impl RunHistory for FallbackHistory {
     ) -> Result<bool, HistoryError> {
         strict!(self, p => p.connection_replace(connection, expected_updated_at), f => f.connection_replace(connection, expected_updated_at))
     }
+    async fn connection_insert_new(
+        &self,
+        connection: &super::tenants::ConnectionRecord,
+    ) -> Result<bool, HistoryError> {
+        strict!(self, p => p.connection_insert_new(connection), f => f.connection_insert_new(connection))
+    }
+    async fn connection_upsert_in_tenant(
+        &self,
+        connection: &super::tenants::ConnectionRecord,
+    ) -> Result<bool, HistoryError> {
+        strict!(self, p => p.connection_upsert_in_tenant(connection), f => f.connection_upsert_in_tenant(connection))
+    }
     async fn connection_get(
         &self,
         tenant: &str,
@@ -1376,6 +1388,51 @@ mod tests {
         healthy.degraded.store(true, Ordering::Release);
         assert!(healthy.policy_version_insert(&rec).await.is_err());
         assert!(healthy.policy_version_get("server", 1).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn tenant_scoped_connection_writes_reach_the_primary_and_never_the_fallback() {
+        use crate::serve::history::tenants::{ConnectionRecord, TenantRecord};
+        let now = chrono::Utc::now();
+        let conn = ConnectionRecord {
+            tenant: "acme".into(),
+            name: "crm".into(),
+            provider_type: "static".into(),
+            connect_provider: None,
+            sealed: "s".into(),
+            status: Default::default(),
+            reauth_reason: None,
+            created_at: now,
+            updated_at: now,
+            updated_by: "t".into(),
+            generation: "g".into(),
+        };
+        let healthy = FallbackHistory::healthy(
+            Box::new(MemoryHistory::new(Duration::from_secs(60))),
+            Duration::from_secs(60),
+            "test",
+        );
+        healthy
+            .tenant_upsert(&TenantRecord {
+                id: "acme".into(),
+                name: None,
+                labels: Default::default(),
+                limits: Default::default(),
+                notifications: Vec::new(),
+                notifications_sealed: None,
+                suspended: false,
+                created_at: now,
+                updated_at: now,
+                created_by: "t".into(),
+            })
+            .await
+            .unwrap();
+        assert!(healthy.connection_insert_new(&conn).await.unwrap());
+        assert!(healthy.connection_upsert_in_tenant(&conn).await.unwrap());
+
+        healthy.degraded.store(true, Ordering::Release);
+        assert!(healthy.connection_insert_new(&conn).await.is_err());
+        assert!(healthy.connection_upsert_in_tenant(&conn).await.is_err());
     }
 
     #[tokio::test]

@@ -430,7 +430,7 @@ by `request_timeout_secs` and any caller deadline, metered (`bulk` / `request`),
 and sent once — an append without `_id` must never be re-sent. The per-item
 `429` / `503` re-send waits through the same context.
 Redirects are followed by `faucet_core::http::Client`: a hop to another
-origin drops `Authorization`, cookies and every credential header, and a request
+origin keeps only standard request headers (`faucet_core::http::CROSS_ORIGIN_SAFE_HEADERS`): `Authorization`, cookies and every other header stay behind, and a request
 body is never replayed to another origin.
 
 ## How it is built

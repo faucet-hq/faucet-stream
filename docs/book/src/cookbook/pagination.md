@@ -188,12 +188,18 @@ pagination:
 
 A server-given link (either style, or an async-job URL) that points at another
 scheme, host or port than `base_url` is fetched **without** the source's
-credentials, and an `https` base never follows a plain-`http` link. When the API
-really serves pages from a second host, list it:
+credentials, and an `https` base never follows a plain-`http` link. A redirect
+to another origin likewise keeps only standard request headers (`Accept`,
+`Content-Type`, `User-Agent`, `Range`, …): auth headers, a shared provider's
+credential and every configured `headers:` entry stay behind. When the API
+really serves pages or results from a second host, list it:
 
 ```yaml
-trusted_hosts: [files.example.com, "*.cdn.example.com"]
+trusted_hosts: [files.example.com, "files.example.com:8443", "*.cdn.example.com"]
 ```
+
+A link or a redirect to a listed host keeps every header when it keeps the
+scheme; a bare host covers any port, `host:port` only that port.
 
 > Use `faucet schema source rest` to see the exact fields and defaults for each
 > style in your installed version.

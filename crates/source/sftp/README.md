@@ -21,16 +21,25 @@ Connection, authentication, and host-key verification come from
 | `username` | string | — | SSH username. |
 | `type` / `config` | auth | — | `password` or `private_key` (see `faucet-common-sftp`). |
 | `known_hosts` | policy | `{ mode: accept_new }` | Host-key verification policy. Wildcard host patterns and `@revoked` keys are honoured; a host trusted only through `@cert-authority` is refused (host certificates are not supported). |
-| `connect_timeout_secs` | integer | `30` | Seconds the TCP connect, SSH handshake, authentication and SFTP subsystem start together may take; a server that accepts and stalls fails the run. |
+| `connect_timeout_secs` | integer | `30` | Seconds the TCP connect, SSH handshake and authentication together may take, and then each SFTP channel's start; a server that accepts and stalls fails the run. |
 | `keepalive_interval_secs` | integer | `15` | Seconds between SSH keepalives on a quiet connection; dropped after three unanswered. `0` disables them. |
 | `path` | string | — | Remote directory to list, or a single file. |
 | `glob` | string | none | Filename glob (`*` / `?`) applied to basenames when `path` is a directory. |
 | `format` | enum | `jsonl` | `jsonl` \| `json_array` \| `raw_text` \| `csv` \| `xml` \| `xlsx`. |
 | `batch_size` | integer | `1000` | Records per page; `0` = one page per file. |
 | `concurrency` | integer | `4` | Files read concurrently. The prefetch is ordered, so records stay in listing order and a failing file is still blamed at its own position; `0` is clamped to 1. Lower than the object-store sources' default because every read shares one SSH channel. For `jsonl` it overlaps only the `open` round-trip (peak memory stays `O(batch_size)`); for `json_array` / `raw_text` up to `concurrency` whole files are resident. |
-| `max_object_bytes` | integer | `2147483648` (2 GiB) | Largest file a format read whole into memory (`json_array`, `raw_text`, `csv`, `xml`, `xlsx`, `avro`, `orc`) may reach. The size the server reports is checked before reading and the read stops one byte past the cap, so a larger file fails with an error naming it instead of exhausting memory. It also bounds one line of a streamed `jsonl` file, so a file with no newline fails the same way; `parquet` streams and is not capped. |
+| `max_object_bytes` | integer | `2147483648` (2 GiB) | Largest file a format read whole into memory (`json_array`, `raw_text`, `csv`, `xml`, `xlsx`, `avro`, `orc`) may reach. The size the server reports is checked before reading and the read stops one byte past the cap, so a larger file fails with an error naming it instead of exhausting memory. It also bounds one line of a streamed `jsonl` file, so a file with no newline fails the same way. `parquet` streams; one byte range it reads is capped at this size. |
+| `max_listed_entries` | integer | `1000000` | Entries one directory listing may scan. Every entry the server sends counts, whether or not it matches `glob`; a directory with more fails the run with an error naming this field. Must be at least 1. |
+| `list_timeout_secs` | integer | `300` | Seconds the directory listing may take, including the stat of each symbolic link in it; a slower listing fails the run with an error naming this field. `0` is treated as `1`. |
 
 Symlinks are followed: a link to a file is read, a link to a directory is skipped.
+
+The listing runs on its own SSH channel, which is closed (and the server's
+close awaited) before the read session opens, so a server that allows one
+session per connection (`MaxSessions 1`) works. Entries are filtered as each
+reply arrives and only matches are kept. Every SFTP packet the server sends
+is limited to 1 MiB + 64 bytes; a longer one closes the channel and fails the
+run with an error naming the limit.
 
 `raw_text` emits one record per file: `{ "path": <remote path>, "content": <file text> }`.
 

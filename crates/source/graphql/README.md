@@ -492,7 +492,7 @@ bounded by `timeout` (300 s when unset), the run's cancel token stops an
 in-flight request or backoff, and the retry policy is unchanged. Responses are
 read with a 1 GiB cap.
 Redirects are followed by `faucet_core::http::Client`: a hop to another
-origin drops `Authorization`, cookies and every credential header, and a request
+origin keeps only standard request headers (`faucet_core::http::CROSS_ORIGIN_SAFE_HEADERS`): `Authorization`, cookies and every other header stay behind, and a request
 body is never replayed to another origin.
 
 ## How it is built

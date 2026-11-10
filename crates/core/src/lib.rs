@@ -15,6 +15,7 @@
 
 pub mod accounting;
 pub mod adaptive;
+pub mod ado;
 pub mod anomaly;
 pub mod auth;
 pub mod batching;
@@ -69,6 +70,7 @@ pub mod metadata;
 pub mod native;
 pub mod object_rollover;
 pub mod observability;
+pub mod path_guard;
 pub mod pipeline;
 #[cfg(feature = "policy")]
 pub mod policy;

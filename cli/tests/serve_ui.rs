@@ -92,6 +92,33 @@ async fn boot(args: ServeArgs) -> (String, reqwest::Client) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn asset_paths_must_be_plain_relative_names() {
+    let port = free_port();
+    let (base, client) = boot(args(port)).await;
+    for path in [
+        "..%2Fui_assets.rs",
+        "..%2F..%2F..%2FCargo.toml",
+        "views%2F..%2Fapp.js",
+        "views%5C..%5Capp.js",
+        "%252F..%252Fui_assets.rs",
+        "/app.js",
+    ] {
+        let r = client
+            .get(format!("{base}/assets/{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404, "{path}");
+    }
+    let r = client
+        .get(format!("{base}/assets/views/runs.js"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn serves_shell_assets_and_spa_fallback() {
     let port = free_port();
     let (base, client) = boot(args(port)).await;

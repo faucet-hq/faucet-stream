@@ -1039,6 +1039,13 @@ pub struct Stmts {
     pub schedule_list: String,
     pub schedule_delete: String,
     pub connection_upsert: String,
+    /// Insert a connection only while its tenant row exists and no
+    /// connection has its name; waits on a concurrent tenant delete. Params:
+    /// tenant, name, status, updated_at, body, tenant.
+    pub connection_insert_new: String,
+    /// [`Stmts::connection_upsert`] only while the tenant row exists; waits
+    /// on a concurrent tenant delete. Params as `connection_insert_new`.
+    pub connection_upsert_in_tenant: String,
     /// Compare-and-set a connection on its stored `updated_at`. Params:
     /// status, updated_at, body, tenant, name, expected updated_at.
     pub connection_replace: String,
@@ -1963,6 +1970,19 @@ impl Stmts {
                 ON CONFLICT (tenant, name) DO UPDATE SET status=excluded.status, \
                 updated_at=excluded.updated_at, body=excluded.body"
                 .into(),
+            connection_insert_new: "WITH t AS (SELECT id FROM faucet_tenants \
+                WHERE id=$6 FOR KEY SHARE) \
+                INSERT INTO faucet_tenant_connections \
+                (tenant, name, status, updated_at, body) SELECT $1,$2,$3,$4,$5 FROM t \
+                ON CONFLICT (tenant, name) DO NOTHING"
+                .into(),
+            connection_upsert_in_tenant: "WITH t AS (SELECT id FROM faucet_tenants \
+                WHERE id=$6 FOR KEY SHARE) \
+                INSERT INTO faucet_tenant_connections \
+                (tenant, name, status, updated_at, body) SELECT $1,$2,$3,$4,$5 FROM t \
+                ON CONFLICT (tenant, name) DO UPDATE SET status=excluded.status, \
+                updated_at=excluded.updated_at, body=excluded.body"
+                .into(),
             connection_select: "SELECT body FROM faucet_tenant_connections \
                 WHERE tenant=$1 AND name=$2"
                 .into(),
@@ -2602,6 +2622,17 @@ impl Stmts {
                 .into(),
             connection_upsert: "INSERT INTO faucet_tenant_connections \
                 (tenant, name, status, updated_at, body) VALUES (?,?,?,?,?) \
+                ON CONFLICT (tenant, name) DO UPDATE SET status=excluded.status, \
+                updated_at=excluded.updated_at, body=excluded.body"
+                .into(),
+            connection_insert_new: "INSERT INTO faucet_tenant_connections \
+                (tenant, name, status, updated_at, body) SELECT ?,?,?,?,? \
+                WHERE EXISTS (SELECT 1 FROM faucet_tenants WHERE id=?) \
+                ON CONFLICT (tenant, name) DO NOTHING"
+                .into(),
+            connection_upsert_in_tenant: "INSERT INTO faucet_tenant_connections \
+                (tenant, name, status, updated_at, body) SELECT ?,?,?,?,? \
+                WHERE EXISTS (SELECT 1 FROM faucet_tenants WHERE id=?) \
                 ON CONFLICT (tenant, name) DO UPDATE SET status=excluded.status, \
                 updated_at=excluded.updated_at, body=excluded.body"
                 .into(),
@@ -3346,6 +3377,28 @@ macro_rules! impl_sql_history {
                 };
                 let body: String = row.try_get("body").map_err(backend)?;
                 Ok(Some($crate::serve::history::sql::decode_json(&body, what)?))
+            }
+
+            /// Run a tenant-scoped connection write; whether it wrote a row.
+            async fn connection_write_in_tenant(
+                &self,
+                stmt: &str,
+                connection: &$crate::serve::history::tenants::ConnectionRecord,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let n = sqlx::query(stmt)
+                    .bind(&connection.tenant)
+                    .bind(&connection.name)
+                    .bind(connection.status.as_str())
+                    .bind(sql::fmt_ts(connection.updated_at))
+                    .bind(sql::encode_json(connection, "connection")?)
+                    .bind(&connection.tenant)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?
+                    .rows_affected();
+                Ok(n == 1)
             }
 
             /// Run a statement returning `body` rows and decode each.
@@ -6086,6 +6139,14 @@ macro_rules! impl_sql_history {
             async fn tenant_delete(&self, id: &str) -> Result<bool, $crate::serve::history::HistoryError> {
                 let backend = $crate::serve::history::sql::classify_backend_error;
                 let mut tx = self.pool.begin_with($begin_write).await.map_err(backend)?;
+                // The tenant row goes first: its lock makes a racing tenant-scoped
+                // connection write wait, and the deletes below see what it wrote.
+                let n = sqlx::query(&self.stmts.tenant_delete)
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(backend)?
+                    .rows_affected();
                 for stmt in [
                     &self.stmts.tenant_delete_connections,
                     &self.stmts.tenant_delete_sessions,
@@ -6099,12 +6160,6 @@ macro_rules! impl_sql_history {
                         .await
                         .map_err(backend)?;
                 }
-                let n = sqlx::query(&self.stmts.tenant_delete)
-                    .bind(id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(backend)?
-                    .rows_affected();
                 tx.commit().await.map_err(backend)?;
                 Ok(n > 0)
             }
@@ -6145,6 +6200,22 @@ macro_rules! impl_sql_history {
                     .await
                     .map_err(backend)?;
                 Ok(())
+            }
+
+            async fn connection_insert_new(
+                &self,
+                connection: &$crate::serve::history::tenants::ConnectionRecord,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                self.connection_write_in_tenant(&self.stmts.connection_insert_new, connection)
+                    .await
+            }
+
+            async fn connection_upsert_in_tenant(
+                &self,
+                connection: &$crate::serve::history::tenants::ConnectionRecord,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                self.connection_write_in_tenant(&self.stmts.connection_upsert_in_tenant, connection)
+                    .await
             }
 
             async fn connection_get(

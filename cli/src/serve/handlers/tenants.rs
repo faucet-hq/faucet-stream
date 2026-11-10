@@ -348,15 +348,14 @@ async fn store_connection(
         .map_err(|e| ServeError::BadConfig(format!("provider: {e}")))?;
     tenants::register_secrets(&provider);
     let history = state.history();
-    let existing = history
-        .connection_get(tenant, name)
-        .await
-        .map_err(store_err)?;
-    if must_be_new && existing.is_some() {
-        return Err(ServeError::Conflict(format!(
-            "tenant '{tenant}' already has a connection '{name}' (use PUT to replace it)"
-        )));
-    }
+    let existing = if must_be_new {
+        None
+    } else {
+        history
+            .connection_get(tenant, name)
+            .await
+            .map_err(store_err)?
+    };
     let now = Utc::now();
     let rec = ConnectionRecord {
         tenant: tenant.to_string(),
@@ -372,8 +371,23 @@ async fn store_connection(
         created_at: existing.map(|e| e.created_at).unwrap_or(now),
         updated_at: now,
         updated_by: actor.principal.clone(),
+        generation: crate::serve::history::tenants::new_generation(),
     };
-    history.connection_upsert(&rec).await.map_err(store_err)?;
+    let written = if must_be_new {
+        history.connection_insert_new(&rec).await
+    } else {
+        history.connection_upsert_in_tenant(&rec).await
+    }
+    .map_err(store_err)?;
+    if !written {
+        if !must_be_new {
+            return Err(ServeError::NotFound);
+        }
+        tenants::get_tenant(state, tenant).await?;
+        return Err(ServeError::Conflict(format!(
+            "tenant '{tenant}' already has a connection '{name}' (use PUT to replace it)"
+        )));
+    }
     tenants::metrics::refresh_connection_gauges(state).await;
     crate::serve::audit::write_target(
         state,

@@ -1302,6 +1302,147 @@ fn a_caller_url_host_may_not_come_from_records() {
     }
 }
 
+fn confined_policy() -> ReferencePolicy {
+    ReferencePolicy::deny_all()
+        .with_path_roots(["/srv/data"])
+        .any_url_scheme()
+        .any_url_host()
+}
+
+#[cfg(any(feature = "source-mssql", feature = "source-oracle"))]
+fn source_cfg(kind: &str, config: Value) -> PipelineConfig {
+    PipelineConfig::from_value(serde_json::json!({
+        "version": 1,
+        "pipeline": {
+            "source": {"type": kind, "config": config},
+            "sink": {"type": "stdout", "config": {}}
+        }
+    }))
+    .unwrap()
+}
+
+/// The caller verdict (`Err` text) and whether the operator's own config
+/// passes, for one source config.
+#[cfg(any(feature = "source-mssql", feature = "source-oracle"))]
+fn screened(kind: &str, config: Value) -> (Result<(), String>, bool) {
+    let cfg = source_cfg(kind, config);
+    let caller = BodyOrigin::Caller {
+        allow_subprocess: false,
+    };
+    let verdict =
+        refuse_server_paths_with(&cfg, &[], caller, &confined_policy()).map_err(|e| e.to_string());
+    let trusted =
+        refuse_server_paths_with(&cfg, &[], BodyOrigin::Trusted, &ReferencePolicy::open()).is_ok();
+    (verdict, trusted)
+}
+
+#[cfg(feature = "source-mssql")]
+#[test]
+fn mssql_connection_string_variants_are_screened() {
+    let cfg = |cs: &str| serde_json::json!({"connection_string": cs, "query": "select 1"});
+    for cs in [
+        "Server=tcp:db.example.com,1433;User Id=sa;Password=x;TrustServerCertificateCA=/etc/x.pem",
+        ";Server=tcp:db.example.com,1433;User Id=sa;Password=x;TrustServerCertificateCA=/etc/x.pem",
+        "App.Name=x;Server=db.example.com;User Id=sa;Password=x;TrustServerCertificateCA=/etc/x.pem",
+        "Server=db.example.com;TrustServerCertificateCA={/etc/x.pem}",
+    ] {
+        let (verdict, trusted) = screened("mssql", cfg(cs));
+        let err = verdict.expect_err(cs);
+        assert!(err.contains("trustservercertificateca"), "{cs}: {err}");
+        assert!(trusted, "{cs}");
+    }
+    for cs in [
+        ";Server=tcp:169.254.169.254,1433;User Id=sa;Password=x",
+        "App.Name=x;Server=169.254.169.254;User Id=sa;Password=x",
+    ] {
+        let (verdict, trusted) = screened("mssql", cfg(cs));
+        assert!(verdict.expect_err(cs).contains("169.254.169.254"), "{cs}");
+        assert!(!trusted, "{cs}");
+    }
+    let (verdict, _) = screened("mssql", cfg("Server=h;junk"));
+    assert!(verdict.unwrap_err().contains("the way the driver reads it"));
+    let ok = "Server=tcp:db.example.com,1433;Database=x;User Id=sa;Password=x;\
+              TrustServerCertificateCA=/srv/data/ca.pem";
+    assert_eq!(screened("mssql", cfg(ok)), (Ok(()), true));
+}
+
+#[cfg(feature = "source-oracle")]
+#[test]
+fn oracle_connect_string_variants_are_screened() {
+    let cfg = |cs: &str| {
+        serde_json::json!({"connect_string": cs, "username": "u", "password": "p",
+            "query": "select 1 from dual"})
+    };
+    for (cs, needle) in [
+        ("//169.254.169.254:1521/svc", "169.254.169.254"),
+        (
+            "db.example.com:1521;169.254.169.254:1521/svc",
+            "169.254.169.254",
+        ),
+        (
+            "(DESCRIPTION=(ADDRESS=(HTTPS_PROXY=169.254.169.254)(PROTOCOL=TCPS)\
+             (HOST=db.example.com)(PORT=443)))",
+            "169.254.169.254",
+        ),
+    ] {
+        let (verdict, trusted) = screened("oracle", cfg(cs));
+        assert!(verdict.expect_err(cs).contains(needle), "{cs}");
+        assert!(!trusted, "{cs}");
+    }
+    for (cs, needle) in [
+        (
+            "db.example.com:2484/svc?wallet_location=/etc/oracle/wallet",
+            "wallet_location",
+        ),
+        (
+            "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=db.example.com)(PORT=2484))\
+             (SECURITY=(TOKEN_AUTH=OCI_TOKEN)(TOKEN_LOCATION=/etc/oci/tok)))",
+            "token_auth",
+        ),
+        (
+            "(DESCRIPTION=(ADDRESS=(PROTOCOL=BEQ)(PROGRAM=/bin/sh)(ARGV0=sh)))",
+            "bequeath",
+        ),
+        ("orclpdb_alias", "net service name"),
+    ] {
+        let (verdict, trusted) = screened("oracle", cfg(cs));
+        assert!(verdict.expect_err(cs).contains(needle), "{cs}");
+        assert!(trusted, "{cs}");
+    }
+    assert_eq!(
+        screened("oracle", cfg("db.example.com:1521/FREEPDB1")),
+        (Ok(()), true)
+    );
+}
+
+#[cfg(feature = "source-mssql")]
+#[test]
+fn refusal_text_hides_connection_passwords() {
+    let cs = ";Server=169.254.169.254;User Id=sa;Password=hunter2-secret";
+    let (verdict, _) = screened(
+        "mssql",
+        serde_json::json!({"connection_string": cs, "query": "select 1"}),
+    );
+    let err = verdict.unwrap_err();
+    assert!(!err.contains("hunter2-secret"), "{err}");
+    assert!(err.contains("connection_string"), "{err}");
+}
+
+#[test]
+fn refusal_text_hides_url_credentials() {
+    let doc = serde_json::json!({
+        "notes": {"endpoint": "postgres://u:hunter2-secret@169.254.169.254/db"}
+    });
+    let err = screen_caller_fragment(&doc, &confined_policy())
+        .unwrap_err()
+        .to_string();
+    assert!(!err.contains("hunter2-secret"), "{err}");
+    assert!(
+        err.contains("notes.endpoint") && err.contains("169.254.169.254"),
+        "{err}"
+    );
+}
+
 fn caller_fields(entries: &[(&str, &str)]) -> crate::params::CallerFields {
     let mut f = crate::params::CallerFields::default();
     for (p, n) in entries {
@@ -1584,6 +1725,213 @@ fn environment_files_in_the_working_directory_are_protected() {
 }
 
 #[test]
+fn environment_files_created_later_are_protected() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("data.csv"), "id\n1\n").unwrap();
+    protect_env_files(dir.path(), None);
+    let d = dir.path().display();
+    for name in [
+        ".env",
+        ".env.local",
+        ".ENV.Local",
+        ".envrc",
+        ".env.production.local",
+    ] {
+        assert!(
+            read_protected(&format!("{d}/{name}")),
+            "{name} before it exists"
+        );
+        assert!(file_is_protected(&format!("{d}/{name}")), "{name}");
+        assert!(
+            data_path_is_protected(&format!("{d}/{name}"), Access::Write),
+            "{name}"
+        );
+    }
+    assert!(read_protected(&format!("{d}/.env/secret")));
+    assert!(data_path_is_protected(
+        &format!("{d}/.Env/x.jsonl"),
+        Access::Write
+    ));
+    std::fs::write(dir.path().join(".env.local"), "X=dummy\n").unwrap();
+    assert!(read_protected(&format!("{d}/.env.local")));
+    assert!(read_protected(&format!("{d}/sub/../.env.local")));
+    assert!(read_protected(&format!("{d}/./.env.local")));
+    assert!(!read_protected(&format!("{d}/data.csv")));
+    assert!(!read_protected(&format!("{d}/environment.csv")));
+}
+
+#[test]
+fn working_directory_listings_and_globs_reach_environment_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::write(data.join("a.csv"), "id\n1\n").unwrap();
+    protect_env_files(dir.path(), None);
+    let d = dir.path().display();
+    assert!(read_protected(&d.to_string()));
+    assert!(read_protected(&format!("{d}/")));
+    assert!(data_path_is_protected(
+        &dir.path().parent().unwrap().display().to_string(),
+        Access::Read { recursive: true }
+    ));
+    for glob in [
+        "*", ".*", ".env*", "*local*", ".e*", ".[e]nv*", ".?nv", "[.]env", "**/*",
+    ] {
+        assert!(read_protected(&format!("{d}/{glob}")), "{glob}");
+    }
+    for glob in [
+        "*.csv",
+        "data/*",
+        "data/**/*.csv",
+        ".git*",
+        "?",
+        "*/x.jsonl",
+        "*/*.csv",
+    ] {
+        assert!(!read_protected(&format!("{d}/{glob}")), "{glob}");
+    }
+    assert!(!read_protected(&data.display().to_string()));
+    assert!(!data_path_is_protected(
+        &data.display().to_string(),
+        Access::Read { recursive: true }
+    ));
+    assert!(read_protected(&format!("{d}/.e*/x.csv")));
+    assert!(!data_path_is_protected(
+        &format!("{d}/${{now.date}}/x.jsonl"),
+        Access::Write
+    ));
+    assert!(data_path_is_protected(
+        &format!("{d}/.env{{part}}"),
+        Access::Write
+    ));
+    assert!(!data_path_is_protected(
+        &format!("{d}/out-{{part}}.jsonl"),
+        Access::Write
+    ));
+    std::fs::write(dir.path().join(".env.csv"), "X=dummy\n").unwrap();
+    assert!(
+        read_protected(&format!("{d}/*.csv")),
+        "an existing match is checked"
+    );
+}
+
+#[test]
+fn environment_files_beside_the_loaded_file_are_protected() {
+    let cwd = tempfile::tempdir().unwrap();
+    let conf = tempfile::tempdir().unwrap();
+    let loaded = conf.path().join("prod.env");
+    std::fs::write(&loaded, "Y=1\n").unwrap();
+    protect_env_files(cwd.path(), Some(&loaded));
+    assert!(read_protected(&loaded.display().to_string()));
+    assert!(read_protected(&format!(
+        "{}/.env.prod",
+        conf.path().display()
+    )));
+    assert!(!read_protected(&format!(
+        "{}/other.csv",
+        conf.path().display()
+    )));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_protected_file_behind_a_swapped_link_stays_protected() {
+    let dir = tempfile::tempdir().unwrap();
+    for v in ["v1", "v2"] {
+        std::fs::create_dir(dir.path().join(v)).unwrap();
+        std::fs::write(dir.path().join(v).join("auth.yaml"), v).unwrap();
+    }
+    let current = dir.path().join("current");
+    std::os::unix::fs::symlink(dir.path().join("v1"), &current).unwrap();
+    protect_file(&current.join("auth.yaml"));
+    assert!(read_protected(&format!(
+        "{}/v1/auth.yaml",
+        dir.path().display()
+    )));
+    std::fs::remove_file(&current).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("v2"), &current).unwrap();
+    // The protected paths are resolved again once the cached snapshot ages out.
+    #[allow(clippy::disallowed_methods)] // waits out the snapshot's real-time TTL
+    std::thread::sleep(RESOLVED_TTL + std::time::Duration::from_millis(50));
+    assert!(read_protected(
+        &current.join("auth.yaml").display().to_string()
+    ));
+    assert!(read_protected(&format!(
+        "{}/v2/auth.yaml",
+        dir.path().display()
+    )));
+    assert!(read_protected(&format!(
+        "{}/v1/auth.yaml",
+        dir.path().display()
+    )));
+    assert!(file_is_protected(&format!(
+        "{}/v2/auth.yaml",
+        dir.path().display()
+    )));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_to_an_environment_file_not_yet_written_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    protect_env_files(dir.path(), None);
+    let link = data.join("settings.txt");
+    std::os::unix::fs::symlink("../.env.local", &link).unwrap();
+    assert!(read_protected(&link.display().to_string()));
+    let chain = data.join("chain.txt");
+    std::os::unix::fs::symlink("settings.txt", &chain).unwrap();
+    assert!(read_protected(&chain.display().to_string()));
+}
+
+#[test]
+fn concrete_paths_are_refused_by_the_run_time_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    protect_env_files(dir.path(), None);
+    std::fs::write(dir.path().join("data.csv"), "id\n").unwrap();
+    std::fs::write(dir.path().join(".env.csv"), "X=dummy\n").unwrap();
+    let refusal = server_file_refusal(&dir.path().join(".env.csv")).unwrap();
+    assert!(refusal.contains("server's own files"), "{refusal}");
+    assert!(server_file_refusal(&dir.path().join(".env/inner")).is_some());
+    assert!(server_file_refusal(std::path::Path::new("/proc/self/environ")).is_some());
+    assert!(server_file_refusal(&dir.path().join("data.csv")).is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn another_spelling_of_an_environment_directory_is_recognised() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    protect_env_files(&real, None);
+    let r = resolved().unwrap();
+    assert!(r.is_env_dir(&real));
+    assert!(!r.is_env_dir(dir.path()));
+}
+
+#[test]
+fn glob_segments_are_read_like_the_glob_crate() {
+    for (seg, can) in [
+        (".env*", true),
+        (".e*", true),
+        (".*", true),
+        (".[a-f]nv", true),
+        (".[!x]nv", true),
+        (".[!e]nv", true),
+        (".[!eE]nv", false),
+        (".E?V", true),
+        (".git*", false),
+        (".[", false),
+        (".x[", false),
+        ("*", true),
+        (".en", false),
+    ] {
+        assert_eq!(segment_can_start_with(seg, ".env"), can, "{seg}");
+    }
+}
+
+#[test]
 fn nothing_under_a_protected_directory_is_reachable() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
@@ -1705,4 +2053,37 @@ fn sql_transforms_get_bounded_resources_when_they_set_none() {
         nodes[0].transforms[0].config["memory_limit"],
         SQL_TRANSFORM_MEMORY_LIMIT
     );
+}
+
+#[test]
+fn a_provider_url_refusal_names_the_field_not_the_value() {
+    let hosts = ReferencePolicy::open().with_url_hosts(["idp.example.com"]);
+    let spec = serde_json::json!({"type": "oauth2", "config": {
+            "token_url": "https://other.example.net/t?client_secret=dummy-secret-value"}});
+    let err = screen_auth_providers([("auth.idp".to_string(), &spec)], &hosts, true)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("`auth.idp.config.token_url`"), "{err}");
+    assert!(err.contains("other.example.net"), "{err}");
+    assert!(!err.contains("dummy-secret-value"), "{err}");
+    assert!(!err.contains("client_secret"), "{err}");
+}
+
+#[test]
+fn a_path_protected_after_a_snapshot_is_refused_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("server-credential.yaml");
+    std::fs::write(&file, "x").unwrap();
+    assert!(server_file_refusal(&file).is_none());
+    let before = resolved().unwrap();
+    protect_file(&file);
+    assert!(server_file_refusal(&file).is_some());
+    assert!(!std::sync::Arc::ptr_eq(&before, &resolved().unwrap()));
+    let other = dir.path().join("other.csv");
+    std::fs::write(&other, "x").unwrap();
+    protect_dir(dir.path());
+    assert!(data_path_is_protected(
+        &format!("{}/*.csv", dir.path().display()),
+        Access::Read { recursive: false }
+    ));
 }

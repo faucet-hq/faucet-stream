@@ -39,7 +39,7 @@ pub struct MssqlConnectionConfig {
     /// `Server=tcp:host,1433;Database=db;User Id=sa;Password=...;`. Mutually
     /// exclusive with [`connection_url`](Self::connection_url).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(extend("x-faucet-resource" = "url"))]
+    #[schemars(extend("x-faucet-resource" = "url", "x-faucet-url-syntax" = "ado"))]
     pub connection_string: Option<String>,
     /// TLS / encryption settings. Defaults to [`MssqlTlsMode::Prefer`].
     #[serde(default)]
@@ -147,24 +147,22 @@ impl MssqlConnectionConfig {
     }
 }
 
-/// Server host, port and database named by an ADO.NET connection string.
+/// Server host, port and database named by an ADO.NET connection string. The
+/// server follows the driver's precedence: `server`, else `data source`
+/// (`address` / `addr` / `network address` are not read by the driver).
 fn ado_scope(raw: &str) -> Option<(String, u16, Option<String>)> {
     let mut server = None;
+    let mut data_source = None;
     let mut database = None;
-    for pair in raw.split(';') {
-        let Some((key, value)) = pair.split_once('=') else {
-            continue;
-        };
-        let value = value.trim().trim_matches(|c| c == '\'' || c == '"');
-        match key.trim().to_ascii_lowercase().as_str() {
-            "server" | "data source" | "address" | "addr" | "network address" => {
-                server = Some(value.to_string());
-            }
-            "database" | "initial catalog" => database = Some(value.to_string()),
+    for (key, value) in faucet_core::ado::parse(raw).ok()? {
+        match key.as_str() {
+            "server" => server = Some(value),
+            "data source" => data_source = Some(value),
+            "database" | "initial catalog" => database = Some(value),
             _ => {}
         }
     }
-    let server = server.filter(|s| !s.is_empty())?;
+    let server = server.or(data_source).filter(|s| !s.is_empty())?;
     let server = server.strip_prefix("tcp:").unwrap_or(&server);
     let (host, port) = match server.split_once(',') {
         Some((host, port)) => (host, port.trim().parse().ok()?),
@@ -317,6 +315,23 @@ mod tests {
             ado_cfg("Server=a;Database=x").scope_label(),
             ado_cfg("Server=b;Database=x").scope_label()
         );
+    }
+
+    #[test]
+    fn scope_label_names_the_server_the_driver_connects_to() {
+        assert_eq!(
+            ado_cfg("Server=b;Data Source=a;Database=x").scope_label(),
+            "b_1433_x"
+        );
+        assert_eq!(
+            ado_cfg("Data Source=a;Server=b;Database=x").scope_label(),
+            "b_1433_x"
+        );
+        assert_eq!(
+            ado_cfg("Address=c;Data Source=a;Database=x").scope_label(),
+            "a_1433_x"
+        );
+        assert_eq!(ado_cfg("Address=c;Database=x").scope_label(), "mssql");
     }
 
     #[test]

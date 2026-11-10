@@ -46,6 +46,9 @@ pub struct LocalOutputObservation {
     /// Identity of the file on disk when it was observed, so the GC can tell
     /// that a different file now sits at the path. `None` = not known.
     pub file_id: Option<FileIdentity>,
+    /// Identity of the file's directory when it was observed, so the GC can
+    /// tell that the directory changed since. `None` = not known.
+    pub parent_id: Option<FileIdentity>,
 }
 
 /// Device and inode of a file — what tells two files at one path apart.
@@ -117,6 +120,10 @@ pub struct LocalOutputRecord {
     /// delete a file whose identity differs (somebody else's file now).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_id: Option<FileIdentity>,
+    /// Identity of the directory faucet last wrote the file in. The GC refuses
+    /// to delete through a directory whose identity differs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<FileIdentity>,
 }
 
 impl LocalOutputRecord {
@@ -140,6 +147,7 @@ impl LocalOutputRecord {
             deleted_bytes: None,
             host: super::local_host(),
             file_id: obs.file_id,
+            parent_id: obs.parent_id,
         }
     }
 
@@ -164,6 +172,7 @@ impl LocalOutputRecord {
         }
         self.host = super::local_host();
         self.file_id = obs.file_id;
+        self.parent_id = obs.parent_id;
         self.dataset_uri = obs.dataset_uri.clone();
         self.dataset_id = obs.dataset_id.clone();
         self.kind = obs.kind.clone();
@@ -393,7 +402,8 @@ pub enum SkipReason {
     /// Another host wrote the file; only a sweeper on that host may delete it.
     OtherHost,
     /// The file at the path is not the one faucet wrote (a different device /
-    /// inode), so it is somebody else's and is left alone.
+    /// inode), or its directory changed after it was recorded, so it is left
+    /// alone.
     Changed,
 }
 
@@ -505,6 +515,7 @@ mod tests {
             retention_days: None,
             observed_at: ts(at),
             file_id: None,
+            parent_id: None,
         }
     }
 
@@ -802,6 +813,24 @@ mod tests {
         let back: LocalOutputRecord =
             serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
         assert_eq!(rec, back);
+    }
+
+    #[test]
+    fn a_row_stored_without_a_directory_identity_still_loads() {
+        let mut rec = LocalOutputRecord::new(&obs("/tmp/a.jsonl", "2026-08-01T00:00:00Z"));
+        let body = serde_json::to_value(&rec).unwrap();
+        assert!(body.get("parent_id").is_none());
+        let back: LocalOutputRecord = serde_json::from_value(body).unwrap();
+        assert_eq!(back.parent_id, None);
+
+        let mut again = obs("/tmp/a.jsonl", "2026-08-02T00:00:00Z");
+        again.parent_id = Some(FileIdentity { dev: 1, ino: 2 });
+        rec.observe(&again);
+        assert_eq!(rec.parent_id, again.parent_id);
+        let body = serde_json::to_value(&rec).unwrap();
+        assert_eq!(body["parent_id"], serde_json::json!({"dev": 1, "ino": 2}));
+        let created = LocalOutputRecord::new(&again);
+        assert_eq!(created.parent_id, again.parent_id);
     }
 
     #[test]

@@ -91,6 +91,11 @@ configured bucket, a URL path appended to a checked `base_url`) goes in
 `scripts/resource-annotation-allow.txt` with a reason instead.
 `cli/tests/resource_annotations.rs` fails on an unannotated field whose name
 looks like a resource, and on an allow-list entry that no longer matches one.
+A `url` field whose value is not a URL also names its grammar, so the server
+reads it the way your client does: `"x-faucet-url-syntax" = "ado"` (an ADO.NET
+connection string), `"oracle"` (an Oracle connect string), `"azure-conn"` (an
+Azure Storage connection string) or `"url-list"` (a `,`-separated broker or
+server list), added to the same `extend(...)`.
 After adding an annotation, regenerate `schemas/faucet.schema.json`.
 
 A connector whose own input can reach past its declared resources — a SQL

@@ -209,6 +209,17 @@ pub struct SftpSinkConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("x-faucet-resource" = "path"))]
     pub scratch_dir: Option<String>,
+    /// Entries one directory listing may scan (default 1,000,000). The sink
+    /// lists its output directory, for example to remove files of an earlier
+    /// run or finish an interrupted overwrite; every entry the server sends
+    /// counts, and a directory with more fails the call with an error naming
+    /// this field. Must be at least 1.
+    #[serde(default = "default_max_listed_entries")]
+    pub max_listed_entries: usize,
+}
+
+fn default_max_listed_entries() -> usize {
+    faucet_common_sftp::DEFAULT_MAX_LISTED_ENTRIES
 }
 
 fn default_file_extension() -> String {
@@ -249,6 +260,7 @@ impl SftpSinkConfig {
             json_lines: faucet_common_file::write::JsonLinesOptions::default(),
             #[cfg(feature = "encryption")]
             encryption: None,
+            max_listed_entries: default_max_listed_entries(),
         }
     }
 
@@ -339,6 +351,11 @@ impl SftpSinkConfig {
     /// write option are checked by the shared writer's rules.
     pub fn validate(&self) -> Result<(), faucet_core::FaucetError> {
         faucet_core::validate_batch_size(self.batch_size)?;
+        if self.max_listed_entries == 0 {
+            return Err(faucet_core::FaucetError::Config(
+                "SFTP sink: max_listed_entries must be at least 1".into(),
+            ));
+        }
         self.write_config().validate()
     }
 

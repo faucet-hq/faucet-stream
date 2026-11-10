@@ -191,6 +191,62 @@ pub struct ConnectionRecord {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub updated_by: String,
+    /// A random id set each time the connection's credentials are stored
+    /// (create, replace, connect flow) and kept by token rotation and
+    /// re-auth marking. Empty on a record written by an earlier release.
+    #[serde(default)]
+    pub generation: String,
+}
+
+/// A fresh [`ConnectionRecord::generation`].
+pub fn new_generation() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// The connection a connect flow started from; its callback writes only
+/// over that same connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConnectBase {
+    /// No connection had the name when the flow started.
+    Absent,
+    /// The stored connection's generation and `updated_at` when the flow
+    /// started. `updated_at` is compared only when `generation` is empty.
+    Generation {
+        generation: String,
+        updated_at: DateTime<Utc>,
+    },
+}
+
+impl ConnectBase {
+    /// The base for the connection a flow starts from (`None` = absent).
+    pub fn of(current: Option<&ConnectionRecord>) -> Self {
+        match current {
+            None => ConnectBase::Absent,
+            Some(c) => ConnectBase::Generation {
+                generation: c.generation.clone(),
+                updated_at: c.updated_at,
+            },
+        }
+    }
+
+    /// Whether `current` is still the connection this base names.
+    pub fn matches(&self, current: Option<&ConnectionRecord>) -> bool {
+        match (self, current) {
+            (ConnectBase::Absent, None) => true,
+            (
+                ConnectBase::Generation {
+                    generation,
+                    updated_at,
+                },
+                Some(c),
+            ) => {
+                c.generation == *generation
+                    && (!generation.is_empty() || c.updated_at == *updated_at)
+            }
+            _ => false,
+        }
+    }
 }
 
 /// A pending hosted-OAuth connect flow. Single-use: taking it deletes it.
@@ -208,6 +264,14 @@ pub struct ConnectSession {
     pub created_by: String,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+    /// The connection the flow started from. `None` on a session stored by
+    /// an earlier release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<ConnectBase>,
+    /// The tenant's `created_at` when the flow started, so a tenant deleted
+    /// and created again under the same id is not written to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_created_at: Option<DateTime<Utc>>,
 }
 
 /// One state key a tenant run used, with the (possibly sealed) store spec
@@ -393,5 +457,72 @@ mod tests {
             serde_json::to_value(ConnectionStatus::NeedsReauth).unwrap(),
             "needs_reauth"
         );
+    }
+
+    fn connection(generation: &str, updated_at: DateTime<Utc>) -> ConnectionRecord {
+        ConnectionRecord {
+            tenant: "acme".into(),
+            name: "crm".into(),
+            provider_type: "static".into(),
+            connect_provider: None,
+            sealed: "x".into(),
+            status: ConnectionStatus::Active,
+            reauth_reason: None,
+            created_at: updated_at,
+            updated_at,
+            updated_by: "t".into(),
+            generation: generation.into(),
+        }
+    }
+
+    #[test]
+    fn a_connect_base_matches_only_the_connection_it_names() {
+        let t0 = Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(1);
+        let absent = ConnectBase::of(None);
+        assert_eq!(absent, ConnectBase::Absent);
+        assert!(absent.matches(None));
+        assert!(!absent.matches(Some(&connection("g1", t0))));
+
+        let g1 = ConnectBase::of(Some(&connection("g1", t0)));
+        assert!(
+            g1.matches(Some(&connection("g1", t1))),
+            "a token rotation keeps it"
+        );
+        assert!(!g1.matches(Some(&connection("g2", t0))), "replaced");
+        assert!(!g1.matches(None), "deleted");
+
+        let legacy = ConnectBase::of(Some(&connection("", t0)));
+        assert!(legacy.matches(Some(&connection("", t0))));
+        assert!(
+            !legacy.matches(Some(&connection("", t1))),
+            "rewritten since"
+        );
+        assert!(
+            !legacy.matches(Some(&connection("g3", t0))),
+            "replaced by a newer release"
+        );
+
+        let back: ConnectBase = serde_json::from_value(serde_json::to_value(&g1).unwrap()).unwrap();
+        assert_eq!(back, g1);
+        assert_eq!(new_generation().len(), 32);
+        assert_ne!(new_generation(), new_generation());
+    }
+
+    #[test]
+    fn records_from_an_earlier_release_read_with_empty_fence_fields() {
+        let t0 = Utc::now();
+        let mut old = serde_json::to_value(connection("g", t0)).unwrap();
+        old.as_object_mut().unwrap().remove("generation");
+        let rec: ConnectionRecord = serde_json::from_value(old).unwrap();
+        assert_eq!(rec.generation, "");
+        let session: ConnectSession = serde_json::from_value(serde_json::json!({
+            "state": "s", "tenant": "acme", "provider": "crm", "connection": "crm",
+            "redirect": "https://app.example", "sealed_verifier": "v", "created_by": "op",
+            "created_at": t0, "expires_at": t0,
+        }))
+        .unwrap();
+        assert_eq!(session.base, None);
+        assert_eq!(session.tenant_created_at, None);
     }
 }

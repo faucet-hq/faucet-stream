@@ -128,12 +128,15 @@ pub struct RestStreamConfig {
     pub headers: HashMap<String, String>,
     /// Extra hosts that may receive this source's credentials when a
     /// server-given URL (a next-page link, an async-job URL, a discovery
-    /// listing's next link) points at them. Credentials — the `auth` block and
-    /// a shared provider's placements — are otherwise sent only to the scheme,
-    /// host and port of `base_url`; a link elsewhere is fetched without them
-    /// and with only non-credential static headers (`Accept`, `User-Agent`, …).
-    /// An entry is a host (`files.example.com`) or a `*.example.com` wildcard.
-    /// An `https` base never follows a link to plain `http`.
+    /// listing's next link) points at them, or a redirect leads to them.
+    /// Credentials — the `auth` block and a shared provider's headers — are
+    /// otherwise sent only to the scheme, host and port of `base_url`; a link
+    /// or redirect elsewhere is fetched without them and with only standard
+    /// headers (`Accept`, `User-Agent`, …). An entry is a host on any port
+    /// (`files.example.com`), a host and port (`files.example.com:8443`, that
+    /// port only), or a `*.example.com` wildcard; a link and a redirect follow
+    /// the same rule, and neither keeps credentials when it changes the
+    /// scheme. An `https` base never follows a link to plain `http`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trusted_hosts: Vec<String>,
     /// Static query-string parameters, rendered as `?k=v`. Values honor
