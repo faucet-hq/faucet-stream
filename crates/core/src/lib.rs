@@ -15,6 +15,7 @@
 
 pub mod accounting;
 pub mod adaptive;
+pub mod ado;
 pub mod anomaly;
 pub mod auth;
 pub mod batching;

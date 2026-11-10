@@ -1302,6 +1302,147 @@ fn a_caller_url_host_may_not_come_from_records() {
     }
 }
 
+fn confined_policy() -> ReferencePolicy {
+    ReferencePolicy::deny_all()
+        .with_path_roots(["/srv/data"])
+        .any_url_scheme()
+        .any_url_host()
+}
+
+#[cfg(any(feature = "source-mssql", feature = "source-oracle"))]
+fn source_cfg(kind: &str, config: Value) -> PipelineConfig {
+    PipelineConfig::from_value(serde_json::json!({
+        "version": 1,
+        "pipeline": {
+            "source": {"type": kind, "config": config},
+            "sink": {"type": "stdout", "config": {}}
+        }
+    }))
+    .unwrap()
+}
+
+/// The caller verdict (`Err` text) and whether the operator's own config
+/// passes, for one source config.
+#[cfg(any(feature = "source-mssql", feature = "source-oracle"))]
+fn screened(kind: &str, config: Value) -> (Result<(), String>, bool) {
+    let cfg = source_cfg(kind, config);
+    let caller = BodyOrigin::Caller {
+        allow_subprocess: false,
+    };
+    let verdict =
+        refuse_server_paths_with(&cfg, &[], caller, &confined_policy()).map_err(|e| e.to_string());
+    let trusted =
+        refuse_server_paths_with(&cfg, &[], BodyOrigin::Trusted, &ReferencePolicy::open()).is_ok();
+    (verdict, trusted)
+}
+
+#[cfg(feature = "source-mssql")]
+#[test]
+fn mssql_connection_string_variants_are_screened() {
+    let cfg = |cs: &str| serde_json::json!({"connection_string": cs, "query": "select 1"});
+    for cs in [
+        "Server=tcp:db.example.com,1433;User Id=sa;Password=x;TrustServerCertificateCA=/etc/x.pem",
+        ";Server=tcp:db.example.com,1433;User Id=sa;Password=x;TrustServerCertificateCA=/etc/x.pem",
+        "App.Name=x;Server=db.example.com;User Id=sa;Password=x;TrustServerCertificateCA=/etc/x.pem",
+        "Server=db.example.com;TrustServerCertificateCA={/etc/x.pem}",
+    ] {
+        let (verdict, trusted) = screened("mssql", cfg(cs));
+        let err = verdict.expect_err(cs);
+        assert!(err.contains("trustservercertificateca"), "{cs}: {err}");
+        assert!(trusted, "{cs}");
+    }
+    for cs in [
+        ";Server=tcp:169.254.169.254,1433;User Id=sa;Password=x",
+        "App.Name=x;Server=169.254.169.254;User Id=sa;Password=x",
+    ] {
+        let (verdict, trusted) = screened("mssql", cfg(cs));
+        assert!(verdict.expect_err(cs).contains("169.254.169.254"), "{cs}");
+        assert!(!trusted, "{cs}");
+    }
+    let (verdict, _) = screened("mssql", cfg("Server=h;junk"));
+    assert!(verdict.unwrap_err().contains("the way the driver reads it"));
+    let ok = "Server=tcp:db.example.com,1433;Database=x;User Id=sa;Password=x;\
+              TrustServerCertificateCA=/srv/data/ca.pem";
+    assert_eq!(screened("mssql", cfg(ok)), (Ok(()), true));
+}
+
+#[cfg(feature = "source-oracle")]
+#[test]
+fn oracle_connect_string_variants_are_screened() {
+    let cfg = |cs: &str| {
+        serde_json::json!({"connect_string": cs, "username": "u", "password": "p",
+            "query": "select 1 from dual"})
+    };
+    for (cs, needle) in [
+        ("//169.254.169.254:1521/svc", "169.254.169.254"),
+        (
+            "db.example.com:1521;169.254.169.254:1521/svc",
+            "169.254.169.254",
+        ),
+        (
+            "(DESCRIPTION=(ADDRESS=(HTTPS_PROXY=169.254.169.254)(PROTOCOL=TCPS)\
+             (HOST=db.example.com)(PORT=443)))",
+            "169.254.169.254",
+        ),
+    ] {
+        let (verdict, trusted) = screened("oracle", cfg(cs));
+        assert!(verdict.expect_err(cs).contains(needle), "{cs}");
+        assert!(!trusted, "{cs}");
+    }
+    for (cs, needle) in [
+        (
+            "db.example.com:2484/svc?wallet_location=/etc/oracle/wallet",
+            "wallet_location",
+        ),
+        (
+            "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=db.example.com)(PORT=2484))\
+             (SECURITY=(TOKEN_AUTH=OCI_TOKEN)(TOKEN_LOCATION=/etc/oci/tok)))",
+            "token_auth",
+        ),
+        (
+            "(DESCRIPTION=(ADDRESS=(PROTOCOL=BEQ)(PROGRAM=/bin/sh)(ARGV0=sh)))",
+            "bequeath",
+        ),
+        ("orclpdb_alias", "net service name"),
+    ] {
+        let (verdict, trusted) = screened("oracle", cfg(cs));
+        assert!(verdict.expect_err(cs).contains(needle), "{cs}");
+        assert!(trusted, "{cs}");
+    }
+    assert_eq!(
+        screened("oracle", cfg("db.example.com:1521/FREEPDB1")),
+        (Ok(()), true)
+    );
+}
+
+#[cfg(feature = "source-mssql")]
+#[test]
+fn refusal_text_hides_connection_passwords() {
+    let cs = ";Server=169.254.169.254;User Id=sa;Password=hunter2-secret";
+    let (verdict, _) = screened(
+        "mssql",
+        serde_json::json!({"connection_string": cs, "query": "select 1"}),
+    );
+    let err = verdict.unwrap_err();
+    assert!(!err.contains("hunter2-secret"), "{err}");
+    assert!(err.contains("connection_string"), "{err}");
+}
+
+#[test]
+fn refusal_text_hides_url_credentials() {
+    let doc = serde_json::json!({
+        "notes": {"endpoint": "postgres://u:hunter2-secret@169.254.169.254/db"}
+    });
+    let err = screen_caller_fragment(&doc, &confined_policy())
+        .unwrap_err()
+        .to_string();
+    assert!(!err.contains("hunter2-secret"), "{err}");
+    assert!(
+        err.contains("notes.endpoint") && err.contains("169.254.169.254"),
+        "{err}"
+    );
+}
+
 fn caller_fields(entries: &[(&str, &str)]) -> crate::params::CallerFields {
     let mut f = crate::params::CallerFields::default();
     for (p, n) in entries {

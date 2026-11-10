@@ -39,7 +39,7 @@ pub struct MssqlConnectionConfig {
     /// `Server=tcp:host,1433;Database=db;User Id=sa;Password=...;`. Mutually
     /// exclusive with [`connection_url`](Self::connection_url).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(extend("x-faucet-resource" = "url"))]
+    #[schemars(extend("x-faucet-resource" = "url", "x-faucet-url-syntax" = "ado"))]
     pub connection_string: Option<String>,
     /// TLS / encryption settings. Defaults to [`MssqlTlsMode::Prefer`].
     #[serde(default)]
@@ -151,16 +151,12 @@ impl MssqlConnectionConfig {
 fn ado_scope(raw: &str) -> Option<(String, u16, Option<String>)> {
     let mut server = None;
     let mut database = None;
-    for pair in raw.split(';') {
-        let Some((key, value)) = pair.split_once('=') else {
-            continue;
-        };
-        let value = value.trim().trim_matches(|c| c == '\'' || c == '"');
-        match key.trim().to_ascii_lowercase().as_str() {
+    for (key, value) in faucet_core::ado::parse(raw).ok()? {
+        match key.as_str() {
             "server" | "data source" | "address" | "addr" | "network address" => {
-                server = Some(value.to_string());
+                server = Some(value);
             }
-            "database" | "initial catalog" => database = Some(value.to_string()),
+            "database" | "initial catalog" => database = Some(value),
             _ => {}
         }
     }

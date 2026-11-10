@@ -1140,6 +1140,9 @@ impl Findings {
         why: Why,
         text: String,
     ) {
+        let value = faucet_core::util::redact_uri_credentials(value);
+        let value = value.as_str();
+        let text = faucet_core::util::redact_uri_credentials(&text);
         match why {
             Why::RecordPath | Why::Protected => self.protected.push(text.clone()),
             Why::RecordHost | Why::TokenHost | Why::Policy(_) => self.policy.push(text.clone()),
@@ -1185,6 +1188,12 @@ impl<'a> Scope<'a> {
             only,
         }
     }
+}
+
+/// The dotted name of the field at `ptr` below `base`, as a refusal names it
+/// in place of a value that may carry credentials.
+fn field_name(base: &str, ptr: &str) -> String {
+    crate::params::caller::display(&format!("{base}{ptr}"))
 }
 
 /// Whether a local path a caller supplied takes a value from records.
@@ -1323,20 +1332,24 @@ fn check_connector(
         if scope.caller
             && (r.kind == ResourceKind::Url
                 || (r.kind == ResourceKind::Path && local_path(&r.value).is_none()))
-            && faucet_core::resolve::url_hosts(&r.value)
+            && faucet_core::resolve::url_hosts_as(&r.value, r.syntax)
                 .iter()
                 .any(|h| takes_record_value(h))
         {
             let text = format!(
-                "{kind}{}: {} (a URL host in a submitted config may not take a value from \
+                "{kind}{}: `{}` (a URL host in a submitted config may not take a value from \
                  records — it cannot be checked)",
-                r.pointer, r.value
+                r.pointer,
+                field_name(base, ptr)
             );
             found.add(scope, base, ptr, &r.value, Why::RecordHost, text);
             continue;
         }
         if let Some(Err(e)) = scope.policy.map(|p| p.check(&r)) {
-            let text = format!("{} ({})", r.value, e.reason);
+            let text = match r.kind {
+                ResourceKind::Url => format!("`{}` ({})", field_name(base, ptr), e.reason),
+                _ => format!("{} ({})", r.value, e.reason),
+            };
             found.add(scope, base, ptr, &r.value, Why::Policy(e.reason), text);
         }
     }
@@ -1962,12 +1975,13 @@ fn url_findings(doc: &Value, scope: &Scope<'_>, found: &mut Findings) {
             .any(|h| h.contains("${"))
         {
             let text = format!(
-                "{s} (a URL host in a submitted document may not come from a token — it cannot \
-                 be checked)"
+                "`{}` (a URL host in a submitted document may not come from a token — it \
+                 cannot be checked)",
+                field_name("", &ptr)
             );
             found.add(scope, "", &ptr, &s, Why::TokenHost, text);
         } else if let Err(e) = policy.check_url(&s) {
-            let text = format!("{s} ({})", e.reason);
+            let text = format!("`{}` ({})", field_name("", &ptr), e.reason);
             found.add(scope, "", &ptr, &s, Why::Policy(e.reason), text);
         }
     }

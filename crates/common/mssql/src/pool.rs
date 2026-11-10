@@ -184,21 +184,13 @@ fn check_ado_trust(ado: &str, tls: &MssqlTls) -> Result<(), FaucetError> {
 /// Whether an ADO.NET string sets `TrustServerCertificate` to true and whether
 /// it names a `TrustServerCertificateCA`.
 fn ado_trust_keys(ado: &str) -> (bool, bool) {
-    let mut bypass = false;
-    let mut ca = false;
-    for pair in ado.split(';') {
-        let Some((key, value)) = pair.split_once('=') else {
-            continue;
-        };
-        let value = value.trim().trim_matches(|c| c == '\'' || c == '"');
-        match key.trim().to_ascii_lowercase().as_str() {
-            "trustservercertificate" => {
-                bypass = matches!(value.to_ascii_lowercase().as_str(), "true" | "yes")
-            }
-            "trustservercertificateca" => ca = !value.is_empty(),
-            _ => {}
-        }
-    }
+    let Ok(pairs) = faucet_core::ado::parse(ado) else {
+        return (false, false);
+    };
+    let bypass = faucet_core::ado::last(&pairs, "trustservercertificate")
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "yes"));
+    let ca =
+        faucet_core::ado::last(&pairs, "trustservercertificateca").is_some_and(|v| !v.is_empty());
     (bypass, ca)
 }
 
@@ -731,5 +723,65 @@ mod tests {
         )
         .await;
         assert!(late.1 && matches!(late.0, Err(FaucetError::Timeout { .. })));
+    }
+
+    #[test]
+    fn the_screen_reads_connection_strings_as_the_driver_does() {
+        use faucet_core::resolve::{ReferencePolicy, RefusalKind, UrlSyntax, url_hosts_as};
+        let confined = ReferencePolicy::deny_all()
+            .with_path_roots(["/srv/data"])
+            .any_url_scheme()
+            .any_url_host();
+        for (cs, ca) in [
+            (";Server=tcp:10.1.2.3,1433;User Id=sa;Password=x", None),
+            (" ; Server=db.example.com;User Id=sa", None),
+            (
+                "App.Name=x;Server=db.example.com;TrustServerCertificateCA=/etc/x.pem",
+                Some("/etc/x.pem"),
+            ),
+            (
+                "a==b=1;Server=db.example.com;TrustServerCertificateCA={/etc/x.pem}",
+                Some("/etc/x.pem"),
+            ),
+            (
+                "Server=db.example.com; TrustServerCertificateCA = '/etc/x''y.pem' ",
+                Some("/etc/x'y.pem"),
+            ),
+            ("Data Source='db.example.com';User Id=sa", None),
+            ("Server=(local);Database=x", None),
+            ("Database=x", None),
+        ] {
+            let config = build_config(&MssqlConnectionConfig {
+                connection_string: Some(cs.into()),
+                ..Default::default()
+            })
+            .unwrap_or_else(|e| panic!("{cs}: {e}"));
+            let addr = config.get_addr();
+            let host = addr.rsplit_once(':').map_or(addr.as_str(), |(h, _)| h);
+            let screened = url_hosts_as(cs, Some(UrlSyntax::Ado));
+            assert!(
+                screened.contains(&faucet_core::resolve::canonical_host(host)),
+                "{cs}: driver host {host}, screen {screened:?}"
+            );
+            let result = confined.check_url_as(cs, Some(UrlSyntax::Ado));
+            match ca {
+                Some(path) => {
+                    assert!(format!("{config:?}").contains(path), "{cs}");
+                    assert_eq!(result.unwrap_err().kind, RefusalKind::Path, "{cs}");
+                }
+                None => assert!(result.is_ok(), "{cs}"),
+            }
+        }
+        for cs in ["Server=h;junk", "Server='open"] {
+            let built = build_config(&MssqlConnectionConfig {
+                connection_string: Some(cs.into()),
+                ..Default::default()
+            });
+            assert!(built.is_err(), "{cs}");
+            assert!(
+                confined.check_url_as(cs, Some(UrlSyntax::Ado)).is_err(),
+                "{cs}"
+            );
+        }
     }
 }

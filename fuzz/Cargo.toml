@@ -28,6 +28,8 @@ tokio = { version = "1", features = ["rt", "io-util"] }
 # so the postgres-cdc crate, and the sqlx macros the sanitizer build cannot load, stay out.
 base64 = "0.22"
 byteorder = "1"
+# The SQL Server driver, to compare its connection-string reading with the screen (fuzz_targets/ado_connection_string.rs).
+tiberius = { version = "0.13", default-features = false, features = ["rustls", "tds73"] }
 tracing = "0.1"
 
 [[bin]]
@@ -110,6 +112,13 @@ bench = false
 [[bin]]
 name = "mysql_query"
 path = "fuzz_targets/mysql_query.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ado_connection_string"
+path = "fuzz_targets/ado_connection_string.rs"
 test = false
 doc = false
 bench = false

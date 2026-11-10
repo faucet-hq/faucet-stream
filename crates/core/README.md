@@ -308,7 +308,15 @@ is confined without serve changes. A free-form string map names the keys
 that hold a resource with `x-faucet-resource-keys` (`{"*endpoint*": "url",
 "*_file": "path"}`). Host-bearing values that are not URLs (`b1:9092,b2:9092`,
 `Server=tcp:host,1433;…`, an Azure Storage connection string) are read for
-their hosts. `check_url` judges a host by how it is written;
+their hosts. A field whose value is not a URL declares its grammar with
+`#[schemars(extend("x-faucet-url-syntax" = "ado"))]` (`"oracle"`,
+`"azure-conn"`, `"url-list"`); `annotated_resources` carries it on
+`ResourceRef::syntax`, and `check` / `check_url_as` / `url_hosts_as` read the
+value the way the connector's client does (`faucet_core::ado::parse` is the SQL
+Server driver's connection-string grammar, shared with the MSSQL crate). A
+policy with path roots (one for configs a host does not trust) refuses a value
+its grammar cannot read, a value from which no server can be read, and a value
+longer than `MAX_SCREENED_LEN` (64 KiB). `check_url` judges a host by how it is written;
 `check_url_resolved` also resolves it, and `faucet_core::http::Client`'s own
 resolver drops link-local / metadata addresses at connection time
 (`resolve::screen_resolved`), unless the policy lists that name exactly.

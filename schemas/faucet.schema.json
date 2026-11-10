@@ -11395,7 +11395,8 @@
                 "connection_string": {
                   "description": "Connection string. Its endpoints (`BlobEndpoint=`, or the account\nhost built from `AccountName=` / `EndpointSuffix=`) are checked\nlike a URL by a host that confines configs.",
                   "type": "string",
-                  "x-faucet-resource": "url"
+                  "x-faucet-resource": "url",
+                  "x-faucet-url-syntax": "azure-conn"
                 }
               }
             }
@@ -20723,7 +20724,8 @@
                 "connection_string": {
                   "description": "Connection string. Its endpoints (`BlobEndpoint=`, or the account\nhost built from `AccountName=` / `EndpointSuffix=`) are checked\nlike a URL by a host that confines configs.",
                   "type": "string",
-                  "x-faucet-resource": "url"
+                  "x-faucet-resource": "url",
+                  "x-faucet-url-syntax": "azure-conn"
                 }
               }
             }
@@ -23684,7 +23686,8 @@
                         "string",
                         "null"
                       ],
-                      "x-faucet-resource": "url"
+                      "x-faucet-resource": "url",
+                      "x-faucet-url-syntax": "ado"
                     },
                     "tls": {
                       "description": "TLS / encryption settings. Defaults to [`MssqlTlsMode::Prefer`].",
@@ -24248,7 +24251,8 @@
                       "default": [
                         "nats://127.0.0.1:4222"
                       ],
-                      "x-faucet-resource": "url"
+                      "x-faucet-resource": "url",
+                      "x-faucet-url-syntax": "url-list"
                     },
                     "auth": {
                       "description": "Authentication mode. Defaults to `none` (anonymous).",
@@ -25909,7 +25913,8 @@
                         "string",
                         "null"
                       ],
-                      "x-faucet-resource": "url"
+                      "x-faucet-resource": "url",
+                      "x-faucet-url-syntax": "ado"
                     },
                     "tls": {
                       "description": "TLS / encryption settings. Defaults to [`MssqlTlsMode::Prefer`].",
@@ -27833,7 +27838,8 @@
                     "brokers": {
                       "description": "Comma-separated bootstrap server list, e.g. `\"broker1:9092,broker2:9092\"`.",
                       "type": "string",
-                      "x-faucet-resource": "url"
+                      "x-faucet-resource": "url",
+                      "x-faucet-url-syntax": "url-list"
                     },
                     "topics": {
                       "description": "One or more topics to subscribe to.",
@@ -29299,7 +29305,8 @@
                         "string",
                         "null"
                       ],
-                      "x-faucet-resource": "url"
+                      "x-faucet-resource": "url",
+                      "x-faucet-url-syntax": "oracle"
                     },
                     "host": {
                       "description": "Database host. Mutually exclusive with `connect_string`.",
@@ -29517,7 +29524,8 @@
                         "string",
                         "null"
                       ],
-                      "x-faucet-resource": "url"
+                      "x-faucet-resource": "url",
+                      "x-faucet-url-syntax": "oracle"
                     },
                     "host": {
                       "description": "Database host. Mutually exclusive with `connect_string`.",
@@ -31301,7 +31309,8 @@
                         "string",
                         "null"
                       ],
-                      "x-faucet-resource": "url"
+                      "x-faucet-resource": "url",
+                      "x-faucet-url-syntax": "ado"
                     },
                     "tls": {
                       "description": "TLS / encryption settings. Defaults to [`MssqlTlsMode::Prefer`].",
@@ -31909,7 +31918,8 @@
                       "default": [
                         "nats://127.0.0.1:4222"
                       ],
-                      "x-faucet-resource": "url"
+                      "x-faucet-resource": "url",
+                      "x-faucet-url-syntax": "url-list"
                     },
                     "auth": {
                       "description": "Authentication mode. Defaults to `none` (anonymous).",
@@ -33473,7 +33483,8 @@
                     "brokers": {
                       "description": "Comma-separated `host:port` bootstrap brokers, passed straight through\nas librdkafka's `bootstrap.servers` (e.g. `\"b1:9092,b2:9092\"`).\nRequired; a blank value is rejected at config load.",
                       "type": "string",
-                      "x-faucet-resource": "url"
+                      "x-faucet-resource": "url",
+                      "x-faucet-url-syntax": "url-list"
                     },
                     "topic": {
                       "description": "Destination topic. Either a fixed name\n(`{ type: fixed, name: events }`) or a per-record JSONPath lookup\n(`{ type: from_path, path: \"$.dest\" }`) for multi-topic routing.\nRequired.",
@@ -36264,7 +36275,8 @@
                         "string",
                         "null"
                       ],
-                      "x-faucet-resource": "url"
+                      "x-faucet-resource": "url",
+                      "x-faucet-url-syntax": "oracle"
                     },
                     "host": {
                       "description": "Database host. Mutually exclusive with `connect_string`.",
