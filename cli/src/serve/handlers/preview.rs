@@ -368,6 +368,7 @@ mod tests {
             retention_days: None,
             observed_at: Utc::now(),
             file_id: None,
+            parent_id: None,
         })
     }
 
@@ -643,6 +644,7 @@ mod tests {
             retention_days: None,
             observed_at: Utc::now(),
             file_id: None,
+            parent_id: None,
         };
         state.history().local_output_record(&obs).await.unwrap();
         let id = crate::local_outputs::ledger::output_id(&path);
@@ -692,6 +694,7 @@ mod tests {
                 retention_days: None,
                 observed_at: Utc::now(),
                 file_id: None,
+                parent_id: None,
             })
             .await
             .unwrap();
@@ -736,6 +739,7 @@ mod tests {
                 retention_days: None,
                 observed_at: Utc::now(),
                 file_id: None,
+                parent_id: None,
             })
             .await
             .unwrap();
@@ -897,6 +901,7 @@ mod tests {
                 retention_days: None,
                 observed_at: Utc::now(),
                 file_id: None,
+                parent_id: None,
             })
             .await
             .unwrap();

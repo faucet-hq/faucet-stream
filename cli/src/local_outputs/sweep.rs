@@ -4,8 +4,8 @@
 //! Split deliberately. Every rule that decides whether a file may be deleted —
 //! the retention arithmetic, the `pre_existing` refusal, the recorded-writer
 //! check — lives in the pure half, where it is exhaustively testable without a
-//! filesystem. The I/O half does only what it is told: `metadata`,
-//! `remove_file`, mark the row. There is no `read_dir`, no glob, and no
+//! filesystem. The I/O half does only what it is told: stat the file through its
+//! directory, unlink it there, mark the row. There is no `read_dir`, no glob, and no
 //! `remove_dir_all` anywhere in this module, which is how the "never a directory
 //! wipe" guardrail is held structurally rather than by review.
 //!
@@ -285,34 +285,8 @@ async fn apply(store: &dyn RunHistory, sel: Selection, opts: &SweepOptions) -> S
         return outcome;
     }
 
-    // Size first, so the report can say how much was reclaimed. A stat failure
-    // that is not "missing" (a permission problem) is not fatal: the delete is
-    // still attempted and its own error is what gets reported.
-    let mut seen = None;
-    let bytes = match tokio::fs::symlink_metadata(rec.fs_path()).await {
-        Ok(meta) if !meta.is_file() => {
-            // A symlink (or a directory) where faucet wrote a file.
-            outcome.skipped = Some(SkipReason::Changed);
-            return outcome;
-        }
-        Ok(meta) => {
-            // Last gate before the unlink, and the only one that asks about the
-            // *path* rather than about a run: a file touched moments ago may have
-            // a writer holding it open right now — including a fresh run whose id
-            // is not in any ledger row yet. Deleting it would corrupt that run's
-            // output, so leave it and let the next pass take it.
-            if written_recently(&meta, opts) {
-                outcome.skipped = Some(SkipReason::InFlight);
-                return outcome;
-            }
-            if replaced_since_recorded(&rec, &meta) {
-                outcome.skipped = Some(SkipReason::Changed);
-                return outcome;
-            }
-            seen = super::ledger::FileIdentity::of(&meta);
-            meta.len()
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+    let (bytes, target) = match probe(&rec, opts).await {
+        Probe::Gone => {
             // Already gone — somebody's `rm`, or a moved workspace. Not an
             // error; the row is marked so the console stops offering a delete
             // that cannot do anything.
@@ -322,7 +296,15 @@ async fn apply(store: &dyn RunHistory, sel: Selection, opts: &SweepOptions) -> S
             }
             return outcome;
         }
-        Err(_) => 0,
+        Probe::Skip(reason) => {
+            outcome.skipped = Some(reason);
+            return outcome;
+        }
+        Probe::Failed(error) => {
+            delete_failed(&mut outcome, &rec, error);
+            return outcome;
+        }
+        Probe::Ready { bytes, target } => (bytes, target),
     };
 
     if opts.dry_run {
@@ -331,88 +313,185 @@ async fn apply(store: &dyn RunHistory, sel: Selection, opts: &SweepOptions) -> S
         return outcome;
     }
 
-    // The only deletion in this subsystem: one recorded file, through its
-    // directory as it resolves now, and only while it is the file just checked.
-    let target = match checked_target(resolved_target(rec.fs_path(), seen).await) {
-        Ok(target) => target,
-        Err(reason) => {
-            outcome.skipped = Some(reason);
-            return outcome;
-        }
-    };
-    match tokio::fs::remove_file(&target).await {
-        Ok(()) => {
+    // The only deletion in this subsystem: one recorded file, and only while it
+    // is the file just checked.
+    match remove(target).await {
+        Removal::Removed => {
             outcome.deleted = true;
             outcome.bytes = bytes;
             mark_deleted(store, &rec, opts.now, bytes).await;
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Raced with another sweeper (or a manual `rm`) between the stat and
-            // the unlink. The end state is the one we wanted.
+        Removal::Gone => {
+            // Raced with another sweeper (or a manual `rm`) between the check
+            // and the unlink. The end state is the one we wanted.
             outcome.skipped = Some(SkipReason::NotOnDisk);
             mark_deleted(store, &rec, opts.now, 0).await;
         }
-        Err(e) => {
-            outcome.skipped = Some(SkipReason::DeleteFailed);
-            outcome.error = Some(e.to_string());
-            tracing::warn!(
-                path = %rec.path,
-                error = %e,
-                "could not delete local sink output — leaving it in place"
-            );
-        }
+        Removal::Changed => outcome.skipped = Some(SkipReason::Changed),
+        Removal::Failed(error) => delete_failed(&mut outcome, &rec, error),
     }
     outcome
 }
 
-/// The path to unlink, or why the file is left: one whose directory cannot be
-/// resolved, or that is no longer the file just checked, has changed.
-fn checked_target(
-    resolved: std::io::Result<Option<std::path::PathBuf>>,
-) -> Result<std::path::PathBuf, SkipReason> {
-    match resolved {
-        Ok(Some(target)) => Ok(target),
-        Ok(None) | Err(_) => Err(SkipReason::Changed),
+fn delete_failed(outcome: &mut SweepOutcome, rec: &LocalOutputRecord, error: String) {
+    tracing::warn!(
+        path = %rec.path,
+        error = %error,
+        "could not delete local sink output — leaving it in place"
+    );
+    outcome.skipped = Some(SkipReason::DeleteFailed);
+    outcome.error = Some(error);
+}
+
+/// What the filesystem says about a recorded output before anything is deleted.
+enum Probe {
+    Gone,
+    Skip(SkipReason),
+    Failed(String),
+    Ready { bytes: u64, target: Target },
+}
+
+/// What happened to a checked output's unlink.
+enum Removal {
+    Removed,
+    Gone,
+    Changed,
+    Failed(String),
+}
+
+/// The checks on the file itself, run on what was read through its directory:
+/// not a regular file (a symlink or a directory where faucet wrote a file),
+/// touched inside the grace window, or a different file from the one recorded.
+fn gate(
+    rec: &LocalOutputRecord,
+    is_file: bool,
+    modified: Option<std::time::SystemTime>,
+    id: Option<super::ledger::FileIdentity>,
+    opts: &SweepOptions,
+) -> Option<SkipReason> {
+    if !is_file {
+        return Some(SkipReason::Changed);
+    }
+    // The only gate that asks about the *path* rather than about a run: a file
+    // touched moments ago may have a writer holding it open right now —
+    // including a fresh run whose id is not in any ledger row yet.
+    if written_recently(modified, opts) {
+        return Some(SkipReason::InFlight);
+    }
+    if replaced_since_recorded(rec, id) {
+        return Some(SkipReason::Changed);
+    }
+    None
+}
+
+#[cfg(unix)]
+type Target = super::held::Held;
+
+/// Reach the output through its directories held open from the root, so the
+/// checks and the unlink both name the same directory.
+#[cfg(unix)]
+async fn probe(rec: &LocalOutputRecord, opts: &SweepOptions) -> Probe {
+    use super::held::{self, Opened};
+    let (path, parent_id, file_id) = (rec.fs_path().to_path_buf(), rec.parent_id, rec.file_id);
+    let opened = tokio::task::spawn_blocking(move || held::open(&path, parent_id, file_id)).await;
+    let held = match opened {
+        Ok(Opened::Held(held)) => held,
+        Ok(Opened::Gone) => return Probe::Gone,
+        Ok(Opened::Changed) => return Probe::Skip(SkipReason::Changed),
+        Ok(Opened::Failed(e)) => return Probe::Failed(e.to_string()),
+        Err(e) => return Probe::Failed(e.to_string()),
+    };
+    let leaf = held.leaf;
+    match gate(rec, leaf.is_file, leaf.modified, Some(leaf.id), opts) {
+        Some(reason) => Probe::Skip(reason),
+        None => Probe::Ready {
+            bytes: leaf.len,
+            target: held,
+        },
     }
 }
 
-/// `path` with its directory resolved, when the file there is still the one
-/// whose identity was `seen` (`None` when it is not). Without an identity the
-/// resolved path is returned as is.
-async fn resolved_target(
-    path: &std::path::Path,
-    seen: Option<super::ledger::FileIdentity>,
-) -> std::io::Result<Option<std::path::PathBuf>> {
-    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
-        return Ok(Some(path.to_path_buf()));
-    };
-    let target = tokio::fs::canonicalize(parent).await?.join(name);
-    let Some(seen) = seen else {
-        return Ok(Some(target));
-    };
-    let now = tokio::fs::symlink_metadata(&target).await?;
-    Ok((now.is_file() && super::ledger::FileIdentity::of(&now) == Some(seen)).then_some(target))
+#[cfg(unix)]
+async fn remove(target: Target) -> Removal {
+    use super::held::{self, Unlinked};
+    match tokio::task::spawn_blocking(move || held::unlink(&target)).await {
+        Ok(Unlinked::Removed) => Removal::Removed,
+        Ok(Unlinked::Gone) => Removal::Gone,
+        Ok(Unlinked::Changed) => Removal::Changed,
+        Ok(Unlinked::Failed(e)) => Removal::Failed(e.to_string()),
+        Err(e) => Removal::Failed(e.to_string()),
+    }
 }
 
-/// Whether `meta`'s mtime falls inside the in-flight grace window.
-///
-/// Conservative on every unknown: a platform that cannot report mtime, or a
-/// timestamp the clock cannot make sense of, counts as "recently written" — the
-/// answer that leaves the file alone.
+#[cfg(not(unix))]
+type Target = std::path::PathBuf;
+
+#[cfg(not(unix))]
+async fn probe(rec: &LocalOutputRecord, opts: &SweepOptions) -> Probe {
+    let path = rec.fs_path().to_path_buf();
+    match tokio::fs::symlink_metadata(&path).await {
+        Ok(meta) => match gate(
+            rec,
+            meta.is_file(),
+            meta.modified().ok(),
+            super::ledger::FileIdentity::of(&meta),
+            opts,
+        ) {
+            Some(reason) => Probe::Skip(reason),
+            None => Probe::Ready {
+                bytes: meta.len(),
+                target: path,
+            },
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Probe::Gone,
+        // A stat failure that is not "missing" is not fatal: the delete is
+        // still attempted and its own error is what gets reported.
+        Err(_) => Probe::Ready {
+            bytes: 0,
+            target: path,
+        },
+    }
+}
+
+#[cfg(not(unix))]
+async fn remove(target: Target) -> Removal {
+    let resolved = match (target.parent(), target.file_name()) {
+        (Some(parent), Some(name)) => match tokio::fs::canonicalize(parent).await {
+            Ok(dir) => dir.join(name),
+            Err(_) => return Removal::Changed,
+        },
+        _ => target,
+    };
+    match tokio::fs::remove_file(&resolved).await {
+        Ok(()) => Removal::Removed,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Removal::Gone,
+        Err(e) => Removal::Failed(e.to_string()),
+    }
+}
+
 /// Whether the file at the path is a different file from the one faucet
 /// recorded. A row recorded without an identity cannot tell, so it is not.
-fn replaced_since_recorded(rec: &LocalOutputRecord, meta: &std::fs::Metadata) -> bool {
-    match (rec.file_id, super::ledger::FileIdentity::of(meta)) {
+fn replaced_since_recorded(
+    rec: &LocalOutputRecord,
+    now: Option<super::ledger::FileIdentity>,
+) -> bool {
+    match (rec.file_id, now) {
         (Some(recorded), Some(now)) => recorded != now,
         _ => false,
     }
 }
 
-fn written_recently(meta: &std::fs::Metadata, opts: &SweepOptions) -> bool {
+/// Whether a file last modified at `modified` falls inside the in-flight grace
+/// window.
+///
+/// Conservative on every unknown: a platform that cannot report mtime, or a
+/// timestamp the clock cannot make sense of, counts as "recently written" — the
+/// answer that leaves the file alone.
+fn written_recently(modified: Option<std::time::SystemTime>, opts: &SweepOptions) -> bool {
     if opts.in_flight_grace.is_zero() {
         return false;
     }
-    let Ok(modified) = meta.modified() else {
+    let Some(modified) = modified else {
         return true;
     };
     match modified.elapsed() {
@@ -450,15 +529,6 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    #[test]
-    fn a_target_whose_directory_cannot_be_resolved_is_left() {
-        let gone = std::io::Error::from(std::io::ErrorKind::NotFound);
-        assert_eq!(checked_target(Err(gone)), Err(SkipReason::Changed));
-        assert_eq!(checked_target(Ok(None)), Err(SkipReason::Changed));
-        let p = PathBuf::from("/x/out.jsonl");
-        assert_eq!(checked_target(Ok(Some(p.clone()))), Ok(p));
-    }
-
     fn ts(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
     }
@@ -479,11 +549,17 @@ mod tests {
             retention_days: None,
             observed_at: ts(at),
             file_id: None,
+            parent_id: dir_id(std::path::Path::new(path)),
         }
     }
 
     fn rec(path: &str, at: &str) -> LocalOutputRecord {
         LocalOutputRecord::new(&obs(path, at))
+    }
+
+    fn dir_id(path: &std::path::Path) -> Option<crate::local_outputs::FileIdentity> {
+        let meta = std::fs::metadata(path.parent()?).ok()?;
+        crate::local_outputs::FileIdentity::of(&meta)
     }
 
     /// Test options with the mtime grace disabled: these files are written
@@ -754,30 +830,141 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn with_ids(path: &std::path::Path, at: &str) -> LocalOutputObservation {
+        let mut o = obs(path.to_str().unwrap(), at);
+        o.file_id = super::super::FileIdentity::of(&std::fs::metadata(path).unwrap());
+        o
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
-    async fn the_unlink_names_the_file_that_was_checked() {
+    async fn a_parent_reached_through_a_symlink_at_record_time_is_still_collected() {
         let dir = tempfile::tempdir().unwrap();
         let real = dir.path().join("real");
         std::fs::create_dir(&real).unwrap();
         std::fs::write(real.join("out.jsonl"), b"x").unwrap();
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        let path = link.join("out.jsonl");
-        let id = super::super::ledger::FileIdentity::of(&std::fs::metadata(&path).unwrap());
-        let target = resolved_target(&path, id).await.unwrap().unwrap();
+        let store = store_with(&[with_ids(&link.join("out.jsonl"), "2026-08-01T00:00:00Z")]).await;
+        let report = run(&store, &SweepScope::All, &opts()).await.unwrap();
+        assert_eq!(report.deleted, 1, "{report:?}");
+        assert!(!real.join("out.jsonl").exists());
+        assert!(link.exists() && real.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_output_whose_directory_changed_after_it_was_recorded_is_left_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let outputs = dir.path().join("outputs");
+        std::fs::create_dir(&outputs).unwrap();
+        let path = outputs.join("out.jsonl");
+        std::fs::write(&path, b"faucet").unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("out.jsonl"), b"other").unwrap();
+        let mut recorded = with_ids(&path, "2026-08-01T00:00:00Z");
+        let store = store_with(std::slice::from_ref(&recorded)).await;
+
+        std::fs::rename(&outputs, dir.path().join("outputs.moved")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &outputs).unwrap();
+
+        let report = run(&store, &SweepScope::All, &opts()).await.unwrap();
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.skipped_for(SkipReason::Changed), 1);
         assert_eq!(
-            target,
-            std::fs::canonicalize(&real).unwrap().join("out.jsonl")
+            std::fs::read(elsewhere.join("out.jsonl")).unwrap(),
+            b"other"
         );
-        let other = super::super::ledger::FileIdentity { dev: 0, ino: 0 };
-        assert!(resolved_target(&path, Some(other)).await.unwrap().is_none());
-        assert!(resolved_target(&path, None).await.unwrap().is_some());
+        assert!(dir.path().join("outputs.moved/out.jsonl").exists());
+
+        recorded.file_id = None;
+        let store = store_with(&[recorded]).await;
+        let report = run(&store, &SweepScope::All, &opts()).await.unwrap();
+        assert_eq!(report.skipped_for(SkipReason::Changed), 1);
         assert_eq!(
-            resolved_target(std::path::Path::new("/"), None)
-                .await
-                .unwrap(),
-            Some(std::path::PathBuf::from("/"))
+            std::fs::read(elsewhere.join("out.jsonl")).unwrap(),
+            b"other"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_row_without_identities_is_collected_only_through_plain_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(dir.path()).unwrap().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let path = real.join("out.jsonl");
+        std::fs::write(&path, b"x").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let bare = |p: &std::path::Path| {
+            let mut o = obs(p.to_str().unwrap(), "2026-08-01T00:00:00Z");
+            o.parent_id = None;
+            o
+        };
+
+        let store = store_with(&[bare(&link.join("out.jsonl"))]).await;
+        let report = run(&store, &SweepScope::All, &opts()).await.unwrap();
+        assert_eq!(report.skipped_for(SkipReason::Changed), 1);
+        assert!(path.exists());
+
+        let store = store_with(&[bare(&path)]).await;
+        let report = run(&store, &SweepScope::All, &opts()).await.unwrap();
+        assert_eq!(report.deleted, 1);
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreachable_directory_is_reported_as_a_failed_delete() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        if std::fs::metadata(dir.path()).unwrap().uid() == 0 {
+            return;
+        }
+        let gate = dir.path().join("gate");
+        let inner = gate.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        let path = inner.join("out.jsonl");
+        std::fs::write(&path, b"x").unwrap();
+        let store = store_with(&[with_ids(&path, "2026-08-01T00:00:00Z")]).await;
+        std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let report = run(&store, &SweepScope::All, &opts()).await.unwrap();
+        std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            report.skipped_for(SkipReason::DeleteFailed),
+            1,
+            "{report:?}"
+        );
+        assert!(report.outputs[0].error.is_some());
+        assert!(path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_unlink_only_takes_the_file_that_was_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.jsonl");
+        std::fs::write(&path, b"faucet").unwrap();
+        let open = || {
+            let id = super::super::FileIdentity::of(&std::fs::metadata(&path).unwrap());
+            match super::super::held::open(&path, None, id) {
+                super::super::held::Opened::Held(h) => h,
+                other => panic!("{other:?}"),
+            }
+        };
+
+        let held = open();
+        let theirs = dir.path().join("theirs");
+        std::fs::write(&theirs, b"theirs").unwrap();
+        std::fs::rename(&theirs, &path).unwrap();
+        assert!(matches!(remove(held).await, Removal::Changed));
+        assert_eq!(std::fs::read(&path).unwrap(), b"theirs");
+
+        let held = open();
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(remove(held).await, Removal::Gone));
     }
 
     #[tokio::test]
@@ -1055,9 +1242,10 @@ mod tests {
             .unwrap();
         let refreshed = std::fs::metadata(&path).unwrap();
         let guarded = SweepOptions::new(7).in_flight_grace(Duration::from_secs(60));
-        assert!(written_recently(&refreshed, &guarded));
+        assert!(written_recently(refreshed.modified().ok(), &guarded));
         // …and a zero grace short-circuits regardless.
-        assert!(!written_recently(&meta, &opts()));
+        assert!(!written_recently(meta.modified().ok(), &opts()));
+        assert!(written_recently(None, &guarded));
     }
 
     #[cfg(unix)]

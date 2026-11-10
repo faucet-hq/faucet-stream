@@ -1199,7 +1199,13 @@ stable value (e.g. the StatefulSet pod name or the volume's name) when a
 container's host name changes on restart but its output volume persists, or
 outputs written before a restart are never collected. `changed` means the file
 at the recorded path is not the one faucet wrote (each row records the device
-and inode of the file it wrote): somebody else's file is never deleted.
+and inode of the file it wrote, and of its directory): somebody else's file is
+never deleted, and neither is an output whose directory changed after it was
+recorded (a directory replaced by a symbolic link, say). The file is deleted
+through its directory held open from the root, so a directory changed after
+that check cannot redirect the delete. A record written before directory
+identities were recorded is checked without following any symbolic link on its
+path, so such an output under a symlinked directory is reported `changed`.
 
 `in_flight` covers two cases, because one is not enough: the output's ledger row
 names a run that is currently executing, **or** the file itself was touched

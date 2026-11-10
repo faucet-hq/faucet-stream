@@ -55,6 +55,8 @@
 //! `catalog:` store to record into, and the console's Datasets page is a catalog
 //! view — so those stay behind `catalog`.
 
+#[cfg(unix)]
+mod held;
 pub mod ledger;
 pub mod metrics;
 pub mod record;

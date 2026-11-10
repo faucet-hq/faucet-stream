@@ -77,6 +77,13 @@ pub async fn record(
         } else {
             None
         };
+        let parent_id = match path.parent() {
+            Some(dir) => tokio::fs::metadata(dir)
+                .await
+                .ok()
+                .and_then(|m| super::ledger::FileIdentity::of(&m)),
+            None => None,
+        };
         let obs = LocalOutputObservation {
             path,
             dataset_uri: ctx.dataset_uri.clone(),
@@ -90,6 +97,7 @@ pub async fn record(
             retention_days: ctx.retention_days,
             observed_at: ctx.observed_at,
             file_id,
+            parent_id,
         };
         match store.local_output_record(&obs).await {
             Ok(()) => written += 1,
@@ -185,6 +193,27 @@ mod tests {
         let expected = crate::local_outputs::FileIdentity::of(&std::fs::metadata(&path).unwrap());
         assert!(expected.is_some());
         assert_eq!(rows[0].file_id, expected);
+        let dir_id =
+            crate::local_outputs::FileIdentity::of(&std::fs::metadata(dir.path()).unwrap());
+        assert_eq!(rows[0].parent_id, dir_id);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_overwrite_output_is_recorded_with_its_directory_identity_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.jsonl");
+        std::fs::write(&path, b"x").unwrap();
+        let store = MemoryHistory::new(Duration::from_secs(60));
+        let mut c = ctx();
+        c.final_file = false;
+        record(&store, &[LocalOutput::created(path.clone())], &c).await;
+        let rows = store
+            .local_output_list(&LocalOutputFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(rows[0].file_id, None);
+        assert!(rows[0].parent_id.is_some());
     }
 
     #[tokio::test]

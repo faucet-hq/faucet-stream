@@ -4754,6 +4754,13 @@ components:
           properties:
             dev: { type: integer }
             ino: { type: integer }
+        parent_id:
+          type: object
+          nullable: true
+          description: Device and inode of the directory faucet last wrote the file in; a sweep leaves an output whose directory changed after it was recorded in place.
+          properties:
+            dev: { type: integer }
+            ino: { type: integer }
         state:
           type: string
           enum: [present, expired, external, replaced]
