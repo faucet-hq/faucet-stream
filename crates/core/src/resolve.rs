@@ -1033,10 +1033,11 @@ fn azure_account_url(pairs: &[(String, String)]) -> Option<String> {
 /// The hosts a value written in `syntax` connects to, in canonical form; the
 /// same as [`url_hosts`] for `None`.
 pub fn url_hosts_as(value: &str, syntax: Option<UrlSyntax>) -> Vec<String> {
+    let raw = value;
     let value = value.trim();
     match syntax {
         None => url_hosts(value),
-        Some(UrlSyntax::Ado) => crate::ado::parse(value)
+        Some(UrlSyntax::Ado) => crate::ado::parse(raw)
             .map(|pairs| ado_hosts(&pairs))
             .unwrap_or_default(),
         Some(UrlSyntax::Oracle) => read_oracle(value).hosts,
@@ -1446,6 +1447,7 @@ impl ReferencePolicy {
     /// it. Under a policy with path roots, a value the client's grammar cannot
     /// read is refused.
     pub fn check_url_as(&self, value: &str, syntax: Option<UrlSyntax>) -> Result<(), Refusal> {
+        let raw = value;
         let value = value.trim_matches(|c: char| c.is_ascii_whitespace());
         if self.path_roots.is_some() && value.len() > MAX_SCREENED_LEN {
             return Err(Refusal::new(
@@ -1456,7 +1458,7 @@ impl ReferencePolicy {
         }
         match syntax {
             None => self.check_plain_url(value),
-            Some(UrlSyntax::Ado) => self.check_ado(value),
+            Some(UrlSyntax::Ado) => self.check_ado(raw),
             Some(UrlSyntax::Oracle) => self.check_oracle(value),
             Some(UrlSyntax::AzureConn) => self.check_azure_conn(value),
             Some(UrlSyntax::UrlList) => {
@@ -3215,6 +3217,25 @@ mod tests {
                 assert!(ReferencePolicy::open().check_resolved(r).is_err());
             }
         }
+    }
+
+    #[test]
+    fn ado_strings_are_read_untrimmed_like_the_driver() {
+        assert_eq!(url_hosts_as("\u{b}=;;", ADO), vec!["localhost".to_string()]);
+        assert_eq!(
+            url_hosts_as("\u{b}Server=169.254.169.254;", ADO),
+            vec!["localhost".to_string()]
+        );
+        let caller = ReferencePolicy::deny_all()
+            .with_path_roots(["/srv/data"])
+            .any_url_scheme()
+            .any_url_host();
+        assert!(caller.check_url_as("\u{b}=;;", ADO).is_ok());
+        assert!(
+            caller
+                .check_url_as(" Server=169.254.169.254;", ADO)
+                .is_err()
+        );
     }
 
     #[test]
