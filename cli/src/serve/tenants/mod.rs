@@ -581,14 +581,24 @@ impl StateStore for ConnectionTokenStore {
         let Some((rec, spec)) = self.load().await? else {
             return Ok(());
         };
+        let since = rec.updated_at;
         let Some(next) = self.rotated(rec, spec, value)? else {
             return Ok(());
         };
-        self.state
+        let written = self
+            .state
             .history()
-            .connection_upsert(&next)
+            .connection_replace(&next, since)
             .await
-            .map_err(|e| FaucetError::State(e.to_string()))
+            .map_err(|e| FaucetError::State(e.to_string()))?;
+        if !written {
+            tracing::info!(
+                tenant = %self.tenant,
+                connection = %self.name,
+                "connection changed since it was read; not storing the rotated refresh token"
+            );
+        }
+        Ok(())
     }
 
     fn supports_compare_and_put(&self) -> bool {
@@ -1240,6 +1250,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             updated_by: "t".into(),
+            generation: crate::serve::history::tenants::new_generation(),
         }
     }
 
@@ -1376,6 +1387,82 @@ mod tests {
             "the reconnect's credentials stay"
         );
         assert!(stored.reauth_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_rotated_token_is_not_stored_over_a_connection_changed_since_it_was_read() {
+        let mem =
+            crate::serve::history::memory::MemoryHistory::new(std::time::Duration::from_secs(60));
+        let v = Vault::new(TEST_VAULT_KEY, &[]).unwrap();
+        let original = conn(
+            &v,
+            "acme",
+            "crm",
+            serde_json::json!({"type": "oauth2_refresh", "config": {"refresh_token": "rt1"}}),
+        );
+        crate::serve::history::RunHistory::connection_upsert(&mem, &original)
+            .await
+            .unwrap();
+        let history =
+            Arc::new(StaleConnectionReads(mem)) as Arc<dyn crate::serve::history::RunHistory>;
+        let state = ServerState::new(
+            &crate::serve::test_support::test_config(),
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            history.clone(),
+            crate::serve::logs::LogHub::new(),
+            None,
+            #[cfg(feature = "triggers")]
+            crate::serve::triggers::health::TriggersHandle::empty(),
+        );
+        state.set_tenants(TenantsRuntime::new(
+            Some(Vault::new(TEST_VAULT_KEY, &[]).unwrap()),
+            Default::default(),
+        ));
+        let store = ConnectionTokenStore {
+            state: state.clone(),
+            tenant: "acme".into(),
+            name: "crm".into(),
+        };
+        store
+            .put("k", &serde_json::json!({"refresh_token": "rt2"}))
+            .await
+            .unwrap();
+        let stored = history
+            .connection_get("acme", "crm")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.sealed, original.sealed, "nothing was written");
+    }
+
+    #[tokio::test]
+    async fn a_token_rotation_keeps_the_connection_generation() {
+        let (state, v) = state_with_vault();
+        let original = conn(
+            &v,
+            "acme",
+            "crm",
+            serde_json::json!({"type": "oauth2_refresh", "config": {"refresh_token": "rt1"}}),
+        );
+        state.history().connection_upsert(&original).await.unwrap();
+        let store = ConnectionTokenStore {
+            state: state.clone(),
+            tenant: "acme".into(),
+            name: "crm".into(),
+        };
+        store
+            .put("k", &serde_json::json!({"refresh_token": "rt2"}))
+            .await
+            .unwrap();
+        let stored = state
+            .history()
+            .connection_get("acme", "crm")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(stored.sealed, original.sealed);
+        assert_eq!(stored.generation, original.generation);
     }
 
     #[tokio::test]

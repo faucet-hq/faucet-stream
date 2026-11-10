@@ -524,3 +524,180 @@ async fn postgres_policy_versions_append_once_list_and_delete() {
     assert_eq!(h.policy_versions_delete(&scope).await.unwrap(), 2);
     assert!(h.policy_versions(&scope, 0).await.unwrap().is_empty());
 }
+
+fn tenant_rec(id: &str) -> faucet_cli::serve::history::tenants::TenantRecord {
+    let now = Utc::now();
+    faucet_cli::serve::history::tenants::TenantRecord {
+        id: id.into(),
+        name: None,
+        labels: BTreeMap::new(),
+        limits: Default::default(),
+        notifications: Vec::new(),
+        notifications_sealed: None,
+        suspended: false,
+        created_at: now,
+        updated_at: now,
+        created_by: "t".into(),
+    }
+}
+
+fn connection_rec(
+    tenant: &str,
+    sealed: &str,
+) -> faucet_cli::serve::history::tenants::ConnectionRecord {
+    use faucet_cli::serve::history::tenants::{ConnectionRecord, ConnectionStatus, new_generation};
+    let now = Utc::now();
+    ConnectionRecord {
+        tenant: tenant.into(),
+        name: "crm".into(),
+        provider_type: "static".into(),
+        connect_provider: None,
+        sealed: sealed.into(),
+        status: ConnectionStatus::Active,
+        reauth_reason: None,
+        created_at: now,
+        updated_at: now,
+        updated_by: "t".into(),
+        generation: new_generation(),
+    }
+}
+
+/// A connection written while its tenant is being deleted never outlives
+/// the tenant, whichever of the two takes the tenant row first.
+#[tokio::test]
+#[allow(clippy::disallowed_methods)] // waits a fixed window to show a write is blocked
+async fn a_connection_write_racing_a_tenant_delete_leaves_nothing() {
+    let Some((_pg, url)) = postgres().await else {
+        return;
+    };
+    let h = std::sync::Arc::new(
+        PostgresHistory::connect(
+            &url,
+            Duration::from_secs(3600),
+            Duration::from_secs(30),
+            "pg-race".into(),
+        )
+        .await
+        .expect("connect postgres history"),
+    );
+    let admin = sqlx::PgPool::connect(&url).await.expect("admin connection");
+    let p = format!("race{}", Utc::now().timestamp_nanos_opt().unwrap_or(0));
+
+    assert!(
+        !h.connection_insert_new(&connection_rec(&format!("{p}-none"), "x"))
+            .await
+            .unwrap()
+    );
+    let plain = format!("{p}-plain");
+    h.tenant_upsert(&tenant_rec(&plain)).await.unwrap();
+    assert!(
+        h.connection_insert_new(&connection_rec(&plain, "a"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !h.connection_insert_new(&connection_rec(&plain, "b"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        h.connection_upsert_in_tenant(&connection_rec(&plain, "c"))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        h.connection_get(&plain, "crm")
+            .await
+            .unwrap()
+            .unwrap()
+            .sealed,
+        "c"
+    );
+
+    // The delete holds the tenant row first: the write waits, then writes nothing.
+    let first = format!("{p}-delete-first");
+    h.tenant_upsert(&tenant_rec(&first)).await.unwrap();
+    let mut tx = admin.begin().await.unwrap();
+    sqlx::query("DELETE FROM faucet_tenants WHERE id=$1")
+        .bind(&first)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let writer = {
+        let h = h.clone();
+        let rec = connection_rec(&first, "late");
+        tokio::spawn(async move { h.connection_insert_new(&rec).await })
+    };
+    let upserter = {
+        let h = h.clone();
+        let rec = connection_rec(&first, "late");
+        tokio::spawn(async move { h.connection_upsert_in_tenant(&rec).await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!writer.is_finished(), "the write waits on the tenant row");
+    sqlx::query("DELETE FROM faucet_tenant_connections WHERE tenant=$1")
+        .bind(&first)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert!(!writer.await.unwrap().unwrap());
+    assert!(!upserter.await.unwrap().unwrap());
+    assert!(h.connection_list(&first).await.unwrap().is_empty());
+
+    // The write holds the tenant row first: the delete waits, then removes it.
+    let second = format!("{p}-write-first");
+    h.tenant_upsert(&tenant_rec(&second)).await.unwrap();
+    let mut tx = admin.begin().await.unwrap();
+    sqlx::query("SELECT id FROM faucet_tenants WHERE id=$1 FOR KEY SHARE")
+        .bind(&second)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO faucet_tenant_connections (tenant, name, status, updated_at, body) \
+         VALUES ($1, 'crm', 'active', '2026-01-01T00:00:00Z', '{}')",
+    )
+    .bind(&second)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    let deleter = {
+        let h = h.clone();
+        let id = second.clone();
+        tokio::spawn(async move { h.tenant_delete(&id).await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!deleter.is_finished(), "the delete waits on the tenant row");
+    tx.commit().await.unwrap();
+    assert!(deleter.await.unwrap().unwrap());
+    let left: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM faucet_tenant_connections WHERE tenant=$1")
+            .bind(&second)
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    assert_eq!(left, 0, "no connection outlives its tenant");
+
+    // Real calls racing each other leave either the tenant or nothing.
+    for i in 0..40 {
+        let id = format!("{p}-loop{i}");
+        h.tenant_upsert(&tenant_rec(&id)).await.unwrap();
+        let rec = connection_rec(&id, "x");
+        let (_, deleted) = tokio::join!(
+            async {
+                if i % 2 == 0 {
+                    h.connection_insert_new(&rec).await.unwrap()
+                } else {
+                    h.connection_upsert_in_tenant(&rec).await.unwrap()
+                }
+            },
+            h.tenant_delete(&id)
+        );
+        assert!(deleted.unwrap());
+        assert!(
+            h.connection_list(&id).await.unwrap().is_empty(),
+            "iteration {i} left a connection without a tenant"
+        );
+    }
+}

@@ -1110,6 +1110,7 @@
     {
       "type": "timeseries",
       "title": "Connect flows (by provider & outcome, per hour)",
+      "description": "Hosted OAuth connect flows. outcome: started, completed, failed, superseded (the connection or tenant was deleted or replaced during the flow; nothing was stored).",
       "gridPos": {
         "x": 12,
         "y": 76,

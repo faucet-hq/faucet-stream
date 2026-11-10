@@ -2271,6 +2271,7 @@ async fn connection_replace_scenario(s: &dyn RunHistory) {
         created_at: t0,
         updated_at: at,
         updated_by: "t".into(),
+        generation: String::new(),
     };
     assert!(
         !s.connection_replace(&rec("a", t0), t0).await.unwrap(),
@@ -2294,6 +2295,79 @@ async fn connection_replace_is_a_compare_and_set() {
     let dir = tempfile::tempdir().unwrap();
     connection_replace_scenario(&store(&dir, "conn.db").await).await;
     connection_replace_scenario(&faucet_cli::serve::history::memory::MemoryHistory::new(
+        Duration::from_secs(3600),
+    ))
+    .await;
+}
+
+async fn connection_insert_new_scenario(s: &dyn RunHistory) {
+    use faucet_cli::serve::history::tenants::{
+        ConnectionRecord, ConnectionStatus, TenantRecord, new_generation,
+    };
+    let t0 = Utc::now();
+    let rec = |sealed: &str| ConnectionRecord {
+        tenant: "acme".into(),
+        name: "crm".into(),
+        provider_type: "static".into(),
+        connect_provider: None,
+        sealed: sealed.into(),
+        status: ConnectionStatus::Active,
+        reauth_reason: None,
+        created_at: t0,
+        updated_at: t0,
+        updated_by: "t".into(),
+        generation: new_generation(),
+    };
+    assert!(
+        !s.connection_insert_new(&rec("a")).await.unwrap(),
+        "no tenant"
+    );
+    assert!(
+        !s.connection_upsert_in_tenant(&rec("a")).await.unwrap(),
+        "no tenant"
+    );
+    assert!(s.connection_get("acme", "crm").await.unwrap().is_none());
+    s.tenant_upsert(&TenantRecord {
+        id: "acme".into(),
+        name: None,
+        labels: BTreeMap::new(),
+        limits: Default::default(),
+        notifications: Vec::new(),
+        notifications_sealed: None,
+        suspended: false,
+        created_at: t0,
+        updated_at: t0,
+        created_by: "t".into(),
+    })
+    .await
+    .unwrap();
+    assert!(s.connection_insert_new(&rec("a")).await.unwrap());
+    assert!(
+        !s.connection_insert_new(&rec("b")).await.unwrap(),
+        "an existing row"
+    );
+    assert_eq!(
+        s.connection_get("acme", "crm")
+            .await
+            .unwrap()
+            .unwrap()
+            .sealed,
+        "a"
+    );
+    assert!(s.connection_upsert_in_tenant(&rec("c")).await.unwrap());
+    let got = s.connection_get("acme", "crm").await.unwrap().unwrap();
+    assert_eq!(got.sealed, "c");
+    assert!(s.tenant_delete("acme").await.unwrap());
+    assert!(s.connection_get("acme", "crm").await.unwrap().is_none());
+    assert!(!s.connection_upsert_in_tenant(&rec("d")).await.unwrap());
+    assert!(s.connection_list("acme").await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn connection_insert_new_refuses_an_existing_row_or_missing_tenant() {
+    let dir = tempfile::tempdir().unwrap();
+    connection_insert_new_scenario(&store(&dir, "conn-new.db").await).await;
+    connection_insert_new_scenario(&faucet_cli::serve::history::memory::MemoryHistory::new(
         Duration::from_secs(3600),
     ))
     .await;

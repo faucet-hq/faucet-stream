@@ -2090,3 +2090,392 @@ async fn a_tenant_sees_only_its_own_errors_of_a_fan_out() {
     let (_, list) = api.get("acme-tok", "/v1/schedules").await;
     assert!(!list.to_string().contains("broken"), "{list}");
 }
+
+// ── A connect callback writes only over the connection it started from ──────
+
+/// The two histories every connect-fence case runs on.
+fn fence_histories(dir: &std::path::Path) -> [Option<String>; 2] {
+    [
+        None,
+        Some(format!("sqlite:{}", dir.join("history.db").display())),
+    ]
+}
+
+/// An identity provider whose code exchange grants a refresh token at once.
+async fn granting_idp() -> MockServer {
+    let idp = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains("grant_type=authorization_code"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "at-dummy", "refresh_token": "rt-dummy", "expires_in": 3600
+        })))
+        .mount(&idp)
+        .await;
+    idp
+}
+
+/// A token endpoint that answers each request only when the test releases
+/// it, so a callback can be held in its code exchange.
+struct HeldIdp {
+    uri: String,
+    arrived: std::sync::Arc<tokio::sync::Notify>,
+    release: std::sync::Arc<tokio::sync::Notify>,
+}
+
+async fn held_idp() -> HeldIdp {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = format!("http://{}", listener.local_addr().unwrap());
+    let arrived = std::sync::Arc::new(tokio::sync::Notify::new());
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let (a, r) = (arrived.clone(), release.clone());
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let (a, r) = (a.clone(), r.clone());
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = sock.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let length = text[..end]
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                a.notify_one();
+                r.notified().await;
+                let body =
+                    r#"{"access_token":"at-dummy","refresh_token":"rt-dummy","expires_in":3600}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+    HeldIdp {
+        uri,
+        arrived,
+        release,
+    }
+}
+
+async fn fence_server(dir: &std::path::Path, history: Option<String>, idp: &str) -> Api {
+    let api = spawn(dir, history, idp).await;
+    let (code, t) = api
+        .post(
+            "admin-tok",
+            "/v1/tenants",
+            json!({"id": "acme", "name": "Acme"}),
+        )
+        .await;
+    assert_eq!(code, 201, "{t}");
+    api
+}
+
+async fn start_connect_flow(api: &Api, connection: &str) -> String {
+    let (code, started) = api
+        .post(
+            "op-tok",
+            "/v1/tenants/acme/connect/crm",
+            json!({"connection": connection, "redirect": "https://app.example/done"}),
+        )
+        .await;
+    assert_eq!(code, 200, "{started}");
+    reqwest::Url::parse(started["authorize_url"].as_str().unwrap())
+        .unwrap()
+        .query_pairs()
+        .find(|(k, _)| k == "state")
+        .unwrap()
+        .1
+        .into_owned()
+}
+
+fn spawn_callback(api: &Api, state: &str) -> tokio::task::JoinHandle<String> {
+    let url = format!("{}/v1/connect/callback?code=abc&state={state}", api.base);
+    let client = api.client.clone();
+    tokio::spawn(async move {
+        let resp = client.get(url).send().await.unwrap();
+        assert!(resp.status().is_redirection(), "{}", resp.status());
+        resp.headers()["location"].to_str().unwrap().to_string()
+    })
+}
+
+async fn finish_connect_flow(api: &Api, state: &str) -> String {
+    spawn_callback(api, state).await.unwrap()
+}
+
+async fn create_static_connection(api: &Api, name: &str, token: &str) {
+    let (code, c) = api
+        .post(
+            "admin-tok",
+            "/v1/tenants/acme/connections",
+            json!({"name": name, "provider": {"type": "static", "config": {"token": token}}}),
+        )
+        .await;
+    assert_eq!(code, 201, "{c}");
+}
+
+const CHANGED: &str =
+    "https://app.example/done?connection=crm&status=error&error=connection_changed";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connect_callback_after_the_connection_was_deleted_stores_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    for history in fence_histories(dir.path()) {
+        let run = tempfile::tempdir().unwrap();
+        let held = held_idp().await;
+        let api = fence_server(run.path(), history.clone(), &held.uri).await;
+
+        // Deleted while the flow waits at the provider.
+        create_static_connection(&api, "crm", "dummy-old").await;
+        let st = start_connect_flow(&api, "crm").await;
+        let (code, _) = api
+            .delete("admin-tok", "/v1/tenants/acme/connections/crm")
+            .await;
+        assert_eq!(code, 204);
+        let cb = spawn_callback(&api, &st);
+        held.arrived.notified().await;
+        held.release.notify_one();
+        assert_eq!(cb.await.unwrap(), CHANGED, "{history:?}");
+        let (code, _) = api
+            .get("admin-tok", "/v1/tenants/acme/connections/crm")
+            .await;
+        assert_eq!(code, 404, "{history:?}: nothing was written back");
+
+        // Deleted while the callback is in its code exchange.
+        create_static_connection(&api, "crm", "dummy-old").await;
+        let st = start_connect_flow(&api, "crm").await;
+        let cb = spawn_callback(&api, &st);
+        held.arrived.notified().await;
+        let (code, _) = api
+            .delete("admin-tok", "/v1/tenants/acme/connections/crm")
+            .await;
+        assert_eq!(code, 204);
+        held.release.notify_one();
+        assert_eq!(cb.await.unwrap(), CHANGED, "{history:?}");
+        let (code, _) = api
+            .get("admin-tok", "/v1/tenants/acme/connections/crm")
+            .await;
+        assert_eq!(code, 404, "{history:?}");
+
+        let (_, audit) = api
+            .get("admin-tok", "/v1/audit?action=connect.complete&limit=50")
+            .await;
+        let results: Vec<&str> = audit["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["result"].as_str())
+            .collect();
+        assert_eq!(results, vec!["superseded", "superseded"], "{audit}");
+    }
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connect_callback_after_the_connection_was_replaced_keeps_the_newer_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let idp = granting_idp().await;
+    for history in fence_histories(dir.path()) {
+        let run = tempfile::tempdir().unwrap();
+        let api = fence_server(run.path(), history.clone(), &idp.uri()).await;
+
+        create_static_connection(&api, "crm", "dummy-old").await;
+        let st = start_connect_flow(&api, "crm").await;
+        let (code, put) = api
+            .put(
+                "admin-tok",
+                "/v1/tenants/acme/connections/crm",
+                json!({"provider": {"type": "static", "config": {"token": "dummy-newer"}}}),
+            )
+            .await;
+        assert_eq!(code, 200, "{put}");
+        assert_eq!(finish_connect_flow(&api, &st).await, CHANGED, "{history:?}");
+        let (_, after) = api
+            .get("admin-tok", "/v1/tenants/acme/connections/crm")
+            .await;
+        assert_eq!(after["provider_type"], "static", "{history:?}: {after}");
+        assert_eq!(after["updated_by"], "alice");
+
+        // Created under the flow's name while the flow was pending.
+        let st = start_connect_flow(&api, "crm2").await;
+        create_static_connection(&api, "crm2", "dummy-newer").await;
+        let location = finish_connect_flow(&api, &st).await;
+        assert!(
+            location.ends_with("error=connection_changed"),
+            "{history:?}: {location}"
+        );
+        let (_, after) = api
+            .get("admin-tok", "/v1/tenants/acme/connections/crm2")
+            .await;
+        assert_eq!(after["provider_type"], "static", "{history:?}");
+
+        // An untouched connection is replaced by the flow.
+        let st = start_connect_flow(&api, "crm").await;
+        assert_eq!(
+            finish_connect_flow(&api, &st).await,
+            "https://app.example/done?connection=crm&status=ok"
+        );
+        let (_, after) = api
+            .get("admin-tok", "/v1/tenants/acme/connections/crm")
+            .await;
+        assert_eq!(after["provider_type"], "oauth2_refresh", "{history:?}");
+
+        // Creating over an existing name stays a conflict; replacing needs the tenant.
+        let (code, _) = api
+            .post(
+                "admin-tok",
+                "/v1/tenants/acme/connections",
+                json!({"name": "crm", "provider": {"type": "static", "config": {"token": "x"}}}),
+            )
+            .await;
+        assert_eq!(code, 409);
+        let (code, _) = api
+            .put(
+                "admin-tok",
+                "/v1/tenants/nobody/connections/crm",
+                json!({"provider": {"type": "static", "config": {"token": "x"}}}),
+            )
+            .await;
+        assert_eq!(code, 404);
+        let (code, _) = api
+            .post(
+                "admin-tok",
+                "/v1/tenants/nobody/connections",
+                json!({"name": "crm", "provider": {"type": "static", "config": {"token": "x"}}}),
+            )
+            .await;
+        assert_eq!(code, 404);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connect_callback_that_finishes_after_the_tenant_was_deleted_stores_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    for history in fence_histories(dir.path()) {
+        let run = tempfile::tempdir().unwrap();
+        let held = held_idp().await;
+        let api = fence_server(run.path(), history.clone(), &held.uri).await;
+
+        // The tenant is deleted while the callback is in its code exchange.
+        let st = start_connect_flow(&api, "crm").await;
+        let cb = spawn_callback(&api, &st);
+        held.arrived.notified().await;
+        let (code, rep) = api.delete("admin-tok", "/v1/tenants/acme").await;
+        assert_eq!(code, 200, "{rep}");
+        held.release.notify_one();
+        assert_eq!(cb.await.unwrap(), CHANGED, "{history:?}");
+        let (code, t) = api
+            .post(
+                "admin-tok",
+                "/v1/tenants",
+                json!({"id": "acme", "name": "Acme again"}),
+            )
+            .await;
+        assert_eq!(code, 201, "{t}");
+        let (_, list) = api.get("admin-tok", "/v1/tenants/acme/connections").await;
+        assert_eq!(
+            list,
+            json!([]),
+            "{history:?}: no connection outlives its tenant"
+        );
+
+        // Deleted and created again under the same id during the exchange.
+        let st = start_connect_flow(&api, "crm").await;
+        let cb = spawn_callback(&api, &st);
+        held.arrived.notified().await;
+        let (code, _) = api.delete("admin-tok", "/v1/tenants/acme").await;
+        assert_eq!(code, 200);
+        let (code, _) = api
+            .post(
+                "admin-tok",
+                "/v1/tenants",
+                json!({"id": "acme", "name": "Acme third"}),
+            )
+            .await;
+        assert_eq!(code, 201);
+        held.release.notify_one();
+        assert_eq!(cb.await.unwrap(), CHANGED, "{history:?}");
+        let (_, list) = api.get("admin-tok", "/v1/tenants/acme/connections").await;
+        assert_eq!(list, json!([]), "{history:?}: the new tenant gets nothing");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connect_callback_survives_a_token_rotation_during_the_flow() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/items"))
+        .and(header("authorization", "Bearer at-rotated"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items": [{"id": 1}]})))
+        .mount(&data)
+        .await;
+    let idp = granting_idp().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "at-rotated", "refresh_token": "rt-rotated", "expires_in": 3600
+        })))
+        .mount(&idp)
+        .await;
+    for history in fence_histories(dir.path()) {
+        let run = tempfile::tempdir().unwrap();
+        let api = fence_server(run.path(), history.clone(), &idp.uri()).await;
+        let out = run.path().join("out");
+        let state_dir = run.path().join("state");
+        std::fs::create_dir_all(&out).unwrap();
+
+        let st = start_connect_flow(&api, "crm").await;
+        assert_eq!(
+            finish_connect_flow(&api, &st).await,
+            "https://app.example/done?connection=crm&status=ok"
+        );
+        let (_, before) = api
+            .get("admin-tok", "/v1/tenants/acme/connections/crm")
+            .await;
+
+        let st = start_connect_flow(&api, "crm").await;
+        let config = template(&data.uri(), &out, &state_dir).replace("ref: api", "ref: crm");
+        let (code, r) = api
+            .post("op-tok", "/v1/tenants/acme/runs", json!({"config": config}))
+            .await;
+        assert_eq!(code, 202, "{r}");
+        let rec = api.wait_run(r["run_id"].as_str().unwrap()).await;
+        assert_eq!(rec["status"], "completed", "{history:?}: {rec}");
+        let (_, rotated) = api
+            .get("admin-tok", "/v1/tenants/acme/connections/crm")
+            .await;
+        assert_ne!(
+            rotated["updated_at"], before["updated_at"],
+            "{history:?}: the run rotated the refresh token"
+        );
+
+        assert_eq!(
+            finish_connect_flow(&api, &st).await,
+            "https://app.example/done?connection=crm&status=ok",
+            "{history:?}"
+        );
+        let (_, after) = api
+            .get("admin-tok", "/v1/tenants/acme/connections/crm")
+            .await;
+        assert_ne!(after["updated_at"], rotated["updated_at"], "{history:?}");
+        assert_eq!(after["created_at"], before["created_at"], "{history:?}");
+    }
+}

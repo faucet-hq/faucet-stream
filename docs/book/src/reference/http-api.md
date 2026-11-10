@@ -1832,5 +1832,6 @@ transaction; the pool opens a fresh one).
 With the `tenants` feature: `faucet_serve_tenant_runs_total{tenant,outcome}`,
 `faucet_serve_tenant_limit_rejections_total{tenant,limit}`,
 `faucet_serve_connections{status}` and
-`faucet_serve_connect_flows_total{provider,outcome}`. See
+`faucet_serve_connect_flows_total{provider,outcome}` (`outcome` is `started`,
+`completed`, `failed` or `superseded`). See
 [Observability](../operations/observability.md).

@@ -1953,6 +1953,41 @@ pub trait RunHistory: Send + Sync {
         }
     }
 
+    /// Insert a connection only when its tenant exists and no connection has
+    /// its name; returns whether it was inserted. The built-in backends
+    /// decide in one statement that waits on a concurrent tenant delete.
+    /// Default: read, check, upsert (not atomic).
+    async fn connection_insert_new(
+        &self,
+        connection: &tenants::ConnectionRecord,
+    ) -> Result<bool, HistoryError> {
+        if self.tenant_get(&connection.tenant).await?.is_none()
+            || self
+                .connection_get(&connection.tenant, &connection.name)
+                .await?
+                .is_some()
+        {
+            return Ok(false);
+        }
+        self.connection_upsert(connection).await?;
+        Ok(true)
+    }
+
+    /// Insert or replace a connection only while its tenant exists; returns
+    /// whether it was written. The built-in backends decide in one statement
+    /// that waits on a concurrent tenant delete. Default: read, check,
+    /// upsert (not atomic).
+    async fn connection_upsert_in_tenant(
+        &self,
+        connection: &tenants::ConnectionRecord,
+    ) -> Result<bool, HistoryError> {
+        if self.tenant_get(&connection.tenant).await?.is_none() {
+            return Ok(false);
+        }
+        self.connection_upsert(connection).await?;
+        Ok(true)
+    }
+
     /// One connection. Default: `None`.
     async fn connection_get(
         &self,
@@ -3176,8 +3211,14 @@ mod tests {
             created_at: now,
             updated_at: now,
             updated_by: "x".into(),
+            generation: String::new(),
         };
         assert!(h.connection_upsert(&c).await.is_err());
+        assert!(!h.connection_insert_new(&c).await.unwrap(), "no tenant");
+        assert!(
+            !h.connection_upsert_in_tenant(&c).await.unwrap(),
+            "no tenant"
+        );
         assert!(h.connection_get("acme", "c").await.unwrap().is_none());
         assert!(h.connection_list("acme").await.unwrap().is_empty());
         assert!(!h.connection_delete("acme", "c").await.unwrap());
@@ -3191,6 +3232,8 @@ mod tests {
             created_by: "x".into(),
             created_at: now,
             expires_at: now,
+            base: None,
+            tenant_created_at: None,
         };
         assert!(h.connect_session_put(&sess).await.is_err());
         assert!(h.connect_session_take("st").await.unwrap().is_none());
@@ -3213,6 +3256,109 @@ mod tests {
             chrono::Utc::now(),
         );
         assert!(!h.release_owned(&rec).await.unwrap());
+    }
+
+    /// `Bare` with tenants and connections read and written through a
+    /// memory history, so the defaulted connection writes run.
+    struct DefaultConnectionWrites(memory::MemoryHistory);
+
+    #[async_trait]
+    impl RunHistory for DefaultConnectionWrites {
+        async fn claim_idempotency(
+            &self,
+            _key: &str,
+            _fingerprint: &str,
+            _run_id: &str,
+            _window: Duration,
+        ) -> Result<Claim, HistoryError> {
+            Ok(Claim::Fresh)
+        }
+        async fn upsert(&self, _rec: &RunRecord) -> Result<(), HistoryError> {
+            Ok(())
+        }
+        async fn get(&self, _id: &str) -> Result<Option<RunRecord>, HistoryError> {
+            Ok(None)
+        }
+        async fn list(&self, _filter: &ListFilter) -> Result<ListPage, HistoryError> {
+            Ok(ListPage {
+                runs: Vec::new(),
+                next_cursor: None,
+            })
+        }
+        async fn delete(&self, _id: &str) -> Result<DeleteOutcome, HistoryError> {
+            Ok(DeleteOutcome::NotFound)
+        }
+        async fn purge_expired(&self, _retain_for: Duration) -> Result<usize, HistoryError> {
+            Ok(0)
+        }
+        async fn recover_orphans(&self) -> Result<usize, HistoryError> {
+            Ok(0)
+        }
+        fn degraded(&self) -> bool {
+            false
+        }
+        async fn tenant_get(
+            &self,
+            id: &str,
+        ) -> Result<Option<tenants::TenantRecord>, HistoryError> {
+            self.0.tenant_get(id).await
+        }
+        async fn connection_get(
+            &self,
+            tenant: &str,
+            name: &str,
+        ) -> Result<Option<tenants::ConnectionRecord>, HistoryError> {
+            self.0.connection_get(tenant, name).await
+        }
+        async fn connection_upsert(
+            &self,
+            connection: &tenants::ConnectionRecord,
+        ) -> Result<(), HistoryError> {
+            self.0.connection_upsert(connection).await
+        }
+    }
+
+    #[tokio::test]
+    async fn default_connection_writes_need_the_tenant_and_refuse_an_existing_name() {
+        let mem = memory::MemoryHistory::new(Duration::from_secs(60));
+        let now = Utc::now();
+        let c = |sealed: &str| tenants::ConnectionRecord {
+            tenant: "acme".into(),
+            name: "c".into(),
+            provider_type: "static".into(),
+            connect_provider: None,
+            sealed: sealed.into(),
+            status: Default::default(),
+            reauth_reason: None,
+            created_at: now,
+            updated_at: now,
+            updated_by: "x".into(),
+            generation: tenants::new_generation(),
+        };
+        let h = DefaultConnectionWrites(mem);
+        assert!(!h.connection_insert_new(&c("a")).await.unwrap());
+        assert!(!h.connection_upsert_in_tenant(&c("a")).await.unwrap());
+        h.0.tenant_upsert(&tenants::TenantRecord {
+            id: "acme".into(),
+            name: None,
+            labels: BTreeMap::new(),
+            limits: Default::default(),
+            notifications: Vec::new(),
+            notifications_sealed: None,
+            suspended: false,
+            created_at: now,
+            updated_at: now,
+            created_by: "x".into(),
+        })
+        .await
+        .unwrap();
+        assert!(h.connection_insert_new(&c("a")).await.unwrap());
+        assert!(!h.connection_insert_new(&c("b")).await.unwrap(), "exists");
+        assert!(h.connection_upsert_in_tenant(&c("b")).await.unwrap());
+        assert_eq!(
+            h.connection_get("acme", "c").await.unwrap().unwrap().sealed,
+            "b"
+        );
     }
 
     #[test]

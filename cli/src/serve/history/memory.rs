@@ -1015,6 +1015,34 @@ impl RunHistory for MemoryHistory {
         }
     }
 
+    async fn connection_insert_new(
+        &self,
+        connection: &tenants::ConnectionRecord,
+    ) -> Result<bool, HistoryError> {
+        let mut st = self.tenant_state()?;
+        let key = (connection.tenant.clone(), connection.name.clone());
+        if !st.tenants.contains_key(&connection.tenant) || st.connections.contains_key(&key) {
+            return Ok(false);
+        }
+        st.connections.insert(key, connection.clone());
+        Ok(true)
+    }
+
+    async fn connection_upsert_in_tenant(
+        &self,
+        connection: &tenants::ConnectionRecord,
+    ) -> Result<bool, HistoryError> {
+        let mut st = self.tenant_state()?;
+        if !st.tenants.contains_key(&connection.tenant) {
+            return Ok(false);
+        }
+        st.connections.insert(
+            (connection.tenant.clone(), connection.name.clone()),
+            connection.clone(),
+        );
+        Ok(true)
+    }
+
     async fn connection_get(
         &self,
         tenant: &str,
