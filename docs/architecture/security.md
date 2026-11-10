@@ -182,9 +182,11 @@ connector's `tls` / transport option as something to configure, not to inherit.
   deny environment and secret-manager reads. A substituted value
   (`${vars.*}`, `${sources.*}`, `${sinks.*}`) can never form a new `${…}`
   directive, and every secret-manager reference is checked against the policy
-  again right before it is fetched. The server's own files (its
-  environment files, input files, run-history database and default-config
-  state directory) are refused as data whatever the path roots allow.
+  again right before it is fetched. The server's own files (every `.env*`
+  file in its working directory or beside its `--env-file`, including ones
+  created after it started, its input files, run-history database and
+  default-config state directory) are refused as data whatever the path roots
+  allow, and its working directory can't be listed as a whole.
   Operator-written configs
   (templates, the triggers file, `--default-config`) are not checked. See
   [Reference policy](../book/src/reference/http-api.md#reference-policy).

@@ -1584,6 +1584,210 @@ fn environment_files_in_the_working_directory_are_protected() {
 }
 
 #[test]
+fn environment_files_created_later_are_protected() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("data.csv"), "id\n1\n").unwrap();
+    protect_env_files(dir.path(), None);
+    let d = dir.path().display();
+    for name in [
+        ".env",
+        ".env.local",
+        ".ENV.Local",
+        ".envrc",
+        ".env.production.local",
+    ] {
+        assert!(
+            read_protected(&format!("{d}/{name}")),
+            "{name} before it exists"
+        );
+        assert!(file_is_protected(&format!("{d}/{name}")), "{name}");
+        assert!(
+            data_path_is_protected(&format!("{d}/{name}"), Access::Write),
+            "{name}"
+        );
+    }
+    assert!(read_protected(&format!("{d}/.env/secret")));
+    assert!(data_path_is_protected(
+        &format!("{d}/.Env/x.jsonl"),
+        Access::Write
+    ));
+    std::fs::write(dir.path().join(".env.local"), "X=dummy\n").unwrap();
+    assert!(read_protected(&format!("{d}/.env.local")));
+    assert!(read_protected(&format!("{d}/sub/../.env.local")));
+    assert!(read_protected(&format!("{d}/./.env.local")));
+    assert!(!read_protected(&format!("{d}/data.csv")));
+    assert!(!read_protected(&format!("{d}/environment.csv")));
+}
+
+#[test]
+fn working_directory_listings_and_globs_reach_environment_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::write(data.join("a.csv"), "id\n1\n").unwrap();
+    protect_env_files(dir.path(), None);
+    let d = dir.path().display();
+    assert!(read_protected(&d.to_string()));
+    assert!(read_protected(&format!("{d}/")));
+    assert!(data_path_is_protected(
+        &dir.path().parent().unwrap().display().to_string(),
+        Access::Read { recursive: true }
+    ));
+    for glob in [
+        "*", ".*", ".env*", "*local*", ".e*", ".[e]nv*", ".?nv", "[.]env", "**/*",
+    ] {
+        assert!(read_protected(&format!("{d}/{glob}")), "{glob}");
+    }
+    for glob in [
+        "*.csv",
+        "data/*",
+        "data/**/*.csv",
+        ".git*",
+        "?",
+        "*/x.jsonl",
+        "*/*.csv",
+    ] {
+        assert!(!read_protected(&format!("{d}/{glob}")), "{glob}");
+    }
+    assert!(!read_protected(&data.display().to_string()));
+    assert!(!data_path_is_protected(
+        &data.display().to_string(),
+        Access::Read { recursive: true }
+    ));
+    assert!(read_protected(&format!("{d}/.e*/x.csv")));
+    assert!(!data_path_is_protected(
+        &format!("{d}/${{now.date}}/x.jsonl"),
+        Access::Write
+    ));
+    assert!(data_path_is_protected(
+        &format!("{d}/.env{{part}}"),
+        Access::Write
+    ));
+    assert!(!data_path_is_protected(
+        &format!("{d}/out-{{part}}.jsonl"),
+        Access::Write
+    ));
+    std::fs::write(dir.path().join(".env.csv"), "X=dummy\n").unwrap();
+    assert!(
+        read_protected(&format!("{d}/*.csv")),
+        "an existing match is checked"
+    );
+}
+
+#[test]
+fn environment_files_beside_the_loaded_file_are_protected() {
+    let cwd = tempfile::tempdir().unwrap();
+    let conf = tempfile::tempdir().unwrap();
+    let loaded = conf.path().join("prod.env");
+    std::fs::write(&loaded, "Y=1\n").unwrap();
+    protect_env_files(cwd.path(), Some(&loaded));
+    assert!(read_protected(&loaded.display().to_string()));
+    assert!(read_protected(&format!(
+        "{}/.env.prod",
+        conf.path().display()
+    )));
+    assert!(!read_protected(&format!(
+        "{}/other.csv",
+        conf.path().display()
+    )));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_protected_file_behind_a_swapped_link_stays_protected() {
+    let dir = tempfile::tempdir().unwrap();
+    for v in ["v1", "v2"] {
+        std::fs::create_dir(dir.path().join(v)).unwrap();
+        std::fs::write(dir.path().join(v).join("auth.yaml"), v).unwrap();
+    }
+    let current = dir.path().join("current");
+    std::os::unix::fs::symlink(dir.path().join("v1"), &current).unwrap();
+    protect_file(&current.join("auth.yaml"));
+    assert!(read_protected(&format!(
+        "{}/v1/auth.yaml",
+        dir.path().display()
+    )));
+    std::fs::remove_file(&current).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("v2"), &current).unwrap();
+    assert!(read_protected(
+        &current.join("auth.yaml").display().to_string()
+    ));
+    assert!(read_protected(&format!(
+        "{}/v2/auth.yaml",
+        dir.path().display()
+    )));
+    assert!(read_protected(&format!(
+        "{}/v1/auth.yaml",
+        dir.path().display()
+    )));
+    assert!(file_is_protected(&format!(
+        "{}/v2/auth.yaml",
+        dir.path().display()
+    )));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_to_an_environment_file_not_yet_written_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    protect_env_files(dir.path(), None);
+    let link = data.join("settings.txt");
+    std::os::unix::fs::symlink("../.env.local", &link).unwrap();
+    assert!(read_protected(&link.display().to_string()));
+    let chain = data.join("chain.txt");
+    std::os::unix::fs::symlink("settings.txt", &chain).unwrap();
+    assert!(read_protected(&chain.display().to_string()));
+}
+
+#[test]
+fn concrete_paths_are_refused_by_the_run_time_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    protect_env_files(dir.path(), None);
+    std::fs::write(dir.path().join("data.csv"), "id\n").unwrap();
+    std::fs::write(dir.path().join(".env.csv"), "X=dummy\n").unwrap();
+    let refusal = server_file_refusal(&dir.path().join(".env.csv")).unwrap();
+    assert!(refusal.contains("server's own files"), "{refusal}");
+    assert!(server_file_refusal(&dir.path().join(".env/inner")).is_some());
+    assert!(server_file_refusal(std::path::Path::new("/proc/self/environ")).is_some());
+    assert!(server_file_refusal(&dir.path().join("data.csv")).is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn another_spelling_of_an_environment_directory_is_recognised() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    protect_env_files(&real, None);
+    let r = resolved().unwrap();
+    assert!(r.is_env_dir(&real));
+    assert!(!r.is_env_dir(dir.path()));
+}
+
+#[test]
+fn glob_segments_are_read_like_the_glob_crate() {
+    for (seg, can) in [
+        (".env*", true),
+        (".e*", true),
+        (".*", true),
+        (".[a-f]nv", true),
+        (".[!x]nv", true),
+        (".[!e]nv", true),
+        (".[!eE]nv", false),
+        (".E?V", true),
+        (".git*", false),
+        (".[", false),
+        (".x[", false),
+        ("*", true),
+        (".en", false),
+    ] {
+        assert_eq!(segment_can_start_with(seg, ".env"), can, "{seg}");
+    }
+}
+
+#[test]
 fn nothing_under_a_protected_directory_is_reachable() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");

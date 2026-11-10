@@ -747,3 +747,158 @@ async fn scheme_shaped_paths_and_the_server_env_file_stay_out_of_reach() {
         assert!(text.contains("may not"), "{text}");
     }
 }
+
+/// Environment files that appear beside the server's env file after it
+/// started are out of reach as data too, whatever path or listing names them,
+/// while the other files there stay readable.
+#[tokio::test(flavor = "multi_thread")]
+async fn environment_files_written_after_start_stay_out_of_reach() {
+    let dir = tempfile::tempdir().unwrap();
+    let env_file = dir.path().join(".env");
+    std::fs::write(&env_file, "FAUCET_TRUST_TEST_TOKEN=dummy-secret\n").unwrap();
+    let api = spawn(
+        dir.path(),
+        PRINCIPALS,
+        |a| {
+            a.env_file = Some(env_file.clone());
+            a.no_env_file = false;
+        },
+        true,
+    )
+    .await;
+    let input = csv_input(dir.path());
+    let later = dir.path().join(".env.local");
+    std::fs::write(&later, "id\ndummy-later-secret\n").unwrap();
+    let d = dir.path().display();
+    for source in [
+        later.display().to_string(),
+        format!("{d}/./.env.local"),
+        format!("{d}/.ENV.LOCAL"),
+        format!("{d}/.env.*"),
+        format!("{d}/*"),
+    ] {
+        let (code, err) = api
+            .post(
+                "op-tok",
+                "/v1/runs",
+                json!({"config": csv_config(dir.path(), &source)}),
+            )
+            .await;
+        assert_eq!(code, 403, "{source}: {err}");
+    }
+    let (code, err) = api
+        .post(
+            "op-tok",
+            "/v1/runs",
+            json!({"config": format!(
+                "version: 1\nname: trust\npipeline:\n  source: {{ type: csv, config: {{ path: \"{}\" }} }}\n  sink: {{ type: jsonl, config: {{ path: \"{d}/.env.production\" }} }}\n",
+                input.display()
+            )}),
+        )
+        .await;
+    assert_eq!(code, 403, "{err}");
+    let (code, err) = api
+        .post(
+            "op-tok",
+            "/v1/dlq/inspect",
+            json!({"location": later.display().to_string()}),
+        )
+        .await;
+    assert_eq!(code, 403, "{err}");
+    let (code, body) = api
+        .post(
+            "op-tok",
+            "/v1/runs",
+            json!({"config": csv_config(dir.path(), &input.display().to_string())}),
+        )
+        .await;
+    assert_eq!(code, 202, "{body}");
+    // What a file connector asks about each file it lists or replaces.
+    let err = faucet_core::path_guard::check(&dir.path().join(".env.secret")).unwrap_err();
+    assert!(err.to_string().contains("server's own files"), "{err}");
+    assert!(faucet_core::path_guard::check(&input).is_ok());
+
+    #[cfg(feature = "mcp")]
+    {
+        let config = format!(
+            "version: 1\npipeline:\n  source: {{ type: csv, config: {{ path: \"{}\" }} }}\n  sink: {{ type: stdout, config: {{}} }}\n",
+            later.display()
+        );
+        let (code, body) = api
+            .post(
+                "op-tok",
+                "/mcp",
+                json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                       "params": {"name": "preview", "arguments": {"config": config, "limit": 3}}}),
+            )
+            .await;
+        assert_eq!(code, 200, "{body}");
+        let text = body.to_string();
+        assert!(text.contains("\"isError\":true"), "{text}");
+        assert!(!text.contains("dummy-later-secret"), "{text}");
+    }
+}
+
+/// The server's working directory: an environment file created there after
+/// start, named by a relative path, is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn environment_files_in_the_working_directory_written_after_start_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("auth.yaml"), PRINCIPALS).unwrap();
+    let input = csv_input(dir.path());
+    let port = free_port();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_faucet"))
+        .current_dir(dir.path())
+        .args([
+            "serve",
+            "--listen",
+            &format!("127.0.0.1:{port}"),
+            "--auth-config",
+            "auth.yaml",
+            "--history",
+            "memory",
+        ])
+        .env("FAUCET_LOG", "warn")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let api = Api {
+        base: format!("http://127.0.0.1:{port}"),
+        client: reqwest::Client::new(),
+    };
+    let mut up = false;
+    for _ in 0..1200 {
+        if api
+            .client
+            .get(format!("{}/healthz", api.base))
+            .send()
+            .await
+            .is_ok()
+        {
+            up = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(up, "server did not start");
+    std::fs::write(dir.path().join(".env.local"), "id\ndummy-later-secret\n").unwrap();
+    let refused = api
+        .post(
+            "op-tok",
+            "/v1/runs",
+            json!({"config": csv_config(dir.path(), ".env.local")}),
+        )
+        .await;
+    let allowed = api
+        .post(
+            "op-tok",
+            "/v1/runs",
+            json!({"config": csv_config(dir.path(), &input.display().to_string())}),
+        )
+        .await;
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(refused.0, 403, "{}", refused.1);
+    assert_eq!(allowed.0, 202, "{}", allowed.1);
+}

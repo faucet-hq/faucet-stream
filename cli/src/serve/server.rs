@@ -968,6 +968,7 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
     if let Ok(cwd) = std::env::current_dir() {
         crate::serve::load::protect_env_files(&cwd, config.env_file.as_deref());
     }
+    faucet_core::path_guard::install(Box::new(crate::serve::load::server_file_refusal));
     for path in [
         &config.policy_path,
         &config.triggers_path,

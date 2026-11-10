@@ -171,11 +171,17 @@ impl FileSource {
             None => {
                 let path = root.to_string();
                 let recursive = self.config.recursive;
-                tokio::task::spawn_blocking(move || plan::list_local(&path, recursive))
-                    .await
-                    .map_err(|e| {
-                        FaucetError::Source(format!("file source: listing task failed: {e}"))
-                    })??
+                tokio::task::spawn_blocking(move || {
+                    let files = plan::list_local(&path, recursive)?;
+                    for f in &files {
+                        faucet_core::path_guard::check(std::path::Path::new(&f.path))?;
+                    }
+                    Ok::<_, FaucetError>(files)
+                })
+                .await
+                .map_err(|e| {
+                    FaucetError::Source(format!("file source: listing task failed: {e}"))
+                })??
             }
         };
         if let Some(member) = *self.shard.lock().expect("shard mutex") {

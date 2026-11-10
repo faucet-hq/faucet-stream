@@ -337,8 +337,11 @@ absolute path — and so is a path starting with `~`, which some engines expand
 to a home directory. `sqlite:` and `duckdb:` locations are read the way their
 drivers read them, percent-decoding included (`sqlite://%2Fdata%2Fx.db` is
 `/data/x.db`), and a SQLite name that is itself a `file:` URI is refused. The
-server's own files — its environment files, input files, run-history database
-and default-config state directory — are refused whatever the roots allow. A URL host is compared in
+server's own files — every `.env*` file in its working directory or beside its
+`--env-file` (including files created after it started), its input files,
+run-history database and default-config state directory — are refused whatever
+the roots allow, and so is listing the working directory as a whole (read a
+subdirectory instead). A URL host is compared in
 the form a URL parser reads it, so `2852039166`, `0xa9fea9fe`, `0251.0376.0251.0376`
 or a trailing dot (`169.254.169.254.`, `metadata.google.internal.`) name the
 metadata address they spell, and an `http(s)` URL's authority ends at a `\` as
