@@ -376,7 +376,7 @@ Search, scroll and discovery requests run through the pipeline's
 run's cancel token, metered as `search` / `scroll` / `discover`, and sent once
 (a retried scroll could skip a page).
 Redirects are followed by `faucet_core::http::Client`: a hop to another
-origin drops `Authorization`, cookies and every credential header, and a request
+origin keeps only standard request headers (`faucet_core::http::CROSS_ORIGIN_SAFE_HEADERS`): `Authorization`, cookies and every other header stay behind, and a request
 body is never replayed to another origin.
 
 ## License

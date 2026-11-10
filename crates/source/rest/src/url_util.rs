@@ -37,7 +37,8 @@ pub fn resolve_link_str(base: &str, link: &str) -> Result<String, FaucetError> {
 
 /// Whether a request to `target` may carry the credentials configured for
 /// `base`: true for the same scheme, host and port, or a host in
-/// `trusted_hosts` (exact, or `*.suffix`); false for any other host, so the
+/// `trusted_hosts` (exact on any port, `host:port`, or `*.suffix`); false for
+/// any other host, so the
 /// request goes out without them. A plain-`http` target from an `https` base is
 /// refused outright — credentials or data would cross the wire in clear.
 pub fn credentials_allowed(
@@ -66,11 +67,14 @@ pub fn credentials_allowed(
         return Ok(false);
     };
     let host = host.to_ascii_lowercase();
+    let host_port = target
+        .port_or_known_default()
+        .map(|p| format!("{host}:{p}"));
     Ok(trusted_hosts.iter().any(|t| {
         let t = t.trim().to_ascii_lowercase();
         match t.strip_prefix("*.") {
             Some(suffix) => host.len() > suffix.len() && host.ends_with(&format!(".{suffix}")),
-            None => host == t,
+            None => host == t || host_port.as_deref() == Some(t.as_str()),
         }
     }))
 }
@@ -180,6 +184,9 @@ mod tests {
         assert!(credentials_allowed(base, "https://files.example.net/x", &trusted).unwrap());
         assert!(credentials_allowed(base, "https://a.blob.example.org/x", &trusted).unwrap());
         assert!(!credentials_allowed(base, "https://blob.example.org/x", &trusted).unwrap());
+        let with_port = ["files.example.net:8443".to_string()];
+        assert!(credentials_allowed(base, "https://files.example.net:8443/x", &with_port).unwrap());
+        assert!(!credentials_allowed(base, "https://files.example.net/x", &with_port).unwrap());
         let err = credentials_allowed(base, "http://api.example.com/v2", &trusted)
             .unwrap_err()
             .to_string();

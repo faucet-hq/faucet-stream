@@ -295,7 +295,7 @@ retries a `5xx` / `429` / connection failure with jittered backoff (a `429`
 waits its `Retry-After`), every attempt is counted as a `send` round trip, and
 a caller deadline ends the call. Custom auth headers are marked sensitive.
 Redirects are followed by `faucet_core::http::Client`: a hop to another
-origin drops `Authorization`, cookies and every credential header, and a request
+origin keeps only standard request headers (`faucet_core::http::CROSS_ORIGIN_SAFE_HEADERS`): `Authorization`, cookies and every other header stay behind, and a request
 body is never replayed to another origin.
 
 ## License
