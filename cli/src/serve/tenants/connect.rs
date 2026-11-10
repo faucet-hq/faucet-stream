@@ -285,9 +285,7 @@ pub async fn start(
             details: None,
         });
     }
-    let current = state
-        .history()
-        .connection_get(tenant, &req.connection)
+    let current = with_generation(state.history().as_ref(), tenant, &req.connection)
         .await
         .map_err(|e| {
             ServeError::Unavailable(format!("reading connection '{}': {e}", req.connection))
@@ -326,6 +324,36 @@ pub async fn start(
         authorize_url,
         expires_at,
     })
+}
+
+/// The connection `name` as a flow starts from it. A connection stored by an
+/// earlier release has no generation, so a flow would have to compare its
+/// `updated_at`, which a token rotation moves; it is given one first, through
+/// the same compare-and-set a rotation writes with, so the callback is fenced
+/// by the generation a rotation keeps. A lost race reads the record again and
+/// takes the generation it now has, assigning one once more if still empty.
+async fn with_generation(
+    history: &dyn crate::serve::history::RunHistory,
+    tenant: &str,
+    name: &str,
+) -> Result<Option<ConnectionRecord>, crate::serve::history::HistoryError> {
+    let mut current = history.connection_get(tenant, name).await?;
+    for _ in 0..2 {
+        let Some(c) = current.as_ref().filter(|c| c.generation.is_empty()) else {
+            return Ok(current);
+        };
+        // `updated_at` stays: a rotation that read the record before this
+        // write still stores its rotated refresh token.
+        let next = ConnectionRecord {
+            generation: new_generation(),
+            ..c.clone()
+        };
+        if history.connection_replace(&next, c.updated_at).await? {
+            return Ok(Some(next));
+        }
+        current = history.connection_get(tenant, name).await?;
+    }
+    Ok(current)
 }
 
 /// `GET /v1/connect/callback` query.
@@ -894,6 +922,76 @@ mod tests {
         let err = store(&state, &old_release, "s8".into()).await.unwrap_err();
         assert!(matches!(err, CompleteError::Superseded(_)), "{err:?}");
         assert!(get().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_flow_from_a_connection_without_a_generation_survives_a_rotation() {
+        let state = crate::serve::test_support::test_state();
+        let t0 = Utc::now() - chrono::Duration::seconds(30);
+        let history = state.history();
+        history.tenant_upsert(&tenant_record(t0)).await.unwrap();
+        history
+            .connection_upsert(&stored("", "old", t0))
+            .await
+            .unwrap();
+
+        let current = with_generation(history.as_ref(), "acme", "crm")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!current.generation.is_empty());
+        assert_eq!(current.updated_at, t0, "assigning it leaves updated_at");
+        assert_eq!(
+            history.connection_get("acme", "crm").await.unwrap(),
+            Some(current.clone())
+        );
+        let session = session_from(Some(ConnectBase::of(Some(&current))), Some(t0));
+
+        let rotated = ConnectionRecord {
+            sealed: "rotated".into(),
+            updated_at: Utc::now(),
+            ..current.clone()
+        };
+        assert!(history.connection_replace(&rotated, t0).await.unwrap());
+        store(&state, &session, "new".into()).await.unwrap();
+        assert_eq!(
+            history
+                .connection_get("acme", "crm")
+                .await
+                .unwrap()
+                .unwrap()
+                .sealed,
+            "new"
+        );
+
+        let again = with_generation(history.as_ref(), "acme", "crm")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!again.generation.is_empty());
+        assert!(
+            with_generation(history.as_ref(), "acme", "none")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_generation_lost_to_every_race_falls_back_to_the_read_record() {
+        let existing = stored("", "old", Utc::now());
+        let state = contended_state(false, &existing).await;
+        let current = with_generation(state.history().as_ref(), "acme", "crm")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(current.generation.is_empty());
+        let state = contended_state(true, &existing).await;
+        assert!(
+            with_generation(state.history().as_ref(), "acme", "crm")
+                .await
+                .is_err()
+        );
     }
 
     /// A memory history whose connection writes always lose their

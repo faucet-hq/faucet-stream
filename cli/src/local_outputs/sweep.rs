@@ -392,8 +392,8 @@ type Target = super::held::Held;
 #[cfg(unix)]
 async fn probe(rec: &LocalOutputRecord, opts: &SweepOptions) -> Probe {
     use super::held::{self, Opened};
-    let (path, parent_id, file_id) = (rec.fs_path().to_path_buf(), rec.parent_id, rec.file_id);
-    let opened = tokio::task::spawn_blocking(move || held::open(&path, parent_id, file_id)).await;
+    let (path, parent_id) = (rec.fs_path().to_path_buf(), rec.parent_id);
+    let opened = tokio::task::spawn_blocking(move || held::open(&path, parent_id)).await;
     let held = match opened {
         Ok(Opened::Held(held)) => held,
         Ok(Opened::Gone) => return Probe::Gone,
@@ -423,8 +423,9 @@ async fn remove(target: Target) -> Removal {
     }
 }
 
+/// The output's path and the identity its check saw, re-checked at the delete.
 #[cfg(not(unix))]
-type Target = std::path::PathBuf;
+type Target = (std::path::PathBuf, Option<super::ledger::FileIdentity>);
 
 #[cfg(not(unix))]
 async fn probe(rec: &LocalOutputRecord, opts: &SweepOptions) -> Probe {
@@ -440,7 +441,7 @@ async fn probe(rec: &LocalOutputRecord, opts: &SweepOptions) -> Probe {
             Some(reason) => Probe::Skip(reason),
             None => Probe::Ready {
                 bytes: meta.len(),
-                target: path,
+                target: (path, super::ledger::FileIdentity::of(&meta)),
             },
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Probe::Gone,
@@ -448,13 +449,16 @@ async fn probe(rec: &LocalOutputRecord, opts: &SweepOptions) -> Probe {
         // still attempted and its own error is what gets reported.
         Err(_) => Probe::Ready {
             bytes: 0,
-            target: path,
+            target: (path, None),
         },
     }
 }
 
+/// Delete the output at its resolved path, while that is still the file the
+/// check saw.
 #[cfg(not(unix))]
 async fn remove(target: Target) -> Removal {
+    let (target, seen) = target;
     let resolved = match (target.parent(), target.file_name()) {
         (Some(parent), Some(name)) => match tokio::fs::canonicalize(parent).await {
             Ok(dir) => dir.join(name),
@@ -462,6 +466,14 @@ async fn remove(target: Target) -> Removal {
         },
         _ => target,
     };
+    if let Some(seen) = seen {
+        match tokio::fs::symlink_metadata(&resolved).await {
+            Ok(now) if now.is_file() && super::ledger::FileIdentity::of(&now) == Some(seen) => {}
+            Ok(_) => return Removal::Changed,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Removal::Gone,
+            Err(e) => return Removal::Failed(e.to_string()),
+        }
+    }
     match tokio::fs::remove_file(&resolved).await {
         Ok(()) => Removal::Removed,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Removal::Gone,
@@ -890,7 +902,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_row_without_identities_is_collected_only_through_plain_directories() {
+    async fn a_row_without_identities_is_collected_through_a_symlinked_directory() {
         let dir = tempfile::tempdir().unwrap();
         let real = std::fs::canonicalize(dir.path()).unwrap().join("real");
         std::fs::create_dir(&real).unwrap();
@@ -906,9 +918,10 @@ mod tests {
 
         let store = store_with(&[bare(&link.join("out.jsonl"))]).await;
         let report = run(&store, &SweepScope::All, &opts()).await.unwrap();
-        assert_eq!(report.skipped_for(SkipReason::Changed), 1);
-        assert!(path.exists());
+        assert_eq!(report.deleted, 1);
+        assert!(!path.exists());
 
+        std::fs::write(&path, b"x").unwrap();
         let store = store_with(&[bare(&path)]).await;
         let report = run(&store, &SweepScope::All, &opts()).await.unwrap();
         assert_eq!(report.deleted, 1);
@@ -947,12 +960,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out.jsonl");
         std::fs::write(&path, b"faucet").unwrap();
-        let open = || {
-            let id = super::super::FileIdentity::of(&std::fs::metadata(&path).unwrap());
-            match super::super::held::open(&path, None, id) {
-                super::super::held::Opened::Held(h) => h,
-                other => panic!("{other:?}"),
-            }
+        let open = || match super::super::held::open(&path, None) {
+            super::super::held::Opened::Held(h) => h,
+            other => panic!("{other:?}"),
         };
 
         let held = open();

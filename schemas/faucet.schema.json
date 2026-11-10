@@ -21963,7 +21963,7 @@
                       }
                     },
                     "trusted_hosts": {
-                      "description": "Extra hosts that may receive this source's credentials when a\nserver-given URL (a next-page link, an async-job URL, a discovery\nlisting's next link) points at them, or a redirect leads to them.\nCredentials — the `auth` block and a shared provider's headers — are\notherwise sent only to the scheme, host and port of `base_url`; a link\nor redirect elsewhere is fetched without them and with only standard\nheaders (`Accept`, `User-Agent`, …). An entry is a host\n(`files.example.com`), a host and port (`files.example.com:8443`), or a\n`*.example.com` wildcard; a redirect to a bare host keeps credentials\nonly on the scheme's default port and never when it changes the\nscheme. An `https` base never follows a link to plain `http`.",
+                      "description": "Extra hosts that may receive this source's credentials when a\nserver-given URL (a next-page link, an async-job URL, a discovery\nlisting's next link) points at them, or a redirect leads to them.\nCredentials — the `auth` block and a shared provider's headers — are\notherwise sent only to the scheme, host and port of `base_url`; a link\nor redirect elsewhere is fetched without them and with only standard\nheaders (`Accept`, `User-Agent`, …). An entry is a host on any port\n(`files.example.com`), a host and port (`files.example.com:8443`, that\nport only), or a `*.example.com` wildcard; a link and a redirect follow\nthe same rule, and neither keeps credentials when it changes the\nscheme. An `https` base never follows a link to plain `http`.",
                       "type": "array",
                       "items": {
                         "type": "string"

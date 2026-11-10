@@ -262,3 +262,53 @@ async fn a_rejection_from_a_redirect_target_does_not_refresh_the_token() {
         "a rejection by the configured origin still refreshes"
     );
 }
+
+#[tokio::test]
+async fn a_rejection_from_a_trusted_redirect_target_refreshes_the_token() {
+    let (first, second) = redirect_pair(401).await;
+    let second_url = reqwest::Url::parse(&second.uri()).unwrap();
+    let trusted = format!(
+        "{}:{}",
+        second_url.host_str().unwrap(),
+        second_url.port().unwrap()
+    );
+    let provider = Arc::new(HeaderCredential::default());
+    let stream = RestStream::new(config(&first).trusted_host(&trusted))
+        .unwrap()
+        .with_auth_provider(provider.clone());
+    let err = stream.fetch_all().await.unwrap_err();
+    assert!(
+        matches!(err, FaucetError::HttpStatus { status: 401, .. }),
+        "{err:?}"
+    );
+    assert_eq!(
+        provider.invalidated.load(Ordering::SeqCst),
+        1,
+        "the credential went to the trusted host, so its rejection refreshes it"
+    );
+    assert_eq!(first.received_requests().await.unwrap().len(), 2);
+    assert!(
+        received_names(&second)
+            .await
+            .iter()
+            .any(|n| n == "x-provider-key")
+    );
+}
+
+#[tokio::test]
+async fn a_bare_trusted_host_on_another_port_keeps_headers_on_a_redirect() {
+    let (first, second) = redirect_pair(200).await;
+    let host = reqwest::Url::parse(&second.uri())
+        .unwrap()
+        .host_str()
+        .unwrap()
+        .to_string();
+    let stream = RestStream::new(config(&first).trusted_host(&host))
+        .unwrap()
+        .with_auth_provider(Arc::new(HeaderCredential::default()));
+    assert_eq!(stream.fetch_all().await.unwrap().len(), 1);
+    let names = received_names(&second).await;
+    for kept in ["x-provider-key", "x-custom-token"] {
+        assert!(names.iter().any(|n| n == kept), "{kept} missing: {names:?}");
+    }
+}

@@ -132,10 +132,10 @@ pub struct RestStreamConfig {
     /// Credentials — the `auth` block and a shared provider's headers — are
     /// otherwise sent only to the scheme, host and port of `base_url`; a link
     /// or redirect elsewhere is fetched without them and with only standard
-    /// headers (`Accept`, `User-Agent`, …). An entry is a host
-    /// (`files.example.com`), a host and port (`files.example.com:8443`), or a
-    /// `*.example.com` wildcard; a redirect to a bare host keeps credentials
-    /// only on the scheme's default port and never when it changes the
+    /// headers (`Accept`, `User-Agent`, …). An entry is a host on any port
+    /// (`files.example.com`), a host and port (`files.example.com:8443`, that
+    /// port only), or a `*.example.com` wildcard; a link and a redirect follow
+    /// the same rule, and neither keeps credentials when it changes the
     /// scheme. An `https` base never follows a link to plain `http`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trusted_hosts: Vec<String>,

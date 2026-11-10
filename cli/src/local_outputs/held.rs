@@ -7,11 +7,12 @@
 //! links, the file is checked relative to the last one, and the delete goes
 //! through that same open directory.
 //!
-//! A row that carries an identity (its file's, its directory's, or both) has
-//! its directory resolved first, so an output written through a symlinked
-//! directory is still found; the identities then prove it is the same place.
-//! A row with neither identity is walked exactly as recorded, so a symbolic
-//! link anywhere on its path reads as changed.
+//! Every row has its directory resolved first, so an output written through a
+//! symlinked directory (`/tmp` on macOS, a symlinked mount) is still found,
+//! and the resolved path is then walked without following links. A row that
+//! carries an identity (its file's, its directory's, or both) is also proved
+//! to be the same place by it; a row recorded before identities were kept is
+//! collected by its resolved path alone.
 
 use super::ledger::FileIdentity;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat};
@@ -61,28 +62,27 @@ pub(super) enum Unlinked {
 }
 
 /// Reach the output at `path`, checking its directory against `parent_id`.
-pub(super) fn open(
-    path: &Path,
-    parent_id: Option<FileIdentity>,
-    file_id: Option<FileIdentity>,
-) -> Opened {
-    match resolve(path, parent_id.is_some() || file_id.is_some()) {
+/// The file's own recorded identity is compared by the caller, against the
+/// [`Leaf`] this returns.
+pub(super) fn open(path: &Path, parent_id: Option<FileIdentity>) -> Opened {
+    match resolve(path) {
         Ok(target) => walk(&target, parent_id),
         Err(opened) => opened,
     }
 }
 
-/// The path to walk: with its directory resolved when `canonical`, as given
-/// otherwise.
-pub(super) fn resolve(path: &Path, canonical: bool) -> Result<PathBuf, Opened> {
+/// The path to walk: the recorded path with its directory resolved. A path
+/// that is relative or names `.` / `..` is not one the sweep recorded.
+pub(super) fn resolve(path: &Path) -> Result<PathBuf, Opened> {
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(Opened::Changed);
     };
-    if !path.is_absolute() {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+    {
         return Err(Opened::Changed);
-    }
-    if !canonical {
-        return Ok(path.to_path_buf());
     }
     std::fs::canonicalize(parent)
         .map(|dir| dir.join(name))
@@ -240,7 +240,7 @@ mod tests {
         let path = root.join("out.jsonl");
         std::fs::write(&path, b"hello").unwrap();
         let meta = std::fs::metadata(&path).unwrap();
-        let h = held(open(&path, id_of(&root), id_of(&path)));
+        let h = held(open(&path, id_of(&root)));
         assert!(h.leaf.is_file);
         assert_eq!(Some(h.leaf.id), id_of(&path));
         assert_eq!(h.leaf.len, 5);
@@ -261,7 +261,7 @@ mod tests {
         std::fs::create_dir(&elsewhere).unwrap();
         std::fs::write(elsewhere.join("out.jsonl"), b"other").unwrap();
 
-        let target = resolve(&path, true).unwrap();
+        let target = resolve(&path).unwrap();
         std::fs::rename(&outputs, root.join("outputs.moved")).unwrap();
         std::os::unix::fs::symlink(&elsewhere, &outputs).unwrap();
 
@@ -287,7 +287,7 @@ mod tests {
         std::fs::create_dir(&elsewhere).unwrap();
         std::fs::write(elsewhere.join("out.jsonl"), b"other").unwrap();
 
-        let h = held(open(&path, id_of(&outputs), id_of(&path)));
+        let h = held(open(&path, id_of(&outputs)));
         std::fs::rename(&outputs, root.join("outputs.moved")).unwrap();
         std::os::unix::fs::symlink(&elsewhere, &outputs).unwrap();
 
@@ -310,7 +310,7 @@ mod tests {
         std::fs::rename(&outputs, root.join("old")).unwrap();
         std::fs::create_dir(&outputs).unwrap();
         std::fs::write(&path, b"y").unwrap();
-        assert!(matches!(open(&path, recorded, None), Opened::Changed));
+        assert!(matches!(open(&path, recorded), Opened::Changed));
     }
 
     #[test]
@@ -318,7 +318,7 @@ mod tests {
         let (_t, root) = root();
         let path = root.join("out.jsonl");
         std::fs::write(&path, b"faucet").unwrap();
-        let h = held(open(&path, None, id_of(&path)));
+        let h = held(open(&path, None));
         let other = root.join("other");
         std::fs::write(&other, b"other").unwrap();
         std::fs::rename(&other, &path).unwrap();
@@ -327,63 +327,65 @@ mod tests {
     }
 
     #[test]
-    fn a_path_without_identities_is_walked_without_following_links() {
+    fn a_row_without_identities_under_a_symlinked_directory_is_collected() {
         let (_t, root) = root();
         let real = root.join("real");
         std::fs::create_dir(&real).unwrap();
         std::fs::write(real.join("out.jsonl"), b"x").unwrap();
         let link = root.join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
+        let legacy = held(open(&link.join("out.jsonl"), None));
+        assert!(legacy.leaf.is_file);
+        assert!(matches!(unlink(&legacy), Unlinked::Removed));
+        assert!(!real.join("out.jsonl").exists());
+        std::fs::write(real.join("out.jsonl"), b"x").unwrap();
         assert!(matches!(
-            open(&link.join("out.jsonl"), None, None),
-            Opened::Changed
-        ));
-        assert!(matches!(
-            open(&real.join("out.jsonl"), None, None),
+            open(&real.join("out.jsonl"), None),
             Opened::Held(_)
         ));
-        let with_id = held(open(&link.join("out.jsonl"), id_of(&real), None));
+        let with_id = held(open(&link.join("out.jsonl"), id_of(&real)));
         assert!(with_id.leaf.is_file);
+        let resolved = resolve(&link.join("out.jsonl")).unwrap();
+        std::fs::remove_file(&link).unwrap();
+        std::fs::create_dir(&link).unwrap();
+        assert!(matches!(open(&link.join("out.jsonl"), None), Opened::Gone));
+        assert!(matches!(walk(&resolved, None), Opened::Held(_)));
     }
 
     #[test]
     fn missing_paths_and_odd_shapes_are_classified() {
         let (_t, root) = root();
         assert!(matches!(
-            open(&root.join("none/out.jsonl"), None, None),
+            open(&root.join("none/out.jsonl"), None),
             Opened::Gone
         ));
         assert!(matches!(
             open(
                 &root.join("none/out.jsonl"),
-                Some(FileIdentity { dev: 0, ino: 0 }),
-                None
+                Some(FileIdentity { dev: 0, ino: 0 })
             ),
             Opened::Gone
         ));
-        assert!(matches!(
-            open(&root.join("out.jsonl"), None, None),
-            Opened::Gone
-        ));
+        assert!(matches!(open(&root.join("out.jsonl"), None), Opened::Gone));
         let file = root.join("file");
         std::fs::write(&file, b"x").unwrap();
         assert!(matches!(
-            open(&file.join("out.jsonl"), None, None),
+            open(&file.join("out.jsonl"), None),
             Opened::Changed
         ));
         assert!(matches!(
-            open(&file.join("out.jsonl"), id_of(&root), None),
+            open(&file.join("out.jsonl"), id_of(&root)),
             Opened::Changed
         ));
-        assert!(matches!(open(Path::new("/"), None, None), Opened::Changed));
+        assert!(matches!(open(Path::new("/"), None), Opened::Changed));
         assert!(matches!(walk(Path::new("/"), None), Opened::Changed));
         std::fs::create_dir(root.join("a")).unwrap();
         assert!(matches!(
-            open(&root.join("a/../out.jsonl"), None, None),
+            open(&root.join("a/../out.jsonl"), None),
             Opened::Changed
         ));
         assert!(matches!(
-            open(Path::new("relative/out.jsonl"), None, None),
+            open(Path::new("relative/out.jsonl"), None),
             Opened::Changed
         ));
     }
@@ -397,9 +399,9 @@ mod tests {
         std::fs::create_dir_all(&inner).unwrap();
         let path = inner.join("out.jsonl");
         std::fs::write(&path, b"x").unwrap();
-        let (dir_id, file_id) = (id_of(&inner), id_of(&path));
+        let dir_id = id_of(&inner);
         std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o100)).unwrap();
-        let opened = open(&path, dir_id, file_id);
+        let opened = open(&path, dir_id);
         let removed = match &opened {
             Opened::Held(h) => Some(matches!(unlink(h), Unlinked::Removed)),
             _ => None,
@@ -421,11 +423,10 @@ mod tests {
         let inner = gate.join("inner");
         std::fs::create_dir(&inner).unwrap();
         std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let without = open(&inner.join("out.jsonl"), None, None);
+        let without = open(&inner.join("out.jsonl"), None);
         let with = open(
             &inner.join("out.jsonl"),
             Some(FileIdentity { dev: 0, ino: 0 }),
-            None,
         );
         std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(matches!(without, Opened::Failed(_)), "{without:?}");

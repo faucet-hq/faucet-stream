@@ -114,6 +114,27 @@ async fn a_trusted_host_receives_the_credentials() {
 }
 
 #[tokio::test]
+async fn a_next_link_to_another_origin_keeps_trace_context() {
+    let (api, other) = two_origins().await;
+    let cfg = next_link_config(
+        &api,
+        Auth::Bearer {
+            token: "tok-123".into(),
+        },
+    )
+    .header(
+        "traceparent",
+        "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+    )
+    .header("Prefer", "odata.maxpagesize=10");
+    assert_eq!(drain(&RestStream::new(cfg).unwrap()).await.len(), 2);
+    let foreign = &other.received_requests().await.unwrap()[0];
+    assert!(foreign.headers.get("authorization").is_none());
+    assert!(foreign.headers.get("traceparent").is_some());
+    assert!(foreign.headers.get("prefer").is_some());
+}
+
+#[tokio::test]
 async fn an_async_job_result_on_another_origin_is_fetched_without_credentials() {
     let api = MockServer::start().await;
     let storage = MockServer::start().await;

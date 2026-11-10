@@ -82,7 +82,7 @@ faucet run pipeline.yaml
 | `method` | string | `GET` | HTTP method for the request. |
 | `auth` | `Auth` / `{ ref }` | `none` | Inline `{ type, config }` auth, or a `{ ref: <name> }` pointer to a shared provider. See [Authentication](#authentication). |
 | `headers` | map<string,string> | empty | Static HTTP headers sent on **every** request (data pages, async-job requests, and OData `$metadata` probes). Applied *before* auth, so an auth header of the same name wins on a clash. Values honor `${env:}` / `${param.*}` interpolation and pass through the secrets/redaction boundary. An invalid header name/value is rejected at config load. See [Custom request headers](#custom-request-headers). |
-| `trusted_hosts` | list<string> | empty | Extra hosts (`files.example.com`, `files.example.com:8443`, or a `*.example.com` wildcard) allowed to receive this source's credentials when a server-given URL — a next-page link, an async-job URL, or a `discovery.list` next link — points at them, or a redirect leads to them. A redirect keeps credentials for a bare host only on the scheme's default port, and never when it changes the scheme (see [Timeouts, cancellation and redirects](#timeouts-cancellation-and-redirects)). Credentials (the `auth` block, a shared provider's placements and an `api_key_query` parameter) otherwise go only to the scheme, host and port of `base_url`; a link to any other origin is fetched without them, and of the static `headers:` only `Accept`, `Accept-Charset`, `Accept-Encoding`, `Accept-Language`, `Cache-Control`, `Content-Type` and `User-Agent` are sent (an `X-API-Key`-style header may hold a secret). An `https` base never follows a link to plain `http` (the run fails). |
+| `trusted_hosts` | list<string> | empty | Extra hosts (`files.example.com` on any port, `files.example.com:8443` on that port only, or a `*.example.com` wildcard) allowed to receive this source's credentials when a server-given URL — a next-page link, an async-job URL, or a `discovery.list` next link — points at them, or a redirect leads to them. A link and a redirect follow the same rule, and neither keeps credentials when it changes the scheme (see [Timeouts, cancellation and redirects](#timeouts-cancellation-and-redirects)). Credentials (the `auth` block, a shared provider's placements and an `api_key_query` parameter) otherwise go only to the scheme, host and port of `base_url`; a link to any other origin is fetched without them, and of the static `headers:` only the standard ones a redirect keeps too (`Accept`, `Content-Type`, `User-Agent`, `Traceparent`, …; the full list is `faucet_core::http::CROSS_ORIGIN_SAFE_HEADERS`) are sent (an `X-API-Key`-style header may hold a secret). An `https` base never follows a link to plain `http` (the run fails). |
 | `query_params` | map<string,string> | empty | Query parameters added to every request. |
 | `query_params_multi` | map<string,list<string>> | empty | Repeated / array-valued query params, rendered as repeated keys — e.g. `{ "group_by[]": ["api_key_id", "model"] }` → `?group_by[]=api_key_id&group_by[]=model`. Applied alongside `query_params`. |
 | `body` | JSON / null | `null` | JSON request body (sent with `Content-Type: application/json`). |
@@ -1157,9 +1157,10 @@ never replayed to another origin. A redirect to `base_url`'s own origin or to a
 `trusted_hosts` entry over the same scheme keeps every header; an https→http
 hop never does. A target that needed a dropped header answers `401` / `403`,
 which fails the run like any other `4xx` — add the host to `trusted_hosts` or
-point the config at the final host. Such a rejection from another origin does
-not refresh the source's token or re-authenticate its shared provider: the
-credential was never sent there.
+point the config at the final host. Such a rejection from another origin that
+is not a `trusted_hosts` entry does not refresh the source's token or
+re-authenticate its shared provider: the credential was never sent there. A
+rejection from a trusted host does, as from `base_url` itself.
 
 ## How it is built
 

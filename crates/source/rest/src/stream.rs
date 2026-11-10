@@ -619,7 +619,8 @@ fn insert_header(headers: &mut HeaderMap, name: &str, value: &str) -> Result<(),
 struct Attempt {
     /// The shared-provider credential the request carried.
     sent: Option<Credential>,
-    /// The request ended at another origin (a redirect) with a 4xx.
+    /// The request ended with a 4xx at another origin (a redirect) that is
+    /// not a credential host, so it went out without the credential.
     rejected_elsewhere: bool,
 }
 
@@ -836,11 +837,15 @@ impl RestDriver {
             }
             _ => {}
         }
+        // The base origin with its port written out, so it matches that port
+        // only (a bare host would match any port).
         let credential_hosts: Vec<String> = reqwest::Url::parse(&config.base_url)
             .ok()
-            .map(|u| u.origin())
-            .filter(|o| o.is_tuple())
-            .map(|o| o.ascii_serialization())
+            .and_then(|u| {
+                let host = u.host_str()?.to_string();
+                let port = u.port_or_known_default()?;
+                Some(format!("{}://{host}:{port}", u.scheme()))
+            })
             .into_iter()
             .chain(config.trusted_hosts.iter().cloned())
             .collect();
@@ -1968,7 +1973,8 @@ impl RestDriver {
             .await
         {
             // A rejection by another origin, reached through a redirect, says
-            // nothing about this source's credential: it went out without it.
+            // nothing about this source's credential when it went out without
+            // it (the origin is not a credential host).
             Err(e @ FaucetError::HttpStatus { .. }) if attempt.rejected_elsewhere => {
                 tracing::debug!(
                     "a redirect target on another origin rejected the request; \
@@ -3069,7 +3075,7 @@ impl RestDriver {
         let status = resp.status();
         attempt.rejected_elsewhere = status.is_client_error()
             && reqwest::Url::parse(&url)
-                .is_ok_and(|u| faucet_core::http::is_cross_origin(&u, resp.url()));
+                .is_ok_and(|u| !self.client.keeps_credentials(&u, resp.url()));
 
         // 429 Too Many Requests: honour Retry-After before retrying, unless a
         // `retry_on_response` rule says where the wait is (#771).

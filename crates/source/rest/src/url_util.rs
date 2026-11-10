@@ -1,6 +1,7 @@
 //! RFC 3986 reference resolution for server-provided links (#750).
 
 use faucet_core::FaucetError;
+use faucet_core::http::CredentialHost;
 use reqwest::Url;
 
 /// Response-header name under which the REST source records the URL of the
@@ -36,11 +37,13 @@ pub fn resolve_link_str(base: &str, link: &str) -> Result<String, FaucetError> {
 }
 
 /// Whether a request to `target` may carry the credentials configured for
-/// `base`: true for the same scheme, host and port, or a host in
-/// `trusted_hosts` (exact on any port, `host:port`, or `*.suffix`); false for
-/// any other host, so the
-/// request goes out without them. A plain-`http` target from an `https` base is
-/// refused outright — credentials or data would cross the wire in clear.
+/// `base`: true for the same scheme, host and port, or a `trusted_hosts` entry
+/// reached over the same scheme (a host on any port, `host:port` on only that
+/// port, `*.suffix`, optionally behind `scheme://` —
+/// [`faucet_core::http::CredentialHost`], the rule a redirect follows too);
+/// false for any other host, so the request goes out without them. A
+/// plain-`http` target from an `https` base is refused outright — credentials
+/// or data would cross the wire in clear.
 pub fn credentials_allowed(
     base: &str,
     target: &str,
@@ -57,35 +60,22 @@ pub fn credentials_allowed(
             target.host_str().unwrap_or_default()
         )));
     }
-    if base.scheme() == target.scheme()
-        && base.host_str() == target.host_str()
-        && base.port_or_known_default() == target.port_or_known_default()
-    {
-        return Ok(true);
-    }
-    let Some(host) = target.host_str() else {
-        return Ok(false);
-    };
-    let host = host.to_ascii_lowercase();
-    let host_port = target
-        .port_or_known_default()
-        .map(|p| format!("{host}:{p}"));
-    Ok(trusted_hosts.iter().any(|t| {
-        let t = t.trim().to_ascii_lowercase();
-        match t.strip_prefix("*.") {
-            Some(suffix) => host.len() > suffix.len() && host.ends_with(&format!(".{suffix}")),
-            None => host == t || host_port.as_deref() == Some(t.as_str()),
-        }
-    }))
+    let hosts: Vec<CredentialHost> = trusted_hosts
+        .iter()
+        .filter_map(|t| CredentialHost::parse(t))
+        .collect();
+    Ok(faucet_core::http::keeps_credentials(&hosts, &base, &target))
 }
 
 /// Header names that carry credentials even when configured as static
 /// headers; dropped from a request to a host that may not receive them.
 pub const CREDENTIAL_HEADERS: [&str; 3] = ["authorization", "cookie", "proxy-authorization"];
 
-/// Static headers still sent to a host that may not receive credentials. Any
-/// other configured header may hold an API key (`X-API-Key`, `Api-Token`, …),
-/// so it is dropped.
+/// Static headers still sent to a host that may not receive credentials.
+///
+/// Superseded by [`faucet_core::http::CROSS_ORIGIN_SAFE_HEADERS`], which
+/// [`retain_cross_origin_safe`] applies; kept for callers that read it. Use
+/// the core list instead.
 pub const CROSS_ORIGIN_SAFE_HEADERS: [&str; 7] = [
     "accept",
     "accept-charset",
@@ -97,16 +87,10 @@ pub const CROSS_ORIGIN_SAFE_HEADERS: [&str; 7] = [
 ];
 
 /// Drop every header a host outside the credential boundary may not receive,
-/// keeping only [`CROSS_ORIGIN_SAFE_HEADERS`].
+/// keeping only [`faucet_core::http::CROSS_ORIGIN_SAFE_HEADERS`] — the same
+/// set a redirect to another origin keeps.
 pub fn retain_cross_origin_safe(headers: &mut reqwest::header::HeaderMap) {
-    let drop: Vec<reqwest::header::HeaderName> = headers
-        .keys()
-        .filter(|k| !CROSS_ORIGIN_SAFE_HEADERS.contains(&k.as_str()))
-        .cloned()
-        .collect();
-    for name in drop {
-        headers.remove(&name);
-    }
+    faucet_core::http::retain_cross_origin_safe(headers);
 }
 
 /// Resolve an async-job URL against the configured `base_url`: absolute URLs
@@ -162,6 +146,22 @@ mod cross_origin_tests {
         names.sort_unstable();
         assert_eq!(names, vec!["accept", "user-agent"]);
     }
+
+    #[test]
+    fn the_kept_set_is_the_one_redirects_keep() {
+        let mut h = HeaderMap::new();
+        for k in faucet_core::http::CROSS_ORIGIN_SAFE_HEADERS {
+            h.insert(
+                reqwest::header::HeaderName::from_static(k),
+                HeaderValue::from_static("v"),
+            );
+        }
+        retain_cross_origin_safe(&mut h);
+        assert_eq!(h.len(), faucet_core::http::CROSS_ORIGIN_SAFE_HEADERS.len());
+        assert!(h.contains_key("traceparent"));
+        let old = CROSS_ORIGIN_SAFE_HEADERS;
+        assert!(old.iter().all(|k| h.contains_key(*k)));
+    }
 }
 
 #[cfg(test)]
@@ -192,6 +192,17 @@ mod tests {
             .to_string();
         assert!(err.contains("downgrade"), "{err}");
         assert!(credentials_allowed("http://h/x", "http://h/y", &none).unwrap());
+        let bare = ["files.example.net".to_string()];
+        assert!(credentials_allowed(base, "https://files.example.net:8443/x", &bare).unwrap());
+        let explicit = ["files.example.net:443".to_string()];
+        assert!(credentials_allowed(base, "https://files.example.net/x", &explicit).unwrap());
+        assert!(!credentials_allowed(base, "https://files.example.net:8443/x", &explicit).unwrap());
+        assert!(
+            !credentials_allowed("http://h/x", "https://files.example.net/x", &bare).unwrap(),
+            "a scheme change never carries credentials, as for a redirect"
+        );
+        let scoped = ["https://files.example.net".to_string()];
+        assert!(credentials_allowed(base, "https://files.example.net:9/x", &scoped).unwrap());
         assert!(!credentials_allowed("http://h/x", "https://other/y", &none).unwrap());
         assert!(!credentials_allowed("http://h/x", "data:text/plain,hi", &none).unwrap());
     }

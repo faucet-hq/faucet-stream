@@ -113,9 +113,15 @@ pub fn retain_cross_origin_safe(headers: &mut HeaderMap) {
     }
 }
 
-/// One [`ClientBuilder::credential_hosts`] entry.
+/// One [`ClientBuilder::credential_hosts`] entry: a host a request may carry
+/// its credentials to.
+///
+/// A bare host (`files.example.net`) matches that host on any port; a host and
+/// port (`files.example.net:443`) only that port, even when it is the scheme's
+/// default; `*.suffix` any subdomain on any port. Any of them may be written
+/// behind `scheme://`, which then has to match too.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CredentialHost {
+pub struct CredentialHost {
     scheme: Option<String>,
     host: HostPattern,
     port: Option<u16>,
@@ -130,12 +136,15 @@ enum HostPattern {
 impl CredentialHost {
     /// Parse `host`, `host:port`, `*.suffix`, or any of them behind
     /// `scheme://`; `None` for anything else.
-    fn parse(entry: &str) -> Option<Self> {
+    pub fn parse(entry: &str) -> Option<Self> {
         let entry = entry.trim().to_ascii_lowercase();
         let (scheme, rest) = match entry.split_once("://") {
             Some((scheme, rest)) => (Some(scheme.to_string()), rest),
             None => (None, entry.as_str()),
         };
+        if scheme.as_deref().is_some_and(str::is_empty) {
+            return None;
+        }
         let rest = rest.strip_suffix('/').unwrap_or(rest);
         if rest.is_empty() || rest.contains(['/', '?', '#', '@']) {
             return None;
@@ -150,19 +159,21 @@ impl CredentialHost {
                 port: None,
             });
         }
+        let (host, port) = split_authority(rest)?;
         let url = Url::parse(&format!(
-            "{}://{rest}",
+            "{}://{host}",
             scheme.as_deref().unwrap_or("https")
         ))
         .ok()?;
         Some(Self {
             host: HostPattern::Exact(url.host_str()?.to_string()),
-            port: url.port(),
+            port,
             scheme,
         })
     }
 
-    fn matches(&self, to: &Url) -> bool {
+    /// Whether `to` is this host.
+    pub fn matches(&self, to: &Url) -> bool {
         let Some(host) = to.host_str() else {
             return false;
         };
@@ -176,13 +187,47 @@ impl CredentialHost {
                 .is_some_and(|label| !label.is_empty()),
             HostPattern::Exact(exact) => {
                 host == exact
-                    && match self.port {
-                        Some(port) => to.port_or_known_default() == Some(port),
-                        None => to.port().is_none(),
-                    }
+                    && self
+                        .port
+                        .is_none_or(|port| to.port_or_known_default() == Some(port))
             }
         }
     }
+}
+
+/// Split `host[:port]` (an IPv6 host in brackets), keeping a written port even
+/// when it is the scheme's default. `None` for an empty or malformed port.
+fn split_authority(authority: &str) -> Option<(&str, Option<u16>)> {
+    let (host, port) = if authority.starts_with('[') {
+        let end = authority.find(']')?;
+        let (host, tail) = authority.split_at(end + 1);
+        match tail {
+            "" => (host, None),
+            _ => (host, Some(tail.strip_prefix(':')?)),
+        }
+    } else {
+        match authority.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        }
+    };
+    if host.is_empty() {
+        return None;
+    }
+    let port = match port {
+        Some(p) if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) => return None,
+        Some(p) => Some(p.parse().ok()?),
+        None => None,
+    };
+    Some((host, port))
+}
+
+/// Whether a request that started at `from` may carry its credentials to
+/// `to`: the same origin, or one of `hosts` reached over the same scheme. The
+/// rule a [`Client`] applies to a redirect, for callers that follow a
+/// server-given link themselves.
+pub fn keeps_credentials(hosts: &[CredentialHost], from: &Url, to: &Url) -> bool {
+    !is_cross_origin(from, to) || keeps_headers(hosts, from, to)
 }
 
 /// A response body was larger than the client's
@@ -300,8 +345,8 @@ impl ClientBuilder {
 
     /// Hosts a redirect may carry every request header to, credentials
     /// included, when the hop keeps its scheme. Each entry is a host
-    /// (`files.example.net`, matching the scheme's default port), a host and
-    /// port (`files.example.net:8443`), a subdomain pattern
+    /// (`files.example.net`, any port), a host and port
+    /// (`files.example.net:8443`, only that port), a subdomain pattern
     /// (`*.blob.example.org`, any port), or any of these behind a scheme
     /// (`https://files.example.net`). An entry of any other shape matches
     /// nothing. A same-origin hop always keeps every header; a hop that
@@ -703,6 +748,13 @@ impl Client {
     /// A builder.
     pub fn builder() -> ClientBuilder {
         ClientBuilder::new()
+    }
+
+    /// Whether a request sent from `from` carried its credentials to `to`
+    /// when a redirect ended there ([`keeps_credentials`] over this client's
+    /// [credential hosts](ClientBuilder::credential_hosts)).
+    pub fn keeps_credentials(&self, from: &Url, to: &Url) -> bool {
+        keeps_credentials(&self.credential_hosts, from, to)
     }
 
     /// The underlying reqwest client, for request shapes this type does not
@@ -1384,7 +1436,7 @@ mod tests {
         };
         assert!(m("Files.Example.NET", "https://files.example.net/x"));
         assert!(m("files.example.net", "http://files.example.net/x"));
-        assert!(!m("files.example.net", "https://files.example.net:8443/x"));
+        assert!(m("files.example.net", "https://files.example.net:8443/x"));
         assert!(m(
             "files.example.net:8443",
             "https://files.example.net:8443/x"
@@ -1417,9 +1469,65 @@ mod tests {
             "files.example.net?x",
             "https://",
             "bad host",
+            "files.example.net:",
+            "files.example.net:x1",
+            "files.example.net:99999",
+            "://files.example.net",
+            "::1",
         ] {
             assert!(CredentialHost::parse(bad).is_none(), "{bad:?} parsed");
         }
+    }
+
+    #[test]
+    fn an_explicit_port_is_kept_and_matched_exactly() {
+        let host = CredentialHost::parse("files.example.net:443").unwrap();
+        let u = |s: &str| Url::parse(s).unwrap();
+        assert!(host.matches(&u("https://files.example.net/x")));
+        assert!(!host.matches(&u("http://files.example.net/x")));
+        assert!(!host.matches(&u("https://files.example.net:8443/x")));
+        let http = CredentialHost::parse("http://files.example.net:80").unwrap();
+        assert!(http.matches(&u("http://files.example.net/x")));
+        assert!(!http.matches(&u("http://files.example.net:8080/x")));
+        let v6 = CredentialHost::parse("[::1]:8443").unwrap();
+        assert!(v6.matches(&u("https://[::1]:8443/x")));
+        assert!(!v6.matches(&u("https://[::1]/x")));
+        assert!(
+            CredentialHost::parse("[::1]")
+                .unwrap()
+                .matches(&u("http://[::1]:9/x"))
+        );
+        assert!(CredentialHost::parse("[::1]x").is_none());
+        assert!(CredentialHost::parse("[::1").is_none());
+
+        let hosts = [host];
+        let from = u("https://api.example.com/x");
+        assert!(keeps_credentials(
+            &hosts,
+            &from,
+            &u("https://files.example.net/f")
+        ));
+        assert!(!keeps_credentials(
+            &hosts,
+            &from,
+            &u("http://files.example.net/f")
+        ));
+        assert!(!keeps_credentials(
+            &hosts,
+            &from,
+            &u("https://files.example.net:8443/f")
+        ));
+        assert!(keeps_credentials(
+            &hosts,
+            &from,
+            &u("https://api.example.com:443/y")
+        ));
+        let client = Client::builder()
+            .credential_hosts(["files.example.net:443"])
+            .build()
+            .unwrap();
+        assert!(client.keeps_credentials(&from, &u("https://files.example.net/f")));
+        assert!(!client.keeps_credentials(&from, &u("http://files.example.net/f")));
     }
 
     #[tokio::test]

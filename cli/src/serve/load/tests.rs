@@ -1850,6 +1850,9 @@ fn a_protected_file_behind_a_swapped_link_stays_protected() {
     )));
     std::fs::remove_file(&current).unwrap();
     std::os::unix::fs::symlink(dir.path().join("v2"), &current).unwrap();
+    // The protected paths are resolved again once the cached snapshot ages out.
+    #[allow(clippy::disallowed_methods)] // waits out the snapshot's real-time TTL
+    std::thread::sleep(RESOLVED_TTL + std::time::Duration::from_millis(50));
     assert!(read_protected(
         &current.join("auth.yaml").display().to_string()
     ));
@@ -2050,4 +2053,37 @@ fn sql_transforms_get_bounded_resources_when_they_set_none() {
         nodes[0].transforms[0].config["memory_limit"],
         SQL_TRANSFORM_MEMORY_LIMIT
     );
+}
+
+#[test]
+fn a_provider_url_refusal_names_the_field_not_the_value() {
+    let hosts = ReferencePolicy::open().with_url_hosts(["idp.example.com"]);
+    let spec = serde_json::json!({"type": "oauth2", "config": {
+            "token_url": "https://other.example.net/t?client_secret=dummy-secret-value"}});
+    let err = screen_auth_providers([("auth.idp".to_string(), &spec)], &hosts, true)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("`auth.idp.config.token_url`"), "{err}");
+    assert!(err.contains("other.example.net"), "{err}");
+    assert!(!err.contains("dummy-secret-value"), "{err}");
+    assert!(!err.contains("client_secret"), "{err}");
+}
+
+#[test]
+fn a_path_protected_after_a_snapshot_is_refused_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("server-credential.yaml");
+    std::fs::write(&file, "x").unwrap();
+    assert!(server_file_refusal(&file).is_none());
+    let before = resolved().unwrap();
+    protect_file(&file);
+    assert!(server_file_refusal(&file).is_some());
+    assert!(!std::sync::Arc::ptr_eq(&before, &resolved().unwrap()));
+    let other = dir.path().join("other.csv");
+    std::fs::write(&other, "x").unwrap();
+    protect_dir(dir.path());
+    assert!(data_path_is_protected(
+        &format!("{}/*.csv", dir.path().display()),
+        Access::Read { recursive: false }
+    ));
 }

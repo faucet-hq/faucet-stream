@@ -2479,3 +2479,71 @@ async fn a_connect_callback_survives_a_token_rotation_during_the_flow() {
         assert_eq!(after["created_at"], before["created_at"], "{history:?}");
     }
 }
+
+/// A connection stored by an earlier release has no generation; a flow that
+/// starts from it still survives a token rotation made while it is pending.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connect_callback_from_a_connection_without_a_generation_survives_a_rotation() {
+    use sqlx::ConnectOptions as _;
+    let dir = tempfile::tempdir().unwrap();
+    let data = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/items"))
+        .and(header("authorization", "Bearer at-rotated"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items": [{"id": 1}]})))
+        .mount(&data)
+        .await;
+    let idp = granting_idp().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "at-rotated", "refresh_token": "rt-rotated", "expires_in": 3600
+        })))
+        .mount(&idp)
+        .await;
+    let db = dir.path().join("history.db");
+    let run = tempfile::tempdir().unwrap();
+    let api = fence_server(
+        run.path(),
+        Some(format!("sqlite:{}", db.display())),
+        &idp.uri(),
+    )
+    .await;
+    let out = run.path().join("out");
+    let state_dir = run.path().join("state");
+    std::fs::create_dir_all(&out).unwrap();
+
+    let st = start_connect_flow(&api, "crm").await;
+    assert_eq!(
+        finish_connect_flow(&api, &st).await,
+        "https://app.example/done?connection=crm&status=ok"
+    );
+    let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&db)
+        .connect()
+        .await
+        .unwrap();
+    let stripped = sqlx::query(
+        "UPDATE faucet_tenant_connections SET body = json_remove(body, '$.generation') \
+         WHERE tenant = 'acme' AND name = 'crm'",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(stripped.rows_affected(), 1);
+    drop(conn);
+
+    let st = start_connect_flow(&api, "crm").await;
+    let config = template(&data.uri(), &out, &state_dir).replace("ref: api", "ref: crm");
+    let (code, r) = api
+        .post("op-tok", "/v1/tenants/acme/runs", json!({"config": config}))
+        .await;
+    assert_eq!(code, 202, "{r}");
+    let rec = api.wait_run(r["run_id"].as_str().unwrap()).await;
+    assert_eq!(rec["status"], "completed", "{rec}");
+    assert_eq!(
+        finish_connect_flow(&api, &st).await,
+        "https://app.example/done?connection=crm&status=ok"
+    );
+}

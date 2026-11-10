@@ -198,8 +198,8 @@ really serves pages or results from a second host, list it:
 trusted_hosts: [files.example.com, "files.example.com:8443", "*.cdn.example.com"]
 ```
 
-A redirect keeps every header for a listed host when it keeps the scheme; a
-bare host covers only the scheme's default port.
+A link or a redirect to a listed host keeps every header when it keeps the
+scheme; a bare host covers any port, `host:port` only that port.
 
 > Use `faucet schema source rest` to see the exact fields and defaults for each
 > style in your installed version.

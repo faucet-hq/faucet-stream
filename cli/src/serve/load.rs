@@ -283,8 +283,9 @@ pub const LOCAL_PATH_KINDS: &[&str] = &[
 ];
 
 /// Paths are kept both as given (made absolute) and as they resolved when
-/// protected; every check also resolves the given form again, so a path whose
-/// ancestor symlink was swapped since (a mounted config volume) still matches.
+/// protected; the given form is resolved again for checks (at most
+/// [`RESOLVED_TTL`] apart), so a path whose ancestor symlink was swapped since
+/// (a mounted config volume) still matches.
 #[derive(Default)]
 struct Protected {
     env: std::collections::BTreeSet<String>,
@@ -302,10 +303,41 @@ fn protected() -> &'static std::sync::RwLock<Protected> {
     P.get_or_init(Default::default)
 }
 
+/// Bumped by every write to [`protected`], so a cached [`Resolved`] snapshot
+/// taken before it is never reused.
+static PROTECTED_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A write guard over [`protected`] that invalidates the [`resolved`]
+/// snapshot when dropped.
+struct ProtectedWrite(std::sync::RwLockWriteGuard<'static, Protected>);
+
+impl std::ops::Deref for ProtectedWrite {
+    type Target = Protected;
+    fn deref(&self) -> &Protected {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ProtectedWrite {
+    fn deref_mut(&mut self) -> &mut Protected {
+        &mut self.0
+    }
+}
+
+impl Drop for ProtectedWrite {
+    fn drop(&mut self) {
+        PROTECTED_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn protected_write() -> Option<ProtectedWrite> {
+    protected().write().ok().map(ProtectedWrite)
+}
+
 /// Mark an environment variable the server read a credential from (an
 /// `--auth-config` token) so no loaded config can resolve it.
 pub fn protect_env(name: &str) {
-    if let Ok(mut p) = protected().write() {
+    if let Some(mut p) = protected_write() {
         p.env.insert(name.to_string());
     }
 }
@@ -313,7 +345,7 @@ pub fn protect_env(name: &str) {
 /// Mark a file the server read a credential from, as [`protect_env`].
 pub fn protect_file(path: &std::path::Path) {
     let forms = path_forms(path);
-    if let Ok(mut p) = protected().write() {
+    if let Some(mut p) = protected_write() {
         p.files.extend(forms);
     }
 }
@@ -322,7 +354,7 @@ pub fn protect_file(path: &std::path::Path) {
 /// no loaded config reads or writes anything under it.
 pub fn protect_dir(path: &std::path::Path) {
     let forms = path_forms(path);
-    if let Ok(mut p) = protected().write() {
+    if let Some(mut p) = protected_write() {
         p.dirs.extend(forms);
     }
 }
@@ -346,7 +378,7 @@ pub fn protect_default_state(base: &Value) {
         && let Some(dir) = state["config"]["path"].as_str()
     {
         let forms = path_forms(std::path::Path::new(dir));
-        if let Ok(mut p) = protected().write() {
+        if let Some(mut p) = protected_write() {
             p.own_state.extend(forms.iter().cloned());
             p.dirs.extend(forms);
         }
@@ -382,7 +414,7 @@ pub fn protect_env_files(cwd: &std::path::Path, loaded: Option<&std::path::Path>
         }
     }
     let forms: Vec<_> = dirs.iter().flat_map(|d| path_forms(d)).collect();
-    if let Ok(mut p) = protected().write() {
+    if let Some(mut p) = protected_write() {
         p.env_dirs.extend(forms);
     }
 }
@@ -415,7 +447,7 @@ const ENV_FILE_NAMES: &[&str] = &[
 /// its own use, so no loaded config can resolve it (or another `#field` of the
 /// same secret).
 pub fn protect_secret_ref(scheme: &str, reference: &str) {
-    if let Ok(mut p) = protected().write() {
+    if let Some(mut p) = protected_write() {
         p.secrets
             .insert((scheme.to_string(), secret_base(reference).to_string()));
     }
@@ -657,12 +689,18 @@ fn glob_is_protected(pattern: &str, access: Access) -> bool {
     {
         return true;
     }
+    let Some(r) = resolved() else {
+        return true;
+    };
     let hit = match glob::Pattern::new(&full) {
-        Ok(p) => protected_files(|f| p.matches_path(f)),
-        Err(_) => protected_files(|f| f.starts_with(&dir)),
-    } || protected_dirs(|d| dir.starts_with(d) || d.starts_with(&dir))
-        || glob_reaches_env_file(&full);
-    hit || (matches!(access, Access::Read { .. }) && glob_match_escapes(&full))
+        Ok(p) => r.files.iter().any(|f| p.matches_path(f)),
+        Err(_) => r.files.iter().any(|f| f.starts_with(&dir)),
+    } || r
+        .dirs
+        .iter()
+        .any(|d| dir.starts_with(d) || d.starts_with(&dir))
+        || glob_reaches_env_file(&r, &full);
+    hit || (matches!(access, Access::Read { .. }) && glob_match_escapes(&r, &full))
 }
 
 /// Whether an absolute glob pattern could match a path in a system tree,
@@ -691,12 +729,9 @@ fn segments_can_reach(pattern: &[&str], target: &[&str]) -> bool {
 
 /// Whether an existing match of `pattern` resolves (through a symlink) into a
 /// system tree or onto a protected file.
-fn glob_match_escapes(pattern: &str) -> bool {
+fn glob_match_escapes(r: &Resolved, pattern: &str) -> bool {
     let Ok(matches) = glob::glob(pattern) else {
         return false;
-    };
-    let Some(r) = resolved() else {
-        return true;
     };
     matches
         .take(GLOB_CHECK_LIMIT)
@@ -710,20 +745,18 @@ fn glob_match_escapes(pattern: &str) -> bool {
 /// walks them (`*` stays within a segment, `**` spans any number). A glob that
 /// matches only by a leading wildcard (`*.csv` against a later `.env.csv`) is
 /// left to [`faucet_core::path_guard`], which checks each file listed.
-fn glob_reaches_env_file(full: &str) -> bool {
+fn glob_reaches_env_file(r: &Resolved, full: &str) -> bool {
     let pattern: Vec<&str> = full.split('/').filter(|s| !s.is_empty()).collect();
-    resolved().is_none_or(|r| {
-        r.env_dirs.iter().any(|d| {
-            let dir: Vec<String> = d
-                .components()
-                .filter_map(|c| match c {
-                    std::path::Component::Normal(n) => Some(n.to_string_lossy().into_owned()),
-                    _ => None,
-                })
-                .collect();
-            let dir: Vec<&str> = dir.iter().map(String::as_str).collect();
-            segments_reach_env_name(&pattern, &dir)
-        })
+    r.env_dirs.iter().any(|d| {
+        let dir: Vec<String> = d
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(n) => Some(n.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect();
+        let dir: Vec<&str> = dir.iter().map(String::as_str).collect();
+        segments_reach_env_name(&pattern, &dir)
     })
 }
 
@@ -926,14 +959,6 @@ fn replace_tokens(path: &str) -> String {
     out
 }
 
-fn protected_files(pred: impl Fn(&std::path::Path) -> bool) -> bool {
-    resolved().is_none_or(|r| r.files.iter().any(|f| pred(f)))
-}
-
-fn protected_dirs(pred: impl Fn(&std::path::Path) -> bool) -> bool {
-    resolved().is_none_or(|r| r.dirs.iter().any(|d| pred(d)))
-}
-
 /// The protected paths, each as stored and as it resolves now.
 struct Resolved {
     files: Vec<std::path::PathBuf>,
@@ -988,10 +1013,34 @@ fn dir_id(_path: &std::path::Path) -> Option<(u64, u64)> {
     None
 }
 
+/// How long a [`Resolved`] snapshot is reused before the protected paths are
+/// resolved again (a symlink swapped since then is seen after at most this).
+const RESOLVED_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// [`Resolved`] now; `None` when the set can't be read (callers treat that as
-/// protected). The sets are copied out so no lock is held across filesystem
-/// calls.
-fn resolved() -> Option<Resolved> {
+/// protected). A snapshot is reused for [`RESOLVED_TTL`] unless a path was
+/// protected since.
+fn resolved() -> Option<std::sync::Arc<Resolved>> {
+    type Cached = Option<(std::time::Instant, u64, std::sync::Arc<Resolved>)>;
+    static CACHE: std::sync::Mutex<Cached> = std::sync::Mutex::new(None);
+    let generation = PROTECTED_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
+    if let Ok(cache) = CACHE.lock()
+        && let Some((at, g, r)) = cache.as_ref()
+        && *g == generation
+        && at.elapsed() < RESOLVED_TTL
+    {
+        return Some(r.clone());
+    }
+    let fresh = std::sync::Arc::new(resolve_protected()?);
+    if let Ok(mut cache) = CACHE.lock() {
+        *cache = Some((std::time::Instant::now(), generation, fresh.clone()));
+    }
+    Some(fresh)
+}
+
+/// The protected sets resolved now. They are copied out so no lock is held
+/// across filesystem calls.
+fn resolve_protected() -> Option<Resolved> {
     let (files, dirs, env_dirs) = protected()
         .read()
         .map(|g| (g.files.clone(), g.dirs.clone(), g.env_dirs.clone()))
@@ -2205,7 +2254,7 @@ fn provider_findings(spec: &Value, at: (&str, &str), scope: &Scope<'_>, found: &
             }
             _ => {
                 if let Some(Err(e)) = scope.policy.map(|p| p.check(&r.to_resource_ref())) {
-                    let text = format!("{at}: {} ({})", r.value, e.reason);
+                    let text = format!("`{at}` ({})", e.reason);
                     found.add(scope, base, ptr, &r.value, Why::Policy(e.reason), text);
                 }
             }
