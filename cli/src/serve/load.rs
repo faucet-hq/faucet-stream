@@ -368,7 +368,7 @@ fn is_default_state(kind: &str, config: &Value) -> bool {
 }
 
 /// Protect the server's environment files: the one it loaded, and every file
-/// named like one (see [`is_env_file_name`]) in its working directory or beside
+/// named like one (`.env`, `.env.local`, `.envrc`, …) in its working directory or beside
 /// the loaded file, including files created after the server started.
 pub fn protect_env_files(cwd: &std::path::Path, loaded: Option<&std::path::Path>) {
     let mut dirs = vec![cwd.to_path_buf()];
