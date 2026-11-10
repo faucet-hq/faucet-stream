@@ -30,7 +30,7 @@ serde_json.workspace = true
 tempfile.workspace = true
 faucet-conformance = { workspace = true, features = ["containers"] }
 testcontainers = "0.27"
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 
 [package.metadata.docs.rs]
 all-features = true

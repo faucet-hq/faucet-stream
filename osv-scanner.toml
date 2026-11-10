@@ -84,3 +84,7 @@ reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; affected APIs unused (2026
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0440"
 reason = "astral-tokio-tar via testcontainers (tests only); no release without it (2026-11-05)"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0459"
+reason = "sqlite bundled in libsqlite3-sys 0.30.1, pinned by sqlx 0.8 (sqlx 0.9 blocked, #979); exposure needs a database and -wal pair from an untrusted writer (2026-11-10)"

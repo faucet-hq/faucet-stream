@@ -8,11 +8,16 @@
 //! random, single-use (taking the session deletes it) and valid for ten
 //! minutes. The final redirect must match one of the provider's
 //! `allowed_redirects`, so the callback is never an open redirector.
+//!
+//! A callback writes only over the connection its flow started from: the
+//! session records that connection's generation (or that there was none), and
+//! a connection deleted or replaced since, or a tenant deleted since, leaves
+//! the callback with `error=connection_changed` and nothing stored.
 
 use crate::serve::error::ServeError;
 use crate::serve::history::tenants::{
-    CONNECT_SESSION_TTL_SECS, ConnectSession, ConnectionRecord, ConnectionStatus,
-    validate_connection_name,
+    CONNECT_SESSION_TTL_SECS, ConnectBase, ConnectSession, ConnectionRecord, ConnectionStatus,
+    new_generation, validate_connection_name,
 };
 use crate::serve::rbac::{AuthContext, Role};
 use crate::serve::state::ServerState;
@@ -27,6 +32,10 @@ use std::path::Path;
 use std::time::Duration;
 
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How many times a callback retries its write while only a token rotation
+/// raced it.
+const STORE_ATTEMPTS: usize = 5;
 
 /// The `--connect-providers` file.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -254,7 +263,7 @@ pub async fn start(
     provider_name: &str,
     req: StartRequest,
 ) -> Result<StartResponse, ServeError> {
-    super::get_tenant(state, tenant).await?;
+    let tenant_rec = super::get_tenant(state, tenant).await?;
     let rt = state.tenants();
     rt.require_vault()?;
     let Some(provider) = rt.providers.get(provider_name) else {
@@ -276,6 +285,12 @@ pub async fn start(
             details: None,
         });
     }
+    let current = with_generation(state.history().as_ref(), tenant, &req.connection)
+        .await
+        .map_err(|e| {
+            ServeError::Unavailable(format!("reading connection '{}': {e}", req.connection))
+        })?;
+    let base = ConnectBase::of(current.as_ref());
     let verifier = random_token();
     let oauth_state = random_token();
     let now = Utc::now();
@@ -292,6 +307,8 @@ pub async fn start(
         created_by: actor.principal.clone(),
         created_at: now,
         expires_at,
+        base: Some(base),
+        tenant_created_at: Some(tenant_rec.created_at),
     };
     let authorize_url = provider
         .authorize_url(&oauth_state, &pkce_challenge(&verifier))
@@ -307,6 +324,36 @@ pub async fn start(
         authorize_url,
         expires_at,
     })
+}
+
+/// The connection `name` as a flow starts from it. A connection stored by an
+/// earlier release has no generation, so a flow would have to compare its
+/// `updated_at`, which a token rotation moves; it is given one first, through
+/// the same compare-and-set a rotation writes with, so the callback is fenced
+/// by the generation a rotation keeps. A lost race reads the record again and
+/// takes the generation it now has, assigning one once more if still empty.
+async fn with_generation(
+    history: &dyn crate::serve::history::RunHistory,
+    tenant: &str,
+    name: &str,
+) -> Result<Option<ConnectionRecord>, crate::serve::history::HistoryError> {
+    let mut current = history.connection_get(tenant, name).await?;
+    for _ in 0..2 {
+        let Some(c) = current.as_ref().filter(|c| c.generation.is_empty()) else {
+            return Ok(current);
+        };
+        // `updated_at` stays: a rotation that read the record before this
+        // write still stores its rotated refresh token.
+        let next = ConnectionRecord {
+            generation: new_generation(),
+            ..c.clone()
+        };
+        if history.connection_replace(&next, c.updated_at).await? {
+            return Ok(Some(next));
+        }
+        current = history.connection_get(tenant, name).await?;
+    }
+    Ok(current)
 }
 
 /// `GET /v1/connect/callback` query.
@@ -334,6 +381,95 @@ fn with_params(redirect: &str, params: &[(&str, &str)]) -> String {
     }
 }
 
+/// Why a connect flow did not store its connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompleteError {
+    /// The connection or tenant the flow started from was deleted or
+    /// replaced since; nothing was stored.
+    Superseded(String),
+    /// The provider, the code exchange or the tenant's state refused the
+    /// flow.
+    Exchange(String),
+    /// The run history could not take the write.
+    Store(String),
+}
+
+impl CompleteError {
+    /// The `error` value the caller's redirect carries.
+    pub fn code(&self) -> &'static str {
+        match self {
+            CompleteError::Superseded(_) => "connection_changed",
+            CompleteError::Exchange(_) => "exchange_failed",
+            CompleteError::Store(_) => "store_unavailable",
+        }
+    }
+
+    /// The `outcome` label of `faucet_serve_connect_flows_total`.
+    pub fn outcome(&self) -> &'static str {
+        match self {
+            CompleteError::Superseded(_) => "superseded",
+            CompleteError::Exchange(_) | CompleteError::Store(_) => "failed",
+        }
+    }
+}
+
+impl std::fmt::Display for CompleteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CompleteError::Superseded(m) | CompleteError::Exchange(m) | CompleteError::Store(m) => {
+                f.write_str(m)
+            }
+        }
+    }
+}
+
+/// Count, audit and build the redirect for a finished flow; `failure` is
+/// `(outcome, error code)`.
+async fn finish(
+    state: &ServerState,
+    session: &ConnectSession,
+    failure: Option<(&'static str, &str)>,
+) -> String {
+    let actor = AuthContext {
+        principal: session.created_by.clone(),
+        role: Role::Operator,
+        source_ip: None,
+        tenant: Some(session.tenant.clone()),
+    };
+    let target = format!("connection:{}/{}", session.tenant, session.connection);
+    match failure {
+        None => {
+            super::metrics::record_connect_flow(&session.provider, "completed");
+            crate::serve::audit::write_target(state, &actor, "connect.complete", target, "ok")
+                .await;
+            with_params(
+                &session.redirect,
+                &[("connection", &session.connection), ("status", "ok")],
+            )
+        }
+        Some((outcome, error)) => {
+            super::metrics::record_connect_flow(&session.provider, outcome);
+            crate::serve::audit::write_target_detail(
+                state,
+                &actor,
+                "connect.complete",
+                target,
+                format!("error={error}"),
+                outcome,
+            )
+            .await;
+            with_params(
+                &session.redirect,
+                &[
+                    ("connection", &session.connection),
+                    ("status", "error"),
+                    ("error", error),
+                ],
+            )
+        }
+    }
+}
+
 /// Finish a connect flow. Returns the URL to redirect the browser to; an
 /// error after the session is known is reported to the caller's redirect
 /// (`status=error`), never as a server error page.
@@ -351,19 +487,8 @@ pub async fn callback(state: &ServerState, q: CallbackQuery) -> Result<String, S
             "unknown or already-used connect session; start the flow again".into(),
         ));
     };
-    let fail = |provider: &str, error: &str| {
-        super::metrics::record_connect_flow(provider, "failed");
-        with_params(
-            &session.redirect,
-            &[
-                ("connection", &session.connection),
-                ("status", "error"),
-                ("error", error),
-            ],
-        )
-    };
     if session.expires_at <= Utc::now() {
-        return Ok(fail(&session.provider, "expired"));
+        return Ok(finish(state, &session, Some(("failed", "expired"))).await);
     }
     if let Some(err) = q.error.as_deref() {
         tracing::info!(
@@ -371,57 +496,94 @@ pub async fn callback(state: &ServerState, q: CallbackQuery) -> Result<String, S
             description = q.error_description.as_deref().unwrap_or(""),
             "connect flow was refused at the provider"
         );
-        return Ok(fail(&session.provider, err));
+        return Ok(finish(state, &session, Some(("failed", err))).await);
     }
     let Some(code) = q.code.as_deref().filter(|c| !c.is_empty()) else {
-        return Ok(fail(&session.provider, "missing_code"));
+        return Ok(finish(state, &session, Some(("failed", "missing_code"))).await);
     };
     match complete(state, &session, code).await {
-        Ok(()) => {
-            super::metrics::record_connect_flow(&session.provider, "completed");
-            Ok(with_params(
-                &session.redirect,
-                &[("connection", &session.connection), ("status", "ok")],
-            ))
-        }
+        Ok(()) => Ok(finish(state, &session, None).await),
         Err(why) => {
-            tracing::warn!(
-                tenant = %session.tenant, provider = %session.provider,
-                error = %crate::secrets::registry::redact(&why),
-                "connect flow failed"
-            );
-            Ok(fail(&session.provider, "exchange_failed"))
+            let message = crate::secrets::registry::redact(&why.to_string()).into_owned();
+            if matches!(why, CompleteError::Superseded(_)) {
+                tracing::info!(
+                    tenant = %session.tenant, connection = %session.connection,
+                    provider = %session.provider, reason = %message,
+                    "connect flow finished after its connection changed; nothing was stored"
+                );
+            } else {
+                tracing::warn!(
+                    tenant = %session.tenant, provider = %session.provider,
+                    error = %message,
+                    "connect flow failed"
+                );
+            }
+            Ok(finish(state, &session, Some((why.outcome(), why.code()))).await)
         }
     }
 }
 
-/// Exchange the code and store the connection.
-async fn complete(state: &ServerState, session: &ConnectSession, code: &str) -> Result<(), String> {
-    match state.history().tenant_get(&session.tenant).await {
-        Ok(Some(t)) if !t.suspended => {}
-        Ok(Some(_)) => return Err(format!("tenant '{}' is suspended", session.tenant)),
-        Ok(None) => return Err(format!("tenant '{}' no longer exists", session.tenant)),
-        Err(e) => return Err(format!("reading tenant '{}': {e}", session.tenant)),
+/// Refuse a flow whose tenant is gone, was created again since the flow
+/// started, or is suspended.
+async fn check_tenant(state: &ServerState, session: &ConnectSession) -> Result<(), CompleteError> {
+    let tenant = &session.tenant;
+    match state.history().tenant_get(tenant).await {
+        Ok(Some(t)) if session.tenant_created_at.is_some_and(|c| c != t.created_at) => {
+            Err(CompleteError::Superseded(format!(
+                "tenant '{tenant}' was created again since the flow started"
+            )))
+        }
+        Ok(Some(t)) if t.suspended => Err(CompleteError::Exchange(format!(
+            "tenant '{tenant}' is suspended"
+        ))),
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(CompleteError::Superseded(format!(
+            "tenant '{tenant}' no longer exists"
+        ))),
+        Err(e) => Err(CompleteError::Store(format!(
+            "reading tenant '{tenant}': {e}"
+        ))),
     }
+}
+
+/// Exchange the code and store the connection.
+async fn complete(
+    state: &ServerState,
+    session: &ConnectSession,
+    code: &str,
+) -> Result<(), CompleteError> {
+    check_tenant(state, session).await?;
     let rt = state.tenants();
-    let provider = rt
-        .providers
-        .get(&session.provider)
-        .ok_or_else(|| format!("provider '{}' is no longer configured", session.provider))?;
-    let vault = rt.vault.as_ref().ok_or("this server has no vault key")?;
-    let verifier = vault.open_str_for(
-        &session.sealed_verifier,
-        &format!("connect-session:{}", session.state),
-    )?;
-    let tokens = exchange(provider, code, &verifier).await?;
+    let provider = rt.providers.get(&session.provider).ok_or_else(|| {
+        CompleteError::Exchange(format!(
+            "provider '{}' is no longer configured",
+            session.provider
+        ))
+    })?;
+    let vault = rt
+        .vault
+        .as_ref()
+        .ok_or_else(|| CompleteError::Exchange("this server has no vault key".into()))?;
+    let verifier = vault
+        .open_str_for(
+            &session.sealed_verifier,
+            &format!("connect-session:{}", session.state),
+        )
+        .map_err(CompleteError::Exchange)?;
+    let tokens = exchange(provider, code, &verifier)
+        .await
+        .map_err(CompleteError::Exchange)?;
     let refresh_token = tokens
         .get("refresh_token")
         .and_then(Value::as_str)
         .filter(|t| !t.is_empty())
-        .ok_or(
-            "the provider returned no refresh_token — request offline access \
-             (e.g. extra_authorize_params: {access_type: offline, prompt: consent})",
-        )?;
+        .ok_or_else(|| {
+            CompleteError::Exchange(
+                "the provider returned no refresh_token — request offline access \
+                 (e.g. extra_authorize_params: {access_type: offline, prompt: consent})"
+                    .into(),
+            )
+        })?;
     crate::secrets::registry::register(refresh_token);
     let mut config = serde_json::json!({
         "token_url": provider.token_url,
@@ -433,50 +595,88 @@ async fn complete(state: &ServerState, session: &ConnectSession, code: &str) -> 
         config["scope"] = Value::String(provider.scopes.join(&provider.scope_separator));
     }
     let spec = serde_json::json!({ "type": "oauth2_refresh", "config": config });
+    let sealed = vault.seal_for(
+        &spec,
+        &super::vault::Vault::connection_context(&session.tenant, &session.connection),
+    );
+    check_tenant(state, session).await?;
+    store(state, session, sealed).await?;
+    super::metrics::refresh_connection_gauges(state).await;
+    Ok(())
+}
+
+/// Write the flow's connection, only over the connection the flow started
+/// from.
+async fn store(
+    state: &ServerState,
+    session: &ConnectSession,
+    sealed: String,
+) -> Result<(), CompleteError> {
     let history = state.history();
-    let now = Utc::now();
-    let created_at = match history
-        .connection_get(&session.tenant, &session.connection)
-        .await
-    {
-        Ok(Some(existing)) => existing.created_at,
-        _ => now,
-    };
-    let rec = ConnectionRecord {
+    let record = |created_at: DateTime<Utc>| ConnectionRecord {
         tenant: session.tenant.clone(),
         name: session.connection.clone(),
         provider_type: "oauth2_refresh".into(),
         connect_provider: Some(session.provider.clone()),
-        sealed: vault.seal_for(
-            &spec,
-            &super::vault::Vault::connection_context(&session.tenant, &session.connection),
-        ),
+        sealed: sealed.clone(),
         status: ConnectionStatus::Active,
         reauth_reason: None,
         created_at,
-        updated_at: now,
+        updated_at: Utc::now(),
         updated_by: session.created_by.clone(),
+        generation: new_generation(),
     };
-    history
-        .connection_upsert(&rec)
-        .await
-        .map_err(|e| format!("storing the connection: {e}"))?;
-    super::metrics::refresh_connection_gauges(state).await;
-    let actor = AuthContext {
-        principal: session.created_by.clone(),
-        role: Role::Operator,
-        source_ip: None,
-        tenant: Some(session.tenant.clone()),
+    let unavailable = |e: crate::serve::history::HistoryError| {
+        CompleteError::Store(format!("storing the connection: {e}"))
     };
-    crate::serve::audit::write_target(
-        state,
-        &actor,
-        "connect.complete",
-        format!("connection:{}/{}", session.tenant, session.connection),
-        "ok",
-    )
-    .await;
-    Ok(())
+    let superseded = || {
+        CompleteError::Superseded(format!(
+            "connection '{}/{}' was deleted or replaced since the flow started",
+            session.tenant, session.connection
+        ))
+    };
+    let written = match &session.base {
+        None => {
+            let created_at = match history
+                .connection_get(&session.tenant, &session.connection)
+                .await
+            {
+                Ok(Some(existing)) => existing.created_at,
+                _ => Utc::now(),
+            };
+            history
+                .connection_upsert_in_tenant(&record(created_at))
+                .await
+                .map_err(unavailable)?
+        }
+        Some(ConnectBase::Absent) => history
+            .connection_insert_new(&record(Utc::now()))
+            .await
+            .map_err(unavailable)?,
+        Some(base) => {
+            for _ in 0..STORE_ATTEMPTS {
+                let current = history
+                    .connection_get(&session.tenant, &session.connection)
+                    .await
+                    .map_err(unavailable)?;
+                let Some(current) = current.filter(|c| base.matches(Some(c))) else {
+                    return Err(superseded());
+                };
+                if history
+                    .connection_replace(&record(current.created_at), current.updated_at)
+                    .await
+                    .map_err(unavailable)?
+                {
+                    return Ok(());
+                }
+            }
+            return Err(CompleteError::Store(format!(
+                "connection '{}/{}' kept changing while it was being stored",
+                session.tenant, session.connection
+            )));
+        }
+    };
+    if written { Ok(()) } else { Err(superseded()) }
 }
 
 /// The authorization-code grant (RFC 6749 §4.1.3) with the PKCE verifier.
@@ -535,8 +735,13 @@ mod tests {
             created_by: "op".into(),
             created_at: now,
             expires_at: now,
+            base: None,
+            tenant_created_at: None,
         };
-        let err = complete(&state, &session, "code").await.unwrap_err();
+        let err = complete(&state, &session, "code")
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("no longer exists"), "{err}");
         let rec = crate::serve::history::tenants::TenantRecord {
             id: "acme".into(),
@@ -551,7 +756,10 @@ mod tests {
             created_by: "admin".into(),
         };
         state.history().tenant_upsert(&rec).await.unwrap();
-        let err = complete(&state, &session, "code").await.unwrap_err();
+        let err = complete(&state, &session, "code")
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("suspended"), "{err}");
         assert!(
             state
@@ -561,6 +769,357 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    fn tenant_record(created_at: DateTime<Utc>) -> crate::serve::history::tenants::TenantRecord {
+        crate::serve::history::tenants::TenantRecord {
+            id: "acme".into(),
+            name: None,
+            labels: Default::default(),
+            limits: Default::default(),
+            notifications: Vec::new(),
+            notifications_sealed: None,
+            suspended: false,
+            created_at,
+            updated_at: created_at,
+            created_by: "admin".into(),
+        }
+    }
+
+    fn session_from(
+        base: Option<ConnectBase>,
+        tenant_created_at: Option<DateTime<Utc>>,
+    ) -> ConnectSession {
+        let now = Utc::now();
+        ConnectSession {
+            state: "st".into(),
+            tenant: "acme".into(),
+            provider: "crm".into(),
+            connection: "crm".into(),
+            redirect: "https://app.example/done".into(),
+            sealed_verifier: "x".into(),
+            created_by: "op".into(),
+            created_at: now,
+            expires_at: now,
+            base,
+            tenant_created_at,
+        }
+    }
+
+    fn stored(generation: &str, sealed: &str, updated_at: DateTime<Utc>) -> ConnectionRecord {
+        ConnectionRecord {
+            tenant: "acme".into(),
+            name: "crm".into(),
+            provider_type: "static".into(),
+            connect_provider: None,
+            sealed: sealed.into(),
+            status: ConnectionStatus::Active,
+            reauth_reason: None,
+            created_at: updated_at,
+            updated_at,
+            updated_by: "admin".into(),
+            generation: generation.into(),
+        }
+    }
+
+    #[test]
+    fn complete_errors_map_to_redirect_codes_and_metric_outcomes() {
+        let cases = [
+            (
+                CompleteError::Superseded("a".into()),
+                "connection_changed",
+                "superseded",
+            ),
+            (
+                CompleteError::Exchange("b".into()),
+                "exchange_failed",
+                "failed",
+            ),
+            (
+                CompleteError::Store("c".into()),
+                "store_unavailable",
+                "failed",
+            ),
+        ];
+        for (err, code, outcome) in cases {
+            assert_eq!(err.code(), code);
+            assert_eq!(err.outcome(), outcome);
+            assert_eq!(err.to_string().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tenant_created_again_under_the_same_id_is_not_written_to() {
+        let state = crate::serve::test_support::test_state();
+        let then = Utc::now() - chrono::Duration::seconds(30);
+        state
+            .history()
+            .tenant_upsert(&tenant_record(Utc::now()))
+            .await
+            .unwrap();
+        let session = session_from(Some(ConnectBase::Absent), Some(then));
+        let err = check_tenant(&state, &session).await.unwrap_err();
+        assert!(matches!(err, CompleteError::Superseded(_)), "{err:?}");
+        let legacy = session_from(None, None);
+        assert_eq!(check_tenant(&state, &legacy).await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn a_callback_write_takes_only_the_connection_it_started_from() {
+        let state = crate::serve::test_support::test_state();
+        let t0 = Utc::now();
+        state
+            .history()
+            .tenant_upsert(&tenant_record(t0))
+            .await
+            .unwrap();
+        let get = || async { state.history().connection_get("acme", "crm").await.unwrap() };
+
+        let absent = session_from(Some(ConnectBase::Absent), Some(t0));
+        store(&state, &absent, "s1".into()).await.unwrap();
+        let first = get().await.unwrap();
+        assert_eq!(first.sealed, "s1");
+        assert_eq!(first.provider_type, "oauth2_refresh");
+        assert!(!first.generation.is_empty());
+        let err = store(&state, &absent, "s2".into()).await.unwrap_err();
+        assert!(matches!(err, CompleteError::Superseded(_)), "{err:?}");
+
+        let based = session_from(Some(ConnectBase::of(Some(&first))), Some(t0));
+        store(&state, &based, "s3".into()).await.unwrap();
+        let second = get().await.unwrap();
+        assert_eq!(second.sealed, "s3");
+        assert_eq!(second.created_at, first.created_at);
+        assert_ne!(second.generation, first.generation);
+        let err = store(&state, &based, "s4".into()).await.unwrap_err();
+        assert!(
+            matches!(err, CompleteError::Superseded(_)),
+            "replaced: {err:?}"
+        );
+
+        let legacy_base = stored("", "old", t0);
+        state
+            .history()
+            .connection_upsert(&legacy_base)
+            .await
+            .unwrap();
+        let legacy = session_from(Some(ConnectBase::of(Some(&legacy_base))), Some(t0));
+        store(&state, &legacy, "s5".into()).await.unwrap();
+        assert_eq!(get().await.unwrap().sealed, "s5");
+
+        let old_release = session_from(None, None);
+        store(&state, &old_release, "s6".into()).await.unwrap();
+        assert_eq!(get().await.unwrap().sealed, "s6");
+        assert!(
+            state
+                .history()
+                .connection_delete("acme", "crm")
+                .await
+                .unwrap()
+        );
+        store(&state, &old_release, "s7".into()).await.unwrap();
+        assert_eq!(get().await.unwrap().sealed, "s7");
+        state.history().tenant_delete("acme").await.unwrap();
+        let err = store(&state, &old_release, "s8".into()).await.unwrap_err();
+        assert!(matches!(err, CompleteError::Superseded(_)), "{err:?}");
+        assert!(get().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_flow_from_a_connection_without_a_generation_survives_a_rotation() {
+        let state = crate::serve::test_support::test_state();
+        let t0 = Utc::now() - chrono::Duration::seconds(30);
+        let history = state.history();
+        history.tenant_upsert(&tenant_record(t0)).await.unwrap();
+        history
+            .connection_upsert(&stored("", "old", t0))
+            .await
+            .unwrap();
+
+        let current = with_generation(history.as_ref(), "acme", "crm")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!current.generation.is_empty());
+        assert_eq!(current.updated_at, t0, "assigning it leaves updated_at");
+        assert_eq!(
+            history.connection_get("acme", "crm").await.unwrap(),
+            Some(current.clone())
+        );
+        let session = session_from(Some(ConnectBase::of(Some(&current))), Some(t0));
+
+        let rotated = ConnectionRecord {
+            sealed: "rotated".into(),
+            updated_at: Utc::now(),
+            ..current.clone()
+        };
+        assert!(history.connection_replace(&rotated, t0).await.unwrap());
+        store(&state, &session, "new".into()).await.unwrap();
+        assert_eq!(
+            history
+                .connection_get("acme", "crm")
+                .await
+                .unwrap()
+                .unwrap()
+                .sealed,
+            "new"
+        );
+
+        let again = with_generation(history.as_ref(), "acme", "crm")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!again.generation.is_empty());
+        assert!(
+            with_generation(history.as_ref(), "acme", "none")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_generation_lost_to_every_race_falls_back_to_the_read_record() {
+        let existing = stored("", "old", Utc::now());
+        let state = contended_state(false, &existing).await;
+        let current = with_generation(state.history().as_ref(), "acme", "crm")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(current.generation.is_empty());
+        let state = contended_state(true, &existing).await;
+        assert!(
+            with_generation(state.history().as_ref(), "acme", "crm")
+                .await
+                .is_err()
+        );
+    }
+
+    /// A memory history whose connection writes always lose their
+    /// compare-and-set, or whose reads fail.
+    struct ContendedConnections {
+        mem: crate::serve::history::memory::MemoryHistory,
+        reads_fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::serve::history::RunHistory for ContendedConnections {
+        async fn claim_idempotency(
+            &self,
+            k: &str,
+            f: &str,
+            r: &str,
+            w: std::time::Duration,
+        ) -> Result<crate::serve::history::Claim, crate::serve::history::HistoryError> {
+            self.mem.claim_idempotency(k, f, r, w).await
+        }
+        async fn upsert(
+            &self,
+            rec: &crate::serve::history::RunRecord,
+        ) -> Result<(), crate::serve::history::HistoryError> {
+            self.mem.upsert(rec).await
+        }
+        async fn get(
+            &self,
+            id: &str,
+        ) -> Result<Option<crate::serve::history::RunRecord>, crate::serve::history::HistoryError>
+        {
+            self.mem.get(id).await
+        }
+        async fn list(
+            &self,
+            f: &crate::serve::history::ListFilter,
+        ) -> Result<crate::serve::history::ListPage, crate::serve::history::HistoryError> {
+            self.mem.list(f).await
+        }
+        async fn delete(
+            &self,
+            id: &str,
+        ) -> Result<crate::serve::history::DeleteOutcome, crate::serve::history::HistoryError>
+        {
+            self.mem.delete(id).await
+        }
+        async fn purge_expired(
+            &self,
+            d: std::time::Duration,
+        ) -> Result<usize, crate::serve::history::HistoryError> {
+            self.mem.purge_expired(d).await
+        }
+        async fn recover_orphans(&self) -> Result<usize, crate::serve::history::HistoryError> {
+            self.mem.recover_orphans().await
+        }
+        fn degraded(&self) -> bool {
+            false
+        }
+        async fn tenant_get(
+            &self,
+            id: &str,
+        ) -> Result<
+            Option<crate::serve::history::tenants::TenantRecord>,
+            crate::serve::history::HistoryError,
+        > {
+            if self.reads_fail {
+                return Err(crate::serve::history::HistoryError::Backend("down".into()));
+            }
+            self.mem.tenant_get(id).await
+        }
+        async fn connection_get(
+            &self,
+            tenant: &str,
+            name: &str,
+        ) -> Result<Option<ConnectionRecord>, crate::serve::history::HistoryError> {
+            if self.reads_fail {
+                return Err(crate::serve::history::HistoryError::Backend("down".into()));
+            }
+            self.mem.connection_get(tenant, name).await
+        }
+        async fn connection_replace(
+            &self,
+            _c: &ConnectionRecord,
+            _expected: DateTime<Utc>,
+        ) -> Result<bool, crate::serve::history::HistoryError> {
+            Ok(false)
+        }
+    }
+
+    async fn contended_state(reads_fail: bool, existing: &ConnectionRecord) -> ServerState {
+        use crate::serve::history::RunHistory as _;
+        let mem =
+            crate::serve::history::memory::MemoryHistory::new(std::time::Duration::from_secs(60));
+        mem.tenant_upsert(&tenant_record(existing.created_at))
+            .await
+            .unwrap();
+        mem.connection_upsert(existing).await.unwrap();
+        ServerState::new(
+            &crate::serve::test_support::test_config(),
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            std::sync::Arc::new(ContendedConnections { mem, reads_fail }),
+            crate::serve::logs::LogHub::new(),
+            None,
+            #[cfg(feature = "triggers")]
+            crate::serve::triggers::health::TriggersHandle::empty(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_write_that_keeps_losing_to_token_rotations_reports_the_store_unavailable() {
+        let existing = stored("g1", "old", Utc::now());
+        let session = session_from(Some(ConnectBase::of(Some(&existing))), None);
+        let state = contended_state(false, &existing).await;
+        let err = store(&state, &session, "new".into()).await.unwrap_err();
+        assert!(matches!(err, CompleteError::Store(_)), "{err:?}");
+        assert!(err.to_string().contains("kept changing"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_history_reports_the_store_unavailable() {
+        let existing = stored("g1", "old", Utc::now());
+        let session = session_from(Some(ConnectBase::of(Some(&existing))), None);
+        let state = contended_state(true, &existing).await;
+        let err = store(&state, &session, "new".into()).await.unwrap_err();
+        assert!(matches!(err, CompleteError::Store(_)), "{err:?}");
+        let err = check_tenant(&state, &session).await.unwrap_err();
+        assert!(matches!(err, CompleteError::Store(_)), "{err:?}");
     }
 
     fn provider() -> ConnectProvider {

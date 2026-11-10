@@ -21,7 +21,7 @@ pub struct OracleConnectionConfig {
     /// Easy Connect (`host:1521/FREEPDB1`), TNS alias, or connect descriptor.
     /// Mutually exclusive with `host`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(extend("x-faucet-resource" = "url"))]
+    #[schemars(extend("x-faucet-resource" = "url", "x-faucet-url-syntax" = "oracle"))]
     pub connect_string: Option<String>,
     /// Database host. Mutually exclusive with `connect_string`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

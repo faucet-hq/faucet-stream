@@ -194,3 +194,116 @@ async fn server() -> Option<(ContainerAsync<GenericImage>, u16)> {
     }
     started
 }
+
+/// The image's sshd configuration with one session per connection.
+const ONE_SESSION_SSHD_CONFIG: &str = "Protocol 2
+HostKey /etc/ssh/ssh_host_ed25519_key
+HostKey /etc/ssh/ssh_host_rsa_key
+UseDNS no
+PermitRootLogin no
+X11Forwarding no
+AllowTcpForwarding no
+Subsystem sftp internal-sftp
+ForceCommand internal-sftp
+ChrootDirectory %h
+MaxSessions 1
+";
+
+async fn one_session_server() -> Option<(ContainerAsync<GenericImage>, u16)> {
+    let started = faucet_conformance::containers::start_or_skip(
+        || {
+            GenericImage::new(
+                "atmoz/sftp",
+                "alpine@sha256:43dd1c023cf1bae487127d4b54660b0aee6e94c188a6599be36fb89ba115f961",
+            )
+            .with_exposed_port(22.tcp())
+            .with_wait_for(WaitFor::message_on_stderr("Server listening on"))
+            .with_cmd(vec![format!("{USER}:{PASS}:::data")])
+            .with_copy_to(
+                "/etc/ssh/sshd_config",
+                ONE_SESSION_SSHD_CONFIG.as_bytes().to_vec(),
+            )
+        },
+        &Default::default(),
+    )
+    .await;
+    let Some(c) = started else {
+        faucet_conformance::containers::backend_missing(
+            "one_session_server: the test backend is unavailable",
+        );
+        return None;
+    };
+    let port = c.get_host_port_ipv4(22).await.expect("port");
+    Some((c, port))
+}
+
+fn backend(port: u16, max_listed_entries: usize) -> faucet_common_sftp::SftpBackend {
+    let template = faucet_common_file::write::NameTemplate::from_path(
+        "x.jsonl",
+        faucet_core::FileFormat::JsonLines,
+        faucet_core::Compression::None,
+        false,
+    )
+    .unwrap()
+    .1;
+    faucet_common_sftp::SftpBackend::builder(connection(port))
+        .max_listed_entries(max_listed_entries)
+        .build("/data/out/", &template)
+        .expect("backend")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sink_listings_are_bounded() {
+    use faucet_common_file::write::{Area, StorageBackend};
+    let Some((_c, port)) = server().await else {
+        return;
+    };
+    let admin = session(port).await;
+    admin.create_dir("/data/out").await.unwrap();
+    for name in ["a.jsonl", "b.jsonl", "c.jsonl"] {
+        put(&admin, &format!("/data/out/{name}")).await;
+    }
+    let template = faucet_common_file::write::NameTemplate::from_path(
+        "x.jsonl",
+        faucet_core::FileFormat::JsonLines,
+        faucet_core::Compression::None,
+        false,
+    )
+    .unwrap()
+    .1;
+    for token in ["67000000aaaaa1", "67000000aaaaa2", "67000000aaaaa3"] {
+        let dir = template.swap_run_dir_name(Some(token));
+        admin.create_dir(format!("/data/out/{dir}")).await.unwrap();
+    }
+
+    let roomy = backend(port, 6);
+    let mut files = roomy
+        .list(Area::Destination)
+        .await
+        .expect("six entries fit");
+    files.sort();
+    assert_eq!(files, ["a.jsonl", "b.jsonl", "c.jsonl"]);
+    let mut runs = roomy.swap_runs().await.expect("six entries fit");
+    runs.sort();
+    assert_eq!(runs, ["67000000aaaaa1", "67000000aaaaa2", "67000000aaaaa3"]);
+
+    let tight = backend(port, 5);
+    let e = tight.list(Area::Destination).await.unwrap_err().to_string();
+    assert!(
+        e.contains("'/data/out'") && e.contains("max_listed_entries"),
+        "{e}"
+    );
+    let e = tight.swap_runs().await.unwrap_err().to_string();
+    assert!(e.contains("max_listed_entries"), "{e}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_one_session_server_names_its_session_limit_when_the_sink_lists() {
+    use faucet_common_file::write::{Area, StorageBackend};
+    let Some((_c, port)) = one_session_server().await else {
+        return;
+    };
+    let b = backend(port, 100);
+    let e = b.list(Area::Destination).await.unwrap_err().to_string();
+    assert!(e.contains("MaxSessions"), "{e}");
+}

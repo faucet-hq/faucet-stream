@@ -13,6 +13,18 @@
 //! through this helper so auth, host-key handling, and error mapping stay
 //! consistent.
 //!
+//! [`authenticate`] splits the same steps for callers that list a directory
+//! before reading: it returns an [`SftpHandle`] whose
+//! [`lister`](SftpHandle::lister) runs bounded listings on a short-lived
+//! channel and whose [`open_session`](SftpHandle::open_session) opens the
+//! read session afterwards.
+//!
+//! ## Limits
+//!
+//! Every SFTP channel refuses an inbound packet longer than
+//! [`MAX_INBOUND_PACKET`], and a listing scans at most the entries its caller
+//! allows (`max_listed_entries`, default [`DEFAULT_MAX_LISTED_ENTRIES`]).
+//!
 //! ## Host-key verification
 //!
 //! Man-in-the-middle protection is on by default. [`HostKeyPolicy`] defaults to
@@ -29,8 +41,14 @@
 //! [`SftpConnectionConfig`] is safe to log.
 
 mod backend;
+mod inbound;
+mod listing;
 
 pub use backend::{SftpBackend, SftpBackendBuilder};
+pub use inbound::{ChunkedReader, MAX_INBOUND_PACKET, MAX_READ_CHUNK};
+pub use listing::{DEFAULT_MAX_LISTED_ENTRIES, ListError, ListedEntry, SftpLister, SftpMetadata};
+
+use inbound::{InboundGuard, LimitedStream};
 
 use std::sync::Arc;
 
@@ -141,9 +159,9 @@ pub struct SftpConnectionConfig {
     /// Host-key verification policy (default: `accept_new`).
     #[serde(default)]
     pub known_hosts: HostKeyPolicy,
-    /// Seconds the TCP connect, SSH handshake, authentication and the SFTP
-    /// subsystem start together may take (default 30). A server that accepts and then stalls fails the run
-    /// instead of hanging it.
+    /// Seconds the TCP connect, SSH handshake and authentication together may
+    /// take, and then each SFTP channel's start (default 30). A server that
+    /// accepts and then stalls fails the run instead of hanging it.
     #[serde(default = "default_connect_timeout_secs")]
     pub connect_timeout_secs: u64,
     /// Seconds between SSH keepalives on a quiet connection (default 15); the
@@ -555,11 +573,96 @@ pub async fn connect(cfg: &SftpConnectionConfig) -> Result<SftpSession, FaucetEr
     // The `Handle` can be dropped once the subsystem is open: the
     // `SftpSession` holds its own clone of the session message sender, so the
     // SSH session task stays alive as long as the returned session is held.
-    within_connect_timeout(cfg, async {
-        let handle = authenticate_unbounded(cfg).await?;
-        open_session(&handle).await
+    authenticate(cfg).await?.open_session().await
+}
+
+/// An authenticated SSH connection: open a [`lister`](Self::lister) for
+/// bounded directory listings, then the read session with
+/// [`open_session`](Self::open_session).
+pub struct SftpHandle {
+    handle: russh::client::Handle<ClientHandler>,
+    guard: Arc<InboundGuard>,
+    server: String,
+    limit: std::time::Duration,
+}
+
+/// Open an SSH transport to the configured server, verify the host key and
+/// authenticate, within `connect_timeout_secs`. Opens no channel.
+///
+/// # Errors
+///
+/// As [`connect`].
+pub async fn authenticate(cfg: &SftpConnectionConfig) -> Result<SftpHandle, FaucetError> {
+    let handle = within_connect_timeout(cfg, authenticate_unbounded(cfg)).await?;
+    Ok(SftpHandle {
+        handle,
+        guard: InboundGuard::new(),
+        server: format!("{}:{}", cfg.host, cfg.port),
+        limit: connect_limit(cfg),
     })
-    .await
+}
+
+impl SftpHandle {
+    /// Open the `sftp` subsystem on a new channel, within
+    /// `connect_timeout_secs`.
+    pub async fn open_session(&self) -> Result<SftpSession, FaucetError> {
+        tokio::time::timeout(self.limit, open_session(&self.handle, &self.guard))
+            .await
+            .map_err(|_| {
+                FaucetError::Custom(
+                    format!(
+                        "SFTP session to {} did not start within {}s (connect_timeout_secs)",
+                        self.server,
+                        self.limit.as_secs()
+                    )
+                    .into(),
+                )
+            })?
+            .map_err(|e| self.explain(e))
+    }
+
+    /// Open a short-lived listing channel, within `connect_timeout_secs`.
+    /// A server that refuses the channel fails with
+    /// [`ListError::ChannelRefused`].
+    pub async fn lister(&self) -> Result<SftpLister, ListError> {
+        let refused = |e: russh::Error| ListError::ChannelRefused {
+            server: self.server.clone(),
+            reason: e.to_string(),
+        };
+        let started = async {
+            let channel = self.handle.channel_open_session().await.map_err(refused)?;
+            channel
+                .request_subsystem(true, "sftp")
+                .await
+                .map_err(refused)?;
+            let lister = SftpLister::start(channel, self.guard.clone());
+            lister.init().await?;
+            Ok(lister)
+        };
+        tokio::time::timeout(self.limit, started)
+            .await
+            .map_err(|_| {
+                ListError::Channel(format!(
+                    "SFTP listing channel to {} did not start within {}s (connect_timeout_secs)",
+                    self.server,
+                    self.limit.as_secs()
+                ))
+            })?
+    }
+
+    /// The error text for a packet this connection refused for being longer
+    /// than [`MAX_INBOUND_PACKET`], if it refused one. A request that failed
+    /// after such a refusal failed because of it.
+    pub fn refusal(&self) -> Option<String> {
+        self.guard.refusal()
+    }
+
+    fn explain(&self, e: FaucetError) -> FaucetError {
+        match self.guard.refusal() {
+            Some(refusal) => FaucetError::Custom(refusal.into()),
+            None => e,
+        }
+    }
 }
 
 /// `posix-rename@openssh.com`: a rename that replaces an existing target
@@ -567,10 +670,13 @@ pub async fn connect(cfg: &SftpConnectionConfig) -> Result<SftpSession, FaucetEr
 pub const POSIX_RENAME: &str = "posix-rename@openssh.com";
 
 /// An [`SftpSession`] plus the server extensions the high-level session does
-/// not expose, opened by [`connect_with_extensions`].
+/// not expose and a bounded directory listing, opened by
+/// [`connect_with_extensions`].
 pub struct SftpConnection {
     session: SftpSession,
     raw: Option<russh_sftp::client::RawSftpSession>,
+    posix_rename: bool,
+    handle: SftpHandle,
 }
 
 impl SftpConnection {
@@ -579,16 +685,48 @@ impl SftpConnection {
         &self.session
     }
 
+    /// List `path`, keeping the entries `keep` accepts (given each entry's
+    /// name and attributes). Every entry the server sends counts against
+    /// `limit`, kept or not; one more fails with
+    /// [`ListError::TooManyEntries`]. Runs on the connection's second
+    /// channel when the server granted one at connect, else on a listing
+    /// channel opened for the call and closed after it.
+    pub async fn list_dir<F>(
+        &self,
+        path: &str,
+        limit: usize,
+        keep: F,
+    ) -> Result<Vec<ListedEntry>, ListError>
+    where
+        F: FnMut(&str, &SftpMetadata) -> bool + Send,
+    {
+        if let Some(raw) = &self.raw {
+            return listing::list_with(raw, path, limit, keep)
+                .await
+                .map_err(|e| e.explained(&self.handle.guard));
+        }
+        let lister = self.handle.lister().await?;
+        let listed = lister.list_dir(path, limit, keep).await;
+        lister.close().await;
+        listed
+    }
+
+    /// The error text for a packet this connection refused for being longer
+    /// than [`MAX_INBOUND_PACKET`], if it refused one.
+    pub fn refusal(&self) -> Option<String> {
+        self.handle.refusal()
+    }
+
     /// Whether the server supports [`POSIX_RENAME`].
     pub fn supports_posix_rename(&self) -> bool {
-        self.raw.is_some()
+        self.posix_rename && self.raw.is_some()
     }
 
     /// Rename `from` to `to`, atomically replacing `to` when it exists.
     /// Fails with [`StatusCode::OpUnsupported`] when the server lacks
     /// [`POSIX_RENAME`] (see [`supports_posix_rename`](Self::supports_posix_rename)).
     pub async fn posix_rename(&self, from: &str, to: &str) -> Result<(), SftpError> {
-        let Some(raw) = &self.raw else {
+        let Some(raw) = self.raw.as_ref().filter(|_| self.posix_rename) else {
             return Err(SftpError::Status(russh_sftp::protocol::Status {
                 id: 0,
                 status_code: StatusCode::OpUnsupported,
@@ -626,50 +764,53 @@ pub fn is_no_such_file(e: &SftpError) -> bool {
 pub async fn connect_with_extensions(
     cfg: &SftpConnectionConfig,
 ) -> Result<SftpConnection, FaucetError> {
-    let limit = connect_limit(cfg);
-    let started = std::time::Instant::now();
-    let (handle, session) = within_connect_timeout(cfg, async {
-        let handle = authenticate_unbounded(cfg).await?;
-        let session = open_session(&handle).await?;
-        Ok((handle, session))
-    })
-    .await?;
-    let remaining = limit.saturating_sub(started.elapsed());
-    let raw = match tokio::time::timeout(remaining, probe_posix_rename(&handle)).await {
-        Ok(Ok(raw)) => raw,
+    let handle = authenticate(cfg).await?;
+    let session = handle.open_session().await?;
+    let probed = tokio::time::timeout(handle.limit, probe_extensions(&handle)).await;
+    let (raw, posix_rename) = match probed {
+        Ok(Ok((raw, posix))) => (Some(raw), posix),
         Ok(Err(e)) => {
             tracing::debug!(error = %e, "SFTP extension probe failed; using plain RENAME");
-            None
+            (None, false)
         }
         Err(_) => {
             tracing::debug!("SFTP extension probe timed out; using plain RENAME");
-            None
+            (None, false)
         }
     };
-    Ok(SftpConnection { session, raw })
+    Ok(SftpConnection {
+        session,
+        raw,
+        posix_rename,
+        handle,
+    })
 }
 
-async fn probe_posix_rename(
-    handle: &russh::client::Handle<ClientHandler>,
-) -> Result<Option<russh_sftp::client::RawSftpSession>, FaucetError> {
-    let raw = russh_sftp::client::RawSftpSession::new(open_subsystem(handle).await?);
+/// A second channel's low-level session, kept for listings, and whether the
+/// server has [`POSIX_RENAME`].
+async fn probe_extensions(
+    handle: &SftpHandle,
+) -> Result<(russh_sftp::client::RawSftpSession, bool), FaucetError> {
+    let raw = russh_sftp::client::RawSftpSession::new(
+        open_subsystem(&handle.handle, &handle.guard).await?,
+    );
     let version = raw
         .init()
         .await
         .map_err(|e| FaucetError::Custom(format!("SFTP extension probe failed: {e}").into()))?;
-    Ok(version
+    let posix = version
         .extensions
         .get(POSIX_RENAME)
-        .is_some_and(|v| v == "1")
-        .then_some(raw))
+        .is_some_and(|v| v == "1");
+    Ok((raw, posix))
 }
 
 fn connect_limit(cfg: &SftpConnectionConfig) -> std::time::Duration {
     std::time::Duration::from_secs(cfg.connect_timeout_secs.max(1))
 }
 
-/// Run the connect steps (TCP, SSH handshake, authentication, SFTP subsystem
-/// start) under `connect_timeout_secs`.
+/// Run the connect steps (TCP, SSH handshake, authentication) under
+/// `connect_timeout_secs`.
 async fn within_connect_timeout<T>(
     cfg: &SftpConnectionConfig,
     steps: impl std::future::Future<Output = Result<T, FaucetError>>,
@@ -678,8 +819,8 @@ async fn within_connect_timeout<T>(
     tokio::time::timeout(limit, steps).await.map_err(|_| {
         FaucetError::Custom(
             format!(
-                "SFTP connect to {}:{} did not finish the SSH handshake, authentication and \
-                 SFTP subsystem start within {}s (connect_timeout_secs)",
+                "SFTP connect to {}:{} did not finish the SSH handshake and authentication \
+                 within {}s (connect_timeout_secs)",
                 cfg.host,
                 cfg.port,
                 limit.as_secs()
@@ -731,19 +872,25 @@ async fn authenticate_unbounded(
 
 async fn open_subsystem(
     handle: &russh::client::Handle<ClientHandler>,
-) -> Result<russh::ChannelStream<russh::client::Msg>, FaucetError> {
+    guard: &Arc<InboundGuard>,
+) -> Result<LimitedStream<russh::ChannelStream<russh::client::Msg>>, FaucetError> {
     let channel = handle.channel_open_session().await.map_err(map_ssh_err)?;
     channel
         .request_subsystem(true, "sftp")
         .await
         .map_err(map_ssh_err)?;
-    Ok(channel.into_stream())
+    Ok(LimitedStream::new(
+        channel.into_stream(),
+        MAX_INBOUND_PACKET,
+        guard.clone(),
+    ))
 }
 
 async fn open_session(
     handle: &russh::client::Handle<ClientHandler>,
+    guard: &Arc<InboundGuard>,
 ) -> Result<SftpSession, FaucetError> {
-    SftpSession::new(open_subsystem(handle).await?)
+    SftpSession::new(open_subsystem(handle, guard).await?)
         .await
         .map_err(|e| FaucetError::Custom(format!("failed to start SFTP subsystem: {e}").into()))
 }

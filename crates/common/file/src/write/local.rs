@@ -131,6 +131,7 @@ impl StorageBackend for LocalBackend {
         let template = self.template.clone();
         let create = area == Area::Swap || self.create_dirs;
         fs(move || {
+            faucet_core::path_guard::check(&dir)?;
             if dir.is_dir() {
                 remove_stale_scratch(&dir, &template);
                 return Ok(());
@@ -190,6 +191,7 @@ impl StorageBackend for LocalBackend {
         let dest = self.path(area, name);
         let scratch = scratch.to_path_buf();
         fs(move || {
+            faucet_core::path_guard::check(&dest)?;
             std::fs::File::open(&scratch)
                 .and_then(|f| f.sync_all())
                 .map_err(|e| io_err("syncing", &scratch, e))?;
@@ -303,14 +305,17 @@ impl StorageBackend for LocalBackend {
             .join(self.template.swap_run_dir_name(run))
             .join(name);
         let dest = self.path(Area::Destination, name);
-        fs(move || match std::fs::rename(&from, &dest) {
-            Ok(()) => {
-                sync_parent(&dest);
-                Ok(())
+        fs(move || {
+            faucet_core::path_guard::check(&dest)?;
+            match std::fs::rename(&from, &dest) {
+                Ok(()) => {
+                    sync_parent(&dest);
+                    Ok(())
+                }
+                // Another begin finished this move first.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && dest.exists() => Ok(()),
+                Err(e) => Err(io_err("moving into place", &dest, e)),
             }
-            // Another begin finished this move first.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && dest.exists() => Ok(()),
-            Err(e) => Err(io_err("moving into place", &dest, e)),
         })
         .await
     }
@@ -351,6 +356,7 @@ impl StorageBackend for LocalBackend {
         let from = self.path(Area::Swap, name);
         let dest = self.path(Area::Destination, name);
         fs(move || {
+            faucet_core::path_guard::check(&dest)?;
             std::fs::rename(&from, &dest).map_err(|e| io_err("moving into place", &dest, e))?;
             sync_parent(&dest);
             Ok(())

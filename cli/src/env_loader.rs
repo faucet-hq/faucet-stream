@@ -29,7 +29,7 @@ pub fn resolve_env_file(
         return Ok(Some(p.to_path_buf()));
     }
     let candidate = dir.join(".env");
-    Ok(candidate.exists().then_some(candidate))
+    Ok(candidate.is_file().then_some(candidate))
 }
 
 /// Load the resolved `.env` via `dotenvy::from_path`. No-op when `path` is
@@ -112,6 +112,13 @@ mod tests {
     #[test]
     fn resolve_env_file_none_when_missing_and_not_explicit() {
         let dir = tempdir().unwrap();
+        assert_eq!(resolve_env_file(None, false, dir.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_env_file_skips_a_dotenv_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".env")).unwrap();
         assert_eq!(resolve_env_file(None, false, dir.path()).unwrap(), None);
     }
 

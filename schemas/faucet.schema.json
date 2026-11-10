@@ -11395,7 +11395,8 @@
                 "connection_string": {
                   "description": "Connection string. Its endpoints (`BlobEndpoint=`, or the account\nhost built from `AccountName=` / `EndpointSuffix=`) are checked\nlike a URL by a host that confines configs.",
                   "type": "string",
-                  "x-faucet-resource": "url"
+                  "x-faucet-resource": "url",
+                  "x-faucet-url-syntax": "azure-conn"
                 }
               }
             }
@@ -20723,7 +20724,8 @@
                 "connection_string": {
                   "description": "Connection string. Its endpoints (`BlobEndpoint=`, or the account\nhost built from `AccountName=` / `EndpointSuffix=`) are checked\nlike a URL by a host that confines configs.",
                   "type": "string",
-                  "x-faucet-resource": "url"
+                  "x-faucet-resource": "url",
+                  "x-faucet-url-syntax": "azure-conn"
                 }
               }
             }
@@ -21961,7 +21963,7 @@
                       }
                     },
                     "trusted_hosts": {
-                      "description": "Extra hosts that may receive this source's credentials when a\nserver-given URL (a next-page link, an async-job URL, a discovery\nlisting's next link) points at them. Credentials — the `auth` block and\na shared provider's placements — are otherwise sent only to the scheme,\nhost and port of `base_url`; a link elsewhere is fetched without them\nand with only non-credential static headers (`Accept`, `User-Agent`, …).\nAn entry is a host (`files.example.com`) or a `*.example.com` wildcard.\nAn `https` base never follows a link to plain `http`.",
+                      "description": "Extra hosts that may receive this source's credentials when a\nserver-given URL (a next-page link, an async-job URL, a discovery\nlisting's next link) points at them, or a redirect leads to them.\nCredentials — the `auth` block and a shared provider's headers — are\notherwise sent only to the scheme, host and port of `base_url`; a link\nor redirect elsewhere is fetched without them and with only standard\nheaders (`Accept`, `User-Agent`, …). An entry is a host on any port\n(`files.example.com`), a host and port (`files.example.com:8443`, that\nport only), or a `*.example.com` wildcard; a link and a redirect follow\nthe same rule, and neither keeps credentials when it changes the\nscheme. An `https` base never follows a link to plain `http`.",
                       "type": "array",
                       "items": {
                         "type": "string"
@@ -23684,7 +23686,8 @@
                         "string",
                         "null"
                       ],
-                      "x-faucet-resource": "url"
+                      "x-faucet-resource": "url",
+                      "x-faucet-url-syntax": "ado"
                     },
                     "tls": {
                       "description": "TLS / encryption settings. Defaults to [`MssqlTlsMode::Prefer`].",
@@ -24248,7 +24251,8 @@
                       "default": [
                         "nats://127.0.0.1:4222"
                       ],
-                      "x-faucet-resource": "url"
+                      "x-faucet-resource": "url",
+                      "x-faucet-url-syntax": "url-list"
                     },
                     "auth": {
                       "description": "Authentication mode. Defaults to `none` (anonymous).",
@@ -24770,7 +24774,7 @@
                       }
                     },
                     "connect_timeout_secs": {
-                      "description": "Seconds the TCP connect, SSH handshake, authentication and the SFTP\nsubsystem start together may take (default 30). A server that accepts and then stalls fails the run\ninstead of hanging it.",
+                      "description": "Seconds the TCP connect, SSH handshake and authentication together may\ntake, and then each SFTP channel's start (default 30). A server that\naccepts and then stalls fails the run instead of hanging it.",
                       "type": [
                         "integer",
                         "string"
@@ -24869,7 +24873,7 @@
                       "default": {}
                     },
                     "max_object_bytes": {
-                      "description": "Largest file, in bytes, a format read whole into memory (JSON array,\nraw text, CSV, XML, Excel, Avro, ORC) may reach; a larger one fails\nwith an error naming it instead of exhausting memory. It also bounds one\nline of a streamed `jsonl` file, so a file with no newline fails the\nsame way; `parquet` streams and is not capped. Default 2 GiB.",
+                      "description": "Largest file, in bytes, a format read whole into memory (JSON array,\nraw text, CSV, XML, Excel, Avro, ORC) may reach; a larger one fails\nwith an error naming it instead of exhausting memory. It also bounds one\nline of a streamed `jsonl` file, so a file with no newline fails the\nsame way; `parquet` streams, and this caps one byte range it reads.\nDefault 2 GiB.",
                       "type": [
                         "integer",
                         "string"
@@ -24877,6 +24881,26 @@
                       "format": "uint64",
                       "minimum": 0,
                       "default": 2147483648
+                    },
+                    "max_listed_entries": {
+                      "description": "Entries one directory listing may scan (default 1,000,000). Every\nentry the server sends counts, whether or not it matches `glob`; a\ndirectory with more fails the run with an error naming this field.\nMust be at least 1.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 1000000
+                    },
+                    "list_timeout_secs": {
+                      "description": "Seconds the directory listing may take (default 300), including the\nstat of each symbolic link in it; a slower listing fails the run with\nan error naming this field. `0` is treated as `1`.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 300
                     }
                   }
                 },
@@ -25909,7 +25933,8 @@
                         "string",
                         "null"
                       ],
-                      "x-faucet-resource": "url"
+                      "x-faucet-resource": "url",
+                      "x-faucet-url-syntax": "ado"
                     },
                     "tls": {
                       "description": "TLS / encryption settings. Defaults to [`MssqlTlsMode::Prefer`].",
@@ -27833,7 +27858,8 @@
                     "brokers": {
                       "description": "Comma-separated bootstrap server list, e.g. `\"broker1:9092,broker2:9092\"`.",
                       "type": "string",
-                      "x-faucet-resource": "url"
+                      "x-faucet-resource": "url",
+                      "x-faucet-url-syntax": "url-list"
                     },
                     "topics": {
                       "description": "One or more topics to subscribe to.",
@@ -29299,7 +29325,8 @@
                         "string",
                         "null"
                       ],
-                      "x-faucet-resource": "url"
+                      "x-faucet-resource": "url",
+                      "x-faucet-url-syntax": "oracle"
                     },
                     "host": {
                       "description": "Database host. Mutually exclusive with `connect_string`.",
@@ -29517,7 +29544,8 @@
                         "string",
                         "null"
                       ],
-                      "x-faucet-resource": "url"
+                      "x-faucet-resource": "url",
+                      "x-faucet-url-syntax": "oracle"
                     },
                     "host": {
                       "description": "Database host. Mutually exclusive with `connect_string`.",
@@ -31301,7 +31329,8 @@
                         "string",
                         "null"
                       ],
-                      "x-faucet-resource": "url"
+                      "x-faucet-resource": "url",
+                      "x-faucet-url-syntax": "ado"
                     },
                     "tls": {
                       "description": "TLS / encryption settings. Defaults to [`MssqlTlsMode::Prefer`].",
@@ -31909,7 +31938,8 @@
                       "default": [
                         "nats://127.0.0.1:4222"
                       ],
-                      "x-faucet-resource": "url"
+                      "x-faucet-resource": "url",
+                      "x-faucet-url-syntax": "url-list"
                     },
                     "auth": {
                       "description": "Authentication mode. Defaults to `none` (anonymous).",
@@ -32297,7 +32327,7 @@
                       }
                     },
                     "connect_timeout_secs": {
-                      "description": "Seconds the TCP connect, SSH handshake, authentication and the SFTP\nsubsystem start together may take (default 30). A server that accepts and then stalls fails the run\ninstead of hanging it.",
+                      "description": "Seconds the TCP connect, SSH handshake and authentication together may\ntake, and then each SFTP channel's start (default 30). A server that\naccepts and then stalls fails the run instead of hanging it.",
                       "type": [
                         "integer",
                         "string"
@@ -32456,6 +32486,16 @@
                         "null"
                       ],
                       "x-faucet-resource": "path"
+                    },
+                    "max_listed_entries": {
+                      "description": "Entries one directory listing may scan (default 1,000,000). The sink\nlists its output directory, for example to remove files of an earlier\nrun or finish an interrupted overwrite; every entry the server sends\ncounts, and a directory with more fails the call with an error naming\nthis field. Must be at least 1.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 1000000
                     }
                   },
                   "oneOf": [
@@ -33473,7 +33513,8 @@
                     "brokers": {
                       "description": "Comma-separated `host:port` bootstrap brokers, passed straight through\nas librdkafka's `bootstrap.servers` (e.g. `\"b1:9092,b2:9092\"`).\nRequired; a blank value is rejected at config load.",
                       "type": "string",
-                      "x-faucet-resource": "url"
+                      "x-faucet-resource": "url",
+                      "x-faucet-url-syntax": "url-list"
                     },
                     "topic": {
                       "description": "Destination topic. Either a fixed name\n(`{ type: fixed, name: events }`) or a per-record JSONPath lookup\n(`{ type: from_path, path: \"$.dest\" }`) for multi-topic routing.\nRequired.",
@@ -36264,7 +36305,8 @@
                         "string",
                         "null"
                       ],
-                      "x-faucet-resource": "url"
+                      "x-faucet-resource": "url",
+                      "x-faucet-url-syntax": "oracle"
                     },
                     "host": {
                       "description": "Database host. Mutually exclusive with `connect_string`.",

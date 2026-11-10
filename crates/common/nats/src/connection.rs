@@ -60,7 +60,7 @@ struct NatsConnectionWire {
     /// client connects to the first reachable server and uses the rest for
     /// failover.
     #[serde(default = "default_servers")]
-    #[schemars(extend("x-faucet-resource" = "url"))]
+    #[schemars(extend("x-faucet-resource" = "url", "x-faucet-url-syntax" = "url-list"))]
     servers: Vec<String>,
     /// Authentication mode. Defaults to `none` (anonymous).
     #[serde(default)]

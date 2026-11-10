@@ -39,16 +39,24 @@ Connection, authentication, and host-key verification come from
 | `username` | string | — | SSH username. |
 | `type` / `config` | auth | — | `password` or `private_key` (see `faucet-common-sftp`). |
 | `known_hosts` | policy | `{ mode: accept_new }` | Host-key verification policy. Wildcard host patterns and `@revoked` keys are honoured; a host trusted only through `@cert-authority` is refused (host certificates are not supported). |
-| `connect_timeout_secs` | integer | `30` | Seconds the TCP connect, SSH handshake, authentication and SFTP subsystem start together may take; a server that accepts and stalls fails the run. |
+| `connect_timeout_secs` | integer | `30` | Seconds the TCP connect, SSH handshake and authentication together may take, and then each SFTP channel's start; a server that accepts and stalls fails the run. |
 | `keepalive_interval_secs` | integer | `15` | Seconds between SSH keepalives on a quiet connection; dropped after three unanswered. `0` disables them. |
 | `path` | string | — | Remote directory prefix under which objects are written. |
 | `format` | enum | `json_lines` | `json_lines` \| `json_array` \| `csv` \| `xml` \| `xlsx` — see [File formats](#file-formats-604). |
 | `file_extension` | string | `.jsonl` | Extension for written objects. |
 | `batch_size` | integer | `1000` | Records per file when `max_records_per_file` is unset (without `file_name`). `0` = no record cap: one file per `flush`; Parquet one per `write_batch`. |
 | `concurrency` | integer | `4` | File uploads in flight over the SSH session: a closed file uploads in the background while the next is encoded. `flush` waits for every upload. |
+| `max_listed_entries` | integer | `1000000` | Entries one directory listing may scan. The sink lists its output directory, for example to remove files of an earlier run or finish an interrupted overwrite; every entry the server sends counts, and a directory with more fails the call with an error naming this field. Must be at least 1. |
 
 The sink opens the SSH connection lazily on the first write and reuses it. It
 attempts to create the target directory on first connect (best-effort).
+
+Listings run on a second SSH channel of the connection, opened at connect
+when the server allows it, else for each listing. A server that allows one
+session per connection (`MaxSessions 1`) refuses that channel, so a write
+that needs a listing fails there with an error naming the session limit.
+Every SFTP packet the server sends is limited to 1 MiB + 64 bytes; a longer
+one closes the channel and fails the call with an error naming the limit.
 
 ## Example
 

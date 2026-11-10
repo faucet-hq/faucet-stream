@@ -3,12 +3,16 @@
 //! [`Client`] wraps a `reqwest::Client` and adds what each HTTP connector
 //! used to write for itself, sometimes wrongly:
 //!
-//! - **Redirects that drop credentials.** Redirects are followed here, not by
-//!   reqwest, so a hop to another origin (scheme, host or port) drops the
-//!   `Authorization`, `Cookie` and `Proxy-Authorization` headers, every header
-//!   marked sensitive, and every header named with
-//!   [`ClientBuilder::sensitive_header`] (an API-key header). reqwest's own
-//!   policy only knows the standard headers.
+//! - **Redirects that keep only standard headers.** Redirects are followed
+//!   here, not by reqwest, so a hop to another origin (scheme, host or port)
+//!   drops the `Authorization`, `Cookie` and `Proxy-Authorization` headers,
+//!   every header marked sensitive, and every header named with
+//!   [`ClientBuilder::sensitive_header`] (an API-key header), and then keeps
+//!   only the headers in [`CROSS_ORIGIN_SAFE_HEADERS`]. Any other header may
+//!   carry a credential under a name nobody registered, so it stays with the
+//!   origin it was set for. A hop to a host declared with
+//!   [`ClientBuilder::credential_hosts`] over the same scheme keeps every
+//!   header. A body is never replayed to another origin.
 //! - **Redirect targets are checked.** A redirect into a link-local or cloud
 //!   instance-metadata address is always refused. A host *name* is judged by
 //!   the addresses it resolves to, at connection time: the client's resolver
@@ -73,6 +77,159 @@ pub const DEFAULT_MAX_RESPONSE_BYTES: u64 = 1 << 30;
 /// The most redirects one request follows by default.
 pub const DEFAULT_MAX_REDIRECTS: usize = 10;
 
+/// The request headers a redirect to another origin keeps (lower-case names).
+/// Every other header is dropped on such a hop, unless the target is a
+/// [credential host](ClientBuilder::credential_hosts).
+pub const CROSS_ORIGIN_SAFE_HEADERS: &[&str] = &[
+    "accept",
+    "accept-charset",
+    "accept-encoding",
+    "accept-language",
+    "cache-control",
+    "content-type",
+    "user-agent",
+    "range",
+    "if-range",
+    "if-match",
+    "if-none-match",
+    "if-modified-since",
+    "if-unmodified-since",
+    "prefer",
+    "odata-version",
+    "odata-maxversion",
+    "traceparent",
+    "tracestate",
+];
+
+/// Drop every header not in [`CROSS_ORIGIN_SAFE_HEADERS`].
+pub fn retain_cross_origin_safe(headers: &mut HeaderMap) {
+    let dropped: Vec<HeaderName> = headers
+        .keys()
+        .filter(|k| !CROSS_ORIGIN_SAFE_HEADERS.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    for name in dropped {
+        headers.remove(&name);
+    }
+}
+
+/// One [`ClientBuilder::credential_hosts`] entry: a host a request may carry
+/// its credentials to.
+///
+/// A bare host (`files.example.net`) matches that host on any port; a host and
+/// port (`files.example.net:443`) only that port, even when it is the scheme's
+/// default; `*.suffix` any subdomain on any port. Any of them may be written
+/// behind `scheme://`, which then has to match too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialHost {
+    scheme: Option<String>,
+    host: HostPattern,
+    port: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HostPattern {
+    Exact(String),
+    Suffix(String),
+}
+
+impl CredentialHost {
+    /// Parse `host`, `host:port`, `*.suffix`, or any of them behind
+    /// `scheme://`; `None` for anything else.
+    pub fn parse(entry: &str) -> Option<Self> {
+        let entry = entry.trim().to_ascii_lowercase();
+        let (scheme, rest) = match entry.split_once("://") {
+            Some((scheme, rest)) => (Some(scheme.to_string()), rest),
+            None => (None, entry.as_str()),
+        };
+        if scheme.as_deref().is_some_and(str::is_empty) {
+            return None;
+        }
+        let rest = rest.strip_suffix('/').unwrap_or(rest);
+        if rest.is_empty() || rest.contains(['/', '?', '#', '@']) {
+            return None;
+        }
+        if let Some(suffix) = rest.strip_prefix("*.") {
+            if suffix.is_empty() || suffix.contains([':', '*']) {
+                return None;
+            }
+            return Some(Self {
+                scheme,
+                host: HostPattern::Suffix(suffix.to_string()),
+                port: None,
+            });
+        }
+        let (host, port) = split_authority(rest)?;
+        let url = Url::parse(&format!(
+            "{}://{host}",
+            scheme.as_deref().unwrap_or("https")
+        ))
+        .ok()?;
+        Some(Self {
+            host: HostPattern::Exact(url.host_str()?.to_string()),
+            port,
+            scheme,
+        })
+    }
+
+    /// Whether `to` is this host.
+    pub fn matches(&self, to: &Url) -> bool {
+        let Some(host) = to.host_str() else {
+            return false;
+        };
+        if self.scheme.as_deref().is_some_and(|s| s != to.scheme()) {
+            return false;
+        }
+        match &self.host {
+            HostPattern::Suffix(suffix) => host
+                .strip_suffix(suffix.as_str())
+                .and_then(|label| label.strip_suffix('.'))
+                .is_some_and(|label| !label.is_empty()),
+            HostPattern::Exact(exact) => {
+                host == exact
+                    && self
+                        .port
+                        .is_none_or(|port| to.port_or_known_default() == Some(port))
+            }
+        }
+    }
+}
+
+/// Split `host[:port]` (an IPv6 host in brackets), keeping a written port even
+/// when it is the scheme's default. `None` for an empty or malformed port.
+fn split_authority(authority: &str) -> Option<(&str, Option<u16>)> {
+    let (host, port) = if authority.starts_with('[') {
+        let end = authority.find(']')?;
+        let (host, tail) = authority.split_at(end + 1);
+        match tail {
+            "" => (host, None),
+            _ => (host, Some(tail.strip_prefix(':')?)),
+        }
+    } else {
+        match authority.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        }
+    };
+    if host.is_empty() {
+        return None;
+    }
+    let port = match port {
+        Some(p) if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) => return None,
+        Some(p) => Some(p.parse().ok()?),
+        None => None,
+    };
+    Some((host, port))
+}
+
+/// Whether a request that started at `from` may carry its credentials to
+/// `to`: the same origin, or one of `hosts` reached over the same scheme. The
+/// rule a [`Client`] applies to a redirect, for callers that follow a
+/// server-given link themselves.
+pub fn keeps_credentials(hosts: &[CredentialHost], from: &Url, to: &Url) -> bool {
+    !is_cross_origin(from, to) || keeps_headers(hosts, from, to)
+}
+
 /// A response body was larger than the client's
 /// [`max_response_bytes`](ClientBuilder::max_response_bytes). Carried in
 /// [`FaucetError::Custom`]; downcast to read it.
@@ -103,6 +260,8 @@ pub struct ClientBuilder {
     max_response_bytes: Option<u64>,
     max_redirects: usize,
     sensitive: Vec<HeaderName>,
+    defaults: HeaderMap,
+    credential_hosts: Vec<CredentialHost>,
     policy: Option<Arc<ReferencePolicy>>,
     lookup: Lookup,
     direct_only: bool,
@@ -115,6 +274,7 @@ impl fmt::Debug for ClientBuilder {
             .field("max_response_bytes", &self.max_response_bytes)
             .field("max_redirects", &self.max_redirects)
             .field("sensitive", &self.sensitive)
+            .field("credential_hosts", &self.credential_hosts)
             .finish_non_exhaustive()
     }
 }
@@ -135,6 +295,8 @@ impl ClientBuilder {
             max_response_bytes: Some(DEFAULT_MAX_RESPONSE_BYTES),
             max_redirects: DEFAULT_MAX_REDIRECTS,
             sensitive: Vec::new(),
+            defaults: HeaderMap::new(),
+            credential_hosts: Vec::new(),
             policy: None,
             lookup: system_lookup(),
             direct_only: false,
@@ -167,9 +329,39 @@ impl ClientBuilder {
         self
     }
 
-    /// Send `headers` on every request.
+    /// Send `headers` on every request that does not set them itself. They are
+    /// part of the request like any other header, so a redirect to another
+    /// origin keeps only the [standard ones](CROSS_ORIGIN_SAFE_HEADERS). A
+    /// later call replaces the values of the names it repeats.
     pub fn default_headers(mut self, headers: HeaderMap) -> Self {
-        self.inner = self.inner.default_headers(headers);
+        for name in headers.keys() {
+            self.defaults.remove(name);
+            for value in headers.get_all(name) {
+                self.defaults.append(name.clone(), value.clone());
+            }
+        }
+        self
+    }
+
+    /// Hosts a redirect may carry every request header to, credentials
+    /// included, when the hop keeps its scheme. Each entry is a host
+    /// (`files.example.net`, any port), a host and port
+    /// (`files.example.net:8443`, only that port), a subdomain pattern
+    /// (`*.blob.example.org`, any port), or any of these behind a scheme
+    /// (`https://files.example.net`). An entry of any other shape matches
+    /// nothing. A same-origin hop always keeps every header; a hop that
+    /// changes the scheme, such as https to http, never keeps more than the
+    /// standard ones.
+    pub fn credential_hosts<I, S>(mut self, hosts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.credential_hosts.extend(
+            hosts
+                .into_iter()
+                .filter_map(|h| CredentialHost::parse(h.as_ref())),
+        );
         self
     }
 
@@ -282,7 +474,10 @@ impl ClientBuilder {
 
     /// Set any other reqwest option: `|b| b.gzip(true)`, an identity, root
     /// certificates. Don't set a redirect policy here — redirects are followed
-    /// by [`Client::send`], which strips credentials on a cross-origin hop.
+    /// by [`Client::send`], which keeps only standard headers on a cross-origin
+    /// hop. Don't set default headers here either: reqwest adds those to every
+    /// request it sends, redirect hops included; use
+    /// [`default_headers`](Self::default_headers).
     pub fn configure(
         mut self,
         f: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
@@ -307,7 +502,9 @@ impl ClientBuilder {
     /// whose public API already hands out a reqwest client. It follows
     /// same-origin redirects only; prefer [`build`](Self::build), which also
     /// follows cross-origin hops safely and bounds reads.
-    pub fn build_reqwest(self) -> Result<reqwest::Client, FaucetError> {
+    pub fn build_reqwest(mut self) -> Result<reqwest::Client, FaucetError> {
+        let defaults = std::mem::take(&mut self.defaults);
+        self.inner = self.inner.default_headers(defaults);
         Ok(self.build()?.inner)
     }
 
@@ -330,6 +527,8 @@ impl ClientBuilder {
             max_response_bytes: self.max_response_bytes,
             max_redirects: self.max_redirects,
             sensitive: self.sensitive.into(),
+            defaults: self.defaults,
+            credential_hosts: self.credential_hosts.into(),
             policy: self.policy,
             lookup: self.lookup,
             direct_only: self.direct_only,
@@ -430,6 +629,8 @@ pub struct Client {
     max_response_bytes: Option<u64>,
     max_redirects: usize,
     sensitive: Arc<[HeaderName]>,
+    defaults: HeaderMap,
+    credential_hosts: Arc<[CredentialHost]>,
     policy: Option<Arc<ReferencePolicy>>,
     lookup: Lookup,
     direct_only: bool,
@@ -533,6 +734,7 @@ impl fmt::Debug for Client {
             .field("max_response_bytes", &self.max_response_bytes)
             .field("max_redirects", &self.max_redirects)
             .field("sensitive", &self.sensitive)
+            .field("credential_hosts", &self.credential_hosts)
             .finish_non_exhaustive()
     }
 }
@@ -548,10 +750,19 @@ impl Client {
         ClientBuilder::new()
     }
 
+    /// Whether a request sent from `from` carried its credentials to `to`
+    /// when a redirect ended there ([`keeps_credentials`] over this client's
+    /// [credential hosts](ClientBuilder::credential_hosts)).
+    pub fn keeps_credentials(&self, from: &Url, to: &Url) -> bool {
+        keeps_credentials(&self.credential_hosts, from, to)
+    }
+
     /// The underlying reqwest client, for request shapes this type does not
     /// cover. It follows same-origin redirects only: a request sent straight
-    /// from it gets a cross-origin 3xx back instead of following it. Send
-    /// through [`send`](Self::send) to follow those with credentials stripped.
+    /// from it gets a cross-origin 3xx back instead of following it, and it
+    /// does not add the builder's
+    /// [default headers](ClientBuilder::default_headers). Send through
+    /// [`send`](Self::send) to follow those hops with only standard headers.
     pub fn inner(&self) -> &reqwest::Client {
         &self.inner
     }
@@ -602,6 +813,13 @@ impl Client {
     pub async fn send_request(&self, request: Request) -> Result<Response, FaucetError> {
         let policy = self.policy.clone().or_else(current_reference_policy);
         let mut current = request;
+        for name in self.defaults.keys() {
+            if !current.headers().contains_key(name) {
+                for value in self.defaults.get_all(name) {
+                    current.headers_mut().append(name.clone(), value.clone());
+                }
+            }
+        }
         let mut hops = 0usize;
         loop {
             guard_target(policy.as_deref(), current.url(), hops)?;
@@ -654,6 +872,7 @@ impl Client {
                     body: format!("too many redirects (more than {})", self.max_redirects),
                 });
             }
+            let keep_headers = keeps_headers(&self.credential_hosts, &from, &next_url);
             let Some(next) = redirect_request(
                 status,
                 method,
@@ -662,6 +881,7 @@ impl Client {
                 headers,
                 template,
                 &self.sensitive,
+                keep_headers,
             ) else {
                 return Ok(resp);
             };
@@ -754,9 +974,18 @@ impl Client {
     }
 }
 
+/// Whether a redirect from `from` to `to` keeps every header: `to` is a
+/// credential host and the hop keeps its scheme.
+fn keeps_headers(hosts: &[CredentialHost], from: &Url, to: &Url) -> bool {
+    from.scheme() == to.scheme() && hosts.iter().any(|h| h.matches(to))
+}
+
 /// The request for the next redirect hop, or `None` when the hop is not
 /// followed: a streamed body cannot be replayed, and a body is never replayed
-/// to another origin (it may carry credentials, like a token form).
+/// to another origin (it may carry credentials, like a token form). A hop to
+/// another origin keeps only standard headers unless `keep_headers` (a
+/// credential host reached over the same scheme).
+#[allow(clippy::too_many_arguments)]
 fn redirect_request(
     status: StatusCode,
     method: Method,
@@ -765,13 +994,28 @@ fn redirect_request(
     mut headers: HeaderMap,
     template: Option<Request>,
     sensitive: &[HeaderName],
+    keep_headers: bool,
 ) -> Option<Request> {
     let to_get = status == StatusCode::SEE_OTHER
         || ((status == StatusCode::MOVED_PERMANENTLY || status == StatusCode::FOUND)
             && method == Method::POST);
     let cross = is_cross_origin(from, &to);
-    if cross {
+    if cross && !keep_headers {
+        let before: Vec<HeaderName> = headers.keys().cloned().collect();
         strip_credentials(&mut headers, sensitive);
+        retain_cross_origin_safe(&mut headers);
+        let dropped: Vec<&str> = before
+            .iter()
+            .filter(|k| !headers.contains_key(*k))
+            .map(HeaderName::as_str)
+            .collect();
+        if !dropped.is_empty() {
+            tracing::debug!(
+                to = %to.origin().ascii_serialization(),
+                dropped = ?dropped,
+                "a redirect to another origin keeps only standard request headers"
+            );
+        }
     }
     let mut next = if to_get {
         for h in [
@@ -987,15 +1231,15 @@ mod tests {
                 .header("x-api-key", "k")
                 .header("x-session", secret.clone())
                 .header("cookie", "a=b")
-                .header("x-trace", "t")
+                .header("traceparent", "t")
         };
         let resp = client.send(req("/start")).await.unwrap();
         assert_eq!(resp.status(), 200);
         assert!(resp.url().as_str().ends_with("/land"));
         for h in ["authorization", "x-api-key", "x-session", "cookie"] {
-            assert!(!has(&seen, "other", h), "{h} leaked cross-origin");
+            assert!(!has(&seen, "other", h), "{h} sent cross-origin");
         }
-        assert!(has(&seen, "other", "x-trace"));
+        assert!(has(&seen, "other", "traceparent"));
         let resp = client
             .send(
                 client
@@ -1013,6 +1257,338 @@ mod tests {
         for h in ["authorization", "x-api-key", "x-session", "cookie"] {
             assert!(has(&seen, "same", h), "{h} kept on a same-origin hop");
         }
+    }
+
+    /// `(origin, other)`: `origin/start` answers 302 to `other/land`, and
+    /// `origin/here` records what it received under `"same"`.
+    async fn origin_and_other(seen: &Seen) -> (String, String) {
+        let other = serve(Router::new().route("/land", get(recorder(seen.clone(), "other")))).await;
+        let to = format!("{other}/land");
+        let origin = serve(
+            Router::new()
+                .route(
+                    "/start",
+                    get(move || {
+                        let to = to.clone();
+                        async move { (AxStatus::FOUND, [("location", to)]).into_response() }
+                    }),
+                )
+                .route("/here", get(recorder(seen.clone(), "same"))),
+        )
+        .await;
+        (origin, other)
+    }
+
+    fn header_names(seen: &Seen, hop: &str) -> Vec<String> {
+        let mut names: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(n, _)| n == hop)
+            .flat_map(|(_, h)| h.iter().map(|(k, _)| k.clone()))
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    #[tokio::test]
+    async fn a_cross_origin_redirect_keeps_only_standard_headers() {
+        let seen: Seen = Arc::default();
+        let (origin, _) = origin_and_other(&seen).await;
+        let client = Client::new().unwrap();
+        let resp = client
+            .send(
+                client
+                    .get(format!("{origin}/start"))
+                    .header("x-custom-token", "dummy-config")
+                    .header("x-provider-key", "dummy-provider")
+                    .header("accept", "application/json")
+                    .header("if-none-match", "\"v1\"")
+                    .header("prefer", "odata.maxpagesize=10")
+                    .header("odata-version", "4.0")
+                    .header("tracestate", "k=v"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let names = header_names(&seen, "other");
+        for kept in [
+            "accept",
+            "if-none-match",
+            "odata-version",
+            "prefer",
+            "tracestate",
+        ] {
+            assert!(names.iter().any(|n| n == kept), "{kept} missing: {names:?}");
+        }
+        for dropped in ["x-custom-token", "x-provider-key"] {
+            assert!(
+                !names.iter().any(|n| n == dropped),
+                "{dropped} sent: {names:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_a_credential_host_keeps_headers() {
+        let seen: Seen = Arc::default();
+        let (origin, other) = origin_and_other(&seen).await;
+        let other_url = Url::parse(&other).unwrap();
+        let authority = format!(
+            "{}:{}",
+            other_url.host_str().unwrap(),
+            other_url.port().unwrap()
+        );
+        for entry in [authority.clone(), format!("http://{authority}/")] {
+            seen.lock().unwrap().clear();
+            let client = Client::builder()
+                .credential_hosts(["not a host/", entry.as_str()])
+                .sensitive_header("x-api-key")
+                .build()
+                .unwrap();
+            let resp = client
+                .send(
+                    client
+                        .get(format!("{origin}/start"))
+                        .bearer_auth("dummy-token")
+                        .header("x-api-key", "dummy-key")
+                        .header("x-custom-token", "dummy-config"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            for h in ["authorization", "x-api-key", "x-custom-token"] {
+                assert!(has(&seen, "other", h), "{h} dropped for {entry}");
+            }
+        }
+        seen.lock().unwrap().clear();
+        let client = Client::builder()
+            .credential_hosts([format!("https://{authority}")])
+            .build()
+            .unwrap();
+        client
+            .send(
+                client
+                    .get(format!("{origin}/start"))
+                    .header("x-custom-token", "dummy-config"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !has(&seen, "other", "x-custom-token"),
+            "an entry for another scheme does not match"
+        );
+    }
+
+    #[test]
+    fn a_downgrade_redirect_to_a_credential_host_strips_headers() {
+        let hosts: Vec<CredentialHost> = ["files.example.net", "*.blob.example.org"]
+            .iter()
+            .filter_map(|h| CredentialHost::parse(h))
+            .collect();
+        let u = |s: &str| Url::parse(s).unwrap();
+        let from = u("https://api.example.com/x");
+        assert!(keeps_headers(
+            &hosts,
+            &from,
+            &u("https://files.example.net/f")
+        ));
+        assert!(!keeps_headers(
+            &hosts,
+            &from,
+            &u("http://files.example.net/f")
+        ));
+        assert!(keeps_headers(
+            &hosts,
+            &from,
+            &u("https://a.blob.example.org:8443/f")
+        ));
+        assert!(!keeps_headers(
+            &hosts,
+            &from,
+            &u("http://a.blob.example.org/f")
+        ));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-custom-token", "dummy".parse().unwrap());
+        headers.insert("accept", "application/json".parse().unwrap());
+        let next = redirect_request(
+            StatusCode::SEE_OTHER,
+            Method::GET,
+            &from,
+            u("http://files.example.net/f"),
+            headers,
+            None,
+            &[],
+            keeps_headers(&hosts, &from, &u("http://files.example.net/f")),
+        )
+        .unwrap();
+        assert!(next.headers().get("x-custom-token").is_none());
+        assert_eq!(next.headers().get("accept").unwrap(), "application/json");
+    }
+
+    #[test]
+    fn credential_host_entries_parse_and_match() {
+        let m = |entry: &str, url: &str| {
+            CredentialHost::parse(entry)
+                .unwrap_or_else(|| panic!("{entry} did not parse"))
+                .matches(&Url::parse(url).unwrap())
+        };
+        assert!(m("Files.Example.NET", "https://files.example.net/x"));
+        assert!(m("files.example.net", "http://files.example.net/x"));
+        assert!(m("files.example.net", "https://files.example.net:8443/x"));
+        assert!(m(
+            "files.example.net:8443",
+            "https://files.example.net:8443/x"
+        ));
+        assert!(!m("files.example.net:8443", "https://files.example.net/x"));
+        assert!(m(
+            "https://files.example.net:443",
+            "https://files.example.net/x"
+        ));
+        assert!(!m(
+            "https://files.example.net",
+            "http://files.example.net/x"
+        ));
+        assert!(m("*.blob.example.org", "https://a.b.blob.example.org:9/x"));
+        assert!(!m("*.blob.example.org", "https://blob.example.org/x"));
+        assert!(!m("*.blob.example.org", "https://ablob.example.org/x"));
+        assert!(!m(
+            "https://*.blob.example.org",
+            "http://a.blob.example.org/x"
+        ));
+        assert!(!m("files.example.net", "data:text/plain,hi"));
+        for bad in [
+            "",
+            "  ",
+            "files.example.net/path",
+            "user@files.example.net",
+            "*.",
+            "*.example.org:443",
+            "*.*.example.org",
+            "files.example.net?x",
+            "https://",
+            "bad host",
+            "files.example.net:",
+            "files.example.net:x1",
+            "files.example.net:99999",
+            "://files.example.net",
+            "::1",
+        ] {
+            assert!(CredentialHost::parse(bad).is_none(), "{bad:?} parsed");
+        }
+    }
+
+    #[test]
+    fn an_explicit_port_is_kept_and_matched_exactly() {
+        let host = CredentialHost::parse("files.example.net:443").unwrap();
+        let u = |s: &str| Url::parse(s).unwrap();
+        assert!(host.matches(&u("https://files.example.net/x")));
+        assert!(!host.matches(&u("http://files.example.net/x")));
+        assert!(!host.matches(&u("https://files.example.net:8443/x")));
+        let http = CredentialHost::parse("http://files.example.net:80").unwrap();
+        assert!(http.matches(&u("http://files.example.net/x")));
+        assert!(!http.matches(&u("http://files.example.net:8080/x")));
+        let v6 = CredentialHost::parse("[::1]:8443").unwrap();
+        assert!(v6.matches(&u("https://[::1]:8443/x")));
+        assert!(!v6.matches(&u("https://[::1]/x")));
+        assert!(
+            CredentialHost::parse("[::1]")
+                .unwrap()
+                .matches(&u("http://[::1]:9/x"))
+        );
+        assert!(CredentialHost::parse("[::1]x").is_none());
+        assert!(CredentialHost::parse("[::1").is_none());
+
+        let hosts = [host];
+        let from = u("https://api.example.com/x");
+        assert!(keeps_credentials(
+            &hosts,
+            &from,
+            &u("https://files.example.net/f")
+        ));
+        assert!(!keeps_credentials(
+            &hosts,
+            &from,
+            &u("http://files.example.net/f")
+        ));
+        assert!(!keeps_credentials(
+            &hosts,
+            &from,
+            &u("https://files.example.net:8443/f")
+        ));
+        assert!(keeps_credentials(
+            &hosts,
+            &from,
+            &u("https://api.example.com:443/y")
+        ));
+        let client = Client::builder()
+            .credential_hosts(["files.example.net:443"])
+            .build()
+            .unwrap();
+        assert!(client.keeps_credentials(&from, &u("https://files.example.net/f")));
+        assert!(!client.keeps_credentials(&from, &u("http://files.example.net/f")));
+    }
+
+    #[tokio::test]
+    async fn default_headers_are_not_sent_across_origins() {
+        let seen: Seen = Arc::default();
+        let (origin, _) = origin_and_other(&seen).await;
+        let mut defaults = HeaderMap::new();
+        defaults.insert("x-default-key", "dummy-default".parse().unwrap());
+        defaults.insert("accept", "text/plain".parse().unwrap());
+        let mut later = HeaderMap::new();
+        later.insert("accept", "application/json".parse().unwrap());
+        let builder = || {
+            Client::builder()
+                .default_headers(defaults.clone())
+                .default_headers(later.clone())
+        };
+        let client = builder().build().unwrap();
+        client
+            .send(client.get(format!("{origin}/here")))
+            .await
+            .unwrap();
+        assert!(has(&seen, "same", "x-default-key"));
+        client
+            .send(client.get(format!("{origin}/start")))
+            .await
+            .unwrap();
+        let names = header_names(&seen, "other");
+        assert!(!names.iter().any(|n| n == "x-default-key"), "{names:?}");
+        let accept = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(n, _)| n == "other")
+            .and_then(|(_, h)| {
+                h.iter()
+                    .find(|(k, _)| k == "accept")
+                    .map(|(_, v)| v.clone())
+            });
+        assert_eq!(accept.as_deref(), Some("application/json"));
+
+        seen.lock().unwrap().clear();
+        client
+            .send(
+                client
+                    .get(format!("{origin}/here"))
+                    .header("x-default-key", "dummy-own"),
+            )
+            .await
+            .unwrap();
+        let own = seen.lock().unwrap()[0]
+            .1
+            .iter()
+            .filter(|(k, _)| k == "x-default-key")
+            .map(|(_, v)| v.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(own, vec!["dummy-own".to_string()]);
+
+        seen.lock().unwrap().clear();
+        let plain = builder().build_reqwest().unwrap();
+        plain.get(format!("{origin}/here")).send().await.unwrap();
+        assert!(has(&seen, "same", "x-default-key"));
     }
 
     fn redirector(to: String) -> Router {

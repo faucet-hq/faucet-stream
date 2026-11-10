@@ -785,6 +785,9 @@ fn expand_plain(location: &str) -> Result<Vec<PathBuf>, FaucetError> {
         }
     };
     files.sort();
+    for f in &files {
+        faucet_core::path_guard::check(f)?;
+    }
     if files.is_empty() {
         return Err(FaucetError::Config(format!(
             "DLQ location '{location}' matched no files (expected a .jsonl file, a directory of \

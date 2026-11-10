@@ -282,11 +282,18 @@ pub const LOCAL_PATH_KINDS: &[&str] = &[
     "file", "csv", "jsonl", "parquet", "sqlite", "duckdb", "delta", "iceberg",
 ];
 
+/// Paths are kept both as given (made absolute) and as they resolved when
+/// protected; the given form is resolved again for checks (at most
+/// [`RESOLVED_TTL`] apart), so a path whose ancestor symlink was swapped since
+/// (a mounted config volume) still matches.
 #[derive(Default)]
 struct Protected {
     env: std::collections::BTreeSet<String>,
     files: std::collections::BTreeSet<std::path::PathBuf>,
     dirs: std::collections::BTreeSet<std::path::PathBuf>,
+    /// Directories in which every environment file name is protected,
+    /// whether the file exists yet or not.
+    env_dirs: std::collections::BTreeSet<std::path::PathBuf>,
     own_state: std::collections::BTreeSet<std::path::PathBuf>,
     secrets: std::collections::BTreeSet<(String, String)>,
 }
@@ -296,27 +303,69 @@ fn protected() -> &'static std::sync::RwLock<Protected> {
     P.get_or_init(Default::default)
 }
 
+/// Bumped by every write to [`protected`], so a cached [`Resolved`] snapshot
+/// taken before it is never reused.
+static PROTECTED_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A write guard over [`protected`] that invalidates the [`resolved`]
+/// snapshot when dropped.
+struct ProtectedWrite(std::sync::RwLockWriteGuard<'static, Protected>);
+
+impl std::ops::Deref for ProtectedWrite {
+    type Target = Protected;
+    fn deref(&self) -> &Protected {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ProtectedWrite {
+    fn deref_mut(&mut self) -> &mut Protected {
+        &mut self.0
+    }
+}
+
+impl Drop for ProtectedWrite {
+    fn drop(&mut self) {
+        PROTECTED_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn protected_write() -> Option<ProtectedWrite> {
+    protected().write().ok().map(ProtectedWrite)
+}
+
 /// Mark an environment variable the server read a credential from (an
 /// `--auth-config` token) so no loaded config can resolve it.
 pub fn protect_env(name: &str) {
-    if let Ok(mut p) = protected().write() {
+    if let Some(mut p) = protected_write() {
         p.env.insert(name.to_string());
     }
 }
 
 /// Mark a file the server read a credential from, as [`protect_env`].
 pub fn protect_file(path: &std::path::Path) {
-    if let Ok(mut p) = protected().write() {
-        p.files.insert(normalize_path(path));
+    let forms = path_forms(path);
+    if let Some(mut p) = protected_write() {
+        p.files.extend(forms);
     }
 }
 
 /// Mark a directory the server keeps its own files in (a file state store) so
 /// no loaded config reads or writes anything under it.
 pub fn protect_dir(path: &std::path::Path) {
-    if let Ok(mut p) = protected().write() {
-        p.dirs.insert(normalize_path(path));
+    let forms = path_forms(path);
+    if let Some(mut p) = protected_write() {
+        p.dirs.extend(forms);
     }
+}
+
+/// `path` made absolute without resolving anything, and resolved.
+fn path_forms(path: &std::path::Path) -> [std::path::PathBuf; 2] {
+    let absolute = match std::path::absolute(path) {
+        Ok(a) => lexical_normalize(&a),
+        Err(_) => lexical_normalize(path),
+    };
+    [absolute, normalize_path(path)]
 }
 
 /// Protect the file state store a `--default-config` keeps its bookmarks in:
@@ -328,10 +377,10 @@ pub fn protect_default_state(base: &Value) {
     if state["type"] == "file"
         && let Some(dir) = state["config"]["path"].as_str()
     {
-        let dir = normalize_path(std::path::Path::new(dir));
-        if let Ok(mut p) = protected().write() {
-            p.dirs.insert(dir.clone());
-            p.own_state.insert(dir);
+        let forms = path_forms(std::path::Path::new(dir));
+        if let Some(mut p) = protected_write() {
+            p.own_state.extend(forms.iter().cloned());
+            p.dirs.extend(forms);
         }
     }
 }
@@ -342,33 +391,63 @@ fn is_default_state(kind: &str, config: &Value) -> bool {
     kind == "file"
         && config["path"].as_str().is_some_and(|dir| {
             let dir = normalize_path(std::path::Path::new(dir));
-            protected()
+            let own = protected()
                 .read()
-                .map(|p| p.own_state.contains(&dir))
-                .unwrap_or(false)
+                .map(|p| p.own_state.clone())
+                .unwrap_or_default();
+            own.iter().any(|o| *o == dir || normalize_path(o) == dir)
         })
 }
 
-/// Protect the server's environment files: the one it loaded, and every
-/// `.env` / `.env.*` in its working directory whether loaded or not.
+/// Protect the server's environment files: the one it loaded, and every file
+/// named like one (`.env`, `.env.local`, `.envrc`, …) in its working directory or beside
+/// the loaded file, including files created after the server started.
 pub fn protect_env_files(cwd: &std::path::Path, loaded: Option<&std::path::Path>) {
+    let mut dirs = vec![cwd.to_path_buf()];
     if let Some(p) = loaded {
         protect_file(p);
-    }
-    if let Ok(entries) = std::fs::read_dir(cwd) {
-        for e in entries.flatten() {
-            if e.file_name().to_string_lossy().starts_with(".env") {
-                protect_file(&e.path());
-            }
+        if let Some(parent) = std::path::absolute(p)
+            .ok()
+            .and_then(|a| a.parent().map(Into::into))
+        {
+            dirs.push(parent);
         }
     }
+    let forms: Vec<_> = dirs.iter().flat_map(|d| path_forms(d)).collect();
+    if let Some(mut p) = protected_write() {
+        p.env_dirs.extend(forms);
+    }
 }
+
+/// Whether a file name is an environment file's (`.env`, `.env.local`,
+/// `.envrc`, …), compared without case so a case-insensitive filesystem's
+/// spellings match too.
+fn is_env_file_name(name: &std::ffi::OsStr) -> bool {
+    name.to_string_lossy()
+        .to_ascii_lowercase()
+        .starts_with(".env")
+}
+
+/// Environment file names a glob is tried against: the ones tools write.
+const ENV_FILE_NAMES: &[&str] = &[
+    ".env",
+    ".envrc",
+    ".env.local",
+    ".env.development",
+    ".env.development.local",
+    ".env.production",
+    ".env.production.local",
+    ".env.test",
+    ".env.test.local",
+    ".env.staging",
+    ".env.staging.local",
+];
 
 /// Mark a secret-manager reference (`${vault:…}`, …) the server resolved for
 /// its own use, so no loaded config can resolve it (or another `#field` of the
 /// same secret).
 pub fn protect_secret_ref(scheme: &str, reference: &str) {
-    if let Ok(mut p) = protected().write() {
+    if let Some(mut p) = protected_write() {
         p.secrets
             .insert((scheme.to_string(), secret_base(reference).to_string()));
     }
@@ -450,29 +529,39 @@ fn secret_screen(
 }
 
 fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
-    let absolute;
-    let path = if path.is_relative() {
-        absolute = std::env::current_dir()
+    /// Dangling symlinks followed before the rest of a path is taken as is.
+    const MAX_LINK_HOPS: usize = 40;
+    let mut path = if path.is_relative() {
+        std::env::current_dir()
             .map(|d| d.join(path))
-            .unwrap_or_else(|_| path.to_path_buf());
-        absolute.as_path()
+            .unwrap_or_else(|_| path.to_path_buf())
     } else {
-        path
+        path.to_path_buf()
     };
-    let mut existing = path;
-    let mut rest = Vec::new();
-    loop {
-        if let Ok(real) = std::fs::canonicalize(existing) {
-            return lexical_normalize(&rest.iter().rev().fold(real, |p, c| p.join(c)));
-        }
-        match (existing.parent(), existing.components().next_back()) {
-            (Some(parent), Some(last)) => {
-                rest.push(last.as_os_str().to_os_string());
-                existing = parent;
+    'hops: for _ in 0..MAX_LINK_HOPS {
+        let mut existing = path.as_path();
+        let mut rest = Vec::new();
+        loop {
+            if let Ok(real) = std::fs::canonicalize(existing) {
+                return lexical_normalize(&rest.iter().rev().fold(real, |p, c| p.join(c)));
             }
-            _ => return lexical_normalize(path),
+            // A link whose target does not exist yet: judge the path by
+            // where it points.
+            if let Ok(target) = std::fs::read_link(existing) {
+                let base = existing.parent().unwrap_or(std::path::Path::new("/"));
+                path = rest.iter().rev().fold(base.join(target), |p, c| p.join(c));
+                continue 'hops;
+            }
+            match (existing.parent(), existing.components().next_back()) {
+                (Some(parent), Some(last)) => {
+                    rest.push(last.as_os_str().to_os_string());
+                    existing = parent;
+                }
+                _ => return lexical_normalize(&path),
+            }
         }
     }
+    lexical_normalize(&path)
 }
 
 /// Resolve `.` and `..` without touching the filesystem, for a path that does
@@ -518,11 +607,18 @@ fn file_is_protected(path: &str) -> bool {
     if in_system_dir(&normalized) {
         return true;
     }
-    protected()
-        .read()
-        .map(|g| g.files.contains(&normalized))
-        .unwrap_or(true)
-        || protected_dirs(|d| normalized.starts_with(d))
+    resolved().is_none_or(|r| r.holds(&normalized))
+}
+
+/// Why a concrete local path a connector is about to list, open or replace is
+/// out of reach; `None` when it is not. What `faucet serve` installs as the
+/// [`faucet_core::path_guard`].
+pub fn server_file_refusal(path: &std::path::Path) -> Option<String> {
+    let normalized = normalize_path(path);
+    let refused = in_system_dir(path)
+        || in_system_dir(&normalized)
+        || resolved().is_none_or(|r| r.holds(&normalized));
+    refused.then(|| "is one of the server's own files".to_string())
 }
 
 /// How a connector touches a local path.
@@ -553,17 +649,23 @@ fn data_path_is_protected(path: &str, access: Access) -> bool {
         if in_system_dir(raw) || in_system_dir(&normalized) {
             return true;
         }
-        let recursive = matches!(access, Access::Read { recursive: true });
-        return protected_files(|f| match access {
-            Access::Write => f == normalized,
+        let Some(r) = resolved() else {
+            return true;
+        };
+        if r.holds(&normalized) {
+            return true;
+        }
+        return match access {
+            Access::Write => false,
             Access::Read { recursive } => {
-                f == normalized
-                    || f.parent() == Some(normalized.as_path())
-                    || (recursive && f.starts_with(&normalized))
+                r.files.iter().any(|f| {
+                    f.parent() == Some(normalized.as_path())
+                        || (recursive && f.starts_with(&normalized))
+                }) || (recursive && r.dirs.iter().any(|d| d.starts_with(&normalized)))
+                    || r.is_env_dir(&normalized)
+                    || (recursive && r.env_dirs.iter().any(|d| d.starts_with(&normalized)))
             }
-        }) || protected_dirs(|d| {
-            normalized.starts_with(d) || (recursive && d.starts_with(&normalized))
-        });
+        };
     }
     glob_is_protected(&pattern, access)
 }
@@ -587,11 +689,18 @@ fn glob_is_protected(pattern: &str, access: Access) -> bool {
     {
         return true;
     }
+    let Some(r) = resolved() else {
+        return true;
+    };
     let hit = match glob::Pattern::new(&full) {
-        Ok(p) => protected_files(|f| p.matches_path(f)),
-        Err(_) => protected_files(|f| f.starts_with(&dir)),
-    } || protected_dirs(|d| dir.starts_with(d) || d.starts_with(&dir));
-    hit || (matches!(access, Access::Read { .. }) && glob_match_escapes(&full))
+        Ok(p) => r.files.iter().any(|f| p.matches_path(f)),
+        Err(_) => r.files.iter().any(|f| f.starts_with(&dir)),
+    } || r
+        .dirs
+        .iter()
+        .any(|d| dir.starts_with(d) || d.starts_with(&dir))
+        || glob_reaches_env_file(&r, &full);
+    hit || (matches!(access, Access::Read { .. }) && glob_match_escapes(&r, &full))
 }
 
 /// Whether an absolute glob pattern could match a path in a system tree,
@@ -620,7 +729,7 @@ fn segments_can_reach(pattern: &[&str], target: &[&str]) -> bool {
 
 /// Whether an existing match of `pattern` resolves (through a symlink) into a
 /// system tree or onto a protected file.
-fn glob_match_escapes(pattern: &str) -> bool {
+fn glob_match_escapes(r: &Resolved, pattern: &str) -> bool {
     let Ok(matches) = glob::glob(pattern) else {
         return false;
     };
@@ -628,11 +737,190 @@ fn glob_match_escapes(pattern: &str) -> bool {
         .take(GLOB_CHECK_LIMIT)
         .filter_map(Result::ok)
         .filter_map(|p| std::fs::canonicalize(p).ok())
-        .any(|real| {
-            in_system_dir(&real)
-                || protected_files(|f| f == real)
-                || protected_dirs(|d| real.starts_with(d))
-        })
+        .any(|real| in_system_dir(&real) || r.holds(&real))
+}
+
+/// Whether a glob could reach an environment file (or a directory named like
+/// one) directly in a protected directory (see [`segment_can_be_env_name`]). Segments are matched the way a listing
+/// walks them (`*` stays within a segment, `**` spans any number). A glob that
+/// matches only by a leading wildcard (`*.csv` against a later `.env.csv`) is
+/// left to [`faucet_core::path_guard`], which checks each file listed.
+fn glob_reaches_env_file(r: &Resolved, full: &str) -> bool {
+    let pattern: Vec<&str> = full.split('/').filter(|s| !s.is_empty()).collect();
+    r.env_dirs.iter().any(|d| {
+        let dir: Vec<String> = d
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(n) => Some(n.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect();
+        let dir: Vec<&str> = dir.iter().map(String::as_str).collect();
+        segments_reach_env_name(&pattern, &dir)
+    })
+}
+
+fn segments_reach_env_name(pattern: &[&str], dir: &[&str]) -> bool {
+    let Some((p, rest)) = pattern.split_first() else {
+        return false;
+    };
+    if *p == "**" {
+        return segments_reach_env_name(rest, dir)
+            || (!dir.is_empty() && segments_reach_env_name(pattern, &dir[1..]));
+    }
+    match dir.split_first() {
+        None => segment_can_be_env_name(p, rest.is_empty()),
+        Some((d, dir_rest)) => {
+            glob::Pattern::new(p).map_or(true, |g| g.matches_with(d, glob_options()))
+                && segments_reach_env_name(rest, dir_rest)
+        }
+    }
+}
+
+/// How a local file listing compares names: `*` never crosses `/`, a leading
+/// `.` needs no literal, and case is ignored (a case-insensitive filesystem
+/// opens either spelling).
+fn glob_options() -> glob::MatchOptions {
+    glob::MatchOptions {
+        case_sensitive: false,
+        require_literal_separator: true,
+        require_literal_leading_dot: false,
+    }
+}
+
+/// Whether a glob segment can name an environment file: one of the names
+/// tools write (for the last segment — a directory of that name is unusual,
+/// and a `${now.date}/` segment must stay usable), or any name starting
+/// `.env` when its first element can match a `.`.
+fn segment_can_be_env_name(segment: &str, last: bool) -> bool {
+    let conventional = last
+        && glob::Pattern::new(segment).map_or(true, |g| {
+            ENV_FILE_NAMES
+                .iter()
+                .any(|n| g.matches_with(n, glob_options()))
+        });
+    let dot_first = glob_tokens(segment)
+        .first()
+        .is_some_and(|t| !matches!(t, GlobToken::Star) && t.matches('.'));
+    conventional || (dot_first && segment_can_start_with(segment, ".env"))
+}
+
+/// Whether a glob segment (`*`, `?`, `[…]`, literals; no `/`) matches some
+/// name that starts with `prefix`, ignoring ASCII case.
+fn segment_can_start_with(segment: &str, prefix: &str) -> bool {
+    let tokens = glob_tokens(segment);
+    let mut states = std::collections::BTreeSet::from([0usize]);
+    let close = |states: &mut std::collections::BTreeSet<usize>| {
+        let mut queue: Vec<usize> = states.iter().copied().collect();
+        while let Some(i) = queue.pop() {
+            if matches!(tokens.get(i), Some(GlobToken::Star)) && states.insert(i + 1) {
+                queue.push(i + 1);
+            }
+        }
+    };
+    close(&mut states);
+    for c in prefix.chars() {
+        let mut next = std::collections::BTreeSet::new();
+        for &i in &states {
+            match tokens.get(i) {
+                Some(GlobToken::Star) => {
+                    next.insert(i);
+                }
+                Some(t) if t.matches(c) => {
+                    next.insert(i + 1);
+                }
+                _ => {}
+            }
+        }
+        close(&mut next);
+        if next.is_empty() {
+            return false;
+        }
+        states = next;
+    }
+    true
+}
+
+enum GlobToken {
+    Star,
+    Any,
+    Literal(char),
+    Class {
+        negated: bool,
+        items: Vec<(char, char)>,
+    },
+}
+
+impl GlobToken {
+    fn matches(&self, c: char) -> bool {
+        let lower = c.to_ascii_lowercase();
+        let upper = c.to_ascii_uppercase();
+        match self {
+            GlobToken::Star | GlobToken::Any => true,
+            GlobToken::Literal(l) => l.eq_ignore_ascii_case(&c),
+            GlobToken::Class { negated, items } => {
+                let has = |c: char| items.iter().any(|(lo, hi)| (*lo..=*hi).contains(&c));
+                if *negated {
+                    !has(lower) || !has(upper)
+                } else {
+                    has(lower) || has(upper)
+                }
+            }
+        }
+    }
+}
+
+/// The tokens of one glob segment, read the way the `glob` crate reads them
+/// (`[!…]` negates, `]` first in a class is literal); an unterminated `[` is a
+/// literal.
+fn glob_tokens(segment: &str) -> Vec<GlobToken> {
+    let chars: Vec<char> = segment.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '*' => {
+                if !matches!(out.last(), Some(GlobToken::Star)) {
+                    out.push(GlobToken::Star);
+                }
+                i += 1;
+            }
+            '?' => {
+                out.push(GlobToken::Any);
+                i += 1;
+            }
+            '[' => {
+                let mut j = i + 1;
+                let negated = chars.get(j) == Some(&'!');
+                if negated {
+                    j += 1;
+                }
+                let start = j;
+                let mut items = Vec::new();
+                while j < chars.len() && (chars[j] != ']' || j == start) {
+                    if j + 2 < chars.len() && chars[j + 1] == '-' && chars[j + 2] != ']' {
+                        items.push((chars[j], chars[j + 2]));
+                        j += 3;
+                    } else {
+                        items.push((chars[j], chars[j]));
+                        j += 1;
+                    }
+                }
+                if j < chars.len() {
+                    out.push(GlobToken::Class { negated, items });
+                    i = j + 1;
+                } else {
+                    out.push(GlobToken::Literal('['));
+                    i += 1;
+                }
+            }
+            c => {
+                out.push(GlobToken::Literal(c));
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 /// Replace `{…}` path-template segments (a file sink's `{part}`) with `*`.
@@ -671,18 +959,107 @@ fn replace_tokens(path: &str) -> String {
     out
 }
 
-fn protected_files(pred: impl Fn(&std::path::Path) -> bool) -> bool {
-    protected()
-        .read()
-        .map(|g| g.files.iter().any(|f| pred(f)))
-        .unwrap_or(true)
+/// The protected paths, each as stored and as it resolves now.
+struct Resolved {
+    files: Vec<std::path::PathBuf>,
+    dirs: Vec<std::path::PathBuf>,
+    env_dirs: Vec<std::path::PathBuf>,
+    /// The env dirs' filesystem identities, so another spelling of the same
+    /// directory (a bind mount) matches too.
+    env_ids: Vec<(u64, u64)>,
 }
 
-fn protected_dirs(pred: impl Fn(&std::path::Path) -> bool) -> bool {
-    protected()
+impl Resolved {
+    /// Whether `path` (resolved) is a protected file, lies under a protected
+    /// directory, or passes through an environment-file name directly inside
+    /// a protected environment directory.
+    fn holds(&self, path: &std::path::Path) -> bool {
+        self.files.iter().any(|f| f == path)
+            || self.dirs.iter().any(|d| path.starts_with(d))
+            || self.under_env_name(path)
+    }
+
+    fn under_env_name(&self, path: &std::path::Path) -> bool {
+        let mut prefix = std::path::PathBuf::new();
+        for c in path.components() {
+            if let std::path::Component::Normal(name) = c
+                && is_env_file_name(name)
+                && self.is_env_dir(&prefix)
+            {
+                return true;
+            }
+            prefix.push(c);
+        }
+        false
+    }
+
+    fn is_env_dir(&self, dir: &std::path::Path) -> bool {
+        self.env_dirs.iter().any(|d| d == dir)
+            || dir_id(dir).is_some_and(|id| self.env_ids.contains(&id))
+    }
+}
+
+#[cfg(unix)]
+fn dir_id(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path)
+        .ok()
+        .filter(std::fs::Metadata::is_dir)
+        .map(|m| (m.dev(), m.ino()))
+}
+
+#[cfg(not(unix))]
+fn dir_id(_path: &std::path::Path) -> Option<(u64, u64)> {
+    None
+}
+
+/// How long a [`Resolved`] snapshot is reused before the protected paths are
+/// resolved again (a symlink swapped since then is seen after at most this).
+const RESOLVED_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// [`Resolved`] now; `None` when the set can't be read (callers treat that as
+/// protected). A snapshot is reused for [`RESOLVED_TTL`] unless a path was
+/// protected since.
+fn resolved() -> Option<std::sync::Arc<Resolved>> {
+    type Cached = Option<(std::time::Instant, u64, std::sync::Arc<Resolved>)>;
+    static CACHE: std::sync::Mutex<Cached> = std::sync::Mutex::new(None);
+    let generation = PROTECTED_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
+    if let Ok(cache) = CACHE.lock()
+        && let Some((at, g, r)) = cache.as_ref()
+        && *g == generation
+        && at.elapsed() < RESOLVED_TTL
+    {
+        return Some(r.clone());
+    }
+    let fresh = std::sync::Arc::new(resolve_protected()?);
+    if let Ok(mut cache) = CACHE.lock() {
+        *cache = Some((std::time::Instant::now(), generation, fresh.clone()));
+    }
+    Some(fresh)
+}
+
+/// The protected sets resolved now. They are copied out so no lock is held
+/// across filesystem calls.
+fn resolve_protected() -> Option<Resolved> {
+    let (files, dirs, env_dirs) = protected()
         .read()
-        .map(|g| g.dirs.iter().any(|d| pred(d)))
-        .unwrap_or(true)
+        .map(|g| (g.files.clone(), g.dirs.clone(), g.env_dirs.clone()))
+        .ok()?;
+    let expand = |set: std::collections::BTreeSet<std::path::PathBuf>| {
+        let mut out: Vec<_> = set.iter().map(|p| normalize_path(p)).collect();
+        out.extend(set);
+        out.sort();
+        out.dedup();
+        out
+    };
+    let env_dirs = expand(env_dirs);
+    let env_ids = env_dirs.iter().filter_map(|d| dir_id(d)).collect();
+    Some(Resolved {
+        files: expand(files),
+        dirs: expand(dirs),
+        env_dirs,
+        env_ids,
+    })
 }
 
 fn for_each_string(value: &Value, f: &mut impl FnMut(&str)) {
@@ -812,6 +1189,9 @@ impl Findings {
         why: Why,
         text: String,
     ) {
+        let value = faucet_core::util::redact_uri_credentials(value);
+        let value = value.as_str();
+        let text = faucet_core::util::redact_uri_credentials(&text);
         match why {
             Why::RecordPath | Why::Protected => self.protected.push(text.clone()),
             Why::RecordHost | Why::TokenHost | Why::Policy(_) => self.policy.push(text.clone()),
@@ -857,6 +1237,12 @@ impl<'a> Scope<'a> {
             only,
         }
     }
+}
+
+/// The dotted name of the field at `ptr` below `base`, as a refusal names it
+/// in place of a value that may carry credentials.
+fn field_name(base: &str, ptr: &str) -> String {
+    crate::params::caller::display(&format!("{base}{ptr}"))
 }
 
 /// Whether a local path a caller supplied takes a value from records.
@@ -995,20 +1381,24 @@ fn check_connector(
         if scope.caller
             && (r.kind == ResourceKind::Url
                 || (r.kind == ResourceKind::Path && local_path(&r.value).is_none()))
-            && faucet_core::resolve::url_hosts(&r.value)
+            && faucet_core::resolve::url_hosts_as(&r.value, r.syntax)
                 .iter()
                 .any(|h| takes_record_value(h))
         {
             let text = format!(
-                "{kind}{}: {} (a URL host in a submitted config may not take a value from \
+                "{kind}{}: `{}` (a URL host in a submitted config may not take a value from \
                  records — it cannot be checked)",
-                r.pointer, r.value
+                r.pointer,
+                field_name(base, ptr)
             );
             found.add(scope, base, ptr, &r.value, Why::RecordHost, text);
             continue;
         }
         if let Some(Err(e)) = scope.policy.map(|p| p.check(&r)) {
-            let text = format!("{} ({})", r.value, e.reason);
+            let text = match r.kind {
+                ResourceKind::Url => format!("`{}` ({})", field_name(base, ptr), e.reason),
+                _ => format!("{} ({})", r.value, e.reason),
+            };
             found.add(scope, base, ptr, &r.value, Why::Policy(e.reason), text);
         }
     }
@@ -1634,12 +2024,13 @@ fn url_findings(doc: &Value, scope: &Scope<'_>, found: &mut Findings) {
             .any(|h| h.contains("${"))
         {
             let text = format!(
-                "{s} (a URL host in a submitted document may not come from a token — it cannot \
-                 be checked)"
+                "`{}` (a URL host in a submitted document may not come from a token — it \
+                 cannot be checked)",
+                field_name("", &ptr)
             );
             found.add(scope, "", &ptr, &s, Why::TokenHost, text);
         } else if let Err(e) = policy.check_url(&s) {
-            let text = format!("{s} ({})", e.reason);
+            let text = format!("`{}` ({})", field_name("", &ptr), e.reason);
             found.add(scope, "", &ptr, &s, Why::Policy(e.reason), text);
         }
     }
@@ -1863,7 +2254,7 @@ fn provider_findings(spec: &Value, at: (&str, &str), scope: &Scope<'_>, found: &
             }
             _ => {
                 if let Some(Err(e)) = scope.policy.map(|p| p.check(&r.to_resource_ref())) {
-                    let text = format!("{at}: {} ({})", r.value, e.reason);
+                    let text = format!("`{at}` ({})", e.reason);
                     found.add(scope, base, ptr, &r.value, Why::Policy(e.reason), text);
                 }
             }

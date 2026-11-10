@@ -293,7 +293,37 @@ included, with no per-connector code. Host-bearing fields that are not URLs
 are annotated too and read for their hosts: a broker or server list
 (`brokers: b1:9092,b2:9092`, NATS `servers`), a bare `host` / `emulator_host`,
 an ADO.NET / ODBC connection string (`Server=tcp:host,1433;…`) and an Azure
-Storage connection string (`BlobEndpoint=…`, or the account host). A free-form
+Storage connection string (`BlobEndpoint=…`, or the account host). A field
+whose value is not a URL also declares its grammar
+(`x-faucet-url-syntax: ado | oracle | azure-conn | url-list`), and the server
+reads it the way the connector's client does:
+
+- **`ado`** (MSSQL `connection_string`): the SQL Server driver's grammar —
+  empty and leading `;` segments are skipped, a key may hold any character
+  (`==` is a literal `=`), and a value may be `'…'` / `"…"` quoted (a doubled
+  quote embeds one) or `{…}` braced. A string the driver would refuse
+  (non-ASCII, an unclosed quote) is refused for a caller.
+- **`oracle`** (Oracle `connect_string`): every Easy Connect address
+  (`//host…`, `;`- and `,`-separated lists), every descriptor `HOST` and every
+  `HTTPS_PROXY` is a host; `wallet_location`, `my_wallet_directory`,
+  `token_location` and `oci_config_file` are paths; `oci_iam_url` and
+  `azure_db_app_id_uri` are URLs. `token_auth` other than `OAUTH` with an
+  explicit `token_location` authenticates with the server's own identity and is
+  refused like `external_auth`; `PROTOCOL=BEQ` / `PROGRAM=` runs a program and
+  needs `--allow-subprocess-connectors`; `PROTOCOL=IPC`, a descriptor without a
+  `HOST`, a bare net service name and `ldap:` naming are refused for a caller,
+  since the server's own Oracle configuration would resolve them.
+- **`azure-conn`** (Azure Storage `connection_string`): every `…Endpoint=` URL
+  and the account host built from `AccountName` / `EndpointSuffix`.
+- **`url-list`** (Kafka `brokers`, NATS `servers`): every element.
+
+Any URL value is trimmed first; a value that is, as a whole, an IP address
+(`fd00:ec2::254`) is a host; a `,` list whose later elements carry their own
+`scheme://` is checked element by element; a `//host/…` reference is checked by
+its host; and a `unix:` / `redis+unix:` URL is checked as a path. A caller's
+value from which no server can be read (`postgres:///db` without a socket
+`host=`, `redis://`) is refused — name the server explicitly. A value longer
+than 64 KiB is refused. A free-form
 option map (Delta `storage_options`) names the keys that hold an endpoint or a
 credential file (`x-faucet-resource-keys`), and those keys are checked like the
 typed fields. A transform's config is read the same way (a `sql` transform's
@@ -316,15 +346,17 @@ are stored and again whenever a run uses them.
 | Local path (connector path, `${file:}`, state / DLQ / lineage file) | under the server's working directory or the system temp directory | `--allow-path-root DIR` (repeatable) |
 | URL scheme | any | `--allow-url-scheme` restricts it to the listed schemes |
 | URL host (including a database URL's `host=` / `hostaddr=` and the servers or `HOST=` entries of a `key=value` connection string or connect descriptor) | any, except link-local and cloud-metadata addresses (`169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`, `fd20:ce::254`, `fd00:c1::a9fe:a9fe`, `100.100.100.200`, `metadata.google.internal`) | `--allow-url-host` restricts it to the listed hosts (`*.example.com` matches subdomains); a metadata host is reachable only when listed |
-| A file a connection string names (`sslkey=`, `sslrootcert=`, `socket=`, `TrustServerCertificateCA=`, a wallet directory) | under the path roots, like any local path | `--allow-path-root DIR` |
+| A file a connection string names (`sslkey=`, `sslrootcert=`, `socket=`, `TrustServerCertificateCA=`, a wallet directory, Oracle `token_location` / `oci_config_file`) | under the path roots, like any local path | `--allow-path-root DIR` |
 | A setting that turns off certificate or host-key verification (`insecure_skip_verify`, MSSQL `trust_server_certificate` / `TrustServerCertificate=true`, SFTP `known_hosts: {mode: insecure}`, `verify_ca=false` in a MySQL URL, `#insecure` on a `rediss://` URL, Kafka `enable.ssl.certificate.verification=false`) | refused | `--allow-unverified-tls` (never for a tenant) |
-| A setting that authenticates with the server's own credentials (Oracle `external_auth`) | refused | — (register the pipeline as a template) |
+| A setting that authenticates with the server's own credentials (Oracle `external_auth`, Oracle `token_auth` other than `OAUTH` with a `token_location`) | refused | — (register the pipeline as a template) |
 | `${env:NAME}` / `${secret:NAME}` | none | `--allow-env NAME` or `--allow-env 'PREFIX*'` |
 | `${vault:}` / `${aws-sm:}` / `${gcp-sm:}` / `${azure-kv:}` | none | `--allow-secret-scheme vault,aws-sm` |
 | A program (`singer`) | refused | `--allow-subprocess-connectors` |
 
 A refused reference is a `403` that names the field, the value and the flag
-that would allow it. `/dev/null` and `:memory:` are always allowed. A path is
+that would allow it; for a URL or connection string it names the field and the
+offending key or host instead of the value, and credentials are removed from
+any value it does show. `/dev/null` and `:memory:` are always allowed. A path is
 compared after symlinks are resolved — a `..` after a symlink climbs out of the
 link's target, as the kernel would — and a `..` that leaves a root, or that
 follows a directory which does not exist yet, is refused. A path field that
@@ -337,8 +369,11 @@ absolute path — and so is a path starting with `~`, which some engines expand
 to a home directory. `sqlite:` and `duckdb:` locations are read the way their
 drivers read them, percent-decoding included (`sqlite://%2Fdata%2Fx.db` is
 `/data/x.db`), and a SQLite name that is itself a `file:` URI is refused. The
-server's own files — its environment files, input files, run-history database
-and default-config state directory — are refused whatever the roots allow. A URL host is compared in
+server's own files — every `.env*` file in its working directory or beside its
+`--env-file` (including files created after it started), its input files,
+run-history database and default-config state directory — are refused whatever
+the roots allow, and so is listing the working directory as a whole (read a
+subdirectory instead). A URL host is compared in
 the form a URL parser reads it, so `2852039166`, `0xa9fea9fe`, `0251.0376.0251.0376`
 or a trailing dot (`169.254.169.254.`, `metadata.google.internal.`) name the
 metadata address they spell, and an `http(s)` URL's authority ends at a `\` as
@@ -1196,7 +1231,13 @@ stable value (e.g. the StatefulSet pod name or the volume's name) when a
 container's host name changes on restart but its output volume persists, or
 outputs written before a restart are never collected. `changed` means the file
 at the recorded path is not the one faucet wrote (each row records the device
-and inode of the file it wrote): somebody else's file is never deleted.
+and inode of the file it wrote, and of its directory): somebody else's file is
+never deleted, and neither is an output whose directory changed after it was
+recorded (a directory replaced by a symbolic link, say). The file is deleted
+through its directory held open from the root, so a directory changed after
+that check cannot redirect the delete. A record written before directory
+identities were recorded is checked without following any symbolic link on its
+path, so such an output under a symlinked directory is reported `changed`.
 
 `in_flight` covers two cases, because one is not enough: the output's ledger row
 names a run that is currently executing, **or** the file itself was touched
@@ -1829,5 +1870,6 @@ transaction; the pool opens a fresh one).
 With the `tenants` feature: `faucet_serve_tenant_runs_total{tenant,outcome}`,
 `faucet_serve_tenant_limit_rejections_total{tenant,limit}`,
 `faucet_serve_connections{status}` and
-`faucet_serve_connect_flows_total{provider,outcome}`. See
+`faucet_serve_connect_flows_total{provider,outcome}` (`outcome` is `started`,
+`completed`, `failed` or `superseded`). See
 [Observability](../operations/observability.md).

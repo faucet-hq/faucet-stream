@@ -135,7 +135,13 @@ Send the user's browser to `authorize_url`. The provider redirects to
 `/v1/connect/callback`, which exchanges the code (PKCE `S256`), stores the
 grant as an `oauth2_refresh` connection, and redirects to your `redirect` with
 `?connection=crm&status=ok` — or `status=error&error=<code>` (`expired`,
-`access_denied`, `exchange_failed`). The `state` parameter is random,
+`access_denied`, `missing_code`, `exchange_failed`, `store_unavailable`,
+`connection_changed`). A callback writes only over the connection its flow
+started from: if the connection was deleted or replaced, or the tenant was
+deleted, while the user was at the provider, nothing is stored and the
+redirect carries `error=connection_changed` — start the flow again. A token
+rotation by a running pipeline in the meantime does not count as a change.
+The `state` parameter is random,
 single-use and valid for ten minutes; a `redirect` outside `allowed_redirects`
 is refused, so the callback is never an open redirector. The start call is a
 bearer-authenticated `POST` precisely so a bearer token never travels in a
@@ -330,4 +336,4 @@ its tenant.
 | `faucet_serve_tenant_runs_total{tenant,outcome}` | Finished tenant runs. |
 | `faucet_serve_tenant_limit_rejections_total{tenant,limit}` | Runs refused by `max_concurrent_runs` or a suspension. |
 | `faucet_serve_connections{status}` | Connections by `active` / `needs_reauth`. |
-| `faucet_serve_connect_flows_total{provider,outcome}` | Connect flows `started` / `completed` / `failed`. |
+| `faucet_serve_connect_flows_total{provider,outcome}` | Connect flows `started` / `completed` / `failed` / `superseded` (the connection or tenant changed during the flow; nothing was stored). |

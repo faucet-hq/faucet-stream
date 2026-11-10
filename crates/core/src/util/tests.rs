@@ -630,6 +630,30 @@ fn redact_keeps_an_at_sign_in_an_object_path() {
 }
 
 #[test]
+fn redact_hides_braced_and_doubled_quote_values() {
+    assert_eq!(
+        redact_uri_credentials("Server=h;Password={a;b};Database=d"),
+        "Server=h;Password=***;Database=d"
+    );
+    assert_eq!(
+        redact_uri_credentials("Server=h;Password='a'';b';Database=d"),
+        "Server=h;Password=***;Database=d"
+    );
+    assert_eq!(
+        redact_uri_credentials("Server=h;Pwd=\"a\"\";b\";Database=d"),
+        "Server=h;Pwd=***;Database=d"
+    );
+    assert_eq!(
+        redact_uri_credentials("Server=h;Password='open;Database=d"),
+        "Server=h;Password=***"
+    );
+    assert_eq!(
+        redact_uri_credentials("Server=h;Password={open;Database=d"),
+        "Server=h;Password=***"
+    );
+}
+
+#[test]
 fn redact_hides_the_whole_value_up_to_the_field_terminator() {
     assert_eq!(
         redact_uri_credentials("Server=h;Password=a&b?c;Database=d"),

@@ -33,6 +33,7 @@ const PASS: &str = "secret";
 /// *download* one.
 async fn start_sftp_inner(
     files: &[(String, String)],
+    sshd_config: Option<&'static str>,
 ) -> Option<(ContainerAsync<GenericImage>, u16)> {
     let container = faucet_conformance::containers::start_or_skip(
         || {
@@ -48,6 +49,9 @@ async fn start_sftp_inner(
                     format!("/home/{USER}/data/{name}"),
                     body.clone().into_bytes(),
                 );
+            }
+            if let Some(config) = sshd_config {
+                image = image.with_copy_to("/etc/ssh/sshd_config", config.as_bytes().to_vec());
             }
             image
         },
@@ -248,7 +252,7 @@ async fn a_sinks_upload_scratch_is_not_read() {
 /// [`start_sftp_inner`], failing instead of skipping when `FAUCET_REQUIRE_BACKENDS`
 /// is set — CI provides Docker, so an unavailable backend is a failure there.
 async fn start_sftp(files: &[(String, String)]) -> Option<(ContainerAsync<GenericImage>, u16)> {
-    let started = start_sftp_inner(files).await;
+    let started = start_sftp_inner(files, None).await;
     if started.is_none() {
         faucet_conformance::containers::backend_missing(
             "start_sftp: the test backend is unavailable",
@@ -363,4 +367,141 @@ async fn a_newline_free_jsonl_file_fails_at_max_object_bytes() {
     assert_eq!(records, 2, "the short-lined file is read");
     let error = error.expect("the newline-free file fails");
     assert!(error.contains("max_object_bytes"), "{error}");
+}
+
+/// The image's sshd configuration with one session per connection.
+const ONE_SESSION_SSHD_CONFIG: &str = "Protocol 2
+HostKey /etc/ssh/ssh_host_ed25519_key
+HostKey /etc/ssh/ssh_host_rsa_key
+UseDNS no
+PermitRootLogin no
+X11Forwarding no
+AllowTcpForwarding no
+Subsystem sftp internal-sftp
+ForceCommand internal-sftp
+ChrootDirectory %h
+MaxSessions 1
+";
+
+async fn drain_result(src: &SftpSource) -> Result<Vec<Value>, String> {
+    let ctx: HashMap<String, Value> = HashMap::new();
+    let mut pages = src.stream_pages(&ctx, 1_000);
+    let mut out = Vec::new();
+    while let Some(page) = pages.next().await {
+        out.extend(page.map_err(|e| e.to_string())?.records);
+    }
+    Ok(out)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_directory_over_the_entry_limit_fails_the_listing() {
+    let Some((_c, port)) = start_sftp(&jsonl_files(3)).await else {
+        return;
+    };
+    let conn = SftpConnectionConfig::with_password("127.0.0.1", USER, PASS).port(port);
+    let mut config = SftpSourceConfig::new(conn.clone(), "/data").glob("part-0001.jsonl");
+    config.max_listed_entries = 2;
+    let error = drain_result(&SftpSource::new(config).expect("config is valid"))
+        .await
+        .expect_err("three entries are over a limit of two, matching or not");
+    assert!(
+        error.contains("'/data'") && error.contains("max_listed_entries"),
+        "{error}"
+    );
+
+    let mut config = SftpSourceConfig::new(conn, "/data");
+    config.max_listed_entries = 3;
+    let records = drain_result(&SftpSource::new(config).expect("config is valid"))
+        .await
+        .expect("exactly the limit lists");
+    assert_eq!(records.len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn listing_then_reading_works_with_one_session_allowed() {
+    let Some((_c, port)) = start_sftp_inner(&jsonl_files(4), Some(ONE_SESSION_SSHD_CONFIG)).await
+    else {
+        faucet_conformance::containers::backend_missing(
+            "listing_then_reading_works_with_one_session_allowed: the test backend is unavailable",
+        );
+        return;
+    };
+    let conn = SftpConnectionConfig::with_password("127.0.0.1", USER, PASS).port(port);
+    let handle = faucet_common_sftp::authenticate(&conn)
+        .await
+        .expect("authenticates");
+    let lister = handle.lister().await.expect("the listing channel opens");
+    let refused = handle
+        .lister()
+        .await
+        .err()
+        .expect("a second channel is refused");
+    assert!(
+        matches!(
+            refused,
+            faucet_common_sftp::ListError::ChannelRefused { .. }
+        ),
+        "{refused}"
+    );
+    assert!(refused.to_string().contains("MaxSessions"), "{refused}");
+    lister.close().await;
+    drop(handle);
+
+    let records = drain(&source(port, SftpFormat::Jsonl, 2, 1_000), 1_000).await;
+    let ids: Vec<i64> = records
+        .iter()
+        .map(|r| r["id"].as_i64().expect("id"))
+        .collect();
+    assert_eq!(
+        ids,
+        [1, 2, 3, 4],
+        "the listing channel closes before the read opens"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_symlinked_file_is_resolved_by_the_listing() {
+    let files = vec![("real.jsonl".to_string(), "{\"id\":7}\n".to_string())];
+    let Some((c, port)) = start_sftp(&files).await else {
+        return;
+    };
+    let dir = format!("/home/{USER}/data");
+    let mut exec = c
+        .exec(testcontainers::core::ExecCommand::new([
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("ln -s real.jsonl {dir}/alias.jsonl && ln -s missing {dir}/broken.jsonl"),
+        ]))
+        .await
+        .expect("symlinks");
+    let _ = exec.stdout_to_vec().await;
+    let conn = SftpConnectionConfig::with_password("127.0.0.1", USER, PASS).port(port);
+    let config = SftpSourceConfig::new(conn.clone(), "/data").glob("alias*");
+    let records = drain_result(&SftpSource::new(config).expect("config is valid"))
+        .await
+        .expect("the link is followed");
+    assert_eq!(records, vec![serde_json::json!({"id": 7})]);
+
+    let config = SftpSourceConfig::new(conn.clone(), "/data").glob("broken*");
+    let error = drain_result(&SftpSource::new(config).expect("config is valid"))
+        .await
+        .expect_err("a dangling link cannot be stat'ed");
+    assert!(
+        error.contains("SFTP stat '/data/broken.jsonl' failed"),
+        "{error}"
+    );
+
+    let handle = faucet_common_sftp::authenticate(&conn)
+        .await
+        .expect("authenticates");
+    let lister = handle.lister().await.expect("the listing channel opens");
+    let target = lister
+        .metadata("/data/alias.jsonl")
+        .await
+        .expect("the link is followed");
+    assert!(target.file_type().is_file());
+    drop(lister);
+    let session = handle.open_session().await.expect("a session opens");
+    assert!(session.try_exists("/data/real.jsonl").await.expect("stat"));
+    assert!(handle.refusal().is_none());
 }

@@ -120,16 +120,29 @@ mod imp {
         inner: R,
         len: u64,
         display: String,
+        max_range_bytes: u64,
     }
 
     impl<R: RangeRead> RangedParquetReader<R> {
         /// A reader over an object of `len` bytes, named `display` in errors.
+        /// One range may be at most
+        /// [`DEFAULT_MAX_OBJECT_BYTES`](crate::file_format::DEFAULT_MAX_OBJECT_BYTES)
+        /// long; see [`with_max_range_bytes`](Self::with_max_range_bytes).
         pub fn new(inner: R, len: u64, display: impl Into<String>) -> Self {
             Self {
                 inner,
                 len,
                 display: display.into(),
+                max_range_bytes: crate::file_format::DEFAULT_MAX_OBJECT_BYTES,
             }
+        }
+
+        /// Refuse a single range longer than `max` bytes (a source passes its
+        /// `max_object_bytes`) before asking the transport for it. A range
+        /// past the object's end is always refused.
+        pub fn with_max_range_bytes(mut self, max: u64) -> Self {
+            self.max_range_bytes = max;
+            self
         }
 
         /// The object's length in bytes.
@@ -148,6 +161,19 @@ mod imp {
                 return Ok(Bytes::new());
             }
             let (start, end) = (range.start, range.end);
+            if end > self.len {
+                return Err(external(format!(
+                    "range {start}..{end} of '{}' lies past its end ({} bytes)",
+                    self.display, self.len
+                )));
+            }
+            if wanted > self.max_range_bytes || usize::try_from(wanted).is_err() {
+                return Err(external(format!(
+                    "range {start}..{end} of '{}' is {wanted} bytes, more than the {} bytes one \
+                     read may fetch (max_object_bytes)",
+                    self.display, self.max_range_bytes
+                )));
+            }
             let bytes = self.inner.read_range(range).await.map_err(|e| {
                 external(format!(
                     "ranged read of '{}' (bytes {start}..{end}) failed: {e}",
@@ -513,5 +539,40 @@ mod tests {
         assert!(e.contains("`nope`"), "{e}");
         let empty = RangedParquetReader::new(Failing, 0, "e");
         assert!(empty.is_empty());
+    }
+
+    #[cfg(feature = "file-format-parquet")]
+    #[tokio::test]
+    async fn ranged_reads_are_capped() {
+        use ::parquet::arrow::async_reader::AsyncFileReader as _;
+        let data = object();
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mem = |reads: &std::sync::Arc<std::sync::atomic::AtomicUsize>| Mem {
+            data: data.clone(),
+            truncate: false,
+            reads: reads.clone(),
+        };
+        let len = data.len() as u64;
+        let mut reader = RangedParquetReader::new(mem(&reads), len, "o").with_max_range_bytes(8);
+        let e = reader.get_bytes(0..9).await.unwrap_err().to_string();
+        assert!(
+            e.contains("'o'") && e.contains("9 bytes") && e.contains("max_object_bytes"),
+            "{e}"
+        );
+        let e = reader
+            .get_bytes(len - 2..len + 1)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("past its end"), "{e}");
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(reader.get_bytes(0..8).await.unwrap().len(), 8);
+        assert_eq!(reader.get_bytes(3..3).await.unwrap().len(), 0);
+
+        let capped = RangedParquetReader::new(mem(&reads), len, "o").with_max_range_bytes(16);
+        let Err(e) = range_stream(capped, &ParquetReadOptions::default(), 0).await else {
+            panic!("a footer read past the cap fails");
+        };
+        assert!(e.to_string().contains("max_object_bytes"), "{e}");
     }
 }

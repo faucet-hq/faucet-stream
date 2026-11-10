@@ -649,7 +649,12 @@ deadline and the cancel token and count the round trip, but never retry:
 Build clients with `faucet_core::http::Client`, never `reqwest::Client`
 directly. It follows redirects itself so a hop to another origin drops
 `Authorization`, cookies, every header marked sensitive and every header named
-with `sensitive_header`, and never replays a request body to another origin. It
+with `sensitive_header`, then keeps only the standard headers in
+`http::CROSS_ORIGIN_SAFE_HEADERS` (default headers set with
+`ClientBuilder::default_headers` included), and never replays a request body to
+another origin. Hosts that may receive every header on a redirect over the same
+scheme go in `ClientBuilder::credential_hosts`. Still mark a credential header
+sensitive (`HeaderValue::set_sensitive`) so it is redacted from debug output. It
 refuses a buffered body above `max_response_bytes` (1 GiB by default), turns a
 non-2xx response into `FaucetError::HttpStatus` (a `429`/`503` with
 `Retry-After` into `RateLimited`), and strips credentials from the URLs errors

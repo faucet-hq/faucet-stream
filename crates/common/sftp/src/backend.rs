@@ -14,7 +14,8 @@
 //! every other stat or remove failure is an error (#783).
 
 use crate::{
-    SftpConnection, SftpConnectionConfig, SftpError, connect_with_extensions, is_no_such_file,
+    DEFAULT_MAX_LISTED_ENTRIES, SftpConnection, SftpConnectionConfig, SftpError,
+    connect_with_extensions, is_no_such_file,
 };
 use async_trait::async_trait;
 use faucet_common_file::write::{NameTemplate, ObjectClient, RemoteBackend};
@@ -42,6 +43,8 @@ struct SftpObjects {
     /// Use `posix-rename` when the server has it (off only in tests, to
     /// cover the plain-`RENAME` fallback against a server that has it).
     posix_rename: bool,
+    /// Entries one directory listing may scan (`max_listed_entries`).
+    max_listed_entries: usize,
     /// The run's call context (#880): every operation runs through it, once.
     calls: Arc<faucet_core::CallSlot>,
 }
@@ -114,6 +117,7 @@ impl SftpObjects {
             session: Mutex::new(None),
             dirs: Mutex::new(HashSet::new()),
             posix_rename: true,
+            max_listed_entries: DEFAULT_MAX_LISTED_ENTRIES,
             calls: Arc::new(faucet_core::CallSlot::new(
                 faucet_core::CallContext::new()
                     .without_timeout()
@@ -141,9 +145,33 @@ impl SftpObjects {
     ) -> Result<T, FaucetError> {
         let result = op.await;
         if result.is_err() {
+            let refusal = self.refusal().await;
             self.drop_if_dead().await;
+            if let Some(refusal) = refusal {
+                return Err(FaucetError::Sink(refusal));
+            }
         }
         result
+    }
+
+    /// The cached connection's refused-packet error, if it refused one.
+    async fn refusal(&self) -> Option<String> {
+        self.session.lock().await.as_ref().and_then(|c| c.refusal())
+    }
+
+    /// The names in `dir` that `keep` accepts, bounded by
+    /// `max_listed_entries`; a missing directory lists as empty.
+    async fn list_names(
+        &self,
+        conn: &SftpConnection,
+        dir: &str,
+        keep: impl FnMut(&str, &crate::SftpMetadata) -> bool + Send,
+    ) -> Result<Vec<String>, FaucetError> {
+        match conn.list_dir(dir, self.max_listed_entries, keep).await {
+            Ok(entries) => Ok(entries.into_iter().map(|e| e.name).collect()),
+            Err(e) if e.is_no_such_file() => Ok(Vec::new()),
+            Err(e) => Err(FaucetError::Sink(e.to_string())),
+        }
     }
 
     async fn drop_if_dead(&self) {
@@ -320,20 +348,13 @@ impl SftpObjects {
     async fn list_now(&self, prefix: &str) -> Result<Vec<String>, FaucetError> {
         let conn = self.connection().await?;
         let (dir, start) = split_prefix(prefix);
-        let entries = match conn.session().read_dir(dir.as_str()).await {
-            Ok(entries) => entries,
-            Err(e) => {
-                missing("list", &dir, e)?;
-                return Ok(Vec::new());
-            }
-        };
         let base = &prefix[..prefix.len() - start.len()];
-        Ok(entries
-            .filter(|e| e.file_type().is_file())
-            .map(|e| e.file_name())
-            .filter(|n| n.starts_with(start))
-            .map(|n| format!("{base}{n}"))
-            .collect())
+        let names = self
+            .list_names(&conn, &dir, |name, meta| {
+                meta.file_type().is_file() && name.starts_with(start)
+            })
+            .await?;
+        Ok(names.into_iter().map(|n| format!("{base}{n}")).collect())
     }
 
     async fn exists_now(&self, key: &str) -> Result<bool, FaucetError> {
@@ -400,20 +421,13 @@ impl SftpObjects {
     async fn list_dirs_now(&self, prefix: &str) -> Result<Vec<String>, FaucetError> {
         let conn = self.connection().await?;
         let (dir, start) = split_prefix(prefix);
-        let entries = match conn.session().read_dir(dir.as_str()).await {
-            Ok(entries) => entries,
-            Err(e) => {
-                missing("list", &dir, e)?;
-                return Ok(Vec::new());
-            }
-        };
         let base = &prefix[..prefix.len() - start.len()];
-        Ok(entries
-            .filter(|e| e.file_type().is_dir())
-            .map(|e| e.file_name())
-            .filter(|n| n.starts_with(start))
-            .map(|n| format!("{base}{n}"))
-            .collect())
+        let names = self
+            .list_names(&conn, &dir, |name, meta| {
+                meta.file_type().is_dir() && name.starts_with(start)
+            })
+            .await?;
+        Ok(names.into_iter().map(|n| format!("{base}{n}")).collect())
     }
 
     async fn remove_dir_now(&self, dir: &str) -> Result<(), FaucetError> {
@@ -470,6 +484,7 @@ impl SftpBackend {
             connection,
             concurrency: 1,
             scratch_dir: None,
+            max_listed_entries: DEFAULT_MAX_LISTED_ENTRIES,
         }
     }
 
@@ -503,9 +518,17 @@ pub struct SftpBackendBuilder {
     connection: SftpConnectionConfig,
     concurrency: usize,
     scratch_dir: Option<PathBuf>,
+    max_listed_entries: usize,
 }
 
 impl SftpBackendBuilder {
+    /// Entries one directory listing may scan before it fails. Default
+    /// [`DEFAULT_MAX_LISTED_ENTRIES`].
+    pub fn max_listed_entries(mut self, n: usize) -> Self {
+        self.max_listed_entries = n;
+        self
+    }
+
     /// Files uploaded at once over the one session. Default 1.
     pub fn concurrency(mut self, n: usize) -> Self {
         self.concurrency = n;
@@ -525,7 +548,9 @@ impl SftpBackendBuilder {
         base: impl Into<String>,
         template: &NameTemplate,
     ) -> Result<SftpBackend, FaucetError> {
-        let objects = Arc::new(SftpObjects::new(self.connection));
+        let mut objects = SftpObjects::new(self.connection);
+        objects.max_listed_entries = self.max_listed_entries;
+        let objects = Arc::new(objects);
         let remote =
             RemoteBackend::new(objects.clone(), base, template, self.scratch_dir.as_deref())?
                 .with_upload_concurrency(self.concurrency);

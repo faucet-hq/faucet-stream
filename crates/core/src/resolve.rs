@@ -65,6 +65,74 @@ pub const UNVERIFIED_ANNOTATION: &str = "x-faucet-unverified";
 /// [`ResourceKind::HostCredentials`] reference.
 pub const HOST_CREDENTIALS_ANNOTATION: &str = "x-faucet-host-credentials";
 
+/// The JSON Schema keyword on a [`ResourceKind::Url`] field naming the grammar
+/// its value is written in, when that is not a URL: a [`UrlSyntax`]
+/// (`"ado"`, `"oracle"`, `"azure-conn"`, `"url-list"`). The value is then read
+/// the way the connector's client reads it.
+///
+/// ```ignore
+/// #[schemars(extend("x-faucet-resource" = "url", "x-faucet-url-syntax" = "ado"))]
+/// pub connection_string: Option<String>,
+/// ```
+pub const URL_SYNTAX_ANNOTATION: &str = "x-faucet-url-syntax";
+
+/// The grammar of a [`ResourceKind::Url`] value ([`URL_SYNTAX_ANNOTATION`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum UrlSyntax {
+    /// An ADO.NET connection string (`Server=tcp:host,1433;…`), read with
+    /// [`crate::ado::parse`].
+    Ado,
+    /// An Oracle connect string: Easy Connect (Plus), a connect descriptor, a
+    /// net service alias or directory naming.
+    Oracle,
+    /// An Azure Storage connection string (`AccountName=…;BlobEndpoint=…`).
+    AzureConn,
+    /// URLs or `host:port` addresses separated by `,` or whitespace (a broker
+    /// or server list).
+    UrlList,
+}
+
+impl UrlSyntax {
+    /// The annotation value for this grammar.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UrlSyntax::Ado => "ado",
+            UrlSyntax::Oracle => "oracle",
+            UrlSyntax::AzureConn => "azure-conn",
+            UrlSyntax::UrlList => "url-list",
+        }
+    }
+
+    /// Parse an annotation value.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "ado" => Some(UrlSyntax::Ado),
+            "oracle" => Some(UrlSyntax::Oracle),
+            "azure-conn" => Some(UrlSyntax::AzureConn),
+            "url-list" => Some(UrlSyntax::UrlList),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for UrlSyntax {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+fn syntax_of(node: &Value) -> Option<UrlSyntax> {
+    node.get(URL_SYNTAX_ANNOTATION)
+        .and_then(Value::as_str)
+        .and_then(UrlSyntax::parse)
+}
+
+/// The longest value a policy with path roots (one a host applies to configs
+/// it does not trust) reads; a longer one is refused.
+pub const MAX_SCREENED_LEN: usize = 64 * 1024;
+
 /// Whether map key `key` (any case) matches a [`RESOURCE_KEYS_ANNOTATION`]
 /// pattern.
 fn key_pattern_matches(pattern: &str, key: &str) -> bool {
@@ -146,6 +214,8 @@ pub struct ResourceRef {
     pub pointer: String,
     pub kind: ResourceKind,
     pub value: String,
+    /// The grammar of a URL value that is not a URL ([`URL_SYNTAX_ANNOTATION`]).
+    pub syntax: Option<UrlSyntax>,
 }
 
 impl ResourceRef {
@@ -154,7 +224,14 @@ impl ResourceRef {
             pointer: pointer.into(),
             kind,
             value: value.into(),
+            syntax: None,
         }
+    }
+
+    /// This reference, its value written in `syntax`.
+    pub fn with_syntax(mut self, syntax: Option<UrlSyntax>) -> Self {
+        self.syntax = syntax;
+        self
     }
 }
 
@@ -681,6 +758,12 @@ fn connection_string_pairs(value: &str) -> Option<Vec<(String, String)>> {
 /// taken from a `${…}` token is returned lower-cased as written.
 pub fn url_hosts(value: &str) -> Vec<String> {
     let value = value.trim();
+    if let Some(ip) = ip_literal(value) {
+        return vec![ip];
+    }
+    if let Some(items) = scheme_list(value) {
+        return items.into_iter().flat_map(url_hosts).collect();
+    }
     if value.starts_with('(') {
         let hosts: Vec<String> = descriptor_pairs(value)
             .into_iter()
@@ -716,6 +799,7 @@ pub fn url_hosts(value: &str) -> Vec<String> {
             .collect();
     }
     let after = match value.find("://") {
+        _ if value.starts_with("//") => &value[2..],
         Some(i) => &value[i + 3..],
         None => match &scheme {
             Some(s) => &value[s.len() + 1..],
@@ -759,6 +843,244 @@ pub fn url_hosts(value: &str) -> Vec<String> {
     out
 }
 
+/// The canonical host of a value that is, as a whole, an IP address
+/// (`169.254.169.254`, `fd00:ec2::254`, `[::1]`).
+fn ip_literal(value: &str) -> Option<String> {
+    let bare = value
+        .strip_prefix('[')
+        .and_then(|v| v.strip_suffix(']'))
+        .unwrap_or(value);
+    match bare.parse::<std::net::IpAddr>().ok()? {
+        std::net::IpAddr::V4(v4) => Some(v4.to_string()),
+        std::net::IpAddr::V6(v6) => Some(format!("[{v6}]")),
+    }
+}
+
+/// The elements of a `,`-separated list whose elements after the first carry
+/// their own `scheme://` (`nats://a:4222,nats://b:4222`), or `None`.
+fn scheme_list(value: &str) -> Option<Vec<&str>> {
+    let parts: Vec<&str> = value.split(',').map(str::trim).collect();
+    let later_scheme = parts
+        .iter()
+        .skip(1)
+        .any(|p| scheme_of(p).is_some_and(|s| p[s.len()..].starts_with("://")));
+    (parts.len() > 1 && later_scheme).then(|| parts.into_iter().filter(|p| !p.is_empty()).collect())
+}
+
+/// The elements of a [`UrlSyntax::UrlList`] value.
+fn list_items(value: &str) -> impl Iterator<Item = &str> {
+    value
+        .split(|c: char| c == ',' || c.is_ascii_whitespace())
+        .filter(|p| !p.is_empty())
+}
+
+/// The host of one `host[:port]` address (`[v6]:port` kept bracketed).
+fn address_host(address: &str) -> String {
+    let address = address.trim();
+    let host = if address.starts_with('[') {
+        address.find(']').map_or(address, |end| &address[..=end])
+    } else if let Some(ip) = ip_literal(address) {
+        return ip;
+    } else {
+        address
+            .rsplit_once(':')
+            .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()))
+            .map_or(address, |(host, _)| host)
+    };
+    canonical_host(host)
+}
+
+/// The hosts an ADO.NET connection string connects to: the driver's own
+/// reading ([`crate::ado::server_host`]) and every server-like key read more
+/// broadly (any `tcp:` / `np:` / `lpc:` / `admin:` prefix removed).
+fn ado_hosts(pairs: &[(String, String)]) -> Vec<String> {
+    let mut hosts = vec![canonical_host(&crate::ado::server_host(pairs))];
+    for (k, v) in pairs {
+        if !CONN_HOST_KEYS.contains(&k.as_str()) {
+            continue;
+        }
+        let lower = v.to_ascii_lowercase();
+        let bare = ["tcp:", "np:", "lpc:", "admin:"]
+            .iter()
+            .find_map(|p| lower.starts_with(p).then(|| &v[p.len()..]))
+            .unwrap_or(v);
+        if bare.contains("://") {
+            hosts.extend(url_hosts(bare));
+        } else {
+            hosts.push(canonical_host(&crate::ado::host_of_server(bare)));
+        }
+    }
+    hosts.retain(|h| !h.is_empty());
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
+/// How an Oracle connect string names its database.
+#[derive(Debug, PartialEq, Eq)]
+enum OracleForm {
+    Empty,
+    /// `(DESCRIPTION=…)`.
+    Descriptor,
+    /// `[protocol://][//]host[:port][/service][?params]`.
+    EasyConnect,
+    /// A bare net service name, resolved through the host's Oracle
+    /// configuration (`tnsnames.ora`).
+    Alias,
+    /// `ldap:` naming, resolved through the host's Oracle configuration.
+    Directory,
+}
+
+/// An Oracle connect string as the Oracle client reads it.
+struct OracleRead {
+    form: OracleForm,
+    /// The Easy Connect protocol (`tcps`), lower case.
+    scheme: Option<String>,
+    /// Every server and proxy host, canonical.
+    hosts: Vec<String>,
+    /// Descriptor `(KEY=value)` pairs or Easy Connect Plus parameters, keys
+    /// lower-cased and values unquoted.
+    params: Vec<(String, String)>,
+}
+
+fn unquote(v: &str) -> String {
+    let v = v.trim();
+    v.strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .or_else(|| v.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+        .unwrap_or(v)
+        .to_string()
+}
+
+fn read_oracle(value: &str) -> OracleRead {
+    let value = value.trim();
+    let mut read = OracleRead {
+        form: OracleForm::EasyConnect,
+        scheme: None,
+        hosts: Vec::new(),
+        params: Vec::new(),
+    };
+    let lower = value.to_ascii_lowercase();
+    if value.is_empty() {
+        read.form = OracleForm::Empty;
+    } else if lower.starts_with("ldap:") || lower.starts_with("ldaps:") {
+        read.form = OracleForm::Directory;
+    } else if value.starts_with('(') {
+        read.form = OracleForm::Descriptor;
+        read.params = descriptor_pairs(value);
+        for (k, v) in &read.params {
+            if k == "host" {
+                read.hosts.extend(v.split(',').map(address_host));
+            }
+        }
+    } else if !value.contains([':', '/', '(', ',']) {
+        read.form = OracleForm::Alias;
+    } else {
+        let mut rest = value;
+        if let Some(i) = rest.find("://") {
+            let s = &rest[..i];
+            if !s.is_empty()
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+            {
+                read.scheme = Some(s.to_ascii_lowercase());
+                rest = &rest[i + 3..];
+            }
+        }
+        if read.scheme.is_none() {
+            rest = rest.strip_prefix("//").unwrap_or(rest);
+        }
+        let (main, query) = rest.split_once('?').unwrap_or((rest, ""));
+        let addresses = main.split('/').next().unwrap_or(main);
+        read.hosts
+            .extend(addresses.split([';', ',']).map(address_host));
+        read.params = query
+            .split('&')
+            .filter_map(|kv| kv.split_once('='))
+            .map(|(k, v)| (k.trim().to_ascii_lowercase(), unquote(v)))
+            .collect();
+    }
+    for (k, v) in &read.params {
+        if k == "https_proxy" {
+            read.hosts.push(address_host(v));
+        }
+    }
+    read.hosts.retain(|h| !h.is_empty());
+    read
+}
+
+/// The `key=value` pairs of an Azure Storage connection string, keys
+/// lower-cased.
+fn azure_pairs(value: &str) -> Vec<(String, String)> {
+    value
+        .split(';')
+        .filter_map(|seg| seg.trim().split_once('='))
+        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .filter(|(_, v)| !v.is_empty())
+        .collect()
+}
+
+/// The account host an Azure Storage connection string builds from
+/// `AccountName` and `EndpointSuffix` (`<account>.blob.<suffix>`).
+fn azure_account_url(pairs: &[(String, String)]) -> Option<String> {
+    let get = |key: &str| pairs.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v);
+    let account = get("accountname")?;
+    let suffix = get("endpointsuffix").map_or("core.windows.net", String::as_str);
+    let protocol = get("defaultendpointsprotocol").map_or("https", String::as_str);
+    Some(format!("{protocol}://{account}.blob.{suffix}"))
+}
+
+/// The hosts a value written in `syntax` connects to, in canonical form; the
+/// same as [`url_hosts`] for `None`.
+pub fn url_hosts_as(value: &str, syntax: Option<UrlSyntax>) -> Vec<String> {
+    let raw = value;
+    let value = value.trim();
+    match syntax {
+        None => url_hosts(value),
+        Some(UrlSyntax::Ado) => crate::ado::parse(raw)
+            .map(|pairs| ado_hosts(&pairs))
+            .unwrap_or_default(),
+        Some(UrlSyntax::Oracle) => read_oracle(value).hosts,
+        Some(UrlSyntax::AzureConn) => {
+            let pairs = azure_pairs(value);
+            let mut hosts: Vec<String> = pairs
+                .iter()
+                .filter(|(k, _)| k.ends_with("endpoint"))
+                .flat_map(|(_, v)| url_hosts(v))
+                .collect();
+            hosts.extend(azure_account_url(&pairs).iter().flat_map(|u| url_hosts(u)));
+            hosts
+        }
+        Some(UrlSyntax::UrlList) => list_items(value).flat_map(url_hosts).collect(),
+    }
+}
+
+/// The socket path a `unix:` / `…+unix:` URL (`redis+unix:///run/redis.sock`)
+/// opens, percent-decoded (`Some(None)` when it is not UTF-8); `None` for any
+/// other scheme.
+fn unix_socket_path(scheme: &str, value: &str) -> Option<Option<String>> {
+    if scheme != "unix" && !scheme.ends_with("+unix") {
+        return None;
+    }
+    let rest = &value[scheme.len() + 1..];
+    let rest = rest.strip_prefix("//").unwrap_or(rest);
+    let path = rest.split(['?', '#']).next().unwrap_or(rest);
+    Some(percent_decoded(path).map(|p| p.into_owned()))
+}
+
+/// Connect-string parameters (Easy Connect Plus or descriptor) naming a local
+/// file or directory the Oracle client reads.
+const ORACLE_PATH_PARAMS: &[&str] = &[
+    "wallet_location",
+    "my_wallet_directory",
+    "token_location",
+    "oci_config_file",
+    "directory",
+];
+
+/// Connect-string parameters naming a URL the Oracle client calls.
+const ORACLE_URL_PARAMS: &[&str] = &["oci_iam_url", "azure_db_app_id_uri"];
+
 /// Schemes whose drivers read connection settings from the URL query.
 const DB_URL_SCHEMES: &[&str] = &[
     "postgres",
@@ -772,7 +1094,7 @@ const DB_URL_SCHEMES: &[&str] = &[
 
 /// Query parameters of a database URL that name a host (or, starting with
 /// `/`, a Unix socket directory).
-const DB_HOST_PARAMS: &[&str] = &["host", "hostaddr"];
+const DB_HOST_PARAMS: &[&str] = &["host", "hostaddr", "https_proxy"];
 
 /// Query parameters of a database URL that name a local file.
 const DB_PATH_PARAMS: &[&str] = &[
@@ -789,6 +1111,8 @@ const DB_PATH_PARAMS: &[&str] = &[
     "sslcrl",
     "sslcrldir",
     "trustservercertificateca",
+    "token_location",
+    "oci_config_file",
     "wallet_location",
     "my_wallet_directory",
     "directory",
@@ -1108,12 +1432,277 @@ impl ReferencePolicy {
         })
     }
 
-    /// Check a URL a connector connects to. `file:` / `sqlite:` URLs are
-    /// checked as paths, a scheme-less `host[:port]` as a host, and a relative
-    /// reference (`/jobs`, `./x`) names no host of its own and passes.
+    /// Check a URL a connector connects to. `file:` / `sqlite:` / `unix:` URLs
+    /// are checked as paths, a scheme-less `host[:port]` or IP address as a
+    /// host, a `//host/…` network-path reference by its host, and a relative
+    /// reference (`/jobs`, `./x`) names no host of its own and passes. Under a
+    /// policy with path roots (one for configs the host does not trust), a
+    /// value from which no server can be read is refused.
     pub fn check_url(&self, value: &str) -> Result<(), Refusal> {
+        self.check_url_as(value, None)
+    }
+
+    /// [`check_url`](Self::check_url) for a value written in `syntax`
+    /// ([`URL_SYNTAX_ANNOTATION`]), read the way the connector's client reads
+    /// it. Under a policy with path roots, a value the client's grammar cannot
+    /// read is refused.
+    pub fn check_url_as(&self, value: &str, syntax: Option<UrlSyntax>) -> Result<(), Refusal> {
+        let raw = value;
+        let value = value.trim_matches(|c: char| c.is_ascii_whitespace());
+        if self.path_roots.is_some() && value.len() > MAX_SCREENED_LEN {
+            return Err(Refusal::new(
+                RefusalKind::Url,
+                &value[..value.floor_char_boundary(64)],
+                format!("a value longer than {MAX_SCREENED_LEN} bytes is not read"),
+            ));
+        }
+        match syntax {
+            None => self.check_plain_url(value),
+            Some(UrlSyntax::Ado) => self.check_ado(raw),
+            Some(UrlSyntax::Oracle) => self.check_oracle(value),
+            Some(UrlSyntax::AzureConn) => self.check_azure_conn(value),
+            Some(UrlSyntax::UrlList) => {
+                for item in list_items(value) {
+                    self.check_plain_url(item)
+                        .map_err(|e| Refusal::new(e.kind, value, e.reason))?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Check one host a value names against the host allow-list, or the
+    /// link-local / metadata rule.
+    fn check_host(&self, subject: &str, host: &str) -> Result<(), Refusal> {
+        let refuse = |reason: String| Refusal::new(RefusalKind::Url, subject, reason);
+        if host.contains("${") || host.contains('*') {
+            if self.url_hosts.is_some() {
+                return Err(refuse(
+                    "a host taken from a token cannot be checked against the host allow-list"
+                        .into(),
+                ));
+            }
+            return Ok(());
+        }
+        match &self.url_hosts {
+            Some(list) if list.iter().any(|p| host_matches(p, host)) => Ok(()),
+            Some(_) => Err(refuse(format!("host `{host}` not in the allow-list"))),
+            None if is_metadata_host(host) => Err(refuse(format!(
+                "host `{host}` is a link-local / metadata endpoint"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// Check a URL scheme against the scheme allow-list.
+    fn check_scheme(&self, subject: &str, scheme: &str) -> Result<(), Refusal> {
+        match &self.url_schemes {
+            Some(allowed) if !allowed.contains(scheme) => Err(Refusal::new(
+                RefusalKind::Url,
+                subject,
+                format!("URL scheme `{scheme}` not in the allow-list"),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// Check the local file a connection setting `key` names.
+    fn check_setting_path(&self, subject: &str, key: &str, path: &str) -> Result<(), Refusal> {
+        self.check_local(path).map_err(|reason| {
+            Refusal::new(RefusalKind::Path, subject, format!("`{key}`: {reason}"))
+        })
+    }
+
+    /// Refuse a connection setting that turns off peer verification.
+    fn check_setting_verification(&self, subject: &str, key: &str, v: &str) -> Result<(), Refusal> {
+        let unverified = DB_UNVERIFIED_PARAMS
+            .iter()
+            .any(|(k, vals)| *k == key && vals.iter().any(|x| x.eq_ignore_ascii_case(v.trim())));
+        if unverified && !self.unverified {
+            return Err(Refusal::new(
+                RefusalKind::Url,
+                subject,
+                format!("`{key}={}` turns off certificate verification", v.trim()),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Check an ADO.NET connection string, read as the SQL Server driver
+    /// reads it ([`crate::ado::parse`]).
+    fn check_ado(&self, value: &str) -> Result<(), Refusal> {
+        let pairs = match crate::ado::parse(value) {
+            Ok(pairs) => pairs,
+            Err(e) if self.path_roots.is_some() => {
+                return Err(Refusal::new(
+                    RefusalKind::Url,
+                    value,
+                    format!(
+                        "the connection string cannot be read the way the driver reads it ({e})"
+                    ),
+                ));
+            }
+            Err(_) => return Ok(()),
+        };
+        for host in ado_hosts(&pairs) {
+            self.check_host(value, &host)?;
+        }
+        for (k, v) in &pairs {
+            if DB_PATH_PARAMS.contains(&k.as_str()) && !v.is_empty() {
+                self.check_setting_path(value, k, v)?;
+            }
+            self.check_setting_verification(value, k, v)?;
+        }
+        Ok(())
+    }
+
+    /// Check an Oracle connect string, read as the Oracle client reads it.
+    fn check_oracle(&self, value: &str) -> Result<(), Refusal> {
+        let confined = self.path_roots.is_some();
+        let refuse = |kind: RefusalKind, reason: String| Refusal::new(kind, value, reason);
+        let read = read_oracle(value);
+        match read.form {
+            OracleForm::Empty => return Ok(()),
+            OracleForm::Alias if confined => {
+                return Err(refuse(
+                    RefusalKind::Url,
+                    "a net service name is resolved through the server's own Oracle \
+                     configuration; write an Easy Connect string or a connect descriptor"
+                        .into(),
+                ));
+            }
+            OracleForm::Directory if confined => {
+                return Err(refuse(
+                    RefusalKind::Url,
+                    "directory naming is resolved through the server's own Oracle \
+                     configuration; write an Easy Connect string or a connect descriptor"
+                        .into(),
+                ));
+            }
+            OracleForm::Alias | OracleForm::Directory => return Ok(()),
+            OracleForm::Descriptor | OracleForm::EasyConnect => {}
+        }
+        let get = |key: &str| {
+            read.params
+                .iter()
+                .filter(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+                .collect::<Vec<_>>()
+        };
+        let runs_program = get("protocol")
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case("beq"))
+            || !get("program").is_empty();
+        if runs_program && !self.subprocess {
+            return Err(refuse(
+                RefusalKind::Command,
+                "a bequeath connection (`PROTOCOL=BEQ` / `PROGRAM=`) runs a program".into(),
+            ));
+        }
+        if confined
+            && get("protocol")
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case("ipc"))
+        {
+            return Err(refuse(
+                RefusalKind::Url,
+                "an IPC connection (`PROTOCOL=IPC`) reaches a local listener by name".into(),
+            ));
+        }
+        if let Some(scheme) = &read.scheme {
+            self.check_scheme(value, scheme)?;
+        }
+        if confined && !runs_program {
+            if read.form == OracleForm::Descriptor && get("host").is_empty() {
+                return Err(refuse(
+                    RefusalKind::Url,
+                    "the connect descriptor names no `HOST`; name the server explicitly".into(),
+                ));
+            }
+            if read.hosts.is_empty() {
+                return Err(refuse(
+                    RefusalKind::Url,
+                    "no server could be read from this value; name the server explicitly".into(),
+                ));
+            }
+        }
+        for host in &read.hosts {
+            self.check_host(value, host)?;
+        }
+        let token_auth = get("token_auth");
+        if let Some(mode) = token_auth.last() {
+            let own_identity =
+                !mode.eq_ignore_ascii_case("oauth") || get("token_location").is_empty();
+            if own_identity && !self.host_credentials {
+                return Err(refuse(
+                    RefusalKind::HostCredentials,
+                    format!(
+                        "`token_auth={mode}` authenticates with the server's own identity or \
+                         token files; only `OAUTH` with an explicit `token_location` is allowed"
+                    ),
+                ));
+            }
+        }
+        for (k, v) in &read.params {
+            if ORACLE_PATH_PARAMS.contains(&k.as_str()) && !v.is_empty() {
+                self.check_setting_path(value, k, v)?;
+            }
+            if ORACLE_URL_PARAMS.contains(&k.as_str()) && !v.is_empty() {
+                self.check_plain_url(v)
+                    .map_err(|e| refuse(e.kind, format!("`{k}`: {}", e.reason)))?;
+            }
+            self.check_setting_verification(value, k, v)?;
+        }
+        Ok(())
+    }
+
+    /// Check an Azure Storage connection string: every `…Endpoint=` URL and
+    /// the account host built from `AccountName` / `EndpointSuffix`.
+    fn check_azure_conn(&self, value: &str) -> Result<(), Refusal> {
+        let pairs = azure_pairs(value);
+        let account = azure_account_url(&pairs);
+        let endpoints = pairs
+            .iter()
+            .filter(|(k, _)| k.ends_with("endpoint"))
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .chain(account.as_deref().map(|u| ("accountname", u)));
+        for (k, url) in endpoints {
+            self.check_plain_url(url)
+                .map_err(|e| Refusal::new(e.kind, value, format!("`{k}`: {}", e.reason)))?;
+        }
+        if pairs
+            .iter()
+            .any(|(k, v)| k == "usedevelopmentstorage" && v.eq_ignore_ascii_case("true"))
+        {
+            self.check_host(value, "127.0.0.1")?;
+        }
+        Ok(())
+    }
+
+    /// Check a value with no declared grammar.
+    fn check_plain_url(&self, value: &str) -> Result<(), Refusal> {
+        let value = value.trim_matches(|c: char| c.is_ascii_whitespace());
+        if let Some(items) = scheme_list(value) {
+            for item in items {
+                self.check_plain_url(item)
+                    .map_err(|e| Refusal::new(e.kind, value, e.reason))?;
+            }
+            return Ok(());
+        }
         let refuse = |reason: String| Refusal::new(RefusalKind::Url, value, reason);
-        let scheme = scheme_of(value).filter(|_| !value.starts_with('/'));
+        let ip = ip_literal(value);
+        let scheme = scheme_of(value).filter(|_| !value.starts_with('/') && ip.is_none());
+        if let Some(path) = scheme.as_deref().and_then(|s| unix_socket_path(s, value)) {
+            return match path {
+                Some(path) => self.check_setting_path(value, "unix socket", &path),
+                None if self.path_roots.is_some() => Err(Refusal::new(
+                    RefusalKind::Path,
+                    value,
+                    "a percent-encoded path that is not UTF-8 cannot be checked",
+                )),
+                None => Ok(()),
+            };
+        }
         match scheme.as_deref() {
             Some("file") | Some("sqlite") => {
                 return match locate(value) {
@@ -1129,6 +1718,7 @@ impl ReferencePolicy {
                     )),
                 };
             }
+            None if value.starts_with("//") || ip.is_some() => {}
             None if value.starts_with(['/', '.', '?', '#']) => return Ok(()),
             None if is_relative_path(value)
                 && !value.starts_with('(')
@@ -1138,50 +1728,34 @@ impl ReferencePolicy {
             }
             _ => {}
         }
-        if let (Some(scheme), Some(allowed)) = (&scheme, &self.url_schemes)
-            && !allowed.contains(scheme)
+        if let Some(scheme) = &scheme {
+            self.check_scheme(value, scheme)?;
+        }
+        let hosts = url_hosts(value);
+        for host in &hosts {
+            self.check_host(value, host)?;
+        }
+        let params = database_url_params(value);
+        let socket_dir = params
+            .iter()
+            .any(|(k, v)| DB_HOST_PARAMS.contains(&k.as_str()) && v.starts_with('/'));
+        if self.path_roots.is_some()
+            && hosts.is_empty()
+            && !value.is_empty()
+            && !socket_dir
+            && scheme.as_deref() != Some("memory")
         {
-            return Err(refuse(format!(
-                "URL scheme `{scheme}` not in the allow-list"
-            )));
+            return Err(refuse(
+                "no server could be read from this value; name the server explicitly".into(),
+            ));
         }
-        for host in url_hosts(value) {
-            if host.contains("${") || host.contains('*') {
-                if self.url_hosts.is_some() {
-                    return Err(refuse(
-                        "a host taken from a token cannot be checked against the host allow-list"
-                            .into(),
-                    ));
-                }
-                continue;
-            }
-            match &self.url_hosts {
-                Some(list) if list.iter().any(|p| host_matches(p, &host)) => {}
-                Some(_) => return Err(refuse(format!("host `{host}` not in the allow-list"))),
-                None if is_metadata_host(&host) => {
-                    return Err(refuse(format!(
-                        "host `{host}` is a link-local / metadata endpoint"
-                    )));
-                }
-                None => {}
-            }
-        }
-        for (key, v) in database_url_params(value) {
+        for (key, v) in params {
             let names_path = DB_PATH_PARAMS.contains(&key.as_str())
                 || (DB_HOST_PARAMS.contains(&key.as_str()) && v.starts_with('/'));
             if names_path {
-                self.check_local(&v).map_err(|reason| {
-                    Refusal::new(RefusalKind::Path, value, format!("`{key}`: {reason}"))
-                })?;
+                self.check_setting_path(value, &key, &v)?;
             }
-            let unverified = DB_UNVERIFIED_PARAMS
-                .iter()
-                .any(|(k, vals)| *k == key && vals.iter().any(|x| x.eq_ignore_ascii_case(&v)));
-            if unverified && !self.unverified {
-                return Err(refuse(format!(
-                    "`{key}={v}` turns off certificate verification"
-                )));
-            }
+            self.check_setting_verification(value, &key, &v)?;
         }
         if !self.unverified
             && matches!(scheme.as_deref(), Some("rediss" | "valkeys"))
@@ -1217,11 +1791,21 @@ impl ReferencePolicy {
     /// re-pointed between this check and the client's own lookup is not
     /// caught here.
     pub fn check_url_resolved(&self, value: &str) -> Result<(), Refusal> {
-        self.check_url(value)?;
-        if scheme_of(value).is_some_and(|s| s == "file" || s == "sqlite") {
+        self.check_url_resolved_as(value, None)
+    }
+
+    /// [`check_url_resolved`](Self::check_url_resolved) for a value written in
+    /// `syntax` ([`check_url_as`](Self::check_url_as)).
+    pub fn check_url_resolved_as(
+        &self,
+        value: &str,
+        syntax: Option<UrlSyntax>,
+    ) -> Result<(), Refusal> {
+        self.check_url_as(value, syntax)?;
+        if syntax.is_none() && scheme_of(value).is_some_and(|s| s == "file" || s == "sqlite") {
             return Ok(());
         }
-        for host in url_hosts(value) {
+        for host in url_hosts_as(value, syntax) {
             let bare = host.trim_start_matches('[').trim_end_matches(']');
             if host.contains("${") || host.contains('*') || bare.parse::<std::net::IpAddr>().is_ok()
             {
@@ -1239,7 +1823,7 @@ impl ReferencePolicy {
     /// [`check`](Self::check), resolving URL hosts ([`check_url_resolved`](Self::check_url_resolved)).
     pub fn check_resolved(&self, r: &ResourceRef) -> Result<(), Refusal> {
         match r.kind {
-            ResourceKind::Url => self.check_url_resolved(&r.value),
+            ResourceKind::Url => self.check_url_resolved_as(&r.value, r.syntax),
             ResourceKind::Path if matches!(locate(&r.value), Location::Remote) => {
                 self.check_url_resolved(&r.value)
             }
@@ -1264,7 +1848,7 @@ impl ReferencePolicy {
     pub fn check(&self, r: &ResourceRef) -> Result<(), Refusal> {
         match r.kind {
             ResourceKind::Path => self.check_path(&r.value),
-            ResourceKind::Url => self.check_url(&r.value),
+            ResourceKind::Url => self.check_url_as(&r.value, r.syntax),
             ResourceKind::Command => self.check_command(&r.value),
             ResourceKind::Unverified if self.unverified => Ok(()),
             ResourceKind::Unverified => Err(Refusal::new(
@@ -1407,17 +1991,18 @@ fn visit(
         }
     }
     let kind = alts.iter().find_map(|n| annotation_of(n));
+    let syntax = alts.iter().find_map(|n| syntax_of(n));
     match value {
         Value::String(s) => {
             if let Some(kind) = kind {
-                out.push(ResourceRef::new(pointer, kind, s.clone()));
+                out.push(ResourceRef::new(pointer, kind, s.clone()).with_syntax(syntax));
             }
         }
         Value::Array(items) => {
             for (i, item) in items.iter().enumerate() {
                 let p = format!("{pointer}/{i}");
                 if let (Some(kind), Value::String(s)) = (kind, item) {
-                    out.push(ResourceRef::new(p.clone(), kind, s.clone()));
+                    out.push(ResourceRef::new(p.clone(), kind, s.clone()).with_syntax(syntax));
                 }
                 for alt in &alts {
                     if let Some(items_schema) = alt.get("items").filter(|v| v.is_object()) {
@@ -1511,6 +2096,47 @@ fn collect_fields(
 pub fn annotated_fields(schema: &Value) -> Vec<(String, ResourceKind)> {
     let mut out = BTreeSet::new();
     collect_fields(schema, schema, "", &mut out, 0);
+    out.into_iter().collect()
+}
+
+/// Every field a schema marks with [`URL_SYNTAX_ANNOTATION`], as dotted paths
+/// (the same form as [`annotated_fields`]) with their grammar.
+pub fn url_syntax_fields(schema: &Value) -> Vec<(String, UrlSyntax)> {
+    fn walk(
+        root: &Value,
+        node: &Value,
+        path: &str,
+        out: &mut BTreeSet<(String, UrlSyntax)>,
+        depth: usize,
+    ) {
+        if depth > 12 {
+            return;
+        }
+        let mut alts = Vec::new();
+        alternatives(root, node, &mut alts, 0);
+        if let Some(syntax) = alts.iter().find_map(|n| syntax_of(n))
+            && !path.is_empty()
+        {
+            out.insert((path.to_string(), syntax));
+        }
+        for alt in alts {
+            if let Some(Value::Object(props)) = alt.get("properties") {
+                for (k, s) in props {
+                    let p = if path.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{path}.{k}")
+                    };
+                    walk(root, s, &p, out, depth + 1);
+                }
+            }
+            if let Some(items) = alt.get("items").filter(|v| v.is_object()) {
+                walk(root, items, &format!("{path}[]"), out, depth + 1);
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    walk(schema, schema, "", &mut out, 0);
     out.into_iter().collect()
 }
 
@@ -2512,5 +3138,538 @@ mod tests {
         let e = Refusal::new(RefusalKind::Command, "x", "why");
         assert_eq!(e.to_string(), "x (why)");
         assert_eq!(ResourceKind::Url.to_string(), "url");
+    }
+
+    fn confined() -> ReferencePolicy {
+        ReferencePolicy::deny_all()
+            .with_path_roots(["/srv/data"])
+            .any_url_scheme()
+            .any_url_host()
+    }
+
+    fn refused(syntax: Option<UrlSyntax>, value: &str) -> Refusal {
+        confined()
+            .check_url_as(value, syntax)
+            .expect_err(&format!("{value} should be refused"))
+    }
+
+    fn accepted(syntax: Option<UrlSyntax>, value: &str) {
+        if let Err(e) = confined().check_url_as(value, syntax) {
+            panic!("{value} should be accepted: {}", e.reason);
+        }
+    }
+
+    const ADO: Option<UrlSyntax> = Some(UrlSyntax::Ado);
+    const ORACLE: Option<UrlSyntax> = Some(UrlSyntax::Oracle);
+    const AZURE: Option<UrlSyntax> = Some(UrlSyntax::AzureConn);
+    const LIST: Option<UrlSyntax> = Some(UrlSyntax::UrlList);
+
+    #[test]
+    fn url_syntax_round_trips_and_is_read_from_the_schema() {
+        for s in [
+            UrlSyntax::Ado,
+            UrlSyntax::Oracle,
+            UrlSyntax::AzureConn,
+            UrlSyntax::UrlList,
+        ] {
+            assert_eq!(UrlSyntax::parse(s.as_str()), Some(s));
+            assert_eq!(s.to_string(), s.as_str());
+        }
+        assert_eq!(UrlSyntax::parse("jdbc"), None);
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "connection_string": {
+                    "type": "string",
+                    "x-faucet-resource": "url",
+                    "x-faucet-url-syntax": "ado"
+                },
+                "servers": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "x-faucet-resource": "url",
+                    "x-faucet-url-syntax": "url-list"
+                },
+                "plain": {"type": "string", "x-faucet-resource": "url"}
+            }
+        });
+        assert_eq!(
+            url_syntax_fields(&schema),
+            vec![
+                ("connection_string".to_string(), UrlSyntax::Ado),
+                ("servers".to_string(), UrlSyntax::UrlList),
+            ]
+        );
+        let config = serde_json::json!({
+            "connection_string": ";Server=169.254.169.254",
+            "servers": ["nats://ok.example.com,nats://169.254.169.254"],
+            "plain": "https://api.example.com"
+        });
+        let refs = annotated_resources(&schema, &config);
+        let syntax = |p: &str| refs.iter().find(|r| r.pointer == p).unwrap().syntax;
+        assert_eq!(syntax("/connection_string"), ADO);
+        assert_eq!(syntax("/servers/0"), LIST);
+        assert_eq!(syntax("/plain"), None);
+        for r in &refs {
+            let plain = r.pointer == "/plain";
+            assert_eq!(confined().check(r).is_ok(), plain, "{}", r.pointer);
+            if !plain {
+                assert!(ReferencePolicy::open().check_resolved(r).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn ado_strings_are_read_untrimmed_like_the_driver() {
+        assert_eq!(url_hosts_as("\u{b}=;;", ADO), vec!["localhost".to_string()]);
+        assert_eq!(
+            url_hosts_as("\u{b}Server=169.254.169.254;", ADO),
+            vec!["localhost".to_string()]
+        );
+        let caller = ReferencePolicy::deny_all()
+            .with_path_roots(["/srv/data"])
+            .any_url_scheme()
+            .any_url_host();
+        assert!(caller.check_url_as("\u{b}=;;", ADO).is_ok());
+        assert!(
+            caller
+                .check_url_as(" Server=169.254.169.254;", ADO)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn ado_strings_with_leading_separators_name_their_server() {
+        for cs in [
+            ";Server=tcp:169.254.169.254,1433;User Id=sa;Password=x",
+            " ; Server=169.254.169.254;User Id=sa",
+            ";;Data Source='169.254.169.254';User Id=sa",
+            "Data Source={169.254.169.254\\inst,1433}",
+        ] {
+            assert!(refused(ADO, cs).reason.contains("169.254.169.254"), "{cs}");
+            assert!(
+                ReferencePolicy::open().check_url_as(cs, ADO).is_err(),
+                "{cs}"
+            );
+            assert!(
+                url_hosts_as(cs, ADO).contains(&"169.254.169.254".to_string()),
+                "{cs}"
+            );
+        }
+        accepted(
+            ADO,
+            "Server=tcp:db.example.com,1433;Database=x;User Id=sa;Password='p;w'",
+        );
+        accepted(
+            ADO,
+            ";Server=db.example.com;TrustServerCertificateCA=/srv/data/ca.pem",
+        );
+    }
+
+    #[test]
+    fn ado_strings_with_any_first_key_name_their_files() {
+        for cs in [
+            "App.Name=x;Server=db.example.com;TrustServerCertificateCA=/etc/x.pem",
+            "a==b=1;Server=db.example.com;TrustServerCertificateCA=/etc/x.pem",
+            "Server=db.example.com;TrustServerCertificateCA={/etc/x.pem}",
+            "Server=db.example.com; TrustServerCertificateCA = '/etc/x.pem' ",
+            "Server=db.example.com;TrustServerCertificateCA=\"/etc/x\"\"y.pem\"",
+        ] {
+            let e = refused(ADO, cs);
+            assert_eq!(e.kind, RefusalKind::Path, "{cs}");
+            assert!(e.reason.contains("trustservercertificateca"), "{cs}");
+        }
+        let e = refused(ADO, "Server=db.example.com;TrustServerCertificate= yes");
+        assert!(e.reason.contains("turns off certificate verification"));
+        assert!(
+            confined()
+                .with_unverified(true)
+                .check_url_as("Server=db.example.com;TrustServerCertificate=true", ADO)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn ado_strings_the_driver_cannot_read_are_refused_for_callers() {
+        for cs in ["Server=h;junk", "Server='open", "Server=hé", "k==v"] {
+            assert!(
+                refused(ADO, cs)
+                    .reason
+                    .contains("the way the driver reads it")
+            );
+            assert!(
+                ReferencePolicy::open().check_url_as(cs, ADO).is_ok(),
+                "{cs}"
+            );
+            assert!(url_hosts_as(cs, ADO).is_empty());
+        }
+        accepted(ADO, "Database=x");
+        accepted(ADO, "");
+    }
+
+    #[test]
+    fn easy_connect_network_path_names_its_host() {
+        for v in [
+            "//169.254.169.254:1521/svc",
+            "  //169.254.169.254:1521/svc  ",
+            "169.254.169.254/svc",
+            "tcps://169.254.169.254:2484/svc",
+        ] {
+            assert!(refused(ORACLE, v).reason.contains("169.254.169.254"), "{v}");
+        }
+        assert!(
+            refused(None, "//169.254.169.254:1521/svc")
+                .reason
+                .contains("169.254")
+        );
+        assert_eq!(
+            url_hosts("//db.example.com:1521/svc"),
+            vec!["db.example.com"]
+        );
+        accepted(ORACLE, "//db.example.com:1521/FREEPDB1");
+        accepted(ORACLE, "db.example.com:1521/FREEPDB1");
+        accepted(
+            ORACLE,
+            "tcps://db.example.com:2484/svc?ssl_server_dn_match=on",
+        );
+        accepted(None, "/jobs/1");
+        let tcps = ReferencePolicy::open().with_url_schemes(["tcp"]);
+        assert!(
+            tcps.check_url_as("tcps://db.example.com:2484/s", ORACLE)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn easy_connect_plus_parameters_without_scheme_are_read() {
+        let e = refused(
+            ORACLE,
+            "db.example.com:2484/svc?wallet_location=/etc/oracle/wallet",
+        );
+        assert_eq!(e.kind, RefusalKind::Path);
+        assert!(e.reason.contains("wallet_location"));
+        assert!(
+            refused(ORACLE, "db.example.com/svc?WALLET_LOCATION=\"/etc/w\"")
+                .reason
+                .contains("wallet_location")
+        );
+        assert!(
+            refused(ORACLE, "db.example.com/svc?oci_config_file=/etc/oci/config")
+                .reason
+                .contains("oci_config_file")
+        );
+        assert!(
+            refused(
+                ORACLE,
+                "db.example.com/svc?oci_iam_url=http://169.254.169.254/x"
+            )
+            .reason
+            .contains("oci_iam_url")
+        );
+        assert!(
+            refused(ORACLE, "db.example.com/svc?ssl_server_dn_match=off")
+                .reason
+                .contains("turns off")
+        );
+        accepted(
+            ORACLE,
+            "db.example.com:2484/svc?wallet_location=/srv/data/wallet&retry_count=3",
+        );
+    }
+
+    #[test]
+    fn easy_connect_address_lists_name_every_host() {
+        for v in [
+            "db.example.com:1521;169.254.169.254:1521/svc",
+            "db.example.com,169.254.169.254:1521/svc",
+            "[fe80::1]:1521/svc",
+        ] {
+            assert!(refused(ORACLE, v).reason.contains("link-local"), "{v}");
+        }
+        assert_eq!(
+            url_hosts_as("a.example.com,b.example.com:1521;c.example.com/s", ORACLE),
+            vec!["a.example.com", "b.example.com", "c.example.com"]
+        );
+        accepted(ORACLE, "a.example.com:1521;b.example.com:1521/svc");
+    }
+
+    #[test]
+    fn descriptor_proxy_is_a_host() {
+        let v = "(DESCRIPTION=(ADDRESS=(HTTPS_PROXY=169.254.169.254)(HTTPS_PROXY_PORT=80)\
+                 (PROTOCOL=TCPS)(HOST=db.example.com)(PORT=443)))";
+        assert!(refused(ORACLE, v).reason.contains("169.254.169.254"));
+        assert!(
+            refused(ORACLE, "h:1/s?https_proxy=169.254.169.254")
+                .reason
+                .contains("169")
+        );
+        assert!(
+            refused(
+                ORACLE,
+                "( description = ( address = ( host = 169.254.169.254 )( port = 1521 ) ) )"
+            )
+            .reason
+            .contains("169.254.169.254")
+        );
+        assert!(
+            refused(
+                ORACLE,
+                "(DESCRIPTION=(ADDRESS=(HOST=db.example.com,169.254.169.254)))"
+            )
+            .reason
+            .contains("169.254.169.254")
+        );
+        assert!(
+            refused(
+                None,
+                "tcps://db.example.com:2484/s?https_proxy=169.254.169.254"
+            )
+            .reason
+            .contains("169.254.169.254")
+        );
+        let ok = "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=db.example.com)(PORT=2484))\
+                  (CONNECT_DATA=(SERVICE_NAME=s))(SECURITY=(MY_WALLET_DIRECTORY=/srv/data/w)))";
+        accepted(ORACLE, ok);
+        let e = refused(ORACLE, "(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=s)))");
+        assert!(e.reason.contains("names no `HOST`"));
+        assert_eq!(
+            url_hosts_as("(DESCRIPTION=(ADDRESS=(HOST=fe80::1)))", ORACLE),
+            vec!["[fe80::1]"]
+        );
+        assert_eq!(
+            url_hosts_as("https://api.example.com/x", None),
+            vec!["api.example.com"]
+        );
+    }
+
+    #[test]
+    fn token_location_is_a_path() {
+        let v = "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=db.example.com)(PORT=2484))\
+                 (SECURITY=(TOKEN_AUTH=OAUTH)(TOKEN_LOCATION=/etc/oci/tok)))";
+        let e = refused(ORACLE, v);
+        assert_eq!(e.kind, RefusalKind::Path);
+        assert!(e.reason.contains("token_location"));
+        assert!(
+            refused(
+                None,
+                "tcps://db.example.com:2484/s?token_location=/etc/oci/token"
+            )
+            .reason
+            .contains("token_location")
+        );
+        accepted(
+            ORACLE,
+            "db.example.com:2484/s?token_auth=OAUTH&token_location=/srv/data/token",
+        );
+    }
+
+    #[test]
+    fn token_auth_uses_host_credentials() {
+        for v in [
+            "db.example.com:2484/s?token_auth=OCI_INSTANCE_PRINCIPAL",
+            "db.example.com:2484/s?token_auth=AZURE_MANAGED_IDENTITY",
+            "db.example.com:2484/s?token_auth=OAUTH",
+            "(DESCRIPTION=(ADDRESS=(HOST=db.example.com))(SECURITY=(TOKEN_AUTH=OCI_TOKEN)))",
+        ] {
+            assert_eq!(refused(ORACLE, v).kind, RefusalKind::HostCredentials, "{v}");
+            assert!(
+                confined()
+                    .with_host_credentials(true)
+                    .check_url_as(v, ORACLE)
+                    .is_ok(),
+                "{v}"
+            );
+        }
+    }
+
+    #[test]
+    fn bequeath_runs_a_program() {
+        let beq = "(DESCRIPTION=(ADDRESS=(PROTOCOL=BEQ)(PROGRAM=/bin/sh)(ARGV0=sh))\
+                   (CONNECT_DATA=(SID=x)))";
+        assert_eq!(refused(ORACLE, beq).kind, RefusalKind::Command);
+        assert_eq!(
+            refused(ORACLE, "(DESCRIPTION=(ADDRESS=(PROTOCOL=beq)))").kind,
+            RefusalKind::Command
+        );
+        assert!(
+            confined()
+                .with_subprocess(true)
+                .check_url_as(beq, ORACLE)
+                .is_ok()
+        );
+        assert!(ReferencePolicy::open().check_url_as(beq, ORACLE).is_ok());
+        let ipc = "(DESCRIPTION=(ADDRESS=(PROTOCOL=IPC)(KEY=x)))";
+        assert!(refused(ORACLE, ipc).reason.contains("IPC"));
+        assert!(ReferencePolicy::open().check_url_as(ipc, ORACLE).is_ok());
+    }
+
+    #[test]
+    fn names_resolved_by_the_servers_oracle_configuration_are_refused_for_callers() {
+        for v in [
+            "orclpdb_alias",
+            "ldap://ldap.example.com:389/cn=orcl",
+            "LDAP:orcl",
+        ] {
+            assert!(
+                refused(ORACLE, v).reason.contains("Oracle configuration"),
+                "{v}"
+            );
+            assert!(
+                ReferencePolicy::open().check_url_as(v, ORACLE).is_ok(),
+                "{v}"
+            );
+        }
+        accepted(ORACLE, "   ");
+        assert!(refused(ORACLE, ":1521/svc").reason.contains("no server"));
+    }
+
+    #[test]
+    fn azure_connection_strings_check_every_endpoint() {
+        for v in [
+            "TableEndpoint=https://ok.example.com/;BlobEndpoint=http://169.254.169.254/",
+            "AccountName=a;AccountKey=k==;QueueEndpoint=http://169.254.169.254/",
+        ] {
+            assert!(refused(AZURE, v).reason.contains("endpoint`: host"), "{v}");
+        }
+        let https_only = ReferencePolicy::open().with_url_schemes(["https"]);
+        assert!(
+            https_only
+                .check_url_as("AccountName=a;DefaultEndpointsProtocol=http", AZURE)
+                .is_err()
+        );
+        assert_eq!(
+            url_hosts_as(
+                "TableEndpoint=https://ok.example.com/;BlobEndpoint=http://169.254.169.254/",
+                AZURE
+            ),
+            vec!["ok.example.com", "169.254.169.254"]
+        );
+        accepted(
+            AZURE,
+            "DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=k==;\
+             EndpointSuffix=core.windows.net",
+        );
+        accepted(AZURE, "UseDevelopmentStorage=true");
+        accepted(AZURE, "SharedAccessSignature=sv=2024&sig=x");
+        let only = ReferencePolicy::open().with_url_hosts(["acct.blob.core.windows.net"]);
+        assert!(
+            only.check_url_as("UseDevelopmentStorage=true", AZURE)
+                .is_err()
+        );
+        assert!(only.check_url_as("AccountName=acct", AZURE).is_ok());
+    }
+
+    #[test]
+    fn url_lists_and_comma_lists_check_every_element() {
+        for (syntax, v) in [
+            (LIST, "b1.example.com:9092,169.254.169.254:9092"),
+            (LIST, "b1.example.com:9092 SSL://169.254.169.254:9093"),
+            (
+                None,
+                "nats://ok.example.com:4222,nats://169.254.169.254:4222",
+            ),
+            (
+                LIST,
+                "nats://ok.example.com:4222,nats://169.254.169.254:4222",
+            ),
+        ] {
+            assert!(refused(syntax, v).reason.contains("169.254.169.254"), "{v}");
+        }
+        assert_eq!(
+            url_hosts("nats://a.example.com,nats://b.example.com"),
+            vec!["a.example.com", "b.example.com"]
+        );
+        assert_eq!(
+            url_hosts_as("a.example.com:9092, b.example.com:9092", LIST),
+            vec!["a.example.com", "b.example.com"]
+        );
+        accepted(LIST, "b1.example.com:9092,b2.example.com:9092");
+        accepted(LIST, "localhost:9092");
+        accepted(None, "postgres://u@h1.example.com,h2.example.com/db");
+    }
+
+    #[test]
+    fn whole_ip_addresses_are_hosts() {
+        for v in [
+            "fd00:ec2::254",
+            "[fd00:ec2::254]",
+            " 169.254.169.254 ",
+            "fe80::1",
+        ] {
+            assert!(refused(None, v).reason.contains("link-local"), "{v}");
+        }
+        assert_eq!(url_hosts("fd00:ec2::254"), vec!["[fd00:ec2::254]"]);
+        accepted(None, "10.0.0.5");
+        accepted(None, "::1");
+    }
+
+    #[test]
+    fn unreadable_connection_values_are_refused_for_callers() {
+        for v in [
+            "postgres:///db",
+            "redis://",
+            "http://",
+            "mongodb://:27017/x",
+        ] {
+            assert!(refused(None, v).reason.contains("no server"), "{v}");
+            assert!(ReferencePolicy::open().check_url(v).is_ok(), "{v}");
+        }
+        accepted(None, "");
+        accepted(None, "postgres:///db?host=/srv/data/pg");
+        accepted(None, "redis+unix:///srv/data/redis.sock?db=1");
+        accepted(None, "unix:/srv/data/redis.sock");
+        accepted(None, "memory://");
+        assert_eq!(
+            refused(None, "redis+unix:///var/run/redis.sock").kind,
+            RefusalKind::Path
+        );
+        assert_eq!(refused(None, "unix:///x%FF").kind, RefusalKind::Path);
+        assert!(ReferencePolicy::open().check_url("unix:///x%FF").is_ok());
+        let long = format!("https://h.example.com/{}", "a".repeat(MAX_SCREENED_LEN));
+        assert!(refused(None, &long).reason.contains("longer than"));
+        assert!(ReferencePolicy::open().check_url(&long).is_ok());
+    }
+
+    #[test]
+    fn realistic_values_of_every_url_field_are_accepted() {
+        for v in [
+            "https://api.example.com/v1",
+            "http://localhost:8080",
+            "postgres://u:p@db.example.com:5432/app?sslmode=require",
+            "postgresql://u@db.example.com/app",
+            "mysql://u:p@db.example.com:3306/app",
+            "mssql://sa:p@db.example.com:1433/app",
+            "mongodb+srv://u:p@cluster0.example.net/app?retryWrites=true",
+            "mongodb://h1.example.com:27017,h2.example.com:27017/?replicaSet=rs0",
+            "redis://cache.example.com:6379/0",
+            "rediss://cache.example.com:6380/0",
+            "amqp://u:p@rabbit.example.com:5672/%2f",
+            "nats://127.0.0.1:4222",
+            "rabbit.example.com",
+            "db.example.com",
+            "localhost:9010",
+            "broker1:9092,broker2:9092",
+            "http://localhost:8123",
+            "https://sqs.us-east-1.amazonaws.com/123456789012/q",
+            "http://localhost:4566",
+            "https://acct.snowflakecomputing.com",
+            "https://dbc-123.cloud.databricks.com",
+            "grpc.example.com:443",
+            "wss://stream.example.com/feed",
+            "https://login.microsoftonline.us",
+            "http://127.0.0.1:10000/devstoreaccount1",
+            "https://storage.googleapis.com",
+            "http://localhost:4443",
+            "https://catalog.example.com/api/catalog",
+            "thrift://hms.example.com:9083",
+            "s3://bucket/prefix/",
+            "gs://bucket/prefix",
+            "abfss://container@acct.dfs.core.windows.net/path",
+            "https://schema-registry.example.com:8081",
+            "https://es.example.com:9200",
+            "${parent.next_url}",
+        ] {
+            accepted(None, v);
+        }
     }
 }

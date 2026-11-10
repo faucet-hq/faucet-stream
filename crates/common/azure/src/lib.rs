@@ -51,7 +51,7 @@ pub enum AzureCredentials {
         /// Connection string. Its endpoints (`BlobEndpoint=`, or the account
         /// host built from `AccountName=` / `EndpointSuffix=`) are checked
         /// like a URL by a host that confines configs.
-        #[schemars(extend("x-faucet-resource" = "url"))]
+        #[schemars(extend("x-faucet-resource" = "url", "x-faucet-url-syntax" = "azure-conn"))]
         connection_string: String,
     },
     /// Azure Managed Identity (IMDS). For a user-assigned identity, set
