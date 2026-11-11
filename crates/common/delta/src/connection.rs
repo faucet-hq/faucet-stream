@@ -182,9 +182,34 @@ impl DeltaConnection {
         self.check_host_identity()?;
         self.register_handlers();
         let url = self.table_url()?;
-        deltalake::open_table_with_storage_options(url, self.merged_storage_options())
+        self.load(url).await.map_err(|e| self.map_open_error(e))
+    }
+
+    /// Load the table at `url`. Under a reference policy with path roots (a
+    /// config the host does not trust) every file the log names is read
+    /// through a store that refuses keys outside the table.
+    async fn load(
+        &self,
+        url: url::Url,
+    ) -> Result<deltalake::DeltaTable, deltalake::DeltaTableError> {
+        let options = self.merged_storage_options();
+        let confined =
+            faucet_core::http::current_reference_policy().is_some_and(|p| p.path_roots().is_some());
+        if !confined {
+            return deltalake::open_table_with_storage_options(url, options).await;
+        }
+        let root = deltalake::DeltaTableBuilder::from_url(url.clone())?
+            .with_storage_options(options.clone())
+            .build_storage()?
+            .root_object_store(None);
+        let prefix = deltalake::Path::from_url_path(url.path())
+            .map_err(|e| deltalake::DeltaTableError::InvalidTableLocation(format!("{url}: {e}")))?;
+        let store = std::sync::Arc::new(crate::confined::Confined::new(root, prefix));
+        deltalake::DeltaTableBuilder::from_url(url.clone())?
+            .with_storage_options(options)
+            .with_storage_backend(store, url)
+            .load()
             .await
-            .map_err(|e| self.map_open_error(e))
     }
 
     /// Open the table if it exists; return `Ok(None)` when the URI is not (yet)
@@ -194,7 +219,7 @@ impl DeltaConnection {
         self.check_host_identity()?;
         self.register_handlers();
         let url = self.table_url()?;
-        match deltalake::open_table_with_storage_options(url, self.merged_storage_options()).await {
+        match self.load(url).await {
             Ok(t) => Ok(Some(t)),
             Err(e) if is_missing_table(&e) => Ok(None),
             Err(e) => Err(self.map_open_error(e)),
@@ -235,6 +260,12 @@ impl DeltaConnection {
     }
 
     fn map_open_error(&self, e: deltalake::DeltaTableError) -> FaucetError {
+        if e.to_string().contains(crate::confined::OUTSIDE) {
+            return FaucetError::Config(format!(
+                "delta: table '{}' names a file outside its `table_uri`: {e}",
+                self.redacted_uri()
+            ));
+        }
         FaucetError::Source(format!(
             "delta: failed to open table '{}': {e}",
             self.redacted_uri()
@@ -528,6 +559,72 @@ mod tests {
         let c = conn("file:///tmp/t");
         c.register_handlers();
         c.register_handlers();
+    }
+}
+
+#[cfg(test)]
+mod confined_tests {
+    use super::*;
+    use deltalake::logstore::object_store::ObjectStoreExt as _;
+    use faucet_core::resolve::ReferencePolicy;
+    use std::sync::Arc;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delta_log_paths_outside_the_table_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let table = root.join("t");
+        std::fs::create_dir(&table).unwrap();
+        std::fs::create_dir(root.join("other")).unwrap();
+        std::fs::write(root.join("other/x.parquet"), b"PAR1").unwrap();
+        let conn: DeltaConnection = serde_json::from_value(serde_json::json!({
+            "table_uri": table.display().to_string()
+        }))
+        .unwrap();
+        deltalake::operations::create::CreateBuilder::new()
+            .with_location(conn.location_string().unwrap())
+            .with_columns([deltalake::kernel::StructField::new(
+                "id",
+                deltalake::kernel::DataType::LONG,
+                true,
+            )])
+            .await
+            .unwrap();
+
+        let trusted = conn.open().await.unwrap();
+        let store = trusted.log_store().root_object_store(None);
+        assert!(!store.to_string().contains("Confined"));
+
+        let policy = Arc::new(ReferencePolicy::deny_all().with_path_roots(vec![root.clone()]));
+        let caller = faucet_core::http::with_reference_policy(Arc::clone(&policy), conn.open())
+            .await
+            .unwrap();
+        let store = caller.log_store().root_object_store(None);
+        assert!(store.to_string().contains("Confined"), "{store}");
+        let outside = deltalake::Path::from_filesystem_path(root.join("other/x.parquet")).unwrap();
+        let e = store.get(&outside).await.unwrap_err().to_string();
+        assert!(e.contains(crate::confined::OUTSIDE), "{e}");
+        let log = deltalake::Path::from_filesystem_path(
+            table.join("_delta_log/00000000000000000000.json"),
+        )
+        .unwrap();
+        assert!(store.get(&log).await.is_ok());
+        let missing = faucet_core::http::with_reference_policy(policy, async {
+            let conn: DeltaConnection = serde_json::from_value(serde_json::json!({
+                "table_uri": root.join("nope").display().to_string()
+            }))
+            .unwrap();
+            conn.open_optional().await
+        })
+        .await
+        .unwrap();
+        assert!(missing.is_none());
+
+        let refused = conn.map_open_error(deltalake::DeltaTableError::Generic(format!(
+            "'x' {}",
+            crate::confined::OUTSIDE
+        )));
+        assert!(matches!(refused, FaucetError::Config(_)), "{refused}");
     }
 }
 

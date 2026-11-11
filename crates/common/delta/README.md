@@ -12,6 +12,11 @@ Provides:
 - **`DeltaConnection`** — the shared `table_uri` / `credentials` /
   `storage_options` block (flattened into both connector configs) plus the
   open-table, time-travel, storage-option, and handler-registration helpers.
+  Under a reference policy with path roots (`faucet serve` running a config
+  it did not load itself), the table is read through a store that refuses
+  every key outside `table_uri`, so a file the Delta log names elsewhere (a
+  checkpoint sidecar, an add action, a deletion vector) fails the open or the
+  read instead of being read.
 - **`convert`** — Arrow ⇆ JSON conversion (`record_batch_to_json`,
   `infer_arrow_schema`, and `infer_delta_schema` for the Arrow version
   `deltalake` writes with) reused by the source (read) and sink (write).
