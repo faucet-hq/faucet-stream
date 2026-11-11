@@ -71,6 +71,52 @@ async fn a_caller_replay_masks_payloads_that_carry_no_proof() {
     assert_eq!(replay_as(&caller).await["email"], "***");
 }
 
+#[tokio::test]
+async fn a_caller_replay_leaves_out_payloads_a_hash_rule_would_mask_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let dlq = dir.path().join("dlq.jsonl");
+    let out = dir.path().join("out.jsonl");
+    let cfg_yaml = format!(
+        "version: 1\nname: replay\npipeline:\n  source: {{ type: csv, config: {{ path: /dev/null }} }}\n  sink: {{ type: jsonl, config: {{ path: {} }} }}\n  masking:\n    rules:\n      - match: {{ fields: [email] }}\n        action: {{ type: hash }}\n",
+        out.display()
+    );
+    let cfg = parse_with_extension(&cfg_yaml, "yaml").unwrap();
+    let row = faucet_cli::expand::expand(&cfg).unwrap().remove(0).id;
+    let line = |payload: Value| {
+        json!({
+            "error": {"kind": "Sink", "message": "boom"}, "reason": "sink_rejected",
+            "payload": payload, "ts_ms": 1, "sink": "jsonl",
+            "pipeline": "replay", "row": row, "record_index": 0,
+        })
+        .to_string()
+    };
+    std::fs::write(
+        &dlq,
+        format!(
+            "{}\n{}\n",
+            line(json!({"email": "5f0c-hashed"})),
+            line(json!({"id": 7}))
+        ),
+    )
+    .unwrap();
+    let caller = Principal::new(
+        faucet_cli::serve::rbac::AuthContext::runtime(),
+        Origin::Caller {
+            allow_subprocess: false,
+        },
+    );
+    let outcome =
+        faucet_cli::runtime::local::replay_dlq(&caller, &cfg, dlq.to_str().unwrap(), inputs())
+            .await
+            .expect("replay succeeds");
+    assert_eq!(outcome.candidates, 2);
+    assert_eq!(outcome.skipped_unproven, 1);
+    assert_eq!(outcome.records_written, 1);
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(!text.contains("5f0c-hashed"), "{text}");
+    assert_eq!(text.lines().count(), 1, "{text}");
+}
+
 #[test]
 fn installed_keys_sign_and_verify() {
     use faucet_cli::dlq_replay::proof;

@@ -86,6 +86,10 @@ pub struct ReplayOutcome {
     /// Envelopes matching the reason filter that another pipeline or row
     /// wrote, and so were not replayed (`0` with `--all-rows`).
     pub skipped_other_rows: usize,
+    /// Envelopes left out because a `hash` or `tokenize` masking rule would
+    /// rewrite a payload the replay cannot show was masked already (no
+    /// verified masking record, or another row wrote it).
+    pub skipped_unproven: usize,
     /// Records the sink accepted (survivors of transforms/quality/contract).
     /// `0` extra sink writes under `--dry-run` (the sink is a no-op counter).
     pub records_written: usize,
@@ -220,16 +224,29 @@ pub async fn replay(
     // Count candidates up front with the same decryptor and filters the
     // reader will use.
     let target = plan::replay_target(cfg, &node, inputs.all_rows);
-    let (mut matching, mut candidates) = (0usize, 0usize);
+    let foreign = plan::foreign_masking(cfg, &node)?;
+    let (mut matching, mut candidates, mut skipped_unproven) = (0usize, 0usize, 0usize);
     let scan = scan_each(&files, &decryptor, |e| {
         if reason_matches(&e, reason.as_deref()) {
             matching += 1;
             if replay_selects(&e, None, target.as_ref()) {
                 candidates += 1;
+                if foreign.as_ref().is_some_and(|f| f.refuses(&e)) {
+                    skipped_unproven += 1;
+                }
             }
         }
         Ok(())
     })?;
+    if skipped_unproven > 0 {
+        tracing::warn!(
+            skipped = skipped_unproven,
+            row = %node.id,
+            "dlq replay: skipping envelopes a hash or tokenize masking rule would mask again; \
+             they carry no verified masking record (run the server with --vault-key so new \
+             dead letters carry one, or replay them locally from the row that wrote them)"
+        );
+    }
     let skipped_other_rows = matching - candidates;
     if skipped_other_rows > 0 {
         tracing::warn!(
@@ -309,6 +326,7 @@ pub async fn replay(
     Ok(ReplayOutcome {
         candidates,
         skipped_other_rows,
+        skipped_unproven,
         records_written,
         dry_run: inputs.dry_run,
         failed_dlq: failed.to_string_lossy().into_owned(),

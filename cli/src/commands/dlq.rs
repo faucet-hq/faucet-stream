@@ -164,6 +164,14 @@ async fn replay(args: DlqReplayArgs) -> CliResult<()> {
     if let Some(hint) = unsealed_discards_hint(outcome.unsealed_discards) {
         println!("{hint}");
     }
+    if outcome.skipped_unproven > 0 {
+        println!(
+            "Skipped {} envelope(s) a hash or tokenize masking rule would mask a second time: \
+             no verified masking record shows they were masked already (replay them from the \
+             row that wrote them).",
+            outcome.skipped_unproven
+        );
+    }
     if outcome.skipped_other_rows > 0 {
         println!(
             "Skipped {} envelope(s) another pipeline or row wrote (pass --all-rows to replay \

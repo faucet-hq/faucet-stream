@@ -249,7 +249,7 @@ produce `H(H(x))` — breaking the joinability masking exists to guarantee — a
 and contract passes *are* re-applied: they are pure checks over the record, so
 re-checking is idempotent, and a replay is exactly when you want them enforced.
 
-Under `faucet serve` a replay re-masks unless the payload proves it was
+Under `faucet serve` a replay masks a payload again unless it proves it was
 masked under today's rules. When the server has a vault key (`--vault-key`),
 every envelope a pipeline with a `masking:` block dead-letters carries a
 `masking` object: `{"rules": "<fingerprint>", "sig": "<signature>"}`. The
@@ -258,12 +258,19 @@ and the masking `key`; the signature, keyed from the vault key, covers the
 tenant, pipeline, row, fingerprint and payload. A replay through
 `POST /v1/dlq/replay` (including one for a `tenant`) writes a payload as it is
 only when its signature verifies under the current or a previous vault key and
-its fingerprint matches the rules in force; any other payload — no `masking`
+its fingerprint matches the rules in force. Any other payload — no `masking`
 object, a payload or row that changed, rules or a masking key that changed
-since, or a server without a vault key — is masked again first. A DLQ written
-by an older release carries no `masking` object, so its rows are masked again
-on such a replay (for `hash` / `tokenize` rules that means hashed twice). A
-local `faucet dlq replay` keeps trusting the envelope's pipeline and row.
+since, or a server without a vault key — goes through the masking rules again,
+which is safe for `redact` and `partial` (applying them twice gives the same
+value). A payload a `hash` or `tokenize` rule would rewrite is **left out**
+instead, since it may hold a value that is hashed already: the replay counts
+it in `skipped_unproven` and leaves it in the DLQ. Replay such rows with a
+local `faucet dlq replay` from the row that wrote them, which trusts the
+envelope's pipeline and row, or run the server with `--vault-key` so new dead
+letters carry a masking record. A DLQ written by an older release carries no
+`masking` object, so its hash and tokenize rows are left out of such a replay.
+A local replay with `--all-rows` leaves out the same rows for envelopes
+another row wrote.
 
 A replay runs under the config's [`budget:`](./usage.md#run-budgets) and
 [`resilience:`](./resilience.md), like any run. Under `faucet serve`,

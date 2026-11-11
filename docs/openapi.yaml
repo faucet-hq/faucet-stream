@@ -1431,7 +1431,7 @@ paths:
                   description: Replay on behalf of this tenant (`tenants` feature) — the config loads under the tenant's scope and the replay is admitted against its limits, whose per-run ceilings bound it. A principal confined to another tenant gets a 404.
       responses:
         "200":
-          description: Replay outcome (id, tenant, candidates, skipped_other_rows, records_written, failed_dlq, unsealed_discards — discard entries of a sealed DLQ written without its key, which are not honoured)
+          description: Replay outcome (id, tenant, candidates, skipped_other_rows, skipped_unproven — envelopes a hash or tokenize masking rule would mask again because no verified masking record shows they were masked already, left in the DLQ —, records_written, failed_dlq, unsealed_discards — discard entries of a sealed DLQ written without its key, which are not honoured)
           content: { application/json: { schema: { type: object } } }
         "400": { description: Bad config, location, or reason filter }
         "401": { description: Missing or invalid bearer token }
