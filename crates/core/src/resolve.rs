@@ -2851,6 +2851,24 @@ pub fn follows_servers(schema: &Value, config: &Value) -> bool {
     })
 }
 
+/// The JSON Schema keyword (value `true`) on a top-level string config field
+/// whose value is code the connector runs or sends as written (a GraphQL
+/// document, a query or condition expression), other than SQL
+/// ([`SQL_ANNOTATION`]). A host that places values it did not author into a
+/// config keeps them out of such a field:
+///
+/// ```ignore
+/// #[schemars(extend("x-faucet-code" = true))]
+/// pub query: String,
+/// ```
+pub const CODE_ANNOTATION: &str = "x-faucet-code";
+
+/// The top-level config fields `schema` marks with [`CODE_ANNOTATION`],
+/// across every `oneOf` / `anyOf` / `allOf` branch of the root.
+pub fn code_fields(schema: &Value) -> Vec<String> {
+    flagged_fields(schema, CODE_ANNOTATION)
+}
+
 fn flagged_fields(schema: &Value, annotation: &str) -> Vec<String> {
     let mut alts = Vec::new();
     alternatives(schema, schema, &mut alts, 0);
@@ -3032,6 +3050,19 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind, RefusalKind::Path);
         assert!(err.reason.starts_with("`sslkey`"), "{err}");
+    }
+
+    #[test]
+    fn code_fields_are_read_from_every_branch() {
+        let s = json!({"oneOf": [
+            {"type": "object", "properties": {"query": {"type": "string", "x-faucet-code": true}}},
+            {"type": "object", "properties": {"filter": {"$ref": "#/$defs/F"}}}
+        ], "$defs": {"F": {"type": ["string", "null"], "x-faucet-code": true}}});
+        assert_eq!(
+            code_fields(&s),
+            vec!["filter".to_string(), "query".to_string()]
+        );
+        assert!(code_fields(&json!({"type": "object"})).is_empty());
     }
 
     #[test]

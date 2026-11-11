@@ -781,6 +781,13 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                 |id| id_set.contains(id),
                 &format!("row '{row_id}'"),
             )?;
+            crate::sql_bind::check_code_fields(
+                crate::sql_bind::ConfigRole::Source,
+                &src.kind,
+                &src.config,
+                |id| id_set.contains(id),
+                &format!("row '{row_id}'"),
+            )?;
             out.push(ExpandedNode {
                 opt_outs: Vec::new(),
                 id: ids[i].clone(),
@@ -836,6 +843,18 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             |id| id_set.contains(id),
             &format!("row '{row_id}'"),
         )?;
+        for (role, spec) in [
+            (crate::sql_bind::ConfigRole::Source, &merged_source),
+            (crate::sql_bind::ConfigRole::Sink, &merged_sink),
+        ] {
+            crate::sql_bind::check_code_fields(
+                role,
+                &spec.kind,
+                &spec.config,
+                |id| id_set.contains(id),
+                &format!("row '{row_id}'"),
+            )?;
+        }
         // The sink template name this row resolved (or the legacy `default`),
         // used to scope masking `applies_to` per destination.
         let sink_ref = row
@@ -953,6 +972,13 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                 &format!("row `{row_id}` transform[{ti}] (`{}`)", t.kind),
                 false,
                 &HashSet::new(),
+            )?;
+            crate::sql_bind::check_code_fields(
+                crate::sql_bind::ConfigRole::Transform,
+                &t.kind,
+                &t.config,
+                |id| id_set.contains(id),
+                &format!("row `{row_id}` transform[{ti}]"),
             )?;
         }
         if let Some(ref st) = state {
@@ -5822,5 +5848,87 @@ mod partition_tests {
             1,
             "the row's own 5-wide range wins over 100/10"
         );
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "source-graphql",
+    feature = "sink-dynamodb",
+    feature = "source-rest"
+))]
+mod code_field_tests {
+    use super::*;
+    use crate::config::PipelineConfig;
+
+    fn expand_yaml(yaml: &str) -> CliResult<Vec<ExpandedNode>> {
+        expand(&PipelineConfig::from_text(yaml, std::path::Path::new("c.yaml")).unwrap())
+    }
+
+    fn doc(query: &str, condition: &str) -> String {
+        format!(
+            r#"version: 1
+name: c
+vars:
+  team: core
+pipeline:
+  sources:
+    users:
+      type: rest
+      config: {{ base_url: "https://api.example.com" }}
+    detail:
+      type: graphql
+      config:
+        endpoint: "https://gql.example.com/graphql"
+        query: '{query}'
+        records_path: "$.data.items[*]"
+  sinks:
+    out:
+      type: dynamodb
+      config:
+        table_name: t
+        region: us-east-1
+        condition_expression: '{condition}'
+matrix:
+  - id: users
+    source: {{ ref: users }}
+    sink: {{ ref: out }}
+  - id: detail
+    parent: users
+    source: {{ ref: detail }}
+    sink: {{ ref: out }}
+"#
+        )
+    }
+
+    #[test]
+    fn record_values_cannot_be_spliced_into_query_text() {
+        let err = expand_yaml(&doc(
+            "{ user(id: \"${users.id}\") { name } }",
+            "attribute_not_exists(pk)",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("graphql `query`") && err.contains("${users.id}"),
+            "{err}"
+        );
+        assert!(err.contains("`variables`"), "{err}");
+        let err = expand_yaml(&doc(
+            "{ items { id } }",
+            "attribute_not_exists(pk) OR v < ${users.v}",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("dynamodb `condition_expression`")
+                && err.contains("`expression_attribute_values`"),
+            "{err}"
+        );
+        expand_yaml(&doc(
+            "{ items(day: \"${now.date}\", team: \"${vars.team}\") { id } }",
+            "attribute_not_exists(pk)",
+        ))
+        .expect("clock and vars tokens stay allowed");
     }
 }

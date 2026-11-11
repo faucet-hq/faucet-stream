@@ -183,6 +183,7 @@ pub struct GraphqlStreamConfig {
     #[schemars(extend("x-faucet-resource" = "url"))]
     pub endpoint: String,
     /// The GraphQL query string.
+    #[schemars(extend("x-faucet-code" = true))]
     pub query: String,
     /// Variables to pass with the query. Defaults to an empty object.
     #[serde(default = "empty_object")]

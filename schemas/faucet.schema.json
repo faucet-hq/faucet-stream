@@ -22537,7 +22537,8 @@
                     },
                     "query": {
                       "description": "The GraphQL query string.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-code": true
                     },
                     "variables": {
                       "description": "Variables to pass with the query. Defaults to an empty object.",
@@ -29265,14 +29266,16 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-code": true
                     },
                     "key_condition_expression": {
                       "description": "`KeyConditionExpression`. Required for `query`, rejected otherwise.",
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-code": true
                     },
                     "expression_attribute_names": {
                       "description": "`ExpressionAttributeNames` (`#name` → attribute).",
@@ -36218,7 +36221,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-code": true
                     },
                     "expression_attribute_names": {
                       "description": "`ExpressionAttributeNames` for `condition_expression`.",

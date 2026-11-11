@@ -59,6 +59,7 @@ pub struct DynamoDbSinkConfig {
     /// `BatchWriteItem` cannot carry conditions, so a conditional sink writes
     /// item by item.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-code" = true))]
     pub condition_expression: Option<String>,
     /// `ExpressionAttributeNames` for `condition_expression`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

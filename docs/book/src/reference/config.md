@@ -194,7 +194,14 @@ Three stages resolve placeholders:
   holding `/`, `\`, NUL or `..` (a field that is exactly one token takes the
   value whole as a relative path — it may not be absolute, start with `~` or
   climb out with `..`), and a SQL
-  source's query gets it as a bind parameter.
+  source's query gets it as a bind parameter. A field whose value is code
+  the connector runs (a GraphQL `query`, a DynamoDB `filter_expression` /
+  `key_condition_expression` / `condition_expression`, a `sql` transform's
+  `query`; marked `x-faucet-code` in the schema) may not hold a row token at
+  all: the config fails to load. Pass the value as data instead (GraphQL
+  `variables`, DynamoDB `expression_attribute_values`). `${now.*}`,
+  `${backfill.*}`, `${partition.*}`, `${param.*}` and `${vars.*}` stay
+  allowed there.
 
 Reference cycles surface as a clear `InterpolationCycle` error.
 

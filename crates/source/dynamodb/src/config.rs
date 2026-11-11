@@ -95,9 +95,11 @@ pub struct DynamoDbSourceConfig {
     pub projection: Option<String>,
     /// `FilterExpression` applied server-side after the read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-code" = true))]
     pub filter_expression: Option<String>,
     /// `KeyConditionExpression`. Required for `query`, rejected otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-code" = true))]
     pub key_condition_expression: Option<String>,
     /// `ExpressionAttributeNames` (`#name` → attribute).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
