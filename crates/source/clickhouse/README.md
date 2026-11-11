@@ -9,7 +9,8 @@ Talks to ClickHouse over its
 `JSONCompactEachRowWithNamesAndTypes` output format, and streams the response
 body straight into `StreamPage`s. Response bytes are line-buffered and decoded incrementally, so
 memory stays bounded (`batch_size` records per page) regardless of how large the
-result set is.
+result set is. A single response line larger than the HTTP client's response
+limit (1 GiB) fails the read with a `ResponseTooLarge` error.
 
 ## Configuration
 
