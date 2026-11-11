@@ -5078,7 +5078,8 @@
               "type": "object",
               "properties": {
                 "url": {
-                  "type": "string"
+                  "type": "string",
+                  "x-faucet-resource": "url"
                 },
                 "timeout_secs": {
                   "type": "integer",
@@ -5120,7 +5121,8 @@
               "type": "object",
               "properties": {
                 "path": {
-                  "type": "string"
+                  "type": "string",
+                  "x-faucet-resource": "path"
                 }
               },
               "required": [
@@ -5145,7 +5147,9 @@
               "type": "object",
               "properties": {
                 "brokers": {
-                  "type": "string"
+                  "type": "string",
+                  "x-faucet-resource": "url",
+                  "x-faucet-url-syntax": "url-list"
                 },
                 "topic": {
                   "type": "string"

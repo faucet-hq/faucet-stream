@@ -213,6 +213,51 @@ pub fn connector_resources(kind: &str, config: &Value) -> Vec<ResourceRef> {
         .collect()
 }
 
+/// The resources a `kind` state store's `config` names through its own
+/// schema's annotated fields ([`crate::state::state_store_schema`]),
+/// independent of the connectors the build compiles.
+pub fn state_resources(kind: &str, config: &Value) -> Vec<ResourceRef> {
+    static CACHE: OnceLock<SchemaCache> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let schemas = match cache.lock().ok().and_then(|c| c.get(kind).cloned()) {
+        Some(hit) => hit,
+        None => {
+            let found = Arc::new(
+                crate::state::state_store_schema(kind)
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+            );
+            if let Ok(mut c) = cache.lock() {
+                c.insert(kind.to_string(), found.clone());
+            }
+            found
+        }
+    };
+    schemas
+        .iter()
+        .flat_map(|s| annotated_resources(s, config))
+        .collect()
+}
+
+/// The resources a lineage transport (`{type, config}`, its `config` given
+/// here) names through the transport schema's annotated fields, with
+/// pointers relative to that `config`.
+#[cfg(feature = "lineage")]
+pub fn lineage_transport_resources(kind: &str, config: &Value) -> Vec<ResourceRef> {
+    static SCHEMA: OnceLock<Value> = OnceLock::new();
+    let schema = SCHEMA.get_or_init(|| {
+        serde_json::to_value(schemars::schema_for!(faucet_lineage::Transport)).unwrap_or_default()
+    });
+    let whole = serde_json::json!({ "type": kind, "config": config });
+    annotated_resources(schema, &whole)
+        .into_iter()
+        .filter_map(|mut r| {
+            r.pointer = r.pointer.strip_prefix("/config")?.to_string();
+            Some(r)
+        })
+        .collect()
+}
+
 /// Whether connector `kind` runs a program (its schema declares a
 /// `command` field).
 pub fn runs_program(kind: &str) -> bool {

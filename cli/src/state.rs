@@ -14,6 +14,7 @@ use std::sync::Arc;
 #[schemars(title = "file state store")]
 struct FileStateConfig {
     /// Directory holding one JSON file per bookmark.
+    #[schemars(extend("x-faucet-resource" = "path"))]
     path: PathBuf,
     /// Encrypt bookmark files at rest (needs the `encryption` build feature).
     #[serde(default)]
@@ -30,6 +31,7 @@ struct FileStateConfig {
 #[schemars(title = "redis state store")]
 struct RedisStateConfig {
     /// Redis connection URL (`redis://` or `rediss://`).
+    #[schemars(extend("x-faucet-resource" = "url"))]
     url: String,
     /// Prefix for every key, as `{namespace}:{key}`.
     #[serde(default = "default_redis_namespace")]
@@ -50,6 +52,7 @@ fn default_redis_namespace() -> String {
 #[schemars(title = "postgres state store")]
 struct PostgresStateConfig {
     /// PostgreSQL connection URL.
+    #[schemars(extend("x-faucet-resource" = "url"))]
     url: String,
     /// Bookmark table.
     #[serde(default = "default_pg_table")]

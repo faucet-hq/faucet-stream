@@ -1357,16 +1357,66 @@ fn check_connector(
     scope: &Scope<'_>,
     found: &mut Findings,
 ) {
+    check_typed(Typed::Connector, kind, config, base, access, scope, found);
+}
+
+/// What a `{type, config}` object configures, which decides the schema its
+/// resources are read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Typed {
+    Connector,
+    StateStore,
+    #[cfg(feature = "lineage")]
+    LineageTransport,
+}
+
+impl Typed {
+    /// What the `{type, config}` object at `ptr` configures.
+    fn at(ptr: &str) -> Self {
+        if ptr.ends_with("/state") {
+            return Typed::StateStore;
+        }
+        #[cfg(feature = "lineage")]
+        if ptr == "/lineage/transport" {
+            return Typed::LineageTransport;
+        }
+        Typed::Connector
+    }
+
+    fn resources(self, kind: &str, config: &Value) -> Vec<faucet_core::resolve::ResourceRef> {
+        match self {
+            Typed::Connector => crate::serve::references::connector_resources(kind, config),
+            Typed::StateStore => crate::serve::references::state_resources(kind, config),
+            #[cfg(feature = "lineage")]
+            Typed::LineageTransport => {
+                crate::serve::references::lineage_transport_resources(kind, config)
+            }
+        }
+    }
+}
+
+/// [`check_connector`] for a `{type, config}` object of any [`Typed`] kind.
+fn check_typed(
+    typed: Typed,
+    kind: &str,
+    config: &Value,
+    base: &str,
+    access: Access,
+    scope: &Scope<'_>,
+    found: &mut Findings,
+) {
     if scope.only.is_some_and(|f| f.is_empty()) {
         return;
     }
     if LOCAL_PATH_KINDS.contains(&kind) {
         check_local_paths(config, base, access, scope, found);
     }
-    host_identity_findings(kind, config, base, access, scope, found);
+    if typed == Typed::Connector {
+        host_identity_findings(kind, config, base, access, scope, found);
+    }
     let access = read_access(config, access);
-    let azure_hosts = azure_blob_hosts(kind, config);
-    for r in crate::serve::references::connector_resources(kind, config) {
+    let azure_hosts = azure_blob_hosts(kind, config).filter(|_| typed == Typed::Connector);
+    for r in typed.resources(kind, config) {
         if !scope.wants(&r.pointer) {
             continue;
         }
@@ -1557,7 +1607,7 @@ fn data_path_findings(doc: &Value, scope: &Scope<'_>) -> Findings {
                         let rel = scope.only.map(|f| f.under(&base));
                         let inner = scope.within(rel.as_ref());
                         if map.contains_key("config") {
-                            check_connector(t, &config, &base, access, &inner, found);
+                            check_typed(Typed::at(ptr), t, &config, &base, access, &inner, found);
                         } else if !inner.only.is_some_and(|f| f.is_empty()) {
                             check_local_paths(&config, &base, access, &inner, found);
                         }
@@ -2068,20 +2118,30 @@ pub fn refuse_server_paths_with(
     override_findings(cfg, &scope, &mut found);
     let read = Access::Read { recursive: false };
     for n in nodes {
-        let mut check = |kind: &str, config: &Value, access: Access| {
-            check_connector(kind, config, "", access, &scope, &mut found);
+        let mut check = |typed: Typed, kind: &str, config: &Value, access: Access| {
+            check_typed(typed, kind, config, "", access, &scope, &mut found);
         };
-        check(&n.source.kind, &n.source.config, read);
-        check(&n.sink.kind, &n.sink.config, Access::Write);
+        check(Typed::Connector, &n.source.kind, &n.source.config, read);
+        check(
+            Typed::Connector,
+            &n.sink.kind,
+            &n.sink.config,
+            Access::Write,
+        );
         if let Some(st) = n
             .state
             .as_ref()
             .filter(|st| !is_default_state(&st.kind, &st.config))
         {
-            check(&st.kind, &st.config, Access::Write);
+            check(Typed::StateStore, &st.kind, &st.config, Access::Write);
         }
         if let Some(d) = &n.dlq {
-            check(&d.sink.kind, &d.sink.config, Access::Write);
+            check(
+                Typed::Connector,
+                &d.sink.kind,
+                &d.sink.config,
+                Access::Write,
+            );
         }
     }
     findings_error(found)

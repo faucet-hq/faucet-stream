@@ -1165,7 +1165,7 @@ async fn a_callers_auth_providers_are_screened_at_load() {
     };
     let refs = crate::serve::references::ServeReferencePolicy::default();
     let pipeline = serde_json::json!({
-        "source": { "type": "csv", "config": { "path": "in.csv" } },
+        "source": { "type": "file", "config": { "path": "in.csv" } },
         "sink": { "type": "jsonl", "config": { "path": "out.jsonl" } }
     });
     let key = std::env::temp_dir().join("faucet-no-such-key.json");
@@ -2247,4 +2247,96 @@ fn sender_text_spliced_into_a_database_url_query_is_checked_whole() {
         assert!(err.contains("connection_uri"), "{app}: {err}");
     }
     check(&doc("reports")).unwrap();
+}
+
+/// A state store and a lineage transport a caller names are held to the
+/// caller reference policy through their own schemas, whichever connectors
+/// the build compiles.
+#[cfg(all(feature = "state-postgres", feature = "state-redis"))]
+#[test]
+fn caller_state_store_urls_follow_the_reference_policy() {
+    use crate::cli::ReferenceArgs;
+    use crate::serve::references::ServeReferencePolicy;
+    let caller = BodyOrigin::Caller {
+        allow_subprocess: false,
+    };
+    let listed = ServeReferencePolicy::from_args(&ReferenceArgs {
+        allow_url_host: vec!["db.example.com".into()],
+        ..Default::default()
+    })
+    .unwrap()
+    .for_origin(caller, None);
+    let doc = |state: Value| {
+        json!({ "version": 1, "pipeline": {
+            "source": { "type": "file", "config": { "path": "in.csv" } },
+            "sink": { "type": "stdout", "config": {} },
+            "state": state
+        }})
+    };
+    for (state, says) in [
+        (
+            json!({"type": "postgres", "config": {"url": "postgres://u:p@169.254.169.254/x"}}),
+            "pipeline.state.config.url",
+        ),
+        (
+            json!({"type": "postgres", "config": {"url": "postgres://u@evil.example/x"}}),
+            "pipeline.state.config.url",
+        ),
+        (
+            json!({"type": "redis", "config": {"url": "redis://169.254.169.254:6379/0"}}),
+            "pipeline.state.config.url",
+        ),
+        (
+            json!({"type": "redis", "config": {"url": "rediss://db.example.com:6380/0",
+                "tls": {"ca_cert_path": "/etc/ssl/private/ca.pem"}}}),
+            "/etc/ssl/private/ca.pem",
+        ),
+    ] {
+        let cfg = PipelineConfig::from_value(doc(state.clone())).unwrap();
+        let err = refuse_server_paths_with(&cfg, &[], caller, &listed)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(says), "{state}: {err}");
+        let nodes = crate::expand::expand(&cfg).unwrap();
+        let mut bare = cfg.clone();
+        bare.pipeline.state = None;
+        let err = refuse_server_paths_with(&bare, &nodes, caller, &listed)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(says) || err.contains("`url`"),
+            "{state}: {err}"
+        );
+        if !says.contains("169.254") && !state.to_string().contains("169.254") {
+            refuse_server_paths_with(&cfg, &nodes, BodyOrigin::Trusted, &ReferencePolicy::open())
+                .unwrap();
+        }
+    }
+    let ok = PipelineConfig::from_value(doc(
+        json!({"type": "postgres", "config": {"url": "postgres://u@db.example.com/x"}}),
+    ))
+    .unwrap();
+    refuse_server_paths_with(&ok, &[], caller, &listed).unwrap();
+}
+
+#[cfg(feature = "lineage")]
+#[test]
+fn caller_lineage_transport_urls_follow_the_reference_policy() {
+    let caller = BodyOrigin::Caller {
+        allow_subprocess: false,
+    };
+    let policy = crate::serve::references::ServeReferencePolicy::default().for_origin(caller, None);
+    let cfg = PipelineConfig::from_value(json!({ "version": 1,
+        "pipeline": {
+            "source": { "type": "file", "config": { "path": "in.csv" } },
+            "sink": { "type": "stdout", "config": {} }
+        },
+        "lineage": { "namespace": "n", "transport": { "type": "http",
+            "config": { "url": "http://169.254.169.254/api/v1/lineage" } } }
+    }))
+    .unwrap();
+    let err = refuse_server_paths_with(&cfg, &[], caller, &policy)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("lineage.transport.config.url"), "{err}");
 }
