@@ -90,6 +90,7 @@ pub fn exceeded(what: &str, limit: u64) -> FaucetError {
 }
 
 /// Whether `e` is the error [`exceeded`] builds.
+#[cfg(any(test, feature = "file-format-avro"))]
 pub(crate) fn is_exceeded(e: &FaucetError) -> bool {
     matches!(e, FaucetError::Source(m) if m.contains("decodes to more than `max_decoded_bytes`"))
 }
