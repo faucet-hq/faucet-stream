@@ -235,7 +235,7 @@ pub struct KafkaSinkConfig {
     /// `ssl.providers`, `*.cmd`) are refused for configs it does not trust.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     #[schemars(extend("x-faucet-unverified" = {
-        "enable.ssl.certificate.verification": ["false", "0"],
+        "enable.ssl.certificate.verification": ["false", "f", "0", "no", "n", "off"],
         "ssl.endpoint.identification.algorithm": ["none", ""]
     }, "x-faucet-resource-keys" = {
         "bootstrap.servers": {"kind": "url", "syntax": "url-list"},
@@ -514,6 +514,35 @@ impl KafkaSinkConfig {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn every_false_spelling_turns_verification_off_and_is_gated() {
+        let schema = serde_json::to_value(schemars::schema_for!(KafkaSinkConfig)).unwrap();
+        for v in ["false", "F", " f ", "0", "no", "n", "off"] {
+            let config = serde_json::json!({
+                "extra_client_config": {"Enable.SSL.Certificate.Verification": v}
+            });
+            let refs = faucet_core::resolve::annotated_resources(&schema, &config);
+            assert!(
+                refs.iter()
+                    .any(|r| r.kind == faucet_core::resolve::ResourceKind::Unverified),
+                "{v:?} not flagged"
+            );
+        }
+        for v in ["true", "t", "1"] {
+            let config = serde_json::json!({
+                "extra_client_config": {"enable.ssl.certificate.verification": v}
+            });
+            let refs = faucet_core::resolve::annotated_resources(&schema, &config);
+            assert!(
+                !refs
+                    .iter()
+                    .any(|r| r.kind == faucet_core::resolve::ResourceKind::Unverified),
+                "{v:?} flagged"
+            );
+        }
+    }
+
     use super::*;
 
     fn minimal() -> KafkaSinkConfig {
