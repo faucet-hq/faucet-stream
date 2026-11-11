@@ -427,7 +427,7 @@ What each built-in connector reports, and what a caller names instead:
 | `clickhouse`, `mssql` (`staging`), `databricks` (cloud `staging`), `snowflake` (`bulk_load`) | the upload store's `credentials` left to the default chain; Snowflake also a `storage_options` key naming a role, profile, metadata endpoint or workload identity | `credentials: access_key` / `service_account_json_*` / `account_key` / `sas_token`, or static keys in `storage_options` |
 | `delta` | storage options naming no credential of the table's store, a role / profile / metadata / workload-identity key, or (S3) a server environment naming `AWS_IAM_ROLE_ARN` / `AWS_S3_ASSUME_ROLE_ARN` | static keys in `credentials` or `storage_options` |
 | `iceberg` | `client.assume-role.arn`; a Glue client without `aws_access_key_id` / `aws_secret_access_key`, with `profile_name` or without a region; an `s3://` / `gs://` warehouse whose properties name no storage credential (Glue, SQL, HMS) | static keys in `catalog.properties`; a REST catalog's vended credentials keep working |
-| `kafka` | `extra_client_config` `sasl.mechanism` / `sasl.mechanisms` = `GSSAPI` | SASL PLAIN / SCRAM, mTLS |
+| `kafka` | `extra_client_config` `sasl.mechanism` / `sasl.mechanisms` = `GSSAPI`, or a `SASL_*` `security.protocol` with no other mechanism (GSSAPI is librdkafka's default) | SASL PLAIN / SCRAM, mTLS |
 | `mongodb`, `mongodb-cdc`, `oracle`, `oracle-cdc` | as listed above | a user and password |
 
 A refused reference is a `403` that names the field, the value and the flag

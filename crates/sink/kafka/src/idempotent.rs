@@ -25,10 +25,14 @@ use std::time::Duration;
 /// applying them here would let a producer-only property reach a consumer or
 /// admin client and be rejected at create time.
 pub(crate) fn client_config_base(config: &KafkaSinkConfig) -> Result<ClientConfig, FaucetError> {
-    faucet_common_kafka::check_host_identity(&config.extra_client_config)?;
     let mut cfg = ClientConfig::new();
     cfg.set("bootstrap.servers", &config.brokers);
     config.auth.apply(&mut cfg)?;
+    let mut judged = cfg.clone();
+    for (k, v) in &config.extra_client_config {
+        judged.set(k, v);
+    }
+    faucet_common_kafka::check_client_config(&judged)?;
     Ok(cfg)
 }
 
@@ -566,6 +570,45 @@ mod tests {
         assert_eq!(cfg.get("bootstrap.servers"), Some("host:9092"));
         // compression is producer-only — layered by new(), not by the base.
         assert_eq!(cfg.get("compression.type"), None);
+    }
+
+    #[tokio::test]
+    async fn the_client_build_refuses_unplain_kerberos_values() {
+        let mut config: KafkaSinkConfig = serde_json::from_value(serde_json::json!({
+            "brokers": "h:9092",
+            "topic": {"type": "fixed", "name": "t"},
+            "extra_client_config": {
+                "security.protocol": "SASL_PLAINTEXT",
+                "sasl.kerberos.principal": "x; id #",
+                "sasl.kerberos.keytab": "/dev/null"
+            }
+        }))
+        .unwrap();
+        for result in [
+            producer_client_config(&config).map(|_| ()),
+            client_config_base(&config).map(|_| ()),
+        ] {
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("sasl.kerberos.principal"), "{err}");
+        }
+        config.extra_client_config.insert(
+            "sasl.kerberos.principal".into(),
+            "faucet@EXAMPLE.COM".into(),
+        );
+        assert!(
+            producer_client_config(&config).is_ok(),
+            "trusted runs keep Kerberos"
+        );
+        let err = faucet_core::resolve::with_host_credentials(false, async {
+            producer_client_config(&config).map(|_| ())
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("kafka: `extra_client_config.security.protocol`"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -511,7 +511,7 @@ lag, positions or sharding, so either would change those semantics.
 
 ## Caller configs under `faucet serve`
 
-`extra_client_config` with `sasl.mechanism` (or `sasl.mechanisms`) set to `GSSAPI` authenticates with the server's Kerberos identity, so a config a caller submits to `faucet serve` may set it only when the server runs with `--allow-host-credentials` (never for a tenant). `sasl.kerberos.keytab` is a server path and `sasl.kerberos.kinit.cmd` a command; both follow the server's reference policy.
+A client whose final options select GSSAPI authenticates with the server's Kerberos identity: `sasl.mechanism` (or `sasl.mechanisms`) set to `GSSAPI`, or a `SASL_*` `security.protocol` that no other mechanism overrides, since GSSAPI is librdkafka's default. A config a caller submits to `faucet serve` may do that only when the server runs with `--allow-host-credentials` (never for a tenant). `sasl.kerberos.keytab` is a server path and `sasl.kerberos.kinit.cmd` a command; both follow the server's reference policy. Whatever the origin, `sasl.kerberos.principal` and `sasl.kerberos.service.name` may hold only letters, digits and `._/@:-` (so a `HOST$@REALM` principal is refused), and `sasl.kerberos.keytab` no quote, `$`, backtick, backslash or control character: the default `kinit` command line interpolates them.
 
 ## License
 
