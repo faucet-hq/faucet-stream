@@ -99,6 +99,7 @@ impl KafkaSource {
         client_config.set_log_level(RDKafkaLogLevel::Warning);
 
         config.auth.apply(&mut client_config)?;
+        faucet_common_kafka::check_host_identity(&config.extra_client_config)?;
 
         for (k, v) in &config.extra_client_config {
             client_config.set(k, v);

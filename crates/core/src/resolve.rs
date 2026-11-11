@@ -957,6 +957,30 @@ fn ado_hosts(pairs: &[(String, String)]) -> Vec<String> {
     hosts
 }
 
+/// Whether a MongoDB URI authenticates with credentials the host itself
+/// holds: `authMechanism=MONGODB-AWS` or `GSSAPI`, or an
+/// `authMechanismProperties` `ENVIRONMENT` (a cloud or Kubernetes identity).
+pub fn mongodb_uri_uses_host_identity(uri: &str) -> bool {
+    MongoRead::read(uri).is_some_and(|r| r.host_credentials())
+}
+
+/// Whether an Oracle connect string authenticates with the host's identity
+/// or token files: a `TOKEN_AUTH` other than `OAUTH` with an explicit
+/// `TOKEN_LOCATION`.
+pub fn oracle_connect_uses_host_identity(value: &str) -> bool {
+    let read = read_oracle(value);
+    let get = |key: &str| {
+        read.params
+            .iter()
+            .filter(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+            .collect::<Vec<_>>()
+    };
+    get("token_auth")
+        .last()
+        .is_some_and(|mode| !mode.eq_ignore_ascii_case("oauth") || get("token_location").is_empty())
+}
+
 /// How an Oracle connect string names its database.
 #[derive(Debug, PartialEq, Eq)]
 enum OracleForm {
@@ -2576,6 +2600,28 @@ mod tests {
         assert_eq!(local_part("file://host/x"), None);
     }
     use super::*;
+
+    #[test]
+    fn mongodb_and_oracle_values_name_the_hosts_identity() {
+        assert!(mongodb_uri_uses_host_identity(
+            "mongodb://db.example/?authMechanism=MONGODB-AWS"
+        ));
+        assert!(mongodb_uri_uses_host_identity(
+            "mongodb+srv://c.example/?authMechanism=MONGODB-OIDC&authMechanismProperties=ENVIRONMENT:k8s"
+        ));
+        assert!(!mongodb_uri_uses_host_identity("mongodb://u:p@db.example/"));
+        assert!(!mongodb_uri_uses_host_identity("not a uri"));
+        assert!(oracle_connect_uses_host_identity(
+            "tcps://db.example:2484/svc?token_auth=OCI_IAM"
+        ));
+        assert!(oracle_connect_uses_host_identity(
+            "tcps://db.example:2484/svc?token_auth=OAUTH"
+        ));
+        assert!(!oracle_connect_uses_host_identity(
+            "tcps://db.example:2484/svc?token_auth=OAUTH&token_location=/t"
+        ));
+        assert!(!oracle_connect_uses_host_identity("db.example:1521/svc"));
+    }
     use serde_json::json;
 
     /// A schema that refers to itself through `oneOf`, and a config nested

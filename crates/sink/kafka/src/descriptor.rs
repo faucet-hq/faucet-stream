@@ -4,7 +4,8 @@ use faucet_core::capabilities::config::tag;
 use faucet_core::{Capabilities, ConnectorDescriptor, SchemaReport, Value};
 
 /// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
-pub const DESCRIPTOR: ConnectorDescriptor = ConnectorDescriptor::new("kafka", capabilities);
+pub const DESCRIPTOR: ConnectorDescriptor = ConnectorDescriptor::new("kafka", capabilities)
+    .with_host_identity(faucet_common_kafka::host_identity);
 
 pub(crate) fn schema_report(drops_unknown_fields: bool) -> SchemaReport {
     if drops_unknown_fields {

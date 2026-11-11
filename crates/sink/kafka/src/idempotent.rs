@@ -25,6 +25,7 @@ use std::time::Duration;
 /// applying them here would let a producer-only property reach a consumer or
 /// admin client and be rejected at create time.
 pub(crate) fn client_config_base(config: &KafkaSinkConfig) -> Result<ClientConfig, FaucetError> {
+    faucet_common_kafka::check_host_identity(&config.extra_client_config)?;
     let mut cfg = ClientConfig::new();
     cfg.set("bootstrap.servers", &config.brokers);
     config.auth.apply(&mut cfg)?;
