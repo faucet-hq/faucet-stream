@@ -2247,8 +2247,7 @@ async fn a_connect_callback_after_the_connection_was_deleted_stores_nothing() {
         let held = held_idp().await;
         let api = fence_server(run.path(), history.clone(), &held.uri).await;
 
-        // Deleted while the flow waits at the provider: the code is never
-        // exchanged.
+        // Deleted while the flow waits at the provider: the code is never exchanged.
         create_static_connection(&api, "crm", "dummy-old").await;
         let st = start_connect_flow(&api, "crm").await;
         let (code, _) = api

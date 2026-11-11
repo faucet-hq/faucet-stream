@@ -351,8 +351,7 @@ impl Walk<'_> {
                         (None, Scope::Unknown) => Scope::Unknown,
                         (None, _) => Scope::Inside,
                     };
-                    // A key that is not a string has no pointer of its own:
-                    // its value is recorded at the mapping, which errs wide.
+                    // A non-string key is recorded at its mapping (errs wide).
                     let at = match k.as_str() {
                         Some(k) => crate::params::caller::child(ptr, k),
                         None => ptr.to_string(),
@@ -1176,8 +1175,7 @@ mod tests {
                 err.message
             );
         }
-        // A directive the operator wrote stays, and a value's own `${` is
-        // kept literal.
+        // The operator's directive stays; a value's own `${` stays literal.
         let own = query_hook(&[("a", "x"), ("b", "${env:HOME}")]);
         let sub = substitute_tracked(
             "name: \"${env:USER}-${trigger.query.a}-${trigger.query.b}\"\n",

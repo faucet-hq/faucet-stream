@@ -386,8 +386,7 @@ async fn a_caller_param_reaching_the_server_identity_is_refused() {
     assert!(warnings.contains("host credentials"), "{v}");
     assert!(warnings.contains("--allow-host-credentials"), "{v}");
 
-    // The template's own defaults: the operator's body, with the server's
-    // identity allowed when the source builds its client.
+    // The template's own defaults are the operator's: the server identity is allowed.
     let (code, v) = api
         .post("/v1/templates/exports/runs", json!({ "version": 1 }))
         .await;

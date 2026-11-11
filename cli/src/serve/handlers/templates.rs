@@ -241,9 +241,7 @@ pub async fn register_template(
             }
         }
     }
-    // A pipeline that uses the server's own identity and takes params: a
-    // caller's values for them are refused at trigger time unless the server
-    // allows host credentials.
+    // Caller params reaching the server identity are refused at trigger time.
     if let Some(warning) = host_identity_warning(&state, &record) {
         tracing::warn!(template = %record.id, "{warning}");
         summary.warnings.push(warning);

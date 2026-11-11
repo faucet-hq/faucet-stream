@@ -6,9 +6,7 @@ use faucet_common_azure::{
 use faucet_core::resolve::{ReferencePolicy, UrlSyntax, url_hosts_as};
 use libfuzzer_sys::fuzz_target;
 
-// The screen and the Azure client must read a connection string alike: the
-// settings the client is built with are the ones the screen derives, and
-// every host the client connects to is one the screen checks.
+// The screen and the Azure client must read a connection string alike.
 fuzz_target!(|s: &str| {
     let policy = ReferencePolicy::deny_all()
         .with_path_roots(["/srv/data"])

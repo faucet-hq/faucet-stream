@@ -82,8 +82,7 @@ impl faucet_core::file_format::parquet_io::RangeRead for FileRange {
             let primed = &mut self.primed;
             let read = async {
                 if !*primed {
-                    // The SFTP client sizes every later read by its first reply,
-                    // so that reply must come from the file's start, not its footer.
+                    // The client sizes later reads by its first reply: read the start first.
                     file.read(&mut [0u8; 1]).await.map_err(failed)?;
                     *primed = true;
                 }

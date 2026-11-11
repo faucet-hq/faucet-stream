@@ -4,9 +4,7 @@ use faucet_core::resolve::{ReferencePolicy, canonical_host, url_hosts};
 use libfuzzer_sys::fuzz_target;
 use mongodb::options::{AuthMechanism, ConnectionString, HostInfo, ServerAddress, Tls};
 
-// The screen and the MongoDB driver must read a URI alike: every host the
-// driver connects to is one the screen checks, and every file, verification
-// switch or host identity the driver uses is one the screen refuses.
+// The screen and the MongoDB driver must read a URI alike.
 fuzz_target!(|s: &str| {
     let confined = ReferencePolicy::deny_all()
         .with_path_roots(["/srv/data"])

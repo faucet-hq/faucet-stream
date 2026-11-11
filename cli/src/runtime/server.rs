@@ -131,8 +131,7 @@ pub async fn load(
         None => None,
         Some(t) => Some(tenant_scope(state, t).await?),
     };
-    // A body from the server's own triggers file is the operator's; what it
-    // carries in `caller_fields` is only what an event's sender placed in it.
+    // A triggers-file body is the operator's; `caller_fields` holds the sender's values.
     let caller = sub
         .caller_fields
         .map(|fields| crate::serve::load::CallerParams {
@@ -164,8 +163,7 @@ pub async fn load(
         &references,
         caller,
     );
-    // What a caller's config makes the server register for redaction is
-    // held with the caller's values.
+    // Values a caller's config registers for redaction go to the caller set.
     let loaded = if principal.caller_body() {
         crate::secrets::registry::as_caller(loading).await
     } else {
@@ -639,8 +637,7 @@ pub async fn submit(
         },
     )
     .await?;
-    // A caller's run whose connectors check the server's identity only when
-    // they build a client waits until every cluster member does.
+    // Needs every member to check the server identity at client build.
     if crate::serve::host_identity::members_must_check(
         principal.caller_body(),
         principal.tenant(),
@@ -657,8 +654,7 @@ pub async fn submit(
         )
         .await?;
     }
-    // A caller's config that opens a listener runs only where every member
-    // holds it to `--allow-listen`.
+    // A caller's listener needs every member to enforce `--allow-listen`.
     if principal.caller_body() {
         let topology = admitted
             .loaded

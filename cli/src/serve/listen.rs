@@ -168,8 +168,7 @@ mod tests {
             &p,
         )
         .unwrap();
-        // The default address binds 8080, outside the range; the refusal
-        // names the range to use.
+        // The default 8080 is outside the range; the refusal names it.
         refused(serde_json::json!({}), &p, "127.0.0.1:29100-29199");
         refused(
             serde_json::json!({ "listen_addr": "0.0.0.0:29100" }),

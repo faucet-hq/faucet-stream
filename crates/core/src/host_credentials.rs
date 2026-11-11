@@ -128,8 +128,7 @@ mod tests {
 
     #[test]
     fn denying_unscoped_tasks_is_process_wide_and_first_wins() {
-        // The only test in this binary that flips the process-wide switch;
-        // every other test here runs inside a scope.
+        // The only test here that flips the process-wide switch.
         assert!(!unscoped_host_credentials_denied());
         assert!(host_credentials_allowed());
         assert!(require_host_credentials("kinesis", "credentials").is_ok());

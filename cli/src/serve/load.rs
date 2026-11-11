@@ -2953,8 +2953,7 @@ pub async fn load_submission_inputs(
     // parameterized config it applies the declared defaults and rejects a
     // `required` param with no value — which is the honest answer, since
     // `POST /v1/runs` has no param channel (register a template to get one).
-    // A caller value a `params:` default holds lands wherever `${param.*}`
-    // places it: follow it before binding removes the tokens.
+    // Follow a caller value in a `params:` default before binding removes the tokens.
     let param_fields =
         caller_params.map(|c| crate::params::caller::through_refs(&merged, c.fields));
     crate::params::bind_document(

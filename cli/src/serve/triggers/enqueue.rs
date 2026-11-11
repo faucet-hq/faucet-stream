@@ -407,8 +407,7 @@ async fn fire_one(
                 return FireOutcome::Refused(e);
             }
             let mut req = build_submit_request(compiled, event, sub.text, fired_at);
-            // The config is the operator's; the values the sender placed in it
-            // are held to the caller reference policy where they land.
+            // Sender-placed values are held to the caller reference policy.
             req.caller_fields = sub.caller_fields;
             req.idempotency_key = req.idempotency_key.map(idem);
             // A trigger declared in the server's triggers file is a standing
