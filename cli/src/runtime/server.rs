@@ -1860,6 +1860,20 @@ mod templates {
         )
         .await
         .map_err(map_err)?;
+        if !body.pool_by_operator && body.pool.is_some() {
+            let doc: serde_json::Value = serde_json::from_str(&materialized.body)
+                .map_err(|e| ServeError::Internal(format!("materialized config: {e}")))?;
+            let rule = doc
+                .get("pool_override")
+                .map(|v| serde_json::from_value(v.clone()))
+                .transpose()
+                .map_err(|e| ServeError::BadConfig(format!("pool_override: {e}")))?;
+            crate::serve::pools::check_override(
+                body.pool.as_deref(),
+                doc.get("pool").and_then(serde_json::Value::as_str),
+                rule.as_ref(),
+            )?;
+        }
 
         // Caller-supplied values that would land in the persisted body (a
         // `secret: true` param, an `env:` override) are refused (#456 M4) —

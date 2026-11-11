@@ -1425,6 +1425,17 @@ A pool no live replica serves is refused at submit time with `422`. Ignored
 by `faucet run`, `schedule`, `mirror` and `backfill`. See
 [Execution pools](../cookbook/cluster.md#execution-pools).
 
+`pool_override` says whether a run of the config as a registered template may
+ask for another pool: `false` (the default) refuses one, `true` allows any, a
+list allows those pools. It limits template runs a caller or a tenant starts;
+the server's own triggers, schedules and fan-outs are not limited by it. A
+source template may carry `pool_override:` too.
+
+```yaml
+pool: private
+pool_override: [private, gpu]
+```
+
 ## `notifications`
 
 *(requires the `notify` build feature)*

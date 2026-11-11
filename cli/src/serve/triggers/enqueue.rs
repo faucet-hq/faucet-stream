@@ -594,6 +594,7 @@ pub fn template_body_tracked(
         standing_approval: true,
         operator_params: true,
         server_key: true,
+        pool_by_operator: true,
         sender_params,
         allow_untested: tpl.allow_untested,
         ..Default::default()

@@ -1424,7 +1424,9 @@ pub struct TriggerBody {
     /// `orders` after `customers` completes.
     #[serde(default)]
     pub depends_on: Option<crate::run_deps::RunDependencies>,
-    /// The execution pool to run in (#957); wins over the template's `pool:`.
+    /// The execution pool to run in (#957); wins over the template's `pool:`
+    /// only where its `pool_override` allows the pool (a caller's or tenant's
+    /// run; the operator's triggers, schedules and fan-outs always choose).
     #[serde(default)]
     pub pool: Option<String>,
     /// Set (never from the wire) by a fire of a trigger declared in the
@@ -1442,6 +1444,11 @@ pub struct TriggerBody {
     /// `idempotency_key` (a trigger fire, a schedule tick).
     #[serde(skip)]
     pub server_key: bool,
+    /// Set (never from the wire) when the server's operator chose `pool` (a
+    /// triggers-file trigger, an operator's schedule or fan-out): the
+    /// template's `pool_override` does not apply.
+    #[serde(skip)]
+    pub pool_by_operator: bool,
     /// Set (never from the wire) by a trigger fire: the params whose value
     /// holds text the event's sender chose. Even with `operator_params`,
     /// those are held to the caller reference policy.

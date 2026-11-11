@@ -5624,7 +5624,7 @@ components:
         budget: { $ref: "#/components/schemas/BudgetSpec" }
         selection: { $ref: "#/components/schemas/RowSelection" }
         depends_on: { $ref: "#/components/schemas/RunDependencies" }
-        pool: { type: string, pattern: "^[a-z0-9][a-z0-9_-]{0,62}$", description: "Execution pool to run in (#957). Wins over the template's `pool:`; omitted with no `pool:` = `default`. A clustered replica claims only runs in the pools it serves (`--pool`); a pool no live member serves (or, on a single server, one it does not serve) is a 422 naming the pool." }
+        pool: { type: string, pattern: "^[a-z0-9][a-z0-9_-]{0,62}$", description: "Execution pool to run in (#957). Wins over the template's `pool:` only where the template's `pool_override` allows the pool (`true`, or a list naming it); otherwise a pool other than the template's is a 422 naming `pool_override`. Omitted with no `pool:` = `default`. A clustered replica claims only runs in the pools it serves (`--pool`); a pool no live member serves (or, on a single server, one it does not serve) is a 422 naming the pool." }
       example:
         params:
           region: us-east-1

@@ -219,7 +219,7 @@ pub fn tool_defs(ctx: &McpContext) -> Vec<ToolDef> {
                         "selection": { "type": "object", "description": "Run only some matrix rows / streams: { select: [ids], only: [globs], skip: [ids|globs], tags: [..], status: [available|draft|archived], include_parents: off|eligible|all }. Omit to run every row." },
                         "depends_on": { "type": "object", "additionalProperties": { "type": "array", "items": { "type": "string" } }, "description": "Completion dependencies between the run's rows / streams, added to the config's own `depends_on:`: { \"orders\": [\"customers\"] } starts orders only after customers completes. Every name must be a row / stream of the run; a cycle is refused." },
                         "allow_untested": { "type": "boolean", "description": "Run a version whose tests are not `passing`. Once the template has been launched such a run is refused without it; with it the run is labelled `allow_untested=true` and audited. Default false." },
-                        "pool": { "type": "string", "description": "Execution pool to run in (faucet serve): wins over the config's `pool:`; default `default`. A pool no live replica serves is refused." }
+                        "pool": { "type": "string", "description": "Execution pool to run in (faucet serve): wins over the template's `pool:` only when its `pool_override` allows the pool; default `default`. A pool no live replica serves is refused." }
                     },
                     "required": ["id"]
                 }),

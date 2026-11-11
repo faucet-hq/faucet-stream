@@ -400,6 +400,10 @@ pub struct SourceTemplate {
     /// network for a source only reachable there. A run request's `pool` wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool: Option<String>,
+    /// Which other pools a run may ask for, passed through as the composed
+    /// config's `pool_override:` (default: none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_override: Option<crate::config::PoolOverride>,
     /// The tables this source produces; one matrix row each.
     pub streams: Vec<Stream>,
     /// The version's test bundle (#856): cases run against this template

@@ -82,6 +82,41 @@ pub fn resolve(request: Option<&str>, config: Option<&str>) -> Result<String, Se
     Ok(pool.to_string())
 }
 
+/// Refuse a run's requested pool when the template it runs does not let a
+/// run choose one (`pool_override:`). `config` is the template's own
+/// `pool:` and `rule` its `pool_override:`, read from the materialized
+/// config.
+pub fn check_override(
+    request: Option<&str>,
+    config: Option<&str>,
+    rule: Option<&crate::config::PoolOverride>,
+) -> Result<(), ServeError> {
+    use crate::config::PoolOverride;
+    let Some(asked) = request else {
+        return Ok(());
+    };
+    let own = config.unwrap_or(DEFAULT_POOL);
+    if asked == own {
+        return Ok(());
+    }
+    let allowed = match rule {
+        Some(PoolOverride::Any(true)) => return Ok(()),
+        Some(PoolOverride::Pools(list)) if list.iter().any(|p| p == asked) => return Ok(()),
+        Some(PoolOverride::Pools(list)) => {
+            format!("its `pool_override` allows only: {}", list.join(", "))
+        }
+        None | Some(PoolOverride::Any(false)) => {
+            "it sets no `pool_override` that allows another".to_string()
+        }
+    };
+    Err(ServeError::Unprocessable {
+        message: format!(
+            "this template runs in pool `{own}` and the run asked for `{asked}`, but {allowed}"
+        ),
+        details: None,
+    })
+}
+
 /// An idempotency fingerprint that also names a non-default pool, so a key
 /// replayed into another pool is a conflict; a `default` run keeps the
 /// fingerprint it had before pools.
@@ -310,6 +345,29 @@ pub const POOL_UNAVAILABLE: &str = "pool_unavailable";
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_requested_pool_follows_the_templates_pool_override() {
+        use crate::config::PoolOverride;
+        assert!(check_override(None, Some("a"), None).is_ok());
+        assert!(check_override(Some("a"), Some("a"), None).is_ok());
+        assert!(check_override(Some("default"), None, None).is_ok());
+        for rule in [None, Some(PoolOverride::Any(false))] {
+            let e = check_override(Some("b"), Some("a"), rule.as_ref()).unwrap_err();
+            assert!(
+                matches!(&e, ServeError::Unprocessable { message, .. } if message.contains("pool_override")),
+                "{e:?}"
+            );
+        }
+        assert!(check_override(Some("b"), Some("a"), Some(&PoolOverride::Any(true))).is_ok());
+        let list = PoolOverride::Pools(vec!["b".into()]);
+        assert!(check_override(Some("b"), None, Some(&list)).is_ok());
+        let e = check_override(Some("c"), None, Some(&list)).unwrap_err();
+        assert!(
+            matches!(&e, ServeError::Unprocessable { message, .. } if message.contains("allows only: b")),
+            "{e:?}"
+        );
+    }
     use super::*;
     use chrono::Utc;
 

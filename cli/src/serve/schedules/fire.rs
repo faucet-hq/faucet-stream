@@ -475,7 +475,8 @@ pub async fn fire_tick(
     use futures::StreamExt;
     let results: Vec<(Option<String>, TargetResult)> = futures::stream::iter(targets)
         .map(|tenant| async move {
-            let result = fire_target(state, spec, tenant.as_deref(), tick, fired_at, opts).await;
+            let result =
+                fire_target(state, spec, owner, tenant.as_deref(), tick, fired_at, opts).await;
             (tenant, result)
         })
         .buffered(CONCURRENT_TARGETS)
@@ -492,6 +493,7 @@ pub async fn fire_tick(
 async fn fire_target(
     state: &ServerState,
     spec: &ScheduleSpec,
+    owner: Option<&str>,
     tenant: Option<&str>,
     tick: DateTime<Utc>,
     fired_at: DateTime<Utc>,
@@ -516,10 +518,12 @@ async fn fire_target(
             Err(e) => return TargetResult::Retry(format!("checking for an earlier run: {e}")),
         }
     }
-    let body = match body(spec, tick, fired_at, opts, tenant) {
+    let mut body = match body(spec, tick, fired_at, opts, tenant) {
         Ok(b) => b,
         Err(e) => return TargetResult::Failed(e),
     };
+    // A tenant's own schedule asks for a pool as the tenant does.
+    body.pool_by_operator = owner.is_none();
     let principal =
         crate::runtime::Principal::new(actor(&spec.name, tenant), crate::runtime::Origin::Trusted);
     use crate::runtime::server::{TriggerOutcome, trigger_template};

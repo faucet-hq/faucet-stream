@@ -793,7 +793,11 @@ Request body:
   member running a release without pools is live. Part of the idempotency
   fingerprint when it is not `default`. The same field is accepted by
   `POST /v1/templates/{id}/runs` (and tenant runs and fan-out) and
-  `POST /v1/backfill`; the run record carries the resolved `pool`. See
+  `POST /v1/backfill`; the run record carries the resolved `pool`. On a
+  template run a caller or a tenant starts, a pool other than the template's
+  own `pool:` is a `422` unless the template's `pool_override` allows it
+  (`true`, or a list naming the pool); the operator's triggers, schedules and
+  fan-outs are not limited by it. See
   [Execution pools](../cookbook/cluster.md#execution-pools).
 
 Response (`202`):

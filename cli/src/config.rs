@@ -36,6 +36,17 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// Which pools a template run may ask for instead of the template's own
+/// (`pool_override:`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum PoolOverride {
+    /// `true`: any pool; `false`: none.
+    Any(bool),
+    /// Only these pools.
+    Pools(Vec<String>),
+}
+
 /// The only `kind:` a complete pipeline config may carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
@@ -211,6 +222,14 @@ pub struct PipelineConfig {
     /// `faucet run` and the other one-shot runtimes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool: Option<String>,
+
+    /// Whether a run of this config as a registered template may ask for a
+    /// pool other than `pool:` (#957): `false` (the default) refuses it,
+    /// `true` allows any pool, a list allows those pools. Applies to template
+    /// runs a caller or a tenant starts; the server's triggers, schedules and
+    /// fan-outs choose freely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_override: Option<PoolOverride>,
 
     /// Optional source-shard distribution for clustered (Mode B) execution.
     /// Only consumed by `faucet serve --cluster`: a run whose source

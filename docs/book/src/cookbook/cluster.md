@@ -328,6 +328,19 @@ database, one template registry, one catalog.
   2. `pool:` in the pipeline config, or in the source template a composed run
      comes from;
   3. `default`.
+- **Templates choose whether a run may change it.** A run of a registered
+  template that a caller or a tenant starts (`POST /v1/templates/{id}/runs`,
+  tenant template runs, MCP `run_template`) may ask for a pool other than the
+  template's own `pool:` only when the template sets `pool_override`: `true`
+  (any pool) or a list of pools. Without it (or with `false`, the default) the
+  request is a `422` naming `pool_override`. The server operator's own
+  triggers, schedules and fan-outs choose the pool freely, and a raw config a
+  caller submits names its own.
+
+  ```yaml
+  pool: private
+  pool_override: [private, gpu]
+  ```
 - **Claiming** — a replica claims only pending runs, and shards of sharded
   runs, in its pools. Shards inherit their run's pool; a run re-queued after
   its owner's lease expired, or released at shutdown, keeps its pool; an

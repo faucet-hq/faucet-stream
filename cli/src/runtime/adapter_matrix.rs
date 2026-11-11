@@ -1304,3 +1304,105 @@ async fn a_schedule_tick_cannot_be_preempted() {
     .expect("the tick runs");
     assert!(matches!(outcome, super::server::TriggerOutcome::Run(_)));
 }
+
+/// Run template `tpl` over HTTP as `actor` asking for `pool`, returning the
+/// error text (a run cannot start: this server serves only `default`).
+async fn template_pool_error(state: &ServerState, actor: AuthContext, pool: &str) -> String {
+    let body: crate::serve::handlers::templates::TriggerBody =
+        serde_json::from_value(json!({ "version": "newest", "pool": pool })).unwrap();
+    let r = match actor.tenant.clone() {
+        Some(t) => {
+            crate::serve::handlers::tenants::trigger_tenant_template(
+                State(state.clone()),
+                Extension(actor),
+                Path((t, "tpl".to_string())),
+                Json(body),
+            )
+            .await
+        }
+        None => {
+            crate::serve::handlers::templates::trigger_template(
+                State(state.clone()),
+                Extension(actor),
+                Path("tpl".to_string()),
+                Json(body),
+            )
+            .await
+        }
+    };
+    r.map(|_| ()).map_err(error_text).unwrap_err()
+}
+
+/// A template that does not let a run choose its pool refuses one, for a
+/// caller and for a tenant; the server's own fan-out still chooses.
+#[tokio::test]
+async fn a_template_without_override_refuses_a_requested_pool() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = fresh().await;
+    tenant(&state, false, None).await;
+    register(
+        &state,
+        &config(dir.path(), "pooled", "pool: private\n", false),
+    )
+    .await;
+    for actor in [alice(None), alice(Some("acme"))] {
+        let e = template_pool_error(&state, actor, "gpu").await;
+        assert!(e.contains("pool_override"), "{e}");
+    }
+    // The template's own pool is no override.
+    let e = template_pool_error(&state, alice(None), "private").await;
+    assert!(!e.contains("pool_override"), "{e}");
+    let fanout: crate::serve::handlers::tenants::FanoutBody =
+        serde_json::from_value(json!({ "tenants": ["acme"], "version": "newest", "pool": "gpu" }))
+            .unwrap();
+    let results =
+        crate::serve::handlers::tenants::fan_out(&state, &alice(None), "tpl", fanout, "f")
+            .await
+            .unwrap();
+    let why = results[0].reason.clone().unwrap_or_default();
+    assert!(!why.contains("pool_override"), "{why}");
+}
+
+/// A `pool_override` list admits only its pools; `true` admits any.
+#[tokio::test]
+async fn an_allowed_list_admits_only_its_pools() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = fresh().await;
+    register(
+        &state,
+        &config(dir.path(), "listed", "pool_override: [gpu]\n", false),
+    )
+    .await;
+    let e = template_pool_error(&state, alice(None), "gpu").await;
+    assert!(e.contains("does not serve pool `gpu`"), "{e}");
+    let e = template_pool_error(&state, alice(None), "big").await;
+    assert!(e.contains("allows only: gpu"), "{e}");
+    register(
+        &state,
+        &config(dir.path(), "open", "pool_override: true\n", false),
+    )
+    .await;
+    let e = template_pool_error(&state, alice(None), "big").await;
+    assert!(e.contains("does not serve pool `big`"), "{e}");
+}
+
+/// A raw config a caller submits names its own pool, as before.
+#[tokio::test]
+async fn operator_raw_configs_keep_choosing_pools() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = fresh().await;
+    let run: crate::serve::runner::SubmitRequest = serde_json::from_value(
+        json!({ "config": config(dir.path(), "raw", "pool: private\n", false), "pool": "gpu" }),
+    )
+    .unwrap();
+    let e = crate::serve::handlers::runs::submit_run(
+        State(state.clone()),
+        Extension(alice(None)),
+        Json(run),
+    )
+    .await
+    .map(|_| ())
+    .map_err(error_text)
+    .unwrap_err();
+    assert!(e.contains("does not serve pool `gpu`"), "{e}");
+}

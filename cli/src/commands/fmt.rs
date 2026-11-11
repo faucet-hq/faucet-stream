@@ -180,6 +180,7 @@ const KEY_ORDER: &[&str] = &[
     "usage",
     "budget",
     "pool",
+    "pool_override",
     "backfill",
     "mirror",
     "replication",

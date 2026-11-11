@@ -617,6 +617,12 @@ pub fn compose_with(
     if let Some(pool) = &source.pool {
         doc.insert("pool".into(), Value::String(pool.clone()));
     }
+    if let Some(o) = &source.pool_override {
+        doc.insert(
+            "pool_override".into(),
+            serde_json::to_value(o).map_err(internal)?,
+        );
+    }
     if !params.is_empty() {
         doc.insert(
             "params".into(),
@@ -937,6 +943,15 @@ per_stream:
         assert_eq!(c.document["pool"], "private");
         let cfg: crate::config::PipelineConfig = serde_json::from_value(c.document).unwrap();
         assert_eq!(cfg.pool.as_deref(), Some("private"));
+    }
+
+    #[test]
+    fn a_source_template_pool_override_is_composed() {
+        let sink: SinkTemplate = crate::yaml::from_str(BQ).unwrap();
+        let mut s = src();
+        s.pool_override = Some(crate::config::PoolOverride::Pools(vec!["gpu".into()]));
+        let c = compose_with(&s, &sink, ALL).unwrap();
+        assert_eq!(c.document["pool_override"], serde_json::json!(["gpu"]));
     }
 
     #[test]

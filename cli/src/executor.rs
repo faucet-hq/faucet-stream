@@ -5477,6 +5477,7 @@ mod tests {
             usage: None,
             budget: None,
             pool: None,
+            pool_override: None,
             shard: None,
             replication: None,
             backfill: None,

@@ -231,6 +231,17 @@
         "null"
       ]
     },
+    "pool_override": {
+      "description": "Whether a run of this config as a registered template may ask for a\npool other than `pool:` (#957): `false` (the default) refuses it,\n`true` allows any pool, a list allows those pools. Applies to template\nruns a caller or a tenant starts; the server's triggers, schedules and\nfan-outs choose freely.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PoolOverride"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "shard": {
       "description": "Optional source-shard distribution for clustered (Mode B) execution.\nOnly consumed by `faucet serve --cluster`: a run whose source\n[is shardable](faucet_core::Source::is_shardable) is split into\n`shard.count` shards processed concurrently across cluster workers.\nIgnored by `faucet run` and by a non-cluster `serve`, so it is fully\nbackward compatible.",
       "anyOf": [
@@ -4586,6 +4597,22 @@
         }
       },
       "additionalProperties": false
+    },
+    "PoolOverride": {
+      "description": "Which pools a template run may ask for instead of the template's own\n(`pool_override:`).",
+      "anyOf": [
+        {
+          "description": "`true`: any pool; `false`: none.",
+          "type": "boolean"
+        },
+        {
+          "description": "Only these pools.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      ]
     },
     "ShardingSpec": {
       "description": "Source-shard distribution settings for clustered (Mode B) execution.",

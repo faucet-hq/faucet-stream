@@ -918,6 +918,7 @@ impl Mapper<'_> {
             transforms,
             contract: None,
             pool: None,
+            pool_override: None,
             streams,
             tests: None,
         };
