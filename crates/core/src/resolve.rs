@@ -783,7 +783,8 @@ fn connection_string_pairs(value: &str) -> Option<Vec<(String, String)>> {
 /// parser HTTP clients use, so `\\` ends its authority as `/` does. A host
 /// taken from a `${…}` token is returned lower-cased as written.
 pub fn url_hosts(value: &str) -> Vec<String> {
-    let value = value.trim();
+    let value = whatwg_preprocess(value);
+    let value = value.as_ref();
     if let Some(read) = MongoRead::read(value) {
         return read.tcp_hosts();
     }
@@ -894,6 +895,22 @@ fn scheme_list(value: &str) -> Option<Vec<&str>> {
         .skip(1)
         .any(|p| scheme_of(p).is_some_and(|s| p[s.len()..].starts_with("://")));
     (parts.len() > 1 && later_scheme).then(|| parts.into_iter().filter(|p| !p.is_empty()).collect())
+}
+
+/// `value` as a WHATWG URL parser (the `url` crate, which most clients use)
+/// reads it: leading and trailing C0 controls and spaces removed, and every
+/// tab, LF and CR dropped.
+fn whatwg_preprocess(value: &str) -> std::borrow::Cow<'_, str> {
+    let value = value.trim_matches(|c: char| c <= ' ');
+    if value.contains(['\t', '\n', '\r']) {
+        value
+            .chars()
+            .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+            .collect::<String>()
+            .into()
+    } else {
+        value.into()
+    }
 }
 
 /// The elements of a [`UrlSyntax::UrlList`] value.
@@ -2054,9 +2071,19 @@ impl ReferencePolicy {
         Ok(())
     }
 
-    /// Check a value with no declared grammar.
+    /// Check a value with no declared grammar, read the way a WHATWG URL
+    /// parser reads it ([`whatwg_preprocess`]). Under a policy with path
+    /// roots, a value still holding a control character is refused.
     fn check_plain_url(&self, value: &str) -> Result<(), Refusal> {
-        let value = value.trim_matches(|c: char| c.is_ascii_whitespace());
+        let value = whatwg_preprocess(value);
+        let value = value.as_ref();
+        if self.path_roots.is_some() && value.chars().any(char::is_control) {
+            return Err(Refusal::new(
+                RefusalKind::Url,
+                value.escape_debug().to_string(),
+                "a URL may not contain control characters",
+            ));
+        }
         if let Some(read) = MongoRead::read(value) {
             return self.check_mongo(value, &read);
         }
@@ -2180,7 +2207,9 @@ impl ReferencePolicy {
         syntax: Option<UrlSyntax>,
     ) -> Result<(), Refusal> {
         self.check_url_as(value, syntax)?;
-        if syntax.is_none() && scheme_of(value).is_some_and(|s| s == "file" || s == "sqlite") {
+        if syntax.is_none()
+            && scheme_of(&whatwg_preprocess(value)).is_some_and(|s| s == "file" || s == "sqlite")
+        {
             return Ok(());
         }
         for host in url_hosts_as(value, syntax) {
@@ -3552,6 +3581,80 @@ mod tests {
             .with_path_roots(["/srv/data"])
             .any_url_scheme()
             .any_url_host()
+    }
+
+    #[test]
+    fn urls_with_control_characters_are_refused() {
+        let listed = ReferencePolicy::deny_all()
+            .with_path_roots(["/srv/data"])
+            .any_url_scheme()
+            .with_url_hosts(["allowed.example", "cache.example.com"]);
+        for v in [
+            "\u{1}amqp://allowed.example\\@evil.example/",
+            "amqp:/\t/evil.example/x://allowed.example/",
+            "\u{1}nats://evil.example:4222",
+            "\u{1}redis://evil.example:6379/0",
+            "\u{1}rediss://evil.example:6380/0",
+        ] {
+            assert!(listed.check_url(v).is_err(), "{v:?}");
+        }
+        assert!(
+            listed
+                .check_url_as("\u{1}nats://evil.example:4222", Some(UrlSyntax::UrlList))
+                .is_err()
+        );
+        let tls_only = ReferencePolicy::deny_all()
+            .with_path_roots(["/srv/data"])
+            .with_url_schemes(["amqps", "rediss"])
+            .any_url_host();
+        assert!(tls_only.check_url("\u{1}amqp://broker.example/").is_err());
+        assert!(tls_only.check_url("amqps://broker.example/").is_ok());
+        for v in [
+            "rediss://cache.example.com:6380/0#insec\ture",
+            "\u{1}rediss://cache.example.com:6380/0#insecure",
+        ] {
+            assert!(listed.check_url(v).is_err(), "{v:?}");
+        }
+        assert!(listed.check_url("\u{1}unix:///etc/redis.sock").is_err());
+        let unconfined = ReferencePolicy::deny_all()
+            .any_path()
+            .any_url_scheme()
+            .any_url_host();
+        assert!(
+            unconfined
+                .check_url("\u{1}http://169.254.169.254/latest/")
+                .is_err()
+        );
+        assert!(
+            unconfined
+                .check_url("ht\ttp://169.254.169.254/latest/")
+                .is_err()
+        );
+        assert!(
+            listed
+                .check_url("redis://cache.example.com:6379/\u{7}0")
+                .is_err()
+        );
+        assert!(
+            listed
+                .check_url("redis://cache.example.com:6379/\u{7f}0")
+                .is_err()
+        );
+        assert!(
+            unconfined
+                .check_url("redis://cache.example.com:6379/\u{7f}0")
+                .is_ok()
+        );
+        assert!(
+            listed
+                .check_url(" redis://cache.example.com:6379/0 ")
+                .is_ok()
+        );
+        assert!(listed.check_url("cache.example.com:6379").is_ok());
+        assert_eq!(
+            url_hosts("\u{1}amqp://allowed.example\\@evil.example/"),
+            vec!["evil.example".to_string()]
+        );
     }
 
     fn refused(syntax: Option<UrlSyntax>, value: &str) -> Refusal {
