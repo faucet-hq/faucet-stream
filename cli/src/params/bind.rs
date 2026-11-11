@@ -1126,23 +1126,52 @@ fn refuse_new_directives(
         Some(v) => value_to_string(&v),
         None => rewrite_text(src, inert, bound, lenient)?,
     };
-    let mut allowed: Vec<&str> = iter_directives(&baseline).map(|(t, _)| t).collect();
+    if assembles_directive(&baseline, out) {
+        return Err(CliError::Config(
+            "a param value combines with the text around it into an interpolation \
+             directive (`${…}`). Param values are literal data and may not assemble a \
+             directive"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `out` holds an interpolation directive that `baseline` (the same
+/// text with every caller value replaced by an inert one) does not.
+pub(crate) fn assembles_directive(baseline: &str, out: &str) -> bool {
+    let mut allowed: Vec<&str> = iter_directives(baseline).map(|(t, _)| t).collect();
     for (token, _) in iter_directives(out) {
         match allowed.iter().position(|a| *a == token) {
             Some(i) => {
                 allowed.swap_remove(i);
             }
-            None => {
-                return Err(CliError::Config(
-                    "a param value combines with the text around it into an interpolation \
-                     directive (`${…}`). Param values are literal data and may not assemble a \
-                     directive"
-                        .into(),
-                ));
-            }
+            None => return true,
         }
     }
-    Ok(())
+    false
+}
+
+/// Why a caller value spliced into a longer string may not stand there under
+/// the SQL and URL rules a `${param.*}` splice follows, if it may not.
+/// `scalar` is the text holding `token`; `sql` says it is SQL text and `url`
+/// that it is a URL.
+pub(crate) fn embedded_splice_refusal(
+    value: &str,
+    scalar: &str,
+    token: &str,
+    sql: bool,
+    url: bool,
+) -> Option<String> {
+    let value = Value::String(value.to_string());
+    if sql && !always_quoted(scalar, token) {
+        return unquoted_sql_refusal(&value)
+            .map(|c| format!("is {c}, and it stands unquoted in SQL text"));
+    }
+    if url {
+        return url_refusal(&value).map(|c| format!("contains {c} inside a URL"));
+    }
+    None
 }
 
 /// If `s` is *exactly* one `${param.NAME}` token, return that param's value with

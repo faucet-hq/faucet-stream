@@ -132,8 +132,16 @@ lands:
   quotes around the token): no quote (`'`, `"`, `` ` ``), `;` or backslash. A
   path, URL or name (`in/${trigger.object_key}`,
   `s3://bucket/${trigger.object_key}`) may hold them;
+- spliced unquoted into SQL text (`WHERE id = ${trigger.query.id}`): a number
+  only (`42`, `-4.5`), the rule `${param.*}` follows. Quote the token
+  (`WHERE id = '${trigger.query.id}'`) to splice text;
+- spliced into an `http://` / `https://` URL: no `?`, `#`, `&`, whitespace or
+  `..` segment, so a value cannot add a query parameter or a fragment;
 - inside a URL's host (`https://${trigger.header.x-region}.api.example`): host
   name characters only (letters, digits, `.`, `-`);
+- values next to each other, or next to text the config writes, may not
+  combine into an interpolation directive (`${env:…}`, `${file:…}`): a value
+  `$` beside a value `{env:HOME}` is refused;
 - as the whole of a SQL field: refused — a sender never supplies a whole
   statement. A GraphQL `query` or a search or document-store `filter` is not
   SQL and takes a whole value. Outside any connector or transform the trigger

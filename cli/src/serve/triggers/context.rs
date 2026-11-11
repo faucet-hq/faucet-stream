@@ -522,10 +522,13 @@ fn substitute_with(
         || without_tokens(text)
             .chars()
             .any(|c| c.is_whitespace() || "'\"`".contains(c));
+    let url = placement.is_some() && is_http_url(text);
     let mut out = String::with_capacity(text.len());
+    let mut baseline = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find("${trigger.") {
         out.push_str(&rest[..start]);
+        baseline.push_str(&rest[..start]);
         let after = &rest[start + 2..];
         let Some(end) = after.find('}') else {
             return Err(SubstituteError::config("unterminated `${trigger.…}` token"));
@@ -558,8 +561,20 @@ fn substitute_with(
                                 && !v.trim_start().starts_with(['{', '['])
                         }
                     };
+                    let spliced = (!whole)
+                        .then(|| {
+                            crate::params::bind::embedded_splice_refusal(
+                                &v,
+                                text,
+                                &rest[start..start + 2 + end + 1],
+                                sql,
+                                url,
+                            )
+                        })
+                        .flatten();
                     if let Some(why) =
                         placement_refusal(&v, &out, whole, statement, p.key, path_field, free_text)
+                            .or(spliced)
                     {
                         return Err(SubstituteError {
                             message: format!(
@@ -582,10 +597,29 @@ fn substitute_with(
             }
             None => out.push_str(&v),
         }
+        baseline.push('_');
         rest = &after[end + 1..];
     }
     out.push_str(rest);
+    baseline.push_str(rest);
+    if placement.as_ref().is_some_and(|p| p.escape)
+        && crate::params::bind::assembles_directive(&baseline, &out)
+    {
+        return Err(SubstituteError {
+            message: "the `${trigger.…}` values combine with the text around them into an \
+                      interpolation directive (`${…}`); event values are literal data and may \
+                      not assemble one, so the event was not run"
+                .into(),
+            by_sender: true,
+        });
+    }
     Ok(out)
+}
+
+/// Whether a scalar is an `http://` / `https://` URL.
+fn is_http_url(text: &str) -> bool {
+    let t = text.trim_start().to_ascii_lowercase();
+    t.starts_with("http://") || t.starts_with("https://")
 }
 
 /// `text` with its `${trigger.…}` tokens removed.
@@ -1112,5 +1146,90 @@ mod tests {
         let v = parsed(&out);
         assert_eq!(v["b"], "line1\nline2");
         assert_eq!(v["c"], 1, "the value cannot add or move keys");
+    }
+
+    fn query_hook(pairs: &[(&str, &str)]) -> TriggerEvent {
+        TriggerEvent::Webhook {
+            method: "POST".into(),
+            body: String::new(),
+            headers: Default::default(),
+            query: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            idem: "i".into(),
+        }
+    }
+
+    #[test]
+    fn adjacent_sender_values_cannot_form_a_directive() {
+        let split = query_hook(&[("a", "$"), ("b", "{env:HOME}")]);
+        for doc in [
+            "name: \"${trigger.query.a}${trigger.query.b}\"\n",
+            "name: \"run-$${trigger.query.b}\"\n",
+        ] {
+            let err = substitute_tracked(doc, &split, "n", "f").unwrap_err();
+            assert!(err.by_sender, "{doc}");
+            assert!(
+                err.message.contains("interpolation directive"),
+                "{}",
+                err.message
+            );
+        }
+        // A directive the operator wrote stays, and a value's own `${` is
+        // kept literal.
+        let own = query_hook(&[("a", "x"), ("b", "${env:HOME}")]);
+        let sub = substitute_tracked(
+            "name: \"${env:USER}-${trigger.query.a}-${trigger.query.b}\"\n",
+            &own,
+            "n",
+            "f",
+        )
+        .unwrap();
+        assert!(
+            sub.text.contains("${env:USER}-x-$${env:HOME}"),
+            "{}",
+            sub.text
+        );
+    }
+
+    #[test]
+    fn trigger_splices_follow_the_param_placement_rules() {
+        let id = |v: &str| query_hook(&[("id", v)]);
+        let unquoted = "query: \"SELECT * FROM t WHERE id = ${trigger.query.id}\"\n";
+        let err = substitute_tracked(unquoted, &id("1 OR 1=1 --"), "n", "f").unwrap_err();
+        assert!(err.by_sender);
+        assert!(
+            err.message.contains("unquoted in SQL text"),
+            "{}",
+            err.message
+        );
+        assert!(substitute(unquoted, &id("42"), "n", "f").is_ok());
+        assert!(substitute(unquoted, &id("-4.5"), "n", "f").is_ok());
+        let quoted = "query: \"SELECT * FROM t WHERE id = '${trigger.query.id}'\"\n";
+        assert!(substitute(quoted, &id("1 OR 1=1"), "n", "f").is_ok());
+
+        let f = |v: &str| query_hook(&[("f", v)]);
+        let url = "url: \"https://api.example/v1/items?f=${trigger.query.f}\"\n";
+        for bad in ["x&limit=0", "x#frag", "a b", "x?y"] {
+            let err = substitute_tracked(url, &f(bad), "n", "f").unwrap_err();
+            assert!(
+                err.message.contains("inside a URL"),
+                "{bad}: {}",
+                err.message
+            );
+        }
+        assert!(substitute(url, &f("abc"), "n", "f").is_ok());
+        let segment = "url: \"https://api.example/v1/${trigger.query.f}/items\"\n";
+        let err = substitute(segment, &f("../admin"), "n", "f").unwrap_err();
+        assert!(err.contains(".."), "{err}");
+        // An object key in an object-store path keeps its spaces.
+        let obj = TriggerEvent::Object {
+            bucket: "b".into(),
+            key: "in/my file & more.csv".into(),
+            size: 1,
+            last_modified: "t".into(),
+        };
+        assert!(substitute("path: \"s3://b/${trigger.object_key}\"\n", &obj, "n", "f").is_ok());
     }
 }
