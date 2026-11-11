@@ -51,19 +51,19 @@ pub fn interpolate_with_env(input: &str, overlay: &EnvOverlay) -> CliResult<Stri
         Directive::LoadTime { prefix, body } => match prefix {
             "env" | "secret" => {
                 let value = match overlay.get(body) {
-                    Some(v) => v.clone(),
-                    None => std::env::var(body).map_err(|_| CliError::MissingEnvVar {
-                        var: body.to_owned(),
-                        location: format!("${{{prefix}:{body}}}"),
-                    })?,
+                    Some(v) => {
+                        crate::secrets::registry::register(v);
+                        v.clone()
+                    }
+                    None => {
+                        let v = std::env::var(body).map_err(|_| CliError::MissingEnvVar {
+                            var: body.to_owned(),
+                            location: format!("${{{prefix}:{body}}}"),
+                        })?;
+                        crate::secrets::registry::register_server(&v);
+                        v
+                    }
                 };
-                // Register the resolved value for redaction, exactly as the
-                // secrets-manager pass does for `${vault:…}` etc. — otherwise a
-                // credential supplied via the very common `${env:TOKEN}` /
-                // `${secret:VAR}` form leaks into tracing/log/error output while
-                // `${vault:…}` ones are scrubbed (an inconsistent boundary,
-                // #146 M3). `register` no-ops for values below the min length.
-                crate::secrets::registry::register(&value);
                 Ok(Some(value))
             }
             "file" => {

@@ -239,6 +239,19 @@ pub fn register(secret: &str) {
         .insert(forms_of(secret));
 }
 
+/// [`register`] for a value the server resolved from its own environment or
+/// secret managers: held with the server's values even inside a caller's load
+/// or run, so a caller's own values cannot crowd it out.
+pub fn register_server(secret: &str) {
+    if secret.len() < MIN_REDACT_LEN {
+        return;
+    }
+    registry()
+        .write()
+        .expect("secret registry lock poisoned")
+        .insert(forms_of(secret));
+}
+
 /// [`register`] for a value a caller supplied (a `secret: true` template
 /// param): scrubbed like any secret, but held in its own bounded set, so
 /// however many a caller sends, no secret registered with [`register`] or

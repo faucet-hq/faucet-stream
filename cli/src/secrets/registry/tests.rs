@@ -383,3 +383,46 @@ fn a_rotated_protected_secret_is_dropped() {
     );
     unregister("rotating-refresh-token-2");
 }
+
+#[tokio::test]
+#[serial]
+async fn values_the_server_resolves_stay_with_the_servers_inside_a_caller_scope() {
+    as_caller(async {
+        register_server("server-resolved-in-caller-load");
+        register("caller-supplied-in-caller-load");
+        for i in 0..MAX_CALLER_FORMS + 10 {
+            register(&format!("caller-flood-after-{i:06}"));
+        }
+    })
+    .await;
+    let reg = registry().read().unwrap();
+    assert!(reg.forms.contains_key("server-resolved-in-caller-load"));
+    assert!(!reg.caller.contains_key("server-resolved-in-caller-load"));
+    assert!(!reg.forms.contains_key("caller-supplied-in-caller-load"));
+    drop(reg);
+    assert_eq!(redact("v=server-resolved-in-caller-load"), "v=***");
+}
+
+#[tokio::test]
+#[serial]
+#[allow(unsafe_code)] // sets a variable no other test reads
+async fn an_env_directive_is_the_servers_unless_the_caller_supplied_it() {
+    unsafe { std::env::set_var("FAUCET_TEST_SERVER_ENV_SECRET", "server-env-resolved-value") };
+    let overlay = crate::interpolate::EnvOverlay::from([(
+        "FAUCET_TEST_CALLER_ENV".to_string(),
+        "caller-overlay-env-value".to_string(),
+    )]);
+    as_caller(async {
+        crate::interpolate::interpolate_with_env(
+            "${env:FAUCET_TEST_SERVER_ENV_SECRET} ${env:FAUCET_TEST_CALLER_ENV}",
+            &overlay,
+        )
+        .unwrap();
+    })
+    .await;
+    unsafe { std::env::remove_var("FAUCET_TEST_SERVER_ENV_SECRET") };
+    let reg = registry().read().unwrap();
+    assert!(reg.forms.contains_key("server-env-resolved-value"));
+    assert!(reg.caller.contains_key("caller-overlay-env-value"));
+    assert!(!reg.forms.contains_key("caller-overlay-env-value"));
+}
