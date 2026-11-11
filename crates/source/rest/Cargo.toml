@@ -106,6 +106,7 @@ constructible_struct_adds_field = "allow"
 constructible_struct_adds_private_field = "allow"
 enum_struct_variant_field_added = "allow"
 enum_variant_added = "allow"
+global_value_marked_deprecated = "allow"
 
 [lints]
 workspace = true

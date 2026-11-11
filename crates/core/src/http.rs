@@ -1001,20 +1001,23 @@ fn redirect_request(
             && method == Method::POST);
     let cross = is_cross_origin(from, &to);
     if cross && !keep_headers {
-        let before: Vec<HeaderName> = headers.keys().cloned().collect();
+        let before: Option<Vec<HeaderName>> =
+            tracing::enabled!(tracing::Level::DEBUG).then(|| headers.keys().cloned().collect());
         strip_credentials(&mut headers, sensitive);
         retain_cross_origin_safe(&mut headers);
-        let dropped: Vec<&str> = before
-            .iter()
-            .filter(|k| !headers.contains_key(*k))
-            .map(HeaderName::as_str)
-            .collect();
-        if !dropped.is_empty() {
-            tracing::debug!(
-                to = %to.origin().ascii_serialization(),
-                dropped = ?dropped,
-                "a redirect to another origin keeps only standard request headers"
-            );
+        if let Some(before) = before {
+            let dropped: Vec<&str> = before
+                .iter()
+                .filter(|k| !headers.contains_key(*k))
+                .map(HeaderName::as_str)
+                .collect();
+            if !dropped.is_empty() {
+                tracing::debug!(
+                    to = %to.origin().ascii_serialization(),
+                    dropped = ?dropped,
+                    "a redirect to another origin keeps only standard request headers"
+                );
+            }
         }
     }
     let mut next = if to_get {
@@ -1425,6 +1428,62 @@ mod tests {
         .unwrap();
         assert!(next.headers().get("x-custom-token").is_none());
         assert_eq!(next.headers().get("accept").unwrap(), "application/json");
+    }
+
+    /// Collects the `dropped` field of every event, at every level.
+    struct DroppedFields(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for DroppedFields {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Visit<'a>(&'a std::sync::Mutex<Vec<String>>);
+            impl tracing::field::Visit for Visit<'_> {
+                fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                    if f.name() == "dropped" {
+                        self.0.lock().unwrap().push(format!("{v:?}"));
+                    }
+                }
+            }
+            event.record(&mut Visit(&self.0));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn a_cross_origin_hop_names_the_headers_it_dropped_when_debug_is_on() {
+        let u = |s: &str| Url::parse(s).unwrap();
+        let hop = || {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-custom-token", "dummy".parse().unwrap());
+            headers.insert("accept", "application/json".parse().unwrap());
+            redirect_request(
+                StatusCode::SEE_OTHER,
+                Method::GET,
+                &u("https://api.example.com/x"),
+                u("https://other.example.net/y"),
+                headers,
+                None,
+                &[],
+                false,
+            )
+            .unwrap()
+        };
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let next = tracing::subscriber::with_default(DroppedFields(seen.clone()), hop);
+        assert!(next.headers().get("x-custom-token").is_none());
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(seen[0].contains("x-custom-token"), "{seen:?}");
+        assert!(!seen[0].contains("accept"), "{seen:?}");
+        assert!(hop().headers().get("x-custom-token").is_none());
     }
 
     #[test]

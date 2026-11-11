@@ -76,6 +76,7 @@ pub const CREDENTIAL_HEADERS: [&str; 3] = ["authorization", "cookie", "proxy-aut
 /// Superseded by [`faucet_core::http::CROSS_ORIGIN_SAFE_HEADERS`], which
 /// [`retain_cross_origin_safe`] applies; kept for callers that read it. Use
 /// the core list instead.
+#[deprecated(note = "use faucet_core::http::CROSS_ORIGIN_SAFE_HEADERS")]
 pub const CROSS_ORIGIN_SAFE_HEADERS: [&str; 7] = [
     "accept",
     "accept-charset",
@@ -159,6 +160,7 @@ mod cross_origin_tests {
         retain_cross_origin_safe(&mut h);
         assert_eq!(h.len(), faucet_core::http::CROSS_ORIGIN_SAFE_HEADERS.len());
         assert!(h.contains_key("traceparent"));
+        #[allow(deprecated)]
         let old = CROSS_ORIGIN_SAFE_HEADERS;
         assert!(old.iter().all(|k| h.contains_key(*k)));
     }
