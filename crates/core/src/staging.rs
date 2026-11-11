@@ -947,7 +947,11 @@ mod tests {
             assert!(err.contains("`s3://`"), "{err}");
         })
         .await;
-        assert!(build_object_store(&loc("s3://b/p/")).is_ok());
+        let trusted = crate::resolve::with_host_credentials(true, async {
+            build_object_store(&loc("s3://b/p/")).is_ok()
+        })
+        .await;
+        assert!(trusted);
     }
 
     /// An object inserted in reverse-sorted key order (#817).
