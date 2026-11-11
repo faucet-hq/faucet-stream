@@ -179,7 +179,10 @@ mod tests {
         assert!(s.get(&p("tt/c")).await.is_err(), "segment-wise prefix");
         assert!(s.head(&p("other/b")).await.is_err());
         assert!(s.get_ranges(&p("other/b"), &[0..1, 0..1]).await.is_err());
-        assert_eq!(s.get_ranges(&p("t/a"), &[0..1, 0..1]).await.unwrap()[0], "a");
+        assert_eq!(
+            s.get_ranges(&p("t/a"), &[0..1, 0..1]).await.unwrap()[0],
+            "a"
+        );
 
         s.put(&p("t/n"), "n".into()).await.unwrap();
         assert!(s.put(&p("other/n"), "n".into()).await.is_err());
