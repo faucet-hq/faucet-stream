@@ -216,6 +216,7 @@ async fn doctor_check_probes_an_s3_destination_with_head_bucket() {
         prefix: "p/".to_string(),
         region: Some("us-east-1".to_string()),
         endpoint_url: Some("http://127.0.0.1:9".to_string()),
+        credentials: Default::default(),
         allow_http: true,
     }));
     set_test_env();

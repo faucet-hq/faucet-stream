@@ -173,6 +173,7 @@ async fn dataset_uri_s3_prefix_and_bucket_only() {
         prefix: None,
         region: None,
         endpoint_url: None,
+        credentials: Default::default(),
     };
     let source = ParquetSource::new(ParquetSourceConfig::s3(s3))
         .await

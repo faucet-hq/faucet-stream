@@ -1,7 +1,7 @@
 //! Credential configuration + client construction shared by the SQS source
 //! and sink.
 
-use faucet_core::FaucetError;
+use faucet_core::{FaucetError, Value};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -72,6 +72,54 @@ impl std::fmt::Debug for SqsCredentials {
     }
 }
 
+/// Whether the process environment names an AWS region (`AWS_REGION` or
+/// `AWS_DEFAULT_REGION`), so a client whose config names none does not ask
+/// the instance metadata service for one.
+pub fn region_from_env() -> bool {
+    ["AWS_REGION", "AWS_DEFAULT_REGION"]
+        .iter()
+        .any(|k| std::env::var(k).is_ok_and(|v| !v.trim().is_empty()))
+}
+
+/// The config fields that make a client built from `config` authenticate
+/// with the identity of the host it runs on: `credentials` for every variant
+/// but `access_key` (absent = `default`), and `region` when neither the
+/// config nor the process environment names one.
+pub fn host_identity(config: &Value) -> Vec<String> {
+    host_identity_at(config, "/credentials", "/region")
+}
+
+/// [`host_identity`] for credentials and region at other JSON pointers.
+pub fn host_identity_at(config: &Value, credentials: &str, region: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    if faucet_core::capabilities::config::tag_at(config, credentials).unwrap_or("default")
+        != "access_key"
+    {
+        fields.push(dotted(credentials));
+    }
+    if !faucet_core::capabilities::config::non_empty_str_at(config, region) && !region_from_env() {
+        fields.push(dotted(region));
+    }
+    fields
+}
+
+fn dotted(pointer: &str) -> String {
+    pointer.trim_start_matches('/').replace('/', ".")
+}
+
+fn check_host_identity(
+    region: Option<&str>,
+    credentials: &SqsCredentials,
+) -> Result<(), FaucetError> {
+    if !matches!(credentials, SqsCredentials::AccessKey { .. }) {
+        faucet_core::resolve::require_host_credentials("sqs", "credentials")?;
+    }
+    if region.is_none_or(|r| r.trim().is_empty()) && !region_from_env() {
+        faucet_core::resolve::require_host_credentials("sqs", "region")?;
+    }
+    Ok(())
+}
+
 /// Build an `aws_sdk_sqs::Client` from region / endpoint / credentials.
 ///
 /// `region: None` defers to the SDK default chain (env, profile, IMDS);
@@ -84,6 +132,7 @@ pub async fn build_client(
     endpoint_url: Option<&str>,
     credentials: &SqsCredentials,
 ) -> Result<aws_sdk_sqs::Client, FaucetError> {
+    check_host_identity(region, credentials)?;
     let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
     if let Some(region) = region {
         loader = loader.region(aws_config::Region::new(region.to_owned()));
@@ -134,6 +183,74 @@ pub async fn build_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn host_identity_follows_the_selected_credentials() {
+        use faucet_core::json;
+        let region = |fields: Vec<String>| {
+            fields
+                .into_iter()
+                .filter(|f| f != "region")
+                .collect::<Vec<_>>()
+        };
+        for c in [
+            json!({}),
+            json!({"credentials": {"type": "default"}}),
+            json!({"credentials": {"type": "web_identity"}}),
+            json!({"credentials": {"type": "profile", "config": {"name": "p"}}}),
+            json!({"credentials": {"type": "assume_role", "config": {"role_arn": "r"}}}),
+        ] {
+            assert_eq!(region(host_identity(&c)), vec!["credentials"], "{c}");
+        }
+        let keyed = json!({
+            "region": "us-east-1",
+            "credentials": {"type": "access_key", "config": {"access_key_id": "a", "secret_access_key": "s"}}
+        });
+        assert!(host_identity(&keyed).is_empty());
+        let no_region = json!({"credentials": {"type": "access_key"}});
+        assert_eq!(
+            host_identity(&no_region).is_empty(),
+            region_from_env(),
+            "a region comes from the config or the environment"
+        );
+        assert_eq!(
+            host_identity_at(
+                &json!({"x": {"c": {"type": "profile"}}, "r": "eu"}),
+                "/x/c",
+                "/r"
+            ),
+            vec!["x.c"]
+        );
+    }
+
+    #[tokio::test]
+    async fn ambient_clients_are_refused_inside_a_caller_run() {
+        faucet_core::resolve::with_host_credentials(false, async {
+            let err = build_client(Some("us-east-1"), None, &SqsCredentials::Default)
+                .await
+                .expect_err("refused");
+            assert!(err.to_string().contains("`credentials`"), "{err}");
+            let keys = SqsCredentials::AccessKey {
+                access_key_id: "a".into(),
+                secret_access_key: "s".into(),
+                session_token: None,
+            };
+            assert!(build_client(Some("us-east-1"), None, &keys).await.is_ok());
+            assert_eq!(
+                build_client(None, None, &keys).await.is_ok(),
+                region_from_env()
+            );
+        })
+        .await;
+        faucet_core::resolve::with_host_credentials(true, async {
+            assert!(
+                build_client(Some("us-east-1"), None, &SqsCredentials::Default)
+                    .await
+                    .is_ok()
+            );
+        })
+        .await;
+    }
 
     #[test]
     fn credentials_parse_the_consistent_wire_shape() {

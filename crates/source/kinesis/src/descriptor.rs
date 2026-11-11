@@ -3,7 +3,8 @@
 use faucet_core::{Capabilities, ConnectorDescriptor, Value};
 
 /// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
-pub const DESCRIPTOR: ConnectorDescriptor = ConnectorDescriptor::new("kinesis", capabilities);
+pub const DESCRIPTOR: ConnectorDescriptor = ConnectorDescriptor::new("kinesis", capabilities)
+    .with_host_identity(faucet_common_kinesis::host_identity);
 
 fn capabilities(_config: &Value) -> Capabilities {
     Capabilities::builder().reports_lag(true).build()

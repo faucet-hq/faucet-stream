@@ -13,15 +13,23 @@
 //! minor release; any change is called out in the changelog.
 
 mod backend;
+mod credentials;
 mod objects;
 mod parts;
 
 pub use backend::{S3Backend, S3BackendBuilder};
+pub use credentials::{
+    S3Credentials, build_client_with, check_host_identity, host_identity, host_identity_at,
+    region_from_env, sdk_config,
+};
 pub use objects::{MAX_COPY_BYTES, MAX_PARTS, MIN_PART_BYTES, PART_BYTES};
 
 /// An S3 client from the default AWS credential chain, in `region` (else the
 /// chain's region) and against `endpoint_url` (an S3-compatible store) when
-/// set.
+/// set. It does not check whether the task may use the host's identity.
+#[deprecated(
+    note = "use `build_client_with`, which takes the credentials and refuses the host's identity where the task may not use it"
+)]
 pub async fn build_client(region: Option<&str>, endpoint_url: Option<&str>) -> aws_sdk_s3::Client {
     let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
     if let Some(region) = region {
@@ -43,6 +51,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[allow(deprecated)]
     async fn the_client_takes_the_region_and_endpoint() {
         let client = build_client(Some("eu-west-1"), Some("http://127.0.0.1:9")).await;
         let conf = client.config();

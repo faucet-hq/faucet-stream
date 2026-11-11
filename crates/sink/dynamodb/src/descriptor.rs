@@ -4,7 +4,8 @@ use faucet_core::capabilities::config::dedups_by_key;
 use faucet_core::{Capabilities, ConnectorDescriptor, Value, WriteMode};
 
 /// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
-pub const DESCRIPTOR: ConnectorDescriptor = ConnectorDescriptor::new("dynamodb", capabilities);
+pub const DESCRIPTOR: ConnectorDescriptor = ConnectorDescriptor::new("dynamodb", capabilities)
+    .with_host_identity(faucet_common_dynamodb::host_identity);
 
 fn capabilities(config: &Value) -> Capabilities {
     Capabilities::builder()

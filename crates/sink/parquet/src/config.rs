@@ -220,6 +220,11 @@ pub struct ParquetS3Destination {
     #[serde(default)]
     #[schemars(extend("x-faucet-resource" = "url"))]
     pub endpoint_url: Option<String>,
+    /// How to authenticate (default: the AWS default chain, i.e. the
+    /// identity of the host faucet runs on). `access_key` names keys in the
+    /// config; `anonymous` sends unsigned requests.
+    #[serde(default)]
+    pub credentials: faucet_common_s3::S3Credentials,
     /// Accepted for compatibility: the S3 client takes an `http://`
     /// `endpoint_url` (e.g. for LocalStack) without it.
     #[serde(default)]
@@ -385,6 +390,7 @@ mod tests {
             prefix: String::new(),
             region: None,
             endpoint_url: None,
+            credentials: Default::default(),
             allow_http: false,
         }));
         assert!(cfg.validate().is_err());

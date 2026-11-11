@@ -1,5 +1,6 @@
 //! S3 sink configuration.
 
+use faucet_common_s3::S3Credentials;
 use faucet_core::DEFAULT_BATCH_SIZE;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -134,6 +135,11 @@ pub struct S3SinkConfig {
     /// Custom endpoint URL for S3-compatible services (e.g. MinIO).
     #[schemars(extend("x-faucet-resource" = "url"))]
     pub endpoint_url: Option<String>,
+    /// How to authenticate (default: the AWS default chain, i.e. the
+    /// identity of the host faucet runs on). `access_key` names keys in the
+    /// config; `anonymous` sends unsigned requests (public buckets).
+    #[serde(default)]
+    pub credentials: S3Credentials,
     /// File extension for written objects (default: `.jsonl`). Not used when
     /// `path` is set.
     #[serde(default = "default_file_extension")]
@@ -278,6 +284,7 @@ impl S3SinkConfig {
             format: S3SinkFormat::default(),
             region: None,
             endpoint_url: None,
+            credentials: S3Credentials::default(),
             file_extension: ".jsonl".to_string(),
             max_records_per_file: None,
             max_bytes_per_file: None,
@@ -340,6 +347,12 @@ impl S3SinkConfig {
     /// Set the AWS region.
     pub fn region(mut self, region: impl Into<String>) -> Self {
         self.region = Some(region.into());
+        self
+    }
+
+    /// Set how the sink authenticates.
+    pub fn credentials(mut self, credentials: S3Credentials) -> Self {
+        self.credentials = credentials;
         self
     }
 

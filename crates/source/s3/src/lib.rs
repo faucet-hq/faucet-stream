@@ -19,4 +19,5 @@ pub mod verify;
 pub use faucet_core::{FaucetError, Source};
 
 pub use config::{S3FileFormat, S3SourceConfig};
+pub use faucet_common_s3::S3Credentials;
 pub use stream::S3Source;

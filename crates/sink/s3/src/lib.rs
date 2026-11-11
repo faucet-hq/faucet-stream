@@ -17,4 +17,5 @@ pub mod sink;
 pub use faucet_core::{FaucetError, Sink};
 
 pub use config::{S3SinkConfig, S3SinkFormat};
+pub use faucet_common_s3::S3Credentials;
 pub use sink::S3Sink;

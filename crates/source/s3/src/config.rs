@@ -1,5 +1,6 @@
 //! S3 source configuration.
 
+use faucet_common_s3::S3Credentials;
 use faucet_core::DEFAULT_BATCH_SIZE;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -117,6 +118,11 @@ pub struct S3SourceConfig {
     #[serde(default)]
     #[schemars(extend("x-faucet-resource" = "url"))]
     pub endpoint_url: Option<String>,
+    /// How to authenticate (default: the AWS default chain, i.e. the
+    /// identity of the host faucet runs on). `access_key` names keys in the
+    /// config; `anonymous` sends unsigned requests (public buckets).
+    #[serde(default)]
+    pub credentials: S3Credentials,
     /// Format of the files to read. Defaults to `json_lines`.
     #[serde(default)]
     pub file_format: S3FileFormat,
@@ -221,6 +227,7 @@ impl S3SourceConfig {
             prefix: None,
             include: None,
             region: None,
+            credentials: S3Credentials::default(),
             endpoint_url: None,
             file_format: S3FileFormat::default(),
             max_objects: None,
@@ -274,6 +281,12 @@ impl S3SourceConfig {
     /// Set a custom endpoint URL for S3-compatible services.
     pub fn endpoint_url(mut self, url: impl Into<String>) -> Self {
         self.endpoint_url = Some(url.into());
+        self
+    }
+
+    /// Set how the source authenticates.
+    pub fn credentials(mut self, credentials: S3Credentials) -> Self {
+        self.credentials = credentials;
         self
     }
 

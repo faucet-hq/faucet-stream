@@ -18,7 +18,10 @@ pub mod convert;
 pub mod retry;
 pub mod table;
 
-pub use auth::{DynamoDbCredentials, build_client, build_sdk_config, build_streams_client};
+pub use auth::{
+    DynamoDbCredentials, build_client, build_sdk_config, build_streams_client, host_identity,
+    host_identity_at, region_from_env,
+};
 pub use convert::{
     ValueFormat, attribute_to_json, item_size, item_to_json, item_to_typed_json, json_to_attribute,
     json_to_item, json_to_key_attribute, number_to_json, streams_attribute_to_dynamodb,

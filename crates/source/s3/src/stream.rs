@@ -111,24 +111,12 @@ impl S3Source {
 
     /// Build an S3 client from the configuration.
     async fn build_client(config: &S3SourceConfig) -> Result<Client, FaucetError> {
-        let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
-
-        if let Some(ref region) = config.region {
-            config_loader = config_loader.region(aws_config::Region::new(region.clone()));
-        }
-
-        if let Some(ref endpoint) = config.endpoint_url {
-            config_loader = config_loader.endpoint_url(endpoint);
-        }
-
-        let sdk_config = config_loader.load().await;
-        // S3-compatible stores (MinIO) do not serve virtual-hosted bucket names.
-        let client = Client::from_conf(
-            aws_sdk_s3::config::Builder::from(&sdk_config)
-                .force_path_style(config.endpoint_url.is_some())
-                .build(),
-        );
-        Ok(client)
+        faucet_common_s3::build_client_with(
+            config.region.as_deref(),
+            config.endpoint_url.as_deref(),
+            &config.credentials,
+        )
+        .await
     }
 
     /// List object keys matching the configured bucket and prefix.
