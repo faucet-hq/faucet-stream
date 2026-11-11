@@ -75,6 +75,7 @@ faucet run pipeline.yaml
 | `include` | string | *(unset)* | Glob over the whole object key selecting what to read (e.g. `exports/*.parquet`). Without it, zero-byte folder markers and keys with a `_`- or `.`-prefixed segment below the prefix (`_SUCCESS`, `_temporary/…`, `.crc`) are skipped; with it, exactly the matching keys are read. |
 | `max_objects` | int | *(unset)* | Hard cap on the number of objects read (applied after listing, and to an explicit `object_keys` list). |
 | `max_object_bytes` | int | `2147483648` | Largest object, once decompressed, that a whole-object format (JSON array, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet, and JSON Lines under `verify_checksum`) may reach; a larger one fails the run instead of exhausting memory. It also bounds one line of a streamed JSON Lines object, so an object with no newline fails the same way, and one ranged read of a streamed Parquet object (a footer or a column chunk), refused before it is requested. |
+| `max_decoded_bytes` | int | 64 × `max_object_bytes`, at most 16 GiB | Most bytes one object may decode to in memory where a format can expand past its input: an Avro file's records (per batch where the file streams) and an Excel workbook's parts and shared strings. A file past it fails with an error instead of exhausting memory. |
 
 ### Performance
 

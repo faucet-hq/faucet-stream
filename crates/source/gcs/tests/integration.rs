@@ -1141,3 +1141,50 @@ async fn source_reads_xml_and_xlsx_objects() {
         assert_eq!(stream_all(&source).await, rows, "{shared:?}");
     }
 }
+
+/// The first error a stream of pages ends with.
+#[cfg(all(feature = "file-format-avro", feature = "file-format-excel"))]
+async fn first_error<S>(mut pages: S) -> faucet_core::FaucetError
+where
+    S: futures::Stream<Item = Result<faucet_core::StreamPage, faucet_core::FaucetError>> + Unpin,
+{
+    use futures::StreamExt;
+    loop {
+        match pages.next().await {
+            Some(Ok(_)) => {}
+            Some(Err(e)) => return e,
+            None => panic!("the stream ended without an error"),
+        }
+    }
+}
+
+#[cfg(all(feature = "file-format-avro", feature = "file-format-excel"))]
+#[tokio::test]
+async fn objects_that_decode_past_max_decoded_bytes_are_refused() {
+    use faucet_core::file_format::{FileFormat, FormatOptions, encode};
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
+        return;
+    };
+    let rows = vec![serde_json::json!({"id": "1", "name": "ada"})];
+    for (format, shared, name) in [
+        (GcsFileFormat::Avro, FileFormat::Avro, "big-avro/a.avro"),
+        (GcsFileFormat::Xlsx, FileFormat::Xlsx, "big-xlsx/a.xlsx"),
+    ] {
+        let body = encode(&rows, shared, &FormatOptions::default()).unwrap();
+        seed_bytes(&host, &bucket, name, body, "application/octet-stream").await;
+        let prefix = name.split('/').next().unwrap();
+        let mut config = GcsSourceConfig::new(&bucket)
+            .prefix(format!("{prefix}/"))
+            .file_format(format)
+            .auth(GcsCredentials::Anonymous)
+            .storage_host(&host);
+        config.max_decoded_bytes = Some(64);
+        let source = GcsSource::new(config).await.unwrap();
+        let ctx: HashMap<String, serde_json::Value> = HashMap::new();
+        let err = first_error(source.stream_pages(&ctx, 0)).await;
+        assert!(
+            err.to_string().contains("max_decoded_bytes"),
+            "{shared:?}: {err}"
+        );
+    }
+}

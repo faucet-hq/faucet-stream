@@ -266,11 +266,20 @@ impl SftpSource {
                 Fetched::JsonArray(Self::read_file_text(sftp, path, max).await?)
             }
             #[cfg(feature = "file-format-csv")]
-            SftpFormat::Csv => Self::fetch_decoded(sftp, path, format, opts, max).await?,
+            SftpFormat::Csv => {
+                Self::fetch_decoded(sftp, path, format, opts, max, config.decoded_bytes_limit())
+                    .await?
+            }
             #[cfg(feature = "file-format-xml")]
-            SftpFormat::Xml => Self::fetch_decoded(sftp, path, format, opts, max).await?,
+            SftpFormat::Xml => {
+                Self::fetch_decoded(sftp, path, format, opts, max, config.decoded_bytes_limit())
+                    .await?
+            }
             #[cfg(feature = "file-format-excel")]
-            SftpFormat::Xlsx => Self::fetch_decoded(sftp, path, format, opts, max).await?,
+            SftpFormat::Xlsx => {
+                Self::fetch_decoded(sftp, path, format, opts, max, config.decoded_bytes_limit())
+                    .await?
+            }
             #[cfg(feature = "file-format-avro")]
             SftpFormat::Avro => Fetched::Container(Self::read_file(sftp, path, max).await?),
             #[cfg(feature = "file-format-orc")]
@@ -401,10 +410,10 @@ impl SftpSource {
     #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
     fn container_decoder(&self) -> Result<Option<faucet_core::ContainerDecoder>, FaucetError> {
         match self.config.format.shared() {
-            Some(f) if f.is_container() => Ok(Some(faucet_core::ContainerDecoder::new(
-                f,
-                &self.config.format_options(),
-            )?)),
+            Some(f) if f.is_container() => Ok(Some(
+                faucet_core::ContainerDecoder::new(f, &self.config.format_options())?
+                    .with_max_decoded_bytes(self.config.decoded_bytes_limit()),
+            )),
             _ => Ok(None),
         }
     }
@@ -426,12 +435,13 @@ impl SftpSource {
         format: SftpFormat,
         opts: &faucet_core::FormatOptions,
         max: u64,
+        decoded: u64,
     ) -> Result<Fetched, FaucetError> {
         let bytes = Self::read_file(sftp, path, max).await?;
         let shared = format
             .shared()
             .ok_or_else(|| FaucetError::Source(format!("SFTP '{path}': format has no decoder")))?;
-        let records = faucet_core::file_format::decode_owned(bytes, shared, opts)
+        let records = faucet_core::file_format::decode_owned_bounded(bytes, shared, opts, decoded)
             .await
             .map_err(|e| FaucetError::Source(format!("SFTP '{path}': {e}")))?;
         Ok(Fetched::Records(records))

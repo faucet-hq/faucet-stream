@@ -203,10 +203,10 @@ impl GcsSource {
     #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
     fn container_decoder(&self) -> Result<Option<faucet_core::ContainerDecoder>, FaucetError> {
         match self.config.file_format.shared() {
-            Some(f) if f.is_container() => Ok(Some(faucet_core::ContainerDecoder::new(
-                f,
-                &self.config.format_options(),
-            )?)),
+            Some(f) if f.is_container() => Ok(Some(
+                faucet_core::ContainerDecoder::new(f, &self.config.format_options())?
+                    .with_max_decoded_bytes(self.config.decoded_bytes_limit()),
+            )),
             _ => Ok(None),
         }
     }
@@ -248,10 +248,14 @@ impl GcsSource {
             self.config.file_format.shared().ok_or_else(|| {
                 FaucetError::Source(format!("GCS '{key}': format has no decoder"))
             })?;
-        let records =
-            faucet_core::file_format::decode_owned(bytes, format, &self.config.format_options())
-                .await
-                .map_err(|e| FaucetError::Source(format!("GCS '{key}': {e}")))?;
+        let records = faucet_core::file_format::decode_owned_bounded(
+            bytes,
+            format,
+            &self.config.format_options(),
+            self.config.decoded_bytes_limit(),
+        )
+        .await
+        .map_err(|e| FaucetError::Source(format!("GCS '{key}': {e}")))?;
         Ok(Fetched::Records(records))
     }
 

@@ -184,6 +184,12 @@ CSV files have no whole-file limit, but one line may not exceed
 `max_object_bytes`: a file (or `http(s)://` body) with no newline fails the
 same way instead of being buffered whole.
 
+`max_decoded_bytes` (default 64 × `max_object_bytes`, at most 16 GiB) bounds
+what a file may decode to where a format can expand past its input: an Avro
+file's records (per batch, since Avro streams) and an Excel workbook's parts
+and shared strings. A file past it fails with an error instead of exhausting
+memory.
+
 ## HTTP
 
 A URL `path` is one file. `headers:` are sent with every request, for example

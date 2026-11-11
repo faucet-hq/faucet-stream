@@ -35,6 +35,7 @@ enum Opened {
 /// file's schema.
 pub(crate) struct Decoders {
     opts: FormatOptions,
+    max_decoded_bytes: u64,
     containers: HashMap<&'static str, faucet_core::ContainerDecoder>,
     #[cfg(feature = "file-format-parquet")]
     parquet: Option<(String, arrow::datatypes::SchemaRef)>,
@@ -43,9 +44,14 @@ pub(crate) struct Decoders {
 }
 
 impl Decoders {
-    fn new(opts: FormatOptions, parquet_columns: Option<Vec<String>>) -> Arc<Mutex<Self>> {
+    fn new(
+        opts: FormatOptions,
+        max_decoded_bytes: u64,
+        parquet_columns: Option<Vec<String>>,
+    ) -> Arc<Mutex<Self>> {
         Arc::new(Mutex::new(Self {
             opts,
+            max_decoded_bytes,
             parquet_columns,
             containers: HashMap::new(),
             #[cfg(feature = "file-format-parquet")]
@@ -59,7 +65,8 @@ impl Decoders {
     ) -> Result<&mut faucet_core::ContainerDecoder, FaucetError> {
         let key = format.as_str();
         if !self.containers.contains_key(key) {
-            let d = faucet_core::ContainerDecoder::new(format, &self.opts)?;
+            let d = faucet_core::ContainerDecoder::new(format, &self.opts)?
+                .with_max_decoded_bytes(self.max_decoded_bytes);
             self.containers.insert(key, d);
         }
         Ok(self.containers.get_mut(key).expect("inserted above"))
@@ -367,13 +374,14 @@ async fn decode_whole(
     format: FileFormat,
     bytes: Vec<u8>,
     opts: &FormatOptions,
+    max_decoded_bytes: u64,
 ) -> Result<Vec<Value>, FaucetError> {
     if format == FileFormat::RawText {
         let content = String::from_utf8(bytes)
             .map_err(|e| FaucetError::Source(format!("file source: '{path}' is not UTF-8: {e}")))?;
         return Ok(vec![json!({"path": path, "content": content})]);
     }
-    faucet_core::file_format::decode_owned(bytes, format, opts)
+    faucet_core::file_format::decode_owned_bounded(bytes, format, opts, max_decoded_bytes)
         .await
         .map_err(|e| FaucetError::Source(format!("file source: '{path}': {e}")))
 }
@@ -509,7 +517,7 @@ impl faucet_core::Source for FileSource {
             self.check_parquet_schemas(&files).await?;
             let by = self.by();
             let mut bookmark = self.start.lock().expect("bookmark mutex").clone();
-            let decoders = Decoders::new(self.config.format_options(), self.config.parquet.columns.clone());
+            let decoders = Decoders::new(self.config.format_options(), self.config.decoded_bytes_limit(), self.config.parquet.columns.clone());
             let opts = self.config.format_options();
             let chunk = if batch_size == 0 { usize::MAX } else { batch_size };
             let mut buffer: Vec<Value> = Vec::new();
@@ -570,7 +578,7 @@ impl faucet_core::Source for FileSource {
                             join(handle).await?;
                         }
                         Opened::Bytes(bytes) => {
-                            for r in decode_whole(path, format, bytes, &opts).await? {
+                            for r in decode_whole(path, format, bytes, &opts, self.config.decoded_bytes_limit()).await? {
                                 buffer.push(r);
                                 if buffer.len() >= chunk {
                                     yield StreamPage { records: std::mem::take(&mut buffer), bookmark: None };
@@ -627,7 +635,7 @@ impl faucet_core::Source for FileSource {
             self.check_parquet_schemas(&files).await?;
             let by = self.by();
             let mut bookmark = self.start.lock().expect("bookmark mutex").clone();
-            let decoders = Decoders::new(self.config.format_options(), self.config.parquet.columns.clone());
+            let decoders = Decoders::new(self.config.format_options(), self.config.decoded_bytes_limit(), self.config.parquet.columns.clone());
             let mut opened_files = self.prefetch(&files);
             while let Some((file, opened)) = opened_files.next().await {
                 let (mut rx, handle) = batches_task(decoders.clone(), file.path.clone(), format, input_of(opened?), self.config.batch_size);

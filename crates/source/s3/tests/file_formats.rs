@@ -370,3 +370,50 @@ async fn raw_text_objects_read_whole_through_a_host_named_endpoint() {
         ]
     );
 }
+
+/// The first error a stream of pages ends with.
+#[cfg(all(feature = "file-format-avro", feature = "file-format-excel"))]
+async fn first_error<S>(mut pages: S) -> faucet_core::FaucetError
+where
+    S: futures::Stream<Item = Result<faucet_core::StreamPage, faucet_core::FaucetError>> + Unpin,
+{
+    loop {
+        match pages.next().await {
+            Some(Ok(_)) => {}
+            Some(Err(e)) => return e,
+            None => panic!("the stream ended without an error"),
+        }
+    }
+}
+
+#[cfg(all(feature = "file-format-avro", feature = "file-format-excel"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn objects_that_decode_past_max_decoded_bytes_are_refused() {
+    let (_c, endpoint) = start_minio().await;
+    let cases = [
+        (S3FileFormat::Avro, FileFormat::Avro, "big/a.avro"),
+        (S3FileFormat::Xlsx, FileFormat::Xlsx, "big/a.xlsx"),
+    ];
+    let objects: Vec<(String, Vec<u8>)> = cases
+        .iter()
+        .map(|(_, shared, key)| {
+            let body = encode(&records(), *shared, &FormatOptions::default()).expect("encode");
+            (key.to_string(), body)
+        })
+        .collect();
+    seed(&endpoint, &objects).await;
+    for (fmt, shared, key) in cases {
+        let mut config = S3SourceConfig::new(TEST_BUCKET)
+            .file_format(fmt)
+            .prefix(key)
+            .with_batch_size(0);
+        config.max_decoded_bytes = Some(64);
+        let src = build_source(&endpoint, config).await;
+        let ctx: HashMap<String, Value> = HashMap::new();
+        let err = first_error(src.stream_pages(&ctx, 0)).await;
+        assert!(
+            err.to_string().contains("max_decoded_bytes"),
+            "{shared:?}: {err}"
+        );
+    }
+}
