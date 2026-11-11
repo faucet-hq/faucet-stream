@@ -288,3 +288,98 @@ fn a_caller_value_is_redacted_until_unregistered() {
     unregister("caller-param-value");
     assert_eq!(redact("caller-param-value"), "caller-param-value");
 }
+
+#[tokio::test]
+#[serial]
+async fn caller_secrets_cannot_evict_server_secrets() {
+    register("server-flood-guard-secret");
+    as_caller(async {
+        for i in 0..MAX_CALLER_FORMS + 10 {
+            register(&format!("caller-key-line-{i:06}"));
+        }
+    })
+    .await;
+    let caller_policy = std::sync::Arc::new(
+        faucet_core::resolve::ReferencePolicy::deny_all().with_path_roots(["/srv/caller"]),
+    );
+    faucet_core::http::with_reference_policy(caller_policy, async {
+        register("policy-scoped-caller-value");
+    })
+    .await;
+    {
+        let reg = registry().read().unwrap();
+        assert!(reg.forms.contains_key("server-flood-guard-secret"));
+        assert!(!reg.forms.keys().any(|f| f.starts_with("caller-key-line-")));
+        assert!(reg.caller.len() <= MAX_CALLER_FORMS);
+        assert!(reg.caller.contains_key("policy-scoped-caller-value"));
+    }
+    assert_eq!(redact("t=server-flood-guard-secret"), "t=***");
+    // A trusted run's policy is open: its values stay with the server's.
+    faucet_core::http::with_reference_policy(
+        std::sync::Arc::new(faucet_core::resolve::ReferencePolicy::open()),
+        async { register("open-policy-server-value") },
+    )
+    .await;
+    assert!(
+        registry()
+            .read()
+            .unwrap()
+            .forms
+            .contains_key("open-policy-server-value")
+    );
+    for i in 0..MAX_CALLER_FORMS + 10 {
+        unregister(&format!("caller-key-line-{i:06}"));
+    }
+    for s in [
+        "server-flood-guard-secret",
+        "policy-scoped-caller-value",
+        "open-policy-server-value",
+    ] {
+        unregister(s);
+    }
+}
+
+#[test]
+fn protected_secrets_survive_every_flood_until_rotated_away() {
+    let mut reg = Registry {
+        max_forms: 4,
+        max_caller_forms: 4,
+        ..Registry::default()
+    };
+    reg.insert(forms_of("tenant-connection-secret"));
+    reg.protect(forms_of("tenant-connection-secret"));
+    assert!(!reg.forms.contains_key("tenant-connection-secret"));
+    for i in 0..10 {
+        reg.insert(forms_of(&format!("server-churn-{i}")));
+        reg.insert_caller(forms_of(&format!("caller-churn-{i}")));
+    }
+    reg.insert(forms_of("tenant-connection-secret"));
+    reg.insert_caller(forms_of("tenant-connection-secret"));
+    assert!(reg.protected.contains("tenant-connection-secret"));
+    assert!(!reg.forms.contains_key("tenant-connection-secret"));
+    assert!(!reg.caller.contains_key("tenant-connection-secret"));
+    assert!(
+        reg.compile()
+            .patterns
+            .iter()
+            .any(|p| p == "tenant-connection-secret")
+    );
+    reg.pin(forms_of("server-pinned-token"));
+    reg.protect(forms_of("server-pinned-token"));
+    assert!(!reg.protected.contains("server-pinned-token"));
+}
+
+#[test]
+#[serial]
+fn a_rotated_protected_secret_is_dropped() {
+    register_protected("rotating-refresh-token-1");
+    register_protected("abc");
+    assert_eq!(redact("rt=rotating-refresh-token-1"), "rt=***");
+    register_protected("rotating-refresh-token-2");
+    unregister("rotating-refresh-token-1");
+    assert_eq!(
+        redact("rotating-refresh-token-1 rotating-refresh-token-2"),
+        "rotating-refresh-token-1 ***"
+    );
+    unregister("rotating-refresh-token-2");
+}

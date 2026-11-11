@@ -239,7 +239,7 @@ pub fn register_secrets(value: &Value) {
     fn walk(v: &Value, secret: bool) {
         match v {
             Value::String(s) if secret && plausible_secret(s) => {
-                crate::secrets::registry::register(s)
+                crate::secrets::registry::register_protected(s)
             }
             Value::Object(m) => m
                 .iter()
@@ -523,7 +523,7 @@ impl ConnectionTokenStore {
         let Some(token) = value.get("refresh_token").and_then(Value::as_str) else {
             return Ok(None);
         };
-        crate::secrets::registry::register(token);
+        crate::secrets::registry::register_protected(token);
         if let Some(cfg) = spec.get_mut("config").and_then(Value::as_object_mut) {
             let old = cfg.insert("refresh_token".into(), Value::String(token.to_string()));
             // The rotated-away token is revoked; stop paying to scrub it.

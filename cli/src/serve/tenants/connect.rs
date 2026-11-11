@@ -646,7 +646,7 @@ async fn complete(
                     .into(),
             )
         })?;
-    crate::secrets::registry::register(refresh_token);
+    crate::secrets::registry::register_protected(refresh_token);
     let mut config = serde_json::json!({
         "token_url": provider.token_url,
         "client_id": provider.client_id,

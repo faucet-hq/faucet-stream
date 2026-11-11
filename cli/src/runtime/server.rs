@@ -152,17 +152,25 @@ pub async fn load(
         Option<()>,
         Option<crate::serve::history::policies::PolicyPin>,
     ) = (None, None);
-    let loaded = crate::serve::load::load_submission_inputs(
+    let default_base = state.default_base();
+    let references = state.references();
+    let loading = crate::serve::load::load_submission_inputs(
         sub.body,
         sub.format,
-        state.default_base().as_ref(),
+        default_base.as_ref(),
         policy.as_ref(),
         principal.body_origin(),
         scope,
-        &state.references(),
+        &references,
         caller,
-    )
-    .await;
+    );
+    // What a caller's config makes the server register for redaction is
+    // held with the caller's values.
+    let loaded = if principal.caller_body() {
+        crate::secrets::registry::as_caller(loading).await
+    } else {
+        loading.await
+    };
     let mut loaded = match loaded {
         Err(ServeError::Forbidden(m))
             if caller.is_some() && crate::serve::load::caller_refusal_target(&m).is_some() =>

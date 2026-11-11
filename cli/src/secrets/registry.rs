@@ -36,6 +36,9 @@ struct Registry {
     /// Process-lifetime credentials (the server's own tokens and keys):
     /// never evicted, whatever the churn in `forms`.
     pinned: HashSet<String>,
+    /// Credentials the server holds for a tenant (connections, rotating
+    /// refresh tokens): never evicted, removed only when rotated away.
+    protected: HashSet<String>,
     /// Forms of caller-supplied values, bounded on their own.
     caller: HashMap<String, u64>,
     seq: u64,
@@ -49,6 +52,7 @@ impl Default for Registry {
         Self {
             forms: HashMap::new(),
             pinned: HashSet::new(),
+            protected: HashSet::new(),
             caller: HashMap::new(),
             seq: 0,
             max_forms: MAX_FORMS,
@@ -74,7 +78,7 @@ impl Registry {
     fn insert(&mut self, forms: Vec<String>) {
         self.seq += 1;
         for f in forms {
-            if !self.pinned.contains(&f) {
+            if !self.pinned.contains(&f) && !self.protected.contains(&f) {
                 self.forms.insert(f, self.seq);
             }
         }
@@ -85,7 +89,10 @@ impl Registry {
     fn insert_caller(&mut self, forms: Vec<String>) {
         self.seq += 1;
         for f in forms {
-            if !self.pinned.contains(&f) && !self.forms.contains_key(&f) {
+            if !self.pinned.contains(&f)
+                && !self.protected.contains(&f)
+                && !self.forms.contains_key(&f)
+            {
                 self.caller.insert(f, self.seq);
             }
         }
@@ -101,11 +108,23 @@ impl Registry {
         self.compiled = None;
     }
 
+    fn protect(&mut self, forms: Vec<String>) {
+        for f in forms {
+            if !self.pinned.contains(&f) {
+                self.forms.remove(&f);
+                self.caller.remove(&f);
+                self.protected.insert(f);
+            }
+        }
+        self.compiled = None;
+    }
+
     fn compile(&self) -> Compiled {
         let mut patterns: Vec<String> = self
             .forms
             .keys()
             .chain(self.pinned.iter())
+            .chain(self.protected.iter())
             .chain(self.caller.keys().filter(|f| !self.forms.contains_key(*f)))
             .cloned()
             .collect();
@@ -183,12 +202,36 @@ fn forms_of(secret: &str) -> Vec<String> {
     forms
 }
 
+tokio::task_local! {
+    static CALLER_SCOPE: ();
+}
+
+/// Run `fut` with every [`register`] in it counted as a caller's: a config a
+/// caller submitted is being loaded or built.
+pub async fn as_caller<F: std::future::Future>(fut: F) -> F::Output {
+    CALLER_SCOPE.scope((), fut).await
+}
+
+/// Whether a value registered now belongs to a caller's run: inside
+/// [`as_caller`], or under a caller's reference policy (a run of a config a
+/// caller submitted, which bounds its local paths).
+fn in_caller_scope() -> bool {
+    CALLER_SCOPE.try_with(|_| ()).is_ok()
+        || faucet_core::http::current_reference_policy().is_some_and(|p| p.path_roots().is_some())
+}
+
 /// Register a resolved secret value so it is scrubbed from future output —
 /// along with the forms it takes once escaped (JSON logs, `{:?}` fields) and,
-/// for a multi-line secret such as a PEM key, each line on its own.
+/// for a multi-line secret such as a PEM key, each line on its own. Inside a
+/// caller's load or run it is held with the caller's values
+/// ([`register_caller`]), so a caller's config cannot crowd out the
+/// server's.
 pub fn register(secret: &str) {
     if secret.len() < MIN_REDACT_LEN {
         return;
+    }
+    if in_caller_scope() {
+        return register_caller(secret);
     }
     registry()
         .write()
@@ -223,15 +266,30 @@ pub fn register_pinned(secret: &str) {
         .pin(forms_of(secret));
 }
 
+/// [`register`] for a credential the server holds for a tenant (a
+/// connection's secrets, a refresh token): never evicted however many other
+/// values are registered, and kept until [`unregister`]ed when it is rotated
+/// away.
+pub fn register_protected(secret: &str) {
+    if secret.len() < MIN_REDACT_LEN {
+        return;
+    }
+    registry()
+        .write()
+        .expect("secret registry lock poisoned")
+        .protect(forms_of(secret));
+}
+
 /// Stop scrubbing `secret`: a refresh token rotated away (#789 SERVE-24).
 pub fn unregister(secret: &str) {
     let mut reg = registry().write().expect("secret registry lock poisoned");
-    let before = reg.forms.len() + reg.caller.len();
+    let before = reg.forms.len() + reg.caller.len() + reg.protected.len();
     for f in forms_of(secret) {
         reg.forms.remove(&f);
         reg.caller.remove(&f);
+        reg.protected.remove(&f);
     }
-    if reg.forms.len() + reg.caller.len() != before {
+    if reg.forms.len() + reg.caller.len() + reg.protected.len() != before {
         reg.compiled = None;
     }
 }
