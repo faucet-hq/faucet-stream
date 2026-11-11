@@ -7,10 +7,13 @@
 use syn::visit::Visit;
 
 /// Whether a method chain is a call on the run history (`….history().x()`,
-/// `history.x()`), following the receivers only, never the arguments.
+/// `history.x()`, or a function handed the history: `f(history.as_ref())`),
+/// following the receivers and a function's direct arguments, never a
+/// method's arguments.
 fn reads_history(e: &syn::Expr) -> bool {
     match e {
         syn::Expr::MethodCall(m) => m.method == "history" || reads_history(&m.receiver),
+        syn::Expr::Call(c) => c.args.iter().any(reads_history),
         syn::Expr::Await(a) => reads_history(&a.base),
         syn::Expr::Try(t) => reads_history(&t.expr),
         syn::Expr::Field(f) => reads_history(&f.base),
@@ -176,6 +179,7 @@ fn the_scan_finds_each_shape_it_refuses() {
         async fn a(state: &S) -> Result<(), ServeError> {
             state.history().get("x").await.map_err(|e| ServeError::Internal(e.to_string()))?;
             state.history().get("x").await.map_err(|e| ServeError::Internal(format!("read: {e}")))?;
+            read_one(state.history().as_ref(), "x").await.map_err(|e| ServeError::Unavailable(format!("read: {e}")))?;
             Ok(())
         }
         fn b() {
@@ -188,8 +192,9 @@ fn the_scan_finds_each_shape_it_refuses() {
             let _ = state.history().get("x").map_err(ServeError::from);
             let _ = plan(Opts { store: history.as_ref() }).await.map_err(|e| ServeError::BadConfig(e.to_string()));
             let _ = serde_json::to_value(1).map_err(|e| ServeError::Internal(e.to_string()));
+            let _ = check(state, "x").await.map_err(|e| ServeError::Internal(e.to_string()));
         }
         "#,
     );
-    assert_eq!(hits.len(), 4, "{hits:?}");
+    assert_eq!(hits.len(), 5, "{hits:?}");
 }

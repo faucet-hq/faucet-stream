@@ -424,8 +424,11 @@ pub struct InstanceHeartbeat {
 
 /// A member enforces the policy versions a run was admitted under (#1051).
 pub const CAP_POLICY_PIN: &str = "policy_pin";
+/// A member keeps a tenant connection's generation when it rewrites the
+/// connection, so a generation may be assigned with a new `updated_at`.
+pub const CAP_CONNECTION_GENERATION: &str = "connection_generation";
 /// What this build advertises in its heartbeat.
-pub const INSTANCE_CAPABILITIES: &[&str] = &[CAP_POLICY_PIN];
+pub const INSTANCE_CAPABILITIES: &[&str] = &[CAP_POLICY_PIN, CAP_CONNECTION_GENERATION];
 
 /// One live cluster member (for `/readyz` + metrics).
 #[derive(Debug, Clone, Serialize)]

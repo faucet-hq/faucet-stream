@@ -608,7 +608,7 @@ template) `POST /v1/templates/{id}/runs`, `run_template` and a template trigger.
 | `GET`/`POST` | `/v1/tenants/{tenant}/connections` | `200`/`201` | List (never credentials) / store a sealed connection `{name, provider: {type, config}}` — operator / `ConnectionManage` |
 | `GET`/`PUT`/`DELETE` | `/v1/tenants/{tenant}/connections/{name}` | `200`/`204` | Read, replace (reconnect) or delete one connection |
 | `POST` | `/v1/tenants/{tenant}/connect/{provider}` | `200` | Start a hosted OAuth flow — `{connection, redirect}` → `{authorize_url, expires_at}` |
-| `GET` | `/v1/connect/callback` | `303` | OAuth redirect target (unauthenticated; the single-use `state` is the credential) |
+| `GET` | `/v1/connect/callback` | `303` | OAuth redirect target (unauthenticated; the single-use `state` is the credential). Redirects with `status=ok`, or `status=error&error=<code>`; a provider `error` is passed on only when it is 1–64 characters of `[A-Za-z0-9_.-]`, else as `provider_error` |
 | `GET` | `/v1/connect/providers` | `200` | The `--connect-providers` providers |
 | `POST` | `/v1/tenants/{tenant}/runs` | `202` | A `POST /v1/runs` body, run as the tenant — operator / `RunWrite` |
 | `POST` | `/v1/tenants/{tenant}/templates/{id}/runs` | `202` | A template trigger, run as the tenant — operator / `RunWrite` |

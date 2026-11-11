@@ -518,6 +518,7 @@ impl ConnectionTokenStore {
         mut rec: ConnectionRecord,
         mut spec: Value,
         value: &Value,
+        retry: bool,
     ) -> Result<Option<ConnectionRecord>, FaucetError> {
         let Some(token) = value.get("refresh_token").and_then(Value::as_str) else {
             return Ok(None);
@@ -539,7 +540,24 @@ impl ConnectionTokenStore {
             .ok_or_else(|| FaucetError::State("no vault key".into()))?;
         rec.sealed = vault.seal_for(&spec, &Vault::connection_context(&rec.tenant, &rec.name));
         rec.updated_at = Utc::now();
+        // A refresh that succeeded proves the grant alive over a mark that raced it.
+        if retry && rec.status == ConnectionStatus::NeedsReauth {
+            rec.status = ConnectionStatus::Active;
+            rec.reauth_reason = None;
+        }
         Ok(Some(rec))
+    }
+
+    async fn store_rotated(
+        &self,
+        rec: ConnectionRecord,
+        spec: Value,
+        value: &Value,
+    ) -> Result<bool, FaucetError> {
+        replace_retrying(self.state.history().as_ref(), rec, |rec, retry| {
+            self.rotated(rec, spec.clone(), value, retry)
+        })
+        .await
     }
 
     async fn load(&self) -> Result<Option<(ConnectionRecord, Value)>, FaucetError> {
@@ -581,17 +599,10 @@ impl StateStore for ConnectionTokenStore {
         let Some((rec, spec)) = self.load().await? else {
             return Ok(());
         };
-        let since = rec.updated_at;
-        let Some(next) = self.rotated(rec, spec, value)? else {
+        if value.get("refresh_token").and_then(Value::as_str).is_none() {
             return Ok(());
-        };
-        let written = self
-            .state
-            .history()
-            .connection_replace(&next, since)
-            .await
-            .map_err(|e| FaucetError::State(e.to_string()))?;
-        if !written {
+        }
+        if !self.store_rotated(rec, spec, value).await? {
             tracing::info!(
                 tenant = %self.tenant,
                 connection = %self.name,
@@ -621,20 +632,62 @@ impl StateStore for ConnectionTokenStore {
         if stored != wanted {
             return Ok(false);
         }
-        let since = rec.updated_at;
-        let Some(next) = self.rotated(rec, spec, value)? else {
-            return Ok(false);
-        };
-        self.state
-            .history()
-            .connection_replace(&next, since)
-            .await
-            .map_err(|e| FaucetError::State(e.to_string()))
+        self.store_rotated(rec, spec, value).await
     }
 
     async fn delete(&self, _key: &str) -> Result<(), FaucetError> {
         Ok(())
     }
+}
+
+/// How many times a connection write is rebuilt after losing its
+/// compare-and-set to a write that left the sealed grant as it was.
+const REPLACE_RETRIES: usize = 3;
+
+/// Write `build(read, false)` over `read` with a compare-and-set. When it
+/// loses and the stored grant is still the one read (only metadata moved:
+/// a generation, a status), rebuild on the fresh record with
+/// `build(fresh, true)` and try again; otherwise the other write wins.
+/// `build` returning `None` writes nothing.
+async fn replace_retrying<F>(
+    history: &dyn crate::serve::history::RunHistory,
+    read: ConnectionRecord,
+    mut build: F,
+) -> Result<bool, FaucetError>
+where
+    F: FnMut(ConnectionRecord, bool) -> Result<Option<ConnectionRecord>, FaucetError>,
+{
+    let state_err = |e: crate::serve::history::HistoryError| FaucetError::State(e.to_string());
+    let sealed = read.sealed.clone();
+    let (tenant, name) = (read.tenant.clone(), read.name.clone());
+    let mut current = read;
+    let mut retry = false;
+    for attempt in 0..=REPLACE_RETRIES {
+        let since = current.updated_at;
+        let Some(next) = build(current, retry)? else {
+            return Ok(false);
+        };
+        if history
+            .connection_replace(&next, since)
+            .await
+            .map_err(state_err)?
+        {
+            return Ok(true);
+        }
+        if attempt == REPLACE_RETRIES {
+            break;
+        }
+        match history
+            .connection_get(&tenant, &name)
+            .await
+            .map_err(state_err)?
+        {
+            Some(fresh) if fresh.sealed == sealed => current = fresh,
+            _ => return Ok(false),
+        }
+        retry = true;
+    }
+    Ok(false)
 }
 
 /// Whether a provider failure means the grant is gone: the token endpoint
@@ -788,15 +841,20 @@ pub async fn mark_needs_reauth(state: &ServerState, tenant: &str, name: &str, re
     if rec.status == ConnectionStatus::NeedsReauth {
         return;
     }
-    let read_at = rec.updated_at;
-    let mut rec = rec;
-    rec.status = ConnectionStatus::NeedsReauth;
-    rec.reauth_reason = Some(reason.to_string());
-    rec.updated_at = Utc::now();
-    rec.updated_by = "system:tenants".into();
     // Compare-and-set: a reconnect that stored fresh credentials since the
     // read wins, rather than being overwritten with the revoked ones.
-    match history.connection_replace(&rec, read_at).await {
+    let marked = replace_retrying(history.as_ref(), rec, |mut rec, _| {
+        if rec.status == ConnectionStatus::NeedsReauth {
+            return Ok(None);
+        }
+        rec.status = ConnectionStatus::NeedsReauth;
+        rec.reauth_reason = Some(reason.to_string());
+        rec.updated_at = Utc::now();
+        rec.updated_by = "system:tenants".into();
+        Ok(Some(rec))
+    })
+    .await;
+    match marked {
         Ok(true) => {}
         Ok(false) => {
             tracing::info!(
@@ -1463,6 +1521,259 @@ mod tests {
             .unwrap();
         assert_ne!(stored.sealed, original.sealed);
         assert_eq!(stored.generation, original.generation);
+    }
+
+    /// A memory history where another writer replaces the connection just
+    /// before the first compare-and-set lands.
+    struct RacingWrite {
+        mem: crate::serve::history::memory::MemoryHistory,
+        racer: std::sync::Mutex<Option<ConnectionRecord>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::serve::history::RunHistory for RacingWrite {
+        async fn claim_idempotency(
+            &self,
+            k: &str,
+            f: &str,
+            r: &str,
+            w: std::time::Duration,
+        ) -> Result<crate::serve::history::Claim, crate::serve::history::HistoryError> {
+            self.mem.claim_idempotency(k, f, r, w).await
+        }
+        async fn upsert(&self, rec: &RunRecord) -> Result<(), crate::serve::history::HistoryError> {
+            self.mem.upsert(rec).await
+        }
+        async fn get(
+            &self,
+            id: &str,
+        ) -> Result<Option<RunRecord>, crate::serve::history::HistoryError> {
+            self.mem.get(id).await
+        }
+        async fn list(
+            &self,
+            f: &crate::serve::history::ListFilter,
+        ) -> Result<crate::serve::history::ListPage, crate::serve::history::HistoryError> {
+            self.mem.list(f).await
+        }
+        async fn delete(
+            &self,
+            id: &str,
+        ) -> Result<crate::serve::history::DeleteOutcome, crate::serve::history::HistoryError>
+        {
+            self.mem.delete(id).await
+        }
+        async fn purge_expired(
+            &self,
+            d: std::time::Duration,
+        ) -> Result<usize, crate::serve::history::HistoryError> {
+            self.mem.purge_expired(d).await
+        }
+        async fn recover_orphans(&self) -> Result<usize, crate::serve::history::HistoryError> {
+            Ok(0)
+        }
+        fn degraded(&self) -> bool {
+            false
+        }
+        async fn connection_get(
+            &self,
+            tenant: &str,
+            name: &str,
+        ) -> Result<Option<ConnectionRecord>, crate::serve::history::HistoryError> {
+            self.mem.connection_get(tenant, name).await
+        }
+        async fn connection_upsert(
+            &self,
+            c: &ConnectionRecord,
+        ) -> Result<(), crate::serve::history::HistoryError> {
+            self.mem.connection_upsert(c).await
+        }
+        async fn connection_replace(
+            &self,
+            c: &ConnectionRecord,
+            expected: chrono::DateTime<Utc>,
+        ) -> Result<bool, crate::serve::history::HistoryError> {
+            let racer = self.racer.lock().unwrap().take();
+            if let Some(racer) = racer {
+                self.mem.connection_upsert(&racer).await?;
+            }
+            self.mem.connection_replace(c, expected).await
+        }
+    }
+
+    /// A state over `original`, where `race(original)` lands just before the
+    /// first compare-and-set.
+    async fn raced(
+        original: &ConnectionRecord,
+        race: impl FnOnce(ConnectionRecord) -> ConnectionRecord,
+    ) -> ServerState {
+        let mem =
+            crate::serve::history::memory::MemoryHistory::new(std::time::Duration::from_secs(60));
+        crate::serve::history::RunHistory::connection_upsert(&mem, original)
+            .await
+            .unwrap();
+        let history = Arc::new(RacingWrite {
+            mem,
+            racer: std::sync::Mutex::new(Some(race(original.clone()))),
+        });
+        let state = ServerState::new(
+            &crate::serve::test_support::test_config(),
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            history,
+            crate::serve::logs::LogHub::new(),
+            None,
+            #[cfg(feature = "triggers")]
+            crate::serve::triggers::health::TriggersHandle::empty(),
+        );
+        state.set_tenants(TenantsRuntime::new(
+            Some(Vault::new(TEST_VAULT_KEY, &[]).unwrap()),
+            Default::default(),
+        ));
+        state
+    }
+
+    fn refresh_conn(v: &Vault, token: &str) -> ConnectionRecord {
+        let mut c = conn(
+            v,
+            "acme",
+            "crm",
+            serde_json::json!({"type": "oauth2_refresh", "config": {"refresh_token": token}}),
+        );
+        c.generation = String::new();
+        c
+    }
+
+    fn backfilled(c: ConnectionRecord) -> ConnectionRecord {
+        ConnectionRecord {
+            generation: "g-backfill".into(),
+            updated_at: c.updated_at + chrono::Duration::milliseconds(1),
+            ..c
+        }
+    }
+
+    async fn stored_token(state: &ServerState) -> (ConnectionRecord, String) {
+        let rec = state
+            .history()
+            .connection_get("acme", "crm")
+            .await
+            .unwrap()
+            .unwrap();
+        let (spec, _) = open_connection(&state.tenants(), &rec).unwrap();
+        let token = spec["config"]["refresh_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        (rec, token)
+    }
+
+    fn token_store(state: &ServerState) -> ConnectionTokenStore {
+        ConnectionTokenStore {
+            state: state.clone(),
+            tenant: "acme".into(),
+            name: "crm".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rotation_that_read_before_the_generation_was_assigned_keeps_it_and_stores_the_token()
+    {
+        let v = Vault::new(TEST_VAULT_KEY, &[]).unwrap();
+        let original = refresh_conn(&v, "rt1");
+        let state = raced(&original, backfilled).await;
+        token_store(&state)
+            .put("k", &serde_json::json!({"refresh_token": "rt2"}))
+            .await
+            .unwrap();
+        let (rec, token) = stored_token(&state).await;
+        assert_eq!(token, "rt2");
+        assert_eq!(rec.generation, "g-backfill");
+
+        let state = raced(&original, backfilled).await;
+        assert!(
+            token_store(&state)
+                .compare_and_put(
+                    "k",
+                    Some(&serde_json::json!({"refresh_token": "rt1"})),
+                    &serde_json::json!({"refresh_token": "rt3"}),
+                )
+                .await
+                .unwrap()
+        );
+        let (rec, token) = stored_token(&state).await;
+        assert_eq!(token, "rt3");
+        assert_eq!(rec.generation, "g-backfill");
+    }
+
+    #[tokio::test]
+    async fn a_reauth_mark_that_raced_a_generation_backfill_still_lands() {
+        let v = Vault::new(TEST_VAULT_KEY, &[]).unwrap();
+        let original = refresh_conn(&v, "rt1");
+        let state = raced(&original, backfilled).await;
+        mark_needs_reauth(&state, "acme", "crm", "invalid_grant").await;
+        let (rec, _) = stored_token(&state).await;
+        assert_eq!(rec.status, ConnectionStatus::NeedsReauth);
+        assert_eq!(rec.reauth_reason.as_deref(), Some("invalid_grant"));
+        assert_eq!(rec.generation, "g-backfill");
+
+        let state = raced(&original, |c| ConnectionRecord {
+            status: ConnectionStatus::NeedsReauth,
+            reauth_reason: Some("first".into()),
+            ..backfilled(c)
+        })
+        .await;
+        mark_needs_reauth(&state, "acme", "crm", "second").await;
+        let (rec, _) = stored_token(&state).await;
+        assert_eq!(rec.reauth_reason.as_deref(), Some("first"));
+    }
+
+    #[tokio::test]
+    async fn a_successful_rotation_after_a_racing_reauth_mark_leaves_the_connection_active() {
+        let v = Vault::new(TEST_VAULT_KEY, &[]).unwrap();
+        let original = refresh_conn(&v, "rt1");
+        let state = raced(&original, |c| ConnectionRecord {
+            status: ConnectionStatus::NeedsReauth,
+            reauth_reason: Some("invalid_grant".into()),
+            updated_at: c.updated_at + chrono::Duration::milliseconds(1),
+            ..c
+        })
+        .await;
+        token_store(&state)
+            .put("k", &serde_json::json!({"refresh_token": "rt2"}))
+            .await
+            .unwrap();
+        let (rec, token) = stored_token(&state).await;
+        assert_eq!(token, "rt2");
+        assert_eq!(rec.status, ConnectionStatus::Active);
+        assert!(rec.reauth_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_rotation_loses_to_a_reconnect() {
+        let v = Vault::new(TEST_VAULT_KEY, &[]).unwrap();
+        let original = refresh_conn(&v, "rt1");
+        let reconnect = refresh_conn(&v, "rt-reconnected");
+        let state = raced(&original, |c| ConnectionRecord {
+            sealed: reconnect.sealed.clone(),
+            updated_at: c.updated_at + chrono::Duration::milliseconds(1),
+            ..c
+        })
+        .await;
+        token_store(&state)
+            .put("k", &serde_json::json!({"refresh_token": "rt2"}))
+            .await
+            .unwrap();
+        let (_, token) = stored_token(&state).await;
+        assert_eq!(token, "rt-reconnected");
+        let state = raced(&original, |c| ConnectionRecord {
+            sealed: reconnect.sealed.clone(),
+            updated_at: c.updated_at + chrono::Duration::milliseconds(1),
+            ..c
+        })
+        .await;
+        mark_needs_reauth(&state, "acme", "crm", "invalid_grant").await;
+        let (rec, _) = stored_token(&state).await;
+        assert_eq!(rec.status, ConnectionStatus::Active);
     }
 
     #[tokio::test]

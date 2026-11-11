@@ -135,12 +135,17 @@ Send the user's browser to `authorize_url`. The provider redirects to
 `/v1/connect/callback`, which exchanges the code (PKCE `S256`), stores the
 grant as an `oauth2_refresh` connection, and redirects to your `redirect` with
 `?connection=crm&status=ok` — or `status=error&error=<code>` (`expired`,
-`access_denied`, `missing_code`, `exchange_failed`, `store_unavailable`,
-`connection_changed`). A callback writes only over the connection its flow
-started from: if the connection was deleted or replaced, or the tenant was
-deleted, while the user was at the provider, nothing is stored and the
-redirect carries `error=connection_changed` — start the flow again. A token
-rotation by a running pipeline in the meantime does not count as a change.
+`missing_code`, `exchange_failed`, `store_unavailable`,
+`connection_changed`, or the provider's own code such as `access_denied`). A
+provider error code is passed on when it is 1–64 characters of
+`[A-Za-z0-9_.-]`; anything else arrives as `provider_error`. A callback
+writes only over the connection its flow started from: if the connection was
+deleted or replaced, or the tenant was deleted, while the user was at the
+provider, nothing is stored and the redirect carries
+`error=connection_changed` — start the flow again. A change made before the
+callback arrives is caught before the code is exchanged, so no grant is
+issued for it. A token rotation by a running pipeline in the meantime does
+not count as a change.
 The `state` parameter is random,
 single-use and valid for ten minutes; a `redirect` outside `allowed_redirects`
 is refused, so the callback is never an open redirector. The start call is a

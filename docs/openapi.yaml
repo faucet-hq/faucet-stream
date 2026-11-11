@@ -2109,10 +2109,13 @@ paths:
         caller's `redirect` with `connection=<name>&status=ok`, or
         `status=error&error=<code>` (`expired`, `access_denied`,
         `missing_code`, `exchange_failed`, `store_unavailable`,
-        `connection_changed`). The callback writes only over the connection
-        its flow started from; `connection_changed` means the connection or
-        tenant was deleted or replaced during the flow and nothing was stored.
-        An unknown or already-used `state` is a 400.
+        `connection_changed`, or the provider's own error code). The callback
+        writes only over the connection its flow started from;
+        `connection_changed` means the connection or tenant was deleted or
+        replaced during the flow and nothing was stored (a change made before
+        the callback means the code is never exchanged). A provider `error`
+        is passed on when it is 1–64 characters of `[A-Za-z0-9_.-]`, else as
+        `provider_error`. An unknown or already-used `state` is a 400.
       operationId: connectCallback
       parameters:
         - { name: state, in: query, required: true, schema: { type: string } }
@@ -3383,7 +3386,7 @@ paths:
                             instance_id: { type: string }
                             listen: { type: string, nullable: true }
                             pools: { type: array, nullable: true, items: { type: string }, description: "null for a member that predates execution pools: it claims any pending run, so a non-default pool is refused while it is live." }
-                            capabilities: { type: array, nullable: true, items: { type: string }, description: "What the member enforces that older releases do not (`policy_pin`, #1051); null for a member that predates them. Runs under a policy, and policy changes, wait while any live member lacks `policy_pin`." }
+                            capabilities: { type: array, nullable: true, items: { type: string }, description: "What the member enforces that older releases do not (`policy_pin`, #1051; `connection_generation`); null for a member that predates them. Runs under a policy, and policy changes, wait while any live member lacks `policy_pin`. A hosted OAuth flow moves a connection's `updated_at` when it assigns a generation only while every live member has `connection_generation`." }
                             in_flight: { type: integer }
                             max_concurrent: { type: integer }
                   triggers:

@@ -653,20 +653,28 @@ pub async fn require_member_capability(
     cap: &str,
     refusal: &str,
 ) -> Result<(), ServeError> {
-    let cluster = state.cluster();
-    if !cluster.enabled() || cluster.live_members().iter().all(|m| m.has(cap)) {
-        return Ok(());
-    }
-    let members = state
-        .history()
-        .live_instances(cluster.member_ttl())
-        .await
-        .map_err(ServeError::from)?;
-    if members.iter().all(|m| m.has(cap)) {
-        cluster.set_live_members(members);
+    if members_have(state, cap).await.map_err(ServeError::from)? {
         return Ok(());
     }
     Err(ServeError::Unavailable(refusal.to_string()))
+}
+
+/// Whether every live cluster member advertises `cap` (always, on a single
+/// server). The membership is re-read before answering no.
+pub async fn members_have(
+    state: &ServerState,
+    cap: &str,
+) -> Result<bool, crate::serve::history::HistoryError> {
+    let cluster = state.cluster();
+    if !cluster.enabled() || cluster.live_members().iter().all(|m| m.has(cap)) {
+        return Ok(true);
+    }
+    let members = state.history().live_instances(cluster.member_ttl()).await?;
+    if members.iter().all(|m| m.has(cap)) {
+        cluster.set_live_members(members);
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// Fold a request's `depends_on` (#960) into its config text. A body that
