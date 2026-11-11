@@ -158,6 +158,9 @@ anything above it in such a config:
 pub max_staged_records: Option<usize>,
 ```
 
+When such a field's default is no bound, add `"x-faucet-caller-set" = true`:
+`faucet serve` then also refuses a config that leaves it out.
+
 A field that opens a listener is annotated `x-faucet-resource: listen`, so a
 server holds it to its `--allow-listen` ranges.
 

@@ -318,7 +318,9 @@ built-ins: `max_staged_records` on the CDC sources and `oracle-cdc`'s
 `websocket` source's `max_message_bytes` (up to 64 MiB) and a `webhook`
 source's `timeout_secs` (up to 3,600), `max_payloads` (up to 1,000,000) and
 `max_buffered_bytes` (up to 1 GiB). A field the config leaves out keeps the
-connector's default. These are record and byte counts per connector, not a
+connector's default, except a field also marked `x-faucet-caller-set`, whose
+default is no bound (`oracle-cdc`'s `max_staged_records_total`): it must be
+set. These are record and byte counts per connector, not a
 memory limit for the run; registered templates, the triggers file and
 `faucet run` are not limited by them.
 

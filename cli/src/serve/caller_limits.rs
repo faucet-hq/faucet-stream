@@ -9,8 +9,12 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 
-fn ceilings(is_source: bool, kind: &str) -> Arc<Vec<(String, u64)>> {
-    type Cache = RwLock<HashMap<(bool, String), Arc<Vec<(String, u64)>>>>;
+/// A connector's capped fields with their ceilings, and those a caller must
+/// set.
+type Ceilings = (Vec<(String, u64)>, Vec<String>);
+
+fn ceilings(is_source: bool, kind: &str) -> Arc<Ceilings> {
+    type Cache = RwLock<HashMap<(bool, String), Arc<Ceilings>>>;
     static CACHE: OnceLock<Cache> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
     let key = (is_source, kind.to_string());
@@ -24,7 +28,12 @@ fn ceilings(is_source: bool, kind: &str) -> Arc<Vec<(String, u64)>> {
     };
     let out = Arc::new(
         schema
-            .map(|s| faucet_core::resolve::caller_max_fields(&s))
+            .map(|s| {
+                (
+                    faucet_core::resolve::caller_max_fields(&s),
+                    faucet_core::resolve::caller_set_fields(&s),
+                )
+            })
             .unwrap_or_default(),
     );
     if let Ok(mut c) = cache.write() {
@@ -40,8 +49,11 @@ fn refusal(is_source: bool, kind: &str, config: &Value) -> Option<String> {
             "source `{kind}` `batch_size: 0` holds the whole result in one page; set a page size"
         ));
     }
-    for (field, max) in ceilings(is_source, kind).iter() {
+    let ceilings = ceilings(is_source, kind);
+    let (fields, must_set) = &*ceilings;
+    for (field, max) in fields {
         let lifted = match config.get(field) {
+            None if must_set.contains(field) => Some("unset (no bound by default)".to_string()),
             None => continue,
             Some(Value::Null) => Some("`null` (no bound)".to_string()),
             Some(v) => match v.as_u64() {
@@ -194,6 +206,30 @@ mod tests {
             },
             "edges": [ { "from": "in", "to": "w" } ] } });
         refused(topology, "batch_size: 0");
+    }
+
+    #[cfg(feature = "source-oracle-cdc")]
+    #[test]
+    fn an_unbounded_default_must_be_set() {
+        let doc = |extra: Value| {
+            let mut config = serde_json::json!({
+                "host": "h", "service_name": "S", "username": "u", "password": "p",
+                "tables": ["APP.T"] });
+            config
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::json!({ "version": 1, "pipeline": {
+                "source": { "type": "oracle-cdc", "config": config },
+                "sink": { "type": "jsonl", "config": { "path": "o.jsonl" } },
+                "state": { "type": "file", "config": { "path": "state" } } } })
+        };
+        refused(
+            doc(serde_json::json!({})),
+            "`oracle-cdc` `max_staged_records_total` is unset (no bound by default)",
+        );
+        let (cfg, nodes) = load(doc(serde_json::json!({ "max_staged_records_total": 5000 })));
+        screen(&cfg, &nodes).unwrap();
     }
 
     #[cfg(feature = "source-postgres-cdc")]

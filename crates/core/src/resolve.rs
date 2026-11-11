@@ -2765,7 +2765,8 @@ pub fn sql_fields(schema: &Value) -> Vec<String> {
 /// config field that bounds what the connector holds in memory. A host that
 /// runs configs it did not author holds such a field to `1..=N`: `0` and
 /// `null` (the "no bound" values) and anything above `N` are refused. A value
-/// the config leaves out keeps the connector's default.
+/// the config leaves out keeps the connector's default, unless the field also
+/// carries [`CALLER_SET_ANNOTATION`] (its default is no bound).
 ///
 /// ```ignore
 /// #[schemars(extend("x-faucet-caller-max" = 1_000_000))]
@@ -2799,6 +2800,22 @@ pub fn caller_max_fields(schema: &Value) -> Vec<(String, u64)> {
         }
     }
     out.into_iter().collect()
+}
+
+/// The JSON Schema keyword (value `true`) on a [`CALLER_MAX_ANNOTATION`]
+/// field whose default is no bound: a host that runs configs it did not
+/// author requires such a config to set the field.
+///
+/// ```ignore
+/// #[schemars(extend("x-faucet-caller-max" = 1_000_000, "x-faucet-caller-set" = true))]
+/// pub max_staged_records_total: Option<usize>,
+/// ```
+pub const CALLER_SET_ANNOTATION: &str = "x-faucet-caller-set";
+
+/// The top-level config fields `schema` marks with [`CALLER_SET_ANNOTATION`],
+/// across every `oneOf` / `anyOf` / `allOf` branch of the root.
+pub fn caller_set_fields(schema: &Value) -> Vec<String> {
+    flagged_fields(schema, CALLER_SET_ANNOTATION)
 }
 
 /// The top-level config fields `schema` marks with the boolean `annotation`.
@@ -4967,5 +4984,12 @@ mod tests {
             vec![("a".to_string(), 5), ("b".to_string(), 7)]
         );
         assert!(caller_max_fields(&serde_json::json!({})).is_empty());
+        let schema = serde_json::json!({
+            "properties": {
+                "set": { "x-faucet-caller-max": 10, "x-faucet-caller-set": true },
+                "kept": { "x-faucet-caller-max": 10 }
+            }
+        });
+        assert_eq!(caller_set_fields(&schema), vec!["set"]);
     }
 }

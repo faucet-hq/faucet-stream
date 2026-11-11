@@ -93,7 +93,7 @@ fn debug_masks_password() {
 }
 
 #[test]
-fn both_staging_caps_default_and_are_bounded_for_callers() {
+fn both_staging_caps_are_bounded_for_callers() {
     let schema = serde_json::to_value(schemars::schema_for!(OracleCdcSourceConfig)).unwrap();
     let caps = faucet_core::resolve::caller_max_fields(&schema);
     for field in ["max_staged_records", "max_staged_records_total"] {
@@ -107,5 +107,10 @@ fn both_staging_caps_default_and_are_bounded_for_callers() {
         "tables": ["APP.T"]
     }))
     .unwrap();
-    assert_eq!(cfg.max_staged_records_total, Some(1_000_000));
+    assert_eq!(cfg.max_staged_records_total, None);
+    assert_eq!(
+        faucet_core::resolve::caller_set_fields(&schema),
+        vec!["max_staged_records_total"]
+    );
+    assert_eq!(cfg.max_staged_records, Some(1_000_000));
 }
