@@ -62,7 +62,8 @@ serde_json.workspace = true
 schemars.workspace = true
 futures = { workspace = true }
 testcontainers = "0.27"
-testcontainers-modules = { version = "0.15", features = ["minio"] }
+testcontainers-modules = { version = "0.15", features = ["minio", "localstack"] }
+tempfile = "3"
 
 [package.metadata.docs.rs]
 all-features = true
