@@ -65,6 +65,7 @@ pub struct OracleTls {
     pub wallet_location: Option<String>,
     /// Verify that the server certificate's DN matches the host. Defaults to `true`.
     #[serde(default = "default_true")]
+    #[schemars(extend("x-faucet-unverified" = [false]))]
     pub server_dn_match: bool,
     /// Expected server certificate DN, when it differs from the host name.
     #[serde(default, skip_serializing_if = "Option::is_none")]

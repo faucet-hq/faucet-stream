@@ -65,6 +65,8 @@ pub const RESOURCE_KEYS_ANNOTATION: &str = "x-faucet-resource-keys";
 /// - `true` on an object schema (an enum variant): a config object whose
 ///   `const` properties all match the variant's;
 /// - an array of strings on a string field: one of those values (any case);
+/// - an array of booleans on a boolean field: one of those values (`[false]`
+///   marks a switch that turns verification off when `false`);
 /// - an object of key → array of strings on a string map: an entry whose
 ///   value is one of those listed for its key (any case).
 ///
@@ -2509,6 +2511,9 @@ fn flagged_setting(node: &Value, value: &Value, annotation: &str) -> Option<(Str
         (list @ Value::Array(_), Value::String(s)) => {
             in_list(list, s).then(|| (String::new(), s.clone()))
         }
+        (Value::Array(list), Value::Bool(b)) => list
+            .contains(&Value::Bool(*b))
+            .then(|| (String::new(), b.to_string())),
         (Value::Object(keys), Value::Object(map)) => map.iter().find_map(|(k, v)| {
             let list = keys
                 .iter()
@@ -2978,6 +2983,24 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind, RefusalKind::Path);
         assert!(err.reason.starts_with("`sslkey`"), "{err}");
+    }
+
+    #[test]
+    fn a_boolean_value_list_flags_only_the_listed_values() {
+        let s = json!({
+            "type": "object",
+            "properties": {
+                "dn_match": {"type": "boolean", "x-faucet-unverified": [false]},
+                "mode": {"type": "string", "x-faucet-unverified": ["false"]}
+            }
+        });
+        let off = annotated_resources(&s, &json!({"dn_match": false}));
+        assert_eq!(off.len(), 1);
+        assert_eq!(off[0].kind, ResourceKind::Unverified);
+        assert_eq!(off[0].value, "dn_match: false");
+        assert!(annotated_resources(&s, &json!({"dn_match": true})).is_empty());
+        assert!(annotated_resources(&s, &json!({})).is_empty());
+        assert!(annotated_resources(&s, &json!({"mode": false})).is_empty());
     }
 
     #[test]

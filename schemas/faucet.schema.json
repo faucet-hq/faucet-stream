@@ -13836,7 +13836,10 @@
             "boolean",
             "string"
           ],
-          "default": true
+          "default": true,
+          "x-faucet-unverified": [
+            false
+          ]
         },
         "server_cert_dn": {
           "description": "Expected server certificate DN, when it differs from the host name.",
@@ -13915,7 +13918,10 @@
             "boolean",
             "string"
           ],
-          "default": true
+          "default": true,
+          "x-faucet-unverified": [
+            false
+          ]
         },
         "server_cert_dn": {
           "description": "Expected server certificate DN, when it differs from the host name.",
@@ -21838,7 +21844,10 @@
             "boolean",
             "string"
           ],
-          "default": true
+          "default": true,
+          "x-faucet-unverified": [
+            false
+          ]
         },
         "server_cert_dn": {
           "description": "Expected server certificate DN, when it differs from the host name.",
