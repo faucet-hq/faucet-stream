@@ -542,12 +542,41 @@ impl StatementClient {
     }
 
     /// Fetch a follow-up result chunk by its `next_chunk_internal_link`
-    /// (a full API path), returned undecoded.
+    /// (a full API path), returned undecoded. The link must stay on the
+    /// workspace's scheme, host and port.
     pub async fn fetch_chunk(&self, link: &str) -> Result<Value, FaucetError> {
+        let url = self.internal_link(link)?;
         let mut auth = self.authorization().await?;
-        let url = format!("{}{}", self.base_url, link);
-        let resp = self.send(Verb::Get, &url, None, &mut auth).await?;
+        let resp = self.send(Verb::Get, url.as_str(), None, &mut auth).await?;
         self.parse(resp).await
+    }
+
+    /// `link` (an absolute path on the workspace) resolved against the base URL.
+    pub fn internal_link(&self, link: &str) -> Result<reqwest::Url, FaucetError> {
+        let refused = |why: &str| {
+            self.side.error(format!(
+                "databricks: result chunk link `{}` refused: {why}",
+                faucet_core::util::redact_uri_credentials(link)
+            ))
+        };
+        let base = reqwest::Url::parse(&format!("{}/", self.base_url))
+            .map_err(|e| refused(&format!("the workspace URL does not parse: {e}")))?;
+        let Some(rest) = link
+            .strip_prefix('/')
+            .filter(|r| !r.starts_with('/') && !r.starts_with('\\'))
+        else {
+            return Err(refused("it is not a path on the workspace"));
+        };
+        let url = base
+            .join(rest)
+            .map_err(|e| refused(&format!("it does not parse: {e}")))?;
+        if url.scheme() != base.scheme()
+            || url.host() != base.host()
+            || url.port_or_known_default() != base.port_or_known_default()
+        {
+            return Err(refused("it leaves the workspace host"));
+        }
+        Ok(url)
     }
 
     /// Best-effort cancel; a failure is logged, never raised.
