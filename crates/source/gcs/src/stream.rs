@@ -321,6 +321,7 @@ impl GcsSource {
         )
         .await?
         .with_calls(self.calls.get())
+        .with_max_range_bytes(self.config.max_object_bytes)
         .pinned_to(meta.generation);
         let object_len = reader.len();
         let mut builder = ParquetRecordBatchStreamBuilder::new(reader)

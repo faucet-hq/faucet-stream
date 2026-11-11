@@ -692,6 +692,58 @@ async fn parquet_reads_by_row_group_and_whole_object() {
     }
 }
 
+/// A column chunk longer than `max_object_bytes` is refused before it is
+/// requested.
+#[cfg(feature = "arrow")]
+#[tokio::test]
+async fn parquet_ranges_respect_max_object_bytes() {
+    use futures::StreamExt;
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
+        return;
+    };
+    let rows: Vec<_> = (0..4_000)
+        .map(|i| serde_json::json!({"id": i, "payload": format!("{i:0100}")}))
+        .collect();
+    seed_bytes(
+        &host,
+        &bucket,
+        "cap/a.parquet",
+        parquet_bytes(&rows, 4_000),
+        "application/octet-stream",
+    )
+    .await;
+    let source = |max: u64| {
+        let mut cfg = GcsSourceConfig::new(&bucket)
+            .prefix("cap/")
+            .file_format(GcsFileFormat::Parquet)
+            .with_batch_size(1_000)
+            .auth(GcsCredentials::Anonymous)
+            .storage_host(&host);
+        cfg.max_object_bytes = max;
+        GcsSource::new(cfg)
+    };
+    let capped = source(64 * 1024).await.unwrap();
+    let ctx = HashMap::new();
+    let mut pages = capped.stream_pages(&ctx, 1_000);
+    let e = loop {
+        match pages.next().await.expect("the capped read fails") {
+            Ok(_) => continue,
+            Err(e) => break e.to_string(),
+        }
+    };
+    assert!(
+        e.contains("cap/a.parquet") && e.contains("max_object_bytes"),
+        "{e}"
+    );
+    let roomy = source(1 << 30).await.unwrap();
+    let mut pages = roomy.stream_pages(&ctx, 1_000);
+    let mut n = 0;
+    while let Some(page) = pages.next().await {
+        n += page.unwrap().records.len();
+    }
+    assert_eq!(n, 4_000);
+}
+
 /// Every ranged read is pinned to the generation that located the footer, so
 /// replacing the object mid-read fails the read instead of mixing versions.
 #[cfg(feature = "arrow")]

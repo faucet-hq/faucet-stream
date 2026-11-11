@@ -371,7 +371,8 @@ impl S3Source {
             self.roundtrips.recorder(),
             self.calls.get(),
         )
-        .await?;
+        .await?
+        .with_max_range_bytes(self.config.max_object_bytes);
         let object_len = reader.len();
         let mut builder = ParquetRecordBatchStreamBuilder::new(reader)
             .await
