@@ -784,7 +784,10 @@ mod tests {
                 .map(|(_, n)| n.iter().cloned().collect::<Vec<_>>())
                 .unwrap_or_default()
         };
-        assert_eq!(at("/pipeline/source/config/url"), vec!["trigger:header.x-host"]);
+        assert_eq!(
+            at("/pipeline/source/config/url"),
+            vec!["trigger:header.x-host"]
+        );
         assert_eq!(at("/pipeline/source/config/tags/0"), vec!["trigger:body"]);
         assert!(at("/pipeline/source/config/tags/1").is_empty());
         assert_eq!(at("/pipeline/a~1b"), vec!["trigger:body"]);
@@ -796,7 +799,10 @@ mod tests {
         )
         .unwrap()
         .caller_fields;
-        assert_eq!(only.shown("/url", "h.example").as_deref(), Some("h.example"));
+        assert_eq!(
+            only.shown("/url", "h.example").as_deref(),
+            Some("h.example")
+        );
         assert_eq!(only.shown("/tag", "a/b").as_deref(), Some("…b"));
         // A key that is not a string records its value at the mapping above.
         assert!(f.iter().any(|(p, _)| p.is_empty()));
