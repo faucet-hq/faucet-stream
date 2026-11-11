@@ -460,3 +460,38 @@ async fn the_operator_flag_admits_the_server_identity_for_callers() {
         .await;
     assert_eq!(code, 202, "{v}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn the_doctor_first_preflight_runs_in_the_runs_scope() {
+    let api = start(true).await;
+    let ambient = pipeline(
+        "preflight-allowed",
+        json!({"type": "cloud-feed", "config": {"probe": true}}),
+        null_out(),
+    );
+    let (code, v) = api
+        .post(
+            "/v1/runs",
+            json!({ "config": ambient.to_string(), "doctor_first": true }),
+        )
+        .await;
+    assert_eq!(code, 202, "{v}");
+    let run = api.wait_terminal(v["run_id"].as_str().unwrap()).await;
+    assert_eq!(run["status"], "completed", "{run}");
+
+    let api = start(false).await;
+    let probing = pipeline(
+        "preflight-refused",
+        json!({"type": "cloud-feed", "config": {"credentials": keys(), "probe": true}}),
+        null_out(),
+    );
+    let (code, v) = api
+        .post(
+            "/v1/runs",
+            json!({ "config": probing.to_string(), "doctor_first": true }),
+        )
+        .await;
+    assert_eq!(code, 422, "{v}");
+    assert!(v.to_string().contains("--allow-host-credentials"), "{v}");
+}

@@ -1249,7 +1249,7 @@ pub(crate) async fn enqueue(
     // via the early `?`. The (redacted) report is stored on the run record below
     // so `GET /v1/runs/{id}` exposes it (#146 R: doctor_report was never set).
     let doctor_report = if req.doctor_first {
-        Some(run_doctor_first(&state, &loaded).await?)
+        Some(crate::runtime::under(principal, run_doctor_first(&state, &loaded)).await?)
     } else {
         None
     };
