@@ -231,11 +231,9 @@ impl FileSource {
                     .map(|r| r.map_err(std::io::Error::other));
                 Box::pin(tokio_util::io::StreamReader::new(body))
             }
-            None => Box::pin(tokio::io::BufReader::new(
-                tokio::fs::File::open(path)
-                    .await
-                    .map_err(|e| read_err(path, e))?,
-            )),
+            None => Box::pin(tokio::io::BufReader::new(tokio::fs::File::from_std(
+                open_local(path)?,
+            ))),
         })
     }
 
@@ -262,8 +260,7 @@ impl FileSource {
         }
         let binary = format.is_container() || format == FileFormat::Parquet;
         if binary && self.http.is_none() && self.codec_of(path) == Compression::None {
-            let file = std::fs::File::open(path).map_err(|e| read_err(path, e))?;
-            return Ok(Opened::Local(file));
+            return Ok(Opened::Local(open_local(path)?));
         }
         let reader = self.open_reader(path).await?;
         let bytes = faucet_core::file_format::read_to_end_capped(
@@ -332,7 +329,7 @@ impl FileSource {
                 if self.format_of(&f.path)? == Some(FileFormat::Parquet)
                     && self.codec_of(&f.path) == Compression::None
                 {
-                    local.push(f.path.clone());
+                    local.push((f.path.clone(), open_local(&f.path)?));
                 }
             }
             if local.len() < 2 {
@@ -340,7 +337,7 @@ impl FileSource {
             }
             let columns = self.config.parquet.columns.clone();
             tokio::task::spawn_blocking(move || {
-                crate::parquet::check_schemas(&local, columns.as_deref())
+                crate::parquet::check_schemas(local, columns.as_deref())
             })
             .await
             .map_err(|e| FaucetError::Source(format!("file source: schema check failed: {e}")))??;
@@ -362,6 +359,17 @@ impl FileSource {
 
 fn now_ns() -> i64 {
     chrono::Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX)
+}
+
+/// Open a listed local file. Under a scoped reference policy with path roots
+/// the file is reached without following links and must resolve under a root.
+fn open_local(path: &str) -> Result<std::fs::File, FaucetError> {
+    match faucet_core::http::current_reference_policy() {
+        Some(policy) if policy.path_roots().is_some() => {
+            faucet_core::path_guard::open_within(std::path::Path::new(path), Some(&policy))
+        }
+        _ => std::fs::File::open(path).map_err(|e| read_err(path, e)),
+    }
 }
 
 fn read_err(path: &str, e: impl std::fmt::Display) -> FaucetError {

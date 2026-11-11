@@ -15,11 +15,11 @@
 //! collected by its resolved path alone.
 
 use super::ledger::FileIdentity;
-use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat};
+use rustix::fs::{AtFlags, FileType, Stat};
 use rustix::io::Errno;
 use std::ffi::OsString;
 use std::os::fd::OwnedFd;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// What the file at the recorded path is, read through its held directory.
@@ -92,29 +92,16 @@ pub(super) fn walk(target: &Path, parent_id: Option<FileIdentity>) -> Opened {
     let (Some(parent), Some(name)) = (target.parent(), target.file_name()) else {
         return Opened::Changed;
     };
-    let mut dir = match rustix::fs::open("/", dir_flags(), Mode::empty()) {
+    let dir = match faucet_core::path_guard::open_dir_unlinked(parent) {
         Ok(fd) => fd,
-        Err(e) => return from_errno(e),
-    };
-    for component in parent.components() {
-        match component {
-            Component::RootDir => {}
-            Component::Normal(segment) => {
-                dir = match rustix::fs::openat(
-                    &dir,
-                    segment,
-                    dir_flags() | OFlags::NOFOLLOW,
-                    Mode::empty(),
-                ) {
-                    Ok(fd) => fd,
-                    Err(e) => return from_errno(e),
-                };
-            }
-            Component::Prefix(_) | Component::CurDir | Component::ParentDir => {
-                return Opened::Changed;
-            }
+        Err(e) => {
+            return match Errno::from_io_error(&e) {
+                Some(errno) => from_errno(errno),
+                None if e.kind() == std::io::ErrorKind::InvalidInput => Opened::Changed,
+                None => Opened::Failed(e),
+            };
         }
-    }
+    };
     if let Some(want) = parent_id {
         match rustix::fs::fstat(&dir) {
             Ok(st) if identity(&st) == want => {}
@@ -167,27 +154,6 @@ fn from_io(e: &std::io::Error) -> Option<Opened> {
         Opened::Failed(_) => None,
         opened => Some(opened),
     }
-}
-
-/// Directories are opened for lookup only where the platform allows it, so an
-/// ancestor the process may search but not list still works.
-fn dir_flags() -> OFlags {
-    OFlags::DIRECTORY | OFlags::CLOEXEC | search_flag()
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn search_flag() -> OFlags {
-    OFlags::PATH
-}
-
-#[cfg(target_vendor = "apple")]
-fn search_flag() -> OFlags {
-    OFlags::from_bits_retain(libc::O_SEARCH as u32)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-fn search_flag() -> OFlags {
-    OFlags::RDONLY
 }
 
 #[allow(clippy::unnecessary_cast)] // field widths differ by platform; matches std's MetadataExt

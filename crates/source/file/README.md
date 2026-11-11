@@ -44,6 +44,12 @@ when it is also reachable without the link (so bookmarks, which key on the
 path, never switch alias). An unreadable file or directory fails the run with
 its path.
 
+When the host scopes a reference policy with path roots over the run (as
+`faucet serve` does for a config it did not load itself), each listed file is
+resolved and must lie under a root, and it is then opened through directories
+held open without following links, so a link put in place after the check
+fails the read instead of being followed.
+
 A directory or glob never reads a file sink's unfinished output: scratch files
 (`*.faucet-tmp`, `*.faucet-tmp-body`, `-old`, `-seal`, `-prev`, `-upload-<id>`) and anything
 inside the `.faucet-overwrite-*` swap directory of an overwrite run that has

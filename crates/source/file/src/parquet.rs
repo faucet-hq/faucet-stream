@@ -86,13 +86,12 @@ fn open<R: parquet::file::reader::ChunkReader + 'static>(
 /// differ — before any row is read, so a mismatch in a late file never
 /// leaves earlier files half-delivered.
 pub(crate) fn check_schemas(
-    paths: &[String],
+    files: Vec<(String, std::fs::File)>,
     columns: Option<&[String]>,
 ) -> Result<(), FaucetError> {
-    let mut first: Option<(&str, arrow::datatypes::SchemaRef)> = None;
-    for path in paths {
-        let file = std::fs::File::open(path)
-            .map_err(|e| FaucetError::Source(format!("file source: read '{path}': {e}")))?;
+    let mut first: Option<(String, arrow::datatypes::SchemaRef)> = None;
+    for (path, file) in files {
+        let path = path.as_str();
         let builder = open(path, file, columns)?;
         let schema = builder.schema().clone();
         match &first {
@@ -102,7 +101,7 @@ pub(crate) fn check_schemas(
                 ));
             }
             Some(_) => {}
-            None => first = Some((path, schema)),
+            None => first = Some((path.to_string(), schema)),
         }
     }
     Ok(())

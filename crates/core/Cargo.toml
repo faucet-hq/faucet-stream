@@ -204,6 +204,11 @@ bytes = { workspace = true, optional = true }
 # which core does not need.
 parquet = { version = "58", optional = true, features = ["async"] }
 
+[target.'cfg(unix)'.dependencies]
+# Opening files through directories held open, without following links.
+rustix = { version = "1", features = ["fs"] }
+libc = "0.2"
+
 [dev-dependencies]
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }

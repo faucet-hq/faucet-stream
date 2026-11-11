@@ -441,7 +441,10 @@ link's target, as the kernel would — and a `..` that leaves a root, or that
 follows a directory which does not exist yet, is refused. A path field that
 holds a remote location (`s3://`, `s3a://`, `gs://`, `gcs://`, `az://`,
 `abfss://`, `http(s)://`, `sftp://`, …) is checked as a URL, and may not
-contain a `..` segment. Anything else is a local path: a relative path whose
+contain a `..` segment. The file source applies the roots again to every file
+a directory or glob lists: a file whose resolved path leaves the roots (a
+symlink below a root that points outside it) fails the run, and each file is
+opened without following links once it has been checked. Anything else is a local path: a relative path whose
 first segment contains `:` (`zz:/x`, `zz://x`) reads as a URL scheme to some
 readers and as a directory to others, so it is refused — write `./zz:/x` or an
 absolute path — and so is a path starting with `~`, which some engines expand
