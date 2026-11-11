@@ -36,6 +36,7 @@ serde_json.workspace = true
 schemars.workspace = true
 reqwest = { workspace = true }
 testcontainers = "0.27"
+wiremock = "0.6"
 testcontainers-modules = { version = "0.15", features = ["clickhouse"] }
 object_store.workspace = true
 

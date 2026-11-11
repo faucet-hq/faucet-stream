@@ -603,3 +603,28 @@ async fn chunk_links_keep_a_workspace_path_prefix() {
     let c = client(&format!("{}/proxy/", workspace.uri()), opts());
     assert_eq!(c.fetch_chunk("/api/2.0/c").await.unwrap()["ok"], true);
 }
+
+#[tokio::test]
+async fn an_oversized_response_body_is_a_typed_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "{{\"statement_id\":\"s\",\"pad\":\"{}\"}}",
+            "x".repeat(4096)
+        )))
+        .mount(&server)
+        .await;
+    let c = client(&server.uri(), opts()).with_max_response_bytes(Some(1024));
+    let err = c
+        .execute(&StatementRequest::new("SELECT 1"))
+        .await
+        .unwrap_err();
+    let FaucetError::Custom(inner) = &err else {
+        panic!("{err:?}");
+    };
+    let too_large = inner
+        .downcast_ref::<faucet_core::http::ResponseTooLarge>()
+        .expect("ResponseTooLarge");
+    assert_eq!(too_large.limit, 1024);
+}

@@ -153,8 +153,9 @@ impl ClickHouseSource {
             .call(&self.calls.get(), "query", self.request(query))
             .await?;
         let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
-        let body = resp.text().await.map_err(|e| {
-            FaucetError::Source(format!("ClickHouse: reading response failed: {e}"))
+        let body = self.client.text(resp).await.map_err(|e| match e {
+            FaucetError::Custom(_) => e,
+            e => FaucetError::Source(format!("ClickHouse: reading response failed: {e}")),
         })?;
         crate::decode::CompactDecoder::decode_all(&body)
     }
@@ -498,6 +499,30 @@ mod tests {
 
     fn full_cfg() -> ClickHouseSourceConfig {
         ClickHouseSourceConfig::new("http://db.example.com:8123", "SELECT * FROM t")
+    }
+
+    #[tokio::test]
+    async fn an_oversized_response_body_is_a_typed_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("x".repeat(4096)))
+            .mount(&server)
+            .await;
+        let mut source =
+            ClickHouseSource::new(ClickHouseSourceConfig::new(server.uri(), "SELECT 1")).unwrap();
+        source.client = faucet_core::http::Client::builder()
+            .max_response_bytes(Some(1024))
+            .build()
+            .unwrap();
+        let err = source.collect_all(&HashMap::new()).await.unwrap_err();
+        let FaucetError::Custom(inner) = &err else {
+            panic!("{err:?}");
+        };
+        assert!(
+            inner
+                .downcast_ref::<faucet_core::http::ResponseTooLarge>()
+                .is_some()
+        );
     }
 
     #[test]

@@ -683,3 +683,33 @@ fn alias_swap_first_run_only_adds() {
     assert!(actions[0].get("add").is_some());
     assert_eq!(actions[1]["remove"]["alias"], "orders-faucet-ovw-staging");
 }
+
+#[tokio::test]
+async fn an_oversized_response_body_is_a_typed_error() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_string(format!("{{\"idx\":{{\"pad\":\"{}\"}}}}", "x".repeat(4096))),
+        )
+        .mount(&server)
+        .await;
+    let mut sink =
+        ElasticsearchSink::new(ElasticsearchSinkConfig::new(server.uri(), "idx")).unwrap();
+    sink.inner.driver_mut().client = Client::builder()
+        .max_response_bytes(Some(1024))
+        .build()
+        .unwrap();
+    let calls = CallSlot::new(faucet_core::CallContext::new());
+    let err = SchemaDriver::current_schema(sink.inner.driver(), &calls)
+        .await
+        .unwrap_err();
+    let FaucetError::Custom(inner) = &err else {
+        panic!("{err:?}");
+    };
+    assert!(
+        inner
+            .downcast_ref::<faucet_core::http::ResponseTooLarge>()
+            .is_some()
+    );
+}

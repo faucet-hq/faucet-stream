@@ -5645,6 +5645,7 @@ dependencies = [
  "testcontainers-modules",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
@@ -6390,6 +6391,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "wiremock",
 ]
 
 [[package]]

@@ -392,6 +392,7 @@ pub struct StatementClient {
     options: StatementOptions,
     side: ErrorSide,
     calls: CallContext,
+    max_response_bytes: Option<u64>,
 }
 
 impl std::fmt::Debug for StatementClient {
@@ -425,6 +426,7 @@ impl StatementClient {
             options,
             side,
             calls: CallContext::new().without_timeout(),
+            max_response_bytes: Some(faucet_core::http::DEFAULT_MAX_RESPONSE_BYTES),
         }
     }
 
@@ -434,6 +436,13 @@ impl StatementClient {
     /// nothing beyond the HTTP client's own connect / idle-read timeouts.
     pub fn with_call_context(mut self, calls: CallContext) -> Self {
         self.calls = calls;
+        self
+    }
+
+    /// Refuse a response body above `limit` bytes (`None` lifts the limit).
+    /// Defaults to [`faucet_core::http::DEFAULT_MAX_RESPONSE_BYTES`].
+    pub fn with_max_response_bytes(mut self, limit: Option<u64>) -> Self {
+        self.max_response_bytes = limit;
         self
     }
 
@@ -616,7 +625,15 @@ impl StatementClient {
         &self,
         resp: reqwest::Response,
     ) -> Result<T, FaucetError> {
-        resp.json::<T>().await.map_err(|e| {
+        let body = faucet_core::http::read_body_limited(resp, self.max_response_bytes)
+            .await
+            .map_err(|e| match e {
+                FaucetError::Custom(_) => e,
+                e => self
+                    .side
+                    .error(format!("databricks: could not read response: {e}")),
+            })?;
+        serde_json::from_slice::<T>(&body).map_err(|e| {
             self.side
                 .error(format!("databricks: could not parse response: {e}"))
         })

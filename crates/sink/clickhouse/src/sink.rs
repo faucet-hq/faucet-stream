@@ -383,7 +383,7 @@ impl ClickHouseDriver {
         let req = apply_auth(req, &self.config.connection);
         let resp = self.client.call(&calls.get(), "query", req).await?;
         let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
-        resp.text().await.map_err(FaucetError::Http)
+        self.client.text(resp).await
     }
 
     /// Run one DDL/DML statement through the HTTP interface.
@@ -938,6 +938,31 @@ mod tests {
     #[test]
     fn connector_name_is_clickhouse() {
         assert_eq!(sink().connector_name(), "clickhouse");
+    }
+
+    #[tokio::test]
+    async fn an_oversized_response_body_is_a_typed_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("x".repeat(4096)))
+            .mount(&server)
+            .await;
+        let mut driver =
+            ClickHouseDriver::new(ClickHouseSinkConfig::new(server.uri(), "events")).unwrap();
+        driver.client = faucet_core::http::Client::builder()
+            .max_response_bytes(Some(1024))
+            .build()
+            .unwrap();
+        let calls = CallSlot::new(faucet_core::CallContext::new());
+        let err = driver.query_text(&calls, "SELECT 1").await.unwrap_err();
+        let FaucetError::Custom(inner) = &err else {
+            panic!("{err:?}");
+        };
+        assert!(
+            inner
+                .downcast_ref::<faucet_core::http::ResponseTooLarge>()
+                .is_some()
+        );
     }
 
     #[test]

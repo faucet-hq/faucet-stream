@@ -204,7 +204,7 @@ impl EsDriver {
             return Ok(None);
         }
         let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
-        let body: Value = resp.json().await?;
+        let body: Value = self.client.json::<Value>(resp).await?;
         Ok(Some(
             body.as_object()
                 .map(|m| m.keys().cloned().collect())
@@ -251,7 +251,7 @@ impl EsDriver {
             .await?;
         if resp.status().as_u16() != 404 {
             let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
-            let body: Value = resp.json().await?;
+            let body: Value = self.client.json::<Value>(resp).await?;
             for (index, entry) in body.as_object().into_iter().flatten() {
                 let abandoned = entry
                     .get("aliases")
@@ -353,7 +353,7 @@ impl EsDriver {
         if !resp.status().is_success() {
             return Ok(None);
         }
-        let body: Value = resp.json().await?;
+        let body: Value = self.client.json::<Value>(resp).await?;
         Ok(body
             .as_object()
             .and_then(|m| m.values().next())
@@ -380,7 +380,7 @@ impl EsDriver {
         if !resp.status().is_success() {
             return Ok(None);
         }
-        let body: Value = resp.json().await?;
+        let body: Value = self.client.json::<Value>(resp).await?;
         Ok(body
             .as_object()
             .and_then(|m| m.values().next())
@@ -728,7 +728,7 @@ impl EsDriver {
             return Ok(None);
         }
         let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
-        let body: Value = resp.json().await?;
+        let body: Value = self.client.json::<Value>(resp).await?;
         Ok(Some(
             body.get(&self.config.index)
                 .or_else(|| body.as_object().and_then(|m| m.values().next()))
@@ -834,7 +834,7 @@ impl EsDriver {
             return Ok(0);
         }
         let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
-        let resp_body: Value = resp.json().await?;
+        let resp_body: Value = self.client.json::<Value>(resp).await?;
         let deleted = deleted_from_delete_by_query(&resp_body)?;
 
         tracing::info!(
@@ -1777,7 +1777,7 @@ impl SchemaDriver for EsDriver {
             return Ok(None);
         }
         let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
-        let body: Value = resp.json().await?;
+        let body: Value = self.client.json::<Value>(resp).await?;
 
         // Shape: { "<index>": { "mappings": { "properties": { "<f>": {"type": …} } } } }.
         // The top-level key is the concrete index name (exactly one entry).

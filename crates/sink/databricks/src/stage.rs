@@ -313,7 +313,13 @@ impl FilesApiStager {
             {
                 return Ok(status);
             }
-            let text = resp.text().await.unwrap_or_default();
+            let text = faucet_core::http::read_body_limited(
+                resp,
+                Some(faucet_core::util::DEFAULT_ERROR_BODY_MAX_LEN as u64),
+            )
+            .await
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_else(|_| "(body too large to show)".into());
             return Err(FaucetError::Sink(format!(
                 "databricks sink: Files API {method} {path}: HTTP {status}: {text}"
             )));
