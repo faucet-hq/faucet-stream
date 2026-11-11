@@ -58,9 +58,10 @@ fn region_from_env() -> bool {
 }
 
 /// Whether `props` name storage credentials of their own for a warehouse of
-/// `scheme`: S3 keys (an id and its secret, also the Glue catalog's
-/// `aws_*` keys it hands to storage) or anonymous access; a GCS key, token or
-/// anonymous access. A local warehouse needs none.
+/// `scheme`: S3 keys (`s3.access-key-id` and `s3.secret-access-key`) or
+/// anonymous access; a GCS key, token or anonymous access. A local warehouse
+/// needs none. The Glue catalog also hands its `aws_*` keys to storage, which
+/// [`host_identity`] counts for `glue` only.
 pub fn storage_names_credentials(
     scheme: &WarehouseScheme,
     props: &std::collections::HashMap<String, String>,
@@ -77,9 +78,7 @@ pub fn storage_names_credentials(
     match scheme {
         WarehouseScheme::Local | WarehouseScheme::Unsupported(_) => true,
         WarehouseScheme::S3(_) => {
-            (set("s3.access-key-id") && set("s3.secret-access-key"))
-                || (set("aws_access_key_id") && set("aws_secret_access_key"))
-                || on("s3.allow-anonymous")
+            (set("s3.access-key-id") && set("s3.secret-access-key")) || on("s3.allow-anonymous")
         }
         WarehouseScheme::Gcs => {
             set("gcs.credentials-json")
@@ -135,7 +134,11 @@ pub fn host_identity(config: &faucet_core::Value) -> Vec<String> {
     }
     if matches!(kind, "glue" | "sql" | "hms") {
         let scheme = warehouse_scheme(str_at(config, "/catalog/warehouse").unwrap_or(""));
-        if !storage_names_credentials(&scheme, &props)
+        let glue_keys = kind == "glue"
+            && matches!(scheme, WarehouseScheme::S3(_))
+            && set("aws_access_key_id")
+            && set("aws_secret_access_key");
+        if !(glue_keys || storage_names_credentials(&scheme, &props))
             && !fields.iter().any(|f| f == "catalog.properties")
         {
             fields.push("catalog.properties".to_string());
@@ -388,6 +391,32 @@ mod tests {
             "aws_access_key_id": "a", "aws_secret_access_key": "s"}}});
         assert_eq!(host_identity(&unregioned).is_empty(), region_from_env());
         assert!(host_identity(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn glue_client_keys_name_storage_only_for_glue() {
+        use faucet_core::json;
+        for kind in ["sql", "hms"] {
+            let aws_keys = json!({"catalog": {"type": kind, "warehouse": "s3://b/wh", "properties": {
+                "aws_access_key_id": "a", "aws_secret_access_key": "s"}}});
+            assert_eq!(
+                host_identity(&aws_keys),
+                vec!["catalog.properties"],
+                "{kind}"
+            );
+        }
+        let glue = json!({"catalog": {"type": "glue", "warehouse": "s3://b/wh", "properties": {
+            "region_name": "us-east-1", "aws_access_key_id": "a", "aws_secret_access_key": "s"}}});
+        assert!(host_identity(&glue).is_empty());
+        let props: std::collections::HashMap<String, String> =
+            [("aws_access_key_id", "a"), ("aws_secret_access_key", "s")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+        assert!(!storage_names_credentials(
+            &WarehouseScheme::S3("s3"),
+            &props
+        ));
     }
 
     #[tokio::test]

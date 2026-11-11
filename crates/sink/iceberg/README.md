@@ -432,7 +432,7 @@ A config submitted to `faucet serve` by a caller may not authenticate with the s
 
 - `catalog.properties` with `client.assume-role.arn` is refused;
 - a `glue` catalog needs `aws_access_key_id` and `aws_secret_access_key`, no `profile_name`, and a `region_name` (or `AWS_REGION` on the server);
-- a `glue`, `sql` or `hms` catalog with an `s3://` warehouse needs `s3.access-key-id` and `s3.secret-access-key` (or `s3.allow-anonymous`), a `gs://` one `gcs.credentials-json` or `gcs.oauth2.token`.
+- a `glue`, `sql` or `hms` catalog with an `s3://` warehouse needs `s3.access-key-id` and `s3.secret-access-key` (or `s3.allow-anonymous`; a `glue` catalog's `aws_access_key_id` / `aws_secret_access_key` also count, since Glue hands them to storage), a `gs://` one `gcs.credentials-json` or `gcs.oauth2.token`.
 
 For a caller's run the storage only signs with the S3 keys in the properties — after the REST catalog's overrides and the table's vended config are merged, so vended credentials still work — and the GCS backend's environment and VM-metadata lookups are turned off.
 
