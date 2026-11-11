@@ -11,6 +11,8 @@
 //! them for the terminal; `faucet serve` renders them as JSON.
 
 pub mod plan;
+#[cfg(feature = "masking")]
+pub mod proof;
 pub mod reader;
 
 use crate::auth_catalog::AuthCatalog;

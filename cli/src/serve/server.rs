@@ -1222,6 +1222,13 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
             .await
             .map_err(|e| CliError::Serve(format!("seeding the policy store from --policy: {e}")))?;
     }
+    #[cfg(all(feature = "encryption", feature = "masking"))]
+    crate::dlq_replay::proof::install_keys(
+        vault
+            .as_ref()
+            .map(|v| v.derive(crate::dlq_replay::proof::KEY_LABEL))
+            .unwrap_or_default(),
+    );
     #[cfg(feature = "encryption")]
     state.set_vault(vault);
     #[cfg(feature = "tenants")]

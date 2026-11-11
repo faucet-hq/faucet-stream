@@ -193,19 +193,25 @@ pub fn build_replay_node(
     let target = replay_target(cfg, &node, all_rows);
     #[cfg(feature = "masking")]
     let foreign = match &node.masking {
-        Some(spec) => Some(super::reader::ForeignMasking::new(
-            super::reader::ReplayTarget {
-                pipeline: cfg.name.clone(),
-                row: node.id.clone(),
-            },
-            Some(std::sync::Arc::new(
-                faucet_core::CompiledMasking::compile_for_sink(
-                    spec,
-                    &[node.sink_ref.as_str(), node.sink.kind.as_str()],
+        Some(spec) => {
+            let ids = [node.sink_ref.as_str(), node.sink.kind.as_str()];
+            Some(
+                super::reader::ForeignMasking::new(
+                    super::reader::ReplayTarget {
+                        pipeline: cfg.name.clone(),
+                        row: node.id.clone(),
+                    },
+                    Some(std::sync::Arc::new(
+                        faucet_core::CompiledMasking::compile_for_sink(spec, &ids)
+                            .map_err(|e| CliError::Config(format!("masking: {e}")))?,
+                    )),
                 )
-                .map_err(|e| CliError::Config(format!("masking: {e}")))?,
-            )),
-        )),
+                .with_proof(
+                    super::proof::checked_for()
+                        .map(|tenant| super::proof::ProofCheck::new(spec.clone(), &ids, tenant)),
+                ),
+            )
+        }
         None => None,
     };
     #[cfg(not(feature = "masking"))]
@@ -588,6 +594,7 @@ mod tests {
             row: None,
             sink: None,
             ts_ms,
+            masking: None,
         }
     }
 

@@ -249,6 +249,22 @@ produce `H(H(x))` — breaking the joinability masking exists to guarantee — a
 and contract passes *are* re-applied: they are pure checks over the record, so
 re-checking is idempotent, and a replay is exactly when you want them enforced.
 
+Under `faucet serve` a replay re-masks unless the payload proves it was
+masked under today's rules. When the server has a vault key (`--vault-key`),
+every envelope a pipeline with a `masking:` block dead-letters carries a
+`masking` object: `{"rules": "<fingerprint>", "sig": "<signature>"}`. The
+fingerprint covers the masking rules that apply to the pipeline's destination
+and the masking `key`; the signature, keyed from the vault key, covers the
+tenant, pipeline, row, fingerprint and payload. A replay through
+`POST /v1/dlq/replay` (including one for a `tenant`) writes a payload as it is
+only when its signature verifies under the current or a previous vault key and
+its fingerprint matches the rules in force; any other payload — no `masking`
+object, a payload or row that changed, rules or a masking key that changed
+since, or a server without a vault key — is masked again first. A DLQ written
+by an older release carries no `masking` object, so its rows are masked again
+on such a replay (for `hash` / `tokenize` rules that means hashed twice). A
+local `faucet dlq replay` keeps trusting the envelope's pipeline and row.
+
 A replay runs under the config's [`budget:`](./usage.md#run-budgets) and
 [`resilience:`](./resilience.md), like any run. Under `faucet serve`,
 `POST /v1/dlq/replay` returns the replay's `id` (or takes one you choose), and

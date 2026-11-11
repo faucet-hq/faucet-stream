@@ -211,6 +211,9 @@ pub struct UnwrappedEnvelope {
     pub sink: Option<String>,
     /// Epoch-millis timestamp the envelope was written, if present.
     pub ts_ms: Option<i64>,
+    /// The signed record of the masking the payload went through
+    /// ([`crate::masking::MaskingProof`]), if the writer added one.
+    pub masking: Option<Value>,
 }
 
 /// Error returned by [`unwrap_envelope`] when a value is not a usable DLQ
@@ -255,6 +258,7 @@ pub fn unwrap_envelope(value: &Value) -> Result<UnwrappedEnvelope, EnvelopeError
         row: str_field("row"),
         sink: str_field("sink"),
         ts_ms: obj.get("ts_ms").and_then(Value::as_i64),
+        masking: obj.get("masking").cloned(),
     })
 }
 

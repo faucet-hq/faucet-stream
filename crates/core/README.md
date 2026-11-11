@@ -869,7 +869,7 @@ wrapper with `faucet_conformance::forwarding::assert_sink_forwards_every_hook` /
 | `write_mode` | `WriteMode`, `WriteSpec`, `DeleteMarker`, `plan_writes`, `WritePlan` |
 | `quality` | Per-record / per-batch checks (`quality` / `quality-jsonschema` features) |
 | `contract` | Versioned data contracts — `ContractSpec`, `CompiledContract`, `apply_contract`, JSON-Schema / OpenLineage exports (the `contract` feature) |
-| `masking` | PII detection + column-level masking — `MaskingSpec`, `CompiledMasking`, `apply_masking`, `Detector`, `MaskAction` (the `masking` feature) |
+| `masking` | PII detection + column-level masking — `MaskingSpec`, `CompiledMasking`, `apply_masking`, `Detector`, `MaskAction`; `MaskingProof` / `proof::{rules_fingerprint, derive_key}` sign a DLQ envelope's `masking` object (`DlqGovernance::with_masking_proof`) (the `masking` feature) |
 | `replication` | `ReplicationMethod`, `filter_incremental`, `max_replication_value` |
 | `retry` | `execute_with_retry` (exponential backoff + jitter) |
 | `io` | `CallContext`, `CallSlot`, `DEFAULT_CALL_TIMEOUT` — the backend-call wrapper (#880) |

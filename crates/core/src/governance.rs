@@ -236,6 +236,10 @@ pub struct DlqGovernance {
     /// to each envelope's payload.
     #[cfg(feature = "masking")]
     pub masking: Option<Arc<crate::masking::CompiledMasking>>,
+    /// Signs each envelope with the masking its payload went through
+    /// ([`crate::masking::MaskingProof`]), after the DLQ-only rules.
+    #[cfg(feature = "masking")]
+    pub masking_proof: Option<Arc<crate::masking::MaskingProof>>,
 }
 
 impl DlqGovernance {
@@ -247,7 +251,16 @@ impl DlqGovernance {
             facts: None,
             #[cfg(feature = "masking")]
             masking: None,
+            #[cfg(feature = "masking")]
+            masking_proof: None,
         }
+    }
+
+    /// Sign every envelope's payload with `proof`.
+    #[cfg(feature = "masking")]
+    pub fn with_masking_proof(mut self, proof: Arc<crate::masking::MaskingProof>) -> Self {
+        self.masking_proof = Some(proof);
+        self
     }
 
     /// The DLQ destination's identity and attributes for the policy.
@@ -713,6 +726,13 @@ pub(crate) fn govern_dlq(
         sink = Box::new(ps);
     }
     #[cfg(feature = "masking")]
+    if let Some(p) = &dlq.masking_proof {
+        sink = Box::new(DlqProofSink {
+            inner: sink,
+            proof: Arc::clone(p),
+        });
+    }
+    #[cfg(feature = "masking")]
     if let Some(m) = &dlq.masking {
         sink = Box::new(DlqMaskingSink {
             inner: sink,
@@ -969,6 +989,45 @@ impl Sink for DlqMaskingSink {
 
     async fn write_batch_partial(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
         self.inner.write_batch_partial(&self.mask(records)).await
+    }
+}
+
+/// Adds the signed `masking` object to each envelope.
+#[cfg(feature = "masking")]
+struct DlqProofSink {
+    inner: Box<dyn Sink>,
+    proof: Arc<crate::masking::MaskingProof>,
+}
+
+#[cfg(feature = "masking")]
+impl DlqProofSink {
+    fn signed(&self, records: &[Value]) -> Vec<Value> {
+        let mut out = records.to_vec();
+        for e in &mut out {
+            self.proof.sign(e);
+        }
+        out
+    }
+}
+
+#[cfg(feature = "masking")]
+#[async_trait]
+impl Sink for DlqProofSink {
+    crate::forward_sink!(inner; except write_batch, write_batch_reported, write_batch_partial);
+
+    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+        self.inner.write_batch(&self.signed(records)).await
+    }
+
+    async fn write_batch_reported(
+        &self,
+        records: &[Value],
+    ) -> Result<crate::accounting::WriteReport, FaucetError> {
+        self.inner.write_batch_reported(&self.signed(records)).await
+    }
+
+    async fn write_batch_partial(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
+        self.inner.write_batch_partial(&self.signed(records)).await
     }
 }
 
@@ -1374,6 +1433,44 @@ mod tests {
         assert_eq!(seen.len(), 3);
         assert!(seen.iter().all(|(_, r)| r["payload"]["email"] == "***"));
         assert_eq!(meter.snapshot().dlq_records_written, 3);
+    }
+
+    /// The proof is signed over the payload as the DLQ-only rules left it,
+    /// on every write kind.
+    #[cfg(feature = "masking")]
+    #[tokio::test]
+    async fn the_governed_dlq_signs_the_masking_of_every_envelope() {
+        let spec: crate::masking::MaskingSpec = serde_json::from_value(json!({
+            "rules": [{"match": {"fields": ["email"]}, "action": {"type": "redact"}}]
+        }))
+        .unwrap();
+        let proof = Arc::new(crate::masking::MaskingProof::new(b"k".to_vec(), None, "r"));
+        let seen: Seen = Arc::default();
+        let dlq = DlqGovernance::new(DlqConfig::new(Arc::new(Dest(Arc::clone(&seen)))))
+            .with_masking(Arc::new(
+                crate::masking::CompiledMasking::compile(&spec).unwrap(),
+            ))
+            .with_masking_proof(Arc::clone(&proof));
+        let config = Governance::new().with_dlq(dlq).dlq_config().unwrap();
+        let envelope =
+            || json!({"pipeline": "p", "row": "r", "payload": {"email": "a@b.co", "id": 1}});
+        config.sink.write_batch(&[envelope()]).await.unwrap();
+        config
+            .sink
+            .write_batch_reported(&[envelope()])
+            .await
+            .unwrap();
+        config
+            .sink
+            .write_batch_partial(&[envelope()])
+            .await
+            .unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 3);
+        for (_, e) in &seen {
+            assert_eq!(e["payload"]["email"], "***");
+            assert!(proof.verify("p", "r", &e["payload"], &e["masking"]), "{e}");
+        }
     }
 
     /// Opting out of the record passes clears them.

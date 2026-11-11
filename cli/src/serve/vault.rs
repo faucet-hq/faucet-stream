@@ -10,6 +10,7 @@ use serde_json::Value;
 /// Seals and opens connection credentials.
 pub struct Vault {
     enc: CompiledEncryption,
+    secrets: Vec<String>,
 }
 
 impl std::fmt::Debug for Vault {
@@ -37,9 +38,21 @@ impl Vault {
             previous_keys: previous.to_vec(),
             algorithm: Default::default(),
         };
+        let secrets = std::iter::once(key.to_string())
+            .chain(previous.iter().cloned())
+            .collect();
         CompiledEncryption::compile(&spec)
-            .map(|enc| Self { enc })
+            .map(|enc| Self { enc, secrets })
             .map_err(|e| format!("vault key: {e}"))
+    }
+
+    /// Keys for `label` derived from the current key, then each previous key.
+    #[cfg(feature = "masking")]
+    pub fn derive(&self, label: &str) -> Vec<Vec<u8>> {
+        self.secrets
+            .iter()
+            .map(|s| faucet_core::masking::proof::derive_key(s.as_bytes(), label))
+            .collect()
     }
 
     /// Seal a JSON value as base64 text.
