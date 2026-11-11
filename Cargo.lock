@@ -6126,6 +6126,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "faucet-common-redshift",
+ "faucet-common-s3",
  "faucet-common-sql",
  "faucet-conformance",
  "faucet-core",

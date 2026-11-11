@@ -26,6 +26,7 @@ pub mod data_api;
 pub mod iam;
 mod pool;
 
+pub use aws::{host_identity, region_from_env};
 pub use config::{
     DEFAULT_PORT, RedshiftAwsCredentials, RedshiftConnection, RedshiftCredentials, RedshiftTlsMode,
 };

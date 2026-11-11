@@ -405,7 +405,7 @@ impl RedshiftDriver {
             )?),
         };
         let s3 = if config.write_strategy == RedshiftWriteStrategy::Copy {
-            Some(Self::build_s3_client(&config).await)
+            Some(Self::build_s3_client(&config).await?)
         } else {
             None
         };
@@ -424,22 +424,20 @@ impl RedshiftDriver {
         })
     }
 
-    /// Build an S3 client honouring the optional region / endpoint overrides.
-    async fn build_s3_client(config: &RedshiftSinkConfig) -> S3Client {
-        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+    /// Build the staging S3 client from the `COPY` settings.
+    async fn build_s3_client(config: &RedshiftSinkConfig) -> Result<S3Client, FaucetError> {
         let copy_cfg = config.copy_spec();
-        if let Some(region) = &copy_cfg.region {
-            loader = loader.region(aws_config::Region::new(region.clone()));
-        }
-        if let Some(endpoint) = &copy_cfg.endpoint_url {
-            loader = loader.endpoint_url(endpoint);
-        }
-        let sdk_config = loader.load().await;
-        // S3-compatible stores (MinIO) do not serve virtual-hosted bucket names.
-        let s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
-            .force_path_style(copy_cfg.endpoint_url.is_some())
-            .build();
-        S3Client::from_conf(s3_config)
+        faucet_common_s3::check_host_identity(
+            "redshift",
+            copy_cfg.region.as_deref(),
+            &copy_cfg.credentials,
+        )?;
+        faucet_common_s3::build_client_with(
+            copy_cfg.region.as_deref(),
+            copy_cfg.endpoint_url.as_deref(),
+            &copy_cfg.credentials,
+        )
+        .await
     }
 
     fn table_ref(&self) -> String {

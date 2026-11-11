@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 /// Serializes as `{ type: <method>, config: { … } }`, the auth wire shape
 /// every faucet connector shares (the Kinesis / SQS / DynamoDB connectors use
 /// the same variants).
-#[derive(Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", content = "config", rename_all = "snake_case")]
 pub enum S3Credentials {
     /// The AWS SDK default provider chain: environment variables, shared
@@ -72,6 +72,11 @@ impl std::fmt::Debug for S3Credentials {
 }
 
 impl S3Credentials {
+    /// Whether this is [`S3Credentials::Default`].
+    pub fn is_default(&self) -> bool {
+        matches!(self, Self::Default)
+    }
+
     /// Whether these credentials come from the host faucet runs on rather
     /// than the config.
     pub fn uses_host_identity(&self) -> bool {
