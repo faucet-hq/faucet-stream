@@ -23,6 +23,12 @@ impl SqlDialect for Redshift {
         faucet_core::util::quote_ident(name)
     }
 
+    /// Redshift reads `\` as an escape inside a string literal, so it is
+    /// doubled along with `'`.
+    fn quote_literal(&self, value: &str) -> String {
+        format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
+    }
+
     /// `$n`, cast to `sql_type` when given: a value bound as text then
     /// lands in an exact-decimal column parsed by the server (#885).
     fn placeholder(&self, n: usize, sql_type: Option<&str>) -> String {
