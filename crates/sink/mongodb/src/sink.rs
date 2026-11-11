@@ -33,7 +33,29 @@ const NAMESPACE_EXISTS_CODE: i32 = 48;
 ///
 /// Returns a `Sink` error if the map does not convert to a BSON document.
 fn json_map_to_bson_filter(map: &Map<String, Value>) -> Result<Document, FaucetError> {
+    for (col, v) in map {
+        check_filter_value(col, v)?;
+    }
     MongoDriver::value_to_document(&Value::Object(map.clone()))
+}
+
+/// Refuse a key or scope value that the server would read as a query
+/// operator (an object with a `$`-prefixed field, at any depth).
+fn check_filter_value(col: &str, v: &Value) -> Result<(), FaucetError> {
+    fn has_operator(v: &Value) -> bool {
+        match v {
+            Value::Object(m) => m.iter().any(|(k, v)| k.starts_with('$') || has_operator(v)),
+            Value::Array(a) => a.iter().any(has_operator),
+            _ => false,
+        }
+    }
+    if has_operator(v) {
+        return Err(FaucetError::Sink(format!(
+            "MongoDB key or scope value for '{col}' contains a field starting with '$'; \
+             only plain values can identify a document"
+        )));
+    }
+    Ok(())
 }
 
 /// A single planned upsert/delete op, pre-converted to BSON so all conversion
@@ -951,6 +973,14 @@ impl MongoDriver {
             ));
         }
         check_key_alignment(key, seen.keys())?;
+        for (col, v) in scope {
+            check_filter_value(col, v)?;
+        }
+        for kt in seen.keys() {
+            for (col, v) in &kt.0 {
+                check_filter_value(col, v)?;
+            }
+        }
 
         let filter = Self::value_to_document(&cleanup_filter_json(scope, key, seen.keys()))?;
 
@@ -1743,6 +1773,19 @@ mod tests {
     // dataset_uri test is skipped: MongoSink::new() requires a live MongoDB
     // connection (Client::with_uri_str connects in new()), and no offline
     // constructor exists.
+
+    #[test]
+    fn key_values_that_read_as_operators_are_refused() {
+        let mut m = Map::new();
+        m.insert("id".into(), serde_json::json!({"$ne": null}));
+        assert!(super::json_map_to_bson_filter(&m).is_err());
+        let mut nested = Map::new();
+        nested.insert("id".into(), serde_json::json!({"a": [{"$gt": 1}]}));
+        assert!(super::json_map_to_bson_filter(&nested).is_err());
+        let mut plain = Map::new();
+        plain.insert("id".into(), serde_json::json!({"a": "$not-an-operator"}));
+        assert!(super::json_map_to_bson_filter(&plain).is_ok());
+    }
 
     #[test]
     fn filter_doc_from_key_tuple() {
