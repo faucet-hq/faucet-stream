@@ -56,6 +56,7 @@ pub enum OnUnsupported {
 
 /// Configuration for the Oracle LogMiner CDC source.
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(extend("x-faucet-follows-servers" = true))]
 pub struct OracleCdcSourceConfig {
     /// Connection settings. Connect to the PDB that owns the tables (Oracle
     /// 21c+ mines per PDB), or to a non-CDB / the CDB root.
@@ -89,7 +90,14 @@ pub struct OracleCdcSourceConfig {
     /// Abort when one in-flight transaction buffers more than this many
     /// changes (bounded memory). Defaults to 1,000,000; `null` = unbounded.
     #[serde(default = "faucet_core::replication::default_max_staged_records")]
+    #[schemars(extend("x-faucet-caller-max" = 1_000_000))]
     pub max_staged_records: Option<usize>,
+    /// Abort when all open transactions together buffer more than this many
+    /// changes, counting LOB pieces and folded updates. Unset or `null` =
+    /// unbounded.
+    #[serde(default)]
+    #[schemars(extend("x-faucet-caller-max" = 1_000_000, "x-faucet-caller-set" = true))]
+    pub max_staged_records_total: Option<usize>,
     /// `0` aggregates committed transactions into pages of up to 100,000
     /// records, emitted at least every `idle_timeout`, each with its bookmark;
     /// otherwise each committed transaction is its own page. Default
@@ -126,6 +134,7 @@ impl std::fmt::Debug for OracleCdcSourceConfig {
             .field("idle_timeout", &self.idle_timeout)
             .field("max_scn_window", &self.max_scn_window)
             .field("max_staged_records", &self.max_staged_records)
+            .field("max_staged_records_total", &self.max_staged_records_total)
             .field("batch_size", &self.batch_size)
             .field("max_connections", &self.max_connections)
             .field("statement_timeout_secs", &self.statement_timeout_secs)
@@ -147,6 +156,7 @@ impl OracleCdcSourceConfig {
             idle_timeout: default_idle_timeout(),
             max_scn_window: default_max_scn_window(),
             max_staged_records: faucet_core::replication::default_max_staged_records(),
+            max_staged_records_total: None,
             batch_size: default_batch_size(),
             max_connections: default_max_connections(),
             statement_timeout_secs: default_statement_timeout_secs(),

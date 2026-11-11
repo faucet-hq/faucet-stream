@@ -19,9 +19,15 @@
 //! - settings that turn off certificate or host-key verification (fields
 //!   annotated `x-faucet-unverified`) only with `--allow-unverified-tls`, and
 //!   never for a tenant;
-//! - never settings that authenticate with the server's own credentials
+//! - settings and connectors that authenticate with the server's own identity
 //!   (fields annotated `x-faucet-host-credentials`, e.g. Oracle
-//!   `external_auth`).
+//!   `external_auth`, a MongoDB URI's `authMechanism=MONGODB-OIDC` with an
+//!   `ENVIRONMENT` property, and every connector whose descriptor reports host
+//!   identity) only with `--allow-host-credentials`, and never for a tenant;
+//! - a MongoDB URI only when it keeps the client on the server it names
+//!   (`directConnection=true` or `loadBalanced=true`), unless
+//!   `--allow-url-host` lists the hosts a replica set may name; a tenant's
+//!   always does.
 //!
 //! A run for a tenant is further confined to `<--tenant-path-root>/<tenant>`.
 //!
@@ -31,7 +37,9 @@
 //! credentials and the system trees stay out of reach for every origin.
 
 use crate::serve::load::BodyOrigin;
-use faucet_core::resolve::{ReferencePolicy, ResourceKind, ResourceRef, annotated_resources};
+use faucet_core::resolve::{
+    ListenRange, ReferencePolicy, ResourceKind, ResourceRef, annotated_resources,
+};
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -91,7 +99,9 @@ impl ServeReferencePolicy {
             .with_path_roots(roots)
             .with_env(args.allow_env.iter().cloned())
             .with_secret_schemes(&args.allow_secret_scheme)
-            .with_unverified(args.allow_unverified_tls);
+            .with_unverified(args.allow_unverified_tls)
+            .with_pinned_servers(args.allow_url_host.is_empty())
+            .with_host_credentials(args.allow_host_credentials);
         caller = if args.allow_url_scheme.is_empty() {
             caller.any_url_scheme()
         } else {
@@ -102,10 +112,18 @@ impl ServeReferencePolicy {
         } else {
             caller.with_url_hosts(args.allow_url_host.iter().cloned())
         };
+        let caller = caller.with_listen(listen_ranges(&args.allow_listen)?);
         Ok(Self {
             caller,
             tenant_root: args.tenant_path_root.clone(),
         })
+    }
+
+    /// Keep `ports` (the server's own) from every caller listener.
+    #[must_use]
+    pub fn reserve_ports(mut self, ports: impl IntoIterator<Item = u16>) -> Self {
+        self.caller = self.caller.with_reserved_ports(ports);
+        self
     }
 
     /// The policy for a caller-supplied body (subprocess connectors off).
@@ -125,11 +143,17 @@ impl ServeReferencePolicy {
             BodyOrigin::Trusted | BodyOrigin::ServerFile => ReferencePolicy::open(),
             BodyOrigin::Caller { allow_subprocess } => {
                 let unverified = self.caller.allows_unverified() && tenant.is_none();
+                let host_credentials = self.caller.allows_host_credentials() && tenant.is_none();
                 let mut p = self
                     .caller
                     .clone()
                     .with_subprocess(allow_subprocess && tenant.is_none())
-                    .with_unverified(unverified);
+                    .with_unverified(unverified)
+                    .with_pinned_servers(self.caller.pins_servers() || tenant.is_some())
+                    .with_host_credentials(host_credentials);
+                if tenant.is_some() {
+                    p = p.with_listen([]);
+                }
                 if let (Some(root), Some(t)) = (&self.tenant_root, tenant) {
                     p = p.with_path_roots([root.join(t)]);
                 }
@@ -137,6 +161,29 @@ impl ServeReferencePolicy {
             }
         }
     }
+}
+
+/// The listener ranges a caller's config gets when no `--allow-listen` is
+/// given: loopback only, ports 29100–29199.
+pub const DEFAULT_LISTEN: &[&str] = &["127.0.0.1:29100-29199", "[::1]:29100-29199"];
+
+/// Parse `--allow-listen` (`none` = no listener at all).
+fn listen_ranges(args: &[String]) -> Result<Vec<ListenRange>, String> {
+    if args.iter().any(|a| a.trim().eq_ignore_ascii_case("none")) {
+        if args.len() > 1 {
+            return Err("--allow-listen none cannot be combined with an address".into());
+        }
+        return Ok(Vec::new());
+    }
+    let given: Vec<&str> = if args.is_empty() {
+        DEFAULT_LISTEN.to_vec()
+    } else {
+        args.iter().map(String::as_str).collect()
+    };
+    given
+        .into_iter()
+        .map(|a| ListenRange::parse(a).map_err(|e| format!("--allow-listen: {e}")))
+        .collect()
 }
 
 fn installed_cell() -> &'static RwLock<Arc<ServeReferencePolicy>> {
@@ -200,6 +247,71 @@ pub fn connector_resources(kind: &str, config: &Value) -> Vec<ResourceRef> {
         .flat_map(|s| annotated_resources(s, config))
         .filter(|r| seen.insert((r.pointer.clone(), r.kind, r.value.clone())))
         .collect()
+}
+
+/// The resources a `kind` state store's `config` names through its own
+/// schema's annotated fields ([`crate::state::state_store_schema`]),
+/// independent of the connectors the build compiles.
+pub fn state_resources(kind: &str, config: &Value) -> Vec<ResourceRef> {
+    static CACHE: OnceLock<SchemaCache> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let schemas = match cache.lock().ok().and_then(|c| c.get(kind).cloned()) {
+        Some(hit) => hit,
+        None => {
+            let found = Arc::new(
+                crate::state::state_store_schema(kind)
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+            );
+            if let Ok(mut c) = cache.lock() {
+                c.insert(kind.to_string(), found.clone());
+            }
+            found
+        }
+    };
+    schemas
+        .iter()
+        .flat_map(|s| annotated_resources(s, config))
+        .collect()
+}
+
+/// The resources a lineage transport (`{type, config}`, its `config` given
+/// here) names through the transport schema's annotated fields, with
+/// pointers relative to that `config`.
+#[cfg(feature = "lineage")]
+pub fn lineage_transport_resources(kind: &str, config: &Value) -> Vec<ResourceRef> {
+    static SCHEMA: OnceLock<Value> = OnceLock::new();
+    let schema = SCHEMA.get_or_init(|| {
+        serde_json::to_value(schemars::schema_for!(faucet_lineage::Transport)).unwrap_or_default()
+    });
+    let whole = serde_json::json!({ "type": kind, "config": config });
+    annotated_resources(schema, &whole)
+        .into_iter()
+        .filter_map(|mut r| {
+            r.pointer = r.pointer.strip_prefix("/config")?.to_string();
+            Some(r)
+        })
+        .collect()
+}
+
+/// Whether a `kind` connector's client, configured with `config`, connects to
+/// servers the configured ones advertise
+/// ([`faucet_core::resolve::FOLLOWS_SERVERS_ANNOTATION`]).
+pub fn connector_follows_servers(kind: &str, config: &Value) -> bool {
+    schemas(kind)
+        .iter()
+        .any(|s| faucet_core::resolve::follows_servers(s, config))
+}
+
+/// [`connector_follows_servers`] for a lineage transport.
+#[cfg(feature = "lineage")]
+pub fn lineage_transport_follows_servers(kind: &str, config: &Value) -> bool {
+    let schema =
+        serde_json::to_value(schemars::schema_for!(faucet_lineage::Transport)).unwrap_or_default();
+    faucet_core::resolve::follows_servers(
+        &schema,
+        &serde_json::json!({ "type": kind, "config": config }),
+    )
 }
 
 /// Whether connector `kind` runs a program (its schema declares a
@@ -267,8 +379,13 @@ mod tests {
             allow_secret_scheme: vec!["vault".into()],
             tenant_path_root: Some("/srv/tenants".into()),
             allow_unverified_tls: true,
+            allow_host_credentials: false,
+            allow_listen: vec!["[::]:9000".into(), "[::1]:9100-9199".into()],
         };
         let p = ServeReferencePolicy::from_args(&args).unwrap();
+        assert!(p.caller().check_listen("0.0.0.0:9000").is_ok());
+        assert!(p.caller().check_listen("[::1]:9150").is_ok());
+        assert!(p.caller().check_listen("127.0.0.1:29100").is_err());
         let c = p.caller();
         assert!(c.check_env("APP_X").is_ok());
         assert!(c.check_secret("vault", "a").is_ok());
@@ -304,6 +421,50 @@ mod tests {
     }
 
     #[test]
+    fn mongodb_clients_stay_on_one_server_without_a_host_allow_list() {
+        let caller = BodyOrigin::Caller {
+            allow_subprocess: false,
+        };
+        let open = ServeReferencePolicy::default();
+        assert!(open.caller().pins_servers());
+        assert!(open.for_origin(caller, None).pins_servers());
+        let listed = ServeReferencePolicy::from_args(&ReferenceArgs {
+            allow_url_host: vec!["*.example.com".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!listed.for_origin(caller, None).pins_servers());
+        assert!(listed.for_origin(caller, Some("acme")).pins_servers());
+        assert!(!listed.for_origin(BodyOrigin::Trusted, None).pins_servers());
+    }
+
+    #[test]
+    fn host_credentials_are_for_callers_only_with_the_flag_and_never_for_a_tenant() {
+        let caller = BodyOrigin::Caller {
+            allow_subprocess: false,
+        };
+        let off = ServeReferencePolicy::default();
+        assert!(!off.caller().allows_host_credentials());
+        assert!(!off.for_origin(caller, None).allows_host_credentials());
+        let on = ServeReferencePolicy::from_args(&ReferenceArgs {
+            allow_host_credentials: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(on.for_origin(caller, None).allows_host_credentials());
+        assert!(
+            !on.for_origin(caller, Some("acme"))
+                .allows_host_credentials()
+        );
+        for origin in [BodyOrigin::Trusted, BodyOrigin::ServerFile] {
+            assert!(
+                off.for_origin(origin, Some("acme"))
+                    .allows_host_credentials()
+            );
+        }
+    }
+
+    #[test]
     fn bad_flags_are_refused() {
         let bad = ReferenceArgs {
             allow_secret_scheme: vec!["env".into()],
@@ -323,6 +484,28 @@ mod tests {
                 .unwrap_err()
                 .contains("--allow-env")
         );
+        let listen = |v: &[&str]| {
+            ServeReferencePolicy::from_args(&ReferenceArgs {
+                allow_listen: v.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            })
+        };
+        for bad in [
+            &["localhost:80"][..],
+            &["1.2.3.4:0"],
+            &["none", "1.2.3.4:80"],
+        ] {
+            assert!(
+                listen(bad).unwrap_err().contains("--allow-listen"),
+                "{bad:?}"
+            );
+        }
+        let none = listen(&["none"]).unwrap();
+        assert_eq!(none.caller().listen_ranges().map(<[_]>::len), Some(0));
+        let default = listen(&[]).unwrap();
+        assert!(default.caller().check_listen("127.0.0.1:29100").is_ok());
+        assert!(default.caller().check_listen("[::1]:29199").is_ok());
+        assert!(default.caller().check_listen("0.0.0.0:29100").is_err());
     }
 
     #[test]

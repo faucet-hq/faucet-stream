@@ -68,7 +68,7 @@ impl ParquetSource {
         })?;
 
         let s3_store = match &config.source {
-            ParquetLocation::S3(s3) => Some(build_s3_store(s3)?),
+            ParquetLocation::S3(s3) => Some(build_s3_store(s3).await?),
             _ => None,
         };
 
@@ -748,15 +748,45 @@ fn is_hidden(key: &str, prefix: &str) -> bool {
 }
 
 /// Build an `AmazonS3` `object_store` client from a `ParquetS3Config`.
-fn build_s3_store(s3: &ParquetS3Config) -> Result<Arc<dyn ObjectStore>, FaucetError> {
+async fn build_s3_store(s3: &ParquetS3Config) -> Result<Arc<dyn ObjectStore>, FaucetError> {
+    use faucet_common_s3::S3Credentials;
     if s3.bucket.trim().is_empty() {
         return Err(FaucetError::Config(
             "parquet source: S3 bucket must not be empty".into(),
         ));
     }
-
-    let mut builder = AmazonS3Builder::from_env().with_bucket_name(&s3.bucket);
-    if let Some(region) = &s3.region {
+    let region = s3.region.as_deref();
+    faucet_common_s3::check_host_identity("parquet", region, &s3.credentials)?;
+    let mut builder = match &s3.credentials {
+        S3Credentials::Default | S3Credentials::WebIdentity => AmazonS3Builder::from_env(),
+        S3Credentials::AccessKey {
+            access_key_id,
+            secret_access_key,
+            session_token,
+        } => {
+            let builder = env_region(AmazonS3Builder::new())
+                .with_access_key_id(access_key_id)
+                .with_secret_access_key(secret_access_key);
+            match session_token {
+                Some(token) => builder.with_token(token),
+                None => builder,
+            }
+        }
+        S3Credentials::Anonymous => env_region(AmazonS3Builder::new()).with_skip_signature(true),
+        S3Credentials::Profile { .. } | S3Credentials::AssumeRole { .. } => {
+            let conf = faucet_common_s3::sdk_config(region, None, &s3.credentials).await?;
+            let builder = match conf.region() {
+                Some(r) => AmazonS3Builder::new().with_region(r.as_ref()),
+                None => AmazonS3Builder::new(),
+            };
+            let provider = conf.credentials_provider().ok_or_else(|| {
+                FaucetError::Config("parquet source: no S3 credentials provider".into())
+            })?;
+            builder.with_credentials(Arc::new(SdkCredentials::new(provider)))
+        }
+    }
+    .with_bucket_name(&s3.bucket);
+    if let Some(region) = region {
         builder = builder.with_region(region);
     }
     if let Some(endpoint) = &s3.endpoint_url {
@@ -770,6 +800,73 @@ fn build_s3_store(s3: &ParquetS3Config) -> Result<Arc<dyn ObjectStore>, FaucetEr
         .build()
         .map_err(|e| FaucetError::Config(format!("failed to build S3 client: {e}")))?;
     Ok(Arc::new(store))
+}
+
+/// The region the process environment names, for a builder that does not
+/// read the rest of the environment.
+fn env_region(builder: AmazonS3Builder) -> AmazonS3Builder {
+    match ["AWS_REGION", "AWS_DEFAULT_REGION"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()))
+    {
+        Some(region) => builder.with_region(region),
+        None => builder,
+    }
+}
+
+/// AWS SDK credentials (a profile, an assumed role) for `object_store`,
+/// refreshed before they expire.
+#[derive(Debug)]
+struct SdkCredentials {
+    provider: aws_sdk_s3::config::SharedCredentialsProvider,
+    cached: tokio::sync::Mutex<
+        Option<(
+            Arc<object_store::aws::AwsCredential>,
+            Option<std::time::SystemTime>,
+        )>,
+    >,
+}
+
+impl SdkCredentials {
+    fn new(provider: aws_sdk_s3::config::SharedCredentialsProvider) -> Self {
+        Self {
+            provider,
+            cached: tokio::sync::Mutex::new(None),
+        }
+    }
+}
+
+#[async_trait]
+impl object_store::CredentialProvider for SdkCredentials {
+    type Credential = object_store::aws::AwsCredential;
+
+    async fn get_credential(&self) -> object_store::Result<Arc<Self::Credential>> {
+        use aws_sdk_s3::config::ProvideCredentials as _;
+        let mut cached = self.cached.lock().await;
+        let fresh = |expiry: &Option<std::time::SystemTime>| {
+            expiry.is_none_or(|e| {
+                e > std::time::SystemTime::now() + std::time::Duration::from_secs(300)
+            })
+        };
+        if let Some((cred, expiry)) = cached.as_ref()
+            && fresh(expiry)
+        {
+            return Ok(cred.clone());
+        }
+        let creds = self.provider.provide_credentials().await.map_err(|e| {
+            object_store::Error::Generic {
+                store: "S3",
+                source: Box::new(e),
+            }
+        })?;
+        let cred = Arc::new(object_store::aws::AwsCredential {
+            key_id: creds.access_key_id().to_string(),
+            secret_key: creds.secret_access_key().to_string(),
+            token: creds.session_token().map(str::to_string),
+        });
+        *cached = Some((cred.clone(), creds.expiry()));
+        Ok(cred)
+    }
 }
 
 /// Verify every requested column exists in the file's Parquet schema. The
@@ -1044,6 +1141,7 @@ mod tests {
             prefix: None,
             region: None,
             endpoint_url: None,
+            credentials: Default::default(),
         };
         let cfg = ParquetSourceConfig::s3(s3);
         let source = ParquetSource::new(cfg).await.unwrap();
@@ -1051,10 +1149,87 @@ mod tests {
         assert!(matches!(err, FaucetError::Config(_)));
     }
 
-    #[test]
-    fn empty_bucket_rejected() {
+    #[tokio::test]
+    async fn s3_stores_build_from_the_named_credentials() {
+        use faucet_common_s3::S3Credentials;
+        let with = |c: S3Credentials| {
+            ParquetS3Config::object("b", "k.parquet")
+                .region("eu-west-1")
+                .credentials(c)
+        };
+        let keys = S3Credentials::AccessKey {
+            access_key_id: "a".into(),
+            secret_access_key: "s".into(),
+            session_token: Some("t".into()),
+        };
+        faucet_core::resolve::with_host_credentials(false, async {
+            for c in [
+                S3Credentials::Default,
+                S3Credentials::Profile { name: "p".into() },
+            ] {
+                let err = build_s3_store(&with(c)).await.expect_err("refused");
+                assert!(err.to_string().contains("`credentials`"), "{err}");
+            }
+            assert!(build_s3_store(&with(keys.clone())).await.is_ok());
+            assert!(
+                build_s3_store(&with(S3Credentials::Anonymous))
+                    .await
+                    .is_ok()
+            );
+        })
+        .await;
+        for c in [
+            S3Credentials::Default,
+            S3Credentials::Profile {
+                name: "no-such-profile".into(),
+            },
+            S3Credentials::AssumeRole {
+                role_arn: "arn:aws:iam::123456789012:role/x".into(),
+                session_name: None,
+                external_id: None,
+            },
+            keys,
+        ] {
+            let store = with(c).endpoint_url("http://127.0.0.1:9");
+            assert!(build_s3_store(&store).await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_credentials_are_cached_until_they_near_expiry() {
+        use object_store::CredentialProvider as _;
+        let provider = aws_sdk_s3::config::SharedCredentialsProvider::new(
+            aws_sdk_s3::config::Credentials::new("a", "s", Some("t".into()), None, "test"),
+        );
+        let creds = SdkCredentials::new(provider);
+        let first = creds.get_credential().await.unwrap();
+        assert_eq!(
+            (first.key_id.as_str(), first.token.as_deref()),
+            ("a", Some("t"))
+        );
+        let again = creds.get_credential().await.unwrap();
+        assert!(Arc::ptr_eq(&first, &again));
+        let expiring = SdkCredentials::new(aws_sdk_s3::config::SharedCredentialsProvider::new(
+            aws_sdk_s3::config::Credentials::new(
+                "b",
+                "s",
+                None,
+                Some(std::time::SystemTime::now()),
+                "test",
+            ),
+        ));
+        let one = expiring.get_credential().await.unwrap();
+        let two = expiring.get_credential().await.unwrap();
+        assert!(
+            !Arc::ptr_eq(&one, &two),
+            "near-expired credentials are fetched again"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_bucket_rejected() {
         let s3 = ParquetS3Config::object("", "k.parquet");
-        let err = build_s3_store(&s3).unwrap_err();
+        let err = build_s3_store(&s3).await.unwrap_err();
         assert!(matches!(err, FaucetError::Config(_)));
     }
 

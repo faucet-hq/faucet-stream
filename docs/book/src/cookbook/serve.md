@@ -118,6 +118,17 @@ A config submitted over HTTP or MCP may not use the `singer` source or sink —
 they run a program on the host — unless the server is started with
 `--allow-subprocess-connectors`. Registered templates may.
 
+Nor may it authenticate with the server's own identity — its environment, an
+instance or workload role (IRSA, EKS Pod Identity, GKE workload identity,
+Azure managed identity), application-default credentials or local credential
+files — unless the server is started with `--allow-host-credentials`
+(`FAUCET_SERVE_ALLOW_HOST_CREDENTIALS=true`, Helm
+`serve.allowHostCredentials`). A submitted config names its own keys instead;
+a registered template may use the server's identity, but a value a caller
+supplies for one of its params may not land in such a connector's config
+without the flag. A tenant never gets it. Keep it off on a server whose role
+reaches anything a caller should not, and set it the same on every replica.
+
 Every other reference a submitted config makes goes through the same
 allow-list: local paths stay under the working and temp directories, `${env:}`
 and secret-manager references are refused, and cloud-metadata hosts are

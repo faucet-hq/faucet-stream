@@ -142,6 +142,7 @@ async fn golden_parquet_sink_and_s3_sink_write_the_same_records_and_schema() {
             prefix: "golden/pq/".into(),
             region: Some(REGION.into()),
             endpoint_url: Some(endpoint.clone()),
+            credentials: Default::default(),
             allow_http: true,
         },
     )))

@@ -1040,8 +1040,12 @@ async fn build_remote(
     let mut settings = write.settings()?;
     settings.object_per_write = false;
     let (base, template) = write.object_layout(&settings)?;
-    let client =
-        faucet_common_s3::build_client(s3.region.as_deref(), s3.endpoint_url.as_deref()).await;
+    let client = faucet_common_s3::build_client_with(
+        s3.region.as_deref(),
+        s3.endpoint_url.as_deref(),
+        &s3.credentials,
+    )
+    .await?;
     let backend = S3Backend::builder(client, s3.bucket.clone())
         .concurrency(S3_CONCURRENCY)
         .build(base, &template)?;

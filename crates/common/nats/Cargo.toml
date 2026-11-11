@@ -21,7 +21,7 @@ rustls-native-certs = "0.8"
 
 [dev-dependencies]
 faucet-conformance = { workspace = true, features = ["containers"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
 serde_json.workspace = true
 
 [package.metadata.docs.rs]

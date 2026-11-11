@@ -89,3 +89,14 @@ pipeline's `CallContext` (#880): the run's cancel token stops a stalled read,
 any caller deadline ends it, and the open, listing and file opens are metered
 as round trips (`open`, `plan`, `get`). The object store's own timeouts and
 retry are unchanged.
+
+## Caller configs under `faucet serve`
+
+A config submitted to `faucet serve` by a caller may not authenticate with the server's own identity unless the server runs with `--allow-host-credentials` (never for a tenant). The effective storage options (typed `credentials`, then `storage_options`) are checked:
+
+- no credential of the table's store (an S3 key id without its secret counts as none) uses the server's default chain: name keys;
+- a key naming a role, profile, metadata endpoint or workload identity (`AWS_IAM_ROLE_ARN`, `aws_profile`, `azure_federated_token_file`, …) uses it even beside static keys.
+
+The table's object store is then built from those options alone: nothing is filled in from the server's environment (`AWS_SESSION_TOKEN`, `AZURE_STORAGE_ACCOUNT_KEY`, `GOOGLE_SERVICE_ACCOUNT`, …), as delta-rs does for an unchecked config.
+
+Local tables use none. The same check runs when a table is opened or created.

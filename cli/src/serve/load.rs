@@ -42,28 +42,32 @@ impl BodyOrigin {
 /// declares — empty for a connector that has none or an unknown kind. Read
 /// from the same schema `faucet schema` prints, so a plugin connector that
 /// declares one is confined like a built-in.
-pub fn sandbox_fields(is_source: bool, kind: &str) -> std::sync::Arc<[String]> {
-    type Cache =
-        std::sync::RwLock<std::collections::HashMap<(bool, String), std::sync::Arc<[String]>>>;
-    static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(Default::default);
-    let key = (is_source, kind.to_string());
-    if let Some(hit) = cache.read().ok().and_then(|c| c.get(&key).cloned()) {
-        return hit;
-    }
-    let schema = if is_source {
-        crate::registry::source_schema(kind)
-    } else {
-        crate::registry::sink_schema(kind)
+pub fn sandbox_fields(is_source: bool, kind: &str) -> Vec<String> {
+    switch_fields(is_source, kind, Switch::Sandbox)
+}
+
+/// The pin-servers switches (fields annotated `x-faucet-pin-servers`, see
+/// [`faucet_core::resolve::pin_servers_fields`]) a connector's config schema
+/// declares.
+pub fn pin_servers_fields(is_source: bool, kind: &str) -> Vec<String> {
+    switch_fields(is_source, kind, Switch::PinServers)
+}
+
+/// A boolean config switch the server forces on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Switch {
+    Sandbox,
+    PinServers,
+}
+
+fn switch_fields(is_source: bool, kind: &str, switch: Switch) -> Vec<String> {
+    let Some(schema) = crate::registry::cached_connector_schema(is_source, kind) else {
+        return Vec::new();
     };
-    let Ok(schema) = schema else {
-        return std::sync::Arc::from(Vec::new());
-    };
-    let fields: std::sync::Arc<[String]> = faucet_core::resolve::sandbox_fields(&schema).into();
-    if let Ok(mut c) = cache.write() {
-        c.insert(key, std::sync::Arc::clone(&fields));
+    match switch {
+        Switch::Sandbox => faucet_core::resolve::sandbox_fields(&schema),
+        Switch::PinServers => faucet_core::resolve::pin_servers_fields(&schema),
     }
-    fields
 }
 
 /// Whether `faucet serve` confines a source of this kind.
@@ -84,16 +88,16 @@ fn force_fields(config: &mut Value, fields: &[String]) {
     }
 }
 
-fn force_source(config: &mut Value, kind: &str) {
-    force_fields(config, &sandbox_fields(true, kind));
+fn force_source(config: &mut Value, kind: &str, switch: Switch) {
+    force_fields(config, &switch_fields(true, kind, switch));
 }
 
-fn force_sink(config: &mut Value, kind: &str) {
-    force_fields(config, &sandbox_fields(false, kind));
+fn force_sink(config: &mut Value, kind: &str, switch: Switch) {
+    force_fields(config, &switch_fields(false, kind, switch));
 }
 
-fn force_override(config: &mut Option<Value>, is_source: bool, kind: &str) {
-    let fields = sandbox_fields(is_source, kind);
+fn force_override(config: &mut Option<Value>, is_source: bool, kind: &str, switch: Switch) {
+    let fields = switch_fields(is_source, kind, switch);
     if !fields.is_empty() {
         force_fields(
             config.get_or_insert_with(|| Value::Object(Default::default())),
@@ -124,15 +128,80 @@ fn template_kind<'a>(
 /// snapshot, partition bound probes, `verify.destination` and DLQ sinks are
 /// all covered; a submitted `sandbox: false` is overwritten.
 pub fn confine_sql(cfg: &mut PipelineConfig) {
+    force_switch(cfg, Switch::Sandbox);
+    let p = &mut cfg.pipeline;
+    bound_sql_transforms(&mut p.transforms);
+    for spec in p.source.iter_mut().chain(p.sources.values_mut()) {
+        bound_sql_transforms(spec.transforms.iter_mut().flatten());
+    }
+    for node in p.nodes.values_mut() {
+        if let crate::config::NodeSpec::Transform { transforms } = node {
+            bound_sql_transforms(transforms);
+        }
+    }
+    for row in &mut cfg.matrix {
+        bound_sql_transforms(row.transforms.iter_mut().flatten());
+    }
+}
+
+/// Force `ignore_discovered_servers` (and any other `x-faucet-pin-servers`
+/// switch) on every connector the config can build, so a client connects
+/// only to the servers the screened config names.
+pub fn pin_servers(cfg: &mut PipelineConfig) {
+    force_switch(cfg, Switch::PinServers);
+}
+
+/// [`pin_servers`] over expanded rows.
+pub fn pin_servers_nodes(nodes: &mut [ExpandedNode]) {
+    for n in nodes {
+        force_node(n, Switch::PinServers);
+    }
+}
+
+/// Whether the config builds a connector that declares a pin-servers switch:
+/// one of its rows' connectors, or for a topology any connector `type` in the
+/// document.
+pub fn uses_pin_switch(doc: Option<&Value>, nodes: &[ExpandedNode]) -> bool {
+    fn declares(kind: &str) -> bool {
+        !pin_servers_fields(true, kind).is_empty() || !pin_servers_fields(false, kind).is_empty()
+    }
+    fn walk(v: &Value) -> bool {
+        match v {
+            Value::Object(map) => {
+                map.get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(declares)
+                    || map.values().any(walk)
+            }
+            Value::Array(items) => items.iter().any(walk),
+            _ => false,
+        }
+    }
+    nodes.iter().any(|n| {
+        declares(&n.source.kind)
+            || declares(&n.sink.kind)
+            || n.dlq.as_ref().is_some_and(|d| declares(&d.sink.kind))
+    }) || doc.is_some_and(walk)
+}
+
+fn force_node(n: &mut ExpandedNode, switch: Switch) {
+    force_source(&mut n.source.config, &n.source.kind, switch);
+    force_sink(&mut n.sink.config, &n.sink.kind, switch);
+    if let Some(d) = n.dlq.as_mut() {
+        force_sink(&mut d.sink.config, &d.sink.kind, switch);
+    }
+}
+
+fn force_switch(cfg: &mut PipelineConfig, switch: Switch) {
     let p = &mut cfg.pipeline;
     for spec in p.source.iter_mut().chain(p.sources.values_mut()) {
-        force_source(&mut spec.config, &spec.kind);
+        force_source(&mut spec.config, &spec.kind, switch);
     }
     for spec in p.sink.iter_mut().chain(p.sinks.values_mut()) {
-        force_sink(&mut spec.config, &spec.kind);
+        force_sink(&mut spec.config, &spec.kind, switch);
     }
     if let Some(d) = p.dlq.as_mut() {
-        force_sink(&mut d.sink.config, &d.sink.kind);
+        force_sink(&mut d.sink.config, &d.sink.kind, switch);
     }
     let (sources, source, sinks, sink) = (&p.sources, &p.source, &p.sinks, &p.sink);
     for node in p.nodes.values_mut() {
@@ -146,7 +215,7 @@ pub fn confine_sql(cfg: &mut PipelineConfig) {
                     .as_deref()
                     .or_else(|| template_kind(sources, source, template.as_deref()))
                 {
-                    force_override(config, true, k);
+                    force_override(config, true, k, switch);
                 }
             }
             crate::config::NodeSpec::Sink {
@@ -158,7 +227,7 @@ pub fn confine_sql(cfg: &mut PipelineConfig) {
                     .as_deref()
                     .or_else(|| template_kind(sinks, sink, template.as_deref()))
                 {
-                    force_override(config, false, k);
+                    force_override(config, false, k, switch);
                 }
             }
             _ => {}
@@ -182,15 +251,19 @@ pub fn confine_sql(cfg: &mut PipelineConfig) {
                 .as_deref()
                 .or_else(|| template_kind(templates, legacy, over.r#ref.as_deref()))
             {
-                force_override(&mut over.config, is_source, k);
+                force_override(&mut over.config, is_source, k, switch);
             }
         }
         if let Some(Some(d)) = row.dlq.as_mut() {
-            force_sink(&mut d.sink.config, &d.sink.kind);
+            force_sink(&mut d.sink.config, &d.sink.kind, switch);
         }
     }
     if let Some(r) = cfg.replication.as_mut() {
-        force_source(&mut r.snapshot.source.config, &r.snapshot.source.kind);
+        force_source(
+            &mut r.snapshot.source.config,
+            &r.snapshot.source.kind,
+            switch,
+        );
     }
     let probes = cfg
         .partition
@@ -198,26 +271,17 @@ pub fn confine_sql(cfg: &mut PipelineConfig) {
         .chain(cfg.matrix.iter_mut().filter_map(|r| r.partition.as_mut()))
         .filter_map(crate::partition::PartitionSpec::probe_mut);
     for probe in probes {
-        force_source(&mut probe.from_source.config, &probe.from_source.kind);
+        force_source(
+            &mut probe.from_source.config,
+            &probe.from_source.kind,
+            switch,
+        );
     }
     if let Some(dest) = cfg.verify.as_mut().and_then(|v| v.destination.as_mut()) {
-        force_source(&mut dest.config, &dest.kind);
+        force_source(&mut dest.config, &dest.kind, switch);
     }
     if let Some(r) = cfg.reconcile.as_mut() {
-        force_source(&mut r.count.config, &r.count.kind);
-    }
-    let p = &mut cfg.pipeline;
-    bound_sql_transforms(&mut p.transforms);
-    for spec in p.source.iter_mut().chain(p.sources.values_mut()) {
-        bound_sql_transforms(spec.transforms.iter_mut().flatten());
-    }
-    for node in p.nodes.values_mut() {
-        if let crate::config::NodeSpec::Transform { transforms } = node {
-            bound_sql_transforms(transforms);
-        }
-    }
-    for row in &mut cfg.matrix {
-        bound_sql_transforms(row.transforms.iter_mut().flatten());
+        force_source(&mut r.count.config, &r.count.kind, switch);
     }
 }
 
@@ -252,11 +316,25 @@ fn bound_sql_transforms<'a>(transforms: impl IntoIterator<Item = &'a mut Transfo
 pub fn confine_sql_nodes(nodes: &mut [ExpandedNode]) {
     for n in nodes {
         bound_sql_transforms(&mut n.transforms);
-        force_source(&mut n.source.config, &n.source.kind);
-        force_sink(&mut n.sink.config, &n.sink.kind);
-        if let Some(d) = n.dlq.as_mut() {
-            force_sink(&mut d.sink.config, &d.sink.kind);
+        force_node(n, Switch::Sandbox);
+    }
+}
+
+/// Config keys the server sets on a run itself, never a caller.
+const INTERNAL_KEYS: &[&str] = &[faucet_core::idempotency::OVERWRITE_RUN_KEY];
+
+/// Remove [`INTERNAL_KEYS`] from every object in a caller's config: an
+/// overwrite run token is the executor's to choose.
+fn strip_internal_keys(doc: &mut Value) {
+    match doc {
+        Value::Object(map) => {
+            for key in INTERNAL_KEYS {
+                map.remove(*key);
+            }
+            map.values_mut().for_each(strip_internal_keys);
         }
+        Value::Array(items) => items.iter_mut().for_each(strip_internal_keys),
+        _ => {}
     }
 }
 
@@ -1147,6 +1225,9 @@ enum Why {
     ProviderFile,
     /// The reference policy's reason.
     Policy(String),
+    /// A connector that authenticates with the server's own identity, and
+    /// how it says so.
+    HostCredentials(String),
 }
 
 /// One refused value. `text` is how a refusal of a whole submitted config
@@ -1194,7 +1275,9 @@ impl Findings {
         let text = faucet_core::util::redact_uri_credentials(&text);
         match why {
             Why::RecordPath | Why::Protected => self.protected.push(text.clone()),
-            Why::RecordHost | Why::TokenHost | Why::Policy(_) => self.policy.push(text.clone()),
+            Why::RecordHost | Why::TokenHost | Why::Policy(_) | Why::HostCredentials(_) => {
+                self.policy.push(text.clone())
+            }
             Why::Program | Why::ProviderFile => {}
         }
         let caller = scope.only.map(|f| CallerFinding {
@@ -1352,14 +1435,92 @@ fn check_connector(
     scope: &Scope<'_>,
     found: &mut Findings,
 ) {
+    check_typed(Typed::Connector, kind, config, base, access, scope, found);
+}
+
+/// What a `{type, config}` object configures, which decides the schema its
+/// resources are read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Typed {
+    Connector,
+    StateStore,
+    #[cfg(feature = "lineage")]
+    LineageTransport,
+}
+
+impl Typed {
+    /// What the `{type, config}` object at `ptr` configures.
+    fn at(ptr: &str) -> Self {
+        if ptr.ends_with("/state") {
+            return Typed::StateStore;
+        }
+        #[cfg(feature = "lineage")]
+        if ptr == "/lineage/transport" {
+            return Typed::LineageTransport;
+        }
+        Typed::Connector
+    }
+
+    /// Whether the client this object configures connects to servers that
+    /// the configured ones advertise.
+    fn follows_servers(self, kind: &str, config: &Value) -> bool {
+        match self {
+            Typed::Connector => crate::serve::references::connector_follows_servers(kind, config),
+            Typed::StateStore => false,
+            #[cfg(feature = "lineage")]
+            Typed::LineageTransport => {
+                crate::serve::references::lineage_transport_follows_servers(kind, config)
+            }
+        }
+    }
+
+    fn resources(self, kind: &str, config: &Value) -> Vec<faucet_core::resolve::ResourceRef> {
+        match self {
+            Typed::Connector => crate::serve::references::connector_resources(kind, config),
+            Typed::StateStore => crate::serve::references::state_resources(kind, config),
+            #[cfg(feature = "lineage")]
+            Typed::LineageTransport => {
+                crate::serve::references::lineage_transport_resources(kind, config)
+            }
+        }
+    }
+}
+
+/// [`check_connector`] for a `{type, config}` object of any [`Typed`] kind.
+fn check_typed(
+    typed: Typed,
+    kind: &str,
+    config: &Value,
+    base: &str,
+    access: Access,
+    scope: &Scope<'_>,
+    found: &mut Findings,
+) {
     if scope.only.is_some_and(|f| f.is_empty()) {
         return;
     }
     if LOCAL_PATH_KINDS.contains(&kind) {
         check_local_paths(config, base, access, scope, found);
     }
+    if scope.caller
+        && scope.only.is_none()
+        && scope.policy.is_some_and(ReferencePolicy::pins_servers)
+        && typed.follows_servers(kind, config)
+    {
+        let reason = format!(
+            "a `{kind}` client also connects to the servers its configured ones advertise, \
+             which the server cannot check; it runs only when the server lists the hosts \
+             a config may reach (`--allow-url-host`)"
+        );
+        let text = format!("{kind}: {reason}");
+        found.add(scope, base, "", kind, Why::Policy(reason), text);
+    }
+    if typed == Typed::Connector {
+        host_identity_findings(kind, config, base, access, scope, found);
+    }
     let access = read_access(config, access);
-    for r in crate::serve::references::connector_resources(kind, config) {
+    let azure_hosts = azure_blob_hosts(kind, config).filter(|_| typed == Typed::Connector);
+    for r in typed.resources(kind, config) {
         if !scope.wants(&r.pointer) {
             continue;
         }
@@ -1394,7 +1555,24 @@ fn check_connector(
             found.add(scope, base, ptr, &r.value, Why::RecordHost, text);
             continue;
         }
-        if let Some(Err(e)) = scope.policy.map(|p| p.check(&r)) {
+        let checked = match (scope.policy, azure_hosts.as_deref()) {
+            (Some(_), Some(_))
+                if ptr == AZURE_BLOB_URLS[0]
+                    && config.pointer(AZURE_BLOB_URLS[1]).is_some()
+                    && scope.wants(AZURE_BLOB_URLS[1]) =>
+            {
+                None
+            }
+            (Some(p), Some(hosts)) if AZURE_BLOB_URLS.contains(&ptr) => {
+                let string = config
+                    .pointer(AZURE_BLOB_URLS[1])
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                Some(p.check_azure_conn_with_hosts(string, hosts))
+            }
+            (policy, _) => policy.map(|p| p.check(&r)),
+        };
+        if let Some(Err(e)) = checked {
             let text = match r.kind {
                 ResourceKind::Url => format!("`{}` ({})", field_name(base, ptr), e.reason),
                 _ => format!("{} ({})", r.value, e.reason),
@@ -1402,6 +1580,74 @@ fn check_connector(
             found.add(scope, base, ptr, &r.value, Why::Policy(e.reason), text);
         }
     }
+}
+
+/// A caller's template param (#989) that lands in the config of a connector
+/// that authenticates with the server's own identity: refused unless the
+/// caller policy allows host credentials, since the caller then chooses what
+/// the server's identity reaches.
+fn host_identity_findings(
+    kind: &str,
+    config: &Value,
+    base: &str,
+    access: Access,
+    scope: &Scope<'_>,
+    found: &mut Findings,
+) {
+    let Some(fields) = scope.only.filter(|f| !f.is_empty()) else {
+        return;
+    };
+    if scope.policy.is_none_or(|p| p.allows_host_credentials()) {
+        return;
+    }
+    let role = match access {
+        Access::Write => crate::serve::host_identity::Role::Sink,
+        Access::Read { .. } => crate::serve::host_identity::Role::Source,
+    };
+    let identity = role.host_identity(kind, config);
+    if !identity.uses_host_identity() {
+        return;
+    }
+    let how = if identity.fields().is_empty() {
+        "a custom connector that does not say whether it does".to_string()
+    } else {
+        identity
+            .fields()
+            .iter()
+            .map(|f| format!("`{f}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let ptr = fields
+        .iter()
+        .next()
+        .map(|(p, _)| p.clone())
+        .unwrap_or_default();
+    let text = format!(
+        "{kind}: authenticates with the server's own identity ({how}) — {}",
+        crate::serve::host_identity::FLAG
+    );
+    found.add(scope, base, &ptr, "", Why::HostCredentials(how), text);
+}
+
+/// The fields of an Azure Blob connector's config whose hosts the client
+/// reads together with the rest of the connection: the custom endpoint and
+/// the connection string.
+const AZURE_BLOB_URLS: [&str; 2] = ["/endpoint", "/auth/config/connection_string"];
+
+/// The hosts an `azure-blob` connector's `config` connects to, read from the
+/// whole connection (account, endpoint, emulator, connection string and the
+/// server's environment) the way its client builds it; `None` for any other
+/// kind or a config that is not one.
+fn azure_blob_hosts(kind: &str, config: &Value) -> Option<Vec<String>> {
+    #[cfg(any(feature = "source-azure-blob", feature = "sink-azure-blob"))]
+    if kind == "azure-blob" {
+        let conn: faucet_common_azure::AzureConnection =
+            serde_json::from_value(config.clone()).ok()?;
+        return Some(faucet_common_azure::effective_hosts(&conn));
+    }
+    let _ = (kind, config);
+    None
 }
 
 /// The access a document position implies: under a `sink` / `sinks` / `dlq` /
@@ -1465,7 +1711,7 @@ fn data_path_findings(doc: &Value, scope: &Scope<'_>) -> Findings {
                         let rel = scope.only.map(|f| f.under(&base));
                         let inner = scope.within(rel.as_ref());
                         if map.contains_key("config") {
-                            check_connector(t, &config, &base, access, &inner, found);
+                            check_typed(Typed::at(ptr), t, &config, &base, access, &inner, found);
                         } else if !inner.only.is_some_and(|f| f.is_empty()) {
                             check_local_paths(&config, &base, access, &inner, found);
                         }
@@ -1689,6 +1935,23 @@ pub struct CallerParams<'a> {
 /// How a refusal of a caller-supplied param value starts.
 pub const CALLER_PARAM_REFUSAL: &str = "a value a caller supplied for a template param";
 
+/// How a refusal of a value an event's sender placed in a trigger's config
+/// starts.
+pub const TRIGGER_VALUE_REFUSAL: &str = "a value an event's sender supplied to a trigger";
+
+/// Whether `message` is a refusal of caller-supplied values
+/// ([`CALLER_PARAM_REFUSAL`] / [`TRIGGER_VALUE_REFUSAL`]), and the audit
+/// target that names what was refused.
+pub fn caller_refusal_target(message: &str) -> Option<&'static str> {
+    if message.starts_with(TRIGGER_VALUE_REFUSAL) {
+        Some("trigger values")
+    } else if message.starts_with(CALLER_PARAM_REFUSAL) {
+        Some("template params")
+    } else {
+        None
+    }
+}
+
 /// `fields` extended through the config's own references: a string holding
 /// `${vars.X}` / `${sources.N.PATH}` / `${sinks.N.PATH}` that names a
 /// caller-supplied value carries it too. Also recorded under the canonical
@@ -1785,18 +2048,23 @@ pub fn refuse_caller_params(
             &mut found,
         );
     }
-    caller_params_error(found, for_tenant)
+    caller_params_error(found, for_tenant, fields.only_trigger_values())
 }
 
 /// The refusal [`refuse_caller_params`]'s findings amount to, if any: each
 /// names the params (and `env` overrides) that wrote the value, the field,
 /// and only the text the caller sent.
-fn caller_params_error(found: Findings, for_tenant: bool) -> Result<(), ServeError> {
+fn caller_params_error(
+    found: Findings,
+    for_tenant: bool,
+    triggered: bool,
+) -> Result<(), ServeError> {
     let mut lines: Vec<String> = found
         .items
         .into_iter()
         .filter_map(|f| {
             let c = f.caller?;
+            let host_credentials = matches!(f.why, Why::HostCredentials(_));
             let reason = match f.why {
                 Why::RecordPath => {
                     "a path a caller chooses may not also take a value from records".to_string()
@@ -1816,14 +2084,20 @@ fn caller_params_error(found: Findings, for_tenant: bool) -> Result<(), ServeErr
                                       — pass a key inline as `key_json`"
                     .into(),
                 Why::Policy(r) => c.reason.unwrap_or(r),
+                Why::HostCredentials(how) => format!(
+                    "it configures a connector that authenticates with the server's own \
+                     identity ({how}); the operator can allow it with {} (never for a tenant)",
+                    crate::serve::host_identity::FLAG
+                ),
             };
+            let shown = if host_credentials { None } else { c.shown };
             let names = c
                 .names
                 .iter()
                 .map(|n| crate::params::caller::describe(n))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let to = c.shown.map(|v| format!(" to {v}")).unwrap_or_default();
+            let to = shown.map(|v| format!(" to {v}")).unwrap_or_default();
             Some(format!(
                 "{names} sets `{}`{to} ({reason})",
                 crate::params::caller::display(&c.field),
@@ -1835,18 +2109,29 @@ fn caller_params_error(found: Findings, for_tenant: bool) -> Result<(), ServeErr
     }
     lines.sort();
     lines.dedup();
-    Err(ServeError::Forbidden(
-        crate::secrets::registry::redact_message(&format!(
+    let tenant_note = if for_tenant {
+        " (a tenant is confined to --tenant-path-root/<tenant>)"
+    } else {
+        ""
+    };
+    let message = if triggered {
+        format!(
+            "{TRIGGER_VALUE_REFUSAL} reaches what the server's reference policy does not allow a \
+             caller: {}; the event was not run. The operator can allow it with \
+             --allow-path-root / --allow-url-host / --allow-url-scheme{tenant_note}",
+            lines.join("; "),
+        )
+    } else {
+        format!(
             "{CALLER_PARAM_REFUSAL} reaches what the server's reference policy does not allow a \
              caller: {}; the operator can allow it with --allow-path-root / --allow-url-host / \
-             --allow-url-scheme{}, or the template's author can declare the param `trusted: true`",
+             --allow-url-scheme{tenant_note}, or the template's author can declare the param \
+             `trusted: true`",
             lines.join("; "),
-            if for_tenant {
-                " (a tenant is confined to --tenant-path-root/<tenant>)"
-            } else {
-                ""
-            }
-        )),
+        )
+    };
+    Err(ServeError::Forbidden(
+        crate::secrets::registry::redact_message(&message),
     ))
 }
 
@@ -1937,20 +2222,30 @@ pub fn refuse_server_paths_with(
     override_findings(cfg, &scope, &mut found);
     let read = Access::Read { recursive: false };
     for n in nodes {
-        let mut check = |kind: &str, config: &Value, access: Access| {
-            check_connector(kind, config, "", access, &scope, &mut found);
+        let mut check = |typed: Typed, kind: &str, config: &Value, access: Access| {
+            check_typed(typed, kind, config, "", access, &scope, &mut found);
         };
-        check(&n.source.kind, &n.source.config, read);
-        check(&n.sink.kind, &n.sink.config, Access::Write);
+        check(Typed::Connector, &n.source.kind, &n.source.config, read);
+        check(
+            Typed::Connector,
+            &n.sink.kind,
+            &n.sink.config,
+            Access::Write,
+        );
         if let Some(st) = n
             .state
             .as_ref()
             .filter(|st| !is_default_state(&st.kind, &st.config))
         {
-            check(&st.kind, &st.config, Access::Write);
+            check(Typed::StateStore, &st.kind, &st.config, Access::Write);
         }
         if let Some(d) = &n.dlq {
-            check(&d.sink.kind, &d.sink.config, Access::Write);
+            check(
+                Typed::Connector,
+                &d.sink.kind,
+                &d.sink.config,
+                Access::Write,
+            );
         }
     }
     findings_error(found)
@@ -1974,8 +2269,8 @@ fn findings_error(mut found: Findings) -> Result<(), ServeError> {
         return Err(ServeError::Forbidden(format!(
             "the config names resources a submitted config may not reach under the server's \
              reference policy: {}; the operator can allow them with --allow-path-root / \
-             --allow-url-host / --allow-url-scheme / --allow-unverified-tls, or register the \
-             pipeline as a template",
+             --allow-url-host / --allow-url-scheme / --allow-unverified-tls / --allow-listen, or \
+             register the pipeline as a template",
             found.policy.join(", ")
         )));
     }
@@ -2658,6 +2953,9 @@ pub async fn load_submission_inputs(
     // parameterized config it applies the declared defaults and rejects a
     // `required` param with no value — which is the honest answer, since
     // `POST /v1/runs` has no param channel (register a template to get one).
+    // Follow a caller value in a `params:` default before binding removes the tokens.
+    let param_fields =
+        caller_params.map(|c| crate::params::caller::through_refs(&merged, c.fields));
     crate::params::bind_document(
         &mut merged,
         &Default::default(),
@@ -2675,6 +2973,10 @@ pub async fn load_submission_inputs(
     // The document the caller's param pointers address (#989).
     let caller_doc = caller_params.map(|_| merged.clone());
 
+    if matches!(origin, BodyOrigin::Caller { .. }) {
+        strip_internal_keys(&mut merged);
+    }
+
     // 4. Version gate + structural-ref resolution.
     let mut cfg = PipelineConfig::from_value(merged).map_err(|e| ServeError::Unprocessable {
         message: e.to_string(),
@@ -2683,6 +2985,9 @@ pub async fn load_submission_inputs(
 
     if origin.confines_sql() {
         confine_sql(&mut cfg);
+    }
+    if refs.pins_servers() {
+        pin_servers(&mut cfg);
     }
 
     // serve runs once per submission; a schedule: block is a category error.
@@ -2778,7 +3083,8 @@ pub async fn load_submission_inputs(
     if let (Some(c), Some(doc)) = (caller_params, caller_doc.as_ref()) {
         let tenant_id = tenant.as_deref().map(|t| t.values.id.as_str());
         let caller_refs = references.for_origin(c.origin, tenant_id);
-        refuse_caller_params(doc, &cfg, c.fields, &caller_refs, tenant_id.is_some())?;
+        let fields = param_fields.as_ref().unwrap_or(c.fields);
+        refuse_caller_params(doc, &cfg, fields, &caller_refs, tenant_id.is_some())?;
     }
 
     // 5b. Discovery-driven matrix fan-out (#647): a source whose `discovery:` /
@@ -2831,6 +3137,9 @@ pub async fn load_submission_inputs(
             details: None,
         })?;
         refuse_server_paths_with(&cfg, &[], origin, &refs)?;
+        if matches!(origin, BodyOrigin::Caller { .. }) {
+            crate::serve::caller_limits::screen(&cfg, &[])?;
+        }
         return Ok(LoadedSubmission {
             cfg,
             nodes: Vec::new(),
@@ -2847,8 +3156,15 @@ pub async fn load_submission_inputs(
     if origin.confines_sql() {
         confine_sql_nodes(&mut nodes);
     }
+    if refs.pins_servers() {
+        pin_servers_nodes(&mut nodes);
+    }
 
     refuse_server_paths_with(&cfg, &nodes, origin, &refs)?;
+    crate::serve::listen::screen(&nodes, &refs)?;
+    if matches!(origin, BodyOrigin::Caller { .. }) {
+        crate::serve::caller_limits::screen(&cfg, &nodes)?;
+    }
 
     if let Some(t) = &tenant {
         t.check_refs(&cfg, &nodes)?;

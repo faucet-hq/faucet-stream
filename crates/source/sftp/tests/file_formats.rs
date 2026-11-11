@@ -270,3 +270,45 @@ async fn start_sftp(files: &[(String, Vec<u8>)]) -> Option<(ContainerAsync<Gener
     }
     started
 }
+
+/// The first error a stream of pages ends with.
+#[cfg(all(feature = "file-format-avro", feature = "file-format-excel"))]
+async fn first_error<S>(mut pages: S) -> faucet_core::FaucetError
+where
+    S: futures::Stream<Item = Result<faucet_core::StreamPage, faucet_core::FaucetError>> + Unpin,
+{
+    loop {
+        match pages.next().await {
+            Some(Ok(_)) => {}
+            Some(Err(e)) => return e,
+            None => panic!("the stream ended without an error"),
+        }
+    }
+}
+
+#[cfg(all(feature = "file-format-avro", feature = "file-format-excel"))]
+#[tokio::test]
+async fn files_that_decode_past_max_decoded_bytes_are_refused() {
+    let avro = encode(&records(), FileFormat::Avro, &FormatOptions::default()).expect("encode");
+    let xlsx = encode(&records(), FileFormat::Xlsx, &FormatOptions::default()).expect("encode");
+    let Some((_c, port)) =
+        start_sftp(&[("a.avro".to_string(), avro), ("a.xlsx".to_string(), xlsx)]).await
+    else {
+        return;
+    };
+    for (fmt, name) in [(SftpFormat::Avro, "a.avro"), (SftpFormat::Xlsx, "a.xlsx")] {
+        let conn = SftpConnectionConfig::with_password("127.0.0.1", USER, PASS).port(port);
+        let mut cfg = SftpSourceConfig::new(conn, "/data")
+            .format(fmt)
+            .glob(name)
+            .with_batch_size(0);
+        cfg.max_decoded_bytes = Some(64);
+        let src = SftpSource::new(cfg).expect("config is valid");
+        let ctx: HashMap<String, Value> = HashMap::new();
+        let err = first_error(src.stream_pages(&ctx, 0)).await;
+        assert!(
+            err.to_string().contains("max_decoded_bytes"),
+            "{fmt:?}: {err}"
+        );
+    }
+}

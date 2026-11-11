@@ -7,9 +7,17 @@ Shared S3 pieces for the [faucet-stream](https://github.com/faucet-hq/faucet-str
 connectors that write to S3. This crate is a building block, not a connector
 itself. It provides:
 
-- `build_client(region, endpoint_url)` — an S3 client from the default AWS
-  credential chain, optionally against an S3-compatible endpoint (MinIO,
-  LocalStack, R2, …).
+- `S3Credentials` — how a client authenticates (`default`, `profile`,
+  `access_key`, `assume_role`, `web_identity`, `anonymous`; the shared
+  `{type, config}` wire shape, default `default`), and
+  `build_client_with(region, endpoint_url, &credentials)` /
+  `sdk_config(..)` — an S3 client (or SDK config) from them, optionally
+  against an S3-compatible endpoint (MinIO, LocalStack, R2, …). Both refuse,
+  where the task may not use the host's identity, every variant but
+  `access_key` / `anonymous`, and a missing region the environment does not
+  name (`check_host_identity`); `host_identity` / `host_identity_at` answer
+  the same from a config. `build_client(region, endpoint_url)` (default chain,
+  no check) is deprecated.
 - `S3Backend` — the `StorageBackend` the shared file writer in
   [`faucet-common-file`](https://crates.io/crates/faucet-common-file)
   publishes objects through. The
@@ -43,10 +51,10 @@ itself. It provides:
 
 ```rust,ignore
 use faucet_common_file::write::{FileSink, WriteConfig};
-use faucet_common_s3::{S3Backend, build_client};
+use faucet_common_s3::{S3Backend, S3Credentials, build_client_with};
 use std::sync::Arc;
 
-let client = build_client(Some("us-east-1"), None).await;
+let client = build_client_with(Some("us-east-1"), None, &S3Credentials::Default).await?;
 let write = WriteConfig { /* the sink config's write fields */ ..Default::default() };
 let settings = write.settings()?;
 let (base, template) = write.object_layout(&settings)?;

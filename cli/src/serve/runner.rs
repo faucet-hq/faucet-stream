@@ -119,6 +119,12 @@ pub struct SubmitRequest {
     /// for the template's params, held to the caller reference policy.
     #[serde(skip)]
     pub caller_fields: crate::params::CallerFields,
+    /// Set in-process where the server writes the whole idempotency key (a
+    /// trigger fire, a schedule tick, a backfill unit, an approved change),
+    /// never accepted from a client: only such a key may use a reserved
+    /// prefix.
+    #[serde(skip)]
+    pub server_key: bool,
 }
 
 impl SubmitRequest {
@@ -412,10 +418,16 @@ fn resume_claimed(
         // claiming instance acts as the (ephemeral) coordinator — and is NOT
         // executed as a whole. Enumeration + insert is idempotent, so two
         // instances both claiming + coordinating converge on the same shard set.
+        let principal = crate::runtime::Principal::stored(&state, AuthContext::runtime(), &rec);
         if let Some(sh) = loaded.cfg.shard.clone()
             && sh.count >= 2
         {
-            match shard_with_retry(&state, &rec, &loaded, sh.count, &run_token, deadline).await {
+            let coordinated = crate::runtime::under(
+                &principal,
+                shard_with_retry(&state, &rec, &loaded, sh.count, &run_token, deadline),
+            )
+            .await;
+            match coordinated {
                 Ok(true) => return, // expanded into shards — shard loop runs them
                 Ok(false) => {}     // not shardable → fall through, run the whole run
                 Err(term) => {
@@ -433,7 +445,6 @@ fn resume_claimed(
                 .await
                 .expect("semaphore not closed"),
         };
-        let principal = crate::runtime::Principal::stored(&state, AuthContext::runtime(), &rec);
         crate::runtime::under(
             &principal.clone(),
             execute_run(
@@ -779,18 +790,21 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
         let principal = crate::runtime::Principal::stored(&state, AuthContext::runtime(), &run);
         let (outcome, exit) = crate::runtime::under(
             &principal,
-            execute_shard(
-                &state,
-                &principal,
-                loaded,
-                &run_id,
-                &shard_id,
-                shard,
-                coop,
-                run.timeout_secs,
-                run.clock.clone(),
-                run.concurrency,
-                run.submitted_at,
+            crate::executor::with_untrusted_targets(
+                run.caller_config || !run.caller_params.is_empty(),
+                execute_shard(
+                    &state,
+                    &principal,
+                    loaded,
+                    &run_id,
+                    &shard_id,
+                    shard,
+                    coop,
+                    run.timeout_secs,
+                    run.clock.clone(),
+                    run.concurrency,
+                    run.submitted_at,
+                ),
             ),
         )
         .await;
@@ -1235,7 +1249,7 @@ pub(crate) async fn enqueue(
     // via the early `?`. The (redacted) report is stored on the run record below
     // so `GET /v1/runs/{id}` exposes it (#146 R: doctor_report was never set).
     let doctor_report = if req.doctor_first {
-        Some(run_doctor_first(&state, &loaded).await?)
+        Some(crate::runtime::under(principal, run_doctor_first(&state, &loaded)).await?)
     } else {
         None
     };
@@ -1564,9 +1578,10 @@ async fn replay_response(
 }
 
 /// Prefixes of the idempotency keys the server derives itself (tenant
-/// namespaces, trigger fires, backfill units, approved changes).
+/// namespaces, trigger fires, schedule ticks, backfill units, approved
+/// changes).
 pub(crate) const RESERVED_IDEMPOTENCY_PREFIXES: &[&str] =
-    &["tenant:", "trig:", "backfill:", "change:"];
+    &["tenant:", "trig:", "sched:", "backfill:", "change:"];
 
 /// Refuse a caller's idempotency key in a namespace the server derives keys
 /// in: an unscoped caller could otherwise occupy a tenant's key or a
@@ -2050,6 +2065,7 @@ async fn execute_run(
     mut own: RunRecord,
 ) {
     let server_shutdown = state.shutdown_token();
+    let untrusted_targets = own.caller_config || !own.caller_params.is_empty();
     let auth_result = loaded.auth_catalog();
     let LoadedSubmission {
         cfg, nodes, tenant, ..
@@ -2215,7 +2231,13 @@ async fn execute_run(
         tracing::info!("pipeline run starting");
         let result = match &topology {
             Some((cfg, auth, run)) => crate::topology::run_topology(cfg, auth, run.clone()).await,
-            None => crate::runtime::run(&principal, nodes, opts).await,
+            None => {
+                crate::executor::with_untrusted_targets(
+                    untrusted_targets,
+                    crate::runtime::run(&principal, nodes, opts),
+                )
+                .await
+            }
         };
         audit_runtime_policy_denials(&audit_state, &audit_run_id, principal.tenant(), &result)
             .await;
@@ -3365,7 +3387,13 @@ mod tests {
     fn caller_idempotency_keys_stay_out_of_the_server_namespaces() {
         assert!(refuse_reserved_idempotency_key(None).is_ok());
         assert!(refuse_reserved_idempotency_key(Some("nightly-2026-10-12")).is_ok());
-        for k in ["tenant:acme:k", "trig:t:1", "backfill:h:u", "change:c1"] {
+        for k in [
+            "tenant:acme:k",
+            "trig:t:1",
+            "sched:nightly:2026-11-12T00:00:00Z",
+            "backfill:h:u",
+            "change:c1",
+        ] {
             let err = refuse_reserved_idempotency_key(Some(k)).unwrap_err();
             assert!(
                 matches!(err, ServeError::BadConfig(ref m) if m.contains(k)),
@@ -3592,6 +3620,21 @@ mod tests {
         assert_eq!(rec.status, RunStatus::Failed, "{rec:?}");
     }
 
+    /// A free port a caller's listener may take by default (the
+    /// `--allow-listen` range), distinct per test in this process.
+    #[cfg(feature = "source-webhook")]
+    fn caller_listen_port() -> u16 {
+        use std::sync::atomic::{AtomicU16, Ordering};
+        static NEXT: AtomicU16 = AtomicU16::new(29100);
+        loop {
+            let port = NEXT.fetch_add(1, Ordering::Relaxed);
+            assert!(port <= 29199, "no free port in the default listener range");
+            if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+                return port;
+            }
+        }
+    }
+
     #[cfg(feature = "source-webhook")]
     #[tokio::test]
     async fn a_run_that_outlives_its_timeout_is_stopped_and_failed() {
@@ -3599,7 +3642,8 @@ mod tests {
         let state = crate::serve::test_support::test_state();
         let req: SubmitRequest = serde_json::from_value(serde_json::json!({
             "config": format!(
-                "version: 1\npipeline:\n  source: {{ type: webhook, config: {{ listen_addr: \"127.0.0.1:0\", timeout_secs: 60 }} }}\n  sink: {{ type: jsonl, config: {{ path: \"{}\" }} }}\n",
+                "version: 1\npipeline:\n  source: {{ type: webhook, config: {{ listen_addr: \"127.0.0.1:{}\", timeout_secs: 60 }} }}\n  sink: {{ type: jsonl, config: {{ path: \"{}\" }} }}\n",
+                caller_listen_port(),
                 dir.path().join("out.jsonl").display()
             ),
             "timeout_secs": 1,
@@ -3746,6 +3790,7 @@ mod tests {
             server_file: false,
             sealed_params: None,
             caller_fields: Default::default(),
+            server_key: false,
         };
 
         let err = submit(state.clone(), req, admin_actor()).await.unwrap_err();
@@ -3863,6 +3908,7 @@ mod tests {
             server_file: false,
             sealed_params: None,
             caller_fields: Default::default(),
+            server_key: false,
         };
         let resp = submit(state.clone(), req, admin_actor()).await.unwrap();
         assert_eq!(resp.status, RunStatus::Pending);
@@ -4116,6 +4162,7 @@ mod tests {
             server_file: false,
             sealed_params: None,
             caller_fields: Default::default(),
+            server_key: false,
         };
         let err = submit(state.clone(), req, admin_actor()).await.unwrap_err();
         assert!(

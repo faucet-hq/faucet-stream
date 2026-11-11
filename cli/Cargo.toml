@@ -181,7 +181,7 @@ source-mssql-cdc = ["dep:faucet-source-mssql-cdc", "faucet-registry/source-mssql
 source-redshift = ["dep:faucet-source-redshift", "faucet-registry/source-redshift"]
 source-pubsub = ["dep:faucet-source-pubsub", "faucet-registry/source-pubsub"]
 source-clickhouse = ["dep:faucet-source-clickhouse", "faucet-registry/source-clickhouse"]
-source-azure-blob = ["dep:faucet-source-azure-blob", "faucet-registry/source-azure-blob"]
+source-azure-blob = ["dep:faucet-source-azure-blob", "dep:faucet-common-azure", "faucet-registry/source-azure-blob"]
 source-redis = ["dep:faucet-source-redis", "faucet-registry/source-redis"]
 source-webhook = ["dep:faucet-source-webhook", "faucet-registry/source-webhook"]
 source-websocket = ["dep:faucet-source-websocket", "faucet-registry/source-websocket"]
@@ -246,7 +246,7 @@ sink-pubsub = ["dep:faucet-sink-pubsub", "faucet-registry/sink-pubsub"]
 sink-clickhouse = ["dep:faucet-sink-clickhouse", "faucet-registry/sink-clickhouse"]
 # Staged bulk load for the ClickHouse sink (#528): stage to S3/GCS + server-side s3()/gcs() pull.
 sink-clickhouse-staging = ["sink-clickhouse", "faucet-sink-clickhouse/staging", "faucet-registry/sink-clickhouse-staging"]
-sink-azure-blob = ["dep:faucet-sink-azure-blob", "faucet-registry/sink-azure-blob"]
+sink-azure-blob = ["dep:faucet-sink-azure-blob", "dep:faucet-common-azure", "faucet-registry/sink-azure-blob"]
 sink-dynamodb = ["dep:faucet-sink-dynamodb", "faucet-registry/sink-dynamodb"]
 sink-databricks = ["dep:faucet-sink-databricks", "faucet-registry/sink-databricks"]
 # Cloud (s3:// / gs:// / abfss://) staging for the Databricks sink (#713).
@@ -579,6 +579,7 @@ faucet-source-duckdb = { workspace = true, optional = true }
 faucet-source-sqs = { workspace = true, optional = true }
 faucet-common-sqs = { workspace = true, optional = true }
 faucet-common-file = { workspace = true, optional = true }
+faucet-common-azure = { workspace = true, optional = true }
 faucet-source-nats = { workspace = true, optional = true }
 faucet-common-nats = { workspace = true, optional = true }
 faucet-source-rabbitmq = { workspace = true, optional = true }

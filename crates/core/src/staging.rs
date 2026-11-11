@@ -155,6 +155,151 @@ pub struct StagingSpec {
     /// unquoted — the operator owns its correctness.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copy_options: Option<String>,
+    /// How faucet authenticates to the stage when it writes the files
+    /// (default: the store's default chain, i.e. the identity of the host
+    /// faucet runs on). The warehouse reads them with its own grant.
+    #[serde(default, skip_serializing_if = "StagingCredentials::is_default")]
+    pub credentials: StagingCredentials,
+}
+
+/// How faucet authenticates to a staging location. Serializes as
+/// `{ type: <method>, config: { … } }`, the variant shapes of the S3, GCS and
+/// Azure connectors' credentials.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", content = "config", rename_all = "snake_case")]
+pub enum StagingCredentials {
+    /// The store's default chain (environment, instance or workload role,
+    /// local credential files): the identity of the host faucet runs on.
+    #[default]
+    Default,
+    /// Static S3 access keys (`s3://`).
+    AccessKey {
+        /// Access key id.
+        access_key_id: String,
+        /// Secret access key.
+        secret_access_key: String,
+        /// Optional session token (temporary credentials).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_token: Option<String>,
+    },
+    /// A GCS service-account JSON key file (`gs://`).
+    ServiceAccountJsonFile {
+        /// Path to the key file.
+        #[schemars(extend("x-faucet-resource" = "path"))]
+        path: String,
+    },
+    /// A GCS service-account JSON key, inline (`gs://`).
+    ServiceAccountJsonInline {
+        /// The key JSON.
+        json: String,
+    },
+    /// An Azure storage-account access key (`az://`).
+    AccountKey {
+        /// Base64 account key.
+        account_key: String,
+    },
+    /// An Azure shared-access-signature token (`az://`).
+    SasToken {
+        /// SAS token string.
+        sas_token: String,
+    },
+}
+
+impl std::fmt::Debug for StagingCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::util::fmt_redacted(
+            f,
+            "StagingCredentials",
+            self,
+            &[
+                "secret_access_key",
+                "session_token",
+                "json",
+                "account_key",
+                "sas_token",
+            ],
+        )
+    }
+}
+
+impl StagingCredentials {
+    /// Whether this is [`StagingCredentials::Default`].
+    pub fn is_default(&self) -> bool {
+        matches!(self, Self::Default)
+    }
+
+    /// The scheme these credentials belong to, `None` for the default chain.
+    pub fn scheme(&self) -> Option<StagingScheme> {
+        match self {
+            Self::Default => None,
+            Self::AccessKey { .. } => Some(StagingScheme::S3),
+            Self::ServiceAccountJsonFile { .. } | Self::ServiceAccountJsonInline { .. } => {
+                Some(StagingScheme::Gcs)
+            }
+            Self::AccountKey { .. } | Self::SasToken { .. } => Some(StagingScheme::Azure),
+        }
+    }
+
+    /// The `object_store` option keys that select these credentials (empty
+    /// for the default chain).
+    pub fn store_options(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::Default => Vec::new(),
+            Self::AccessKey {
+                access_key_id,
+                secret_access_key,
+                session_token,
+            } => {
+                let mut out = vec![
+                    ("aws_access_key_id", access_key_id.clone()),
+                    ("aws_secret_access_key", secret_access_key.clone()),
+                ];
+                if let Some(token) = session_token {
+                    out.push(("aws_session_token", token.clone()));
+                }
+                out
+            }
+            Self::ServiceAccountJsonFile { path } => {
+                vec![("google_service_account", path.clone())]
+            }
+            Self::ServiceAccountJsonInline { json } => {
+                vec![("google_service_account_key", json.clone())]
+            }
+            Self::AccountKey { account_key } => {
+                vec![("azure_storage_account_key", account_key.clone())]
+            }
+            Self::SasToken { sas_token } => vec![(
+                "azure_storage_sas_key",
+                sas_token.trim_start_matches('?').to_string(),
+            )],
+        }
+    }
+
+    /// Refuse credentials of another scheme than the location's.
+    pub fn check_scheme(&self, scheme: StagingScheme) -> Result<(), FaucetError> {
+        match self.scheme() {
+            Some(own) if own != scheme => Err(FaucetError::Config(format!(
+                "staging: these `credentials` are for `{}://` locations, not `{}://`",
+                own.as_str(),
+                scheme.as_str()
+            ))),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// The config fields that make the staging block at `pointer` authenticate
+/// with the identity of the host faucet runs on: its `credentials` when they
+/// select (or default to) the default chain. Empty when no block is set.
+pub fn staging_host_identity(config: &Value, pointer: &str) -> Vec<String> {
+    use crate::capabilities::config::{is_set_at, tag_at};
+    let credentials = format!("{pointer}/credentials");
+    if is_set_at(config, pointer) && tag_at(config, &credentials).unwrap_or("default") == "default"
+    {
+        vec![credentials.trim_start_matches('/').replace('/', ".")]
+    } else {
+        Vec::new()
+    }
 }
 
 fn default_format() -> StagingFormat {
@@ -193,6 +338,7 @@ impl StagingSpec {
                     .join(", ")
             )));
         }
+        self.credentials.check_scheme(loc.scheme)?;
         if self.compression != StagingCompression::None && !self.format.allows_text_compression() {
             return Err(FaucetError::Config(
                 "staging: `compression` applies only to csv/jsonl (parquet compresses internally)"
@@ -425,7 +571,7 @@ fn csv_field(s: &str) -> String {
 }
 
 #[cfg(feature = "staging")]
-pub use upload::{StageUploader, build_object_store};
+pub use upload::{StageUploader, build_object_store, build_object_store_with, object_store_for};
 
 #[cfg(feature = "staging")]
 mod upload {
@@ -433,43 +579,147 @@ mod upload {
     use object_store::{ObjectStore, ObjectStoreExt};
     use std::sync::Arc;
 
-    /// Build the object store for a location from environment/ambient
-    /// credentials (the warehouse itself reads the files with its own grant;
-    /// this store is only how faucet *writes* them). Kept minimal — richer
-    /// credential wiring is a follow-up; the default credential chains cover the
-    /// common case.
+    /// Build the object store for a location from the store's default
+    /// credential chain ([`build_object_store_with`] with
+    /// [`StagingCredentials::Default`]).
     pub fn build_object_store(loc: &StagingLocation) -> Result<Arc<dyn ObjectStore>, FaucetError> {
-        let store: Arc<dyn ObjectStore> = match loc.scheme {
-            StagingScheme::S3 => Arc::new(
-                object_store::aws::AmazonS3Builder::from_env()
-                    .with_bucket_name(&loc.bucket)
+        build_object_store_with(loc, &StagingCredentials::Default)
+    }
+
+    /// Build the object store faucet writes a location's files through (the
+    /// warehouse reads them with its own grant). The default chain is refused
+    /// where the task may not use the host's identity
+    /// ([`crate::resolve::require_host_credentials`]).
+    pub fn build_object_store_with(
+        loc: &StagingLocation,
+        credentials: &StagingCredentials,
+    ) -> Result<Arc<dyn ObjectStore>, FaucetError> {
+        object_store_for(loc.scheme, &loc.bucket, loc.account.as_deref(), credentials)
+    }
+
+    /// [`build_object_store_with`] for a bucket (or container, with its
+    /// account) of `scheme`.
+    pub fn object_store_for(
+        scheme: StagingScheme,
+        bucket: &str,
+        account: Option<&str>,
+        credentials: &StagingCredentials,
+    ) -> Result<Arc<dyn ObjectStore>, FaucetError> {
+        credentials.check_scheme(scheme)?;
+        if credentials.is_default() {
+            crate::resolve::require_host_credentials("staging", "credentials")?;
+        }
+        let failed = |what: &str| {
+            let what = what.to_string();
+            let bucket = bucket.to_string();
+            move |e: object_store::Error| {
+                FaucetError::Sink(format!("staging: {what} store for `{bucket}`: {e}"))
+            }
+        };
+        let store: Arc<dyn ObjectStore> = match scheme {
+            StagingScheme::S3 => {
+                let builder = match credentials {
+                    StagingCredentials::AccessKey {
+                        access_key_id,
+                        secret_access_key,
+                        session_token,
+                    } => {
+                        let builder = s3_settings_from_env()
+                            .with_access_key_id(access_key_id)
+                            .with_secret_access_key(secret_access_key);
+                        match session_token {
+                            Some(token) => builder.with_token(token),
+                            None => builder,
+                        }
+                    }
+                    _ => object_store::aws::AmazonS3Builder::from_env(),
+                };
+                Arc::new(
+                    builder
+                        .with_bucket_name(bucket)
+                        .build()
+                        .map_err(failed("S3"))?,
+                )
+            }
+            StagingScheme::Gcs => {
+                let builder = match credentials {
+                    StagingCredentials::ServiceAccountJsonFile { path } => {
+                        crate::google_credentials::check_object_store_credentials_file(
+                            "staging",
+                            "credentials",
+                            std::path::Path::new(path),
+                        )?;
+                        object_store::gcp::GoogleCloudStorageBuilder::new()
+                            .with_service_account_path(path)
+                    }
+                    StagingCredentials::ServiceAccountJsonInline { json } => {
+                        crate::google_credentials::check_object_store_credentials(
+                            "staging",
+                            "credentials",
+                            json,
+                        )?;
+                        object_store::gcp::GoogleCloudStorageBuilder::new()
+                            .with_service_account_key(json)
+                    }
+                    _ => object_store::gcp::GoogleCloudStorageBuilder::from_env(),
+                };
+                Arc::new(
+                    builder
+                        .with_bucket_name(bucket)
+                        .build()
+                        .map_err(failed("GCS"))?,
+                )
+            }
+            StagingScheme::Azure => {
+                use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
+                let builder = match credentials {
+                    StagingCredentials::AccountKey { account_key } => {
+                        MicrosoftAzureBuilder::new().with_access_key(account_key)
+                    }
+                    StagingCredentials::SasToken { sas_token } => MicrosoftAzureBuilder::new()
+                        .with_config(AzureConfigKey::SasKey, sas_token.trim_start_matches('?')),
+                    _ => MicrosoftAzureBuilder::from_env(),
+                };
+                let account = account.map(str::to_string).or_else(|| {
+                    (!credentials.is_default())
+                        .then(|| std::env::var("AZURE_STORAGE_ACCOUNT_NAME").ok())
+                        .flatten()
+                });
+                let builder = builder.with_container_name(bucket);
+                Arc::new(
+                    match account {
+                        Some(account) => builder.with_account(account),
+                        None => builder,
+                    }
                     .build()
-                    .map_err(|e| {
-                        FaucetError::Sink(format!("staging: S3 store for `{}`: {e}", loc.bucket))
-                    })?,
-            ),
-            StagingScheme::Gcs => Arc::new(
-                object_store::gcp::GoogleCloudStorageBuilder::from_env()
-                    .with_bucket_name(&loc.bucket)
-                    .build()
-                    .map_err(|e| {
-                        FaucetError::Sink(format!("staging: GCS store for `{}`: {e}", loc.bucket))
-                    })?,
-            ),
-            StagingScheme::Azure => Arc::new({
-                let builder = object_store::azure::MicrosoftAzureBuilder::from_env()
-                    .with_container_name(&loc.bucket);
-                match &loc.account {
-                    Some(account) => builder.with_account(account),
-                    None => builder,
-                }
-                .build()
-                .map_err(|e| {
-                    FaucetError::Sink(format!("staging: Azure store for `{}`: {e}", loc.bucket))
-                })?
-            }),
+                    .map_err(failed("Azure"))?,
+                )
+            }
         };
         Ok(store)
+    }
+
+    /// An S3 builder with only the non-credential `AWS_*` settings of the
+    /// environment (region, endpoint, addressing, HTTP client), so the keys
+    /// a config names are the only credential the store uses.
+    fn s3_settings_from_env() -> object_store::aws::AmazonS3Builder {
+        use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
+        std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .filter(|(k, _)| k.starts_with("AWS_"))
+            .filter_map(|(k, v)| {
+                let key: AmazonS3ConfigKey = k.to_ascii_lowercase().parse().ok()?;
+                matches!(
+                    key,
+                    AmazonS3ConfigKey::Region
+                        | AmazonS3ConfigKey::DefaultRegion
+                        | AmazonS3ConfigKey::Endpoint
+                        | AmazonS3ConfigKey::VirtualHostedStyleRequest
+                        | AmazonS3ConfigKey::Client(_)
+                )
+                .then_some((key, v))
+            })
+            .fold(AmazonS3Builder::new(), |b, (k, v)| b.with_config(k, v))
     }
 
     /// Uploads staged objects to an [`ObjectStore`] and cleans them up. The store
@@ -503,7 +753,16 @@ mod upload {
         /// Build an uploader whose store is constructed from the location's
         /// scheme + ambient credentials.
         pub fn from_location(location: StagingLocation) -> Result<Self, FaucetError> {
-            let store = build_object_store(&location)?;
+            Self::from_location_with(location, &StagingCredentials::Default)
+        }
+
+        /// [`StageUploader::from_location`] with the credentials the config
+        /// names ([`build_object_store_with`]).
+        pub fn from_location_with(
+            location: StagingLocation,
+            credentials: &StagingCredentials,
+        ) -> Result<Self, FaucetError> {
+            let store = build_object_store_with(&location, credentials)?;
             Ok(Self::new(store, location))
         }
 
@@ -606,6 +865,105 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn host_identity_follows_the_selected_credentials() {
+        assert!(staging_host_identity(&json!({}), "/staging").is_empty());
+        assert_eq!(
+            staging_host_identity(&json!({"staging": {"location": "s3://b/p/"}}), "/staging"),
+            vec!["staging.credentials"]
+        );
+        let keyed = json!({"staging": {"location": "s3://b/p/", "credentials": {
+            "type": "access_key", "config": {"access_key_id": "a", "secret_access_key": "s"}}}});
+        assert!(staging_host_identity(&keyed, "/staging").is_empty());
+    }
+
+    #[test]
+    fn staging_credentials_must_match_the_location_scheme() {
+        let spec: StagingSpec = serde_json::from_value(json!({
+            "location": "gs://b/p/",
+            "credentials": {"type": "access_key", "config": {"access_key_id": "a", "secret_access_key": "s"}}
+        }))
+        .unwrap();
+        let err = spec
+            .validate(&[StagingScheme::Gcs], &[StagingFormat::Parquet])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`s3://`") && err.contains("`gs://`"), "{err}");
+        for (creds, scheme) in [
+            (
+                json!({"type": "service_account_json_inline", "config": {"json": "{}"}}),
+                StagingScheme::Gcs,
+            ),
+            (
+                json!({"type": "service_account_json_file", "config": {"path": "k.json"}}),
+                StagingScheme::Gcs,
+            ),
+            (
+                json!({"type": "account_key", "config": {"account_key": "k"}}),
+                StagingScheme::Azure,
+            ),
+            (
+                json!({"type": "sas_token", "config": {"sas_token": "sv=1"}}),
+                StagingScheme::Azure,
+            ),
+            (json!({"type": "default"}), StagingScheme::S3),
+        ] {
+            let c: StagingCredentials = serde_json::from_value(creds).unwrap();
+            assert!(c.check_scheme(scheme).is_ok());
+            let dbg = format!("{c:?}");
+            assert!(!dbg.contains("sv=1") && !dbg.contains("\"k\""), "{dbg}");
+        }
+        assert!(StagingCredentials::default().is_default());
+    }
+
+    #[cfg(feature = "staging")]
+    #[tokio::test]
+    async fn staging_uploads_use_their_own_credentials() {
+        let loc = |uri: &str| StagingLocation::parse(uri).unwrap();
+        crate::resolve::with_host_credentials(false, async {
+            for uri in [
+                "s3://b/p/",
+                "gs://b/p/",
+                "az://c@acct.dfs.core.windows.net/p/",
+            ] {
+                let err = build_object_store(&loc(uri))
+                    .expect_err("refused")
+                    .to_string();
+                assert!(err.contains("staging: `credentials`"), "{err}");
+            }
+            let s3 = StagingCredentials::AccessKey {
+                access_key_id: "a".into(),
+                secret_access_key: "s".into(),
+                session_token: Some("t".into()),
+            };
+            assert!(build_object_store_with(&loc("s3://b/p/"), &s3).is_ok());
+            let az = StagingCredentials::AccountKey {
+                account_key: "a2V5".into(),
+            };
+            assert!(
+                build_object_store_with(&loc("az://c@acct.dfs.core.windows.net/p/"), &az).is_ok()
+            );
+            let sas = StagingCredentials::SasToken {
+                sas_token: "?sv=2024&sig=x".into(),
+            };
+            assert!(
+                build_object_store_with(&loc("az://c@acct.dfs.core.windows.net/p/"), &sas).is_ok()
+            );
+            assert!(StageUploader::from_location_with(loc("s3://b/p/"), &s3).is_ok());
+            assert!(StageUploader::from_location(loc("s3://b/p/")).is_err());
+            let err = build_object_store_with(&loc("gs://b/p/"), &s3)
+                .expect_err("wrong scheme")
+                .to_string();
+            assert!(err.contains("`s3://`"), "{err}");
+        })
+        .await;
+        let trusted = crate::resolve::with_host_credentials(true, async {
+            build_object_store(&loc("s3://b/p/")).is_ok()
+        })
+        .await;
+        assert!(trusted);
+    }
+
     /// An object inserted in reverse-sorted key order (#817).
     fn login_then_id() -> Value {
         let mut m = serde_json::Map::new();
@@ -700,6 +1058,7 @@ mod tests {
             compression: StagingCompression::None,
             cleanup: StagingCleanup::Always,
             copy_options: None,
+            credentials: StagingCredentials::Default,
         };
         // ok for an S3+parquet sink
         assert!(
@@ -796,6 +1155,7 @@ mod tests {
             compression: StagingCompression::None,
             cleanup: StagingCleanup::OnSuccess,
             copy_options: None,
+            credentials: StagingCredentials::Default,
         };
         let recs = vec![json!({"a": 1}), json!({"a": 2})];
         let f = up
@@ -830,6 +1190,7 @@ mod tests {
             compression: StagingCompression::None,
             cleanup: StagingCleanup::Always,
             copy_options: None,
+            credentials: StagingCredentials::Default,
         };
         let err = up
             .stage_page(&spec, "p", "r", 0, &[json!({"a": 1})], None)
@@ -865,6 +1226,7 @@ mod tests {
             compression: StagingCompression::None,
             cleanup: StagingCleanup::Always,
             copy_options: None,
+            credentials: StagingCredentials::Default,
         };
         let f = up
             .stage_page(&spec, "p", "r", 0, &[json!({"a": 1})], None)
@@ -888,6 +1250,7 @@ mod tests {
             compression: StagingCompression::None,
             cleanup: StagingCleanup::OnSuccess,
             copy_options: None,
+            credentials: StagingCredentials::Default,
         };
         let f = up
             .stage_page(&spec, "p", "r", 1, &[json!({"a":1})], None)
@@ -898,5 +1261,26 @@ mod tests {
         up.cleanup(std::slice::from_ref(&f), StagingCleanup::OnSuccess, false)
             .await;
         assert!(store.get(&path).await.is_ok());
+    }
+
+    #[cfg(feature = "staging")]
+    #[tokio::test]
+    async fn a_caller_gcs_key_cannot_move_the_store_endpoint() {
+        use std::sync::Arc;
+        let policy = Arc::new(
+            crate::resolve::ReferencePolicy::deny_all()
+                .with_path_roots(["/srv/data"])
+                .any_url_scheme()
+                .with_url_hosts(["storage.googleapis.com", "oauth2.googleapis.com"]),
+        );
+        let key = r#"{"type": "service_account", "client_email": "a@b.iam", "private_key": "x", "gcs_base_url": "http://169.254.169.254"}"#;
+        let creds = StagingCredentials::ServiceAccountJsonInline { json: key.into() };
+        let err = crate::http::with_reference_policy(policy, async {
+            object_store_for(StagingScheme::Gcs, "b", None, &creds)
+                .map(|_| ())
+                .unwrap_err()
+        })
+        .await;
+        assert!(err.to_string().contains("`gcs_base_url`"), "{err}");
     }
 }

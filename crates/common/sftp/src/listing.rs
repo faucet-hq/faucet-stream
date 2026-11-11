@@ -12,7 +12,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::oneshot;
 
 use crate::SftpError;
-use crate::inbound::{InboundGuard, LimitedStream, MAX_INBOUND_PACKET};
+use crate::inbound::{InboundGuard, MAX_INBOUND_PACKET, Observed, client_config};
 
 /// Default for `max_listed_entries`: entries one directory listing may scan.
 pub const DEFAULT_MAX_LISTED_ENTRIES: usize = 1_000_000;
@@ -57,6 +57,14 @@ pub enum ListError {
         /// `host:port` of the server.
         server: String,
         /// The SSH error.
+        reason: String,
+    },
+    /// The server refused an extra channel on the connection, so the listing
+    /// opened a second connection, and that failed too.
+    SecondConnectionRefused {
+        /// `host:port` of the server.
+        server: String,
+        /// Why the second connection or its channel failed.
         reason: String,
     },
     /// Opening or starting the listing channel failed for another reason.
@@ -111,6 +119,13 @@ impl std::fmt::Display for ListError {
                 "the SFTP server at {server} refused the extra SSH channel a directory listing \
                  runs on ({reason}); the server may allow only one session per connection \
                  (sshd MaxSessions)"
+            ),
+            ListError::SecondConnectionRefused { server, reason } => write!(
+                f,
+                "the SFTP server at {server} allows one session per connection (sshd \
+                 MaxSessions), so the directory listing opened a second connection, which \
+                 failed too ({reason}); allow two sessions per connection or two connections \
+                 per user"
             ),
             ListError::Sftp { what, path, error } => {
                 write!(f, "SFTP {what} '{path}' failed: {error}")
@@ -305,7 +320,10 @@ impl ListingChannel {
             read: output,
             write: write.make_writer(),
         };
-        let raw = RawSftpSession::new(LimitedStream::new(stream, MAX_INBOUND_PACKET, guard));
+        let raw = RawSftpSession::new_with_config(
+            Observed::new(stream, MAX_INBOUND_PACKET, guard),
+            client_config(),
+        );
         (
             Self {
                 write: Some(write),
@@ -316,14 +334,18 @@ impl ListingChannel {
     }
 
     async fn close(&mut self) {
-        if let Some(write) = self.write.take() {
-            let _ = write.close().await;
-        }
-        if let Some(closed) = self.closed.take()
-            && tokio::time::timeout(CLOSE_WAIT, closed).await.is_err()
-        {
+        let Some(write) = self.write.take() else {
+            return;
+        };
+        let _ = write.eof().await;
+        let confirmed = match self.closed.take() {
+            Some(closed) => tokio::time::timeout(CLOSE_WAIT, closed).await.is_ok(),
+            None => true,
+        };
+        if !confirmed {
             tracing::debug!("SFTP listing channel: the server did not confirm its close in time");
         }
+        let _ = write.close().await;
     }
 }
 
@@ -333,6 +355,7 @@ impl Drop for ListingChannel {
             && let Ok(runtime) = tokio::runtime::Handle::try_current()
         {
             runtime.spawn(async move {
+                let _ = write.eof().await;
                 let _ = write.close().await;
             });
         }
@@ -384,6 +407,16 @@ impl SftpLister {
         list_with(&self.raw, path, limit, keep)
             .await
             .map_err(|e| e.explained(&self.guard))
+    }
+
+    /// Whether this channel refused a packet (and so closed).
+    pub(crate) fn refused(&self) -> bool {
+        self.guard.refusal().is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn guard_for_tests(&self) -> &InboundGuard {
+        &self.guard
     }
 
     /// The attributes of `path`, following symbolic links.

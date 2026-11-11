@@ -24,9 +24,11 @@
 //! round-trip through YAML/JSON configs and CLI introspection.
 
 pub mod arrow_bridge;
+mod confined;
 pub mod connection;
 pub mod convert;
 pub mod credentials;
+mod own_store;
 
 pub use connection::DeltaConnection;
 pub use credentials::{AwsCredentials, AzureCredentials, DeltaCredentials, GcpCredentials};

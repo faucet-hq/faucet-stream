@@ -111,7 +111,7 @@ All fields are keys under `sink.config`.
 | `batch_size` | int | `1000` | In-flight `FuturesUnordered` send-window cap per `write_batch`, and the seed for librdkafka's `queue.buffering.max.messages`. **`0` = no cap** (bounded only by `max_in_flight`). See [Streaming & batching](#streaming--batching). |
 | `linger` | int (seconds) | `0` *(5ms)* | Time the producer waits to accumulate a batch before flushing. The default is **5 ms**; for other sub-second values set `linger.ms` via `extra_client_config`. |
 | `compression` | `"none" \| "gzip" \| "snappy" \| "lz4" \| "zstd"` | `"none"` | Producer-side compression codec. See [Compression](#compression). |
-| `extra_client_config` | object (string→string) | `{}` | Raw librdkafka client properties. **Overrides** anything set by `auth` or the typed fields above. |
+| `extra_client_config` | object (string→string) | `{}` | Raw librdkafka client properties. **Overrides** anything set by `auth` or the typed fields above. Under `faucet serve`, keys naming a broker (`bootstrap.servers`, `metadata.broker.list`), a URL (`*.url`) or a file (`*.location`, `*.file`, `sasl.kerberos.keytab`) are checked like the typed fields, and keys that load or run a program (`plugin.library.paths`, `ssl.engine.location`, `ssl.providers`, `*.cmd`) are refused for configs the server does not trust. |
 
 ### Effectively-once
 
@@ -500,6 +500,10 @@ Declares `write_mode: append` and idempotent (exactly-once) writes. Under `value
 ## Timeouts, cancellation and retries
 
 Every produced record's delivery, the `QueueFull` backoff, the transaction calls (`init`, `commit`) and the commit-token read run through the pipeline's `CallContext` (#880): the run's deadline ends a delivery that an unreachable or stalled cluster never confirms, and a `QueueFull` wait, promptly; a commit cut short is aborted. Each counts as one round trip (`produce`, `init`, `commit`, `metadata`, `read_token`) in `faucet_sink_roundtrips_total`, and Schema Registry requests run under the same context (`schema`, `register`). The sink never re-sends a delivered-or-unknown record itself.
+
+## Caller configs under `faucet serve`
+
+A client whose final options select GSSAPI authenticates with the server's Kerberos identity: `sasl.mechanism` (or `sasl.mechanisms`) set to `GSSAPI`, or a `SASL_*` `security.protocol` that no other mechanism overrides, since GSSAPI is librdkafka's default. A config a caller submits to `faucet serve` may do that only when the server runs with `--allow-host-credentials` (never for a tenant). `sasl.kerberos.keytab` is a server path and `sasl.kerberos.kinit.cmd` a command; both follow the server's reference policy. Whatever the origin, `sasl.kerberos.principal` and `sasl.kerberos.service.name` may hold only letters, digits and `._/@:-` (so a `HOST$@REALM` principal is refused), and `sasl.kerberos.keytab` no quote, `$`, backtick, backslash or control character: the default `kinit` command line interpolates them.
 
 ## License
 

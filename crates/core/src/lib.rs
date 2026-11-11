@@ -46,8 +46,11 @@ pub mod error;
 pub mod fidelity;
 pub mod file_format;
 pub mod forward;
+mod google_credentials;
 pub mod governance;
+mod host_credentials;
 pub mod http;
+mod store_options;
 // The conformance crate's forwarding harness, compiled into core's own unit
 // tests under the `faucet_core::` paths it is written against.
 #[cfg(test)]
@@ -243,8 +246,8 @@ pub use stage::{ExplodeSpec, OnMissing};
 pub use stage::{FilterOp, FilterSpec};
 pub use stage::{TransformStage, apply_stages, compile_stage};
 pub use staging::{
-    StagedFile, StagingCleanup, StagingCompression, StagingFormat, StagingLocation, StagingScheme,
-    StagingSpec, serialize_records,
+    StagedFile, StagingCleanup, StagingCompression, StagingCredentials, StagingFormat,
+    StagingLocation, StagingScheme, StagingSpec, serialize_records, staging_host_identity,
 };
 pub use state::{FileStateStore, MemoryStateStore, StateExport, StateStore};
 pub use state_key::{KEY_SCHEME_VERSION, KeyMigration, KeySuffix, StateKey, migrate_state_key};

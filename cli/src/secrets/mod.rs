@@ -655,7 +655,7 @@ async fn fetch_all(
                     }
                 })?);
                 let value = resolver.resolve(&reference).await?;
-                registry::register(&value);
+                registry::register_server(&value);
                 Ok::<(SecretRef, String), CliError>(((scheme, reference), value))
             })
             .buffer_unordered(MAX_CONCURRENCY)

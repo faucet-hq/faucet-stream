@@ -153,8 +153,9 @@ impl ClickHouseSource {
             .call(&self.calls.get(), "query", self.request(query))
             .await?;
         let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
-        let body = resp.text().await.map_err(|e| {
-            FaucetError::Source(format!("ClickHouse: reading response failed: {e}"))
+        let body = self.client.text(resp).await.map_err(|e| match e {
+            FaucetError::Custom(_) => e,
+            e => FaucetError::Source(format!("ClickHouse: reading response failed: {e}")),
         })?;
         crate::decode::CompactDecoder::decode_all(&body)
     }
@@ -281,12 +282,41 @@ fn substitute_context_sql(
 /// unit-testable.
 fn split_complete_lines(buf: &mut Vec<u8>) -> Vec<Vec<u8>> {
     let mut lines = Vec::new();
-    while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-        let mut line: Vec<u8> = buf.drain(..=pos).collect();
-        line.pop(); // strip the trailing '\n'
-        lines.push(line);
+    let mut start = 0;
+    while let Some(pos) = buf[start..].iter().position(|&b| b == b'\n') {
+        lines.push(buf[start..start + pos].to_vec());
+        start += pos + 1;
     }
+    buf.drain(..start);
     lines
+}
+
+/// Append a streamed chunk to `buf` and take out the complete lines. Only a
+/// chunk holding a newline triggers a scan, and a partial line longer than
+/// `limit` is refused.
+fn push_chunk(
+    buf: &mut Vec<u8>,
+    bytes: &[u8],
+    limit: Option<u64>,
+    url: &str,
+) -> Result<Vec<Vec<u8>>, FaucetError> {
+    buf.extend_from_slice(bytes);
+    let lines = if bytes.contains(&b'\n') {
+        split_complete_lines(buf)
+    } else {
+        Vec::new()
+    };
+    if let Some(limit) = limit
+        && buf.len() as u64 > limit
+    {
+        return Err(FaucetError::Custom(Box::new(
+            faucet_core::http::ResponseTooLarge {
+                url: faucet_core::redact_uri_credentials(url),
+                limit,
+            },
+        )));
+    }
+    Ok(lines)
 }
 
 /// Derive a default state-store key from the connection host + a query
@@ -377,14 +407,15 @@ impl Source for ClickHouseSource {
             let reads = calls.with_roundtrip_metering(false);
 
             let mut buf: Vec<u8> = Vec::new();
+            let limit = self.client.max_response_bytes();
             let mut decoder = crate::decode::CompactDecoder::default();
             let mut page: Vec<Value> = Vec::with_capacity(cap);
             let mut total = 0usize;
 
             while let Some(chunk_result) = next_chunk(&reads, &mut body).await? {
                 let bytes = chunk_result.map_err(FaucetError::Http)?;
-                buf.extend_from_slice(&bytes);
-                for line in split_complete_lines(&mut buf) {
+                let lines = push_chunk(&mut buf, &bytes, limit, &self.base_url)?;
+                for line in lines {
                     let Some(value) = decoder.push_line(&line)? else { continue };
                     if tracker.as_mut().is_none_or(|t| t.admit(&value)) {
                         page.push(value);
@@ -498,6 +529,61 @@ mod tests {
 
     fn full_cfg() -> ClickHouseSourceConfig {
         ClickHouseSourceConfig::new("http://db.example.com:8123", "SELECT * FROM t")
+    }
+
+    #[tokio::test]
+    async fn an_oversized_response_body_is_a_typed_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("x".repeat(4096)))
+            .mount(&server)
+            .await;
+        let mut source =
+            ClickHouseSource::new(ClickHouseSourceConfig::new(server.uri(), "SELECT 1")).unwrap();
+        source.client = faucet_core::http::Client::builder()
+            .max_response_bytes(Some(1024))
+            .build()
+            .unwrap();
+        let err = source.collect_all(&HashMap::new()).await.unwrap_err();
+        let FaucetError::Custom(inner) = &err else {
+            panic!("{err:?}");
+        };
+        assert!(
+            inner
+                .downcast_ref::<faucet_core::http::ResponseTooLarge>()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_streamed_row_is_a_typed_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("x".repeat(4096)))
+            .mount(&server)
+            .await;
+        let mut source =
+            ClickHouseSource::new(ClickHouseSourceConfig::new(server.uri(), "SELECT 1")).unwrap();
+        source.client = faucet_core::http::Client::builder()
+            .max_response_bytes(Some(1024))
+            .build()
+            .unwrap();
+        let context = HashMap::new();
+        let mut pages = source.stream_pages(&context, 100);
+        let err = loop {
+            match pages.next().await {
+                Some(Err(e)) => break e,
+                Some(Ok(_)) => continue,
+                None => panic!("the stream ended without an error"),
+            }
+        };
+        let FaucetError::Custom(inner) = &err else {
+            panic!("{err:?}");
+        };
+        let too_large = inner
+            .downcast_ref::<faucet_core::http::ResponseTooLarge>()
+            .expect("a ResponseTooLarge");
+        assert_eq!(too_large.limit, 1024);
     }
 
     #[test]
@@ -763,6 +849,32 @@ mod tests {
         buf.extend_from_slice(b"1}\n");
         let lines = split_complete_lines(&mut buf);
         assert_eq!(lines, vec![b"{\"a\":1}".to_vec()]);
+    }
+
+    #[test]
+    fn push_chunk_bounds_only_the_partial_line() {
+        let mut buf = Vec::new();
+        assert!(
+            push_chunk(&mut buf, b"{\"a\":", Some(8), "http://h")
+                .unwrap()
+                .is_empty()
+        );
+        let lines = push_chunk(&mut buf, b"1}\n{\"b\":2}\n{", Some(8), "http://h").unwrap();
+        assert_eq!(lines, vec![b"{\"a\":1}".to_vec(), b"{\"b\":2}".to_vec()]);
+        assert_eq!(buf, b"{");
+        assert!(
+            push_chunk(&mut buf, b"12345678", None, "http://h")
+                .unwrap()
+                .is_empty()
+        );
+        let err = push_chunk(&mut buf, b"9", Some(8), "http://u:p@h").unwrap_err();
+        let FaucetError::Custom(inner) = &err else {
+            panic!("{err:?}");
+        };
+        let too_large = inner
+            .downcast_ref::<faucet_core::http::ResponseTooLarge>()
+            .unwrap();
+        assert!(!too_large.url.contains(":p@"), "{}", too_large.url);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! S3 source configuration.
 
+use faucet_common_s3::S3Credentials;
 use faucet_core::DEFAULT_BATCH_SIZE;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -117,6 +118,11 @@ pub struct S3SourceConfig {
     #[serde(default)]
     #[schemars(extend("x-faucet-resource" = "url"))]
     pub endpoint_url: Option<String>,
+    /// How to authenticate (default: the AWS default chain, i.e. the
+    /// identity of the host faucet runs on). `access_key` names keys in the
+    /// config; `anonymous` sends unsigned requests (public buckets).
+    #[serde(default)]
+    pub credentials: S3Credentials,
     /// Format of the files to read. Defaults to `json_lines`.
     #[serde(default)]
     pub file_format: S3FileFormat,
@@ -175,6 +181,13 @@ pub struct S3SourceConfig {
     /// way. Default 2 GiB.
     #[serde(default = "default_max_object_bytes")]
     pub max_object_bytes: u64,
+    /// Most bytes one object may decode to in memory where a format can
+    /// expand past its input: an Avro file's records (per batch where the file
+    /// streams), an Excel workbook's parts and shared strings. A file past it
+    /// fails with an error instead of exhausting memory. Default 64 ×
+    /// `max_object_bytes`, at most 16 GiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_decoded_bytes: Option<u64>,
     /// Compression codec applied to each downloaded object. Defaults to
     /// [`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —
     /// the codec is resolved per-object-key, so a single source can read a
@@ -221,6 +234,7 @@ impl S3SourceConfig {
             prefix: None,
             include: None,
             region: None,
+            credentials: S3Credentials::default(),
             endpoint_url: None,
             file_format: S3FileFormat::default(),
             max_objects: None,
@@ -229,6 +243,7 @@ impl S3SourceConfig {
             verify_length: true,
             verify_checksum: false,
             max_object_bytes: default_max_object_bytes(),
+            max_decoded_bytes: None,
             #[cfg(feature = "compression")]
             compression: faucet_core::CompressionConfig::default(),
             csv: faucet_core::CsvOptions::default(),
@@ -238,6 +253,18 @@ impl S3SourceConfig {
             orc: faucet_core::OrcOptions::default(),
             parquet: faucet_core::ParquetReadOptions::default(),
         }
+    }
+
+    /// `max_decoded_bytes`, or its default.
+    #[cfg_attr(
+        not(any(feature = "file-format-avro", feature = "file-format-excel")),
+        allow(dead_code)
+    )]
+    pub(crate) fn decoded_bytes_limit(&self) -> u64 {
+        faucet_core::file_format::budget::effective_max_decoded_bytes(
+            self.max_decoded_bytes,
+            self.max_object_bytes,
+        )
     }
 
     /// The per-format option blocks in the shape
@@ -274,6 +301,12 @@ impl S3SourceConfig {
     /// Set a custom endpoint URL for S3-compatible services.
     pub fn endpoint_url(mut self, url: impl Into<String>) -> Self {
         self.endpoint_url = Some(url.into());
+        self
+    }
+
+    /// Set how the source authenticates.
+    pub fn credentials(mut self, credentials: S3Credentials) -> Self {
+        self.credentials = credentials;
         self
     }
 
@@ -340,6 +373,20 @@ impl S3SourceConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decoded_bytes_default_to_a_multiple_of_the_object_limit() {
+        let mut c = S3SourceConfig::new("b");
+        c.max_object_bytes = 1024;
+        assert_eq!(c.decoded_bytes_limit(), 64 * 1024);
+        c.max_object_bytes = faucet_core::file_format::DEFAULT_MAX_OBJECT_BYTES;
+        assert_eq!(
+            c.decoded_bytes_limit(),
+            faucet_core::file_format::budget::MAX_DEFAULT_DECODED_BYTES
+        );
+        c.max_decoded_bytes = Some(10);
+        assert_eq!(c.decoded_bytes_limit(), 10);
+    }
 
     #[test]
     fn default_config() {

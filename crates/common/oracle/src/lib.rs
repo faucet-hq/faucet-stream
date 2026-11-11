@@ -43,3 +43,22 @@ pub use types::{
 
 /// Re-export of the driver so connector crates share one version.
 pub use oracle;
+
+/// The fields of an Oracle source or sink config (the connection block is
+/// flattened at its top level) that make it authenticate with the identity of
+/// the host it runs on: `external_auth: true` (OS or wallet authentication),
+/// and a `connect_string` whose `TOKEN_AUTH` uses the host's identity or
+/// token files.
+pub fn host_identity(config: &faucet_core::Value) -> Vec<String> {
+    use faucet_core::capabilities::config::{bool_at, str_at};
+    let mut fields = Vec::new();
+    if bool_at(config, "/external_auth", false) {
+        fields.push("external_auth".to_string());
+    }
+    if str_at(config, "/connect_string")
+        .is_some_and(faucet_core::resolve::oracle_connect_uses_host_identity)
+    {
+        fields.push("connect_string".to_string());
+    }
+    fields
+}

@@ -99,10 +99,10 @@ impl KafkaSource {
         client_config.set_log_level(RDKafkaLogLevel::Warning);
 
         config.auth.apply(&mut client_config)?;
-
         for (k, v) in &config.extra_client_config {
             client_config.set(k, v);
         }
+        faucet_common_kafka::check_client_config(&client_config)?;
 
         let context = BookmarkContext::new();
         context.earliest.store(
@@ -1310,6 +1310,53 @@ mod tests {
         KafkaSource::new(config)
             .await
             .expect("offline construction")
+    }
+
+    #[tokio::test]
+    async fn the_client_build_refuses_unplain_kerberos_values() {
+        let config = KafkaSourceConfig {
+            brokers: "127.0.0.1:1".into(),
+            topics: vec!["orders".into()],
+            group_id: "g".into(),
+            auth: faucet_common_kafka::KafkaAuth::None,
+            value_format: faucet_common_kafka::KafkaValueFormat::Json,
+            key_format: None,
+            auto_offset_reset: OffsetReset::Latest,
+            max_messages: Some(1),
+            idle_timeout: None,
+            poll_timeout: Duration::from_secs(1),
+            session_timeout: Duration::from_secs(30),
+            on_decode_error: OnDecodeError::Fail,
+            extra_client_config: BTreeMap::from([
+                (
+                    "security.protocol".to_string(),
+                    "SASL_PLAINTEXT".to_string(),
+                ),
+                ("sasl.kerberos.principal".to_string(), "x; id #".to_string()),
+                ("sasl.kerberos.keytab".to_string(), "/dev/null".to_string()),
+            ]),
+            batch_size: 10,
+        };
+        let err = KafkaSource::new(config.clone())
+            .await
+            .err()
+            .expect("refused")
+            .to_string();
+        assert!(err.contains("sasl.kerberos.principal"), "{err}");
+        let mut kerberos = config;
+        kerberos.extra_client_config.insert(
+            "sasl.kerberos.principal".into(),
+            "faucet@EXAMPLE.COM".into(),
+        );
+        let err = faucet_core::resolve::with_host_credentials(false, KafkaSource::new(kerberos))
+            .await
+            .err()
+            .expect("refused")
+            .to_string();
+        assert!(
+            err.contains("kafka: `extra_client_config.security.protocol`"),
+            "{err}"
+        );
     }
 
     #[test]

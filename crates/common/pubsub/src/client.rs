@@ -29,6 +29,21 @@ fn auth_err(context: &str, e: impl std::fmt::Display) -> FaucetError {
     FaucetError::Auth(format!("pubsub auth ({context}): {e}"))
 }
 
+/// The config fields that make a Pub/Sub client built from `config`
+/// authenticate with the identity of the host it runs on: `credentials` when
+/// it selects `application_default` (also when absent) and no
+/// `emulator_host` is set.
+pub fn host_identity(config: &faucet_core::Value) -> Vec<String> {
+    use faucet_core::capabilities::config::{non_empty_str_at, tag_at};
+    let adc =
+        tag_at(config, "/credentials").unwrap_or("application_default") == "application_default";
+    if adc && !non_empty_str_at(config, "/emulator_host") {
+        vec!["credentials".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Build a Pub/Sub [`Client`] from a [`PubsubConnection`].
 ///
 /// * When an emulator host is configured (config `emulator_host` or the
@@ -70,11 +85,19 @@ pub async fn build_client(conn: &PubsubConnection) -> Result<Client, FaucetError
     let config = if use_auth {
         match &conn.credentials {
             PubsubCredentials::Anonymous => config, // unreachable: filtered above
-            PubsubCredentials::ApplicationDefault => config
-                .with_auth()
-                .await
-                .map_err(|e| auth_err("application default", e))?,
+            PubsubCredentials::ApplicationDefault => {
+                faucet_core::resolve::require_host_credentials("pubsub", "credentials")?;
+                config
+                    .with_auth()
+                    .await
+                    .map_err(|e| auth_err("application default", e))?
+            }
             PubsubCredentials::ServiceAccountJsonFile { path } => {
+                faucet_core::resolve::check_google_credentials_file(
+                    "pubsub",
+                    "credentials",
+                    std::path::Path::new(path),
+                )?;
                 let cf = CredentialsFile::new_from_file(path.clone())
                     .await
                     .map_err(|e| auth_err("service-account file", e))?;
@@ -84,6 +107,7 @@ pub async fn build_client(conn: &PubsubConnection) -> Result<Client, FaucetError
                     .map_err(|e| auth_err("service-account file", e))?
             }
             PubsubCredentials::ServiceAccountJsonInline { json } => {
+                faucet_core::resolve::check_google_credentials("pubsub", "credentials", json)?;
                 let cf = CredentialsFile::new_from_str(json)
                     .await
                     .map_err(|e| auth_err("inline service-account key", e))?;
@@ -105,6 +129,78 @@ pub async fn build_client(conn: &PubsubConnection) -> Result<Client, FaucetError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_identity_follows_the_selected_credentials() {
+        use faucet_core::json;
+        assert_eq!(host_identity(&json!({})), vec!["credentials"]);
+        assert!(host_identity(&json!({"emulator_host": "localhost:8085"})).is_empty());
+        for t in [
+            "anonymous",
+            "service_account_json_file",
+            "service_account_json_inline",
+        ] {
+            assert!(
+                host_identity(&json!({"credentials": {"type": t}})).is_empty(),
+                "{t}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_runs_take_only_service_account_keys() {
+        if std::env::var_os("PUBSUB_EMULATOR_HOST").is_some() {
+            return;
+        }
+        let conn = PubsubConnection {
+            project_id: Some("p".into()),
+            credentials: PubsubCredentials::ServiceAccountJsonInline {
+                json: r#"{"type": "authorized_user", "client_id": "c", "client_secret": "s",
+                    "refresh_token": "r", "token_uri": "http://127.0.0.1:1/token"}"#
+                    .into(),
+            },
+            ..Default::default()
+        };
+        let caller = std::sync::Arc::new(
+            faucet_core::resolve::ReferencePolicy::deny_all()
+                .with_path_roots(["/srv/data"])
+                .any_url_scheme()
+                .any_url_host(),
+        );
+        let err = faucet_core::http::with_reference_policy(caller, build_client(&conn))
+            .await
+            .expect_err("refused")
+            .to_string();
+        assert!(err.contains("pubsub: `credentials`"), "{err}");
+        assert!(err.contains("authorized_user"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn ambient_clients_are_refused_inside_a_caller_run() {
+        if std::env::var_os("PUBSUB_EMULATOR_HOST").is_some() {
+            return;
+        }
+        let conn = PubsubConnection {
+            project_id: Some("p".into()),
+            credentials: PubsubCredentials::ApplicationDefault,
+            ..Default::default()
+        };
+        let err = faucet_core::resolve::with_host_credentials(false, build_client(&conn))
+            .await
+            .expect_err("refused")
+            .to_string();
+        assert!(err.contains("pubsub: `credentials`"), "{err}");
+        let emulated = PubsubConnection {
+            emulator_host: Some("127.0.0.1:1".into()),
+            ..conn
+        };
+        let emulated = faucet_core::resolve::with_host_credentials(false, build_client(&emulated))
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(!emulated.contains("--allow-host-credentials"), "{emulated}");
+    }
 
     /// An explicit `emulator_host` configures this client only; it no longer
     /// leaks into the process environment for every later client (#789

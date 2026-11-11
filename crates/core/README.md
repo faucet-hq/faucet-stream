@@ -295,7 +295,9 @@ carries `#[allow(clippy::disallowed_methods)] // <reason>`.
 ## Resource annotations and reference policies
 
 Mark a config field that names a local path, a URL or a program with
-`#[schemars(extend("x-faucet-resource" = "path"))]` (`"url"`, `"command"`).
+`#[schemars(extend("x-faucet-resource" = "path"))]` (`"url"`, `"command"`;
+`"key"` for a path on the connector's own remote server, which a policy with
+path roots refuses when it holds a `..` segment).
 `faucet_core::resolve` reads the annotation back from a config schema
 (`annotated_resources(schema, config)`, `declares(schema, kind)`) and checks
 each value with a `ReferencePolicy`: an allow-list of path roots (compared
@@ -306,7 +308,13 @@ default and `open()` allows everything but metadata hosts. `faucet serve` uses
 it to confine configs a caller submits, so an annotated third-party connector
 is confined without serve changes. A free-form string map names the keys
 that hold a resource with `x-faucet-resource-keys` (`{"*endpoint*": "url",
-"*_file": "path"}`). Host-bearing values that are not URLs (`b1:9092,b2:9092`,
+"*_file": "path"}`, or `{"kind": "url", "syntax": "url-list"}` to name a key's
+grammar too; an exact key wins over a pattern). Such a key that runs a program
+does not make `declares(schema, Command)` true: it is reported only when a
+config sets it. `AzureConnSettings::read` reads an Azure Storage connection
+string with the Azure client's own rules (exact-case keys, last wins) and is
+shared by the check and `faucet-common-azure`; `is_valid_azure_account_name`
+is the service's account-name rule. Host-bearing values that are not URLs (`b1:9092,b2:9092`,
 `Server=tcp:host,1433;…`, an Azure Storage connection string) are read for
 their hosts. A field whose value is not a URL declares its grammar with
 `#[schemars(extend("x-faucet-url-syntax" = "ado"))]` (`"oracle"`,
@@ -316,7 +324,14 @@ value the way the connector's client does (`faucet_core::ado::parse` is the SQL
 Server driver's connection-string grammar, shared with the MSSQL crate). A
 policy with path roots (one for configs a host does not trust) refuses a value
 its grammar cannot read, a value from which no server can be read, and a value
-longer than `MAX_SCREENED_LEN` (64 KiB). `check_url` judges a host by how it is written;
+longer than `MAX_SCREENED_LEN` (64 KiB). A `mongodb://` / `mongodb+srv://`
+URI, in any field, is read with the MongoDB driver's own rules (hosts up to the
+first `/` split on `,`, `.sock` hosts as paths, Unicode-folded option keys,
+`tlsCAFile` / `tlsCertificateKeyFile` as paths, the TLS verification switches,
+`authMechanism` / `ENVIRONMENT` identities as host credentials, `proxyHost` as
+a host, a `+srv` name's parent domain against the host allow-list), and
+`with_pinned_servers(true)` requires it to keep the driver on the server it
+names (`directConnection=true` or `loadBalanced=true`). `check_url` judges a host by how it is written;
 `check_url_resolved` also resolves it, and `faucet_core::http::Client`'s own
 resolver drops link-local / metadata addresses at connection time
 (`resolve::screen_resolved`), unless the policy lists that name exactly.
@@ -326,6 +341,37 @@ engine that can `ATTACH` or `read_csv` — exposes a boolean switch that confine
 it and marks it `#[schemars(extend("x-faucet-sandbox" = true))]`;
 `resolve::sandbox_fields(schema)` reads the marked fields back, and a host
 loading a config it does not trust forces each one on.
+
+A connector that can authenticate with the identity of the host it runs on
+(a cloud default credential chain, an instance or workload role, a local
+credential file, OS authentication) answers which config fields select that
+through its descriptor, `ConnectorDescriptor::new(..).with_host_identity(f)`
+(`f: fn(&Value) -> Vec<String>`, read with `capabilities::config::tag_at` /
+`str_at` / `non_empty_str_at` and other JSON-pointer readers). Where the answer
+can also come from what the connector learns at run time, it adds
+`.with_runtime_host_identity()` and calls
+`resolve::require_host_credentials(connector, field)?` before building the
+client. `resolve::host_credentials_allowed()` reads the current task's scope:
+`resolve::with_host_credentials(allowed, fut)`, or the scoped reference
+policy's `allows_host_credentials()` (`http::with_reference_policy` carries it,
+`http::inherit_reference_policy` passes it to a spawned task); a task with no
+scope is allowed unless the host called `resolve::deny_unscoped_host_credentials()`
+(first call wins), as `faucet serve` does at startup.
+
+Two helpers serve connectors built on object stores:
+`resolve::store_options_host_identity(StoreKind, options)` reads an
+`object_store`-style option map (any case, with or without the `aws_` /
+`google_` / `azure_storage_` prefix) and names the key that reaches the host's
+identity — a role, profile, metadata endpoint, container or workload identity,
+even beside static keys — or `"credentials"` when the map names no credential
+of its store. A staged load's `StagingSpec.credentials` (`StagingCredentials`:
+`default`, `access_key`, `service_account_json_file`,
+`service_account_json_inline`, `account_key`, `sas_token`, checked against the
+location's scheme) builds the upload store through
+`staging::build_object_store_with` / `object_store_for` /
+`StageUploader::from_location_with`, which refuse the default chain where the
+task may not use the host's identity; `staging_host_identity(config,
+pointer)` is the descriptor's answer for a `staging:` block.
 
 ## Error types
 
@@ -823,7 +869,7 @@ wrapper with `faucet_conformance::forwarding::assert_sink_forwards_every_hook` /
 | `write_mode` | `WriteMode`, `WriteSpec`, `DeleteMarker`, `plan_writes`, `WritePlan` |
 | `quality` | Per-record / per-batch checks (`quality` / `quality-jsonschema` features) |
 | `contract` | Versioned data contracts — `ContractSpec`, `CompiledContract`, `apply_contract`, JSON-Schema / OpenLineage exports (the `contract` feature) |
-| `masking` | PII detection + column-level masking — `MaskingSpec`, `CompiledMasking`, `apply_masking`, `Detector`, `MaskAction` (the `masking` feature) |
+| `masking` | PII detection + column-level masking — `MaskingSpec`, `CompiledMasking`, `apply_masking`, `Detector`, `MaskAction`; `MaskingProof` / `proof::{rules_fingerprint, derive_key}` sign a DLQ envelope's `masking` object (`DlqGovernance::with_masking_proof`) (the `masking` feature) |
 | `replication` | `ReplicationMethod`, `filter_incremental`, `max_replication_value` |
 | `retry` | `execute_with_retry` (exponential backoff + jitter) |
 | `io` | `CallContext`, `CallSlot`, `DEFAULT_CALL_TIMEOUT` — the backend-call wrapper (#880) |
@@ -834,7 +880,7 @@ wrapper with `faucet_conformance::forwarding::assert_sink_forwards_every_hook` /
 | `check` | `CheckContext`, `Probe`, `CheckReport` for `faucet doctor` |
 | `observability` | Pipeline-internal `tracing`/`metrics` decorators; `install_observability` |
 | `compression` | `CompressionConfig`, `compress_buf` (the `compression` feature) |
-| `file_format` | One format vocabulary for every file connector — `FileFormat` (incl. `from_path` extension detection), `decode` / `encode`, `ContainerDecoder` (Avro / ORC across many files, resolved against the first file's schema), `avro` (OCF read + write, explicit logical-type mapping, schema inference), `orc` (read-only, projection, stripe streaming) |
+| `file_format` | One format vocabulary for every file connector — `FileFormat` (incl. `from_path` extension detection), `decode` / `encode`, `ContainerDecoder` (Avro / ORC across many files, resolved against the first file's schema), `avro` (OCF read + write, explicit logical-type mapping, schema inference), `orc` (read-only, projection, stripe streaming), `budget` (`DecodeBudget`: `max_decoded_bytes`, what one object or batch may decode to; `decode_bounded` / `decode_owned_bounded` / `ContainerDecoder::with_max_decoded_bytes` apply it to Avro and Excel) |
 | `util` | `quote_ident`, `extract_records`, `check_http_response`, `redact_uri_credentials`, `encode_url_component` (percent-encode one URL path segment or query value) |
 
 ## Feature flags

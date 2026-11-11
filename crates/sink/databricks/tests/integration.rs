@@ -31,6 +31,7 @@ fn volume(c: &mut faucet_sink_databricks::DatabricksSinkConfig, cleanup: Staging
         location: "/Volumes/main/sales/stage".into(),
         cleanup,
         copy_options: Some("'mergeSchema' = 'false'".into()),
+        credentials: Default::default(),
     });
 }
 
@@ -796,6 +797,7 @@ async fn cloud_staging_goes_through_the_object_store() {
             location: "s3://bucket/pre".into(),
             cleanup: StagingCleanup::Never,
             copy_options: None,
+            credentials: Default::default(),
         });
     })
     .with_object_store(store.clone());
@@ -817,6 +819,7 @@ async fn cloud_staging_goes_through_the_object_store() {
             location: "s3://bucket/pre".into(),
             cleanup: StagingCleanup::Always,
             copy_options: None,
+            credentials: Default::default(),
         });
     })
     .with_object_store(store.clone());

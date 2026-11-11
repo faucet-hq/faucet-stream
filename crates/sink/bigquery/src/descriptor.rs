@@ -3,7 +3,22 @@ use faucet_core::{Capabilities, ConnectorDescriptor, SchemaReport, WriteMode};
 use serde_json::Value;
 
 /// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
-pub const DESCRIPTOR: ConnectorDescriptor = ConnectorDescriptor::new("bigquery", capabilities);
+pub const DESCRIPTOR: ConnectorDescriptor =
+    ConnectorDescriptor::new("bigquery", capabilities).with_host_identity(host_identity);
+
+/// `auth`, then a `bulk_load` block's `gcs_auth` (default
+/// `application_default`).
+fn host_identity(config: &Value) -> Vec<String> {
+    use faucet_core::capabilities::config::{is_set_at, tag_at};
+    let mut fields = faucet_common_bigquery::host_identity(config);
+    if is_set_at(config, "/bulk_load")
+        && tag_at(config, "/bulk_load/gcs_auth").unwrap_or("application_default")
+            == "application_default"
+    {
+        fields.push("bulk_load.gcs_auth".to_string());
+    }
+    fields
+}
 
 fn capabilities(config: &Value) -> Capabilities {
     let base = Capabilities::builder()
@@ -41,6 +56,26 @@ fn capabilities(config: &Value) -> Capabilities {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn host_identity_follows_the_selected_credentials() {
+        let key = json!({"type": "service_account_key_path", "config": {"path": "k"}});
+        assert_eq!(
+            DESCRIPTOR.host_identity(&json!({"auth": key})),
+            Some(vec![])
+        );
+        assert_eq!(
+            DESCRIPTOR.host_identity(&json!({"auth": {"type": "application_default"}})),
+            Some(vec!["auth".to_string()])
+        );
+        assert_eq!(
+            DESCRIPTOR.host_identity(&json!({"auth": key, "bulk_load": {"bucket": "b"}})),
+            Some(vec!["bulk_load.gcs_auth".to_string()])
+        );
+        let anon =
+            json!({"auth": key, "bulk_load": {"bucket": "b", "gcs_auth": {"type": "anonymous"}}});
+        assert_eq!(DESCRIPTOR.host_identity(&anon), Some(vec![]));
+    }
 
     fn assert_static(c: &Capabilities) {
         assert_eq!(

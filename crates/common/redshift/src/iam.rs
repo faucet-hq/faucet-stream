@@ -186,25 +186,29 @@ impl IamCredentials {
         }))
     }
 
-    async fn client(&self) -> &Client {
+    async fn client(&self) -> Result<&Client, FaucetError> {
         self.client
-            .get_or_init(|| async {
+            .get_or_try_init(|| async {
                 let sdk =
-                    crate::aws::sdk_config(self.region.as_deref(), &self.aws_credentials).await;
+                    crate::aws::sdk_config(self.region.as_deref(), &self.aws_credentials).await?;
                 match &self.target {
                     Target::Cluster { .. } => {
                         let mut b = aws_sdk_redshift::config::Builder::from(&sdk);
                         if let Some(e) = &self.endpoint_url {
                             b = b.endpoint_url(e);
                         }
-                        Client::Cluster(aws_sdk_redshift::Client::from_conf(b.build()))
+                        Ok(Client::Cluster(aws_sdk_redshift::Client::from_conf(
+                            b.build(),
+                        )))
                     }
                     Target::Workgroup { .. } => {
                         let mut b = aws_sdk_redshiftserverless::config::Builder::from(&sdk);
                         if let Some(e) = &self.endpoint_url {
                             b = b.endpoint_url(e);
                         }
-                        Client::Workgroup(aws_sdk_redshiftserverless::Client::from_conf(b.build()))
+                        Ok(Client::Workgroup(
+                            aws_sdk_redshiftserverless::Client::from_conf(b.build()),
+                        ))
                     }
                 }
             })
@@ -213,7 +217,7 @@ impl IamCredentials {
 
     /// Fetch a new user and password, as the call `credentials`.
     pub async fn fetch(&self, calls: &CallContext) -> Result<TempCredentials, FaucetError> {
-        let client = self.client().await;
+        let client = self.client().await?;
         calls
             .call("credentials", || async {
                 let (user, password, expires) = match (client, &self.target) {

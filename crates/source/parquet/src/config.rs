@@ -182,6 +182,12 @@ pub struct ParquetS3Config {
     #[serde(default)]
     #[schemars(extend("x-faucet-resource" = "url"))]
     pub endpoint_url: Option<String>,
+
+    /// How to authenticate (default: the AWS default chain, i.e. the
+    /// identity of the host faucet runs on). `access_key` names keys in the
+    /// config; `anonymous` sends unsigned requests (public buckets).
+    #[serde(default)]
+    pub credentials: faucet_common_s3::S3Credentials,
 }
 
 impl ParquetS3Config {
@@ -193,6 +199,7 @@ impl ParquetS3Config {
             prefix: None,
             region: None,
             endpoint_url: None,
+            credentials: faucet_common_s3::S3Credentials::default(),
         }
     }
 
@@ -204,12 +211,19 @@ impl ParquetS3Config {
             prefix: Some(prefix.into()),
             region: None,
             endpoint_url: None,
+            credentials: faucet_common_s3::S3Credentials::default(),
         }
     }
 
     /// Set the AWS region.
     pub fn region(mut self, region: impl Into<String>) -> Self {
         self.region = Some(region.into());
+        self
+    }
+
+    /// Set how the source authenticates.
+    pub fn credentials(mut self, credentials: faucet_common_s3::S3Credentials) -> Self {
+        self.credentials = credentials;
         self
     }
 

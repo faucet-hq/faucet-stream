@@ -32,6 +32,9 @@ array, CSV, XML, Excel, Avro, Parquet, raw text), compression, encryption at
 rest, `{part}` rollover by records or bytes, `if_exists: replace | append |
 error`, the `write_mode: overwrite` swap, CSV headers written when a file is
 published, and Parquet schema inference, widening or an explicit schema.
+Appending to a stored CSV file reads it back first; a stored file larger than
+2 GiB (compressed or once decompressed), or with a record longer than 256 MiB,
+is refused instead of read into memory — add `{part}` to start new files.
 
 A sink maps its config onto `WriteConfig` — the one mapping every file sink
 shares (record and byte caps, `batch_size`, the path rules, the per-sink

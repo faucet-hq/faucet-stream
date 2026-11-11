@@ -1,5 +1,6 @@
 //! Snowflake sink configuration.
 
+use faucet_core::staging::StagingCredentials;
 use faucet_core::{AuthSpec, DEFAULT_BATCH_SIZE};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -146,8 +147,31 @@ pub struct SnowflakeStageConfig {
     /// region, endpoint, …), applied verbatim — e.g. `aws_access_key_id`,
     /// `aws_secret_access_key`, `aws_region`, `google_service_account_key`.
     /// Prefer `${secret:…}` / `${env:…}` interpolation for secret values.
+    ///
+    /// Keys that name an endpoint (`*endpoint*`, `*_url`, `*_uri`, a proxy)
+    /// or a local file (`*_file`, `*_path`, a service-account or
+    /// application-credentials file) are checked like the typed fields by a
+    /// host that confines configs (`faucet serve`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[schemars(extend("x-faucet-resource-keys" = {
+        "*endpoint*": "url",
+        "*_url": "url",
+        "*_uri": "url",
+        "*_host": "url",
+        "*proxy": "url",
+        "*authority_host": "url",
+        "*_file": "path",
+        "*_path": "path",
+        "*application_credentials": "path",
+        "google_service_account": "path",
+        "service_account": "path"
+    }))]
     pub storage_options: HashMap<String, String>,
+    /// How the upload client authenticates (default: the store's default
+    /// chain, i.e. the identity of the host faucet runs on, unless
+    /// `storage_options` names credentials). Keys in `storage_options` win.
+    #[serde(default, skip_serializing_if = "StagingCredentials::is_default")]
+    pub credentials: StagingCredentials,
     /// `MATCH_BY_COLUMN_NAME` COPY option — defaults to `CASE_INSENSITIVE` so
     /// Parquet columns map to table columns by name. Set to `NONE` for
     /// positional loading (rarely wanted for Parquet).
@@ -161,6 +185,52 @@ pub struct SnowflakeStageConfig {
 
 /// Manual `Debug` so `storage_options` values (which may carry cloud
 /// credentials) are never printed — only the key names are shown.
+impl SnowflakeStageConfig {
+    /// The option map the upload client is built from: the credentials'
+    /// keys, then `storage_options` (which win).
+    pub fn effective_storage_options(&self) -> HashMap<String, String> {
+        let mut options: HashMap<String, String> = self
+            .credentials
+            .store_options()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        options.extend(self.storage_options.clone());
+        options
+    }
+}
+
+/// The field of a `bulk_load` block (a JSON object) that makes the upload
+/// client authenticate with the identity of the host faucet runs on:
+/// `bulk_load.storage_options.<key>` for a key naming a role, profile or
+/// metadata endpoint, else `bulk_load.credentials` when neither the
+/// credentials nor `storage_options` name a credential of the stage's store.
+pub fn bulk_load_host_identity(stage: &faucet_core::Value) -> Option<String> {
+    use faucet_core::resolve::{StoreKind, store_options_host_identity};
+    let kind = StoreKind::from_url(stage.get("url")?.as_str()?)?;
+    let mut options: Vec<(String, String)> = serde_json::from_value::<StagingCredentials>(
+        stage.get("credentials").cloned().unwrap_or_default(),
+    )
+    .unwrap_or_default()
+    .store_options()
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect();
+    if let Some(map) = stage.get("storage_options").and_then(|m| m.as_object()) {
+        options.extend(
+            map.iter()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))),
+        );
+    }
+    store_options_host_identity(kind, options).map(|key| {
+        if key == "credentials" {
+            "bulk_load.credentials".to_string()
+        } else {
+            format!("bulk_load.storage_options.{key}")
+        }
+    })
+}
+
 impl std::fmt::Debug for SnowflakeStageConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SnowflakeStageConfig")
@@ -170,6 +240,7 @@ impl std::fmt::Debug for SnowflakeStageConfig {
                 "storage_options",
                 &self.storage_options.keys().collect::<Vec<_>>(),
             )
+            .field("credentials", &self.credentials)
             .field("match_by_column_name", &self.match_by_column_name)
             .field("purge", &self.purge)
             .finish()
@@ -344,6 +415,7 @@ mod tests {
             storage_options: std::collections::HashMap::new(),
             match_by_column_name: default_match_by_column_name(),
             purge: false,
+            credentials: Default::default(),
         });
         let stage = cfg.bulk_load.expect("bulk_load set");
         assert_eq!(stage.stage, "STG");
@@ -359,6 +431,47 @@ mod tests {
     }
 
     #[test]
+    fn bulk_load_host_identity_follows_the_selected_credentials() {
+        use serde_json::json;
+        let host = |v: serde_json::Value| bulk_load_host_identity(&v);
+        assert_eq!(
+            host(json!({"stage": "S", "url": "s3://b/p/"})).as_deref(),
+            Some("bulk_load.credentials")
+        );
+        assert_eq!(host(json!({"stage": "S", "url": "file:///tmp/x/"})), None);
+        assert_eq!(
+            host(json!({"stage": "S", "url": "s3://b/p/", "credentials": {
+                "type": "access_key", "config": {"access_key_id": "a", "secret_access_key": "s"}}})),
+            None
+        );
+        assert_eq!(
+            host(
+                json!({"stage": "S", "url": "s3://b/p/", "storage_options": {
+                "aws_access_key_id": "a", "aws_secret_access_key": "s"}})
+            ),
+            None
+        );
+        assert_eq!(
+            host(
+                json!({"stage": "S", "url": "s3://b/p/", "storage_options": {
+                "aws_access_key_id": "a", "aws_secret_access_key": "s", "aws_role_arn": "r"}})
+            )
+            .as_deref(),
+            Some("bulk_load.storage_options.aws_role_arn")
+        );
+        assert_eq!(
+            host(json!({"stage": "S", "url": "gs://b/p/", "credentials": {
+                "type": "service_account_json_inline", "config": {"json": "{}"}}})),
+            None
+        );
+        assert_eq!(
+            host(json!({"stage": "S", "url": "azure://c/p/", "credentials": {
+                "type": "sas_token", "config": {"sas_token": "?sv=1"}}})),
+            None
+        );
+    }
+
+    #[test]
     fn stage_debug_masks_storage_option_values() {
         let mut opts = std::collections::HashMap::new();
         opts.insert(
@@ -371,6 +484,7 @@ mod tests {
             storage_options: opts,
             match_by_column_name: default_match_by_column_name(),
             purge: true,
+            credentials: Default::default(),
         };
         let dbg = format!("{stage:?}");
         assert!(!dbg.contains("SUPER_SECRET"), "secret leaked: {dbg}");

@@ -243,7 +243,12 @@ any of whose segments could match into a system tree or onto a protected file
 is refused only when it would write such a file, so it may use a directory
 that also holds one. In a config the request carries, such a path may not
 take a value from records (`${parent.*}` and other runtime tokens other than
-`${now.*}`, `${backfill.*}` and `${partition.*}`).
+`${now.*}`, `${backfill.*}` and `${partition.*}`). In a run of a caller's
+config, or of a template holding values its caller supplied, a record value
+in a path or remote-path field may not turn the path into a URL or leave a
+leading segment empty (anchoring the path at the root), and a remote path on
+the connector's own server (an SFTP `path` or `file_name`) may not take a `..`
+segment from a caller-supplied value.
 
 ### SQL connectors run sandboxed
 
@@ -283,6 +288,50 @@ otherwise it is a `422`. A config submitted for a tenant is refused even then.
 Registered templates and the triggers file are written by the server's
 operator and may always use them.
 
+### Listeners
+
+A connector field annotated `x-faucet-resource: listen` opens a listener in
+the server process — among the built-ins, a `webhook` source's
+`listen_addr`. In a config **the request carries** it must be a literal
+`address:port` inside an `--allow-listen` range (default `127.0.0.1` and
+`[::1]`, ports 29100–29199): a host name, port `0`, the server's own
+`--listen` port or an address outside the ranges is a `403` naming the
+ranges to use. An address the config leaves out is the connector's default
+(`127.0.0.1:8080` for `webhook`), and is checked the same way. A listener
+off loopback also needs a non-empty `auth_token` or a `signature` with a
+non-empty `secret`, so not everyone who
+can reach the port can add records. `POST /v1/doctor` (whose probe binds
+the address) is checked too, and the webhook source checks again when it
+binds inside a caller's run. A tenant's config may open none. Registered
+templates, the triggers file and `faucet run` bind where they say. In a
+cluster, while a member that does not check listeners is live, a caller's
+config that opens one is refused with `503` until the rolling upgrade
+finishes.
+
+### Memory bounds
+
+A config **the request carries** may not lift what a connector holds in the
+server's memory: a source's `batch_size: 0` (one page holding the whole
+result) is a `403`, and so is a field whose schema carries
+`x-faucet-caller-max: N` set to `null`, `0` or above `N`. Among the
+built-ins: `max_staged_records` on the CDC sources and `oracle-cdc`'s
+`max_staged_records_total` (1 to 1,000,000), a
+`websocket` source's `max_message_bytes` (up to 64 MiB) and a `webhook`
+source's `timeout_secs` (up to 3,600), `max_payloads` (up to 1,000,000) and
+`max_buffered_bytes` (up to 1 GiB). A field the config leaves out keeps the
+connector's default, except a field also marked `x-faucet-caller-set`, whose
+default is no bound (`oracle-cdc`'s `max_staged_records_total`): it must be
+set. These are record and byte counts per connector, not a
+memory limit for the run; registered templates, the triggers file and
+`faucet run` are not limited by them.
+
+### Keys the server sets
+
+A sink config key the server sets for a run itself is removed from a config
+**the request carries** before it loads: `_overwrite_run` (the token that
+gives an overwrite run its own staging area) is always chosen by the server,
+so two runs never share one.
+
 ### Reference policy
 
 Every config the server loads from a caller is checked against one
@@ -313,9 +362,60 @@ reads it the way the connector's client does:
   needs `--allow-subprocess-connectors`; `PROTOCOL=IPC`, a descriptor without a
   `HOST`, a bare net service name and `ldap:` naming are refused for a caller,
   since the server's own Oracle configuration would resolve them.
-- **`azure-conn`** (Azure Storage `connection_string`): every `…Endpoint=` URL
-  and the account host built from `AccountName` / `EndpointSuffix`.
+- **`azure-conn`** (Azure Storage `connection_string`): read as the Azure
+  client reads it — only the exact keys `AccountName`, `AccountKey`,
+  `SharedAccessSignature`, `BlobEndpoint`, `EndpointSuffix`,
+  `DefaultEndpointsProtocol` and `UseDevelopmentStorage` count, and the last of
+  a repeated key wins. The host checked is `BlobEndpoint`, else the account
+  host built from `AccountName` / `EndpointSuffix` (default
+  `core.windows.net`), plus the loopback host for `UseDevelopmentStorage=true`;
+  every other `…Endpoint=` key, in any case, is checked too. For an
+  `azure-blob` connector the blob host comes from the whole connection
+  (`account`, `endpoint`, `use_emulator` and the string, in the order the
+  client applies them), so a private endpoint or the emulator needs only its
+  own host allowed. `AccountName` (and the connector's `account`) must be an
+  Azure storage account name — 3 to 24 lowercase letters and digits — and
+  `DefaultEndpointsProtocol` must be `http` or `https`, under every policy. A
+  caller's string that writes one of those keys in another case
+  (`accountname=`), which the client ignores, is refused, naming the key.
 - **`url-list`** (Kafka `brokers`, NATS `servers`): every element.
+
+A `mongodb://` or `mongodb+srv://` URI, in any field, is read the way the
+MongoDB driver reads it: options start at the first `?` (a `,` or `://` inside
+an option does not start a new URL), user info ends at the last `@`, hosts end
+at the first `/` and are split on `,` (`#` and `;` are ordinary host
+characters), option keys are compared after lower-casing (Unicode, so
+`tlsCertificateKeyFile` is matched however it is cased) and values are
+percent-decoded with `+` kept as `+`. For a caller's config:
+
+- every host, and `proxyHost`, is checked against the host rules; a host ending
+  in `.sock` is a Unix socket path, checked against the path roots (a relative
+  one is refused);
+- `tlsCAFile` and `tlsCertificateKeyFile` are paths under the path roots;
+- `tlsInsecure`, `tlsAllowInvalidCertificates` and `tlsAllowInvalidHostnames`
+  with any value other than `false` need `--allow-unverified-tls`;
+- `authMechanism=MONGODB-AWS` or `GSSAPI`, or any `ENVIRONMENT` entry in
+  `authMechanismProperties` (`MONGODB-OIDC` with the server's Kubernetes,
+  Azure or GCP identity), authenticates with the server's own credentials and
+  is refused;
+- with `--allow-url-host`, a `mongodb+srv://` name must be admitted by a
+  `*.<parent domain>` entry, since its lookup may return any host under that
+  domain;
+- without `--allow-url-host`, and always for a tenant, the URI must keep the
+  driver on the server it names: add `directConnection=true` (one server), or
+  `loadBalanced=true` behind a load balancer. A replica set seed list, a
+  `replicaSet` without `directConnection=true` and `mongodb+srv://` (without
+  `loadBalanced=true`) are refused, because the server the driver reaches
+  names the further hosts it connects to.
+
+The same rule covers other clients that learn servers from the one they
+reach. Without `--allow-url-host`, and always for a tenant, a NATS client is
+built with `ignore_discovered_servers: true` (a submitted `false` is
+overwritten), and a `kafka` source, sink, DLQ sink or lineage transport and an
+`oracle` / `oracle-cdc` source or sink are refused (`403`): those clients
+follow the brokers and listener redirects their servers advertise, which the
+server cannot check. With `--allow-url-host` they run, and the advertised
+addresses are not checked against the list.
 
 Any URL value is trimmed first; a value that is, as a whole, an IP address
 (`fd00:ec2::254`) is a host; a `,` list whose later elements carry their own
@@ -324,9 +424,15 @@ its host; and a `unix:` / `redis+unix:` URL is checked as a path. A caller's
 value from which no server can be read (`postgres:///db` without a socket
 `host=`, `redis://`) is refused — name the server explicitly. A value longer
 than 64 KiB is refused. A free-form
-option map (Delta `storage_options`) names the keys that hold an endpoint or a
-credential file (`x-faucet-resource-keys`), and those keys are checked like the
-typed fields. A transform's config is read the same way (a `sql` transform's
+option map (Delta `storage_options`, Kafka `extra_client_config`) names the keys
+that hold an endpoint, a credential file or a program (`x-faucet-resource-keys`),
+and those keys are checked like the typed fields: Kafka's `bootstrap.servers`
+and `metadata.broker.list` as broker lists, `*.url` keys as URLs, `*.location`,
+`*.file` and `sasl.kerberos.keytab` as paths, and `plugin.library.paths`,
+`ssl.engine.location`, `ssl.providers` and `*.cmd` as programs, which a caller
+config may not set unless the server allows subprocess connectors (a tenant
+never). A Delta Azure account option (`azure_storage_account_name`,
+`account_name`) must be a storage account name. A transform's config is read the same way (a `sql` transform's
 `http` relation `url` and `csv` / `jsonl` relation `path`). The same allow-list covers `${env:}`,
 `${file:}`, `${secret:}` and secret-manager directives, the state, DLQ and
 lineage paths, every endpoint an `auth:` provider calls (`token_url`, `url`,
@@ -345,13 +451,46 @@ are stored and again whenever a run uses them.
 |-----------|-------------------------------|------------|
 | Local path (connector path, `${file:}`, state / DLQ / lineage file) | under the server's working directory or the system temp directory | `--allow-path-root DIR` (repeatable) |
 | URL scheme | any | `--allow-url-scheme` restricts it to the listed schemes |
-| URL host (including a database URL's `host=` / `hostaddr=` and the servers or `HOST=` entries of a `key=value` connection string or connect descriptor) | any, except link-local and cloud-metadata addresses (`169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`, `fd20:ce::254`, `fd00:c1::a9fe:a9fe`, `100.100.100.200`, `metadata.google.internal`) | `--allow-url-host` restricts it to the listed hosts (`*.example.com` matches subdomains); a metadata host is reachable only when listed |
-| A file a connection string names (`sslkey=`, `sslrootcert=`, `socket=`, `TrustServerCertificateCA=`, a wallet directory, Oracle `token_location` / `oci_config_file`) | under the path roots, like any local path | `--allow-path-root DIR` |
-| A setting that turns off certificate or host-key verification (`insecure_skip_verify`, MSSQL `trust_server_certificate` / `TrustServerCertificate=true`, SFTP `known_hosts: {mode: insecure}`, `verify_ca=false` in a MySQL URL, `#insecure` on a `rediss://` URL, Kafka `enable.ssl.certificate.verification=false`) | refused | `--allow-unverified-tls` (never for a tenant) |
-| A setting that authenticates with the server's own credentials (Oracle `external_auth`, Oracle `token_auth` other than `OAUTH` with a `token_location`) | refused | — (register the pipeline as a template) |
+| URL host (including a database URL's `host=` / `hostaddr=`, the servers or `HOST=` entries of a `key=value` connection string or connect descriptor, and a state store's or lineage transport's `url` / `brokers`, read from the state store's or transport's own schema whatever connectors the build includes) | any, except link-local and cloud-metadata addresses (`169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`, `fd20:ce::254`, `fd00:c1::a9fe:a9fe`, `100.100.100.200`, `metadata.google.internal`) | `--allow-url-host` restricts it to the listed hosts (`*.example.com` matches subdomains); a metadata host is reachable only when listed |
+| A Google credential key a Pub/Sub, Spanner or BigQuery connector is given (inline or as a file) | a `service_account` key only, whose `token_uri` follows the URL host and scheme rules; `authorized_user` and `external_account` credentials are refused | `--allow-url-host` / `--allow-url-scheme` for the `token_uri` |
+| A URL holding a control character (tabs, line breaks and leading or trailing control characters are first removed, as URL parsers do; the scheme, host and fragment are then read from what is left) | refused | — |
+| A file a connection string names (`sslkey=`, `sslrootcert=`, `socket=`, `TrustServerCertificateCA=`, MongoDB `tlsCAFile=` / `tlsCertificateKeyFile=` and `.sock` hosts, a wallet directory, Oracle `token_location` / `oci_config_file`) | under the path roots, like any local path | `--allow-path-root DIR` |
+| A setting that turns off certificate or host-key verification (`insecure_skip_verify`, MSSQL `trust_server_certificate` / `TrustServerCertificate=true`, SFTP `known_hosts: {mode: insecure}`, `verify_ca=false` in a MySQL URL, `#insecure` on a `rediss://` URL, MongoDB `tlsInsecure` / `tlsAllowInvalidCertificates` / `tlsAllowInvalidHostnames`, Kafka `enable.ssl.certificate.verification=false`, Oracle `tls.server_dn_match: false`) | refused | `--allow-unverified-tls` (never for a tenant) |
+| A connector that authenticates with the server's own identity: its environment, instance or workload role (IRSA, EKS Pod Identity, GKE workload identity, Azure managed identity), application-default credentials, local credential files or OS authentication (Oracle `external_auth`, Oracle `token_auth` other than `OAUTH` with a `token_location`, MongoDB `authMechanism=MONGODB-AWS` / `GSSAPI` or an `ENVIRONMENT` entry in `authMechanismProperties`, and every connector whose descriptor reports it, for example a cloud connector whose credentials are left to the default chain). An absent credentials field counts as the default it selects. A custom connector registered without an answer counts too | refused | `--allow-host-credentials` (never for a tenant), or register the pipeline as a template |
+| A MongoDB URI the driver may extend with hosts its server names (a seed list, `replicaSet`, `mongodb+srv://`) | refused; add `directConnection=true` (one server) or `loadBalanced=true` | `--allow-url-host` (never for a tenant) |
+| A client that follows servers its servers advertise: Kafka (source, sink, DLQ, lineage transport), Oracle (`oracle`, `oracle-cdc`) | refused; a NATS client is kept on its `servers` (`ignore_discovered_servers` forced on) | `--allow-url-host` (never for a tenant) |
 | `${env:NAME}` / `${secret:NAME}` | none | `--allow-env NAME` or `--allow-env 'PREFIX*'` |
 | `${vault:}` / `${aws-sm:}` / `${gcp-sm:}` / `${azure-kv:}` | none | `--allow-secret-scheme vault,aws-sm` |
 | A program (`singer`) | refused | `--allow-subprocess-connectors` |
+| A listener (a `webhook` source's `listen_addr`) | `127.0.0.1` and `[::1]`, ports 29100–29199 | `--allow-listen` (never for a tenant); see [Listeners](#listeners) |
+
+A config that would use the server's own identity is checked after its matrix
+rows are merged, for every row's source, sink and DLQ sink, every topology
+node and a mirror's snapshot source; the `403` names each connector and field,
+never a value. A value a caller supplies for a registered template's param
+(or a trigger value, or a schedule param) that lands in the config of such a
+connector is refused the same way, because the caller would then choose what
+the server's identity reaches; registering such a template answers with a
+warning. Inside a caller's run, a connector that would fall back to the
+server's identity when it builds its client fails the run with the same flag
+in its error. In a cluster, while a member that does not check this when it
+builds a connector is live, a caller's run whose connectors check it only at
+build time is refused with `503` until the rolling upgrade finishes; set
+`--allow-host-credentials` the same on every replica.
+
+What each built-in connector reports, and what a caller names instead:
+
+| Connector | Uses the server's identity | Name instead |
+|---|---|---|
+| `kinesis`, `sqs`, `dynamodb`, `s3`, `parquet` (S3 location) | `credentials` other than `access_key` (and `anonymous` for S3), or absent; `region` absent when the server's environment names none | `access_key` (LocalStack / MinIO too), `anonymous` for a public S3 bucket, and a `region` |
+| `redshift` | `iam` / `redshift_data_api` with `aws_credentials` other than `access_key` (or absent) or no region; the `copy` staging client's `copy.credentials` | `aws_credentials: access_key`, `copy.credentials: access_key` |
+| `gcs`, `bigquery`, `spanner`, `pubsub` | `application_default` (the default); BigQuery's `bulk_load.gcs_auth` too; nothing with `emulator_host` (Spanner, Pub/Sub) | a service-account key, file or inline; `anonymous` (GCS) |
+| `azure-blob` | `default` without `use_emulator`, `managed_identity`, a connection string with no key, SAS or emulator | `account_key`, `sas_token`, `service_principal`, a keyed connection string |
+| `clickhouse`, `mssql` (`staging`), `databricks` (cloud `staging`), `snowflake` (`bulk_load`) | the upload store's `credentials` left to the default chain; Snowflake also a `storage_options` key naming a role, profile, metadata endpoint or workload identity | `credentials: access_key` / `service_account_json_*` / `account_key` / `sas_token`, or static keys in `storage_options` |
+| `delta` | storage options naming no credential of the table's store, or a role / profile / metadata / workload-identity key; the table's store is built from the config's options alone, never the server's environment | static keys in `credentials` or `storage_options` |
+| `iceberg` | `client.assume-role.arn`; a Glue client without `aws_access_key_id` / `aws_secret_access_key`, with `profile_name` or without a region; an `s3://` / `gs://` warehouse whose properties name no storage credential (Glue, SQL, HMS) | static keys in `catalog.properties`; a REST catalog's vended credentials keep working |
+| `kafka` | `extra_client_config` `sasl.mechanism` / `sasl.mechanisms` = `GSSAPI`, or a `SASL_*` `security.protocol` with no other mechanism (GSSAPI is librdkafka's default) | SASL PLAIN / SCRAM, mTLS |
+| `mongodb`, `mongodb-cdc`, `oracle`, `oracle-cdc` | as listed above | a user and password |
 
 A refused reference is a `403` that names the field, the value and the flag
 that would allow it; for a URL or connection string it names the field and the
@@ -362,7 +501,10 @@ link's target, as the kernel would — and a `..` that leaves a root, or that
 follows a directory which does not exist yet, is refused. A path field that
 holds a remote location (`s3://`, `s3a://`, `gs://`, `gcs://`, `az://`,
 `abfss://`, `http(s)://`, `sftp://`, …) is checked as a URL, and may not
-contain a `..` segment. Anything else is a local path: a relative path whose
+contain a `..` segment. The file source applies the roots again to every file
+a directory or glob lists: a file whose resolved path leaves the roots (a
+symlink below a root that points outside it) fails the run, and each file is
+opened without following links once it has been checked. Anything else is a local path: a relative path whose
 first segment contains `:` (`zz:/x`, `zz://x`) reads as a URL scheme to some
 readers and as a directory to others, so it is refused — write `./zz:/x` or an
 absolute path — and so is a path starting with `~`, which some engines expand
@@ -588,7 +730,7 @@ template) `POST /v1/templates/{id}/runs`, `run_template` and a template trigger.
 | `GET`/`POST` | `/v1/tenants/{tenant}/connections` | `200`/`201` | List (never credentials) / store a sealed connection `{name, provider: {type, config}}` — operator / `ConnectionManage` |
 | `GET`/`PUT`/`DELETE` | `/v1/tenants/{tenant}/connections/{name}` | `200`/`204` | Read, replace (reconnect) or delete one connection |
 | `POST` | `/v1/tenants/{tenant}/connect/{provider}` | `200` | Start a hosted OAuth flow — `{connection, redirect}` → `{authorize_url, expires_at}` |
-| `GET` | `/v1/connect/callback` | `303` | OAuth redirect target (unauthenticated; the single-use `state` is the credential) |
+| `GET` | `/v1/connect/callback` | `303` | OAuth redirect target (unauthenticated; the single-use `state` is the credential). Redirects with `status=ok`, or `status=error&error=<code>`; a provider `error` is passed on only when it is 1–64 characters of `[A-Za-z0-9_.-]`, else as `provider_error` |
 | `GET` | `/v1/connect/providers` | `200` | The `--connect-providers` providers |
 | `POST` | `/v1/tenants/{tenant}/runs` | `202` | A `POST /v1/runs` body, run as the tenant — operator / `RunWrite` |
 | `POST` | `/v1/tenants/{tenant}/templates/{id}/runs` | `202` | A template trigger, run as the tenant — operator / `RunWrite` |
@@ -640,8 +782,10 @@ Request body:
   submit returns `422` with the doctor report in `error.details`.
 - **`idempotency_key`** — replay protection (see cookbook). Keys are scoped to
   the tenant a run is for, so two tenants sending the same key start two runs.
-  The prefixes `tenant:`, `trig:`, `backfill:` and `change:` are reserved for
-  the keys the server derives itself; a caller's key starting with one is a `400`.
+  The prefixes `tenant:`, `trig:`, `sched:`, `backfill:` and `change:` are
+  reserved for the keys the server derives itself; a caller's key starting with
+  one is a `400` on every route that submits a run (including tenant runs,
+  template runs, fan-outs and `POST /v1/changes`).
   The request is identified by the config as submitted (before references
   resolve, merged with `--default-config`); a key claimed by the previous
   release, which identified it by the resolved config, still replays.
@@ -697,7 +841,11 @@ Request body:
   member running a release without pools is live. Part of the idempotency
   fingerprint when it is not `default`. The same field is accepted by
   `POST /v1/templates/{id}/runs` (and tenant runs and fan-out) and
-  `POST /v1/backfill`; the run record carries the resolved `pool`. See
+  `POST /v1/backfill`; the run record carries the resolved `pool`. On a
+  template run a caller or a tenant starts, a pool other than the template's
+  own `pool:` is a `422` unless the template's `pool_override` allows it
+  (`true`, or a list naming the pool); the operator's triggers, schedules and
+  fan-outs are not limited by it. See
   [Execution pools](../cookbook/cluster.md#execution-pools).
 
 Response (`202`):

@@ -171,6 +171,9 @@ pub fn host_of_server(server: &str) -> String {
     let bare = server.strip_prefix("tcp:").unwrap_or(server);
     let bare = bare.split(',').next().unwrap_or(bare);
     let bare = bare.split('\\').next().unwrap_or(bare);
+    if bare == "." {
+        return "localhost".to_string();
+    }
     bare.replace("(local)", "localhost")
 }
 
@@ -238,6 +241,8 @@ mod tests {
     #[test]
     fn names_the_server_host() {
         let host = |s: &str| server_host(&parse(s).unwrap());
+        assert_eq!(host("server=."), "localhost");
+        assert_eq!(host("server=tcp:.,1433"), "localhost");
         assert_eq!(host("Server=tcp:db.example.com,1433"), "db.example.com");
         assert_eq!(host("Data Source=db\\inst,1433"), "db");
         assert_eq!(host("Server=(local)"), "localhost");

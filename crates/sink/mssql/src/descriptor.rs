@@ -4,7 +4,12 @@ use faucet_core::capabilities::config::{dedups_by_key, is_set, tag};
 use faucet_core::{Capabilities, ConnectorDescriptor, SchemaReport, Value, WriteMode};
 
 /// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
-pub const DESCRIPTOR: ConnectorDescriptor = ConnectorDescriptor::new("mssql", capabilities);
+pub const DESCRIPTOR: ConnectorDescriptor =
+    ConnectorDescriptor::new("mssql", capabilities).with_host_identity(host_identity);
+
+fn host_identity(config: &Value) -> Vec<String> {
+    faucet_core::staging_host_identity(config, "/staging")
+}
 
 fn capabilities(config: &Value) -> Capabilities {
     let kind_level = config.is_null();

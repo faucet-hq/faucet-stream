@@ -10,7 +10,7 @@
 
 mod auth;
 
-pub use auth::{SqsCredentials, build_client};
+pub use auth::{SqsCredentials, build_client, host_identity, host_identity_at, region_from_env};
 
 /// Whether `queue_url` names a FIFO queue (SQS FIFO queue names end in
 /// `.fifo`). FIFO queues need per-group ordering care on both sides.

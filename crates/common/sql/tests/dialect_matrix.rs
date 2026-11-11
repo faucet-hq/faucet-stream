@@ -170,6 +170,8 @@ fn matrix_quoting() {
     assert_eq!(BigQuery.quote_ident("a`b"), "`a\\`b`");
     assert_eq!(Databricks.quote_literal("a\\'b"), "'a\\\\\\'b'");
     assert_eq!(Snowflake.quote_literal("a\\'b"), "'a\\\\''b'");
+    assert_eq!(Redshift.quote_literal("a\\'b"), "'a\\\\''b'");
+    assert_eq!(Redshift.quote_literal("dir\\"), "'dir\\\\'");
 }
 
 fn mapping_follows_the_dialect_rule<D: SqlDialect>(d: D) {

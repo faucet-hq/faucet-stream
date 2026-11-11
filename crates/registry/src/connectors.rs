@@ -1682,6 +1682,90 @@ pub fn sink_capabilities(kind: &str, config: &Value) -> Capabilities {
     }
 }
 
+/// Whether a connector authenticates with the identity of the host it runs
+/// on (its environment, instance or workload role, local credential files)
+/// under a config ([`source_host_identity`] / [`sink_host_identity`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HostIdentity {
+    /// The config fields that make it use the host's identity; empty = it
+    /// does not.
+    Fields(Vec<String>),
+    /// A custom connector registered without an answer
+    /// ([`ConnectorDescriptor::with_host_identity`]): it may.
+    Unknown,
+}
+
+impl HostIdentity {
+    /// Whether the connector does, or may, use the host's identity.
+    pub fn uses_host_identity(&self) -> bool {
+        match self {
+            HostIdentity::Fields(f) => !f.is_empty(),
+            HostIdentity::Unknown => true,
+        }
+    }
+
+    /// The fields named, empty for [`HostIdentity::Unknown`].
+    pub fn fields(&self) -> &[String] {
+        match self {
+            HostIdentity::Fields(f) => f,
+            HostIdentity::Unknown => &[],
+        }
+    }
+}
+
+/// The answer of a registered custom connector's descriptor, or of the
+/// built-in one when `custom` is `None` (a first-party connector without an
+/// answer, or a kind this binary does not know, uses none).
+fn host_identity_of(
+    custom: Option<Option<ConnectorDescriptor>>,
+    builtin: Option<ConnectorDescriptor>,
+    config: &Value,
+) -> HostIdentity {
+    let config = config_object(config);
+    match custom {
+        Some(d) => d
+            .and_then(|d| d.host_identity(&config))
+            .map_or(HostIdentity::Unknown, HostIdentity::Fields),
+        None => HostIdentity::Fields(
+            builtin
+                .and_then(|d| d.host_identity(&config))
+                .unwrap_or_default(),
+        ),
+    }
+}
+
+/// Whether a source of `kind` configured with `config` authenticates with the
+/// host's own identity, read without building it. A custom connector
+/// registered without an answer is [`HostIdentity::Unknown`].
+pub fn source_host_identity(kind: &str, config: &Value) -> HostIdentity {
+    host_identity_of(
+        global().sources.get(kind).map(|e| e.descriptor),
+        builtin_source_descriptor(kind),
+        config,
+    )
+}
+
+/// [`source_host_identity`] for sinks.
+pub fn sink_host_identity(kind: &str, config: &Value) -> HostIdentity {
+    host_identity_of(
+        global().sinks.get(kind).map(|e| e.descriptor),
+        builtin_sink_descriptor(kind),
+        config,
+    )
+}
+
+/// Whether a source of `kind` also checks the host's identity when it builds
+/// a client ([`ConnectorDescriptor::with_runtime_host_identity`]).
+pub fn source_checks_host_identity_at_runtime(kind: &str) -> bool {
+    source_descriptor(kind).is_some_and(|d| d.checks_host_identity_at_runtime())
+}
+
+/// [`source_checks_host_identity_at_runtime`] for sinks.
+pub fn sink_checks_host_identity_at_runtime(kind: &str) -> bool {
+    sink_descriptor(kind).is_some_and(|d| d.checks_host_identity_at_runtime())
+}
+
 /// Every capability some config of a source `kind` enables — the kind-level
 /// view listings show ([`ConnectorDescriptor::kind_capabilities`]).
 pub fn source_kind_capabilities(kind: &str) -> Capabilities {

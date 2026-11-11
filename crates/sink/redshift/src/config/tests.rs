@@ -39,6 +39,7 @@ fn validate_checks_the_effective_copy_block() {
         iam_role: Some("arn:role".into()),
         region: None,
         endpoint_url: None,
+        credentials: Default::default(),
     });
     c.validate().expect("copy block alone is valid");
 
@@ -50,6 +51,7 @@ fn validate_checks_the_effective_copy_block() {
         iam_role: None,
         region: None,
         endpoint_url: None,
+        credentials: Default::default(),
     });
     assert!(
         c.validate().is_err(),

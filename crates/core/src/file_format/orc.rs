@@ -1,9 +1,16 @@
 //! Apache ORC (#719) — **read-only**.
 //!
 //! Decoded with `orc-rust`, which reads straight into Arrow `RecordBatch`es,
-//! stripe by stripe: memory is bounded by one stripe's decoded batch (capped at
-//! the configured batch size), not by the file. `orc.columns` projects
-//! top-level columns before any stripe is decoded.
+//! stripe by stripe, at most the configured batch size per batch.
+//! `orc.columns` projects top-level columns before any stripe is decoded.
+//!
+//! Memory is not bounded by the batch size alone: `orc-rust` decompresses the
+//! footer and each stream chunk whole, without a limit on the decompressed
+//! size, so a small file can decompress to far more than it holds. Bounding
+//! that needs `orc-rust` to cap every codec's output (faucet-stream#1062).
+//! On [`ContainerDecoder`](super::ContainerDecoder)'s record path the
+//! converted records are charged against `max_decoded_bytes` (see
+//! [`DecodeBudget`](super::DecodeBudget)).
 //!
 //! There is no ORC writer here by design. `orc-rust`'s writer is experimental:
 //! it covers primitive columns only, panics on nested and temporal types, and

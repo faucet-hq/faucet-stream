@@ -2,7 +2,9 @@ use faucet_core::{Capabilities, ConnectorDescriptor, SchemaReport};
 use serde_json::Value;
 
 /// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
-pub const DESCRIPTOR: ConnectorDescriptor = ConnectorDescriptor::new("delta", capabilities);
+pub const DESCRIPTOR: ConnectorDescriptor = ConnectorDescriptor::new("delta", capabilities)
+    .with_host_identity(faucet_common_delta::connection::host_identity)
+    .with_runtime_host_identity();
 
 fn capabilities(_config: &Value) -> Capabilities {
     Capabilities::append_only_sink()

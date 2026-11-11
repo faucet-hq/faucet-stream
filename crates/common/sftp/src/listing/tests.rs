@@ -253,3 +253,62 @@ fn joined_paths_follow_the_listed_path() {
     assert_eq!(join("/d", "a"), "/d/a");
     assert_eq!(join("d/", "a"), "d/a");
 }
+
+#[test]
+fn a_failed_second_connection_names_both_limits() {
+    let e = ListError::SecondConnectionRefused {
+        server: "h:22".into(),
+        reason: "connection refused".into(),
+    }
+    .to_string();
+    assert!(
+        e.contains("h:22") && e.contains("connection refused"),
+        "{e}"
+    );
+    assert!(e.contains("MaxSessions"), "{e}");
+    assert!(e.contains("two connections per user"), "{e}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lister_refusal_stays_with_its_lister() {
+    let Some((_c, port)) = crate::test_support::server().await else {
+        return;
+    };
+    let handle = crate::authenticate(&crate::test_support::config(port))
+        .await
+        .unwrap();
+    let first = handle.lister().await.unwrap();
+    first.guard.record(crate::MAX_INBOUND_PACKET + 1);
+    assert!(handle.refusal().is_none());
+    let e = ListError::Channel("closed".into()).explained(&first.guard);
+    assert!(matches!(e, ListError::PacketTooLarge(_)), "{e}");
+
+    let second = handle.lister().await.unwrap();
+    assert!(second.guard.refusal().is_none());
+    second.list_dir("/data", 10, |_, _| true).await.unwrap();
+    first.close().await;
+    second.close().await;
+    let session = handle.open_session().await.unwrap();
+    session.canonicalize(".").await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn closing_a_lister_waits_only_for_the_servers_close() {
+    let Some((_c, port)) = crate::test_support::server().await else {
+        return;
+    };
+    let handle = crate::authenticate(&crate::test_support::config(port))
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        let lister = handle.lister().await.unwrap();
+        lister.list_dir("/data", 10, |_, _| true).await.unwrap();
+        let started = std::time::Instant::now();
+        lister.close().await;
+        assert!(
+            started.elapsed() < CLOSE_WAIT / 2,
+            "{:?}",
+            started.elapsed()
+        );
+    }
+}

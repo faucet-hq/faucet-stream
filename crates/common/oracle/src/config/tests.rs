@@ -253,3 +253,24 @@ fn scope_label_separates_hosts_sharing_a_service_name() {
         "unchanged for a connect string"
     );
 }
+
+#[test]
+fn turning_off_dn_matching_needs_the_unverified_flag() {
+    let schema = serde_json::to_value(schemars::schema_for!(OracleConnectionConfig)).unwrap();
+    let unverified = |config: serde_json::Value| {
+        faucet_core::resolve::annotated_resources(&schema, &config)
+            .into_iter()
+            .filter(|r| r.kind == faucet_core::resolve::ResourceKind::Unverified)
+            .map(|r| r.value)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        unverified(json!({"host": "db", "tls": {"enabled": true, "server_dn_match": false}})),
+        vec!["tls.server_dn_match: false".to_string()]
+    );
+    assert!(
+        unverified(json!({"host": "db", "tls": {"enabled": true, "server_dn_match": true}}))
+            .is_empty()
+    );
+    assert!(unverified(json!({"host": "db", "tls": {"enabled": true}})).is_empty());
+}

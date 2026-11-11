@@ -66,6 +66,7 @@ pub enum LineageKind {
 pub enum Transport {
     /// POST each event to an OpenLineage HTTP endpoint (e.g. Marquez).
     Http {
+        #[schemars(extend("x-faucet-resource" = "url"))]
         url: String,
         #[serde(
             with = "faucet_core::config::duration_secs",
@@ -77,10 +78,18 @@ pub enum Transport {
         auth: Option<HttpAuth>,
     },
     /// Append each event as one JSON line to a local file.
-    File { path: PathBuf },
+    File {
+        #[schemars(extend("x-faucet-resource" = "path"))]
+        path: PathBuf,
+    },
     /// Produce each event as a JSON message to a Kafka topic.
     #[cfg(feature = "transport-kafka")]
-    Kafka { brokers: String, topic: String },
+    #[schemars(extend("x-faucet-follows-servers" = true))]
+    Kafka {
+        #[schemars(extend("x-faucet-resource" = "url", "x-faucet-url-syntax" = "url-list"))]
+        brokers: String,
+        topic: String,
+    },
 }
 
 /// HTTP transport auth. Same `{ type, config: { … } }` shape as connector auth

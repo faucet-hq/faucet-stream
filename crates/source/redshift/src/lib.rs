@@ -21,7 +21,8 @@ pub use stream::RedshiftSource;
 
 /// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
 pub const DESCRIPTOR: faucet_core::ConnectorDescriptor =
-    faucet_core::ConnectorDescriptor::new("redshift", capabilities);
+    faucet_core::ConnectorDescriptor::new("redshift", capabilities)
+        .with_host_identity(faucet_common_redshift::host_identity);
 
 /// The query's columns are declared from its describe (#955).
 fn capabilities(_config: &faucet_core::Value) -> faucet_core::Capabilities {

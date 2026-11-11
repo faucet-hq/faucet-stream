@@ -34,6 +34,9 @@ pub struct NatsConnectionConfig {
     pub tls_options: TlsOptions,
     /// Optional client connection name (surfaced in NATS server monitoring).
     pub name: Option<String>,
+    /// Connect only to `servers`, ignoring the cluster members a server
+    /// advertises. Defaults to `false`.
+    pub ignore_discovered_servers: bool,
 }
 
 /// `tls:` on the wire: a flag or a settings block.
@@ -74,6 +77,11 @@ struct NatsConnectionWire {
     /// Optional client connection name (surfaced in NATS server monitoring).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+    /// Connect only to `servers`, ignoring the cluster members a server
+    /// advertises. Defaults to `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[schemars(extend("x-faucet-pin-servers" = true))]
+    ignore_discovered_servers: bool,
 }
 
 impl From<NatsConnectionWire> for NatsConnectionConfig {
@@ -88,6 +96,7 @@ impl From<NatsConnectionWire> for NatsConnectionConfig {
             tls,
             tls_options,
             name: w.name,
+            ignore_discovered_servers: w.ignore_discovered_servers,
         }
     }
 }
@@ -104,6 +113,7 @@ impl From<NatsConnectionConfig> for NatsConnectionWire {
             auth: c.auth,
             tls,
             name: c.name,
+            ignore_discovered_servers: c.ignore_discovered_servers,
         }
     }
 }
@@ -144,6 +154,7 @@ impl std::fmt::Debug for NatsConnectionConfig {
             .field("tls", &self.tls)
             .field("tls_options", &self.tls_options)
             .field("name", &self.name)
+            .field("ignore_discovered_servers", &self.ignore_discovered_servers)
             .finish()
     }
 }
@@ -156,6 +167,7 @@ impl Default for NatsConnectionConfig {
             tls: false,
             tls_options: TlsOptions::default(),
             name: None,
+            ignore_discovered_servers: false,
         }
     }
 }
@@ -228,6 +240,9 @@ pub async fn connect(cfg: &NatsConnectionConfig) -> Result<async_nats::Client, F
     options = options.max_reconnects(MAX_RECONNECTS);
     if let Some(name) = &cfg.name {
         options = options.name(name.clone());
+    }
+    if cfg.ignore_discovered_servers {
+        options = options.ignore_discovered_servers();
     }
 
     async_nats::connect_with_options(cfg.servers.clone(), options)
@@ -337,6 +352,72 @@ impl rustls::client::danger::ServerCertVerifier for NoVerification {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A one-shot fake NATS server that advertises `other` as a cluster
+    /// member, then stops listening; `other` counts the connections it gets.
+    #[allow(clippy::disallowed_methods)] // drives time directly
+    async fn discovered_server_hits(ignore: bool) -> usize {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let other = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let other_addr = other.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counted = hits.clone();
+        let counter = tokio::spawn(async move {
+            while let Ok((s, _)) = other.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                drop(s);
+            }
+        });
+        let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = first.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = first.accept().await.unwrap();
+            drop(first);
+            let info = format!(
+                "INFO {{\"server_id\":\"a\",\"max_payload\":1048576,\"connect_urls\":[\"{other_addr}\"]}}\r\n"
+            );
+            s.write_all(info.as_bytes()).await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf).await;
+            let _ = s.write_all(b"PONG\r\n").await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        });
+        let cfg = NatsConnectionConfig {
+            servers: vec![format!("nats://{addr}")],
+            ignore_discovered_servers: ignore,
+            ..Default::default()
+        };
+        let client = connect(&cfg).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        drop(client);
+        counter.abort();
+        hits.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn nats_ignores_discovered_servers_for_callers() {
+        assert_eq!(discovered_server_hits(true).await, 0);
+        assert!(discovered_server_hits(false).await > 0);
+    }
+
+    #[test]
+    fn ignore_discovered_servers_round_trips_and_is_a_pin_switch() {
+        let cfg: NatsConnectionConfig =
+            serde_json::from_value(json!({"ignore_discovered_servers": true})).unwrap();
+        assert!(cfg.ignore_discovered_servers);
+        assert_eq!(
+            serde_json::to_value(&cfg).unwrap()["ignore_discovered_servers"],
+            true
+        );
+        let plain = serde_json::to_value(NatsConnectionConfig::default()).unwrap();
+        assert!(plain.get("ignore_discovered_servers").is_none());
+        let schema = serde_json::to_value(schemars::schema_for!(NatsConnectionConfig)).unwrap();
+        assert_eq!(
+            faucet_core::resolve::pin_servers_fields(&schema),
+            vec!["ignore_discovered_servers".to_string()]
+        );
+    }
 
     #[test]
     fn debug_redacts_credentials_in_server_urls() {

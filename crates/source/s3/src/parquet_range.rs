@@ -38,6 +38,7 @@ pub(crate) struct S3RangeReader {
     pin: Pin,
     recorder: Option<Arc<faucet_core::observability::RoundtripRecorder>>,
     calls: faucet_core::CallContext,
+    max_range_bytes: u64,
 }
 
 /// What every range read is tied to, so all of them see the object as the
@@ -111,7 +112,15 @@ impl S3RangeReader {
             pin,
             recorder,
             calls,
+            max_range_bytes: faucet_core::file_format::DEFAULT_MAX_OBJECT_BYTES,
         })
+    }
+
+    /// Refuse a single range longer than `max` bytes (`max_object_bytes`),
+    /// or one past the object's end, before any request.
+    pub(crate) fn with_max_range_bytes(mut self, max: u64) -> Self {
+        self.max_range_bytes = max;
+        self
     }
 
     pub(crate) fn len(&self) -> u64 {
@@ -123,6 +132,7 @@ impl S3RangeReader {
         if wanted == 0 {
             return Ok(Bytes::new());
         }
+        check_range(&self.key, &range, self.len, self.max_range_bytes)?;
         let header = range_header(&range);
         if let Some(r) = &self.recorder {
             r.record("get");
@@ -164,6 +174,30 @@ impl S3RangeReader {
 /// data instead of erroring.
 fn range_header(range: &Range<u64>) -> String {
     format!("bytes={}-{}", range.start, range.end.saturating_sub(1))
+}
+
+/// Refuse a range past the object's end or longer than `max_object_bytes`
+/// before any request: the ranges come from the object's own footer.
+fn check_range(key: &str, range: &Range<u64>, len: u64, max: u64) -> Result<(), ParquetError> {
+    let wanted = range.end.saturating_sub(range.start);
+    let refused = if range.end > len {
+        format!(
+            "S3 object '{key}' asks for bytes {}..{} but is {len} bytes; its Parquet metadata \
+             is corrupt",
+            range.start, range.end
+        )
+    } else if wanted > max {
+        format!(
+            "range {}..{} of S3 object '{key}' is {wanted} bytes, more than the {max} bytes one \
+             read may fetch (max_object_bytes)",
+            range.start, range.end
+        )
+    } else {
+        return Ok(());
+    };
+    Err(ParquetError::External(Box::new(std::io::Error::other(
+        refused,
+    ))))
 }
 
 /// A range read that failed outright.
@@ -230,6 +264,18 @@ mod tests {
         // fifth byte and shift every subsequent column value.
         assert_eq!(range_header(&(0..4)), "bytes=0-3");
         assert_eq!(range_header(&(1_000..1_001)), "bytes=1000-1000");
+    }
+
+    #[test]
+    fn a_range_past_the_end_or_over_the_cap_is_refused() {
+        assert!(check_range("k", &(0..10), 10, 10).is_ok());
+        let e = check_range("k", &(5..11), 10, 100).unwrap_err().to_string();
+        assert!(e.contains("'k'") && e.contains("corrupt"), "{e}");
+        let e = check_range("k", &(0..10), 10, 9).unwrap_err().to_string();
+        assert!(
+            e.contains("10 bytes") && e.contains("max_object_bytes"),
+            "{e}"
+        );
     }
 
     #[test]

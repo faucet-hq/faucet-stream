@@ -67,15 +67,19 @@ impl JournalColumn {
     }
 }
 
-/// `CAST(JSON_OBJECT('c1', <c1>, …) AS CHAR)` over the journaled columns —
-/// the row as JSON text.
-fn row_json_expr(columns: &[JournalColumn]) -> String {
-    let parts: Vec<String> = columns
+/// `CAST(JSON_OBJECT(?, <c1>, …) AS CHAR)` over the journaled columns — the
+/// row as JSON text — and the column names to bind to its placeholders, in
+/// order.
+fn row_json_expr(columns: &[JournalColumn]) -> (String, Vec<String>) {
+    let journaled: Vec<&JournalColumn> = columns.iter().filter(|c| !c.is_generated()).collect();
+    let parts: Vec<String> = journaled
         .iter()
-        .filter(|c| !c.is_generated())
-        .map(|c| format!("'{}', {}", c.name.replace('\'', "''"), c.image_expr()))
+        .map(|c| format!("?, {}", c.image_expr()))
         .collect();
-    format!("CAST(JSON_OBJECT({}) AS CHAR)", parts.join(", "))
+    (
+        format!("CAST(JSON_OBJECT({}) AS CHAR)", parts.join(", ")),
+        journaled.iter().map(|c| c.name.clone()).collect(),
+    )
 }
 
 impl MysqlDriver {
@@ -213,10 +217,10 @@ impl MysqlDriver {
                     .any(|c| c.name.eq_ignore_ascii_case(k) && is_binary_type(&c.data_type))
             })
             .collect();
-        let row_expr = row_json_expr(&columns);
+        let (row_expr, names) = row_json_expr(&columns);
         let sql = journal_sql();
 
-        let per = (MAX_MYSQL_PARAMS / (key.len().max(1) * 4)).max(1);
+        let per = (MAX_MYSQL_PARAMS.saturating_sub(names.len()) / (key.len().max(1) * 4)).max(1);
         for chunk in keys.chunks(per) {
             // Attribute each current row to its key by position: re-deriving
             // the key from the row's text misses a row whose stored form
@@ -225,6 +229,9 @@ impl MysqlDriver {
             // the run and deleted on rollback (#789 SQL-32).
             let select = positional_key_select(&table_ref, key, &row_expr, chunk.len());
             let mut q = sqlx::query(&select);
+            for name in &names {
+                q = q.bind(name);
+            }
             for kt in chunk {
                 q = self.bind_key_tuple(q, &kt.0, &binary)?;
             }
@@ -729,7 +736,10 @@ mod tests {
         };
         assert_eq!(
             row_json_expr(&[col("id", "int", ""), col("o'k", "varchar", "")]),
-            "CAST(JSON_OBJECT('id', `id`, 'o''k', `o'k`) AS CHAR)"
+            (
+                "CAST(JSON_OBJECT(?, `id`, ?, `o'k`) AS CHAR)".to_string(),
+                vec!["id".to_string(), "o'k".to_string()]
+            )
         );
         assert_eq!(
             row_json_expr(&[
@@ -739,10 +749,26 @@ mod tests {
                 col("g", "int", "STORED GENERATED"),
                 col("ts", "timestamp", "DEFAULT_GENERATED"),
             ]),
-            "CAST(JSON_OBJECT('b', REPLACE(TO_BASE64(`b`), CHAR(10 USING ascii), ''), \
-             'f', CAST(`f` AS UNSIGNED), \
-             'd', CAST(`d` AS CHAR), 'ts', `ts`) AS CHAR)"
+            (
+                "CAST(JSON_OBJECT(?, REPLACE(TO_BASE64(`b`), CHAR(10 USING ascii), ''), \
+                 ?, CAST(`f` AS UNSIGNED), \
+                 ?, CAST(`d` AS CHAR), ?, `ts`) AS CHAR)"
+                    .to_string(),
+                vec!["b".into(), "f".into(), "d".into(), "ts".into()]
+            )
         );
+    }
+
+    #[test]
+    fn journal_column_names_are_bound_not_spliced() {
+        let col = |name: &str| JournalColumn {
+            name: name.into(),
+            data_type: "varchar".into(),
+            extra: String::new(),
+        };
+        let (expr, names) = row_json_expr(&[col("a\\"), col("b', 1) -- ")]);
+        assert_eq!(expr, "CAST(JSON_OBJECT(?, `a\\`, ?, `b', 1) -- `) AS CHAR)");
+        assert_eq!(names, vec!["a\\".to_string(), "b', 1) -- ".to_string()]);
     }
 
     #[test]

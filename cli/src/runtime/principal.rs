@@ -64,6 +64,13 @@ impl Principal {
         self.caller_body
     }
 
+    /// Whether the body is the server operator's (a template, the triggers
+    /// file, a run admitted from one) rather than a caller's or a local
+    /// command's.
+    pub fn operator_body(&self) -> bool {
+        !self.caller_body && matches!(self.origin, Origin::Trusted | Origin::ServerFile)
+    }
+
     /// The reference policy the operation's runtime HTTP clients check their
     /// requests and redirects against: the caller policy for a body a caller
     /// supplied, none otherwise.

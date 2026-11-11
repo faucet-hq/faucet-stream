@@ -96,6 +96,34 @@ fn sync_parent(path: &Path) {
     }
 }
 
+/// Write `bytes` to a new file at `path`, fsynced. Whatever is at `path`
+/// already (a stale file or a link) is removed, never followed.
+pub(crate) fn write_fresh(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()
+}
+
+/// Refuse a directory that is a link: side files are only written in real
+/// directories of the output.
+fn refuse_linked_dir(dir: &Path) -> Result<(), FaucetError> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(m) if m.file_type().is_symlink() => Err(FaucetError::Sink(format!(
+            "file sink: '{}' is a link, not a directory",
+            dir.display()
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Remove the scratch files of `template` a crashed run left in `dir`.
 fn remove_stale_scratch(dir: &Path, template: &NameTemplate) {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -132,6 +160,9 @@ impl StorageBackend for LocalBackend {
         let create = area == Area::Swap || self.create_dirs;
         fs(move || {
             faucet_core::path_guard::check(&dir)?;
+            if area == Area::Swap {
+                refuse_linked_dir(&dir)?;
+            }
             if dir.is_dir() {
                 remove_stale_scratch(&dir, &template);
                 return Ok(());
@@ -337,12 +368,15 @@ impl StorageBackend for LocalBackend {
         let dir = self.dir.join(self.template.commit_ledger_dir_name());
         let text = text.to_string();
         fs(move || {
+            faucet_core::path_guard::check(&dir)?;
             std::fs::create_dir_all(&dir)
                 .map_err(|e| io_err("creating the overwrite commit ledger", &dir, e))?;
+            refuse_linked_dir(&dir)?;
             let path = dir.join(super::layout::COMMIT_LEDGER_FILE);
             let tmp = dir.join(format!("{}.tmp", super::layout::COMMIT_LEDGER_FILE));
-            std::fs::write(&tmp, text.as_bytes())
-                .and_then(|()| std::fs::File::open(&tmp)?.sync_all())
+            faucet_core::path_guard::check(&tmp)?;
+            faucet_core::path_guard::check(&path)?;
+            write_fresh(&tmp, text.as_bytes())
                 .map_err(|e| io_err("writing the overwrite commit ledger", &tmp, e))?;
             std::fs::rename(&tmp, &path)
                 .map_err(|e| io_err("writing the overwrite commit ledger", &path, e))?;
@@ -476,6 +510,64 @@ mod tests {
         b.delete(Area::Swap, "h").await.unwrap();
         assert!(!b.swap_dir().exists(), "the empty swap area is removed");
         assert!(!b.exists(Area::Swap, "h").await.unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_planted_symlink_at_the_ledger_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let b = backend(&dir.path().join("out"), true);
+        let ledger = dir
+            .path()
+            .join("out")
+            .join(template().commit_ledger_dir_name());
+        std::fs::create_dir_all(&ledger).unwrap();
+        std::fs::write(ledger.join(super::super::layout::COMMIT_LEDGER_FILE), b"0").unwrap();
+        let tmp = ledger.join(format!("{}.tmp", super::super::layout::COMMIT_LEDGER_FILE));
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+        b.write_commit_record("7").await.unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        assert_eq!(b.read_commit_record().await.unwrap().as_deref(), Some("7"));
+        assert!(std::fs::symlink_metadata(&tmp).is_err(), "the link is gone");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn side_files_replace_links_and_linked_swap_areas_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let marker = dir.path().join("marker.faucet-tmp");
+        std::os::unix::fs::symlink(&victim, &marker).unwrap();
+        write_fresh(&marker, b"m").unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        assert_eq!(std::fs::read(&marker).unwrap(), b"m");
+        write_fresh(&marker, b"n").unwrap();
+        assert_eq!(std::fs::read(&marker).unwrap(), b"n");
+        assert!(write_fresh(&dir.path().join("no/such"), b"x").is_err());
+        let as_dir = dir.path().join("d");
+        std::fs::create_dir_all(as_dir.join("x")).unwrap();
+        assert!(write_fresh(&as_dir, b"x").is_err());
+
+        let out = dir.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+        let b = backend(&out, true);
+        std::os::unix::fs::symlink(dir.path(), b.swap_dir()).unwrap();
+        let e = b.prepare(Area::Swap).await.unwrap_err();
+        assert!(e.to_string().contains("is a link"), "{e}");
+        b.prepare(Area::Destination).await.unwrap();
+
+        let other = dir.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        let ledger = other.join(template().commit_ledger_dir_name());
+        std::os::unix::fs::symlink(dir.path(), &ledger).unwrap();
+        let e = backend(&other, true)
+            .write_commit_record("1")
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("is a link"), "{e}");
     }
 
     #[tokio::test]

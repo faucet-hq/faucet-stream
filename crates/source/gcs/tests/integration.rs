@@ -692,6 +692,58 @@ async fn parquet_reads_by_row_group_and_whole_object() {
     }
 }
 
+/// A column chunk longer than `max_object_bytes` is refused before it is
+/// requested.
+#[cfg(feature = "arrow")]
+#[tokio::test]
+async fn parquet_ranges_respect_max_object_bytes() {
+    use futures::StreamExt;
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
+        return;
+    };
+    let rows: Vec<_> = (0..4_000)
+        .map(|i| serde_json::json!({"id": i, "payload": format!("{i:0100}")}))
+        .collect();
+    seed_bytes(
+        &host,
+        &bucket,
+        "cap/a.parquet",
+        parquet_bytes(&rows, 4_000),
+        "application/octet-stream",
+    )
+    .await;
+    let source = |max: u64| {
+        let mut cfg = GcsSourceConfig::new(&bucket)
+            .prefix("cap/")
+            .file_format(GcsFileFormat::Parquet)
+            .with_batch_size(1_000)
+            .auth(GcsCredentials::Anonymous)
+            .storage_host(&host);
+        cfg.max_object_bytes = max;
+        GcsSource::new(cfg)
+    };
+    let capped = source(64 * 1024).await.unwrap();
+    let ctx = HashMap::new();
+    let mut pages = capped.stream_pages(&ctx, 1_000);
+    let e = loop {
+        match pages.next().await.expect("the capped read fails") {
+            Ok(_) => continue,
+            Err(e) => break e.to_string(),
+        }
+    };
+    assert!(
+        e.contains("cap/a.parquet") && e.contains("max_object_bytes"),
+        "{e}"
+    );
+    let roomy = source(1 << 30).await.unwrap();
+    let mut pages = roomy.stream_pages(&ctx, 1_000);
+    let mut n = 0;
+    while let Some(page) = pages.next().await {
+        n += page.unwrap().records.len();
+    }
+    assert_eq!(n, 4_000);
+}
+
 /// Every ranged read is pinned to the generation that located the footer, so
 /// replacing the object mid-read fails the read instead of mixing versions.
 #[cfg(feature = "arrow")]
@@ -1087,5 +1139,52 @@ async fn source_reads_xml_and_xlsx_objects() {
         .await
         .unwrap();
         assert_eq!(stream_all(&source).await, rows, "{shared:?}");
+    }
+}
+
+/// The first error a stream of pages ends with.
+#[cfg(all(feature = "file-format-avro", feature = "file-format-excel"))]
+async fn first_error<S>(mut pages: S) -> faucet_core::FaucetError
+where
+    S: futures::Stream<Item = Result<faucet_core::StreamPage, faucet_core::FaucetError>> + Unpin,
+{
+    use futures::StreamExt;
+    loop {
+        match pages.next().await {
+            Some(Ok(_)) => {}
+            Some(Err(e)) => return e,
+            None => panic!("the stream ended without an error"),
+        }
+    }
+}
+
+#[cfg(all(feature = "file-format-avro", feature = "file-format-excel"))]
+#[tokio::test]
+async fn objects_that_decode_past_max_decoded_bytes_are_refused() {
+    use faucet_core::file_format::{FileFormat, FormatOptions, encode};
+    let Some((_gcs, host, bucket)) = spawn_fake_gcs().await else {
+        return;
+    };
+    let rows = vec![serde_json::json!({"id": "1", "name": "ada"})];
+    for (format, shared, name) in [
+        (GcsFileFormat::Avro, FileFormat::Avro, "big-avro/a.avro"),
+        (GcsFileFormat::Xlsx, FileFormat::Xlsx, "big-xlsx/a.xlsx"),
+    ] {
+        let body = encode(&rows, shared, &FormatOptions::default()).unwrap();
+        seed_bytes(&host, &bucket, name, body, "application/octet-stream").await;
+        let prefix = name.split('/').next().unwrap();
+        let mut config = GcsSourceConfig::new(&bucket)
+            .prefix(format!("{prefix}/"))
+            .file_format(format)
+            .auth(GcsCredentials::Anonymous)
+            .storage_host(&host);
+        config.max_decoded_bytes = Some(64);
+        let source = GcsSource::new(config).await.unwrap();
+        let ctx: HashMap<String, serde_json::Value> = HashMap::new();
+        let err = first_error(source.stream_pages(&ctx, 0)).await;
+        assert!(
+            err.to_string().contains("max_decoded_bytes"),
+            "{shared:?}: {err}"
+        );
     }
 }

@@ -59,7 +59,7 @@ pipeline:
 | `poll_interval` | `1s` | Wait between empty polls. |
 | `idle_timeout` | `30s` | End the fetch cycle after this much continuous quiet. A long-running runtime (`faucet schedule` / `faucet serve`) re-invokes to keep tailing. |
 | `batch_size` | `1000` | `0` accumulates every change into a single trailing page. |
-| `max_staged_records` | `1000000` | Abort (typed error) if one in-progress transaction buffers more than this (`null` = unbounded). |
+| `max_staged_records` | `1000000` | Abort (typed error) if one in-progress transaction buffers more than this (`null` = unbounded). In a config submitted to `faucet serve` it may be 1 to 1,000,000; `null` and `0` are refused. |
 | `state_key` | derived | `mssql-cdc:<db>:<capture_instance>` for one instance, else `mssql-cdc:<db>:<digest>`. |
 | `on_gap` | `fail` | When a run resumes behind the capture instance's retained minimum LSN (downtime longer than the CDC cleanup retention, three days by default), the purged changes are lost. `fail` stops the run with an error naming the capture instance; `skip` logs a warning and resumes from the earliest retained change — use it only after re-snapshotting the destination. |
 

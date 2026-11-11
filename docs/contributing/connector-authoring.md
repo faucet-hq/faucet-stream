@@ -88,7 +88,11 @@ operator's [reference policy](../book/src/reference/http-api.md#reference-policy
 before running a config a caller sent, so your connector is confined with no
 serve code. A field that only looks like a resource (an object key inside a
 configured bucket, a URL path appended to a checked `base_url`) goes in
-`scripts/resource-annotation-allow.txt` with a reason instead.
+`scripts/resource-annotation-allow.txt` with a reason instead. A path on the
+connector's own remote server that it joins into the names it reads or writes
+(an SFTP directory or file-name template) is annotated `"key"`: under a
+caller's policy it may not hold a `..` segment, and a fan-out record value in
+it must stay one name.
 `cli/tests/resource_annotations.rs` fails on an unannotated field whose name
 looks like a resource, and on an allow-list entry that no longer matches one.
 A `url` field whose value is not a URL also names its grammar, so the server
@@ -143,6 +147,22 @@ pub query: String,
 
 A webhook or object-arrival trigger refuses a sender-chosen value that would
 be the whole of such a field.
+
+A numeric field that bounds what the connector holds in memory (a staging
+buffer, a message size, a receive window) carries the largest value a config
+the server did not author may set; `faucet serve` refuses `null`, `0` and
+anything above it in such a config:
+
+```rust
+#[schemars(extend("x-faucet-caller-max" = 1_000_000))]
+pub max_staged_records: Option<usize>,
+```
+
+When such a field's default is no bound, add `"x-faucet-caller-set" = true`:
+`faucet serve` then also refuses a config that leaves it out.
+
+A field that opens a listener is annotated `x-faucet-resource: listen`, so a
+server holds it to its `--allow-listen` ranges.
 
 ### Resumability
 

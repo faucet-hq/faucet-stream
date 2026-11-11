@@ -15,11 +15,11 @@
 //! collected by its resolved path alone.
 
 use super::ledger::FileIdentity;
-use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat};
+use rustix::fs::{AtFlags, FileType, Stat};
 use rustix::io::Errno;
 use std::ffi::OsString;
 use std::os::fd::OwnedFd;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// What the file at the recorded path is, read through its held directory.
@@ -71,17 +71,14 @@ pub(super) fn open(path: &Path, parent_id: Option<FileIdentity>) -> Opened {
     }
 }
 
-/// The path to walk: the recorded path with its directory resolved. A path
-/// that is relative or names `.` / `..` is not one the sweep recorded.
+/// The path to walk: the recorded path with its directory resolved, `..`
+/// included, the way the writer's `open` resolved it. A relative path is not
+/// one the sweep recorded.
 pub(super) fn resolve(path: &Path) -> Result<PathBuf, Opened> {
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(Opened::Changed);
     };
-    if !path.is_absolute()
-        || path
-            .components()
-            .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
-    {
+    if !path.is_absolute() {
         return Err(Opened::Changed);
     }
     std::fs::canonicalize(parent)
@@ -95,33 +92,26 @@ pub(super) fn walk(target: &Path, parent_id: Option<FileIdentity>) -> Opened {
     let (Some(parent), Some(name)) = (target.parent(), target.file_name()) else {
         return Opened::Changed;
     };
-    let mut dir = match rustix::fs::open("/", dir_flags(), Mode::empty()) {
+    let dir = match faucet_core::path_guard::open_dir_unlinked(parent) {
         Ok(fd) => fd,
-        Err(e) => return from_errno(e),
-    };
-    for component in parent.components() {
-        match component {
-            Component::RootDir => {}
-            Component::Normal(segment) => {
-                dir = match rustix::fs::openat(
-                    &dir,
-                    segment,
-                    dir_flags() | OFlags::NOFOLLOW,
-                    Mode::empty(),
-                ) {
-                    Ok(fd) => fd,
-                    Err(e) => return from_errno(e),
-                };
-            }
-            Component::Prefix(_) | Component::CurDir | Component::ParentDir => {
-                return Opened::Changed;
-            }
+        Err(e) => {
+            return match Errno::from_io_error(&e) {
+                Some(errno) => from_errno(errno),
+                None if e.kind() == std::io::ErrorKind::InvalidInput => Opened::Changed,
+                None => Opened::Failed(e),
+            };
         }
-    }
+    };
     if let Some(want) = parent_id {
         match rustix::fs::fstat(&dir) {
             Ok(st) if identity(&st) == want => {}
-            Ok(_) => return Opened::Changed,
+            Ok(_) => {
+                return match rustix::fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+                    Err(Errno::NOENT) => Opened::Gone,
+                    Ok(_) => Opened::Changed,
+                    Err(e) => Opened::Failed(e.into()),
+                };
+            }
             Err(e) => return from_errno(e),
         }
     }
@@ -164,27 +154,6 @@ fn from_io(e: &std::io::Error) -> Option<Opened> {
         Opened::Failed(_) => None,
         opened => Some(opened),
     }
-}
-
-/// Directories are opened for lookup only where the platform allows it, so an
-/// ancestor the process may search but not list still works.
-fn dir_flags() -> OFlags {
-    OFlags::DIRECTORY | OFlags::CLOEXEC | search_flag()
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn search_flag() -> OFlags {
-    OFlags::PATH
-}
-
-#[cfg(target_vendor = "apple")]
-fn search_flag() -> OFlags {
-    OFlags::from_bits_retain(libc::O_SEARCH as u32)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-fn search_flag() -> OFlags {
-    OFlags::RDONLY
 }
 
 #[allow(clippy::unnecessary_cast)] // field widths differ by platform; matches std's MetadataExt
@@ -382,7 +351,7 @@ mod tests {
         std::fs::create_dir(root.join("a")).unwrap();
         assert!(matches!(
             open(&root.join("a/../out.jsonl"), None),
-            Opened::Changed
+            Opened::Gone
         ));
         assert!(matches!(
             open(Path::new("relative/out.jsonl"), None),
@@ -431,5 +400,75 @@ mod tests {
         std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(matches!(without, Opened::Failed(_)), "{without:?}");
         assert!(matches!(with, Opened::Failed(_)), "{with:?}");
+    }
+
+    #[test]
+    fn a_recorded_path_through_a_parent_component_is_collected() {
+        let (_t, root) = root();
+        let outputs = root.join("outputs");
+        std::fs::create_dir_all(outputs.join("sub")).unwrap();
+        let path = outputs.join("out.jsonl");
+        std::fs::write(&path, b"x").unwrap();
+        let h = held(open(&outputs.join("sub/../out.jsonl"), id_of(&outputs)));
+        assert!(h.leaf.is_file);
+        assert_eq!(Some(h.leaf.id), id_of(&path));
+        assert!(matches!(unlink(&h), Unlinked::Removed));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_parent_component_after_a_symlink_names_the_written_directory() {
+        let (_t, root) = root();
+        let real = root.join("deep/real");
+        std::fs::create_dir_all(&real).unwrap();
+        let written = root.join("deep/out.jsonl");
+        std::fs::write(&written, b"x").unwrap();
+        std::fs::write(root.join("out.jsonl"), b"lexical").unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let h = held(open(&link.join("../out.jsonl"), id_of(&root.join("deep"))));
+        assert_eq!(Some(h.leaf.id), id_of(&written));
+        assert!(matches!(unlink(&h), Unlinked::Removed));
+        assert!(!written.exists());
+        assert_eq!(std::fs::read(root.join("out.jsonl")).unwrap(), b"lexical");
+    }
+
+    #[test]
+    fn a_file_missing_from_a_recreated_directory_is_gone() {
+        let (_t, root) = root();
+        let outputs = root.join("outputs");
+        std::fs::create_dir(&outputs).unwrap();
+        let path = outputs.join("out.jsonl");
+        std::fs::write(&path, b"x").unwrap();
+        let recorded = id_of(&outputs);
+        let replacement = root.join("outputs.new");
+        std::fs::create_dir(&replacement).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&outputs).unwrap();
+        std::fs::rename(&replacement, &outputs).unwrap();
+        assert_ne!(id_of(&outputs), recorded);
+        assert!(matches!(open(&path, recorded), Opened::Gone));
+    }
+
+    #[test]
+    fn a_file_present_in_a_recreated_directory_is_changed() {
+        let (_t, root) = root();
+        let outputs = root.join("outputs");
+        std::fs::create_dir(&outputs).unwrap();
+        let path = outputs.join("out.jsonl");
+        std::fs::write(&path, b"x").unwrap();
+        let recorded = id_of(&outputs);
+        let replacement = root.join("outputs.new");
+        std::fs::create_dir(&replacement).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&outputs).unwrap();
+        std::fs::rename(&replacement, &outputs).unwrap();
+        assert_ne!(id_of(&outputs), recorded);
+        std::os::unix::fs::symlink(root.join("elsewhere"), &path).unwrap();
+        assert!(matches!(open(&path, recorded), Opened::Changed));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"y").unwrap();
+        assert!(matches!(open(&path, recorded), Opened::Changed));
+        assert_eq!(std::fs::read(&path).unwrap(), b"y");
     }
 }

@@ -2248,6 +2248,28 @@ pub struct ReferenceArgs {
     /// tenant.
     #[arg(long = "allow-unverified-tls")]
     pub allow_unverified_tls: bool,
+    /// Let a submitted config authenticate with the server's own identity:
+    /// its environment, instance or workload role (IRSA, workload identity,
+    /// managed identity), application-default credentials, local credential
+    /// files, OS authentication. Default: refused. Never for a tenant.
+    #[arg(
+        long = "allow-host-credentials",
+        env = "FAUCET_SERVE_ALLOW_HOST_CREDENTIALS"
+    )]
+    pub allow_host_credentials: bool,
+    /// Where a submitted config may open a listener (a `webhook` source's
+    /// `listen_addr`, any field annotated `x-faucet-resource: listen`):
+    /// `ADDR:PORT` or `ADDR:FIRST-LAST`, an IPv6 address in brackets
+    /// (`[::]` also covers `0.0.0.0`). Repeatable or comma-separated.
+    /// Default: `127.0.0.1:29100-29199,[::1]:29100-29199`; `none` allows no
+    /// listener. Never for a tenant.
+    #[arg(
+        long = "allow-listen",
+        value_name = "ADDR:PORTS",
+        value_delimiter = ',',
+        env = "FAUCET_SERVE_ALLOW_LISTEN"
+    )]
+    pub allow_listen: Vec<String>,
 }
 
 /// `faucet serve` arguments.

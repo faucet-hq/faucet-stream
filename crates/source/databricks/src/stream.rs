@@ -300,11 +300,35 @@ impl DatabricksSource {
     }
 }
 
+/// A presigned link must be an `http(s)` URL whose host is not a link-local
+/// or cloud-metadata address.
+fn check_external_link(url: &str) -> Result<(), FaucetError> {
+    let refused = |why: &str| {
+        FaucetError::Source(format!(
+            "databricks: external link `{}` refused: {why}",
+            faucet_core::util::redact_uri_credentials(url)
+        ))
+    };
+    let parsed =
+        reqwest::Url::parse(url).map_err(|e| refused(&format!("it does not parse: {e}")))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(refused("it is not an http(s) URL"));
+    }
+    match parsed.host_str() {
+        None => Err(refused("it names no host")),
+        Some(h) if faucet_core::resolve::is_metadata_host(h) => {
+            Err(refused("the host is a link-local / cloud-metadata address"))
+        }
+        Some(_) => Ok(()),
+    }
+}
+
 impl DatabricksSource {
     /// GET a presigned external link. It is signed for the storage service, so
     /// it is fetched **without** an `Authorization` header (adding one breaks
     /// the signature).
     async fn get_external(&self, url: &str) -> Result<Vec<u8>, FaucetError> {
+        check_external_link(url)?;
         self.calls
             .call("chunk", || async {
                 let resp = self.client.get(url).send().await.map_err(|e| {

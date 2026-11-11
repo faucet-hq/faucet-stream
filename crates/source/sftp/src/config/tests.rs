@@ -199,3 +199,12 @@ fn the_format_option_blocks_reach_the_decoder() {
     assert_eq!(opts.excel.header_row, 1);
     assert_eq!(opts.xml.record_element, "order");
 }
+
+#[test]
+fn decoded_bytes_default_to_a_multiple_of_the_object_limit() {
+    let mut c = SftpSourceConfig::new(conn(), "/in");
+    c.max_object_bytes = 1024;
+    assert_eq!(c.decoded_bytes_limit(), 64 * 1024);
+    c.max_decoded_bytes = Some(10);
+    assert_eq!(c.decoded_bytes_limit(), 10);
+}

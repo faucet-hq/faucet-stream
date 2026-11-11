@@ -986,6 +986,8 @@ pub struct ForeignMasking {
     own: ReplayTarget,
     #[cfg(feature = "masking")]
     masking: Option<Arc<faucet_core::CompiledMasking>>,
+    #[cfg(feature = "masking")]
+    proof: Option<super::proof::ProofCheck>,
 }
 
 impl ForeignMasking {
@@ -993,28 +995,58 @@ impl ForeignMasking {
     /// not provably write.
     #[cfg(feature = "masking")]
     pub fn new(own: ReplayTarget, masking: Option<Arc<faucet_core::CompiledMasking>>) -> Self {
-        Self { own, masking }
+        Self {
+            own,
+            masking,
+            proof: None,
+        }
     }
 
-    fn apply(&self, env: UnwrappedEnvelope) -> Value {
+    /// Also mask every payload whose signed masking record does not verify
+    /// against `proof`.
+    #[cfg(feature = "masking")]
+    pub fn with_proof(mut self, proof: Option<super::proof::ProofCheck>) -> Self {
+        self.proof = proof;
+        self
+    }
+
+    #[cfg(feature = "masking")]
+    fn already_masked(&self, env: &UnwrappedEnvelope) -> bool {
+        self.own.wrote(env) && self.proof.as_ref().is_none_or(|p| p.holds(env))
+    }
+
+    /// The payload as the replay writes it; `None` when it is not shown to
+    /// be masked already and a `hash` or `tokenize` rule would rewrite it,
+    /// since masking it again would hash a value that may be hashed already.
+    fn apply(&self, env: UnwrappedEnvelope) -> Option<Value> {
         #[cfg(feature = "masking")]
         if let Some(m) = &self.masking
-            && !self.own.wrote(&env)
+            && !self.already_masked(&env)
         {
-            return faucet_core::apply_masking(vec![env.payload], m)
-                .records
-                .pop()
-                .unwrap_or(Value::Null);
+            let mut out = faucet_core::apply_masking(vec![env.payload], m);
+            if out
+                .hits
+                .iter()
+                .any(|h| matches!(h.action, "hash" | "tokenize"))
+            {
+                return None;
+            }
+            return Some(out.records.pop().unwrap_or(Value::Null));
         }
-        env.payload
+        Some(env.payload)
+    }
+
+    /// Whether `apply` leaves `env` out of the replay.
+    pub fn refuses(&self, env: &UnwrappedEnvelope) -> bool {
+        self.apply(env.clone()).is_none()
     }
 }
 
-/// An envelope's payload as a replay writes it.
-fn replayed(env: UnwrappedEnvelope, foreign: Option<&ForeignMasking>) -> Value {
+/// An envelope's payload as a replay writes it, if it is replayed.
+fn replayed(env: UnwrappedEnvelope, foreign: Option<&ForeignMasking>) -> Option<Value> {
     match foreign {
         Some(f) => f.apply(env),
-        None => env.payload,
+        None => Some(env.payload),
     }
 }
 
@@ -1131,7 +1163,7 @@ impl Source for DlqReaderSource {
             let mut out = Vec::new();
             scan_each(&files, &dec, |env| {
                 if replay_selects(&env, reason.as_deref(), target.as_ref()) {
-                    out.push(replayed(env, foreign.as_ref()));
+                    out.extend(replayed(env, foreign.as_ref()));
                 }
                 Ok(())
             })
@@ -1166,7 +1198,7 @@ impl Source for DlqReaderSource {
                 let mut page = Vec::new();
                 let scanned = scan_each(&files, &dec, |env| {
                     if replay_selects(&env, reason.as_deref(), target.as_ref()) {
-                        page.push(replayed(env, foreign.as_ref()));
+                        page.extend(replayed(env, foreign.as_ref()));
                         if page.len() >= chunk {
                             tx.blocking_send(Ok(std::mem::take(&mut page)))
                                 .map_err(|_| FaucetError::Source("DLQ reader stopped".into()))?;
@@ -1344,6 +1376,7 @@ mod tests {
             row: None,
             sink: None,
             ts_ms: None,
+            masking: None,
         };
         assert!(reason_matches(&env, None));
         assert!(reason_matches(&env, Some("contract")));
@@ -1539,6 +1572,148 @@ mod tests {
         assert!(!is_archive(Path::new("a/archived.jsonl.d/x.jsonl")));
     }
 
+    #[cfg(feature = "masking")]
+    mod masking_proof {
+        use super::*;
+        use crate::dlq_replay::proof::ProofCheck;
+        use faucet_core::masking::proof::derive_key;
+
+        fn spec(key: &str) -> faucet_core::MaskingSpec {
+            serde_json::from_value(json!({
+                "key": key,
+                "rules": [{"match": {"fields": ["email"]}, "action": {"type": "hash"}}]
+            }))
+            .unwrap()
+        }
+
+        fn own() -> ReplayTarget {
+            ReplayTarget {
+                pipeline: Some("etl".into()),
+                row: "r".into(),
+            }
+        }
+
+        fn signed(payload: Value, key: &[u8], spec_key: &str) -> Value {
+            let mut e = json!({"pipeline": "etl", "row": "r", "payload": payload});
+            let rules = faucet_core::masking::proof::rules_fingerprint(
+                &crate::dlq_replay::proof::destination_rules(&spec(spec_key), &["out"]),
+                Some(spec_key),
+                key,
+            );
+            faucet_core::masking::MaskingProof::new(key.to_vec(), Some("t"), rules).sign(&mut e);
+            e
+        }
+
+        fn replay_one(e: &Value, check: Option<ProofCheck>) -> Option<Value> {
+            let masking = Arc::new(
+                faucet_core::CompiledMasking::compile_for_sink(&spec("k1"), &["out"]).unwrap(),
+            );
+            let foreign = ForeignMasking::new(own(), Some(masking)).with_proof(check);
+            replayed(unwrap_envelope(e).unwrap(), Some(&foreign))
+        }
+
+        fn check(keys: Vec<Vec<u8>>) -> Option<ProofCheck> {
+            Some(ProofCheck::for_tests(spec("k1"), &["out"], Some("t"), keys))
+        }
+
+        #[test]
+        fn rows_without_a_valid_masking_proof_are_not_hashed_again() {
+            let key = derive_key(b"vault", "dlq-masking");
+            let bare = json!({"pipeline": "etl", "row": "r", "payload": {"email": "a@b.co"}});
+            assert_eq!(replay_one(&bare, check(vec![key.clone()])), None);
+            assert_eq!(
+                replay_one(&bare, None).unwrap()["email"],
+                "a@b.co",
+                "local replays trust the row"
+            );
+            let signed_bare = signed(json!({"email": "a@b.co"}), &key, "k1");
+            assert_eq!(
+                replay_one(&signed_bare, check(Vec::new())),
+                None,
+                "no key on the replaying server"
+            );
+            let other_row = json!({"pipeline": "etl", "row": "other", "payload": {"email": "h"}});
+            assert_eq!(replay_one(&other_row, None), None, "another row wrote it");
+            let untouched = json!({"pipeline": "etl", "row": "r", "payload": {"id": 1}});
+            assert_eq!(
+                replay_one(&untouched, check(vec![key])),
+                Some(json!({"id": 1})),
+                "no hash rule rewrites it"
+            );
+        }
+
+        #[test]
+        fn idempotent_rules_are_applied_again() {
+            let spec: faucet_core::MaskingSpec = serde_json::from_value(json!({
+                "rules": [
+                    {"match": {"fields": ["ssn"]}, "action": {"type": "redact"}},
+                    {"match": {"fields": ["card"]}, "action": {"type": "partial", "keep_last": 4}}
+                ]
+            }))
+            .unwrap();
+            let masking =
+                Arc::new(faucet_core::CompiledMasking::compile_for_sink(&spec, &["out"]).unwrap());
+            let foreign = ForeignMasking::new(own(), Some(masking)).with_proof(Some(
+                ProofCheck::for_tests(spec, &["out"], Some("t"), Vec::new()),
+            ));
+            let e = json!({"pipeline": "etl", "row": "r",
+                           "payload": {"ssn": "123-45-6789", "card": "4111111111111111"}});
+            let env = unwrap_envelope(&e).unwrap();
+            assert!(!foreign.refuses(&env));
+            let once = replayed(env, Some(&foreign)).unwrap();
+            assert_eq!(once["ssn"], "***");
+            assert_eq!(once["card"], "************1111");
+            let again = json!({"pipeline": "etl", "row": "r", "payload": once.clone()});
+            assert_eq!(
+                replayed(unwrap_envelope(&again).unwrap(), Some(&foreign)).unwrap(),
+                once
+            );
+        }
+
+        #[test]
+        fn replay_keeps_rows_masked_under_the_current_rules() {
+            let key = derive_key(b"vault", "dlq-masking");
+            let e = signed(json!({"email": "already-hashed"}), &key, "k1");
+            assert_eq!(
+                replay_one(&e, check(vec![key])).unwrap()["email"],
+                "already-hashed"
+            );
+        }
+
+        #[test]
+        fn a_forged_masking_claim_is_not_replayed() {
+            let key = derive_key(b"vault", "dlq-masking");
+            let mut e = signed(json!({"email": "x"}), &key, "k1");
+            e["payload"]["email"] = json!("a@b.co");
+            assert_eq!(replay_one(&e, check(vec![key.clone()])), None);
+            let mut e = signed(
+                json!({"email": "a@b.co"}),
+                &derive_key(b"other", "dlq-masking"),
+                "k1",
+            );
+            e["row"] = json!("r");
+            assert_eq!(replay_one(&e, check(vec![key])), None);
+        }
+
+        #[test]
+        fn changed_rules_leave_the_row_out() {
+            let key = derive_key(b"vault", "dlq-masking");
+            let e = signed(json!({"email": "old-hash"}), &key, "k0");
+            assert_eq!(replay_one(&e, check(vec![key])), None);
+        }
+
+        #[test]
+        fn rotated_keys_still_verify() {
+            let old = derive_key(b"old-vault", "dlq-masking");
+            let new = derive_key(b"new-vault", "dlq-masking");
+            let e = signed(json!({"email": "kept"}), &old, "k1");
+            assert_eq!(
+                replay_one(&e, check(vec![new, old])).unwrap()["email"],
+                "kept"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn dlq_reader_source_yields_filtered_payloads() {
         let body = format!(
@@ -1570,6 +1745,7 @@ mod tests {
             row: row.map(Into::into),
             sink: None,
             ts_ms: None,
+            masking: None,
         };
         let t = ReplayTarget {
             pipeline: Some("etl".into()),

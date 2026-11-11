@@ -131,11 +131,9 @@ pub async fn load(
         None => None,
         Some(t) => Some(tenant_scope(state, t).await?),
     };
-    // A body from the server's own triggers file carries the operator's
-    // params, not a caller's.
+    // A triggers-file body is the operator's; `caller_fields` holds the sender's values.
     let caller = sub
         .caller_fields
-        .filter(|_| principal.origin() != Origin::ServerFile)
         .map(|fields| crate::serve::load::CallerParams {
             fields,
             origin: state.caller_origin(),
@@ -153,26 +151,34 @@ pub async fn load(
         Option<()>,
         Option<crate::serve::history::policies::PolicyPin>,
     ) = (None, None);
-    let loaded = crate::serve::load::load_submission_inputs(
+    let default_base = state.default_base();
+    let references = state.references();
+    let loading = crate::serve::load::load_submission_inputs(
         sub.body,
         sub.format,
-        state.default_base().as_ref(),
+        default_base.as_ref(),
         policy.as_ref(),
         principal.body_origin(),
         scope,
-        &state.references(),
+        &references,
         caller,
-    )
-    .await;
+    );
+    // Values a caller's config registers for redaction go to the caller set.
+    let loaded = if principal.caller_body() {
+        crate::secrets::registry::as_caller(loading).await
+    } else {
+        loading.await
+    };
     let mut loaded = match loaded {
         Err(ServeError::Forbidden(m))
-            if caller.is_some() && m.starts_with(crate::serve::load::CALLER_PARAM_REFUSAL) =>
+            if caller.is_some() && crate::serve::load::caller_refusal_target(&m).is_some() =>
         {
+            let target = crate::serve::load::caller_refusal_target(&m).unwrap_or_default();
             crate::serve::audit::write_target_detail(
                 state,
                 &principal.actor(),
                 "policy.denied",
-                "template params".into(),
+                target.into(),
                 crate::secrets::registry::redact_message(&m),
                 "denied",
             )
@@ -182,6 +188,22 @@ pub async fn load(
         other => other?,
     };
     loaded.policy_pin = policy_pin;
+    if principal.caller_body() {
+        let policy =
+            crate::serve::host_identity::caller_policy(&state.references(), principal.tenant());
+        if let Err(e) = crate::serve::host_identity::refuse(&loaded.cfg, &loaded.nodes, &policy) {
+            crate::serve::audit::write_target_detail(
+                state,
+                &principal.actor(),
+                "policy.denied",
+                "host credentials".into(),
+                e.to_string(),
+                "denied",
+            )
+            .await;
+            return Err(e);
+        }
+    }
     if let Some(sel) = sub.selection {
         let nodes = std::mem::take(&mut loaded.nodes);
         let bad = |e: crate::error::CliError| {
@@ -524,6 +546,9 @@ pub async fn submit(
     mut req: SubmitRequest,
     approval: Approval,
 ) -> Result<SubmitOutcome, ServeError> {
+    if !req.server_key {
+        crate::serve::runner::refuse_reserved_idempotency_key(req.idempotency_key.as_deref())?;
+    }
     // A malformed request field is refused before anything is queued or
     // proposed, so a change request never waits for approval only to fail
     // when it executes.
@@ -612,6 +637,48 @@ pub async fn submit(
         },
     )
     .await?;
+    // Needs every member to check the server identity at client build.
+    if crate::serve::host_identity::members_must_check(
+        principal.caller_body(),
+        principal.tenant(),
+        &state.references(),
+        crate::serve::host_identity::checked_at_runtime(
+            &admitted.loaded.cfg,
+            &admitted.loaded.nodes,
+        ),
+    ) {
+        require_member_capability(
+            state,
+            crate::serve::history::CAP_HOST_CREDENTIALS,
+            crate::serve::host_identity::MEMBER_REFUSAL,
+        )
+        .await?;
+    }
+    // A caller's listener needs every member to enforce `--allow-listen`.
+    if principal.caller_body() {
+        let topology = admitted
+            .loaded
+            .nodes
+            .is_empty()
+            .then(|| serde_json::to_value(&admitted.loaded.cfg).ok())
+            .flatten();
+        if crate::serve::listen::opens_listener(topology.as_ref(), &admitted.loaded.nodes) {
+            require_member_capability(
+                state,
+                crate::serve::history::CAP_REFERENCE_KINDS_V2,
+                REFERENCE_KINDS_REFUSAL,
+            )
+            .await?;
+        }
+        if crate::serve::load::uses_pin_switch(topology.as_ref(), &admitted.loaded.nodes) {
+            require_member_capability(
+                state,
+                crate::serve::history::CAP_REFERENCE_KINDS_V2,
+                PIN_SERVERS_REFUSAL,
+            )
+            .await?;
+        }
+    }
     // The execution pool (#957): the request's, else the config's, else
     // `default` — refused when no replica would run it.
     let pool =
@@ -641,6 +708,17 @@ pub async fn submit(
         .map(SubmitOutcome::Accepted)
 }
 
+/// The refusal while a cluster member does not hold a caller's listener to
+/// `--allow-listen`.
+pub const REFERENCE_KINDS_REFUSAL: &str = "listener unavailable: a cluster member does not \
+     check where a submitted config may open a listener; finish the rolling upgrade, then retry";
+
+/// The refusal while a cluster member does not keep a submitted config's
+/// clients on the servers it names.
+pub const PIN_SERVERS_REFUSAL: &str = "server pinning unavailable: a cluster member does not \
+     keep a submitted config's clients on the servers it names; finish the rolling upgrade, \
+     then retry";
+
 /// The refusal while a cluster member does not enforce policy pins (#1051).
 pub const POLICY_PIN_REFUSAL: &str = "policy unavailable: a cluster member does not enforce the \
      policy versions a run is admitted under; finish the rolling upgrade, then retry";
@@ -653,20 +731,28 @@ pub async fn require_member_capability(
     cap: &str,
     refusal: &str,
 ) -> Result<(), ServeError> {
-    let cluster = state.cluster();
-    if !cluster.enabled() || cluster.live_members().iter().all(|m| m.has(cap)) {
-        return Ok(());
-    }
-    let members = state
-        .history()
-        .live_instances(cluster.member_ttl())
-        .await
-        .map_err(ServeError::from)?;
-    if members.iter().all(|m| m.has(cap)) {
-        cluster.set_live_members(members);
+    if members_have(state, cap).await.map_err(ServeError::from)? {
         return Ok(());
     }
     Err(ServeError::Unavailable(refusal.to_string()))
+}
+
+/// Whether every live cluster member advertises `cap` (always, on a single
+/// server). The membership is re-read before answering no.
+pub async fn members_have(
+    state: &ServerState,
+    cap: &str,
+) -> Result<bool, crate::serve::history::HistoryError> {
+    let cluster = state.cluster();
+    if !cluster.enabled() || cluster.live_members().iter().all(|m| m.has(cap)) {
+        return Ok(true);
+    }
+    let members = state.history().live_instances(cluster.member_ttl()).await?;
+    if members.iter().all(|m| m.has(cap)) {
+        cluster.set_live_members(members);
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// Fold a request's `depends_on` (#960) into its config text. A body that
@@ -1815,6 +1901,20 @@ mod templates {
         )
         .await
         .map_err(map_err)?;
+        if !body.pool_by_operator && body.pool.is_some() {
+            let doc: serde_json::Value = serde_json::from_str(&materialized.body)
+                .map_err(|e| ServeError::Internal(format!("materialized config: {e}")))?;
+            let rule = doc
+                .get("pool_override")
+                .map(|v| serde_json::from_value(v.clone()))
+                .transpose()
+                .map_err(|e| ServeError::BadConfig(format!("pool_override: {e}")))?;
+            crate::serve::pools::check_override(
+                body.pool.as_deref(),
+                doc.get("pool").and_then(serde_json::Value::as_str),
+                rule.as_ref(),
+            )?;
+        }
 
         // Caller-supplied values that would land in the persisted body (a
         // `secret: true` param, an `env:` override) are refused (#456 M4) —
@@ -1944,10 +2044,13 @@ mod templates {
             // the operator's params; any other (a schedule made through the
             // API, even with a standing approval) passes a caller's (#1051).
             caller_fields: if body.operator_params {
-                Default::default()
+                materialized.caller_fields.select(&body.sender_params, |p| {
+                    crate::params::caller::trigger_name(&format!("param:{p}"))
+                })
             } else {
                 materialized.caller_fields.clone()
             },
+            server_key: body.server_key,
         };
         // The template is the operator's: the run loads it trusted.
         let run_as = Principal::new(actor.clone(), Origin::Trusted).on_behalf_of(tenant);
@@ -2115,6 +2218,201 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(&err, ServeError::Unavailable(m) if m.contains("rolling upgrade")));
+    }
+
+    /// A caller's config that opens a listener waits until every member
+    /// holds listeners to `--allow-listen`; one that opens none does not.
+    #[cfg(all(feature = "source-webhook", feature = "sink-jsonl"))]
+    #[tokio::test]
+    async fn a_member_without_listener_checks_holds_caller_listeners() {
+        use crate::serve::history::RunHistory as _;
+        let dir = tempfile::tempdir().unwrap();
+        let history = crate::serve::history::sqlite::SqliteHistory::connect(
+            &format!("sqlite:{}", dir.path().join("h.db").display()),
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(30),
+            "old".into(),
+        )
+        .await
+        .unwrap();
+        history
+            .heartbeat_instance(&crate::serve::history::InstanceHeartbeat {
+                started_at: chrono::Utc::now(),
+                listen: None,
+                max_concurrent: 1,
+                in_flight: 0,
+                state_format: 0,
+                pools: Vec::new(),
+                capabilities: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let mut config = crate::serve::test_support::test_config();
+        config.cluster.enabled = true;
+        let mixed = ServerState::new(
+            &config,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            std::sync::Arc::new(history),
+            crate::serve::logs::LogHub::new(),
+            None,
+            #[cfg(feature = "triggers")]
+            crate::serve::triggers::health::TriggersHandle::empty(),
+        );
+        mixed
+            .cluster()
+            .set_live_members(vec![crate::serve::history::InstanceRecord {
+                instance_id: "old".into(),
+                started_at: chrono::Utc::now(),
+                last_heartbeat: chrono::Utc::now(),
+                listen: None,
+                max_concurrent: 1,
+                in_flight: 0,
+                state_format: 0,
+                pools: None,
+                capabilities: None,
+            }]);
+        let actor = crate::serve::rbac::AuthContext {
+            principal: "alice".into(),
+            role: crate::serve::rbac::Role::Operator,
+            source_ip: None,
+            tenant: None,
+        };
+        let principal = crate::runtime::Principal::caller(&mixed, actor);
+        let out = dir.path().join("o.jsonl").display().to_string();
+        let run = |source: serde_json::Value| -> SubmitRequest {
+            serde_json::from_value(serde_json::json!({ "config": serde_json::json!({
+                "version": 1,
+                "pipeline": { "source": source,
+                              "sink": { "type": "jsonl", "config": { "path": out } } }
+            }).to_string(), "config_format": "json" }))
+            .unwrap()
+        };
+        let err = submit(
+            &mixed,
+            &principal,
+            run(serde_json::json!({ "type": "webhook",
+                "config": { "listen_addr": "127.0.0.1:29100" } })),
+            Approval::Required,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, ServeError::Unavailable(m) if m == REFERENCE_KINDS_REFUSAL),
+            "{err:?}"
+        );
+        let csv = dir.path().join("in.csv");
+        std::fs::write(&csv, "id\n1\n").unwrap();
+        let other = submit(
+            &mixed,
+            &principal,
+            run(serde_json::json!({ "type": "csv",
+                "config": { "path": csv.display().to_string() } })),
+            Approval::Required,
+        )
+        .await;
+        assert!(
+            !matches!(&other, Err(ServeError::Unavailable(m)) if m == REFERENCE_KINDS_REFUSAL),
+            "{other:?}"
+        );
+    }
+
+    /// A caller's config whose client a pin-servers switch keeps on its
+    /// servers waits until every member forces the switch.
+    #[cfg(all(feature = "source-nats", feature = "sink-jsonl"))]
+    #[tokio::test]
+    async fn a_member_without_server_pinning_holds_caller_nats_configs() {
+        use crate::serve::history::RunHistory as _;
+        let dir = tempfile::tempdir().unwrap();
+        let history = crate::serve::history::sqlite::SqliteHistory::connect(
+            &format!("sqlite:{}", dir.path().join("h.db").display()),
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(30),
+            "old".into(),
+        )
+        .await
+        .unwrap();
+        history
+            .heartbeat_instance(&crate::serve::history::InstanceHeartbeat {
+                started_at: chrono::Utc::now(),
+                listen: None,
+                max_concurrent: 1,
+                in_flight: 0,
+                state_format: 0,
+                pools: Vec::new(),
+                capabilities: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let mut config = crate::serve::test_support::test_config();
+        config.cluster.enabled = true;
+        let mixed = ServerState::new(
+            &config,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            std::sync::Arc::new(history),
+            crate::serve::logs::LogHub::new(),
+            None,
+            #[cfg(feature = "triggers")]
+            crate::serve::triggers::health::TriggersHandle::empty(),
+        );
+        mixed
+            .cluster()
+            .set_live_members(vec![crate::serve::history::InstanceRecord {
+                instance_id: "old".into(),
+                started_at: chrono::Utc::now(),
+                last_heartbeat: chrono::Utc::now(),
+                listen: None,
+                max_concurrent: 1,
+                in_flight: 0,
+                state_format: 0,
+                pools: None,
+                capabilities: None,
+            }]);
+        let actor = crate::serve::rbac::AuthContext {
+            principal: "alice".into(),
+            role: crate::serve::rbac::Role::Operator,
+            source_ip: None,
+            tenant: None,
+        };
+        let principal = crate::runtime::Principal::caller(&mixed, actor);
+        let out = dir.path().join("o.jsonl").display().to_string();
+        let run = |source: serde_json::Value| -> SubmitRequest {
+            serde_json::from_value(serde_json::json!({ "config": serde_json::json!({
+                "version": 1,
+                "pipeline": { "source": source,
+                              "sink": { "type": "jsonl", "config": { "path": out } } }
+            }).to_string(), "config_format": "json" }))
+            .unwrap()
+        };
+        let err = submit(
+            &mixed,
+            &principal,
+            run(serde_json::json!({ "type": "nats",
+                "config": { "servers": ["nats://n.example.com:4222"], "subject": "s",
+                            "max_messages": 1 } })),
+            Approval::Required,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, ServeError::Unavailable(m) if m == PIN_SERVERS_REFUSAL),
+            "{err:?}"
+        );
+        let csv = dir.path().join("in.csv");
+        std::fs::write(&csv, "id\n1\n").unwrap();
+        let other = submit(
+            &mixed,
+            &principal,
+            run(serde_json::json!({ "type": "csv",
+                "config": { "path": csv.display().to_string() } })),
+            Approval::Required,
+        )
+        .await;
+        assert!(
+            !matches!(&other, Err(ServeError::Unavailable(m)) if m == PIN_SERVERS_REFUSAL),
+            "{other:?}"
+        );
     }
 
     /// A tenant can cancel its own run on this replica from the registry,

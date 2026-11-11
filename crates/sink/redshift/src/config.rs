@@ -1,6 +1,7 @@
 //! Amazon Redshift sink configuration.
 
 use faucet_common_redshift::RedshiftConnection;
+use faucet_common_s3::S3Credentials;
 use faucet_core::{DEFAULT_BATCH_SIZE, FaucetError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -85,6 +86,11 @@ pub struct RedshiftCopySpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("x-faucet-resource" = "url"))]
     pub endpoint_url: Option<String>,
+    /// How the S3 client that stages the files authenticates (default: the
+    /// AWS default chain, i.e. the identity of the host faucet runs on).
+    /// `access_key` names keys in the config.
+    #[serde(default, skip_serializing_if = "S3Credentials::is_default")]
+    pub credentials: S3Credentials,
 }
 
 /// Configuration for the Amazon Redshift sink.
@@ -211,6 +217,7 @@ impl RedshiftSinkConfig {
             iam_role: self.iam_role.clone(),
             region: self.region.clone(),
             endpoint_url: self.endpoint_url.clone(),
+            credentials: S3Credentials::default(),
         })
     }
 

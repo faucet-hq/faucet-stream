@@ -162,8 +162,8 @@ pub fn spawn_watchers(
                 start_at,
                 lookback_secs,
                 poll_timeout_secs,
-            } => match object_arrival::ObjectArrivalWatcher::build_store(store) {
-                Ok((s, bucket, prefix)) => {
+            } => match object_arrival::ObjectArrivalWatcher::build_paged_store(store) {
+                Ok(((s, bucket, prefix), pager)) => {
                     let w = object_arrival::ObjectArrivalWatcher::new(
                         Arc::new(t.clone()),
                         s,
@@ -175,7 +175,8 @@ pub fn spawn_watchers(
                         chrono::Utc::now(),
                     )
                     .with_lookback(Duration::from_secs(*lookback_secs))
-                    .with_poll_timeout(poll_timeout_secs.map(Duration::from_secs));
+                    .with_poll_timeout(poll_timeout_secs.map(Duration::from_secs))
+                    .with_pager(pager);
                     handles.push(tokio::spawn(watcher::run_supervised(
                         w,
                         state.clone(),

@@ -31,9 +31,14 @@ arrow = { workspace = true, features = ["ffi"] }
 arrow-delta = { package = "arrow", version = "59", default-features = false, features = ["ffi"] }
 chrono.workspace = true
 url.workspace = true
+futures.workspace = true
+bytes.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wiremock = "0.6"
 
 [package.metadata.docs.rs]
 all-features = true

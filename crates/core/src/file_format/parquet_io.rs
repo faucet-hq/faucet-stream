@@ -121,27 +121,38 @@ mod imp {
         len: u64,
         display: String,
         max_range_bytes: u64,
+        limit_field: Option<&'static str>,
     }
 
     impl<R: RangeRead> RangedParquetReader<R> {
         /// A reader over an object of `len` bytes, named `display` in errors.
         /// One range may be at most
         /// [`DEFAULT_MAX_OBJECT_BYTES`](crate::file_format::DEFAULT_MAX_OBJECT_BYTES)
-        /// long; see [`with_max_range_bytes`](Self::with_max_range_bytes).
+        /// long, and the error for a longer one names no setting; see
+        /// [`with_max_range_bytes`](Self::with_max_range_bytes).
         pub fn new(inner: R, len: u64, display: impl Into<String>) -> Self {
             Self {
                 inner,
                 len,
                 display: display.into(),
                 max_range_bytes: crate::file_format::DEFAULT_MAX_OBJECT_BYTES,
+                limit_field: None,
             }
         }
 
-        /// Refuse a single range longer than `max` bytes (a source passes its
-        /// `max_object_bytes`) before asking the transport for it. A range
-        /// past the object's end is always refused.
-        pub fn with_max_range_bytes(mut self, max: u64) -> Self {
+        /// Refuse a single range longer than `max` bytes before asking the
+        /// transport for it; the error names the source's
+        /// `max_object_bytes`. A range past the object's end is always
+        /// refused.
+        pub fn with_max_range_bytes(self, max: u64) -> Self {
+            self.with_max_range_bytes_named(max, "max_object_bytes")
+        }
+
+        /// [`with_max_range_bytes`](Self::with_max_range_bytes), naming
+        /// `field` as the setting that raises the limit.
+        pub fn with_max_range_bytes_named(mut self, max: u64, field: &'static str) -> Self {
             self.max_range_bytes = max;
+            self.limit_field = Some(field);
             self
         }
 
@@ -168,9 +179,13 @@ mod imp {
                 )));
             }
             if wanted > self.max_range_bytes || usize::try_from(wanted).is_err() {
+                let setting = self
+                    .limit_field
+                    .map(|f| format!(" ({f})"))
+                    .unwrap_or_default();
                 return Err(external(format!(
                     "range {start}..{end} of '{}' is {wanted} bytes, more than the {} bytes one \
-                     read may fetch (max_object_bytes)",
+                     read may fetch{setting}",
                     self.display, self.max_range_bytes
                 )));
             }
@@ -574,5 +589,36 @@ mod tests {
             panic!("a footer read past the cap fails");
         };
         assert!(e.to_string().contains("max_object_bytes"), "{e}");
+    }
+
+    #[cfg(feature = "file-format-parquet")]
+    #[tokio::test]
+    async fn a_range_over_the_cap_names_the_field_only_when_one_is_set() {
+        use ::parquet::arrow::async_reader::AsyncFileReader as _;
+        let data = object();
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mem = || Mem {
+            data: data.clone(),
+            truncate: false,
+            reads: reads.clone(),
+        };
+        let len = data.len() as u64;
+        let over = len.min(4) + 1;
+
+        let cap = crate::file_format::DEFAULT_MAX_OBJECT_BYTES;
+        let mut unnamed = RangedParquetReader::new(mem(), cap * 2, "o");
+        let e = unnamed.get_bytes(0..cap + 1).await.unwrap_err().to_string();
+        assert!(e.contains("one read may fetch"), "{e}");
+        assert!(!e.contains('('), "no setting is named: {e}");
+
+        let mut named =
+            RangedParquetReader::new(mem(), len, "o").with_max_range_bytes_named(4, "range_cap");
+        let e = named.get_bytes(0..over).await.unwrap_err().to_string();
+        assert!(e.contains("(range_cap)"), "{e}");
+
+        let mut default = RangedParquetReader::new(mem(), len, "o").with_max_range_bytes(4);
+        let e = default.get_bytes(0..over).await.unwrap_err().to_string();
+        assert!(e.contains("(max_object_bytes)"), "{e}");
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

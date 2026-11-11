@@ -53,8 +53,27 @@ pub fn env_name(var: &str) -> String {
     format!("env:{var}")
 }
 
-/// How a recorded name reads in a message: `param 'x'` / `env override 'X'`.
+/// The name a value an event's sender placed is recorded under: the
+/// `${trigger.<token>}` it came from, or `param:<name>` for a template param
+/// a trigger set from the event.
+pub fn trigger_name(what: &str) -> String {
+    format!("trigger:{what}")
+}
+
+/// Whether a recorded name is a value an event's sender placed.
+pub fn is_trigger_name(name: &str) -> bool {
+    name.starts_with("trigger:")
+}
+
+/// How a recorded name reads in a message: `param 'x'` / `env override 'X'`
+/// / `` `${trigger.body}` `` / `param 'x' (set from the event)`.
 pub fn describe(name: &str) -> String {
+    if let Some(what) = name.strip_prefix("trigger:") {
+        return match what.strip_prefix("param:") {
+            Some(param) => format!("param '{param}' (set from the event)"),
+            None => format!("`${{trigger.{what}}}`"),
+        };
+    }
     match name.strip_prefix("env:") {
         Some(var) => format!("env override '{var}'"),
         None => format!("param '{name}'"),
@@ -137,6 +156,38 @@ impl CallerFields {
                 .or_default()
                 .extend(t.iter().cloned());
         }
+    }
+
+    /// The entries `names` wrote, each name recorded as `rename` gives it,
+    /// with its texts.
+    pub fn select(
+        &self,
+        names: &BTreeSet<String>,
+        rename: impl Fn(&str) -> String,
+    ) -> CallerFields {
+        let mut out = CallerFields::default();
+        for (ptr, written) in &self.entries {
+            for n in written.intersection(names) {
+                let how = if self.whole.contains(&(ptr.clone(), n.clone())) {
+                    Wrote::Whole
+                } else {
+                    Wrote::Part
+                };
+                out.insert_as(ptr.clone(), rename(n), how);
+            }
+        }
+        for n in names {
+            for t in self.texts.get(n).into_iter().flatten() {
+                out.add_text(rename(n), t.clone());
+            }
+        }
+        out
+    }
+
+    /// Whether every recorded name is a value an event's sender placed
+    /// ([`is_trigger_name`]).
+    pub fn only_trigger_values(&self) -> bool {
+        !self.entries.is_empty() && self.entries.values().flatten().all(|n| is_trigger_name(n))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&String, &BTreeSet<String>)> {
@@ -385,7 +436,8 @@ pub fn reference_leaves(doc: &Value) -> Vec<(String, String)> {
 
 /// `fields` extended through `doc`'s own references: a string holding
 /// `${vars.X}` / `${sources.N.PATH}` / `${sinks.N.PATH}` that names a value
-/// holding caller text holds it too.
+/// holding caller text holds it too, and so does one holding `${param.NAME}`
+/// when the param's declaration (`params.NAME`, its `default`) does.
 pub fn through_refs(doc: &Value, fields: &CallerFields) -> CallerFields {
     use crate::interpolate::{Directive, iter_directives};
     let leaves = reference_leaves(doc);
@@ -397,7 +449,12 @@ pub fn through_refs(doc: &Value, fields: &CallerFields) -> CallerFields {
                 let Directive::Deferred { id, path } = d else {
                     continue;
                 };
-                for t in ref_targets(id, path) {
+                let targets = if id == "param" {
+                    vec![format!("/params/{}", escape(path))]
+                } else {
+                    ref_targets(id, path)
+                };
+                for t in targets {
                     let params = out.params_at(&t);
                     if !params.is_empty() {
                         out.insert_all(ptr, &params);

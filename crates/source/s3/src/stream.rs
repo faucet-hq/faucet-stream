@@ -111,24 +111,12 @@ impl S3Source {
 
     /// Build an S3 client from the configuration.
     async fn build_client(config: &S3SourceConfig) -> Result<Client, FaucetError> {
-        let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
-
-        if let Some(ref region) = config.region {
-            config_loader = config_loader.region(aws_config::Region::new(region.clone()));
-        }
-
-        if let Some(ref endpoint) = config.endpoint_url {
-            config_loader = config_loader.endpoint_url(endpoint);
-        }
-
-        let sdk_config = config_loader.load().await;
-        // S3-compatible stores (MinIO) do not serve virtual-hosted bucket names.
-        let client = Client::from_conf(
-            aws_sdk_s3::config::Builder::from(&sdk_config)
-                .force_path_style(config.endpoint_url.is_some())
-                .build(),
-        );
-        Ok(client)
+        faucet_common_s3::build_client_with(
+            config.region.as_deref(),
+            config.endpoint_url.as_deref(),
+            &config.credentials,
+        )
+        .await
     }
 
     /// List object keys matching the configured bucket and prefix.
@@ -284,10 +272,10 @@ impl S3Source {
     #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
     fn container_decoder(&self) -> Result<Option<faucet_core::ContainerDecoder>, FaucetError> {
         match self.config.file_format.shared() {
-            Some(f) if f.is_container() => Ok(Some(faucet_core::ContainerDecoder::new(
-                f,
-                &self.config.format_options(),
-            )?)),
+            Some(f) if f.is_container() => Ok(Some(
+                faucet_core::ContainerDecoder::new(f, &self.config.format_options())?
+                    .with_max_decoded_bytes(self.config.decoded_bytes_limit()),
+            )),
             _ => Ok(None),
         }
     }
@@ -320,10 +308,14 @@ impl S3Source {
             .file_format
             .shared()
             .ok_or_else(|| FaucetError::Source(format!("S3 '{key}': format has no decoder")))?;
-        let records =
-            faucet_core::file_format::decode_owned(bytes, format, &self.config.format_options())
-                .await
-                .map_err(|e| FaucetError::Source(format!("S3 '{key}': {e}")))?;
+        let records = faucet_core::file_format::decode_owned_bounded(
+            bytes,
+            format,
+            &self.config.format_options(),
+            self.config.decoded_bytes_limit(),
+        )
+        .await
+        .map_err(|e| FaucetError::Source(format!("S3 '{key}': {e}")))?;
         Ok(Fetched::Records(records))
     }
 
@@ -371,7 +363,8 @@ impl S3Source {
             self.roundtrips.recorder(),
             self.calls.get(),
         )
-        .await?;
+        .await?
+        .with_max_range_bytes(self.config.max_object_bytes);
         let object_len = reader.len();
         let mut builder = ParquetRecordBatchStreamBuilder::new(reader)
             .await

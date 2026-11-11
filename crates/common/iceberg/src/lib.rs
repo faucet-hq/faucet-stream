@@ -9,6 +9,8 @@
 //! storage-factory selection used by the non-REST catalogs.
 
 pub mod catalog;
+#[cfg(feature = "storage-opendal")]
+mod checked;
 pub mod config;
 #[cfg(feature = "catalog-hms")]
 pub mod hms;

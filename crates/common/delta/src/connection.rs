@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::credentials::DeltaCredentials;
 
+/// Storage options naming the Azure storage account (any case).
+const AZURE_ACCOUNT_KEYS: &[&str] = &["azure_storage_account_name", "account_name"];
+
 /// Location + credentials for a Delta table. Flattened (`#[serde(flatten)]`)
 /// into both the source and sink config so the same three keys appear at the
 /// connector-config top level.
@@ -68,6 +71,17 @@ impl std::fmt::Debug for DeltaConnection {
     }
 }
 
+/// The fields of a Delta source or sink config (the connection block is
+/// flattened at its top level) that make it use the host's identity
+/// ([`DeltaConnection::host_identity`]).
+pub fn host_identity(config: &faucet_core::Value) -> Vec<String> {
+    serde_json::from_value::<DeltaConnection>(config.clone())
+        .ok()
+        .and_then(|c| c.host_identity())
+        .into_iter()
+        .collect()
+}
+
 impl DeltaConnection {
     /// Build the effective `storage_options` map: credential-derived keys with
     /// the user's explicit `storage_options` layered on top (explicit wins).
@@ -93,9 +107,29 @@ impl DeltaConnection {
         register_all_handlers();
     }
 
+    /// Check the connection before any request: an Azure storage account
+    /// name (`credentials.account_name`, or an `azure_storage_account_name` /
+    /// `account_name` storage option in any case) must be 3 to 24 lowercase
+    /// letters and digits, the service's own rule.
+    pub fn validate(&self) -> Result<(), FaucetError> {
+        for (key, value) in self.merged_storage_options() {
+            let key = key.to_ascii_lowercase();
+            if AZURE_ACCOUNT_KEYS.contains(&key.as_str())
+                && !faucet_core::resolve::is_valid_azure_account_name(&value)
+            {
+                return Err(FaucetError::Config(format!(
+                    "delta: `{key}` must be an Azure storage account name: 3 to 24 lowercase \
+                     letters and digits"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Resolve `table_uri` to a `Url`, turning bare local paths into `file://`
     /// (delta-rs's `open_table*` functions take a `Url`, not a string).
     fn table_url(&self) -> Result<url::Url, FaucetError> {
+        self.validate()?;
         deltalake::ensure_table_uri(&self.table_uri).map_err(|e| {
             FaucetError::Config(format!(
                 "delta: invalid table_uri '{}': {e}",
@@ -110,22 +144,112 @@ impl DeltaConnection {
         Ok(self.table_url()?.to_string())
     }
 
+    /// The field that makes this connection authenticate with the identity
+    /// of the host faucet runs on, if any: `storage_options.<key>` for a key
+    /// naming a role, profile, metadata service or workload identity;
+    /// `credentials` when the effective options name no credential of the
+    /// table's store (an S3 key id needs its secret). A task that may not use
+    /// the host's identity builds its store from these options alone, so the
+    /// process environment does not count. A local table uses none.
+    pub fn host_identity(&self) -> Option<String> {
+        use faucet_core::resolve::{StoreKind, store_options_host_identity};
+        let kind = StoreKind::from_url(&self.table_uri)?;
+        match store_options_host_identity(kind, self.merged_storage_options())? {
+            key if key != "credentials" => Some(format!("storage_options.{key}")),
+            _ => Some("credentials".into()),
+        }
+    }
+
+    /// Refuse a connection that would authenticate with the host's identity
+    /// where the task may not use it ([`DeltaConnection::host_identity`]).
+    pub fn check_host_identity(&self) -> Result<(), FaucetError> {
+        match self.host_identity() {
+            Some(field) => faucet_core::resolve::require_host_credentials("delta", &field),
+            None => Ok(()),
+        }
+    }
+
     /// Open the table at its latest version. Registers handlers first.
     pub async fn open(&self) -> Result<deltalake::DeltaTable, FaucetError> {
+        self.check_host_identity()?;
         self.register_handlers();
         let url = self.table_url()?;
-        deltalake::open_table_with_storage_options(url, self.merged_storage_options())
-            .await
-            .map_err(|e| self.map_open_error(e))
+        self.load(url).await.map_err(|e| self.map_open_error(e))
+    }
+
+    /// Load the table at `url` ([`DeltaConnection::table_builder`]).
+    async fn load(
+        &self,
+        url: url::Url,
+    ) -> Result<deltalake::DeltaTable, deltalake::DeltaTableError> {
+        match self.table_builder(url.clone())? {
+            Some(builder) => builder.load().await,
+            None => {
+                deltalake::open_table_with_storage_options(url, self.merged_storage_options()).await
+            }
+        }
+    }
+
+    /// The builder for `url` when the task needs its own store, else `None`
+    /// (delta-rs builds it from the options). Where the task may not use the
+    /// host's identity the store is built from the connection's options alone,
+    /// never the process environment; under a reference policy with path roots
+    /// (a config the host does not trust) it refuses keys outside the table.
+    fn table_builder(
+        &self,
+        url: url::Url,
+    ) -> Result<Option<deltalake::DeltaTableBuilder>, deltalake::DeltaTableError> {
+        let options = self.merged_storage_options();
+        let confined =
+            faucet_core::http::current_reference_policy().is_some_and(|p| p.path_roots().is_some());
+        let own = !faucet_core::resolve::host_credentials_allowed();
+        if !confined && !own {
+            return Ok(None);
+        }
+        let builder = deltalake::DeltaTableBuilder::from_url(url.clone())?
+            .with_storage_options(options.clone());
+        let built = if own {
+            crate::own_store::build(&url, &options)?
+        } else {
+            None
+        };
+        let mut root = match built {
+            Some(store) => store,
+            None => builder.build_storage()?.root_object_store(None),
+        };
+        if confined {
+            let prefix = deltalake::Path::from_url_path(url.path()).map_err(|e| {
+                deltalake::DeltaTableError::InvalidTableLocation(format!("{url}: {e}"))
+            })?;
+            root = std::sync::Arc::new(crate::confined::Confined::new(root, prefix));
+        }
+        Ok(Some(builder.with_storage_backend(root, url)))
+    }
+
+    /// The table's log store, built as [`DeltaConnection::open`] builds it —
+    /// for delta-rs operations that create the table (`CreateBuilder`).
+    pub fn log_store(&self) -> Result<deltalake::logstore::LogStoreRef, FaucetError> {
+        self.check_host_identity()?;
+        self.register_handlers();
+        let url = self.table_url()?;
+        let builder = match self.table_builder(url.clone()) {
+            Ok(Some(b)) => b,
+            Ok(None) => deltalake::DeltaTableBuilder::from_url(url)
+                .map(|b| b.with_storage_options(self.merged_storage_options()))
+                .map_err(|e| self.map_open_error(e))?,
+            Err(e) => return Err(self.map_open_error(e)),
+        };
+        builder.build_storage().map_err(|e| self.map_open_error(e))
     }
 
     /// Open the table if it exists; return `Ok(None)` when the URI is not (yet)
     /// a Delta table. Other errors (auth, I/O) propagate. Used by the sink's
     /// `create_if_not_missing` path.
     pub async fn open_optional(&self) -> Result<Option<deltalake::DeltaTable>, FaucetError> {
+        self.check_host_identity()?;
         self.register_handlers();
         let url = self.table_url()?;
-        match deltalake::open_table_with_storage_options(url, self.merged_storage_options()).await {
+        match self.load(url).await {
             Ok(t) => Ok(Some(t)),
             Err(e) if is_missing_table(&e) => Ok(None),
             Err(e) => Err(self.map_open_error(e)),
@@ -166,6 +290,12 @@ impl DeltaConnection {
     }
 
     fn map_open_error(&self, e: deltalake::DeltaTableError) -> FaucetError {
+        if e.to_string().contains(crate::confined::OUTSIDE) {
+            return FaucetError::Config(format!(
+                "delta: table '{}' names a file outside its `table_uri`: {e}",
+                self.redacted_uri()
+            ));
+        }
         FaucetError::Source(format!(
             "delta: failed to open table '{}': {e}",
             self.redacted_uri()
@@ -225,12 +355,103 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn delta_role_options_are_refused_for_callers() {
+        let keyed = json!({"table_uri": "s3://b/t", "credentials": {"type": "aws", "config": {
+            "access_key_id": "a", "secret_access_key": "s", "region": "us-east-1"}}});
+        assert!(
+            host_identity(&keyed).is_empty(),
+            "static keys are the config's own"
+        );
+        assert_eq!(
+            host_identity(&json!({"table_uri": "s3://b/t"})),
+            vec!["credentials"]
+        );
+        let id_only = json!({"table_uri": "s3://b/t", "credentials": {"type": "aws", "config": {
+            "access_key_id": "a"}}});
+        assert_eq!(host_identity(&id_only), vec!["credentials"]);
+        let role = json!({"table_uri": "s3://b/t", "credentials": {"type": "aws", "config": {
+            "access_key_id": "a", "secret_access_key": "s"}},
+            "storage_options": {"AWS_IAM_ROLE_ARN": "arn:aws:iam::1:role/r"}});
+        assert_eq!(
+            host_identity(&role),
+            vec!["storage_options.AWS_IAM_ROLE_ARN"]
+        );
+        assert!(host_identity(&json!({"table_uri": "/tmp/t"})).is_empty());
+        assert!(host_identity(&json!({"table_uri": "file:///tmp/t"})).is_empty());
+        let az = json!({"table_uri": "abfss://c@a.dfs.core.windows.net/t", "credentials": {
+            "type": "azure", "config": {"account_name": "a", "access_key": "k"}}});
+        assert!(host_identity(&az).is_empty());
+        assert_eq!(
+            host_identity(&json!({"table_uri": "abfss://c@a.dfs.core.windows.net/t"})),
+            vec!["credentials"]
+        );
+        let gcs = json!({"table_uri": "gs://b/t", "credentials": {"type": "gcp", "config": {
+            "service_account_key": "{}"}}});
+        assert!(host_identity(&gcs).is_empty());
+        assert_eq!(
+            host_identity(&json!({"table_uri": "gs://b/t"})),
+            vec!["credentials"]
+        );
+    }
+
+    #[tokio::test]
+    async fn ambient_clients_are_refused_inside_a_caller_run() {
+        let conn: DeltaConnection =
+            serde_json::from_value(json!({"table_uri": "s3://b/t"})).unwrap();
+        faucet_core::resolve::with_host_credentials(false, async {
+            let err = conn.open().await.expect_err("refused").to_string();
+            assert!(err.contains("delta: `credentials`"), "{err}");
+            let err = conn.open_optional().await.expect_err("refused").to_string();
+            assert!(err.contains("delta: `credentials`"), "{err}");
+        })
+        .await;
+        let local: DeltaConnection =
+            serde_json::from_value(json!({"table_uri": "/nonexistent/faucet/t"})).unwrap();
+        assert!(local.check_host_identity().is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_caller_run_builds_its_log_store_from_its_own_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = conn(dir.path().to_str().unwrap());
+        let trusted = local.log_store().unwrap();
+        let caller =
+            faucet_core::resolve::with_host_credentials(false, async { local.log_store() })
+                .await
+                .unwrap();
+        assert_eq!(caller.root_url(), trusted.root_url());
+    }
+
     fn conn(uri: &str) -> DeltaConnection {
         DeltaConnection {
             table_uri: uri.into(),
             credentials: DeltaCredentials::default(),
             storage_options: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn azure_account_names_follow_the_service_rule() {
+        let mut c = conn("abfss://c@acct.dfs.core.windows.net/t");
+        assert!(c.validate().is_ok());
+        c.storage_options
+            .insert("AZURE_STORAGE_ACCOUNT_NAME".into(), "evil.example#".into());
+        let e = c.location_string().unwrap_err().to_string();
+        assert!(
+            e.contains("azure_storage_account_name") && !e.contains("evil"),
+            "{e}"
+        );
+        c.storage_options.clear();
+        c.storage_options
+            .insert("account_name".into(), "acct".into());
+        assert!(c.validate().is_ok());
+        c.credentials = serde_json::from_value(
+            json!({"type": "azure", "config": {"account_name": "Bad.Name"}}),
+        )
+        .unwrap();
+        c.storage_options.clear();
+        assert!(c.validate().is_err());
     }
 
     #[test]
@@ -376,6 +597,72 @@ mod tests {
         let c = conn("file:///tmp/t");
         c.register_handlers();
         c.register_handlers();
+    }
+}
+
+#[cfg(test)]
+mod confined_tests {
+    use super::*;
+    use deltalake::logstore::object_store::ObjectStoreExt as _;
+    use faucet_core::resolve::ReferencePolicy;
+    use std::sync::Arc;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delta_log_paths_outside_the_table_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let table = root.join("t");
+        std::fs::create_dir(&table).unwrap();
+        std::fs::create_dir(root.join("other")).unwrap();
+        std::fs::write(root.join("other/x.parquet"), b"PAR1").unwrap();
+        let conn: DeltaConnection = serde_json::from_value(serde_json::json!({
+            "table_uri": table.display().to_string()
+        }))
+        .unwrap();
+        deltalake::operations::create::CreateBuilder::new()
+            .with_location(conn.location_string().unwrap())
+            .with_columns([deltalake::kernel::StructField::new(
+                "id",
+                deltalake::kernel::DataType::LONG,
+                true,
+            )])
+            .await
+            .unwrap();
+
+        let trusted = conn.open().await.unwrap();
+        let store = trusted.log_store().root_object_store(None);
+        assert!(!store.to_string().contains("Confined"));
+
+        let policy = Arc::new(ReferencePolicy::deny_all().with_path_roots(vec![root.clone()]));
+        let caller = faucet_core::http::with_reference_policy(Arc::clone(&policy), conn.open())
+            .await
+            .unwrap();
+        let store = caller.log_store().root_object_store(None);
+        assert!(store.to_string().contains("Confined"), "{store}");
+        let outside = deltalake::Path::from_filesystem_path(root.join("other/x.parquet")).unwrap();
+        let e = store.get(&outside).await.unwrap_err().to_string();
+        assert!(e.contains(crate::confined::OUTSIDE), "{e}");
+        let log = deltalake::Path::from_filesystem_path(
+            table.join("_delta_log/00000000000000000000.json"),
+        )
+        .unwrap();
+        assert!(store.get(&log).await.is_ok());
+        let missing = faucet_core::http::with_reference_policy(policy, async {
+            let conn: DeltaConnection = serde_json::from_value(serde_json::json!({
+                "table_uri": root.join("nope").display().to_string()
+            }))
+            .unwrap();
+            conn.open_optional().await
+        })
+        .await
+        .unwrap();
+        assert!(missing.is_none());
+
+        let refused = conn.map_open_error(deltalake::DeltaTableError::Generic(format!(
+            "'x' {}",
+            crate::confined::OUTSIDE
+        )));
+        assert!(matches!(refused, FaucetError::Config(_)), "{refused}");
     }
 }
 

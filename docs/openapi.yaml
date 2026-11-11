@@ -1431,7 +1431,7 @@ paths:
                   description: Replay on behalf of this tenant (`tenants` feature) — the config loads under the tenant's scope and the replay is admitted against its limits, whose per-run ceilings bound it. A principal confined to another tenant gets a 404.
       responses:
         "200":
-          description: Replay outcome (id, tenant, candidates, skipped_other_rows, records_written, failed_dlq, unsealed_discards — discard entries of a sealed DLQ written without its key, which are not honoured)
+          description: Replay outcome (id, tenant, candidates, skipped_other_rows, skipped_unproven — envelopes a hash or tokenize masking rule would mask again because no verified masking record shows they were masked already, left in the DLQ —, records_written, failed_dlq, unsealed_discards — discard entries of a sealed DLQ written without its key, which are not honoured)
           content: { application/json: { schema: { type: object } } }
         "400": { description: Bad config, location, or reason filter }
         "401": { description: Missing or invalid bearer token }
@@ -2109,10 +2109,13 @@ paths:
         caller's `redirect` with `connection=<name>&status=ok`, or
         `status=error&error=<code>` (`expired`, `access_denied`,
         `missing_code`, `exchange_failed`, `store_unavailable`,
-        `connection_changed`). The callback writes only over the connection
-        its flow started from; `connection_changed` means the connection or
-        tenant was deleted or replaced during the flow and nothing was stored.
-        An unknown or already-used `state` is a 400.
+        `connection_changed`, or the provider's own error code). The callback
+        writes only over the connection its flow started from;
+        `connection_changed` means the connection or tenant was deleted or
+        replaced during the flow and nothing was stored (a change made before
+        the callback means the code is never exchanged). A provider `error`
+        is passed on when it is 1–64 characters of `[A-Za-z0-9_.-]`, else as
+        `provider_error`. An unknown or already-used `state` is a 400.
       operationId: connectCallback
       parameters:
         - { name: state, in: query, required: true, schema: { type: string } }
@@ -3383,7 +3386,7 @@ paths:
                             instance_id: { type: string }
                             listen: { type: string, nullable: true }
                             pools: { type: array, nullable: true, items: { type: string }, description: "null for a member that predates execution pools: it claims any pending run, so a non-default pool is refused while it is live." }
-                            capabilities: { type: array, nullable: true, items: { type: string }, description: "What the member enforces that older releases do not (`policy_pin`, #1051); null for a member that predates them. Runs under a policy, and policy changes, wait while any live member lacks `policy_pin`." }
+                            capabilities: { type: array, nullable: true, items: { type: string }, description: "What the member enforces that older releases do not (`policy_pin`, #1051; `connection_generation`; `host_credentials`); null for a member that predates them. Runs under a policy, and policy changes, wait while any live member lacks `policy_pin`. A hosted OAuth flow moves a connection's `updated_at` when it assigns a generation only while every live member has `connection_generation`. A caller's run whose connectors check the server's own identity when they are built is refused (503) while any live member lacks `host_credentials`." }
                             in_flight: { type: integer }
                             max_concurrent: { type: integer }
                   triggers:
@@ -5621,7 +5624,7 @@ components:
         budget: { $ref: "#/components/schemas/BudgetSpec" }
         selection: { $ref: "#/components/schemas/RowSelection" }
         depends_on: { $ref: "#/components/schemas/RunDependencies" }
-        pool: { type: string, pattern: "^[a-z0-9][a-z0-9_-]{0,62}$", description: "Execution pool to run in (#957). Wins over the template's `pool:`; omitted with no `pool:` = `default`. A clustered replica claims only runs in the pools it serves (`--pool`); a pool no live member serves (or, on a single server, one it does not serve) is a 422 naming the pool." }
+        pool: { type: string, pattern: "^[a-z0-9][a-z0-9_-]{0,62}$", description: "Execution pool to run in (#957). Wins over the template's `pool:` only where the template's `pool_override` allows the pool (`true`, or a list naming it); otherwise a pool other than the template's is a 422 naming `pool_override`. Omitted with no `pool:` = `default`. A clustered replica claims only runs in the pools it serves (`--pool`); a pool no live member serves (or, on a single server, one it does not serve) is a 422 naming the pool." }
       example:
         params:
           region: us-east-1

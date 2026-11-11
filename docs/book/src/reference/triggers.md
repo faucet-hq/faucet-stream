@@ -111,6 +111,12 @@ a store that stops answering fails the poll (the watcher backs off and, after
 three failures in a row, reports unhealthy) rather than freezing it. Set
 `poll_timeout_secs` to also bound the whole poll — listing plus firing.
 
+A key the object-store client cannot read as a path (an empty, `.` or `..`
+segment, or a control character, such as `in//x.csv`) does not stop the
+prefix: the listing narrows to that key, skips it with a warning naming it
+(counted in `faucet_serve_trigger_errors_total`), and resumes right after it,
+so every other object still fires.
+
 **`${trigger.*}` tokens injected into the run config:**
 
 Tokens are substituted inside each string value of the parsed config, with the
@@ -132,8 +138,16 @@ lands:
   quotes around the token): no quote (`'`, `"`, `` ` ``), `;` or backslash. A
   path, URL or name (`in/${trigger.object_key}`,
   `s3://bucket/${trigger.object_key}`) may hold them;
+- spliced unquoted into SQL text (`WHERE id = ${trigger.query.id}`): a number
+  only (`42`, `-4.5`), the rule `${param.*}` follows. Quote the token
+  (`WHERE id = '${trigger.query.id}'`) to splice text;
+- spliced into an `http://` / `https://` URL: no `?`, `#`, `&`, whitespace or
+  `..` segment, so a value cannot add a query parameter or a fragment;
 - inside a URL's host (`https://${trigger.header.x-region}.api.example`): host
   name characters only (letters, digits, `.`, `-`);
+- values next to each other, or next to text the config writes, may not
+  combine into an interpolation directive (`${env:…}`, `${file:…}`): a value
+  `$` beside a value `{env:HOME}` is refused;
 - as the whole of a SQL field: refused — a sender never supplies a whole
   statement. A GraphQL `query` or a search or document-store `filter` is not
   SQL and takes a whole value. Outside any connector or transform the trigger
@@ -144,13 +158,27 @@ lands:
   `--allow-path-root`, and never the system trees or the server's credential
   files).
 
+The trigger's config is the operator's and loads as the server's own, but
+every value that holds sender text is then held to the caller reference policy
+where it lands, read with that field's grammar: a `brokers` list, an ADO.NET or
+Azure Storage connection string, an annotated option key, an absolute URL, an
+`auth:` provider endpoint. A scalar that holds any sender text is judged whole,
+operator text included, because a fragment can change what the rest means
+(a later `key=` in a connection string wins). A sender value placed in a
+`params:` default is followed to every `${param.NAME}` that uses it. A refusal
+names the field and the token (`${trigger.header.x-brokers}`), shows only the
+sender's text, and is audited as `policy.denied` on `trigger values`. Allow
+fixed hosts with `--allow-url-host`. A bare `host:port` in a field no schema
+marks as a host is not read as one, as for a caller's own config.
+
 A `template:` trigger's `params` are checked the same way. Where the template
 places a param is not known when the trigger fires, so a sender value in a
 param is judged by the param's name and the value itself: no `..` segment in a
 value that reads as a path, no whole value for a param named `query`, `sql`,
 `statement`, `where` or `filter`, no quote, `;` or backslash when spliced into
 free text, and a URL or a leading absolute path must pass the caller reference
-policy.
+policy. Once the template is bound, a param that holds sender text is checked
+where the template places it, as a config trigger's value is.
 
 A refused fire never runs: a webhook answers `422` (the trigger stays healthy),
 and an `object_arrival` watcher skips the object and reports it, then fires the

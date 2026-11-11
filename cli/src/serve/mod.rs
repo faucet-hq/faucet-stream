@@ -6,6 +6,7 @@
 pub mod audit;
 pub mod auth;
 pub mod callback;
+pub mod caller_limits;
 pub mod changes;
 pub mod cluster;
 pub mod config;
@@ -13,7 +14,9 @@ pub mod error;
 pub mod guard;
 pub mod handlers;
 pub mod history;
+pub mod host_identity;
 pub mod idempotency;
+pub mod listen;
 pub mod load;
 pub mod log_export;
 pub mod logs;

@@ -246,8 +246,7 @@ impl DeltaDriver {
         })?;
 
         let mut builder = CreateBuilder::new()
-            .with_location(self.config.connection.location_string()?)
-            .with_storage_options(self.config.connection.merged_storage_options())
+            .with_log_store(self.config.connection.log_store()?)
             .with_columns(delta_schema.fields().cloned());
         if !self.config.partition_by.is_empty() {
             builder = builder.with_partition_columns(self.config.partition_by.clone());

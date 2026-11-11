@@ -3,7 +3,17 @@ use faucet_core::{Capabilities, ConnectorDescriptor};
 use serde_json::Value;
 
 /// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
-pub const DESCRIPTOR: ConnectorDescriptor = ConnectorDescriptor::new("snowflake", capabilities);
+pub const DESCRIPTOR: ConnectorDescriptor =
+    ConnectorDescriptor::new("snowflake", capabilities).with_host_identity(host_identity);
+
+fn host_identity(config: &Value) -> Vec<String> {
+    config
+        .get("bulk_load")
+        .filter(|b| b.is_object())
+        .and_then(crate::config::bulk_load_host_identity)
+        .into_iter()
+        .collect()
+}
 
 fn capabilities(config: &Value) -> Capabilities {
     let bulk_load = config.is_null() || is_set(config, "bulk_load");

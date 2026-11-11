@@ -634,7 +634,8 @@ async fn plan_run(
     {
         #[cfg(feature = "catalog")]
         let history = state.history();
-        let report = crate::commands::plan::plan_node(
+        let report = crate::runtime::local::plan(
+            &principal,
             &loaded.cfg,
             node,
             &auth,
@@ -1138,6 +1139,9 @@ pub async fn create(
                 details: None,
             },
         )?;
+        crate::serve::runner::refuse_reserved_idempotency_key(
+            payload.get("idempotency_key").and_then(Value::as_str),
+        )?;
         // The request is stored before it runs, so its callback is held to
         // the rules a submitted run's is, now.
         if let Some(cb) = payload.get("callback").filter(|c| !c.is_null()) {
@@ -1571,8 +1575,10 @@ async fn execute(
             req.labels.insert("change".to_string(), change.id.clone());
             // A retried execution (a double approval, the sweep reconciling an
             // interrupted one) replays this run instead of starting another.
-            req.idempotency_key
-                .get_or_insert_with(|| format!("change:{}", change.id));
+            if req.idempotency_key.is_none() {
+                req.idempotency_key = Some(format!("change:{}", change.id));
+                req.server_key = true;
+            }
             // The approved run, as its requester: every stage runs again
             // at submission, and the approval was granted (`approved_change`).
             let principal =

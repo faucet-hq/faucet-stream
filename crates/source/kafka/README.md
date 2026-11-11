@@ -100,7 +100,7 @@ All fields are keys under `source.config`.
 |-------|------|---------|-------------|
 | `auto_offset_reset` | `earliest` \| `latest` | `latest` | Where to start a partition that has **no** bookmarked offset and no offset committed by the consumer group (`group_id`) — i.e. a first-ever run or a newly-added partition. Resumed partitions always start from their bookmark; a partition without one starts at the group's committed offset when the group has one (for example after a sharded member-mode run). |
 | `on_decode_error` | `fail` \| `skip` | `fail` | What to do when one message fails to decode. `fail` aborts the batch; `skip` drops the message and logs a `WARN`. |
-| `extra_client_config` | object | `{}` | Raw librdkafka client properties passed straight to the consumer. These can override anything set by `auth` or the typed fields above — use with care. |
+| `extra_client_config` | object | `{}` | Raw librdkafka client properties passed straight to the consumer. These can override anything set by `auth` or the typed fields above — use with care. Under `faucet serve`, keys naming a broker (`bootstrap.servers`, `metadata.broker.list`), a URL (`*.url`) or a file (`*.location`, `*.file`, `sasl.kerberos.keytab`) are checked like the typed fields, and keys that load or run a program (`plugin.library.paths`, `ssl.engine.location`, `ssl.providers`, `*.cmd`) are refused for configs the server does not trust. |
 
 ### Batching
 
@@ -508,6 +508,10 @@ sink's commit token), reports lag, orders and compares positions for
 the group at durable page boundaries. `MessageSourceDriver` acknowledges each
 page and bookmarks only a consumed count, and `SourceDriver` has no hooks for
 lag, positions or sharding, so either would change those semantics.
+
+## Caller configs under `faucet serve`
+
+A client whose final options select GSSAPI authenticates with the server's Kerberos identity: `sasl.mechanism` (or `sasl.mechanisms`) set to `GSSAPI`, or a `SASL_*` `security.protocol` that no other mechanism overrides, since GSSAPI is librdkafka's default. A config a caller submits to `faucet serve` may do that only when the server runs with `--allow-host-credentials` (never for a tenant). `sasl.kerberos.keytab` is a server path and `sasl.kerberos.kinit.cmd` a command; both follow the server's reference policy. Whatever the origin, `sasl.kerberos.principal` and `sasl.kerberos.service.name` may hold only letters, digits and `._/@:-` (so a `HOST$@REALM` principal is refused), and `sasl.kerberos.keytab` no quote, `$`, backtick, backslash or control character: the default `kinit` command line interpolates them.
 
 ## License
 

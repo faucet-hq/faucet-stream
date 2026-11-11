@@ -82,6 +82,7 @@ impl IdentifierCase {
 
 /// Configuration for [`OracleSink`](crate::OracleSink).
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(extend("x-faucet-follows-servers" = true))]
 pub struct OracleSinkConfig {
     /// Connection settings (`connect_string` or `host` + `service_name`/`sid`).
     #[serde(flatten)]

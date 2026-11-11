@@ -327,6 +327,7 @@ pub async fn submit_backfill(
             server_file: false,
             sealed_params: None,
             caller_fields: Default::default(),
+            server_key: true,
         };
         let outcome = crate::runtime::server::submit(
             &state,

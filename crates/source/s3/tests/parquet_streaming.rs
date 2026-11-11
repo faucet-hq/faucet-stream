@@ -377,6 +377,33 @@ async fn parquet_columns_project_on_both_read_paths() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn parquet_ranges_respect_max_object_bytes() {
+    let (_c, endpoint) = start_minio().await;
+    seed(&endpoint, "big.parquet", parquet_bytes(4_000, 4_000, 100)).await;
+    let mut capped = config(1_000);
+    capped.max_object_bytes = 64 * 1024;
+    let source = build_source(&endpoint, capped).await;
+    let ctx: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut pages = source.stream_pages(&ctx, 1_000);
+    let e = loop {
+        match pages.next().await.expect("the capped read fails") {
+            Ok(_) => continue,
+            Err(e) => break e.to_string(),
+        }
+    };
+    assert!(
+        e.contains("big.parquet") && e.contains("max_object_bytes"),
+        "{e}"
+    );
+    assert_eq!(
+        collect_ids(&build_source(&endpoint, config(1_000)).await, 1_000)
+            .await
+            .len(),
+        4_000
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn an_object_replaced_mid_read_fails_rather_than_mixing_versions() {
     let (_c, endpoint) = start_minio().await;
     seed(&endpoint, "swap.parquet", parquet_bytes(5_000, 500, 10)).await;

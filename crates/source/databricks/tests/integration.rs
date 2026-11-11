@@ -634,3 +634,54 @@ async fn a_stalled_external_link_body_honours_the_call_deadline() {
         "{err}"
     );
 }
+
+#[tokio::test]
+async fn chunk_links_to_metadata_addresses_are_refused() {
+    for target in [
+        "http://169.254.169.254/latest/meta-data",
+        "http://0xa9fea9fe/x",
+        "http://[fe80::1]/x",
+        "file:///etc/hosts",
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "statement_id": "s",
+                "status": { "state": "SUCCEEDED" },
+                "manifest": manifest(&[("id", "INT")]),
+                "result": { "external_links": [{ "chunk_index": 0, "external_link": target }] }
+            })))
+            .mount(&server)
+            .await;
+        let src = source(&server.uri(), "SELECT id FROM t").await;
+        let err = src.fetch_with_context(&HashMap::new()).await.unwrap_err();
+        assert!(err.to_string().contains("refused"), "{target}: {err}");
+    }
+}
+
+#[tokio::test]
+async fn chunk_links_to_other_origins_carry_no_credentials() {
+    let workspace = MockServer::start().await;
+    let other = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data_array": [["9"]]})))
+        .mount(&other)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "statement_id": "s",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": manifest(&[("id", "INT")]),
+            "result": { "data_array": [["1"]],
+                        "next_chunk_index": 1,
+                        "next_chunk_internal_link": format!("@{}/x", other.address()) }
+        })))
+        .mount(&workspace)
+        .await;
+    let src = source(&workspace.uri(), "SELECT id FROM t").await;
+    let err = src.fetch_with_context(&HashMap::new()).await.unwrap_err();
+    assert!(err.to_string().contains("refused"), "{err}");
+    assert!(other.received_requests().await.unwrap().is_empty());
+}

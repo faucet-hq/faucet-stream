@@ -11,4 +11,6 @@
 
 mod auth;
 
-pub use auth::{KinesisCredentials, build_client};
+pub use auth::{
+    KinesisCredentials, build_client, host_identity, host_identity_at, region_from_env,
+};

@@ -124,3 +124,95 @@ fn ranged_reads_grow_with_the_bytes_received() {
     assert_eq!(initial_range_capacity(1_000), 1_000);
     assert_eq!(initial_range_capacity(u64::MAX), 8 * 1024 * 1024);
 }
+
+/// A fake SFTP server serving one file, answering each `READ` with at most
+/// `cap` bytes and recording every requested read length.
+#[cfg(feature = "arrow")]
+async fn serve_file(
+    mut io: tokio::io::DuplexStream,
+    file: Vec<u8>,
+    cap: usize,
+    reads: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    fn frame(body: Vec<u8>) -> Vec<u8> {
+        let mut out = (body.len() as u32).to_be_bytes().to_vec();
+        out.extend(body);
+        out
+    }
+    fn status(id: &[u8], code: u32) -> Vec<u8> {
+        let mut b = vec![101];
+        b.extend_from_slice(id);
+        b.extend_from_slice(&code.to_be_bytes());
+        b.extend_from_slice(&[0; 8]);
+        frame(b)
+    }
+    let u32_at = |b: &[u8], at: usize| u32::from_be_bytes(b[at..at + 4].try_into().unwrap());
+    while let Ok(len) = io.read_u32().await {
+        let mut body = vec![0u8; len as usize];
+        if io.read_exact(&mut body).await.is_err() {
+            return;
+        }
+        let id = body[1..5].to_vec();
+        let reply = match body[0] {
+            1 => frame(vec![2, 0, 0, 0, 3]),
+            3 => {
+                let mut b = vec![102];
+                b.extend_from_slice(&id);
+                b.extend_from_slice(&1u32.to_be_bytes());
+                b.push(b'h');
+                frame(b)
+            }
+            5 => {
+                let handle_len = u32_at(&body, 5) as usize;
+                let at = 9 + handle_len;
+                let offset = u64::from_be_bytes(body[at..at + 8].try_into().unwrap()) as usize;
+                let want = u32_at(&body, at + 8);
+                reads.lock().unwrap().push(want);
+                if offset >= file.len() {
+                    status(&id, 1)
+                } else {
+                    let end = file.len().min(offset + (want as usize).min(cap));
+                    let mut b = vec![103];
+                    b.extend_from_slice(&id);
+                    b.extend_from_slice(&((end - offset) as u32).to_be_bytes());
+                    b.extend_from_slice(&file[offset..end]);
+                    frame(b)
+                }
+            }
+            _ => status(&id, 0),
+        };
+        if io.write_all(&reply).await.is_err() {
+            return;
+        }
+    }
+}
+
+#[cfg(feature = "arrow")]
+#[tokio::test]
+async fn ranged_reads_after_the_footer_use_full_size_reads() {
+    use faucet_core::file_format::parquet_io::RangeRead;
+    let file: Vec<u8> = (0..600_000u32).map(|i| i as u8).collect();
+    let reads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (client, server) = tokio::io::duplex(1 << 20);
+    tokio::spawn(serve_file(server, file.clone(), 64 * 1024, reads.clone()));
+    let sftp = russh_sftp::client::SftpSession::new(client).await.unwrap();
+    let mut range = FileRange {
+        file: sftp.open("/f").await.unwrap(),
+        path: "/f".into(),
+        calls: faucet_core::CallContext::new(),
+        primed: false,
+    };
+    let len = file.len() as u64;
+    let footer = range.read_range(len - 8..len).await.unwrap();
+    assert_eq!(&footer[..], &file[file.len() - 8..]);
+    reads.lock().unwrap().clear();
+    let body = range.read_range(1_000..401_000).await.unwrap();
+    assert_eq!(&body[..], &file[1_000..401_000]);
+    let reads = reads.lock().unwrap().clone();
+    assert!(
+        reads.iter().all(|&n| n >= 64 * 1024),
+        "every read asks for a full reply: {reads:?}"
+    );
+    assert!(reads.len() <= 32, "{} reads for 400 KB", reads.len());
+}

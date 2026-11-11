@@ -431,7 +431,7 @@ version: 1
 name: plain
 pipeline:
   source: { type: sqlite, config: { database_url: "sqlite::memory:", query: "SELECT '${backfill.start}' AS s" } }
-  sink:   { type: s3, config: { bucket: b, path: exports/orders.jsonl } }
+  sink:   { type: s3, config: { bucket: b, path: exports/orders.jsonl, region: us-east-1, credentials: { type: access_key, config: { access_key_id: dummy, secret_access_key: dummy } } } }
 "#;
     let resp = client
         .post(format!("{url}/v1/backfill"))

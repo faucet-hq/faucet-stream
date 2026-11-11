@@ -35,7 +35,13 @@ pub fn resolve_store(cfg: &SnowflakeStageConfig) -> Result<BulkStore, FaucetErro
             cfg.url
         ))
     })?;
-    let (store, base) = object_store::parse_url_opts(&url, &cfg.storage_options).map_err(|e| {
+    let as_value = serde_json::to_value(cfg)
+        .map_err(|e| FaucetError::Config(format!("snowflake bulk_load: {e}")))?;
+    if let Some(field) = crate::config::bulk_load_host_identity(&as_value) {
+        faucet_core::resolve::require_host_credentials("snowflake", &field)?;
+    }
+    let options = cfg.effective_storage_options();
+    let (store, base) = object_store::parse_url_opts(&url, &options).map_err(|e| {
         FaucetError::Sink(format!(
             "snowflake bulk_load: cannot open object store for '{}': {e}",
             cfg.url
@@ -128,6 +134,7 @@ mod tests {
             storage_options: HashMap::new(),
             match_by_column_name: "CASE_INSENSITIVE".into(),
             purge: false,
+            credentials: Default::default(),
         }
     }
 
@@ -166,6 +173,33 @@ mod tests {
         let sql = build_copy_into("db", "sc", r#"ev"il"#, &stage(), "f.parquet");
         // The embedded quote is doubled by quote_ident, not left to break out.
         assert!(sql.contains(r#""ev""il""#), "{sql}");
+    }
+
+    #[tokio::test]
+    async fn ambient_clients_are_refused_inside_a_caller_run() {
+        faucet_core::resolve::with_host_credentials(false, async {
+            let err = resolve_store(&stage()).err().expect("refused").to_string();
+            assert!(err.contains("snowflake: `bulk_load.credentials`"), "{err}");
+            let mut keyed = stage();
+            keyed.credentials = faucet_core::staging::StagingCredentials::AccessKey {
+                access_key_id: "a".into(),
+                secret_access_key: "s".into(),
+                session_token: None,
+            };
+            keyed
+                .storage_options
+                .insert("aws_region".into(), "us-east-1".into());
+            assert!(resolve_store(&keyed).is_ok());
+            keyed
+                .storage_options
+                .insert("aws_role_arn".into(), "arn:aws:iam::1:role/r".into());
+            let err = resolve_store(&keyed).err().expect("refused").to_string();
+            assert!(
+                err.contains("bulk_load.storage_options.aws_role_arn"),
+                "{err}"
+            );
+        })
+        .await;
     }
 
     #[test]

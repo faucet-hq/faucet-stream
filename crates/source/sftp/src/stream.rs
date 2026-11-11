@@ -26,7 +26,7 @@ use std::pin::Pin;
 /// line-by-line afterwards, so memory stays O(batch) — while the whole-file
 /// formats hold at most `concurrency` bodies at once.
 enum Fetched {
-    Lines(SftpFile),
+    Lines(Box<SftpFile>),
     RawText(String),
     JsonArray(String),
     /// A whole file already decoded into records by
@@ -60,6 +60,7 @@ struct FileRange {
     file: SftpFile,
     path: String,
     calls: faucet_core::CallContext,
+    primed: bool,
 }
 
 #[cfg(feature = "arrow")]
@@ -78,7 +79,13 @@ impl faucet_core::file_format::parquet_io::RangeRead for FileRange {
             let failed =
                 |e: std::io::Error| FaucetError::Source(format!("SFTP read '{path}' failed: {e}"));
             let file = &mut self.file;
+            let primed = &mut self.primed;
             let read = async {
+                if !*primed {
+                    // The client sizes later reads by its first reply: read the start first.
+                    file.read(&mut [0u8; 1]).await.map_err(failed)?;
+                    *primed = true;
+                }
                 file.seek(std::io::SeekFrom::Start(range.start))
                     .await
                     .map_err(failed)?;
@@ -248,21 +255,30 @@ impl SftpSource {
         let format = config.format;
         let max = config.max_object_bytes;
         Ok(match format {
-            SftpFormat::Jsonl => Fetched::Lines(
-                sftp.open(path)
-                    .await
-                    .map_err(|e| FaucetError::Source(format!("SFTP open '{path}' failed: {e}")))?,
-            ),
+            SftpFormat::Jsonl => {
+                Fetched::Lines(Box::new(sftp.open(path).await.map_err(|e| {
+                    FaucetError::Source(format!("SFTP open '{path}' failed: {e}"))
+                })?))
+            }
             SftpFormat::RawText => Fetched::RawText(Self::read_file_text(sftp, path, max).await?),
             SftpFormat::JsonArray => {
                 Fetched::JsonArray(Self::read_file_text(sftp, path, max).await?)
             }
             #[cfg(feature = "file-format-csv")]
-            SftpFormat::Csv => Self::fetch_decoded(sftp, path, format, opts, max).await?,
+            SftpFormat::Csv => {
+                Self::fetch_decoded(sftp, path, format, opts, max, config.decoded_bytes_limit())
+                    .await?
+            }
             #[cfg(feature = "file-format-xml")]
-            SftpFormat::Xml => Self::fetch_decoded(sftp, path, format, opts, max).await?,
+            SftpFormat::Xml => {
+                Self::fetch_decoded(sftp, path, format, opts, max, config.decoded_bytes_limit())
+                    .await?
+            }
             #[cfg(feature = "file-format-excel")]
-            SftpFormat::Xlsx => Self::fetch_decoded(sftp, path, format, opts, max).await?,
+            SftpFormat::Xlsx => {
+                Self::fetch_decoded(sftp, path, format, opts, max, config.decoded_bytes_limit())
+                    .await?
+            }
             #[cfg(feature = "file-format-avro")]
             SftpFormat::Avro => Fetched::Container(Self::read_file(sftp, path, max).await?),
             #[cfg(feature = "file-format-orc")]
@@ -331,6 +347,7 @@ impl SftpSource {
                 file,
                 path: path.to_string(),
                 calls: calls.clone(),
+                primed: false,
             },
             len,
             path,
@@ -392,10 +409,10 @@ impl SftpSource {
     #[cfg(any(feature = "file-format-avro", feature = "file-format-orc"))]
     fn container_decoder(&self) -> Result<Option<faucet_core::ContainerDecoder>, FaucetError> {
         match self.config.format.shared() {
-            Some(f) if f.is_container() => Ok(Some(faucet_core::ContainerDecoder::new(
-                f,
-                &self.config.format_options(),
-            )?)),
+            Some(f) if f.is_container() => Ok(Some(
+                faucet_core::ContainerDecoder::new(f, &self.config.format_options())?
+                    .with_max_decoded_bytes(self.config.decoded_bytes_limit()),
+            )),
             _ => Ok(None),
         }
     }
@@ -417,12 +434,13 @@ impl SftpSource {
         format: SftpFormat,
         opts: &faucet_core::FormatOptions,
         max: u64,
+        decoded: u64,
     ) -> Result<Fetched, FaucetError> {
         let bytes = Self::read_file(sftp, path, max).await?;
         let shared = format
             .shared()
             .ok_or_else(|| FaucetError::Source(format!("SFTP '{path}': format has no decoder")))?;
-        let records = faucet_core::file_format::decode_owned(bytes, shared, opts)
+        let records = faucet_core::file_format::decode_owned_bounded(bytes, shared, opts, decoded)
             .await
             .map_err(|e| FaucetError::Source(format!("SFTP '{path}': {e}")))?;
         Ok(Fetched::Records(records))
@@ -525,7 +543,7 @@ impl faucet_core::Source for SftpSource {
                         // file with no newline fails instead of being
                         // buffered whole.
                         let mut lines = faucet_core::file_format::capped_lines(
-                            reads.reader(ChunkedReader::new(handle)),
+                            reads.reader(ChunkedReader::new(*handle)),
                             self.config.max_object_bytes,
                         );
                         let mut line_num = 0usize;

@@ -25,17 +25,33 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
+pub use crate::google_credentials::{check_google_credentials, check_google_credentials_file};
+pub use crate::host_credentials::{
+    deny_unscoped_host_credentials, host_credentials_allowed, require_host_credentials,
+    scoped_host_credentials, unscoped_host_credentials_denied, with_host_credentials,
+};
+pub use crate::store_options::{StoreKind, store_options_host_identity};
+
+mod azure;
+pub use azure::{AzureConnKey, AzureConnSettings, is_valid_azure_account_name};
+
 /// The JSON Schema keyword marking a config field that names an external
 /// resource. Its value is a [`ResourceKind`] (`"path"`, `"url"`, `"command"`).
 pub const RESOURCE_ANNOTATION: &str = "x-faucet-resource";
 
 /// The JSON Schema keyword on a free-form string map (object-store options,
 /// driver properties) naming which of its keys hold a resource: an object of
-/// key pattern → [`ResourceKind`]. A pattern is matched against the key
-/// lower-cased: exact, `PREFIX*`, `*SUFFIX` or `*INFIX*`.
+/// key pattern → [`ResourceKind`], or → `{"kind": …, "syntax": …}` to also
+/// name the value's grammar ([`UrlSyntax`]). A pattern is matched against the
+/// key lower-cased: exact, `PREFIX*`, `*SUFFIX` or `*INFIX*`; an exact
+/// pattern wins over the others.
 ///
 /// ```ignore
-/// #[schemars(extend("x-faucet-resource-keys" = {"*endpoint*": "url", "*_file": "path"}))]
+/// #[schemars(extend("x-faucet-resource-keys" = {
+///     "*endpoint*": "url",
+///     "*_file": "path",
+///     "bootstrap.servers": {"kind": "url", "syntax": "url-list"}
+/// }))]
 /// pub storage_options: HashMap<String, String>,
 /// ```
 pub const RESOURCE_KEYS_ANNOTATION: &str = "x-faucet-resource-keys";
@@ -49,6 +65,8 @@ pub const RESOURCE_KEYS_ANNOTATION: &str = "x-faucet-resource-keys";
 /// - `true` on an object schema (an enum variant): a config object whose
 ///   `const` properties all match the variant's;
 /// - an array of strings on a string field: one of those values (any case);
+/// - an array of booleans on a boolean field: one of those values (`[false]`
+///   marks a switch that turns verification off when `false`);
 /// - an object of key → array of strings on a string map: an entry whose
 ///   value is one of those listed for its key (any case).
 ///
@@ -148,13 +166,38 @@ fn key_pattern_matches(pattern: &str, key: &str) -> bool {
     }
 }
 
-/// The kind a [`RESOURCE_KEYS_ANNOTATION`] on `node` gives map key `key`.
-fn keyed_annotation(node: &Value, key: &str) -> Option<ResourceKind> {
-    node.get(RESOURCE_KEYS_ANNOTATION)?
-        .as_object()?
+/// The kind (and grammar) one [`RESOURCE_KEYS_ANNOTATION`] entry gives: a
+/// kind string (`"url"`), or an object `{"kind": "url", "syntax": "url-list"}`
+/// naming the value's grammar too ([`URL_SYNTAX_ANNOTATION`]).
+fn keyed_entry(entry: &Value) -> Option<(ResourceKind, Option<UrlSyntax>)> {
+    match entry {
+        Value::String(kind) => ResourceKind::parse(kind).map(|k| (k, None)),
+        Value::Object(o) => {
+            let kind = o.get("kind")?.as_str().and_then(ResourceKind::parse)?;
+            let syntax = o
+                .get("syntax")
+                .and_then(Value::as_str)
+                .and_then(UrlSyntax::parse);
+            Some((kind, syntax))
+        }
+        _ => None,
+    }
+}
+
+/// The kind a [`RESOURCE_KEYS_ANNOTATION`] on `node` gives map key `key`, and
+/// its grammar. An exact pattern wins over a wildcard one.
+fn keyed_annotation(node: &Value, key: &str) -> Option<(ResourceKind, Option<UrlSyntax>)> {
+    let patterns = node.get(RESOURCE_KEYS_ANNOTATION)?.as_object()?;
+    let exact = patterns
         .iter()
-        .find(|(pattern, _)| key_pattern_matches(pattern, key))
-        .and_then(|(_, kind)| kind.as_str().and_then(ResourceKind::parse))
+        .find(|(p, _)| !p.contains('*') && key_pattern_matches(p, key));
+    exact
+        .or_else(|| {
+            patterns
+                .iter()
+                .find(|(p, _)| p.contains('*') && key_pattern_matches(p, key))
+        })
+        .and_then(|(_, entry)| keyed_entry(entry))
 }
 
 /// What kind of external resource a config field names.
@@ -175,6 +218,13 @@ pub enum ResourceKind {
     /// A setting that authenticates with the host's own credentials
     /// ([`HOST_CREDENTIALS_ANNOTATION`]); the value is the setting as configured.
     HostCredentials,
+    /// A path on a remote server the connector joins into the names it
+    /// writes or reads (an SFTP directory or file-name template). Its host is
+    /// the connector's configured server; a `..` segment would climb out of
+    /// the directory the config names.
+    Key,
+    /// A local `address:port` the connector opens a listener on.
+    Listen,
 }
 
 impl ResourceKind {
@@ -186,6 +236,8 @@ impl ResourceKind {
             ResourceKind::Command => "command",
             ResourceKind::Unverified => "unverified",
             ResourceKind::HostCredentials => "host_credentials",
+            ResourceKind::Key => "key",
+            ResourceKind::Listen => "listen",
         }
     }
 
@@ -195,6 +247,8 @@ impl ResourceKind {
             "path" => Some(ResourceKind::Path),
             "url" => Some(ResourceKind::Url),
             "command" => Some(ResourceKind::Command),
+            "key" => Some(ResourceKind::Key),
+            "listen" => Some(ResourceKind::Listen),
             _ => None,
         }
     }
@@ -255,6 +309,8 @@ pub enum RefusalKind {
     Unverified,
     /// A setting that authenticates with the host's own credentials.
     HostCredentials,
+    /// A local address a connector listens on.
+    Listen,
 }
 
 /// Why a reference was refused.
@@ -285,6 +341,72 @@ impl std::fmt::Display for Refusal {
 
 impl std::error::Error for Refusal {}
 
+/// Local addresses a listener may bind: one IP and an inclusive port range
+/// (`127.0.0.1:29100-29199`, `[::1]:29100`). An unspecified IPv6 address
+/// (`[::]`) also covers `0.0.0.0`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenRange {
+    ip: std::net::IpAddr,
+    first: u16,
+    last: u16,
+}
+
+impl ListenRange {
+    /// `ip` on ports `first..=last` (port 0 is never allowed).
+    pub fn new(ip: std::net::IpAddr, first: u16, last: u16) -> Result<Self, String> {
+        if first == 0 || first > last {
+            return Err(format!("invalid port range {first}-{last}"));
+        }
+        Ok(Self { ip, first, last })
+    }
+
+    /// Parse `addr:port` or `addr:first-last` (an IPv6 address in brackets).
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        let (host, ports) = s
+            .rsplit_once(':')
+            .ok_or_else(|| format!("`{s}` is not `address:port` or `address:first-last`"))?;
+        let ip: std::net::IpAddr = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse()
+            .map_err(|_| format!("`{host}` is not an IP address"))?;
+        if ip.is_ipv6() && !host.starts_with('[') {
+            return Err(format!("write the IPv6 address in `{s}` in brackets"));
+        }
+        let port = |p: &str| {
+            p.parse::<u16>()
+                .map_err(|_| format!("`{p}` is not a port number"))
+        };
+        let (first, last) = match ports.split_once('-') {
+            Some((a, b)) => (port(a)?, port(b)?),
+            None => (port(ports)?, port(ports)?),
+        };
+        Self::new(ip, first, last)
+    }
+
+    /// Whether `addr` falls in the range.
+    pub fn covers(&self, addr: std::net::SocketAddr) -> bool {
+        let ip_ok = addr.ip() == self.ip
+            || (self.ip == std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+                && addr.ip() == std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        ip_ok && (self.first..=self.last).contains(&addr.port())
+    }
+}
+
+impl std::fmt::Display for ListenRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ip = std::net::SocketAddr::new(self.ip, self.first);
+        let host = ip.to_string();
+        let host = host.rsplit_once(':').map_or(host.as_str(), |(h, _)| h);
+        if self.first == self.last {
+            write!(f, "{host}:{}", self.first)
+        } else {
+            write!(f, "{host}:{}-{}", self.first, self.last)
+        }
+    }
+}
+
 /// The external resources a config of one origin may reach.
 ///
 /// Every dimension is either open (`None` — anything) or an allow-list
@@ -301,6 +423,9 @@ pub struct ReferencePolicy {
     subprocess: bool,
     unverified: bool,
     host_credentials: bool,
+    pin_servers: bool,
+    listen: Option<Vec<ListenRange>>,
+    reserved_ports: BTreeSet<u16>,
 }
 
 impl Default for ReferencePolicy {
@@ -657,22 +782,7 @@ fn connection_string_hosts(value: &str) -> Option<Vec<String>> {
     let mut hosts = Vec::new();
     for (k, v) in &pairs {
         if CONN_HOST_KEYS.contains(&k.as_str()) {
-            let lower = v.to_ascii_lowercase();
-            let bare = ["tcp:", "np:", "lpc:", "admin:"]
-                .iter()
-                .find_map(|p| lower.starts_with(p).then(|| &v[p.len()..]))
-                .unwrap_or(v);
-            let bare = bare.split(',').next().unwrap_or(bare);
-            let bare = bare.split('\\').next().unwrap_or(bare);
-            if bare.starts_with('/') {
-                continue;
-            }
-            let host = if bare.contains("://") {
-                url_hosts(bare)
-            } else {
-                url_hosts(&format!("tcp://{bare}"))
-            };
-            hosts.extend(host);
+            hosts.extend(server_value_hosts(v));
         } else if CONN_ENDPOINT_KEYS.contains(&k.as_str()) {
             hosts.extend(url_hosts(v));
         }
@@ -757,7 +867,14 @@ fn connection_string_pairs(value: &str) -> Option<Vec<(String, String)>> {
 /// parser HTTP clients use, so `\\` ends its authority as `/` does. A host
 /// taken from a `${…}` token is returned lower-cased as written.
 pub fn url_hosts(value: &str) -> Vec<String> {
-    let value = value.trim();
+    if let Some(read) = MongoRead::read(value) {
+        return read.tcp_hosts();
+    }
+    let value = whatwg_preprocess(value);
+    let value = value.as_ref();
+    if let Some(read) = MongoRead::read(value) {
+        return read.tcp_hosts();
+    }
     if let Some(ip) = ip_literal(value) {
         return vec![ip];
     }
@@ -867,6 +984,22 @@ fn scheme_list(value: &str) -> Option<Vec<&str>> {
     (parts.len() > 1 && later_scheme).then(|| parts.into_iter().filter(|p| !p.is_empty()).collect())
 }
 
+/// `value` as a WHATWG URL parser (the `url` crate, which most clients use)
+/// reads it: leading and trailing C0 controls and spaces removed, and every
+/// tab, LF and CR dropped.
+fn whatwg_preprocess(value: &str) -> std::borrow::Cow<'_, str> {
+    let value = value.trim_matches(|c: char| c <= ' ');
+    if value.contains(['\t', '\n', '\r']) {
+        value
+            .chars()
+            .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+            .collect::<String>()
+            .into()
+    } else {
+        value.into()
+    }
+}
+
 /// The elements of a [`UrlSyntax::UrlList`] value.
 fn list_items(value: &str) -> impl Iterator<Item = &str> {
     value
@@ -890,30 +1023,66 @@ fn address_host(address: &str) -> String {
     canonical_host(host)
 }
 
+/// The hosts one server value of a connection string names (`tcp:host,1433`,
+/// `host\instance`, `(local)`, a URL): any `tcp:` / `np:` / `lpc:` / `admin:`
+/// prefix (any case) removed, port and instance dropped. A value starting
+/// with `/` names no host.
+fn server_value_hosts(v: &str) -> Vec<String> {
+    if v.contains("://") {
+        return url_hosts(v);
+    }
+    let lower = v.to_ascii_lowercase();
+    let bare = ["tcp:", "np:", "lpc:", "admin:"]
+        .iter()
+        .find_map(|p| lower.starts_with(p).then(|| &v[p.len()..]))
+        .unwrap_or(v);
+    if bare.contains("://") {
+        return url_hosts(bare);
+    }
+    if bare.starts_with('/') {
+        return Vec::new();
+    }
+    url_hosts(&format!("tcp://{}", crate::ado::host_of_server(bare)))
+}
+
 /// The hosts an ADO.NET connection string connects to: the driver's own
 /// reading ([`crate::ado::server_host`]) and every server-like key read more
-/// broadly (any `tcp:` / `np:` / `lpc:` / `admin:` prefix removed).
+/// broadly ([`server_value_hosts`]).
 fn ado_hosts(pairs: &[(String, String)]) -> Vec<String> {
     let mut hosts = vec![canonical_host(&crate::ado::server_host(pairs))];
     for (k, v) in pairs {
-        if !CONN_HOST_KEYS.contains(&k.as_str()) {
-            continue;
-        }
-        let lower = v.to_ascii_lowercase();
-        let bare = ["tcp:", "np:", "lpc:", "admin:"]
-            .iter()
-            .find_map(|p| lower.starts_with(p).then(|| &v[p.len()..]))
-            .unwrap_or(v);
-        if bare.contains("://") {
-            hosts.extend(url_hosts(bare));
-        } else {
-            hosts.push(canonical_host(&crate::ado::host_of_server(bare)));
+        if CONN_HOST_KEYS.contains(&k.as_str()) {
+            hosts.extend(server_value_hosts(v));
         }
     }
     hosts.retain(|h| !h.is_empty());
     hosts.sort();
     hosts.dedup();
     hosts
+}
+
+/// Whether a MongoDB URI authenticates with credentials the host itself
+/// holds: `authMechanism=MONGODB-AWS` or `GSSAPI`, or an
+/// `authMechanismProperties` `ENVIRONMENT` (a cloud or Kubernetes identity).
+pub fn mongodb_uri_uses_host_identity(uri: &str) -> bool {
+    MongoRead::read(uri).is_some_and(|r| r.host_credentials())
+}
+
+/// Whether an Oracle connect string authenticates with the host's identity
+/// or token files: a `TOKEN_AUTH` other than `OAUTH` with an explicit
+/// `TOKEN_LOCATION`.
+pub fn oracle_connect_uses_host_identity(value: &str) -> bool {
+    let read = read_oracle(value);
+    let get = |key: &str| {
+        read.params
+            .iter()
+            .filter(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+            .collect::<Vec<_>>()
+    };
+    get("token_auth")
+        .last()
+        .is_some_and(|mode| !mode.eq_ignore_ascii_case("oauth") || get("token_location").is_empty())
 }
 
 /// How an Oracle connect string names its database.
@@ -1020,14 +1189,22 @@ fn azure_pairs(value: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The account host an Azure Storage connection string builds from
-/// `AccountName` and `EndpointSuffix` (`<account>.blob.<suffix>`).
-fn azure_account_url(pairs: &[(String, String)]) -> Option<String> {
-    let get = |key: &str| pairs.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v);
-    let account = get("accountname")?;
-    let suffix = get("endpointsuffix").map_or("core.windows.net", String::as_str);
-    let protocol = get("defaultendpointsprotocol").map_or("https", String::as_str);
-    Some(format!("{protocol}://{account}.blob.{suffix}"))
+/// The URLs an Azure Storage connection string names, with the key each
+/// came from: every `…Endpoint` key in any case (wider than the client,
+/// which reads only `BlobEndpoint`), then — without a `BlobEndpoint` — the
+/// account endpoint the client builds ([`AzureConnSettings::account_url`]).
+fn azure_conn_urls(value: &str) -> Vec<(String, String)> {
+    let mut urls: Vec<(String, String)> = azure_pairs(value)
+        .into_iter()
+        .filter(|(k, _)| k.ends_with("endpoint"))
+        .collect();
+    let settings = AzureConnSettings::read(value);
+    if settings.get(AzureConnKey::BlobEndpoint).is_none()
+        && let Some(url) = settings.account_url()
+    {
+        urls.push(("accountname".into(), url));
+    }
+    urls
 }
 
 /// The hosts a value written in `syntax` connects to, in canonical form; the
@@ -1042,13 +1219,13 @@ pub fn url_hosts_as(value: &str, syntax: Option<UrlSyntax>) -> Vec<String> {
             .unwrap_or_default(),
         Some(UrlSyntax::Oracle) => read_oracle(value).hosts,
         Some(UrlSyntax::AzureConn) => {
-            let pairs = azure_pairs(value);
-            let mut hosts: Vec<String> = pairs
+            let mut hosts: Vec<String> = azure_conn_urls(value)
                 .iter()
-                .filter(|(k, _)| k.ends_with("endpoint"))
-                .flat_map(|(_, v)| url_hosts(v))
+                .flat_map(|(_, u)| url_hosts(u))
                 .collect();
-            hosts.extend(azure_account_url(&pairs).iter().flat_map(|u| url_hosts(u)));
+            if AzureConnSettings::read(value).use_development_storage() {
+                hosts.push("127.0.0.1".into());
+            }
             hosts
         }
         Some(UrlSyntax::UrlList) => list_items(value).flat_map(url_hosts).collect(),
@@ -1066,6 +1243,160 @@ fn unix_socket_path(scheme: &str, value: &str) -> Option<Option<String>> {
     let rest = rest.strip_prefix("//").unwrap_or(rest);
     let path = rest.split(['?', '#']).next().unwrap_or(rest);
     Some(percent_decoded(path).map(|p| p.into_owned()))
+}
+
+/// One server address of a MongoDB URI, read as `ServerAddress::parse` reads
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MongoHost {
+    /// A TCP host, canonical.
+    Tcp(String),
+    /// A Unix socket path (a segment ending in `.sock`), percent-decoded;
+    /// `None` when it is not UTF-8.
+    Socket(Option<String>),
+    /// A segment the driver refuses.
+    Unreadable,
+}
+
+/// A `mongodb://` / `mongodb+srv://` URI read as the MongoDB driver reads it:
+/// options after the first `?`, user info up to the last `@`, hosts up to the
+/// first `/`, split on `,` (`#` and `;` are host characters); options split on
+/// `&` and the first `=`, keys folded with Unicode lower-casing and not
+/// decoded, values percent-decoded (lossy, no `+` → space).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MongoRead {
+    srv: bool,
+    hosts: Vec<MongoHost>,
+    options: Vec<(String, String)>,
+}
+
+impl MongoRead {
+    fn read(value: &str) -> Option<Self> {
+        let (scheme, after) = value.split_once("://")?;
+        let srv = if scheme.eq_ignore_ascii_case("mongodb") {
+            false
+        } else if scheme.eq_ignore_ascii_case("mongodb+srv") {
+            true
+        } else {
+            return None;
+        };
+        let (pre, query) = match after.split_once('?') {
+            Some((pre, q)) => (pre, Some(q)),
+            None => (after, None),
+        };
+        let hosts_and_db = pre.rsplit_once('@').map_or(pre, |(_, h)| h);
+        let hosts = hosts_and_db
+            .split_once('/')
+            .map_or(hosts_and_db, |(h, _)| h);
+        let hosts = hosts.split(',').map(mongo_host).collect();
+        let options = query
+            .into_iter()
+            .flat_map(|q| q.split('&'))
+            .filter_map(|pair| pair.split_once('='))
+            .map(|(k, v)| {
+                let v = percent_encoding::percent_decode_str(v).decode_utf8_lossy();
+                (k.to_lowercase(), v.into_owned())
+            })
+            .collect();
+        Some(Self {
+            srv,
+            hosts,
+            options,
+        })
+    }
+
+    fn values(&self, key: &str) -> impl Iterator<Item = &str> {
+        self.options
+            .iter()
+            .filter(move |(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn is_true(&self, key: &str) -> bool {
+        self.values(key).any(|v| v == "true")
+    }
+
+    /// Whether the client stays on the server it names rather than learning
+    /// others from it.
+    fn pinned(&self) -> bool {
+        self.is_true("loadbalanced") || (!self.srv && self.is_true("directconnection"))
+    }
+
+    /// Whether the URI authenticates with credentials the host itself holds
+    /// (cloud or Kubernetes identity, Kerberos).
+    fn host_credentials(&self) -> bool {
+        let mechanism = self.values("authmechanism").any(|m| {
+            ["MONGODB-AWS", "GSSAPI"]
+                .iter()
+                .any(|x| m.eq_ignore_ascii_case(x))
+        });
+        let environment = self.values("authmechanismproperties").any(|props| {
+            props.split(',').any(|p| {
+                p.split_once(':')
+                    .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("environment"))
+            })
+        });
+        mechanism || environment
+    }
+
+    /// The TCP hosts the client connects to, the proxy included.
+    fn tcp_hosts(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .hosts
+            .iter()
+            .filter_map(|h| match h {
+                MongoHost::Tcp(h) => Some(h.clone()),
+                _ => None,
+            })
+            .collect();
+        out.extend(
+            self.values("proxyhost")
+                .map(canonical_host)
+                .filter(|h| !h.is_empty()),
+        );
+        out
+    }
+}
+
+/// The MongoDB options that name a local file.
+const MONGO_PATH_OPTIONS: &[&str] = &["tlscafile", "tlscertificatekeyfile"];
+
+/// The MongoDB options that turn off peer verification unless `false`.
+const MONGO_UNVERIFIED_OPTIONS: &[&str] = &[
+    "tlsinsecure",
+    "tlsallowinvalidcertificates",
+    "tlsallowinvalidhostnames",
+];
+
+fn mongo_host(segment: &str) -> MongoHost {
+    if segment.ends_with(".sock") {
+        return MongoHost::Socket(percent_decoded(segment).map(|p| p.into_owned()));
+    }
+    let host = match segment.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']') {
+            Some((ip, port))
+                if ip.parse::<std::net::Ipv6Addr>().is_ok()
+                    && (port.is_empty() || port.starts_with(':')) =>
+            {
+                return MongoHost::Tcp(canonical_host(&format!("[{ip}]")));
+            }
+            _ => return MongoHost::Unreadable,
+        },
+        None => segment.split_once(':').map_or(segment, |(h, _)| h),
+    };
+    match canonical_host(host) {
+        h if h.is_empty() => MongoHost::Unreadable,
+        h => MongoHost::Tcp(h),
+    }
+}
+
+/// The domain every host a `mongodb+srv` lookup of `name` returns must end
+/// with: `name` without its first label when it has three or more.
+fn srv_parent(name: &str) -> &str {
+    match name.split_once('.') {
+        Some((_, rest)) if rest.contains('.') => rest,
+        _ => name,
+    }
 }
 
 /// Connect-string parameters (Easy Connect Plus or descriptor) naming a local
@@ -1163,6 +1494,10 @@ impl ReferencePolicy {
             subprocess: true,
             unverified: true,
             host_credentials: true,
+
+            pin_servers: false,
+            listen: None,
+            reserved_ports: BTreeSet::new(),
         }
     }
 
@@ -1177,6 +1512,10 @@ impl ReferencePolicy {
             subprocess: false,
             unverified: false,
             host_credentials: false,
+
+            pin_servers: false,
+            listen: Some(Vec::new()),
+            reserved_ports: BTreeSet::new(),
         }
     }
 
@@ -1320,6 +1659,20 @@ impl ReferencePolicy {
         self.subprocess
     }
 
+    /// Require a client that learns further servers from the one it reaches
+    /// (a MongoDB replica set or `mongodb+srv` lookup) to stay on the server
+    /// the value names (`directConnection=true` or `loadBalanced=true`).
+    pub fn with_pinned_servers(mut self, pinned: bool) -> Self {
+        self.pin_servers = pinned;
+        self
+    }
+
+    /// Whether clients must stay on the servers a value names
+    /// ([`with_pinned_servers`](Self::with_pinned_servers)).
+    pub fn pins_servers(&self) -> bool {
+        self.pin_servers
+    }
+
     /// Whether settings that turn off peer verification are allowed.
     pub fn allows_unverified(&self) -> bool {
         self.unverified
@@ -1329,6 +1682,66 @@ impl ReferencePolicy {
     /// allowed.
     pub fn allows_host_credentials(&self) -> bool {
         self.host_credentials
+    }
+
+    /// Allow listeners only on these addresses ([`ResourceKind::Listen`]);
+    /// an empty list allows none.
+    pub fn with_listen(mut self, ranges: impl IntoIterator<Item = ListenRange>) -> Self {
+        self.listen = Some(ranges.into_iter().collect());
+        self
+    }
+
+    /// Allow a listener on any address.
+    pub fn any_listen(mut self) -> Self {
+        self.listen = None;
+        self
+    }
+
+    /// Ports no listener may take even where a range covers them (the host
+    /// process's own).
+    pub fn with_reserved_ports(mut self, ports: impl IntoIterator<Item = u16>) -> Self {
+        self.reserved_ports.extend(ports);
+        self
+    }
+
+    /// The allowed listener ranges, `None` when any address is allowed.
+    pub fn listen_ranges(&self) -> Option<&[ListenRange]> {
+        self.listen.as_deref()
+    }
+
+    /// Check a local `address:port` a connector listens on: a literal socket
+    /// address (no host name, no port 0) inside an allowed range.
+    pub fn check_listen(&self, value: &str) -> Result<(), Refusal> {
+        let Some(ranges) = &self.listen else {
+            return Ok(());
+        };
+        let refuse = |why: String| Err(Refusal::new(RefusalKind::Listen, value, why));
+        if ranges.is_empty() {
+            return refuse("connectors that open a listener are not allowed".into());
+        }
+        let allowed = ranges
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let Ok(addr) = value.trim().parse::<std::net::SocketAddr>() else {
+            return refuse(format!(
+                "a listener must name a literal `address:port`; allowed: {allowed}"
+            ));
+        };
+        if addr.port() == 0 || self.reserved_ports.contains(&addr.port()) {
+            return refuse(format!(
+                "port {} is not available for a listener; allowed: {allowed}",
+                addr.port()
+            ));
+        }
+        if ranges.iter().any(|r| r.covers(addr)) {
+            Ok(())
+        } else {
+            refuse(format!(
+                "outside the allowed listener addresses ({allowed})"
+            ))
+        }
     }
 
     /// Check an `${env:NAME}` / `${secret:NAME}` reference.
@@ -1656,32 +2069,185 @@ impl ReferencePolicy {
         Ok(())
     }
 
-    /// Check an Azure Storage connection string: every `…Endpoint=` URL and
-    /// the account host built from `AccountName` / `EndpointSuffix`.
+    /// Check an Azure Storage connection string, read as the client reads it
+    /// ([`AzureConnSettings`]): every `…Endpoint=` URL, the account endpoint
+    /// built from `AccountName` / `EndpointSuffix`, the emulator's loopback
+    /// host, the account-name and protocol rules, and — under a policy with
+    /// path roots — no key in another case than the one the client reads.
     fn check_azure_conn(&self, value: &str) -> Result<(), Refusal> {
-        let pairs = azure_pairs(value);
-        let account = azure_account_url(&pairs);
-        let endpoints = pairs
-            .iter()
-            .filter(|(k, _)| k.ends_with("endpoint"))
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .chain(account.as_deref().map(|u| ("accountname", u)));
-        for (k, url) in endpoints {
-            self.check_plain_url(url)
+        self.check_azure_conn_hosts(value, None)
+    }
+
+    /// [`check_url_as`](Self::check_url_as) for an Azure Storage connection
+    /// string whose blob hosts are `hosts` — what the client connects to once
+    /// the rest of the connection (account, endpoint, emulator) is applied —
+    /// instead of the ones the string alone names. The string's other
+    /// endpoints and its rules are checked as usual.
+    pub fn check_azure_conn_with_hosts(
+        &self,
+        value: &str,
+        hosts: &[String],
+    ) -> Result<(), Refusal> {
+        let raw = value;
+        let value = value.trim_matches(|c: char| c.is_ascii_whitespace());
+        if self.path_roots.is_some() && value.len() > MAX_SCREENED_LEN {
+            return self.check_url_as(raw, Some(UrlSyntax::AzureConn));
+        }
+        self.check_azure_conn_hosts(value, Some(hosts))
+    }
+
+    fn check_azure_conn_hosts(&self, value: &str, hosts: Option<&[String]>) -> Result<(), Refusal> {
+        let settings = AzureConnSettings::read(value);
+        for (k, url) in azure_conn_urls(value) {
+            if hosts.is_some() && matches!(k.as_str(), "blobendpoint" | "accountname") {
+                continue;
+            }
+            self.check_plain_url(&url)
                 .map_err(|e| Refusal::new(e.kind, value, format!("`{k}`: {}", e.reason)))?;
         }
-        if pairs
-            .iter()
-            .any(|(k, v)| k == "usedevelopmentstorage" && v.eq_ignore_ascii_case("true"))
+        match hosts {
+            Some(hosts) => {
+                for host in hosts {
+                    self.check_host(value, host)?;
+                }
+            }
+            None if settings.use_development_storage() => self.check_host(value, "127.0.0.1")?,
+            None => {}
+        }
+        if let Some(problem) = settings.problem() {
+            return Err(Refusal::new(RefusalKind::Url, value, problem));
+        }
+        if self.path_roots.is_some()
+            && let Some(key) = settings.other_case_keys().first()
         {
-            self.check_host(value, "127.0.0.1")?;
+            let canonical = AzureConnKey::ALL
+                .iter()
+                .find(|k| k.as_str().eq_ignore_ascii_case(key))
+                .map_or("", |k| k.as_str());
+            return Err(Refusal::new(
+                RefusalKind::Url,
+                value,
+                format!(
+                    "`{key}` is not read by the client, which reads `{canonical}`; write the key \
+                     in that case"
+                ),
+            ));
         }
         Ok(())
     }
 
-    /// Check a value with no declared grammar.
+    /// Check a MongoDB URI, read as the driver reads it ([`MongoRead`]).
+    fn check_mongo(&self, value: &str, read: &MongoRead) -> Result<(), Refusal> {
+        let confined = self.path_roots.is_some();
+        let refuse = |kind: RefusalKind, reason: String| Refusal::new(kind, value, reason);
+        self.check_scheme(value, if read.srv { "mongodb+srv" } else { "mongodb" })?;
+        let mut server = false;
+        for host in &read.hosts {
+            match host {
+                MongoHost::Tcp(h) => {
+                    self.check_host(value, h)?;
+                    if read.srv && self.url_hosts.is_some() {
+                        let parent = srv_parent(h);
+                        self.check_host(value, &format!("x.{parent}"))
+                            .map_err(|_| {
+                                refuse(
+                                    RefusalKind::Url,
+                                    format!(
+                                        "a `mongodb+srv` lookup of `{h}` may return any host under \
+                                     `{parent}`; the host allow-list must admit `*.{parent}`"
+                                    ),
+                                )
+                            })?;
+                    }
+                    server = true;
+                }
+                MongoHost::Socket(Some(p)) if confined && !p.starts_with('/') => {
+                    return Err(refuse(
+                        RefusalKind::Path,
+                        "a relative Unix socket path cannot be checked; use an absolute path"
+                            .into(),
+                    ));
+                }
+                MongoHost::Socket(Some(p)) => {
+                    self.check_setting_path(value, "unix socket", p)?;
+                    server = true;
+                }
+                MongoHost::Socket(None) if confined => {
+                    return Err(refuse(
+                        RefusalKind::Path,
+                        "a percent-encoded path that is not UTF-8 cannot be checked".into(),
+                    ));
+                }
+                MongoHost::Socket(None) | MongoHost::Unreadable => {}
+            }
+        }
+        if confined && !server {
+            return Err(refuse(
+                RefusalKind::Url,
+                "no server could be read from this value; name the server explicitly".into(),
+            ));
+        }
+        for (key, v) in &read.options {
+            if MONGO_PATH_OPTIONS.contains(&key.as_str()) {
+                self.check_setting_path(value, key, v)?;
+            }
+            if MONGO_UNVERIFIED_OPTIONS.contains(&key.as_str()) && v != "false" && !self.unverified
+            {
+                return Err(refuse(
+                    RefusalKind::Url,
+                    format!("`{key}` turns off certificate verification"),
+                ));
+            }
+            if key == "proxyhost" {
+                self.check_host(value, &canonical_host(v))?;
+            }
+        }
+        if read.host_credentials() && !self.host_credentials {
+            return Err(refuse(
+                RefusalKind::HostCredentials,
+                "`authMechanism` / `authMechanismProperties` authenticate with the server's own \
+                 identity (cloud, Kubernetes or Kerberos credentials)"
+                    .into(),
+            ));
+        }
+        if self.pin_servers && !read.pinned() {
+            return Err(refuse(
+                RefusalKind::Url,
+                "a MongoDB client connects to further servers the one it reaches names; add \
+                 `directConnection=true` to use one server (or `loadBalanced=true` behind a load \
+                 balancer), or have the hosts it may reach listed in the host allow-list"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Check a value with no declared grammar, read the way a WHATWG URL
+    /// parser reads it ([`whatwg_preprocess`]). Under a policy with path
+    /// roots, a value still holding a control character is refused.
     fn check_plain_url(&self, value: &str) -> Result<(), Refusal> {
-        let value = value.trim_matches(|c: char| c.is_ascii_whitespace());
+        if let Some(read) = MongoRead::read(value) {
+            if self.path_roots.is_some() && value.chars().any(char::is_control) {
+                return Err(Refusal::new(
+                    RefusalKind::Url,
+                    value.escape_debug().to_string(),
+                    "a URL may not contain control characters",
+                ));
+            }
+            return self.check_mongo(value, &read);
+        }
+        let value = whatwg_preprocess(value);
+        let value = value.as_ref();
+        if self.path_roots.is_some() && value.chars().any(char::is_control) {
+            return Err(Refusal::new(
+                RefusalKind::Url,
+                value.escape_debug().to_string(),
+                "a URL may not contain control characters",
+            ));
+        }
+        if let Some(read) = MongoRead::read(value) {
+            return self.check_mongo(value, &read);
+        }
         if let Some(items) = scheme_list(value) {
             for item in items {
                 self.check_plain_url(item)
@@ -1802,7 +2368,9 @@ impl ReferencePolicy {
         syntax: Option<UrlSyntax>,
     ) -> Result<(), Refusal> {
         self.check_url_as(value, syntax)?;
-        if syntax.is_none() && scheme_of(value).is_some_and(|s| s == "file" || s == "sqlite") {
+        if syntax.is_none()
+            && scheme_of(&whatwg_preprocess(value)).is_some_and(|s| s == "file" || s == "sqlite")
+        {
             return Ok(());
         }
         for host in url_hosts_as(value, syntax) {
@@ -1831,6 +2399,19 @@ impl ReferencePolicy {
         }
     }
 
+    /// Check a remote path ([`ResourceKind::Key`]): under a policy with path
+    /// roots it may not hold a `..` segment.
+    pub fn check_key(&self, value: &str) -> Result<(), Refusal> {
+        if self.path_roots.is_some() && has_parent_segment(value) {
+            return Err(Refusal::new(
+                RefusalKind::Path,
+                value,
+                "a remote path may not contain a `..` segment",
+            ));
+        }
+        Ok(())
+    }
+
     /// Check a program a connector runs.
     pub fn check_command(&self, value: &str) -> Result<(), Refusal> {
         if self.subprocess {
@@ -1850,6 +2431,7 @@ impl ReferencePolicy {
             ResourceKind::Path => self.check_path(&r.value),
             ResourceKind::Url => self.check_url_as(&r.value, r.syntax),
             ResourceKind::Command => self.check_command(&r.value),
+            ResourceKind::Key => self.check_key(&r.value),
             ResourceKind::Unverified if self.unverified => Ok(()),
             ResourceKind::Unverified => Err(Refusal::new(
                 RefusalKind::Unverified,
@@ -1862,6 +2444,7 @@ impl ReferencePolicy {
                 r.value.clone(),
                 "settings that authenticate with the server's own credentials are not allowed",
             )),
+            ResourceKind::Listen => self.check_listen(&r.value),
         }
     }
 }
@@ -1941,6 +2524,9 @@ fn flagged_setting(node: &Value, value: &Value, annotation: &str) -> Option<(Str
         (list @ Value::Array(_), Value::String(s)) => {
             in_list(list, s).then(|| (String::new(), s.clone()))
         }
+        (Value::Array(list), Value::Bool(b)) => list
+            .contains(&Value::Bool(*b))
+            .then(|| (String::new(), b.to_string())),
         (Value::Object(keys), Value::Object(map)) => map.iter().find_map(|(k, v)| {
             let list = keys
                 .iter()
@@ -2014,10 +2600,10 @@ fn visit(
         Value::Object(map) => {
             for (k, child) in map {
                 let p = format!("{pointer}/{}", escape_pointer(k));
-                if let (Some(kind), Value::String(s)) =
+                if let (Some((kind, syntax)), Value::String(s)) =
                     (alts.iter().find_map(|n| keyed_annotation(n, k)), child)
                 {
-                    out.push(ResourceRef::new(p.clone(), kind, s.clone()));
+                    out.push(ResourceRef::new(p.clone(), kind, s.clone()).with_syntax(syntax));
                 }
                 for alt in &alts {
                     let declared = alt.get("properties").and_then(|props| props.get(k));
@@ -2066,8 +2652,8 @@ fn collect_fields(
     }
     for alt in alts {
         if let Some(Value::Object(keys)) = alt.get(RESOURCE_KEYS_ANNOTATION) {
-            for (pattern, kind) in keys {
-                if let Some(kind) = kind.as_str().and_then(ResourceKind::parse) {
+            for (pattern, entry) in keys {
+                if let Some((kind, _)) = keyed_entry(entry) {
                     out.insert((format!("{path}{{{pattern}}}"), kind));
                 }
             }
@@ -2140,9 +2726,16 @@ pub fn url_syntax_fields(schema: &Value) -> Vec<(String, UrlSyntax)> {
     out.into_iter().collect()
 }
 
-/// Whether a schema declares at least one field of `kind`.
+/// Whether a schema declares at least one field of `kind`. For
+/// [`ResourceKind::Command`] (a connector that runs a program), a key pattern
+/// of a free-form map ([`RESOURCE_KEYS_ANNOTATION`]) does not count: such a
+/// key runs a program only when a config sets it, which
+/// [`annotated_resources`] reports.
 pub fn declares(schema: &Value, kind: ResourceKind) -> bool {
-    annotated_fields(schema).iter().any(|(_, k)| *k == kind)
+    annotated_fields(schema).iter().any(|(path, k)| {
+        *k == kind
+            && (kind != ResourceKind::Command || !path.ends_with('}') || path.ends_with("{}"))
+    })
 }
 
 /// The JSON Schema keyword (value `true`) on a top-level boolean config field
@@ -2181,7 +2774,131 @@ pub fn sql_fields(schema: &Value) -> Vec<String> {
     flagged_fields(schema, SQL_ANNOTATION)
 }
 
+/// The JSON Schema keyword (a positive integer `N`) on a top-level numeric
+/// config field that bounds what the connector holds in memory. A host that
+/// runs configs it did not author holds such a field to `1..=N`: `0` and
+/// `null` (the "no bound" values) and anything above `N` are refused. A value
+/// the config leaves out keeps the connector's default, unless the field also
+/// carries [`CALLER_SET_ANNOTATION`] (its default is no bound).
+///
+/// ```ignore
+/// #[schemars(extend("x-faucet-caller-max" = 1_000_000))]
+/// pub max_staged_records: Option<usize>,
+/// ```
+pub const CALLER_MAX_ANNOTATION: &str = "x-faucet-caller-max";
+
+/// The top-level config fields `schema` marks with [`CALLER_MAX_ANNOTATION`]
+/// and their ceilings, across every `oneOf` / `anyOf` / `allOf` branch of the
+/// root (the lowest ceiling when branches disagree).
+pub fn caller_max_fields(schema: &Value) -> Vec<(String, u64)> {
+    let mut alts = Vec::new();
+    alternatives(schema, schema, &mut alts, 0);
+    let mut out: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for alt in alts {
+        let Some(Value::Object(props)) = alt.get("properties") else {
+            continue;
+        };
+        for (name, field) in props {
+            let mut field_alts = Vec::new();
+            alternatives(schema, field, &mut field_alts, 0);
+            if let Some(max) = field_alts
+                .iter()
+                .filter_map(|n| n.get(CALLER_MAX_ANNOTATION).and_then(Value::as_u64))
+                .min()
+            {
+                out.entry(name.clone())
+                    .and_modify(|m| *m = (*m).min(max))
+                    .or_insert(max);
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// The JSON Schema keyword (value `true`) on a [`CALLER_MAX_ANNOTATION`]
+/// field whose default is no bound: a host that runs configs it did not
+/// author requires such a config to set the field.
+///
+/// ```ignore
+/// #[schemars(extend("x-faucet-caller-max" = 1_000_000, "x-faucet-caller-set" = true))]
+/// pub max_staged_records_total: Option<usize>,
+/// ```
+pub const CALLER_SET_ANNOTATION: &str = "x-faucet-caller-set";
+
+/// The top-level config fields `schema` marks with [`CALLER_SET_ANNOTATION`],
+/// across every `oneOf` / `anyOf` / `allOf` branch of the root.
+pub fn caller_set_fields(schema: &Value) -> Vec<String> {
+    flagged_fields(schema, CALLER_SET_ANNOTATION)
+}
+
 /// The top-level config fields `schema` marks with the boolean `annotation`.
+/// The JSON Schema keyword (value `true`) on a top-level boolean config field
+/// that keeps the client on the servers the config names, ignoring further
+/// servers those servers advertise. A host whose reference policy pins
+/// servers ([`ReferencePolicy::pins_servers`]) forces every such field on:
+///
+/// ```ignore
+/// #[schemars(extend("x-faucet-pin-servers" = true))]
+/// pub ignore_discovered_servers: bool,
+/// ```
+pub const PIN_SERVERS_ANNOTATION: &str = "x-faucet-pin-servers";
+
+/// The top-level config fields `schema` marks with [`PIN_SERVERS_ANNOTATION`],
+/// across every `oneOf` / `anyOf` / `allOf` branch of the root.
+pub fn pin_servers_fields(schema: &Value) -> Vec<String> {
+    flagged_fields(schema, PIN_SERVERS_ANNOTATION)
+}
+
+/// The JSON Schema keyword (value `true`) on a config schema (the root, or an
+/// enum variant's object) whose client connects to servers that the servers
+/// it is configured with advertise (Kafka brokers, Oracle listener
+/// redirects), with no setting that keeps it on the configured ones. A host
+/// whose reference policy pins servers refuses such a config.
+///
+/// ```ignore
+/// #[derive(JsonSchema)]
+/// #[schemars(extend("x-faucet-follows-servers" = true))]
+/// pub struct KafkaSourceConfig { /* … */ }
+/// ```
+pub const FOLLOWS_SERVERS_ANNOTATION: &str = "x-faucet-follows-servers";
+
+/// Whether `config` is an instance of a branch of `schema` marked with
+/// [`FOLLOWS_SERVERS_ANNOTATION`]: a marked branch matches when every
+/// `const` property it declares has that value in `config`.
+pub fn follows_servers(schema: &Value, config: &Value) -> bool {
+    let mut alts = Vec::new();
+    alternatives(schema, schema, &mut alts, 0);
+    alts.iter().any(|n| {
+        n.get(FOLLOWS_SERVERS_ANNOTATION) == Some(&Value::Bool(true))
+            && n.get("properties")
+                .and_then(Value::as_object)
+                .is_none_or(|props| {
+                    props
+                        .iter()
+                        .filter_map(|(k, p)| p.get("const").map(|c| (k, c)))
+                        .all(|(k, c)| config.get(k) == Some(c))
+                })
+    })
+}
+
+/// The JSON Schema keyword (value `true`) on a top-level string config field
+/// whose value is code the connector runs or sends as written (a GraphQL
+/// document, a query or condition expression), other than SQL
+/// ([`SQL_ANNOTATION`]). A host that places values it did not author into a
+/// config keeps them out of such a field:
+///
+/// ```ignore
+/// #[schemars(extend("x-faucet-code" = true))]
+/// pub query: String,
+/// ```
+pub const CODE_ANNOTATION: &str = "x-faucet-code";
+
+/// The top-level config fields `schema` marks with [`CODE_ANNOTATION`],
+/// across every `oneOf` / `anyOf` / `allOf` branch of the root.
+pub fn code_fields(schema: &Value) -> Vec<String> {
+    flagged_fields(schema, CODE_ANNOTATION)
+}
+
 fn flagged_fields(schema: &Value, annotation: &str) -> Vec<String> {
     let mut alts = Vec::new();
     alternatives(schema, schema, &mut alts, 0);
@@ -2215,6 +2932,28 @@ mod tests {
         assert_eq!(local_part("file://host/x"), None);
     }
     use super::*;
+
+    #[test]
+    fn mongodb_and_oracle_values_name_the_hosts_identity() {
+        assert!(mongodb_uri_uses_host_identity(
+            "mongodb://db.example/?authMechanism=MONGODB-AWS"
+        ));
+        assert!(mongodb_uri_uses_host_identity(
+            "mongodb+srv://c.example/?authMechanism=MONGODB-OIDC&authMechanismProperties=ENVIRONMENT:k8s"
+        ));
+        assert!(!mongodb_uri_uses_host_identity("mongodb://u:p@db.example/"));
+        assert!(!mongodb_uri_uses_host_identity("not a uri"));
+        assert!(oracle_connect_uses_host_identity(
+            "tcps://db.example:2484/svc?token_auth=OCI_IAM"
+        ));
+        assert!(oracle_connect_uses_host_identity(
+            "tcps://db.example:2484/svc?token_auth=OAUTH"
+        ));
+        assert!(!oracle_connect_uses_host_identity(
+            "tcps://db.example:2484/svc?token_auth=OAUTH&token_location=/t"
+        ));
+        assert!(!oracle_connect_uses_host_identity("db.example:1521/svc"));
+    }
     use serde_json::json;
 
     /// A schema that refers to itself through `oneOf`, and a config nested
@@ -2344,6 +3083,66 @@ mod tests {
     }
 
     #[test]
+    fn code_fields_are_read_from_every_branch() {
+        let s = json!({"oneOf": [
+            {"type": "object", "properties": {"query": {"type": "string", "x-faucet-code": true}}},
+            {"type": "object", "properties": {"filter": {"$ref": "#/$defs/F"}}}
+        ], "$defs": {"F": {"type": ["string", "null"], "x-faucet-code": true}}});
+        assert_eq!(
+            code_fields(&s),
+            vec!["filter".to_string(), "query".to_string()]
+        );
+        assert!(code_fields(&json!({"type": "object"})).is_empty());
+    }
+
+    #[test]
+    fn pin_and_follow_annotations_are_read() {
+        let s = json!({
+            "type": "object",
+            "x-faucet-follows-servers": true,
+            "properties": {
+                "pin": {"type": "boolean", "x-faucet-pin-servers": true},
+                "other": {"type": "string"}
+            }
+        });
+        assert_eq!(pin_servers_fields(&s), vec!["pin".to_string()]);
+        assert!(follows_servers(&s, &json!({})));
+        let tagged = json!({"oneOf": [
+            {"type": "object", "properties": {"type": {"const": "http"}, "config": {}}},
+            {"type": "object", "x-faucet-follows-servers": true,
+             "properties": {"type": {"const": "kafka"}, "config": {}}}
+        ]});
+        assert!(follows_servers(
+            &tagged,
+            &json!({"type": "kafka", "config": {}})
+        ));
+        assert!(!follows_servers(
+            &tagged,
+            &json!({"type": "http", "config": {}})
+        ));
+        assert!(!follows_servers(&json!({"type": "object"}), &json!({})));
+        assert!(pin_servers_fields(&json!({"type": "object"})).is_empty());
+    }
+
+    #[test]
+    fn a_boolean_value_list_flags_only_the_listed_values() {
+        let s = json!({
+            "type": "object",
+            "properties": {
+                "dn_match": {"type": "boolean", "x-faucet-unverified": [false]},
+                "mode": {"type": "string", "x-faucet-unverified": ["false"]}
+            }
+        });
+        let off = annotated_resources(&s, &json!({"dn_match": false}));
+        assert_eq!(off.len(), 1);
+        assert_eq!(off[0].kind, ResourceKind::Unverified);
+        assert_eq!(off[0].value, "dn_match: false");
+        assert!(annotated_resources(&s, &json!({"dn_match": true})).is_empty());
+        assert!(annotated_resources(&s, &json!({})).is_empty());
+        assert!(annotated_resources(&s, &json!({"mode": false})).is_empty());
+    }
+
+    #[test]
     fn settings_that_turn_off_verification_are_reported_and_follow_the_policy() {
         let s = json!({
             "type": "object",
@@ -2417,6 +3216,8 @@ mod tests {
         assert_eq!(found[0].kind, ResourceKind::HostCredentials);
         assert_eq!(found[0].value, "external_auth: true");
         assert_eq!(ResourceKind::HostCredentials.as_str(), "host_credentials");
+        assert_eq!(ResourceKind::Key.as_str(), "key");
+        assert_eq!(ResourceKind::parse("key"), Some(ResourceKind::Key));
         let refused = ReferencePolicy::deny_all().check(&found[0]).unwrap_err();
         assert_eq!(refused.kind, RefusalKind::HostCredentials);
         assert!(ReferencePolicy::open().check(&found[0]).is_ok());
@@ -3147,6 +3948,80 @@ mod tests {
             .any_url_host()
     }
 
+    #[test]
+    fn urls_with_control_characters_are_refused() {
+        let listed = ReferencePolicy::deny_all()
+            .with_path_roots(["/srv/data"])
+            .any_url_scheme()
+            .with_url_hosts(["allowed.example", "cache.example.com"]);
+        for v in [
+            "\u{1}amqp://allowed.example\\@evil.example/",
+            "amqp:/\t/evil.example/x://allowed.example/",
+            "\u{1}nats://evil.example:4222",
+            "\u{1}redis://evil.example:6379/0",
+            "\u{1}rediss://evil.example:6380/0",
+        ] {
+            assert!(listed.check_url(v).is_err(), "{v:?}");
+        }
+        assert!(
+            listed
+                .check_url_as("\u{1}nats://evil.example:4222", Some(UrlSyntax::UrlList))
+                .is_err()
+        );
+        let tls_only = ReferencePolicy::deny_all()
+            .with_path_roots(["/srv/data"])
+            .with_url_schemes(["amqps", "rediss"])
+            .any_url_host();
+        assert!(tls_only.check_url("\u{1}amqp://broker.example/").is_err());
+        assert!(tls_only.check_url("amqps://broker.example/").is_ok());
+        for v in [
+            "rediss://cache.example.com:6380/0#insec\ture",
+            "\u{1}rediss://cache.example.com:6380/0#insecure",
+        ] {
+            assert!(listed.check_url(v).is_err(), "{v:?}");
+        }
+        assert!(listed.check_url("\u{1}unix:///etc/redis.sock").is_err());
+        let unconfined = ReferencePolicy::deny_all()
+            .any_path()
+            .any_url_scheme()
+            .any_url_host();
+        assert!(
+            unconfined
+                .check_url("\u{1}http://169.254.169.254/latest/")
+                .is_err()
+        );
+        assert!(
+            unconfined
+                .check_url("ht\ttp://169.254.169.254/latest/")
+                .is_err()
+        );
+        assert!(
+            listed
+                .check_url("redis://cache.example.com:6379/\u{7}0")
+                .is_err()
+        );
+        assert!(
+            listed
+                .check_url("redis://cache.example.com:6379/\u{7f}0")
+                .is_err()
+        );
+        assert!(
+            unconfined
+                .check_url("redis://cache.example.com:6379/\u{7f}0")
+                .is_ok()
+        );
+        assert!(
+            listed
+                .check_url(" redis://cache.example.com:6379/0 ")
+                .is_ok()
+        );
+        assert!(listed.check_url("cache.example.com:6379").is_ok());
+        assert_eq!(
+            url_hosts("\u{1}amqp://allowed.example\\@evil.example/"),
+            vec!["evil.example".to_string()]
+        );
+    }
+
     fn refused(syntax: Option<UrlSyntax>, value: &str) -> Refusal {
         confined()
             .check_url_as(value, syntax)
@@ -3464,6 +4339,25 @@ mod tests {
     }
 
     #[test]
+    fn key_fields_refuse_parent_segments_under_path_roots() {
+        let schema = json!({
+            "properties": {
+                "dir": {"type": "string", "x-faucet-resource": "key"},
+                "name": {"type": "string", "x-faucet-resource": "key"}
+            }
+        });
+        let found = annotated_resources(&schema, &json!({"dir": "/data/a", "name": "../b/x.csv"}));
+        assert!(found.iter().all(|r| r.kind == ResourceKind::Key));
+        let caller = ReferencePolicy::deny_all().with_path_roots(Vec::<PathBuf>::new());
+        let refused: Vec<_> = found.iter().filter(|r| caller.check(r).is_err()).collect();
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].pointer, "/name");
+        assert!(caller.check_key("/data/%2e%2e/b").is_err());
+        assert!(caller.check_key("/data/a..b/c").is_ok());
+        assert!(ReferencePolicy::open().check_key("../x").is_ok());
+    }
+
+    #[test]
     fn token_auth_uses_host_credentials() {
         for v in [
             "db.example.com:2484/s?token_auth=OCI_INSTANCE_PRINCIPAL",
@@ -3557,6 +4451,146 @@ mod tests {
                 .is_err()
         );
         assert!(only.check_url_as("AccountName=acct", AZURE).is_ok());
+    }
+
+    #[test]
+    fn azure_string_hosts_follow_the_client_reading() {
+        let v = "AccountName=acct;EndpointSuffix=evil.example;AccountKey=k==;\
+                 accountname=ok;endpointsuffix=core.windows.net";
+        assert_eq!(url_hosts_as(v, AZURE), vec!["acct.blob.evil.example"]);
+        let only = ReferencePolicy::open().with_url_hosts(["*.blob.core.windows.net"]);
+        assert!(only.check_url_as(v, AZURE).is_err());
+        let suffix = "AccountName=acct;EndpointSuffix=x@evil.example";
+        assert_eq!(url_hosts_as(suffix, AZURE), vec!["evil.example"]);
+        assert_eq!(
+            url_hosts_as("UseDevelopmentStorage=true", AZURE),
+            vec!["127.0.0.1"]
+        );
+        assert_eq!(
+            url_hosts_as("AccountName=acct;DefaultEndpointsProtocol=http", AZURE),
+            vec!["acct.blob.core.windows.net"]
+        );
+        for bad in [
+            "AccountName=evil.example#;AccountKey=k",
+            "AccountName=acct;EndpointSuffix=core.windows.net;\
+             DefaultEndpointsProtocol=https://evil.example/?",
+        ] {
+            let e = ReferencePolicy::open()
+                .check_url_as(bad, AZURE)
+                .expect_err(bad);
+            assert!(!e.reason.contains("evil"), "{}", e.reason);
+        }
+    }
+
+    #[test]
+    fn azure_key_in_another_case_is_refused_for_callers() {
+        let v = "AccountName=acct;accountname=other;AccountKey=k==";
+        let e = refused(AZURE, v);
+        assert!(e.reason.contains("`accountname`"), "{}", e.reason);
+        assert!(e.reason.contains("`AccountName`"), "{}", e.reason);
+        assert!(!e.reason.contains("other"), "{}", e.reason);
+        assert!(ReferencePolicy::open().check_url_as(v, AZURE).is_ok());
+        accepted(AZURE, "AccountName=acct;AccountKey=k==");
+    }
+
+    #[test]
+    fn azure_blob_endpoint_replaces_the_account_host() {
+        let v = "AccountName=acct;EndpointSuffix=core.windows.net;BlobEndpoint=https://b.example/";
+        assert_eq!(url_hosts_as(v, AZURE), vec!["b.example"]);
+        let only = ReferencePolicy::open().with_url_hosts(["b.example"]);
+        assert!(only.check_url_as(v, AZURE).is_ok());
+        let effective = vec!["10.1.2.3".to_string()];
+        let private = ReferencePolicy::open().with_url_hosts(["10.1.2.3"]);
+        assert!(
+            private
+                .check_azure_conn_with_hosts("AccountName=acct;AccountKey=k==", &effective)
+                .is_ok()
+        );
+        assert!(
+            private
+                .check_url_as("AccountName=acct;AccountKey=k==", AZURE)
+                .is_err()
+        );
+        assert!(
+            private
+                .check_azure_conn_with_hosts(
+                    "AccountName=acct;QueueEndpoint=https://q.example/",
+                    &effective
+                )
+                .is_err()
+        );
+        assert!(
+            private
+                .check_azure_conn_with_hosts("AccountName=a#;AccountKey=k==", &effective)
+                .is_err()
+        );
+        let long = "a".repeat(MAX_SCREENED_LEN + 1);
+        assert!(confined().check_azure_conn_with_hosts(&long, &[]).is_err());
+    }
+
+    #[test]
+    fn server_values_read_alike_in_ado_and_plain_strings() {
+        for (server, host) in [
+            ("tcp:db.example.com,1433", "db.example.com"),
+            ("TCP:db.example.com", "db.example.com"),
+            ("np:db\\inst", "db"),
+            ("(local)", "localhost"),
+        ] {
+            let plain = url_hosts(&format!("Server={server};Database=x"));
+            let ado = url_hosts_as(&format!("Server={server};Database=x"), ADO);
+            assert!(plain.contains(&host.to_string()), "{server}: {plain:?}");
+            assert!(ado.contains(&host.to_string()), "{server}: {ado:?}");
+        }
+        assert!(server_value_hosts("/var/run/sock").is_empty());
+        assert!(server_value_hosts("np:/pipe").is_empty());
+        assert_eq!(
+            server_value_hosts("tcp://db.example.com:1433"),
+            vec!["db.example.com"]
+        );
+    }
+
+    #[test]
+    fn keyed_entries_can_name_a_grammar() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"extra": {
+                "type": "object",
+                "additionalProperties": {"type": "string"},
+                "x-faucet-resource-keys": {
+                    "bootstrap.servers": {"kind": "url", "syntax": "url-list"},
+                    "*.location": "path",
+                    "ssl.engine.location": "command",
+                    "*.cmd": "command",
+                    "bad": {"syntax": "url-list"}
+                }
+            }}
+        });
+        let config = json!({"extra": {
+            "bootstrap.servers": "ok.example.com:9092,169.254.169.254:9092",
+            "ssl.engine.location": "/lib/x.so",
+            "ssl.ca.location": "/etc/ca.pem",
+            "bad": "x"
+        }});
+        let found = annotated_resources(&schema, &config);
+        let find = |p: &str| found.iter().find(|r| r.pointer == p).cloned();
+        let brokers = find("/extra/bootstrap.servers").unwrap();
+        assert_eq!(brokers.syntax, Some(UrlSyntax::UrlList));
+        assert!(ReferencePolicy::open().check(&brokers).is_err());
+        assert_eq!(
+            find("/extra/ssl.engine.location").unwrap().kind,
+            ResourceKind::Command
+        );
+        assert_eq!(
+            find("/extra/ssl.ca.location").unwrap().kind,
+            ResourceKind::Path
+        );
+        assert!(find("/extra/bad").is_none());
+        assert!(!declares(&schema, ResourceKind::Command));
+        assert!(declares(&schema, ResourceKind::Url));
+        let typed =
+            json!({"type": "object", "properties": {"cmd": {"x-faucet-resource": "command"}}});
+        assert!(declares(&typed, ResourceKind::Command));
+        assert!(keyed_entry(&json!(3)).is_none());
     }
 
     #[test]
@@ -3671,5 +4705,308 @@ mod tests {
         ] {
             accepted(None, v);
         }
+    }
+
+    #[test]
+    fn mongodb_tls_files_follow_the_path_roots() {
+        for v in [
+            "mongodb://db.example.com/?tlsCAFile=/etc/ssl/private/ca.pem",
+            "mongodb://db.example.com/?TLSCERTIFICATEKEYFILE=%2Fetc%2Fpasswd",
+            "mongodb://db.example.com/?tls=true&tlsCertificateKeyFile=/srv/data/../../etc/passwd",
+            "mongodb://db.example.com/?tlsCertificate\u{212A}eyFile=/etc/passwd",
+            "mongodb://db.example.com/?appName=a,b://c&tlsCertificateKeyFile=/etc/passwd",
+            "mongodb+srv://cluster0.example.net/?tlsCAFile=/etc/passwd",
+        ] {
+            let e = refused(None, v);
+            assert_eq!(e.kind, RefusalKind::Path, "{v}");
+            assert!(!e.reason.contains("/etc"), "{v}: {}", e.reason);
+        }
+        accepted(None, "mongodb://db.example.com/?tlsCAFile=/srv/data/ca.pem");
+        accepted(
+            None,
+            "mongodb://db.example.com/?tlsCAFile=%2Fsrv%2Fdata%2Fca.pem",
+        );
+        assert!(
+            ReferencePolicy::open()
+                .check_url("mongodb://db.example.com/?tlsCAFile=/etc/ssl/ca.pem")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn mongodb_unverified_tls_needs_the_flag() {
+        for v in [
+            "mongodb://db.example.com/?tlsInsecure=true",
+            "mongodb://db.example.com/?tlsAllowInvalidCertificates=true",
+            "mongodb://db.example.com/?TLSALLOWINVALIDHOSTNAMES=yes",
+            "mongodb://db.example.com/?tlsinsecure=%74rue",
+        ] {
+            let e = refused(None, v);
+            assert!(e.reason.contains("verification"), "{v}: {}", e.reason);
+            assert!(confined().with_unverified(true).check_url(v).is_ok(), "{v}");
+        }
+        accepted(None, "mongodb://db.example.com/?tlsInsecure=false&tls=true");
+    }
+
+    #[test]
+    fn mongodb_ambient_auth_needs_host_credentials() {
+        for v in [
+            "mongodb://db.example.com/?authMechanism=MONGODB-OIDC&authMechanismProperties=ENVIRONMENT:k8s",
+            "mongodb://db.example.com/?authMechanism=MONGODB-OIDC&authMechanismProperties=TOKEN_RESOURCE:x,ENVIRONMENT%3Aazure",
+            "mongodb://db.example.com/?authMechanism=MONGODB-AWS",
+            "mongodb://db.example.com/?authmechanism=gssapi",
+            "mongodb+srv://cluster0.example.net/?authMechanism=MONGODB%2DOIDC&authMechanismProperties=ENVIRONMENT:gcp",
+        ] {
+            let e = refused(None, v);
+            assert_eq!(e.kind, RefusalKind::HostCredentials, "{v}");
+            assert!(
+                confined().with_host_credentials(true).check_url(v).is_ok(),
+                "{v}"
+            );
+        }
+        accepted(
+            None,
+            "mongodb://u:p@db.example.com/?authMechanism=SCRAM-SHA-256",
+        );
+        accepted(
+            None,
+            "mongodb://db.example.com/?authMechanism=MONGODB-X509&tlsCertificateKeyFile=/srv/data/c.pem",
+        );
+    }
+
+    #[test]
+    fn mongodb_socket_hosts_are_paths() {
+        for v in [
+            "mongodb://%2Fvar%2Frun%2Fmongodb-27017.sock/",
+            "mongodb://db.example.com,%2Ftmp%2F..%2Fetc%2Fm.sock/db",
+            "mongodb://m.sock/",
+            "mongodb://%2Fsrv%2Fdata%2F%FF.sock/",
+        ] {
+            assert_eq!(refused(None, v).kind, RefusalKind::Path, "{v}");
+        }
+        accepted(None, "mongodb://%2Fsrv%2Fdata%2Fmongodb.sock/");
+        assert_eq!(
+            url_hosts("mongodb://%2Fsrv%2Fdata%2Fm.sock,db.example.com/"),
+            vec!["db.example.com"]
+        );
+        assert_eq!(url_hosts("mongodb://evil.SOCK/"), vec!["evil.sock"]);
+        assert!(
+            ReferencePolicy::open()
+                .check_url("mongodb://%2Fvar%2Frun%2Fm.sock/")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn mongodb_hosts_are_read_like_the_driver() {
+        for v in [
+            "mongodb://ok.example.com#,169.254.169.254:80/",
+            "mongodb://ok.example.com;x,169.254.169.254/",
+            "mongodb://u:p@x@ok.example.com,169.254.169.254/?appName=a",
+            "mongodb://ok.example.com/?proxyHost=169.254.169.254",
+            "mongodb://ok.example.com/?appName=x,nats://ok.example.com&proxyHost=169.254.169.254",
+        ] {
+            assert!(refused(None, v).reason.contains("169.254.169.254"), "{v}");
+        }
+        assert_eq!(
+            url_hosts("mongodb://a.example.com#,B.example.com:27018/?x=1"),
+            vec!["a.example.com#", "b.example.com"]
+        );
+    }
+
+    #[test]
+    fn mongodb_srv_needs_the_parent_domain_listed() {
+        let exact = confined().with_url_hosts(["cluster0.example.net"]);
+        let parent = confined().with_url_hosts(["*.example.net"]);
+        let v = "mongodb+srv://cluster0.example.net/app";
+        assert!(exact.check_url(v).is_err());
+        assert!(parent.check_url(v).is_ok());
+        assert!(
+            exact
+                .check_url("mongodb://cluster0.example.net/app")
+                .is_ok()
+        );
+        accepted(None, v);
+    }
+
+    #[test]
+    fn mongodb_values_keep_plus_signs() {
+        let read = MongoRead::read(
+            "mongodb://u:p@db.example.com/app?tlsCAFile=/srv/data/a+b%20c.pem&appName=x%FF",
+        )
+        .unwrap();
+        assert_eq!(
+            read.values("tlscafile").collect::<Vec<_>>(),
+            vec!["/srv/data/a+b c.pem"]
+        );
+        assert_eq!(
+            read.values("appname").collect::<Vec<_>>(),
+            vec!["x\u{FFFD}"]
+        );
+        let read = MongoRead::read("MONGODB://h/?tlsCertificate\u{212A}eyFile=/x&bad&k=").unwrap();
+        assert_eq!(
+            read.options,
+            vec![
+                ("tlscertificatekeyfile".to_string(), "/x".to_string()),
+                ("k".to_string(), String::new())
+            ]
+        );
+        assert_eq!(
+            url_hosts("mongodb://n4o\u{1}"),
+            vec!["n4o\u{1}".to_string()]
+        );
+        assert!(MongoRead::read("mongodb:/h").is_none());
+        assert!(MongoRead::read("postgres://h").is_none());
+    }
+
+    #[test]
+    fn mongodb_server_addresses_are_read_like_the_driver() {
+        let read = MongoRead::read(
+            "mongodb+srv://a@b@[::1]:27017,[::1]x,[zz],:1,h:x:y,%2Fs.sock,%FF.sock/db,x?y",
+        )
+        .unwrap();
+        assert!(read.srv);
+        assert_eq!(
+            read.hosts,
+            vec![
+                MongoHost::Tcp("[::1]".into()),
+                MongoHost::Unreadable,
+                MongoHost::Unreadable,
+                MongoHost::Unreadable,
+                MongoHost::Tcp("h".into()),
+                MongoHost::Socket(Some("/s.sock".into())),
+                MongoHost::Socket(None),
+            ]
+        );
+        assert_eq!(srv_parent("cluster0.example.net"), "example.net");
+        assert_eq!(srv_parent("example.net"), "example.net");
+        assert_eq!(srv_parent("localhost"), "localhost");
+    }
+
+    #[test]
+    fn mongodb_clients_stay_on_the_named_server_when_pinned() {
+        let pinned = confined().with_pinned_servers(true);
+        assert!(pinned.pins_servers());
+        assert!(!confined().pins_servers());
+        for v in [
+            "mongodb://db.example.com/app",
+            "mongodb://a.example.com,b.example.com/?replicaSet=rs0",
+            "mongodb://db.example.com/?directConnection=false",
+            "mongodb+srv://cluster0.example.net/",
+            "mongodb+srv://cluster0.example.net/?directConnection=true",
+        ] {
+            let e = pinned.check_url(v).expect_err(v);
+            assert!(e.reason.contains("directConnection=true"), "{v}");
+        }
+        for v in [
+            "mongodb://db.example.com/app?directConnection=true",
+            "mongodb://db.example.com/?replicaSet=rs0&directConnection=true",
+            "mongodb://lb.example.com/?loadBalanced=true",
+            "mongodb+srv://cluster0.example.net/?loadBalanced=true",
+        ] {
+            assert!(pinned.check_url(v).is_ok(), "{v}");
+        }
+    }
+
+    #[test]
+    fn mongodb_urls_are_checked_by_scheme() {
+        let only_https = confined().with_url_schemes(["https"]);
+        assert!(
+            only_https
+                .check_url("mongodb://db.example.com/")
+                .unwrap_err()
+                .reason
+                .contains("mongodb")
+        );
+        assert!(
+            only_https
+                .check_url("mongodb+srv://c.example.net/")
+                .unwrap_err()
+                .reason
+                .contains("mongodb+srv")
+        );
+        assert_eq!(
+            url_hosts("mongodb://a.example.com/?proxyHost=Proxy.example.com"),
+            vec!["a.example.com", "proxy.example.com"]
+        );
+        assert!(
+            ReferencePolicy::open()
+                .check_url("mongodb://:1,%FF.sock/")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn listeners_bind_only_inside_the_allowed_ranges() {
+        let range = |s: &str| ListenRange::parse(s).unwrap();
+        assert_eq!(
+            range("127.0.0.1:29100-29199").to_string(),
+            "127.0.0.1:29100-29199"
+        );
+        assert_eq!(range("[::1]:29100").to_string(), "[::1]:29100");
+        for bad in [
+            "localhost:1",
+            "127.0.0.1",
+            "::1:80",
+            "1.2.3.4:0",
+            "1.2.3.4:9-1",
+            "1.2.3.4:x",
+        ] {
+            assert!(ListenRange::parse(bad).is_err(), "{bad}");
+        }
+        let p = ReferencePolicy::deny_all()
+            .with_listen([range("127.0.0.1:29100-29199"), range("[::]:9000")])
+            .with_reserved_ports([29150]);
+        assert_eq!(p.listen_ranges().map(<[_]>::len), Some(2));
+        p.check_listen("127.0.0.1:29100").unwrap();
+        p.check_listen("0.0.0.0:9000").unwrap();
+        p.check_listen("[::]:9000").unwrap();
+        for (bad, why) in [
+            ("127.0.0.1:8080", "127.0.0.1:29100-29199"),
+            ("10.0.0.5:29100", "outside"),
+            ("localhost:29100", "literal"),
+            ("127.0.0.1:0", "port 0"),
+            ("127.0.0.1:29150", "port 29150"),
+        ] {
+            let r = p.check_listen(bad).unwrap_err();
+            assert_eq!(r.kind, RefusalKind::Listen);
+            assert!(r.reason.contains(why), "{bad}: {}", r.reason);
+        }
+        let r = ReferencePolicy::deny_all()
+            .check_listen("127.0.0.1:1")
+            .unwrap_err();
+        assert!(r.reason.contains("not allowed"), "{}", r.reason);
+        ReferencePolicy::open().check_listen("anything").unwrap();
+        assert!(p.clone().any_listen().check_listen("x").is_ok());
+        let listen = ResourceRef::new("/listen_addr", ResourceKind::Listen, "127.0.0.1:1");
+        assert!(p.check(&listen).is_err());
+        assert_eq!(ResourceKind::parse("listen"), Some(ResourceKind::Listen));
+        assert_eq!(ResourceKind::Listen.as_str(), "listen");
+    }
+
+    #[test]
+    fn caller_ceilings_are_read_from_the_schema() {
+        let schema = serde_json::json!({
+            "oneOf": [
+                { "properties": {
+                    "a": { "type": "integer", "x-faucet-caller-max": 10 },
+                    "b": { "anyOf": [{ "$ref": "#/$defs/B" }, { "type": "null" }] },
+                    "c": { "type": "integer" } } },
+                { "properties": { "a": { "x-faucet-caller-max": 5 } } }
+            ],
+            "$defs": { "B": { "type": "integer", "x-faucet-caller-max": 7 } }
+        });
+        assert_eq!(
+            caller_max_fields(&schema),
+            vec![("a".to_string(), 5), ("b".to_string(), 7)]
+        );
+        assert!(caller_max_fields(&serde_json::json!({})).is_empty());
+        let schema = serde_json::json!({
+            "properties": {
+                "set": { "x-faucet-caller-max": 10, "x-faucet-caller-set": true },
+                "kept": { "x-faucet-caller-max": 10 }
+            }
+        });
+        assert_eq!(caller_set_fields(&schema), vec!["set"]);
     }
 }

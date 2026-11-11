@@ -257,6 +257,21 @@ Discovery is read-only and cheap: one `listCollections`, plus one metadata count
 
 If a sink needs flat scalar columns instead of the `{"$oid": …}` / `{"$date": …}` wrappers, add a transform (e.g. `set` / `rename_field` / `cast`) between the source and sink.
 
+## Connection URIs in `faucet serve`
+
+`faucet serve` reads `connection_uri` the way the MongoDB driver does and holds
+a config a request carried to the server's reference policy: every host and
+`proxyHost` follows the host rules, a `.sock` host and `tlsCAFile` /
+`tlsCertificateKeyFile` must sit under the allowed path roots,
+`tlsInsecure` / `tlsAllowInvalidCertificates` / `tlsAllowInvalidHostnames`
+need `--allow-unverified-tls`, and `authMechanism=MONGODB-AWS` / `GSSAPI` or an
+`ENVIRONMENT` entry in `authMechanismProperties` (which would use the server's
+own cloud or Kubernetes identity) is refused. Unless the server lists hosts
+with `--allow-url-host` (and always for a tenant), the URI must keep the driver
+on the server it names: add `directConnection=true`, or `loadBalanced=true`
+behind a load balancer. Templates and the triggers file are not limited. See
+the [HTTP API reference](https://faucet-hq.github.io/faucet-stream/reference/http-api.html).
+
 ## Config loading & schema
 
 Load config from a JSON file or environment in library code:

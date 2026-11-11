@@ -241,6 +241,11 @@ pub async fn register_template(
             }
         }
     }
+    // Caller params reaching the server identity are refused at trigger time.
+    if let Some(warning) = host_identity_warning(&state, &record) {
+        tracing::warn!(template = %record.id, "{warning}");
+        summary.warnings.push(warning);
+    }
     Ok((
         StatusCode::CREATED,
         Json(RegisterResponse {
@@ -249,6 +254,43 @@ pub async fn register_template(
             tests_inherited_from: registered.tests_inherited_from,
             companions_retested: registered.companions_retested,
         }),
+    ))
+}
+
+/// The warning for a registered pipeline template whose connectors use the
+/// server's own identity and whose params a caller may supply, while the
+/// server refuses host credentials to callers.
+fn host_identity_warning(
+    state: &ServerState,
+    record: &crate::serve::history::templates::TemplateRecord,
+) -> Option<String> {
+    if record.kind != crate::hub::TemplateKind::Pipeline
+        || state.references().caller().allows_host_credentials()
+    {
+        return None;
+    }
+    let doc: serde_json::Value = match record.format {
+        crate::serve::load::ConfigFormat::Yaml => crate::yaml::from_str(&record.body).ok()?,
+        crate::serve::load::ConfigFormat::Json => serde_json::from_str(&record.body).ok()?,
+    };
+    if doc
+        .get("params")
+        .and_then(serde_json::Value::as_object)
+        .is_none_or(|p| p.is_empty())
+    {
+        return None;
+    }
+    let cfg = crate::templates::store::validate_pipeline_body(&doc).ok()?;
+    let nodes = crate::expand::expand(&crate::partition::offline(&cfg)).ok()?;
+    let found = crate::serve::host_identity::uses(&cfg, &nodes);
+    let first = found.first()?;
+    Some(format!(
+        "host credentials: {} `{}` authenticates with the server's own identity, so a run whose \
+         caller-supplied params land in its config is refused unless `faucet serve` runs with \
+         `{}` (never for a tenant)",
+        first.at,
+        first.kind,
+        crate::serve::host_identity::FLAG
     ))
 }
 
@@ -1380,7 +1422,9 @@ pub struct TriggerBody {
     /// `orders` after `customers` completes.
     #[serde(default)]
     pub depends_on: Option<crate::run_deps::RunDependencies>,
-    /// The execution pool to run in (#957); wins over the template's `pool:`.
+    /// The execution pool to run in (#957); wins over the template's `pool:`
+    /// only where its `pool_override` allows the pool (a caller's or tenant's
+    /// run; the operator's triggers, schedules and fan-outs always choose).
     #[serde(default)]
     pub pool: Option<String>,
     /// Set (never from the wire) by a fire of a trigger declared in the
@@ -1394,6 +1438,20 @@ pub struct TriggerBody {
     /// even when the run itself carries a standing approval (#1051).
     #[serde(skip)]
     pub operator_params: bool,
+    /// Set (never from the wire) where the server wrote the whole
+    /// `idempotency_key` (a trigger fire, a schedule tick).
+    #[serde(skip)]
+    pub server_key: bool,
+    /// Set (never from the wire) when the server's operator chose `pool` (a
+    /// triggers-file trigger, an operator's schedule or fan-out): the
+    /// template's `pool_override` does not apply.
+    #[serde(skip)]
+    pub pool_by_operator: bool,
+    /// Set (never from the wire) by a trigger fire: the params whose value
+    /// holds text the event's sender chose. Even with `operator_params`,
+    /// those are held to the caller reference policy.
+    #[serde(skip)]
+    pub sender_params: std::collections::BTreeSet<String>,
 }
 
 /// A trigger's `overlay`: a registered deployment id, or an inline document.
@@ -1479,9 +1537,6 @@ pub async fn trigger_template(
     Json(body): Json<TriggerBody>,
 ) -> Result<axum::response::Response, ServeError> {
     use axum::response::IntoResponse;
-    if actor.tenant.is_none() {
-        runner::refuse_reserved_idempotency_key(body.idempotency_key.as_deref())?;
-    }
     match trigger_template_outcome(state, actor, id, body).await? {
         TriggerOutcome::Run(resp) => Ok((StatusCode::ACCEPTED, Json(resp)).into_response()),
         // Approval first (#703): the trigger became a change request.

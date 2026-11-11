@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 pub struct SqlTransformConfig {
     /// The SQL statement. The page's records are the relation `batch`. Must
     /// produce a result set; each result row becomes one output record.
-    #[schemars(extend("x-faucet-sql" = true))]
+    #[schemars(extend("x-faucet-sql" = true, "x-faucet-code" = true))]
     pub query: String,
     /// Reference relations loaded once at compile time and joinable by name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

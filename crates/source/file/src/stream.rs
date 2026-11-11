@@ -35,6 +35,7 @@ enum Opened {
 /// file's schema.
 pub(crate) struct Decoders {
     opts: FormatOptions,
+    max_decoded_bytes: u64,
     containers: HashMap<&'static str, faucet_core::ContainerDecoder>,
     #[cfg(feature = "file-format-parquet")]
     parquet: Option<(String, arrow::datatypes::SchemaRef)>,
@@ -43,9 +44,14 @@ pub(crate) struct Decoders {
 }
 
 impl Decoders {
-    fn new(opts: FormatOptions, parquet_columns: Option<Vec<String>>) -> Arc<Mutex<Self>> {
+    fn new(
+        opts: FormatOptions,
+        max_decoded_bytes: u64,
+        parquet_columns: Option<Vec<String>>,
+    ) -> Arc<Mutex<Self>> {
         Arc::new(Mutex::new(Self {
             opts,
+            max_decoded_bytes,
             parquet_columns,
             containers: HashMap::new(),
             #[cfg(feature = "file-format-parquet")]
@@ -59,7 +65,8 @@ impl Decoders {
     ) -> Result<&mut faucet_core::ContainerDecoder, FaucetError> {
         let key = format.as_str();
         if !self.containers.contains_key(key) {
-            let d = faucet_core::ContainerDecoder::new(format, &self.opts)?;
+            let d = faucet_core::ContainerDecoder::new(format, &self.opts)?
+                .with_max_decoded_bytes(self.max_decoded_bytes);
             self.containers.insert(key, d);
         }
         Ok(self.containers.get_mut(key).expect("inserted above"))
@@ -224,11 +231,9 @@ impl FileSource {
                     .map(|r| r.map_err(std::io::Error::other));
                 Box::pin(tokio_util::io::StreamReader::new(body))
             }
-            None => Box::pin(tokio::io::BufReader::new(
-                tokio::fs::File::open(path)
-                    .await
-                    .map_err(|e| read_err(path, e))?,
-            )),
+            None => Box::pin(tokio::io::BufReader::new(tokio::fs::File::from_std(
+                open_local(path)?,
+            ))),
         })
     }
 
@@ -255,8 +260,7 @@ impl FileSource {
         }
         let binary = format.is_container() || format == FileFormat::Parquet;
         if binary && self.http.is_none() && self.codec_of(path) == Compression::None {
-            let file = std::fs::File::open(path).map_err(|e| read_err(path, e))?;
-            return Ok(Opened::Local(file));
+            return Ok(Opened::Local(open_local(path)?));
         }
         let reader = self.open_reader(path).await?;
         let bytes = faucet_core::file_format::read_to_end_capped(
@@ -325,7 +329,7 @@ impl FileSource {
                 if self.format_of(&f.path)? == Some(FileFormat::Parquet)
                     && self.codec_of(&f.path) == Compression::None
                 {
-                    local.push(f.path.clone());
+                    local.push((f.path.clone(), open_local(&f.path)?));
                 }
             }
             if local.len() < 2 {
@@ -333,7 +337,7 @@ impl FileSource {
             }
             let columns = self.config.parquet.columns.clone();
             tokio::task::spawn_blocking(move || {
-                crate::parquet::check_schemas(&local, columns.as_deref())
+                crate::parquet::check_schemas(local, columns.as_deref())
             })
             .await
             .map_err(|e| FaucetError::Source(format!("file source: schema check failed: {e}")))??;
@@ -357,6 +361,17 @@ fn now_ns() -> i64 {
     chrono::Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX)
 }
 
+/// Open a listed local file. Under a scoped reference policy with path roots
+/// the file is reached without following links and must resolve under a root.
+fn open_local(path: &str) -> Result<std::fs::File, FaucetError> {
+    match faucet_core::http::current_reference_policy() {
+        Some(policy) if policy.path_roots().is_some() => {
+            faucet_core::path_guard::open_within(std::path::Path::new(path), Some(&policy))
+        }
+        _ => std::fs::File::open(path).map_err(|e| read_err(path, e)),
+    }
+}
+
 fn read_err(path: &str, e: impl std::fmt::Display) -> FaucetError {
     FaucetError::Source(format!("file source: read '{path}': {e}"))
 }
@@ -367,13 +382,14 @@ async fn decode_whole(
     format: FileFormat,
     bytes: Vec<u8>,
     opts: &FormatOptions,
+    max_decoded_bytes: u64,
 ) -> Result<Vec<Value>, FaucetError> {
     if format == FileFormat::RawText {
         let content = String::from_utf8(bytes)
             .map_err(|e| FaucetError::Source(format!("file source: '{path}' is not UTF-8: {e}")))?;
         return Ok(vec![json!({"path": path, "content": content})]);
     }
-    faucet_core::file_format::decode_owned(bytes, format, opts)
+    faucet_core::file_format::decode_owned_bounded(bytes, format, opts, max_decoded_bytes)
         .await
         .map_err(|e| FaucetError::Source(format!("file source: '{path}': {e}")))
 }
@@ -509,7 +525,7 @@ impl faucet_core::Source for FileSource {
             self.check_parquet_schemas(&files).await?;
             let by = self.by();
             let mut bookmark = self.start.lock().expect("bookmark mutex").clone();
-            let decoders = Decoders::new(self.config.format_options(), self.config.parquet.columns.clone());
+            let decoders = Decoders::new(self.config.format_options(), self.config.decoded_bytes_limit(), self.config.parquet.columns.clone());
             let opts = self.config.format_options();
             let chunk = if batch_size == 0 { usize::MAX } else { batch_size };
             let mut buffer: Vec<Value> = Vec::new();
@@ -570,7 +586,7 @@ impl faucet_core::Source for FileSource {
                             join(handle).await?;
                         }
                         Opened::Bytes(bytes) => {
-                            for r in decode_whole(path, format, bytes, &opts).await? {
+                            for r in decode_whole(path, format, bytes, &opts, self.config.decoded_bytes_limit()).await? {
                                 buffer.push(r);
                                 if buffer.len() >= chunk {
                                     yield StreamPage { records: std::mem::take(&mut buffer), bookmark: None };
@@ -627,7 +643,7 @@ impl faucet_core::Source for FileSource {
             self.check_parquet_schemas(&files).await?;
             let by = self.by();
             let mut bookmark = self.start.lock().expect("bookmark mutex").clone();
-            let decoders = Decoders::new(self.config.format_options(), self.config.parquet.columns.clone());
+            let decoders = Decoders::new(self.config.format_options(), self.config.decoded_bytes_limit(), self.config.parquet.columns.clone());
             let mut opened_files = self.prefetch(&files);
             while let Some((file, opened)) = opened_files.next().await {
                 let (mut rx, handle) = batches_task(decoders.clone(), file.path.clone(), format, input_of(opened?), self.config.batch_size);

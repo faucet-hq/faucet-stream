@@ -95,7 +95,8 @@ finished: scratch objects (`*.faucet-tmp`, `*.faucet-tmp-body`, `-old`,
 | `file_format` | enum | `json_lines` | How object bodies are parsed — `json_lines`, `json_array`, `raw_text`, `parquet`, `csv`, `xml`, `xlsx`. See below. |
 | `include` | string | *(unset)* | Glob over the whole object key selecting what to read (e.g. `exports/*.parquet`). Without it, zero-byte folder markers and keys with a `_`- or `.`-prefixed segment below the prefix (`_SUCCESS`, `_temporary/…`, `.crc`) are skipped; with it, exactly the matching keys are read. |
 | `max_objects` | int | *(all)* | Cap on the number of objects read. `None` reads every matching object. |
-| `max_object_bytes` | int | `2147483648` | Largest object, once decompressed, that a whole-object format (JSON array, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet, and JSON Lines under `verify_checksum`) may reach; a larger one fails the run instead of exhausting memory. It also bounds one line of a streamed JSON Lines object, so an object with no newline fails the same way. |
+| `max_object_bytes` | int | `2147483648` | Largest object, once decompressed, that a whole-object format (JSON array, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet, and JSON Lines under `verify_checksum`) may reach; a larger one fails the run instead of exhausting memory. It also bounds one line of a streamed JSON Lines object, so an object with no newline fails the same way, and one ranged read of a streamed Parquet object (a footer or a column chunk), refused before it is requested. |
+| `max_decoded_bytes` | int | 64 × `max_object_bytes`, at most 16 GiB | Most bytes one object may decode to in memory where a format can expand past its input: an Avro file's records (per batch where the file streams) and an Excel workbook's parts and shared strings. A file past it fails with an error instead of exhausting memory. |
 | `concurrency` | int | `10` | Maximum number of objects fetched concurrently. Clamped to `≥ 1` at runtime. |
 | `batch_size` | int | `1000` | Records per emitted `StreamPage`. See [Streaming & batching](#streaming--batching). Rejected above `MAX_BATCH_SIZE` (1,000,000) by `faucet_core::validate_batch_size`. |
 | `compression` | enum | `auto` | *(requires the `compression` feature)* Per-object decompression codec — `none` / `gzip` / `zstd` / `auto`. |
@@ -516,6 +517,16 @@ trips are still metered as `list` / `get` / `head` (see Usage signals). The
 object body is read under the same context, so a body that stops arriving
 mid-stream ends at the deadline or on cancel too. The SDK's own timeouts and
 retry are unchanged.
+
+## Caller configs under `faucet serve`
+
+A config submitted to `faucet serve` by a caller may not authenticate with the server's own identity unless the server runs with `--allow-host-credentials` (never for a tenant). For this connector that means:
+
+- `credentials` of type `default`, `profile`, `assume_role` or `web_identity` (or no `credentials`) uses the server's identity: name keys with `access_key`, or use `anonymous` for a public bucket.
+- A missing `region` counts too when the server's environment names none (`AWS_REGION` / `AWS_DEFAULT_REGION`), since the SDK would ask the instance metadata service.
+- S3-compatible stores (MinIO, LocalStack) still need some `access_key` pair and a `region`; requester-pays buckets need keys.
+
+The same check runs when the client is built, so a refused config fails with a config error naming the field.
 
 ## License
 

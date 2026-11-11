@@ -163,6 +163,38 @@ pub fn select_replay_node(nodes: Vec<ExpandedNode>, row: Option<&str>) -> CliRes
 /// replayed rows is never the complete set a cleanup deletes against. Unless
 /// `all_rows` is set, only envelopes the target pipeline and row wrote are
 /// replayed ([`replay_target`]).
+/// How a replay into `node` treats payloads its row is not shown to have
+/// masked already ([`super::reader::ForeignMasking`]); `None` without a
+/// `masking:` block.
+pub fn foreign_masking(
+    cfg: &PipelineConfig,
+    node: &ExpandedNode,
+) -> CliResult<Option<super::reader::ForeignMasking>> {
+    #[cfg(feature = "masking")]
+    if let Some(spec) = &node.masking {
+        let ids = [node.sink_ref.as_str(), node.sink.kind.as_str()];
+        return Ok(Some(
+            super::reader::ForeignMasking::new(
+                super::reader::ReplayTarget {
+                    pipeline: cfg.name.clone(),
+                    row: node.id.clone(),
+                },
+                Some(std::sync::Arc::new(
+                    faucet_core::CompiledMasking::compile_for_sink(spec, &ids)
+                        .map_err(|e| CliError::Config(format!("masking: {e}")))?,
+                )),
+            )
+            .with_proof(
+                super::proof::checked_for()
+                    .map(|tenant| super::proof::ProofCheck::new(spec.clone(), &ids, tenant)),
+            ),
+        ));
+    }
+    #[cfg(not(feature = "masking"))]
+    let _ = (cfg, node);
+    Ok(None)
+}
+
 pub fn build_replay_node(
     cfg: &PipelineConfig,
     from_files: Vec<PathBuf>,
@@ -191,25 +223,7 @@ pub fn build_replay_node(
             .and_then(|o| o.sink.config.get("encryption").cloned())
     });
     let target = replay_target(cfg, &node, all_rows);
-    #[cfg(feature = "masking")]
-    let foreign = match &node.masking {
-        Some(spec) => Some(super::reader::ForeignMasking::new(
-            super::reader::ReplayTarget {
-                pipeline: cfg.name.clone(),
-                row: node.id.clone(),
-            },
-            Some(std::sync::Arc::new(
-                faucet_core::CompiledMasking::compile_for_sink(
-                    spec,
-                    &[node.sink_ref.as_str(), node.sink.kind.as_str()],
-                )
-                .map_err(|e| CliError::Config(format!("masking: {e}")))?,
-            )),
-        )),
-        None => None,
-    };
-    #[cfg(not(feature = "masking"))]
-    let foreign = None;
+    let foreign = foreign_masking(cfg, &node)?;
     let reader = DlqReaderSource::new(from_files, reason, decryptor)
         .with_target(target)
         .with_foreign_masking(foreign);
@@ -588,6 +602,7 @@ mod tests {
             row: None,
             sink: None,
             ts_ms,
+            masking: None,
         }
     }
 

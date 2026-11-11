@@ -285,11 +285,15 @@ pub async fn start(
             details: None,
         });
     }
-    let current = with_generation(state.history().as_ref(), tenant, &req.connection)
+    let bump = crate::runtime::server::members_have(
+        state,
+        crate::serve::history::CAP_CONNECTION_GENERATION,
+    )
+    .await
+    .map_err(ServeError::from)?;
+    let current = with_generation(state.history().as_ref(), tenant, &req.connection, bump)
         .await
-        .map_err(|e| {
-            ServeError::Unavailable(format!("reading connection '{}': {e}", req.connection))
-        })?;
+        .map_err(ServeError::from)?;
     let base = ConnectBase::of(current.as_ref());
     let verifier = random_token();
     let oauth_state = random_token();
@@ -332,20 +336,29 @@ pub async fn start(
 /// the same compare-and-set a rotation writes with, so the callback is fenced
 /// by the generation a rotation keeps. A lost race reads the record again and
 /// takes the generation it now has, assigning one once more if still empty.
+///
+/// With `bump`, the write also moves `updated_at`, so a writer that read the
+/// record before it rebuilds on the new one and keeps the generation. Without
+/// it (a cluster member that would drop its rotated token instead),
+/// `updated_at` stays.
 async fn with_generation(
     history: &dyn crate::serve::history::RunHistory,
     tenant: &str,
     name: &str,
+    bump: bool,
 ) -> Result<Option<ConnectionRecord>, crate::serve::history::HistoryError> {
     let mut current = history.connection_get(tenant, name).await?;
     for _ in 0..2 {
         let Some(c) = current.as_ref().filter(|c| c.generation.is_empty()) else {
             return Ok(current);
         };
-        // `updated_at` stays: a rotation that read the record before this
-        // write still stores its rotated refresh token.
         let next = ConnectionRecord {
             generation: new_generation(),
+            updated_at: if bump {
+                next_instant(c.updated_at)
+            } else {
+                c.updated_at
+            },
             ..c.clone()
         };
         if history.connection_replace(&next, c.updated_at).await? {
@@ -354,6 +367,11 @@ async fn with_generation(
         current = history.connection_get(tenant, name).await?;
     }
     Ok(current)
+}
+
+/// Now, or just after `previous` when the clock has not moved past it.
+fn next_instant(previous: DateTime<Utc>) -> DateTime<Utc> {
+    Utc::now().max(previous + chrono::Duration::microseconds(1))
 }
 
 /// `GET /v1/connect/callback` query.
@@ -491,12 +509,13 @@ pub async fn callback(state: &ServerState, q: CallbackQuery) -> Result<String, S
         return Ok(finish(state, &session, Some(("failed", "expired"))).await);
     }
     if let Some(err) = q.error.as_deref() {
+        let code = provider_error_code(err);
         tracing::info!(
-            tenant = %session.tenant, provider = %session.provider, error = err,
-            description = q.error_description.as_deref().unwrap_or(""),
+            tenant = %session.tenant, provider = %session.provider, error = code,
+            description = truncated(q.error_description.as_deref().unwrap_or(""), 256),
             "connect flow was refused at the provider"
         );
-        return Ok(finish(state, &session, Some(("failed", err))).await);
+        return Ok(finish(state, &session, Some(("failed", code))).await);
     }
     let Some(code) = q.code.as_deref().filter(|c| !c.is_empty()) else {
         return Ok(finish(state, &session, Some(("failed", "missing_code"))).await);
@@ -520,6 +539,48 @@ pub async fn callback(state: &ServerState, q: CallbackQuery) -> Result<String, S
             }
             Ok(finish(state, &session, Some((why.outcome(), why.code()))).await)
         }
+    }
+}
+
+/// A provider's `error` as the caller's redirect carries it: an OAuth error
+/// code (1–64 characters of `[A-Za-z0-9_.-]`), else `provider_error`.
+fn provider_error_code(err: &str) -> &str {
+    let code_like = (1..=64).contains(&err.len())
+        && err
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
+    if code_like { err } else { "provider_error" }
+}
+
+/// At most `max` characters of `s`.
+fn truncated(s: &str, max: usize) -> &str {
+    s.char_indices().nth(max).map_or(s, |(i, _)| &s[..i])
+}
+
+fn superseded(session: &ConnectSession) -> CompleteError {
+    CompleteError::Superseded(format!(
+        "connection '{}/{}' was deleted or replaced since the flow started",
+        session.tenant, session.connection
+    ))
+}
+
+/// Refuse a flow whose connection was deleted or replaced since it started,
+/// before its code is exchanged for a grant nothing would store.
+async fn check_base(state: &ServerState, session: &ConnectSession) -> Result<(), CompleteError> {
+    let Some(base) = &session.base else {
+        return Ok(());
+    };
+    let current = state
+        .history()
+        .connection_get(&session.tenant, &session.connection)
+        .await
+        .map_err(|e| {
+            CompleteError::Store(format!("reading connection '{}': {e}", session.connection))
+        })?;
+    if base.matches(current.as_ref()) {
+        Ok(())
+    } else {
+        Err(superseded(session))
     }
 }
 
@@ -553,6 +614,7 @@ async fn complete(
     code: &str,
 ) -> Result<(), CompleteError> {
     check_tenant(state, session).await?;
+    check_base(state, session).await?;
     let rt = state.tenants();
     let provider = rt.providers.get(&session.provider).ok_or_else(|| {
         CompleteError::Exchange(format!(
@@ -584,7 +646,7 @@ async fn complete(
                     .into(),
             )
         })?;
-    crate::secrets::registry::register(refresh_token);
+    crate::secrets::registry::register_protected(refresh_token);
     let mut config = serde_json::json!({
         "token_url": provider.token_url,
         "client_id": provider.client_id,
@@ -599,8 +661,21 @@ async fn complete(
         &spec,
         &super::vault::Vault::connection_context(&session.tenant, &session.connection),
     );
-    check_tenant(state, session).await?;
-    store(state, session, sealed).await?;
+    let stored = match check_tenant(state, session).await {
+        Ok(()) => store(state, session, sealed).await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = stored {
+        if matches!(e, CompleteError::Superseded(_)) {
+            crate::secrets::registry::unregister(refresh_token);
+            tracing::info!(
+                tenant = %session.tenant, connection = %session.connection,
+                provider = %session.provider,
+                "the provider issued a grant for a connection replaced meanwhile; it was not stored"
+            );
+        }
+        return Err(e);
+    }
     super::metrics::refresh_connection_gauges(state).await;
     Ok(())
 }
@@ -629,12 +704,7 @@ async fn store(
     let unavailable = |e: crate::serve::history::HistoryError| {
         CompleteError::Store(format!("storing the connection: {e}"))
     };
-    let superseded = || {
-        CompleteError::Superseded(format!(
-            "connection '{}/{}' was deleted or replaced since the flow started",
-            session.tenant, session.connection
-        ))
-    };
+    let superseded = || superseded(session);
     let written = match &session.base {
         None => {
             let created_at = match history
@@ -935,7 +1005,7 @@ mod tests {
             .await
             .unwrap();
 
-        let current = with_generation(history.as_ref(), "acme", "crm")
+        let current = with_generation(history.as_ref(), "acme", "crm", false)
             .await
             .unwrap()
             .unwrap();
@@ -964,13 +1034,13 @@ mod tests {
             "new"
         );
 
-        let again = with_generation(history.as_ref(), "acme", "crm")
+        let again = with_generation(history.as_ref(), "acme", "crm", false)
             .await
             .unwrap()
             .unwrap();
         assert!(!again.generation.is_empty());
         assert!(
-            with_generation(history.as_ref(), "acme", "none")
+            with_generation(history.as_ref(), "acme", "none", false)
                 .await
                 .unwrap()
                 .is_none()
@@ -981,14 +1051,14 @@ mod tests {
     async fn a_generation_lost_to_every_race_falls_back_to_the_read_record() {
         let existing = stored("", "old", Utc::now());
         let state = contended_state(false, &existing).await;
-        let current = with_generation(state.history().as_ref(), "acme", "crm")
+        let current = with_generation(state.history().as_ref(), "acme", "crm", false)
             .await
             .unwrap()
             .unwrap();
         assert!(current.generation.is_empty());
         let state = contended_state(true, &existing).await;
         assert!(
-            with_generation(state.history().as_ref(), "acme", "crm")
+            with_generation(state.history().as_ref(), "acme", "crm", false)
                 .await
                 .is_err()
         );
@@ -1284,5 +1354,357 @@ mod tests {
             "https://app.example/cb?a=1&status=ok"
         );
         assert_eq!(with_params("::", &[("s", "x")]), "::");
+    }
+
+    const FLOW_VAULT_KEY: &str = "0123456789abcdef0123456789abcdef";
+
+    /// A memory history whose connection reads find nothing after the first
+    /// `visible` of them, or fail.
+    struct VanishingConnection {
+        mem: crate::serve::history::memory::MemoryHistory,
+        visible: usize,
+        reads: std::sync::atomic::AtomicUsize,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::serve::history::RunHistory for VanishingConnection {
+        async fn claim_idempotency(
+            &self,
+            k: &str,
+            f: &str,
+            r: &str,
+            w: std::time::Duration,
+        ) -> Result<crate::serve::history::Claim, crate::serve::history::HistoryError> {
+            self.mem.claim_idempotency(k, f, r, w).await
+        }
+        async fn upsert(
+            &self,
+            rec: &crate::serve::history::RunRecord,
+        ) -> Result<(), crate::serve::history::HistoryError> {
+            self.mem.upsert(rec).await
+        }
+        async fn get(
+            &self,
+            id: &str,
+        ) -> Result<Option<crate::serve::history::RunRecord>, crate::serve::history::HistoryError>
+        {
+            self.mem.get(id).await
+        }
+        async fn list(
+            &self,
+            f: &crate::serve::history::ListFilter,
+        ) -> Result<crate::serve::history::ListPage, crate::serve::history::HistoryError> {
+            self.mem.list(f).await
+        }
+        async fn delete(
+            &self,
+            id: &str,
+        ) -> Result<crate::serve::history::DeleteOutcome, crate::serve::history::HistoryError>
+        {
+            self.mem.delete(id).await
+        }
+        async fn purge_expired(
+            &self,
+            d: std::time::Duration,
+        ) -> Result<usize, crate::serve::history::HistoryError> {
+            self.mem.purge_expired(d).await
+        }
+        async fn recover_orphans(&self) -> Result<usize, crate::serve::history::HistoryError> {
+            Ok(0)
+        }
+        fn degraded(&self) -> bool {
+            false
+        }
+        async fn tenant_get(
+            &self,
+            id: &str,
+        ) -> Result<
+            Option<crate::serve::history::tenants::TenantRecord>,
+            crate::serve::history::HistoryError,
+        > {
+            self.mem.tenant_get(id).await
+        }
+        async fn tenant_upsert(
+            &self,
+            t: &crate::serve::history::tenants::TenantRecord,
+        ) -> Result<(), crate::serve::history::HistoryError> {
+            self.mem.tenant_upsert(t).await
+        }
+        async fn connection_get(
+            &self,
+            tenant: &str,
+            name: &str,
+        ) -> Result<Option<ConnectionRecord>, crate::serve::history::HistoryError> {
+            if self.fail {
+                return Err(crate::serve::history::HistoryError::Backend("down".into()));
+            }
+            let n = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n >= self.visible {
+                return Ok(None);
+            }
+            self.mem.connection_get(tenant, name).await
+        }
+        async fn connection_replace(
+            &self,
+            c: &ConnectionRecord,
+            expected: DateTime<Utc>,
+        ) -> Result<bool, crate::serve::history::HistoryError> {
+            self.mem.connection_replace(c, expected).await
+        }
+        async fn connect_session_put(
+            &self,
+            s: &ConnectSession,
+        ) -> Result<(), crate::serve::history::HistoryError> {
+            self.mem.connect_session_put(s).await
+        }
+        async fn connect_session_take(
+            &self,
+            st: &str,
+        ) -> Result<Option<ConnectSession>, crate::serve::history::HistoryError> {
+            self.mem.connect_session_take(st).await
+        }
+    }
+
+    async fn flow_state(
+        history: std::sync::Arc<dyn crate::serve::history::RunHistory>,
+        token_url: &str,
+    ) -> ServerState {
+        history
+            .tenant_upsert(&tenant_record(Utc::now() - chrono::Duration::seconds(60)))
+            .await
+            .unwrap();
+        let state = ServerState::new(
+            &crate::serve::test_support::test_config(),
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            history,
+            crate::serve::logs::LogHub::new(),
+            None,
+            #[cfg(feature = "triggers")]
+            crate::serve::triggers::health::TriggersHandle::empty(),
+        );
+        let providers = ConnectProviders::from_file(ConnectProvidersFile {
+            version: 1,
+            providers: vec![ConnectProvider {
+                token_url: token_url.into(),
+                ..provider()
+            }],
+        })
+        .unwrap();
+        state.set_tenants(super::super::TenantsRuntime::new(
+            Some(super::super::vault::Vault::new(FLOW_VAULT_KEY, &[]).unwrap()),
+            providers,
+        ));
+        state
+    }
+
+    fn flow_session(state: &ServerState, base: Option<ConnectBase>) -> ConnectSession {
+        let vault = state.tenants().vault.clone().unwrap();
+        let oauth_state = random_token();
+        ConnectSession {
+            sealed_verifier: vault
+                .seal_str_for("verifier", &format!("connect-session:{oauth_state}")),
+            state: oauth_state,
+            expires_at: Utc::now() + chrono::Duration::minutes(5),
+            ..session_from(base, None)
+        }
+    }
+
+    async fn granting(refresh_token: &str, calls: u64) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"access_token": "at", "refresh_token": refresh_token}),
+            ))
+            .expect(calls)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn memory() -> std::sync::Arc<dyn crate::serve::history::RunHistory> {
+        std::sync::Arc::new(crate::serve::history::memory::MemoryHistory::new(
+            std::time::Duration::from_secs(60),
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_flow_whose_connection_was_replaced_before_the_callback_never_exchanges_the_code() {
+        let idp = granting("rt-never-issued", 0).await;
+        let state = flow_state(memory(), &format!("{}/token", idp.uri())).await;
+        let started = stored("g1", "s1", Utc::now());
+        state.history().connection_upsert(&started).await.unwrap();
+        let session = flow_session(&state, Some(ConnectBase::of(Some(&started))));
+        state
+            .history()
+            .connection_upsert(&stored("g2", "s2", Utc::now()))
+            .await
+            .unwrap();
+        state.history().connect_session_put(&session).await.unwrap();
+        let location = callback(
+            &state,
+            CallbackQuery {
+                code: Some("code".into()),
+                state: Some(session.state.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(location.ends_with("error=connection_changed"), "{location}");
+        let after = state
+            .history()
+            .connection_get("acme", "crm")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.sealed, "s2");
+        idp.verify().await;
+
+        let deleted = flow_session(&state, Some(ConnectBase::of(Some(&after))));
+        assert!(
+            state
+                .history()
+                .connection_delete("acme", "crm")
+                .await
+                .unwrap()
+        );
+        let err = complete(&state, &deleted, "code").await.unwrap_err();
+        assert!(matches!(err, CompleteError::Superseded(_)), "{err:?}");
+        idp.verify().await;
+    }
+
+    #[tokio::test]
+    async fn a_grant_issued_for_a_connection_replaced_during_the_exchange_is_no_longer_redacted() {
+        let token = format!("rt-{}", random_token());
+        let idp = granting(&token, 1).await;
+        let mem =
+            crate::serve::history::memory::MemoryHistory::new(std::time::Duration::from_secs(60));
+        let started = stored("g1", "s1", Utc::now());
+        crate::serve::history::RunHistory::connection_upsert(&mem, &started)
+            .await
+            .unwrap();
+        let history = std::sync::Arc::new(VanishingConnection {
+            mem,
+            visible: 1,
+            reads: Default::default(),
+            fail: false,
+        });
+        let state = flow_state(history, &format!("{}/token", idp.uri())).await;
+        let session = flow_session(&state, Some(ConnectBase::of(Some(&started))));
+        let err = complete(&state, &session, "code").await.unwrap_err();
+        assert!(matches!(err, CompleteError::Superseded(_)), "{err:?}");
+        idp.verify().await;
+        assert_eq!(crate::secrets::registry::redact(&token), token);
+
+        let kept = format!("rt-{}", random_token());
+        let idp = granting(&kept, 1).await;
+        let state = flow_state(memory(), &format!("{}/token", idp.uri())).await;
+        let absent = flow_session(&state, Some(ConnectBase::Absent));
+        complete(&state, &absent, "code").await.unwrap();
+        assert_ne!(crate::secrets::registry::redact(&kept), kept);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_connection_before_the_exchange_reports_the_store_unavailable() {
+        let idp = granting("rt-never-issued", 0).await;
+        let history = std::sync::Arc::new(VanishingConnection {
+            mem: crate::serve::history::memory::MemoryHistory::new(std::time::Duration::from_secs(
+                60,
+            )),
+            visible: usize::MAX,
+            reads: Default::default(),
+            fail: true,
+        });
+        let state = flow_state(history, &format!("{}/token", idp.uri())).await;
+        let session = flow_session(&state, Some(ConnectBase::Absent));
+        let err = complete(&state, &session, "code").await.unwrap_err();
+        assert!(matches!(err, CompleteError::Store(_)), "{err:?}");
+        idp.verify().await;
+    }
+
+    #[tokio::test]
+    async fn a_flow_start_assigns_a_generation_and_moves_updated_at_on_a_single_server() {
+        let state = flow_state(memory(), "https://idp.example/token").await;
+        let t0 = Utc::now() - chrono::Duration::seconds(30);
+        state
+            .history()
+            .connection_upsert(&stored("", "old", t0))
+            .await
+            .unwrap();
+        let actor = AuthContext::system("test");
+        start(
+            &state,
+            &actor,
+            "acme",
+            "crm",
+            StartRequest {
+                connection: "crm".into(),
+                redirect: "https://app.example/done".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let after = state
+            .history()
+            .connection_get("acme", "crm")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!after.generation.is_empty());
+        assert!(after.updated_at > t0);
+        assert_eq!(after.sealed, "old");
+
+        let same = stored("", "x", t0);
+        assert!(next_instant(same.updated_at) > t0);
+        let future = Utc::now() + chrono::Duration::hours(1);
+        assert!(next_instant(future) > future);
+    }
+
+    #[tokio::test]
+    async fn a_provider_error_code_is_passed_through() {
+        let state = flow_state(memory(), "https://idp.example/token").await;
+        let session = flow_session(&state, None);
+        state.history().connect_session_put(&session).await.unwrap();
+        let location = callback(
+            &state,
+            CallbackQuery {
+                state: Some(session.state.clone()),
+                error: Some("access_denied".into()),
+                error_description: Some("x".repeat(1000)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(location.ends_with("error=access_denied"), "{location}");
+        for ok in ["invalid_scope", "a", "server.error-1", &"e".repeat(64)] {
+            assert_eq!(provider_error_code(ok), ok);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_oversized_or_unusual_provider_error_is_replaced() {
+        let state = flow_state(memory(), "https://idp.example/token").await;
+        let session = flow_session(&state, None);
+        state.history().connect_session_put(&session).await.unwrap();
+        let location = callback(
+            &state,
+            CallbackQuery {
+                state: Some(session.state.clone()),
+                error: Some("<b>please log in at evil.example</b>".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(location.ends_with("error=provider_error"), "{location}");
+        for bad in ["", "has space", "a/b", "ü", &"e".repeat(65)] {
+            assert_eq!(provider_error_code(bad), "provider_error", "{bad}");
+        }
+        assert_eq!(truncated("héllo", 2), "hé");
+        assert_eq!(truncated("hi", 256), "hi");
     }
 }

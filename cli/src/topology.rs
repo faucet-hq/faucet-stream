@@ -713,6 +713,34 @@ pub fn sink_nodes(cfg: &PipelineConfig) -> CliResult<Vec<(String, String, Value)
     Ok(out)
 }
 
+/// Every source node's id with its resolved `(kind, config)`, sorted by id.
+pub fn source_nodes(cfg: &PipelineConfig) -> CliResult<Vec<(String, String, Value)>> {
+    let spec = &cfg.pipeline;
+    let mut ids: Vec<&String> = spec.nodes.keys().collect();
+    ids.sort();
+    let mut out = Vec::new();
+    for id in ids {
+        if let NodeSpec::Source {
+            template,
+            kind,
+            config,
+        } = &spec.nodes[id]
+        {
+            let (k, c) = resolve_connector(
+                &spec.sources,
+                &spec.source,
+                template.as_deref(),
+                kind.as_deref(),
+                config.as_ref(),
+                id,
+                "source",
+            )?;
+            out.push((id.clone(), k, c));
+        }
+    }
+    Ok(out)
+}
+
 /// Number of source nodes in the graph.
 pub fn source_node_count(cfg: &PipelineConfig) -> usize {
     cfg.pipeline

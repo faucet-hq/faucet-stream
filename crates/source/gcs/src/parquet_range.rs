@@ -37,6 +37,7 @@ pub(crate) struct GcsRangeReader {
     generation: Option<i64>,
     recorder: Option<Arc<faucet_core::observability::RoundtripRecorder>>,
     calls: faucet_core::CallContext,
+    max_range_bytes: u64,
 }
 
 impl GcsRangeReader {
@@ -64,7 +65,15 @@ impl GcsRangeReader {
             generation: None,
             recorder,
             calls: faucet_core::CallContext::new(),
+            max_range_bytes: faucet_core::file_format::DEFAULT_MAX_OBJECT_BYTES,
         })
+    }
+
+    /// Refuse a single range longer than `max` bytes (`max_object_bytes`)
+    /// before any request.
+    pub(crate) fn with_max_range_bytes(mut self, max: u64) -> Self {
+        self.max_range_bytes = max;
+        self
     }
 
     /// Make every range read through `calls` (#880).
@@ -89,6 +98,7 @@ impl GcsRangeReader {
     async fn fetch(&self, range: Range<u64>) -> Result<Bytes, ParquetError> {
         check_range(&self.key, &range, self.len)?;
         let wanted = range.end - range.start;
+        check_cap(&self.key, &range, self.max_range_bytes)?;
         if wanted == 0 {
             return Ok(Bytes::new());
         }
@@ -142,6 +152,19 @@ const MAX_INITIAL_CAPACITY: u64 = 8 * 1024 * 1024;
 
 fn initial_capacity(wanted: u64) -> usize {
     usize::try_from(wanted.min(MAX_INITIAL_CAPACITY)).unwrap_or(0)
+}
+
+/// Refuse a range longer than `max_object_bytes` before reading anything.
+fn check_cap(key: &str, range: &Range<u64>, max: u64) -> Result<(), ParquetError> {
+    let wanted = range.end - range.start;
+    if wanted > max {
+        return Err(ParquetError::General(format!(
+            "range {}..{} of '{key}' is {wanted} bytes, more than the {max} bytes one read may \
+             fetch (max_object_bytes)",
+            range.start, range.end
+        )));
+    }
+    Ok(())
 }
 
 /// Refuse a range outside the object before reading or allocating anything.
@@ -251,6 +274,23 @@ mod tests {
             msg.contains("empty.parquet") && msg.contains("footer"),
             "the error must name the object and the reason: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_range_over_max_object_bytes_is_refused_before_any_request() {
+        let storage = offline_storage().await;
+        let reader =
+            GcsRangeReader::open(&storage, "projects/_/buckets/b", "o.parquet", 1_024, None)
+                .await
+                .expect("opens")
+                .with_max_range_bytes(16);
+        let msg = reader.fetch(0..17).await.unwrap_err().to_string();
+        assert!(
+            msg.contains("'o.parquet'") && msg.contains("max_object_bytes"),
+            "{msg}"
+        );
+        let msg = reader.fetch(1_000..1_025).await.unwrap_err().to_string();
+        assert!(msg.contains("corrupt"), "{msg}");
     }
 
     #[tokio::test]

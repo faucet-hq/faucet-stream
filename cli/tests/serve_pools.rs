@@ -668,3 +668,48 @@ async fn history_claims_filter_on_pool() {
     assert_eq!(members[1].instance_id, "old");
     assert_eq!(members[1].pools, None);
 }
+
+/// A template run may choose another pool only when the template's
+/// `pool_override` allows it.
+#[cfg(feature = "templates")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_template_run_chooses_another_pool_only_when_the_template_allows_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite:{}", dir.path().join("h.db").display());
+    let src = dir.path().join("src.db");
+    seed_source(&src).await;
+    let base = start(args(free_port(), url, false, &["a", "b", "default"])).await;
+    let client = reqwest::Client::new();
+    let register = |id: &str, override_line: &str| {
+        let out = dir.path().join(format!("{id}.db"));
+        let body = format!(
+            "name: {id}\n{override_line}{}",
+            config(&src, &out, Some("a"), false)
+        );
+        client
+            .post(format!("{base}/v1/templates"))
+            .json(&json!({ "config": body }))
+            .send()
+    };
+    let trigger = |id: &str, pool: &str| {
+        client
+            .post(format!("{base}/v1/templates/{id}/runs"))
+            .json(&json!({ "pool": pool, "version": 1 }))
+            .send()
+    };
+
+    let r = register("fixed", "").await.unwrap();
+    assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    let r = trigger("fixed", "b").await.unwrap();
+    assert_eq!(r.status().as_u16(), 422);
+    assert!(r.text().await.unwrap().contains("pool_override"));
+    let r = trigger("fixed", "a").await.unwrap();
+    assert_eq!(r.status().as_u16(), 202, "{}", r.text().await.unwrap());
+
+    let r = register("listed", "pool_override: [b]\n").await.unwrap();
+    assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    let r = trigger("listed", "b").await.unwrap();
+    assert_eq!(r.status().as_u16(), 202, "{}", r.text().await.unwrap());
+    let r = trigger("listed", "default").await.unwrap();
+    assert_eq!(r.status().as_u16(), 422);
+}

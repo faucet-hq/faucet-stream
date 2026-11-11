@@ -279,3 +279,47 @@ mod containers {
         Ok(())
     }
 }
+
+/// The first error a stream of pages ends with.
+#[cfg(all(feature = "file-format-avro", feature = "file-format-excel"))]
+async fn first_error<S>(mut pages: S) -> faucet_core::FaucetError
+where
+    S: futures::Stream<Item = Result<faucet_core::StreamPage, faucet_core::FaucetError>> + Unpin,
+{
+    loop {
+        match pages.next().await {
+            Some(Ok(_)) => {}
+            Some(Err(e)) => return e,
+            None => panic!("the stream ended without an error"),
+        }
+    }
+}
+
+#[cfg(all(feature = "file-format-avro", feature = "file-format-excel"))]
+#[tokio::test]
+async fn blobs_that_decode_past_max_decoded_bytes_are_refused() {
+    let (_c, port) = start_azurite().await;
+    create_container(port).await;
+    for (fmt, shared, key) in [
+        (AzureFileFormat::Avro, FileFormat::Avro, "big/a.avro"),
+        (AzureFileFormat::Xlsx, FileFormat::Xlsx, "big/a.xlsx"),
+    ] {
+        let body = encode(&records(), shared, &FormatOptions::default()).expect("encode");
+        seed_store(port)
+            .put(&ObjPath::from(key), PutPayload::from(body))
+            .await
+            .expect("seed blob");
+        let mut cfg = source_config(port)
+            .file_format(fmt)
+            .prefix(key)
+            .with_batch_size(0);
+        cfg.max_decoded_bytes = Some(64);
+        let src = AzureBlobSource::new(cfg).await.expect("source");
+        let ctx: HashMap<String, Value> = HashMap::new();
+        let err = first_error(src.stream_pages(&ctx, 0)).await;
+        assert!(
+            err.to_string().contains("max_decoded_bytes"),
+            "{shared:?}: {err}"
+        );
+    }
+}

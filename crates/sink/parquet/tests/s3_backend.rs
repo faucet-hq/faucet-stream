@@ -19,6 +19,7 @@ fn config(endpoint: &str) -> ParquetSinkConfig {
         prefix: "out/".into(),
         region: Some("us-east-1".into()),
         endpoint_url: Some(endpoint.into()),
+        credentials: Default::default(),
         allow_http: true,
     }))
     .compression(ParquetCompression::Zstd)

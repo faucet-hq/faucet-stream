@@ -524,6 +524,7 @@ async fn s3_destination_builds_without_credentials_for_endpoint_url() {
         prefix: "data/".to_string(),
         region: Some("us-east-1".to_string()),
         endpoint_url: Some("http://localhost:4566".to_string()),
+        credentials: Default::default(),
         allow_http: true,
     }));
     set_test_env();

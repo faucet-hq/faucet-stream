@@ -335,6 +335,11 @@ mod tests {
     }
 
     #[test]
+    fn string_literal_doubles_backslashes() {
+        assert_eq!(sql_string_literal("imports/a\\'b/"), "'imports/a\\\\''b/'");
+    }
+
+    #[test]
     fn copy_jsonl_omits_columns_and_uses_json_auto() {
         let sql = copy_statement(
             "\"public\".\"events\"",

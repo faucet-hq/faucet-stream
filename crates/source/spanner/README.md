@@ -166,6 +166,10 @@ any caller deadline ends it, and the begin and query are metered as round trips
 (`begin`, `query`). Rows are read a page at a time per call, so the per-row cost
 is unchanged; nothing is retried by faucet.
 
+## Caller configs under `faucet serve`
+
+A config submitted to `faucet serve` by a caller may not authenticate with the server's own identity unless the server runs with `--allow-host-credentials` (never for a tenant). For this connector, `auth` of type `application_default` (the default) uses the server's identity: name a service-account key (file or inline) instead. A config with `emulator_host` set uses none. The same check runs when the client is built. A caller's key (inline or in a file) must be a service-account key (`type: service_account`); `authorized_user` and `external_account` credentials are refused, and the key's `token_uri` must pass the server's URL rules (`--allow-url-host` / `--allow-url-scheme`, never a link-local or metadata address).
+
 ## License
 
 MIT OR Apache-2.0

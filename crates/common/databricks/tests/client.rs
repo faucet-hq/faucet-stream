@@ -557,3 +557,74 @@ async fn a_cancel_lost_in_transport_is_logged_and_metered() {
     let trips = meter.snapshot().sink_roundtrips;
     assert_eq!(trips.get("cancel"), Some(&1), "{trips:?}");
 }
+
+#[tokio::test]
+async fn chunk_links_to_other_origins_carry_no_credentials() {
+    let workspace = MockServer::start().await;
+    let other = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"chunk_index": 1})))
+        .mount(&other)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/s/result/chunks/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"chunk_index": 1})))
+        .mount(&workspace)
+        .await;
+    let c = client(&workspace.uri(), opts());
+    let host = other.address().to_string();
+    for link in [
+        format!("http://{host}/x"),
+        format!("//{host}/x"),
+        format!("@{host}/x"),
+        format!("/\\\\{host}/x"),
+        format!("/http://{host}/x"),
+        "api/2.0/x".to_string(),
+    ] {
+        let err = c.fetch_chunk(&link).await.unwrap_err();
+        assert!(err.to_string().contains("refused"), "{link}: {err}");
+    }
+    assert!(other.received_requests().await.unwrap().is_empty());
+    let chunk = c
+        .fetch_chunk("/api/2.0/sql/statements/s/result/chunks/1")
+        .await
+        .unwrap();
+    assert_eq!(chunk["chunk_index"], 1);
+}
+
+#[tokio::test]
+async fn chunk_links_keep_a_workspace_path_prefix() {
+    let workspace = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/proxy/api/2.0/c"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .mount(&workspace)
+        .await;
+    let c = client(&format!("{}/proxy/", workspace.uri()), opts());
+    assert_eq!(c.fetch_chunk("/api/2.0/c").await.unwrap()["ok"], true);
+}
+
+#[tokio::test]
+async fn an_oversized_response_body_is_a_typed_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "{{\"statement_id\":\"s\",\"pad\":\"{}\"}}",
+            "x".repeat(4096)
+        )))
+        .mount(&server)
+        .await;
+    let c = client(&server.uri(), opts()).with_max_response_bytes(Some(1024));
+    let err = c
+        .execute(&StatementRequest::new("SELECT 1"))
+        .await
+        .unwrap_err();
+    let FaucetError::Custom(inner) = &err else {
+        panic!("{err:?}");
+    };
+    let too_large = inner
+        .downcast_ref::<faucet_core::http::ResponseTooLarge>()
+        .expect("ResponseTooLarge");
+    assert_eq!(too_large.limit, 1024);
+}

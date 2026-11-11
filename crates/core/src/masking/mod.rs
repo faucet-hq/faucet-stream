@@ -20,9 +20,11 @@ pub mod compile;
 pub mod config;
 pub mod detect;
 mod hash;
+pub mod proof;
 
 pub use compile::CompiledMasking;
 pub use config::{Detector, MaskAction, MaskRule, MaskingSpec, MatchSpec};
+pub use proof::MaskingProof;
 
 use compile::CompiledRule;
 use serde_json::Value;

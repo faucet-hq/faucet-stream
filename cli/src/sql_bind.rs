@@ -349,6 +349,48 @@ pub fn check_source_query(
         .map_err(|e| CliError::Config(format!("{owner}: {kind} source `{field}`: {e}")))
 }
 
+/// The kind of config a [`check_code_fields`] reads, which decides the
+/// schema its code fields come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConfigRole {
+    Source,
+    Sink,
+    Transform,
+}
+
+/// The fields of a `kind` config marked `x-faucet-code` in its schema.
+pub fn code_fields(role: ConfigRole, kind: &str) -> Vec<String> {
+    crate::registry::cached_schema(role, kind)
+        .map(|s| faucet_core::resolve::code_fields(&s))
+        .unwrap_or_default()
+}
+
+/// Refuse a fan-out token (`${<row>.path}`, a value from another row's
+/// records) in a field whose value is code the connector runs or sends
+/// (`x-faucet-code`). Clock, backfill, partition, param and vars tokens are
+/// not fan-out tokens and stay allowed.
+pub fn check_code_fields(
+    role: ConfigRole,
+    kind: &str,
+    cfg: &Value,
+    is_fanout: impl Fn(&str) -> bool,
+    owner: &str,
+) -> CliResult<()> {
+    for field in code_fields(role, kind).iter() {
+        let Some(text) = cfg.get(field).and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(token) = first_fanout_token(text, &is_fanout) {
+            return Err(CliError::Config(format!(
+                "{owner}: {kind} `{field}` may not hold `{token}`: a value from another \
+                 row's records would become part of the code it runs; pass it as data \
+                 instead (GraphQL `variables`, DynamoDB `expression_attribute_values`)"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Config fields that name a table, collection or index. A fan-out token may
 /// fill one (one table per parent), but the resolved value must be a plain
 /// identifier so upstream data cannot smuggle SQL or a path through it.

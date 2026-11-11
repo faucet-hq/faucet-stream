@@ -148,9 +148,13 @@ pub async fn preview_output(
 
     let rows = policy.resolve_rows(query.requested()?);
     let request = source_spec(&record, rows)?;
-    let page = read_capped(&request, &crate::auth_catalog::AuthCatalog::new())
-        .await
-        .map_err(|e| read_error(&record, e))?;
+    // A local file the ledger names: read without the server's own identity.
+    let page = faucet_core::resolve::with_host_credentials(
+        false,
+        read_capped(&request, &crate::auth_catalog::AuthCatalog::new()),
+    )
+    .await
+    .map_err(|e| read_error(&record, e))?;
     audit(&state, &actor, &record, page.rows.len()).await;
     Ok(Json(response(&record, page, rows, policy.max_rows())))
 }

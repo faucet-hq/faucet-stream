@@ -16,7 +16,7 @@
 mod client;
 mod config;
 
-pub use client::build_client;
+pub use client::{build_client, host_identity};
 pub use config::{PubsubConnection, PubsubCredentials};
 
 // Re-export the SDK message type connector authors round-trip through, so

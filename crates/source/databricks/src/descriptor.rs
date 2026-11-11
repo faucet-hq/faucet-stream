@@ -3,7 +3,8 @@ use faucet_core::{Capabilities, ConnectorDescriptor};
 use serde_json::Value;
 
 /// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
-pub const DESCRIPTOR: ConnectorDescriptor = ConnectorDescriptor::new("databricks", capabilities);
+pub const DESCRIPTOR: ConnectorDescriptor =
+    ConnectorDescriptor::new("databricks", capabilities).with_host_identity(|_| Vec::new());
 
 fn capabilities(config: &Value) -> Capabilities {
     let arrow_native = config.is_null() || bool_field(config, "arrow_native", false);

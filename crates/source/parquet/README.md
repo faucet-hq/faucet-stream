@@ -24,7 +24,7 @@ Built on the `parquet` + `arrow` crates wired through `object_store`, so local a
 - **Vectorized streaming** — one Arrow `RecordBatch` per row-group; memory is bounded by `batch_size`, not file size.
 - **Fail-fast schema validation** — multi-file scans validate every file's Arrow schema up front (cheap footer probe) and surface a mismatch naming both files and the first diverging field, *before* any rows are committed downstream.
 - **S3-compatible** — custom `endpoint_url` for MinIO / LocalStack; credentials from the standard AWS chain.
-- **Consistent S3 reads** — an S3 object is read over byte ranges, each carrying the object's ETag (as its first metadata read saw it) as an `If-Match` precondition, so an object replaced mid-read fails the run instead of mixing row groups from two versions.
+- **Consistent S3 reads** — an S3 object is read over byte ranges, each carrying the object's ETag (as its first metadata read saw it) as an `If-Match` precondition, so an object replaced mid-read fails the run instead of mixing row groups from two versions. One ranged read may fetch at most 2 GiB (a footer or a column chunk); a larger one is refused before it is requested. This source has no setting for the limit; the `s3` source's `max_object_bytes` sets it.
 - **Arrow columnar fast path** (`arrow` feature, RFC 0002) — emits Arrow `RecordBatch`es natively (`stream_batches`), so a `parquet → parquet` pipeline moves data end-to-end without materializing `serde_json::Value` rows. Opt-in; off by default and inert unless the sink is also columnar.
 
 ## Installation
@@ -214,6 +214,16 @@ cluster coordinator a run reads every file, unchanged.
 > Cross-file schema validation still covers the **full** resolved file set on
 > every worker, so a schema mismatch fails the run even when the mismatching
 > files hash into different shards.
+
+## Caller configs under `faucet serve`
+
+A config submitted to `faucet serve` by a caller may not authenticate with the server's own identity unless the server runs with `--allow-host-credentials` (never for a tenant). For an `s3` location (`source.credentials`, `source.region`):
+
+- `credentials` of type `default`, `profile`, `assume_role` or `web_identity` (or no `credentials`) uses the server's identity: name keys with `access_key`, or use `anonymous` for a public bucket.
+- A missing `region` counts too when the server's environment names none (`AWS_REGION` / `AWS_DEFAULT_REGION`), since the SDK would ask the instance metadata service.
+- S3-compatible stores (MinIO, LocalStack) still need some `access_key` pair and a `region`; requester-pays buckets need keys.
+
+The same check runs when the client is built, so a refused config fails with a config error naming the field.
 
 ## License
 

@@ -29,11 +29,12 @@ impl S3Sink {
     /// Builds the S3 client eagerly so it is reused across calls.
     pub async fn new(config: S3SinkConfig) -> Result<Self, FaucetError> {
         config.validate()?;
-        let client = faucet_common_s3::build_client(
+        let client = faucet_common_s3::build_client_with(
             config.region.as_deref(),
             config.endpoint_url.as_deref(),
+            &config.credentials,
         )
-        .await;
+        .await?;
         Self::with_client(config, client)
     }
 

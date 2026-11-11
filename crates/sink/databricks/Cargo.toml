@@ -14,7 +14,7 @@ categories.workspace = true
 # Cloud staging locations (s3:// / gs:// / abfss://), uploaded through
 # `object_store` with ambient credentials. Unity Catalog volume staging needs
 # no feature.
-staging = ["dep:object_store"]
+staging = ["dep:object_store", "faucet-core/staging"]
 
 [dependencies]
 faucet-core.workspace = true

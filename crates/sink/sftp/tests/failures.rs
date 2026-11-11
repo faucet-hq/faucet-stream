@@ -298,12 +298,57 @@ async fn sink_listings_are_bounded() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_one_session_server_names_its_session_limit_when_the_sink_lists() {
+async fn a_one_session_server_lists_over_a_second_connection() {
     use faucet_common_file::write::{Area, StorageBackend};
     let Some((_c, port)) = one_session_server().await else {
         return;
     };
+    let admin = session(port).await;
+    admin.create_dir("/data/out").await.unwrap();
+    put(&admin, "/data/out/a.jsonl").await;
+    let template = faucet_common_file::write::NameTemplate::from_path(
+        "x.jsonl",
+        faucet_core::FileFormat::JsonLines,
+        faucet_core::Compression::None,
+        false,
+    )
+    .unwrap()
+    .1;
+    let dir = template.swap_run_dir_name(Some("67000000aaaaa1"));
+    admin.create_dir(format!("/data/out/{dir}")).await.unwrap();
+    drop(admin);
+
     let b = backend(port, 100);
-    let e = b.list(Area::Destination).await.unwrap_err().to_string();
-    assert!(e.contains("MaxSessions"), "{e}");
+    assert_eq!(b.list(Area::Destination).await.unwrap(), ["a.jsonl"]);
+    assert_eq!(b.swap_runs().await.unwrap(), ["67000000aaaaa1"]);
+
+    let overwrite = json!({"if_exists": "replace", "write_mode": "overwrite", "file_name": "part-{part}.jsonl"});
+    let s = sink(port, "/data/r/", overwrite.clone());
+    s.begin_overwrite().await.unwrap();
+    write_and_flush(&s, &[json!({"a": 1})]).await.unwrap();
+    s.commit_overwrite().await.unwrap();
+    let s = sink(port, "/data/r/", overwrite);
+    s.begin_overwrite().await.unwrap();
+    write_and_flush(&s, &[json!({"a": 2})]).await.unwrap();
+    s.commit_overwrite().await.unwrap();
+
+    let s = sink(
+        port,
+        "/data/r/",
+        json!({"if_exists": "append", "file_name": "part-{part}.jsonl"}),
+    );
+    write_and_flush(&s, &[json!({"a": 3})]).await.unwrap();
+
+    let admin = session(port).await;
+    let mut names: Vec<String> = admin
+        .read_dir("/data/r")
+        .await
+        .unwrap()
+        .map(|e| e.file_name())
+        .filter(|n| n.starts_with("part-"))
+        .collect();
+    names.sort();
+    assert_eq!(names, ["part-00001.jsonl", "part-00002.jsonl"], "{names:?}");
+    let first = admin.read("/data/r/part-00001.jsonl").await.unwrap();
+    assert_eq!(first, b"{\"a\":2}\n");
 }

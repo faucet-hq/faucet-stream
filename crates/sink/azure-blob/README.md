@@ -241,6 +241,10 @@ sent once, any caller deadline ends it, and round trips are still metered as
 `put` / `list` / `head` / `get` / `copy` / `delete`. The store client's own
 timeouts and retry are unchanged.
 
+## Caller configs under `faucet serve`
+
+A config submitted to `faucet serve` by a caller may not authenticate with the server's own identity unless the server runs with `--allow-host-credentials` (never for a tenant). For this connector, `auth` of type `default` (the default, unless `use_emulator` is set) or `managed_identity`, and a `connection_string` with neither `AccountKey`, `SharedAccessSignature` nor `UseDevelopmentStorage=true`, use the server's identity: use `account_key`, `sas_token`, `service_principal` or a keyed connection string. The same check runs when the store is built.
+
 ## License
 
 MIT

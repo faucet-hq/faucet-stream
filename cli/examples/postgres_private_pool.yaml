@@ -11,12 +11,15 @@
 #     curl -X POST localhost:8080/v1/runs -H 'content-type: application/json' \
 #       -H "Authorization: Bearer $TOKEN" -d @-
 #
-# A request's own `pool` wins over this one; a pool no live replica serves is
-# refused with 422. `faucet run` ignores `pool:`.
+# A raw config's request `pool` wins over this one; a pool no live replica
+# serves is refused with 422. Registered as a template, a caller's or a
+# tenant's run may ask only for the pools `pool_override` lists. `faucet run`
+# ignores both.
 version: 1
 name: postgres_private_pool
 
 pool: private
+pool_override: [private, private-eu]
 
 pipeline:
   source:

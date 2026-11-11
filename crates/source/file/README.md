@@ -44,6 +44,12 @@ when it is also reachable without the link (so bookmarks, which key on the
 path, never switch alias). An unreadable file or directory fails the run with
 its path.
 
+When the host scopes a reference policy with path roots over the run (as
+`faucet serve` does for a config it did not load itself), each listed file is
+resolved and must lie under a root, and it is then opened through directories
+held open without following links, so a link put in place after the check
+fails the read instead of being followed.
+
 A directory or glob never reads a file sink's unfinished output: scratch files
 (`*.faucet-tmp`, `*.faucet-tmp-body`, `-old`, `-seal`, `-prev`, `-upload-<id>`) and anything
 inside the `.faucet-overwrite-*` swap directory of an overwrite run that has
@@ -183,6 +189,12 @@ an error naming the file instead of exhausting memory. Streamed JSON Lines and
 CSV files have no whole-file limit, but one line may not exceed
 `max_object_bytes`: a file (or `http(s)://` body) with no newline fails the
 same way instead of being buffered whole.
+
+`max_decoded_bytes` (default 64 × `max_object_bytes`, at most 16 GiB) bounds
+what a file may decode to where a format can expand past its input: an Avro
+file's records (per batch, since Avro streams) and an Excel workbook's parts
+and shared strings. A file past it fails with an error instead of exhausting
+memory.
 
 ## HTTP
 

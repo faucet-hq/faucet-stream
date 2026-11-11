@@ -67,14 +67,16 @@ mod vocabulary;
 
 pub use auth_catalog::AuthCatalog;
 pub use connectors::{
-    PluginRegistry, SchemaFn, SinkFactory, SourceFactory, build_sink, build_sink_with,
-    build_source, build_source_with, migrate_source_state, plugin_connectors, sink_capabilities,
-    sink_descriptions, sink_descriptor, sink_exists, sink_kind_capabilities, sink_kinds,
-    sink_kinds_where, sink_runs_program, sink_schema, source_capabilities, source_descriptions,
-    source_descriptor, source_exists, source_kind_capabilities, source_kinds, source_kinds_where,
-    source_position_fields, source_reads_a_delta, source_resumes_from_bookmark,
-    source_runs_program, source_schema, source_state_schema, state_codec_for, undescribed_plugins,
-    validate_sink_config, validate_source_config, warn_undescribed_plugins,
+    HostIdentity, PluginRegistry, SchemaFn, SinkFactory, SourceFactory, build_sink,
+    build_sink_with, build_source, build_source_with, migrate_source_state, plugin_connectors,
+    sink_capabilities, sink_checks_host_identity_at_runtime, sink_descriptions, sink_descriptor,
+    sink_exists, sink_host_identity, sink_kind_capabilities, sink_kinds, sink_kinds_where,
+    sink_runs_program, sink_schema, source_capabilities, source_checks_host_identity_at_runtime,
+    source_descriptions, source_descriptor, source_exists, source_host_identity,
+    source_kind_capabilities, source_kinds, source_kinds_where, source_position_fields,
+    source_reads_a_delta, source_resumes_from_bookmark, source_runs_program, source_schema,
+    source_state_schema, state_codec_for, undescribed_plugins, validate_sink_config,
+    validate_source_config, warn_undescribed_plugins,
 };
 pub use error::{RegistryError, RegistryResult};
 pub use policy::BuildPolicy;

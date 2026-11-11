@@ -35,6 +35,23 @@ taken from the environment (plus `AZURE_AUTHORITY_HOST` for a service principal
 without an `authority_host`), so a key, secret or workload identity there can
 never replace the configured credential.
 
+`account` (and a connection string's `AccountName`) must be an Azure storage
+account name — 3 to 24 lowercase letters and digits — and a connection
+string's `DefaultEndpointsProtocol` must be `http` or `https`;
+`AzureConnection::validate` (run by `build_store`) refuses anything else with a
+`FaucetError::Config` naming the field. A connection string is read with
+`faucet_core::resolve::AzureConnSettings`: only the exact keys
+`AccountName`, `AccountKey`, `SharedAccessSignature`, `BlobEndpoint`,
+`EndpointSuffix`, `DefaultEndpointsProtocol` and `UseDevelopmentStorage`
+count, the last of a repeated key wins, and any other spelling is ignored.
+
+`effective_settings(&conn)` / `effective_hosts(&conn)` say where the store
+connects — the account, endpoint and emulator settings after the environment,
+the typed fields and the connection string are applied in `build_store`'s
+order (the string last), and the hosts that follow. `faucet serve` checks those
+hosts against its reference policy, so a private endpoint or the emulator is
+asked for nothing else.
+
 ```rust
 use faucet_common_azure::{AzureConnection, AzureCredentials, build_store};
 

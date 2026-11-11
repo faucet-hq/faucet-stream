@@ -1149,7 +1149,8 @@ Redirects are followed by `faucet_core::http::Client`: a redirect to another
 origin keeps only standard request headers (`Accept`, `Accept-Encoding`,
 `Content-Type`, `User-Agent`, `Range`, the conditional `If-*` headers,
 `Prefer`, `OData-Version`, `Traceparent`, …; the full list is
-`faucet_core::http::CROSS_ORIGIN_SAFE_HEADERS`). `Authorization`, cookies,
+`faucet_core::http::CROSS_ORIGIN_SAFE_HEADERS`; this crate's older, shorter
+`url_util::CROSS_ORIGIN_SAFE_HEADERS` is deprecated). `Authorization`, cookies,
 inline auth headers, a shared provider's credential, a flow provider's header
 placements, async-job `submit` / `poll` / `fetch` headers and every configured
 `headers:` entry stay with the origin they were set for, and a request body is

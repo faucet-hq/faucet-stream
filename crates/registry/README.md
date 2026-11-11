@@ -143,6 +143,16 @@ faucet_registry::PluginRegistry::with_builtins()
 Use `register_source_described` / `register_sink_described` with your crate's
 `ConnectorDescriptor` so capability lookups see what it declares.
 
+`source_host_identity` / `sink_host_identity(kind, config)` answer whether a
+connector authenticates with the host's own identity under a config
+(`HostIdentity::Fields(names)`, empty = no), read from the descriptor's
+`with_host_identity` answer; a custom connector registered without one is
+`HostIdentity::Unknown`. `source_checks_host_identity_at_runtime` /
+`sink_checks_host_identity_at_runtime(kind)` report a descriptor marked
+`with_runtime_host_identity`. `faucet serve` refuses a caller's config that
+uses the host's identity, or names an unknown connector, unless it runs with
+`--allow-host-credentials`.
+
 ## Errors
 
 `RegistryError` (`#[non_exhaustive]`): `UnknownConnector`,

@@ -155,10 +155,10 @@ fn sandboxed_kinds_are_read_from_the_schema() {
 
 fn force_override_value(cfg: &mut Value) {
     let mut opt = Some(cfg.clone());
-    force_override(&mut opt, true, "no-such-kind");
+    force_override(&mut opt, true, "no-such-kind", Switch::Sandbox);
     *cfg = opt.unwrap();
     let mut none = None;
-    force_override(&mut none, true, "no-such-kind");
+    force_override(&mut none, true, "no-such-kind", Switch::Sandbox);
     assert!(none.is_none(), "an unconfined kind gets no override block");
 }
 
@@ -1165,7 +1165,7 @@ async fn a_callers_auth_providers_are_screened_at_load() {
     };
     let refs = crate::serve::references::ServeReferencePolicy::default();
     let pipeline = serde_json::json!({
-        "source": { "type": "csv", "config": { "path": "in.csv" } },
+        "source": { "type": "file", "config": { "path": "in.csv" } },
         "sink": { "type": "jsonl", "config": { "path": "out.jsonl" } }
     });
     let key = std::env::temp_dir().join("faucet-no-such-key.json");
@@ -2086,4 +2086,500 @@ fn a_path_protected_after_a_snapshot_is_refused_at_once() {
         &format!("{}/*.csv", dir.path().display()),
         Access::Read { recursive: false }
     ));
+}
+
+#[cfg(feature = "source-azure-blob")]
+#[test]
+fn azure_blob_hosts_come_from_the_whole_connection() {
+    let cfg = |config: Value| {
+        PipelineConfig::from_value(serde_json::json!({
+            "version": 1,
+            "pipeline": {
+                "source": {"type": "azure-blob", "config": config},
+                "sink": {"type": "stdout", "config": {}}
+            }
+        }))
+        .unwrap()
+    };
+    let only = |host: &str| {
+        ReferencePolicy::deny_all()
+            .with_path_roots(["/srv/data"])
+            .any_url_scheme()
+            .with_url_hosts([host])
+    };
+    let caller = BodyOrigin::Caller {
+        allow_subprocess: false,
+    };
+    let string = |cs: &str| serde_json::json!({"type": "connection_string", "config": {"connection_string": cs}});
+    let private = cfg(serde_json::json!({
+        "container": "c",
+        "endpoint": "https://10.1.2.3/acct",
+        "auth": string("AccountName=acct;AccountKey=a2V5")
+    }));
+    refuse_server_paths_with(&private, &[], caller, &only("10.1.2.3")).unwrap();
+    let overridden = cfg(serde_json::json!({
+        "container": "c",
+        "endpoint": "https://10.1.2.3/acct",
+        "auth": string("AccountName=acct;BlobEndpoint=https://other.example/")
+    }));
+    let err = refuse_server_paths_with(&overridden, &[], caller, &only("10.1.2.3"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("other.example"), "{err}");
+    let emulator = cfg(serde_json::json!({
+        "container": "c",
+        "use_emulator": true,
+        "endpoint": "https://ignored.example/"
+    }));
+    refuse_server_paths_with(&emulator, &[], caller, &only("127.0.0.1")).unwrap();
+    let cased = cfg(serde_json::json!({
+        "container": "c",
+        "auth": string("AccountName=acct;accountname=other;AccountKey=a2V5")
+    }));
+    let err = refuse_server_paths_with(&cased, &[], caller, &only("acct.blob.core.windows.net"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("`accountname`"), "{err}");
+    refuse_server_paths_with(&cased, &[], BodyOrigin::Trusted, &ReferencePolicy::open()).unwrap();
+}
+
+#[cfg(feature = "source-mongodb")]
+#[tokio::test]
+async fn caller_mongodb_options_follow_the_reference_policy() {
+    use crate::cli::ReferenceArgs;
+    use crate::serve::references::ServeReferencePolicy;
+    let caller = BodyOrigin::Caller {
+        allow_subprocess: false,
+    };
+    let body = |uri: &str| {
+        serde_json::json!({ "version": 1, "pipeline": {
+            "source": { "type": "mongodb", "config": {
+                "connection_uri": uri, "database": "app", "collection": "c" } },
+            "sink": { "type": "stdout", "config": {} }
+        }})
+        .to_string()
+    };
+    let refs = ServeReferencePolicy::default();
+    let load = |uri: &str, origin: BodyOrigin, refs: &ServeReferencePolicy| {
+        let body = body(uri);
+        let refs = refs.clone();
+        async move {
+            load_submission_with(&body, ConfigFormat::Json, None, None, origin, None, &refs).await
+        }
+    };
+    for (uri, says) in [
+        (
+            "mongodb://db.example.com/?directConnection=true&tlsCAFile=/etc/ssl/private/k.pem",
+            "tlscafile",
+        ),
+        (
+            "mongodb://db.example.com/?directConnection=true&tlsInsecure=true",
+            "verification",
+        ),
+        (
+            "mongodb://db.example.com/?directConnection=true&authMechanism=MONGODB-OIDC\
+             &authMechanismProperties=ENVIRONMENT:k8s",
+            "own identity",
+        ),
+        ("mongodb://db.example.com/app", "directConnection=true"),
+        (
+            "mongodb://a.example.com,b.example.com/?replicaSet=rs0",
+            "directConnection=true",
+        ),
+    ] {
+        let err = load(uri, caller, &refs).await.unwrap_err();
+        assert!(
+            matches!(&err, ServeError::Forbidden(m) if m.contains(says)),
+            "{uri}: {err:?}"
+        );
+        load(uri, BodyOrigin::Trusted, &refs)
+            .await
+            .unwrap_or_else(|e| panic!("{uri} from a template: {e:?}"));
+    }
+    load(
+        "mongodb://db.example.com/app?directConnection=true",
+        caller,
+        &refs,
+    )
+    .await
+    .unwrap();
+    let listed = ServeReferencePolicy::from_args(&ReferenceArgs {
+        allow_url_host: vec!["*.example.com".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    load(
+        "mongodb://a.example.com,b.example.com/?replicaSet=rs0",
+        caller,
+        &listed,
+    )
+    .await
+    .unwrap();
+}
+
+/// Text a caller splices into a template's MongoDB URI is judged with the
+/// whole URI it lands in, so an option it appends is read as the driver reads
+/// it.
+#[cfg(feature = "source-mongodb")]
+#[test]
+fn sender_text_spliced_into_a_database_url_query_is_checked_whole() {
+    let doc = |app: &str| {
+        json!({ "version": 1, "pipeline": {
+            "source": { "type": "mongodb", "config": {
+                "connection_uri": format!(
+                    "mongodb://db.example.com/?directConnection=true&appName={app}"
+                ),
+                "database": "app", "collection": "c" } },
+            "sink": { "type": "stdout", "config": {} }
+        }})
+    };
+    let f = caller_fields(&[("/pipeline/source/config/connection_uri", "app")]);
+    let check = |d: &Value| {
+        let cfg = PipelineConfig::from_value(d.clone()).unwrap();
+        refuse_caller_params(d, &cfg, &f, &confined_policy(), false)
+    };
+    for app in [
+        "x&tlsCertificateKeyFile=/etc/passwd",
+        "x,nats://n&tlsCAFile=%2Fetc%2Fshadow",
+        "x&authMechanism=MONGODB-OIDC&authMechanismProperties=ENVIRONMENT:k8s",
+    ] {
+        let err = check(&doc(app)).unwrap_err().to_string();
+        assert!(err.contains("connection_uri"), "{app}: {err}");
+    }
+    check(&doc("reports")).unwrap();
+}
+
+/// A state store and a lineage transport a caller names are held to the
+/// caller reference policy through their own schemas, whichever connectors
+/// the build compiles.
+#[cfg(all(feature = "state-postgres", feature = "state-redis"))]
+#[test]
+fn caller_state_store_urls_follow_the_reference_policy() {
+    use crate::cli::ReferenceArgs;
+    use crate::serve::references::ServeReferencePolicy;
+    let caller = BodyOrigin::Caller {
+        allow_subprocess: false,
+    };
+    let listed = ServeReferencePolicy::from_args(&ReferenceArgs {
+        allow_url_host: vec!["db.example.com".into()],
+        ..Default::default()
+    })
+    .unwrap()
+    .for_origin(caller, None);
+    let doc = |state: Value| {
+        json!({ "version": 1, "pipeline": {
+            "source": { "type": "file", "config": { "path": "in.csv" } },
+            "sink": { "type": "stdout", "config": {} },
+            "state": state
+        }})
+    };
+    for (state, says) in [
+        (
+            json!({"type": "postgres", "config": {"url": "postgres://u:p@169.254.169.254/x"}}),
+            "pipeline.state.config.url",
+        ),
+        (
+            json!({"type": "postgres", "config": {"url": "postgres://u@evil.example/x"}}),
+            "pipeline.state.config.url",
+        ),
+        (
+            json!({"type": "redis", "config": {"url": "redis://169.254.169.254:6379/0"}}),
+            "pipeline.state.config.url",
+        ),
+        (
+            json!({"type": "redis", "config": {"url": "rediss://db.example.com:6380/0",
+                "tls": {"ca_cert_path": "/etc/ssl/private/ca.pem"}}}),
+            "/etc/ssl/private/ca.pem",
+        ),
+    ] {
+        let cfg = PipelineConfig::from_value(doc(state.clone())).unwrap();
+        let err = refuse_server_paths_with(&cfg, &[], caller, &listed)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(says), "{state}: {err}");
+        let nodes = crate::expand::expand(&cfg).unwrap();
+        let mut bare = cfg.clone();
+        bare.pipeline.state = None;
+        let err = refuse_server_paths_with(&bare, &nodes, caller, &listed)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(says) || err.contains("`url`"),
+            "{state}: {err}"
+        );
+        if !says.contains("169.254") && !state.to_string().contains("169.254") {
+            refuse_server_paths_with(&cfg, &nodes, BodyOrigin::Trusted, &ReferencePolicy::open())
+                .unwrap();
+        }
+    }
+    let ok = PipelineConfig::from_value(doc(
+        json!({"type": "postgres", "config": {"url": "postgres://u@db.example.com/x"}}),
+    ))
+    .unwrap();
+    refuse_server_paths_with(&ok, &[], caller, &listed).unwrap();
+}
+
+#[cfg(feature = "lineage")]
+#[test]
+fn caller_lineage_transport_urls_follow_the_reference_policy() {
+    let caller = BodyOrigin::Caller {
+        allow_subprocess: false,
+    };
+    let policy = crate::serve::references::ServeReferencePolicy::default().for_origin(caller, None);
+    let cfg = PipelineConfig::from_value(json!({ "version": 1,
+        "pipeline": {
+            "source": { "type": "file", "config": { "path": "in.csv" } },
+            "sink": { "type": "stdout", "config": {} }
+        },
+        "lineage": { "namespace": "n", "transport": { "type": "http",
+            "config": { "url": "http://169.254.169.254/api/v1/lineage" } } }
+    }))
+    .unwrap();
+    let err = refuse_server_paths_with(&cfg, &[], caller, &policy)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("lineage.transport.config.url"), "{err}");
+}
+
+/// A caller-supplied value in a remote path field (`x-faucet-resource: key`)
+/// may not hold a `..` segment; the template's own value may.
+#[cfg(all(feature = "source-rest", feature = "sink-sftp"))]
+#[test]
+fn dotdot_in_a_key_field_is_refused_for_callers() {
+    let root = tempfile::tempdir().unwrap();
+    let doc = |name: &str| {
+        json!({
+            "version": 1,
+            "pipeline": {
+                "source": { "type": "rest", "config": { "base_url": "https://api.example.com" } },
+                "sink": { "type": "sftp", "config": {
+                    "host": "sftp.example.com", "username": "u",
+                    "auth": { "type": "password", "config": { "password": "p" } },
+                    "path": "/data/a", "file_name": name } }
+            }
+        })
+    };
+    let check = |d: &Value, f: &crate::params::CallerFields| {
+        let cfg = PipelineConfig::from_value(d.clone()).unwrap();
+        refuse_caller_params(d, &cfg, f, &rooted(root.path()), true)
+    };
+    let f = caller_fields(&[("/pipeline/sink/config/file_name", "report")]);
+    let err = check(&doc("../b/x.csv"), &f).unwrap_err().to_string();
+    assert!(
+        err.contains("param 'report' sets `pipeline.sink.config.file_name`"),
+        "{err}"
+    );
+    assert!(err.contains("`..`"), "{err}");
+    check(&doc("b/x.csv"), &f).unwrap();
+    check(&doc("../b/x.csv"), &Default::default()).unwrap();
+}
+
+/// A caller's config cannot pin the overwrite run token the executor
+/// chooses; an operator's keeps it.
+#[cfg(all(feature = "source-csv", feature = "sink-jsonl"))]
+#[tokio::test]
+async fn caller_overwrite_run_tokens_are_ignored() {
+    let root = tempfile::tempdir().unwrap();
+    let args = crate::cli::ReferenceArgs {
+        allow_path_root: vec![root.path().to_path_buf()],
+        ..Default::default()
+    };
+    let refs = crate::serve::references::ServeReferencePolicy::from_args(&args).unwrap();
+    let input = root.path().join("in.csv");
+    std::fs::write(&input, "id\n1\n").unwrap();
+    let token = "0123456789abcdef0123456789abcdef";
+    let body = serde_json::json!({
+        "version": 1,
+        "pipeline": {
+            "source": { "type": "csv", "config": { "path": input.display().to_string() } },
+            "sink": { "type": "jsonl", "config": {
+                "path": root.path().join("o.jsonl").display().to_string(),
+                "_overwrite_run": token,
+            } },
+        },
+        "matrix": [ { "id": "a", "sink": { "config": { "_overwrite_run": token } } } ],
+    })
+    .to_string();
+    let load =
+        |origin| load_submission_with(&body, ConfigFormat::Json, None, None, origin, None, &refs);
+    let caller = load(BodyOrigin::Caller {
+        allow_subprocess: false,
+    })
+    .await
+    .unwrap();
+    assert!(
+        caller.nodes[0].sink.config.get("_overwrite_run").is_none(),
+        "{}",
+        caller.nodes[0].sink.config
+    );
+    let trusted = load(BodyOrigin::Trusted).await.unwrap();
+    assert_eq!(trusted.nodes[0].sink.config["_overwrite_run"], token);
+}
+
+#[cfg(all(feature = "source-nats", feature = "sink-stdout"))]
+#[tokio::test]
+async fn nats_ignores_discovered_servers_for_callers() {
+    use crate::cli::ReferenceArgs;
+    use crate::serve::references::ServeReferencePolicy;
+    let body = json!({ "version": 1, "pipeline": {
+        "source": { "type": "nats", "config": {
+            "servers": ["nats://n.example.com:4222"], "subject": "s",
+            "ignore_discovered_servers": false, "max_messages": 1 } },
+        "sink": { "type": "stdout", "config": {} }
+    }})
+    .to_string();
+    let caller = BodyOrigin::Caller {
+        allow_subprocess: false,
+    };
+    let load = |origin: BodyOrigin, refs: ServeReferencePolicy| {
+        let body = body.clone();
+        async move {
+            load_submission_with(&body, ConfigFormat::Json, None, None, origin, None, &refs)
+                .await
+                .unwrap()
+        }
+    };
+    let pinned = load(caller, ServeReferencePolicy::default()).await;
+    assert_eq!(
+        pinned.nodes[0].source.config["ignore_discovered_servers"],
+        true
+    );
+    assert!(uses_pin_switch(None, &pinned.nodes));
+    let trusted = load(BodyOrigin::Trusted, ServeReferencePolicy::default()).await;
+    assert_eq!(
+        trusted.nodes[0].source.config["ignore_discovered_servers"],
+        false
+    );
+    let listed = ServeReferencePolicy::from_args(&ReferenceArgs {
+        allow_url_host: vec!["*.example.com".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    let open = load(caller, listed).await;
+    assert_eq!(
+        open.nodes[0].source.config["ignore_discovered_servers"],
+        false
+    );
+    assert!(uses_pin_switch(
+        Some(&json!({ "nodes": { "a": { "type": "nats" } } })),
+        &[]
+    ));
+    assert!(!uses_pin_switch(Some(&json!({ "type": "stdout" })), &[]));
+}
+
+#[cfg(all(
+    feature = "source-kafka",
+    feature = "sink-kafka",
+    feature = "sink-stdout"
+))]
+#[tokio::test]
+async fn caller_kafka_and_oracle_need_a_host_allow_list() {
+    use crate::cli::ReferenceArgs;
+    use crate::serve::references::ServeReferencePolicy;
+    let kafka = json!({ "type": "kafka", "config": {
+        "brokers": "k.example.com:9092", "topics": ["t"], "group_id": "g", "max_messages": 1 } });
+    let kafka_sink = json!({ "type": "kafka", "config": {
+        "brokers": "k.example.com:9092", "topic": "t" } });
+    let stdout = json!({ "type": "stdout", "config": {} });
+    let bodies = [
+        json!({ "version": 1, "pipeline": { "source": kafka, "sink": stdout } }),
+        json!({ "version": 1, "pipeline": { "source": kafka, "sink": kafka_sink } }),
+        json!({ "version": 1, "pipeline": { "source": kafka, "sink": stdout,
+            "dlq": { "sink": kafka_sink } } }),
+    ];
+    let caller = BodyOrigin::Caller {
+        allow_subprocess: false,
+    };
+    let listed = ServeReferencePolicy::from_args(&ReferenceArgs {
+        allow_url_host: vec!["*.example.com".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    for body in bodies {
+        let body = body.to_string();
+        let load = |origin: BodyOrigin, refs: &ServeReferencePolicy| {
+            let body = body.clone();
+            let refs = refs.clone();
+            async move {
+                load_submission_with(&body, ConfigFormat::Json, None, None, origin, None, &refs)
+                    .await
+            }
+        };
+        let err = load(caller, &ServeReferencePolicy::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ServeError::Forbidden(m) if m.contains("`kafka` client") && m.contains("--allow-url-host")),
+            "{body}: {err:?}"
+        );
+        load(caller, &listed).await.unwrap();
+        load(BodyOrigin::Trusted, &ServeReferencePolicy::default())
+            .await
+            .unwrap();
+    }
+}
+
+#[cfg(all(feature = "source-oracle", feature = "sink-stdout"))]
+#[tokio::test]
+async fn caller_oracle_needs_a_host_allow_list() {
+    use crate::serve::references::ServeReferencePolicy;
+    let body = json!({ "version": 1, "pipeline": {
+        "source": { "type": "oracle", "config": {
+            "host": "o.example.com", "service_name": "S", "username": "u", "password": "p",
+            "query": "SELECT 1 FROM dual" } },
+        "sink": { "type": "stdout", "config": {} }
+    }})
+    .to_string();
+    let err = load_submission_with(
+        &body,
+        ConfigFormat::Json,
+        None,
+        None,
+        BodyOrigin::Caller {
+            allow_subprocess: false,
+        },
+        None,
+        &ServeReferencePolicy::default(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&err, ServeError::Forbidden(m) if m.contains("`oracle` client")),
+        "{err:?}"
+    );
+}
+
+#[cfg(all(
+    feature = "lineage-kafka",
+    feature = "source-csv",
+    feature = "sink-stdout"
+))]
+#[tokio::test]
+async fn a_caller_kafka_lineage_transport_needs_a_host_allow_list() {
+    use crate::serve::references::ServeReferencePolicy;
+    let body = json!({ "version": 1,
+        "pipeline": {
+            "source": { "type": "csv", "config": { "path": "in.csv" } },
+            "sink": { "type": "stdout", "config": {} } },
+        "lineage": { "namespace": "ns", "transport": { "type": "kafka", "config": {
+            "brokers": "k.example.com:9092", "topic": "ol" } } }
+    })
+    .to_string();
+    let err = load_submission_with(
+        &body,
+        ConfigFormat::Json,
+        None,
+        None,
+        BodyOrigin::Caller {
+            allow_subprocess: false,
+        },
+        None,
+        &ServeReferencePolicy::default(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&err, ServeError::Forbidden(m) if m.contains("`kafka` client")),
+        "{err:?}"
+    );
 }

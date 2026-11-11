@@ -292,6 +292,42 @@ async fn upsert_rollback_restores_before_images_and_guards_later_runs() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn journal_handles_column_names_with_backslashes_and_quotes() {
+    let (_c, url) = start_mysql().await;
+    exec(
+        &url,
+        "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255), _faucet_run_id VARCHAR(64), \
+         `a\\` VARCHAR(32), `b'c` VARCHAR(32))",
+    )
+    .await;
+    exec(
+        &url,
+        "INSERT INTO users VALUES (1, 'old-1', 'r0', 'x\\\\y', 'q''r')",
+    )
+    .await;
+    let sink = MysqlSink::new(upsert_config(&url, "r1")).await.unwrap();
+    sink.write_batch(&[json!({
+        "id": 1, "name": "new-1", RUN_COL: "r1", "a\\": "changed", "b'c": "changed"
+    })])
+    .await
+    .unwrap();
+    let out = sink
+        .rollback_run("r1", &opts(RollbackMode::Upsert))
+        .await
+        .unwrap();
+    assert_eq!((out.restored, out.applied), (1, true), "{out:?}");
+    let pool = sqlx::MySqlPool::connect(&url).await.unwrap();
+    let r = sqlx::query("SELECT name, `a\\` AS a, `b'c` AS b FROM users WHERE id = 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(r.get::<String, _>("name"), "old-1");
+    assert_eq!(r.get::<String, _>("a"), "x\\y");
+    assert_eq!(r.get::<String, _>("b"), "q'r");
+    pool.close().await;
+}
+
 async fn overwrite_run(url: &str, run_id: &str, keep_previous: bool, page: &[Value]) {
     let cfg = config(
         url,

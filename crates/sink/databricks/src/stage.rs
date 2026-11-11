@@ -34,6 +34,17 @@ fn bucket_and_prefix(rest: &str) -> (String, String) {
 }
 
 impl StageLocation {
+    /// The object-store scheme of a cloud location, `None` for a volume.
+    pub fn scheme(&self) -> Option<faucet_core::staging::StagingScheme> {
+        use faucet_core::staging::StagingScheme;
+        match self {
+            StageLocation::Volume { .. } => None,
+            StageLocation::S3 { .. } => Some(StagingScheme::S3),
+            StageLocation::Gcs { .. } => Some(StagingScheme::Gcs),
+            StageLocation::Azure { .. } => Some(StagingScheme::Azure),
+        }
+    }
+
     /// Parse and validate a staging location.
     pub fn parse(location: &str) -> Result<Self, FaucetError> {
         let loc = location.trim();
@@ -302,7 +313,13 @@ impl FilesApiStager {
             {
                 return Ok(status);
             }
-            let text = resp.text().await.unwrap_or_default();
+            let text = faucet_core::http::read_body_limited(
+                resp,
+                Some(faucet_core::util::DEFAULT_ERROR_BODY_MAX_LEN as u64),
+            )
+            .await
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_else(|_| "(body too large to show)".into());
             return Err(FaucetError::Sink(format!(
                 "databricks sink: Files API {method} {path}: HTTP {status}: {text}"
             )));
@@ -363,41 +380,29 @@ impl Stager for ObjectStoreStager {
     }
 }
 
-/// Build the object store for a cloud location from ambient credentials.
+/// Build the object store for a cloud location with `credentials` (the
+/// default chain is refused where the task may not use the host's identity).
 #[cfg(feature = "staging")]
 pub fn build_object_store(
     loc: &StageLocation,
+    credentials: &faucet_core::staging::StagingCredentials,
 ) -> Result<Arc<dyn object_store::ObjectStore>, FaucetError> {
-    let err = |e: object_store::Error| {
-        FaucetError::Config(format!("databricks sink: staging store: {e}"))
-    };
-    Ok(match loc {
-        StageLocation::S3 { bucket, .. } => Arc::new(
-            object_store::aws::AmazonS3Builder::from_env()
-                .with_bucket_name(bucket)
-                .build()
-                .map_err(err)?,
-        ),
-        StageLocation::Gcs { bucket, .. } => Arc::new(
-            object_store::gcp::GoogleCloudStorageBuilder::from_env()
-                .with_bucket_name(bucket)
-                .build()
-                .map_err(err)?,
-        ),
+    use faucet_core::staging::object_store_for;
+    let scheme = loc.scheme().ok_or_else(|| {
+        FaucetError::Config("databricks sink: volume locations upload through the Files API".into())
+    })?;
+    let store = match loc {
+        StageLocation::S3 { bucket, .. } | StageLocation::Gcs { bucket, .. } => {
+            object_store_for(scheme, bucket, None, credentials)
+        }
         StageLocation::Azure {
             container, account, ..
-        } => Arc::new(
-            object_store::azure::MicrosoftAzureBuilder::from_env()
-                .with_account(account)
-                .with_container_name(container)
-                .build()
-                .map_err(err)?,
-        ),
-        StageLocation::Volume { .. } => {
-            return Err(FaucetError::Config(
-                "databricks sink: volume locations upload through the Files API".into(),
-            ));
-        }
+        } => object_store_for(scheme, container, Some(account), credentials),
+        StageLocation::Volume { .. } => unreachable!("a volume has no scheme"),
+    };
+    store.map_err(|e| match e {
+        FaucetError::Sink(m) => FaucetError::Config(format!("databricks sink: {m}")),
+        other => other,
     })
 }
 
@@ -405,6 +410,31 @@ pub fn build_object_store(
 #[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
+
+    #[cfg(feature = "staging")]
+    #[tokio::test]
+    async fn staging_uploads_use_their_own_credentials() {
+        use faucet_core::staging::StagingCredentials;
+        let s3 = StageLocation::parse("s3://b/p").unwrap();
+        faucet_core::resolve::with_host_credentials(false, async {
+            let err = build_object_store(&s3, &StagingCredentials::Default)
+                .expect_err("refused")
+                .to_string();
+            assert!(err.contains("staging: `credentials`"), "{err}");
+            let keys = StagingCredentials::AccessKey {
+                access_key_id: "a".into(),
+                secret_access_key: "s".into(),
+                session_token: None,
+            };
+            assert!(build_object_store(&s3, &keys).is_ok());
+            let az = StageLocation::parse("abfss://c@acct.dfs.core.windows.net/p").unwrap();
+            let sas = StagingCredentials::SasToken {
+                sas_token: "sv=1&sig=x".into(),
+            };
+            assert!(build_object_store(&az, &sas).is_ok());
+        })
+        .await;
+    }
 
     #[test]
     fn parses_every_location_kind() {
@@ -559,8 +589,14 @@ mod tests {
             "gs://b/p",
             "abfss://c@acct.dfs.core.windows.net/p",
         ] {
-            let _ = build_object_store(&StageLocation::parse(loc).unwrap());
+            let _ = build_object_store(&StageLocation::parse(loc).unwrap(), &Default::default());
         }
-        assert!(build_object_store(&StageLocation::parse("/Volumes/a/b/c").unwrap()).is_err());
+        assert!(
+            build_object_store(
+                &StageLocation::parse("/Volumes/a/b/c").unwrap(),
+                &Default::default()
+            )
+            .is_err()
+        );
     }
 }

@@ -1440,3 +1440,76 @@ fn an_unknown_connector_kind_is_ignored_rather_than_erroring() {
         None
     );
 }
+
+fn ambient_credentials(c: &Value) -> Vec<String> {
+    match faucet_core::capabilities::config::tag_at(c, "/credentials").unwrap_or("default") {
+        "access_key" => Vec::new(),
+        _ => vec!["credentials".to_string()],
+    }
+}
+
+#[test]
+fn host_identity_is_the_descriptors_answer_or_unknown_for_a_silent_plugin() {
+    const CLOUD: ConnectorDescriptor =
+        ConnectorDescriptor::new("cloud-src", faucet_core::capabilities::plain_source)
+            .with_host_identity(ambient_credentials)
+            .with_runtime_host_identity();
+    const SILENT: ConnectorDescriptor =
+        ConnectorDescriptor::new("silent-sink", faucet_core::capabilities::append_only_sink);
+    let reg = PluginRegistry::default()
+        .register_source_described(
+            CLOUD,
+            |_| Err(RegistryError::Config("unused".into())),
+            || json!({"type": "object"}),
+            "",
+        )
+        .register_sink_described(
+            SILENT,
+            |_| Err(RegistryError::Config("unused".into())),
+            || json!({"type": "object"}),
+            "",
+        )
+        .register_sink("bare-sink", |_| Err(RegistryError::Config("unused".into())));
+    let src = |config: &Value| {
+        host_identity_of(
+            reg.sources.get("cloud-src").map(|e| e.descriptor),
+            None,
+            config,
+        )
+    };
+    let sink =
+        |kind: &str| host_identity_of(reg.sinks.get(kind).map(|e| e.descriptor), None, &json!({}));
+    let ambient = src(&Value::Null);
+    assert_eq!(ambient, HostIdentity::Fields(vec!["credentials".into()]));
+    assert!(ambient.uses_host_identity());
+    assert_eq!(ambient.fields(), ["credentials".to_string()]);
+    let own = src(&json!({"credentials": {"type": "access_key"}}));
+    assert!(!own.uses_host_identity());
+    for kind in ["silent-sink", "bare-sink"] {
+        let unknown = sink(kind);
+        assert_eq!(unknown, HostIdentity::Unknown, "{kind}");
+        assert!(unknown.uses_host_identity());
+        assert!(unknown.fields().is_empty());
+    }
+    assert_eq!(
+        host_identity_of(None, Some(CLOUD), &json!({})),
+        HostIdentity::Fields(vec!["credentials".into()])
+    );
+    assert_eq!(
+        host_identity_of(None, Some(SILENT), &json!({})),
+        HostIdentity::Fields(Vec::new()),
+        "a first-party connector without an answer uses none"
+    );
+    assert_eq!(
+        host_identity_of(None, None, &json!({})),
+        HostIdentity::Fields(Vec::new())
+    );
+}
+
+#[test]
+fn unknown_kinds_report_no_host_identity_and_no_runtime_check() {
+    assert!(!source_host_identity("no-such-kind", &json!({})).uses_host_identity());
+    assert!(!sink_host_identity("no-such-kind", &json!({})).uses_host_identity());
+    assert!(!source_checks_host_identity_at_runtime("no-such-kind"));
+    assert!(!sink_checks_host_identity_at_runtime("no-such-kind"));
+}

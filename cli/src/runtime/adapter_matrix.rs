@@ -1167,3 +1167,242 @@ async fn a_claimed_run_rechecks_its_callers_params() {
         "a claimed run skipped its caller's params"
     );
 }
+
+/// A caller's idempotency key may not use a prefix the server writes its
+/// own keys under, on any route that submits a run.
+#[tokio::test]
+async fn caller_keys_cannot_use_server_prefixes() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = fresh().await;
+    tenant(&state, false, None).await;
+    let body = config(dir.path(), "keys", "", false);
+    register(&state, &body).await;
+    let refused = |r: Outcome, route: &str, key: &str| {
+        let e = r.expect_err(&format!("{route} accepted {key}"));
+        assert!(e.contains("reserves for its own keys"), "{route}: {e}");
+    };
+    for key in [
+        "sched:nightly:2026-11-12T00:00:00Z:acme",
+        "trig:hook:1",
+        "tenant:acme:k",
+        "change:c1",
+        "backfill:h:u",
+    ] {
+        let run: crate::serve::runner::SubmitRequest =
+            serde_json::from_value(json!({ "config": body, "idempotency_key": key })).unwrap();
+        let trigger = || -> crate::serve::handlers::templates::TriggerBody {
+            serde_json::from_value(json!({ "version": "newest", "idempotency_key": key })).unwrap()
+        };
+        let r = crate::serve::handlers::runs::submit_run(
+            State(state.clone()),
+            Extension(alice(None)),
+            Json(run.clone()),
+        )
+        .await;
+        refused(r.map(|_| None).map_err(error_text), "/v1/runs", key);
+        let r = crate::serve::handlers::tenants::submit_tenant_run(
+            State(state.clone()),
+            Extension(alice(None)),
+            Path("acme".to_string()),
+            Json(run),
+        )
+        .await;
+        refused(r.map(|_| None).map_err(error_text), "tenant runs", key);
+        let r = crate::serve::handlers::templates::trigger_template(
+            State(state.clone()),
+            Extension(alice(None)),
+            Path("tpl".to_string()),
+            Json(trigger()),
+        )
+        .await;
+        refused(r.map(|_| None).map_err(error_text), "template runs", key);
+        for actor in [alice(None), alice(Some("acme"))] {
+            let r = crate::serve::handlers::tenants::trigger_tenant_template(
+                State(state.clone()),
+                Extension(actor),
+                Path(("acme".to_string(), "tpl".to_string())),
+                Json(trigger()),
+            )
+            .await;
+            refused(
+                r.map(|_| None).map_err(error_text),
+                "tenant template runs",
+                key,
+            );
+        }
+        let fanout: crate::serve::handlers::tenants::FanoutBody = serde_json::from_value(
+            json!({ "tenants": ["acme"], "version": "newest", "idempotency_key": key }),
+        )
+        .unwrap();
+        let r = crate::serve::handlers::tenants::fan_out(&state, &alice(None), "tpl", fanout, "f")
+            .await;
+        refused(r.map(|_| None).map_err(error_text), "fan-out", key);
+        let r = crate::serve::changes::create(
+            &state,
+            &alice(None),
+            crate::serve::changes::NewChange {
+                kind: crate::serve::changes::ChangeKind::Run,
+                payload: json!({ "config": body, "idempotency_key": key }),
+                reason: None,
+                budget: None,
+                trusted_config: false,
+                caller_params: Default::default(),
+            },
+        )
+        .await;
+        refused(r.map(|_| None).map_err(error_text), "/v1/changes", key);
+    }
+    let run: crate::serve::runner::SubmitRequest =
+        serde_json::from_value(json!({ "config": body, "idempotency_key": "nightly-1" })).unwrap();
+    crate::serve::handlers::runs::submit_run(
+        State(state.clone()),
+        Extension(alice(None)),
+        Json(run),
+    )
+    .await
+    .expect("an ordinary key is accepted");
+}
+
+/// A schedule tick's key cannot be claimed first by a tenant, and the tick
+/// still runs under it.
+#[cfg(feature = "schedule")]
+#[tokio::test]
+async fn a_schedule_tick_cannot_be_preempted() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = fresh().await;
+    tenant(&state, false, None).await;
+    register(&state, &config(dir.path(), "tick", "", false)).await;
+    let key = crate::serve::schedules::fire::idempotency_key(
+        "nightly",
+        "2026-11-12T00:00:00Z",
+        None,
+        Some("acme"),
+    );
+    let mut body: crate::serve::handlers::templates::TriggerBody =
+        serde_json::from_value(json!({ "version": "newest", "idempotency_key": key })).unwrap();
+    let r = crate::serve::handlers::tenants::trigger_tenant_template(
+        State(state.clone()),
+        Extension(alice(Some("acme"))),
+        Path(("acme".to_string(), "tpl".to_string())),
+        Json(body.clone()),
+    )
+    .await;
+    assert!(r.is_err(), "a tenant claimed the tick's key");
+    body.standing_approval = true;
+    body.server_key = true;
+    let outcome = super::server::trigger_template(
+        state.clone(),
+        crate::runtime::Principal::new(
+            crate::serve::schedules::fire::actor("nightly", Some("acme")),
+            crate::runtime::Origin::Trusted,
+        ),
+        "tpl".into(),
+        body,
+    )
+    .await
+    .map_err(error_text)
+    .expect("the tick runs");
+    assert!(matches!(outcome, super::server::TriggerOutcome::Run(_)));
+}
+
+/// Run template `tpl` over HTTP as `actor` asking for `pool`, returning the
+/// error text (a run cannot start: this server serves only `default`).
+async fn template_pool_error(state: &ServerState, actor: AuthContext, pool: &str) -> String {
+    let body: crate::serve::handlers::templates::TriggerBody =
+        serde_json::from_value(json!({ "version": "newest", "pool": pool })).unwrap();
+    let r = match actor.tenant.clone() {
+        Some(t) => {
+            crate::serve::handlers::tenants::trigger_tenant_template(
+                State(state.clone()),
+                Extension(actor),
+                Path((t, "tpl".to_string())),
+                Json(body),
+            )
+            .await
+        }
+        None => {
+            crate::serve::handlers::templates::trigger_template(
+                State(state.clone()),
+                Extension(actor),
+                Path("tpl".to_string()),
+                Json(body),
+            )
+            .await
+        }
+    };
+    r.map(|_| ()).map_err(error_text).unwrap_err()
+}
+
+/// A template that does not let a run choose its pool refuses one, for a
+/// caller and for a tenant; the server's own fan-out still chooses.
+#[tokio::test]
+async fn a_template_without_override_refuses_a_requested_pool() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = fresh().await;
+    tenant(&state, false, None).await;
+    register(
+        &state,
+        &config(dir.path(), "pooled", "pool: private\n", false),
+    )
+    .await;
+    for actor in [alice(None), alice(Some("acme"))] {
+        let e = template_pool_error(&state, actor, "gpu").await;
+        assert!(e.contains("pool_override"), "{e}");
+    }
+    // The template's own pool is no override.
+    let e = template_pool_error(&state, alice(None), "private").await;
+    assert!(!e.contains("pool_override"), "{e}");
+    let fanout: crate::serve::handlers::tenants::FanoutBody =
+        serde_json::from_value(json!({ "tenants": ["acme"], "version": "newest", "pool": "gpu" }))
+            .unwrap();
+    let results =
+        crate::serve::handlers::tenants::fan_out(&state, &alice(None), "tpl", fanout, "f")
+            .await
+            .unwrap();
+    let why = results[0].reason.clone().unwrap_or_default();
+    assert!(!why.contains("pool_override"), "{why}");
+}
+
+/// A `pool_override` list admits only its pools; `true` admits any.
+#[tokio::test]
+async fn an_allowed_list_admits_only_its_pools() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = fresh().await;
+    register(
+        &state,
+        &config(dir.path(), "listed", "pool_override: [gpu]\n", false),
+    )
+    .await;
+    let e = template_pool_error(&state, alice(None), "gpu").await;
+    assert!(e.contains("does not serve pool `gpu`"), "{e}");
+    let e = template_pool_error(&state, alice(None), "big").await;
+    assert!(e.contains("allows only: gpu"), "{e}");
+    register(
+        &state,
+        &config(dir.path(), "open", "pool_override: true\n", false),
+    )
+    .await;
+    let e = template_pool_error(&state, alice(None), "big").await;
+    assert!(e.contains("does not serve pool `big`"), "{e}");
+}
+
+/// A raw config a caller submits names its own pool, as before.
+#[tokio::test]
+async fn operator_raw_configs_keep_choosing_pools() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = fresh().await;
+    let run: crate::serve::runner::SubmitRequest = serde_json::from_value(
+        json!({ "config": config(dir.path(), "raw", "pool: private\n", false), "pool": "gpu" }),
+    )
+    .unwrap();
+    let e = crate::serve::handlers::runs::submit_run(
+        State(state.clone()),
+        Extension(alice(None)),
+        Json(run),
+    )
+    .await
+    .map(|_| ())
+    .map_err(error_text)
+    .unwrap_err();
+    assert!(e.contains("does not serve pool `gpu`"), "{e}");
+}

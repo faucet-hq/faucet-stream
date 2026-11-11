@@ -234,6 +234,23 @@ serve:
     # 0 disables it. Surfaced as FAUCET_LOCAL_SINK_OUTPUT_IN_FLIGHT_GRACE_SECS.
     inFlightGraceSeconds: 60
 
+  # FAUCET_SERVE_ALLOW_HOST_CREDENTIALS — let a config submitted over HTTP or
+  # MCP authenticate with the pod's own identity (its service account's IRSA /
+  # workload-identity / managed-identity role, application-default
+  # credentials, files in the image). Off: a submitted config names its own
+  # keys. Never applies to a tenant. Keep it off when the pod's role reaches
+  # anything a caller should not; set it the same on every replica.
+  allowHostCredentials: false
+
+  # FAUCET_SERVE_ALLOW_LISTEN — where a config submitted over HTTP or MCP may
+  # open a listener (a `webhook` source's `listen_addr`): `ADDR:PORT` or
+  # `ADDR:FIRST-LAST` entries (IPv6 in brackets; `[::]` also covers
+  # `0.0.0.0`). Empty: the server default, `127.0.0.1:29100-29199` and
+  # `[::1]:29100-29199`; `[none]` allows no listener. A non-loopback listener
+  # must also set `auth_token` or `signature`. Never applies to a tenant. A
+  # range reachable from outside the pod also needs a Service port.
+  allowListen: []
+
   # Dataset preview of those local outputs (#586): the console's Datasets page
   # can read back the first N rows of a tracked jsonl / csv / parquet file.
   #

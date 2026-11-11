@@ -379,6 +379,7 @@ fn config(
             iam_role: Some(ROLE.into()),
             region: Some(stores::MINIO_REGION.into()),
             endpoint_url: Some(env.minio.replace("127.0.0.1", "localhost")),
+            credentials: Default::default(),
         }),
         copy_format: RedshiftCopyFormat::Jsonl,
         staging_bucket: None,

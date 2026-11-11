@@ -69,6 +69,7 @@ pub async fn record(
                 }
             }
         };
+        let path = resolve_parent_components(path).await;
         let file_id = if ctx.final_file {
             tokio::fs::metadata(&path)
                 .await
@@ -117,6 +118,26 @@ pub async fn record(
     }
     super::metrics::recorded(&ctx.kind, written);
     written
+}
+
+/// A path naming `.` or `..` is stored with its directory resolved, so the
+/// sweep walks the directory the writer opened. Unresolvable → stored as is.
+async fn resolve_parent_components(path: std::path::PathBuf) -> std::path::PathBuf {
+    use std::path::{Component, PathBuf};
+    let dotted = path
+        .components()
+        .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+        || path.components().collect::<PathBuf>().as_os_str() != path.as_os_str();
+    if !dotted {
+        return path;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => match tokio::fs::canonicalize(parent).await {
+            Ok(dir) => dir.join(name),
+            Err(_) => path,
+        },
+        _ => path,
+    }
 }
 
 #[cfg(test)]
@@ -377,5 +398,68 @@ mod tests {
             .unwrap();
         assert_eq!(rows[0].retention_days, Some(2));
         assert_eq!(rows[0].effective_retention_days(7), Some(2));
+    }
+
+    #[tokio::test]
+    async fn relative_paths_with_parent_components_are_stored_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::write(root.join("a/out.jsonl"), b"x").unwrap();
+        let store = MemoryHistory::new(Duration::from_secs(60));
+        record(
+            &store,
+            &[
+                LocalOutput::created(root.join("a/b/../out.jsonl")),
+                LocalOutput::created(root.join("a/./b/x.jsonl")),
+                LocalOutput::created(root.join("missing/../y.jsonl")),
+                LocalOutput::created(root.join("a/plain.jsonl")),
+                LocalOutput::created("../rel-parent.jsonl"),
+            ],
+            &ctx(),
+        )
+        .await;
+        let mut paths: Vec<String> = store
+            .local_output_list(&LocalOutputFilter::default())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.path)
+            .collect();
+        paths.sort();
+        let mut want = vec![
+            root.join("a/out.jsonl").to_string_lossy().into_owned(),
+            root.join("a/b/x.jsonl").to_string_lossy().into_owned(),
+            root.join("missing/../y.jsonl")
+                .to_string_lossy()
+                .into_owned(),
+            root.join("a/plain.jsonl").to_string_lossy().into_owned(),
+            std::fs::canonicalize(std::env::current_dir().unwrap().join(".."))
+                .unwrap()
+                .join("rel-parent.jsonl")
+                .to_string_lossy()
+                .into_owned(),
+        ];
+        want.sort();
+        assert_eq!(paths, want);
+        let rows = store
+            .local_output_list(&LocalOutputFilter::default())
+            .await
+            .unwrap();
+        let resolved = rows
+            .iter()
+            .find(|r| r.path == root.join("a/out.jsonl").to_string_lossy())
+            .unwrap();
+        assert_eq!(
+            resolved.parent_id,
+            crate::local_outputs::FileIdentity::of(&std::fs::metadata(root.join("a")).unwrap())
+        );
+        assert!(resolved.file_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_path_ending_in_a_parent_component_is_kept_as_written() {
+        let path = std::path::PathBuf::from("/tmp/x/..");
+        assert_eq!(resolve_parent_components(path.clone()).await, path);
     }
 }

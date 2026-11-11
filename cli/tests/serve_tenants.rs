@@ -2121,6 +2121,7 @@ struct HeldIdp {
     uri: String,
     arrived: std::sync::Arc<tokio::sync::Notify>,
     release: std::sync::Arc<tokio::sync::Notify>,
+    hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 async fn held_idp() -> HeldIdp {
@@ -2129,10 +2130,11 @@ async fn held_idp() -> HeldIdp {
     let uri = format!("http://{}", listener.local_addr().unwrap());
     let arrived = std::sync::Arc::new(tokio::sync::Notify::new());
     let release = std::sync::Arc::new(tokio::sync::Notify::new());
-    let (a, r) = (arrived.clone(), release.clone());
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (a, r, h) = (arrived.clone(), release.clone(), hits.clone());
     tokio::spawn(async move {
         while let Ok((mut sock, _)) = listener.accept().await {
-            let (a, r) = (a.clone(), r.clone());
+            let (a, r, h) = (a.clone(), r.clone(), h.clone());
             tokio::spawn(async move {
                 let mut buf = Vec::new();
                 let mut chunk = [0u8; 4096];
@@ -2157,6 +2159,7 @@ async fn held_idp() -> HeldIdp {
                         }
                     }
                 }
+                h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 a.notify_one();
                 r.notified().await;
                 let body =
@@ -2173,6 +2176,7 @@ async fn held_idp() -> HeldIdp {
         uri,
         arrived,
         release,
+        hits,
     }
 }
 
@@ -2243,17 +2247,15 @@ async fn a_connect_callback_after_the_connection_was_deleted_stores_nothing() {
         let held = held_idp().await;
         let api = fence_server(run.path(), history.clone(), &held.uri).await;
 
-        // Deleted while the flow waits at the provider.
+        // Deleted while the flow waits at the provider: the code is never exchanged.
         create_static_connection(&api, "crm", "dummy-old").await;
         let st = start_connect_flow(&api, "crm").await;
         let (code, _) = api
             .delete("admin-tok", "/v1/tenants/acme/connections/crm")
             .await;
         assert_eq!(code, 204);
-        let cb = spawn_callback(&api, &st);
-        held.arrived.notified().await;
-        held.release.notify_one();
-        assert_eq!(cb.await.unwrap(), CHANGED, "{history:?}");
+        assert_eq!(finish_connect_flow(&api, &st).await, CHANGED, "{history:?}");
+        assert_eq!(held.hits.load(std::sync::atomic::Ordering::SeqCst), 0);
         let (code, _) = api
             .get("admin-tok", "/v1/tenants/acme/connections/crm")
             .await;
@@ -2270,6 +2272,7 @@ async fn a_connect_callback_after_the_connection_was_deleted_stores_nothing() {
         assert_eq!(code, 204);
         held.release.notify_one();
         assert_eq!(cb.await.unwrap(), CHANGED, "{history:?}");
+        assert_eq!(held.hits.load(std::sync::atomic::Ordering::SeqCst), 1);
         let (code, _) = api
             .get("admin-tok", "/v1/tenants/acme/connections/crm")
             .await;

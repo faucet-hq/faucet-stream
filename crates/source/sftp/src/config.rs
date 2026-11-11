@@ -94,6 +94,7 @@ pub struct SftpSourceConfig {
     pub connection: SftpConnectionConfig,
     /// Remote path to read: a directory whose files are listed and streamed,
     /// or a single file.
+    #[schemars(extend("x-faucet-resource" = "key"))]
     pub path: String,
     /// Optional filename glob (`*` / `?`) applied to the basenames of files in
     /// a directory listing. Ignored when `path` points at a single file.
@@ -147,6 +148,13 @@ pub struct SftpSourceConfig {
     /// Default 2 GiB.
     #[serde(default = "default_max_object_bytes")]
     pub max_object_bytes: u64,
+    /// Most bytes one object may decode to in memory where a format can
+    /// expand past its input: an Avro file's records (per batch where the file
+    /// streams), an Excel workbook's parts and shared strings. A file past it
+    /// fails with an error instead of exhausting memory. Default 64 ×
+    /// `max_object_bytes`, at most 16 GiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_decoded_bytes: Option<u64>,
     /// Entries one directory listing may scan (default 1,000,000). Every
     /// entry the server sends counts, whether or not it matches `glob`; a
     /// directory with more fails the run with an error naming this field.
@@ -198,9 +206,22 @@ impl SftpSourceConfig {
             orc: faucet_core::OrcOptions::default(),
             parquet: faucet_core::ParquetReadOptions::default(),
             max_object_bytes: default_max_object_bytes(),
+            max_decoded_bytes: None,
             max_listed_entries: default_max_listed_entries(),
             list_timeout_secs: default_list_timeout_secs(),
         }
+    }
+
+    /// `max_decoded_bytes`, or its default.
+    #[cfg_attr(
+        not(any(feature = "file-format-avro", feature = "file-format-excel")),
+        allow(dead_code)
+    )]
+    pub(crate) fn decoded_bytes_limit(&self) -> u64 {
+        faucet_core::file_format::budget::effective_max_decoded_bytes(
+            self.max_decoded_bytes,
+            self.max_object_bytes,
+        )
     }
 
     /// The per-format option blocks in the shape

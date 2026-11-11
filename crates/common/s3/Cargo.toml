@@ -19,6 +19,8 @@ tokio = { workspace = true, features = ["fs", "io-util", "sync", "time"] }
 futures.workspace = true
 aws-sdk-s3 = { workspace = true }
 aws-config = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+schemars.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
@@ -35,6 +37,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 constructible_struct_adds_field = "allow"
 constructible_struct_adds_private_field = "allow"
 enum_struct_variant_field_added = "allow"
+function_marked_deprecated = "allow"
 
 [lints]
 workspace = true

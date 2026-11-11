@@ -68,7 +68,11 @@ fn args_on(port: u16, token: Option<&str>) -> ServeArgs {
         connect_providers: None,
         allow_subprocess_connectors: false,
         grafana_url: None,
-        references: Default::default(),
+        // The webhook runs below listen on ephemeral ports.
+        references: faucet_cli::cli::ReferenceArgs {
+            allow_listen: vec!["127.0.0.1:1024-65535".into()],
+            ..Default::default()
+        },
         pools: Default::default(),
     }
 }

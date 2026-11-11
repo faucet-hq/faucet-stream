@@ -216,16 +216,16 @@ impl DataApiClient {
         }))
     }
 
-    async fn client(&self) -> &aws_sdk_redshiftdata::Client {
+    async fn client(&self) -> Result<&aws_sdk_redshiftdata::Client, FaucetError> {
         self.client
-            .get_or_init(|| async {
+            .get_or_try_init(|| async {
                 let sdk =
-                    crate::aws::sdk_config(self.region.as_deref(), &self.aws_credentials).await;
+                    crate::aws::sdk_config(self.region.as_deref(), &self.aws_credentials).await?;
                 let mut b = aws_sdk_redshiftdata::config::Builder::from(&sdk);
                 if let Some(e) = &self.endpoint_url {
                     b = b.endpoint_url(e);
                 }
-                aws_sdk_redshiftdata::Client::from_conf(b.build())
+                Ok(aws_sdk_redshiftdata::Client::from_conf(b.build()))
             })
             .await
     }
@@ -248,7 +248,7 @@ impl DataApiClient {
         effect: Effect,
         statement: &Statement,
     ) -> Result<Executed, FaucetError> {
-        let client = self.client().await;
+        let client = self.client().await?;
         let mut parameters = Vec::with_capacity(statement.parameters.len());
         for (name, value) in &statement.parameters {
             parameters.push(
@@ -380,7 +380,7 @@ impl DataApiClient {
         id: &str,
         next_token: Option<&str>,
     ) -> Result<ResultPage, FaucetError> {
-        let client = self.client().await;
+        let client = self.client().await?;
         let out = calls
             .call("fetch", || async {
                 client

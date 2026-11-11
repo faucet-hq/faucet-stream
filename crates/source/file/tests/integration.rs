@@ -594,6 +594,36 @@ async fn a_whole_file_past_max_object_bytes_fails_instead_of_exhausting_memory()
     assert!(FileSource::new(cfg).is_err());
 }
 
+/// Avro (streamed, per batch) and Excel (whole file) stop at
+/// `max_decoded_bytes`, and read with room to spare.
+#[tokio::test]
+async fn files_that_decode_past_max_decoded_bytes_fail() {
+    let dir = tempfile::tempdir().unwrap();
+    let rows = vec![
+        json!({"id": 1, "name": "ada"}),
+        json!({"id": 2, "name": "bo"}),
+    ];
+    for (name, format) in [("a.avro", FileFormat::Avro), ("a.xlsx", FileFormat::Xlsx)] {
+        let body = encode(&rows, format, &FormatOptions::default()).unwrap();
+        let path = write(dir.path(), name, &body);
+        let mut cfg = FileSourceConfig::new(path);
+        cfg.max_decoded_bytes = Some(64);
+        let err = read_all(&FileSource::new(cfg.clone()).unwrap())
+            .await
+            .unwrap_err();
+        assert!(err.contains("max_decoded_bytes"), "{name}: {err}");
+        cfg.max_decoded_bytes = None;
+        assert_eq!(
+            read_all(&FileSource::new(cfg).unwrap())
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "{name}"
+        );
+    }
+}
+
 /// A streamed JSON Lines or CSV file is read without a whole-file cap, but one
 /// record is bounded by `max_object_bytes`: a file with no record delimiter
 /// fails instead of being buffered whole, and a large file of short records

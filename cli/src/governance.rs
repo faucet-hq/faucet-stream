@@ -163,7 +163,19 @@ pub(crate) async fn governance_for(req: GovernanceRequest<'_>) -> CliResult<Gove
         } else {
             crate::executor::build_dlq_config(dlq).await?
         };
-        g = g.with_dlq(dlq_governance(node, dlq, config)?);
+        #[allow(unused_mut)]
+        let mut d = dlq_governance(node, dlq, config)?;
+        #[cfg(feature = "masking")]
+        if let Some(spec) = &node.masking
+            && let Some(p) = crate::dlq_replay::proof::signer(
+                spec,
+                &[node.sink_ref.as_str(), node.sink.kind.as_str()],
+                opts.state_scope.namespace.as_deref(),
+            )
+        {
+            d = d.with_masking_proof(Arc::new(p));
+        }
+        g = g.with_dlq(d);
     }
     let mut profiler = None;
     if let Some(spec) = &node.profiling {

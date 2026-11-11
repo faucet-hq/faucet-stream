@@ -120,7 +120,32 @@ pub struct SpannerConnection {
     pub emulator_host: Option<String>,
 }
 
+/// The config fields that make a Spanner client built from `config`
+/// authenticate with the identity of the host it runs on: `auth` when it
+/// selects `application_default` (also when absent) and no `emulator_host`
+/// is set.
+pub fn host_identity(config: &faucet_core::Value) -> Vec<String> {
+    use faucet_core::capabilities::config::{non_empty_str_at, tag_at};
+    let adc = tag_at(config, "/auth").unwrap_or("application_default") == "application_default";
+    if adc && !non_empty_str_at(config, "/emulator_host") {
+        vec!["auth".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
 impl SpannerConnection {
+    /// Refuse Application Default Credentials outside an emulator where the
+    /// task may not use the host's identity.
+    fn check_host_identity(&self) -> Result<(), FaucetError> {
+        let emulated = self.emulator_host.is_some()
+            || std::env::var_os("SPANNER_EMULATOR_HOST").is_some_and(|v| !v.is_empty());
+        if matches!(self.auth, SpannerCredentials::ApplicationDefault) && !emulated {
+            faucet_core::resolve::require_host_credentials("spanner", "auth")?;
+        }
+        Ok(())
+    }
+
     /// Fully-qualified database path:
     /// `projects/{project}/instances/{instance}/databases/{database}`.
     pub fn database_path(&self) -> String {
@@ -155,6 +180,7 @@ impl SpannerConnection {
     /// unset, the `SPANNER_EMULATOR_HOST` env var via the client default).
     pub async fn connect(&self) -> Result<Client, FaucetError> {
         self.validate()?;
+        self.check_host_identity()?;
         let mut config = ClientConfig::default();
         config.channel_config.num_channels = self.max_sessions.div_ceil(SESSIONS_PER_CHANNEL);
         config.session_config.min_opened = 1;
@@ -176,6 +202,7 @@ impl SpannerConnection {
     /// as [`connect`](Self::connect).
     pub async fn connect_admin(&self) -> Result<AdminClient, FaucetError> {
         self.validate()?;
+        self.check_host_identity()?;
         let mut config = AdminClientConfig::default();
         if let Some(host) = &self.emulator_host {
             config.environment = Environment::Emulator(host.clone());
@@ -221,12 +248,18 @@ impl SpannerConnection {
 }
 
 async fn credentials_from_file(path: &str) -> Result<CredentialsFile, FaucetError> {
+    faucet_core::resolve::check_google_credentials_file(
+        "spanner",
+        "auth",
+        std::path::Path::new(path),
+    )?;
     CredentialsFile::new_from_file(path.to_string())
         .await
         .map_err(|e| FaucetError::Auth(format!("spanner key file {path}: {e}")))
 }
 
 async fn credentials_from_str(json: &str) -> Result<CredentialsFile, FaucetError> {
+    faucet_core::resolve::check_google_credentials("spanner", "auth", json)?;
     CredentialsFile::new_from_str(json)
         .await
         .map_err(|e| FaucetError::Auth(format!("spanner inline key: {e}")))
@@ -243,6 +276,80 @@ pub fn quote_ident_spanner(ident: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn host_identity_follows_the_selected_credentials() {
+        assert_eq!(host_identity(&json!({})), vec!["auth"]);
+        assert!(host_identity(&json!({"emulator_host": "localhost:9010"})).is_empty());
+        for t in ["service_account_key_path", "service_account_key"] {
+            assert!(
+                host_identity(&json!({"auth": {"type": t}})).is_empty(),
+                "{t}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_runs_take_only_service_account_keys() {
+        if std::env::var_os("SPANNER_EMULATOR_HOST").is_some() {
+            return;
+        }
+        let conn: SpannerConnection = serde_json::from_value(json!({
+            "project_id": "p", "instance": "i", "database": "d",
+            "auth": {"type": "service_account_key", "config": {
+                "json": "{\"type\": \"external_account\", \"token_url\": \"http://127.0.0.1:1/t\"}"
+            }}
+        }))
+        .unwrap();
+        let caller = std::sync::Arc::new(
+            faucet_core::resolve::ReferencePolicy::deny_all()
+                .with_path_roots(["/srv/data"])
+                .any_url_scheme()
+                .any_url_host(),
+        );
+        faucet_core::http::with_reference_policy(caller, async {
+            for err in [
+                conn.connect().await.err().expect("refused").to_string(),
+                conn.connect_admin()
+                    .await
+                    .err()
+                    .expect("refused")
+                    .to_string(),
+            ] {
+                assert!(err.contains("spanner: `auth`"), "{err}");
+                assert!(err.contains("external_account"), "{err}");
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn ambient_clients_are_refused_inside_a_caller_run() {
+        if std::env::var_os("SPANNER_EMULATOR_HOST").is_some() {
+            return;
+        }
+        let conn: SpannerConnection = serde_json::from_value(json!({
+            "project_id": "p", "instance": "i", "database": "d"
+        }))
+        .unwrap();
+        faucet_core::resolve::with_host_credentials(false, async {
+            let err = conn.connect().await.err().expect("refused").to_string();
+            assert!(err.contains("spanner: `auth`"), "{err}");
+            let err = conn
+                .connect_admin()
+                .await
+                .err()
+                .expect("refused")
+                .to_string();
+            assert!(err.contains("spanner: `auth`"), "{err}");
+            let emulated = SpannerConnection {
+                emulator_host: Some("127.0.0.1:1".into()),
+                ..conn.clone()
+            };
+            assert!(emulated.check_host_identity().is_ok());
+        })
+        .await;
+    }
 
     #[test]
     fn credentials_serde_shape_is_adjacently_tagged() {

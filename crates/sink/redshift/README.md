@@ -197,3 +197,14 @@ text cast to that type (`$n::numeric(38,9)`), so an exact decimal string from a
 source (`"12345678901234567890.123456789"`) and a non-integer JSON number both
 land with every digit — the server parses them, never a double. See
 [value fidelity](https://faucet-hq.github.io/faucet-stream/reference/value-fidelity.html).
+
+## Caller configs under `faucet serve`
+
+A config submitted to `faucet serve` by a caller may not authenticate with the server's own identity unless the server runs with `--allow-host-credentials` (never for a tenant). For this connector that means:
+
+- For `iam` and `redshift_data_api`, `aws_credentials` of type `default`, `profile`, `assume_role` or `web_identity` (or none) uses the server's identity: name keys with `access_key` instead.
+- A missing `region` (on those methods) counts too when the server's environment names none (`AWS_REGION` / `AWS_DEFAULT_REGION`), since the SDK would ask the instance metadata service.
+- Emulators such as LocalStack still need some `access_key` pair and a `region`.
+
+The same check runs when the client is built, so a refused config fails with a config error naming the field.
+- The `copy` strategy's staging client uses `copy.credentials` (same variants as the S3 connector's, plus `anonymous`) and `copy.region`.

@@ -32,7 +32,15 @@ impl MssqlDriver {
         // Uploads are bounded by the run's deadline and cancel, not the
         // per-statement timeout: a large page takes as long as it takes.
         let ctx = self.calls.get().without_timeout();
-        let uploader = StageUploader::from_location(loc)?.with_call_context(ctx.clone());
+        let store = faucet_core::staging::object_store_for(
+            loc.scheme,
+            &loc.bucket,
+            loc.account
+                .as_deref()
+                .or(staging.storage_account.as_deref()),
+            &staging.spec.credentials,
+        )?;
+        let uploader = StageUploader::new(store, loc).with_call_context(ctx.clone());
         let seq = self.stage_seq.fetch_add(1, Ordering::Relaxed);
         let (staged, sql) = crate::staged::build_staged_copy_sql(
             &uploader,

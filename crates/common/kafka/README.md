@@ -157,6 +157,18 @@ Kerberos (`sasl.mechanism: GSSAPI` through the connectors' `extra_client_config`
 works there; Cyrus SASL does not build on Windows, so GSSAPI is unavailable in
 Windows builds.
 
+### Kerberos and the host's identity
+
+`check_client_config(&ClientConfig)` checks a client's final options (after
+`auth` and `extra_client_config` are applied) before it is created. GSSAPI,
+set explicitly or as librdkafka's default mechanism for a `SASL_*`
+`security.protocol`, authenticates with the host's Kerberos identity and is
+refused where the task may not use it. `sasl.kerberos.principal` and
+`sasl.kerberos.service.name` must hold only letters, digits and `._/@:-`, and
+`sasl.kerberos.keytab` no quote, `$`, backtick, backslash or control
+character, whatever the task. `host_identity(&Value)` gives the same answer for
+a config before it is built.
+
 ---
 
 ## Troubleshooting / FAQ

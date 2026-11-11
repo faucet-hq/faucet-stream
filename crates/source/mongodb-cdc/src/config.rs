@@ -125,6 +125,7 @@ pub struct MongoCdcSourceConfig {
     /// high-throughput stream. Mirrors the same field on the sibling
     /// `postgres-cdc` / `mysql-cdc` sources.
     #[serde(default = "faucet_core::replication::default_max_staged_records")]
+    #[schemars(extend("x-faucet-caller-max" = 1_000_000))]
     pub max_staged_records: Option<usize>,
 }
 

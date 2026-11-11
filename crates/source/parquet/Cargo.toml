@@ -33,6 +33,8 @@ object_store = { workspace = true, features = ["aws"] }
 glob.workspace = true
 url.workspace = true
 bytes.workspace = true
+faucet-common-s3.workspace = true
+aws-sdk-s3.workspace = true
 
 [dev-dependencies]
 arrow-json.workspace = true

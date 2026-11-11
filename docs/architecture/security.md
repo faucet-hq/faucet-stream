@@ -175,8 +175,16 @@ connector's `tls` / transport option as something to configure, not to inherit.
   certificate or host-key verification (fields annotated
   `x-faucet-unverified`, `verify_ca=false` in a MySQL URL, `#insecure` on a
   `rediss://` URL) need `--allow-unverified-tls`, and never apply to a tenant;
-  settings that authenticate with the server's own credentials (Oracle
-  `external_auth`, marked `x-faucet-host-credentials`) are refused. Under
+  settings and connectors that authenticate with the server's own identity
+  (Oracle `external_auth`, marked `x-faucet-host-credentials`, and every
+  connector whose descriptor reports it through `with_host_identity`) need
+  `--allow-host-credentials`, and never apply to a tenant; a listener a
+  caller's config opens (fields annotated `x-faucet-resource: listen`, a
+  `webhook` source's `listen_addr`) must sit inside an `--allow-listen` range
+  (default loopback, ports 29100–29199), off loopback with a shared secret,
+  and never for a tenant; a connector that
+  learns it at run time checks `require_host_credentials` when it builds its
+  client, and a serve task with no principal scope is refused. Under
   `faucet serve`, database connectors never fill a missing password, user or
   certificate from the server's environment (`PGPASSWORD`, `~/.pgpass`, …). The defaults
   deny environment and secret-manager reads. A substituted value
@@ -187,6 +195,18 @@ connector's `tls` / transport option as something to configure, not to inherit.
   created after it started, its input files, run-history database and
   default-config state directory) are refused as data whatever the path roots
   allow, and its working directory can't be listed as a whole.
+- **Servers a client learns from the servers it reaches.** Unless the
+  operator lists hosts with `--allow-url-host` (and always for a tenant), a
+  caller's config is kept on the servers it names: a MongoDB URI needs
+  `directConnection=true` or `loadBalanced=true`, and a NATS client is built
+  with `ignore_discovered_servers` (schema switch `x-faucet-pin-servers`, forced
+  on). Clients that follow servers their brokers or listeners advertise and
+  have no setting to stop it (Kafka sources, sinks, DLQ sinks and the lineage
+  transport; Oracle sources, sinks and `oracle-cdc`, marked
+  `x-faucet-follows-servers`) are refused for such a caller. With
+  `--allow-url-host` set they run, and the addresses their servers advertise
+  are not checked against the list: like a host name re-pointed after the
+  check, this is a limit of what the server can see.
   Operator-written configs
   (templates, the triggers file, `--default-config`) are not checked. See
   [Reference policy](../book/src/reference/http-api.md#reference-policy).

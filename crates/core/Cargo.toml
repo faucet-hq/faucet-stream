@@ -122,7 +122,7 @@ arrow = ["dep:arrow", "dep:arrow-json", "arrow/chrono-tz"]
 # xlsx writer. `file-formats` is the aggregate.
 file-format-csv = ["dep:csv", "dep:csv-async"]
 file-format-xml = ["dep:quick-xml"]
-file-format-excel = ["dep:calamine", "dep:rust_xlsxwriter"]
+file-format-excel = ["dep:calamine", "dep:rust_xlsxwriter", "dep:zip", "dep:quick-xml"]
 # Apache Avro Object Container Files (#719). Read + write through the record
 # helper; with `arrow` also decoded straight to `RecordBatch`es.
 file-format-avro = ["dep:apache-avro"]
@@ -194,6 +194,7 @@ csv = { workspace = true, optional = true }
 csv-async = { workspace = true, optional = true }
 quick-xml = { workspace = true, optional = true }
 calamine = { workspace = true, optional = true }
+zip = { workspace = true, optional = true }
 rust_xlsxwriter = { workspace = true, optional = true }
 arrow-json = { workspace = true, optional = true }
 apache-avro = { workspace = true, optional = true, features = ["snappy", "zstandard"] }
@@ -202,6 +203,11 @@ bytes = { workspace = true, optional = true }
 # Default features only: the workspace entry adds `async` + `object_store`,
 # which core does not need.
 parquet = { version = "58", optional = true, features = ["async"] }
+
+[target.'cfg(unix)'.dependencies]
+# Opening files through directories held open, without following links.
+rustix = { version = "1", features = ["fs"] }
+libc = "0.2"
 
 [dev-dependencies]
 serde_json.workspace = true

@@ -180,6 +180,7 @@ pub fn build_submit_request(
         server_file: true,
         sealed_params: None,
         caller_fields: Default::default(),
+        server_key: true,
     }
 }
 
@@ -405,8 +406,9 @@ async fn fire_one(
                 count_error(state, compiled, kind);
                 return FireOutcome::Refused(e);
             }
-            let text = sub.text;
-            let mut req = build_submit_request(compiled, event, text, fired_at);
+            let mut req = build_submit_request(compiled, event, sub.text, fired_at);
+            // Sender-placed values are held to the caller reference policy.
+            req.caller_fields = sub.caller_fields;
             req.idempotency_key = req.idempotency_key.map(idem);
             // A trigger declared in the server's triggers file is a standing
             // approval; its config file is the server's own.
@@ -545,10 +547,14 @@ pub fn template_body_tracked(
     }
     let mut params = std::collections::BTreeMap::new();
     let mut event_values = Vec::new();
+    let mut sender_params = std::collections::BTreeSet::new();
     for (k, v) in &tpl.params {
         let v = match v {
             serde_json::Value::String(s) => {
                 let sub = context::substitute_param(s, k, event, compiled.name(), fired_at)?;
+                if !sub.event_values.is_empty() {
+                    sender_params.insert(k.clone());
+                }
                 event_values.extend(sub.event_values);
                 serde_json::Value::String(sub.text)
             }
@@ -586,6 +592,9 @@ pub fn template_body_tracked(
         pool: compiled.spec.run.pool.clone(),
         standing_approval: true,
         operator_params: true,
+        server_key: true,
+        pool_by_operator: true,
+        sender_params,
         allow_untested: tpl.allow_untested,
         ..Default::default()
     };
@@ -877,6 +886,136 @@ mod tests {
             },
             webhook_path: Some("/v1/triggers/hook".into()),
         }
+    }
+
+    /// A config trigger whose `brokers` (and `topics`) come from `brokers`.
+    #[cfg(all(feature = "source-kafka", feature = "sink-jsonl"))]
+    fn kafka_trigger(brokers: &str, params: Option<serde_json::Value>) -> CompiledTrigger {
+        let mut doc = serde_json::json!({
+            "version": 1,
+            "pipeline": {
+                "source": {"type": "kafka", "config": {
+                    "brokers": brokers,
+                    "topics": ["${trigger.header.x-topic}"],
+                    "group_id": "g",
+                    "max_messages": 1
+                }},
+                "sink": {"type": "jsonl", "config": {"path": "/tmp/faucet-trigger-test.jsonl"}}
+            }
+        });
+        if let Some(p) = params {
+            doc["params"] = p;
+        }
+        let mut c = compiled_webhook();
+        c.spec.config = Some(PipelineRef::Inline(doc));
+        c
+    }
+
+    #[cfg(all(feature = "source-kafka", feature = "sink-jsonl"))]
+    fn hook_with(headers: &[(&str, &str)]) -> TriggerEvent {
+        TriggerEvent::Webhook {
+            method: "POST".into(),
+            body: String::new(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            query: Default::default(),
+            idem: uuid::Uuid::new_v4().to_string(),
+        }
+    }
+
+    #[cfg(all(feature = "source-kafka", feature = "sink-jsonl"))]
+    fn refusal(outcome: FireOutcome) -> String {
+        match outcome {
+            FireOutcome::Failed(m) | FireOutcome::Refused(m) => m,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[cfg(all(feature = "source-kafka", feature = "sink-jsonl"))]
+    #[tokio::test]
+    async fn sender_values_in_connection_fields_follow_the_field_grammar() {
+        let state = crate::serve::test_support::test_state();
+        let c = kafka_trigger("${trigger.header.x-brokers}", None);
+        let event = hook_with(&[("x-brokers", "169.254.169.254:9092"), ("x-topic", "t")]);
+        let m = refusal(fire(&state, &c, event, "f").await);
+        assert!(
+            m.starts_with(crate::serve::load::TRIGGER_VALUE_REFUSAL),
+            "{m}"
+        );
+        assert!(m.contains("${trigger.header.x-brokers}"), "{m}");
+        assert!(m.contains("pipeline.source.config.brokers"), "{m}");
+        let audit = state
+            .history()
+            .list_audit(&Default::default())
+            .await
+            .unwrap();
+        assert!(
+            audit
+                .iter()
+                .any(|a| a.action == "policy.denied"
+                    && a.target.as_deref() == Some("trigger values")),
+            "{audit:?}"
+        );
+    }
+
+    #[cfg(all(feature = "source-kafka", feature = "sink-jsonl"))]
+    #[tokio::test]
+    async fn sender_values_spliced_into_operator_text_are_checked_whole() {
+        let state = crate::serve::test_support::test_state();
+        let c = kafka_trigger("ok.example.com:9092,${trigger.header.x-brokers}", None);
+        let event = hook_with(&[("x-brokers", "169.254.169.254:9092"), ("x-topic", "t")]);
+        let m = refusal(fire(&state, &c, event, "f").await);
+        assert!(m.contains("169.254.169.254:9092"), "{m}");
+        assert!(!m.contains("ok.example.com"), "{m}");
+    }
+
+    #[cfg(all(feature = "source-kafka", feature = "sink-jsonl"))]
+    #[tokio::test]
+    async fn operator_text_without_sender_values_still_loads_trusted() {
+        let state = crate::serve::test_support::test_state();
+        let c = kafka_trigger("10.0.0.5:9092", None);
+        let event = hook_with(&[("x-topic", "t")]);
+        let outcome = fire(&state, &c, event, "f").await;
+        assert!(matches!(outcome, FireOutcome::Enqueued(_)), "{outcome:?}");
+    }
+
+    #[cfg(all(feature = "source-kafka", feature = "sink-jsonl"))]
+    #[tokio::test]
+    async fn allowed_hosts_from_senders_still_run() {
+        let mut config = crate::serve::test_support::test_config();
+        config.references =
+            crate::serve::references::ServeReferencePolicy::from_args(&crate::cli::ReferenceArgs {
+                allow_url_host: vec!["ok.example.com".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        let state = crate::serve::test_support::state_from(&config);
+        let c = kafka_trigger("${trigger.header.x-brokers}", None);
+        let ok = hook_with(&[("x-brokers", "ok.example.com:9092"), ("x-topic", "t")]);
+        let outcome = fire(&state, &c, ok, "f").await;
+        assert!(matches!(outcome, FireOutcome::Enqueued(_)), "{outcome:?}");
+        let other = hook_with(&[("x-brokers", "other.example.com:9092"), ("x-topic", "t")]);
+        let m = refusal(fire(&state, &c, other, "f").await);
+        assert!(m.contains("other.example.com"), "{m}");
+    }
+
+    #[cfg(all(feature = "source-kafka", feature = "sink-jsonl"))]
+    #[tokio::test]
+    async fn sender_values_passed_through_params_are_checked_where_used() {
+        let state = crate::serve::test_support::test_state();
+        let c = kafka_trigger(
+            "${param.brokers}",
+            Some(serde_json::json!({"brokers": {"default": "${trigger.header.x-brokers}"}})),
+        );
+        let event = hook_with(&[("x-brokers", "169.254.169.254:9092"), ("x-topic", "t")]);
+        let m = refusal(fire(&state, &c, event, "f").await);
+        assert!(
+            m.starts_with(crate::serve::load::TRIGGER_VALUE_REFUSAL),
+            "{m}"
+        );
+        assert!(m.contains("pipeline.source.config.brokers"), "{m}");
     }
 
     #[test]

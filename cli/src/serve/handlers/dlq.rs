@@ -448,6 +448,7 @@ mod tests {
             dry_run: false,
             failed_dlq: "/dlq.failed".into(),
             skipped_other_rows: 0,
+            skipped_unproven: 0,
             unsealed_discards: 0,
         });
         running.finish(&outcome, false).await;

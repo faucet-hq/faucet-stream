@@ -231,6 +231,17 @@
         "null"
       ]
     },
+    "pool_override": {
+      "description": "Whether a run of this config as a registered template may ask for a\npool other than `pool:` (#957): `false` (the default) refuses it,\n`true` allows any pool, a list allows those pools. Applies to template\nruns a caller or a tenant starts; the server's triggers, schedules and\nfan-outs choose freely.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PoolOverride"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "shard": {
       "description": "Optional source-shard distribution for clustered (Mode B) execution.\nOnly consumed by `faucet serve --cluster`: a run whose source\n[is shardable](faucet_core::Source::is_shardable) is split into\n`shard.count` shards processed concurrently across cluster workers.\nIgnored by `faucet run` and by a non-cluster `serve`, so it is fully\nbackward compatible.",
       "anyOf": [
@@ -4587,6 +4598,22 @@
       },
       "additionalProperties": false
     },
+    "PoolOverride": {
+      "description": "Which pools a template run may ask for instead of the template's own\n(`pool_override:`).",
+      "anyOf": [
+        {
+          "description": "`true`: any pool; `false`: none.",
+          "type": "boolean"
+        },
+        {
+          "description": "Only these pools.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      ]
+    },
     "ShardingSpec": {
       "description": "Source-shard distribution settings for clustered (Mode B) execution.",
       "type": "object",
@@ -5078,7 +5105,8 @@
               "type": "object",
               "properties": {
                 "url": {
-                  "type": "string"
+                  "type": "string",
+                  "x-faucet-resource": "url"
                 },
                 "timeout_secs": {
                   "type": "integer",
@@ -5120,7 +5148,8 @@
               "type": "object",
               "properties": {
                 "path": {
-                  "type": "string"
+                  "type": "string",
+                  "x-faucet-resource": "path"
                 }
               },
               "required": [
@@ -5145,7 +5174,9 @@
               "type": "object",
               "properties": {
                 "brokers": {
-                  "type": "string"
+                  "type": "string",
+                  "x-faucet-resource": "url",
+                  "x-faucet-url-syntax": "url-list"
                 },
                 "topic": {
                   "type": "string"
@@ -5160,7 +5191,8 @@
           "required": [
             "type",
             "config"
-          ]
+          ],
+          "x-faucet-follows-servers": true
         }
       ]
     },
@@ -12990,6 +13022,13 @@
               "default": null,
               "x-faucet-resource": "url"
             },
+            "credentials": {
+              "description": "How to authenticate (default: the AWS default chain, i.e. the\nidentity of the host faucet runs on). `access_key` names keys in the\nconfig; `anonymous` sends unsigned requests (public buckets).",
+              "$ref": "#/$defs/source_parquet__S3Credentials",
+              "default": {
+                "type": "default"
+              }
+            },
             "type": {
               "type": "string",
               "const": "s3"
@@ -13798,7 +13837,10 @@
             "boolean",
             "string"
           ],
-          "default": true
+          "default": true,
+          "x-faucet-unverified": [
+            false
+          ]
         },
         "server_cert_dn": {
           "description": "Expected server certificate DN, when it differs from the host name.",
@@ -13877,7 +13919,10 @@
             "boolean",
             "string"
           ],
-          "default": true
+          "default": true,
+          "x-faucet-unverified": [
+            false
+          ]
         },
         "server_cert_dn": {
           "description": "Expected server certificate DN, when it differs from the host name.",
@@ -15192,11 +15237,28 @@
           "x-faucet-resource": "url"
         },
         "storage_options": {
-          "description": "Extra `object_store` config keys for the upload client (credentials,\nregion, endpoint, …), applied verbatim — e.g. `aws_access_key_id`,\n`aws_secret_access_key`, `aws_region`, `google_service_account_key`.\nPrefer `${secret:…}` / `${env:…}` interpolation for secret values.",
+          "description": "Extra `object_store` config keys for the upload client (credentials,\nregion, endpoint, …), applied verbatim — e.g. `aws_access_key_id`,\n`aws_secret_access_key`, `aws_region`, `google_service_account_key`.\nPrefer `${secret:…}` / `${env:…}` interpolation for secret values.\n\nKeys that name an endpoint (`*endpoint*`, `*_url`, `*_uri`, a proxy)\nor a local file (`*_file`, `*_path`, a service-account or\napplication-credentials file) are checked like the typed fields by a\nhost that confines configs (`faucet serve`).",
           "type": "object",
           "additionalProperties": {
             "type": "string"
+          },
+          "x-faucet-resource-keys": {
+            "*endpoint*": "url",
+            "*_url": "url",
+            "*_uri": "url",
+            "*_host": "url",
+            "*proxy": "url",
+            "*authority_host": "url",
+            "*_file": "path",
+            "*_path": "path",
+            "*application_credentials": "path",
+            "google_service_account": "path",
+            "service_account": "path"
           }
+        },
+        "credentials": {
+          "description": "How the upload client authenticates (default: the store's default\nchain, i.e. the identity of the host faucet runs on, unless\n`storage_options` names credentials). Keys in `storage_options` win.",
+          "$ref": "#/$defs/sink_snowflake__StagingCredentials"
         },
         "match_by_column_name": {
           "description": "`MATCH_BY_COLUMN_NAME` COPY option — defaults to `CASE_INSENSITIVE` so\nParquet columns map to table columns by name. Set to `NONE` for\npositional loading (rarely wanted for Parquet).",
@@ -15534,6 +15596,10 @@
             "string",
             "null"
           ]
+        },
+        "credentials": {
+          "description": "How faucet authenticates to the stage when it writes the files\n(default: the store's default chain, i.e. the identity of the host\nfaucet runs on). The warehouse reads them with its own grant.",
+          "$ref": "#/$defs/sink_mssql__StagingCredentials"
         },
         "storage_account": {
           "description": "Azure storage account (the `az://` URI does not carry it) used to build\nthe `COPY INTO` HTTPS URL.",
@@ -18791,6 +18857,13 @@
               "default": null,
               "x-faucet-resource": "url"
             },
+            "credentials": {
+              "description": "How to authenticate (default: the AWS default chain, i.e. the\nidentity of the host faucet runs on). `access_key` names keys in the\nconfig; `anonymous` sends unsigned requests.",
+              "$ref": "#/$defs/sink_parquet__S3Credentials",
+              "default": {
+                "type": "default"
+              }
+            },
             "allow_http": {
               "description": "Accepted for compatibility: the S3 client takes an `http://`\n`endpoint_url` (e.g. for LocalStack) without it.",
               "type": [
@@ -20400,6 +20473,10 @@
             "null"
           ],
           "x-faucet-resource": "url"
+        },
+        "credentials": {
+          "description": "How the S3 client that stages the files authenticates (default: the\nAWS default chain, i.e. the identity of the host faucet runs on).\n`access_key` names keys in the config.",
+          "$ref": "#/$defs/sink_redshift__S3Credentials"
         }
       },
       "additionalProperties": true
@@ -20576,6 +20653,10 @@
             "string",
             "null"
           ]
+        },
+        "credentials": {
+          "description": "How faucet authenticates to the stage when it writes the files\n(default: the store's default chain, i.e. the identity of the host\nfaucet runs on). The warehouse reads them with its own grant.",
+          "$ref": "#/$defs/sink_clickhouse__StagingCredentials"
         },
         "region": {
           "description": "AWS region for the derived `s3()` URL (virtual-hosted). Ignored for `gs://`.",
@@ -21637,6 +21718,10 @@
             "string",
             "null"
           ]
+        },
+        "credentials": {
+          "description": "How faucet authenticates to a cloud location when it uploads the\nfiles (default: the store's default chain, i.e. the identity of the\nhost faucet runs on). Must stay unset for a volume, which uploads with\nthe sink's own credentials.",
+          "$ref": "#/$defs/sink_databricks__StagingCredentials"
         }
       },
       "additionalProperties": true
@@ -21760,7 +21845,10 @@
             "boolean",
             "string"
           ],
-          "default": true
+          "default": true,
+          "x-faucet-unverified": [
+            false
+          ]
         },
         "server_cert_dn": {
           "description": "Expected server certificate DN, when it differs from the host name.",
@@ -22449,7 +22537,8 @@
                     },
                     "query": {
                       "description": "The GraphQL query string.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-code": true
                     },
                     "variables": {
                       "description": "Variables to pass with the query. Defaults to an empty object.",
@@ -23388,7 +23477,8 @@
                       ],
                       "format": "uint",
                       "minimum": 0,
-                      "default": 1000000
+                      "default": 1000000,
+                      "x-faucet-caller-max": 1000000
                     },
                     "max_buffered_events": {
                       "description": "Replication events read ahead while the pipeline is busy writing a\npage. Reading ahead keeps the replication client sending its status\nupdates, so a long sink write does not let the server's\n`wal_sender_timeout` (default 60 s) end the connection. Past this many\nbuffered events reading pauses until the pipeline catches up — keep a\npage write well under `wal_sender_timeout`, or raise it, if a page\nwrite can outlast that much change volume. Default 100 000.",
@@ -24273,6 +24363,14 @@
                         "null"
                       ]
                     },
+                    "ignore_discovered_servers": {
+                      "description": "Connect only to `servers`, ignoring the cluster members a server\nadvertises. Defaults to `false`.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "x-faucet-pin-servers": true
+                    },
                     "subject": {
                       "description": "Subject to subscribe to. Supports NATS wildcards (`*` for one token,\n`>` for the remaining tokens). In JetStream mode the durable consumer's\nown filter subject governs delivery and this field is informational.",
                       "type": "string"
@@ -24795,7 +24893,8 @@
                     },
                     "path": {
                       "description": "Remote path to read: a directory whose files are listed and streamed,\nor a single file.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "key"
                     },
                     "glob": {
                       "description": "Optional filename glob (`*` / `?`) applied to the basenames of files in\na directory listing. Ignored when `path` points at a single file.",
@@ -24881,6 +24980,16 @@
                       "format": "uint64",
                       "minimum": 0,
                       "default": 2147483648
+                    },
+                    "max_decoded_bytes": {
+                      "description": "Most bytes one object may decode to in memory where a format can\nexpand past its input: an Avro file's records (per batch where the file\nstreams), an Excel workbook's parts and shared strings. A file past it\nfails with an error instead of exhausting memory. Default 64 ×\n`max_object_bytes`, at most 16 GiB.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0
                     },
                     "max_listed_entries": {
                       "description": "Entries one directory listing may scan (default 1,000,000). Every\nentry the server sends counts, whether or not it matches `glob`; a\ndirectory with more fails the run with an error naming this field.\nMust be at least 1.",
@@ -25061,6 +25170,16 @@
                       "format": "uint64",
                       "minimum": 0,
                       "default": 2147483648
+                    },
+                    "max_decoded_bytes": {
+                      "description": "Most bytes one object may decode to in memory where a format can\nexpand past its input: an Avro file's records (per batch where the file\nstreams), an Excel workbook's parts and shared strings. A file past it\nfails with an error instead of exhausting memory. Default 64 ×\n`max_object_bytes`, at most 16 GiB.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0
                     },
                     "max_files": {
                       "description": "Read at most this many files (after sorting and filtering).",
@@ -25273,6 +25392,13 @@
                       "default": null,
                       "x-faucet-resource": "url"
                     },
+                    "credentials": {
+                      "description": "How to authenticate (default: the AWS default chain, i.e. the\nidentity of the host faucet runs on). `access_key` names keys in the\nconfig; `anonymous` sends unsigned requests (public buckets).",
+                      "$ref": "#/$defs/source_s3__S3Credentials",
+                      "default": {
+                        "type": "default"
+                      }
+                    },
                     "file_format": {
                       "description": "Format of the files to read. Defaults to `json_lines`.",
                       "$ref": "#/$defs/source_s3__S3FileFormat",
@@ -25334,6 +25460,16 @@
                       "format": "uint64",
                       "minimum": 0,
                       "default": 2147483648
+                    },
+                    "max_decoded_bytes": {
+                      "description": "Most bytes one object may decode to in memory where a format can\nexpand past its input: an Avro file's records (per batch where the file\nstreams), an Excel workbook's parts and shared strings. A file past it\nfails with an error instead of exhausting memory. Default 64 ×\n`max_object_bytes`, at most 16 GiB.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0
                     },
                     "compression": {
                       "description": "Compression codec applied to each downloaded object. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) —\nthe codec is resolved per-object-key, so a single source can read a\nmix of compressed and uncompressed objects. Requires the\ncrate-local `compression` feature.",
@@ -25674,7 +25810,8 @@
                       ],
                       "format": "uint",
                       "minimum": 0,
-                      "default": 1000000
+                      "default": 1000000,
+                      "x-faucet-caller-max": 1000000
                     }
                   }
                 },
@@ -25833,7 +25970,8 @@
                       ],
                       "format": "uint",
                       "minimum": 0,
-                      "default": 1000000
+                      "default": 1000000,
+                      "x-faucet-caller-max": 1000000
                     },
                     "batch_size": {
                       "description": "Advisory per-page record count. `0` = accumulate all txns into one page.",
@@ -25986,7 +26124,8 @@
                       ],
                       "format": "uint",
                       "minimum": 0,
-                      "default": 1000000
+                      "default": 1000000,
+                      "x-faucet-caller-max": 1000000
                     },
                     "batch_size": {
                       "description": "Advisory per-page record count. `0` accumulates every change into a\nsingle trailing page (snapshot/test convenience). Default\n[`DEFAULT_BATCH_SIZE`].",
@@ -26790,6 +26929,16 @@
                       "minimum": 0,
                       "default": 2147483648
                     },
+                    "max_decoded_bytes": {
+                      "description": "Most bytes one object may decode to in memory where a format can\nexpand past its input: an Avro file's records (per batch where the file\nstreams), an Excel workbook's parts and shared strings. A file past it\nfails with an error instead of exhausting memory. Default 64 ×\n`max_object_bytes`, at most 16 GiB.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0
+                    },
                     "compression": {
                       "description": "Compression codec applied to each downloaded object. Defaults to\n[`CompressionConfig::Auto`](faucet_core::CompressionConfig::Auto) — the\ncodec is resolved per-object-key, so a single source can read a mix of\ncompressed and uncompressed objects. Requires the crate-local\n`compression` feature.",
                       "$ref": "#/$defs/source_azure-blob__CompressionConfig",
@@ -27052,7 +27201,8 @@
                     "listen_addr": {
                       "description": "Address to bind the HTTP server to (default: `\"127.0.0.1:8080\"`).\n\n**Security:** the default binds to loopback only. Binding to\n`0.0.0.0` exposes the receiver to the whole network — only do so\nbehind a trusted gateway, and set `auth_token` to require a shared\nsecret on every request.",
                       "type": "string",
-                      "default": "127.0.0.1:8080"
+                      "default": "127.0.0.1:8080",
+                      "x-faucet-resource": "listen"
                     },
                     "path": {
                       "description": "Endpoint path for receiving webhooks (default: `\"/webhook\"`).",
@@ -27068,7 +27218,8 @@
                       ],
                       "format": "uint",
                       "minimum": 0,
-                      "default": null
+                      "default": null,
+                      "x-faucet-caller-max": 1000000
                     },
                     "timeout_secs": {
                       "description": "How long to listen before returning, in seconds (default: 30).",
@@ -27078,7 +27229,8 @@
                       ],
                       "format": "uint64",
                       "minimum": 0,
-                      "default": 30
+                      "default": 30,
+                      "x-faucet-caller-max": 3600
                     },
                     "max_body_bytes": {
                       "description": "Maximum accepted request body size in bytes (default: 1 MiB). Larger\nPOSTs are rejected with `413 Payload Too Large` so a single huge\nrequest can't exhaust memory.",
@@ -27098,7 +27250,8 @@
                       ],
                       "format": "uint",
                       "minimum": 0,
-                      "default": 268435456
+                      "default": 268435456,
+                      "x-faucet-caller-max": 1073741824
                     },
                     "auth_token": {
                       "description": "Optional shared secret. When set, every request must carry it in the\n`Authorization` header (either the raw token or `Bearer <token>`);\nrequests without it are rejected with `401 Unauthorized`. When `None`\n(default) the endpoint is unauthenticated.",
@@ -27314,7 +27467,8 @@
                         "string"
                       ],
                       "format": "uint",
-                      "minimum": 0
+                      "minimum": 0,
+                      "x-faucet-caller-max": 67108864
                     },
                     "batch_size": {
                       "description": "Records per emitted [`StreamPage`](faucet_core::StreamPage). Default\n[`DEFAULT_BATCH_SIZE`]. `0` drains the entire run window into a single\npage (same sentinel as the Kafka source).",
@@ -27948,7 +28102,7 @@
                       "default": "fail"
                     },
                     "extra_client_config": {
-                      "description": "Raw librdkafka client properties to pass through. Use with care —\nthese can override anything set by `auth` or the typed fields above.",
+                      "description": "Raw librdkafka client properties to pass through. Use with care —\nthese can override anything set by `auth` or the typed fields above.\n\nKeys that name a broker (`bootstrap.servers`, `metadata.broker.list`),\na URL (`*.url`) or a local file (`*.location`, `*.file`,\n`sasl.kerberos.keytab`) are checked like the typed fields by a host\nthat confines configs (`faucet serve`); keys that load or run a\nprogram (`plugin.library.paths`, `ssl.engine.location`,\n`ssl.providers`, `*.cmd`) are refused for configs it does not trust.",
                       "type": "object",
                       "additionalProperties": {
                         "type": "string"
@@ -27956,12 +28110,34 @@
                       "x-faucet-unverified": {
                         "enable.ssl.certificate.verification": [
                           "false",
-                          "0"
+                          "f",
+                          "0",
+                          "no",
+                          "n",
+                          "off"
                         ],
                         "ssl.endpoint.identification.algorithm": [
                           "none",
                           ""
                         ]
+                      },
+                      "x-faucet-resource-keys": {
+                        "bootstrap.servers": {
+                          "kind": "url",
+                          "syntax": "url-list"
+                        },
+                        "metadata.broker.list": {
+                          "kind": "url",
+                          "syntax": "url-list"
+                        },
+                        "*.url": "url",
+                        "*.location": "path",
+                        "*.file": "path",
+                        "sasl.kerberos.keytab": "path",
+                        "ssl.engine.location": "command",
+                        "ssl.providers": "command",
+                        "plugin.library.paths": "command",
+                        "*.cmd": "command"
                       }
                     },
                     "batch_size": {
@@ -27974,7 +28150,8 @@
                       "minimum": 0,
                       "default": 1000
                     }
-                  }
+                  },
+                  "x-faucet-follows-servers": true
                 },
                 true
               ]
@@ -29089,14 +29266,16 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-code": true
                     },
                     "key_condition_expression": {
                       "description": "`KeyConditionExpression`. Required for `query`, rejected otherwise.",
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-code": true
                     },
                     "expression_attribute_names": {
                       "description": "`ExpressionAttributeNames` (`#name` → attribute).",
@@ -29464,7 +29643,8 @@
                   },
                   "title": "OracleSourceConfig",
                   "description": "Configuration for [`OracleSource`](crate::OracleSource).",
-                  "type": "object"
+                  "type": "object",
+                  "x-faucet-follows-servers": true
                 },
                 true
               ]
@@ -29660,7 +29840,21 @@
                       ],
                       "format": "uint",
                       "minimum": 0,
-                      "default": 1000000
+                      "default": 1000000,
+                      "x-faucet-caller-max": 1000000
+                    },
+                    "max_staged_records_total": {
+                      "description": "Abort when all open transactions together buffer more than this many\nchanges, counting LOB pieces and folded updates. Unset or `null` =\nunbounded.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": null,
+                      "x-faucet-caller-max": 1000000,
+                      "x-faucet-caller-set": true
                     },
                     "batch_size": {
                       "description": "`0` aggregates committed transactions into pages of up to 100,000\nrecords, emitted at least every `idle_timeout`, each with its bookmark;\notherwise each committed transaction is its own page. Default\n[`DEFAULT_BATCH_SIZE`].",
@@ -29712,7 +29906,8 @@
                   },
                   "title": "OracleCdcSourceConfig",
                   "description": "Configuration for the Oracle LogMiner CDC source.",
-                  "type": "object"
+                  "type": "object",
+                  "x-faucet-follows-servers": true
                 },
                 true
               ]
@@ -29882,6 +30077,16 @@
                       "format": "uint64",
                       "minimum": 0,
                       "default": 2147483648
+                    },
+                    "max_decoded_bytes": {
+                      "description": "Most bytes one object may decode to in memory where a format can\nexpand past its input: an Avro file's records (per batch where the file\nstreams), an Excel workbook's parts and shared strings. A file past it\nfails with an error instead of exhausting memory. Default 64 ×\n`max_object_bytes`, at most 16 GiB.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0
                     },
                     "storage_host": {
                       "description": "Optional storage-host override (e.g. `http://localhost:4443` for\nfake-gcs-server). Production users should leave this unset.\n\nProcess-held credentials (`application_default`, a key file) are sent\nonly to a Google endpoint; use `auth: { type: anonymous }` elsewhere.",
@@ -31960,6 +32165,14 @@
                         "null"
                       ]
                     },
+                    "ignore_discovered_servers": {
+                      "description": "Connect only to `servers`, ignoring the cluster members a server\nadvertises. Defaults to `false`.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "x-faucet-pin-servers": true
+                    },
                     "subject": {
                       "description": "Default subject every record is published to.",
                       "type": "string"
@@ -32348,14 +32561,16 @@
                     },
                     "path": {
                       "description": "Remote directory the files are written in.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "key"
                     },
                     "file_name": {
                       "description": "File-name template inside `path` — the file sink's `path` file name\n(#777). May contain `{part}` (numbered files) and `${now.*}` tokens; a\ntrailing `/` is a subdirectory of `part-{part}<extension>` files. When\nset, `file_extension` is not used. Unset: every run writes new files\nnamed `<run id>-<part><file_extension>` (`<run id>` is a fresh\ntime-ordered UUID, `<part>` is `00001`, `00002`, …).\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "key"
                     },
                     "if_exists": {
                       "description": "What to do when a file of the same name already exists\n(`if_exists`): `replace` it (default), `append` to it (JSON Lines, CSV,\nraw text) or fail with `error` (#777). Needs `file_name`. `mode` is\naccepted as another name for this key, and `overwrite` /\n`error_if_exists` for its values.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
@@ -32829,6 +33044,13 @@
                         "null"
                       ],
                       "x-faucet-resource": "url"
+                    },
+                    "credentials": {
+                      "description": "How to authenticate (default: the AWS default chain, i.e. the\nidentity of the host faucet runs on). `access_key` names keys in the\nconfig; `anonymous` sends unsigned requests (public buckets).",
+                      "$ref": "#/$defs/sink_s3__S3Credentials",
+                      "default": {
+                        "type": "default"
+                      }
                     },
                     "file_extension": {
                       "description": "File extension for written objects (default: `.jsonl`). Not used when\n`path` is set.",
@@ -33705,7 +33927,7 @@
                       "default": -1
                     },
                     "extra_client_config": {
-                      "description": "Raw librdkafka producer properties, applied **last** so they override\neverything this config derives (`acks`, `enable.idempotence`,\n`compression.type`, `linger.ms`, `message.timeout.ms`,\n`queue.buffering.max.messages`). Empty by default.\n\nThe escape hatch for a knob faucet does not model — and the sharp edge\nthat goes with it: overriding a safety property here can weaken\ndelivery guarantees. The only exceptions are the exactly-once\ninvariants (`transactional.id`, `enable.idempotence`, `acks=all`),\nwhich the transactional producer force-sets on top so an override\ncannot break EOS.",
+                      "description": "Raw librdkafka producer properties, applied **last** so they override\neverything this config derives (`acks`, `enable.idempotence`,\n`compression.type`, `linger.ms`, `message.timeout.ms`,\n`queue.buffering.max.messages`). Empty by default.\n\nThe escape hatch for a knob faucet does not model — and the sharp edge\nthat goes with it: overriding a safety property here can weaken\ndelivery guarantees. The only exceptions are the exactly-once\ninvariants (`transactional.id`, `enable.idempotence`, `acks=all`),\nwhich the transactional producer force-sets on top so an override\ncannot break EOS.\n\nKeys that name a broker (`bootstrap.servers`, `metadata.broker.list`),\na URL (`*.url`) or a local file (`*.location`, `*.file`,\n`sasl.kerberos.keytab`) are checked like the typed fields by a host\nthat confines configs (`faucet serve`); keys that load or run a\nprogram (`plugin.library.paths`, `ssl.engine.location`,\n`ssl.providers`, `*.cmd`) are refused for configs it does not trust.",
                       "type": "object",
                       "additionalProperties": {
                         "type": "string"
@@ -33713,15 +33935,38 @@
                       "x-faucet-unverified": {
                         "enable.ssl.certificate.verification": [
                           "false",
-                          "0"
+                          "f",
+                          "0",
+                          "no",
+                          "n",
+                          "off"
                         ],
                         "ssl.endpoint.identification.algorithm": [
                           "none",
                           ""
                         ]
+                      },
+                      "x-faucet-resource-keys": {
+                        "bootstrap.servers": {
+                          "kind": "url",
+                          "syntax": "url-list"
+                        },
+                        "metadata.broker.list": {
+                          "kind": "url",
+                          "syntax": "url-list"
+                        },
+                        "*.url": "url",
+                        "*.location": "path",
+                        "*.file": "path",
+                        "sasl.kerberos.keytab": "path",
+                        "ssl.engine.location": "command",
+                        "ssl.providers": "command",
+                        "plugin.library.paths": "command",
+                        "*.cmd": "command"
                       }
                     }
-                  }
+                  },
+                  "x-faucet-follows-servers": true
                 },
                 true
               ]
@@ -35977,7 +36222,8 @@
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-code": true
                     },
                     "expression_attribute_names": {
                       "description": "`ExpressionAttributeNames` for `condition_expression`.",
@@ -36461,7 +36707,8 @@
                   },
                   "title": "OracleSinkConfig",
                   "description": "Configuration for [`OracleSink`](crate::OracleSink).",
-                  "type": "object"
+                  "type": "object",
+                  "x-faucet-follows-servers": true
                 },
                 true
               ]
@@ -36507,6 +36754,1079 @@
             "type"
           ],
           "additionalProperties": false
+        }
+      ]
+    },
+    "source_s3__S3Credentials": {
+      "description": "How to authenticate with S3.\n\nSerializes as `{ type: <method>, config: { … } }`, the auth wire shape\nevery faucet connector shares (the Kinesis / SQS / DynamoDB connectors use\nthe same variants).",
+      "oneOf": [
+        {
+          "description": "The AWS SDK default provider chain: environment variables, shared\nconfig/credentials files, container credentials, web-identity tokens\nand the instance profile. The identity of the host faucet runs on.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "default"
+            }
+          }
+        },
+        {
+          "description": "A named profile from the shared AWS config/credentials files.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "profile"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "description": "Profile name (as in `~/.aws/credentials`).",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Static access keys. Prefer `${env:…}` / secrets-manager interpolation\nover literals in config files.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "access_key"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "access_key_id": {
+                  "description": "AWS access key id.",
+                  "type": "string"
+                },
+                "secret_access_key": {
+                  "description": "AWS secret access key.",
+                  "type": "string"
+                },
+                "session_token": {
+                  "description": "Optional session token (for temporary credentials).",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Assume an IAM role via STS on top of the default provider chain.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "assume_role"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "role_arn": {
+                  "description": "ARN of the role to assume.",
+                  "type": "string"
+                },
+                "session_name": {
+                  "description": "Session name recorded in CloudTrail. Defaults to `faucet-stream`.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "external_id": {
+                  "description": "Optional external id for cross-account trust policies.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Web-identity federation (`AWS_WEB_IDENTITY_TOKEN_FILE` +\n`AWS_ROLE_ARN`), resolved by the default chain.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "web_identity"
+            }
+          }
+        },
+        {
+          "description": "Unsigned requests, for public buckets.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "anonymous"
+            }
+          }
+        }
+      ]
+    },
+    "source_parquet__S3Credentials": {
+      "description": "How to authenticate with S3.\n\nSerializes as `{ type: <method>, config: { … } }`, the auth wire shape\nevery faucet connector shares (the Kinesis / SQS / DynamoDB connectors use\nthe same variants).",
+      "oneOf": [
+        {
+          "description": "The AWS SDK default provider chain: environment variables, shared\nconfig/credentials files, container credentials, web-identity tokens\nand the instance profile. The identity of the host faucet runs on.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "default"
+            }
+          }
+        },
+        {
+          "description": "A named profile from the shared AWS config/credentials files.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "profile"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "description": "Profile name (as in `~/.aws/credentials`).",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Static access keys. Prefer `${env:…}` / secrets-manager interpolation\nover literals in config files.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "access_key"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "access_key_id": {
+                  "description": "AWS access key id.",
+                  "type": "string"
+                },
+                "secret_access_key": {
+                  "description": "AWS secret access key.",
+                  "type": "string"
+                },
+                "session_token": {
+                  "description": "Optional session token (for temporary credentials).",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Assume an IAM role via STS on top of the default provider chain.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "assume_role"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "role_arn": {
+                  "description": "ARN of the role to assume.",
+                  "type": "string"
+                },
+                "session_name": {
+                  "description": "Session name recorded in CloudTrail. Defaults to `faucet-stream`.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "external_id": {
+                  "description": "Optional external id for cross-account trust policies.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Web-identity federation (`AWS_WEB_IDENTITY_TOKEN_FILE` +\n`AWS_ROLE_ARN`), resolved by the default chain.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "web_identity"
+            }
+          }
+        },
+        {
+          "description": "Unsigned requests, for public buckets.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "anonymous"
+            }
+          }
+        }
+      ]
+    },
+    "sink_snowflake__StagingCredentials": {
+      "description": "How faucet authenticates to a staging location. Serializes as\n`{ type: <method>, config: { … } }`, the variant shapes of the S3, GCS and\nAzure connectors' credentials.",
+      "oneOf": [
+        {
+          "description": "The store's default chain (environment, instance or workload role,\nlocal credential files): the identity of the host faucet runs on.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "default"
+            }
+          }
+        },
+        {
+          "description": "Static S3 access keys (`s3://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "access_key"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "access_key_id": {
+                  "description": "Access key id.",
+                  "type": "string"
+                },
+                "secret_access_key": {
+                  "description": "Secret access key.",
+                  "type": "string"
+                },
+                "session_token": {
+                  "description": "Optional session token (temporary credentials).",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "A GCS service-account JSON key file (`gs://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "service_account_json_file"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "description": "Path to the key file.",
+                  "type": "string",
+                  "x-faucet-resource": "path"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "A GCS service-account JSON key, inline (`gs://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "service_account_json_inline"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "json": {
+                  "description": "The key JSON.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "An Azure storage-account access key (`az://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "account_key"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "account_key": {
+                  "description": "Base64 account key.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "An Azure shared-access-signature token (`az://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "sas_token"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "sas_token": {
+                  "description": "SAS token string.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "sink_mssql__StagingCredentials": {
+      "description": "How faucet authenticates to a staging location. Serializes as\n`{ type: <method>, config: { … } }`, the variant shapes of the S3, GCS and\nAzure connectors' credentials.",
+      "oneOf": [
+        {
+          "description": "The store's default chain (environment, instance or workload role,\nlocal credential files): the identity of the host faucet runs on.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "default"
+            }
+          }
+        },
+        {
+          "description": "Static S3 access keys (`s3://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "access_key"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "access_key_id": {
+                  "description": "Access key id.",
+                  "type": "string"
+                },
+                "secret_access_key": {
+                  "description": "Secret access key.",
+                  "type": "string"
+                },
+                "session_token": {
+                  "description": "Optional session token (temporary credentials).",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "A GCS service-account JSON key file (`gs://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "service_account_json_file"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "description": "Path to the key file.",
+                  "type": "string",
+                  "x-faucet-resource": "path"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "A GCS service-account JSON key, inline (`gs://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "service_account_json_inline"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "json": {
+                  "description": "The key JSON.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "An Azure storage-account access key (`az://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "account_key"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "account_key": {
+                  "description": "Base64 account key.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "An Azure shared-access-signature token (`az://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "sas_token"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "sas_token": {
+                  "description": "SAS token string.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "sink_s3__S3Credentials": {
+      "description": "How to authenticate with S3.\n\nSerializes as `{ type: <method>, config: { … } }`, the auth wire shape\nevery faucet connector shares (the Kinesis / SQS / DynamoDB connectors use\nthe same variants).",
+      "oneOf": [
+        {
+          "description": "The AWS SDK default provider chain: environment variables, shared\nconfig/credentials files, container credentials, web-identity tokens\nand the instance profile. The identity of the host faucet runs on.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "default"
+            }
+          }
+        },
+        {
+          "description": "A named profile from the shared AWS config/credentials files.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "profile"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "description": "Profile name (as in `~/.aws/credentials`).",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Static access keys. Prefer `${env:…}` / secrets-manager interpolation\nover literals in config files.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "access_key"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "access_key_id": {
+                  "description": "AWS access key id.",
+                  "type": "string"
+                },
+                "secret_access_key": {
+                  "description": "AWS secret access key.",
+                  "type": "string"
+                },
+                "session_token": {
+                  "description": "Optional session token (for temporary credentials).",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Assume an IAM role via STS on top of the default provider chain.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "assume_role"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "role_arn": {
+                  "description": "ARN of the role to assume.",
+                  "type": "string"
+                },
+                "session_name": {
+                  "description": "Session name recorded in CloudTrail. Defaults to `faucet-stream`.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "external_id": {
+                  "description": "Optional external id for cross-account trust policies.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Web-identity federation (`AWS_WEB_IDENTITY_TOKEN_FILE` +\n`AWS_ROLE_ARN`), resolved by the default chain.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "web_identity"
+            }
+          }
+        },
+        {
+          "description": "Unsigned requests, for public buckets.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "anonymous"
+            }
+          }
+        }
+      ]
+    },
+    "sink_parquet__S3Credentials": {
+      "description": "How to authenticate with S3.\n\nSerializes as `{ type: <method>, config: { … } }`, the auth wire shape\nevery faucet connector shares (the Kinesis / SQS / DynamoDB connectors use\nthe same variants).",
+      "oneOf": [
+        {
+          "description": "The AWS SDK default provider chain: environment variables, shared\nconfig/credentials files, container credentials, web-identity tokens\nand the instance profile. The identity of the host faucet runs on.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "default"
+            }
+          }
+        },
+        {
+          "description": "A named profile from the shared AWS config/credentials files.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "profile"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "description": "Profile name (as in `~/.aws/credentials`).",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Static access keys. Prefer `${env:…}` / secrets-manager interpolation\nover literals in config files.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "access_key"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "access_key_id": {
+                  "description": "AWS access key id.",
+                  "type": "string"
+                },
+                "secret_access_key": {
+                  "description": "AWS secret access key.",
+                  "type": "string"
+                },
+                "session_token": {
+                  "description": "Optional session token (for temporary credentials).",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Assume an IAM role via STS on top of the default provider chain.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "assume_role"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "role_arn": {
+                  "description": "ARN of the role to assume.",
+                  "type": "string"
+                },
+                "session_name": {
+                  "description": "Session name recorded in CloudTrail. Defaults to `faucet-stream`.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "external_id": {
+                  "description": "Optional external id for cross-account trust policies.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Web-identity federation (`AWS_WEB_IDENTITY_TOKEN_FILE` +\n`AWS_ROLE_ARN`), resolved by the default chain.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "web_identity"
+            }
+          }
+        },
+        {
+          "description": "Unsigned requests, for public buckets.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "anonymous"
+            }
+          }
+        }
+      ]
+    },
+    "sink_redshift__S3Credentials": {
+      "description": "How to authenticate with S3.\n\nSerializes as `{ type: <method>, config: { … } }`, the auth wire shape\nevery faucet connector shares (the Kinesis / SQS / DynamoDB connectors use\nthe same variants).",
+      "oneOf": [
+        {
+          "description": "The AWS SDK default provider chain: environment variables, shared\nconfig/credentials files, container credentials, web-identity tokens\nand the instance profile. The identity of the host faucet runs on.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "default"
+            }
+          }
+        },
+        {
+          "description": "A named profile from the shared AWS config/credentials files.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "profile"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "description": "Profile name (as in `~/.aws/credentials`).",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Static access keys. Prefer `${env:…}` / secrets-manager interpolation\nover literals in config files.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "access_key"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "access_key_id": {
+                  "description": "AWS access key id.",
+                  "type": "string"
+                },
+                "secret_access_key": {
+                  "description": "AWS secret access key.",
+                  "type": "string"
+                },
+                "session_token": {
+                  "description": "Optional session token (for temporary credentials).",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Assume an IAM role via STS on top of the default provider chain.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "assume_role"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "role_arn": {
+                  "description": "ARN of the role to assume.",
+                  "type": "string"
+                },
+                "session_name": {
+                  "description": "Session name recorded in CloudTrail. Defaults to `faucet-stream`.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "external_id": {
+                  "description": "Optional external id for cross-account trust policies.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Web-identity federation (`AWS_WEB_IDENTITY_TOKEN_FILE` +\n`AWS_ROLE_ARN`), resolved by the default chain.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "web_identity"
+            }
+          }
+        },
+        {
+          "description": "Unsigned requests, for public buckets.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "anonymous"
+            }
+          }
+        }
+      ]
+    },
+    "sink_clickhouse__StagingCredentials": {
+      "description": "How faucet authenticates to a staging location. Serializes as\n`{ type: <method>, config: { … } }`, the variant shapes of the S3, GCS and\nAzure connectors' credentials.",
+      "oneOf": [
+        {
+          "description": "The store's default chain (environment, instance or workload role,\nlocal credential files): the identity of the host faucet runs on.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "default"
+            }
+          }
+        },
+        {
+          "description": "Static S3 access keys (`s3://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "access_key"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "access_key_id": {
+                  "description": "Access key id.",
+                  "type": "string"
+                },
+                "secret_access_key": {
+                  "description": "Secret access key.",
+                  "type": "string"
+                },
+                "session_token": {
+                  "description": "Optional session token (temporary credentials).",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "A GCS service-account JSON key file (`gs://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "service_account_json_file"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "description": "Path to the key file.",
+                  "type": "string",
+                  "x-faucet-resource": "path"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "A GCS service-account JSON key, inline (`gs://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "service_account_json_inline"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "json": {
+                  "description": "The key JSON.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "An Azure storage-account access key (`az://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "account_key"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "account_key": {
+                  "description": "Base64 account key.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "An Azure shared-access-signature token (`az://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "sas_token"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "sas_token": {
+                  "description": "SAS token string.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "sink_databricks__StagingCredentials": {
+      "description": "How faucet authenticates to a staging location. Serializes as\n`{ type: <method>, config: { … } }`, the variant shapes of the S3, GCS and\nAzure connectors' credentials.",
+      "oneOf": [
+        {
+          "description": "The store's default chain (environment, instance or workload role,\nlocal credential files): the identity of the host faucet runs on.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "default"
+            }
+          }
+        },
+        {
+          "description": "Static S3 access keys (`s3://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "access_key"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "access_key_id": {
+                  "description": "Access key id.",
+                  "type": "string"
+                },
+                "secret_access_key": {
+                  "description": "Secret access key.",
+                  "type": "string"
+                },
+                "session_token": {
+                  "description": "Optional session token (temporary credentials).",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "A GCS service-account JSON key file (`gs://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "service_account_json_file"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "description": "Path to the key file.",
+                  "type": "string",
+                  "x-faucet-resource": "path"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "A GCS service-account JSON key, inline (`gs://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "service_account_json_inline"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "json": {
+                  "description": "The key JSON.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "An Azure storage-account access key (`az://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "account_key"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "account_key": {
+                  "description": "Base64 account key.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "An Azure shared-access-signature token (`az://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "sas_token"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "sas_token": {
+                  "description": "SAS token string.",
+                  "type": "string"
+                }
+              }
+            }
+          }
         }
       ]
     }
