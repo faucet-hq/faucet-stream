@@ -243,7 +243,12 @@ any of whose segments could match into a system tree or onto a protected file
 is refused only when it would write such a file, so it may use a directory
 that also holds one. In a config the request carries, such a path may not
 take a value from records (`${parent.*}` and other runtime tokens other than
-`${now.*}`, `${backfill.*}` and `${partition.*}`).
+`${now.*}`, `${backfill.*}` and `${partition.*}`). In a run of a caller's
+config, or of a template holding values its caller supplied, a record value
+in a path or remote-path field may not turn the path into a URL or leave a
+leading segment empty (anchoring the path at the root), and a remote path on
+the connector's own server (an SFTP `path` or `file_name`) may not take a `..`
+segment from a caller-supplied value.
 
 ### SQL connectors run sandboxed
 

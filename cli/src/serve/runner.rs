@@ -784,18 +784,21 @@ pub fn resume_claimed_shard(state: ServerState, claimed: ClaimedShard) {
         let principal = crate::runtime::Principal::stored(&state, AuthContext::runtime(), &run);
         let (outcome, exit) = crate::runtime::under(
             &principal,
-            execute_shard(
-                &state,
-                &principal,
-                loaded,
-                &run_id,
-                &shard_id,
-                shard,
-                coop,
-                run.timeout_secs,
-                run.clock.clone(),
-                run.concurrency,
-                run.submitted_at,
+            crate::executor::with_untrusted_targets(
+                run.caller_config || !run.caller_params.is_empty(),
+                execute_shard(
+                    &state,
+                    &principal,
+                    loaded,
+                    &run_id,
+                    &shard_id,
+                    shard,
+                    coop,
+                    run.timeout_secs,
+                    run.clock.clone(),
+                    run.concurrency,
+                    run.submitted_at,
+                ),
             ),
         )
         .await;
@@ -2055,6 +2058,7 @@ async fn execute_run(
     mut own: RunRecord,
 ) {
     let server_shutdown = state.shutdown_token();
+    let untrusted_targets = own.caller_config || !own.caller_params.is_empty();
     let auth_result = loaded.auth_catalog();
     let LoadedSubmission {
         cfg, nodes, tenant, ..
@@ -2220,7 +2224,13 @@ async fn execute_run(
         tracing::info!("pipeline run starting");
         let result = match &topology {
             Some((cfg, auth, run)) => crate::topology::run_topology(cfg, auth, run.clone()).await,
-            None => crate::runtime::run(&principal, nodes, opts).await,
+            None => {
+                crate::executor::with_untrusted_targets(
+                    untrusted_targets,
+                    crate::runtime::run(&principal, nodes, opts),
+                )
+                .await
+            }
         };
         audit_runtime_policy_denials(&audit_state, &audit_run_id, principal.tenant(), &result)
             .await;

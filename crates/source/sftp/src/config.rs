@@ -94,6 +94,7 @@ pub struct SftpSourceConfig {
     pub connection: SftpConnectionConfig,
     /// Remote path to read: a directory whose files are listed and streamed,
     /// or a single file.
+    #[schemars(extend("x-faucet-resource" = "key"))]
     pub path: String,
     /// Optional filename glob (`*` / `?`) applied to the basenames of files in
     /// a directory listing. Ignored when `path` points at a single file.

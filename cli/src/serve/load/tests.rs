@@ -2340,3 +2340,36 @@ fn caller_lineage_transport_urls_follow_the_reference_policy() {
         .to_string();
     assert!(err.contains("lineage.transport.config.url"), "{err}");
 }
+
+/// A caller-supplied value in a remote path field (`x-faucet-resource: key`)
+/// may not hold a `..` segment; the template's own value may.
+#[cfg(all(feature = "source-rest", feature = "sink-sftp"))]
+#[test]
+fn dotdot_in_a_key_field_is_refused_for_callers() {
+    let root = tempfile::tempdir().unwrap();
+    let doc = |name: &str| {
+        json!({
+            "version": 1,
+            "pipeline": {
+                "source": { "type": "rest", "config": { "base_url": "https://api.example.com" } },
+                "sink": { "type": "sftp", "config": {
+                    "host": "sftp.example.com", "username": "u",
+                    "auth": { "type": "password", "config": { "password": "p" } },
+                    "path": "/data/a", "file_name": name } }
+            }
+        })
+    };
+    let check = |d: &Value, f: &crate::params::CallerFields| {
+        let cfg = PipelineConfig::from_value(d.clone()).unwrap();
+        refuse_caller_params(d, &cfg, f, &rooted(root.path()), true)
+    };
+    let f = caller_fields(&[("/pipeline/sink/config/file_name", "report")]);
+    let err = check(&doc("../b/x.csv"), &f).unwrap_err().to_string();
+    assert!(
+        err.contains("param 'report' sets `pipeline.sink.config.file_name`"),
+        "{err}"
+    );
+    assert!(err.contains("`..`"), "{err}");
+    check(&doc("b/x.csv"), &f).unwrap();
+    check(&doc("../b/x.csv"), &Default::default()).unwrap();
+}

@@ -295,7 +295,9 @@ carries `#[allow(clippy::disallowed_methods)] // <reason>`.
 ## Resource annotations and reference policies
 
 Mark a config field that names a local path, a URL or a program with
-`#[schemars(extend("x-faucet-resource" = "path"))]` (`"url"`, `"command"`).
+`#[schemars(extend("x-faucet-resource" = "path"))]` (`"url"`, `"command"`;
+`"key"` for a path on the connector's own remote server, which a policy with
+path roots refuses when it holds a `..` segment).
 `faucet_core::resolve` reads the annotation back from a config schema
 (`annotated_resources(schema, config)`, `declares(schema, kind)`) and checks
 each value with a `ReferencePolicy`: an allow-list of path roots (compared

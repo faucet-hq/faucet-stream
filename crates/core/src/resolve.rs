@@ -216,6 +216,11 @@ pub enum ResourceKind {
     /// A setting that authenticates with the host's own credentials
     /// ([`HOST_CREDENTIALS_ANNOTATION`]); the value is the setting as configured.
     HostCredentials,
+    /// A path on a remote server the connector joins into the names it
+    /// writes or reads (an SFTP directory or file-name template). Its host is
+    /// the connector's configured server; a `..` segment would climb out of
+    /// the directory the config names.
+    Key,
 }
 
 impl ResourceKind {
@@ -227,6 +232,7 @@ impl ResourceKind {
             ResourceKind::Command => "command",
             ResourceKind::Unverified => "unverified",
             ResourceKind::HostCredentials => "host_credentials",
+            ResourceKind::Key => "key",
         }
     }
 
@@ -236,6 +242,7 @@ impl ResourceKind {
             "path" => Some(ResourceKind::Path),
             "url" => Some(ResourceKind::Url),
             "command" => Some(ResourceKind::Command),
+            "key" => Some(ResourceKind::Key),
             _ => None,
         }
     }
@@ -2239,6 +2246,19 @@ impl ReferencePolicy {
         }
     }
 
+    /// Check a remote path ([`ResourceKind::Key`]): under a policy with path
+    /// roots it may not hold a `..` segment.
+    pub fn check_key(&self, value: &str) -> Result<(), Refusal> {
+        if self.path_roots.is_some() && has_parent_segment(value) {
+            return Err(Refusal::new(
+                RefusalKind::Path,
+                value,
+                "a remote path may not contain a `..` segment",
+            ));
+        }
+        Ok(())
+    }
+
     /// Check a program a connector runs.
     pub fn check_command(&self, value: &str) -> Result<(), Refusal> {
         if self.subprocess {
@@ -2258,6 +2278,7 @@ impl ReferencePolicy {
             ResourceKind::Path => self.check_path(&r.value),
             ResourceKind::Url => self.check_url_as(&r.value, r.syntax),
             ResourceKind::Command => self.check_command(&r.value),
+            ResourceKind::Key => self.check_key(&r.value),
             ResourceKind::Unverified if self.unverified => Ok(()),
             ResourceKind::Unverified => Err(Refusal::new(
                 RefusalKind::Unverified,
@@ -2854,6 +2875,8 @@ mod tests {
         assert_eq!(found[0].kind, ResourceKind::HostCredentials);
         assert_eq!(found[0].value, "external_auth: true");
         assert_eq!(ResourceKind::HostCredentials.as_str(), "host_credentials");
+        assert_eq!(ResourceKind::Key.as_str(), "key");
+        assert_eq!(ResourceKind::parse("key"), Some(ResourceKind::Key));
         let refused = ReferencePolicy::deny_all().check(&found[0]).unwrap_err();
         assert_eq!(refused.kind, RefusalKind::HostCredentials);
         assert!(ReferencePolicy::open().check(&found[0]).is_ok());
@@ -3972,6 +3995,25 @@ mod tests {
             ORACLE,
             "db.example.com:2484/s?token_auth=OAUTH&token_location=/srv/data/token",
         );
+    }
+
+    #[test]
+    fn key_fields_refuse_parent_segments_under_path_roots() {
+        let schema = json!({
+            "properties": {
+                "dir": {"type": "string", "x-faucet-resource": "key"},
+                "name": {"type": "string", "x-faucet-resource": "key"}
+            }
+        });
+        let found = annotated_resources(&schema, &json!({"dir": "/data/a", "name": "../b/x.csv"}));
+        assert!(found.iter().all(|r| r.kind == ResourceKind::Key));
+        let caller = ReferencePolicy::deny_all().with_path_roots(Vec::<PathBuf>::new());
+        let refused: Vec<_> = found.iter().filter(|r| caller.check(r).is_err()).collect();
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].pointer, "/name");
+        assert!(caller.check_key("/data/%2e%2e/b").is_err());
+        assert!(caller.check_key("/data/a..b/c").is_ok());
+        assert!(ReferencePolicy::open().check_key("../x").is_ok());
     }
 
     #[test]

@@ -1184,26 +1184,31 @@ async fn run_expanded_unredacted(
             let unit_cancel = level_cancel.child_token();
             let dlq_sinks = Arc::clone(&dlq_sinks);
             let state_stores = Arc::clone(&state_stores);
+            let untrusted = untrusted_targets();
             let handle = joinset.spawn(
-                faucet_core::http::inherit_reference_policy(STATE_STORES.scope(
-                    state_stores,
-                    DLQ_SINKS.scope(dlq_sinks, async move {
-                        let _permit = sem.acquire().await.expect("semaphore not closed");
-                        run_unit(
-                            &unit,
-                            capture,
-                            &captured,
-                            &discovered,
-                            &collected,
-                            &opts2,
-                            unit_cancel,
-                            suppress_overwrite,
-                            overwrite_grouped,
-                        )
-                        .await
-                    }),
-                ))
-                .in_current_span(),
+                UNTRUSTED_TARGETS
+                    .scope(
+                        untrusted,
+                        faucet_core::http::inherit_reference_policy(STATE_STORES.scope(
+                            state_stores,
+                            DLQ_SINKS.scope(dlq_sinks, async move {
+                                let _permit = sem.acquire().await.expect("semaphore not closed");
+                                run_unit(
+                                    &unit,
+                                    capture,
+                                    &captured,
+                                    &discovered,
+                                    &collected,
+                                    &opts2,
+                                    unit_cancel,
+                                    suppress_overwrite,
+                                    overwrite_grouped,
+                                )
+                                .await
+                            }),
+                        )),
+                    )
+                    .in_current_span(),
             );
             task_meta.insert(handle.id(), meta);
         }
@@ -4104,6 +4109,23 @@ fn resolve_xml_body_fields(
     Ok(())
 }
 
+tokio::task_local! {
+    static UNTRUSTED_TARGETS: bool;
+}
+
+/// Run `fut` with fan-out record values in a connector's path and remote-path
+/// fields held to the rules for a config the server's operator did not write
+/// alone (a caller's config, or a template holding caller-supplied values): a
+/// value may not turn a path into a URL or anchor it at a root.
+pub async fn with_untrusted_targets<F: std::future::Future>(untrusted: bool, fut: F) -> F::Output {
+    UNTRUSTED_TARGETS.scope(untrusted, fut).await
+}
+
+fn untrusted_targets() -> bool {
+    UNTRUSTED_TARGETS.try_with(|u| *u).unwrap_or(false)
+        || faucet_core::http::current_reference_policy().is_some_and(|p| p.path_roots().is_some())
+}
+
 /// Resolve fan-out tokens in the fields of a connector config that name a
 /// resource, so a value from an upstream record fills one part of it and
 /// cannot re-target it (#862 L-122):
@@ -4141,7 +4163,15 @@ fn resolve_resource_fields(
         };
         *s = match r.kind {
             ResourceKind::Url => crate::interpolate::interpolate_record_path(s, ctx)?,
-            ResourceKind::Path => crate::interpolate::interpolate_record_file_path(s, ctx)?,
+            ResourceKind::Path | ResourceKind::Key
+                if r.kind == ResourceKind::Path || untrusted_targets() =>
+            {
+                let out = crate::interpolate::interpolate_record_file_path(s, ctx)?;
+                if untrusted_targets() {
+                    crate::interpolate::refuse_retargeted_path(s, &out)?;
+                }
+                out
+            }
             _ => continue,
         };
     }
@@ -4259,6 +4289,67 @@ mod xml_body_tests {
         let dots = HashMap::from([("p".into(), json!({"id": ".."}))]);
         let mut cfg = json!({"path": "/accounts/${p.id}/invoices"});
         assert!(resolve_resource_fields(true, "xml", &mut cfg, &dots).is_err());
+    }
+
+    #[tokio::test]
+    async fn record_values_cannot_turn_a_file_path_into_a_url() {
+        let ctx = |v: &str| HashMap::from([("p".into(), json!({ "v": v }))]);
+        let resolve = |kind: &'static str, sink: bool, cfg: Value, ctx: HashMap<String, Value>| {
+            let mut cfg = cfg;
+            resolve_resource_fields(!sink, kind, &mut cfg, &ctx).map(|()| cfg)
+        };
+        let url = || json!({"path": "${p.v}"});
+        let leading = || json!({"path": "${p.v}/data.jsonl"});
+        let scheme = || json!({"path": "s3://bucket/${p.v}.jsonl"});
+
+        let trusted = resolve("file", false, url(), ctx("http://internal.example/x")).unwrap();
+        assert_eq!(trusted["path"], "http://internal.example/x");
+        assert!(resolve("file", true, leading(), ctx("")).is_ok());
+
+        with_untrusted_targets(true, async {
+            for v in ["http://internal.example/x", "file:///etc/hosts"] {
+                let e = resolve("file", false, url(), ctx(v)).unwrap_err();
+                assert!(e.to_string().contains("into a URL"), "{v}: {e}");
+            }
+            let e = resolve("file", true, leading(), ctx("")).unwrap_err();
+            assert!(e.to_string().contains("anchor"), "{e}");
+            assert_eq!(
+                resolve("file", true, leading(), ctx("in")).unwrap()["path"],
+                "in/data.jsonl"
+            );
+            assert_eq!(
+                resolve("file", true, scheme(), ctx("x")).unwrap()["path"],
+                "s3://bucket/x.jsonl"
+            );
+            assert!(resolve("file", false, url(), ctx("C:x")).is_err());
+        })
+        .await;
+        assert!(!untrusted_targets(), "scoped to the future only");
+    }
+
+    #[cfg(feature = "sink-sftp")]
+    #[tokio::test]
+    async fn record_values_in_remote_paths_stay_in_their_directory_for_untrusted_configs() {
+        let ctx = HashMap::from([("p".into(), json!({ "v": "../b" }))]);
+        let cfg = || {
+            json!({"host": "sftp.example", "username": "u", "path": "/data/a",
+                   "file_name": "${p.v}/x.csv"})
+        };
+        let mut trusted = cfg();
+        resolve_resource_fields(false, "sftp", &mut trusted, &ctx).unwrap();
+        assert_eq!(
+            trusted["file_name"], "${p.v}/x.csv",
+            "left to the generic pass"
+        );
+        with_untrusted_targets(true, async {
+            let mut c = cfg();
+            assert!(resolve_resource_fields(false, "sftp", &mut c, &ctx).is_err());
+            let ok = HashMap::from([("p".into(), json!({ "v": "b" }))]);
+            let mut c = cfg();
+            resolve_resource_fields(false, "sftp", &mut c, &ok).unwrap();
+            assert_eq!(c["file_name"], "b/x.csv");
+        })
+        .await;
     }
 
     #[test]

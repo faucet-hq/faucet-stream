@@ -88,6 +88,7 @@ pub struct SftpSinkConfig {
     #[serde(flatten)]
     pub connection: SftpConnectionConfig,
     /// Remote directory the files are written in.
+    #[schemars(extend("x-faucet-resource" = "key"))]
     pub path: String,
     /// File-name template inside `path` — the file sink's `path` file name
     /// (#777). May contain `{part}` (numbered files) and `${now.*}` tokens; a
@@ -99,6 +100,7 @@ pub struct SftpSinkConfig {
     /// **Experimental** (PRINCIPLES.md §3): this block's shape may change in a
     /// minor release; any change is called out in the changelog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-resource" = "key"))]
     pub file_name: Option<String>,
     /// What to do when a file of the same name already exists
     /// (`if_exists`): `replace` it (default), `append` to it (JSON Lines, CSV,

@@ -24846,7 +24846,8 @@
                     },
                     "path": {
                       "description": "Remote path to read: a directory whose files are listed and streamed,\nor a single file.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "key"
                     },
                     "glob": {
                       "description": "Optional filename glob (`*` / `?`) applied to the basenames of files in\na directory listing. Ignored when `path` points at a single file.",
@@ -32474,14 +32475,16 @@
                     },
                     "path": {
                       "description": "Remote directory the files are written in.",
-                      "type": "string"
+                      "type": "string",
+                      "x-faucet-resource": "key"
                     },
                     "file_name": {
                       "description": "File-name template inside `path` — the file sink's `path` file name\n(#777). May contain `{part}` (numbered files) and `${now.*}` tokens; a\ntrailing `/` is a subdirectory of `part-{part}<extension>` files. When\nset, `file_extension` is not used. Unset: every run writes new files\nnamed `<run id>-<part><file_extension>` (`<run id>` is a fresh\ntime-ordered UUID, `<part>` is `00001`, `00002`, …).\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",
                       "type": [
                         "string",
                         "null"
-                      ]
+                      ],
+                      "x-faucet-resource": "key"
                     },
                     "if_exists": {
                       "description": "What to do when a file of the same name already exists\n(`if_exists`): `replace` it (default), `append` to it (JSON Lines, CSV,\nraw text) or fail with `error` (#777). Needs `file_name`. `mode` is\naccepted as another name for this key, and `overwrite` /\n`error_if_exists` for its values.\n\n**Experimental** (PRINCIPLES.md §3): this block's shape may change in a\nminor release; any change is called out in the changelog.",

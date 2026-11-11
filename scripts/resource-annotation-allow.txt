@@ -9,8 +9,6 @@
 sink:azure-blob path  # object key template inside the configured container
 sink:gcs path  # object key template inside the configured bucket
 sink:s3 path  # object key template inside the configured bucket
-sink:sftp path  # remote path on the configured SFTP server
-source:sftp path  # remote path on the configured SFTP server
 
 # URL path segments and routes resolved against a checked base URL.
 source:rest path  # path appended to the checked `base_url`

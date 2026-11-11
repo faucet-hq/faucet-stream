@@ -288,6 +288,38 @@ pub fn interpolate_record_file_path(
     })
 }
 
+/// Refuse a fan-out result that record values re-targeted: `out` names a URL
+/// where `template` (before its tokens resolved) did not, or `out` is
+/// anchored at a root or home directory where `template` was not (an empty
+/// value for a leading token).
+pub fn refuse_retargeted_path(template: &str, out: &str) -> CliResult<()> {
+    let literal = template.split("${").next().unwrap_or("");
+    if has_scheme(out) && !has_scheme(literal) {
+        return Err(CliError::Config(format!(
+            "`{template}` resolved to `{out}`: a record value may not turn a path into a URL"
+        )));
+    }
+    if leaves_relative(out) && !leaves_relative(template) {
+        return Err(CliError::Config(format!(
+            "`{template}` resolved to `{out}`: a record value may not anchor a relative path \
+             at a root or home directory"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `s` starts with a URL scheme (`name:`, two characters or more).
+fn has_scheme(s: &str) -> bool {
+    let first = s.split(['/', '\\']).next().unwrap_or("");
+    first.split_once(':').is_some_and(|(scheme, _)| {
+        scheme.len() >= 2
+            && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    })
+}
+
 /// Whether a path is anchored somewhere other than the working directory:
 /// absolute, a Windows drive or UNC prefix, or `~`.
 fn leaves_relative(path: &str) -> bool {
@@ -1231,6 +1263,19 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn retargeted_paths_are_named() {
+        assert!(refuse_retargeted_path("${p.x}", "https://h/x").is_err());
+        assert!(refuse_retargeted_path("${p.x}/a", "/a").is_err());
+        assert!(refuse_retargeted_path("${p.x}/a", "~/a").is_err());
+        assert!(refuse_retargeted_path("/data/${p.x}", "/data/a").is_ok());
+        assert!(refuse_retargeted_path("gs://b/${p.x}", "gs://b/a").is_ok());
+        assert!(refuse_retargeted_path("${p.x}", "a:b").is_err());
+        assert!(refuse_retargeted_path("${p.x}", "ab:c").is_err());
+        assert!(refuse_retargeted_path("${p.x}", "1a:c").is_ok());
+        assert!(refuse_retargeted_path("${p.x}", "a b:c").is_ok());
+    }
 
     #[test]
     fn passes_through_text_with_no_directives() {
