@@ -21,9 +21,10 @@ pub enum StoreKind {
 }
 
 impl StoreKind {
-    /// The store a location URL names (`s3://`, `s3a://`, `gs://`, `az://`,
-    /// `abfss://`, an `https://` Azure blob or DFS host, …), `None` for
-    /// anything else (a local path, `memory://`).
+    /// The store a location URL names, read the way `object_store` reads it
+    /// (`s3://`, `s3a://`, `gs://`, `az://`, `abfss://`, an `https://` Azure
+    /// blob, DFS or Fabric host, an `https://` S3 or R2 host), `None` for
+    /// anything else (a local path, `memory://`, a plain HTTP store).
     pub fn from_url(url: &str) -> Option<Self> {
         let lower = url.trim().to_ascii_lowercase();
         let (scheme, rest) = lower.split_once("://")?;
@@ -31,14 +32,25 @@ impl StoreKind {
             "s3" | "s3a" => Some(Self::S3),
             "gs" | "gcs" => Some(Self::Gcs),
             "az" | "adl" | "azure" | "abfs" | "abfss" => Some(Self::Azure),
-            "http" | "https" => {
-                let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
-                if host.ends_with(".amazonaws.com") || host.ends_with(".r2.cloudflarestorage.com") {
-                    Some(Self::S3)
-                } else if host.contains(".blob.core.") || host.contains(".dfs.core.") {
+            "https" => {
+                let host = rest
+                    .split(['/', '?', '#'])
+                    .next()
+                    .unwrap_or_default()
+                    .rsplit('@')
+                    .next()
+                    .unwrap_or_default();
+                let host = host.split(':').next().unwrap_or_default();
+                if host.ends_with("dfs.core.windows.net")
+                    || host.ends_with("blob.core.windows.net")
+                    || host.ends_with("dfs.fabric.microsoft.com")
+                    || host.ends_with("blob.fabric.microsoft.com")
+                {
                     Some(Self::Azure)
-                } else if host == "storage.googleapis.com" {
-                    Some(Self::Gcs)
+                } else if host.ends_with("amazonaws.com")
+                    || host.ends_with("r2.cloudflarestorage.com")
+                {
+                    Some(Self::S3)
                 } else {
                     None
                 }
@@ -83,13 +95,15 @@ where
     V: AsRef<str>,
 {
     let mut set = std::collections::BTreeMap::new();
+    let mut exact = std::collections::BTreeSet::new();
     for (k, v) in options {
         let (k, v) = (k.as_ref(), v.as_ref());
         if !v.trim().is_empty() {
+            exact.insert(k.to_ascii_lowercase());
             set.insert(normalized(k, kind), (k.to_string(), v.to_string()));
         }
     }
-    let has = |names: &[&str]| names.iter().any(|n| set.contains_key(*n));
+    let given = |names: &[&str]| names.iter().any(|n| exact.contains(*n));
     let on = |name: &str| set.get(name).is_some_and(|(_, v)| truthy(v));
     let host_keys: &[&str] = match kind {
         StoreKind::S3 => &[
@@ -119,31 +133,65 @@ where
     if kind == StoreKind::Azure && on("use_azure_cli") {
         return Some(set["use_azure_cli"].0.clone());
     }
-    let own = on("skip_signature")
-        || match kind {
-            StoreKind::S3 => has(&["access_key_id"]) && has(&["secret_access_key"]),
-            StoreKind::Gcs => has(&[
-                "service_account",
-                "service_account_path",
-                "service_account_key",
-                "application_credentials",
-            ]),
-            StoreKind::Azure => {
-                has(&[
+    let own = match kind {
+        StoreKind::S3 => {
+            given(&["aws_skip_signature", "skip_signature"])
+                && set.get("skip_signature").is_some_and(|(_, v)| truthy(v))
+                || given(&["aws_access_key_id", "access_key_id"])
+                    && given(&["aws_secret_access_key", "secret_access_key"])
+        }
+        StoreKind::Gcs => {
+            given(&["google_skip_signature", "skip_signature"])
+                && set.get("skip_signature").is_some_and(|(_, v)| truthy(v))
+                || given(&[
+                    "google_service_account",
+                    "service_account",
+                    "google_service_account_path",
+                    "service_account_path",
+                    "google_service_account_key",
+                    "service_account_key",
+                    "google_application_credentials",
+                    "application_credentials",
+                ])
+        }
+        StoreKind::Azure => {
+            given(&["azure_skip_signature", "skip_signature"])
+                && set.get("skip_signature").is_some_and(|(_, v)| truthy(v))
+                || given(&[
+                    "azure_storage_account_key",
+                    "azure_storage_access_key",
+                    "azure_storage_master_key",
+                    "master_key",
                     "account_key",
                     "access_key",
-                    "master_key",
+                    "azure_storage_sas_key",
+                    "azure_storage_sas_token",
                     "sas_key",
                     "sas_token",
-                    "token",
+                    "azure_storage_token",
                     "bearer_token",
+                    "token",
+                    "azure_fabric_session_token",
                     "fabric_session_token",
-                ]) || on("use_emulator")
-                    || (has(&["client_id"])
-                        && has(&["client_secret"])
-                        && has(&["tenant_id", "authority_id"]))
-            }
-        };
+                ])
+                || given(&["azure_storage_use_emulator", "use_emulator"])
+                    && set.get("use_emulator").is_some_and(|(_, v)| truthy(v))
+                || given(&["azure_storage_client_id", "azure_client_id", "client_id"])
+                    && given(&[
+                        "azure_storage_client_secret",
+                        "azure_client_secret",
+                        "client_secret",
+                    ])
+                    && given(&[
+                        "azure_storage_tenant_id",
+                        "azure_storage_authority_id",
+                        "azure_tenant_id",
+                        "azure_authority_id",
+                        "tenant_id",
+                        "authority_id",
+                    ])
+        }
+    };
     (!own).then(|| "credentials".to_string())
 }
 
@@ -168,7 +216,20 @@ mod tests {
                 "https://b.s3.us-east-1.amazonaws.com/k",
                 Some(StoreKind::S3),
             ),
-            ("https://storage.googleapis.com/b", Some(StoreKind::Gcs)),
+            ("https://storage.googleapis.com/b", None),
+            ("http://b.s3.amazonaws.com/k", None),
+            (
+                "https://ws.dfs.fabric.microsoft.com/f",
+                Some(StoreKind::Azure),
+            ),
+            (
+                "https://ws.blob.fabric.microsoft.com/f",
+                Some(StoreKind::Azure),
+            ),
+            (
+                "https://acct.r2.cloudflarestorage.com/b",
+                Some(StoreKind::S3),
+            ),
             ("https://minio.example/b", None),
             ("/data/table", None),
             ("memory://", None),
@@ -278,6 +339,36 @@ mod tests {
                 &[("account_key", "k"), ("azure_federated_token_file", "/t")]
             ),
             Some("azure_federated_token_file".into())
+        );
+    }
+
+    #[test]
+    fn only_key_spellings_the_store_reads_count_as_its_own_credentials() {
+        assert_eq!(
+            host(
+                StoreKind::S3,
+                &[(" AWS_ACCESS_KEY_ID", "a"), ("AWS_SECRET_ACCESS_KEY ", "s")]
+            ),
+            Some("credentials".into())
+        );
+        assert_eq!(
+            host(
+                StoreKind::S3,
+                &[("AWS_ACCESS_KEY_ID", "a"), ("AWS_SECRET_ACCESS_KEY", "s")]
+            ),
+            None
+        );
+        assert_eq!(
+            host(StoreKind::Azure, &[("azure_account_key", "k")]),
+            Some("credentials".into())
+        );
+        assert_eq!(
+            host(StoreKind::Gcs, &[("gcp_service_account", "k")]),
+            Some("credentials".into())
+        );
+        assert_eq!(
+            host(StoreKind::S3, &[("skip_signature", "false")]),
+            Some("credentials".into())
         );
     }
 }
