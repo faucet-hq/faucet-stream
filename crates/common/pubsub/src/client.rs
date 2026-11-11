@@ -93,6 +93,11 @@ pub async fn build_client(conn: &PubsubConnection) -> Result<Client, FaucetError
                     .map_err(|e| auth_err("application default", e))?
             }
             PubsubCredentials::ServiceAccountJsonFile { path } => {
+                faucet_core::resolve::check_google_credentials_file(
+                    "pubsub",
+                    "credentials",
+                    std::path::Path::new(path),
+                )?;
                 let cf = CredentialsFile::new_from_file(path.clone())
                     .await
                     .map_err(|e| auth_err("service-account file", e))?;
@@ -102,6 +107,7 @@ pub async fn build_client(conn: &PubsubConnection) -> Result<Client, FaucetError
                     .map_err(|e| auth_err("service-account file", e))?
             }
             PubsubCredentials::ServiceAccountJsonInline { json } => {
+                faucet_core::resolve::check_google_credentials("pubsub", "credentials", json)?;
                 let cf = CredentialsFile::new_from_str(json)
                     .await
                     .map_err(|e| auth_err("inline service-account key", e))?;
@@ -139,6 +145,34 @@ mod tests {
                 "{t}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn caller_runs_take_only_service_account_keys() {
+        if std::env::var_os("PUBSUB_EMULATOR_HOST").is_some() {
+            return;
+        }
+        let conn = PubsubConnection {
+            project_id: Some("p".into()),
+            credentials: PubsubCredentials::ServiceAccountJsonInline {
+                json: r#"{"type": "authorized_user", "client_id": "c", "client_secret": "s",
+                    "refresh_token": "r", "token_uri": "http://127.0.0.1:1/token"}"#
+                    .into(),
+            },
+            ..Default::default()
+        };
+        let caller = std::sync::Arc::new(
+            faucet_core::resolve::ReferencePolicy::deny_all()
+                .with_path_roots(["/srv/data"])
+                .any_url_scheme()
+                .any_url_host(),
+        );
+        let err = faucet_core::http::with_reference_policy(caller, build_client(&conn))
+            .await
+            .expect_err("refused")
+            .to_string();
+        assert!(err.contains("pubsub: `credentials`"), "{err}");
+        assert!(err.contains("authorized_user"), "{err}");
     }
 
     #[tokio::test]

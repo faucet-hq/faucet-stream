@@ -248,12 +248,18 @@ impl SpannerConnection {
 }
 
 async fn credentials_from_file(path: &str) -> Result<CredentialsFile, FaucetError> {
+    faucet_core::resolve::check_google_credentials_file(
+        "spanner",
+        "auth",
+        std::path::Path::new(path),
+    )?;
     CredentialsFile::new_from_file(path.to_string())
         .await
         .map_err(|e| FaucetError::Auth(format!("spanner key file {path}: {e}")))
 }
 
 async fn credentials_from_str(json: &str) -> Result<CredentialsFile, FaucetError> {
+    faucet_core::resolve::check_google_credentials("spanner", "auth", json)?;
     CredentialsFile::new_from_str(json)
         .await
         .map_err(|e| FaucetError::Auth(format!("spanner inline key: {e}")))
@@ -281,6 +287,40 @@ mod tests {
                 "{t}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn caller_runs_take_only_service_account_keys() {
+        if std::env::var_os("SPANNER_EMULATOR_HOST").is_some() {
+            return;
+        }
+        let conn: SpannerConnection = serde_json::from_value(json!({
+            "project_id": "p", "instance": "i", "database": "d",
+            "auth": {"type": "service_account_key", "config": {
+                "json": "{\"type\": \"external_account\", \"token_url\": \"http://127.0.0.1:1/t\"}"
+            }}
+        }))
+        .unwrap();
+        let caller = std::sync::Arc::new(
+            faucet_core::resolve::ReferencePolicy::deny_all()
+                .with_path_roots(["/srv/data"])
+                .any_url_scheme()
+                .any_url_host(),
+        );
+        faucet_core::http::with_reference_policy(caller, async {
+            for err in [
+                conn.connect().await.err().expect("refused").to_string(),
+                conn.connect_admin()
+                    .await
+                    .err()
+                    .expect("refused")
+                    .to_string(),
+            ] {
+                assert!(err.contains("spanner: `auth`"), "{err}");
+                assert!(err.contains("external_account"), "{err}");
+            }
+        })
+        .await;
     }
 
     #[tokio::test]

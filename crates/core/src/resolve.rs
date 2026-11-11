@@ -25,6 +25,7 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
+pub use crate::google_credentials::{check_google_credentials, check_google_credentials_file};
 pub use crate::host_credentials::{
     deny_unscoped_host_credentials, host_credentials_allowed, require_host_credentials,
     scoped_host_credentials, unscoped_host_credentials_denied, with_host_credentials,

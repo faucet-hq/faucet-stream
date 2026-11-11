@@ -80,13 +80,33 @@ pub fn check_host_identity(creds: &BigQueryCredentials) -> Result<(), FaucetErro
     Ok(())
 }
 
+/// [`check_host_identity`], then the key itself: in a task running a config
+/// the host does not trust, only a `service_account` key whose `token_uri`
+/// passes that task's reference policy.
+fn check_credentials(creds: &BigQueryCredentials) -> Result<(), FaucetError> {
+    check_host_identity(creds)?;
+    match creds {
+        BigQueryCredentials::ServiceAccountKey { json } => {
+            faucet_core::resolve::check_google_credentials("bigquery", "auth", json)
+        }
+        BigQueryCredentials::ServiceAccountKeyPath { path } => {
+            faucet_core::resolve::check_google_credentials_file(
+                "bigquery",
+                "auth",
+                std::path::Path::new(path),
+            )
+        }
+        BigQueryCredentials::ApplicationDefault => Ok(()),
+    }
+}
+
 /// Build a [`gcp_bigquery_client::Client`] from a faucet credential spec.
 ///
 /// Returns [`FaucetError::Auth`] on authentication failures and on inline
 /// service-account JSON that fails to parse, and refuses what
 /// [`check_host_identity`] refuses.
 pub async fn build_client(creds: &BigQueryCredentials) -> Result<Client, FaucetError> {
-    check_host_identity(creds)?;
+    check_credentials(creds)?;
     let mut builder = gcp_bigquery_client::client_builder::ClientBuilder::new();
     builder.with_client(http_client()?);
     match creds {
@@ -125,7 +145,7 @@ pub const BQ_OAUTH_SCOPE: &str = "https://www.googleapis.com/auth/bigquery";
 /// so the token is cached until shortly before it expires; building and
 /// minting are bounded by [`TOKEN_MINT_TIMEOUT`].
 pub async fn access_token(creds: &BigQueryCredentials) -> Result<String, FaucetError> {
-    check_host_identity(creds)?;
+    check_credentials(creds)?;
     access_token_bq(creds).await.map_err(auth_error)
 }
 
@@ -133,7 +153,7 @@ pub async fn access_token(creds: &BigQueryCredentials) -> Result<String, FaucetE
 /// refreshes it shortly before expiry, so every request made through it reuses
 /// one token instead of minting a new one.
 pub async fn token_provider(creds: &BigQueryCredentials) -> Result<TokenProvider, FaucetError> {
-    check_host_identity(creds)?;
+    check_credentials(creds)?;
     token_provider_bq(creds).await.map_err(auth_error)
 }
 
@@ -361,6 +381,42 @@ fn http_client() -> Result<reqwest_bq::Client, FaucetError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn caller_runs_take_only_service_account_keys_with_a_checked_token_uri() {
+        let caller = std::sync::Arc::new(
+            faucet_core::resolve::ReferencePolicy::deny_all()
+                .with_path_roots(["/srv/data"])
+                .any_url_scheme()
+                .any_url_host(),
+        );
+        for (json, says) in [
+            (r#"{"type": "authorized_user"}"#, "authorized_user"),
+            (
+                r#"{"type": "service_account", "token_uri": "http://169.254.169.254/t"}"#,
+                "token_uri",
+            ),
+        ] {
+            let creds = BigQueryCredentials::ServiceAccountKey { json: json.into() };
+            let err = faucet_core::http::with_reference_policy(caller.clone(), async {
+                build_client(&creds).await.map(|_| ())
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("bigquery: `auth`") && err.contains(says),
+                "{err}"
+            );
+            let err = faucet_core::http::with_reference_policy(caller.clone(), async {
+                access_token(&creds).await.map(|_| ())
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains(says), "{err}");
+        }
+    }
 
     #[test]
     fn host_identity_follows_the_selected_credentials() {

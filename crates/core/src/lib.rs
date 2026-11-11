@@ -46,6 +46,7 @@ pub mod error;
 pub mod fidelity;
 pub mod file_format;
 pub mod forward;
+mod google_credentials;
 pub mod governance;
 mod host_credentials;
 pub mod http;
