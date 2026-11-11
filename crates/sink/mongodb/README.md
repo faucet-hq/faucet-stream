@@ -211,6 +211,21 @@ delivery: exactly_once
 
 The sink overrides `write_batch_partial`, so a `dlq:` block in the pipeline config catches per-row failures (missing/null-key rows in `upsert` / `delete` mode) and routes them to the dead-letter sink while the rest of the page commits. Without a DLQ, a row-level failure aborts the batch. See the [DLQ cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html).
 
+## Connection URIs in `faucet serve`
+
+`faucet serve` reads `connection_uri` the way the MongoDB driver does and holds
+a config a request carried to the server's reference policy: every host and
+`proxyHost` follows the host rules, a `.sock` host and `tlsCAFile` /
+`tlsCertificateKeyFile` must sit under the allowed path roots,
+`tlsInsecure` / `tlsAllowInvalidCertificates` / `tlsAllowInvalidHostnames`
+need `--allow-unverified-tls`, and `authMechanism=MONGODB-AWS` / `GSSAPI` or an
+`ENVIRONMENT` entry in `authMechanismProperties` (which would use the server's
+own cloud or Kubernetes identity) is refused. Unless the server lists hosts
+with `--allow-url-host` (and always for a tenant), the URI must keep the driver
+on the server it names: add `directConnection=true`, or `loadBalanced=true`
+behind a load balancer. Templates and the triggers file are not limited. See
+the [HTTP API reference](https://faucet-hq.github.io/faucet-stream/reference/http-api.html).
+
 ## Config loading & schema
 
 Load config from YAML/JSON, environment variables, or a `.env` file:

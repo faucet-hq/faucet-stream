@@ -322,7 +322,14 @@ value the way the connector's client does (`faucet_core::ado::parse` is the SQL
 Server driver's connection-string grammar, shared with the MSSQL crate). A
 policy with path roots (one for configs a host does not trust) refuses a value
 its grammar cannot read, a value from which no server can be read, and a value
-longer than `MAX_SCREENED_LEN` (64 KiB). `check_url` judges a host by how it is written;
+longer than `MAX_SCREENED_LEN` (64 KiB). A `mongodb://` / `mongodb+srv://`
+URI, in any field, is read with the MongoDB driver's own rules (hosts up to the
+first `/` split on `,`, `.sock` hosts as paths, Unicode-folded option keys,
+`tlsCAFile` / `tlsCertificateKeyFile` as paths, the TLS verification switches,
+`authMechanism` / `ENVIRONMENT` identities as host credentials, `proxyHost` as
+a host, a `+srv` name's parent domain against the host allow-list), and
+`with_pinned_servers(true)` requires it to keep the driver on the server it
+names (`directConnection=true` or `loadBalanced=true`). `check_url` judges a host by how it is written;
 `check_url_resolved` also resolves it, and `faucet_core::http::Client`'s own
 resolver drops link-local / metadata addresses at connection time
 (`resolve::screen_resolved`), unless the policy lists that name exactly.

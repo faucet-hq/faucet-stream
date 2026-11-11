@@ -335,6 +335,7 @@ pub struct ReferencePolicy {
     subprocess: bool,
     unverified: bool,
     host_credentials: bool,
+    pin_servers: bool,
 }
 
 impl Default for ReferencePolicy {
@@ -777,6 +778,9 @@ fn connection_string_pairs(value: &str) -> Option<Vec<(String, String)>> {
 /// taken from a `${…}` token is returned lower-cased as written.
 pub fn url_hosts(value: &str) -> Vec<String> {
     let value = value.trim();
+    if let Some(read) = MongoRead::read(value) {
+        return read.tcp_hosts();
+    }
     if let Some(ip) = ip_literal(value) {
         return vec![ip];
     }
@@ -1107,6 +1111,160 @@ fn unix_socket_path(scheme: &str, value: &str) -> Option<Option<String>> {
     Some(percent_decoded(path).map(|p| p.into_owned()))
 }
 
+/// One server address of a MongoDB URI, read as `ServerAddress::parse` reads
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MongoHost {
+    /// A TCP host, canonical.
+    Tcp(String),
+    /// A Unix socket path (a segment ending in `.sock`), percent-decoded;
+    /// `None` when it is not UTF-8.
+    Socket(Option<String>),
+    /// A segment the driver refuses.
+    Unreadable,
+}
+
+/// A `mongodb://` / `mongodb+srv://` URI read as the MongoDB driver reads it:
+/// options after the first `?`, user info up to the last `@`, hosts up to the
+/// first `/`, split on `,` (`#` and `;` are host characters); options split on
+/// `&` and the first `=`, keys folded with Unicode lower-casing and not
+/// decoded, values percent-decoded (lossy, no `+` → space).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MongoRead {
+    srv: bool,
+    hosts: Vec<MongoHost>,
+    options: Vec<(String, String)>,
+}
+
+impl MongoRead {
+    fn read(value: &str) -> Option<Self> {
+        let (scheme, after) = value.split_once("://")?;
+        let srv = if scheme.eq_ignore_ascii_case("mongodb") {
+            false
+        } else if scheme.eq_ignore_ascii_case("mongodb+srv") {
+            true
+        } else {
+            return None;
+        };
+        let (pre, query) = match after.split_once('?') {
+            Some((pre, q)) => (pre, Some(q)),
+            None => (after, None),
+        };
+        let hosts_and_db = pre.rsplit_once('@').map_or(pre, |(_, h)| h);
+        let hosts = hosts_and_db
+            .split_once('/')
+            .map_or(hosts_and_db, |(h, _)| h);
+        let hosts = hosts.split(',').map(mongo_host).collect();
+        let options = query
+            .into_iter()
+            .flat_map(|q| q.split('&'))
+            .filter_map(|pair| pair.split_once('='))
+            .map(|(k, v)| {
+                let v = percent_encoding::percent_decode_str(v).decode_utf8_lossy();
+                (k.to_lowercase(), v.into_owned())
+            })
+            .collect();
+        Some(Self {
+            srv,
+            hosts,
+            options,
+        })
+    }
+
+    fn values(&self, key: &str) -> impl Iterator<Item = &str> {
+        self.options
+            .iter()
+            .filter(move |(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn is_true(&self, key: &str) -> bool {
+        self.values(key).any(|v| v == "true")
+    }
+
+    /// Whether the client stays on the server it names rather than learning
+    /// others from it.
+    fn pinned(&self) -> bool {
+        self.is_true("loadbalanced") || (!self.srv && self.is_true("directconnection"))
+    }
+
+    /// Whether the URI authenticates with credentials the host itself holds
+    /// (cloud or Kubernetes identity, Kerberos).
+    fn host_credentials(&self) -> bool {
+        let mechanism = self.values("authmechanism").any(|m| {
+            ["MONGODB-AWS", "GSSAPI"]
+                .iter()
+                .any(|x| m.eq_ignore_ascii_case(x))
+        });
+        let environment = self.values("authmechanismproperties").any(|props| {
+            props.split(',').any(|p| {
+                p.split_once(':')
+                    .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("environment"))
+            })
+        });
+        mechanism || environment
+    }
+
+    /// The TCP hosts the client connects to, the proxy included.
+    fn tcp_hosts(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .hosts
+            .iter()
+            .filter_map(|h| match h {
+                MongoHost::Tcp(h) => Some(h.clone()),
+                _ => None,
+            })
+            .collect();
+        out.extend(
+            self.values("proxyhost")
+                .map(canonical_host)
+                .filter(|h| !h.is_empty()),
+        );
+        out
+    }
+}
+
+/// The MongoDB options that name a local file.
+const MONGO_PATH_OPTIONS: &[&str] = &["tlscafile", "tlscertificatekeyfile"];
+
+/// The MongoDB options that turn off peer verification unless `false`.
+const MONGO_UNVERIFIED_OPTIONS: &[&str] = &[
+    "tlsinsecure",
+    "tlsallowinvalidcertificates",
+    "tlsallowinvalidhostnames",
+];
+
+fn mongo_host(segment: &str) -> MongoHost {
+    if segment.ends_with(".sock") {
+        return MongoHost::Socket(percent_decoded(segment).map(|p| p.into_owned()));
+    }
+    let host = match segment.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']') {
+            Some((ip, port))
+                if ip.parse::<std::net::Ipv6Addr>().is_ok()
+                    && (port.is_empty() || port.starts_with(':')) =>
+            {
+                return MongoHost::Tcp(canonical_host(&format!("[{ip}]")));
+            }
+            _ => return MongoHost::Unreadable,
+        },
+        None => segment.split_once(':').map_or(segment, |(h, _)| h),
+    };
+    match canonical_host(host) {
+        h if h.is_empty() => MongoHost::Unreadable,
+        h => MongoHost::Tcp(h),
+    }
+}
+
+/// The domain every host a `mongodb+srv` lookup of `name` returns must end
+/// with: `name` without its first label when it has three or more.
+fn srv_parent(name: &str) -> &str {
+    match name.split_once('.') {
+        Some((_, rest)) if rest.contains('.') => rest,
+        _ => name,
+    }
+}
+
 /// Connect-string parameters (Easy Connect Plus or descriptor) naming a local
 /// file or directory the Oracle client reads.
 const ORACLE_PATH_PARAMS: &[&str] = &[
@@ -1202,6 +1360,8 @@ impl ReferencePolicy {
             subprocess: true,
             unverified: true,
             host_credentials: true,
+
+            pin_servers: false,
         }
     }
 
@@ -1216,6 +1376,8 @@ impl ReferencePolicy {
             subprocess: false,
             unverified: false,
             host_credentials: false,
+
+            pin_servers: false,
         }
     }
 
@@ -1357,6 +1519,20 @@ impl ReferencePolicy {
     /// Whether connectors that run a program are allowed.
     pub fn allows_subprocess(&self) -> bool {
         self.subprocess
+    }
+
+    /// Require a client that learns further servers from the one it reaches
+    /// (a MongoDB replica set or `mongodb+srv` lookup) to stay on the server
+    /// the value names (`directConnection=true` or `loadBalanced=true`).
+    pub fn with_pinned_servers(mut self, pinned: bool) -> Self {
+        self.pin_servers = pinned;
+        self
+    }
+
+    /// Whether clients must stay on the servers a value names
+    /// ([`with_pinned_servers`](Self::with_pinned_servers)).
+    pub fn pins_servers(&self) -> bool {
+        self.pin_servers
     }
 
     /// Whether settings that turn off peer verification are allowed.
@@ -1762,9 +1938,98 @@ impl ReferencePolicy {
         Ok(())
     }
 
+    /// Check a MongoDB URI, read as the driver reads it ([`MongoRead`]).
+    fn check_mongo(&self, value: &str, read: &MongoRead) -> Result<(), Refusal> {
+        let confined = self.path_roots.is_some();
+        let refuse = |kind: RefusalKind, reason: String| Refusal::new(kind, value, reason);
+        self.check_scheme(value, if read.srv { "mongodb+srv" } else { "mongodb" })?;
+        let mut server = false;
+        for host in &read.hosts {
+            match host {
+                MongoHost::Tcp(h) => {
+                    self.check_host(value, h)?;
+                    if read.srv && self.url_hosts.is_some() {
+                        let parent = srv_parent(h);
+                        self.check_host(value, &format!("x.{parent}"))
+                            .map_err(|_| {
+                                refuse(
+                                    RefusalKind::Url,
+                                    format!(
+                                        "a `mongodb+srv` lookup of `{h}` may return any host under \
+                                     `{parent}`; the host allow-list must admit `*.{parent}`"
+                                    ),
+                                )
+                            })?;
+                    }
+                    server = true;
+                }
+                MongoHost::Socket(Some(p)) if confined && !p.starts_with('/') => {
+                    return Err(refuse(
+                        RefusalKind::Path,
+                        "a relative Unix socket path cannot be checked; use an absolute path"
+                            .into(),
+                    ));
+                }
+                MongoHost::Socket(Some(p)) => {
+                    self.check_setting_path(value, "unix socket", p)?;
+                    server = true;
+                }
+                MongoHost::Socket(None) if confined => {
+                    return Err(refuse(
+                        RefusalKind::Path,
+                        "a percent-encoded path that is not UTF-8 cannot be checked".into(),
+                    ));
+                }
+                MongoHost::Socket(None) | MongoHost::Unreadable => {}
+            }
+        }
+        if confined && !server {
+            return Err(refuse(
+                RefusalKind::Url,
+                "no server could be read from this value; name the server explicitly".into(),
+            ));
+        }
+        for (key, v) in &read.options {
+            if MONGO_PATH_OPTIONS.contains(&key.as_str()) {
+                self.check_setting_path(value, key, v)?;
+            }
+            if MONGO_UNVERIFIED_OPTIONS.contains(&key.as_str()) && v != "false" && !self.unverified
+            {
+                return Err(refuse(
+                    RefusalKind::Url,
+                    format!("`{key}` turns off certificate verification"),
+                ));
+            }
+            if key == "proxyhost" {
+                self.check_host(value, &canonical_host(v))?;
+            }
+        }
+        if read.host_credentials() && !self.host_credentials {
+            return Err(refuse(
+                RefusalKind::HostCredentials,
+                "`authMechanism` / `authMechanismProperties` authenticate with the server's own \
+                 identity (cloud, Kubernetes or Kerberos credentials)"
+                    .into(),
+            ));
+        }
+        if self.pin_servers && !read.pinned() {
+            return Err(refuse(
+                RefusalKind::Url,
+                "a MongoDB client connects to further servers the one it reaches names; add \
+                 `directConnection=true` to use one server (or `loadBalanced=true` behind a load \
+                 balancer), or have the hosts it may reach listed in the host allow-list"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Check a value with no declared grammar.
     fn check_plain_url(&self, value: &str) -> Result<(), Refusal> {
         let value = value.trim_matches(|c: char| c.is_ascii_whitespace());
+        if let Some(read) = MongoRead::read(value) {
+            return self.check_mongo(value, &read);
+        }
         if let Some(items) = scheme_list(value) {
             for item in items {
                 self.check_plain_url(item)
@@ -3901,5 +4166,230 @@ mod tests {
         ] {
             accepted(None, v);
         }
+    }
+
+    #[test]
+    fn mongodb_tls_files_follow_the_path_roots() {
+        for v in [
+            "mongodb://db.example.com/?tlsCAFile=/etc/ssl/private/ca.pem",
+            "mongodb://db.example.com/?TLSCERTIFICATEKEYFILE=%2Fetc%2Fpasswd",
+            "mongodb://db.example.com/?tls=true&tlsCertificateKeyFile=/srv/data/../../etc/passwd",
+            "mongodb://db.example.com/?tlsCertificate\u{212A}eyFile=/etc/passwd",
+            "mongodb://db.example.com/?appName=a,b://c&tlsCertificateKeyFile=/etc/passwd",
+            "mongodb+srv://cluster0.example.net/?tlsCAFile=/etc/passwd",
+        ] {
+            let e = refused(None, v);
+            assert_eq!(e.kind, RefusalKind::Path, "{v}");
+            assert!(!e.reason.contains("/etc"), "{v}: {}", e.reason);
+        }
+        accepted(None, "mongodb://db.example.com/?tlsCAFile=/srv/data/ca.pem");
+        accepted(
+            None,
+            "mongodb://db.example.com/?tlsCAFile=%2Fsrv%2Fdata%2Fca.pem",
+        );
+        assert!(
+            ReferencePolicy::open()
+                .check_url("mongodb://db.example.com/?tlsCAFile=/etc/ssl/ca.pem")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn mongodb_unverified_tls_needs_the_flag() {
+        for v in [
+            "mongodb://db.example.com/?tlsInsecure=true",
+            "mongodb://db.example.com/?tlsAllowInvalidCertificates=true",
+            "mongodb://db.example.com/?TLSALLOWINVALIDHOSTNAMES=yes",
+            "mongodb://db.example.com/?tlsinsecure=%74rue",
+        ] {
+            let e = refused(None, v);
+            assert!(e.reason.contains("verification"), "{v}: {}", e.reason);
+            assert!(confined().with_unverified(true).check_url(v).is_ok(), "{v}");
+        }
+        accepted(None, "mongodb://db.example.com/?tlsInsecure=false&tls=true");
+    }
+
+    #[test]
+    fn mongodb_ambient_auth_needs_host_credentials() {
+        for v in [
+            "mongodb://db.example.com/?authMechanism=MONGODB-OIDC&authMechanismProperties=ENVIRONMENT:k8s",
+            "mongodb://db.example.com/?authMechanism=MONGODB-OIDC&authMechanismProperties=TOKEN_RESOURCE:x,ENVIRONMENT%3Aazure",
+            "mongodb://db.example.com/?authMechanism=MONGODB-AWS",
+            "mongodb://db.example.com/?authmechanism=gssapi",
+            "mongodb+srv://cluster0.example.net/?authMechanism=MONGODB%2DOIDC&authMechanismProperties=ENVIRONMENT:gcp",
+        ] {
+            let e = refused(None, v);
+            assert_eq!(e.kind, RefusalKind::HostCredentials, "{v}");
+            assert!(
+                confined().with_host_credentials(true).check_url(v).is_ok(),
+                "{v}"
+            );
+        }
+        accepted(
+            None,
+            "mongodb://u:p@db.example.com/?authMechanism=SCRAM-SHA-256",
+        );
+        accepted(
+            None,
+            "mongodb://db.example.com/?authMechanism=MONGODB-X509&tlsCertificateKeyFile=/srv/data/c.pem",
+        );
+    }
+
+    #[test]
+    fn mongodb_socket_hosts_are_paths() {
+        for v in [
+            "mongodb://%2Fvar%2Frun%2Fmongodb-27017.sock/",
+            "mongodb://db.example.com,%2Ftmp%2F..%2Fetc%2Fm.sock/db",
+            "mongodb://m.sock/",
+            "mongodb://%2Fsrv%2Fdata%2F%FF.sock/",
+        ] {
+            assert_eq!(refused(None, v).kind, RefusalKind::Path, "{v}");
+        }
+        accepted(None, "mongodb://%2Fsrv%2Fdata%2Fmongodb.sock/");
+        assert_eq!(
+            url_hosts("mongodb://%2Fsrv%2Fdata%2Fm.sock,db.example.com/"),
+            vec!["db.example.com"]
+        );
+        assert_eq!(url_hosts("mongodb://evil.SOCK/"), vec!["evil.sock"]);
+        assert!(
+            ReferencePolicy::open()
+                .check_url("mongodb://%2Fvar%2Frun%2Fm.sock/")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn mongodb_hosts_are_read_like_the_driver() {
+        for v in [
+            "mongodb://ok.example.com#,169.254.169.254:80/",
+            "mongodb://ok.example.com;x,169.254.169.254/",
+            "mongodb://u:p@x@ok.example.com,169.254.169.254/?appName=a",
+            "mongodb://ok.example.com/?proxyHost=169.254.169.254",
+            "mongodb://ok.example.com/?appName=x,nats://ok.example.com&proxyHost=169.254.169.254",
+        ] {
+            assert!(refused(None, v).reason.contains("169.254.169.254"), "{v}");
+        }
+        assert_eq!(
+            url_hosts("mongodb://a.example.com#,B.example.com:27018/?x=1"),
+            vec!["a.example.com#", "b.example.com"]
+        );
+    }
+
+    #[test]
+    fn mongodb_srv_needs_the_parent_domain_listed() {
+        let exact = confined().with_url_hosts(["cluster0.example.net"]);
+        let parent = confined().with_url_hosts(["*.example.net"]);
+        let v = "mongodb+srv://cluster0.example.net/app";
+        assert!(exact.check_url(v).is_err());
+        assert!(parent.check_url(v).is_ok());
+        assert!(
+            exact
+                .check_url("mongodb://cluster0.example.net/app")
+                .is_ok()
+        );
+        accepted(None, v);
+    }
+
+    #[test]
+    fn mongodb_values_keep_plus_signs() {
+        let read = MongoRead::read(
+            "mongodb://u:p@db.example.com/app?tlsCAFile=/srv/data/a+b%20c.pem&appName=x%FF",
+        )
+        .unwrap();
+        assert_eq!(
+            read.values("tlscafile").collect::<Vec<_>>(),
+            vec!["/srv/data/a+b c.pem"]
+        );
+        assert_eq!(
+            read.values("appname").collect::<Vec<_>>(),
+            vec!["x\u{FFFD}"]
+        );
+        let read = MongoRead::read("MONGODB://h/?tlsCertificate\u{212A}eyFile=/x&bad&k=").unwrap();
+        assert_eq!(
+            read.options,
+            vec![
+                ("tlscertificatekeyfile".to_string(), "/x".to_string()),
+                ("k".to_string(), String::new())
+            ]
+        );
+        assert!(MongoRead::read("mongodb:/h").is_none());
+        assert!(MongoRead::read("postgres://h").is_none());
+    }
+
+    #[test]
+    fn mongodb_server_addresses_are_read_like_the_driver() {
+        let read = MongoRead::read(
+            "mongodb+srv://a@b@[::1]:27017,[::1]x,[zz],:1,h:x:y,%2Fs.sock,%FF.sock/db,x?y",
+        )
+        .unwrap();
+        assert!(read.srv);
+        assert_eq!(
+            read.hosts,
+            vec![
+                MongoHost::Tcp("[::1]".into()),
+                MongoHost::Unreadable,
+                MongoHost::Unreadable,
+                MongoHost::Unreadable,
+                MongoHost::Tcp("h".into()),
+                MongoHost::Socket(Some("/s.sock".into())),
+                MongoHost::Socket(None),
+            ]
+        );
+        assert_eq!(srv_parent("cluster0.example.net"), "example.net");
+        assert_eq!(srv_parent("example.net"), "example.net");
+        assert_eq!(srv_parent("localhost"), "localhost");
+    }
+
+    #[test]
+    fn mongodb_clients_stay_on_the_named_server_when_pinned() {
+        let pinned = confined().with_pinned_servers(true);
+        assert!(pinned.pins_servers());
+        assert!(!confined().pins_servers());
+        for v in [
+            "mongodb://db.example.com/app",
+            "mongodb://a.example.com,b.example.com/?replicaSet=rs0",
+            "mongodb://db.example.com/?directConnection=false",
+            "mongodb+srv://cluster0.example.net/",
+            "mongodb+srv://cluster0.example.net/?directConnection=true",
+        ] {
+            let e = pinned.check_url(v).expect_err(v);
+            assert!(e.reason.contains("directConnection=true"), "{v}");
+        }
+        for v in [
+            "mongodb://db.example.com/app?directConnection=true",
+            "mongodb://db.example.com/?replicaSet=rs0&directConnection=true",
+            "mongodb://lb.example.com/?loadBalanced=true",
+            "mongodb+srv://cluster0.example.net/?loadBalanced=true",
+        ] {
+            assert!(pinned.check_url(v).is_ok(), "{v}");
+        }
+    }
+
+    #[test]
+    fn mongodb_urls_are_checked_by_scheme() {
+        let only_https = confined().with_url_schemes(["https"]);
+        assert!(
+            only_https
+                .check_url("mongodb://db.example.com/")
+                .unwrap_err()
+                .reason
+                .contains("mongodb")
+        );
+        assert!(
+            only_https
+                .check_url("mongodb+srv://c.example.net/")
+                .unwrap_err()
+                .reason
+                .contains("mongodb+srv")
+        );
+        assert_eq!(
+            url_hosts("mongodb://a.example.com/?proxyHost=Proxy.example.com"),
+            vec!["a.example.com", "proxy.example.com"]
+        );
+        assert!(
+            ReferencePolicy::open()
+                .check_url("mongodb://:1,%FF.sock/")
+                .is_ok()
+        );
     }
 }

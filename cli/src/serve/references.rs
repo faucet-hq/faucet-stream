@@ -21,7 +21,12 @@
 //!   never for a tenant;
 //! - never settings that authenticate with the server's own credentials
 //!   (fields annotated `x-faucet-host-credentials`, e.g. Oracle
-//!   `external_auth`).
+//!   `external_auth`, or a MongoDB URI's `authMechanism=MONGODB-OIDC` with an
+//!   `ENVIRONMENT` property);
+//! - a MongoDB URI only when it keeps the client on the server it names
+//!   (`directConnection=true` or `loadBalanced=true`), unless
+//!   `--allow-url-host` lists the hosts a replica set may name; a tenant's
+//!   always does.
 //!
 //! A run for a tenant is further confined to `<--tenant-path-root>/<tenant>`.
 //!
@@ -91,7 +96,8 @@ impl ServeReferencePolicy {
             .with_path_roots(roots)
             .with_env(args.allow_env.iter().cloned())
             .with_secret_schemes(&args.allow_secret_scheme)
-            .with_unverified(args.allow_unverified_tls);
+            .with_unverified(args.allow_unverified_tls)
+            .with_pinned_servers(args.allow_url_host.is_empty());
         caller = if args.allow_url_scheme.is_empty() {
             caller.any_url_scheme()
         } else {
@@ -129,7 +135,8 @@ impl ServeReferencePolicy {
                     .caller
                     .clone()
                     .with_subprocess(allow_subprocess && tenant.is_none())
-                    .with_unverified(unverified);
+                    .with_unverified(unverified)
+                    .with_pinned_servers(self.caller.pins_servers() || tenant.is_some());
                 if let (Some(root), Some(t)) = (&self.tenant_root, tenant) {
                     p = p.with_path_roots([root.join(t)]);
                 }
@@ -301,6 +308,24 @@ mod tests {
         for origin in [BodyOrigin::Trusted, BodyOrigin::ServerFile] {
             assert_eq!(p.for_origin(origin, Some("t")), ReferencePolicy::open());
         }
+    }
+
+    #[test]
+    fn mongodb_clients_stay_on_one_server_without_a_host_allow_list() {
+        let caller = BodyOrigin::Caller {
+            allow_subprocess: false,
+        };
+        let open = ServeReferencePolicy::default();
+        assert!(open.caller().pins_servers());
+        assert!(open.for_origin(caller, None).pins_servers());
+        let listed = ServeReferencePolicy::from_args(&ReferenceArgs {
+            allow_url_host: vec!["*.example.com".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!listed.for_origin(caller, None).pins_servers());
+        assert!(listed.for_origin(caller, Some("acme")).pins_servers());
+        assert!(!listed.for_origin(BodyOrigin::Trusted, None).pins_servers());
     }
 
     #[test]

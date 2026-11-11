@@ -270,6 +270,21 @@ pipeline:
       path: ./users-changes.jsonl
 ```
 
+## Connection URIs in `faucet serve`
+
+`faucet serve` reads `connection_uri` the way the MongoDB driver does and holds
+a config a request carried to the server's reference policy: every host and
+`proxyHost` follows the host rules, a `.sock` host and `tlsCAFile` /
+`tlsCertificateKeyFile` must sit under the allowed path roots,
+`tlsInsecure` / `tlsAllowInvalidCertificates` / `tlsAllowInvalidHostnames`
+need `--allow-unverified-tls`, and `authMechanism=MONGODB-AWS` / `GSSAPI` or an
+`ENVIRONMENT` entry in `authMechanismProperties` (which would use the server's
+own cloud or Kubernetes identity) is refused. Unless the server lists hosts
+with `--allow-url-host` (and always for a tenant), the URI must keep the driver
+on the server it names: add `directConnection=true`, or `loadBalanced=true`
+behind a load balancer. Templates and the triggers file are not limited. See
+the [HTTP API reference](https://faucet-hq.github.io/faucet-stream/reference/http-api.html).
+
 ## Streaming & batching
 
 The source overrides `stream_pages` to tail the change stream natively. It accumulates change events into a `StreamPage` and yields a page when **either** `batch_size` events have accumulated **or** `idle_timeout` elapses with no new event. The bookmark carried on each page is the `resume_token` of the last event in that page, so the pipeline persists durable progress every page. When the cycle ends idle, the final page carries the stream's **post-batch resume token** instead — it covers the events the server filtered out (`operation_types`, `aggregation_pipeline`) and the quiet period, so a filtered or low-write stream's bookmark keeps moving and never falls out of the oplog window; the page is emitted (bookmark-only) even when no event arrived. A page that reaches `batch_size` in the middle of a multi-document transaction is held until that transaction's events are all buffered, so a reader never sees half of a source transaction. A cycle that ends abruptly (the server closes the stream, or a poll outlives its bound) flushes only the events before a transaction it cannot prove complete; that transaction is read again on the next run.

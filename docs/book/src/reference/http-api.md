@@ -331,6 +331,34 @@ reads it the way the connector's client does:
   (`accountname=`), which the client ignores, is refused, naming the key.
 - **`url-list`** (Kafka `brokers`, NATS `servers`): every element.
 
+A `mongodb://` or `mongodb+srv://` URI, in any field, is read the way the
+MongoDB driver reads it: options start at the first `?` (a `,` or `://` inside
+an option does not start a new URL), user info ends at the last `@`, hosts end
+at the first `/` and are split on `,` (`#` and `;` are ordinary host
+characters), option keys are compared after lower-casing (Unicode, so
+`tlsCertificateKeyFile` is matched however it is cased) and values are
+percent-decoded with `+` kept as `+`. For a caller's config:
+
+- every host, and `proxyHost`, is checked against the host rules; a host ending
+  in `.sock` is a Unix socket path, checked against the path roots (a relative
+  one is refused);
+- `tlsCAFile` and `tlsCertificateKeyFile` are paths under the path roots;
+- `tlsInsecure`, `tlsAllowInvalidCertificates` and `tlsAllowInvalidHostnames`
+  with any value other than `false` need `--allow-unverified-tls`;
+- `authMechanism=MONGODB-AWS` or `GSSAPI`, or any `ENVIRONMENT` entry in
+  `authMechanismProperties` (`MONGODB-OIDC` with the server's Kubernetes,
+  Azure or GCP identity), authenticates with the server's own credentials and
+  is refused;
+- with `--allow-url-host`, a `mongodb+srv://` name must be admitted by a
+  `*.<parent domain>` entry, since its lookup may return any host under that
+  domain;
+- without `--allow-url-host`, and always for a tenant, the URI must keep the
+  driver on the server it names: add `directConnection=true` (one server), or
+  `loadBalanced=true` behind a load balancer. A replica set seed list, a
+  `replicaSet` without `directConnection=true` and `mongodb+srv://` (without
+  `loadBalanced=true`) are refused, because the server the driver reaches
+  names the further hosts it connects to.
+
 Any URL value is trimmed first; a value that is, as a whole, an IP address
 (`fd00:ec2::254`) is a host; a `,` list whose later elements carry their own
 `scheme://` is checked element by element; a `//host/…` reference is checked by
@@ -366,9 +394,10 @@ are stored and again whenever a run uses them.
 | Local path (connector path, `${file:}`, state / DLQ / lineage file) | under the server's working directory or the system temp directory | `--allow-path-root DIR` (repeatable) |
 | URL scheme | any | `--allow-url-scheme` restricts it to the listed schemes |
 | URL host (including a database URL's `host=` / `hostaddr=` and the servers or `HOST=` entries of a `key=value` connection string or connect descriptor) | any, except link-local and cloud-metadata addresses (`169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`, `fd20:ce::254`, `fd00:c1::a9fe:a9fe`, `100.100.100.200`, `metadata.google.internal`) | `--allow-url-host` restricts it to the listed hosts (`*.example.com` matches subdomains); a metadata host is reachable only when listed |
-| A file a connection string names (`sslkey=`, `sslrootcert=`, `socket=`, `TrustServerCertificateCA=`, a wallet directory, Oracle `token_location` / `oci_config_file`) | under the path roots, like any local path | `--allow-path-root DIR` |
-| A setting that turns off certificate or host-key verification (`insecure_skip_verify`, MSSQL `trust_server_certificate` / `TrustServerCertificate=true`, SFTP `known_hosts: {mode: insecure}`, `verify_ca=false` in a MySQL URL, `#insecure` on a `rediss://` URL, Kafka `enable.ssl.certificate.verification=false`) | refused | `--allow-unverified-tls` (never for a tenant) |
-| A setting that authenticates with the server's own credentials (Oracle `external_auth`, Oracle `token_auth` other than `OAUTH` with a `token_location`) | refused | — (register the pipeline as a template) |
+| A file a connection string names (`sslkey=`, `sslrootcert=`, `socket=`, `TrustServerCertificateCA=`, MongoDB `tlsCAFile=` / `tlsCertificateKeyFile=` and `.sock` hosts, a wallet directory, Oracle `token_location` / `oci_config_file`) | under the path roots, like any local path | `--allow-path-root DIR` |
+| A setting that turns off certificate or host-key verification (`insecure_skip_verify`, MSSQL `trust_server_certificate` / `TrustServerCertificate=true`, SFTP `known_hosts: {mode: insecure}`, `verify_ca=false` in a MySQL URL, `#insecure` on a `rediss://` URL, MongoDB `tlsInsecure` / `tlsAllowInvalidCertificates` / `tlsAllowInvalidHostnames`, Kafka `enable.ssl.certificate.verification=false`) | refused | `--allow-unverified-tls` (never for a tenant) |
+| A setting that authenticates with the server's own credentials (Oracle `external_auth`, Oracle `token_auth` other than `OAUTH` with a `token_location`, MongoDB `authMechanism=MONGODB-AWS` / `GSSAPI` or an `ENVIRONMENT` entry in `authMechanismProperties`) | refused | — (register the pipeline as a template) |
+| A MongoDB URI the driver may extend with hosts its server names (a seed list, `replicaSet`, `mongodb+srv://`) | refused; add `directConnection=true` (one server) or `loadBalanced=true` | `--allow-url-host` (never for a tenant) |
 | `${env:NAME}` / `${secret:NAME}` | none | `--allow-env NAME` or `--allow-env 'PREFIX*'` |
 | `${vault:}` / `${aws-sm:}` / `${gcp-sm:}` / `${azure-kv:}` | none | `--allow-secret-scheme vault,aws-sm` |
 | A program (`singer`) | refused | `--allow-subprocess-connectors` |

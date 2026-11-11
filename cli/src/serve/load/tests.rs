@@ -2142,3 +2142,109 @@ fn azure_blob_hosts_come_from_the_whole_connection() {
     assert!(err.contains("`accountname`"), "{err}");
     refuse_server_paths_with(&cased, &[], BodyOrigin::Trusted, &ReferencePolicy::open()).unwrap();
 }
+
+#[cfg(feature = "source-mongodb")]
+#[tokio::test]
+async fn caller_mongodb_options_follow_the_reference_policy() {
+    use crate::cli::ReferenceArgs;
+    use crate::serve::references::ServeReferencePolicy;
+    let caller = BodyOrigin::Caller {
+        allow_subprocess: false,
+    };
+    let body = |uri: &str| {
+        serde_json::json!({ "version": 1, "pipeline": {
+            "source": { "type": "mongodb", "config": {
+                "connection_uri": uri, "database": "app", "collection": "c" } },
+            "sink": { "type": "stdout", "config": {} }
+        }})
+        .to_string()
+    };
+    let refs = ServeReferencePolicy::default();
+    let load = |uri: &str, origin: BodyOrigin, refs: &ServeReferencePolicy| {
+        let body = body(uri);
+        let refs = refs.clone();
+        async move {
+            load_submission_with(&body, ConfigFormat::Json, None, None, origin, None, &refs).await
+        }
+    };
+    for (uri, says) in [
+        (
+            "mongodb://db.example.com/?directConnection=true&tlsCAFile=/etc/ssl/private/k.pem",
+            "tlscafile",
+        ),
+        (
+            "mongodb://db.example.com/?directConnection=true&tlsInsecure=true",
+            "verification",
+        ),
+        (
+            "mongodb://db.example.com/?directConnection=true&authMechanism=MONGODB-OIDC\
+             &authMechanismProperties=ENVIRONMENT:k8s",
+            "own identity",
+        ),
+        ("mongodb://db.example.com/app", "directConnection=true"),
+        (
+            "mongodb://a.example.com,b.example.com/?replicaSet=rs0",
+            "directConnection=true",
+        ),
+    ] {
+        let err = load(uri, caller, &refs).await.unwrap_err();
+        assert!(
+            matches!(&err, ServeError::Forbidden(m) if m.contains(says)),
+            "{uri}: {err:?}"
+        );
+        load(uri, BodyOrigin::Trusted, &refs)
+            .await
+            .unwrap_or_else(|e| panic!("{uri} from a template: {e:?}"));
+    }
+    load(
+        "mongodb://db.example.com/app?directConnection=true",
+        caller,
+        &refs,
+    )
+    .await
+    .unwrap();
+    let listed = ServeReferencePolicy::from_args(&ReferenceArgs {
+        allow_url_host: vec!["*.example.com".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    load(
+        "mongodb://a.example.com,b.example.com/?replicaSet=rs0",
+        caller,
+        &listed,
+    )
+    .await
+    .unwrap();
+}
+
+/// Text a caller splices into a template's MongoDB URI is judged with the
+/// whole URI it lands in, so an option it appends is read as the driver reads
+/// it.
+#[cfg(feature = "source-mongodb")]
+#[test]
+fn sender_text_spliced_into_a_database_url_query_is_checked_whole() {
+    let doc = |app: &str| {
+        json!({ "version": 1, "pipeline": {
+            "source": { "type": "mongodb", "config": {
+                "connection_uri": format!(
+                    "mongodb://db.example.com/?directConnection=true&appName={app}"
+                ),
+                "database": "app", "collection": "c" } },
+            "sink": { "type": "stdout", "config": {} }
+        }})
+    };
+    let f = caller_fields(&[("/pipeline/source/config/connection_uri", "app")]);
+    let check = |d: &Value| {
+        let cfg = PipelineConfig::from_value(d.clone()).unwrap();
+        refuse_caller_params(d, &cfg, &f, &confined_policy(), false)
+    };
+    for app in [
+        "x&tlsCertificateKeyFile=/etc/passwd",
+        "x,nats://n&tlsCAFile=%2Fetc%2Fshadow",
+        "x&authMechanism=MONGODB-OIDC&authMechanismProperties=ENVIRONMENT:k8s",
+    ] {
+        let err = check(&doc(app)).unwrap_err().to_string();
+        assert!(err.contains("connection_uri"), "{app}: {err}");
+    }
+    check(&doc("reports")).unwrap();
+}

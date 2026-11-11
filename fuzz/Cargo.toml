@@ -32,6 +32,8 @@ byteorder = "1"
 tiberius = { version = "0.13", default-features = false, features = ["rustls", "tds73"] }
 # The Azure Blob client's settings, to compare with the connection-string screen (fuzz_targets/azure_connection_string.rs).
 faucet-common-azure = { path = "../crates/common/azure" }
+# The MongoDB driver, to compare its URI reading with the screen (fuzz_targets/mongodb_uri.rs).
+mongodb = "3.9"
 tracing = "0.1"
 
 [[bin]]
@@ -128,6 +130,13 @@ bench = false
 [[bin]]
 name = "azure_connection_string"
 path = "fuzz_targets/azure_connection_string.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mongodb_uri"
+path = "fuzz_targets/mongodb_uri.rs"
 test = false
 doc = false
 bench = false
