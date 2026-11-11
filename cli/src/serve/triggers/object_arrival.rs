@@ -9,6 +9,7 @@ use crate::serve::state::ServerState;
 use async_trait::async_trait;
 use futures::StreamExt;
 use object_store::ObjectStore;
+use object_store::list::{PaginatedListOptions, PaginatedListStore};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -206,11 +207,39 @@ pub struct ObjectArrivalWatcher {
     poll_timeout: Option<Duration>,
     /// Longest wait for the next listing page before the poll fails.
     page_timeout: Duration,
+    /// The same store, listed page by page so a key object_store cannot
+    /// read is skipped rather than failing the listing.
+    pager: Option<Arc<dyn PaginatedListStore>>,
+}
+
+/// Keys asked for per listing page.
+const LIST_PAGE: usize = 1000;
+
+/// Unreadable keys skipped in one poll before it gives up.
+const MAX_UNREADABLE_KEYS: usize = 1000;
+
+/// The key a listing error names when object_store cannot read it (an empty,
+/// `.` or `..` segment, or a control character).
+fn unreadable_key(e: &object_store::Error) -> Option<&str> {
+    use object_store::path::Error as PathError;
+    match e {
+        object_store::Error::InvalidPath {
+            source: PathError::EmptySegment { path } | PathError::BadSegment { path, .. },
+        } => Some(path),
+        _ => None,
+    }
 }
 
 impl ObjectArrivalWatcher {
     /// Build the object_store client for the configured store.
     pub fn build_store(store: &StoreSpec) -> Result<StoreTriple, String> {
+        Self::build_paged_store(store).map(|(triple, _)| triple)
+    }
+
+    /// [`Self::build_store`], with the same client as a page-by-page lister.
+    pub fn build_paged_store(
+        store: &StoreSpec,
+    ) -> Result<(StoreTriple, Arc<dyn PaginatedListStore>), String> {
         match store {
             StoreSpec::S3 {
                 bucket,
@@ -225,15 +254,17 @@ impl ObjectArrivalWatcher {
                 if let Some(e) = endpoint {
                     b = b.with_endpoint(e).with_allow_http(true);
                 }
-                let s = b.build().map_err(|e| format!("building S3 client: {e}"))?;
-                Ok((Arc::new(s), bucket.clone(), prefix.clone()))
+                let s = Arc::new(b.build().map_err(|e| format!("building S3 client: {e}"))?);
+                Ok(((s.clone(), bucket.clone(), prefix.clone()), s))
             }
             StoreSpec::Gcs { bucket, prefix } => {
-                let s = object_store::gcp::GoogleCloudStorageBuilder::from_env()
-                    .with_bucket_name(bucket)
-                    .build()
-                    .map_err(|e| format!("building GCS client: {e}"))?;
-                Ok((Arc::new(s), bucket.clone(), prefix.clone()))
+                let s = Arc::new(
+                    object_store::gcp::GoogleCloudStorageBuilder::from_env()
+                        .with_bucket_name(bucket)
+                        .build()
+                        .map_err(|e| format!("building GCS client: {e}"))?,
+                );
+                Ok(((s.clone(), bucket.clone(), prefix.clone()), s))
             }
         }
     }
@@ -265,7 +296,15 @@ impl ObjectArrivalWatcher {
             compiled,
             poll_timeout: None,
             page_timeout: super::watcher::default_poll_timeout(poll),
+            pager: None,
         }
+    }
+
+    /// List through `pager` (the same store, page by page).
+    #[must_use]
+    pub fn with_pager(mut self, pager: Arc<dyn PaginatedListStore>) -> Self {
+        self.pager = Some(pager);
+        self
     }
 
     /// Bound the whole poll (`poll_timeout_secs`); without it only each
@@ -330,6 +369,9 @@ impl ObjectArrivalWatcher {
     /// List the prefix, keeping only the objects the cursor has not fired:
     /// memory follows the new objects, not the size of the prefix.
     async fn list_new(&self) -> Result<Vec<ListedObject>, String> {
+        if let Some(pager) = &self.pager {
+            return self.list_paged(pager.as_ref()).await;
+        }
         let prefix_path = self.prefix.as_deref().map(object_store::path::Path::from);
         let mut stream = self.store.list(prefix_path.as_ref());
         let mut out = Vec::new();
@@ -345,18 +387,107 @@ impl ObjectArrivalWatcher {
                     )
                 })?;
             let Some(meta) = next else { break };
-            let meta = meta.map_err(|e| format!("listing objects: {e}"))?;
-            let o = ListedObject {
-                key: meta.location.to_string(),
-                last_modified: meta.last_modified,
-                size: meta.size,
-                etag: meta.e_tag,
-            };
-            if self.cursor.is_new(&o) {
-                out.push(o);
-            }
+            let meta = meta.map_err(|e| match unreadable_key(&e) {
+                Some(key) => format!(
+                    "listing objects: the store lists key {key:?}, which cannot be read as an \
+                     object path; nothing in the prefix fires until it is removed"
+                ),
+                None => format!("listing objects: {e}"),
+            })?;
+            self.keep_if_new(meta, &mut out);
         }
         Ok(out)
+    }
+
+    fn keep_if_new(&self, meta: object_store::ObjectMeta, out: &mut Vec<ListedObject>) {
+        let o = ListedObject {
+            key: meta.location.to_string(),
+            last_modified: meta.last_modified,
+            size: meta.size,
+            etag: meta.e_tag,
+        };
+        if self.cursor.is_new(&o) {
+            out.push(o);
+        }
+    }
+
+    /// [`Self::list_new`] page by page. A page holding a key object_store
+    /// cannot read is asked for again in smaller pages until that key stands
+    /// alone; it is then skipped (counted and logged) and the listing resumes
+    /// right after it, so every other object in the prefix is still seen.
+    async fn list_paged(
+        &self,
+        pager: &dyn PaginatedListStore,
+    ) -> Result<Vec<ListedObject>, String> {
+        let prefix = self
+            .prefix
+            .as_deref()
+            .map(object_store::path::Path::from)
+            .filter(|p| !p.as_ref().is_empty())
+            .map(|p| format!("{}/", p.as_ref()));
+        let mut out = Vec::new();
+        let mut offset: Option<String> = None;
+        let mut token: Option<String> = None;
+        let mut size = LIST_PAGE;
+        let mut skipped = 0usize;
+        loop {
+            let opts = PaginatedListOptions {
+                offset: offset.clone(),
+                max_keys: Some(size),
+                page_token: token.clone(),
+                ..Default::default()
+            };
+            let page = tokio::time::timeout(
+                self.page_timeout,
+                pager.list_paginated(prefix.as_deref(), opts),
+            )
+            .await
+            .map_err(|_| {
+                format!(
+                    "listing objects: no response from the store within {}s",
+                    self.page_timeout.as_secs()
+                )
+            })?;
+            match page {
+                Ok(page) => {
+                    let empty = page.result.objects.is_empty();
+                    for meta in page.result.objects {
+                        self.keep_if_new(meta, &mut out);
+                    }
+                    match page.page_token {
+                        Some(t) if !empty || token.as_deref() != Some(t.as_str()) => {
+                            token = Some(t)
+                        }
+                        _ => return Ok(out),
+                    }
+                }
+                Err(e) => {
+                    let Some(key) = unreadable_key(&e) else {
+                        return Err(format!("listing objects: {e}"));
+                    };
+                    if size > 1 {
+                        size /= 2;
+                        continue;
+                    }
+                    skipped += 1;
+                    super::metrics::error(&self.name, "object_arrival");
+                    tracing::warn!(
+                        trigger = %self.name,
+                        key = ?key,
+                        "object skipped: its key cannot be read as an object path"
+                    );
+                    if skipped > MAX_UNREADABLE_KEYS {
+                        return Err(format!(
+                            "listing objects: more than {MAX_UNREADABLE_KEYS} keys in the prefix \
+                             cannot be read as object paths (the last: {key:?})"
+                        ));
+                    }
+                    offset = Some(key.to_string());
+                    token = None;
+                    size = LIST_PAGE;
+                }
+            }
+        }
     }
 }
 
@@ -598,5 +729,150 @@ mod cursor_tests {
         assert_eq!(c.new_objects(std::slice::from_ref(&a)).len(), 1);
         c.commit(&a);
         assert!(c.new_objects(&[a]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod listing_tests {
+    use super::*;
+    use crate::serve::triggers::spec::{RunTemplate, TriggerKind, TriggerSpec};
+
+    /// A ListObjectsV2 endpoint over a fixed key set: honours `prefix`,
+    /// `start-after`, `continuation-token` (the last key returned) and
+    /// `max-keys`.
+    struct FakeS3 {
+        keys: Vec<&'static str>,
+    }
+
+    impl wiremock::Respond for FakeS3 {
+        fn respond(&self, req: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let q: std::collections::HashMap<String, String> =
+                req.url.query_pairs().into_owned().collect();
+            let after = q
+                .get("continuation-token")
+                .or_else(|| q.get("start-after"))
+                .cloned()
+                .unwrap_or_default();
+            let prefix = q.get("prefix").cloned().unwrap_or_default();
+            let max: usize = q
+                .get("max-keys")
+                .and_then(|m| m.parse().ok())
+                .unwrap_or(1000);
+            let mut keys: Vec<&str> = self
+                .keys
+                .iter()
+                .copied()
+                .filter(|k| k.starts_with(prefix.as_str()) && *k > after.as_str())
+                .collect();
+            keys.sort_unstable();
+            let more = keys.len() > max;
+            keys.truncate(max);
+            let mut xml =
+                String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult>");
+            for k in &keys {
+                xml.push_str(&format!(
+                    "<Contents><Key>{k}</Key><Size>1</Size>\
+                     <LastModified>2026-11-11T00:00:00.000Z</LastModified></Contents>"
+                ));
+            }
+            if more {
+                xml.push_str(&format!(
+                    "<NextContinuationToken>{}</NextContinuationToken>",
+                    keys.last().unwrap()
+                ));
+            }
+            xml.push_str("</ListBucketResult>");
+            wiremock::ResponseTemplate::new(200).set_body_string(xml)
+        }
+    }
+
+    fn compiled() -> Arc<super::super::compiled::CompiledTrigger> {
+        Arc::new(super::super::compiled::CompiledTrigger {
+            spec: TriggerSpec {
+                name: "drop".into(),
+                enabled: true,
+                config: None,
+                template: None,
+                tenants: None,
+                run: RunTemplate {
+                    name: None,
+                    labels: Default::default(),
+                    timeout_secs: None,
+                    selection: None,
+                    depends_on: None,
+                    pool: None,
+                },
+                kind: TriggerKind::Webhook {
+                    methods: vec!["POST".into()],
+                    dedupe_header: None,
+                    debounce_secs: 0,
+                    content_types: super::super::spec::default_webhook_content_types(),
+                },
+            },
+            webhook_path: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_key_is_skipped_and_the_rest_still_fire() {
+        let server = wiremock::MockServer::start().await;
+        let mut keys = vec!["in//empty.csv", "in/b/./c.csv", "in/d.csv", "out/x.csv"];
+        keys.extend([
+            "in/a0.csv",
+            "in/a1.csv",
+            "in/a2.csv",
+            "in/a3.csv",
+            "in/a4.csv",
+        ]);
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/b"))
+            .respond_with(FakeS3 { keys })
+            .mount(&server)
+            .await;
+        let s3 = Arc::new(
+            object_store::aws::AmazonS3Builder::new()
+                .with_bucket_name("b")
+                .with_region("us-east-1")
+                .with_access_key_id("k")
+                .with_secret_access_key("s")
+                .with_endpoint(server.uri())
+                .with_allow_http(true)
+                .build()
+                .unwrap(),
+        );
+        let watcher = |pager: bool| {
+            let w = ObjectArrivalWatcher::new(
+                compiled(),
+                s3.clone(),
+                "b".into(),
+                Some("in".into()),
+                ArrivalMode::PerObject,
+                Duration::from_secs(30),
+                StartAt::Beginning,
+                chrono::Utc::now(),
+            );
+            if pager { w.with_pager(s3.clone()) } else { w }
+        };
+        let listed: Vec<String> = watcher(true)
+            .list_new()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|o| o.key)
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                "in/a0.csv",
+                "in/a1.csv",
+                "in/a2.csv",
+                "in/a3.csv",
+                "in/a4.csv",
+                "in/d.csv"
+            ]
+        );
+        // A store listed only as a stream reports the key it cannot read.
+        let err = watcher(false).list_new().await.unwrap_err();
+        assert!(err.contains("in//empty.csv"), "{err}");
     }
 }

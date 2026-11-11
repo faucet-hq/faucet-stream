@@ -111,6 +111,12 @@ a store that stops answering fails the poll (the watcher backs off and, after
 three failures in a row, reports unhealthy) rather than freezing it. Set
 `poll_timeout_secs` to also bound the whole poll — listing plus firing.
 
+A key the object-store client cannot read as a path (an empty, `.` or `..`
+segment, or a control character, such as `in//x.csv`) does not stop the
+prefix: the listing narrows to that key, skips it with a warning naming it
+(counted in `faucet_serve_trigger_errors_total`), and resumes right after it,
+so every other object still fires.
+
 **`${trigger.*}` tokens injected into the run config:**
 
 Tokens are substituted inside each string value of the parsed config, with the
