@@ -260,7 +260,7 @@ faucet-common-nats = { path = "crates/common/nats", version = "1" }
 faucet-common-redis = { path = "crates/common/redis", version = "1" }
 faucet-source-nats = { path = "crates/source/nats", version = "1" }
 faucet-sink-nats = { path = "crates/sink/nats", version = "1" }
-faucet-common-sftp = { path = "crates/common/sftp", version = "1" }
+faucet-common-sftp = { path = "crates/common/sftp", version = "2" }
 faucet-source-sftp = { path = "crates/source/sftp", version = "1" }
 faucet-sink-sftp = { path = "crates/sink/sftp", version = "1" }
 faucet-common-rabbitmq = { path = "crates/common/rabbitmq", version = "1" }
