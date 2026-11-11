@@ -325,12 +325,14 @@ pub async fn plan_node(
         // the probe is skipped until secrets are resolved.
         let mut unresolved = std::collections::BTreeSet::new();
         crate::secrets::collect_refs(&node.sink.config, &mut unresolved);
-        let sink = if unresolved.is_empty() {
-            crate::registry::build_sink(&node.sink.kind, node.sink.config.clone(), auth)
-                .await
-                .ok()
+        let (sink, build_error) = if unresolved.is_empty() {
+            match crate::registry::build_sink(&node.sink.kind, node.sink.config.clone(), auth).await
+            {
+                Ok(s) => (Some(s), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
         } else {
-            None
+            (None, None)
         };
         let sink_schema = match &sink {
             Some(s) => s.current_schema().await.ok().flatten(),
@@ -353,7 +355,10 @@ pub async fn plan_node(
                  --resolve-secrets)"
                     .to_owned(),
             ),
-            None => Some("sink could not be built (skipped probe)".to_owned()),
+            None => Some(format!(
+                "sink could not be built (skipped probe): {}",
+                crate::secrets::registry::redact(build_error.as_deref().unwrap_or("unknown error"))
+            )),
         };
         let schema_delta = match &sink_schema {
             Some(dest) => render_delta(dest, &inferred),
@@ -828,6 +833,40 @@ mod tests {
             let config = live_source_config(&nodes[0], 10);
             assert_eq!(config["batch_size"], expected, "batch_size {configured}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_sink_that_cannot_be_built_says_why() {
+        let cfg = crate::config::PipelineConfig::from_text(
+            "version: 1\npipeline:\n  source: { type: csv, config: { path: in.csv } }\n  sink: { type: jsonl, config: { path: out.jsonl } }\n",
+            std::path::Path::new("p.yaml"),
+        )
+        .unwrap();
+        let mut nodes = crate::expand::expand(&cfg).unwrap();
+        nodes[0].sink.config = serde_json::json!({"path": 7});
+        let report = plan_node(
+            &cfg,
+            &nodes[0],
+            &Default::default(),
+            PlanOptions {
+                sample: Some((vec![serde_json::json!({"a": 1})], "fixture".into())),
+                #[cfg(feature = "catalog")]
+                impact: None,
+                #[cfg(not(feature = "catalog"))]
+                _marker: std::marker::PhantomData,
+            },
+        )
+        .await
+        .unwrap();
+        let probe = report.sink_probe.expect("a probe note");
+        assert!(
+            probe.starts_with("sink could not be built (skipped probe): "),
+            "{probe}"
+        );
+        assert!(
+            probe.len() > "sink could not be built (skipped probe): ".len(),
+            "{probe}"
+        );
     }
 
     #[tokio::test]

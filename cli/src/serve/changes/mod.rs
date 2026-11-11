@@ -634,7 +634,8 @@ async fn plan_run(
     {
         #[cfg(feature = "catalog")]
         let history = state.history();
-        let report = crate::commands::plan::plan_node(
+        let report = crate::runtime::local::plan(
+            &principal,
             &loaded.cfg,
             node,
             &auth,
