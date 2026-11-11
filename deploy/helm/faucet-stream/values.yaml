@@ -234,6 +234,14 @@ serve:
     # 0 disables it. Surfaced as FAUCET_LOCAL_SINK_OUTPUT_IN_FLIGHT_GRACE_SECS.
     inFlightGraceSeconds: 60
 
+  # FAUCET_SERVE_ALLOW_HOST_CREDENTIALS — let a config submitted over HTTP or
+  # MCP authenticate with the pod's own identity (its service account's IRSA /
+  # workload-identity / managed-identity role, application-default
+  # credentials, files in the image). Off: a submitted config names its own
+  # keys. Never applies to a tenant. Keep it off when the pod's role reaches
+  # anything a caller should not; set it the same on every replica.
+  allowHostCredentials: false
+
   # Dataset preview of those local outputs (#586): the console's Datasets page
   # can read back the first N rows of a tracked jsonl / csv / parquet file.
   #

@@ -13,6 +13,7 @@ pub mod error;
 pub mod guard;
 pub mod handlers;
 pub mod history;
+pub mod host_identity;
 pub mod idempotency;
 pub mod load;
 pub mod log_export;

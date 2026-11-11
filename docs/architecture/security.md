@@ -175,8 +175,12 @@ connector's `tls` / transport option as something to configure, not to inherit.
   certificate or host-key verification (fields annotated
   `x-faucet-unverified`, `verify_ca=false` in a MySQL URL, `#insecure` on a
   `rediss://` URL) need `--allow-unverified-tls`, and never apply to a tenant;
-  settings that authenticate with the server's own credentials (Oracle
-  `external_auth`, marked `x-faucet-host-credentials`) are refused. Under
+  settings and connectors that authenticate with the server's own identity
+  (Oracle `external_auth`, marked `x-faucet-host-credentials`, and every
+  connector whose descriptor reports it through `with_host_identity`) need
+  `--allow-host-credentials`, and never apply to a tenant; a connector that
+  learns it at run time checks `require_host_credentials` when it builds its
+  client, and a serve task with no principal scope is refused. Under
   `faucet serve`, database connectors never fill a missing password, user or
   certificate from the server's environment (`PGPASSWORD`, `~/.pgpass`, …). The defaults
   deny environment and secret-manager reads. A substituted value

@@ -451,13 +451,58 @@ impl CapabilitiesBuilder {
 pub struct ConnectorDescriptor {
     kind: &'static str,
     capabilities: fn(&Value) -> Capabilities,
+    host_identity: Option<fn(&Value) -> Vec<String>>,
+    runtime_host_identity: bool,
 }
 
 impl ConnectorDescriptor {
     /// Describe connector `kind` by `capabilities`, which must be pure (no
     /// I/O) and must agree with the built connector's `capabilities()`.
     pub const fn new(kind: &'static str, capabilities: fn(&Value) -> Capabilities) -> Self {
-        Self { kind, capabilities }
+        Self {
+            kind,
+            capabilities,
+            host_identity: None,
+            runtime_host_identity: false,
+        }
+    }
+
+    /// Answer which config fields make the connector authenticate with the
+    /// identity of the host it runs on (its environment, instance or workload
+    /// role, local credential files) rather than credentials the config
+    /// names. `host_identity` must be pure: it reads the credentials variant
+    /// the config selects, an absent field counting as the default the typed
+    /// config picks, and returns the dotted field names (empty = none).
+    pub const fn with_host_identity(mut self, host_identity: fn(&Value) -> Vec<String>) -> Self {
+        self.host_identity = Some(host_identity);
+        self
+    }
+
+    /// Mark a connector whose use of the host's identity can also come from
+    /// what it learns at run time (a catalog's storage settings, an option
+    /// map the client library reads), so it checks
+    /// [`crate::resolve::require_host_credentials`] when it builds a client.
+    pub const fn with_runtime_host_identity(mut self) -> Self {
+        self.runtime_host_identity = true;
+        self
+    }
+
+    /// The config fields that make this connector use the host's identity
+    /// under `config` (empty = none); `None` when the descriptor gives no
+    /// answer ([`ConnectorDescriptor::with_host_identity`]).
+    pub fn host_identity(&self, config: &Value) -> Option<Vec<String>> {
+        self.host_identity.map(|f| f(config))
+    }
+
+    /// Whether the descriptor answers [`ConnectorDescriptor::host_identity`].
+    pub fn answers_host_identity(&self) -> bool {
+        self.host_identity.is_some()
+    }
+
+    /// Whether the connector also checks the host's identity when it builds
+    /// a client ([`ConnectorDescriptor::with_runtime_host_identity`]).
+    pub fn checks_host_identity_at_runtime(&self) -> bool {
+        self.runtime_host_identity
     }
 
     /// The connector's `type:` name.
@@ -544,7 +589,11 @@ pub mod config {
     /// The tag of an enum field serialized as a string or as `{ "type": … }`
     /// / a single-key object (`{"auto_map": {…}}`).
     pub fn tag<'a>(config: &'a Value, field: &str) -> Option<&'a str> {
-        match config.get(field)? {
+        tag_of(config.get(field)?)
+    }
+
+    fn tag_of(value: &Value) -> Option<&str> {
+        match value {
             Value::String(s) => Some(s),
             Value::Object(o) => o
                 .get("type")
@@ -552,6 +601,40 @@ pub mod config {
                 .or_else(|| (o.len() == 1).then(|| o.keys().next().map(String::as_str))?),
             _ => None,
         }
+    }
+
+    /// The value at a JSON pointer (`/bulk_load/gcs_auth`), when present and
+    /// not null.
+    pub fn at<'a>(config: &'a Value, pointer: &str) -> Option<&'a Value> {
+        config.pointer(pointer).filter(|v| !v.is_null())
+    }
+
+    /// The string at a JSON pointer, when present.
+    pub fn str_at<'a>(config: &'a Value, pointer: &str) -> Option<&'a str> {
+        at(config, pointer).and_then(Value::as_str)
+    }
+
+    /// Whether the value at a JSON pointer is a non-empty string.
+    pub fn non_empty_str_at(config: &Value, pointer: &str) -> bool {
+        str_at(config, pointer).is_some_and(|s| !s.trim().is_empty())
+    }
+
+    /// Whether a value is present (and not null) at a JSON pointer.
+    pub fn is_set_at(config: &Value, pointer: &str) -> bool {
+        at(config, pointer).is_some()
+    }
+
+    /// The boolean at a JSON pointer, or `default` when absent or not a
+    /// boolean.
+    pub fn bool_at(config: &Value, pointer: &str, default: bool) -> bool {
+        at(config, pointer)
+            .and_then(Value::as_bool)
+            .unwrap_or(default)
+    }
+
+    /// The tag of the enum value at a JSON pointer (see [`tag`]).
+    pub fn tag_at<'a>(config: &'a Value, pointer: &str) -> Option<&'a str> {
+        tag_of(at(config, pointer)?)
     }
 }
 
@@ -802,5 +885,76 @@ mod tests {
             config::write_spec(&Value::Null).write_mode,
             WriteMode::Append
         );
+    }
+
+    fn ambient(c: &Value) -> Vec<String> {
+        match config::tag_at(c, "/credentials").unwrap_or("default") {
+            "default" | "profile" => vec!["credentials".to_string()],
+            _ => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn descriptor_answers_host_identity_when_asked_to() {
+        const PLAIN: ConnectorDescriptor = ConnectorDescriptor::new("rich", rich);
+        assert!(!PLAIN.answers_host_identity());
+        assert_eq!(PLAIN.host_identity(&json!({})), None);
+        assert!(!PLAIN.checks_host_identity_at_runtime());
+
+        const D: ConnectorDescriptor = ConnectorDescriptor::new("cloud", rich)
+            .with_host_identity(ambient)
+            .with_runtime_host_identity();
+        assert!(D.answers_host_identity());
+        assert!(D.checks_host_identity_at_runtime());
+        assert_eq!(
+            D.host_identity(&json!({})),
+            Some(vec!["credentials".into()])
+        );
+        assert_eq!(
+            D.host_identity(&json!({"credentials": {"type": "profile", "config": {}}})),
+            Some(vec!["credentials".into()])
+        );
+        assert_eq!(
+            D.host_identity(&json!({"credentials": {"type": "access_key"}})),
+            Some(Vec::new())
+        );
+        assert_eq!(D.capabilities(&json!({})), PLAIN.capabilities(&json!({})));
+    }
+
+    #[test]
+    fn pointer_helpers_read_nested_values() {
+        let c = json!({
+            "staging": {"credentials": {"type": "access_key", "config": {"id": "k", "blank": " "}}},
+            "bulk_load": {"gcs_auth": "application_default", "on": true, "none": null}
+        });
+        assert_eq!(
+            config::tag_at(&c, "/staging/credentials"),
+            Some("access_key")
+        );
+        assert_eq!(
+            config::tag_at(&c, "/bulk_load/gcs_auth"),
+            Some("application_default")
+        );
+        assert_eq!(config::tag_at(&c, "/bulk_load/on"), None);
+        assert_eq!(config::tag_at(&c, "/missing"), None);
+        assert_eq!(
+            config::str_at(&c, "/staging/credentials/config/id"),
+            Some("k")
+        );
+        assert!(config::non_empty_str_at(
+            &c,
+            "/staging/credentials/config/id"
+        ));
+        assert!(!config::non_empty_str_at(
+            &c,
+            "/staging/credentials/config/blank"
+        ));
+        assert!(!config::non_empty_str_at(&c, "/missing"));
+        assert!(config::is_set_at(&c, "/bulk_load/on"));
+        assert!(!config::is_set_at(&c, "/bulk_load/none"));
+        assert!(config::at(&c, "/bulk_load/none").is_none());
+        assert!(config::bool_at(&c, "/bulk_load/on", false));
+        assert!(config::bool_at(&c, "/bulk_load/missing", true));
+        assert!(!config::bool_at(&c, "/bulk_load/gcs_auth", false));
     }
 }

@@ -516,6 +516,45 @@ fn capabilities(cfg: &Value) -> Capabilities {
   `register_sink_described`; a connector registered without one is treated as
   append-only with no capabilities.
 
+### Declaring the server's identity
+
+A connector that can authenticate with the identity of the host it runs on —
+an AWS / GCP / Azure default credential chain, an instance or workload role,
+application-default credentials, a profile or token file on disk, OS
+authentication — says which config fields select that, so `faucet serve`
+can refuse it for configs callers submit unless the operator passes
+`--allow-host-credentials`:
+
+```rust
+use faucet_core::capabilities::config;
+use faucet_core::{ConnectorDescriptor, Value};
+
+pub const DESCRIPTOR: ConnectorDescriptor =
+    ConnectorDescriptor::new("acme", capabilities).with_host_identity(host_identity);
+
+fn host_identity(cfg: &Value) -> Vec<String> {
+    // An absent field is the variant the typed config defaults to.
+    match config::tag_at(cfg, "/credentials").unwrap_or("default") {
+        "access_key" => Vec::new(),
+        _ => vec!["credentials".into()],
+    }
+}
+```
+
+- Read the variant the config selects, including nested blocks
+  (`config::tag_at` / `str_at` / `non_empty_str_at` take a JSON pointer), and
+  return the dotted field names; empty means the config names its own
+  credentials.
+- When the answer can also depend on what the connector learns at run time
+  (a catalog's storage settings, an option map the client library reads),
+  add `.with_runtime_host_identity()` and call
+  `faucet_core::resolve::require_host_credentials("acme", "credentials")?`
+  right before building the client: it fails inside a caller's run on a
+  server without the flag, and passes everywhere else (`faucet run`,
+  templates, the triggers file).
+- A custom connector registered without an answer is refused for caller
+  configs unless the operator passes the flag.
+
 ### Multi-table mirror hooks
 
 A CDC source joins a multi-table `faucet mirror` (`mirror.tables`) through four

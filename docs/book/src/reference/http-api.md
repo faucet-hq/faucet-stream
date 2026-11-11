@@ -396,11 +396,25 @@ are stored and again whenever a run uses them.
 | URL host (including a database URL's `host=` / `hostaddr=` and the servers or `HOST=` entries of a `key=value` connection string or connect descriptor) | any, except link-local and cloud-metadata addresses (`169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`, `fd20:ce::254`, `fd00:c1::a9fe:a9fe`, `100.100.100.200`, `metadata.google.internal`) | `--allow-url-host` restricts it to the listed hosts (`*.example.com` matches subdomains); a metadata host is reachable only when listed |
 | A file a connection string names (`sslkey=`, `sslrootcert=`, `socket=`, `TrustServerCertificateCA=`, MongoDB `tlsCAFile=` / `tlsCertificateKeyFile=` and `.sock` hosts, a wallet directory, Oracle `token_location` / `oci_config_file`) | under the path roots, like any local path | `--allow-path-root DIR` |
 | A setting that turns off certificate or host-key verification (`insecure_skip_verify`, MSSQL `trust_server_certificate` / `TrustServerCertificate=true`, SFTP `known_hosts: {mode: insecure}`, `verify_ca=false` in a MySQL URL, `#insecure` on a `rediss://` URL, MongoDB `tlsInsecure` / `tlsAllowInvalidCertificates` / `tlsAllowInvalidHostnames`, Kafka `enable.ssl.certificate.verification=false`) | refused | `--allow-unverified-tls` (never for a tenant) |
-| A setting that authenticates with the server's own credentials (Oracle `external_auth`, Oracle `token_auth` other than `OAUTH` with a `token_location`, MongoDB `authMechanism=MONGODB-AWS` / `GSSAPI` or an `ENVIRONMENT` entry in `authMechanismProperties`) | refused | — (register the pipeline as a template) |
+| A connector that authenticates with the server's own identity: its environment, instance or workload role (IRSA, EKS Pod Identity, GKE workload identity, Azure managed identity), application-default credentials, local credential files or OS authentication (Oracle `external_auth`, Oracle `token_auth` other than `OAUTH` with a `token_location`, MongoDB `authMechanism=MONGODB-AWS` / `GSSAPI` or an `ENVIRONMENT` entry in `authMechanismProperties`, and every connector whose descriptor reports it, for example a cloud connector whose credentials are left to the default chain). An absent credentials field counts as the default it selects. A custom connector registered without an answer counts too | refused | `--allow-host-credentials` (never for a tenant), or register the pipeline as a template |
 | A MongoDB URI the driver may extend with hosts its server names (a seed list, `replicaSet`, `mongodb+srv://`) | refused; add `directConnection=true` (one server) or `loadBalanced=true` | `--allow-url-host` (never for a tenant) |
 | `${env:NAME}` / `${secret:NAME}` | none | `--allow-env NAME` or `--allow-env 'PREFIX*'` |
 | `${vault:}` / `${aws-sm:}` / `${gcp-sm:}` / `${azure-kv:}` | none | `--allow-secret-scheme vault,aws-sm` |
 | A program (`singer`) | refused | `--allow-subprocess-connectors` |
+
+A config that would use the server's own identity is checked after its matrix
+rows are merged, for every row's source, sink and DLQ sink, every topology
+node and a mirror's snapshot source; the `403` names each connector and field,
+never a value. A value a caller supplies for a registered template's param
+(or a trigger value, or a schedule param) that lands in the config of such a
+connector is refused the same way, because the caller would then choose what
+the server's identity reaches; registering such a template answers with a
+warning. Inside a caller's run, a connector that would fall back to the
+server's identity when it builds its client fails the run with the same flag
+in its error. In a cluster, while a member that does not check this when it
+builds a connector is live, a caller's run whose connectors check it only at
+build time is refused with `503` until the rolling upgrade finishes; set
+`--allow-host-credentials` the same on every replica.
 
 A refused reference is a `403` that names the field, the value and the flag
 that would allow it; for a URL or connection string it names the field and the

@@ -1147,6 +1147,9 @@ enum Why {
     ProviderFile,
     /// The reference policy's reason.
     Policy(String),
+    /// A connector that authenticates with the server's own identity, and
+    /// how it says so.
+    HostCredentials(String),
 }
 
 /// One refused value. `text` is how a refusal of a whole submitted config
@@ -1194,7 +1197,9 @@ impl Findings {
         let text = faucet_core::util::redact_uri_credentials(&text);
         match why {
             Why::RecordPath | Why::Protected => self.protected.push(text.clone()),
-            Why::RecordHost | Why::TokenHost | Why::Policy(_) => self.policy.push(text.clone()),
+            Why::RecordHost | Why::TokenHost | Why::Policy(_) | Why::HostCredentials(_) => {
+                self.policy.push(text.clone())
+            }
             Why::Program | Why::ProviderFile => {}
         }
         let caller = scope.only.map(|f| CallerFinding {
@@ -1358,6 +1363,7 @@ fn check_connector(
     if LOCAL_PATH_KINDS.contains(&kind) {
         check_local_paths(config, base, access, scope, found);
     }
+    host_identity_findings(kind, config, base, access, scope, found);
     let access = read_access(config, access);
     let azure_hosts = azure_blob_hosts(kind, config);
     for r in crate::serve::references::connector_resources(kind, config) {
@@ -1420,6 +1426,54 @@ fn check_connector(
             found.add(scope, base, ptr, &r.value, Why::Policy(e.reason), text);
         }
     }
+}
+
+/// A caller's template param (#989) that lands in the config of a connector
+/// that authenticates with the server's own identity: refused unless the
+/// caller policy allows host credentials, since the caller then chooses what
+/// the server's identity reaches.
+fn host_identity_findings(
+    kind: &str,
+    config: &Value,
+    base: &str,
+    access: Access,
+    scope: &Scope<'_>,
+    found: &mut Findings,
+) {
+    let Some(fields) = scope.only.filter(|f| !f.is_empty()) else {
+        return;
+    };
+    if scope.policy.is_none_or(|p| p.allows_host_credentials()) {
+        return;
+    }
+    let role = match access {
+        Access::Write => crate::serve::host_identity::Role::Sink,
+        Access::Read { .. } => crate::serve::host_identity::Role::Source,
+    };
+    let identity = role.host_identity(kind, config);
+    if !identity.uses_host_identity() {
+        return;
+    }
+    let how = if identity.fields().is_empty() {
+        "a custom connector that does not say whether it does".to_string()
+    } else {
+        identity
+            .fields()
+            .iter()
+            .map(|f| format!("`{f}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let ptr = fields
+        .iter()
+        .next()
+        .map(|(p, _)| p.clone())
+        .unwrap_or_default();
+    let text = format!(
+        "{kind}: authenticates with the server's own identity ({how}) — {}",
+        crate::serve::host_identity::FLAG
+    );
+    found.add(scope, base, &ptr, "", Why::HostCredentials(how), text);
 }
 
 /// The fields of an Azure Blob connector's config whose hosts the client
@@ -1856,6 +1910,7 @@ fn caller_params_error(
         .into_iter()
         .filter_map(|f| {
             let c = f.caller?;
+            let host_credentials = matches!(f.why, Why::HostCredentials(_));
             let reason = match f.why {
                 Why::RecordPath => {
                     "a path a caller chooses may not also take a value from records".to_string()
@@ -1875,14 +1930,20 @@ fn caller_params_error(
                                       — pass a key inline as `key_json`"
                     .into(),
                 Why::Policy(r) => c.reason.unwrap_or(r),
+                Why::HostCredentials(how) => format!(
+                    "it configures a connector that authenticates with the server's own \
+                     identity ({how}); the operator can allow it with {} (never for a tenant)",
+                    crate::serve::host_identity::FLAG
+                ),
             };
+            let shown = if host_credentials { None } else { c.shown };
             let names = c
                 .names
                 .iter()
                 .map(|n| crate::params::caller::describe(n))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let to = c.shown.map(|v| format!(" to {v}")).unwrap_or_default();
+            let to = shown.map(|v| format!(" to {v}")).unwrap_or_default();
             Some(format!(
                 "{names} sets `{}`{to} ({reason})",
                 crate::params::caller::display(&c.field),

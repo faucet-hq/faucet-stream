@@ -3386,7 +3386,7 @@ paths:
                             instance_id: { type: string }
                             listen: { type: string, nullable: true }
                             pools: { type: array, nullable: true, items: { type: string }, description: "null for a member that predates execution pools: it claims any pending run, so a non-default pool is refused while it is live." }
-                            capabilities: { type: array, nullable: true, items: { type: string }, description: "What the member enforces that older releases do not (`policy_pin`, #1051; `connection_generation`); null for a member that predates them. Runs under a policy, and policy changes, wait while any live member lacks `policy_pin`. A hosted OAuth flow moves a connection's `updated_at` when it assigns a generation only while every live member has `connection_generation`." }
+                            capabilities: { type: array, nullable: true, items: { type: string }, description: "What the member enforces that older releases do not (`policy_pin`, #1051; `connection_generation`; `host_credentials`); null for a member that predates them. Runs under a policy, and policy changes, wait while any live member lacks `policy_pin`. A hosted OAuth flow moves a connection's `updated_at` when it assigns a generation only while every live member has `connection_generation`. A caller's run whose connectors check the server's own identity when they are built is refused (503) while any live member lacks `host_credentials`." }
                             in_flight: { type: integer }
                             max_concurrent: { type: integer }
                   triggers:

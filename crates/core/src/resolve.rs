@@ -25,6 +25,11 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
+pub use crate::host_credentials::{
+    deny_unscoped_host_credentials, host_credentials_allowed, require_host_credentials,
+    scoped_host_credentials, unscoped_host_credentials_denied, with_host_credentials,
+};
+
 mod azure;
 pub use azure::{AzureConnKey, AzureConnSettings, is_valid_azure_account_name};
 

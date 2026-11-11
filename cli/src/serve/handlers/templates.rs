@@ -241,6 +241,13 @@ pub async fn register_template(
             }
         }
     }
+    // A pipeline that uses the server's own identity and takes params: a
+    // caller's values for them are refused at trigger time unless the server
+    // allows host credentials.
+    if let Some(warning) = host_identity_warning(&state, &record) {
+        tracing::warn!(template = %record.id, "{warning}");
+        summary.warnings.push(warning);
+    }
     Ok((
         StatusCode::CREATED,
         Json(RegisterResponse {
@@ -249,6 +256,43 @@ pub async fn register_template(
             tests_inherited_from: registered.tests_inherited_from,
             companions_retested: registered.companions_retested,
         }),
+    ))
+}
+
+/// The warning for a registered pipeline template whose connectors use the
+/// server's own identity and whose params a caller may supply, while the
+/// server refuses host credentials to callers.
+fn host_identity_warning(
+    state: &ServerState,
+    record: &crate::serve::history::templates::TemplateRecord,
+) -> Option<String> {
+    if record.kind != crate::hub::TemplateKind::Pipeline
+        || state.references().caller().allows_host_credentials()
+    {
+        return None;
+    }
+    let doc: serde_json::Value = match record.format {
+        crate::serve::load::ConfigFormat::Yaml => crate::yaml::from_str(&record.body).ok()?,
+        crate::serve::load::ConfigFormat::Json => serde_json::from_str(&record.body).ok()?,
+    };
+    if doc
+        .get("params")
+        .and_then(serde_json::Value::as_object)
+        .is_none_or(|p| p.is_empty())
+    {
+        return None;
+    }
+    let cfg = crate::templates::store::validate_pipeline_body(&doc).ok()?;
+    let nodes = crate::expand::expand(&crate::partition::offline(&cfg)).ok()?;
+    let found = crate::serve::host_identity::uses(&cfg, &nodes);
+    let first = found.first()?;
+    Some(format!(
+        "host credentials: {} `{}` authenticates with the server's own identity, so a run whose \
+         caller-supplied params land in its config is refused unless `faucet serve` runs with \
+         `{}` (never for a tenant)",
+        first.at,
+        first.kind,
+        crate::serve::host_identity::FLAG
     ))
 }
 

@@ -182,6 +182,22 @@ pub async fn load(
         other => other?,
     };
     loaded.policy_pin = policy_pin;
+    if principal.caller_body() {
+        let policy =
+            crate::serve::host_identity::caller_policy(&state.references(), principal.tenant());
+        if let Err(e) = crate::serve::host_identity::refuse(&loaded.cfg, &loaded.nodes, &policy) {
+            crate::serve::audit::write_target_detail(
+                state,
+                &principal.actor(),
+                "policy.denied",
+                "host credentials".into(),
+                e.to_string(),
+                "denied",
+            )
+            .await;
+            return Err(e);
+        }
+    }
     if let Some(sel) = sub.selection {
         let nodes = std::mem::take(&mut loaded.nodes);
         let bad = |e: crate::error::CliError| {
@@ -612,6 +628,24 @@ pub async fn submit(
         },
     )
     .await?;
+    // A caller's run whose connectors check the server's identity only when
+    // they build a client waits until every cluster member does.
+    if crate::serve::host_identity::members_must_check(
+        principal.caller_body(),
+        principal.tenant(),
+        &state.references(),
+        crate::serve::host_identity::checked_at_runtime(
+            &admitted.loaded.cfg,
+            &admitted.loaded.nodes,
+        ),
+    ) {
+        require_member_capability(
+            state,
+            crate::serve::history::CAP_HOST_CREDENTIALS,
+            crate::serve::host_identity::MEMBER_REFUSAL,
+        )
+        .await?;
+    }
     // The execution pool (#957): the request's, else the config's, else
     // `default` — refused when no replica would run it.
     let pool =

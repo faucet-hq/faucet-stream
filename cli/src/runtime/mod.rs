@@ -92,10 +92,17 @@ pub async fn run(
 }
 
 /// Run `fut` under the principal's runtime reference policy, if any: the
-/// whole of an operation whose HTTP clients act for the principal.
+/// whole of an operation whose HTTP clients act for the principal. A body
+/// the server's operator wrote runs with the server's own identity allowed
+/// ([`faucet_core::resolve::host_credentials_allowed`]); a caller's body
+/// only as far as its reference policy allows; [`Principal::local`] keeps
+/// whatever scope encloses it.
 pub async fn under<F: std::future::Future>(principal: &Principal, fut: F) -> F::Output {
     match principal.reference_policy() {
         Some(p) => faucet_core::http::with_reference_policy(p, fut).await,
+        None if principal.operator_body() => {
+            faucet_core::resolve::with_host_credentials(true, fut).await
+        }
         None => fut.await,
     }
 }
@@ -138,6 +145,33 @@ mod tests {
                 "governance",
                 "execution"
             ]
+        );
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn under_scopes_the_host_identity_by_origin() {
+        use crate::serve::rbac::AuthContext;
+        use faucet_core::resolve::{scoped_host_credentials, with_host_credentials};
+        let seen =
+            |p: Principal| async move { under(&p, async { scoped_host_credentials() }).await };
+        for origin in [Origin::Trusted, Origin::ServerFile] {
+            let p = Principal::new(AuthContext::system("t"), origin);
+            assert_eq!(seen(p).await, Some(true), "{origin:?}");
+        }
+        let caller = Principal::new(
+            AuthContext::system("t"),
+            Origin::Caller {
+                allow_subprocess: false,
+            },
+        );
+        assert_eq!(seen(caller).await, Some(false));
+        assert_eq!(seen(Principal::local()).await, None);
+        let inside = with_host_credentials(false, seen(Principal::local())).await;
+        assert_eq!(
+            inside,
+            Some(false),
+            "a local principal keeps its enclosing scope"
         );
     }
 

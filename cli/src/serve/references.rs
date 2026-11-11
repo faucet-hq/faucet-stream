@@ -19,10 +19,11 @@
 //! - settings that turn off certificate or host-key verification (fields
 //!   annotated `x-faucet-unverified`) only with `--allow-unverified-tls`, and
 //!   never for a tenant;
-//! - never settings that authenticate with the server's own credentials
+//! - settings and connectors that authenticate with the server's own identity
 //!   (fields annotated `x-faucet-host-credentials`, e.g. Oracle
-//!   `external_auth`, or a MongoDB URI's `authMechanism=MONGODB-OIDC` with an
-//!   `ENVIRONMENT` property);
+//!   `external_auth`, a MongoDB URI's `authMechanism=MONGODB-OIDC` with an
+//!   `ENVIRONMENT` property, and every connector whose descriptor reports host
+//!   identity) only with `--allow-host-credentials`, and never for a tenant;
 //! - a MongoDB URI only when it keeps the client on the server it names
 //!   (`directConnection=true` or `loadBalanced=true`), unless
 //!   `--allow-url-host` lists the hosts a replica set may name; a tenant's
@@ -97,7 +98,8 @@ impl ServeReferencePolicy {
             .with_env(args.allow_env.iter().cloned())
             .with_secret_schemes(&args.allow_secret_scheme)
             .with_unverified(args.allow_unverified_tls)
-            .with_pinned_servers(args.allow_url_host.is_empty());
+            .with_pinned_servers(args.allow_url_host.is_empty())
+            .with_host_credentials(args.allow_host_credentials);
         caller = if args.allow_url_scheme.is_empty() {
             caller.any_url_scheme()
         } else {
@@ -131,12 +133,14 @@ impl ServeReferencePolicy {
             BodyOrigin::Trusted | BodyOrigin::ServerFile => ReferencePolicy::open(),
             BodyOrigin::Caller { allow_subprocess } => {
                 let unverified = self.caller.allows_unverified() && tenant.is_none();
+                let host_credentials = self.caller.allows_host_credentials() && tenant.is_none();
                 let mut p = self
                     .caller
                     .clone()
                     .with_subprocess(allow_subprocess && tenant.is_none())
                     .with_unverified(unverified)
-                    .with_pinned_servers(self.caller.pins_servers() || tenant.is_some());
+                    .with_pinned_servers(self.caller.pins_servers() || tenant.is_some())
+                    .with_host_credentials(host_credentials);
                 if let (Some(root), Some(t)) = (&self.tenant_root, tenant) {
                     p = p.with_path_roots([root.join(t)]);
                 }
@@ -274,6 +278,7 @@ mod tests {
             allow_secret_scheme: vec!["vault".into()],
             tenant_path_root: Some("/srv/tenants".into()),
             allow_unverified_tls: true,
+            allow_host_credentials: false,
         };
         let p = ServeReferencePolicy::from_args(&args).unwrap();
         let c = p.caller();
@@ -326,6 +331,32 @@ mod tests {
         assert!(!listed.for_origin(caller, None).pins_servers());
         assert!(listed.for_origin(caller, Some("acme")).pins_servers());
         assert!(!listed.for_origin(BodyOrigin::Trusted, None).pins_servers());
+    }
+
+    #[test]
+    fn host_credentials_are_for_callers_only_with_the_flag_and_never_for_a_tenant() {
+        let caller = BodyOrigin::Caller {
+            allow_subprocess: false,
+        };
+        let off = ServeReferencePolicy::default();
+        assert!(!off.caller().allows_host_credentials());
+        assert!(!off.for_origin(caller, None).allows_host_credentials());
+        let on = ServeReferencePolicy::from_args(&ReferenceArgs {
+            allow_host_credentials: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(on.for_origin(caller, None).allows_host_credentials());
+        assert!(
+            !on.for_origin(caller, Some("acme"))
+                .allows_host_credentials()
+        );
+        for origin in [BodyOrigin::Trusted, BodyOrigin::ServerFile] {
+            assert!(
+                off.for_origin(origin, Some("acme"))
+                    .allows_host_credentials()
+            );
+        }
     }
 
     #[test]

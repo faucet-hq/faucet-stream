@@ -649,7 +649,13 @@ pub async fn with_reference_policy<F: std::future::Future>(
     policy: Arc<ReferencePolicy>,
     fut: F,
 ) -> F::Output {
-    SCOPED_POLICY.scope(policy, fut).await
+    let host_credentials = policy.allows_host_credentials();
+    SCOPED_POLICY
+        .scope(
+            policy,
+            crate::resolve::with_host_credentials(host_credentials, fut),
+        )
+        .await
 }
 
 /// The reference policy scoped over the current task, if any.
@@ -657,13 +663,21 @@ pub fn current_reference_policy() -> Option<Arc<ReferencePolicy>> {
     SCOPED_POLICY.try_with(Arc::clone).ok()
 }
 
-/// `fut` under the reference policy scoped over the current task, for a
-/// future about to be spawned onto another task.
+/// `fut` under the reference policy (and the host-credentials grant,
+/// [`crate::resolve::host_credentials_allowed`]) scoped over the current
+/// task, for a future about to be spawned onto another task.
 pub fn inherit_reference_policy<F: std::future::Future>(
     fut: F,
 ) -> impl std::future::Future<Output = F::Output> {
     let policy = current_reference_policy();
+    let host_credentials = crate::resolve::scoped_host_credentials();
     async move {
+        let fut = async move {
+            match host_credentials {
+                Some(allowed) => crate::resolve::with_host_credentials(allowed, fut).await,
+                None => fut.await,
+            }
+        };
         match policy {
             Some(p) => SCOPED_POLICY.scope(p, fut).await,
             None => fut.await,

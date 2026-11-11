@@ -2248,6 +2248,15 @@ pub struct ReferenceArgs {
     /// tenant.
     #[arg(long = "allow-unverified-tls")]
     pub allow_unverified_tls: bool,
+    /// Let a submitted config authenticate with the server's own identity:
+    /// its environment, instance or workload role (IRSA, workload identity,
+    /// managed identity), application-default credentials, local credential
+    /// files, OS authentication. Default: refused. Never for a tenant.
+    #[arg(
+        long = "allow-host-credentials",
+        env = "FAUCET_SERVE_ALLOW_HOST_CREDENTIALS"
+    )]
+    pub allow_host_credentials: bool,
 }
 
 /// `faucet serve` arguments.

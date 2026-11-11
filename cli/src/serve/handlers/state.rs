@@ -60,18 +60,9 @@ fn cli_to_serve(e: CliError) -> ServeError {
     }
 }
 
-/// Load the config a request names; returns it with its pipeline name.
-async fn resolve(
-    state: &ServerState,
-    actor: &AuthContext,
-    src: &ConfigSource,
-) -> Result<(PipelineConfig, String), ServeError> {
-    let (cfg, name, _) = resolve_as(state, actor, src).await?;
-    Ok((cfg, name))
-}
-
-/// [`resolve`], with the principal the config was loaded as: what reads the
-/// pipeline's state or probes its sink runs under its reference policy.
+/// Load the config a request names; returns it with its pipeline name and
+/// the principal it was loaded as: what reads the pipeline's state or probes
+/// its sink runs under that principal's scope.
 async fn resolve_as(
     state: &ServerState,
     actor: &AuthContext,
@@ -389,8 +380,8 @@ async fn target_for(
     actor: &AuthContext,
     pipeline: &str,
     src: &ConfigSource,
-) -> Result<(PipelineConfig, PipelineTarget), ServeError> {
-    let (cfg, name) = resolve(state, actor, src).await?;
+) -> Result<(PipelineConfig, PipelineTarget, crate::runtime::Principal), ServeError> {
+    let (cfg, name, principal) = resolve_as(state, actor, src).await?;
     if name != pipeline {
         return Err(ServeError::Unprocessable {
             message: format!(
@@ -400,10 +391,10 @@ async fn target_for(
             details: None,
         });
     }
-    let target = PipelineTarget::resolve_live(&cfg, &name)
+    let target = crate::runtime::under(&principal, PipelineTarget::resolve_live(&cfg, &name))
         .await
         .map_err(cli_to_serve)?;
-    Ok((cfg, target))
+    Ok((cfg, target, principal))
 }
 
 /// Refuse a mutation while this server has a run of the pipeline in flight.
@@ -427,11 +418,13 @@ pub async fn get_state(
     Path((pipeline, row)): Path<(String, String)>,
     Query(q): Query<SourceQuery>,
 ) -> Result<Json<Value>, ServeError> {
-    let (_, target) = target_for(&state, &actor, &pipeline, &q.source()).await?;
-    let stores = Stores::build(&target, None).await.map_err(cli_to_serve)?;
-    let report = ops::show(&target, &stores, Some(&row), Utc::now())
-        .await
-        .map_err(cli_to_serve)?;
+    let (_, target, principal) = target_for(&state, &actor, &pipeline, &q.source()).await?;
+    let report = crate::runtime::under(&principal, async {
+        let stores = Stores::build(&target, None).await?;
+        ops::show(&target, &stores, Some(&row), Utc::now()).await
+    })
+    .await
+    .map_err(cli_to_serve)?;
     crate::serve::audit::write(&state, &actor, "state.get", None, None, "ok").await;
     let row = report.rows.into_iter().next();
     Ok(Json(serde_json::to_value(row).unwrap_or(Value::Null)))
@@ -462,10 +455,9 @@ pub async fn put_state(
     Path((pipeline, row)): Path<(String, String)>,
     Json(body): Json<SetBody>,
 ) -> Result<Json<ops::SetOutcome>, ServeError> {
-    let (cfg, target) = target_for(&state, &actor, &pipeline, &body.source).await?;
+    let (cfg, target, principal) = target_for(&state, &actor, &pipeline, &body.source).await?;
     refuse_active(&state, &pipeline, body.force).await?;
     let auth = crate::auth_catalog::build_auth_catalog(cfg.auth.as_ref()).map_err(cli_to_serve)?;
-    let stores = Stores::build(&target, None).await.map_err(cli_to_serve)?;
     let req = ops::SetRequest {
         row,
         parent_key: body.parent_key,
@@ -475,7 +467,11 @@ pub async fn put_state(
         skip_watermark_check: body.skip_watermark_check,
         legacy_format: state.cluster().legacy_state_writes(),
     };
-    let result = ops::set(&target, &stores, &auth, &req, Utc::now()).await;
+    let result = crate::runtime::under(&principal, async {
+        let stores = Stores::build(&target, None).await?;
+        ops::set(&target, &stores, &auth, &req, Utc::now()).await
+    })
+    .await;
     let outcome = match &result {
         Ok(o) if o.applied => "applied",
         Ok(_) => "dry_run",
@@ -528,10 +524,9 @@ pub async fn delete_state(
         sink: q.sink.clone(),
     }
     .source();
-    let (cfg, target) = target_for(&state, &actor, &pipeline, &source).await?;
+    let (cfg, target, principal) = target_for(&state, &actor, &pipeline, &source).await?;
     refuse_active(&state, &pipeline, q.force).await?;
     let auth = crate::auth_catalog::build_auth_catalog(cfg.auth.as_ref()).map_err(cli_to_serve)?;
-    let stores = Stores::build(&target, None).await.map_err(cli_to_serve)?;
     let req = ops::ResetRequest {
         row,
         parent_key: q.parent_key,
@@ -542,7 +537,11 @@ pub async fn delete_state(
         rewind_token: q.rewind_token,
         legacy_format: state.cluster().legacy_state_writes(),
     };
-    let result = ops::reset(&target, &stores, &auth, &req, Utc::now()).await;
+    let result = crate::runtime::under(&principal, async {
+        let stores = Stores::build(&target, None).await?;
+        ops::reset(&target, &stores, &auth, &req, Utc::now()).await
+    })
+    .await;
     let outcome = match &result {
         Ok(o) if o.applied => "applied",
         Ok(_) => "dry_run",

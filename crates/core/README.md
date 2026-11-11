@@ -340,6 +340,22 @@ it and marks it `#[schemars(extend("x-faucet-sandbox" = true))]`;
 `resolve::sandbox_fields(schema)` reads the marked fields back, and a host
 loading a config it does not trust forces each one on.
 
+A connector that can authenticate with the identity of the host it runs on
+(a cloud default credential chain, an instance or workload role, a local
+credential file, OS authentication) answers which config fields select that
+through its descriptor, `ConnectorDescriptor::new(..).with_host_identity(f)`
+(`f: fn(&Value) -> Vec<String>`, read with `capabilities::config::tag_at` /
+`str_at` / `non_empty_str_at` and other JSON-pointer readers). Where the answer
+can also come from what the connector learns at run time, it adds
+`.with_runtime_host_identity()` and calls
+`resolve::require_host_credentials(connector, field)?` before building the
+client. `resolve::host_credentials_allowed()` reads the current task's scope:
+`resolve::with_host_credentials(allowed, fut)`, or the scoped reference
+policy's `allows_host_credentials()` (`http::with_reference_policy` carries it,
+`http::inherit_reference_policy` passes it to a spawned task); a task with no
+scope is allowed unless the host called `resolve::deny_unscoped_host_credentials()`
+(first call wins), as `faucet serve` does at startup.
+
 ## Error types
 
 `FaucetError` covers every failure mode:

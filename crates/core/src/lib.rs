@@ -47,6 +47,7 @@ pub mod fidelity;
 pub mod file_format;
 pub mod forward;
 pub mod governance;
+mod host_credentials;
 pub mod http;
 // The conformance crate's forwarding harness, compiled into core's own unit
 // tests under the `faucet_core::` paths it is written against.

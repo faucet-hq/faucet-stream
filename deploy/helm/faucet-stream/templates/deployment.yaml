@@ -157,6 +157,10 @@ spec:
             # Dataset preview of local sink outputs (#586). Off unless explicitly
             # enabled: it reads file contents back over HTTP. The two caps ride
             # along so they can be tuned per environment without a rebuild.
+            # Submitted configs may use the pod's own identity only when
+            # this is on; tenants never.
+            - name: FAUCET_SERVE_ALLOW_HOST_CREDENTIALS
+              value: {{ .Values.serve.allowHostCredentials | default false | quote }}
             - name: FAUCET_SERVE_PREVIEW_LOCAL_OUTPUTS
               value: {{ .Values.serve.preview.enabled | quote }}
             - name: FAUCET_SERVE_PREVIEW_DEFAULT_ROWS

@@ -947,6 +947,9 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         );
     }
     crate::serve::references::install(config.references.clone());
+    // An operation that runs a connector outside a principal's scope may not
+    // use the server's own identity.
+    faucet_core::resolve::deny_unscoped_host_credentials();
     crate::serve::metrics::set_cluster_enabled(config.cluster.enabled);
     if let Some(h) = &prom {
         spawn_metrics_upkeep(h.clone(), Duration::from_secs(5));

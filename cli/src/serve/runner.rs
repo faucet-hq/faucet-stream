@@ -412,10 +412,16 @@ fn resume_claimed(
         // claiming instance acts as the (ephemeral) coordinator — and is NOT
         // executed as a whole. Enumeration + insert is idempotent, so two
         // instances both claiming + coordinating converge on the same shard set.
+        let principal = crate::runtime::Principal::stored(&state, AuthContext::runtime(), &rec);
         if let Some(sh) = loaded.cfg.shard.clone()
             && sh.count >= 2
         {
-            match shard_with_retry(&state, &rec, &loaded, sh.count, &run_token, deadline).await {
+            let coordinated = crate::runtime::under(
+                &principal,
+                shard_with_retry(&state, &rec, &loaded, sh.count, &run_token, deadline),
+            )
+            .await;
+            match coordinated {
                 Ok(true) => return, // expanded into shards — shard loop runs them
                 Ok(false) => {}     // not shardable → fall through, run the whole run
                 Err(term) => {
@@ -433,7 +439,6 @@ fn resume_claimed(
                 .await
                 .expect("semaphore not closed"),
         };
-        let principal = crate::runtime::Principal::stored(&state, AuthContext::runtime(), &rec);
         crate::runtime::under(
             &principal.clone(),
             execute_run(

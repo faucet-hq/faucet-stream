@@ -427,8 +427,15 @@ pub const CAP_POLICY_PIN: &str = "policy_pin";
 /// A member keeps a tenant connection's generation when it rewrites the
 /// connection, so a generation may be assigned with a new `updated_at`.
 pub const CAP_CONNECTION_GENERATION: &str = "connection_generation";
+/// A member checks, when it builds a connector for a caller's run, whether
+/// the connector would use the server's own identity.
+pub const CAP_HOST_CREDENTIALS: &str = "host_credentials";
 /// What this build advertises in its heartbeat.
-pub const INSTANCE_CAPABILITIES: &[&str] = &[CAP_POLICY_PIN, CAP_CONNECTION_GENERATION];
+pub const INSTANCE_CAPABILITIES: &[&str] = &[
+    CAP_POLICY_PIN,
+    CAP_CONNECTION_GENERATION,
+    CAP_HOST_CREDENTIALS,
+];
 
 /// One live cluster member (for `/readyz` + metrics).
 #[derive(Debug, Clone, Serialize)]
