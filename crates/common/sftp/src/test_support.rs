@@ -24,13 +24,28 @@ ChrootDirectory %h
 MaxSessions 1
 ";
 
+/// A password made fresh for each test process.
+fn password() -> &'static str {
+    static PASSWORD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PASSWORD.get_or_init(|| {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos()),
+        );
+        format!("p{:016x}", h.finish())
+    })
+}
+
 async fn start(one_session: bool) -> Option<Server> {
     let started = faucet_conformance::containers::start_or_skip(
         || {
             let image = GenericImage::new("atmoz/sftp", IMAGE_TAG)
                 .with_exposed_port(22.tcp())
                 .with_wait_for(WaitFor::message_on_stderr("Server listening on"))
-                .with_cmd(vec!["faucet:secret:::data".to_string()]);
+                .with_cmd(vec![format!("faucet:{}:::data", password())]);
             if one_session {
                 image.with_copy_to(
                     "/etc/ssh/sshd_config",
@@ -62,7 +77,7 @@ pub(crate) async fn one_session_server() -> Option<Server> {
 }
 
 pub(crate) fn config(port: u16) -> SftpConnectionConfig {
-    SftpConnectionConfig::with_password("127.0.0.1", "faucet", "secret")
+    SftpConnectionConfig::with_password("127.0.0.1", "faucet", password())
         .port(port)
         .known_hosts(crate::HostKeyPolicy::Insecure)
 }

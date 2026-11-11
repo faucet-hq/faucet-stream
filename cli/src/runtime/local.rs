@@ -71,7 +71,7 @@ pub async fn replay_dlq(
     location: &str,
     inputs: crate::dlq_replay::ReplayInputs<'_>,
 ) -> CliResult<crate::dlq_replay::ReplayOutcome> {
-    let replay = crate::dlq_replay::replay(cfg, location, inputs);
+    let replay = Box::pin(crate::dlq_replay::replay(cfg, location, inputs));
     #[cfg(feature = "masking")]
     if principal.origin() != super::Origin::Local {
         let tenant = principal.tenant().map(str::to_string);

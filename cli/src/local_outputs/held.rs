@@ -441,9 +441,12 @@ mod tests {
         let path = outputs.join("out.jsonl");
         std::fs::write(&path, b"x").unwrap();
         let recorded = id_of(&outputs);
+        let replacement = root.join("outputs.new");
+        std::fs::create_dir(&replacement).unwrap();
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_dir(&outputs).unwrap();
-        std::fs::create_dir(&outputs).unwrap();
+        std::fs::rename(&replacement, &outputs).unwrap();
+        assert_ne!(id_of(&outputs), recorded);
         assert!(matches!(open(&path, recorded), Opened::Gone));
     }
 
@@ -455,9 +458,12 @@ mod tests {
         let path = outputs.join("out.jsonl");
         std::fs::write(&path, b"x").unwrap();
         let recorded = id_of(&outputs);
+        let replacement = root.join("outputs.new");
+        std::fs::create_dir(&replacement).unwrap();
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_dir(&outputs).unwrap();
-        std::fs::create_dir(&outputs).unwrap();
+        std::fs::rename(&replacement, &outputs).unwrap();
+        assert_ne!(id_of(&outputs), recorded);
         std::os::unix::fs::symlink(root.join("elsewhere"), &path).unwrap();
         assert!(matches!(open(&path, recorded), Opened::Changed));
         std::fs::remove_file(&path).unwrap();

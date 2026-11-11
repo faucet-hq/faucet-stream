@@ -269,7 +269,7 @@ pub async fn replay(
         Some(spec) => Some(spec.to_policy()?),
         None => None,
     };
-    let summary = crate::runtime::run_local(
+    let summary = Box::pin(crate::runtime::run_local(
         vec![node],
         ExecuteOptions {
             legacy_state_writes: false,
@@ -306,7 +306,7 @@ pub async fn replay(
             usage: Default::default(),
             budget,
         },
-    )
+    ))
     .await?;
 
     let records_written = summary.invocations.iter().map(written_by).sum();
