@@ -501,6 +501,10 @@ Declares `write_mode: append` and idempotent (exactly-once) writes. Under `value
 
 Every produced record's delivery, the `QueueFull` backoff, the transaction calls (`init`, `commit`) and the commit-token read run through the pipeline's `CallContext` (#880): the run's deadline ends a delivery that an unreachable or stalled cluster never confirms, and a `QueueFull` wait, promptly; a commit cut short is aborted. Each counts as one round trip (`produce`, `init`, `commit`, `metadata`, `read_token`) in `faucet_sink_roundtrips_total`, and Schema Registry requests run under the same context (`schema`, `register`). The sink never re-sends a delivered-or-unknown record itself.
 
+## Caller configs under `faucet serve`
+
+`extra_client_config` with `sasl.mechanism` (or `sasl.mechanisms`) set to `GSSAPI` authenticates with the server's Kerberos identity, so a config a caller submits to `faucet serve` may set it only when the server runs with `--allow-host-credentials` (never for a tenant). `sasl.kerberos.keytab` is a server path and `sasl.kerberos.kinit.cmd` a command; both follow the server's reference policy.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

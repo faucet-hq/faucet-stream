@@ -430,6 +430,11 @@ request with rows bound as one JSON payload, so there is no connection or
 transaction for that adapter to open and commit. The public type and config
 are unchanged.
 
+## Caller configs under `faucet serve`
+
+The `bulk_load` upload authenticates with `bulk_load.credentials` (default: the store's default chain, i.e. the server's own identity). A config submitted to `faucet serve` by a caller may use the server's identity only when the server runs with `--allow-host-credentials` (never for a tenant), so a caller names `access_key` (`s3://`), `service_account_json_file` / `service_account_json_inline` (`gs://`), or `account_key` / `sas_token` (`az://`). The same check runs when the upload store is built.
+Keys in `bulk_load.storage_options` count the way `object_store` reads them: static keys (an id with its secret, a service-account key, an account key or SAS) are the config's own; a key naming a role, profile, metadata endpoint or workload identity uses the server's identity even beside static keys.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

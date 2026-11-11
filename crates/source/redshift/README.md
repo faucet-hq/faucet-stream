@@ -136,3 +136,13 @@ pool's connect timeout still applies and nothing is retried.
 ## Declared column types
 
 The source declares the query's columns and their types (`Source::declared_columns`, #955) from the describe its read makes (a `LIMIT 0` run through the Data API), so a sink that creates its table types it from the source rather than from the first page's JSON values. See [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types).
+
+## Caller configs under `faucet serve`
+
+A config submitted to `faucet serve` by a caller may not authenticate with the server's own identity unless the server runs with `--allow-host-credentials` (never for a tenant). For this connector that means:
+
+- For `iam` and `redshift_data_api`, `aws_credentials` of type `default`, `profile`, `assume_role` or `web_identity` (or none) uses the server's identity: name keys with `access_key` instead.
+- A missing `region` (on those methods) counts too when the server's environment names none (`AWS_REGION` / `AWS_DEFAULT_REGION`), since the SDK would ask the instance metadata service.
+- Emulators such as LocalStack still need some `access_key` pair and a `region`.
+
+The same check runs when the client is built, so a refused config fails with a config error naming the field.

@@ -195,6 +195,10 @@ transactions to open and commit, rows travel as a `JSONEachRow` HTTP body
 rather than bound statements, and pages are merged into commit groups. The
 public type and config are unchanged.
 
+## Caller configs under `faucet serve`
+
+The `staging` upload authenticates with `staging.credentials` (default: the store's default chain, i.e. the server's own identity). A config submitted to `faucet serve` by a caller may use the server's identity only when the server runs with `--allow-host-credentials` (never for a tenant), so a caller names `access_key` (`s3://`), `service_account_json_file` / `service_account_json_inline` (`gs://`), or `account_key` / `sas_token` (`az://`). The same check runs when the upload store is built.
+
 ## License
 
 Licensed under either of Apache License, Version 2.0 or MIT license at your

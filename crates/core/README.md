@@ -356,6 +356,21 @@ policy's `allows_host_credentials()` (`http::with_reference_policy` carries it,
 scope is allowed unless the host called `resolve::deny_unscoped_host_credentials()`
 (first call wins), as `faucet serve` does at startup.
 
+Two helpers serve connectors built on object stores:
+`resolve::store_options_host_identity(StoreKind, options)` reads an
+`object_store`-style option map (any case, with or without the `aws_` /
+`google_` / `azure_storage_` prefix) and names the key that reaches the host's
+identity — a role, profile, metadata endpoint, container or workload identity,
+even beside static keys — or `"credentials"` when the map names no credential
+of its store. A staged load's `StagingSpec.credentials` (`StagingCredentials`:
+`default`, `access_key`, `service_account_json_file`,
+`service_account_json_inline`, `account_key`, `sas_token`, checked against the
+location's scheme) builds the upload store through
+`staging::build_object_store_with` / `object_store_for` /
+`StageUploader::from_location_with`, which refuse the default chain where the
+task may not use the host's identity; `staging_host_identity(config,
+pointer)` is the descriptor's answer for a `staging:` block.
+
 ## Error types
 
 `FaucetError` covers every failure mode:

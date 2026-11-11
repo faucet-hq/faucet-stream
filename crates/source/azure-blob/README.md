@@ -195,6 +195,10 @@ round trip (`list`, `head`, `get`). The blob body is read under the same
 context, so a body that stops arriving mid-stream ends at the deadline or on
 cancel too. The store client's own timeouts and retry are unchanged.
 
+## Caller configs under `faucet serve`
+
+A config submitted to `faucet serve` by a caller may not authenticate with the server's own identity unless the server runs with `--allow-host-credentials` (never for a tenant). For this connector, `auth` of type `default` (the default, unless `use_emulator` is set) or `managed_identity`, and a `connection_string` with neither `AccountKey`, `SharedAccessSignature` nor `UseDevelopmentStorage=true`, use the server's identity: use `account_key`, `sas_token`, `service_principal` or a keyed connection string. The same check runs when the store is built.
+
 ## License
 
 MIT

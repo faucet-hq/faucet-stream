@@ -105,3 +105,13 @@ wraps it in a `DriverSink`, which derives the capabilities (append only) and
 serves the plain, reported and per-row write paths with row accounting. Every
 table open, write and commit is a call through the run's call context (op
 labels `open`, `write`, `commit`). The public type and config are unchanged.
+
+## Caller configs under `faucet serve`
+
+A config submitted to `faucet serve` by a caller may not authenticate with the server's own identity unless the server runs with `--allow-host-credentials` (never for a tenant). The effective storage options (typed `credentials`, then `storage_options`) are read the way delta-rs reads them:
+
+- no credential of the table's store (an S3 key id without its secret counts as none) uses the server's default chain: name keys;
+- a key naming a role, profile, metadata endpoint or workload identity (`AWS_IAM_ROLE_ARN`, `aws_profile`, `azure_federated_token_file`, …) uses it even beside static keys;
+- for S3, a server whose environment sets `AWS_IAM_ROLE_ARN` / `AWS_S3_ASSUME_ROLE_ARN` refuses every caller S3 table, since delta-rs merges that environment.
+
+Local tables use none. The same check runs when a table is opened or created.

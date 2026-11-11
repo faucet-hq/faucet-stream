@@ -178,6 +178,16 @@ round trip (`scan` / `query`, `describe_table`, `list_tables`,
 `describe_stream`, `get_shard_iterator`, `get_records`). The throttle-aware
 `retry:` policy is unchanged; its backoffs wait through the same context.
 
+## Caller configs under `faucet serve`
+
+A config submitted to `faucet serve` by a caller may not authenticate with the server's own identity unless the server runs with `--allow-host-credentials` (never for a tenant). For this connector that means:
+
+- `credentials` of type `default`, `profile`, `assume_role` or `web_identity` (or no `credentials`) uses the server's identity: name keys with `access_key` instead.
+- A missing `region` counts too when the server's environment names none (`AWS_REGION` / `AWS_DEFAULT_REGION`), since the SDK would ask the instance metadata service.
+- Emulators such as LocalStack still need some `access_key` pair and a `region`.
+
+The same check runs when the client is built, so a refused config fails with a config error naming the field.
+
 ## License
 
 MIT OR Apache-2.0

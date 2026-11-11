@@ -126,3 +126,7 @@ logged, the message redelivers), idleness is a time window, and the
 cumulative bookmark has its own shape and state key. `MessageSourceDriver`
 has no nack, propagates an ack failure and bookmarks `{consumed}`, so it
 would change those semantics.
+
+## Caller configs under `faucet serve`
+
+A config submitted to `faucet serve` by a caller may not authenticate with the server's own identity unless the server runs with `--allow-host-credentials` (never for a tenant). For this connector, `credentials` of type `application_default` (the default) uses the server's identity: name a service-account key (file or inline) instead. A config with `emulator_host` set uses none. The same check runs when the client is built.

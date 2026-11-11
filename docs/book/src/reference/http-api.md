@@ -416,6 +416,20 @@ builds a connector is live, a caller's run whose connectors check it only at
 build time is refused with `503` until the rolling upgrade finishes; set
 `--allow-host-credentials` the same on every replica.
 
+What each built-in connector reports, and what a caller names instead:
+
+| Connector | Uses the server's identity | Name instead |
+|---|---|---|
+| `kinesis`, `sqs`, `dynamodb`, `s3`, `parquet` (S3 location) | `credentials` other than `access_key` (and `anonymous` for S3), or absent; `region` absent when the server's environment names none | `access_key` (LocalStack / MinIO too), `anonymous` for a public S3 bucket, and a `region` |
+| `redshift` | `iam` / `redshift_data_api` with `aws_credentials` other than `access_key` (or absent) or no region; the `copy` staging client's `copy.credentials` | `aws_credentials: access_key`, `copy.credentials: access_key` |
+| `gcs`, `bigquery`, `spanner`, `pubsub` | `application_default` (the default); BigQuery's `bulk_load.gcs_auth` too; nothing with `emulator_host` (Spanner, Pub/Sub) | a service-account key, file or inline; `anonymous` (GCS) |
+| `azure-blob` | `default` without `use_emulator`, `managed_identity`, a connection string with no key, SAS or emulator | `account_key`, `sas_token`, `service_principal`, a keyed connection string |
+| `clickhouse`, `mssql` (`staging`), `databricks` (cloud `staging`), `snowflake` (`bulk_load`) | the upload store's `credentials` left to the default chain; Snowflake also a `storage_options` key naming a role, profile, metadata endpoint or workload identity | `credentials: access_key` / `service_account_json_*` / `account_key` / `sas_token`, or static keys in `storage_options` |
+| `delta` | storage options naming no credential of the table's store, a role / profile / metadata / workload-identity key, or (S3) a server environment naming `AWS_IAM_ROLE_ARN` / `AWS_S3_ASSUME_ROLE_ARN` | static keys in `credentials` or `storage_options` |
+| `iceberg` | `client.assume-role.arn`; a Glue client without `aws_access_key_id` / `aws_secret_access_key`, with `profile_name` or without a region; an `s3://` / `gs://` warehouse whose properties name no storage credential (Glue, SQL, HMS) | static keys in `catalog.properties`; a REST catalog's vended credentials keep working |
+| `kafka` | `extra_client_config` `sasl.mechanism` / `sasl.mechanisms` = `GSSAPI` | SASL PLAIN / SCRAM, mTLS |
+| `mongodb`, `mongodb-cdc`, `oracle`, `oracle-cdc` | as listed above | a user and password |
+
 A refused reference is a `403` that names the field, the value and the flag
 that would allow it; for a URL or connection string it names the field and the
 offending key or host instead of the value, and credentials are removed from

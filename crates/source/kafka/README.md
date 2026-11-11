@@ -509,6 +509,10 @@ the group at durable page boundaries. `MessageSourceDriver` acknowledges each
 page and bookmarks only a consumed count, and `SourceDriver` has no hooks for
 lag, positions or sharding, so either would change those semantics.
 
+## Caller configs under `faucet serve`
+
+`extra_client_config` with `sasl.mechanism` (or `sasl.mechanisms`) set to `GSSAPI` authenticates with the server's Kerberos identity, so a config a caller submits to `faucet serve` may set it only when the server runs with `--allow-host-credentials` (never for a tenant). `sasl.kerberos.keytab` is a server path and `sasl.kerberos.kinit.cmd` a command; both follow the server's reference policy.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

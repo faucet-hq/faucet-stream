@@ -502,6 +502,16 @@ any caller deadline ends it, and round trips are still metered as `put` /
 `list` / `head` / `get` / `copy` / `delete`. The SDK's own timeouts and retry
 are unchanged.
 
+## Caller configs under `faucet serve`
+
+A config submitted to `faucet serve` by a caller may not authenticate with the server's own identity unless the server runs with `--allow-host-credentials` (never for a tenant). For this connector that means:
+
+- `credentials` of type `default`, `profile`, `assume_role` or `web_identity` (or no `credentials`) uses the server's identity: name keys with `access_key`, or use `anonymous` for a public bucket.
+- A missing `region` counts too when the server's environment names none (`AWS_REGION` / `AWS_DEFAULT_REGION`), since the SDK would ask the instance metadata service.
+- S3-compatible stores (MinIO, LocalStack) still need some `access_key` pair and a `region`; requester-pays buckets need keys.
+
+The same check runs when the client is built, so a refused config fails with a config error naming the field.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.

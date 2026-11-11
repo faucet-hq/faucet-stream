@@ -490,6 +490,10 @@ transaction, and rows travel as load-job media, `insertAll` bodies or one
 JSON payload parameter rather than bound statements. The public type and
 config are unchanged.
 
+## Caller configs under `faucet serve`
+
+A config submitted to `faucet serve` by a caller may not authenticate with the server's own identity unless the server runs with `--allow-host-credentials` (never for a tenant). For this connector, `auth` of type `application_default` (the default) uses the server's identity: name a service-account key (file or inline) instead. A `bulk_load` block's `gcs_auth` (default `application_default`) follows the same rule. The same check runs when the client is built.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or [MIT license](https://opensource.org/licenses/MIT) at your option.
