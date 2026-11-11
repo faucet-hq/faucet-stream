@@ -143,7 +143,7 @@ fn check_kerberos_values<'a>(
 }
 
 /// Check the final options of a Kafka client before it is created: Kerberos
-/// option values must be plain words ([`check_kerberos_values`] rules), and a
+/// option values must be plain words, and a
 /// client that authenticates with the host's Kerberos identity — GSSAPI set
 /// explicitly, or the default mechanism of a `SASL_*` `security.protocol` —
 /// is refused where the task may not use the host's identity.
