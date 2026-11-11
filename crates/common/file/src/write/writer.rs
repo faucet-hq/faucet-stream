@@ -952,7 +952,8 @@ impl FileWriter {
 
     async fn put_marker(&self, name: &str, body: &str) -> Result<(), FaucetError> {
         let scratch = self.backend.scratch_path(Area::Swap, name);
-        std::fs::write(&scratch, body).map_err(|e| {
+        faucet_core::path_guard::check(&scratch)?;
+        super::local::write_fresh(&scratch, body.as_bytes()).map_err(|e| {
             FaucetError::Sink(format!(
                 "file sink: writing the overwrite marker '{}': {e}",
                 scratch.display()
