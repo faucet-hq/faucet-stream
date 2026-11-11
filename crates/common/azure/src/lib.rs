@@ -500,6 +500,71 @@ fn env_layer(
     out
 }
 
+/// Whether a connection string names its own credential: an account key, a
+/// shared access signature, or the emulator.
+fn connection_string_names_a_credential(cs: &str) -> bool {
+    parse_connection_string(cs).iter().any(|(k, v)| {
+        matches!(
+            *k,
+            "azure_storage_access_key" | "azure_storage_sas_key" | "azure_storage_use_emulator"
+        ) && !v.trim().is_empty()
+    })
+}
+
+/// The config fields that make an Azure client built from `config`
+/// authenticate with the identity of the host it runs on: `auth` when it
+/// selects `default` (also when absent) without `use_emulator`,
+/// `managed_identity`, or a `connection_string` with neither an account key,
+/// a shared access signature nor the emulator.
+pub fn host_identity(config: &faucet_core::Value) -> Vec<String> {
+    host_identity_at(config, "")
+}
+
+/// [`host_identity`] for an Azure connection block at another JSON pointer
+/// (`""` for the config root).
+pub fn host_identity_at(config: &faucet_core::Value, base: &str) -> Vec<String> {
+    use faucet_core::capabilities::config::{bool_at, str_at, tag_at};
+    let auth = format!("{base}/auth");
+    let host = match tag_at(config, &auth).unwrap_or("default") {
+        "default" => !bool_at(config, &format!("{base}/use_emulator"), false),
+        "managed_identity" => true,
+        "connection_string" => !str_at(config, &format!("{auth}/config/connection_string"))
+            .is_some_and(connection_string_names_a_credential),
+        _ => false,
+    };
+    if host {
+        vec![auth.trim_start_matches('/').replace('/', ".")]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Refuse a connection that would authenticate with the host's identity
+/// where the task may not use it. `vars` is the environment the builder
+/// reads (its emulator switch counts for `auth: default`).
+fn check_host_identity(
+    conn: &AzureConnection,
+    vars: &[(String, String)],
+) -> Result<(), FaucetError> {
+    let host = match &conn.auth {
+        AzureCredentials::Default => {
+            !conn.use_emulator
+                && !vars
+                    .iter()
+                    .any(|(k, v)| k == "AZURE_STORAGE_USE_EMULATOR" && truthy(v))
+        }
+        AzureCredentials::ManagedIdentity { .. } => true,
+        AzureCredentials::ConnectionString { connection_string } => {
+            !connection_string_names_a_credential(connection_string)
+        }
+        _ => false,
+    };
+    if host {
+        faucet_core::resolve::require_host_credentials("azure", "auth")?;
+    }
+    Ok(())
+}
+
 fn configured_builder(conn: &AzureConnection) -> Result<MicrosoftAzureBuilder, FaucetError> {
     configured_builder_with(conn, process_env())
 }
@@ -509,6 +574,8 @@ fn configured_builder_with(
     vars: impl IntoIterator<Item = (String, String)>,
 ) -> Result<MicrosoftAzureBuilder, FaucetError> {
     conn.validate()?;
+    let vars: Vec<(String, String)> = vars.into_iter().collect();
+    check_host_identity(conn, &vars)?;
     if conn.container.trim().is_empty() {
         return Err(FaucetError::Config(
             "azure: container name must not be empty".into(),
@@ -688,6 +755,78 @@ pub fn builder_settings_with(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn host_identity_follows_the_selected_credentials() {
+        let cs = |s: &str| json!({"auth": {"type": "connection_string", "config": {"connection_string": s}}});
+        assert_eq!(host_identity(&json!({})), vec!["auth"]);
+        assert!(host_identity(&json!({"use_emulator": true})).is_empty());
+        assert_eq!(
+            host_identity(&json!({"auth": {"type": "managed_identity"}})),
+            vec!["auth"]
+        );
+        assert_eq!(
+            host_identity(&cs("AccountName=a;BlobEndpoint=https://a.example")),
+            vec!["auth"]
+        );
+        assert!(host_identity(&cs("AccountName=a;AccountKey=k")).is_empty());
+        assert!(
+            host_identity(&cs(
+                "BlobEndpoint=https://a.example;SharedAccessSignature=sv=1"
+            ))
+            .is_empty()
+        );
+        assert!(host_identity(&cs("UseDevelopmentStorage=true")).is_empty());
+        for t in ["account_key", "sas_token", "service_principal"] {
+            assert!(
+                host_identity(&json!({"auth": {"type": t}})).is_empty(),
+                "{t}"
+            );
+        }
+        assert_eq!(
+            host_identity_at(&json!({"staging": {}}), "/staging"),
+            vec!["staging.auth"]
+        );
+    }
+
+    #[tokio::test]
+    async fn ambient_clients_are_refused_inside_a_caller_run() {
+        let with = |auth: AzureCredentials| AzureConnection::new("c").account("acct").auth(auth);
+        faucet_core::resolve::with_host_credentials(false, async {
+            for auth in [
+                AzureCredentials::Default,
+                AzureCredentials::ManagedIdentity { client_id: None },
+                AzureCredentials::ConnectionString {
+                    connection_string: "AccountName=acct;BlobEndpoint=https://acct.example".into(),
+                },
+            ] {
+                let err = configured_builder_with(&with(auth), Vec::new())
+                    .expect_err("refused")
+                    .to_string();
+                assert!(err.contains("azure: `auth`"), "{err}");
+            }
+            assert!(
+                configured_builder_with(
+                    &with(AzureCredentials::Default).use_emulator(true),
+                    Vec::new()
+                )
+                .is_ok()
+            );
+            assert!(
+                configured_builder_with(
+                    &with(AzureCredentials::Default),
+                    vec![("AZURE_STORAGE_USE_EMULATOR".into(), "true".into())]
+                )
+                .is_ok()
+            );
+            let key = AzureCredentials::AccountKey {
+                account_key: "a2V5".into(),
+            };
+            assert!(configured_builder_with(&with(key), Vec::new()).is_ok());
+        })
+        .await;
+        assert!(configured_builder_with(&with(AzureCredentials::Default), Vec::new()).is_ok());
+    }
 
     fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs
