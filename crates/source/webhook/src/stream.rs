@@ -105,6 +105,7 @@ impl WebhookDriver {
     /// and return what was stored (API-14).
     async fn receive(&self, path: &str) -> Result<Vec<Value>, FaucetError> {
         crate::config::validate_resolved_path(path)?;
+        self.config.check_listener()?;
         let state = self.new_state();
         let app = self.build_router(path, Arc::clone(&state));
 
@@ -473,6 +474,7 @@ impl SourceDriver for WebhookDriver {
     ) -> Result<Option<faucet_core::check::CheckReport>, FaucetError> {
         use faucet_core::check::{CheckReport, Probe};
 
+        self.config.check_listener()?;
         let start = std::time::Instant::now();
         match tokio::net::TcpListener::bind(&self.config.listen_addr).await {
             Ok(listener) => {

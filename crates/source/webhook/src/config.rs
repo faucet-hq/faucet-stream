@@ -18,6 +18,7 @@ pub struct WebhookSourceConfig {
     /// `0.0.0.0` exposes the receiver to the whole network — only do so
     /// behind a trusted gateway, and set `auth_token` to require a shared
     /// secret on every request.
+    #[schemars(extend("x-faucet-resource" = "listen"))]
     pub listen_addr: String,
     /// Endpoint path for receiving webhooks (default: `"/webhook"`).
     pub path: String,
@@ -177,6 +178,33 @@ impl Default for WebhookSourceConfig {
 }
 
 impl WebhookSourceConfig {
+    /// Hold `listen_addr` to the reference policy scoped over the run, if
+    /// any ([`faucet_core::http::current_reference_policy`]): an address the
+    /// policy's listener ranges allow, and, off loopback, `auth_token` or
+    /// `signature` set.
+    pub fn check_listener(&self) -> Result<(), faucet_core::FaucetError> {
+        let Some(policy) = faucet_core::http::current_reference_policy() else {
+            return Ok(());
+        };
+        policy.check_listen(&self.listen_addr).map_err(|r| {
+            faucet_core::FaucetError::Config(format!("webhook source: `listen_addr` {r}"))
+        })?;
+        let open_to_network = policy.listen_ranges().is_some()
+            && self
+                .listen_addr
+                .trim()
+                .parse::<std::net::SocketAddr>()
+                .is_ok_and(|a| !a.ip().is_loopback());
+        if open_to_network && self.auth_token.is_none() && self.signature.is_none() {
+            return Err(faucet_core::FaucetError::Config(format!(
+                "webhook source: `listen_addr` {} is reachable from the network; set \
+                 `auth_token` or `signature`",
+                self.listen_addr
+            )));
+        }
+        Ok(())
+    }
+
     /// Create a new config with sensible defaults.
     pub fn new() -> Self {
         Self::default()
@@ -266,6 +294,36 @@ impl WebhookSourceConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_listener_is_held_to_the_runs_reference_policy() {
+        use faucet_core::resolve::{ListenRange, ReferencePolicy};
+        let at = |addr: &str| WebhookSourceConfig::new().listen_addr(addr);
+        at("127.0.0.1:0").check_listener().unwrap();
+        let policy = std::sync::Arc::new(ReferencePolicy::deny_all().with_listen([
+            ListenRange::parse("127.0.0.1:29100-29199").unwrap(),
+            ListenRange::parse("[::]:9000").unwrap(),
+        ]));
+        let checked = |cfg: WebhookSourceConfig| {
+            faucet_core::http::with_reference_policy(
+                policy.clone(),
+                async move { cfg.check_listener() },
+            )
+        };
+        checked(at("127.0.0.1:29100")).await.unwrap();
+        let e = checked(at("127.0.0.1:8080")).await.unwrap_err().to_string();
+        assert!(e.contains("127.0.0.1:29100-29199"), "{e}");
+        let e = checked(at("0.0.0.0:9000")).await.unwrap_err().to_string();
+        assert!(e.contains("auth_token"), "{e}");
+        checked(at("0.0.0.0:9000").auth_token("t")).await.unwrap();
+        // An operator's run binds where it says.
+        faucet_core::http::with_reference_policy(
+            std::sync::Arc::new(ReferencePolicy::open()),
+            async { at("0.0.0.0:8080").check_listener() },
+        )
+        .await
+        .unwrap();
+    }
 
     #[test]
     fn a_resolved_path_may_not_keep_a_placeholder() {

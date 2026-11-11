@@ -221,6 +221,8 @@ pub enum ResourceKind {
     /// the connector's configured server; a `..` segment would climb out of
     /// the directory the config names.
     Key,
+    /// A local `address:port` the connector opens a listener on.
+    Listen,
 }
 
 impl ResourceKind {
@@ -233,6 +235,7 @@ impl ResourceKind {
             ResourceKind::Unverified => "unverified",
             ResourceKind::HostCredentials => "host_credentials",
             ResourceKind::Key => "key",
+            ResourceKind::Listen => "listen",
         }
     }
 
@@ -243,6 +246,7 @@ impl ResourceKind {
             "url" => Some(ResourceKind::Url),
             "command" => Some(ResourceKind::Command),
             "key" => Some(ResourceKind::Key),
+            "listen" => Some(ResourceKind::Listen),
             _ => None,
         }
     }
@@ -303,6 +307,8 @@ pub enum RefusalKind {
     Unverified,
     /// A setting that authenticates with the host's own credentials.
     HostCredentials,
+    /// A local address a connector listens on.
+    Listen,
 }
 
 /// Why a reference was refused.
@@ -333,6 +339,72 @@ impl std::fmt::Display for Refusal {
 
 impl std::error::Error for Refusal {}
 
+/// Local addresses a listener may bind: one IP and an inclusive port range
+/// (`127.0.0.1:29100-29199`, `[::1]:29100`). An unspecified IPv6 address
+/// (`[::]`) also covers `0.0.0.0`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenRange {
+    ip: std::net::IpAddr,
+    first: u16,
+    last: u16,
+}
+
+impl ListenRange {
+    /// `ip` on ports `first..=last` (port 0 is never allowed).
+    pub fn new(ip: std::net::IpAddr, first: u16, last: u16) -> Result<Self, String> {
+        if first == 0 || first > last {
+            return Err(format!("invalid port range {first}-{last}"));
+        }
+        Ok(Self { ip, first, last })
+    }
+
+    /// Parse `addr:port` or `addr:first-last` (an IPv6 address in brackets).
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        let (host, ports) = s
+            .rsplit_once(':')
+            .ok_or_else(|| format!("`{s}` is not `address:port` or `address:first-last`"))?;
+        let ip: std::net::IpAddr = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse()
+            .map_err(|_| format!("`{host}` is not an IP address"))?;
+        if ip.is_ipv6() && !host.starts_with('[') {
+            return Err(format!("write the IPv6 address in `{s}` in brackets"));
+        }
+        let port = |p: &str| {
+            p.parse::<u16>()
+                .map_err(|_| format!("`{p}` is not a port number"))
+        };
+        let (first, last) = match ports.split_once('-') {
+            Some((a, b)) => (port(a)?, port(b)?),
+            None => (port(ports)?, port(ports)?),
+        };
+        Self::new(ip, first, last)
+    }
+
+    /// Whether `addr` falls in the range.
+    pub fn covers(&self, addr: std::net::SocketAddr) -> bool {
+        let ip_ok = addr.ip() == self.ip
+            || (self.ip == std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+                && addr.ip() == std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        ip_ok && (self.first..=self.last).contains(&addr.port())
+    }
+}
+
+impl std::fmt::Display for ListenRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ip = std::net::SocketAddr::new(self.ip, self.first);
+        let host = ip.to_string();
+        let host = host.rsplit_once(':').map_or(host.as_str(), |(h, _)| h);
+        if self.first == self.last {
+            write!(f, "{host}:{}", self.first)
+        } else {
+            write!(f, "{host}:{}-{}", self.first, self.last)
+        }
+    }
+}
+
 /// The external resources a config of one origin may reach.
 ///
 /// Every dimension is either open (`None` — anything) or an allow-list
@@ -350,6 +422,8 @@ pub struct ReferencePolicy {
     unverified: bool,
     host_credentials: bool,
     pin_servers: bool,
+    listen: Option<Vec<ListenRange>>,
+    reserved_ports: BTreeSet<u16>,
 }
 
 impl Default for ReferencePolicy {
@@ -1417,6 +1491,8 @@ impl ReferencePolicy {
             host_credentials: true,
 
             pin_servers: false,
+            listen: None,
+            reserved_ports: BTreeSet::new(),
         }
     }
 
@@ -1433,6 +1509,8 @@ impl ReferencePolicy {
             host_credentials: false,
 
             pin_servers: false,
+            listen: Some(Vec::new()),
+            reserved_ports: BTreeSet::new(),
         }
     }
 
@@ -1599,6 +1677,66 @@ impl ReferencePolicy {
     /// allowed.
     pub fn allows_host_credentials(&self) -> bool {
         self.host_credentials
+    }
+
+    /// Allow listeners only on these addresses ([`ResourceKind::Listen`]);
+    /// an empty list allows none.
+    pub fn with_listen(mut self, ranges: impl IntoIterator<Item = ListenRange>) -> Self {
+        self.listen = Some(ranges.into_iter().collect());
+        self
+    }
+
+    /// Allow a listener on any address.
+    pub fn any_listen(mut self) -> Self {
+        self.listen = None;
+        self
+    }
+
+    /// Ports no listener may take even where a range covers them (the host
+    /// process's own).
+    pub fn with_reserved_ports(mut self, ports: impl IntoIterator<Item = u16>) -> Self {
+        self.reserved_ports.extend(ports);
+        self
+    }
+
+    /// The allowed listener ranges, `None` when any address is allowed.
+    pub fn listen_ranges(&self) -> Option<&[ListenRange]> {
+        self.listen.as_deref()
+    }
+
+    /// Check a local `address:port` a connector listens on: a literal socket
+    /// address (no host name, no port 0) inside an allowed range.
+    pub fn check_listen(&self, value: &str) -> Result<(), Refusal> {
+        let Some(ranges) = &self.listen else {
+            return Ok(());
+        };
+        let refuse = |why: String| Err(Refusal::new(RefusalKind::Listen, value, why));
+        if ranges.is_empty() {
+            return refuse("connectors that open a listener are not allowed".into());
+        }
+        let allowed = ranges
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let Ok(addr) = value.trim().parse::<std::net::SocketAddr>() else {
+            return refuse(format!(
+                "a listener must name a literal `address:port`; allowed: {allowed}"
+            ));
+        };
+        if addr.port() == 0 || self.reserved_ports.contains(&addr.port()) {
+            return refuse(format!(
+                "port {} is not available for a listener; allowed: {allowed}",
+                addr.port()
+            ));
+        }
+        if ranges.iter().any(|r| r.covers(addr)) {
+            Ok(())
+        } else {
+            refuse(format!(
+                "outside the allowed listener addresses ({allowed})"
+            ))
+        }
     }
 
     /// Check an `${env:NAME}` / `${secret:NAME}` reference.
@@ -2291,6 +2429,7 @@ impl ReferencePolicy {
                 r.value.clone(),
                 "settings that authenticate with the server's own credentials are not allowed",
             )),
+            ResourceKind::Listen => self.check_listen(&r.value),
         }
     }
 }
@@ -4589,5 +4728,53 @@ mod tests {
                 .check_url("mongodb://:1,%FF.sock/")
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn listeners_bind_only_inside_the_allowed_ranges() {
+        let range = |s: &str| ListenRange::parse(s).unwrap();
+        assert_eq!(
+            range("127.0.0.1:29100-29199").to_string(),
+            "127.0.0.1:29100-29199"
+        );
+        assert_eq!(range("[::1]:29100").to_string(), "[::1]:29100");
+        for bad in [
+            "localhost:1",
+            "127.0.0.1",
+            "::1:80",
+            "1.2.3.4:0",
+            "1.2.3.4:9-1",
+            "1.2.3.4:x",
+        ] {
+            assert!(ListenRange::parse(bad).is_err(), "{bad}");
+        }
+        let p = ReferencePolicy::deny_all()
+            .with_listen([range("127.0.0.1:29100-29199"), range("[::]:9000")])
+            .with_reserved_ports([29150]);
+        assert_eq!(p.listen_ranges().map(<[_]>::len), Some(2));
+        p.check_listen("127.0.0.1:29100").unwrap();
+        p.check_listen("0.0.0.0:9000").unwrap();
+        p.check_listen("[::]:9000").unwrap();
+        for (bad, why) in [
+            ("127.0.0.1:8080", "127.0.0.1:29100-29199"),
+            ("10.0.0.5:29100", "outside"),
+            ("localhost:29100", "literal"),
+            ("127.0.0.1:0", "port 0"),
+            ("127.0.0.1:29150", "port 29150"),
+        ] {
+            let r = p.check_listen(bad).unwrap_err();
+            assert_eq!(r.kind, RefusalKind::Listen);
+            assert!(r.reason.contains(why), "{bad}: {}", r.reason);
+        }
+        let r = ReferencePolicy::deny_all()
+            .check_listen("127.0.0.1:1")
+            .unwrap_err();
+        assert!(r.reason.contains("not allowed"), "{}", r.reason);
+        ReferencePolicy::open().check_listen("anything").unwrap();
+        assert!(p.clone().any_listen().check_listen("x").is_ok());
+        let listen = ResourceRef::new("/listen_addr", ResourceKind::Listen, "127.0.0.1:1");
+        assert!(p.check(&listen).is_err());
+        assert_eq!(ResourceKind::parse("listen"), Some(ResourceKind::Listen));
+        assert_eq!(ResourceKind::Listen.as_str(), "listen");
     }
 }

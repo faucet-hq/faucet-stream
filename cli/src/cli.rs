@@ -2257,6 +2257,19 @@ pub struct ReferenceArgs {
         env = "FAUCET_SERVE_ALLOW_HOST_CREDENTIALS"
     )]
     pub allow_host_credentials: bool,
+    /// Where a submitted config may open a listener (a `webhook` source's
+    /// `listen_addr`, any field annotated `x-faucet-resource: listen`):
+    /// `ADDR:PORT` or `ADDR:FIRST-LAST`, an IPv6 address in brackets
+    /// (`[::]` also covers `0.0.0.0`). Repeatable or comma-separated.
+    /// Default: `127.0.0.1:29100-29199,[::1]:29100-29199`; `none` allows no
+    /// listener. Never for a tenant.
+    #[arg(
+        long = "allow-listen",
+        value_name = "ADDR:PORTS",
+        value_delimiter = ',',
+        env = "FAUCET_SERVE_ALLOW_LISTEN"
+    )]
+    pub allow_listen: Vec<String>,
 }
 
 /// `faucet serve` arguments.

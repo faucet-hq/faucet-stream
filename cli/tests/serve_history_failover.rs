@@ -68,7 +68,14 @@ fn config(url: &str) -> ServeConfig {
         connect_providers_path: None,
         allow_subprocess_connectors: false,
         grafana_url: None,
-        references: Default::default(),
+        // The webhook runs below listen on an ephemeral port.
+        references: faucet_cli::serve::references::ServeReferencePolicy::from_args(
+            &faucet_cli::cli::ReferenceArgs {
+                allow_listen: vec!["127.0.0.1:1024-65535".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap(),
     }
 }
 

@@ -178,7 +178,11 @@ connector's `tls` / transport option as something to configure, not to inherit.
   settings and connectors that authenticate with the server's own identity
   (Oracle `external_auth`, marked `x-faucet-host-credentials`, and every
   connector whose descriptor reports it through `with_host_identity`) need
-  `--allow-host-credentials`, and never apply to a tenant; a connector that
+  `--allow-host-credentials`, and never apply to a tenant; a listener a
+  caller's config opens (fields annotated `x-faucet-resource: listen`, a
+  `webhook` source's `listen_addr`) must sit inside an `--allow-listen` range
+  (default loopback, ports 29100–29199), off loopback with a shared secret,
+  and never for a tenant; a connector that
   learns it at run time checks `require_host_credentials` when it builds its
   client, and a serve task with no principal scope is refused. Under
   `faucet serve`, database connectors never fill a missing password, user or

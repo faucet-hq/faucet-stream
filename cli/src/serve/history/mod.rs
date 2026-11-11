@@ -430,11 +430,15 @@ pub const CAP_CONNECTION_GENERATION: &str = "connection_generation";
 /// A member checks, when it builds a connector for a caller's run, whether
 /// the connector would use the server's own identity.
 pub const CAP_HOST_CREDENTIALS: &str = "host_credentials";
+/// A member holds a caller's config to the reference kinds added after
+/// `x-faucet-resource: path | url | command` (a listener's address).
+pub const CAP_REFERENCE_KINDS_V2: &str = "reference_kinds_v2";
 /// What this build advertises in its heartbeat.
 pub const INSTANCE_CAPABILITIES: &[&str] = &[
     CAP_POLICY_PIN,
     CAP_CONNECTION_GENERATION,
     CAP_HOST_CREDENTIALS,
+    CAP_REFERENCE_KINDS_V2,
 ];
 
 /// One live cluster member (for `/readyz` + metrics).

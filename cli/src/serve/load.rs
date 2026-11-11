@@ -2183,8 +2183,8 @@ fn findings_error(mut found: Findings) -> Result<(), ServeError> {
         return Err(ServeError::Forbidden(format!(
             "the config names resources a submitted config may not reach under the server's \
              reference policy: {}; the operator can allow them with --allow-path-root / \
-             --allow-url-host / --allow-url-scheme / --allow-unverified-tls, or register the \
-             pipeline as a template",
+             --allow-url-host / --allow-url-scheme / --allow-unverified-tls / --allow-listen, or \
+             register the pipeline as a template",
             found.policy.join(", ")
         )));
     }
@@ -3067,6 +3067,7 @@ pub async fn load_submission_inputs(
     }
 
     refuse_server_paths_with(&cfg, &nodes, origin, &refs)?;
+    crate::serve::listen::screen(&nodes, &refs)?;
 
     if let Some(t) = &tenant {
         t.check_refs(&cfg, &nodes)?;

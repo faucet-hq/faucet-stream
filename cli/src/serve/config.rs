@@ -688,7 +688,8 @@ impl ServeConfig {
             connect_providers_path: args.connect_providers,
             allow_subprocess_connectors: args.allow_subprocess_connectors,
             references: crate::serve::references::ServeReferencePolicy::from_args(&args.references)
-                .map_err(CliError::Config)?,
+                .map_err(CliError::Config)?
+                .reserve_ports([listen.port()]),
             grafana_url: grafana_url(args.grafana_url.as_deref())?,
         })
     }

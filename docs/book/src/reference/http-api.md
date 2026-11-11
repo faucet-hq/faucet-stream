@@ -288,6 +288,25 @@ otherwise it is a `422`. A config submitted for a tenant is refused even then.
 Registered templates and the triggers file are written by the server's
 operator and may always use them.
 
+### Listeners
+
+A connector field annotated `x-faucet-resource: listen` opens a listener in
+the server process — among the built-ins, a `webhook` source's
+`listen_addr`. In a config **the request carries** it must be a literal
+`address:port` inside an `--allow-listen` range (default `127.0.0.1` and
+`[::1]`, ports 29100–29199): a host name, port `0`, the server's own
+`--listen` port or an address outside the ranges is a `403` naming the
+ranges to use. An address the config leaves out is the connector's default
+(`127.0.0.1:8080` for `webhook`), and is checked the same way. A listener
+off loopback also needs `auth_token` or `signature`, so not everyone who
+can reach the port can add records. `POST /v1/doctor` (whose probe binds
+the address) is checked too, and the webhook source checks again when it
+binds inside a caller's run. A tenant's config may open none. Registered
+templates, the triggers file and `faucet run` bind where they say. In a
+cluster, while a member that does not check listeners is live, a caller's
+config that opens one is refused with `503` until the rolling upgrade
+finishes.
+
 ### Keys the server sets
 
 A sink config key the server sets for a run itself is removed from a config
@@ -415,6 +434,7 @@ are stored and again whenever a run uses them.
 | `${env:NAME}` / `${secret:NAME}` | none | `--allow-env NAME` or `--allow-env 'PREFIX*'` |
 | `${vault:}` / `${aws-sm:}` / `${gcp-sm:}` / `${azure-kv:}` | none | `--allow-secret-scheme vault,aws-sm` |
 | A program (`singer`) | refused | `--allow-subprocess-connectors` |
+| A listener (a `webhook` source's `listen_addr`) | `127.0.0.1` and `[::1]`, ports 29100–29199 | `--allow-listen` (never for a tenant); see [Listeners](#listeners) |
 
 A config that would use the server's own identity is checked after its matrix
 rows are merged, for every row's source, sink and DLQ sink, every topology

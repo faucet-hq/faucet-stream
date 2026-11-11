@@ -242,6 +242,15 @@ serve:
   # anything a caller should not; set it the same on every replica.
   allowHostCredentials: false
 
+  # FAUCET_SERVE_ALLOW_LISTEN — where a config submitted over HTTP or MCP may
+  # open a listener (a `webhook` source's `listen_addr`): `ADDR:PORT` or
+  # `ADDR:FIRST-LAST` entries (IPv6 in brackets; `[::]` also covers
+  # `0.0.0.0`). Empty: the server default, `127.0.0.1:29100-29199` and
+  # `[::1]:29100-29199`; `[none]` allows no listener. A non-loopback listener
+  # must also set `auth_token` or `signature`. Never applies to a tenant. A
+  # range reachable from outside the pod also needs a Service port.
+  allowListen: []
+
   # Dataset preview of those local outputs (#586): the console's Datasets page
   # can read back the first N rows of a tracked jsonl / csv / parquet file.
   #

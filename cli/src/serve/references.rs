@@ -37,7 +37,9 @@
 //! credentials and the system trees stay out of reach for every origin.
 
 use crate::serve::load::BodyOrigin;
-use faucet_core::resolve::{ReferencePolicy, ResourceKind, ResourceRef, annotated_resources};
+use faucet_core::resolve::{
+    ListenRange, ReferencePolicy, ResourceKind, ResourceRef, annotated_resources,
+};
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -110,10 +112,18 @@ impl ServeReferencePolicy {
         } else {
             caller.with_url_hosts(args.allow_url_host.iter().cloned())
         };
+        let caller = caller.with_listen(listen_ranges(&args.allow_listen)?);
         Ok(Self {
             caller,
             tenant_root: args.tenant_path_root.clone(),
         })
+    }
+
+    /// Keep `ports` (the server's own) from every caller listener.
+    #[must_use]
+    pub fn reserve_ports(mut self, ports: impl IntoIterator<Item = u16>) -> Self {
+        self.caller = self.caller.with_reserved_ports(ports);
+        self
     }
 
     /// The policy for a caller-supplied body (subprocess connectors off).
@@ -141,6 +151,9 @@ impl ServeReferencePolicy {
                     .with_unverified(unverified)
                     .with_pinned_servers(self.caller.pins_servers() || tenant.is_some())
                     .with_host_credentials(host_credentials);
+                if tenant.is_some() {
+                    p = p.with_listen([]);
+                }
                 if let (Some(root), Some(t)) = (&self.tenant_root, tenant) {
                     p = p.with_path_roots([root.join(t)]);
                 }
@@ -148,6 +161,29 @@ impl ServeReferencePolicy {
             }
         }
     }
+}
+
+/// The listener ranges a caller's config gets when no `--allow-listen` is
+/// given: loopback only, ports 29100–29199.
+pub const DEFAULT_LISTEN: &[&str] = &["127.0.0.1:29100-29199", "[::1]:29100-29199"];
+
+/// Parse `--allow-listen` (`none` = no listener at all).
+fn listen_ranges(args: &[String]) -> Result<Vec<ListenRange>, String> {
+    if args.iter().any(|a| a.trim().eq_ignore_ascii_case("none")) {
+        if args.len() > 1 {
+            return Err("--allow-listen none cannot be combined with an address".into());
+        }
+        return Ok(Vec::new());
+    }
+    let given: Vec<&str> = if args.is_empty() {
+        DEFAULT_LISTEN.to_vec()
+    } else {
+        args.iter().map(String::as_str).collect()
+    };
+    given
+        .into_iter()
+        .map(|a| ListenRange::parse(a).map_err(|e| format!("--allow-listen: {e}")))
+        .collect()
 }
 
 fn installed_cell() -> &'static RwLock<Arc<ServeReferencePolicy>> {
@@ -324,8 +360,12 @@ mod tests {
             tenant_path_root: Some("/srv/tenants".into()),
             allow_unverified_tls: true,
             allow_host_credentials: false,
+            allow_listen: vec!["[::]:9000".into(), "[::1]:9100-9199".into()],
         };
         let p = ServeReferencePolicy::from_args(&args).unwrap();
+        assert!(p.caller().check_listen("0.0.0.0:9000").is_ok());
+        assert!(p.caller().check_listen("[::1]:9150").is_ok());
+        assert!(p.caller().check_listen("127.0.0.1:29100").is_err());
         let c = p.caller();
         assert!(c.check_env("APP_X").is_ok());
         assert!(c.check_secret("vault", "a").is_ok());
@@ -424,6 +464,28 @@ mod tests {
                 .unwrap_err()
                 .contains("--allow-env")
         );
+        let listen = |v: &[&str]| {
+            ServeReferencePolicy::from_args(&ReferenceArgs {
+                allow_listen: v.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            })
+        };
+        for bad in [
+            &["localhost:80"][..],
+            &["1.2.3.4:0"],
+            &["none", "1.2.3.4:80"],
+        ] {
+            assert!(
+                listen(bad).unwrap_err().contains("--allow-listen"),
+                "{bad:?}"
+            );
+        }
+        let none = listen(&["none"]).unwrap();
+        assert_eq!(none.caller().listen_ranges().map(<[_]>::len), Some(0));
+        let default = listen(&[]).unwrap();
+        assert!(default.caller().check_listen("127.0.0.1:29100").is_ok());
+        assert!(default.caller().check_listen("[::1]:29199").is_ok());
+        assert!(default.caller().check_listen("0.0.0.0:29100").is_err());
     }
 
     #[test]

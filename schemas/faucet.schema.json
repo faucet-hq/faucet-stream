@@ -27178,7 +27178,8 @@
                     "listen_addr": {
                       "description": "Address to bind the HTTP server to (default: `\"127.0.0.1:8080\"`).\n\n**Security:** the default binds to loopback only. Binding to\n`0.0.0.0` exposes the receiver to the whole network — only do so\nbehind a trusted gateway, and set `auth_token` to require a shared\nsecret on every request.",
                       "type": "string",
-                      "default": "127.0.0.1:8080"
+                      "default": "127.0.0.1:8080",
+                      "x-faucet-resource": "listen"
                     },
                     "path": {
                       "description": "Endpoint path for receiving webhooks (default: `\"/webhook\"`).",

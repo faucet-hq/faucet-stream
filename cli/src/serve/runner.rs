@@ -3620,6 +3620,21 @@ mod tests {
         assert_eq!(rec.status, RunStatus::Failed, "{rec:?}");
     }
 
+    /// A free port a caller's listener may take by default (the
+    /// `--allow-listen` range), distinct per test in this process.
+    #[cfg(feature = "source-webhook")]
+    fn caller_listen_port() -> u16 {
+        use std::sync::atomic::{AtomicU16, Ordering};
+        static NEXT: AtomicU16 = AtomicU16::new(29100);
+        loop {
+            let port = NEXT.fetch_add(1, Ordering::Relaxed);
+            assert!(port <= 29199, "no free port in the default listener range");
+            if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+                return port;
+            }
+        }
+    }
+
     #[cfg(feature = "source-webhook")]
     #[tokio::test]
     async fn a_run_that_outlives_its_timeout_is_stopped_and_failed() {
@@ -3627,7 +3642,8 @@ mod tests {
         let state = crate::serve::test_support::test_state();
         let req: SubmitRequest = serde_json::from_value(serde_json::json!({
             "config": format!(
-                "version: 1\npipeline:\n  source: {{ type: webhook, config: {{ listen_addr: \"127.0.0.1:0\", timeout_secs: 60 }} }}\n  sink: {{ type: jsonl, config: {{ path: \"{}\" }} }}\n",
+                "version: 1\npipeline:\n  source: {{ type: webhook, config: {{ listen_addr: \"127.0.0.1:{}\", timeout_secs: 60 }} }}\n  sink: {{ type: jsonl, config: {{ path: \"{}\" }} }}\n",
+                caller_listen_port(),
                 dir.path().join("out.jsonl").display()
             ),
             "timeout_secs": 1,
