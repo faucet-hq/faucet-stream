@@ -4685,6 +4685,7 @@ dependencies = [
  "dashmap",
  "dotenvy",
  "faucet-auth",
+ "faucet-common-azure",
  "faucet-common-file",
  "faucet-common-nats",
  "faucet-common-rabbitmq",

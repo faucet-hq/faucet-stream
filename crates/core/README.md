@@ -306,7 +306,13 @@ default and `open()` allows everything but metadata hosts. `faucet serve` uses
 it to confine configs a caller submits, so an annotated third-party connector
 is confined without serve changes. A free-form string map names the keys
 that hold a resource with `x-faucet-resource-keys` (`{"*endpoint*": "url",
-"*_file": "path"}`). Host-bearing values that are not URLs (`b1:9092,b2:9092`,
+"*_file": "path"}`, or `{"kind": "url", "syntax": "url-list"}` to name a key's
+grammar too; an exact key wins over a pattern). Such a key that runs a program
+does not make `declares(schema, Command)` true: it is reported only when a
+config sets it. `AzureConnSettings::read` reads an Azure Storage connection
+string with the Azure client's own rules (exact-case keys, last wins) and is
+shared by the check and `faucet-common-azure`; `is_valid_azure_account_name`
+is the service's account-name rule. Host-bearing values that are not URLs (`b1:9092,b2:9092`,
 `Server=tcp:host,1433;…`, an Azure Storage connection string) are read for
 their hosts. A field whose value is not a URL declares its grammar with
 `#[schemars(extend("x-faucet-url-syntax" = "ado"))]` (`"oracle"`,

@@ -1394,6 +1394,11 @@ pub struct TriggerBody {
     /// even when the run itself carries a standing approval (#1051).
     #[serde(skip)]
     pub operator_params: bool,
+    /// Set (never from the wire) by a trigger fire: the params whose value
+    /// holds text the event's sender chose. Even with `operator_params`,
+    /// those are held to the caller reference policy.
+    #[serde(skip)]
+    pub sender_params: std::collections::BTreeSet<String>,
 }
 
 /// A trigger's `overlay`: a registered deployment id, or an inline document.

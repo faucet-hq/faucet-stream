@@ -113,6 +113,15 @@ rather than a new run.
 > `dedupe_header` when callers are trusted or the header is verified
 > upstream (e.g. HMAC-signed by the sender).
 
+Values the request supplies (`${trigger.body}`, `${trigger.header.*}`,
+`${trigger.query.*}`) are checked where they land in `sync.yaml`, under the
+same rules as a caller's submitted config: a header placed in a Kafka
+`brokers` list or a connection string must name a host the server allows
+(`--allow-url-host`), even when the rest of that value is your own text. A
+refused request gets `422` and an audit entry (`policy.denied`, target
+`trigger values`). See
+[Triggers → substitution](../reference/triggers.md) for the full rules.
+
 ### Fire the webhook
 
 ```bash

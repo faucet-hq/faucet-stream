@@ -1359,6 +1359,7 @@ fn check_connector(
         check_local_paths(config, base, access, scope, found);
     }
     let access = read_access(config, access);
+    let azure_hosts = azure_blob_hosts(kind, config);
     for r in crate::serve::references::connector_resources(kind, config) {
         if !scope.wants(&r.pointer) {
             continue;
@@ -1394,7 +1395,24 @@ fn check_connector(
             found.add(scope, base, ptr, &r.value, Why::RecordHost, text);
             continue;
         }
-        if let Some(Err(e)) = scope.policy.map(|p| p.check(&r)) {
+        let checked = match (scope.policy, azure_hosts.as_deref()) {
+            (Some(_), Some(_))
+                if ptr == AZURE_BLOB_URLS[0]
+                    && config.pointer(AZURE_BLOB_URLS[1]).is_some()
+                    && scope.wants(AZURE_BLOB_URLS[1]) =>
+            {
+                None
+            }
+            (Some(p), Some(hosts)) if AZURE_BLOB_URLS.contains(&ptr) => {
+                let string = config
+                    .pointer(AZURE_BLOB_URLS[1])
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                Some(p.check_azure_conn_with_hosts(string, hosts))
+            }
+            (policy, _) => policy.map(|p| p.check(&r)),
+        };
+        if let Some(Err(e)) = checked {
             let text = match r.kind {
                 ResourceKind::Url => format!("`{}` ({})", field_name(base, ptr), e.reason),
                 _ => format!("{} ({})", r.value, e.reason),
@@ -1402,6 +1420,26 @@ fn check_connector(
             found.add(scope, base, ptr, &r.value, Why::Policy(e.reason), text);
         }
     }
+}
+
+/// The fields of an Azure Blob connector's config whose hosts the client
+/// reads together with the rest of the connection: the custom endpoint and
+/// the connection string.
+const AZURE_BLOB_URLS: [&str; 2] = ["/endpoint", "/auth/config/connection_string"];
+
+/// The hosts an `azure-blob` connector's `config` connects to, read from the
+/// whole connection (account, endpoint, emulator, connection string and the
+/// server's environment) the way its client builds it; `None` for any other
+/// kind or a config that is not one.
+fn azure_blob_hosts(kind: &str, config: &Value) -> Option<Vec<String>> {
+    #[cfg(any(feature = "source-azure-blob", feature = "sink-azure-blob"))]
+    if kind == "azure-blob" {
+        let conn: faucet_common_azure::AzureConnection =
+            serde_json::from_value(config.clone()).ok()?;
+        return Some(faucet_common_azure::effective_hosts(&conn));
+    }
+    let _ = (kind, config);
+    None
 }
 
 /// The access a document position implies: under a `sink` / `sinks` / `dlq` /
@@ -1689,6 +1727,23 @@ pub struct CallerParams<'a> {
 /// How a refusal of a caller-supplied param value starts.
 pub const CALLER_PARAM_REFUSAL: &str = "a value a caller supplied for a template param";
 
+/// How a refusal of a value an event's sender placed in a trigger's config
+/// starts.
+pub const TRIGGER_VALUE_REFUSAL: &str = "a value an event's sender supplied to a trigger";
+
+/// Whether `message` is a refusal of caller-supplied values
+/// ([`CALLER_PARAM_REFUSAL`] / [`TRIGGER_VALUE_REFUSAL`]), and the audit
+/// target that names what was refused.
+pub fn caller_refusal_target(message: &str) -> Option<&'static str> {
+    if message.starts_with(TRIGGER_VALUE_REFUSAL) {
+        Some("trigger values")
+    } else if message.starts_with(CALLER_PARAM_REFUSAL) {
+        Some("template params")
+    } else {
+        None
+    }
+}
+
 /// `fields` extended through the config's own references: a string holding
 /// `${vars.X}` / `${sources.N.PATH}` / `${sinks.N.PATH}` that names a
 /// caller-supplied value carries it too. Also recorded under the canonical
@@ -1785,13 +1840,17 @@ pub fn refuse_caller_params(
             &mut found,
         );
     }
-    caller_params_error(found, for_tenant)
+    caller_params_error(found, for_tenant, fields.only_trigger_values())
 }
 
 /// The refusal [`refuse_caller_params`]'s findings amount to, if any: each
 /// names the params (and `env` overrides) that wrote the value, the field,
 /// and only the text the caller sent.
-fn caller_params_error(found: Findings, for_tenant: bool) -> Result<(), ServeError> {
+fn caller_params_error(
+    found: Findings,
+    for_tenant: bool,
+    triggered: bool,
+) -> Result<(), ServeError> {
     let mut lines: Vec<String> = found
         .items
         .into_iter()
@@ -1835,18 +1894,29 @@ fn caller_params_error(found: Findings, for_tenant: bool) -> Result<(), ServeErr
     }
     lines.sort();
     lines.dedup();
-    Err(ServeError::Forbidden(
-        crate::secrets::registry::redact_message(&format!(
+    let tenant_note = if for_tenant {
+        " (a tenant is confined to --tenant-path-root/<tenant>)"
+    } else {
+        ""
+    };
+    let message = if triggered {
+        format!(
+            "{TRIGGER_VALUE_REFUSAL} reaches what the server's reference policy does not allow a \
+             caller: {}; the event was not run. The operator can allow it with \
+             --allow-path-root / --allow-url-host / --allow-url-scheme{tenant_note}",
+            lines.join("; "),
+        )
+    } else {
+        format!(
             "{CALLER_PARAM_REFUSAL} reaches what the server's reference policy does not allow a \
              caller: {}; the operator can allow it with --allow-path-root / --allow-url-host / \
-             --allow-url-scheme{}, or the template's author can declare the param `trusted: true`",
+             --allow-url-scheme{tenant_note}, or the template's author can declare the param \
+             `trusted: true`",
             lines.join("; "),
-            if for_tenant {
-                " (a tenant is confined to --tenant-path-root/<tenant>)"
-            } else {
-                ""
-            }
-        )),
+        )
+    };
+    Err(ServeError::Forbidden(
+        crate::secrets::registry::redact_message(&message),
     ))
 }
 
@@ -2658,6 +2728,10 @@ pub async fn load_submission_inputs(
     // parameterized config it applies the declared defaults and rejects a
     // `required` param with no value — which is the honest answer, since
     // `POST /v1/runs` has no param channel (register a template to get one).
+    // A caller value a `params:` default holds lands wherever `${param.*}`
+    // places it: follow it before binding removes the tokens.
+    let param_fields =
+        caller_params.map(|c| crate::params::caller::through_refs(&merged, c.fields));
     crate::params::bind_document(
         &mut merged,
         &Default::default(),
@@ -2778,7 +2852,8 @@ pub async fn load_submission_inputs(
     if let (Some(c), Some(doc)) = (caller_params, caller_doc.as_ref()) {
         let tenant_id = tenant.as_deref().map(|t| t.values.id.as_str());
         let caller_refs = references.for_origin(c.origin, tenant_id);
-        refuse_caller_params(doc, &cfg, c.fields, &caller_refs, tenant_id.is_some())?;
+        let fields = param_fields.as_ref().unwrap_or(c.fields);
+        refuse_caller_params(doc, &cfg, fields, &caller_refs, tenant_id.is_some())?;
     }
 
     // 5b. Discovery-driven matrix fan-out (#647): a source whose `discovery:` /

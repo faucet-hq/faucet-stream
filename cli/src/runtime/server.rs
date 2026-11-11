@@ -131,11 +131,10 @@ pub async fn load(
         None => None,
         Some(t) => Some(tenant_scope(state, t).await?),
     };
-    // A body from the server's own triggers file carries the operator's
-    // params, not a caller's.
+    // A body from the server's own triggers file is the operator's; what it
+    // carries in `caller_fields` is only what an event's sender placed in it.
     let caller = sub
         .caller_fields
-        .filter(|_| principal.origin() != Origin::ServerFile)
         .map(|fields| crate::serve::load::CallerParams {
             fields,
             origin: state.caller_origin(),
@@ -166,13 +165,14 @@ pub async fn load(
     .await;
     let mut loaded = match loaded {
         Err(ServeError::Forbidden(m))
-            if caller.is_some() && m.starts_with(crate::serve::load::CALLER_PARAM_REFUSAL) =>
+            if caller.is_some() && crate::serve::load::caller_refusal_target(&m).is_some() =>
         {
+            let target = crate::serve::load::caller_refusal_target(&m).unwrap_or_default();
             crate::serve::audit::write_target_detail(
                 state,
                 &principal.actor(),
                 "policy.denied",
-                "template params".into(),
+                target.into(),
                 crate::secrets::registry::redact_message(&m),
                 "denied",
             )
@@ -1944,7 +1944,9 @@ mod templates {
             // the operator's params; any other (a schedule made through the
             // API, even with a standing approval) passes a caller's (#1051).
             caller_fields: if body.operator_params {
-                Default::default()
+                materialized.caller_fields.select(&body.sender_params, |p| {
+                    crate::params::caller::trigger_name(&format!("param:{p}"))
+                })
             } else {
                 materialized.caller_fields.clone()
             },

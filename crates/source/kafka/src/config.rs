@@ -66,10 +66,28 @@ pub struct KafkaSourceConfig {
     pub on_decode_error: OnDecodeError,
     /// Raw librdkafka client properties to pass through. Use with care —
     /// these can override anything set by `auth` or the typed fields above.
+    ///
+    /// Keys that name a broker (`bootstrap.servers`, `metadata.broker.list`),
+    /// a URL (`*.url`) or a local file (`*.location`, `*.file`,
+    /// `sasl.kerberos.keytab`) are checked like the typed fields by a host
+    /// that confines configs (`faucet serve`); keys that load or run a
+    /// program (`plugin.library.paths`, `ssl.engine.location`,
+    /// `ssl.providers`, `*.cmd`) are refused for configs it does not trust.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     #[schemars(extend("x-faucet-unverified" = {
         "enable.ssl.certificate.verification": ["false", "0"],
         "ssl.endpoint.identification.algorithm": ["none", ""]
+    }, "x-faucet-resource-keys" = {
+        "bootstrap.servers": {"kind": "url", "syntax": "url-list"},
+        "metadata.broker.list": {"kind": "url", "syntax": "url-list"},
+        "*.url": "url",
+        "*.location": "path",
+        "*.file": "path",
+        "sasl.kerberos.keytab": "path",
+        "ssl.engine.location": "command",
+        "ssl.providers": "command",
+        "plugin.library.paths": "command",
+        "*.cmd": "command"
     }))]
     pub extra_client_config: BTreeMap<String, String>,
     /// Messages per emitted [`StreamPage`](faucet_core::StreamPage). Messages
@@ -319,5 +337,80 @@ mod debug_redaction_tests {
         let v: KafkaSourceConfig = serde_json::from_str(r#"{"brokers":"b:9092","topics":["t"],"group_id":"g","auth":{"type":"sasl_plain","config":{"username":"u","password":"S3CRET-1"}},"extra_client_config":{"sasl.password":"S3CRET-2"}}"#).unwrap();
         let dbg = format!("{v:?}");
         assert!(!dbg.contains("S3CRET") && dbg.contains("***"), "{dbg}");
+    }
+}
+
+#[cfg(test)]
+mod client_override_tests {
+    use super::*;
+    use faucet_core::resolve::{ReferencePolicy, ResourceKind, UrlSyntax, annotated_resources};
+
+    #[test]
+    fn kafka_client_overrides_follow_the_reference_policy() {
+        let schema = serde_json::to_value(schemars::schema_for!(KafkaSourceConfig)).unwrap();
+        let config = serde_json::json!({"extra_client_config": {
+            "bootstrap.servers": "ok.example.com:9092,169.254.169.254:9092",
+            "metadata.broker.list": "ok.example.com:9092",
+            "sasl.oauthbearer.token.endpoint.url": "http://169.254.169.254/token",
+            "ssl.ca.location": "/etc/ssl/ca.pem",
+            "sasl.kerberos.keytab": "/etc/krb5.keytab",
+            "plugin.library.paths": "/tmp/x.so",
+            "sasl.kerberos.kinit.cmd": "kinit",
+            "ssl.engine.location": "/tmp/engine.so",
+            "linger.ms": "5"
+        }});
+        let found = annotated_resources(&schema, &config);
+        let kind = |k: &str| {
+            found
+                .iter()
+                .find(|r| r.pointer == format!("/extra_client_config/{k}"))
+                .map(|r| (r.kind, r.syntax))
+        };
+        assert_eq!(
+            kind("bootstrap.servers"),
+            Some((ResourceKind::Url, Some(UrlSyntax::UrlList)))
+        );
+        assert_eq!(
+            kind("metadata.broker.list"),
+            Some((ResourceKind::Url, Some(UrlSyntax::UrlList)))
+        );
+        assert_eq!(
+            kind("sasl.oauthbearer.token.endpoint.url"),
+            Some((ResourceKind::Url, None))
+        );
+        assert_eq!(kind("ssl.ca.location"), Some((ResourceKind::Path, None)));
+        assert_eq!(
+            kind("sasl.kerberos.keytab"),
+            Some((ResourceKind::Path, None))
+        );
+        for k in [
+            "plugin.library.paths",
+            "sasl.kerberos.kinit.cmd",
+            "ssl.engine.location",
+        ] {
+            assert_eq!(kind(k), Some((ResourceKind::Command, None)), "{k}");
+        }
+        assert_eq!(kind("linger.ms"), None);
+        let open = ReferencePolicy::open().with_subprocess(false);
+        for r in &found {
+            let refused = open.check(r).is_err();
+            let expected = r.kind == ResourceKind::Command || r.value.contains("169.254.169.254");
+            assert_eq!(refused, expected, "{}", r.pointer);
+        }
+        assert!(!faucet_core::resolve::declares(
+            &schema,
+            ResourceKind::Command
+        ));
+    }
+
+    #[test]
+    fn kafka_client_overrides_without_resources_still_load() {
+        let schema = serde_json::to_value(schemars::schema_for!(KafkaSourceConfig)).unwrap();
+        let config = serde_json::json!({"extra_client_config": {
+            "linger.ms": "5",
+            "ssl.endpoint.identification.algorithm": "https",
+            "security.protocol": "SASL_SSL"
+        }});
+        assert!(annotated_resources(&schema, &config).is_empty());
     }
 }

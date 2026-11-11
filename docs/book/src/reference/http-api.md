@@ -313,8 +313,22 @@ reads it the way the connector's client does:
   needs `--allow-subprocess-connectors`; `PROTOCOL=IPC`, a descriptor without a
   `HOST`, a bare net service name and `ldap:` naming are refused for a caller,
   since the server's own Oracle configuration would resolve them.
-- **`azure-conn`** (Azure Storage `connection_string`): every `…Endpoint=` URL
-  and the account host built from `AccountName` / `EndpointSuffix`.
+- **`azure-conn`** (Azure Storage `connection_string`): read as the Azure
+  client reads it — only the exact keys `AccountName`, `AccountKey`,
+  `SharedAccessSignature`, `BlobEndpoint`, `EndpointSuffix`,
+  `DefaultEndpointsProtocol` and `UseDevelopmentStorage` count, and the last of
+  a repeated key wins. The host checked is `BlobEndpoint`, else the account
+  host built from `AccountName` / `EndpointSuffix` (default
+  `core.windows.net`), plus the loopback host for `UseDevelopmentStorage=true`;
+  every other `…Endpoint=` key, in any case, is checked too. For an
+  `azure-blob` connector the blob host comes from the whole connection
+  (`account`, `endpoint`, `use_emulator` and the string, in the order the
+  client applies them), so a private endpoint or the emulator needs only its
+  own host allowed. `AccountName` (and the connector's `account`) must be an
+  Azure storage account name — 3 to 24 lowercase letters and digits — and
+  `DefaultEndpointsProtocol` must be `http` or `https`, under every policy. A
+  caller's string that writes one of those keys in another case
+  (`accountname=`), which the client ignores, is refused, naming the key.
 - **`url-list`** (Kafka `brokers`, NATS `servers`): every element.
 
 Any URL value is trimmed first; a value that is, as a whole, an IP address
@@ -324,9 +338,15 @@ its host; and a `unix:` / `redis+unix:` URL is checked as a path. A caller's
 value from which no server can be read (`postgres:///db` without a socket
 `host=`, `redis://`) is refused — name the server explicitly. A value longer
 than 64 KiB is refused. A free-form
-option map (Delta `storage_options`) names the keys that hold an endpoint or a
-credential file (`x-faucet-resource-keys`), and those keys are checked like the
-typed fields. A transform's config is read the same way (a `sql` transform's
+option map (Delta `storage_options`, Kafka `extra_client_config`) names the keys
+that hold an endpoint, a credential file or a program (`x-faucet-resource-keys`),
+and those keys are checked like the typed fields: Kafka's `bootstrap.servers`
+and `metadata.broker.list` as broker lists, `*.url` keys as URLs, `*.location`,
+`*.file` and `sasl.kerberos.keytab` as paths, and `plugin.library.paths`,
+`ssl.engine.location`, `ssl.providers` and `*.cmd` as programs, which a caller
+config may not set unless the server allows subprocess connectors (a tenant
+never). A Delta Azure account option (`azure_storage_account_name`,
+`account_name`) must be a storage account name. A transform's config is read the same way (a `sql` transform's
 `http` relation `url` and `csv` / `jsonl` relation `path`). The same allow-list covers `${env:}`,
 `${file:}`, `${secret:}` and secret-manager directives, the state, DLQ and
 lineage paths, every endpoint an `auth:` provider calls (`token_url`, `url`,

@@ -2087,3 +2087,58 @@ fn a_path_protected_after_a_snapshot_is_refused_at_once() {
         Access::Read { recursive: false }
     ));
 }
+
+#[cfg(feature = "source-azure-blob")]
+#[test]
+fn azure_blob_hosts_come_from_the_whole_connection() {
+    let cfg = |config: Value| {
+        PipelineConfig::from_value(serde_json::json!({
+            "version": 1,
+            "pipeline": {
+                "source": {"type": "azure-blob", "config": config},
+                "sink": {"type": "stdout", "config": {}}
+            }
+        }))
+        .unwrap()
+    };
+    let only = |host: &str| {
+        ReferencePolicy::deny_all()
+            .with_path_roots(["/srv/data"])
+            .any_url_scheme()
+            .with_url_hosts([host])
+    };
+    let caller = BodyOrigin::Caller {
+        allow_subprocess: false,
+    };
+    let string = |cs: &str| serde_json::json!({"type": "connection_string", "config": {"connection_string": cs}});
+    let private = cfg(serde_json::json!({
+        "container": "c",
+        "endpoint": "https://10.1.2.3/acct",
+        "auth": string("AccountName=acct;AccountKey=a2V5")
+    }));
+    refuse_server_paths_with(&private, &[], caller, &only("10.1.2.3")).unwrap();
+    let overridden = cfg(serde_json::json!({
+        "container": "c",
+        "endpoint": "https://10.1.2.3/acct",
+        "auth": string("AccountName=acct;BlobEndpoint=https://other.example/")
+    }));
+    let err = refuse_server_paths_with(&overridden, &[], caller, &only("10.1.2.3"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("other.example"), "{err}");
+    let emulator = cfg(serde_json::json!({
+        "container": "c",
+        "use_emulator": true,
+        "endpoint": "https://ignored.example/"
+    }));
+    refuse_server_paths_with(&emulator, &[], caller, &only("127.0.0.1")).unwrap();
+    let cased = cfg(serde_json::json!({
+        "container": "c",
+        "auth": string("AccountName=acct;accountname=other;AccountKey=a2V5")
+    }));
+    let err = refuse_server_paths_with(&cased, &[], caller, &only("acct.blob.core.windows.net"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("`accountname`"), "{err}");
+    refuse_server_paths_with(&cased, &[], BodyOrigin::Trusted, &ReferencePolicy::open()).unwrap();
+}

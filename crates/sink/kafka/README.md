@@ -111,7 +111,7 @@ All fields are keys under `sink.config`.
 | `batch_size` | int | `1000` | In-flight `FuturesUnordered` send-window cap per `write_batch`, and the seed for librdkafka's `queue.buffering.max.messages`. **`0` = no cap** (bounded only by `max_in_flight`). See [Streaming & batching](#streaming--batching). |
 | `linger` | int (seconds) | `0` *(5ms)* | Time the producer waits to accumulate a batch before flushing. The default is **5 ms**; for other sub-second values set `linger.ms` via `extra_client_config`. |
 | `compression` | `"none" \| "gzip" \| "snappy" \| "lz4" \| "zstd"` | `"none"` | Producer-side compression codec. See [Compression](#compression). |
-| `extra_client_config` | object (string→string) | `{}` | Raw librdkafka client properties. **Overrides** anything set by `auth` or the typed fields above. |
+| `extra_client_config` | object (string→string) | `{}` | Raw librdkafka client properties. **Overrides** anything set by `auth` or the typed fields above. Under `faucet serve`, keys naming a broker (`bootstrap.servers`, `metadata.broker.list`), a URL (`*.url`) or a file (`*.location`, `*.file`, `sasl.kerberos.keytab`) are checked like the typed fields, and keys that load or run a program (`plugin.library.paths`, `ssl.engine.location`, `ssl.providers`, `*.cmd`) are refused for configs the server does not trust. |
 
 ### Effectively-once
 

@@ -27948,7 +27948,7 @@
                       "default": "fail"
                     },
                     "extra_client_config": {
-                      "description": "Raw librdkafka client properties to pass through. Use with care —\nthese can override anything set by `auth` or the typed fields above.",
+                      "description": "Raw librdkafka client properties to pass through. Use with care —\nthese can override anything set by `auth` or the typed fields above.\n\nKeys that name a broker (`bootstrap.servers`, `metadata.broker.list`),\na URL (`*.url`) or a local file (`*.location`, `*.file`,\n`sasl.kerberos.keytab`) are checked like the typed fields by a host\nthat confines configs (`faucet serve`); keys that load or run a\nprogram (`plugin.library.paths`, `ssl.engine.location`,\n`ssl.providers`, `*.cmd`) are refused for configs it does not trust.",
                       "type": "object",
                       "additionalProperties": {
                         "type": "string"
@@ -27962,6 +27962,24 @@
                           "none",
                           ""
                         ]
+                      },
+                      "x-faucet-resource-keys": {
+                        "bootstrap.servers": {
+                          "kind": "url",
+                          "syntax": "url-list"
+                        },
+                        "metadata.broker.list": {
+                          "kind": "url",
+                          "syntax": "url-list"
+                        },
+                        "*.url": "url",
+                        "*.location": "path",
+                        "*.file": "path",
+                        "sasl.kerberos.keytab": "path",
+                        "ssl.engine.location": "command",
+                        "ssl.providers": "command",
+                        "plugin.library.paths": "command",
+                        "*.cmd": "command"
                       }
                     },
                     "batch_size": {
@@ -33705,7 +33723,7 @@
                       "default": -1
                     },
                     "extra_client_config": {
-                      "description": "Raw librdkafka producer properties, applied **last** so they override\neverything this config derives (`acks`, `enable.idempotence`,\n`compression.type`, `linger.ms`, `message.timeout.ms`,\n`queue.buffering.max.messages`). Empty by default.\n\nThe escape hatch for a knob faucet does not model — and the sharp edge\nthat goes with it: overriding a safety property here can weaken\ndelivery guarantees. The only exceptions are the exactly-once\ninvariants (`transactional.id`, `enable.idempotence`, `acks=all`),\nwhich the transactional producer force-sets on top so an override\ncannot break EOS.",
+                      "description": "Raw librdkafka producer properties, applied **last** so they override\neverything this config derives (`acks`, `enable.idempotence`,\n`compression.type`, `linger.ms`, `message.timeout.ms`,\n`queue.buffering.max.messages`). Empty by default.\n\nThe escape hatch for a knob faucet does not model — and the sharp edge\nthat goes with it: overriding a safety property here can weaken\ndelivery guarantees. The only exceptions are the exactly-once\ninvariants (`transactional.id`, `enable.idempotence`, `acks=all`),\nwhich the transactional producer force-sets on top so an override\ncannot break EOS.\n\nKeys that name a broker (`bootstrap.servers`, `metadata.broker.list`),\na URL (`*.url`) or a local file (`*.location`, `*.file`,\n`sasl.kerberos.keytab`) are checked like the typed fields by a host\nthat confines configs (`faucet serve`); keys that load or run a\nprogram (`plugin.library.paths`, `ssl.engine.location`,\n`ssl.providers`, `*.cmd`) are refused for configs it does not trust.",
                       "type": "object",
                       "additionalProperties": {
                         "type": "string"
@@ -33719,6 +33737,24 @@
                           "none",
                           ""
                         ]
+                      },
+                      "x-faucet-resource-keys": {
+                        "bootstrap.servers": {
+                          "kind": "url",
+                          "syntax": "url-list"
+                        },
+                        "metadata.broker.list": {
+                          "kind": "url",
+                          "syntax": "url-list"
+                        },
+                        "*.url": "url",
+                        "*.location": "path",
+                        "*.file": "path",
+                        "sasl.kerberos.keytab": "path",
+                        "ssl.engine.location": "command",
+                        "ssl.providers": "command",
+                        "plugin.library.paths": "command",
+                        "*.cmd": "command"
                       }
                     }
                   }

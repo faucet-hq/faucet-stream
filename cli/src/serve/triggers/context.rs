@@ -162,6 +162,16 @@ pub struct EventValue {
 pub struct Substitution {
     pub text: String,
     pub event_values: Vec<EventValue>,
+    /// Where in the substituted document each sender-chosen value landed:
+    /// the scalar holding it, under the name `trigger:<token>`
+    /// ([`trigger_field_name`]).
+    pub caller_fields: crate::params::CallerFields,
+}
+
+/// The name a sender-chosen `${trigger.<token>}` value is recorded under in
+/// [`Substitution::caller_fields`].
+pub fn trigger_field_name(token: &str) -> String {
+    format!("trigger:{token}")
 }
 
 /// [`substitute`], also returning the sender-chosen values it placed.
@@ -174,12 +184,13 @@ pub fn substitute_tracked(
     if !text.contains("${trigger.") {
         return Ok(Substitution {
             text: text.to_string(),
-            event_values: Vec::new(),
+            ..Default::default()
         });
     }
     let mut doc: crate::yaml::Value = crate::yaml::from_str(text)
         .map_err(|e| SubstituteError::config(format!("pipeline config is not valid YAML: {e}")))?;
     let mut event_values = Vec::new();
+    let mut caller_fields = crate::params::CallerFields::default();
     let root = doc.clone();
     let mut walk = Walk {
         event,
@@ -187,11 +198,16 @@ pub fn substitute_tracked(
         fired_at,
         root: &root,
         seen: &mut event_values,
+        fields: &mut caller_fields,
     };
-    walk.value(&mut doc, None, &Scope::Unknown)?;
+    walk.value(&mut doc, None, "", &Scope::Unknown)?;
     let text = crate::yaml::to_string(&doc)
         .map_err(|e| SubstituteError::config(format!("re-rendering pipeline config: {e}")))?;
-    Ok(Substitution { text, event_values })
+    Ok(Substitution {
+        text,
+        event_values,
+        caller_fields,
+    })
 }
 
 /// The top-level fields of a connector or transform kind that hold a SQL
@@ -265,6 +281,7 @@ struct Walk<'a> {
     fired_at: &'a str,
     root: &'a crate::yaml::Value,
     seen: &'a mut Vec<EventValue>,
+    fields: &'a mut crate::params::CallerFields,
 }
 
 impl Walk<'_> {
@@ -272,10 +289,13 @@ impl Walk<'_> {
         &mut self,
         v: &mut crate::yaml::Value,
         key: Option<&str>,
+        ptr: &str,
         scope: &Scope,
     ) -> Result<(), SubstituteError> {
         match v {
             crate::yaml::Value::String(s) if s.contains("${trigger.") => {
+                let before = self.seen.len();
+                let lone = s.starts_with("${trigger.") && s.find('}') == Some(s.len() - 1);
                 let landing = match scope {
                     Scope::Unknown => Landing::Unknown,
                     Scope::Field(f) => Landing::Known {
@@ -299,10 +319,20 @@ impl Walk<'_> {
                         escape: true,
                     }),
                 )?;
+                let how = if lone {
+                    crate::params::caller::Wrote::Whole
+                } else {
+                    crate::params::caller::Wrote::Part
+                };
+                for ev in &self.seen[before..] {
+                    let name = trigger_field_name(&ev.token);
+                    self.fields.insert_as(ptr, name.clone(), how);
+                    self.fields.add_text(name, ev.value.clone());
+                }
             }
             crate::yaml::Value::Sequence(items) => {
-                for item in items {
-                    self.value(item, key, scope)?;
+                for (i, item) in items.iter_mut().enumerate() {
+                    self.value(item, key, &format!("{ptr}/{i}"), scope)?;
                 }
             }
             crate::yaml::Value::Mapping(map) => {
@@ -321,11 +351,17 @@ impl Walk<'_> {
                         (None, Scope::Unknown) => Scope::Unknown,
                         (None, _) => Scope::Inside,
                     };
-                    self.value(item, k.as_str(), &child)?;
+                    // A key that is not a string has no pointer of its own:
+                    // its value is recorded at the mapping, which errs wide.
+                    let at = match k.as_str() {
+                        Some(k) => crate::params::caller::child(ptr, k),
+                        None => ptr.to_string(),
+                    };
+                    self.value(item, k.as_str(), &at, &child)?;
                 }
             }
             crate::yaml::Value::Tagged(tagged) => {
-                self.value(&mut tagged.value, key, scope)?;
+                self.value(&mut tagged.value, key, ptr, scope)?;
             }
             _ => {}
         }
@@ -399,7 +435,11 @@ pub fn substitute_param(
             escape: false,
         }),
     )?;
-    Ok(Substitution { text, event_values })
+    Ok(Substitution {
+        text,
+        event_values,
+        ..Default::default()
+    })
 }
 
 /// Where a config substitution lands: the mapping key of the scalar, and the
@@ -721,6 +761,47 @@ mod tests {
         assert_eq!(parsed(&whole)["key"], "x' OR 1;");
         let path = substitute("path: out/${trigger.object_key}\n", &obj("../up"), "n", "f");
         assert!(path.is_err());
+    }
+
+    #[test]
+    fn sender_values_are_recorded_where_they_land() {
+        let hook = TriggerEvent::Webhook {
+            method: "POST".into(),
+            body: "b".into(),
+            headers: [("x-host".to_string(), "h.example".to_string())].into(),
+            query: Default::default(),
+            idem: "i".into(),
+        };
+        let doc = "pipeline:\n  source:\n    config:\n      url: ${trigger.header.x-host}\n      \
+                   tags: [\"a/${trigger.body}\", \"${trigger.name}\"]\n  a/b: ${trigger.body}\n\
+                   1: ${trigger.body}\n";
+        let sub = substitute_tracked(doc, &hook, "n", "f").unwrap();
+        let f = &sub.caller_fields;
+        assert!(f.only_trigger_values());
+        let at = |p: &str| {
+            f.iter()
+                .find(|(ptr, _)| ptr.as_str() == p)
+                .map(|(_, n)| n.iter().cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        assert_eq!(at("/pipeline/source/config/url"), vec!["trigger:header.x-host"]);
+        assert_eq!(at("/pipeline/source/config/tags/0"), vec!["trigger:body"]);
+        assert!(at("/pipeline/source/config/tags/1").is_empty());
+        assert_eq!(at("/pipeline/a~1b"), vec!["trigger:body"]);
+        let only = substitute_tracked(
+            "url: ${trigger.header.x-host}\ntag: a/${trigger.body}\n",
+            &hook,
+            "n",
+            "f",
+        )
+        .unwrap()
+        .caller_fields;
+        assert_eq!(only.shown("/url", "h.example").as_deref(), Some("h.example"));
+        assert_eq!(only.shown("/tag", "a/b").as_deref(), Some("…b"));
+        // A key that is not a string records its value at the mapping above.
+        assert!(f.iter().any(|(p, _)| p.is_empty()));
+        let none = substitute_tracked("a: ${trigger.name}\n", &hook, "n", "f").unwrap();
+        assert!(none.caller_fields.is_empty());
     }
 
     /// A value placed in a path, a URL or a name may hold quotes and `;`

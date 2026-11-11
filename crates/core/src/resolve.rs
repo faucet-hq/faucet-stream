@@ -25,17 +25,26 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
+mod azure;
+pub use azure::{AzureConnKey, AzureConnSettings, is_valid_azure_account_name};
+
 /// The JSON Schema keyword marking a config field that names an external
 /// resource. Its value is a [`ResourceKind`] (`"path"`, `"url"`, `"command"`).
 pub const RESOURCE_ANNOTATION: &str = "x-faucet-resource";
 
 /// The JSON Schema keyword on a free-form string map (object-store options,
 /// driver properties) naming which of its keys hold a resource: an object of
-/// key pattern → [`ResourceKind`]. A pattern is matched against the key
-/// lower-cased: exact, `PREFIX*`, `*SUFFIX` or `*INFIX*`.
+/// key pattern → [`ResourceKind`], or → `{"kind": …, "syntax": …}` to also
+/// name the value's grammar ([`UrlSyntax`]). A pattern is matched against the
+/// key lower-cased: exact, `PREFIX*`, `*SUFFIX` or `*INFIX*`; an exact
+/// pattern wins over the others.
 ///
 /// ```ignore
-/// #[schemars(extend("x-faucet-resource-keys" = {"*endpoint*": "url", "*_file": "path"}))]
+/// #[schemars(extend("x-faucet-resource-keys" = {
+///     "*endpoint*": "url",
+///     "*_file": "path",
+///     "bootstrap.servers": {"kind": "url", "syntax": "url-list"}
+/// }))]
 /// pub storage_options: HashMap<String, String>,
 /// ```
 pub const RESOURCE_KEYS_ANNOTATION: &str = "x-faucet-resource-keys";
@@ -148,13 +157,38 @@ fn key_pattern_matches(pattern: &str, key: &str) -> bool {
     }
 }
 
-/// The kind a [`RESOURCE_KEYS_ANNOTATION`] on `node` gives map key `key`.
-fn keyed_annotation(node: &Value, key: &str) -> Option<ResourceKind> {
-    node.get(RESOURCE_KEYS_ANNOTATION)?
-        .as_object()?
+/// The kind (and grammar) one [`RESOURCE_KEYS_ANNOTATION`] entry gives: a
+/// kind string (`"url"`), or an object `{"kind": "url", "syntax": "url-list"}`
+/// naming the value's grammar too ([`URL_SYNTAX_ANNOTATION`]).
+fn keyed_entry(entry: &Value) -> Option<(ResourceKind, Option<UrlSyntax>)> {
+    match entry {
+        Value::String(kind) => ResourceKind::parse(kind).map(|k| (k, None)),
+        Value::Object(o) => {
+            let kind = o.get("kind")?.as_str().and_then(ResourceKind::parse)?;
+            let syntax = o
+                .get("syntax")
+                .and_then(Value::as_str)
+                .and_then(UrlSyntax::parse);
+            Some((kind, syntax))
+        }
+        _ => None,
+    }
+}
+
+/// The kind a [`RESOURCE_KEYS_ANNOTATION`] on `node` gives map key `key`, and
+/// its grammar. An exact pattern wins over a wildcard one.
+fn keyed_annotation(node: &Value, key: &str) -> Option<(ResourceKind, Option<UrlSyntax>)> {
+    let patterns = node.get(RESOURCE_KEYS_ANNOTATION)?.as_object()?;
+    let exact = patterns
         .iter()
-        .find(|(pattern, _)| key_pattern_matches(pattern, key))
-        .and_then(|(_, kind)| kind.as_str().and_then(ResourceKind::parse))
+        .find(|(p, _)| !p.contains('*') && key_pattern_matches(p, key));
+    exact
+        .or_else(|| {
+            patterns
+                .iter()
+                .find(|(p, _)| p.contains('*') && key_pattern_matches(p, key))
+        })
+        .and_then(|(_, entry)| keyed_entry(entry))
 }
 
 /// What kind of external resource a config field names.
@@ -657,22 +691,7 @@ fn connection_string_hosts(value: &str) -> Option<Vec<String>> {
     let mut hosts = Vec::new();
     for (k, v) in &pairs {
         if CONN_HOST_KEYS.contains(&k.as_str()) {
-            let lower = v.to_ascii_lowercase();
-            let bare = ["tcp:", "np:", "lpc:", "admin:"]
-                .iter()
-                .find_map(|p| lower.starts_with(p).then(|| &v[p.len()..]))
-                .unwrap_or(v);
-            let bare = bare.split(',').next().unwrap_or(bare);
-            let bare = bare.split('\\').next().unwrap_or(bare);
-            if bare.starts_with('/') {
-                continue;
-            }
-            let host = if bare.contains("://") {
-                url_hosts(bare)
-            } else {
-                url_hosts(&format!("tcp://{bare}"))
-            };
-            hosts.extend(host);
+            hosts.extend(server_value_hosts(v));
         } else if CONN_ENDPOINT_KEYS.contains(&k.as_str()) {
             hosts.extend(url_hosts(v));
         }
@@ -890,24 +909,36 @@ fn address_host(address: &str) -> String {
     canonical_host(host)
 }
 
+/// The hosts one server value of a connection string names (`tcp:host,1433`,
+/// `host\instance`, `(local)`, a URL): any `tcp:` / `np:` / `lpc:` / `admin:`
+/// prefix (any case) removed, port and instance dropped. A value starting
+/// with `/` names no host.
+fn server_value_hosts(v: &str) -> Vec<String> {
+    if v.contains("://") {
+        return url_hosts(v);
+    }
+    let lower = v.to_ascii_lowercase();
+    let bare = ["tcp:", "np:", "lpc:", "admin:"]
+        .iter()
+        .find_map(|p| lower.starts_with(p).then(|| &v[p.len()..]))
+        .unwrap_or(v);
+    if bare.contains("://") {
+        return url_hosts(bare);
+    }
+    if bare.starts_with('/') {
+        return Vec::new();
+    }
+    url_hosts(&format!("tcp://{}", crate::ado::host_of_server(bare)))
+}
+
 /// The hosts an ADO.NET connection string connects to: the driver's own
 /// reading ([`crate::ado::server_host`]) and every server-like key read more
-/// broadly (any `tcp:` / `np:` / `lpc:` / `admin:` prefix removed).
+/// broadly ([`server_value_hosts`]).
 fn ado_hosts(pairs: &[(String, String)]) -> Vec<String> {
     let mut hosts = vec![canonical_host(&crate::ado::server_host(pairs))];
     for (k, v) in pairs {
-        if !CONN_HOST_KEYS.contains(&k.as_str()) {
-            continue;
-        }
-        let lower = v.to_ascii_lowercase();
-        let bare = ["tcp:", "np:", "lpc:", "admin:"]
-            .iter()
-            .find_map(|p| lower.starts_with(p).then(|| &v[p.len()..]))
-            .unwrap_or(v);
-        if bare.contains("://") {
-            hosts.extend(url_hosts(bare));
-        } else {
-            hosts.push(canonical_host(&crate::ado::host_of_server(bare)));
+        if CONN_HOST_KEYS.contains(&k.as_str()) {
+            hosts.extend(server_value_hosts(v));
         }
     }
     hosts.retain(|h| !h.is_empty());
@@ -1020,14 +1051,22 @@ fn azure_pairs(value: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The account host an Azure Storage connection string builds from
-/// `AccountName` and `EndpointSuffix` (`<account>.blob.<suffix>`).
-fn azure_account_url(pairs: &[(String, String)]) -> Option<String> {
-    let get = |key: &str| pairs.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v);
-    let account = get("accountname")?;
-    let suffix = get("endpointsuffix").map_or("core.windows.net", String::as_str);
-    let protocol = get("defaultendpointsprotocol").map_or("https", String::as_str);
-    Some(format!("{protocol}://{account}.blob.{suffix}"))
+/// The URLs an Azure Storage connection string names, with the key each
+/// came from: every `…Endpoint` key in any case (wider than the client,
+/// which reads only `BlobEndpoint`), then — without a `BlobEndpoint` — the
+/// account endpoint the client builds ([`AzureConnSettings::account_url`]).
+fn azure_conn_urls(value: &str) -> Vec<(String, String)> {
+    let mut urls: Vec<(String, String)> = azure_pairs(value)
+        .into_iter()
+        .filter(|(k, _)| k.ends_with("endpoint"))
+        .collect();
+    let settings = AzureConnSettings::read(value);
+    if settings.get(AzureConnKey::BlobEndpoint).is_none()
+        && let Some(url) = settings.account_url()
+    {
+        urls.push(("accountname".into(), url));
+    }
+    urls
 }
 
 /// The hosts a value written in `syntax` connects to, in canonical form; the
@@ -1042,13 +1081,13 @@ pub fn url_hosts_as(value: &str, syntax: Option<UrlSyntax>) -> Vec<String> {
             .unwrap_or_default(),
         Some(UrlSyntax::Oracle) => read_oracle(value).hosts,
         Some(UrlSyntax::AzureConn) => {
-            let pairs = azure_pairs(value);
-            let mut hosts: Vec<String> = pairs
+            let mut hosts: Vec<String> = azure_conn_urls(value)
                 .iter()
-                .filter(|(k, _)| k.ends_with("endpoint"))
-                .flat_map(|(_, v)| url_hosts(v))
+                .flat_map(|(_, u)| url_hosts(u))
                 .collect();
-            hosts.extend(azure_account_url(&pairs).iter().flat_map(|u| url_hosts(u)));
+            if AzureConnSettings::read(value).use_development_storage() {
+                hosts.push("127.0.0.1".into());
+            }
             hosts
         }
         Some(UrlSyntax::UrlList) => list_items(value).flat_map(url_hosts).collect(),
@@ -1656,25 +1695,69 @@ impl ReferencePolicy {
         Ok(())
     }
 
-    /// Check an Azure Storage connection string: every `…Endpoint=` URL and
-    /// the account host built from `AccountName` / `EndpointSuffix`.
+    /// Check an Azure Storage connection string, read as the client reads it
+    /// ([`AzureConnSettings`]): every `…Endpoint=` URL, the account endpoint
+    /// built from `AccountName` / `EndpointSuffix`, the emulator's loopback
+    /// host, the account-name and protocol rules, and — under a policy with
+    /// path roots — no key in another case than the one the client reads.
     fn check_azure_conn(&self, value: &str) -> Result<(), Refusal> {
-        let pairs = azure_pairs(value);
-        let account = azure_account_url(&pairs);
-        let endpoints = pairs
-            .iter()
-            .filter(|(k, _)| k.ends_with("endpoint"))
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .chain(account.as_deref().map(|u| ("accountname", u)));
-        for (k, url) in endpoints {
-            self.check_plain_url(url)
+        self.check_azure_conn_hosts(value, None)
+    }
+
+    /// [`check_url_as`](Self::check_url_as) for an Azure Storage connection
+    /// string whose blob hosts are `hosts` — what the client connects to once
+    /// the rest of the connection (account, endpoint, emulator) is applied —
+    /// instead of the ones the string alone names. The string's other
+    /// endpoints and its rules are checked as usual.
+    pub fn check_azure_conn_with_hosts(
+        &self,
+        value: &str,
+        hosts: &[String],
+    ) -> Result<(), Refusal> {
+        let raw = value;
+        let value = value.trim_matches(|c: char| c.is_ascii_whitespace());
+        if self.path_roots.is_some() && value.len() > MAX_SCREENED_LEN {
+            return self.check_url_as(raw, Some(UrlSyntax::AzureConn));
+        }
+        self.check_azure_conn_hosts(value, Some(hosts))
+    }
+
+    fn check_azure_conn_hosts(&self, value: &str, hosts: Option<&[String]>) -> Result<(), Refusal> {
+        let settings = AzureConnSettings::read(value);
+        for (k, url) in azure_conn_urls(value) {
+            if hosts.is_some() && matches!(k.as_str(), "blobendpoint" | "accountname") {
+                continue;
+            }
+            self.check_plain_url(&url)
                 .map_err(|e| Refusal::new(e.kind, value, format!("`{k}`: {}", e.reason)))?;
         }
-        if pairs
-            .iter()
-            .any(|(k, v)| k == "usedevelopmentstorage" && v.eq_ignore_ascii_case("true"))
+        match hosts {
+            Some(hosts) => {
+                for host in hosts {
+                    self.check_host(value, host)?;
+                }
+            }
+            None if settings.use_development_storage() => self.check_host(value, "127.0.0.1")?,
+            None => {}
+        }
+        if let Some(problem) = settings.problem() {
+            return Err(Refusal::new(RefusalKind::Url, value, problem));
+        }
+        if self.path_roots.is_some()
+            && let Some(key) = settings.other_case_keys().first()
         {
-            self.check_host(value, "127.0.0.1")?;
+            let canonical = AzureConnKey::ALL
+                .iter()
+                .find(|k| k.as_str().eq_ignore_ascii_case(key))
+                .map_or("", |k| k.as_str());
+            return Err(Refusal::new(
+                RefusalKind::Url,
+                value,
+                format!(
+                    "`{key}` is not read by the client, which reads `{canonical}`; write the key \
+                     in that case"
+                ),
+            ));
         }
         Ok(())
     }
@@ -2014,10 +2097,10 @@ fn visit(
         Value::Object(map) => {
             for (k, child) in map {
                 let p = format!("{pointer}/{}", escape_pointer(k));
-                if let (Some(kind), Value::String(s)) =
+                if let (Some((kind, syntax)), Value::String(s)) =
                     (alts.iter().find_map(|n| keyed_annotation(n, k)), child)
                 {
-                    out.push(ResourceRef::new(p.clone(), kind, s.clone()));
+                    out.push(ResourceRef::new(p.clone(), kind, s.clone()).with_syntax(syntax));
                 }
                 for alt in &alts {
                     let declared = alt.get("properties").and_then(|props| props.get(k));
@@ -2066,8 +2149,8 @@ fn collect_fields(
     }
     for alt in alts {
         if let Some(Value::Object(keys)) = alt.get(RESOURCE_KEYS_ANNOTATION) {
-            for (pattern, kind) in keys {
-                if let Some(kind) = kind.as_str().and_then(ResourceKind::parse) {
+            for (pattern, entry) in keys {
+                if let Some((kind, _)) = keyed_entry(entry) {
                     out.insert((format!("{path}{{{pattern}}}"), kind));
                 }
             }
@@ -2140,9 +2223,16 @@ pub fn url_syntax_fields(schema: &Value) -> Vec<(String, UrlSyntax)> {
     out.into_iter().collect()
 }
 
-/// Whether a schema declares at least one field of `kind`.
+/// Whether a schema declares at least one field of `kind`. For
+/// [`ResourceKind::Command`] (a connector that runs a program), a key pattern
+/// of a free-form map ([`RESOURCE_KEYS_ANNOTATION`]) does not count: such a
+/// key runs a program only when a config sets it, which
+/// [`annotated_resources`] reports.
 pub fn declares(schema: &Value, kind: ResourceKind) -> bool {
-    annotated_fields(schema).iter().any(|(_, k)| *k == kind)
+    annotated_fields(schema).iter().any(|(path, k)| {
+        *k == kind
+            && (kind != ResourceKind::Command || !path.ends_with('}') || path.ends_with("{}"))
+    })
 }
 
 /// The JSON Schema keyword (value `true`) on a top-level boolean config field
@@ -3557,6 +3647,146 @@ mod tests {
                 .is_err()
         );
         assert!(only.check_url_as("AccountName=acct", AZURE).is_ok());
+    }
+
+    #[test]
+    fn azure_string_hosts_follow_the_client_reading() {
+        let v = "AccountName=acct;EndpointSuffix=evil.example;AccountKey=k==;\
+                 accountname=ok;endpointsuffix=core.windows.net";
+        assert_eq!(url_hosts_as(v, AZURE), vec!["acct.blob.evil.example"]);
+        let only = ReferencePolicy::open().with_url_hosts(["*.blob.core.windows.net"]);
+        assert!(only.check_url_as(v, AZURE).is_err());
+        let suffix = "AccountName=acct;EndpointSuffix=x@evil.example";
+        assert_eq!(url_hosts_as(suffix, AZURE), vec!["evil.example"]);
+        assert_eq!(
+            url_hosts_as("UseDevelopmentStorage=true", AZURE),
+            vec!["127.0.0.1"]
+        );
+        assert_eq!(
+            url_hosts_as("AccountName=acct;DefaultEndpointsProtocol=http", AZURE),
+            vec!["acct.blob.core.windows.net"]
+        );
+        for bad in [
+            "AccountName=evil.example#;AccountKey=k",
+            "AccountName=acct;EndpointSuffix=core.windows.net;\
+             DefaultEndpointsProtocol=https://evil.example/?",
+        ] {
+            let e = ReferencePolicy::open()
+                .check_url_as(bad, AZURE)
+                .expect_err(bad);
+            assert!(!e.reason.contains("evil"), "{}", e.reason);
+        }
+    }
+
+    #[test]
+    fn azure_key_in_another_case_is_refused_for_callers() {
+        let v = "AccountName=acct;accountname=other;AccountKey=k==";
+        let e = refused(AZURE, v);
+        assert!(e.reason.contains("`accountname`"), "{}", e.reason);
+        assert!(e.reason.contains("`AccountName`"), "{}", e.reason);
+        assert!(!e.reason.contains("other"), "{}", e.reason);
+        assert!(ReferencePolicy::open().check_url_as(v, AZURE).is_ok());
+        accepted(AZURE, "AccountName=acct;AccountKey=k==");
+    }
+
+    #[test]
+    fn azure_blob_endpoint_replaces_the_account_host() {
+        let v = "AccountName=acct;EndpointSuffix=core.windows.net;BlobEndpoint=https://b.example/";
+        assert_eq!(url_hosts_as(v, AZURE), vec!["b.example"]);
+        let only = ReferencePolicy::open().with_url_hosts(["b.example"]);
+        assert!(only.check_url_as(v, AZURE).is_ok());
+        let effective = vec!["10.1.2.3".to_string()];
+        let private = ReferencePolicy::open().with_url_hosts(["10.1.2.3"]);
+        assert!(
+            private
+                .check_azure_conn_with_hosts("AccountName=acct;AccountKey=k==", &effective)
+                .is_ok()
+        );
+        assert!(
+            private
+                .check_url_as("AccountName=acct;AccountKey=k==", AZURE)
+                .is_err()
+        );
+        assert!(
+            private
+                .check_azure_conn_with_hosts(
+                    "AccountName=acct;QueueEndpoint=https://q.example/",
+                    &effective
+                )
+                .is_err()
+        );
+        assert!(
+            private
+                .check_azure_conn_with_hosts("AccountName=a#;AccountKey=k==", &effective)
+                .is_err()
+        );
+        let long = "a".repeat(MAX_SCREENED_LEN + 1);
+        assert!(confined().check_azure_conn_with_hosts(&long, &[]).is_err());
+    }
+
+    #[test]
+    fn server_values_read_alike_in_ado_and_plain_strings() {
+        for (server, host) in [
+            ("tcp:db.example.com,1433", "db.example.com"),
+            ("TCP:db.example.com", "db.example.com"),
+            ("np:db\\inst", "db"),
+            ("(local)", "localhost"),
+        ] {
+            let plain = url_hosts(&format!("Server={server};Database=x"));
+            let ado = url_hosts_as(&format!("Server={server};Database=x"), ADO);
+            assert!(plain.contains(&host.to_string()), "{server}: {plain:?}");
+            assert!(ado.contains(&host.to_string()), "{server}: {ado:?}");
+        }
+        assert!(server_value_hosts("/var/run/sock").is_empty());
+        assert!(server_value_hosts("np:/pipe").is_empty());
+        assert_eq!(
+            server_value_hosts("tcp://db.example.com:1433"),
+            vec!["db.example.com"]
+        );
+    }
+
+    #[test]
+    fn keyed_entries_can_name_a_grammar() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"extra": {
+                "type": "object",
+                "additionalProperties": {"type": "string"},
+                "x-faucet-resource-keys": {
+                    "bootstrap.servers": {"kind": "url", "syntax": "url-list"},
+                    "*.location": "path",
+                    "ssl.engine.location": "command",
+                    "*.cmd": "command",
+                    "bad": {"syntax": "url-list"}
+                }
+            }}
+        });
+        let config = json!({"extra": {
+            "bootstrap.servers": "ok.example.com:9092,169.254.169.254:9092",
+            "ssl.engine.location": "/lib/x.so",
+            "ssl.ca.location": "/etc/ca.pem",
+            "bad": "x"
+        }});
+        let found = annotated_resources(&schema, &config);
+        let find = |p: &str| found.iter().find(|r| r.pointer == p).cloned();
+        let brokers = find("/extra/bootstrap.servers").unwrap();
+        assert_eq!(brokers.syntax, Some(UrlSyntax::UrlList));
+        assert!(ReferencePolicy::open().check(&brokers).is_err());
+        assert_eq!(
+            find("/extra/ssl.engine.location").unwrap().kind,
+            ResourceKind::Command
+        );
+        assert_eq!(
+            find("/extra/ssl.ca.location").unwrap().kind,
+            ResourceKind::Path
+        );
+        assert!(find("/extra/bad").is_none());
+        assert!(!declares(&schema, ResourceKind::Command));
+        assert!(declares(&schema, ResourceKind::Url));
+        let typed =
+            json!({"type": "object", "properties": {"cmd": {"x-faucet-resource": "command"}}});
+        assert!(declares(&typed, ResourceKind::Command));
+        assert!(keyed_entry(&json!(3)).is_none());
     }
 
     #[test]

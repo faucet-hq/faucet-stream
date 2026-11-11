@@ -144,13 +144,27 @@ lands:
   `--allow-path-root`, and never the system trees or the server's credential
   files).
 
+The trigger's config is the operator's and loads as the server's own, but
+every value that holds sender text is then held to the caller reference policy
+where it lands, read with that field's grammar: a `brokers` list, an ADO.NET or
+Azure Storage connection string, an annotated option key, an absolute URL, an
+`auth:` provider endpoint. A scalar that holds any sender text is judged whole,
+operator text included, because a fragment can change what the rest means
+(a later `key=` in a connection string wins). A sender value placed in a
+`params:` default is followed to every `${param.NAME}` that uses it. A refusal
+names the field and the token (`${trigger.header.x-brokers}`), shows only the
+sender's text, and is audited as `policy.denied` on `trigger values`. Allow
+fixed hosts with `--allow-url-host`. A bare `host:port` in a field no schema
+marks as a host is not read as one, as for a caller's own config.
+
 A `template:` trigger's `params` are checked the same way. Where the template
 places a param is not known when the trigger fires, so a sender value in a
 param is judged by the param's name and the value itself: no `..` segment in a
 value that reads as a path, no whole value for a param named `query`, `sql`,
 `statement`, `where` or `filter`, no quote, `;` or backslash when spliced into
 free text, and a URL or a leading absolute path must pass the caller reference
-policy.
+policy. Once the template is bound, a param that holds sender text is checked
+where the template places it, as a config trigger's value is.
 
 A refused fire never runs: a webhook answers `422` (the trigger stays healthy),
 and an `object_arrival` watcher skips the object and reports it, then fires the

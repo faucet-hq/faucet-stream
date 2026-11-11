@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::credentials::DeltaCredentials;
 
+/// Storage options naming the Azure storage account (any case).
+const AZURE_ACCOUNT_KEYS: &[&str] = &["azure_storage_account_name", "account_name"];
+
 /// Location + credentials for a Delta table. Flattened (`#[serde(flatten)]`)
 /// into both the source and sink config so the same three keys appear at the
 /// connector-config top level.
@@ -93,9 +96,29 @@ impl DeltaConnection {
         register_all_handlers();
     }
 
+    /// Check the connection before any request: an Azure storage account
+    /// name (`credentials.account_name`, or an `azure_storage_account_name` /
+    /// `account_name` storage option in any case) must be 3 to 24 lowercase
+    /// letters and digits, the service's own rule.
+    pub fn validate(&self) -> Result<(), FaucetError> {
+        for (key, value) in self.merged_storage_options() {
+            let key = key.to_ascii_lowercase();
+            if AZURE_ACCOUNT_KEYS.contains(&key.as_str())
+                && !faucet_core::resolve::is_valid_azure_account_name(&value)
+            {
+                return Err(FaucetError::Config(format!(
+                    "delta: `{key}` must be an Azure storage account name: 3 to 24 lowercase \
+                     letters and digits"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Resolve `table_uri` to a `Url`, turning bare local paths into `file://`
     /// (delta-rs's `open_table*` functions take a `Url`, not a string).
     fn table_url(&self) -> Result<url::Url, FaucetError> {
+        self.validate()?;
         deltalake::ensure_table_uri(&self.table_uri).map_err(|e| {
             FaucetError::Config(format!(
                 "delta: invalid table_uri '{}': {e}",
@@ -231,6 +254,29 @@ mod tests {
             credentials: DeltaCredentials::default(),
             storage_options: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn azure_account_names_follow_the_service_rule() {
+        let mut c = conn("abfss://c@acct.dfs.core.windows.net/t");
+        assert!(c.validate().is_ok());
+        c.storage_options
+            .insert("AZURE_STORAGE_ACCOUNT_NAME".into(), "evil.example#".into());
+        let e = c.location_string().unwrap_err().to_string();
+        assert!(
+            e.contains("azure_storage_account_name") && !e.contains("evil"),
+            "{e}"
+        );
+        c.storage_options.clear();
+        c.storage_options
+            .insert("account_name".into(), "acct".into());
+        assert!(c.validate().is_ok());
+        c.credentials = serde_json::from_value(
+            json!({"type": "azure", "config": {"account_name": "Bad.Name"}}),
+        )
+        .unwrap();
+        c.storage_options.clear();
+        assert!(c.validate().is_err());
     }
 
     #[test]
