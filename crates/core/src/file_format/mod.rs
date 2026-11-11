@@ -53,6 +53,9 @@ use serde_json::Value;
 
 #[cfg(feature = "file-format-avro")]
 pub mod avro;
+#[cfg(feature = "file-format-avro")]
+mod avro_bound;
+pub mod budget;
 pub mod container;
 #[cfg(feature = "file-format-csv")]
 pub mod csv;
@@ -65,6 +68,7 @@ pub mod parquet_io;
 #[cfg(feature = "file-format-xml")]
 pub mod xml;
 
+pub use budget::DecodeBudget;
 pub use container::{ContainerDecoder, FileInput};
 
 /// How the bytes of one object are laid out.
@@ -425,15 +429,27 @@ pub async fn decode(
     format: FileFormat,
     opts: &FormatOptions,
 ) -> Result<Vec<Value>, FaucetError> {
+    decode_bounded(bytes, format, opts, budget::MAX_DEFAULT_DECODED_BYTES).await
+}
+
+/// [`decode`], refusing an object that decodes to more than
+/// `max_decoded_bytes` (see [`DecodeBudget`]) where a format can expand past
+/// its input (Avro, Excel).
+pub async fn decode_bounded(
+    bytes: &[u8],
+    format: FileFormat,
+    opts: &FormatOptions,
+    max_decoded_bytes: u64,
+) -> Result<Vec<Value>, FaucetError> {
     match format {
         FileFormat::JsonLines => json::decode_lines(bytes),
         FileFormat::JsonArray => json::decode_array(bytes),
         FileFormat::RawText => json::decode_raw_text(bytes),
         FileFormat::Csv => decode_csv(bytes, opts).await,
         FileFormat::Xml => decode_xml(bytes, opts),
-        FileFormat::Xlsx => decode_xlsx(bytes, opts),
+        FileFormat::Xlsx => decode_xlsx(bytes, opts, max_decoded_bytes),
         FileFormat::Parquet => Err(columnar_refusal("decode")),
-        FileFormat::Avro => decode_avro(bytes, opts),
+        FileFormat::Avro => decode_avro(bytes, opts, max_decoded_bytes),
         FileFormat::Orc => decode_orc(bytes, opts),
     }
 }
@@ -449,11 +465,23 @@ pub async fn decode_owned(
     format: FileFormat,
     opts: &FormatOptions,
 ) -> Result<Vec<Value>, FaucetError> {
+    decode_owned_bounded(bytes, format, opts, budget::MAX_DEFAULT_DECODED_BYTES).await
+}
+
+/// [`decode_owned`] with [`decode_bounded`]'s `max_decoded_bytes`.
+pub async fn decode_owned_bounded(
+    bytes: Vec<u8>,
+    format: FileFormat,
+    opts: &FormatOptions,
+    max_decoded_bytes: u64,
+) -> Result<Vec<Value>, FaucetError> {
     let opts = opts.clone();
     tokio::task::spawn_blocking(move || match format {
         #[cfg(feature = "file-format-orc")]
         FileFormat::Orc => orc::decode_owned(bytes, &opts.orc),
-        other => futures::executor::block_on(decode(&bytes, other, &opts)),
+        other => {
+            futures::executor::block_on(decode_bounded(&bytes, other, &opts, max_decoded_bytes))
+        }
     })
     .await
     .map_err(|e| FaucetError::Source(format!("file_format: decode task failed: {e}")))?
@@ -732,12 +760,17 @@ fn encode_xml(_: &[Value], _: &FormatOptions) -> Result<Vec<u8>, FaucetError> {
 }
 
 #[cfg(feature = "file-format-excel")]
-fn decode_xlsx(bytes: &[u8], opts: &FormatOptions) -> Result<Vec<Value>, FaucetError> {
-    excel::decode(bytes, opts.excel.sheet.as_deref(), opts.excel.header_row)
+fn decode_xlsx(bytes: &[u8], opts: &FormatOptions, max: u64) -> Result<Vec<Value>, FaucetError> {
+    excel::decode_bounded(
+        bytes,
+        opts.excel.sheet.as_deref(),
+        opts.excel.header_row,
+        max,
+    )
 }
 
 #[cfg(not(feature = "file-format-excel"))]
-fn decode_xlsx(_: &[u8], _: &FormatOptions) -> Result<Vec<Value>, FaucetError> {
+fn decode_xlsx(_: &[u8], _: &FormatOptions, _: u64) -> Result<Vec<Value>, FaucetError> {
     Err(missing_feature(FileFormat::Xlsx, "file-format-excel"))
 }
 
@@ -752,12 +785,12 @@ fn encode_xlsx(_: &[Value], _: &FormatOptions) -> Result<Vec<u8>, FaucetError> {
 }
 
 #[cfg(feature = "file-format-avro")]
-fn decode_avro(bytes: &[u8], opts: &FormatOptions) -> Result<Vec<Value>, FaucetError> {
-    avro::decode(bytes, &opts.avro)
+fn decode_avro(bytes: &[u8], opts: &FormatOptions, max: u64) -> Result<Vec<Value>, FaucetError> {
+    avro::decode_bounded(bytes, &opts.avro, max)
 }
 
 #[cfg(not(feature = "file-format-avro"))]
-fn decode_avro(_: &[u8], _: &FormatOptions) -> Result<Vec<Value>, FaucetError> {
+fn decode_avro(_: &[u8], _: &FormatOptions, _: u64) -> Result<Vec<Value>, FaucetError> {
     Err(missing_feature(FileFormat::Avro, "file-format-avro"))
 }
 
@@ -884,6 +917,28 @@ mod sheet_extent_tests {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(all(feature = "file-format-avro", feature = "file-format-excel"))]
+    #[tokio::test]
+    async fn bounded_decodes_pass_the_limit_to_avro_and_excel() {
+        let recs = vec![serde_json::json!({"name": "a"})];
+        for format in [FileFormat::Avro, FileFormat::Xlsx] {
+            let opts = FormatOptions::default();
+            let bytes = encode(&recs, format, &opts).unwrap();
+            assert_eq!(decode(&bytes, format, &opts).await.unwrap(), recs);
+            assert_eq!(
+                decode_owned(bytes.clone(), format, &opts).await.unwrap(),
+                recs
+            );
+            let err = decode_owned_bounded(bytes, format, &opts, 1)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("max_decoded_bytes"),
+                "{format:?}: {err}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn line_capped_bounds_one_line_not_the_stream() {

@@ -32,7 +32,7 @@ use serde_json::Value;
 #[derive(Debug)]
 pub enum FileInput {
     /// A local file — decoded incrementally (Avro block by block, ORC stripe
-    /// by stripe), so memory is bounded by the chunk, not the file.
+    /// by stripe), so the records held at once are one chunk, not the file.
     File(std::fs::File),
     /// A whole object already in memory (object stores).
     Bytes(Vec<u8>),
@@ -55,6 +55,7 @@ pub struct ContainerDecoder {
     #[cfg(feature = "file-format-avro")]
     configured: bool,
     anchor: Option<(String, Anchor)>,
+    max_decoded_bytes: u64,
 }
 
 impl ContainerDecoder {
@@ -87,7 +88,16 @@ impl ContainerDecoder {
             #[cfg(feature = "file-format-avro")]
             configured: anchor.is_some(),
             anchor,
+            max_decoded_bytes: super::budget::MAX_DEFAULT_DECODED_BYTES,
         })
+    }
+
+    /// Refuse a file whose records, per chunk or batch (the whole file for
+    /// [`decode_all`](Self::decode_all)), decode to more than `bytes` (see
+    /// [`DecodeBudget`](super::DecodeBudget)). Default 16 GiB.
+    pub fn with_max_decoded_bytes(mut self, bytes: u64) -> Self {
+        self.max_decoded_bytes = bytes;
+        self
     }
 
     /// The format this decoder reads.
@@ -175,6 +185,7 @@ impl ContainerDecoder {
                         reader_schema.as_ref(),
                         check.as_deref(),
                         chunk,
+                        self.max_decoded_bytes,
                         f,
                     )
                 });
@@ -184,8 +195,15 @@ impl ContainerDecoder {
             FileFormat::Orc => {
                 let batch = if chunk == usize::MAX { 0 } else { chunk };
                 let mut pending: Vec<Value> = Vec::new();
+                let mut budget = super::DecodeBudget::new(self.max_decoded_bytes);
                 self.orc_read(name, input, batch, &mut |b| {
                     let rows = crate::columnar::record_batch_to_values(&b)?;
+                    if chunk != usize::MAX {
+                        budget.reset();
+                    }
+                    for row in &rows {
+                        budget.charge_value(row, "an orc batch")?;
+                    }
                     if chunk == usize::MAX {
                         pending.extend(rows);
                         Ok(())
@@ -224,6 +242,7 @@ impl ContainerDecoder {
                         reader_schema.as_ref(),
                         check.as_deref(),
                         batch_size,
+                        self.max_decoded_bytes,
                         f,
                     )
                 });
@@ -294,7 +313,9 @@ impl ContainerDecoder {
                 Ok(())
             }
             (Ok(_), Some(_)) => Ok(()),
-            (Err(e), Some((first, _))) if reader_schema.is_some() => {
+            (Err(e), Some((first, _)))
+                if reader_schema.is_some() && !super::budget::is_exceeded(&e) =>
+            {
                 let against = if self.configured {
                     "the configured `avro.schema`".to_string()
                 } else {
@@ -710,6 +731,41 @@ mod tests {
             .unwrap();
         assert_eq!(n, 2);
         assert_eq!(schema.field(0).name(), "id");
+    }
+
+    #[cfg(feature = "file-format-orc")]
+    #[test]
+    fn orc_records_are_charged_per_chunk() {
+        const FIXTURE: &[u8] = include_bytes!("../../tests/fixtures/orc/people.orc");
+        let mut whole = Vec::new();
+        ContainerDecoder::new(FileFormat::Orc, &FormatOptions::default())
+            .unwrap()
+            .records("a.orc", FileInput::Bytes(FIXTURE.to_vec()), 0, &mut |c| {
+                whole.extend(c);
+                Ok(())
+            })
+            .unwrap();
+        let one = super::super::budget::decoded_size(&whole[0]);
+        let all: u64 = whole.iter().map(super::super::budget::decoded_size).sum();
+        let mut tight = ContainerDecoder::new(FileFormat::Orc, &FormatOptions::default())
+            .unwrap()
+            .with_max_decoded_bytes(all - 1);
+        let err = tight
+            .records("a.orc", FileInput::Bytes(FIXTURE.to_vec()), 0, &mut |_| {
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("max_decoded_bytes"), "{err}");
+        let mut rows = 0;
+        ContainerDecoder::new(FileFormat::Orc, &FormatOptions::default())
+            .unwrap()
+            .with_max_decoded_bytes(one + one / 2)
+            .records("a.orc", FileInput::Bytes(FIXTURE.to_vec()), 1, &mut |c| {
+                rows += c.len();
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(rows, 3);
     }
 
     #[cfg(feature = "file-format-orc")]

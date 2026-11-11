@@ -43,6 +43,122 @@ fn check_sheet_extent<RS: std::io::Read + std::io::Seek>(
     extent.check(what)
 }
 
+/// Check each part's declared size, and read the shared-string table through
+/// a capped inflate. Input that is not a readable zip is left for the
+/// workbook reader to report.
+fn check_parts(bytes: &[u8], limit: u64) -> Result<(), FaucetError> {
+    let Ok(mut zip) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else {
+        return Ok(());
+    };
+    for i in 0..zip.len() {
+        let Ok(mut part) = zip.by_index(i) else {
+            continue;
+        };
+        let name = String::from_utf8_lossy(part.name_raw()).into_owned();
+        if part.size() > limit {
+            return Err(super::budget::exceeded(
+                &format!("xlsx part '{name}'"),
+                limit,
+            ));
+        }
+        if name.to_ascii_lowercase().ends_with("sharedstrings.xml") {
+            check_shared_strings(&mut part, &name, limit)?;
+        }
+    }
+    Ok(())
+}
+
+/// Reads at most `left` bytes, then fails and sets `over` if more follow.
+struct Capped<R> {
+    inner: R,
+    left: u64,
+    over: bool,
+}
+
+impl<R: std::io::Read> std::io::Read for Capped<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.left == 0 {
+            let mut probe = [0u8; 1];
+            if self.inner.read(&mut probe)? == 0 {
+                return Ok(0);
+            }
+            self.over = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "part larger than its limit",
+            ));
+        }
+        let want = buf
+            .len()
+            .min(usize::try_from(self.left).unwrap_or(usize::MAX));
+        let n = self.inner.read(&mut buf[..want])?;
+        self.left -= n as u64;
+        Ok(n)
+    }
+}
+
+/// Refuse a shared-string table whose `uniqueCount` is more than one string
+/// per four bytes of the part, or whose strings alone would pass the limit.
+fn check_shared_strings<R: std::io::Read>(
+    part: R,
+    name: &str,
+    limit: u64,
+) -> Result<(), FaucetError> {
+    use quick_xml::events::Event;
+    let too_big = || super::budget::exceeded(&format!("xlsx part '{name}'"), limit);
+    let mut capped = Capped {
+        inner: part,
+        left: limit,
+        over: false,
+    };
+    let mut xml = quick_xml::Reader::from_reader(std::io::BufReader::new(&mut capped));
+    let config = xml.config_mut();
+    config.check_end_names = false;
+    config.trim_text(false);
+    config.check_comments = false;
+    config.expand_empty_elements = true;
+    let mut buf = Vec::new();
+    let mut declared: Option<u64> = None;
+    loop {
+        buf.clear();
+        match xml.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) if e.local_name().as_ref() == "sst" => {
+                declared = e
+                    .attributes()
+                    .with_checks(false)
+                    .flatten()
+                    .find(|a| a.key.as_ref() == "uniqueCount")
+                    .and_then(|a| a.value.parse::<u64>().ok());
+                break;
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    let mut rest = xml.into_inner();
+    let drained = std::io::copy(&mut rest, &mut std::io::sink());
+    drop(rest);
+    if capped.over {
+        return Err(too_big());
+    }
+    if drained.is_err() {
+        return Ok(());
+    }
+    let size = limit - capped.left;
+    if let Some(n) = declared {
+        if n.saturating_mul(4) > size {
+            return Err(FaucetError::Source(format!(
+                "xlsx: '{name}' declares {n} shared strings, more than its {size} bytes can hold"
+            )));
+        }
+        if n.saturating_mul(std::mem::size_of::<String>() as u64) > limit {
+            return Err(too_big());
+        }
+    }
+    Ok(())
+}
+
 /// Parse a workbook into records.
 ///
 /// `sheet` is a worksheet name, or an index as a string; `header_row` is the
@@ -54,7 +170,25 @@ pub fn decode(
     sheet: Option<&str>,
     header_row: usize,
 ) -> Result<Vec<Value>, FaucetError> {
+    decode_bounded(
+        bytes,
+        sheet,
+        header_row,
+        super::budget::MAX_DEFAULT_DECODED_BYTES,
+    )
+}
+
+/// [`decode`], refusing a workbook whose parts decompress to more than
+/// `max_decoded_bytes`, or whose shared-string table declares more strings
+/// than its part could hold, before the workbook is opened.
+pub fn decode_bounded(
+    bytes: &[u8],
+    sheet: Option<&str>,
+    header_row: usize,
+    max_decoded_bytes: u64,
+) -> Result<Vec<Value>, FaucetError> {
     use calamine::{Reader, Xlsx};
+    check_parts(bytes, max_decoded_bytes)?;
     // Borrow the body rather than copying it: `&[u8]` is `Read + Seek`, so a
     // `to_vec()` here would be a second whole-file allocation on top of the one
     // calamine makes.
@@ -336,6 +470,84 @@ mod tests {
         assert!(err.contains("record 1 is not a JSON object"), "{err}");
     }
     use serde_json::json;
+
+    /// `encode`'s workbook with its shared-string part replaced by `sst`.
+    fn with_shared_strings(sst: &[u8]) -> Vec<u8> {
+        use std::io::{Read, Write};
+        let base = encode(&[json!({"name": "a"})], None).unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(base)).unwrap();
+        let mut out = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        let mut found = false;
+        for i in 0..zip.len() {
+            let mut part = zip.by_index(i).unwrap();
+            let name = String::from_utf8_lossy(part.name_raw()).into_owned();
+            let mut body = Vec::new();
+            part.read_to_end(&mut body).unwrap();
+            if name.ends_with("sharedStrings.xml") {
+                body = sst.to_vec();
+                found = true;
+            }
+            out.start_file(name, opts).unwrap();
+            out.write_all(&body).unwrap();
+        }
+        assert!(found, "the workbook has a shared-string part");
+        out.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn a_workbook_declaring_more_strings_than_it_holds_is_refused() {
+        let bomb = with_shared_strings(
+            br#"<?xml version="1.0" encoding="UTF-8"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="1" uniqueCount="10000000000000"><si><t>name</t></si><si><t>a</t></si></sst>"#,
+        );
+        assert!(bomb.len() < 16 * 1024, "{}", bomb.len());
+        let err = decode(&bomb, None, 0).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("declares 10000000000000 shared strings"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_shared_string_count_above_the_true_count_is_accepted_within_the_part() {
+        let ok = with_shared_strings(
+            br#"<?xml version="1.0" encoding="UTF-8"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="99" uniqueCount="5"><si><t>name</t></si><si><t>a</t></si></sst>"#,
+        );
+        assert_eq!(decode(&ok, None, 0).unwrap(), vec![json!({"name": "a"})]);
+    }
+
+    #[test]
+    fn a_shared_string_part_that_inflates_past_the_limit_is_refused() {
+        let mut sst = br#"<?xml version="1.0" encoding="UTF-8"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" uniqueCount="2"><si><t>name</t></si><si><t>a</t></si>"#.to_vec();
+        sst.extend(std::iter::repeat_n(b' ', 200_000));
+        sst.extend_from_slice(b"</sst>");
+        let bomb = with_shared_strings(&sst);
+        assert!(bomb.len() < 16 * 1024, "{}", bomb.len());
+        let err = decode_bounded(&bomb, None, 0, 64 * 1024).unwrap_err();
+        assert!(err.to_string().contains("max_decoded_bytes"), "{err}");
+        assert_eq!(
+            decode_bounded(&bomb, None, 0, 1 << 20).unwrap(),
+            vec![json!({"name": "a"})]
+        );
+    }
+
+    #[test]
+    fn strings_that_would_pass_the_limit_are_refused() {
+        let mut sst = br#"<?xml version="1.0" encoding="UTF-8"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" uniqueCount="40000"><si><t>name</t></si><si><t>a</t></si>"#.to_vec();
+        sst.extend(std::iter::repeat_n(b' ', 200_000));
+        sst.extend_from_slice(b"</sst>");
+        let err = decode_bounded(&with_shared_strings(&sst), None, 0, 300_000).unwrap_err();
+        assert!(err.to_string().contains("max_decoded_bytes"), "{err}");
+    }
+
+    #[test]
+    fn input_that_is_not_a_zip_is_left_to_the_workbook_reader() {
+        let err = decode(b"not a workbook", None, 0).unwrap_err();
+        assert!(err.to_string().contains("opening workbook"), "{err}");
+        assert!(check_parts(b"not a workbook", 10).is_ok());
+    }
 
     #[test]
     fn a_workbook_round_trips_with_its_types() {

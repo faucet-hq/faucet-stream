@@ -92,12 +92,29 @@ pub fn parse_schema(v: &Value) -> Result<Schema, FaucetError> {
 
 /// Decode a whole OCF into records, resolved against `opts.schema` when set.
 pub fn decode(bytes: &[u8], opts: &AvroOptions) -> Result<Vec<Value>, FaucetError> {
+    decode_bounded(bytes, opts, super::budget::MAX_DEFAULT_DECODED_BYTES)
+}
+
+/// [`decode`], refusing a file whose records decode to more than
+/// `max_decoded_bytes` (see [`DecodeBudget`](super::DecodeBudget)).
+pub fn decode_bounded(
+    bytes: &[u8],
+    opts: &AvroOptions,
+    max_decoded_bytes: u64,
+) -> Result<Vec<Value>, FaucetError> {
     let reader_schema = opts.parsed_schema()?;
     let mut out = Vec::new();
-    read_records(bytes, reader_schema.as_ref(), usize::MAX, &mut |chunk| {
-        out.extend(chunk);
-        Ok(())
-    })
+    read_records_checked(
+        bytes,
+        reader_schema.as_ref(),
+        None,
+        usize::MAX,
+        max_decoded_bytes,
+        &mut |chunk| {
+            out.extend(chunk);
+            Ok(())
+        },
+    )
     .map_err(|e| FaucetError::Source(format!("avro: {e}")))?;
     Ok(out)
 }
@@ -117,7 +134,14 @@ pub fn read_records<R: std::io::Read>(
     chunk: usize,
     f: &mut dyn FnMut(Vec<Value>) -> Result<(), FaucetError>,
 ) -> Result<Schema, FaucetError> {
-    read_records_checked(reader, reader_schema, None, chunk, f)
+    read_records_checked(
+        reader,
+        reader_schema,
+        None,
+        chunk,
+        super::budget::MAX_DEFAULT_DECODED_BYTES,
+        f,
+    )
 }
 
 /// Checks a file's writer schema before any of its rows are decoded.
@@ -129,6 +153,7 @@ pub(crate) fn read_records_checked<R: std::io::Read>(
     reader_schema: Option<&Schema>,
     check: Option<&WriterCheck<'_>>,
     chunk: usize,
+    max_decoded_bytes: u64,
     f: &mut dyn FnMut(Vec<Value>) -> Result<(), FaucetError>,
 ) -> Result<Schema, FaucetError> {
     read_with(
@@ -136,6 +161,7 @@ pub(crate) fn read_records_checked<R: std::io::Read>(
         reader_schema,
         check,
         chunk,
+        max_decoded_bytes,
         Mode::Record,
         &mut |chunk, _| f(chunk),
     )
@@ -157,15 +183,25 @@ pub(crate) fn read_with<R: std::io::Read>(
     reader_schema: Option<&Schema>,
     check: Option<&WriterCheck<'_>>,
     chunk: usize,
+    max_decoded_bytes: u64,
     mode: Mode,
     f: &mut ChunkSink<'_>,
 ) -> Result<Schema, FaucetError> {
+    let failure = super::avro_bound::Failure::default();
+    let refusal = |e: apache_avro::Error, what: &str| {
+        failure
+            .borrow_mut()
+            .take()
+            .unwrap_or_else(|| FaucetError::Source(format!("{what}: {e}")))
+    };
+    let reader =
+        super::avro_bound::Bounded::new(reader, max_decoded_bytes, reader_schema, failure.clone());
     let builder = apache_avro::Reader::builder(reader);
     let r = match reader_schema {
         Some(s) => builder.reader_schema(s).build(),
         None => builder.build(),
     }
-    .map_err(|e| FaucetError::Source(format!("avro header: {e}")))?;
+    .map_err(|e| refusal(e, "avro header"))?;
     if let Some(check) = check {
         check(r.writer_schema())?;
     }
@@ -174,11 +210,15 @@ pub(crate) fn read_with<R: std::io::Read>(
         .unwrap_or_else(|| r.writer_schema().clone());
     let names = named(&schema);
     let chunk = chunk.max(1);
+    let mut budget = super::DecodeBudget::new(max_decoded_bytes);
     let mut buf = Vec::with_capacity(chunk.min(4096));
     for datum in r {
-        let datum = datum.map_err(|e| FaucetError::Source(format!("avro datum: {e}")))?;
-        buf.push(root_to_json(&datum, &schema, &names, mode)?);
+        let datum = datum.map_err(|e| refusal(e, "avro datum"))?;
+        let json = root_to_json(&datum, &schema, &names, mode)?;
+        budget.charge_value(&json, "an avro batch")?;
+        buf.push(json);
         if buf.len() >= chunk {
+            budget.reset();
             f(std::mem::take(&mut buf), &schema)?;
         }
     }
@@ -1333,7 +1373,14 @@ pub fn read_batches<R: std::io::Read>(
     batch_size: usize,
     f: &mut dyn FnMut(arrow::array::RecordBatch) -> Result<(), FaucetError>,
 ) -> Result<(Schema, arrow::datatypes::SchemaRef), FaucetError> {
-    read_batches_checked(reader, reader_schema, None, batch_size, f)
+    read_batches_checked(
+        reader,
+        reader_schema,
+        None,
+        batch_size,
+        super::budget::MAX_DEFAULT_DECODED_BYTES,
+        f,
+    )
 }
 
 /// [`read_batches`] with a writer-schema check run before the first row.
@@ -1343,6 +1390,7 @@ pub(crate) fn read_batches_checked<R: std::io::Read>(
     reader_schema: Option<&Schema>,
     check: Option<&WriterCheck<'_>>,
     batch_size: usize,
+    max_decoded_bytes: u64,
     f: &mut dyn FnMut(arrow::array::RecordBatch) -> Result<(), FaucetError>,
 ) -> Result<(Schema, arrow::datatypes::SchemaRef), FaucetError> {
     let chunk = if batch_size == 0 {
@@ -1356,6 +1404,7 @@ pub(crate) fn read_batches_checked<R: std::io::Read>(
         reader_schema,
         check,
         chunk,
+        max_decoded_bytes,
         Mode::Arrow,
         &mut |rows, schema| {
             let target = match &arrow {
