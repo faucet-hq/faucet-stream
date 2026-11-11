@@ -155,10 +155,10 @@ fn sandboxed_kinds_are_read_from_the_schema() {
 
 fn force_override_value(cfg: &mut Value) {
     let mut opt = Some(cfg.clone());
-    force_override(&mut opt, true, "no-such-kind");
+    force_override(&mut opt, true, "no-such-kind", Switch::Sandbox);
     *cfg = opt.unwrap();
     let mut none = None;
-    force_override(&mut none, true, "no-such-kind");
+    force_override(&mut none, true, "no-such-kind", Switch::Sandbox);
     assert!(none.is_none(), "an unconfined kind gets no override block");
 }
 
@@ -2414,4 +2414,172 @@ async fn caller_overwrite_run_tokens_are_ignored() {
     );
     let trusted = load(BodyOrigin::Trusted).await.unwrap();
     assert_eq!(trusted.nodes[0].sink.config["_overwrite_run"], token);
+}
+
+#[cfg(all(feature = "source-nats", feature = "sink-stdout"))]
+#[tokio::test]
+async fn nats_ignores_discovered_servers_for_callers() {
+    use crate::cli::ReferenceArgs;
+    use crate::serve::references::ServeReferencePolicy;
+    let body = json!({ "version": 1, "pipeline": {
+        "source": { "type": "nats", "config": {
+            "servers": ["nats://n.example.com:4222"], "subject": "s",
+            "ignore_discovered_servers": false, "max_messages": 1 } },
+        "sink": { "type": "stdout", "config": {} }
+    }})
+    .to_string();
+    let caller = BodyOrigin::Caller {
+        allow_subprocess: false,
+    };
+    let load = |origin: BodyOrigin, refs: ServeReferencePolicy| {
+        let body = body.clone();
+        async move {
+            load_submission_with(&body, ConfigFormat::Json, None, None, origin, None, &refs)
+                .await
+                .unwrap()
+        }
+    };
+    let pinned = load(caller, ServeReferencePolicy::default()).await;
+    assert_eq!(
+        pinned.nodes[0].source.config["ignore_discovered_servers"],
+        true
+    );
+    assert!(uses_pin_switch(None, &pinned.nodes));
+    let trusted = load(BodyOrigin::Trusted, ServeReferencePolicy::default()).await;
+    assert_eq!(
+        trusted.nodes[0].source.config["ignore_discovered_servers"],
+        false
+    );
+    let listed = ServeReferencePolicy::from_args(&ReferenceArgs {
+        allow_url_host: vec!["*.example.com".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    let open = load(caller, listed).await;
+    assert_eq!(
+        open.nodes[0].source.config["ignore_discovered_servers"],
+        false
+    );
+    assert!(uses_pin_switch(
+        Some(&json!({ "nodes": { "a": { "type": "nats" } } })),
+        &[]
+    ));
+    assert!(!uses_pin_switch(Some(&json!({ "type": "stdout" })), &[]));
+}
+
+#[cfg(all(
+    feature = "source-kafka",
+    feature = "sink-kafka",
+    feature = "sink-stdout"
+))]
+#[tokio::test]
+async fn caller_kafka_and_oracle_need_a_host_allow_list() {
+    use crate::cli::ReferenceArgs;
+    use crate::serve::references::ServeReferencePolicy;
+    let kafka = json!({ "type": "kafka", "config": {
+        "brokers": "k.example.com:9092", "topics": ["t"], "group_id": "g", "max_messages": 1 } });
+    let kafka_sink = json!({ "type": "kafka", "config": {
+        "brokers": "k.example.com:9092", "topic": "t" } });
+    let stdout = json!({ "type": "stdout", "config": {} });
+    let bodies = [
+        json!({ "version": 1, "pipeline": { "source": kafka, "sink": stdout } }),
+        json!({ "version": 1, "pipeline": { "source": kafka, "sink": kafka_sink } }),
+        json!({ "version": 1, "pipeline": { "source": kafka, "sink": stdout,
+            "dlq": { "sink": kafka_sink } } }),
+    ];
+    let caller = BodyOrigin::Caller {
+        allow_subprocess: false,
+    };
+    let listed = ServeReferencePolicy::from_args(&ReferenceArgs {
+        allow_url_host: vec!["*.example.com".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    for body in bodies {
+        let body = body.to_string();
+        let load = |origin: BodyOrigin, refs: &ServeReferencePolicy| {
+            let body = body.clone();
+            let refs = refs.clone();
+            async move {
+                load_submission_with(&body, ConfigFormat::Json, None, None, origin, None, &refs)
+                    .await
+            }
+        };
+        let err = load(caller, &ServeReferencePolicy::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ServeError::Forbidden(m) if m.contains("`kafka` client") && m.contains("--allow-url-host")),
+            "{body}: {err:?}"
+        );
+        load(caller, &listed).await.unwrap();
+        load(BodyOrigin::Trusted, &ServeReferencePolicy::default())
+            .await
+            .unwrap();
+    }
+}
+
+#[cfg(all(feature = "source-oracle", feature = "sink-stdout"))]
+#[tokio::test]
+async fn caller_oracle_needs_a_host_allow_list() {
+    use crate::serve::references::ServeReferencePolicy;
+    let body = json!({ "version": 1, "pipeline": {
+        "source": { "type": "oracle", "config": {
+            "host": "o.example.com", "service_name": "S", "username": "u", "password": "p",
+            "query": "SELECT 1 FROM dual" } },
+        "sink": { "type": "stdout", "config": {} }
+    }})
+    .to_string();
+    let err = load_submission_with(
+        &body,
+        ConfigFormat::Json,
+        None,
+        None,
+        BodyOrigin::Caller {
+            allow_subprocess: false,
+        },
+        None,
+        &ServeReferencePolicy::default(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&err, ServeError::Forbidden(m) if m.contains("`oracle` client")),
+        "{err:?}"
+    );
+}
+
+#[cfg(all(
+    feature = "lineage-kafka",
+    feature = "source-csv",
+    feature = "sink-stdout"
+))]
+#[tokio::test]
+async fn a_caller_kafka_lineage_transport_needs_a_host_allow_list() {
+    use crate::serve::references::ServeReferencePolicy;
+    let body = json!({ "version": 1,
+        "pipeline": {
+            "source": { "type": "csv", "config": { "path": "in.csv" } },
+            "sink": { "type": "stdout", "config": {} } },
+        "lineage": { "namespace": "ns", "transport": { "type": "kafka", "config": {
+            "brokers": "k.example.com:9092", "topic": "ol" } } }
+    })
+    .to_string();
+    let err = load_submission_with(
+        &body,
+        ConfigFormat::Json,
+        None,
+        None,
+        BodyOrigin::Caller {
+            allow_subprocess: false,
+        },
+        None,
+        &ServeReferencePolicy::default(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&err, ServeError::Forbidden(m) if m.contains("`kafka` client")),
+        "{err:?}"
+    );
 }

@@ -195,6 +195,18 @@ connector's `tls` / transport option as something to configure, not to inherit.
   created after it started, its input files, run-history database and
   default-config state directory) are refused as data whatever the path roots
   allow, and its working directory can't be listed as a whole.
+- **Servers a client learns from the servers it reaches.** Unless the
+  operator lists hosts with `--allow-url-host` (and always for a tenant), a
+  caller's config is kept on the servers it names: a MongoDB URI needs
+  `directConnection=true` or `loadBalanced=true`, and a NATS client is built
+  with `ignore_discovered_servers` (schema switch `x-faucet-pin-servers`, forced
+  on). Clients that follow servers their brokers or listeners advertise and
+  have no setting to stop it (Kafka sources, sinks, DLQ sinks and the lineage
+  transport; Oracle sources, sinks and `oracle-cdc`, marked
+  `x-faucet-follows-servers`) are refused for such a caller. With
+  `--allow-url-host` set they run, and the addresses their servers advertise
+  are not checked against the list: like a host name re-pointed after the
+  check, this is a limit of what the server can see.
   Operator-written configs
   (templates, the triggers file, `--default-config`) are not checked. See
   [Reference policy](../book/src/reference/http-api.md#reference-policy).

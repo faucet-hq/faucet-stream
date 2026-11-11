@@ -56,6 +56,7 @@ pub enum OnUnsupported {
 
 /// Configuration for the Oracle LogMiner CDC source.
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(extend("x-faucet-follows-servers" = true))]
 pub struct OracleCdcSourceConfig {
     /// Connection settings. Connect to the PDB that owns the tables (Oracle
     /// 21c+ mines per PDB), or to a non-CDB / the CDB root.

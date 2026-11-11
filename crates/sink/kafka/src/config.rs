@@ -14,6 +14,7 @@ use std::time::Duration;
 /// Validated at config load by [`validate`](Self::validate).
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("x-faucet-follows-servers" = true))]
 pub struct KafkaSinkConfig {
     /// Comma-separated `host:port` bootstrap brokers, passed straight through
     /// as librdkafka's `bootstrap.servers` (e.g. `"b1:9092,b2:9092"`).

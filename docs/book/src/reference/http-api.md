@@ -405,6 +405,15 @@ percent-decoded with `+` kept as `+`. For a caller's config:
   `loadBalanced=true`) are refused, because the server the driver reaches
   names the further hosts it connects to.
 
+The same rule covers other clients that learn servers from the one they
+reach. Without `--allow-url-host`, and always for a tenant, a NATS client is
+built with `ignore_discovered_servers: true` (a submitted `false` is
+overwritten), and a `kafka` source, sink, DLQ sink or lineage transport and an
+`oracle` / `oracle-cdc` source or sink are refused (`403`): those clients
+follow the brokers and listener redirects their servers advertise, which the
+server cannot check. With `--allow-url-host` they run, and the advertised
+addresses are not checked against the list.
+
 Any URL value is trimmed first; a value that is, as a whole, an IP address
 (`fd00:ec2::254`) is a host; a `,` list whose later elements carry their own
 `scheme://` is checked element by element; a `//host/…` reference is checked by
@@ -446,6 +455,7 @@ are stored and again whenever a run uses them.
 | A setting that turns off certificate or host-key verification (`insecure_skip_verify`, MSSQL `trust_server_certificate` / `TrustServerCertificate=true`, SFTP `known_hosts: {mode: insecure}`, `verify_ca=false` in a MySQL URL, `#insecure` on a `rediss://` URL, MongoDB `tlsInsecure` / `tlsAllowInvalidCertificates` / `tlsAllowInvalidHostnames`, Kafka `enable.ssl.certificate.verification=false`, Oracle `tls.server_dn_match: false`) | refused | `--allow-unverified-tls` (never for a tenant) |
 | A connector that authenticates with the server's own identity: its environment, instance or workload role (IRSA, EKS Pod Identity, GKE workload identity, Azure managed identity), application-default credentials, local credential files or OS authentication (Oracle `external_auth`, Oracle `token_auth` other than `OAUTH` with a `token_location`, MongoDB `authMechanism=MONGODB-AWS` / `GSSAPI` or an `ENVIRONMENT` entry in `authMechanismProperties`, and every connector whose descriptor reports it, for example a cloud connector whose credentials are left to the default chain). An absent credentials field counts as the default it selects. A custom connector registered without an answer counts too | refused | `--allow-host-credentials` (never for a tenant), or register the pipeline as a template |
 | A MongoDB URI the driver may extend with hosts its server names (a seed list, `replicaSet`, `mongodb+srv://`) | refused; add `directConnection=true` (one server) or `loadBalanced=true` | `--allow-url-host` (never for a tenant) |
+| A client that follows servers its servers advertise: Kafka (source, sink, DLQ, lineage transport), Oracle (`oracle`, `oracle-cdc`) | refused; a NATS client is kept on its `servers` (`ignore_discovered_servers` forced on) | `--allow-url-host` (never for a tenant) |
 | `${env:NAME}` / `${secret:NAME}` | none | `--allow-env NAME` or `--allow-env 'PREFIX*'` |
 | `${vault:}` / `${aws-sm:}` / `${gcp-sm:}` / `${azure-kv:}` | none | `--allow-secret-scheme vault,aws-sm` |
 | A program (`singer`) | refused | `--allow-subprocess-connectors` |

@@ -674,6 +674,14 @@ pub async fn submit(
             )
             .await?;
         }
+        if crate::serve::load::uses_pin_switch(topology.as_ref(), &admitted.loaded.nodes) {
+            require_member_capability(
+                state,
+                crate::serve::history::CAP_REFERENCE_KINDS_V2,
+                PIN_SERVERS_REFUSAL,
+            )
+            .await?;
+        }
     }
     // The execution pool (#957): the request's, else the config's, else
     // `default` — refused when no replica would run it.
@@ -708,6 +716,12 @@ pub async fn submit(
 /// `--allow-listen`.
 pub const REFERENCE_KINDS_REFUSAL: &str = "listener unavailable: a cluster member does not \
      check where a submitted config may open a listener; finish the rolling upgrade, then retry";
+
+/// The refusal while a cluster member does not keep a submitted config's
+/// clients on the servers it names.
+pub const PIN_SERVERS_REFUSAL: &str = "server pinning unavailable: a cluster member does not \
+     keep a submitted config's clients on the servers it names; finish the rolling upgrade, \
+     then retry";
 
 /// The refusal while a cluster member does not enforce policy pins (#1051).
 pub const POLICY_PIN_REFUSAL: &str = "policy unavailable: a cluster member does not enforce the \
@@ -2303,6 +2317,104 @@ mod tests {
         .await;
         assert!(
             !matches!(&other, Err(ServeError::Unavailable(m)) if m == REFERENCE_KINDS_REFUSAL),
+            "{other:?}"
+        );
+    }
+
+    /// A caller's config whose client a pin-servers switch keeps on its
+    /// servers waits until every member forces the switch.
+    #[cfg(all(feature = "source-nats", feature = "sink-jsonl"))]
+    #[tokio::test]
+    async fn a_member_without_server_pinning_holds_caller_nats_configs() {
+        use crate::serve::history::RunHistory as _;
+        let dir = tempfile::tempdir().unwrap();
+        let history = crate::serve::history::sqlite::SqliteHistory::connect(
+            &format!("sqlite:{}", dir.path().join("h.db").display()),
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(30),
+            "old".into(),
+        )
+        .await
+        .unwrap();
+        history
+            .heartbeat_instance(&crate::serve::history::InstanceHeartbeat {
+                started_at: chrono::Utc::now(),
+                listen: None,
+                max_concurrent: 1,
+                in_flight: 0,
+                state_format: 0,
+                pools: Vec::new(),
+                capabilities: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let mut config = crate::serve::test_support::test_config();
+        config.cluster.enabled = true;
+        let mixed = ServerState::new(
+            &config,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            std::sync::Arc::new(history),
+            crate::serve::logs::LogHub::new(),
+            None,
+            #[cfg(feature = "triggers")]
+            crate::serve::triggers::health::TriggersHandle::empty(),
+        );
+        mixed
+            .cluster()
+            .set_live_members(vec![crate::serve::history::InstanceRecord {
+                instance_id: "old".into(),
+                started_at: chrono::Utc::now(),
+                last_heartbeat: chrono::Utc::now(),
+                listen: None,
+                max_concurrent: 1,
+                in_flight: 0,
+                state_format: 0,
+                pools: None,
+                capabilities: None,
+            }]);
+        let actor = crate::serve::rbac::AuthContext {
+            principal: "alice".into(),
+            role: crate::serve::rbac::Role::Operator,
+            source_ip: None,
+            tenant: None,
+        };
+        let principal = crate::runtime::Principal::caller(&mixed, actor);
+        let out = dir.path().join("o.jsonl").display().to_string();
+        let run = |source: serde_json::Value| -> SubmitRequest {
+            serde_json::from_value(serde_json::json!({ "config": serde_json::json!({
+                "version": 1,
+                "pipeline": { "source": source,
+                              "sink": { "type": "jsonl", "config": { "path": out } } }
+            }).to_string(), "config_format": "json" }))
+            .unwrap()
+        };
+        let err = submit(
+            &mixed,
+            &principal,
+            run(serde_json::json!({ "type": "nats",
+                "config": { "servers": ["nats://n.example.com:4222"], "subject": "s",
+                            "max_messages": 1 } })),
+            Approval::Required,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, ServeError::Unavailable(m) if m == PIN_SERVERS_REFUSAL),
+            "{err:?}"
+        );
+        let csv = dir.path().join("in.csv");
+        std::fs::write(&csv, "id\n1\n").unwrap();
+        let other = submit(
+            &mixed,
+            &principal,
+            run(serde_json::json!({ "type": "csv",
+                "config": { "path": csv.display().to_string() } })),
+            Approval::Required,
+        )
+        .await;
+        assert!(
+            !matches!(&other, Err(ServeError::Unavailable(m)) if m == PIN_SERVERS_REFUSAL),
             "{other:?}"
         );
     }

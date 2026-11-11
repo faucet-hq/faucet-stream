@@ -5191,7 +5191,8 @@
           "required": [
             "type",
             "config"
-          ]
+          ],
+          "x-faucet-follows-servers": true
         }
       ]
     },
@@ -24361,6 +24362,14 @@
                         "null"
                       ]
                     },
+                    "ignore_discovered_servers": {
+                      "description": "Connect only to `servers`, ignoring the cluster members a server\nadvertises. Defaults to `false`.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "x-faucet-pin-servers": true
+                    },
                     "subject": {
                       "description": "Subject to subscribe to. Supports NATS wildcards (`*` for one token,\n`>` for the remaining tokens). In JetStream mode the durable consumer's\nown filter subject governs delivery and this field is informational.",
                       "type": "string"
@@ -28140,7 +28149,8 @@
                       "minimum": 0,
                       "default": 1000
                     }
-                  }
+                  },
+                  "x-faucet-follows-servers": true
                 },
                 true
               ]
@@ -29630,7 +29640,8 @@
                   },
                   "title": "OracleSourceConfig",
                   "description": "Configuration for [`OracleSource`](crate::OracleSource).",
-                  "type": "object"
+                  "type": "object",
+                  "x-faucet-follows-servers": true
                 },
                 true
               ]
@@ -29891,7 +29902,8 @@
                   },
                   "title": "OracleCdcSourceConfig",
                   "description": "Configuration for the Oracle LogMiner CDC source.",
-                  "type": "object"
+                  "type": "object",
+                  "x-faucet-follows-servers": true
                 },
                 true
               ]
@@ -32149,6 +32161,14 @@
                         "null"
                       ]
                     },
+                    "ignore_discovered_servers": {
+                      "description": "Connect only to `servers`, ignoring the cluster members a server\nadvertises. Defaults to `false`.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "x-faucet-pin-servers": true
+                    },
                     "subject": {
                       "description": "Default subject every record is published to.",
                       "type": "string"
@@ -33941,7 +33961,8 @@
                         "*.cmd": "command"
                       }
                     }
-                  }
+                  },
+                  "x-faucet-follows-servers": true
                 },
                 true
               ]
@@ -36681,7 +36702,8 @@
                   },
                   "title": "OracleSinkConfig",
                   "description": "Configuration for [`OracleSink`](crate::OracleSink).",
-                  "type": "object"
+                  "type": "object",
+                  "x-faucet-follows-servers": true
                 },
                 true
               ]

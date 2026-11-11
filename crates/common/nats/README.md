@@ -29,6 +29,7 @@ imports do not change.
   | `auth`    | `NatsAuth`      | `none`                       | authentication mode                      |
   | `tls`     | `bool` or block | `false`                      | `true` requires TLS with the platform roots; a block (below) also requires TLS |
   | `name`    | `Option<String>`| —                            | client connection name (server monitor)  |
+  | `ignore_discovered_servers` | `bool` | `false` | connect only to `servers`, ignoring cluster members a server advertises; `faucet serve` forces it on for a submitted config unless `--allow-url-host` is set |
 
   In Rust the block lands in `NatsConnectionConfig::tls_options`
   (`NatsTls`, an alias of `faucet_core::TlsOptions`, #973):

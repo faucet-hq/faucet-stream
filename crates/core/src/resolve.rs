@@ -2802,6 +2802,55 @@ pub fn caller_max_fields(schema: &Value) -> Vec<(String, u64)> {
 }
 
 /// The top-level config fields `schema` marks with the boolean `annotation`.
+/// The JSON Schema keyword (value `true`) on a top-level boolean config field
+/// that keeps the client on the servers the config names, ignoring further
+/// servers those servers advertise. A host whose reference policy pins
+/// servers ([`ReferencePolicy::pins_servers`]) forces every such field on:
+///
+/// ```ignore
+/// #[schemars(extend("x-faucet-pin-servers" = true))]
+/// pub ignore_discovered_servers: bool,
+/// ```
+pub const PIN_SERVERS_ANNOTATION: &str = "x-faucet-pin-servers";
+
+/// The top-level config fields `schema` marks with [`PIN_SERVERS_ANNOTATION`],
+/// across every `oneOf` / `anyOf` / `allOf` branch of the root.
+pub fn pin_servers_fields(schema: &Value) -> Vec<String> {
+    flagged_fields(schema, PIN_SERVERS_ANNOTATION)
+}
+
+/// The JSON Schema keyword (value `true`) on a config schema (the root, or an
+/// enum variant's object) whose client connects to servers that the servers
+/// it is configured with advertise (Kafka brokers, Oracle listener
+/// redirects), with no setting that keeps it on the configured ones. A host
+/// whose reference policy pins servers refuses such a config.
+///
+/// ```ignore
+/// #[derive(JsonSchema)]
+/// #[schemars(extend("x-faucet-follows-servers" = true))]
+/// pub struct KafkaSourceConfig { /* … */ }
+/// ```
+pub const FOLLOWS_SERVERS_ANNOTATION: &str = "x-faucet-follows-servers";
+
+/// Whether `config` is an instance of a branch of `schema` marked with
+/// [`FOLLOWS_SERVERS_ANNOTATION`]: a marked branch matches when every
+/// `const` property it declares has that value in `config`.
+pub fn follows_servers(schema: &Value, config: &Value) -> bool {
+    let mut alts = Vec::new();
+    alternatives(schema, schema, &mut alts, 0);
+    alts.iter().any(|n| {
+        n.get(FOLLOWS_SERVERS_ANNOTATION) == Some(&Value::Bool(true))
+            && n.get("properties")
+                .and_then(Value::as_object)
+                .is_none_or(|props| {
+                    props
+                        .iter()
+                        .filter_map(|(k, p)| p.get("const").map(|c| (k, c)))
+                        .all(|(k, c)| config.get(k) == Some(c))
+                })
+    })
+}
+
 fn flagged_fields(schema: &Value, annotation: &str) -> Vec<String> {
     let mut alts = Vec::new();
     alternatives(schema, schema, &mut alts, 0);
@@ -2983,6 +3032,35 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind, RefusalKind::Path);
         assert!(err.reason.starts_with("`sslkey`"), "{err}");
+    }
+
+    #[test]
+    fn pin_and_follow_annotations_are_read() {
+        let s = json!({
+            "type": "object",
+            "x-faucet-follows-servers": true,
+            "properties": {
+                "pin": {"type": "boolean", "x-faucet-pin-servers": true},
+                "other": {"type": "string"}
+            }
+        });
+        assert_eq!(pin_servers_fields(&s), vec!["pin".to_string()]);
+        assert!(follows_servers(&s, &json!({})));
+        let tagged = json!({"oneOf": [
+            {"type": "object", "properties": {"type": {"const": "http"}, "config": {}}},
+            {"type": "object", "x-faucet-follows-servers": true,
+             "properties": {"type": {"const": "kafka"}, "config": {}}}
+        ]});
+        assert!(follows_servers(
+            &tagged,
+            &json!({"type": "kafka", "config": {}})
+        ));
+        assert!(!follows_servers(
+            &tagged,
+            &json!({"type": "http", "config": {}})
+        ));
+        assert!(!follows_servers(&json!({"type": "object"}), &json!({})));
+        assert!(pin_servers_fields(&json!({"type": "object"})).is_empty());
     }
 
     #[test]

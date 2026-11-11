@@ -9,6 +9,7 @@ use std::time::Duration;
 
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("x-faucet-follows-servers" = true))]
 pub struct KafkaSourceConfig {
     /// Comma-separated bootstrap server list, e.g. `"broker1:9092,broker2:9092"`.
     #[schemars(extend("x-faucet-resource" = "url", "x-faucet-url-syntax" = "url-list"))]

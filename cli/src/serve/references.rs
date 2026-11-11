@@ -294,6 +294,26 @@ pub fn lineage_transport_resources(kind: &str, config: &Value) -> Vec<ResourceRe
         .collect()
 }
 
+/// Whether a `kind` connector's client, configured with `config`, connects to
+/// servers the configured ones advertise
+/// ([`faucet_core::resolve::FOLLOWS_SERVERS_ANNOTATION`]).
+pub fn connector_follows_servers(kind: &str, config: &Value) -> bool {
+    schemas(kind)
+        .iter()
+        .any(|s| faucet_core::resolve::follows_servers(s, config))
+}
+
+/// [`connector_follows_servers`] for a lineage transport.
+#[cfg(feature = "lineage")]
+pub fn lineage_transport_follows_servers(kind: &str, config: &Value) -> bool {
+    let schema =
+        serde_json::to_value(schemars::schema_for!(faucet_lineage::Transport)).unwrap_or_default();
+    faucet_core::resolve::follows_servers(
+        &schema,
+        &serde_json::json!({ "type": kind, "config": config }),
+    )
+}
+
 /// Whether connector `kind` runs a program (its schema declares a
 /// `command` field).
 pub fn runs_program(kind: &str) -> bool {

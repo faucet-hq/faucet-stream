@@ -43,11 +43,30 @@ impl BodyOrigin {
 /// from the same schema `faucet schema` prints, so a plugin connector that
 /// declares one is confined like a built-in.
 pub fn sandbox_fields(is_source: bool, kind: &str) -> std::sync::Arc<[String]> {
-    type Cache =
-        std::sync::RwLock<std::collections::HashMap<(bool, String), std::sync::Arc<[String]>>>;
+    switch_fields(is_source, kind, Switch::Sandbox)
+}
+
+/// The pin-servers switches (fields annotated `x-faucet-pin-servers`, see
+/// [`faucet_core::resolve::pin_servers_fields`]) a connector's config schema
+/// declares.
+pub fn pin_servers_fields(is_source: bool, kind: &str) -> std::sync::Arc<[String]> {
+    switch_fields(is_source, kind, Switch::PinServers)
+}
+
+/// A boolean config switch the server forces on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Switch {
+    Sandbox,
+    PinServers,
+}
+
+fn switch_fields(is_source: bool, kind: &str, switch: Switch) -> std::sync::Arc<[String]> {
+    type Cache = std::sync::RwLock<
+        std::collections::HashMap<(bool, String, Switch), std::sync::Arc<[String]>>,
+    >;
     static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
-    let key = (is_source, kind.to_string());
+    let key = (is_source, kind.to_string(), switch);
     if let Some(hit) = cache.read().ok().and_then(|c| c.get(&key).cloned()) {
         return hit;
     }
@@ -59,7 +78,11 @@ pub fn sandbox_fields(is_source: bool, kind: &str) -> std::sync::Arc<[String]> {
     let Ok(schema) = schema else {
         return std::sync::Arc::from(Vec::new());
     };
-    let fields: std::sync::Arc<[String]> = faucet_core::resolve::sandbox_fields(&schema).into();
+    let fields: std::sync::Arc<[String]> = match switch {
+        Switch::Sandbox => faucet_core::resolve::sandbox_fields(&schema),
+        Switch::PinServers => faucet_core::resolve::pin_servers_fields(&schema),
+    }
+    .into();
     if let Ok(mut c) = cache.write() {
         c.insert(key, std::sync::Arc::clone(&fields));
     }
@@ -84,16 +107,16 @@ fn force_fields(config: &mut Value, fields: &[String]) {
     }
 }
 
-fn force_source(config: &mut Value, kind: &str) {
-    force_fields(config, &sandbox_fields(true, kind));
+fn force_source(config: &mut Value, kind: &str, switch: Switch) {
+    force_fields(config, &switch_fields(true, kind, switch));
 }
 
-fn force_sink(config: &mut Value, kind: &str) {
-    force_fields(config, &sandbox_fields(false, kind));
+fn force_sink(config: &mut Value, kind: &str, switch: Switch) {
+    force_fields(config, &switch_fields(false, kind, switch));
 }
 
-fn force_override(config: &mut Option<Value>, is_source: bool, kind: &str) {
-    let fields = sandbox_fields(is_source, kind);
+fn force_override(config: &mut Option<Value>, is_source: bool, kind: &str, switch: Switch) {
+    let fields = switch_fields(is_source, kind, switch);
     if !fields.is_empty() {
         force_fields(
             config.get_or_insert_with(|| Value::Object(Default::default())),
@@ -124,15 +147,80 @@ fn template_kind<'a>(
 /// snapshot, partition bound probes, `verify.destination` and DLQ sinks are
 /// all covered; a submitted `sandbox: false` is overwritten.
 pub fn confine_sql(cfg: &mut PipelineConfig) {
+    force_switch(cfg, Switch::Sandbox);
+    let p = &mut cfg.pipeline;
+    bound_sql_transforms(&mut p.transforms);
+    for spec in p.source.iter_mut().chain(p.sources.values_mut()) {
+        bound_sql_transforms(spec.transforms.iter_mut().flatten());
+    }
+    for node in p.nodes.values_mut() {
+        if let crate::config::NodeSpec::Transform { transforms } = node {
+            bound_sql_transforms(transforms);
+        }
+    }
+    for row in &mut cfg.matrix {
+        bound_sql_transforms(row.transforms.iter_mut().flatten());
+    }
+}
+
+/// Force `ignore_discovered_servers` (and any other `x-faucet-pin-servers`
+/// switch) on every connector the config can build, so a client connects
+/// only to the servers the screened config names.
+pub fn pin_servers(cfg: &mut PipelineConfig) {
+    force_switch(cfg, Switch::PinServers);
+}
+
+/// [`pin_servers`] over expanded rows.
+pub fn pin_servers_nodes(nodes: &mut [ExpandedNode]) {
+    for n in nodes {
+        force_node(n, Switch::PinServers);
+    }
+}
+
+/// Whether the config builds a connector that declares a pin-servers switch:
+/// one of its rows' connectors, or for a topology any connector `type` in the
+/// document.
+pub fn uses_pin_switch(doc: Option<&Value>, nodes: &[ExpandedNode]) -> bool {
+    fn declares(kind: &str) -> bool {
+        !pin_servers_fields(true, kind).is_empty() || !pin_servers_fields(false, kind).is_empty()
+    }
+    fn walk(v: &Value) -> bool {
+        match v {
+            Value::Object(map) => {
+                map.get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(declares)
+                    || map.values().any(walk)
+            }
+            Value::Array(items) => items.iter().any(walk),
+            _ => false,
+        }
+    }
+    nodes.iter().any(|n| {
+        declares(&n.source.kind)
+            || declares(&n.sink.kind)
+            || n.dlq.as_ref().is_some_and(|d| declares(&d.sink.kind))
+    }) || doc.is_some_and(walk)
+}
+
+fn force_node(n: &mut ExpandedNode, switch: Switch) {
+    force_source(&mut n.source.config, &n.source.kind, switch);
+    force_sink(&mut n.sink.config, &n.sink.kind, switch);
+    if let Some(d) = n.dlq.as_mut() {
+        force_sink(&mut d.sink.config, &d.sink.kind, switch);
+    }
+}
+
+fn force_switch(cfg: &mut PipelineConfig, switch: Switch) {
     let p = &mut cfg.pipeline;
     for spec in p.source.iter_mut().chain(p.sources.values_mut()) {
-        force_source(&mut spec.config, &spec.kind);
+        force_source(&mut spec.config, &spec.kind, switch);
     }
     for spec in p.sink.iter_mut().chain(p.sinks.values_mut()) {
-        force_sink(&mut spec.config, &spec.kind);
+        force_sink(&mut spec.config, &spec.kind, switch);
     }
     if let Some(d) = p.dlq.as_mut() {
-        force_sink(&mut d.sink.config, &d.sink.kind);
+        force_sink(&mut d.sink.config, &d.sink.kind, switch);
     }
     let (sources, source, sinks, sink) = (&p.sources, &p.source, &p.sinks, &p.sink);
     for node in p.nodes.values_mut() {
@@ -146,7 +234,7 @@ pub fn confine_sql(cfg: &mut PipelineConfig) {
                     .as_deref()
                     .or_else(|| template_kind(sources, source, template.as_deref()))
                 {
-                    force_override(config, true, k);
+                    force_override(config, true, k, switch);
                 }
             }
             crate::config::NodeSpec::Sink {
@@ -158,7 +246,7 @@ pub fn confine_sql(cfg: &mut PipelineConfig) {
                     .as_deref()
                     .or_else(|| template_kind(sinks, sink, template.as_deref()))
                 {
-                    force_override(config, false, k);
+                    force_override(config, false, k, switch);
                 }
             }
             _ => {}
@@ -182,15 +270,19 @@ pub fn confine_sql(cfg: &mut PipelineConfig) {
                 .as_deref()
                 .or_else(|| template_kind(templates, legacy, over.r#ref.as_deref()))
             {
-                force_override(&mut over.config, is_source, k);
+                force_override(&mut over.config, is_source, k, switch);
             }
         }
         if let Some(Some(d)) = row.dlq.as_mut() {
-            force_sink(&mut d.sink.config, &d.sink.kind);
+            force_sink(&mut d.sink.config, &d.sink.kind, switch);
         }
     }
     if let Some(r) = cfg.replication.as_mut() {
-        force_source(&mut r.snapshot.source.config, &r.snapshot.source.kind);
+        force_source(
+            &mut r.snapshot.source.config,
+            &r.snapshot.source.kind,
+            switch,
+        );
     }
     let probes = cfg
         .partition
@@ -198,26 +290,17 @@ pub fn confine_sql(cfg: &mut PipelineConfig) {
         .chain(cfg.matrix.iter_mut().filter_map(|r| r.partition.as_mut()))
         .filter_map(crate::partition::PartitionSpec::probe_mut);
     for probe in probes {
-        force_source(&mut probe.from_source.config, &probe.from_source.kind);
+        force_source(
+            &mut probe.from_source.config,
+            &probe.from_source.kind,
+            switch,
+        );
     }
     if let Some(dest) = cfg.verify.as_mut().and_then(|v| v.destination.as_mut()) {
-        force_source(&mut dest.config, &dest.kind);
+        force_source(&mut dest.config, &dest.kind, switch);
     }
     if let Some(r) = cfg.reconcile.as_mut() {
-        force_source(&mut r.count.config, &r.count.kind);
-    }
-    let p = &mut cfg.pipeline;
-    bound_sql_transforms(&mut p.transforms);
-    for spec in p.source.iter_mut().chain(p.sources.values_mut()) {
-        bound_sql_transforms(spec.transforms.iter_mut().flatten());
-    }
-    for node in p.nodes.values_mut() {
-        if let crate::config::NodeSpec::Transform { transforms } = node {
-            bound_sql_transforms(transforms);
-        }
-    }
-    for row in &mut cfg.matrix {
-        bound_sql_transforms(row.transforms.iter_mut().flatten());
+        force_source(&mut r.count.config, &r.count.kind, switch);
     }
 }
 
@@ -252,11 +335,7 @@ fn bound_sql_transforms<'a>(transforms: impl IntoIterator<Item = &'a mut Transfo
 pub fn confine_sql_nodes(nodes: &mut [ExpandedNode]) {
     for n in nodes {
         bound_sql_transforms(&mut n.transforms);
-        force_source(&mut n.source.config, &n.source.kind);
-        force_sink(&mut n.sink.config, &n.sink.kind);
-        if let Some(d) = n.dlq.as_mut() {
-            force_sink(&mut d.sink.config, &d.sink.kind);
-        }
+        force_node(n, Switch::Sandbox);
     }
 }
 
@@ -1401,6 +1480,19 @@ impl Typed {
         Typed::Connector
     }
 
+    /// Whether the client this object configures connects to servers that
+    /// the configured ones advertise.
+    fn follows_servers(self, kind: &str, config: &Value) -> bool {
+        match self {
+            Typed::Connector => crate::serve::references::connector_follows_servers(kind, config),
+            Typed::StateStore => false,
+            #[cfg(feature = "lineage")]
+            Typed::LineageTransport => {
+                crate::serve::references::lineage_transport_follows_servers(kind, config)
+            }
+        }
+    }
+
     fn resources(self, kind: &str, config: &Value) -> Vec<faucet_core::resolve::ResourceRef> {
         match self {
             Typed::Connector => crate::serve::references::connector_resources(kind, config),
@@ -1428,6 +1520,19 @@ fn check_typed(
     }
     if LOCAL_PATH_KINDS.contains(&kind) {
         check_local_paths(config, base, access, scope, found);
+    }
+    if scope.caller
+        && scope.only.is_none()
+        && scope.policy.is_some_and(ReferencePolicy::pins_servers)
+        && typed.follows_servers(kind, config)
+    {
+        let reason = format!(
+            "a `{kind}` client also connects to the servers its configured ones advertise, \
+             which the server cannot check; it runs only when the server lists the hosts \
+             a config may reach (`--allow-url-host`)"
+        );
+        let text = format!("{kind}: {reason}");
+        found.add(scope, base, "", kind, Why::Policy(reason), text);
     }
     if typed == Typed::Connector {
         host_identity_findings(kind, config, base, access, scope, found);
@@ -2901,6 +3006,9 @@ pub async fn load_submission_inputs(
     if origin.confines_sql() {
         confine_sql(&mut cfg);
     }
+    if refs.pins_servers() {
+        pin_servers(&mut cfg);
+    }
 
     // serve runs once per submission; a schedule: block is a category error.
     #[cfg(feature = "schedule")]
@@ -3067,6 +3175,9 @@ pub async fn load_submission_inputs(
     })?;
     if origin.confines_sql() {
         confine_sql_nodes(&mut nodes);
+    }
+    if refs.pins_servers() {
+        pin_servers_nodes(&mut nodes);
     }
 
     refuse_server_paths_with(&cfg, &nodes, origin, &refs)?;

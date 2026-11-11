@@ -84,6 +84,7 @@ pub enum Transport {
     },
     /// Produce each event as a JSON message to a Kafka topic.
     #[cfg(feature = "transport-kafka")]
+    #[schemars(extend("x-faucet-follows-servers" = true))]
     Kafka {
         #[schemars(extend("x-faucet-resource" = "url", "x-faucet-url-syntax" = "url-list"))]
         brokers: String,
