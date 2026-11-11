@@ -207,3 +207,114 @@ async fn refused_stats_are_errors_not_missing_files() {
         .to_string();
     assert!(e.contains("rename into place"), "{e}");
 }
+
+const OVERSIZED: u32 = crate::MAX_INBOUND_PACKET + 1;
+
+async fn live_objects() -> Option<(
+    testcontainers::ContainerAsync<testcontainers::GenericImage>,
+    SftpObjects,
+)> {
+    let (c, port) = crate::test_support::server().await?;
+    Some((c, SftpObjects::new(crate::test_support::config(port))))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_listing_channel_does_not_relabel_later_errors() {
+    let Some((_c, o)) = live_objects().await else {
+        return;
+    };
+    let conn = o.connection().await.unwrap();
+    assert!(conn.raw.is_some());
+    let r: Result<(), FaucetError> = o
+        .guarded(async {
+            conn.raw_guard.record(OVERSIZED);
+            Err(FaucetError::Sink(
+                "SFTP list '/data' failed: its own error".into(),
+            ))
+        })
+        .await;
+    let e = r.unwrap_err().to_string();
+    assert!(e.contains("its own error"), "{e}");
+    assert!(
+        o.session.lock().await.is_none(),
+        "the connection is dropped"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let e = o
+        .download("/data/missing", &dir.path().join("x"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("SFTP open '/data/missing' failed"), "{e}");
+    assert!(!e.contains("packet"), "{e}");
+
+    let fresh = o.connection().await.unwrap();
+    fresh.handle.guard.record(OVERSIZED);
+    let r: Result<(), FaucetError> = o
+        .guarded(async { Err(FaucetError::Sink("a later error".into())) })
+        .await;
+    let e = r.unwrap_err().to_string();
+    assert!(
+        e.contains("a later error"),
+        "a refusal before the operation: {e}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_listing_channel_is_not_reused() {
+    let Some((_c, o)) = live_objects().await else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("f");
+    std::fs::write(&src, b"x\n").unwrap();
+    o.upload(&src, "/data/l/a").await.unwrap();
+    let old = o.connection().await.unwrap();
+    old.raw_guard.record(OVERSIZED);
+
+    let listed = old.list_dir("/data/l", 10, |_, _| true).await.unwrap();
+    assert_eq!(listed.len(), 1, "the listing skips the refused channel");
+    assert!(
+        old.supports_posix_rename(),
+        "never downgraded to plain RENAME"
+    );
+    let e = old
+        .posix_rename("/data/l/a", "/data/l/b")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("packet"), "{e}");
+
+    assert_eq!(o.list("/data/l/").await.unwrap(), ["/data/l/a"]);
+    let now = o.connection().await.unwrap();
+    assert!(!Arc::ptr_eq(&old, &now), "a new connection");
+    assert_eq!(now.refusals(), (0, 0));
+    o.rename("/data/l/a", "/data/l/b").await.unwrap();
+    assert!(o.exists("/data/l/b").await.unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_main_channel_reconnects_on_the_next_operation() {
+    let Some((_c, o)) = live_objects().await else {
+        return;
+    };
+    let old = o.connection().await.unwrap();
+    let r: Result<(), FaucetError> = o
+        .guarded(async {
+            old.handle.guard.record(OVERSIZED);
+            Err(FaucetError::Sink("channel closed".into()))
+        })
+        .await;
+    let e = r.unwrap_err().to_string();
+    assert!(e.contains(&OVERSIZED.to_string()), "{e}");
+    assert!(o.session.lock().await.is_none());
+    assert!(o.exists("/data").await.unwrap());
+    let now = o.connection().await.unwrap();
+    assert!(!Arc::ptr_eq(&old, &now));
+
+    old.handle.guard.record(OVERSIZED);
+    *o.session.lock().await = Some(old.clone());
+    assert!(o.exists("/data").await.unwrap());
+    assert!(!Arc::ptr_eq(&old, &o.connection().await.unwrap()));
+}

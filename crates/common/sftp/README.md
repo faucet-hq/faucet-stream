@@ -49,14 +49,15 @@ Man-in-the-middle protection is on by default. The policy is selected via the
 
 Both policies honour wildcard host patterns (`*.example`, `!skip.example`) and refuse a key marked `@revoked`. A host trusted only through `@cert-authority` is refused: host certificates are not supported, so list the host key itself.
 
-| `insecure`    | Disable verification entirely. **Vulnerable to MITM** — use only on trusted networks / test servers. |
+| `insecure`    | Disable verification entirely. **Vulnerable to MITM** — use only on trusted networks / test servers. A second connection (listings on a one-session server) resolves the host name again, and under this policy nothing checks that it reaches the same server. |
 
 The TCP connect, SSH handshake and authentication are bounded by `connect_timeout_secs` (default 30), and so is each SFTP channel's start after them. A quiet connection sends a keepalive every `keepalive_interval_secs` (default 15, `0` = off), dropping it after three go unanswered.
 
 ## Limits
 
 - **One packet.** Every SFTP channel reads each packet's length first and refuses one longer than `MAX_INBOUND_PACKET` (1 MiB + 64 bytes): the channel closes and the request fails with an error naming the limit. `ChunkedReader` keeps a file read to at most `MAX_READ_CHUNK` (1 MiB) per request, so a reply always fits, whatever read length the server advertises.
-- **One listing.** `authenticate` returns an `SftpHandle`; its `lister()` opens a short-lived channel whose `list_dir(path, limit, keep)` filters entries as each reply arrives, keeps only matches, and fails with `ListError::TooManyEntries` once more than `limit` entries arrive (`DEFAULT_MAX_LISTED_ENTRIES` is 1,000,000). `close()` waits for the server to confirm the channel closed, so a server that allows one session per connection accepts the read session opened next with `open_session()`. `SftpConnection::list_dir` does the same on the connection's second channel. A refused channel is `ListError::ChannelRefused`.
+- **One listing.** `authenticate` returns an `SftpHandle`; its `lister()` opens a short-lived channel whose `list_dir(path, limit, keep)` filters entries as each reply arrives, keeps only matches, and fails with `ListError::TooManyEntries` once more than `limit` entries arrive (`DEFAULT_MAX_LISTED_ENTRIES` is 1,000,000). `close()` waits for the server to confirm the channel closed, so a server that allows one session per connection accepts the read session opened next with `open_session()`. `SftpConnection::list_dir` does the same on the connection's second channel; on a server that refuses that channel (one session per connection) it lists over a second SSH connection with the same credentials and host-key policy, opened once and closed with the connection. A refused channel is `ListError::ChannelRefused`; a second connection that fails too is `ListError::SecondConnectionRefused`, naming both limits.
+- **One channel's refusal.** A packet refused on a listing channel affects only that channel: the read session keeps working and later errors keep their own text. The sink backend opens a new connection after any refusal, and never falls back from `posix-rename` to a plain `RENAME` inside a run.
 
 ## Auth config shapes
 

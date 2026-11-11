@@ -52,9 +52,11 @@ The sink opens the SSH connection lazily on the first write and reuses it. It
 attempts to create the target directory on first connect (best-effort).
 
 Listings run on a second SSH channel of the connection, opened at connect
-when the server allows it, else for each listing. A server that allows one
-session per connection (`MaxSessions 1`) refuses that channel, so a write
-that needs a listing fails there with an error naming the session limit.
+when the server allows it. A server that allows one session per connection
+(`MaxSessions 1`) refuses that channel, so listings there run on a second SSH
+connection with the same credentials and host-key policy, opened on the first
+listing and kept until the sink's connection closes. A server that also
+refuses the second connection fails the call with an error naming both limits.
 Every SFTP packet the server sends is limited to 1 MiB + 64 bytes; a longer
 one closes the channel and fails the call with an error naming the limit.
 

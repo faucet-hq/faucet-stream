@@ -4,6 +4,7 @@
 
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, ready};
 
@@ -17,11 +18,12 @@ pub const MAX_INBOUND_PACKET: u32 = 1024 * 1024 + 64;
 /// Largest read requested from the server in one SFTP `READ`, in bytes.
 pub const MAX_READ_CHUNK: usize = 1024 * 1024;
 
-/// Records the first packet a [`LimitedStream`] refused, shared by every
-/// channel of one SSH connection so callers can explain the failure.
+/// Records the first packet a [`LimitedStream`] refused, shared by the
+/// streams of one SFTP channel so callers can explain the failure.
 #[derive(Debug, Default)]
 pub(crate) struct InboundGuard {
     refused: OnceLock<u32>,
+    count: AtomicU64,
 }
 
 impl InboundGuard {
@@ -31,6 +33,13 @@ impl InboundGuard {
 
     pub(crate) fn record(&self, len: u32) {
         let _ = self.refused.set(len);
+        self.count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// How many packets were refused so far: compared before and after an
+    /// operation to tell whether it saw a refusal.
+    pub(crate) fn refusals(&self) -> u64 {
+        self.count.load(Ordering::SeqCst)
     }
 
     /// The error text for a refused packet, if one was refused.

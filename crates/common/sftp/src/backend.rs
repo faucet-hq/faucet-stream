@@ -126,37 +126,63 @@ impl SftpObjects {
         }
     }
 
+    /// The cached connection, or a new one when there is none or one of its
+    /// channels refused a packet (that channel is closed).
     async fn connection(&self) -> Result<Arc<SftpConnection>, FaucetError> {
         let mut guard = self.session.lock().await;
         if let Some(s) = guard.as_ref() {
-            return Ok(s.clone());
+            if s.refusals() == (0, 0) {
+                return Ok(s.clone());
+            }
+            *guard = None;
         }
         let s = Arc::new(connect_with_extensions(&self.connection).await?);
         *guard = Some(s.clone());
         Ok(s)
     }
 
-    /// Run `op`; when it fails, drop the cached session if it no longer
-    /// answers, so the next operation reconnects instead of reusing a dead
-    /// transport.
+    /// Run `op`; when it fails, drop the cached session if one of its
+    /// channels refused a packet during `op`, or if it no longer answers, so
+    /// the next operation reconnects instead of reusing a dead transport. A
+    /// refusal by the SFTP session replaces `op`'s error with the refusal's;
+    /// an operation sharing that session at the same time may report it too.
     async fn guarded<T>(
         &self,
         op: impl std::future::Future<Output = Result<T, FaucetError>>,
     ) -> Result<T, FaucetError> {
+        let before = self.session.lock().await.clone();
+        let before = before.map(|c| {
+            let counts = c.refusals();
+            (c, counts)
+        });
         let result = op.await;
         if result.is_err() {
-            let refusal = self.refusal().await;
-            self.drop_if_dead().await;
-            if let Some(refusal) = refusal {
-                return Err(FaucetError::Sink(refusal));
+            let Some(conn) = self.session.lock().await.clone() else {
+                return result;
+            };
+            let (session0, raw0) = match &before {
+                Some((c, counts)) if Arc::ptr_eq(c, &conn) => *counts,
+                _ => (0, 0),
+            };
+            let (session, raw) = conn.refusals();
+            if session > session0 || raw > raw0 {
+                self.forget(&conn).await;
+                return match conn.refusal().filter(|_| session > session0) {
+                    Some(refusal) => Err(FaucetError::Sink(refusal)),
+                    None => result,
+                };
             }
+            self.drop_if_dead().await;
         }
         result
     }
 
-    /// The cached connection's refused-packet error, if it refused one.
-    async fn refusal(&self) -> Option<String> {
-        self.session.lock().await.as_ref().and_then(|c| c.refusal())
+    /// Drop `conn` from the cache, if it is still the cached one.
+    async fn forget(&self, conn: &Arc<SftpConnection>) {
+        let mut guard = self.session.lock().await;
+        if guard.as_ref().is_some_and(|s| Arc::ptr_eq(s, conn)) {
+            *guard = None;
+        }
     }
 
     /// The names in `dir` that `keep` accepts, bounded by
@@ -180,14 +206,11 @@ impl SftpObjects {
         };
         let probe = tokio::time::timeout(LIVENESS_TIMEOUT, conn.session().canonicalize(".")).await;
         if session_is_dead(&probe) {
-            let mut guard = self.session.lock().await;
-            if guard.as_ref().is_some_and(|s| Arc::ptr_eq(s, &conn)) {
-                tracing::warn!(
-                    host = %self.connection.host,
-                    "SFTP: the session stopped answering; the next operation reconnects"
-                );
-                *guard = None;
-            }
+            tracing::warn!(
+                host = %self.connection.host,
+                "SFTP: the session stopped answering; the next operation reconnects"
+            );
+            self.forget(&conn).await;
         }
     }
 

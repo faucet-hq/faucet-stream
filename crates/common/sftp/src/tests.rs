@@ -407,3 +407,194 @@ fn config_schema_is_object() {
     let schema = serde_json::to_value(schemars::schema_for!(SftpConnectionConfig)).unwrap();
     assert!(schema.is_object());
 }
+
+#[test]
+fn only_a_server_side_refusal_counts_as_a_refused_channel() {
+    use russh::ChannelOpenFailure as F;
+    for refusal in [
+        F::AdministrativelyProhibited,
+        F::ConnectFailed,
+        F::ResourceShortage,
+    ] {
+        assert!(is_channel_refusal(&russh::Error::ChannelOpenFailure(
+            refusal
+        )));
+    }
+    for other in [
+        russh::Error::ChannelOpenFailure(F::UnknownChannelType),
+        russh::Error::ChannelOpenFailure(F::Other {
+            code: 9,
+            reason: "x".into(),
+        }),
+        russh::Error::Disconnect,
+        russh::Error::SendError,
+    ] {
+        assert!(!is_channel_refusal(&other), "{other:?}");
+    }
+}
+
+#[test]
+fn a_private_key_is_read_once_when_the_credential_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("id");
+    let mut cfg = SftpConnectionConfig::with_password("h", "u", "p");
+    assert!(matches!(Credential::load(&cfg).unwrap(), Credential::Password(p) if p == "p"));
+    cfg.auth = SftpAuth::PrivateKey {
+        path: path.display().to_string(),
+        passphrase: None,
+    };
+    let e = Credential::load(&cfg)
+        .err()
+        .expect("no key file")
+        .to_string();
+    assert!(e.contains("failed to load SFTP private key"), "{e}");
+    let key = russh::keys::PrivateKey::from(
+        russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[7; 32]),
+    );
+    std::fs::write(
+        &path,
+        key.to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    let loaded = Credential::load(&cfg).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert!(matches!(loaded, Credential::Key(k) if k.public_key() == key.public_key()));
+}
+
+async fn list_all(conn: &SftpConnection) -> Result<Vec<String>, ListError> {
+    conn.list_dir("/data", 100, |_, _| true)
+        .await
+        .map(|entries| entries.into_iter().map(|e| e.name).collect())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_one_session_server_lists_over_one_kept_second_connection() {
+    let Some((c, port)) = test_support::one_session_server().await else {
+        return;
+    };
+    let conn = connect_with_extensions(&test_support::config(port))
+        .await
+        .unwrap();
+    assert!(conn.raw.is_none());
+    assert!(conn.single_session.load(Ordering::SeqCst));
+    conn.session().create("/data/a").await.unwrap();
+    assert_eq!(list_all(&conn).await.unwrap(), ["a"]);
+    assert_eq!(list_all(&conn).await.unwrap(), ["a"]);
+    test_support::wait_for_connections(&c, 2).await;
+
+    conn.single_session.store(false, Ordering::SeqCst);
+    assert_eq!(list_all(&conn).await.unwrap(), ["a"]);
+    assert!(conn.single_session.load(Ordering::SeqCst));
+
+    let e = conn.list_dir("/nope", 100, |_, _| true).await.unwrap_err();
+    assert!(e.is_no_such_file(), "{e}");
+    let e = conn.list_dir("/data", 0, |_, _| true).await.unwrap_err();
+    assert!(matches!(e, ListError::TooManyEntries { .. }), "{e}");
+    let kept = conn.second.lock().await.as_ref().map(|s| s.reusable());
+    assert_eq!(kept, Some(true), "a status reply keeps the channel");
+
+    conn.second.lock().await.take().expect("kept").close();
+    assert_eq!(list_all(&conn).await.unwrap(), ["a"]);
+    test_support::wait_for_connections(&c, 2).await;
+
+    conn.second
+        .lock()
+        .await
+        .as_ref()
+        .expect("reopened")
+        .lister
+        .guard_for_tests()
+        .record(MAX_INBOUND_PACKET + 1);
+    assert_eq!(list_all(&conn).await.unwrap(), ["a"]);
+    {
+        let second = conn.second.lock().await;
+        let h = &second.as_ref().expect("reopened").handle.handle;
+        h.disconnect(russh::Disconnect::ByApplication, "", "en")
+            .await
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !h.is_closed() {
+            assert!(std::time::Instant::now() < deadline, "still open");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+    assert_eq!(list_all(&conn).await.unwrap(), ["a"]);
+    test_support::wait_for_connections(&c, 2).await;
+
+    drop(conn);
+    test_support::wait_for_connections(&c, 0).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_second_connection_names_both_limits() {
+    let Some((_c, port)) = test_support::one_session_server().await else {
+        return;
+    };
+    let mut conn = connect_with_extensions(&test_support::config(port))
+        .await
+        .unwrap();
+    conn.config.port = 1;
+    let e = list_all(&conn).await.unwrap_err();
+    assert!(
+        matches!(e, ListError::SecondConnectionRefused { .. }),
+        "{e}"
+    );
+    let e = e.to_string();
+    assert!(
+        e.contains("MaxSessions") && e.contains("two connections per user"),
+        "{e}"
+    );
+    assert!(conn.second.lock().await.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_listing_leaves_no_connection_open() {
+    let Some((c, port)) = test_support::one_session_server().await else {
+        return;
+    };
+    for delay_ms in [0u64, 1, 5, 20, 80, 300] {
+        let conn = connect_with_extensions(&test_support::config(port))
+            .await
+            .unwrap();
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_millis(delay_ms), list_all(&conn)).await;
+        assert!(test_support::open_connections(&c).await <= 2);
+        assert!(list_all(&conn).await.unwrap().is_empty());
+        drop(conn);
+        test_support::wait_for_connections(&c, 0).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_read_session_opens_right_after_a_listing_closes() {
+    let Some((_c, port)) = test_support::one_session_server().await else {
+        return;
+    };
+    let handle = authenticate(&test_support::config(port)).await.unwrap();
+    let lister = handle.lister().await.unwrap();
+    let e = handle
+        .open_session()
+        .await
+        .err()
+        .expect("one session at a time");
+    assert!(e.to_string().contains("SFTP SSH error"), "{e}");
+    lister.close().await;
+    let session = handle
+        .open_session()
+        .await
+        .expect("the listing's session is freed");
+    session.canonicalize(".").await.unwrap();
+    for _ in 0..5 {
+        let handle = authenticate(&test_support::config(port)).await.unwrap();
+        let lister = handle.lister().await.unwrap();
+        lister.list_dir("/data", 10, |_, _| true).await.unwrap();
+        lister.close().await;
+        let session = handle
+            .open_session()
+            .await
+            .expect("the listing's session is freed");
+        session.canonicalize(".").await.unwrap();
+    }
+}
