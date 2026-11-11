@@ -867,6 +867,9 @@ fn connection_string_pairs(value: &str) -> Option<Vec<(String, String)>> {
 /// parser HTTP clients use, so `\\` ends its authority as `/` does. A host
 /// taken from a `${…}` token is returned lower-cased as written.
 pub fn url_hosts(value: &str) -> Vec<String> {
+    if let Some(read) = MongoRead::read(value) {
+        return read.tcp_hosts();
+    }
     let value = whatwg_preprocess(value);
     let value = value.as_ref();
     if let Some(read) = MongoRead::read(value) {
@@ -2223,6 +2226,16 @@ impl ReferencePolicy {
     /// parser reads it ([`whatwg_preprocess`]). Under a policy with path
     /// roots, a value still holding a control character is refused.
     fn check_plain_url(&self, value: &str) -> Result<(), Refusal> {
+        if let Some(read) = MongoRead::read(value) {
+            if self.path_roots.is_some() && value.chars().any(char::is_control) {
+                return Err(Refusal::new(
+                    RefusalKind::Url,
+                    value.escape_debug().to_string(),
+                    "a URL may not contain control characters",
+                ));
+            }
+            return self.check_mongo(value, &read);
+        }
         let value = whatwg_preprocess(value);
         let value = value.as_ref();
         if self.path_roots.is_some() && value.chars().any(char::is_control) {
@@ -4837,6 +4850,10 @@ mod tests {
                 ("tlscertificatekeyfile".to_string(), "/x".to_string()),
                 ("k".to_string(), String::new())
             ]
+        );
+        assert_eq!(
+            url_hosts("mongodb://n4o\u{1}"),
+            vec!["n4o\u{1}".to_string()]
         );
         assert!(MongoRead::read("mongodb:/h").is_none());
         assert!(MongoRead::read("postgres://h").is_none());

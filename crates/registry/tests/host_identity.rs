@@ -236,6 +236,50 @@ fn host_identity_follows_the_selected_credentials() {
         let aws = json!({"connection_uri": "mongodb://db.example/?authMechanism=MONGODB-AWS"});
         assert_eq!(fields(Role::Source, "mongodb", aws), vec!["connection_uri"]);
     }
+    let aws = json!({"connection_uri": "mongodb://db.example/?authMechanism=MONGODB-AWS"});
+    let plain = json!({"connection_uri": "mongodb://db.example/?directConnection=true"});
+    #[cfg(feature = "sink-mongodb")]
+    {
+        assert_eq!(
+            fields(Role::Sink, "mongodb", aws.clone()),
+            vec!["connection_uri"]
+        );
+        assert!(fields(Role::Sink, "mongodb", plain.clone()).is_empty());
+    }
+    #[cfg(feature = "source-mongodb-cdc")]
+    {
+        assert_eq!(
+            fields(Role::Source, "mongodb-cdc", aws.clone()),
+            vec!["connection_uri"]
+        );
+        assert!(fields(Role::Source, "mongodb-cdc", plain.clone()).is_empty());
+    }
+    let _ = (aws, plain);
+    #[cfg(feature = "sink-databricks")]
+    {
+        let cloud = json!({"staging": {"location": "s3://b/p/"}});
+        assert_eq!(
+            fields(Role::Sink, "databricks", cloud),
+            vec!["staging.credentials"]
+        );
+        let volume = json!({"staging": {"location": "/Volumes/c/s/v/p"}});
+        assert!(fields(Role::Sink, "databricks", volume).is_empty());
+    }
+    #[cfg(feature = "source-databricks")]
+    assert!(fields(Role::Source, "databricks", json!({})).is_empty());
+    #[cfg(feature = "source-mssql")]
+    assert!(fields(Role::Source, "mssql", json!({})).is_empty());
+    #[cfg(feature = "source-snowflake")]
+    assert!(fields(Role::Source, "snowflake", json!({})).is_empty());
+    #[cfg(feature = "source-clickhouse")]
+    assert!(fields(Role::Source, "clickhouse", json!({})).is_empty());
+    #[cfg(feature = "source-oracle")]
+    {
+        let os = json!({"connect_string": "//db.example/svc", "external_auth": true});
+        assert_eq!(fields(Role::Source, "oracle", os), vec!["external_auth"]);
+        let plain = json!({"connect_string": "//db.example/svc", "username": "u"});
+        assert!(fields(Role::Source, "oracle", plain).is_empty());
+    }
 }
 
 /// The connectors whose identity can come from what they learn at run time
