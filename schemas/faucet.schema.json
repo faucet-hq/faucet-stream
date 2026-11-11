@@ -12990,6 +12990,13 @@
               "default": null,
               "x-faucet-resource": "url"
             },
+            "credentials": {
+              "description": "How to authenticate (default: the AWS default chain, i.e. the\nidentity of the host faucet runs on). `access_key` names keys in the\nconfig; `anonymous` sends unsigned requests (public buckets).",
+              "$ref": "#/$defs/source_parquet__S3Credentials",
+              "default": {
+                "type": "default"
+              }
+            },
             "type": {
               "type": "string",
               "const": "s3"
@@ -15192,11 +15199,28 @@
           "x-faucet-resource": "url"
         },
         "storage_options": {
-          "description": "Extra `object_store` config keys for the upload client (credentials,\nregion, endpoint, …), applied verbatim — e.g. `aws_access_key_id`,\n`aws_secret_access_key`, `aws_region`, `google_service_account_key`.\nPrefer `${secret:…}` / `${env:…}` interpolation for secret values.",
+          "description": "Extra `object_store` config keys for the upload client (credentials,\nregion, endpoint, …), applied verbatim — e.g. `aws_access_key_id`,\n`aws_secret_access_key`, `aws_region`, `google_service_account_key`.\nPrefer `${secret:…}` / `${env:…}` interpolation for secret values.\n\nKeys that name an endpoint (`*endpoint*`, `*_url`, `*_uri`, a proxy)\nor a local file (`*_file`, `*_path`, a service-account or\napplication-credentials file) are checked like the typed fields by a\nhost that confines configs (`faucet serve`).",
           "type": "object",
           "additionalProperties": {
             "type": "string"
+          },
+          "x-faucet-resource-keys": {
+            "*endpoint*": "url",
+            "*_url": "url",
+            "*_uri": "url",
+            "*_host": "url",
+            "*proxy": "url",
+            "*authority_host": "url",
+            "*_file": "path",
+            "*_path": "path",
+            "*application_credentials": "path",
+            "google_service_account": "path",
+            "service_account": "path"
           }
+        },
+        "credentials": {
+          "description": "How the upload client authenticates (default: the store's default\nchain, i.e. the identity of the host faucet runs on, unless\n`storage_options` names credentials). Keys in `storage_options` win.",
+          "$ref": "#/$defs/sink_snowflake__StagingCredentials"
         },
         "match_by_column_name": {
           "description": "`MATCH_BY_COLUMN_NAME` COPY option — defaults to `CASE_INSENSITIVE` so\nParquet columns map to table columns by name. Set to `NONE` for\npositional loading (rarely wanted for Parquet).",
@@ -15534,6 +15558,10 @@
             "string",
             "null"
           ]
+        },
+        "credentials": {
+          "description": "How faucet authenticates to the stage when it writes the files\n(default: the store's default chain, i.e. the identity of the host\nfaucet runs on). The warehouse reads them with its own grant.",
+          "$ref": "#/$defs/sink_mssql__StagingCredentials"
         },
         "storage_account": {
           "description": "Azure storage account (the `az://` URI does not carry it) used to build\nthe `COPY INTO` HTTPS URL.",
@@ -18791,6 +18819,13 @@
               "default": null,
               "x-faucet-resource": "url"
             },
+            "credentials": {
+              "description": "How to authenticate (default: the AWS default chain, i.e. the\nidentity of the host faucet runs on). `access_key` names keys in the\nconfig; `anonymous` sends unsigned requests.",
+              "$ref": "#/$defs/sink_parquet__S3Credentials",
+              "default": {
+                "type": "default"
+              }
+            },
             "allow_http": {
               "description": "Accepted for compatibility: the S3 client takes an `http://`\n`endpoint_url` (e.g. for LocalStack) without it.",
               "type": [
@@ -20400,6 +20435,10 @@
             "null"
           ],
           "x-faucet-resource": "url"
+        },
+        "credentials": {
+          "description": "How the S3 client that stages the files authenticates (default: the\nAWS default chain, i.e. the identity of the host faucet runs on).\n`access_key` names keys in the config.",
+          "$ref": "#/$defs/sink_redshift__S3Credentials"
         }
       },
       "additionalProperties": true
@@ -20576,6 +20615,10 @@
             "string",
             "null"
           ]
+        },
+        "credentials": {
+          "description": "How faucet authenticates to the stage when it writes the files\n(default: the store's default chain, i.e. the identity of the host\nfaucet runs on). The warehouse reads them with its own grant.",
+          "$ref": "#/$defs/sink_clickhouse__StagingCredentials"
         },
         "region": {
           "description": "AWS region for the derived `s3()` URL (virtual-hosted). Ignored for `gs://`.",
@@ -21637,6 +21680,10 @@
             "string",
             "null"
           ]
+        },
+        "credentials": {
+          "description": "How faucet authenticates to a cloud location when it uploads the\nfiles (default: the store's default chain, i.e. the identity of the\nhost faucet runs on). Must stay unset for a volume, which uploads with\nthe sink's own credentials.",
+          "$ref": "#/$defs/sink_databricks__StagingCredentials"
         }
       },
       "additionalProperties": true
@@ -25272,6 +25319,13 @@
                       ],
                       "default": null,
                       "x-faucet-resource": "url"
+                    },
+                    "credentials": {
+                      "description": "How to authenticate (default: the AWS default chain, i.e. the\nidentity of the host faucet runs on). `access_key` names keys in the\nconfig; `anonymous` sends unsigned requests (public buckets).",
+                      "$ref": "#/$defs/source_s3__S3Credentials",
+                      "default": {
+                        "type": "default"
+                      }
                     },
                     "file_format": {
                       "description": "Format of the files to read. Defaults to `json_lines`.",
@@ -32848,6 +32902,13 @@
                       ],
                       "x-faucet-resource": "url"
                     },
+                    "credentials": {
+                      "description": "How to authenticate (default: the AWS default chain, i.e. the\nidentity of the host faucet runs on). `access_key` names keys in the\nconfig; `anonymous` sends unsigned requests (public buckets).",
+                      "$ref": "#/$defs/sink_s3__S3Credentials",
+                      "default": {
+                        "type": "default"
+                      }
+                    },
                     "file_extension": {
                       "description": "File extension for written objects (default: `.jsonl`). Not used when\n`path` is set.",
                       "type": "string",
@@ -36543,6 +36604,1079 @@
             "type"
           ],
           "additionalProperties": false
+        }
+      ]
+    },
+    "source_s3__S3Credentials": {
+      "description": "How to authenticate with S3.\n\nSerializes as `{ type: <method>, config: { … } }`, the auth wire shape\nevery faucet connector shares (the Kinesis / SQS / DynamoDB connectors use\nthe same variants).",
+      "oneOf": [
+        {
+          "description": "The AWS SDK default provider chain: environment variables, shared\nconfig/credentials files, container credentials, web-identity tokens\nand the instance profile. The identity of the host faucet runs on.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "default"
+            }
+          }
+        },
+        {
+          "description": "A named profile from the shared AWS config/credentials files.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "profile"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "description": "Profile name (as in `~/.aws/credentials`).",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Static access keys. Prefer `${env:…}` / secrets-manager interpolation\nover literals in config files.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "access_key"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "access_key_id": {
+                  "description": "AWS access key id.",
+                  "type": "string"
+                },
+                "secret_access_key": {
+                  "description": "AWS secret access key.",
+                  "type": "string"
+                },
+                "session_token": {
+                  "description": "Optional session token (for temporary credentials).",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Assume an IAM role via STS on top of the default provider chain.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "assume_role"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "role_arn": {
+                  "description": "ARN of the role to assume.",
+                  "type": "string"
+                },
+                "session_name": {
+                  "description": "Session name recorded in CloudTrail. Defaults to `faucet-stream`.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "external_id": {
+                  "description": "Optional external id for cross-account trust policies.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Web-identity federation (`AWS_WEB_IDENTITY_TOKEN_FILE` +\n`AWS_ROLE_ARN`), resolved by the default chain.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "web_identity"
+            }
+          }
+        },
+        {
+          "description": "Unsigned requests, for public buckets.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "anonymous"
+            }
+          }
+        }
+      ]
+    },
+    "source_parquet__S3Credentials": {
+      "description": "How to authenticate with S3.\n\nSerializes as `{ type: <method>, config: { … } }`, the auth wire shape\nevery faucet connector shares (the Kinesis / SQS / DynamoDB connectors use\nthe same variants).",
+      "oneOf": [
+        {
+          "description": "The AWS SDK default provider chain: environment variables, shared\nconfig/credentials files, container credentials, web-identity tokens\nand the instance profile. The identity of the host faucet runs on.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "default"
+            }
+          }
+        },
+        {
+          "description": "A named profile from the shared AWS config/credentials files.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "profile"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "description": "Profile name (as in `~/.aws/credentials`).",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Static access keys. Prefer `${env:…}` / secrets-manager interpolation\nover literals in config files.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "access_key"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "access_key_id": {
+                  "description": "AWS access key id.",
+                  "type": "string"
+                },
+                "secret_access_key": {
+                  "description": "AWS secret access key.",
+                  "type": "string"
+                },
+                "session_token": {
+                  "description": "Optional session token (for temporary credentials).",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Assume an IAM role via STS on top of the default provider chain.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "assume_role"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "role_arn": {
+                  "description": "ARN of the role to assume.",
+                  "type": "string"
+                },
+                "session_name": {
+                  "description": "Session name recorded in CloudTrail. Defaults to `faucet-stream`.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "external_id": {
+                  "description": "Optional external id for cross-account trust policies.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Web-identity federation (`AWS_WEB_IDENTITY_TOKEN_FILE` +\n`AWS_ROLE_ARN`), resolved by the default chain.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "web_identity"
+            }
+          }
+        },
+        {
+          "description": "Unsigned requests, for public buckets.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "anonymous"
+            }
+          }
+        }
+      ]
+    },
+    "sink_snowflake__StagingCredentials": {
+      "description": "How faucet authenticates to a staging location. Serializes as\n`{ type: <method>, config: { … } }`, the variant shapes of the S3, GCS and\nAzure connectors' credentials.",
+      "oneOf": [
+        {
+          "description": "The store's default chain (environment, instance or workload role,\nlocal credential files): the identity of the host faucet runs on.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "default"
+            }
+          }
+        },
+        {
+          "description": "Static S3 access keys (`s3://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "access_key"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "access_key_id": {
+                  "description": "Access key id.",
+                  "type": "string"
+                },
+                "secret_access_key": {
+                  "description": "Secret access key.",
+                  "type": "string"
+                },
+                "session_token": {
+                  "description": "Optional session token (temporary credentials).",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "A GCS service-account JSON key file (`gs://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "service_account_json_file"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "description": "Path to the key file.",
+                  "type": "string",
+                  "x-faucet-resource": "path"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "A GCS service-account JSON key, inline (`gs://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "service_account_json_inline"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "json": {
+                  "description": "The key JSON.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "An Azure storage-account access key (`az://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "account_key"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "account_key": {
+                  "description": "Base64 account key.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "An Azure shared-access-signature token (`az://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "sas_token"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "sas_token": {
+                  "description": "SAS token string.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "sink_mssql__StagingCredentials": {
+      "description": "How faucet authenticates to a staging location. Serializes as\n`{ type: <method>, config: { … } }`, the variant shapes of the S3, GCS and\nAzure connectors' credentials.",
+      "oneOf": [
+        {
+          "description": "The store's default chain (environment, instance or workload role,\nlocal credential files): the identity of the host faucet runs on.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "default"
+            }
+          }
+        },
+        {
+          "description": "Static S3 access keys (`s3://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "access_key"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "access_key_id": {
+                  "description": "Access key id.",
+                  "type": "string"
+                },
+                "secret_access_key": {
+                  "description": "Secret access key.",
+                  "type": "string"
+                },
+                "session_token": {
+                  "description": "Optional session token (temporary credentials).",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "A GCS service-account JSON key file (`gs://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "service_account_json_file"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "description": "Path to the key file.",
+                  "type": "string",
+                  "x-faucet-resource": "path"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "A GCS service-account JSON key, inline (`gs://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "service_account_json_inline"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "json": {
+                  "description": "The key JSON.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "An Azure storage-account access key (`az://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "account_key"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "account_key": {
+                  "description": "Base64 account key.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "An Azure shared-access-signature token (`az://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "sas_token"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "sas_token": {
+                  "description": "SAS token string.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "sink_s3__S3Credentials": {
+      "description": "How to authenticate with S3.\n\nSerializes as `{ type: <method>, config: { … } }`, the auth wire shape\nevery faucet connector shares (the Kinesis / SQS / DynamoDB connectors use\nthe same variants).",
+      "oneOf": [
+        {
+          "description": "The AWS SDK default provider chain: environment variables, shared\nconfig/credentials files, container credentials, web-identity tokens\nand the instance profile. The identity of the host faucet runs on.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "default"
+            }
+          }
+        },
+        {
+          "description": "A named profile from the shared AWS config/credentials files.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "profile"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "description": "Profile name (as in `~/.aws/credentials`).",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Static access keys. Prefer `${env:…}` / secrets-manager interpolation\nover literals in config files.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "access_key"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "access_key_id": {
+                  "description": "AWS access key id.",
+                  "type": "string"
+                },
+                "secret_access_key": {
+                  "description": "AWS secret access key.",
+                  "type": "string"
+                },
+                "session_token": {
+                  "description": "Optional session token (for temporary credentials).",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Assume an IAM role via STS on top of the default provider chain.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "assume_role"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "role_arn": {
+                  "description": "ARN of the role to assume.",
+                  "type": "string"
+                },
+                "session_name": {
+                  "description": "Session name recorded in CloudTrail. Defaults to `faucet-stream`.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "external_id": {
+                  "description": "Optional external id for cross-account trust policies.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Web-identity federation (`AWS_WEB_IDENTITY_TOKEN_FILE` +\n`AWS_ROLE_ARN`), resolved by the default chain.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "web_identity"
+            }
+          }
+        },
+        {
+          "description": "Unsigned requests, for public buckets.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "anonymous"
+            }
+          }
+        }
+      ]
+    },
+    "sink_parquet__S3Credentials": {
+      "description": "How to authenticate with S3.\n\nSerializes as `{ type: <method>, config: { … } }`, the auth wire shape\nevery faucet connector shares (the Kinesis / SQS / DynamoDB connectors use\nthe same variants).",
+      "oneOf": [
+        {
+          "description": "The AWS SDK default provider chain: environment variables, shared\nconfig/credentials files, container credentials, web-identity tokens\nand the instance profile. The identity of the host faucet runs on.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "default"
+            }
+          }
+        },
+        {
+          "description": "A named profile from the shared AWS config/credentials files.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "profile"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "description": "Profile name (as in `~/.aws/credentials`).",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Static access keys. Prefer `${env:…}` / secrets-manager interpolation\nover literals in config files.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "access_key"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "access_key_id": {
+                  "description": "AWS access key id.",
+                  "type": "string"
+                },
+                "secret_access_key": {
+                  "description": "AWS secret access key.",
+                  "type": "string"
+                },
+                "session_token": {
+                  "description": "Optional session token (for temporary credentials).",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Assume an IAM role via STS on top of the default provider chain.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "assume_role"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "role_arn": {
+                  "description": "ARN of the role to assume.",
+                  "type": "string"
+                },
+                "session_name": {
+                  "description": "Session name recorded in CloudTrail. Defaults to `faucet-stream`.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "external_id": {
+                  "description": "Optional external id for cross-account trust policies.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Web-identity federation (`AWS_WEB_IDENTITY_TOKEN_FILE` +\n`AWS_ROLE_ARN`), resolved by the default chain.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "web_identity"
+            }
+          }
+        },
+        {
+          "description": "Unsigned requests, for public buckets.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "anonymous"
+            }
+          }
+        }
+      ]
+    },
+    "sink_redshift__S3Credentials": {
+      "description": "How to authenticate with S3.\n\nSerializes as `{ type: <method>, config: { … } }`, the auth wire shape\nevery faucet connector shares (the Kinesis / SQS / DynamoDB connectors use\nthe same variants).",
+      "oneOf": [
+        {
+          "description": "The AWS SDK default provider chain: environment variables, shared\nconfig/credentials files, container credentials, web-identity tokens\nand the instance profile. The identity of the host faucet runs on.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "default"
+            }
+          }
+        },
+        {
+          "description": "A named profile from the shared AWS config/credentials files.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "profile"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "description": "Profile name (as in `~/.aws/credentials`).",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Static access keys. Prefer `${env:…}` / secrets-manager interpolation\nover literals in config files.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "access_key"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "access_key_id": {
+                  "description": "AWS access key id.",
+                  "type": "string"
+                },
+                "secret_access_key": {
+                  "description": "AWS secret access key.",
+                  "type": "string"
+                },
+                "session_token": {
+                  "description": "Optional session token (for temporary credentials).",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Assume an IAM role via STS on top of the default provider chain.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "assume_role"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "role_arn": {
+                  "description": "ARN of the role to assume.",
+                  "type": "string"
+                },
+                "session_name": {
+                  "description": "Session name recorded in CloudTrail. Defaults to `faucet-stream`.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "external_id": {
+                  "description": "Optional external id for cross-account trust policies.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Web-identity federation (`AWS_WEB_IDENTITY_TOKEN_FILE` +\n`AWS_ROLE_ARN`), resolved by the default chain.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "web_identity"
+            }
+          }
+        },
+        {
+          "description": "Unsigned requests, for public buckets.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "anonymous"
+            }
+          }
+        }
+      ]
+    },
+    "sink_clickhouse__StagingCredentials": {
+      "description": "How faucet authenticates to a staging location. Serializes as\n`{ type: <method>, config: { … } }`, the variant shapes of the S3, GCS and\nAzure connectors' credentials.",
+      "oneOf": [
+        {
+          "description": "The store's default chain (environment, instance or workload role,\nlocal credential files): the identity of the host faucet runs on.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "default"
+            }
+          }
+        },
+        {
+          "description": "Static S3 access keys (`s3://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "access_key"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "access_key_id": {
+                  "description": "Access key id.",
+                  "type": "string"
+                },
+                "secret_access_key": {
+                  "description": "Secret access key.",
+                  "type": "string"
+                },
+                "session_token": {
+                  "description": "Optional session token (temporary credentials).",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "A GCS service-account JSON key file (`gs://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "service_account_json_file"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "description": "Path to the key file.",
+                  "type": "string",
+                  "x-faucet-resource": "path"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "A GCS service-account JSON key, inline (`gs://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "service_account_json_inline"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "json": {
+                  "description": "The key JSON.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "An Azure storage-account access key (`az://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "account_key"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "account_key": {
+                  "description": "Base64 account key.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "An Azure shared-access-signature token (`az://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "sas_token"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "sas_token": {
+                  "description": "SAS token string.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "sink_databricks__StagingCredentials": {
+      "description": "How faucet authenticates to a staging location. Serializes as\n`{ type: <method>, config: { … } }`, the variant shapes of the S3, GCS and\nAzure connectors' credentials.",
+      "oneOf": [
+        {
+          "description": "The store's default chain (environment, instance or workload role,\nlocal credential files): the identity of the host faucet runs on.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "default"
+            }
+          }
+        },
+        {
+          "description": "Static S3 access keys (`s3://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "access_key"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "access_key_id": {
+                  "description": "Access key id.",
+                  "type": "string"
+                },
+                "secret_access_key": {
+                  "description": "Secret access key.",
+                  "type": "string"
+                },
+                "session_token": {
+                  "description": "Optional session token (temporary credentials).",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "A GCS service-account JSON key file (`gs://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "service_account_json_file"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "description": "Path to the key file.",
+                  "type": "string",
+                  "x-faucet-resource": "path"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "A GCS service-account JSON key, inline (`gs://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "service_account_json_inline"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "json": {
+                  "description": "The key JSON.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "An Azure storage-account access key (`az://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "account_key"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "account_key": {
+                  "description": "Base64 account key.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "An Azure shared-access-signature token (`az://`).",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "sas_token"
+            },
+            "config": {
+              "type": "object",
+              "properties": {
+                "sas_token": {
+                  "description": "SAS token string.",
+                  "type": "string"
+                }
+              }
+            }
+          }
         }
       ]
     }
