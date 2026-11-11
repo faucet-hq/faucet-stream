@@ -1036,7 +1036,7 @@ impl ForeignMasking {
         Some(env.payload)
     }
 
-    /// Whether [`Self::apply`] leaves `env` out of the replay.
+    /// Whether `apply` leaves `env` out of the replay.
     pub fn refuses(&self, env: &UnwrappedEnvelope) -> bool {
         self.apply(env.clone()).is_none()
     }

@@ -118,6 +118,7 @@ async fn a_read_only_failover_admits_nothing_and_the_finished_run_lands_after() 
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let cfg = config(&url);
+    faucet_cli::serve::references::install(cfg.references.clone());
     let history = faucet_cli::serve::history::connect(
         &cfg.history,
         Duration::from_secs(60),
