@@ -64,6 +64,12 @@ pub(crate) async fn write_columnar_in(
     // Build (once) the GCS client, then stage the Parquet object.
     let store: &Storage = gcs_store
         .get_or_try_init(|| async {
+            if matches!(
+                cfg.gcs_auth,
+                faucet_common_gcs::GcsCredentials::ApplicationDefault
+            ) {
+                faucet_core::resolve::require_host_credentials("bigquery", "bulk_load.gcs_auth")?;
+            }
             faucet_common_gcs::build_storage(&cfg.gcs_auth, cfg.storage_host.as_deref()).await
         })
         .await?;

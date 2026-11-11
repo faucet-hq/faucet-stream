@@ -51,11 +51,33 @@ impl std::fmt::Debug for GcsCredentials {
     }
 }
 
+/// The config fields that make a GCS client built from `config` authenticate
+/// with the identity of the host it runs on: `auth` when it selects
+/// `application_default` (also when absent).
+pub fn host_identity(config: &faucet_core::Value) -> Vec<String> {
+    host_identity_at(config, "/auth")
+}
+
+/// [`host_identity`] for credentials at another JSON pointer.
+pub fn host_identity_at(config: &faucet_core::Value, pointer: &str) -> Vec<String> {
+    let tag = faucet_core::capabilities::config::tag_at(config, pointer);
+    if tag.unwrap_or("application_default") == "application_default" {
+        vec![pointer.trim_start_matches('/').replace('/', ".")]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Build a `google_cloud_auth::credentials::Credentials` from a faucet
-/// credential spec. All failures map to `FaucetError::Auth`.
+/// credential spec. All failures map to `FaucetError::Auth`; Application
+/// Default Credentials are refused where the task may not use the host's
+/// identity.
 pub async fn build_credentials(
     creds: &GcsCredentials,
 ) -> Result<google_cloud_auth::credentials::Credentials, FaucetError> {
+    if matches!(creds, GcsCredentials::ApplicationDefault) {
+        faucet_core::resolve::require_host_credentials("gcs", "auth")?;
+    }
     match creds {
         GcsCredentials::ApplicationDefault => google_cloud_auth::credentials::Builder::default()
             .build()
@@ -198,6 +220,42 @@ pub fn refuse_held_credentials_off_google(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_identity_follows_the_selected_credentials() {
+        use faucet_core::json;
+        assert_eq!(host_identity(&json!({})), vec!["auth"]);
+        assert_eq!(
+            host_identity(&json!({"auth": {"type": "application_default"}})),
+            vec!["auth"]
+        );
+        for t in [
+            "anonymous",
+            "service_account_json_file",
+            "service_account_json_inline",
+        ] {
+            assert!(
+                host_identity(&json!({"auth": {"type": t}})).is_empty(),
+                "{t}"
+            );
+        }
+        assert_eq!(
+            host_identity_at(&json!({"bulk_load": {}}), "/bulk_load/gcs_auth"),
+            vec!["bulk_load.gcs_auth"]
+        );
+    }
+
+    #[tokio::test]
+    async fn ambient_clients_are_refused_inside_a_caller_run() {
+        faucet_core::resolve::with_host_credentials(false, async {
+            let err = build_credentials(&GcsCredentials::ApplicationDefault)
+                .await
+                .expect_err("refused");
+            assert!(err.to_string().contains("gcs: `auth`"), "{err}");
+            assert!(build_credentials(&GcsCredentials::Anonymous).await.is_ok());
+        })
+        .await;
+    }
     use serde_json::json;
 
     #[tokio::test]

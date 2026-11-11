@@ -60,11 +60,33 @@ impl std::fmt::Debug for BigQueryCredentials {
     }
 }
 
+/// The config fields that make a BigQuery client built from `config`
+/// authenticate with the identity of the host it runs on: `auth` when it
+/// selects `application_default`.
+pub fn host_identity(config: &faucet_core::Value) -> Vec<String> {
+    if faucet_core::capabilities::config::tag_at(config, "/auth") == Some("application_default") {
+        vec!["auth".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Refuse Application Default Credentials where the task may not use the
+/// host's identity.
+pub fn check_host_identity(creds: &BigQueryCredentials) -> Result<(), FaucetError> {
+    if matches!(creds, BigQueryCredentials::ApplicationDefault) {
+        faucet_core::resolve::require_host_credentials("bigquery", "auth")?;
+    }
+    Ok(())
+}
+
 /// Build a [`gcp_bigquery_client::Client`] from a faucet credential spec.
 ///
 /// Returns [`FaucetError::Auth`] on authentication failures and on inline
-/// service-account JSON that fails to parse.
+/// service-account JSON that fails to parse, and refuses what
+/// [`check_host_identity`] refuses.
 pub async fn build_client(creds: &BigQueryCredentials) -> Result<Client, FaucetError> {
+    check_host_identity(creds)?;
     let mut builder = gcp_bigquery_client::client_builder::ClientBuilder::new();
     builder.with_client(http_client()?);
     match creds {
@@ -103,6 +125,7 @@ pub const BQ_OAUTH_SCOPE: &str = "https://www.googleapis.com/auth/bigquery";
 /// so the token is cached until shortly before it expires; building and
 /// minting are bounded by [`TOKEN_MINT_TIMEOUT`].
 pub async fn access_token(creds: &BigQueryCredentials) -> Result<String, FaucetError> {
+    check_host_identity(creds)?;
     access_token_bq(creds).await.map_err(auth_error)
 }
 
@@ -110,6 +133,7 @@ pub async fn access_token(creds: &BigQueryCredentials) -> Result<String, FaucetE
 /// refreshes it shortly before expiry, so every request made through it reuses
 /// one token instead of minting a new one.
 pub async fn token_provider(creds: &BigQueryCredentials) -> Result<TokenProvider, FaucetError> {
+    check_host_identity(creds)?;
     token_provider_bq(creds).await.map_err(auth_error)
 }
 
@@ -337,6 +361,39 @@ fn http_client() -> Result<reqwest_bq::Client, FaucetError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_identity_follows_the_selected_credentials() {
+        use faucet_core::json;
+        assert_eq!(
+            host_identity(&json!({"auth": {"type": "application_default"}})),
+            vec!["auth"]
+        );
+        assert!(
+            host_identity(
+                &json!({"auth": {"type": "service_account_key_path", "config": {"path": "k"}}})
+            )
+            .is_empty()
+        );
+        assert!(host_identity(&json!({})).is_empty());
+    }
+
+    #[tokio::test]
+    async fn ambient_clients_are_refused_inside_a_caller_run() {
+        faucet_core::resolve::with_host_credentials(false, async {
+            let adc = BigQueryCredentials::ApplicationDefault;
+            for err in [
+                build_client(&adc).await.err(),
+                access_token(&adc).await.err(),
+                token_provider(&adc).await.err(),
+                build_client_with_tokens(&adc).await.err(),
+            ] {
+                let err = err.expect("refused").to_string();
+                assert!(err.contains("bigquery: `auth`"), "{err}");
+            }
+        })
+        .await;
+    }
 
     #[test]
     fn adc_file_location_and_authorized_user_detection() {

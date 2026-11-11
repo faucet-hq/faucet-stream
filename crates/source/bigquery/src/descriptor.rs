@@ -3,7 +3,8 @@ use faucet_core::{Capabilities, ConnectorDescriptor};
 use serde_json::Value;
 
 /// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
-pub const DESCRIPTOR: ConnectorDescriptor = ConnectorDescriptor::new("bigquery", capabilities);
+pub const DESCRIPTOR: ConnectorDescriptor = ConnectorDescriptor::new("bigquery", capabilities)
+    .with_host_identity(faucet_common_bigquery::host_identity);
 
 fn capabilities(config: &Value) -> Capabilities {
     let read_api = config.is_null() || bool_field(config, "read_api", false);
