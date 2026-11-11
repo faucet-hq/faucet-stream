@@ -4994,7 +4994,9 @@ dependencies = [
 name = "faucet-common-iceberg"
 version = "1.2.1"
 dependencies = [
+ "bytes",
  "faucet-core",
+ "futures",
  "hive_metastore",
  "iceberg",
  "iceberg-catalog-glue",
@@ -5011,7 +5013,9 @@ dependencies = [
  "tokio",
  "tracing",
  "typetag",
+ "url",
  "volo-thrift",
+ "wiremock",
 ]
 
 [[package]]

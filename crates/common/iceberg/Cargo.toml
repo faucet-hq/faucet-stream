@@ -14,11 +14,11 @@ categories.workspace = true
 # No default catalog: each connector's `catalog-*` features forward here, so the
 # source and sink gate catalogs identically.
 default = []
-catalog-rest = ["dep:iceberg-catalog-rest", "storage-opendal"]
+catalog-rest = ["dep:iceberg-catalog-rest", "storage-opendal", "dep:url"]
 catalog-glue = ["dep:iceberg-catalog-glue", "storage-opendal"]
 catalog-sql  = ["dep:iceberg-catalog-sql",  "storage-opendal"]
 catalog-hms  = ["dep:iceberg-catalog-hms", "dep:hive_metastore", "dep:volo-thrift", "dep:pilota", "dep:tokio", "dep:tracing", "storage-opendal"]
-storage-opendal = ["dep:iceberg-storage-opendal", "dep:typetag", "dep:reqsign-core"]
+storage-opendal = ["dep:iceberg-storage-opendal", "dep:typetag", "dep:reqsign-core", "dep:bytes", "dep:futures"]
 
 [dependencies]
 faucet-core.workspace = true
@@ -39,9 +39,13 @@ iceberg-storage-opendal = { version = "0.10.0", default-features = false, featur
 typetag = { version = "0.2", optional = true }
 # The S3 credential loader the storage factory installs (`storage_factory.rs`).
 reqsign-core = { version = "3.3", optional = true }
+bytes = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wiremock = "0.6"
 serde_json.workspace = true
 tempfile = "3"
 

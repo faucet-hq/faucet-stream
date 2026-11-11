@@ -63,6 +63,12 @@ async fn build_rest(inner: &CatalogInner) -> Result<Arc<dyn Catalog>, FaucetErro
         props.insert("token".to_string(), credential.clone());
     }
 
+    if let Some(policy) =
+        faucet_core::http::current_reference_policy().filter(|p| p.path_roots().is_some())
+    {
+        check_rest_config(&props, &policy).await?;
+    }
+
     let catalog = RestCatalogBuilder::default()
         .with_storage_factory(crate::storage_factory::rest_storage_factory())
         .load(crate::CATALOG_NAME, props)
@@ -70,6 +76,136 @@ async fn build_rest(inner: &CatalogInner) -> Result<Arc<dyn Catalog>, FaucetErro
         .map_err(|e| FaucetError::Config(format!("iceberg: REST catalog init failed: {e}")))?;
 
     Ok(Arc::new(catalog))
+}
+
+/// Read the REST catalog's `/v1/config` the way the catalog client will, and
+/// refuse server settings that would move it where `policy` does not allow: a
+/// `uri` override on another host, or a `uri` / `oauth2-server-uri` the
+/// policy refuses.
+#[cfg(feature = "catalog-rest")]
+async fn check_rest_config(
+    props: &HashMap<String, String>,
+    policy: &faucet_core::resolve::ReferencePolicy,
+) -> Result<(), FaucetError> {
+    let uri = props.get("uri").map(String::as_str).unwrap_or_default();
+    let base = url::Url::parse(uri)
+        .map_err(|e| FaucetError::Config(format!("iceberg: REST catalog `uri`: {e}")))?;
+    let client = faucet_core::http::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let ctx = faucet_core::CallContext::new();
+    let token = match (props.get("token"), props.get("credential")) {
+        (Some(t), _) => Some(t.clone()),
+        (None, Some(credential)) => Some(rest_token(&client, &ctx, uri, props, credential).await?),
+        (None, None) => None,
+    };
+    let mut config_url = url::Url::parse(&format!("{}/v1/config", uri.trim_end_matches('/')))
+        .map_err(|e| FaucetError::Config(format!("iceberg: REST catalog `uri`: {e}")))?;
+    if let Some(w) = props.get("warehouse") {
+        config_url.query_pairs_mut().append_pair("warehouse", w);
+    }
+    let resp = client
+        .execute(&ctx, "config", || {
+            let req = client.get(config_url.clone());
+            match &token {
+                Some(t) => req.bearer_auth(t),
+                None => req,
+            }
+        })
+        .await
+        .map_err(|e| {
+            FaucetError::Config(format!(
+                "iceberg: the REST catalog's /v1/config could not be read to check it: {e}"
+            ))
+        })?;
+    let config = client.json_value(resp).await?;
+    let overrides = config.get("overrides");
+    if let Some(over) = overrides
+        .and_then(|o| o.get("uri"))
+        .and_then(|v| v.as_str())
+    {
+        let moved = url::Url::parse(over).map_or(true, |u| {
+            u.host_str() != base.host_str()
+                || u.port_or_known_default() != base.port_or_known_default()
+        });
+        if moved {
+            return Err(FaucetError::Config(format!(
+                "iceberg: the REST catalog's /v1/config moves `uri` to another host ({over}), \
+                 which is not followed for this config"
+            )));
+        }
+    }
+    for key in ["uri", "oauth2-server-uri"] {
+        for layer in ["defaults", "overrides"] {
+            if let Some(v) = config
+                .get(layer)
+                .and_then(|l| l.get(key))
+                .and_then(|v| v.as_str())
+            {
+                policy.check_url(v).map_err(|r| {
+                    FaucetError::Config(format!(
+                        "iceberg: the REST catalog's /v1/config sets `{key}`: {r}"
+                    ))
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A bearer token for `credential` (`client_id:client_secret` or a secret
+/// alone), from the token endpoint the catalog client uses.
+#[cfg(feature = "catalog-rest")]
+async fn rest_token(
+    client: &faucet_core::http::Client,
+    ctx: &faucet_core::CallContext,
+    uri: &str,
+    props: &HashMap<String, String>,
+    credential: &str,
+) -> Result<String, FaucetError> {
+    let endpoint = props
+        .get("oauth2-server-uri")
+        .cloned()
+        .unwrap_or_else(|| format!("{}/v1/oauth/tokens", uri.trim_end_matches('/')));
+    let (id, secret) = match credential.split_once(':') {
+        Some((id, secret)) => (Some(id), secret),
+        None => (None, credential),
+    };
+    let mut form = url::form_urlencoded::Serializer::new(String::new());
+    form.append_pair("grant_type", "client_credentials");
+    if let Some(id) = id {
+        form.append_pair("client_id", id);
+    }
+    form.append_pair("client_secret", secret);
+    form.append_pair(
+        "scope",
+        props.get("scope").map(String::as_str).unwrap_or("catalog"),
+    );
+    let body = form.finish();
+    let resp = client
+        .execute(ctx, "token", || {
+            client
+                .post(endpoint.as_str())
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(body.clone())
+        })
+        .await
+        .map_err(|e| {
+            FaucetError::Config(format!(
+                "iceberg: the REST catalog token could not be fetched to check its config: {e}"
+            ))
+        })?;
+    client
+        .json_value(resp)
+        .await?
+        .get("access_token")
+        .and_then(|t| t.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            FaucetError::Config(
+                "iceberg: the REST catalog token response has no access_token".into(),
+            )
+        })
 }
 
 #[cfg(not(feature = "catalog-rest"))]
@@ -258,6 +394,95 @@ mod tests {
             credential: None,
             properties: Default::default(),
         }
+    }
+
+    #[cfg(feature = "catalog-rest")]
+    #[tokio::test]
+    async fn rest_config_overrides_are_checked_for_callers() {
+        use wiremock::matchers::{body_string_contains, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let same = format!("{}/other-prefix", server.uri());
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .and(query_param("warehouse", "moved"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "defaults": {}, "overrides": {"uri": "http://catalog.elsewhere.example:8181"}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .and(query_param("warehouse", "same"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "defaults": {"oauth2-server-uri": "http://169.254.169.254/token"},
+                "overrides": {"uri": same}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .and(query_param("warehouse", "plain"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "defaults": {}, "overrides": {}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/oauth/tokens"))
+            .and(body_string_contains("client_id=id"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"access_token": "t"})),
+            )
+            .mount(&server)
+            .await;
+        let cfg = |warehouse: &str, props: &[(&str, &str)]| {
+            CatalogConfig::Rest(CatalogInner {
+                uri: Some(server.uri()),
+                warehouse: Some(warehouse.into()),
+                credential: None,
+                properties: props
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            })
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let policy = Arc::new(
+            faucet_core::resolve::ReferencePolicy::deny_all()
+                .with_path_roots(vec![dir.path().to_path_buf()])
+                .any_url_scheme()
+                .any_url_host(),
+        );
+        let caller = |c: CatalogConfig| {
+            let policy = Arc::clone(&policy);
+            async move {
+                faucet_core::http::with_reference_policy(policy, async { build_catalog(&c).await })
+                    .await
+            }
+        };
+
+        assert!(
+            build_catalog(&cfg("moved", &[])).await.is_ok(),
+            "trusted runs"
+        );
+        let e = caller(cfg("moved", &[])).await.err().unwrap();
+        assert!(e.to_string().contains("another host"), "{e}");
+        let e = caller(cfg("same", &[])).await.err().unwrap();
+        assert!(e.to_string().contains("oauth2-server-uri"), "{e}");
+        assert!(
+            caller(cfg("plain", &[("credential", "id:secret")]))
+                .await
+                .is_ok()
+        );
+        assert!(caller(cfg("plain", &[("token", "t")])).await.is_ok());
+        let e = caller(cfg("plain", &[("credential", "nobody")]))
+            .await
+            .err()
+            .unwrap();
+        assert!(e.to_string().contains("token could not be fetched"), "{e}");
+        let e = caller(cfg("missing", &[])).await.err().unwrap();
+        assert!(e.to_string().contains("could not be read"), "{e}");
     }
 
     #[cfg(not(feature = "catalog-rest"))]

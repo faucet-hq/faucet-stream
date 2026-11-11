@@ -223,7 +223,7 @@ fn cloud_factory_gcs(props: &HashMap<String, String>) -> Arc<dyn StorageFactory>
 /// file path's scheme, configured from the catalog properties merged with the
 /// server's config and the table's (vended) config.
 pub fn rest_storage_factory() -> Arc<dyn StorageFactory> {
-    Arc::new(GuardedResolvingFactory)
+    crate::checked::checked(Arc::new(GuardedResolvingFactory))
 }
 
 /// Select an Iceberg `StorageFactory` from a catalog's warehouse URI scheme.
@@ -236,16 +236,19 @@ pub fn select_storage_factory(
     inner: &CatalogInner,
 ) -> Result<Arc<dyn StorageFactory>, FaucetError> {
     let warehouse = inner.warehouse.as_deref().unwrap_or("");
-    match warehouse_scheme(warehouse) {
-        WarehouseScheme::Local => Ok(Arc::new(LocalFsStorageFactory)),
-        WarehouseScheme::S3(_) => Ok(cloud_factory_s3(&inner.properties)),
-        WarehouseScheme::Gcs => Ok(cloud_factory_gcs(&inner.properties)),
-        WarehouseScheme::Unsupported(s) => Err(FaucetError::Config(format!(
-            "iceberg: warehouse scheme '{s}://' has no storage factory; supported \
-             schemes are file://, s3://, s3a://, gs:// (use the REST catalog for \
-             other object stores)"
-        ))),
-    }
+    let factory: Arc<dyn StorageFactory> = match warehouse_scheme(warehouse) {
+        WarehouseScheme::Local => Arc::new(LocalFsStorageFactory),
+        WarehouseScheme::S3(_) => cloud_factory_s3(&inner.properties),
+        WarehouseScheme::Gcs => cloud_factory_gcs(&inner.properties),
+        WarehouseScheme::Unsupported(s) => {
+            return Err(FaucetError::Config(format!(
+                "iceberg: warehouse scheme '{s}://' has no storage factory; supported \
+                 schemes are file://, s3://, s3a://, gs:// (use the REST catalog for \
+                 other object stores)"
+            )));
+        }
+    };
+    Ok(crate::checked::checked(factory))
 }
 
 #[cfg(test)]
