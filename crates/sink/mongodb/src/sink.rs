@@ -33,29 +33,44 @@ const NAMESPACE_EXISTS_CODE: i32 = 48;
 ///
 /// Returns a `Sink` error if the map does not convert to a BSON document.
 fn json_map_to_bson_filter(map: &Map<String, Value>) -> Result<Document, FaucetError> {
-    for (col, v) in map {
+    let doc = MongoDriver::value_to_document(&Value::Object(map.clone()))?;
+    for (col, v) in &doc {
         check_filter_value(col, v)?;
     }
-    MongoDriver::value_to_document(&Value::Object(map.clone()))
+    Ok(doc)
 }
 
-/// Refuse a key or scope value that the server would read as a query
-/// operator (an object with a `$`-prefixed field, at any depth).
-fn check_filter_value(col: &str, v: &Value) -> Result<(), FaucetError> {
-    fn has_operator(v: &Value) -> bool {
+/// Refuse a key or scope value the server would read as a query operator or a
+/// pattern: a document that still has a `$`-prefixed field after extended-JSON
+/// conversion (`$oid`, `$date`, … have already become typed values), or a
+/// regular expression / code value.
+fn check_filter_value(col: &str, v: &Bson) -> Result<(), FaucetError> {
+    fn reads_as_query(v: &Bson) -> bool {
         match v {
-            Value::Object(m) => m.iter().any(|(k, v)| k.starts_with('$') || has_operator(v)),
-            Value::Array(a) => a.iter().any(has_operator),
+            Bson::Document(d) => d
+                .iter()
+                .any(|(k, v)| k.starts_with('$') || reads_as_query(v)),
+            Bson::Array(a) => a.iter().any(reads_as_query),
+            Bson::RegularExpression(_)
+            | Bson::JavaScriptCode(_)
+            | Bson::JavaScriptCodeWithScope(_) => true,
             _ => false,
         }
     }
-    if has_operator(v) {
+    if reads_as_query(v) {
         return Err(FaucetError::Sink(format!(
-            "MongoDB key or scope value for '{col}' contains a field starting with '$'; \
+            "MongoDB key or scope value for '{col}' would be read as a query operator or pattern; \
              only plain values can identify a document"
         )));
     }
     Ok(())
+}
+
+/// [`check_filter_value`] for a JSON value, judged after BSON conversion.
+fn check_filter_json(col: &str, v: &Value) -> Result<(), FaucetError> {
+    let mut m = Map::with_capacity(1);
+    m.insert(col.to_string(), v.clone());
+    json_map_to_bson_filter(&m).map(|_| ())
 }
 
 /// A single planned upsert/delete op, pre-converted to BSON so all conversion
@@ -974,11 +989,11 @@ impl MongoDriver {
         }
         check_key_alignment(key, seen.keys())?;
         for (col, v) in scope {
-            check_filter_value(col, v)?;
+            check_filter_json(col, v)?;
         }
         for kt in seen.keys() {
             for (col, v) in &kt.0 {
-                check_filter_value(col, v)?;
+                check_filter_json(col, v)?;
             }
         }
 
@@ -1785,6 +1800,26 @@ mod tests {
         let mut plain = Map::new();
         plain.insert("id".into(), serde_json::json!({"a": "$not-an-operator"}));
         assert!(super::json_map_to_bson_filter(&plain).is_ok());
+        let mut oid = Map::new();
+        oid.insert(
+            "_id".into(),
+            serde_json::json!({"$oid": "507f1f77bcf86cd799439011"}),
+        );
+        let doc = super::json_map_to_bson_filter(&oid).expect("an ObjectId key is a plain value");
+        assert!(matches!(doc.get("_id"), Some(Bson::ObjectId(_))));
+        let mut date = Map::new();
+        date.insert(
+            "at".into(),
+            serde_json::json!({"$date": "2026-01-01T00:00:00Z"}),
+        );
+        assert!(super::json_map_to_bson_filter(&date).is_ok());
+        let mut regex = Map::new();
+        regex.insert(
+            "id".into(),
+            serde_json::json!({"$regularExpression": {"pattern": ".*", "options": ""}}),
+        );
+        assert!(super::json_map_to_bson_filter(&regex).is_err());
+        assert!(super::check_filter_json("id", &serde_json::json!({"$gt": 1})).is_err());
     }
 
     #[test]
