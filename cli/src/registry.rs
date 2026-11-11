@@ -91,6 +91,45 @@ pub fn sink_schema(kind: &str) -> CliResult<Value> {
     Ok(faucet_registry::sink_schema(kind)?)
 }
 
+/// The config schema of a `kind` in `role`, looked up once per process;
+/// `None` for a kind this build does not know.
+pub fn cached_schema(
+    role: crate::sql_bind::ConfigRole,
+    kind: &str,
+) -> Option<std::sync::Arc<Value>> {
+    use crate::sql_bind::ConfigRole;
+    use std::collections::HashMap;
+    use std::sync::{Arc, OnceLock, RwLock};
+    type Cache = RwLock<HashMap<(ConfigRole, String), Option<Arc<Value>>>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let key = (role, kind.to_string());
+    if let Some(hit) = cache.read().ok().and_then(|c| c.get(&key).cloned()) {
+        return hit;
+    }
+    let schema = match role {
+        ConfigRole::Source => source_schema(kind),
+        ConfigRole::Sink => sink_schema(kind),
+        ConfigRole::Transform => crate::transforms::transform_schema(kind),
+    }
+    .ok()
+    .map(Arc::new);
+    if let Ok(mut c) = cache.write() {
+        c.insert(key, schema.clone());
+    }
+    schema
+}
+
+/// [`cached_schema`] for a source (`is_source`) or a sink.
+pub fn cached_connector_schema(is_source: bool, kind: &str) -> Option<std::sync::Arc<Value>> {
+    let role = if is_source {
+        crate::sql_bind::ConfigRole::Source
+    } else {
+        crate::sql_bind::ConfigRole::Sink
+    };
+    cached_schema(role, kind)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -6,8 +6,6 @@ use crate::expand::ExpandedNode;
 use crate::serve::error::ServeError;
 use faucet_core::resolve::{ReferencePolicy, ResourceKind, annotated_fields};
 use serde_json::Value;
-use std::collections::HashMap;
-use std::sync::{Arc, OnceLock, RwLock};
 
 /// One kind's listen fields: the top-level field, its schema default, and
 /// whether the kind can require a shared secret (`auth_token` / `signature`).
@@ -17,21 +15,9 @@ struct KindListeners {
     authenticates: bool,
 }
 
-fn kind_listeners(is_source: bool, kind: &str) -> Arc<KindListeners> {
-    type Cache = RwLock<HashMap<(bool, String), Arc<KindListeners>>>;
-    static CACHE: OnceLock<Cache> = OnceLock::new();
-    let cache = CACHE.get_or_init(Default::default);
-    let key = (is_source, kind.to_string());
-    if let Some(hit) = cache.read().ok().and_then(|c| c.get(&key).cloned()) {
-        return hit;
-    }
-    let schema = if is_source {
-        crate::registry::source_schema(kind).ok()
-    } else {
-        crate::registry::sink_schema(kind).ok()
-    };
+fn kind_listeners(is_source: bool, kind: &str) -> KindListeners {
     let mut out = KindListeners::default();
-    if let Some(schema) = schema {
+    if let Some(schema) = crate::registry::cached_connector_schema(is_source, kind) {
         let props = schema.get("properties");
         out.fields = annotated_fields(&schema)
             .into_iter()
@@ -47,10 +33,6 @@ fn kind_listeners(is_source: bool, kind: &str) -> Arc<KindListeners> {
             .collect();
         out.authenticates =
             props.is_some_and(|p| p.get("auth_token").is_some() || p.get("signature").is_some());
-    }
-    let out = Arc::new(out);
-    if let Ok(mut c) = cache.write() {
-        c.insert(key, Arc::clone(&out));
     }
     out
 }

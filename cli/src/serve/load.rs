@@ -42,14 +42,14 @@ impl BodyOrigin {
 /// declares — empty for a connector that has none or an unknown kind. Read
 /// from the same schema `faucet schema` prints, so a plugin connector that
 /// declares one is confined like a built-in.
-pub fn sandbox_fields(is_source: bool, kind: &str) -> std::sync::Arc<[String]> {
+pub fn sandbox_fields(is_source: bool, kind: &str) -> Vec<String> {
     switch_fields(is_source, kind, Switch::Sandbox)
 }
 
 /// The pin-servers switches (fields annotated `x-faucet-pin-servers`, see
 /// [`faucet_core::resolve::pin_servers_fields`]) a connector's config schema
 /// declares.
-pub fn pin_servers_fields(is_source: bool, kind: &str) -> std::sync::Arc<[String]> {
+pub fn pin_servers_fields(is_source: bool, kind: &str) -> Vec<String> {
     switch_fields(is_source, kind, Switch::PinServers)
 }
 
@@ -60,33 +60,14 @@ enum Switch {
     PinServers,
 }
 
-fn switch_fields(is_source: bool, kind: &str, switch: Switch) -> std::sync::Arc<[String]> {
-    type Cache = std::sync::RwLock<
-        std::collections::HashMap<(bool, String, Switch), std::sync::Arc<[String]>>,
-    >;
-    static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(Default::default);
-    let key = (is_source, kind.to_string(), switch);
-    if let Some(hit) = cache.read().ok().and_then(|c| c.get(&key).cloned()) {
-        return hit;
-    }
-    let schema = if is_source {
-        crate::registry::source_schema(kind)
-    } else {
-        crate::registry::sink_schema(kind)
+fn switch_fields(is_source: bool, kind: &str, switch: Switch) -> Vec<String> {
+    let Some(schema) = crate::registry::cached_connector_schema(is_source, kind) else {
+        return Vec::new();
     };
-    let Ok(schema) = schema else {
-        return std::sync::Arc::from(Vec::new());
-    };
-    let fields: std::sync::Arc<[String]> = match switch {
+    match switch {
         Switch::Sandbox => faucet_core::resolve::sandbox_fields(&schema),
         Switch::PinServers => faucet_core::resolve::pin_servers_fields(&schema),
     }
-    .into();
-    if let Ok(mut c) = cache.write() {
-        c.insert(key, std::sync::Arc::clone(&fields));
-    }
-    fields
 }
 
 /// Whether `faucet serve` confines a source of this kind.

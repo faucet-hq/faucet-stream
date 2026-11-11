@@ -6,28 +6,15 @@ use crate::config::PipelineConfig;
 use crate::expand::ExpandedNode;
 use crate::serve::error::ServeError;
 use serde_json::Value;
-use std::collections::HashMap;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::Arc;
 
 /// A connector's capped fields with their ceilings, and those a caller must
 /// set.
 type Ceilings = (Vec<(String, u64)>, Vec<String>);
 
 fn ceilings(is_source: bool, kind: &str) -> Arc<Ceilings> {
-    type Cache = RwLock<HashMap<(bool, String), Arc<Ceilings>>>;
-    static CACHE: OnceLock<Cache> = OnceLock::new();
-    let cache = CACHE.get_or_init(Default::default);
-    let key = (is_source, kind.to_string());
-    if let Some(hit) = cache.read().ok().and_then(|c| c.get(&key).cloned()) {
-        return hit;
-    }
-    let schema = if is_source {
-        crate::registry::source_schema(kind).ok()
-    } else {
-        crate::registry::sink_schema(kind).ok()
-    };
-    let out = Arc::new(
-        schema
+    Arc::new(
+        crate::registry::cached_connector_schema(is_source, kind)
             .map(|s| {
                 (
                     faucet_core::resolve::caller_max_fields(&s),
@@ -35,11 +22,7 @@ fn ceilings(is_source: bool, kind: &str) -> Arc<Ceilings> {
                 )
             })
             .unwrap_or_default(),
-    );
-    if let Ok(mut c) = cache.write() {
-        c.insert(key, Arc::clone(&out));
-    }
-    out
+    )
 }
 
 /// Why one connector's config lifts a bound a caller may not, if it does.

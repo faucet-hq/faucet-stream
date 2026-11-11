@@ -359,27 +359,10 @@ pub enum ConfigRole {
 }
 
 /// The fields of a `kind` config marked `x-faucet-code` in its schema.
-pub fn code_fields(role: ConfigRole, kind: &str) -> std::sync::Arc<[String]> {
-    type Cache = std::sync::RwLock<HashMap<(ConfigRole, String), std::sync::Arc<[String]>>>;
-    static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(Default::default);
-    let key = (role, kind.to_string());
-    if let Some(hit) = cache.read().ok().and_then(|c| c.get(&key).cloned()) {
-        return hit;
-    }
-    let schema = match role {
-        ConfigRole::Source => crate::registry::source_schema(kind),
-        ConfigRole::Sink => crate::registry::sink_schema(kind),
-        ConfigRole::Transform => crate::transforms::transform_schema(kind),
-    };
-    let fields: std::sync::Arc<[String]> = schema
+pub fn code_fields(role: ConfigRole, kind: &str) -> Vec<String> {
+    crate::registry::cached_schema(role, kind)
         .map(|s| faucet_core::resolve::code_fields(&s))
         .unwrap_or_default()
-        .into();
-    if let Ok(mut c) = cache.write() {
-        c.insert(key, std::sync::Arc::clone(&fields));
-    }
-    fields
 }
 
 /// Refuse a fan-out token (`${<row>.path}`, a value from another row's
