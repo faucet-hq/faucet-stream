@@ -288,6 +288,13 @@ otherwise it is a `422`. A config submitted for a tenant is refused even then.
 Registered templates and the triggers file are written by the server's
 operator and may always use them.
 
+### Keys the server sets
+
+A sink config key the server sets for a run itself is removed from a config
+**the request carries** before it loads: `_overwrite_run` (the token that
+gives an overwrite run its own staging area) is always chosen by the server,
+so two runs never share one.
+
 ### Reference policy
 
 Every config the server loads from a caller is checked against one

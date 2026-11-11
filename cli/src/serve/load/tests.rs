@@ -2372,4 +2372,45 @@ fn dotdot_in_a_key_field_is_refused_for_callers() {
     assert!(err.contains("`..`"), "{err}");
     check(&doc("b/x.csv"), &f).unwrap();
     check(&doc("../b/x.csv"), &Default::default()).unwrap();
+
+/// A caller's config cannot pin the overwrite run token the executor
+/// chooses; an operator's keeps it.
+#[cfg(all(feature = "source-csv", feature = "sink-jsonl"))]
+#[tokio::test]
+async fn caller_overwrite_run_tokens_are_ignored() {
+    let root = tempfile::tempdir().unwrap();
+    let args = crate::cli::ReferenceArgs {
+        allow_path_root: vec![root.path().to_path_buf()],
+        ..Default::default()
+    };
+    let refs = crate::serve::references::ServeReferencePolicy::from_args(&args).unwrap();
+    let input = root.path().join("in.csv");
+    std::fs::write(&input, "id\n1\n").unwrap();
+    let token = "0123456789abcdef0123456789abcdef";
+    let body = serde_json::json!({
+        "version": 1,
+        "pipeline": {
+            "source": { "type": "csv", "config": { "path": input.display().to_string() } },
+            "sink": { "type": "jsonl", "config": {
+                "path": root.path().join("o.jsonl").display().to_string(),
+                "_overwrite_run": token,
+            } },
+        },
+        "matrix": [ { "id": "a", "sink": { "config": { "_overwrite_run": token } } } ],
+    })
+    .to_string();
+    let load =
+        |origin| load_submission_with(&body, ConfigFormat::Json, None, None, origin, None, &refs);
+    let caller = load(BodyOrigin::Caller {
+        allow_subprocess: false,
+    })
+    .await
+    .unwrap();
+    assert!(
+        caller.nodes[0].sink.config.get("_overwrite_run").is_none(),
+        "{}",
+        caller.nodes[0].sink.config
+    );
+    let trusted = load(BodyOrigin::Trusted).await.unwrap();
+    assert_eq!(trusted.nodes[0].sink.config["_overwrite_run"], token);
 }

@@ -260,6 +260,24 @@ pub fn confine_sql_nodes(nodes: &mut [ExpandedNode]) {
     }
 }
 
+/// Config keys the server sets on a run itself, never a caller.
+const INTERNAL_KEYS: &[&str] = &[faucet_core::idempotency::OVERWRITE_RUN_KEY];
+
+/// Remove [`INTERNAL_KEYS`] from every object in a caller's config: an
+/// overwrite run token is the executor's to choose.
+fn strip_internal_keys(doc: &mut Value) {
+    match doc {
+        Value::Object(map) => {
+            for key in INTERNAL_KEYS {
+                map.remove(*key);
+            }
+            map.values_mut().for_each(strip_internal_keys);
+        }
+        Value::Array(items) => items.iter_mut().for_each(strip_internal_keys),
+        _ => {}
+    }
+}
+
 /// Environment variables `faucet serve` reads its own credentials from. A
 /// loaded config can never resolve them through `${env:}` / `${secret:}`.
 pub const SERVER_SECRET_ENV: &[&str] = &[
@@ -2869,6 +2887,10 @@ pub async fn load_submission_inputs(
 
     // The document the caller's param pointers address (#989).
     let caller_doc = caller_params.map(|_| merged.clone());
+
+    if matches!(origin, BodyOrigin::Caller { .. }) {
+        strip_internal_keys(&mut merged);
+    }
 
     // 4. Version gate + structural-ref resolution.
     let mut cfg = PipelineConfig::from_value(merged).map_err(|e| ServeError::Unprocessable {
