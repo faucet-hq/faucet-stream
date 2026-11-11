@@ -1448,6 +1448,15 @@ mod tests {
     struct DroppedFields(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
 
     impl tracing::Subscriber for DroppedFields {
+        fn register_callsite(
+            &self,
+            _: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::TRACE)
+        }
         fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
             true
         }
@@ -1491,7 +1500,10 @@ mod tests {
             .unwrap()
         };
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let next = tracing::subscriber::with_default(DroppedFields(seen.clone()), hop);
+        let next = tracing::subscriber::with_default(DroppedFields(seen.clone()), || {
+            tracing::callsite::rebuild_interest_cache();
+            hop()
+        });
         assert!(next.headers().get("x-custom-token").is_none());
         let seen = seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 1, "{seen:?}");
