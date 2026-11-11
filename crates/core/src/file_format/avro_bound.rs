@@ -19,7 +19,7 @@ use apache_avro::schema::{
 };
 use apache_avro::{Codec, Schema};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read};
 use std::rc::Rc;
 use std::str::FromStr;
@@ -52,7 +52,7 @@ pub(crate) struct Bounded<R> {
     limit: u64,
     failure: Failure,
     state: State,
-    out: Vec<u8>,
+    out: VecDeque<Vec<u8>>,
     pos: usize,
     recorded: Vec<u8>,
     sync: [u8; 16],
@@ -74,7 +74,7 @@ impl<R: Read> Bounded<R> {
             limit,
             failure,
             state: State::Header,
-            out: Vec::new(),
+            out: VecDeque::new(),
             pos: 0,
             recorded: Vec::new(),
             sync: [0; 16],
@@ -93,19 +93,24 @@ impl<R: Read> Bounded<R> {
 
     /// Hand on everything read for the current section, then the rest.
     fn pass_through(&mut self) {
-        self.out = std::mem::take(&mut self.recorded);
+        self.out = VecDeque::from([std::mem::take(&mut self.recorded)]);
         self.pos = 0;
         self.state = State::Passthrough;
     }
 
-    fn take_exact(&mut self, n: u64) -> io::Result<Option<Vec<u8>>> {
+    /// Read `n` bytes onto `recorded`; where they sit there, if all arrived.
+    fn take_range(&mut self, n: u64) -> io::Result<Option<std::ops::Range<usize>>> {
         if n > MAX_SECTION {
             return Ok(None);
         }
-        let mut buf = Vec::new();
-        (&mut self.inner).take(n).read_to_end(&mut buf)?;
-        self.recorded.extend_from_slice(&buf);
-        Ok((buf.len() as u64 == n).then_some(buf))
+        let start = self.recorded.len();
+        (&mut self.inner).take(n).read_to_end(&mut self.recorded)?;
+        let end = self.recorded.len();
+        Ok(((end - start) as u64 == n).then_some(start..end))
+    }
+
+    fn take_exact(&mut self, n: u64) -> io::Result<Option<Vec<u8>>> {
+        Ok(self.take_range(n)?.map(|r| self.recorded[r].to_vec()))
     }
 
     /// A zig-zag long; `Ok(None)` at a clean end of input or a malformed one.
@@ -216,7 +221,7 @@ impl<R: Read> Bounded<R> {
         put_bytes(&mut out, b"null");
         put_long(&mut out, 0);
         out.extend_from_slice(&self.sync);
-        self.out = out;
+        self.out = VecDeque::from([out]);
         self.pos = 0;
         self.state = State::Blocks;
         Ok(())
@@ -266,18 +271,21 @@ impl<R: Read> Bounded<R> {
             }
         };
         let data = match self.long(&mut eof)? {
-            Some(n) if n >= 0 => self.take_exact(n as u64)?,
+            Some(n) if n >= 0 => self.take_range(n as u64)?,
             _ => None,
         };
-        let sync = self.take_exact(16)?;
-        let (Some(mut data), Some(sync)) = (data, sync) else {
+        let sync = self.take_range(16)?;
+        let (Some(range), Some(sync)) = (data, sync) else {
             self.pass_through();
             return Ok(());
         };
-        if sync != self.sync {
+        if self.recorded[sync] != self.sync {
             self.pass_through();
             return Ok(());
         }
+        let mut data = std::mem::take(&mut self.recorded);
+        data.truncate(range.end);
+        data.drain(..range.start);
         if let Err(e) = self.codec.decompress(&mut data) {
             return Err(self.fail(FaucetError::Source(format!("avro block: {e}"))));
         }
@@ -307,12 +315,10 @@ impl<R: Read> Bounded<R> {
                 break;
             }
         }
-        let mut out = Vec::with_capacity(data.len() + 36);
-        put_long(&mut out, count);
-        put_long(&mut out, data.len() as i64);
-        out.extend_from_slice(&data);
-        out.extend_from_slice(&self.sync);
-        self.out = out;
+        let mut prefix = Vec::with_capacity(20);
+        put_long(&mut prefix, count);
+        put_long(&mut prefix, data.len() as i64);
+        self.out = VecDeque::from([prefix, data, self.sync.to_vec()]);
         self.pos = 0;
         Ok(())
     }
@@ -321,11 +327,16 @@ impl<R: Read> Bounded<R> {
 impl<R: Read> Read for Bounded<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
-            if self.pos < self.out.len() {
-                let n = buf.len().min(self.out.len() - self.pos);
-                buf[..n].copy_from_slice(&self.out[self.pos..self.pos + n]);
-                self.pos += n;
-                return Ok(n);
+            if let Some(front) = self.out.front() {
+                if self.pos < front.len() {
+                    let n = buf.len().min(front.len() - self.pos);
+                    buf[..n].copy_from_slice(&front[self.pos..self.pos + n]);
+                    self.pos += n;
+                    return Ok(n);
+                }
+                self.out.pop_front();
+                self.pos = 0;
+                continue;
             }
             match self.state {
                 State::Header => self.header()?,
@@ -714,6 +725,21 @@ mod tests {
         let err = read_records(&unknown[..], Some(&reader), 10, &mut |_| Ok(())).unwrap_err();
         assert!(err.to_string().contains("does not resolve"), "{err}");
         assert!(read(&ocf(NULLS, &[]), 1 << 20).unwrap().is_empty());
+    }
+
+    #[test]
+    fn uncompressed_blocks_pass_through_byte_for_byte() {
+        let file = ocf(
+            NULLS,
+            &[(1, longs(&[2, 0])), (2, longs(&[1, 0, 0])), (0, vec![])],
+        );
+        let mut bounded = Bounded::new(&file[..], 1 << 20, None, Failure::default());
+        let mut seen = Vec::new();
+        let mut byte = [0u8; 1];
+        while bounded.read(&mut byte).unwrap() == 1 {
+            seen.push(byte[0]);
+        }
+        assert_eq!(seen, file);
     }
 
     #[test]
