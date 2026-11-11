@@ -2,7 +2,8 @@ use faucet_core::{Capabilities, ConnectorDescriptor};
 use serde_json::Value;
 
 /// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
-pub const DESCRIPTOR: ConnectorDescriptor = ConnectorDescriptor::new("snowflake", capabilities);
+pub const DESCRIPTOR: ConnectorDescriptor =
+    ConnectorDescriptor::new("snowflake", capabilities).with_host_identity(|_| Vec::new());
 
 fn capabilities(_config: &Value) -> Capabilities {
     Capabilities::builder().discover(true).build()

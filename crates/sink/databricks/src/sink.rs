@@ -495,8 +495,14 @@ impl DatabricksDriver {
         }
         #[cfg(feature = "staging")]
         {
+            let credentials = self
+                .config
+                .staging
+                .as_ref()
+                .map(|s| s.credentials.clone())
+                .unwrap_or_default();
             Ok(Arc::new(stage::ObjectStoreStager::new(
-                stage::build_object_store(loc)?,
+                stage::build_object_store(loc, &credentials)?,
             )))
         }
         #[cfg(not(feature = "staging"))]
@@ -1235,6 +1241,7 @@ mod tests {
             location: "/Volumes/m/s/v".into(),
             cleanup: Default::default(),
             copy_options: None,
+            credentials: Default::default(),
         });
         let auto = DatabricksSink::new(c.clone()).unwrap();
         assert!(!auto.use_staging(99));
@@ -1257,6 +1264,7 @@ mod tests {
             location: "s3://b/p".into(),
             cleanup: Default::default(),
             copy_options: None,
+            credentials: Default::default(),
         });
         assert!(DatabricksSink::new(c).is_err());
     }

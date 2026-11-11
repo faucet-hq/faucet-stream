@@ -4,7 +4,8 @@ use faucet_core::capabilities::config::is_set;
 use faucet_core::{Capabilities, ConnectorDescriptor, Value};
 
 /// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
-pub const DESCRIPTOR: ConnectorDescriptor = ConnectorDescriptor::new("mssql", capabilities);
+pub const DESCRIPTOR: ConnectorDescriptor =
+    ConnectorDescriptor::new("mssql", capabilities).with_host_identity(|_| Vec::new());
 
 fn capabilities(config: &Value) -> Capabilities {
     Capabilities::builder()

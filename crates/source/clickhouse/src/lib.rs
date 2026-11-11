@@ -40,4 +40,5 @@ pub use faucet_common_clickhouse::ClickHouseConnection;
 
 /// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
 pub const DESCRIPTOR: faucet_core::ConnectorDescriptor =
-    faucet_core::ConnectorDescriptor::new("clickhouse", faucet_core::capabilities::plain_source);
+    faucet_core::ConnectorDescriptor::new("clickhouse", faucet_core::capabilities::plain_source)
+        .with_host_identity(|_| Vec::new());

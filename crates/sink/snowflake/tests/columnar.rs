@@ -94,6 +94,7 @@ fn staged_sink(server: &MockServer, stage_dir: &std::path::Path) -> SnowflakeSin
         storage_options: Default::default(),
         match_by_column_name: "CASE_INSENSITIVE".into(),
         purge: false,
+        credentials: Default::default(),
     });
     SnowflakeSink::new(config)
         .unwrap()

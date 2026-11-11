@@ -3,7 +3,20 @@ use faucet_core::{Capabilities, ConnectorDescriptor, SchemaReport, WriteMode};
 use serde_json::Value;
 
 /// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
-pub const DESCRIPTOR: ConnectorDescriptor = ConnectorDescriptor::new("databricks", capabilities);
+pub const DESCRIPTOR: ConnectorDescriptor =
+    ConnectorDescriptor::new("databricks", capabilities).with_host_identity(host_identity);
+
+/// A cloud `staging.location`'s `credentials` when they select (or default
+/// to) the default chain; a volume uploads with the sink's own credentials.
+fn host_identity(config: &Value) -> Vec<String> {
+    let volume = faucet_core::capabilities::config::str_at(config, "/staging/location")
+        .is_some_and(|l| l.trim_start().starts_with("/Volumes"));
+    if volume {
+        Vec::new()
+    } else {
+        faucet_core::staging_host_identity(config, "/staging")
+    }
+}
 
 fn capabilities(config: &Value) -> Capabilities {
     Capabilities::builder()
@@ -30,6 +43,24 @@ fn capabilities(config: &Value) -> Capabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_identity_follows_the_selected_credentials() {
+        let cloud = serde_json::json!({"staging": {"location": "s3://b/p"}});
+        assert_eq!(
+            DESCRIPTOR.host_identity(&cloud),
+            Some(vec!["staging.credentials".to_string()])
+        );
+        let volume = serde_json::json!({"staging": {"location": "/Volumes/a/b/c"}});
+        assert_eq!(DESCRIPTOR.host_identity(&volume), Some(vec![]));
+        let keyed = serde_json::json!({"staging": {"location": "s3://b/p", "credentials": {
+            "type": "access_key", "config": {"access_key_id": "a", "secret_access_key": "s"}}}});
+        assert_eq!(DESCRIPTOR.host_identity(&keyed), Some(vec![]));
+        assert_eq!(
+            DESCRIPTOR.host_identity(&serde_json::json!({})),
+            Some(vec![])
+        );
+    }
     use serde_json::json;
 
     fn assert_static(c: &Capabilities) {

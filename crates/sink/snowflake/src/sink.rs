@@ -1614,6 +1614,7 @@ mod tests {
             storage_options: Default::default(),
             match_by_column_name: "CASE_INSENSITIVE".into(),
             purge: false,
+            credentials: Default::default(),
         }))
         .unwrap();
         assert!(staged.supports_columnar());

@@ -1,6 +1,6 @@
 //! Databricks SQL warehouse sink configuration.
 
-use faucet_core::staging::StagingCleanup;
+use faucet_core::staging::{StagingCleanup, StagingCredentials};
 use faucet_core::{AuthSpec, DEFAULT_BATCH_SIZE, FaucetError, WriteMode, WriteSpec};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -45,6 +45,12 @@ pub struct DatabricksStagingConfig {
     /// correctness.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copy_options: Option<String>,
+    /// How faucet authenticates to a cloud location when it uploads the
+    /// files (default: the store's default chain, i.e. the identity of the
+    /// host faucet runs on). Must stay unset for a volume, which uploads with
+    /// the sink's own credentials.
+    #[serde(default, skip_serializing_if = "StagingCredentials::is_default")]
+    pub credentials: StagingCredentials,
 }
 
 fn default_true() -> bool {
@@ -244,7 +250,16 @@ impl DatabricksSinkConfig {
             ));
         }
         if let Some(s) = &self.staging {
-            crate::stage::StageLocation::parse(&s.location)?;
+            let loc = crate::stage::StageLocation::parse(&s.location)?;
+            if let Some(scheme) = loc.scheme() {
+                s.credentials.check_scheme(scheme)?;
+            } else if !s.credentials.is_default() {
+                return Err(FaucetError::Config(
+                    "databricks sink: a volume `staging.location` uploads with the sink's own \
+                     credentials; remove `staging.credentials`"
+                        .into(),
+                ));
+            }
         }
         self.write.validate()?;
         if self.write.write_mode == WriteMode::Overwrite && self.table.ends_with(OVW_SUFFIX) {
@@ -328,9 +343,30 @@ mod tests {
                     location: "ftp://nope".into(),
                     cleanup: StagingCleanup::Always,
                     copy_options: None,
+                    credentials: Default::default(),
                 })
             }),
             Box::new(|c| c.write.write_mode = WriteMode::Upsert),
+            Box::new(|c| {
+                c.staging = Some(DatabricksStagingConfig {
+                    location: "/Volumes/a/b/c".into(),
+                    cleanup: StagingCleanup::Always,
+                    copy_options: None,
+                    credentials: StagingCredentials::AccountKey {
+                        account_key: "k".into(),
+                    },
+                })
+            }),
+            Box::new(|c| {
+                c.staging = Some(DatabricksStagingConfig {
+                    location: "gs://b/p".into(),
+                    cleanup: StagingCleanup::Always,
+                    copy_options: None,
+                    credentials: StagingCredentials::AccountKey {
+                        account_key: "k".into(),
+                    },
+                })
+            }),
             Box::new(|c| {
                 c.write.write_mode = WriteMode::Overwrite;
                 c.table = "t__faucet_ovw".into();

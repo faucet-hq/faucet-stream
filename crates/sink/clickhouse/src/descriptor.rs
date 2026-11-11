@@ -4,7 +4,12 @@ use faucet_core::capabilities::config::is_set;
 use faucet_core::{Capabilities, ConnectorDescriptor, Value};
 
 /// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
-pub const DESCRIPTOR: ConnectorDescriptor = ConnectorDescriptor::new("clickhouse", capabilities);
+pub const DESCRIPTOR: ConnectorDescriptor =
+    ConnectorDescriptor::new("clickhouse", capabilities).with_host_identity(host_identity);
+
+fn host_identity(config: &Value) -> Vec<String> {
+    faucet_core::staging_host_identity(config, "/staging")
+}
 
 fn capabilities(config: &Value) -> Capabilities {
     Capabilities::append_only_sink()
