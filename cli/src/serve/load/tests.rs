@@ -2372,6 +2372,7 @@ fn dotdot_in_a_key_field_is_refused_for_callers() {
     assert!(err.contains("`..`"), "{err}");
     check(&doc("b/x.csv"), &f).unwrap();
     check(&doc("../b/x.csv"), &Default::default()).unwrap();
+}
 
 /// A caller's config cannot pin the overwrite run token the executor
 /// chooses; an operator's keeps it.
