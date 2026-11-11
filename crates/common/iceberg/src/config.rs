@@ -46,6 +46,128 @@ pub fn warehouse_scheme(warehouse: &str) -> WarehouseScheme {
     }
 }
 
+// ── Host identity ─────────────────────────────────────────────────────────────
+
+/// The catalog property that makes the warehouse storage assume a role.
+pub const ASSUME_ROLE_PROP: &str = "client.assume-role.arn";
+
+fn region_from_env() -> bool {
+    ["AWS_REGION", "AWS_DEFAULT_REGION"]
+        .iter()
+        .any(|k| std::env::var(k).is_ok_and(|v| !v.trim().is_empty()))
+}
+
+/// Whether `props` name storage credentials of their own for a warehouse of
+/// `scheme`: S3 keys (an id and its secret, also the Glue catalog's
+/// `aws_*` keys it hands to storage) or anonymous access; a GCS key, token or
+/// anonymous access. A local warehouse needs none.
+pub fn storage_names_credentials(
+    scheme: &WarehouseScheme,
+    props: &std::collections::HashMap<String, String>,
+) -> bool {
+    let set = |k: &str| props.get(k).is_some_and(|v| !v.trim().is_empty());
+    let on = |k: &str| {
+        props.get(k).is_some_and(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes" | "on"
+            )
+        })
+    };
+    match scheme {
+        WarehouseScheme::Local | WarehouseScheme::Unsupported(_) => true,
+        WarehouseScheme::S3(_) => {
+            (set("s3.access-key-id") && set("s3.secret-access-key"))
+                || (set("aws_access_key_id") && set("aws_secret_access_key"))
+                || on("s3.allow-anonymous")
+        }
+        WarehouseScheme::Gcs => {
+            set("gcs.credentials-json")
+                || set("gcs.oauth2.token")
+                || on("gcs.allow-anonymous")
+                || on("gcs.no-auth")
+        }
+    }
+}
+
+/// The fields of an Iceberg source or sink config (its `catalog` block) that
+/// make it authenticate with the identity of the host faucet runs on:
+///
+/// - `catalog.properties.client.assume-role.arn` (the storage assumes a role
+///   through the host's credentials);
+/// - for `glue`: `catalog.properties` when the Glue client has no
+///   `aws_access_key_id` / `aws_secret_access_key`,
+///   `catalog.properties.profile_name`, and `catalog.properties.region_name`
+///   when neither it nor the process environment names a region;
+/// - for `glue`, `sql` and `hms`: `catalog.properties` when an `s3://` or
+///   `gs://` warehouse's storage names no credential of its own.
+///
+/// A `rest` catalog may hand out storage credentials at run time, so it is
+/// checked when its storage is built.
+pub fn host_identity(config: &faucet_core::Value) -> Vec<String> {
+    use faucet_core::capabilities::config::{at, str_at, tag_at};
+    let Some(kind) = tag_at(config, "/catalog") else {
+        return Vec::new();
+    };
+    let props: std::collections::HashMap<String, String> = at(config, "/catalog/properties")
+        .and_then(|p| p.as_object())
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    let set = |k: &str| props.get(k).is_some_and(|v| !v.trim().is_empty());
+    let mut fields = Vec::new();
+    if set(ASSUME_ROLE_PROP) {
+        fields.push(format!("catalog.properties.{ASSUME_ROLE_PROP}"));
+    }
+    if kind == "glue" {
+        if !(set("aws_access_key_id") && set("aws_secret_access_key")) {
+            fields.push("catalog.properties".to_string());
+        }
+        if set("profile_name") {
+            fields.push("catalog.properties.profile_name".to_string());
+        }
+        if !set("region_name") && !region_from_env() {
+            fields.push("catalog.properties.region_name".to_string());
+        }
+    }
+    if matches!(kind, "glue" | "sql" | "hms") {
+        let scheme = warehouse_scheme(str_at(config, "/catalog/warehouse").unwrap_or(""));
+        if !storage_names_credentials(&scheme, &props)
+            && !fields.iter().any(|f| f == "catalog.properties")
+        {
+            fields.push("catalog.properties".to_string());
+        }
+    }
+    fields
+}
+
+/// Refuse, where the task may not use the host's identity, a Glue catalog
+/// client that would use it ([`host_identity`]'s Glue rules).
+pub fn check_glue_client(
+    props: &std::collections::HashMap<String, String>,
+) -> Result<(), faucet_core::FaucetError> {
+    let set = |k: &str| props.get(k).is_some_and(|v| !v.trim().is_empty());
+    if !(set("aws_access_key_id") && set("aws_secret_access_key")) {
+        faucet_core::resolve::require_host_credentials("iceberg", "catalog.properties")?;
+    }
+    if set("profile_name") {
+        faucet_core::resolve::require_host_credentials(
+            "iceberg",
+            "catalog.properties.profile_name",
+        )?;
+    }
+    if !set("region_name") && !region_from_env() {
+        faucet_core::resolve::require_host_credentials(
+            "iceberg",
+            "catalog.properties.region_name",
+        )?;
+    }
+    Ok(())
+}
+
 // ── Catalog config ────────────────────────────────────────────────────────────
 
 /// Configuration fields shared by every catalog variant.
@@ -223,6 +345,74 @@ impl CatalogConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_identity_follows_the_selected_credentials() {
+        use faucet_core::json;
+        let keys = json!({"s3.access-key-id": "a", "s3.secret-access-key": "s"});
+        for kind in ["sql", "hms"] {
+            let bare = json!({"catalog": {"type": kind, "warehouse": "s3://b/wh"}});
+            assert_eq!(host_identity(&bare), vec!["catalog.properties"], "{kind}");
+            let keyed =
+                json!({"catalog": {"type": kind, "warehouse": "s3://b/wh", "properties": keys}});
+            assert!(host_identity(&keyed).is_empty(), "{kind}");
+            let local = json!({"catalog": {"type": kind, "warehouse": "/tmp/wh"}});
+            assert!(host_identity(&local).is_empty(), "{kind}");
+            let gcs = json!({"catalog": {"type": kind, "warehouse": "gs://b/wh",
+                "properties": {"gcs.credentials-json": "{}"}}});
+            assert!(host_identity(&gcs).is_empty(), "{kind}");
+            let role = json!({"catalog": {"type": kind, "warehouse": "s3://b/wh", "properties": {
+                "s3.access-key-id": "a", "s3.secret-access-key": "s",
+                "client.assume-role.arn": "arn:aws:iam::1:role/r"}}});
+            assert_eq!(
+                host_identity(&role),
+                vec!["catalog.properties.client.assume-role.arn"]
+            );
+        }
+        let rest = json!({"catalog": {"type": "rest", "uri": "https://cat.example"}});
+        assert!(host_identity(&rest).is_empty());
+        let glue = json!({"catalog": {"type": "glue", "warehouse": "s3://b/wh",
+            "properties": {"region_name": "us-east-1"}}});
+        assert_eq!(host_identity(&glue), vec!["catalog.properties"]);
+        let glue_keyed = json!({"catalog": {"type": "glue", "warehouse": "s3://b/wh", "properties": {
+            "region_name": "us-east-1", "aws_access_key_id": "a", "aws_secret_access_key": "s"}}});
+        assert!(host_identity(&glue_keyed).is_empty());
+        let glue_profile = json!({"catalog": {"type": "glue", "warehouse": "s3://b/wh", "properties": {
+            "region_name": "us-east-1", "aws_access_key_id": "a", "aws_secret_access_key": "s",
+            "profile_name": "p"}}});
+        assert_eq!(
+            host_identity(&glue_profile),
+            vec!["catalog.properties.profile_name"]
+        );
+        let unregioned = json!({"catalog": {"type": "glue", "warehouse": "s3://b/wh", "properties": {
+            "aws_access_key_id": "a", "aws_secret_access_key": "s"}}});
+        assert_eq!(host_identity(&unregioned).is_empty(), region_from_env());
+        assert!(host_identity(&json!({})).is_empty());
+    }
+
+    #[tokio::test]
+    async fn glue_clients_without_keys_are_refused_inside_a_caller_run() {
+        let keyed: std::collections::HashMap<String, String> = [
+            ("aws_access_key_id", "a"),
+            ("aws_secret_access_key", "s"),
+            ("region_name", "us-east-1"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        faucet_core::resolve::with_host_credentials(false, async {
+            let err = check_glue_client(&Default::default())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("iceberg: `catalog.properties`"), "{err}");
+            assert!(check_glue_client(&keyed).is_ok());
+            let mut profiled = keyed.clone();
+            profiled.insert("profile_name".into(), "p".into());
+            assert!(check_glue_client(&profiled).is_err());
+        })
+        .await;
+        assert!(check_glue_client(&Default::default()).is_ok());
+    }
 
     fn cat(v: serde_json::Value) -> CatalogConfig {
         serde_json::from_value(v).unwrap()

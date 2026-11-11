@@ -86,6 +86,7 @@ async fn build_glue(inner: &CatalogInner) -> Result<Arc<dyn Catalog>, FaucetErro
     use iceberg::CatalogBuilder;
     use iceberg_catalog_glue::{GLUE_CATALOG_PROP_WAREHOUSE, GlueCatalogBuilder};
 
+    crate::config::check_glue_client(&inner.properties)?;
     let mut props: HashMap<String, String> = inner.properties.clone();
 
     if let Some(warehouse) = &inner.warehouse {

@@ -18,7 +18,7 @@ catalog-rest = ["dep:iceberg-catalog-rest", "storage-opendal"]
 catalog-glue = ["dep:iceberg-catalog-glue", "storage-opendal"]
 catalog-sql  = ["dep:iceberg-catalog-sql",  "storage-opendal"]
 catalog-hms  = ["dep:iceberg-catalog-hms", "dep:hive_metastore", "dep:volo-thrift", "dep:pilota", "dep:tokio", "dep:tracing", "storage-opendal"]
-storage-opendal = ["dep:iceberg-storage-opendal", "dep:typetag"]
+storage-opendal = ["dep:iceberg-storage-opendal", "dep:typetag", "dep:reqsign-core"]
 
 [dependencies]
 faucet-core.workspace = true
@@ -37,6 +37,8 @@ tokio = { workspace = true, features = ["rt", "time"], optional = true }
 tracing = { workspace = true, optional = true }
 iceberg-storage-opendal = { version = "0.10.0", default-features = false, features = ["opendal-s3", "opendal-gcs", "opendal-fs"], optional = true }
 typetag = { version = "0.2", optional = true }
+# The S3 credential loader the storage factory installs (`storage_factory.rs`).
+reqsign-core = { version = "3.3", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
