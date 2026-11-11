@@ -39,6 +39,7 @@ fn check_json(
     connector: &str,
     field: &str,
     json: &str,
+    object_store: bool,
 ) -> Result<(), FaucetError> {
     let Ok(key) = serde_json::from_str::<serde_json::Value>(json) else {
         return Err(refused(
@@ -66,6 +67,26 @@ fn check_json(
             .check_url(uri)
             .map_err(|e| refused(connector, field, format!("`token_uri` {}", e.reason)))?;
     }
+    if object_store {
+        if let Some(url) = key.get("gcs_base_url") {
+            let Some(url) = url.as_str() else {
+                return Err(refused(connector, field, "`gcs_base_url` must be a string"));
+            };
+            policy
+                .check_url(url)
+                .map_err(|e| refused(connector, field, format!("`gcs_base_url` {}", e.reason)))?;
+        }
+        if key
+            .get("disable_oauth")
+            .is_some_and(|v| v != &serde_json::Value::Bool(false))
+        {
+            return Err(refused(
+                connector,
+                field,
+                "`disable_oauth` is not accepted for this config",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -79,7 +100,7 @@ pub fn check_google_credentials(
     json: &str,
 ) -> Result<(), FaucetError> {
     match caller_policy() {
-        Some(policy) => check_json(&policy, connector, field, json),
+        Some(policy) => check_json(&policy, connector, field, json, false),
         None => Ok(()),
     }
 }
@@ -90,6 +111,40 @@ pub fn check_google_credentials_file(
     connector: &str,
     field: &str,
     path: &std::path::Path,
+) -> Result<(), FaucetError> {
+    check_file(connector, field, path, false)
+}
+
+/// [`check_google_credentials`] for a key an `object_store` GCS client reads,
+/// which also honours `gcs_base_url` (checked against the policy) and
+/// `disable_oauth` (refused).
+#[cfg_attr(not(feature = "staging"), allow(dead_code))]
+pub(crate) fn check_object_store_credentials(
+    connector: &str,
+    field: &str,
+    json: &str,
+) -> Result<(), FaucetError> {
+    match caller_policy() {
+        Some(policy) => check_json(&policy, connector, field, json, true),
+        None => Ok(()),
+    }
+}
+
+/// [`check_object_store_credentials`] for a key file at `path`.
+#[cfg_attr(not(feature = "staging"), allow(dead_code))]
+pub(crate) fn check_object_store_credentials_file(
+    connector: &str,
+    field: &str,
+    path: &std::path::Path,
+) -> Result<(), FaucetError> {
+    check_file(connector, field, path, true)
+}
+
+fn check_file(
+    connector: &str,
+    field: &str,
+    path: &std::path::Path,
+    object_store: bool,
 ) -> Result<(), FaucetError> {
     let Some(policy) = caller_policy() else {
         return Ok(());
@@ -102,7 +157,7 @@ pub fn check_google_credentials_file(
             Ok(text)
         })
         .map_err(|e| refused(connector, field, format!("reading the key file: {e}")))?;
-    check_json(&policy, connector, field, &text)
+    check_json(&policy, connector, field, &text, object_store)
 }
 
 #[cfg(test)]
@@ -198,6 +253,49 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("reading the key file"), "{err}");
+        })
+        .await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn object_store_keys_have_their_endpoint_and_oauth_switch_checked_for_callers() {
+        let redirected = r#"{"type": "service_account", "gcs_base_url": "http://169.254.169.254"}"#;
+        let no_oauth = r#"{"type": "service_account", "disable_oauth": true}"#;
+        let google = r#"{"type": "service_account", "gcs_base_url": "https://storage.googleapis.com", "disable_oauth": false}"#;
+        let listed = Arc::new(
+            ReferencePolicy::deny_all()
+                .with_path_roots(["/srv/data"])
+                .any_url_scheme()
+                .with_url_hosts(["storage.googleapis.com"]),
+        );
+        crate::http::with_reference_policy(listed, async {
+            let err = check_object_store_credentials("staging", "credentials", redirected)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("`gcs_base_url`"), "{err}");
+            let err = check_object_store_credentials("staging", "credentials", no_oauth)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("`disable_oauth`"), "{err}");
+            let numeric = r#"{"type": "service_account", "gcs_base_url": 7}"#;
+            assert!(check_object_store_credentials("staging", "credentials", numeric).is_err());
+            assert!(check_object_store_credentials("staging", "credentials", google).is_ok());
+            assert!(check_google_credentials("staging", "credentials", no_oauth).is_ok());
+            let user = r#"{"type": "authorized_user"}"#;
+            assert!(check_object_store_credentials("staging", "credentials", user).is_err());
+        })
+        .await;
+        crate::http::with_reference_policy(Arc::new(ReferencePolicy::open()), async {
+            assert!(check_object_store_credentials("staging", "credentials", no_oauth).is_ok());
+        })
+        .await;
+        let dir = std::env::temp_dir().join(format!("faucet-oscred-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("sa.json");
+        std::fs::write(&file, no_oauth).unwrap();
+        crate::http::with_reference_policy(caller(), async {
+            assert!(check_object_store_credentials_file("staging", "credentials", &file).is_err());
         })
         .await;
         std::fs::remove_dir_all(&dir).unwrap();

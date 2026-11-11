@@ -644,10 +644,20 @@ mod upload {
             StagingScheme::Gcs => {
                 let builder = match credentials {
                     StagingCredentials::ServiceAccountJsonFile { path } => {
+                        crate::google_credentials::check_object_store_credentials_file(
+                            "staging",
+                            "credentials",
+                            std::path::Path::new(path),
+                        )?;
                         object_store::gcp::GoogleCloudStorageBuilder::new()
                             .with_service_account_path(path)
                     }
                     StagingCredentials::ServiceAccountJsonInline { json } => {
+                        crate::google_credentials::check_object_store_credentials(
+                            "staging",
+                            "credentials",
+                            json,
+                        )?;
                         object_store::gcp::GoogleCloudStorageBuilder::new()
                             .with_service_account_key(json)
                     }
@@ -1251,5 +1261,26 @@ mod tests {
         up.cleanup(std::slice::from_ref(&f), StagingCleanup::OnSuccess, false)
             .await;
         assert!(store.get(&path).await.is_ok());
+    }
+
+    #[cfg(feature = "staging")]
+    #[tokio::test]
+    async fn a_caller_gcs_key_cannot_move_the_store_endpoint() {
+        use std::sync::Arc;
+        let policy = Arc::new(
+            crate::resolve::ReferencePolicy::deny_all()
+                .with_path_roots(["/srv/data"])
+                .any_url_scheme()
+                .with_url_hosts(["storage.googleapis.com", "oauth2.googleapis.com"]),
+        );
+        let key = r#"{"type": "service_account", "client_email": "a@b.iam", "private_key": "x", "gcs_base_url": "http://169.254.169.254"}"#;
+        let creds = StagingCredentials::ServiceAccountJsonInline { json: key.into() };
+        let err = crate::http::with_reference_policy(policy, async {
+            object_store_for(StagingScheme::Gcs, "b", None, &creds)
+                .map(|_| ())
+                .unwrap_err()
+        })
+        .await;
+        assert!(err.to_string().contains("`gcs_base_url`"), "{err}");
     }
 }
