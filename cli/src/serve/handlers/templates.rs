@@ -1438,6 +1438,10 @@ pub struct TriggerBody {
     /// even when the run itself carries a standing approval (#1051).
     #[serde(skip)]
     pub operator_params: bool,
+    /// Set (never from the wire) where the server wrote the whole
+    /// `idempotency_key` (a trigger fire, a schedule tick).
+    #[serde(skip)]
+    pub server_key: bool,
     /// Set (never from the wire) by a trigger fire: the params whose value
     /// holds text the event's sender chose. Even with `operator_params`,
     /// those are held to the caller reference policy.
@@ -1528,9 +1532,6 @@ pub async fn trigger_template(
     Json(body): Json<TriggerBody>,
 ) -> Result<axum::response::Response, ServeError> {
     use axum::response::IntoResponse;
-    if actor.tenant.is_none() {
-        runner::refuse_reserved_idempotency_key(body.idempotency_key.as_deref())?;
-    }
     match trigger_template_outcome(state, actor, id, body).await? {
         TriggerOutcome::Run(resp) => Ok((StatusCode::ACCEPTED, Json(resp)).into_response()),
         // Approval first (#703): the trigger became a change request.

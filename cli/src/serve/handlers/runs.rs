@@ -55,7 +55,6 @@ pub async fn submit_run(
     if actor.tenant.is_some() {
         return Err(ServeError::Forbidden(TENANT_RAW_CONFIG.to_string()));
     }
-    runner::refuse_reserved_idempotency_key(req.idempotency_key.as_deref())?;
     let principal = crate::runtime::Principal::caller(&state, actor);
     match crate::runtime::server::submit(
         &state,

@@ -119,6 +119,12 @@ pub struct SubmitRequest {
     /// for the template's params, held to the caller reference policy.
     #[serde(skip)]
     pub caller_fields: crate::params::CallerFields,
+    /// Set in-process where the server writes the whole idempotency key (a
+    /// trigger fire, a schedule tick, a backfill unit, an approved change),
+    /// never accepted from a client: only such a key may use a reserved
+    /// prefix.
+    #[serde(skip)]
+    pub server_key: bool,
 }
 
 impl SubmitRequest {
@@ -1572,9 +1578,10 @@ async fn replay_response(
 }
 
 /// Prefixes of the idempotency keys the server derives itself (tenant
-/// namespaces, trigger fires, backfill units, approved changes).
+/// namespaces, trigger fires, schedule ticks, backfill units, approved
+/// changes).
 pub(crate) const RESERVED_IDEMPOTENCY_PREFIXES: &[&str] =
-    &["tenant:", "trig:", "backfill:", "change:"];
+    &["tenant:", "trig:", "sched:", "backfill:", "change:"];
 
 /// Refuse a caller's idempotency key in a namespace the server derives keys
 /// in: an unscoped caller could otherwise occupy a tenant's key or a
@@ -3380,7 +3387,13 @@ mod tests {
     fn caller_idempotency_keys_stay_out_of_the_server_namespaces() {
         assert!(refuse_reserved_idempotency_key(None).is_ok());
         assert!(refuse_reserved_idempotency_key(Some("nightly-2026-10-12")).is_ok());
-        for k in ["tenant:acme:k", "trig:t:1", "backfill:h:u", "change:c1"] {
+        for k in [
+            "tenant:acme:k",
+            "trig:t:1",
+            "sched:nightly:2026-11-12T00:00:00Z",
+            "backfill:h:u",
+            "change:c1",
+        ] {
             let err = refuse_reserved_idempotency_key(Some(k)).unwrap_err();
             assert!(
                 matches!(err, ServeError::BadConfig(ref m) if m.contains(k)),
@@ -3761,6 +3774,7 @@ mod tests {
             server_file: false,
             sealed_params: None,
             caller_fields: Default::default(),
+            server_key: false,
         };
 
         let err = submit(state.clone(), req, admin_actor()).await.unwrap_err();
@@ -3878,6 +3892,7 @@ mod tests {
             server_file: false,
             sealed_params: None,
             caller_fields: Default::default(),
+            server_key: false,
         };
         let resp = submit(state.clone(), req, admin_actor()).await.unwrap();
         assert_eq!(resp.status, RunStatus::Pending);
@@ -4131,6 +4146,7 @@ mod tests {
             server_file: false,
             sealed_params: None,
             caller_fields: Default::default(),
+            server_key: false,
         };
         let err = submit(state.clone(), req, admin_actor()).await.unwrap_err();
         assert!(

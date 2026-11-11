@@ -252,6 +252,7 @@ pub fn body(
         // that needs an approval it does not have.
         standing_approval: true,
         operator_params: opts.from_file,
+        server_key: true,
         ..Default::default()
     })
 }

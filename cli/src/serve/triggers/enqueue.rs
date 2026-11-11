@@ -180,6 +180,7 @@ pub fn build_submit_request(
         server_file: true,
         sealed_params: None,
         caller_fields: Default::default(),
+        server_key: true,
     }
 }
 
@@ -592,6 +593,7 @@ pub fn template_body_tracked(
         pool: compiled.spec.run.pool.clone(),
         standing_approval: true,
         operator_params: true,
+        server_key: true,
         sender_params,
         allow_untested: tpl.allow_untested,
         ..Default::default()

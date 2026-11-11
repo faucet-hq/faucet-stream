@@ -540,6 +540,9 @@ pub async fn submit(
     mut req: SubmitRequest,
     approval: Approval,
 ) -> Result<SubmitOutcome, ServeError> {
+    if !req.server_key {
+        crate::serve::runner::refuse_reserved_idempotency_key(req.idempotency_key.as_deref())?;
+    }
     // A malformed request field is refused before anything is queued or
     // proposed, so a change request never waits for approval only to fail
     // when it executes.
@@ -1992,6 +1995,7 @@ mod templates {
             } else {
                 materialized.caller_fields.clone()
             },
+            server_key: body.server_key,
         };
         // The template is the operator's: the run loads it trusted.
         let run_as = Principal::new(actor.clone(), Origin::Trusted).on_behalf_of(tenant);

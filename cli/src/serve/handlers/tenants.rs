@@ -698,6 +698,7 @@ pub async fn fan_out(
     fanout_id: &str,
 ) -> Result<Vec<FanoutResult>, ServeError> {
     body.tenants.validate().map_err(ServeError::BadConfig)?;
+    crate::serve::runner::refuse_reserved_idempotency_key(body.trigger.idempotency_key.as_deref())?;
     let concurrency = body
         .fanout_concurrency
         .unwrap_or(DEFAULT_FANOUT_CONCURRENCY)

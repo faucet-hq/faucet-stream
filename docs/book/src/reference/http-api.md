@@ -727,8 +727,10 @@ Request body:
   submit returns `422` with the doctor report in `error.details`.
 - **`idempotency_key`** — replay protection (see cookbook). Keys are scoped to
   the tenant a run is for, so two tenants sending the same key start two runs.
-  The prefixes `tenant:`, `trig:`, `backfill:` and `change:` are reserved for
-  the keys the server derives itself; a caller's key starting with one is a `400`.
+  The prefixes `tenant:`, `trig:`, `sched:`, `backfill:` and `change:` are
+  reserved for the keys the server derives itself; a caller's key starting with
+  one is a `400` on every route that submits a run (including tenant runs,
+  template runs, fan-outs and `POST /v1/changes`).
   The request is identified by the config as submitted (before references
   resolve, merged with `--default-config`); a key claimed by the previous
   release, which identified it by the resolved config, still replays.
