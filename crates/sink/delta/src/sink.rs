@@ -245,6 +245,7 @@ impl DeltaDriver {
             ))
         })?;
 
+        self.config.connection.check_host_identity()?;
         let mut builder = CreateBuilder::new()
             .with_location(self.config.connection.location_string()?)
             .with_storage_options(self.config.connection.merged_storage_options())
