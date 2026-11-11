@@ -69,7 +69,7 @@ pub async fn record(
                 }
             }
         };
-        let path = resolve_parent_components(path);
+        let path = resolve_parent_components(path).await;
         let file_id = if ctx.final_file {
             tokio::fs::metadata(&path)
                 .await
@@ -122,7 +122,7 @@ pub async fn record(
 
 /// A path naming `.` or `..` is stored with its directory resolved, so the
 /// sweep walks the directory the writer opened. Unresolvable → stored as is.
-fn resolve_parent_components(path: std::path::PathBuf) -> std::path::PathBuf {
+async fn resolve_parent_components(path: std::path::PathBuf) -> std::path::PathBuf {
     use std::path::{Component, PathBuf};
     let dotted = path
         .components()
@@ -132,7 +132,7 @@ fn resolve_parent_components(path: std::path::PathBuf) -> std::path::PathBuf {
         return path;
     }
     match (path.parent(), path.file_name()) {
-        (Some(parent), Some(name)) => match std::fs::canonicalize(parent) {
+        (Some(parent), Some(name)) => match tokio::fs::canonicalize(parent).await {
             Ok(dir) => dir.join(name),
             Err(_) => path,
         },
@@ -457,9 +457,9 @@ mod tests {
         assert!(resolved.file_id.is_some());
     }
 
-    #[test]
-    fn a_path_ending_in_a_parent_component_is_kept_as_written() {
+    #[tokio::test]
+    async fn a_path_ending_in_a_parent_component_is_kept_as_written() {
         let path = std::path::PathBuf::from("/tmp/x/..");
-        assert_eq!(resolve_parent_components(path.clone()), path);
+        assert_eq!(resolve_parent_components(path.clone()).await, path);
     }
 }
