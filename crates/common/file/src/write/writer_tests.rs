@@ -832,6 +832,38 @@ async fn appending_to_an_unreadable_csv_file_is_an_error() {
 }
 
 #[cfg(feature = "file-format-csv")]
+async fn append_csv_over(name: &str, codec: Compression, stored: &[u8]) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let body = faucet_core::compress_buf(stored, codec).unwrap();
+    assert!(body.len() < 64 * 1024 || codec == Compression::None);
+    std::fs::write(dir.path().join(name), &body).unwrap();
+    let mut s = WriteSettings::new(FileFormat::Csv, codec);
+    s.if_exists = IfExists::Append;
+    let w = local(dir.path(), name, s);
+    w.write_rows(&[json!({"a": 1})])
+        .await
+        .unwrap_err()
+        .to_string()
+}
+
+#[cfg(feature = "file-format-csv")]
+#[tokio::test]
+async fn appending_reads_back_a_bounded_csv_file() {
+    let mut rows = b"a\n".to_vec();
+    rows.extend(b"1\n".repeat(600 * 1024));
+    let e = append_csv_over("big.csv.gz", Compression::Gzip, &rows).await;
+    assert!(e.contains("once decompressed"), "{e}");
+
+    let mut long = b"a\n\"".to_vec();
+    long.extend(std::iter::repeat_n(b'x', 200 * 1024));
+    let e = append_csv_over("long.csv.gz", Compression::Gzip, &long).await;
+    assert!(e.contains("a record is longer"), "{e}");
+
+    let e = append_csv_over("raw.csv", Compression::None, &rows).await;
+    assert!(e.contains("too large to append to"), "{e}");
+}
+
+#[cfg(feature = "file-format-csv")]
 #[tokio::test]
 async fn a_csv_record_that_is_not_an_object_is_refused_cleanly() {
     let dir = tempfile::tempdir().unwrap();

@@ -932,6 +932,51 @@ pub(crate) fn remove_fetched(path: &Path) {
     }
 }
 
+/// Largest stored CSV file an append reads back, compressed or not.
+#[cfg(feature = "file-format-csv")]
+const MAX_READ_BACK_BYTES: u64 = if cfg!(test) {
+    1 << 20
+} else {
+    faucet_core::file_format::DEFAULT_MAX_OBJECT_BYTES
+};
+
+/// Longest single record an append reads back.
+#[cfg(feature = "file-format-csv")]
+const MAX_READ_BACK_RECORD: u64 = if cfg!(test) { 64 << 10 } else { 256 << 20 };
+
+/// The decompressed stored file, failing once it passes `total` bytes or one
+/// record runs past `record` bytes from where the last record ended.
+#[cfg(feature = "file-format-csv")]
+struct ReadBack<R> {
+    inner: R,
+    pulled: u64,
+    total: u64,
+    record: u64,
+    record_start: std::rc::Rc<std::cell::Cell<u64>>,
+}
+
+#[cfg(feature = "file-format-csv")]
+impl<R: std::io::Read> std::io::Read for ReadBack<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.pulled += n as u64;
+        let refuse = |msg: String| std::io::Error::new(std::io::ErrorKind::InvalidData, msg);
+        if self.pulled > self.total {
+            return Err(refuse(format!(
+                "it is larger than {} bytes once decompressed",
+                self.total
+            )));
+        }
+        if self.pulled.saturating_sub(self.record_start.get()) > self.record {
+            return Err(refuse(format!(
+                "a record is longer than {} bytes",
+                self.record
+            )));
+        }
+        Ok(n)
+    }
+}
+
 /// CSV rows waiting for their header.
 #[cfg(feature = "file-format-csv")]
 pub(crate) struct CsvState {
@@ -987,12 +1032,30 @@ impl CsvState {
             }
         }
         if let Some(existing) = existing {
+            let size = std::fs::metadata(existing)
+                .map_err(|e| io_err("reading", existing, e))?
+                .len();
+            if size > MAX_READ_BACK_BYTES {
+                remove_fetched(existing);
+                return Err(FaucetError::Sink(format!(
+                    "file sink: reading existing '{label}': it is larger than \
+                     {MAX_READ_BACK_BYTES} bytes, too large to append to — add `{{part}}` to \
+                     the path to start a new file"
+                )));
+            }
             let stored = ctx.read_stored(existing, label);
             remove_fetched(existing);
-            let reader = faucet_core::compression::wrap_sync_reader(
-                std::io::Cursor::new(stored?),
-                ctx.codec,
-            );
+            let record_start = std::rc::Rc::new(std::cell::Cell::new(0));
+            let reader = ReadBack {
+                inner: faucet_core::compression::wrap_sync_reader(
+                    std::io::Cursor::new(stored?),
+                    ctx.codec,
+                ),
+                pulled: 0,
+                total: MAX_READ_BACK_BYTES,
+                record: MAX_READ_BACK_RECORD,
+                record_start: record_start.clone(),
+            };
             let mut rdr = csv::ReaderBuilder::new()
                 .has_headers(false)
                 .flexible(true)
@@ -1000,10 +1063,15 @@ impl CsvState {
                 .quote(quote)
                 .from_reader(reader);
             let mut first = has_headers;
-            for rec in rdr.records() {
-                let rec = rec.map_err(|e| {
+            let mut rec = csv::StringRecord::new();
+            loop {
+                let more = rdr.read_record(&mut rec).map_err(|e| {
                     FaucetError::Sink(format!("file sink: reading existing '{label}': {e}"))
                 })?;
+                if !more {
+                    break;
+                }
+                record_start.set(rdr.position().byte());
                 if first {
                     first = false;
                     for h in &rec {
