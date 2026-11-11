@@ -219,9 +219,14 @@ struct Txn {
     events: Vec<Event>,
     pieces: Vec<Piece>,
     lobs: Vec<PendingLob>,
+    lob_changes: usize,
 }
 
 impl Txn {
+    fn staged(&self) -> usize {
+        self.events.len() + self.pieces.len() + self.lob_changes
+    }
+
     /// Revert the latest change of `original` kind on row `rid`.
     fn undo(&mut self, rid: &str, original: DmlKind) {
         let events = &self.events;
@@ -264,6 +269,8 @@ pub struct Miner {
     open: HashMap<String, Txn>,
     on_unsupported: OnUnsupported,
     max_staged: Option<usize>,
+    max_staged_total: Option<usize>,
+    staged_total: usize,
     ddl_seen: Vec<(String, String)>,
     next_id: u64,
 }
@@ -295,9 +302,21 @@ impl Miner {
             open: HashMap::new(),
             on_unsupported,
             max_staged,
+            max_staged_total: None,
+            staged_total: 0,
             ddl_seen: Vec::new(),
             next_id: 0,
         }
+    }
+
+    /// Also cap the changes all open transactions buffer together.
+    pub fn with_max_staged_total(mut self, max: Option<usize>) -> Self {
+        self.max_staged_total = max;
+        self
+    }
+
+    fn staged_in(&self, xid: &str) -> usize {
+        self.open.get(xid).map_or(0, Txn::staged)
     }
 
     fn id(&mut self) -> u64 {
@@ -358,6 +377,22 @@ impl Miner {
 
     /// Feed one row; returns a transaction when this row committed it.
     pub fn apply(&mut self, row: &LogRow) -> Result<Option<Committed>, FaucetError> {
+        let before = self.staged_in(&row.xid);
+        let result = self.apply_row(row);
+        self.staged_total = self.staged_total - before + self.staged_in(&row.xid);
+        let result = result?;
+        if let Some(max) = self.max_staged_total
+            && self.staged_total > max
+        {
+            return Err(FaucetError::Source(format!(
+                "oracle-cdc: open transactions buffer more than max_staged_records_total ({max}) \
+                 changes; raise the limit or commit source transactions sooner"
+            )));
+        }
+        Ok(result)
+    }
+
+    fn apply_row(&mut self, row: &LogRow) -> Result<Option<Committed>, FaucetError> {
         match row.op {
             op::START => {
                 self.txn(&row.xid, row.scn);
@@ -538,6 +573,7 @@ impl Miner {
                     .find(|p| p.event_id == e.id && p.column == change.column)
                 {
                     p.changes.push(change);
+                    txn.lob_changes += 1;
                     return;
                 }
                 let base = e
@@ -557,6 +593,7 @@ impl Miner {
                 (id, None, true)
             }
         };
+        txn.lob_changes += 1;
         txn.lobs.push(PendingLob {
             event_id,
             column: change.column.clone(),
@@ -572,7 +609,10 @@ impl Miner {
     /// whole value; otherwise it goes through `on_unsupported`, since
     /// synthesising it would emit a padded or truncated LOB.
     fn settle_lobs(&mut self, xid: &str) -> Result<(), FaucetError> {
-        let Some(pending) = self.open.get_mut(xid).map(|t| std::mem::take(&mut t.lobs)) else {
+        let Some(pending) = self.open.get_mut(xid).map(|t| {
+            t.lob_changes = 0;
+            std::mem::take(&mut t.lobs)
+        }) else {
             return Ok(());
         };
         for p in pending {
@@ -1269,6 +1309,56 @@ mod tests {
         no_owner.owner = None;
         no_owner.table = None;
         assert!(skip.apply(&no_owner).unwrap().is_none());
+    }
+
+    #[test]
+    fn the_staging_cap_counts_every_open_transaction() {
+        let ins = |scn, xid: &str| {
+            row(
+                scn,
+                op::INSERT,
+                xid,
+                r#"insert into "APP"."T"("ID") values ('1')"#,
+            )
+        };
+        let mut m = Miner::new(OnUnsupported::Fail, Some(10)).with_max_staged_total(Some(5));
+        m.apply(&ins(1, "A")).unwrap();
+        m.apply(&ins(2, "B")).unwrap();
+        let err = m.apply(&ins(3, "C")).unwrap_err();
+        assert!(
+            err.to_string().contains("max_staged_records_total (5)"),
+            "{err}"
+        );
+
+        let mut m = Miner::new(OnUnsupported::Fail, None).with_max_staged_total(Some(5));
+        m.apply(&ins(1, "A")).unwrap();
+        m.apply(&ins(2, "B")).unwrap();
+        m.apply(&row(3, op::COMMIT, "A", ""))
+            .unwrap()
+            .expect("committed");
+        m.apply(&row(4, op::ROLLBACK, "B", "")).unwrap();
+        assert_eq!(m.staged_total, 0);
+        m.apply(&ins(5, "C")).unwrap();
+        m.apply(&ins(6, "D")).unwrap();
+
+        let lob = |scn, off| {
+            row(
+                scn,
+                op::LOB_WRITE,
+                "L",
+                &format!(
+                    "DECLARE loc_c CLOB; BEGIN select \"N\" into loc_c from \"APP\".\"T\" where \"ID\" = '7' for update; buf_c := 'x'; dbms_lob.write(loc_c, 1, {off}, buf_c); END;"
+                ),
+            )
+        };
+        let mut m = Miner::new(OnUnsupported::Fail, None).with_max_staged_total(Some(3));
+        m.apply(&lob(1, 1)).unwrap();
+        m.apply(&lob(2, 2)).unwrap();
+        let err = m.apply(&lob(3, 3)).unwrap_err();
+        assert!(
+            err.to_string().contains("max_staged_records_total"),
+            "{err}"
+        );
     }
 
     #[test]

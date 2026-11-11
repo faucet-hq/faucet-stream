@@ -335,7 +335,8 @@ impl Shared {
                 p
             }
         };
-        let mut miner = Miner::new(self.config.on_unsupported, self.config.max_staged_records);
+        let mut miner = Miner::new(self.config.on_unsupported, self.config.max_staged_records)
+            .with_max_staged_total(self.config.max_staged_records_total);
         let mut from = position.restart_scn.saturating_sub(1);
         let mut agg: Vec<Value> = Vec::new();
         let mut agg_since = Instant::now();

@@ -29829,6 +29829,18 @@
                       "default": 1000000,
                       "x-faucet-caller-max": 1000000
                     },
+                    "max_staged_records_total": {
+                      "description": "Abort when all open transactions together buffer more than this many\nchanges, counting LOB pieces and folded updates. Defaults to\n1,000,000; `null` = unbounded.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 1000000,
+                      "x-faucet-caller-max": 1000000
+                    },
                     "batch_size": {
                       "description": "`0` aggregates committed transactions into pages of up to 100,000\nrecords, emitted at least every `idle_timeout`, each with its bookmark;\notherwise each committed transaction is its own page. Default\n[`DEFAULT_BATCH_SIZE`].",
                       "type": [

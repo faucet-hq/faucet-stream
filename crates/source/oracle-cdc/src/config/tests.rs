@@ -91,3 +91,21 @@ fn debug_masks_password() {
     );
     assert!(!format!("{cfg:?}").contains("pw123"));
 }
+
+#[test]
+fn both_staging_caps_default_and_are_bounded_for_callers() {
+    let schema = serde_json::to_value(schemars::schema_for!(OracleCdcSourceConfig)).unwrap();
+    let caps = faucet_core::resolve::caller_max_fields(&schema);
+    for field in ["max_staged_records", "max_staged_records_total"] {
+        assert!(
+            caps.contains(&(field.to_string(), 1_000_000)),
+            "{field}: {caps:?}"
+        );
+    }
+    let cfg: OracleCdcSourceConfig = serde_json::from_value(serde_json::json!({
+        "host": "h", "service_name": "S", "username": "u", "password": "p",
+        "tables": ["APP.T"]
+    }))
+    .unwrap();
+    assert_eq!(cfg.max_staged_records_total, Some(1_000_000));
+}
