@@ -38,6 +38,7 @@ bytes.workspace = true
 serde_json.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wiremock = "0.6"
 
 [package.metadata.docs.rs]
 all-features = true

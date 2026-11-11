@@ -16,7 +16,10 @@ Provides:
   it did not load itself), the table is read through a store that refuses
   every key outside `table_uri`, so a file the Delta log names elsewhere (a
   checkpoint sidecar, an add action, a deletion vector) fails the open or the
-  read instead of being read.
+  read instead of being read. Where the task may not use the host's identity,
+  the object store is built from the connection's options alone, with nothing
+  read from the process environment; `log_store()` builds the same store for
+  delta-rs operations that create the table.
 - **`convert`** — Arrow ⇆ JSON conversion (`record_batch_to_json`,
   `infer_arrow_schema`, and `infer_delta_schema` for the Arrow version
   `deltalake` writes with) reused by the source (read) and sink (write).

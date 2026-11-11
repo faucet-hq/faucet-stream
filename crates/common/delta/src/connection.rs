@@ -148,23 +148,15 @@ impl DeltaConnection {
     /// of the host faucet runs on, if any: `storage_options.<key>` for a key
     /// naming a role, profile, metadata service or workload identity;
     /// `credentials` when the effective options name no credential of the
-    /// table's store (an S3 key id needs its secret), or, for S3, when the
-    /// process environment names a role delta-rs would assume
-    /// (`AWS_IAM_ROLE_ARN` / `AWS_S3_ASSUME_ROLE_ARN`). A local table uses
-    /// none.
+    /// table's store (an S3 key id needs its secret). A task that may not use
+    /// the host's identity builds its store from these options alone, so the
+    /// process environment does not count. A local table uses none.
     pub fn host_identity(&self) -> Option<String> {
         use faucet_core::resolve::{StoreKind, store_options_host_identity};
         let kind = StoreKind::from_url(&self.table_uri)?;
-        let found = store_options_host_identity(kind, self.merged_storage_options());
-        let env_role = kind == StoreKind::S3
-            && ["AWS_IAM_ROLE_ARN", "AWS_S3_ASSUME_ROLE_ARN"]
-                .iter()
-                .any(|k| std::env::var(k).is_ok_and(|v| !v.trim().is_empty()));
-        match found {
-            Some(key) if key != "credentials" => Some(format!("storage_options.{key}")),
-            Some(_) => Some("credentials".into()),
-            None if env_role => Some("credentials".into()),
-            None => None,
+        match store_options_host_identity(kind, self.merged_storage_options())? {
+            key if key != "credentials" => Some(format!("storage_options.{key}")),
+            _ => Some("credentials".into()),
         }
     }
 
@@ -185,31 +177,69 @@ impl DeltaConnection {
         self.load(url).await.map_err(|e| self.map_open_error(e))
     }
 
-    /// Load the table at `url`. Under a reference policy with path roots (a
-    /// config the host does not trust) every file the log names is read
-    /// through a store that refuses keys outside the table.
+    /// Load the table at `url` ([`DeltaConnection::table_builder`]).
     async fn load(
         &self,
         url: url::Url,
     ) -> Result<deltalake::DeltaTable, deltalake::DeltaTableError> {
+        match self.table_builder(url.clone())? {
+            Some(builder) => builder.load().await,
+            None => {
+                deltalake::open_table_with_storage_options(url, self.merged_storage_options()).await
+            }
+        }
+    }
+
+    /// The builder for `url` when the task needs its own store, else `None`
+    /// (delta-rs builds it from the options). Where the task may not use the
+    /// host's identity the store is built from the connection's options alone,
+    /// never the process environment; under a reference policy with path roots
+    /// (a config the host does not trust) it refuses keys outside the table.
+    fn table_builder(
+        &self,
+        url: url::Url,
+    ) -> Result<Option<deltalake::DeltaTableBuilder>, deltalake::DeltaTableError> {
         let options = self.merged_storage_options();
         let confined =
             faucet_core::http::current_reference_policy().is_some_and(|p| p.path_roots().is_some());
-        if !confined {
-            return deltalake::open_table_with_storage_options(url, options).await;
+        let own = !faucet_core::resolve::host_credentials_allowed();
+        if !confined && !own {
+            return Ok(None);
         }
-        let root = deltalake::DeltaTableBuilder::from_url(url.clone())?
-            .with_storage_options(options.clone())
-            .build_storage()?
-            .root_object_store(None);
-        let prefix = deltalake::Path::from_url_path(url.path())
-            .map_err(|e| deltalake::DeltaTableError::InvalidTableLocation(format!("{url}: {e}")))?;
-        let store = std::sync::Arc::new(crate::confined::Confined::new(root, prefix));
-        deltalake::DeltaTableBuilder::from_url(url.clone())?
-            .with_storage_options(options)
-            .with_storage_backend(store, url)
-            .load()
-            .await
+        let builder = deltalake::DeltaTableBuilder::from_url(url.clone())?
+            .with_storage_options(options.clone());
+        let built = if own {
+            crate::own_store::build(&url, &options)?
+        } else {
+            None
+        };
+        let mut root = match built {
+            Some(store) => store,
+            None => builder.build_storage()?.root_object_store(None),
+        };
+        if confined {
+            let prefix = deltalake::Path::from_url_path(url.path()).map_err(|e| {
+                deltalake::DeltaTableError::InvalidTableLocation(format!("{url}: {e}"))
+            })?;
+            root = std::sync::Arc::new(crate::confined::Confined::new(root, prefix));
+        }
+        Ok(Some(builder.with_storage_backend(root, url)))
+    }
+
+    /// The table's log store, built as [`DeltaConnection::open`] builds it —
+    /// for delta-rs operations that create the table (`CreateBuilder`).
+    pub fn log_store(&self) -> Result<deltalake::logstore::LogStoreRef, FaucetError> {
+        self.check_host_identity()?;
+        self.register_handlers();
+        let url = self.table_url()?;
+        let builder = match self.table_builder(url.clone()) {
+            Ok(Some(b)) => b,
+            Ok(None) => deltalake::DeltaTableBuilder::from_url(url)
+                .map(|b| b.with_storage_options(self.merged_storage_options()))
+                .map_err(|e| self.map_open_error(e))?,
+            Err(e) => return Err(self.map_open_error(e)),
+        };
+        builder.build_storage().map_err(|e| self.map_open_error(e))
     }
 
     /// Open the table if it exists; return `Ok(None)` when the URI is not (yet)
@@ -326,16 +356,12 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn delta_role_options_and_server_role_env_are_refused_for_callers() {
-        let env_role = ["AWS_IAM_ROLE_ARN", "AWS_S3_ASSUME_ROLE_ARN"]
-            .iter()
-            .any(|k| std::env::var(k).is_ok_and(|v| !v.trim().is_empty()));
+    fn delta_role_options_are_refused_for_callers() {
         let keyed = json!({"table_uri": "s3://b/t", "credentials": {"type": "aws", "config": {
             "access_key_id": "a", "secret_access_key": "s", "region": "us-east-1"}}});
-        assert_eq!(
+        assert!(
             host_identity(&keyed).is_empty(),
-            !env_role,
-            "static keys are the config's own unless the server names a role"
+            "static keys are the config's own"
         );
         assert_eq!(
             host_identity(&json!({"table_uri": "s3://b/t"})),
@@ -383,6 +409,18 @@ mod tests {
         let local: DeltaConnection =
             serde_json::from_value(json!({"table_uri": "/nonexistent/faucet/t"})).unwrap();
         assert!(local.check_host_identity().is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_caller_run_builds_its_log_store_from_its_own_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = conn(dir.path().to_str().unwrap());
+        let trusted = local.log_store().unwrap();
+        let caller =
+            faucet_core::resolve::with_host_credentials(false, async { local.log_store() })
+                .await
+                .unwrap();
+        assert_eq!(caller.root_url(), trusted.root_url());
     }
 
     fn conn(uri: &str) -> DeltaConnection {
