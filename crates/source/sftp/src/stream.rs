@@ -26,7 +26,7 @@ use std::pin::Pin;
 /// line-by-line afterwards, so memory stays O(batch) — while the whole-file
 /// formats hold at most `concurrency` bodies at once.
 enum Fetched {
-    Lines(SftpFile),
+    Lines(Box<SftpFile>),
     RawText(String),
     JsonArray(String),
     /// A whole file already decoded into records by
@@ -60,6 +60,7 @@ struct FileRange {
     file: SftpFile,
     path: String,
     calls: faucet_core::CallContext,
+    primed: bool,
 }
 
 #[cfg(feature = "arrow")]
@@ -78,7 +79,14 @@ impl faucet_core::file_format::parquet_io::RangeRead for FileRange {
             let failed =
                 |e: std::io::Error| FaucetError::Source(format!("SFTP read '{path}' failed: {e}"));
             let file = &mut self.file;
+            let primed = &mut self.primed;
             let read = async {
+                if !*primed {
+                    // The SFTP client sizes every later read by its first reply,
+                    // so that reply must come from the file's start, not its footer.
+                    file.read(&mut [0u8; 1]).await.map_err(failed)?;
+                    *primed = true;
+                }
                 file.seek(std::io::SeekFrom::Start(range.start))
                     .await
                     .map_err(failed)?;
@@ -248,11 +256,11 @@ impl SftpSource {
         let format = config.format;
         let max = config.max_object_bytes;
         Ok(match format {
-            SftpFormat::Jsonl => Fetched::Lines(
-                sftp.open(path)
-                    .await
-                    .map_err(|e| FaucetError::Source(format!("SFTP open '{path}' failed: {e}")))?,
-            ),
+            SftpFormat::Jsonl => {
+                Fetched::Lines(Box::new(sftp.open(path).await.map_err(|e| {
+                    FaucetError::Source(format!("SFTP open '{path}' failed: {e}"))
+                })?))
+            }
             SftpFormat::RawText => Fetched::RawText(Self::read_file_text(sftp, path, max).await?),
             SftpFormat::JsonArray => {
                 Fetched::JsonArray(Self::read_file_text(sftp, path, max).await?)
@@ -331,6 +339,7 @@ impl SftpSource {
                 file,
                 path: path.to_string(),
                 calls: calls.clone(),
+                primed: false,
             },
             len,
             path,
@@ -525,7 +534,7 @@ impl faucet_core::Source for SftpSource {
                         // file with no newline fails instead of being
                         // buffered whole.
                         let mut lines = faucet_core::file_format::capped_lines(
-                            reads.reader(ChunkedReader::new(handle)),
+                            reads.reader(ChunkedReader::new(*handle)),
                             self.config.max_object_bytes,
                         );
                         let mut line_num = 0usize;

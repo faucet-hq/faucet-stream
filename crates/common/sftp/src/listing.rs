@@ -12,7 +12,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::oneshot;
 
 use crate::SftpError;
-use crate::inbound::{InboundGuard, LimitedStream, MAX_INBOUND_PACKET};
+use crate::inbound::{InboundGuard, MAX_INBOUND_PACKET, Observed, client_config};
 
 /// Default for `max_listed_entries`: entries one directory listing may scan.
 pub const DEFAULT_MAX_LISTED_ENTRIES: usize = 1_000_000;
@@ -320,7 +320,10 @@ impl ListingChannel {
             read: output,
             write: write.make_writer(),
         };
-        let raw = RawSftpSession::new(LimitedStream::new(stream, MAX_INBOUND_PACKET, guard));
+        let raw = RawSftpSession::new_with_config(
+            Observed::new(stream, MAX_INBOUND_PACKET, guard),
+            client_config(),
+        );
         (
             Self {
                 write: Some(write),

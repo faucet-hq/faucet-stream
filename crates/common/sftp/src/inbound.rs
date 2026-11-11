@@ -1,6 +1,6 @@
 //! Bounds on what the server can make the client hold: the length of one
-//! inbound SFTP packet ([`LimitedStream`]) and the size of one read request
-//! ([`ChunkedReader`]).
+//! inbound SFTP packet ([`client_config`], reported through [`Observed`]) and
+//! the size of one read handed to a caller ([`ChunkedReader`]).
 
 use std::io;
 use std::pin::Pin;
@@ -12,14 +12,14 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// Largest inbound SFTP packet accepted, in bytes (its 4-byte length prefix
 /// excluded). A reply to a [`MAX_READ_CHUNK`] read fits with room to spare; a
-/// longer packet closes the connection's SFTP channel with a typed error.
+/// longer packet closes the SFTP channel it arrived on with a typed error.
 pub const MAX_INBOUND_PACKET: u32 = 1024 * 1024 + 64;
 
-/// Largest read requested from the server in one SFTP `READ`, in bytes.
+/// Largest read a [`ChunkedReader`] passes to the reader it wraps, in bytes.
 pub const MAX_READ_CHUNK: usize = 1024 * 1024;
 
-/// Records the first packet a [`LimitedStream`] refused, shared by the
-/// streams of one SFTP channel so callers can explain the failure.
+/// Records the first over-limit packet an [`Observed`] stream saw, shared by
+/// the streams of one SFTP channel so callers can explain the failure.
 #[derive(Debug, Default)]
 pub(crate) struct InboundGuard {
     refused: OnceLock<u32>,
@@ -55,107 +55,110 @@ fn refusal_message(len: u32) -> String {
     )
 }
 
-#[derive(Debug, Clone, Copy)]
-enum Frame {
-    Header { got: usize },
-    Emit { pos: usize, body: u32 },
-    Body { remaining: u32 },
-    Refused,
+/// Largest outgoing SFTP `WRITE` packet, unless the server advertises a
+/// smaller write length: the 256 KiB message size servers accept by default.
+const MAX_WRITE_PACKET: u32 = 256 * 1024;
+
+/// File reads one open file keeps in flight; each holds up to one packet.
+const MAX_READS_IN_FLIGHT: usize = 4;
+
+/// SFTP client settings for every session this crate opens: the client
+/// refuses an inbound packet longer than [`MAX_INBOUND_PACKET`].
+pub(crate) fn client_config() -> russh_sftp::client::Config {
+    russh_sftp::client::Config {
+        max_packet_len: MAX_INBOUND_PACKET,
+        max_write_packet_len: MAX_WRITE_PACKET,
+        max_concurrent_reads: MAX_READS_IN_FLIGHT,
+        ..Default::default()
+    }
 }
 
-/// An SFTP channel stream that reads each packet's 4-byte length prefix and
-/// refuses one above `max` before any of its body is read: the read fails
-/// once (the SFTP client logs it) and then reports end of stream, which ends
-/// the client's reader. Writes pass through.
-pub(crate) struct LimitedStream<S> {
-    inner: S,
+/// Follows SFTP packet framing over the bytes it has seen and finds the
+/// first length prefix above `max`.
+#[derive(Debug)]
+struct Framing {
     max: u32,
     header: [u8; 4],
-    frame: Frame,
+    got: usize,
+    remaining: u32,
+    found: bool,
+}
+
+impl Framing {
+    fn new(max: u32) -> Self {
+        Self {
+            max,
+            header: [0; 4],
+            got: 0,
+            remaining: 0,
+            found: false,
+        }
+    }
+
+    /// Advance over `bytes`; the length of an over-limit packet whose
+    /// prefix completes in them, the first time one does.
+    fn advance(&mut self, mut bytes: &[u8]) -> Option<u32> {
+        while !self.found && !bytes.is_empty() {
+            if self.remaining > 0 {
+                let skip = (self.remaining as usize).min(bytes.len());
+                self.remaining -= skip as u32;
+                bytes = &bytes[skip..];
+                continue;
+            }
+            let take = (4 - self.got).min(bytes.len());
+            self.header[self.got..self.got + take].copy_from_slice(&bytes[..take]);
+            self.got += take;
+            bytes = &bytes[take..];
+            if self.got == 4 {
+                self.got = 0;
+                let len = u32::from_be_bytes(self.header);
+                if len > self.max {
+                    self.found = true;
+                    return Some(len);
+                }
+                self.remaining = len;
+            }
+        }
+        None
+    }
+}
+
+/// An SFTP channel stream that hands every byte through unchanged and, as
+/// they pass, records an inbound packet longer than the limit in its
+/// [`InboundGuard`]; the SFTP client itself refuses that packet.
+pub(crate) struct Observed<S> {
+    inner: S,
+    framing: Framing,
     guard: Arc<InboundGuard>,
 }
 
-impl<S> LimitedStream<S> {
+impl<S> Observed<S> {
     pub(crate) fn new(inner: S, max: u32, guard: Arc<InboundGuard>) -> Self {
         Self {
             inner,
-            max,
-            header: [0; 4],
-            frame: Frame::Header { got: 0 },
+            framing: Framing::new(max),
             guard,
         }
     }
 }
 
-impl<S: AsyncRead + Unpin> AsyncRead for LimitedStream<S> {
+impl<S: AsyncRead + Unpin> AsyncRead for Observed<S> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if buf.remaining() == 0 {
-            return Poll::Ready(Ok(()));
+        let before = buf.filled().len();
+        ready!(Pin::new(&mut this.inner).poll_read(cx, buf))?;
+        if let Some(len) = this.framing.advance(&buf.filled()[before..]) {
+            this.guard.record(len);
         }
-        loop {
-            match this.frame {
-                Frame::Refused => return Poll::Ready(Ok(())),
-                Frame::Header { got } => {
-                    let mut head = ReadBuf::new(&mut this.header[got..]);
-                    ready!(Pin::new(&mut this.inner).poll_read(cx, &mut head))?;
-                    let n = head.filled().len();
-                    if n == 0 {
-                        return Poll::Ready(Ok(()));
-                    }
-                    let got = got + n;
-                    if got < 4 {
-                        this.frame = Frame::Header { got };
-                        continue;
-                    }
-                    let len = u32::from_be_bytes(this.header);
-                    if len > this.max {
-                        this.guard.record(len);
-                        this.frame = Frame::Refused;
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            refusal_message(len),
-                        )));
-                    }
-                    this.frame = Frame::Emit { pos: 0, body: len };
-                }
-                Frame::Emit { pos, body } => {
-                    let n = (4 - pos).min(buf.remaining());
-                    buf.put_slice(&this.header[pos..pos + n]);
-                    let pos = pos + n;
-                    this.frame = match (pos, body) {
-                        (4, 0) => Frame::Header { got: 0 },
-                        (4, body) => Frame::Body { remaining: body },
-                        (pos, body) => Frame::Emit { pos, body },
-                    };
-                    return Poll::Ready(Ok(()));
-                }
-                Frame::Body { remaining } => {
-                    let want = (remaining as usize).min(buf.remaining());
-                    let mut part = ReadBuf::new(buf.initialize_unfilled_to(want));
-                    ready!(Pin::new(&mut this.inner).poll_read(cx, &mut part))?;
-                    let n = part.filled().len();
-                    buf.advance(n);
-                    if n > 0 {
-                        let left = remaining - n as u32;
-                        this.frame = if left == 0 {
-                            Frame::Header { got: 0 }
-                        } else {
-                            Frame::Body { remaining: left }
-                        };
-                    }
-                    return Poll::Ready(Ok(()));
-                }
-            }
-        }
+        Poll::Ready(Ok(()))
     }
 }
 
-impl<S: AsyncWrite + Unpin> AsyncWrite for LimitedStream<S> {
+impl<S: AsyncWrite + Unpin> AsyncWrite for Observed<S> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -173,9 +176,8 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for LimitedStream<S> {
     }
 }
 
-/// A reader that asks for at most [`MAX_READ_CHUNK`] bytes per read, so an
-/// SFTP file read never requests more than one inbound packet can carry,
-/// whatever read length the server advertises.
+/// A reader that asks for at most [`MAX_READ_CHUNK`] bytes per read. The SFTP
+/// client sizes each `READ` request to fit one inbound packet itself.
 pub struct ChunkedReader<R> {
     inner: R,
 }

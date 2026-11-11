@@ -363,7 +363,7 @@ lapin = { version = "4.12", default-features = false, features = ["tokio"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 # SFTP over SSH (pure-Rust) for the sftp source/sink pair.
 russh = "0.65"
-russh-sftp = "2"
+russh-sftp = "3"
 azure_security_keyvault_secrets = "1"
 azure_identity = "1"
 azure_core = "1"

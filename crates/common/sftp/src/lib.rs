@@ -48,7 +48,7 @@ pub use backend::{SftpBackend, SftpBackendBuilder};
 pub use inbound::{ChunkedReader, MAX_INBOUND_PACKET, MAX_READ_CHUNK};
 pub use listing::{DEFAULT_MAX_LISTED_ENTRIES, ListError, ListedEntry, SftpLister, SftpMetadata};
 
-use inbound::{InboundGuard, LimitedStream};
+use inbound::{InboundGuard, Observed, client_config};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1050,11 +1050,10 @@ async fn probe_extensions(
         .request_subsystem(true, "sftp")
         .await
         .map_err(ProbeFailure::other)?;
-    let raw = russh_sftp::client::RawSftpSession::new(LimitedStream::new(
-        channel.into_stream(),
-        MAX_INBOUND_PACKET,
-        guard.clone(),
-    ));
+    let raw = russh_sftp::client::RawSftpSession::new_with_config(
+        Observed::new(channel.into_stream(), MAX_INBOUND_PACKET, guard.clone()),
+        client_config(),
+    );
     let version = raw.init().await.map_err(ProbeFailure::other)?;
     let posix = version
         .extensions
@@ -1162,13 +1161,13 @@ async fn pause(d: std::time::Duration) {
 async fn open_subsystem(
     handle: &russh::client::Handle<ClientHandler>,
     guard: &Arc<InboundGuard>,
-) -> Result<LimitedStream<russh::ChannelStream<russh::client::Msg>>, FaucetError> {
+) -> Result<Observed<russh::ChannelStream<russh::client::Msg>>, FaucetError> {
     let channel = open_channel_settling(handle).await.map_err(map_ssh_err)?;
     channel
         .request_subsystem(true, "sftp")
         .await
         .map_err(map_ssh_err)?;
-    Ok(LimitedStream::new(
+    Ok(Observed::new(
         channel.into_stream(),
         MAX_INBOUND_PACKET,
         guard.clone(),
@@ -1179,7 +1178,7 @@ async fn open_session(
     handle: &russh::client::Handle<ClientHandler>,
     guard: &Arc<InboundGuard>,
 ) -> Result<SftpSession, FaucetError> {
-    SftpSession::new(open_subsystem(handle, guard).await?)
+    SftpSession::new_with_config(open_subsystem(handle, guard).await?, client_config())
         .await
         .map_err(|e| FaucetError::Custom(format!("failed to start SFTP subsystem: {e}").into()))
 }
