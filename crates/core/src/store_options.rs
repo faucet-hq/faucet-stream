@@ -26,21 +26,13 @@ impl StoreKind {
     /// blob, DFS or Fabric host, an `https://` S3 or R2 host), `None` for
     /// anything else (a local path, `memory://`, a plain HTTP store).
     pub fn from_url(url: &str) -> Option<Self> {
-        let lower = url.trim().to_ascii_lowercase();
-        let (scheme, rest) = lower.split_once("://")?;
-        match scheme {
+        let parsed = url::Url::parse(url.trim()).ok()?;
+        match parsed.scheme() {
             "s3" | "s3a" => Some(Self::S3),
             "gs" | "gcs" => Some(Self::Gcs),
             "az" | "adl" | "azure" | "abfs" | "abfss" => Some(Self::Azure),
             "https" => {
-                let host = rest
-                    .split(['/', '?', '#'])
-                    .next()
-                    .unwrap_or_default()
-                    .rsplit('@')
-                    .next()
-                    .unwrap_or_default();
-                let host = host.split(':').next().unwrap_or_default();
+                let host = parsed.host_str()?;
                 if host.ends_with("dfs.core.windows.net")
                     || host.ends_with("blob.core.windows.net")
                     || host.ends_with("dfs.fabric.microsoft.com")
@@ -61,7 +53,11 @@ impl StoreKind {
 }
 
 fn normalized(key: &str, kind: StoreKind) -> String {
-    let lower = key.trim().to_ascii_lowercase();
+    stripped(&key.trim().to_ascii_lowercase(), kind)
+}
+
+/// `lower` without its store prefix, as the store's option parser reads it.
+fn stripped(lower: &str, kind: StoreKind) -> String {
     let prefixes: &[&str] = match kind {
         StoreKind::S3 => &["aws_"],
         StoreKind::Gcs => &["google_"],
@@ -70,7 +66,8 @@ fn normalized(key: &str, kind: StoreKind) -> String {
     prefixes
         .iter()
         .find_map(|p| lower.strip_prefix(p))
-        .map_or_else(|| lower.clone(), str::to_string)
+        .unwrap_or(lower)
+        .to_string()
 }
 
 fn truthy(v: &str) -> bool {
@@ -87,7 +84,10 @@ fn truthy(v: &str) -> bool {
 ///
 /// A key naming a role, a profile, the instance metadata service, a
 /// container or workload-identity credential, or the Azure CLI counts even
-/// beside static keys: the library then resolves it through the host.
+/// beside static keys: the library then resolves it through the host. So
+/// does one of two keys the store reads as the same option (`skip_signature`
+/// beside `aws_skip_signature`, or two spellings differing only in case):
+/// which one the library applies last is not ours to know.
 pub fn store_options_host_identity<I, K, V>(kind: StoreKind, options: I) -> Option<String>
 where
     I: IntoIterator<Item = (K, V)>,
@@ -96,15 +96,28 @@ where
 {
     let mut set = std::collections::BTreeMap::new();
     let mut exact = std::collections::BTreeSet::new();
+    let mut read: std::collections::BTreeMap<String, (String, String)> = Default::default();
+    let mut collision = None;
     for (k, v) in options {
         let (k, v) = (k.as_ref(), v.as_ref());
+        let lower = k.to_ascii_lowercase();
+        if read
+            .insert(stripped(&lower, kind), (k.to_string(), v.to_string()))
+            .is_some()
+        {
+            collision.get_or_insert_with(|| k.to_string());
+        }
         if !v.trim().is_empty() {
-            exact.insert(k.to_ascii_lowercase());
+            exact.insert(lower);
             set.insert(normalized(k, kind), (k.to_string(), v.to_string()));
         }
     }
+    if collision.is_some() {
+        return collision;
+    }
     let given = |names: &[&str]| names.iter().any(|n| exact.contains(*n));
     let on = |name: &str| set.get(name).is_some_and(|(_, v)| truthy(v));
+    let read_on = |name: &str| read.get(name).is_some_and(|(_, v)| truthy(v));
     let host_keys: &[&str] = match kind {
         StoreKind::S3 => &[
             "role_arn",
@@ -135,14 +148,12 @@ where
     }
     let own = match kind {
         StoreKind::S3 => {
-            given(&["aws_skip_signature", "skip_signature"])
-                && set.get("skip_signature").is_some_and(|(_, v)| truthy(v))
+            given(&["aws_skip_signature", "skip_signature"]) && read_on("skip_signature")
                 || given(&["aws_access_key_id", "access_key_id"])
                     && given(&["aws_secret_access_key", "secret_access_key"])
         }
         StoreKind::Gcs => {
-            given(&["google_skip_signature", "skip_signature"])
-                && set.get("skip_signature").is_some_and(|(_, v)| truthy(v))
+            given(&["google_skip_signature", "skip_signature"]) && read_on("skip_signature")
                 || given(&[
                     "google_service_account",
                     "service_account",
@@ -155,8 +166,7 @@ where
                 ])
         }
         StoreKind::Azure => {
-            given(&["azure_skip_signature", "skip_signature"])
-                && set.get("skip_signature").is_some_and(|(_, v)| truthy(v))
+            given(&["azure_skip_signature", "skip_signature"]) && read_on("skip_signature")
                 || given(&[
                     "azure_storage_account_key",
                     "azure_storage_access_key",
@@ -174,8 +184,7 @@ where
                     "azure_fabric_session_token",
                     "fabric_session_token",
                 ])
-                || given(&["azure_storage_use_emulator", "use_emulator"])
-                    && set.get("use_emulator").is_some_and(|(_, v)| truthy(v))
+                || given(&["azure_storage_use_emulator", "use_emulator"]) && read_on("use_emulator")
                 || given(&["azure_storage_client_id", "azure_client_id", "client_id"])
                     && given(&[
                         "azure_storage_client_secret",
@@ -339,6 +348,94 @@ mod tests {
                 &[("account_key", "k"), ("azure_federated_token_file", "/t")]
             ),
             Some("azure_federated_token_file".into())
+        );
+    }
+
+    #[test]
+    fn percent_encoded_store_hosts_are_recognised() {
+        for (url, kind) in [
+            (
+                "https://acct.blob.core.windows%2Enet/container/p",
+                Some(StoreKind::Azure),
+            ),
+            (
+                "https://acct.blob.core.windows\u{3002}net/container/p",
+                Some(StoreKind::Azure),
+            ),
+            ("https://b.s3.amazonaws%2ecom/k", Some(StoreKind::S3)),
+            (
+                "https://ACCT.DFS.CORE.WINDOWS.NET/f",
+                Some(StoreKind::Azure),
+            ),
+            (
+                "https://user@acct.blob.core.windows.net:443/c",
+                Some(StoreKind::Azure),
+            ),
+            (
+                "\u{1}https://acct.blob.core.windows.net/c",
+                Some(StoreKind::Azure),
+            ),
+            ("https://minio%2Eexample/b", None),
+        ] {
+            assert_eq!(StoreKind::from_url(url), kind, "{url}");
+        }
+    }
+
+    #[test]
+    fn colliding_store_option_keys_are_refused_for_callers() {
+        assert_eq!(
+            host(
+                StoreKind::S3,
+                &[
+                    ("aws_skip_signature", "false"),
+                    (" skip_signature", "true"),
+                    ("skip_signature ", "true")
+                ]
+            ),
+            Some("credentials".into()),
+            "padded spellings are not read by the store"
+        );
+        assert_eq!(
+            host(
+                StoreKind::S3,
+                &[("aws_skip_signature", "false"), ("skip_signature", "true")]
+            ),
+            Some("skip_signature".into())
+        );
+        assert_eq!(
+            host(
+                StoreKind::S3,
+                &[("SKIP_SIGNATURE", "false"), ("skip_signature", "true")]
+            ),
+            Some("skip_signature".into())
+        );
+        assert_eq!(
+            host(
+                StoreKind::Azure,
+                &[
+                    ("azure_storage_use_emulator", "true"),
+                    ("use_emulator", "false")
+                ]
+            ),
+            Some("use_emulator".into())
+        );
+        assert_eq!(
+            host(
+                StoreKind::S3,
+                &[
+                    ("aws_access_key_id", "a"),
+                    ("access_key_id", "b"),
+                    ("aws_secret_access_key", "s")
+                ]
+            ),
+            Some("access_key_id".into())
+        );
+        assert_eq!(
+            host(
+                StoreKind::S3,
+                &[("aws_access_key_id", "a"), ("aws_secret_access_key", "s")]
+            ),
+            None
         );
     }
 
