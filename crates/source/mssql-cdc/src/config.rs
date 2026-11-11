@@ -96,6 +96,7 @@ pub struct MssqlCdcSourceConfig {
     /// aborts with a typed error (rather than risking unbounded memory growth).
     /// Defaults to 1,000,000; `null` = unbounded.
     #[serde(default = "faucet_core::replication::default_max_staged_records")]
+    #[schemars(extend("x-faucet-caller-max" = 1_000_000))]
     pub max_staged_records: Option<usize>,
     /// Advisory per-page record count. `0` accumulates every change into a
     /// single trailing page (snapshot/test convenience). Default

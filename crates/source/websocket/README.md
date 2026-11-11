@@ -87,7 +87,7 @@ This connects to the Binance trade stream, captures the first 100 trade messages
 | `reconnect_backoff` | int (seconds) | `1` | Base wait before the first retry; subsequent retries grow exponentially with jitter, capped. |
 | `reconnect_max_attempts` | int | *(unlimited)* | Cap on *consecutive* failed reconnects (resets on a received data frame — a server that accepts the handshake and closes again still counts). Unset = unlimited (then `idle_timeout` is the natural cap). With only `max_messages` set, a server that accepts and then closes with a non-rejecting code (1000 / 1001 / 1011) is reconnected forever — set this cap (or `idle_timeout`) for such endpoints. The historical spelling `max_reconnect_attempts` is still accepted — the prefix order used to be reversed against the gRPC source, so whichever you learned first was silently dropped on the other (#654). |
 | `connect_timeout` | int (seconds) | `30` | Limit on the TCP connect + upgrade handshake and on sending the subscribe frames. Expiry is a connect failure (retried under `reconnect`). |
-| `max_message_bytes` | int | *(tungstenite default)* | Bound the max message/frame size (bytes) to prevent runaway memory. Unset = tungstenite default (64 MiB message / 16 MiB frame). |
+| `max_message_bytes` | int | *(tungstenite default)* | Bound the max message/frame size (bytes) to prevent runaway memory. Unset = tungstenite default (64 MiB message / 16 MiB frame). In a config submitted to `faucet serve` it may be 1 to 64 MiB (67,108,864); `null` and `0` are refused. |
 
 ### Termination
 

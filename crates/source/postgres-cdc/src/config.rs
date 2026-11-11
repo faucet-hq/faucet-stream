@@ -161,6 +161,7 @@ pub struct PostgresCdcSourceConfig {
     /// to your available memory if you replicate tables subject to large bulk
     /// writes.
     #[serde(default = "faucet_core::replication::default_max_staged_records")]
+    #[schemars(extend("x-faucet-caller-max" = 1_000_000))]
     pub max_staged_records: Option<usize>,
 
     /// Replication events read ahead while the pipeline is busy writing a

@@ -105,6 +105,7 @@ pub struct WebsocketSourceConfig {
     /// Bound the max WebSocket message/frame size (bytes) to prevent runaway
     /// memory. `None` = tungstenite default (64 MiB message / 16 MiB frame).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-faucet-caller-max" = 67_108_864))]
     pub max_message_bytes: Option<usize>,
 
     /// Records per emitted [`StreamPage`](faucet_core::StreamPage). Default

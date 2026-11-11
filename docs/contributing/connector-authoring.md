@@ -148,6 +148,19 @@ pub query: String,
 A webhook or object-arrival trigger refuses a sender-chosen value that would
 be the whole of such a field.
 
+A numeric field that bounds what the connector holds in memory (a staging
+buffer, a message size, a receive window) carries the largest value a config
+the server did not author may set; `faucet serve` refuses `null`, `0` and
+anything above it in such a config:
+
+```rust
+#[schemars(extend("x-faucet-caller-max" = 1_000_000))]
+pub max_staged_records: Option<usize>,
+```
+
+A field that opens a listener is annotated `x-faucet-resource: listen`, so a
+server holds it to its `--allow-listen` ranges.
+
 ### Resumability
 
 If your source can resume, implement two methods:

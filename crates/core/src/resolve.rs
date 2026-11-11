@@ -2756,6 +2756,46 @@ pub fn sql_fields(schema: &Value) -> Vec<String> {
     flagged_fields(schema, SQL_ANNOTATION)
 }
 
+/// The JSON Schema keyword (a positive integer `N`) on a top-level numeric
+/// config field that bounds what the connector holds in memory. A host that
+/// runs configs it did not author holds such a field to `1..=N`: `0` and
+/// `null` (the "no bound" values) and anything above `N` are refused. A value
+/// the config leaves out keeps the connector's default.
+///
+/// ```ignore
+/// #[schemars(extend("x-faucet-caller-max" = 1_000_000))]
+/// pub max_staged_records: Option<usize>,
+/// ```
+pub const CALLER_MAX_ANNOTATION: &str = "x-faucet-caller-max";
+
+/// The top-level config fields `schema` marks with [`CALLER_MAX_ANNOTATION`]
+/// and their ceilings, across every `oneOf` / `anyOf` / `allOf` branch of the
+/// root (the lowest ceiling when branches disagree).
+pub fn caller_max_fields(schema: &Value) -> Vec<(String, u64)> {
+    let mut alts = Vec::new();
+    alternatives(schema, schema, &mut alts, 0);
+    let mut out: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for alt in alts {
+        let Some(Value::Object(props)) = alt.get("properties") else {
+            continue;
+        };
+        for (name, field) in props {
+            let mut field_alts = Vec::new();
+            alternatives(schema, field, &mut field_alts, 0);
+            if let Some(max) = field_alts
+                .iter()
+                .filter_map(|n| n.get(CALLER_MAX_ANNOTATION).and_then(Value::as_u64))
+                .min()
+            {
+                out.entry(name.clone())
+                    .and_modify(|m| *m = (*m).min(max))
+                    .or_insert(max);
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
 /// The top-level config fields `schema` marks with the boolean `annotation`.
 fn flagged_fields(schema: &Value, annotation: &str) -> Vec<String> {
     let mut alts = Vec::new();
@@ -4776,5 +4816,24 @@ mod tests {
         assert!(p.check(&listen).is_err());
         assert_eq!(ResourceKind::parse("listen"), Some(ResourceKind::Listen));
         assert_eq!(ResourceKind::Listen.as_str(), "listen");
+    }
+
+    #[test]
+    fn caller_ceilings_are_read_from_the_schema() {
+        let schema = serde_json::json!({
+            "oneOf": [
+                { "properties": {
+                    "a": { "type": "integer", "x-faucet-caller-max": 10 },
+                    "b": { "anyOf": [{ "$ref": "#/$defs/B" }, { "type": "null" }] },
+                    "c": { "type": "integer" } } },
+                { "properties": { "a": { "x-faucet-caller-max": 5 } } }
+            ],
+            "$defs": { "B": { "type": "integer", "x-faucet-caller-max": 7 } }
+        });
+        assert_eq!(
+            caller_max_fields(&schema),
+            vec![("a".to_string(), 5), ("b".to_string(), 7)]
+        );
+        assert!(caller_max_fields(&serde_json::json!({})).is_empty());
     }
 }

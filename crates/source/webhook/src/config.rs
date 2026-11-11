@@ -23,8 +23,10 @@ pub struct WebhookSourceConfig {
     /// Endpoint path for receiving webhooks (default: `"/webhook"`).
     pub path: String,
     /// Stop after receiving this many payloads.
+    #[schemars(extend("x-faucet-caller-max" = 1_000_000))]
     pub max_payloads: Option<usize>,
     /// How long to listen before returning, in seconds (default: 30).
+    #[schemars(extend("x-faucet-caller-max" = 3_600))]
     pub timeout_secs: u64,
     /// Maximum accepted request body size in bytes (default: 1 MiB). Larger
     /// POSTs are rejected with `413 Payload Too Large` so a single huge
@@ -36,6 +38,7 @@ pub struct WebhookSourceConfig {
     /// with `503 Service Unavailable` + `Retry-After`. An empty window always
     /// takes one POST, however large (`max_body_bytes` bounds it), and closes
     /// once it reaches the bound. `0` removes the bound.
+    #[schemars(extend("x-faucet-caller-max" = 1_073_741_824))]
     pub max_buffered_bytes: usize,
     /// Optional shared secret. When set, every request must carry it in the
     /// `Authorization` header (either the raw token or `Bearer <token>`);

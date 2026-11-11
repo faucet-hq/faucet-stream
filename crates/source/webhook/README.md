@@ -78,15 +78,15 @@ The receive window ends as soon as **any** configured condition is met; the serv
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `timeout_secs` | int | `30` | How long to listen before returning, in seconds. Always applies. |
-| `max_payloads` | int \| null | `null` | Stop once this many payloads have been received. `null` means collect until `timeout_secs` expires. The cap is **exact** under concurrent load. |
+| `timeout_secs` | int | `30` | How long to listen before returning, in seconds. Always applies. In a config submitted to `faucet serve` it may be 1 to 3,600; `null` and `0` are refused. |
+| `max_payloads` | int \| null | `null` | Stop once this many payloads have been received. `null` means collect until `timeout_secs` expires. The cap is **exact** under concurrent load. In a config submitted to `faucet serve` it may be 1 to 1,000,000; `null` and `0` are refused. |
 
 ### Reliability & security
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `max_body_bytes` | int | `1048576` | Max accepted request body size (1 MiB). Larger POSTs are rejected with `413 Payload Too Large` before buffering, so one huge request can't exhaust memory. |
-| `max_buffered_bytes` | int | `268435456` | Most request-body bytes held in memory for one window (256 MiB). A POST that would cross it closes the window — the stored payloads are emitted — and is refused with `503` + `Retry-After`. An empty window always takes one POST, however large (`max_body_bytes` bounds it), and closes once it reaches the bound. `0` removes the bound. |
+| `max_buffered_bytes` | int | `268435456` | Most request-body bytes held in memory for one window (256 MiB). A POST that would cross it closes the window — the stored payloads are emitted — and is refused with `503` + `Retry-After`. An empty window always takes one POST, however large (`max_body_bytes` bounds it), and closes once it reaches the bound. `0` removes the bound. In a config submitted to `faucet serve` it may be 1 to 1 GiB (1,073,741,824); `null` and `0` are refused. |
 | `auth_token` | string \| null | `null` | Optional shared secret. When set, requests must carry it in the `Authorization` header (raw value or `Bearer <token>`); others get `401`. Comparison is constant-time. Strongly recommended whenever `listen_addr` isn't loopback. |
 | `signature` | object \| null | `null` | HMAC verification of the raw body for senders that sign requests: `header` (signature header), `secret`, `algorithm` (`sha256` default / `sha512`), `encoding` (`hex` default, case-insensitive / `base64`), optional `prefix` (e.g. `sha256=`), optional `timestamp_header` (then the signed content is `<timestamp>.<body>` and a timestamp more than `tolerance_secs` — default 300 — from now is refused, and a request repeating one already stored in the window gets `200` without being stored again; the timestamp must be plain unix seconds, as the content is rebuilt from its integer value). One signature per request in the `<timestamp>.<body>` layout is supported — schemes that sign another layout (`v0:<ts>:<body>`), pack `t=…,v1=…` into one header, send several signatures during key rotation, or use URL-safe / unpadded base64 cannot be verified. Checked in constant time; failures get `401`. |
 

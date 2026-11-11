@@ -93,6 +93,7 @@ pub struct MysqlCdcSourceConfig {
     /// behind an undecided XA transaction, which default to 1,000,000 when this
     /// is `null`.
     #[serde(default = "faucet_core::replication::default_max_staged_records")]
+    #[schemars(extend("x-faucet-caller-max" = 1_000_000))]
     pub max_staged_records: Option<usize>,
     /// Advisory per-page record count. `0` = accumulate all txns into one page.
     #[serde(default = "default_batch_size")]

@@ -3049,6 +3049,9 @@ pub async fn load_submission_inputs(
             details: None,
         })?;
         refuse_server_paths_with(&cfg, &[], origin, &refs)?;
+        if matches!(origin, BodyOrigin::Caller { .. }) {
+            crate::serve::caller_limits::screen(&cfg, &[])?;
+        }
         return Ok(LoadedSubmission {
             cfg,
             nodes: Vec::new(),
@@ -3068,6 +3071,9 @@ pub async fn load_submission_inputs(
 
     refuse_server_paths_with(&cfg, &nodes, origin, &refs)?;
     crate::serve::listen::screen(&nodes, &refs)?;
+    if matches!(origin, BodyOrigin::Caller { .. }) {
+        crate::serve::caller_limits::screen(&cfg, &nodes)?;
+    }
 
     if let Some(t) = &tenant {
         t.check_refs(&cfg, &nodes)?;

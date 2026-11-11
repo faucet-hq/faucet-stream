@@ -307,6 +307,20 @@ cluster, while a member that does not check listeners is live, a caller's
 config that opens one is refused with `503` until the rolling upgrade
 finishes.
 
+### Memory bounds
+
+A config **the request carries** may not lift what a connector holds in the
+server's memory: a source's `batch_size: 0` (one page holding the whole
+result) is a `403`, and so is a field whose schema carries
+`x-faucet-caller-max: N` set to `null`, `0` or above `N`. Among the
+built-ins: `max_staged_records` on the CDC sources (1 to 1,000,000), a
+`websocket` source's `max_message_bytes` (up to 64 MiB) and a `webhook`
+source's `timeout_secs` (up to 3,600), `max_payloads` (up to 1,000,000) and
+`max_buffered_bytes` (up to 1 GiB). A field the config leaves out keeps the
+connector's default. These are record and byte counts per connector, not a
+memory limit for the run; registered templates, the triggers file and
+`faucet run` are not limited by them.
+
 ### Keys the server sets
 
 A sink config key the server sets for a run itself is removed from a config

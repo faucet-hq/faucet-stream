@@ -89,6 +89,7 @@ pub struct OracleCdcSourceConfig {
     /// Abort when one in-flight transaction buffers more than this many
     /// changes (bounded memory). Defaults to 1,000,000; `null` = unbounded.
     #[serde(default = "faucet_core::replication::default_max_staged_records")]
+    #[schemars(extend("x-faucet-caller-max" = 1_000_000))]
     pub max_staged_records: Option<usize>,
     /// `0` aggregates committed transactions into pages of up to 100,000
     /// records, emitted at least every `idle_timeout`, each with its bookmark;

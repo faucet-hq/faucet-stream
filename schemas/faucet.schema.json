@@ -23466,7 +23466,8 @@
                       ],
                       "format": "uint",
                       "minimum": 0,
-                      "default": 1000000
+                      "default": 1000000,
+                      "x-faucet-caller-max": 1000000
                     },
                     "max_buffered_events": {
                       "description": "Replication events read ahead while the pipeline is busy writing a\npage. Reading ahead keeps the replication client sending its status\nupdates, so a long sink write does not let the server's\n`wal_sender_timeout` (default 60 s) end the connection. Past this many\nbuffered events reading pauses until the pipeline catches up — keep a\npage write well under `wal_sender_timeout`, or raise it, if a page\nwrite can outlast that much change volume. Default 100 000.",
@@ -25790,7 +25791,8 @@
                       ],
                       "format": "uint",
                       "minimum": 0,
-                      "default": 1000000
+                      "default": 1000000,
+                      "x-faucet-caller-max": 1000000
                     }
                   }
                 },
@@ -25949,7 +25951,8 @@
                       ],
                       "format": "uint",
                       "minimum": 0,
-                      "default": 1000000
+                      "default": 1000000,
+                      "x-faucet-caller-max": 1000000
                     },
                     "batch_size": {
                       "description": "Advisory per-page record count. `0` = accumulate all txns into one page.",
@@ -26102,7 +26105,8 @@
                       ],
                       "format": "uint",
                       "minimum": 0,
-                      "default": 1000000
+                      "default": 1000000,
+                      "x-faucet-caller-max": 1000000
                     },
                     "batch_size": {
                       "description": "Advisory per-page record count. `0` accumulates every change into a\nsingle trailing page (snapshot/test convenience). Default\n[`DEFAULT_BATCH_SIZE`].",
@@ -27195,7 +27199,8 @@
                       ],
                       "format": "uint",
                       "minimum": 0,
-                      "default": null
+                      "default": null,
+                      "x-faucet-caller-max": 1000000
                     },
                     "timeout_secs": {
                       "description": "How long to listen before returning, in seconds (default: 30).",
@@ -27205,7 +27210,8 @@
                       ],
                       "format": "uint64",
                       "minimum": 0,
-                      "default": 30
+                      "default": 30,
+                      "x-faucet-caller-max": 3600
                     },
                     "max_body_bytes": {
                       "description": "Maximum accepted request body size in bytes (default: 1 MiB). Larger\nPOSTs are rejected with `413 Payload Too Large` so a single huge\nrequest can't exhaust memory.",
@@ -27225,7 +27231,8 @@
                       ],
                       "format": "uint",
                       "minimum": 0,
-                      "default": 268435456
+                      "default": 268435456,
+                      "x-faucet-caller-max": 1073741824
                     },
                     "auth_token": {
                       "description": "Optional shared secret. When set, every request must carry it in the\n`Authorization` header (either the raw token or `Bearer <token>`);\nrequests without it are rejected with `401 Unauthorized`. When `None`\n(default) the endpoint is unauthenticated.",
@@ -27441,7 +27448,8 @@
                         "string"
                       ],
                       "format": "uint",
-                      "minimum": 0
+                      "minimum": 0,
+                      "x-faucet-caller-max": 67108864
                     },
                     "batch_size": {
                       "description": "Records per emitted [`StreamPage`](faucet_core::StreamPage). Default\n[`DEFAULT_BATCH_SIZE`]. `0` drains the entire run window into a single\npage (same sentinel as the Kafka source).",
@@ -29805,7 +29813,8 @@
                       ],
                       "format": "uint",
                       "minimum": 0,
-                      "default": 1000000
+                      "default": 1000000,
+                      "x-faucet-caller-max": 1000000
                     },
                     "batch_size": {
                       "description": "`0` aggregates committed transactions into pages of up to 100,000\nrecords, emitted at least every `idle_timeout`, each with its bookmark;\notherwise each committed transaction is its own page. Default\n[`DEFAULT_BATCH_SIZE`].",
