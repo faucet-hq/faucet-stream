@@ -94,10 +94,7 @@ pub fn screen(nodes: &[ExpandedNode], policy: &ReferencePolicy) -> Result<(), Se
                 .trim()
                 .parse::<std::net::SocketAddr>()
                 .is_ok_and(|a| !a.ip().is_loopback());
-            let secret = ["auth_token", "signature"]
-                .iter()
-                .any(|f| config.get(*f).is_some_and(|v| !v.is_null()));
-            if off_loopback && k.authenticates && !secret {
+            if off_loopback && k.authenticates && !holds_secret(config) {
                 return Err(ServeError::Forbidden(format!(
                     "`{kind}` `{field}` {addr} is reachable from the network; set `auth_token` \
                      or `signature`"
@@ -106,6 +103,21 @@ pub fn screen(nodes: &[ExpandedNode], policy: &ReferencePolicy) -> Result<(), Se
         }
     }
     Ok(())
+}
+
+/// Whether a listener config names a non-empty `auth_token` or a
+/// `signature` with a non-empty `secret`.
+fn holds_secret(config: &Value) -> bool {
+    let token = config
+        .get("auth_token")
+        .and_then(Value::as_str)
+        .is_some_and(|t| !t.trim().is_empty());
+    let signature = config
+        .get("signature")
+        .and_then(|s| s.get("secret"))
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.is_empty());
+    token || signature
 }
 
 /// Whether the config opens a listener: one of its rows' connectors (or, for
@@ -210,6 +222,25 @@ mod tests {
             &wide,
         )
         .unwrap();
+        screen(
+            &nodes(serde_json::json!({
+                "listen_addr": "0.0.0.0:9000",
+                "signature": { "header": "x-sig", "secret": "s" }
+            })),
+            &wide,
+        )
+        .unwrap();
+        for blank in ["", "  "] {
+            refused(
+                serde_json::json!({ "listen_addr": "0.0.0.0:9000", "auth_token": blank }),
+                &wide,
+                "auth_token",
+            );
+        }
+        assert!(!holds_secret(
+            &serde_json::json!({ "signature": { "header": "x-sig", "secret": "" } })
+        ));
+        assert!(!holds_secret(&serde_json::json!({ "auth_token": null })));
 
         let tenant = crate::serve::references::ServeReferencePolicy::default().for_origin(
             crate::serve::load::BodyOrigin::Caller {

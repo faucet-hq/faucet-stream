@@ -198,7 +198,15 @@ impl WebhookSourceConfig {
                 .trim()
                 .parse::<std::net::SocketAddr>()
                 .is_ok_and(|a| !a.ip().is_loopback());
-        if open_to_network && self.auth_token.is_none() && self.signature.is_none() {
+        let token = self
+            .auth_token
+            .as_ref()
+            .is_some_and(|t| !t.trim().is_empty());
+        let signature = self
+            .signature
+            .as_ref()
+            .is_some_and(|s| !s.secret.is_empty());
+        if open_to_network && !token && !signature {
             return Err(faucet_core::FaucetError::Config(format!(
                 "webhook source: `listen_addr` {} is reachable from the network; set \
                  `auth_token` or `signature`",
@@ -222,6 +230,15 @@ impl WebhookSourceConfig {
     /// Everything [`validate`](Self::validate) checks except the path, for a
     /// path template that is resolved against a context first.
     pub(crate) fn validate_settings(&self) -> Result<(), faucet_core::FaucetError> {
+        if self
+            .auth_token
+            .as_ref()
+            .is_some_and(|t| t.trim().is_empty())
+        {
+            return Err(faucet_core::FaucetError::Config(
+                "webhook source: `auth_token` must not be empty".into(),
+            ));
+        }
         if let Some(sig) = &self.signature
             && (sig.header.trim().is_empty() || sig.secret.is_empty())
         {
@@ -319,6 +336,11 @@ mod tests {
         let e = checked(at("0.0.0.0:9000")).await.unwrap_err().to_string();
         assert!(e.contains("auth_token"), "{e}");
         checked(at("0.0.0.0:9000").auth_token("t")).await.unwrap();
+        let e = checked(at("0.0.0.0:9000").auth_token(" "))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("auth_token"), "{e}");
         // An operator's run binds where it says.
         faucet_core::http::with_reference_policy(
             std::sync::Arc::new(ReferencePolicy::open()),
@@ -326,6 +348,22 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn an_empty_auth_token_is_refused() {
+        for blank in ["", " \t"] {
+            let e = WebhookSourceConfig::new()
+                .auth_token(blank)
+                .validate()
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("`auth_token` must not be empty"), "{e}");
+        }
+        WebhookSourceConfig::new()
+            .auth_token("t")
+            .validate()
+            .unwrap();
     }
 
     #[test]

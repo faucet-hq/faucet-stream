@@ -298,7 +298,8 @@ the server process — among the built-ins, a `webhook` source's
 `--listen` port or an address outside the ranges is a `403` naming the
 ranges to use. An address the config leaves out is the connector's default
 (`127.0.0.1:8080` for `webhook`), and is checked the same way. A listener
-off loopback also needs `auth_token` or `signature`, so not everyone who
+off loopback also needs a non-empty `auth_token` or a `signature` with a
+non-empty `secret`, so not everyone who
 can reach the port can add records. `POST /v1/doctor` (whose probe binds
 the address) is checked too, and the webhook source checks again when it
 binds inside a caller's run. A tenant's config may open none. Registered
