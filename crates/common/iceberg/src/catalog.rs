@@ -171,17 +171,19 @@ async fn rest_token(
         Some((id, secret)) => (Some(id), secret),
         None => (None, credential),
     };
-    let mut form = url::form_urlencoded::Serializer::new(String::new());
-    form.append_pair("grant_type", "client_credentials");
-    if let Some(id) = id {
-        form.append_pair("client_id", id);
-    }
-    form.append_pair("client_secret", secret);
-    form.append_pair(
-        "scope",
-        props.get("scope").map(String::as_str).unwrap_or("catalog"),
-    );
-    let body = form.finish();
+    let body = {
+        let mut form = url::form_urlencoded::Serializer::new(String::new());
+        form.append_pair("grant_type", "client_credentials");
+        if let Some(id) = id {
+            form.append_pair("client_id", id);
+        }
+        form.append_pair("client_secret", secret);
+        form.append_pair(
+            "scope",
+            props.get("scope").map(String::as_str).unwrap_or("catalog"),
+        );
+        form.finish()
+    };
     let resp = client
         .execute(ctx, "token", || {
             client
