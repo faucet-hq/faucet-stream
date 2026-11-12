@@ -1,16 +1,26 @@
 #![no_main]
 
-use faucet_core::resolve::{ReferencePolicy, canonical_host, url_hosts};
+use faucet_core::resolve::{
+    ReferencePolicy, is_plain_host, literal_host, mongodb_uri_problem, url_hosts,
+};
 use libfuzzer_sys::fuzz_target;
 use mongodb::options::{AuthMechanism, ConnectionString, HostInfo, ServerAddress, Tls};
 
-// The screen and the MongoDB driver must read a URI alike.
+// The screen reads a URI as the driver does, or refuses it.
 fuzz_target!(|s: &str| {
     let confined = ReferencePolicy::deny_all()
         .with_path_roots(["/srv/data"])
         .any_url_scheme()
         .any_url_host();
     let verdict = confined.check_url(s);
+    // The driver's parser panics on these; the screen refuses them first.
+    if mongodb_uri_problem(s).is_some() {
+        let lower = s.to_ascii_lowercase();
+        if lower.starts_with("mongodb://") || lower.starts_with("mongodb+srv://") {
+            assert!(verdict.is_err(), "{s:?} accepted");
+        }
+        return;
+    }
     let Ok(cs) = ConnectionString::parse(s) else {
         return;
     };
@@ -23,10 +33,14 @@ fuzz_target!(|s: &str| {
                     ServerAddress::Tcp { host, .. } => {
                         let host = match host.parse() {
                             Ok(std::net::IpAddr::V6(v6)) => format!("[{v6}]"),
-                            _ => canonical_host(host),
+                            _ => literal_host(host),
                         };
                         assert!(
-                            screened.contains(&host),
+                            is_plain_host(&host) || verdict.is_err(),
+                            "{s:?}: {host:?} accepted"
+                        );
+                        assert!(
+                            host.is_empty() || screened.contains(&host) || verdict.is_err(),
                             "{s:?}: {host} not in {screened:?}"
                         );
                     }
@@ -36,9 +50,13 @@ fuzz_target!(|s: &str| {
             }
         }
         HostInfo::DnsRecord(name) => {
-            let name = canonical_host(name);
+            let name = literal_host(name);
             assert!(
-                screened.contains(&name),
+                is_plain_host(&name) || verdict.is_err(),
+                "{s:?}: {name:?} accepted"
+            );
+            assert!(
+                name.is_empty() || screened.contains(&name) || verdict.is_err(),
                 "{s:?}: {name} not in {screened:?}"
             );
         }

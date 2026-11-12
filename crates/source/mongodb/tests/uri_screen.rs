@@ -2,7 +2,7 @@
 //! URI the driver accepts, the hosts, files, verification switches, identity
 //! source and server pinning the screen sees are the driver's own.
 
-use faucet_core::resolve::{ReferencePolicy, canonical_host, url_hosts};
+use faucet_core::resolve::{ReferencePolicy, is_plain_host, literal_host, url_hosts};
 use mongodb::options::{AuthMechanism, ConnectionString, HostInfo, ServerAddress, Tls};
 
 #[derive(Debug, Default)]
@@ -24,14 +24,14 @@ fn driver(uri: &str) -> Option<Reading> {
                 match a {
                     ServerAddress::Tcp { host, .. } => r.hosts.push(match host.parse() {
                         Ok(std::net::IpAddr::V6(v6)) => format!("[{v6}]"),
-                        _ => canonical_host(host),
+                        _ => literal_host(host),
                     }),
                     ServerAddress::Unix { path } => r.paths.push(path.display().to_string()),
                     _ => {}
                 }
             }
         }
-        HostInfo::DnsRecord(name) => r.hosts.push(canonical_host(name)),
+        HostInfo::DnsRecord(name) => r.hosts.push(literal_host(name)),
         _ => {}
     }
     if let Some(Tls::Enabled(t)) = &cs.tls {
@@ -93,6 +93,8 @@ const CORPUS: &[&str] = &[
     "mongodb://a.example.com,b.example.com/?replicaSet=rs0",
     "mongodb://a.example.com/?replicaSet=rs0&directConnection=true",
     "mongodb://lb.example.com/?loadBalanced=true",
+    "mongodb://7\r\rcccc6\u{19D}&.7",
+    "mongodb://a\u{AD}b.example.com,B\u{212A}.example.com/?directConnection=true",
 ];
 
 fn check(uri: &str, policy: &ReferencePolicy, refused: bool) {
@@ -112,9 +114,12 @@ fn screened_mongodb_options_match_the_driver_reading() {
         let mut hosts = d.hosts.clone();
         screened.sort();
         hosts.sort();
-        assert_eq!(screened, hosts, "{uri}");
+        let odd = hosts.iter().chain(&screened).any(|h| !is_plain_host(h));
+        if !odd {
+            assert_eq!(screened, hosts, "{uri}");
+        }
         let outside = d.paths.iter().any(|p| !p.starts_with(&format!("{ROOT}/")));
-        check(uri, &roots(), outside);
+        check(uri, &roots(), outside || odd);
         check(
             uri,
             &ReferencePolicy::open().with_unverified(false),
@@ -146,4 +151,22 @@ fn uris_the_driver_refuses_are_harmless_to_accept() {
     ] {
         assert!(driver(uri).is_none(), "the driver accepts {uri}");
     }
+}
+
+/// A URI the driver's own parser cannot read (it panics on a `%` followed by
+/// a non-ASCII character) is refused with an error before the driver sees it.
+#[tokio::test]
+async fn a_uri_the_driver_cannot_parse_is_an_error() {
+    let config: faucet_source_mongodb::MongoSourceConfig =
+        faucet_core::serde_json::from_value(faucet_core::serde_json::json!({
+            "connection_uri": "mongodb://u%a\u{E9}@db.example.com/",
+            "database": "app",
+            "collection": "c"
+        }))
+        .unwrap();
+    let err = faucet_source_mongodb::MongoSource::new(config)
+        .await
+        .err()
+        .expect("refused");
+    assert!(err.to_string().contains("hexadecimal"), "{err}");
 }

@@ -1170,6 +1170,7 @@ dependencies = [
  "futures",
  "futures-core",
  "jsonpath-rust",
+ "libc",
  "metrics",
  "metrics-exporter-prometheus",
  "percent-encoding",
@@ -1177,6 +1178,7 @@ dependencies = [
  "regex",
  "reqwest 0.13.5",
  "rust_xlsxwriter",
+ "rustix",
  "rustls",
  "schemars",
  "serde",
@@ -1189,6 +1191,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "zip",
  "zstd 0.13.3",
 ]
 

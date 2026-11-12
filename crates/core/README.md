@@ -321,7 +321,11 @@ their hosts. A field whose value is not a URL declares its grammar with
 `"azure-conn"`, `"url-list"`); `annotated_resources` carries it on
 `ResourceRef::syntax`, and `check` / `check_url_as` / `url_hosts_as` read the
 value the way the connector's client does (`faucet_core::ado::parse` is the SQL
-Server driver's connection-string grammar, shared with the MSSQL crate). A
+Server driver's connection-string grammar, shared with the MSSQL crate). A host
+such a client dials as written is read with `literal_host` (only an ASCII host
+is canonicalised), and a policy that compares hosts refuses a host holding
+characters no host name can; `check_host_literal` judges a host a client
+received from elsewhere (an MSSQL routing redirect). A
 policy with path roots (one for configs a host does not trust) refuses a value
 its grammar cannot read, a value from which no server can be read, and a value
 longer than `MAX_SCREENED_LEN` (64 KiB). A `mongodb://` / `mongodb+srv://`

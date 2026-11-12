@@ -81,15 +81,20 @@ fn check_redirect(
     host: &str,
     port: u16,
 ) -> Result<(), String> {
-    let target = format!("mssql://{host}:{port}");
     let refusal = match policy {
-        Some(p) => p.check_url(&target).err().map(|r| r.reason),
-        None => faucet_core::resolve::is_metadata_host(host)
-            .then(|| format!("host `{host}` is a link-local / metadata endpoint")),
+        Some(p) => p.check_host_literal(host).err().map(|r| r.reason),
+        None if host.contains('\0') => Some("the host holds a NUL character".to_string()),
+        None => faucet_core::resolve::is_metadata_host(host).then(|| {
+            format!(
+                "host `{}` is a link-local / metadata endpoint",
+                host.escape_debug()
+            )
+        }),
     };
     match refusal {
         Some(reason) => Err(format!(
-            "MSSQL routing redirect to {host}:{port} refused: {reason}"
+            "MSSQL routing redirect to {}:{port} refused: {reason}",
+            host.escape_debug()
         )),
         None => Ok(()),
     }
@@ -483,6 +488,16 @@ mod tests {
             .with_url_hosts(["*.example.com"]);
         assert!(check_redirect(Some(&policy), "replica.example.com", 11000).is_ok());
         assert!(check_redirect(Some(&policy), "db.internal", 1433).is_err());
+        for host in [
+            "x@replica.example.com",
+            "a\rb.example.com",
+            "x/y.example.com",
+        ] {
+            assert!(check_redirect(Some(&policy), host, 1433).is_err(), "{host}");
+        }
+        assert!(check_redirect(None, "fd00:ec2::254%0", 1433).is_err());
+        let err = check_redirect(None, "a\0b", 1433).unwrap_err();
+        assert!(err.contains("a\\0b"), "{err}");
     }
 
     #[test]
@@ -760,7 +775,7 @@ mod tests {
             let host = addr.rsplit_once(':').map_or(addr.as_str(), |(h, _)| h);
             let screened = url_hosts_as(cs, Some(UrlSyntax::Ado));
             assert!(
-                screened.contains(&faucet_core::resolve::canonical_host(host)),
+                screened.contains(&faucet_core::resolve::literal_host(host)),
                 "{cs}: driver host {host}, screen {screened:?}"
             );
             let result = confined.check_url_as(cs, Some(UrlSyntax::Ado));

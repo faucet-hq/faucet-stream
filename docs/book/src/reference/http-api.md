@@ -520,7 +520,14 @@ the form a URL parser reads it, so `2852039166`, `0xa9fea9fe`, `0251.0376.0251.0
 or a trailing dot (`169.254.169.254.`, `metadata.google.internal.`) name the
 metadata address they spell, and an `http(s)` URL's authority ends at a `\` as
 it does for HTTP clients (`http://169.254.169.254\@allowed.example/` names
-`169.254.169.254`). A URL whose host a caller's config takes from
+`169.254.169.254`). A host a client dials without parsing it as a URL (a
+MongoDB URI, a SQL Server or Oracle connection string, a Kafka broker list) is
+compared as that client reads it: as written, case aside. A host holding
+anything but ASCII letters, digits, `.`, `-` and `_` (bracketed IPv6 aside) —
+a control character, a space, a non-ASCII or invisible character, a `%` —
+is refused (write an internationalised name in its `xn--` form), and an IPv6
+zone id (`fe80::1%eth0`) does not hide a link-local or metadata address. A
+broker list is split on commas, as librdkafka splits it. A URL whose host a caller's config takes from
 records (`https://${parent.host}/…`, a whole `${parent.next_url}`) cannot be
 checked, so it is refused; register the pipeline as a template instead.
 
