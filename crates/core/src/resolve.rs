@@ -480,28 +480,51 @@ pub fn literal_host(host: &str) -> String {
     }
 }
 
-/// Whether `host` (a host as [`url_hosts`] returns it) holds only the
-/// characters a host name or bracketed IPv6 address can (ASCII letters,
-/// digits, `.`, `-`, `_`, `[`, `]`, `:`), `${…}` tokens and `*` (a token
-/// already replaced by a pattern). A policy that compares hosts refuses any
-/// other host.
-pub fn is_plain_host(host: &str) -> bool {
+/// Characters a `${…}` token name in a host may hold besides ASCII letters
+/// and digits.
+const HOST_TOKEN_CHARS: &[char] = &['.', '_', ':', '%', '-', '[', ']'];
+
+/// Why a host is not plain ([`is_plain_host`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostProblem {
+    /// A character no host name holds, outside any token.
+    Characters,
+    /// A `${…}` token that is empty, unclosed, or whose name holds other
+    /// characters than [`HOST_TOKEN_CHARS`].
+    TokenName,
+}
+
+fn host_problem(host: &str) -> Option<HostProblem> {
     let plain = |part: &str| {
-        part.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '[' | ']' | ':' | '*')
-        })
+        part.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '[' | ']' | ':'))
+    };
+    let token = |name: &str| {
+        !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || HOST_TOKEN_CHARS.contains(&c))
     };
     let mut rest = host;
-    while let Some(start) = rest.find("${") {
-        if !plain(&rest[..start]) {
-            return false;
+    while let Some((before, body)) = rest.split_once("${") {
+        if !plain(before) {
+            return Some(HostProblem::Characters);
         }
-        match rest[start..].find('}') {
-            Some(end) => rest = &rest[start + end + 1..],
-            None => return false,
+        match body.split_once('}') {
+            Some((name, after)) if token(name) => rest = after,
+            _ => return Some(HostProblem::TokenName),
         }
     }
-    plain(rest)
+    (!plain(rest)).then_some(HostProblem::Characters)
+}
+
+/// Whether `host` (a host as [`url_hosts`] returns it) holds only the
+/// characters a host name or bracketed IPv6 address can (ASCII letters,
+/// digits, `.`, `-`, `_`, `[`, `]`, `:`) and `${…}` tokens whose name holds
+/// only ASCII letters, digits and `.`, `_`, `:`, `%`, `-`, `[`, `]`. A policy
+/// that compares hosts refuses any other host.
+pub fn is_plain_host(host: &str) -> bool {
+    host_problem(host).is_none()
 }
 
 /// IPv6 instance-metadata endpoints outside link-local space (AWS, GCP, OCI).
@@ -690,7 +713,11 @@ fn sqlite_file(value: &str) -> Location<'_> {
     let database = rest.split('?').next().unwrap_or(rest);
     match percent_decoded(database) {
         // SQLite opens a name starting `file:` as a URI and decodes it again.
-        Some(name) if name.len() >= 5 && name[..5].eq_ignore_ascii_case("file:") => {
+        Some(name)
+            if name
+                .get(..5)
+                .is_some_and(|p| p.eq_ignore_ascii_case("file:")) =>
+        {
             Location::Refused(
                 "a SQLite database name that is itself a `file:` URI cannot be checked",
             )
@@ -2005,14 +2032,36 @@ impl ReferencePolicy {
     fn check_host(&self, subject: &str, host: &str) -> Result<(), Refusal> {
         let refuse = |reason: String| Refusal::new(RefusalKind::Url, subject, reason);
         let compares = self.path_roots.is_some() || self.url_hosts.is_some();
-        if host.contains('\0') || (compares && !is_plain_host(host)) {
-            return Err(refuse(format!(
-                "host `{}` holds characters a host name cannot (only ASCII letters, digits, `.`, \
-                 `-` and `_`; write an internationalised name in its `xn--` form)",
-                host.escape_debug()
-            )));
+        let problem = if host.contains('\0') {
+            Some(HostProblem::Characters)
+        } else if compares {
+            host_problem(host)
+        } else {
+            None
+        };
+        match problem {
+            Some(HostProblem::TokenName) => {
+                let chars: String = HOST_TOKEN_CHARS
+                    .iter()
+                    .map(|c| format!("`{c}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(refuse(format!(
+                    "host `{}` holds a `${{…}}` token that is empty, unclosed or names more than \
+                     ASCII letters, digits and {chars}",
+                    host.escape_debug()
+                )));
+            }
+            Some(HostProblem::Characters) => {
+                return Err(refuse(format!(
+                    "host `{}` holds characters a host name cannot (only ASCII letters, digits, \
+                     `.`, `-` and `_`; write an internationalised name in its `xn--` form)",
+                    host.escape_debug()
+                )));
+            }
+            None => {}
         }
-        if host.contains("${") || host.contains('*') {
+        if host.contains("${") {
             if self.url_hosts.is_some() {
                 return Err(refuse(
                     "a host taken from a token cannot be checked against the host allow-list"
@@ -2039,7 +2088,15 @@ impl ReferencePolicy {
     /// redirect) and dials as written: read literally ([`literal_host`]),
     /// then judged as a host in a value is.
     pub fn check_host_literal(&self, host: &str) -> Result<(), Refusal> {
-        self.check_host(&host.escape_debug().to_string(), &literal_host(host))
+        let subject = host.escape_debug().to_string();
+        if host.contains("${") {
+            return Err(Refusal::new(
+                RefusalKind::Url,
+                &subject,
+                "a host received at run time is dialled as written; `${` cannot be part of it",
+            ));
+        }
+        self.check_host(&subject, &literal_host(host))
     }
 
     /// Check a URL scheme against the scheme allow-list.
@@ -2513,8 +2570,7 @@ impl ReferencePolicy {
         }
         for host in url_hosts_as(value, syntax) {
             let bare = host.trim_start_matches('[').trim_end_matches(']');
-            if host.contains("${") || host.contains('*') || bare.parse::<std::net::IpAddr>().is_ok()
-            {
+            if host.contains("${") || bare.parse::<std::net::IpAddr>().is_ok() {
                 continue;
             }
             let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(bare, 0)) else {
@@ -4341,20 +4397,98 @@ mod tests {
     }
 
     #[test]
-    fn plain_hosts_are_host_names_tokens_or_patterns() {
+    fn plain_hosts_are_host_names_or_tokens() {
         for h in [
             "db.example.com",
             "[fe80::1]",
             "${host}.example.com",
             "a${x}b",
-            "*",
             "x_y-1",
+            "${now.date}.example.com",
+            "${now.strftime.%Y}",
+            "${partition.key:x}",
+            "${parent.items[0]}",
         ] {
             assert!(is_plain_host(h), "{h}");
         }
-        for h in ["a b", "a\rb", "a%b", "a@b", "b\u{FC}cher", "${x", "a/b"] {
+        for h in [
+            "a b",
+            "a\rb",
+            "a%b",
+            "a@b",
+            "b\u{FC}cher",
+            "${x",
+            "a/b",
+            "*",
+            "*.evil.com",
+            "${}",
+            "${\u{497}\u{19D}o\u{199}F}",
+            "${a b}",
+            "${a\r}",
+            "x${a${b}",
+            "${now.date}\u{19D}",
+            "${a@b}",
+        ] {
             assert!(!is_plain_host(h), "{h}");
         }
+    }
+
+    #[test]
+    fn sqlite_names_with_multibyte_characters_are_read_without_panicking() {
+        for v in [
+            "sqlite:ab\u{DF7DF}x",
+            "sqlite://ab%F3%9F%9F%9Fx",
+            "sqlite:\u{E9}\u{E9}\u{E9}",
+        ] {
+            assert!(matches!(sqlite_file(v), Location::Local(_)), "{v}");
+        }
+        assert!(
+            confined()
+                .check_url("mongodb://h/?directConnection=true&tlsCAFile=sqlite:ab%F3%9F%9F%9Fx")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn token_hosts_are_judged_by_their_text() {
+        let crash = "mongodb://upppp${\u{497}\u{19D}o\u{199}F}pppppppppp";
+        let reason = confined().check_url(crash).unwrap_err().reason;
+        assert!(reason.contains("token"), "{reason}");
+        let reason = confined()
+            .check_url("https://b\u{FC}cher.example${now.date}/")
+            .unwrap_err()
+            .reason;
+        assert!(reason.contains("xn--"), "{reason}");
+        let reason = ReferencePolicy::open()
+            .check_host_literal("a\0${x}")
+            .unwrap_err()
+            .reason;
+        assert!(!reason.contains("token"), "{reason}");
+        assert!(
+            ReferencePolicy::open()
+                .check_host_literal("169.254.169.254${x}")
+                .is_err()
+        );
+        assert_eq!(
+            url_hosts("mongodb://a${%41}b/"),
+            vec!["a${%41}b".to_string()]
+        );
+        for v in [
+            "mongodb://*.evil.com/?directConnection=true",
+            "mongodb+srv://x.*.evil.com/",
+        ] {
+            assert!(confined().check_url(v).is_err(), "{v}");
+        }
+        accepted(
+            None,
+            "mongodb://${now.date}.example.com/?directConnection=true",
+        );
+        assert!(
+            ReferencePolicy::open()
+                .with_url_hosts(["*.example.com"])
+                .check_url("https://*.example.com/x")
+                .is_err()
+        );
     }
 
     #[test]
