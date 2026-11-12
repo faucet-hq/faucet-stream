@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.6.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-redis-v1.6.1...faucet-sink-redis-v1.6.2) - 2026-11-12
+
+### Bug Fixes
+
+- *(serve)* Fail closed while the run history is unreachable, #1053 review fixes, real license texts ([#1056](https://github.com/faucet-hq/faucet-stream/pull/1056))
+
 ## [1.6.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-redis-v1.6.0...faucet-sink-redis-v1.6.1) - 2026-11-02
 
 ### Bug Fixes

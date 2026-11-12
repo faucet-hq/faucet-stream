@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.18.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-cli-v1.17.0...faucet-cli-v1.18.0) - 2026-11-12
+
+### Bug Fixes
+
+- *(core)* Compare hosts in connection strings the way their clients read them ([#1065](https://github.com/faucet-hq/faucet-stream/pull/1065))
+- *(serve)* Tighten what caller configs can reach; read connection strings like their clients; bound decoding; russh-sftp 3 ([#1063](https://github.com/faucet-hq/faucet-stream/pull/1063))
+- *(serve)* Per-request file checks, connection write fence, redirect headers, connection-string grammar, bounded SFTP listings ([#1060](https://github.com/faucet-hq/faucet-stream/pull/1060))
+- *(serve)* Fail closed while the run history is unreachable, #1053 review fixes, real license texts ([#1056](https://github.com/faucet-hq/faucet-stream/pull/1056))
+- *(serve)* #1048 review fixes, 5-minute schedule floor, durable degraded history ([#1053](https://github.com/faucet-hq/faucet-stream/pull/1053))
+- *(serve-ui)* Show pipeline block and state store schemas on the Schemas page ([#1039](https://github.com/faucet-hq/faucet-stream/pull/1039))
+
+### Features
+
+- *(serve)* Schedules and Policy in the console, tenant schedules and policies, persistent history by default ([#1048](https://github.com/faucet-hq/faucet-stream/pull/1048))
+- *(serve-ui)* Add a Feeds page marked soon ([#1045](https://github.com/faucet-hq/faucet-stream/pull/1045))
+
 ## [1.17.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-cli-v1.16.0...faucet-cli-v1.17.0) - 2026-11-02
 
 ### Bug Fixes

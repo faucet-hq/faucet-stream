@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.5.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-mysql-cdc-v1.5.1...faucet-source-mysql-cdc-v1.5.2) - 2026-11-12
+
+### Bug Fixes
+
+- *(serve)* Tighten what caller configs can reach; read connection strings like their clients; bound decoding; russh-sftp 3 ([#1063](https://github.com/faucet-hq/faucet-stream/pull/1063))
+- *(serve)* Fail closed while the run history is unreachable, #1053 review fixes, real license texts ([#1056](https://github.com/faucet-hq/faucet-stream/pull/1056))
+
 ## [1.5.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-mysql-cdc-v1.5.0...faucet-source-mysql-cdc-v1.5.1) - 2026-11-02
 
 ### Bug Fixes
