@@ -49,6 +49,9 @@ impl MongoSource {
     /// immediately.
     pub async fn new(config: MongoSourceConfig) -> Result<Self, FaucetError> {
         faucet_core::validate_batch_size(config.batch_size)?;
+        if let Some(problem) = faucet_core::resolve::mongodb_uri_problem(&config.connection_uri) {
+            return Err(FaucetError::Config(problem.to_string()));
+        }
         let client = Client::with_uri_str(&config.connection_uri)
             .await
             .map_err(|e| FaucetError::Source(format!("MongoDB connection failed: {e}")))?;

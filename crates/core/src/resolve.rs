@@ -441,10 +441,53 @@ impl Default for ReferencePolicy {
 pub fn is_metadata_host(host: &str) -> bool {
     let canonical = canonical_host(host);
     let h = canonical.trim_start_matches('[').trim_end_matches(']');
-    if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+    if let Ok(ip) = without_zone(h).parse::<std::net::IpAddr>() {
         return is_metadata_ip(ip);
     }
     matches!(h, "metadata.google.internal" | "metadata")
+}
+
+/// `host` without an IPv6 zone id (`fe80::1%eth0`, `fe80::1%25eth0`), which
+/// the system resolver accepts and drops when it connects.
+fn without_zone(host: &str) -> &str {
+    match host.split_once('%') {
+        Some((ip, _)) if ip.parse::<std::net::Ipv6Addr>().is_ok() => ip,
+        _ => host,
+    }
+}
+
+/// A host as a client that does not parse it as a WHATWG URL (the MongoDB
+/// driver, the SQL Server, Oracle and Kafka clients) dials it. A host of
+/// printable ASCII without `%` is read as the system resolver reads it
+/// ([`canonical_host`]: case, trailing dots, numeric IPv4 forms). Any other
+/// host is returned as written, lower-cased: these clients neither drop
+/// control characters nor map or percent-decode it, so neither does this.
+pub fn literal_host(host: &str) -> String {
+    if host.chars().all(|c| c.is_ascii_graphic()) && !host.contains('%') {
+        canonical_host(host)
+    } else {
+        host.to_lowercase()
+    }
+}
+
+/// Whether `host` (a host as [`url_hosts`] returns it) holds only the
+/// characters a host name or bracketed IPv6 address can (ASCII letters,
+/// digits, `.`, `-`, `_`, `[`, `]`, `:`), `${…}` tokens and `*` (a token
+/// already replaced by a pattern).
+fn plain_host(host: &str) -> bool {
+    let mut rest = host;
+    let mut outside = String::new();
+    while let Some(start) = rest.find("${") {
+        outside.push_str(&rest[..start]);
+        match rest[start..].find('}') {
+            Some(end) => rest = &rest[start + end + 1..],
+            None => return false,
+        }
+    }
+    outside.push_str(rest);
+    outside
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '[' | ']' | ':' | '*'))
 }
 
 /// IPv6 instance-metadata endpoints outside link-local space (AWS, GCP, OCI).
@@ -1000,16 +1043,48 @@ fn whatwg_preprocess(value: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// The elements of a [`UrlSyntax::UrlList`] value.
+/// The elements of a [`UrlSyntax::UrlList`] value, split as librdkafka
+/// splits a broker list: on `,`, with leading spaces dropped. Anything else
+/// (a trailing space, a tab) stays part of the element.
 fn list_items(value: &str) -> impl Iterator<Item = &str> {
     value
-        .split(|c: char| c == ',' || c.is_ascii_whitespace())
+        .split(',')
+        .map(|p| p.trim_start_matches(' '))
         .filter(|p| !p.is_empty())
 }
 
-/// The host of one `host[:port]` address (`[v6]:port` kept bracketed).
+/// Kafka security protocols a broker-list element may name as its scheme
+/// (`SSL://host:9092`); librdkafka reads the rest literally.
+const KAFKA_PROTOCOLS: &[&str] = &["plaintext", "ssl", "sasl_plaintext", "sasl_ssl"];
+
+/// The broker-list element after a Kafka protocol prefix, or `None` when
+/// the element is a URL some other client parses (`nats://…`).
+fn literal_list_address(item: &str) -> Option<&str> {
+    match item.split_once("://") {
+        None => Some(item),
+        Some((scheme, rest))
+            if KAFKA_PROTOCOLS
+                .iter()
+                .any(|p| scheme.eq_ignore_ascii_case(p)) =>
+        {
+            Some(rest)
+        }
+        Some(_) => None,
+    }
+}
+
+/// The hosts one [`UrlSyntax::UrlList`] element names.
+fn list_item_hosts(item: &str) -> Vec<String> {
+    match literal_list_address(item) {
+        Some(address) => vec![address_host(address)],
+        None => url_hosts(item),
+    }
+}
+
+/// The host of one `host[:port]` address (`[v6]:port` kept bracketed), read
+/// literally ([`literal_host`]).
 fn address_host(address: &str) -> String {
-    let address = address.trim();
+    let address = address.trim_start_matches(' ');
     let host = if address.starts_with('[') {
         address.find(']').map_or(address, |end| &address[..=end])
     } else if let Some(ip) = ip_literal(address) {
@@ -1020,7 +1095,7 @@ fn address_host(address: &str) -> String {
             .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()))
             .map_or(address, |(host, _)| host)
     };
-    canonical_host(host)
+    literal_host(host)
 }
 
 /// The hosts one server value of a connection string names (`tcp:host,1433`,
@@ -1042,14 +1117,14 @@ fn server_value_hosts(v: &str) -> Vec<String> {
     if bare.starts_with('/') {
         return Vec::new();
     }
-    url_hosts(&format!("tcp://{}", crate::ado::host_of_server(bare)))
+    vec![address_host(&crate::ado::host_of_server(bare))]
 }
 
 /// The hosts an ADO.NET connection string connects to: the driver's own
 /// reading ([`crate::ado::server_host`]) and every server-like key read more
 /// broadly ([`server_value_hosts`]).
 fn ado_hosts(pairs: &[(String, String)]) -> Vec<String> {
-    let mut hosts = vec![canonical_host(&crate::ado::server_host(pairs))];
+    let mut hosts = vec![literal_host(&crate::ado::server_host(pairs))];
     for (k, v) in pairs {
         if CONN_HOST_KEYS.contains(&k.as_str()) {
             hosts.extend(server_value_hosts(v));
@@ -1213,7 +1288,7 @@ pub fn url_hosts_as(value: &str, syntax: Option<UrlSyntax>) -> Vec<String> {
     let raw = value;
     let value = value.trim();
     match syntax {
-        None => url_hosts(value),
+        None => url_hosts(raw),
         Some(UrlSyntax::Ado) => crate::ado::parse(raw)
             .map(|pairs| ado_hosts(&pairs))
             .unwrap_or_default(),
@@ -1228,7 +1303,7 @@ pub fn url_hosts_as(value: &str, syntax: Option<UrlSyntax>) -> Vec<String> {
             }
             hosts
         }
-        Some(UrlSyntax::UrlList) => list_items(value).flat_map(url_hosts).collect(),
+        Some(UrlSyntax::UrlList) => list_items(value).flat_map(list_item_hosts).collect(),
     }
 }
 
@@ -1351,11 +1426,22 @@ impl MongoRead {
             .collect();
         out.extend(
             self.values("proxyhost")
-                .map(canonical_host)
+                .map(literal_host)
                 .filter(|h| !h.is_empty()),
         );
         out
     }
+}
+
+/// Why the MongoDB driver cannot read `uri`, when it would fail inside its
+/// own parser rather than with an error: a `%` followed by a character that
+/// is not ASCII, which the driver's percent-escape check slices mid-character.
+/// The reason never repeats the value.
+pub fn mongodb_uri_problem(uri: &str) -> Option<&'static str> {
+    uri.split('%')
+        .skip(1)
+        .any(|part| part.len() >= 2 && !part.is_char_boundary(2))
+        .then_some("a `%` in a MongoDB URI must be followed by two hexadecimal digits")
 }
 
 /// The MongoDB options that name a local file.
@@ -1384,7 +1470,7 @@ fn mongo_host(segment: &str) -> MongoHost {
         },
         None => segment.split_once(':').map_or(segment, |(h, _)| h),
     };
-    match canonical_host(host) {
+    match literal_host(host) {
         h if h.is_empty() => MongoHost::Unreadable,
         h => MongoHost::Tcp(h),
     }
@@ -1870,14 +1956,17 @@ impl ReferencePolicy {
             ));
         }
         match syntax {
-            None => self.check_plain_url(value),
+            None => self.check_plain_url(raw),
             Some(UrlSyntax::Ado) => self.check_ado(raw),
             Some(UrlSyntax::Oracle) => self.check_oracle(value),
             Some(UrlSyntax::AzureConn) => self.check_azure_conn(value),
             Some(UrlSyntax::UrlList) => {
                 for item in list_items(value) {
-                    self.check_plain_url(item)
-                        .map_err(|e| Refusal::new(e.kind, value, e.reason))?;
+                    let checked = match literal_list_address(item) {
+                        Some(address) => self.check_host(item, &address_host(address)),
+                        None => self.check_plain_url(item),
+                    };
+                    checked.map_err(|e| Refusal::new(e.kind, value, e.reason))?;
                 }
                 Ok(())
             }
@@ -1888,6 +1977,14 @@ impl ReferencePolicy {
     /// link-local / metadata rule.
     fn check_host(&self, subject: &str, host: &str) -> Result<(), Refusal> {
         let refuse = |reason: String| Refusal::new(RefusalKind::Url, subject, reason);
+        let compares = self.path_roots.is_some() || self.url_hosts.is_some();
+        if host.contains('\0') || (compares && !plain_host(host)) {
+            return Err(refuse(format!(
+                "host `{}` holds characters a host name cannot (only ASCII letters, digits, `.`, \
+                 `-` and `_`; write an internationalised name in its `xn--` form)",
+                host.escape_debug()
+            )));
+        }
         if host.contains("${") || host.contains('*') {
             if self.url_hosts.is_some() {
                 return Err(refuse(
@@ -1905,6 +2002,13 @@ impl ReferencePolicy {
             ))),
             None => Ok(()),
         }
+    }
+
+    /// Check one host a client received from elsewhere (a server's routing
+    /// redirect) and dials as written: read literally ([`literal_host`]),
+    /// then judged as a host in a value is.
+    pub fn check_host_literal(&self, host: &str) -> Result<(), Refusal> {
+        self.check_host(&host.escape_debug().to_string(), &literal_host(host))
     }
 
     /// Check a URL scheme against the scheme allow-list.
@@ -2140,6 +2244,9 @@ impl ReferencePolicy {
     fn check_mongo(&self, value: &str, read: &MongoRead) -> Result<(), Refusal> {
         let confined = self.path_roots.is_some();
         let refuse = |kind: RefusalKind, reason: String| Refusal::new(kind, value, reason);
+        if let Some(problem) = mongodb_uri_problem(value) {
+            return Err(refuse(RefusalKind::Url, problem.into()));
+        }
         self.check_scheme(value, if read.srv { "mongodb+srv" } else { "mongodb" })?;
         let mut server = false;
         for host in &read.hosts {
@@ -2199,7 +2306,7 @@ impl ReferencePolicy {
                 ));
             }
             if key == "proxyhost" {
-                self.check_host(value, &canonical_host(v))?;
+                self.check_host(value, &literal_host(v))?;
             }
         }
         if read.host_credentials() && !self.host_credentials {
@@ -4040,6 +4147,142 @@ mod tests {
     const LIST: Option<UrlSyntax> = Some(UrlSyntax::UrlList);
 
     #[test]
+    fn mongodb_uris_the_driver_cannot_read_are_refused() {
+        for v in [
+            "mongodb://u%\u{DF7DF}x@db.example.com/",
+            "mongodb://u%a\u{E9}@db.example.com/",
+            "mongodb://db.example.com/?appName=%\u{E9}",
+        ] {
+            assert!(mongodb_uri_problem(v).is_some(), "{v}");
+            assert!(ReferencePolicy::open().check_url(v).is_err(), "{v}");
+        }
+        for v in [
+            "mongodb://u%40x:p%2F@db.example.com/",
+            "mongodb://db.example.com/%",
+        ] {
+            assert!(mongodb_uri_problem(v).is_none(), "{v}");
+        }
+    }
+
+    #[test]
+    fn hosts_are_read_as_written_where_the_client_reads_them_so() {
+        let crash = "mongodb://7\r\rcccc6\u{19D}&.7";
+        assert_eq!(url_hosts(crash), vec!["7\r\rcccc6\u{272}&.7".to_string()]);
+        assert!(confined().check_url(crash).is_err());
+        assert_eq!(literal_host("DB.Example.COM."), "db.example.com");
+        assert_eq!(literal_host("0x7f000001"), "127.0.0.1");
+        assert_eq!(literal_host("a\rb.example.com"), "a\rb.example.com");
+        assert_eq!(literal_host("x.exampl\u{AD}e"), "x.exampl\u{AD}e");
+        assert_eq!(literal_host("fe80::1%ETH0"), "fe80::1%eth0");
+        assert_eq!(
+            url_hosts_as("Server=a\rb.example.com;", ADO),
+            vec!["a\rb.example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn hosts_holding_characters_a_host_name_cannot_are_refused() {
+        for (syntax, v) in [
+            (
+                None,
+                "mongodb://a\u{200B}b.example.com/?directConnection=true",
+            ),
+            (None, "mongodb://bücher.example/?directConnection=true"),
+            (
+                None,
+                "mongodb://db.example.com/?directConnection=true&proxyHost=a%20b.example.com",
+            ),
+            (ADO, "Server=a\rb.example.com;Database=d"),
+            (ADO, "Server=tcp:x.corp.exampl\u{AD}e,1433"),
+            (
+                ORACLE,
+                "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=a\u{200B}b.example.com)(PORT=1521)))",
+            ),
+            (ORACLE, "a\u{FF0E}b.example.com:1521/svc"),
+            (LIST, "a\tb:9092"),
+            (LIST, "a ,b:9092"),
+            (LIST, "SSL://a\u{AD}b:9093"),
+            (AZURE, "AccountName=a\rb;AccountKey=k"),
+        ] {
+            refused(syntax, v);
+        }
+        for (syntax, v) in [
+            (None, "https://bücher.example/x"),
+            (None, "mongodb://db.example.com/?directConnection=true"),
+            (ADO, "Server=tcp:db.example.com,1433;Database=d"),
+            (ADO, "Server=(local)"),
+            (ORACLE, "db.example.com:1521/svc"),
+            (
+                LIST,
+                "b1.example.com:9092, b2.example.com:9092,SSL://b3.example.com:9093",
+            ),
+            (LIST, "nats://u:p%40ss@n1.example.com:4222"),
+        ] {
+            accepted(syntax, v);
+        }
+        assert_eq!(
+            url_hosts_as("a:9092, b:9092,SASL_SSL://c:9093,nats://D:4222", LIST),
+            vec!["a", "b", "c", "d"]
+        );
+    }
+
+    #[test]
+    fn ipv6_zone_ids_do_not_hide_metadata_addresses() {
+        for host in [
+            "fe80::1%eth0",
+            "[fe80::1%25eth0]",
+            "fd00:ec2::254%0",
+            "::ffff:169.254.169.254%1",
+        ] {
+            assert!(is_metadata_host(host), "{host}");
+        }
+        assert!(!is_metadata_host("2001:db8::1%eth0"));
+        let open = ReferencePolicy::open();
+        for (syntax, v) in [
+            (ADO, "Server=fd00:ec2::254%0;Database=d"),
+            (ADO, "Server=tcp:fe80::1%eth0,1433"),
+            (
+                ORACLE,
+                "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=fe80::1%eth0)(PORT=1521)))",
+            ),
+            (LIST, "fe80::1%eth0"),
+            (None, "http://[fe80::1%25eth0]/"),
+        ] {
+            assert!(open.check_url_as(v, syntax).is_err(), "{v}");
+        }
+        refused(ADO, "Server=2001:db8::1%eth0");
+    }
+
+    #[test]
+    fn a_nul_in_a_host_is_refused_under_any_policy() {
+        let listed = ReferencePolicy::open().with_url_hosts(["*.corp.example"]);
+        assert!(
+            listed
+                .check_url_as("169.254.169.254\0.corp.example:9092", LIST)
+                .is_err()
+        );
+        assert!(listed.check_host_literal("a\0.corp.example").is_err());
+        assert!(ReferencePolicy::open().check_host_literal("a\0b").is_err());
+    }
+
+    #[test]
+    fn redirect_hosts_are_judged_as_the_client_dials_them() {
+        let listed = ReferencePolicy::open().with_url_hosts(["*.corp.example"]);
+        assert!(listed.check_host_literal("replica.corp.example").is_ok());
+        for host in [
+            "x@ok.corp.example",
+            "a\rb.corp.example",
+            "x/y.corp.example",
+            "x?.corp.example",
+        ] {
+            assert!(listed.check_host_literal(host).is_err(), "{host}");
+        }
+        let open = ReferencePolicy::open();
+        assert!(open.check_host_literal("fd00:ec2::254%0").is_err());
+        assert!(open.check_host_literal("replica.example.com").is_ok());
+    }
+
+    #[test]
     fn url_syntax_round_trips_and_is_read_from_the_schema() {
         for s in [
             UrlSyntax::Ado,
@@ -4806,7 +5049,11 @@ mod tests {
             "mongodb://ok.example.com/?proxyHost=169.254.169.254",
             "mongodb://ok.example.com/?appName=x,nats://ok.example.com&proxyHost=169.254.169.254",
         ] {
-            assert!(refused(None, v).reason.contains("169.254.169.254"), "{v}");
+            let reason = refused(None, v).reason;
+            assert!(
+                reason.contains("169.254.169.254") || reason.contains("holds characters"),
+                "{v}: {reason}"
+            );
         }
         assert_eq!(
             url_hosts("mongodb://a.example.com#,B.example.com:27018/?x=1"),

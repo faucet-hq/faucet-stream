@@ -2583,3 +2583,74 @@ async fn a_caller_kafka_lineage_transport_needs_a_host_allow_list() {
         "{err:?}"
     );
 }
+
+/// A host in a submitted config is judged as the client dials it: a host
+/// holding characters no host name can (a control character, a format
+/// character the URL parser would drop, an IPv6 zone) is refused, whichever
+/// grammar the field is written in.
+#[cfg(all(
+    feature = "source-mongodb",
+    feature = "source-kafka",
+    feature = "source-mssql",
+    feature = "sink-stdout"
+))]
+#[tokio::test]
+async fn caller_hosts_are_judged_as_the_client_dials_them() {
+    use crate::cli::ReferenceArgs;
+    use crate::serve::references::ServeReferencePolicy;
+    let caller = BodyOrigin::Caller {
+        allow_subprocess: false,
+    };
+    let listed = ServeReferencePolicy::from_args(&ReferenceArgs {
+        allow_url_host: vec!["*.example.com".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    let stdout = json!({ "type": "stdout", "config": {} });
+    let body =
+        |source: Value| json!({ "version": 1, "pipeline": { "source": source, "sink": stdout } });
+    let mongo = |uri: &str| {
+        body(json!({ "type": "mongodb", "config": {
+            "connection_uri": uri, "database": "app", "collection": "c" } }))
+    };
+    let kafka = |brokers: &str| {
+        body(json!({ "type": "kafka", "config": {
+            "brokers": brokers, "topics": ["t"], "group_id": "g", "max_messages": 1 } }))
+    };
+    let mssql = |cs: &str| {
+        body(json!({ "type": "mssql", "config": {
+            "connection_string": cs, "query": "SELECT 1" } }))
+    };
+    for doc in [
+        mongo("mongodb://a\u{AD}b.example.com/?directConnection=true"),
+        mongo("mongodb://7\r\rcccc6\u{19D}&.7/?directConnection=true"),
+        kafka("k.example.com:9092,a\u{AD}.example.com:9092"),
+        kafka("k.example.com:9092,a\tb.example.com:9092"),
+        mssql("Server=a\rb.example.com;Database=d;User Id=u;Password=p"),
+        mssql("Server=x.example.co\u{200B}m;Database=d;User Id=u;Password=p"),
+    ] {
+        let text = doc.to_string();
+        let err =
+            load_submission_with(&text, ConfigFormat::Json, None, None, caller, None, &listed)
+                .await
+                .unwrap_err();
+        assert!(matches!(&err, ServeError::Forbidden(_)), "{text}: {err:?}");
+    }
+    for doc in [
+        mongo("mongodb://db.example.com/?directConnection=true"),
+        kafka("k1.example.com:9092, k2.example.com:9092"),
+        mssql("Server=tcp:db.example.com,1433;Database=d;User Id=u;Password=p"),
+    ] {
+        let text = doc.to_string();
+        load_submission_with(&text, ConfigFormat::Json, None, None, caller, None, &listed)
+            .await
+            .unwrap_or_else(|e| panic!("{text}: {e:?}"));
+    }
+    let zone = mssql("Server=fd00:ec2::254%0;Database=d;User Id=u;Password=p").to_string();
+    let open = ServeReferencePolicy::default();
+    assert!(
+        load_submission_with(&zone, ConfigFormat::Json, None, None, caller, None, &open)
+            .await
+            .is_err()
+    );
+}

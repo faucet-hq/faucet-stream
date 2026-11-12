@@ -38,6 +38,7 @@ examples/                     — repo-level examples: docker-compose infra stac
   orchestration/              — ELT recipe: faucet (EL) + dbt (T) + Airflow/Dagster
   wasm-transforms/            — reference `wasm` transform modules (hand-written .wat, Rust, AssemblyScript)
 fuzz/                         — cargo-fuzz targets (own workspace, nightly, never published)
+fuzz/seeds/<target>/          — committed regression inputs, zipped as each target's seed corpus
 .clusterfuzzlite/             — ClusterFuzzLite build for fuzz/ (run on PRs by cflite_pr.yml)
 benchmarks/                   — benchmark harness and configs
 observability/                — Prometheus alert rules and Grafana dashboards

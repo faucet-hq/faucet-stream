@@ -137,6 +137,9 @@ impl MongoCdcSource {
     /// Connect, validate config + topology, and build the source.
     pub async fn new(config: MongoCdcSourceConfig) -> Result<Self, FaucetError> {
         config.validate()?;
+        if let Some(problem) = faucet_core::resolve::mongodb_uri_problem(&config.connection_uri) {
+            return Err(FaucetError::Config(problem.to_string()));
+        }
         let client = Client::with_uri_str(&config.connection_uri)
             .await
             .map_err(|e| FaucetError::Source(format!("MongoDB connection failed: {e}")))?;

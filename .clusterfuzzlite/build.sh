@@ -11,4 +11,8 @@ cd "$SRC/faucet-stream"
 cargo fuzz build -O
 for target in $(cargo fuzz list); do
   cp "fuzz/target/x86_64-unknown-linux-gnu/release/$target" "$OUT/"
+  # Committed regression inputs (fuzz/seeds/<target>/) seed every run.
+  if [ -d "fuzz/seeds/$target" ]; then
+    (cd "fuzz/seeds/$target" && zip -q -j "$OUT/${target}_seed_corpus.zip" ./*)
+  fi
 done

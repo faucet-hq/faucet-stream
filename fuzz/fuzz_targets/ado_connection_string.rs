@@ -1,7 +1,7 @@
 #![no_main]
 
 use faucet_core::ado;
-use faucet_core::resolve::{ReferencePolicy, UrlSyntax, canonical_host, url_hosts_as};
+use faucet_core::resolve::{ReferencePolicy, UrlSyntax, literal_host, url_hosts_as};
 use libfuzzer_sys::fuzz_target;
 
 // The screen and the SQL Server driver must read a connection string alike:
@@ -13,7 +13,7 @@ fuzz_target!(|s: &str| {
         .with_path_roots(["/srv/data"])
         .any_url_scheme()
         .any_url_host();
-    let _ = policy.check_url_as(s, Some(UrlSyntax::Ado));
+    let verdict = policy.check_url_as(s, Some(UrlSyntax::Ado));
     let Ok(config) = tiberius::Config::from_ado_string(s) else {
         return;
     };
@@ -22,6 +22,14 @@ fuzz_target!(|s: &str| {
     let host = addr.rsplit_once(':').map_or(addr.as_str(), |(h, _)| h);
     assert_eq!(ado::server_host(&pairs), host, "{s:?}");
     let hosts = url_hosts_as(s, Some(UrlSyntax::Ado));
-    let host = canonical_host(host);
-    assert!(host.is_empty() || hosts.contains(&host), "{s:?}: {host} not in {hosts:?}");
+    let host = literal_host(host);
+    assert!(
+        host.is_empty() || hosts.contains(&host),
+        "{s:?}: {host} not in {hosts:?}"
+    );
+    let odd = !host.contains("${")
+        && !host.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '[' | ']' | ':' | '*')
+        });
+    assert!(!odd || verdict.is_err(), "{s:?}: {host:?} accepted");
 });

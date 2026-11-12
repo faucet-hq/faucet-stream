@@ -547,6 +547,9 @@ impl MongoDriver {
         // is fine): upsert/delete require a non-empty `key`. MongoDB is
         // schemaless, so there is no column-mapping guard to apply.
         config.write.validate()?;
+        if let Some(problem) = faucet_core::resolve::mongodb_uri_problem(&config.connection_uri) {
+            return Err(FaucetError::Config(problem.to_string()));
+        }
         let client = Client::with_uri_str(&config.connection_uri)
             .await
             .map_err(|e| FaucetError::Config(format!("MongoDB connection failed: {e}")))?;
