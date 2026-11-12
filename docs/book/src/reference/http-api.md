@@ -527,7 +527,9 @@ anything but ASCII letters, digits, `.`, `-` and `_` (bracketed IPv6 aside) —
 a control character, a space, a non-ASCII or invisible character, a `%` —
 is refused (write an internationalised name in its `xn--` form), and an IPv6
 zone id (`fe80::1%eth0`) does not hide a link-local or metadata address. A
-broker list is split on commas, as librdkafka splits it. A URL whose host a caller's config takes from
+`*` is not a host character, and a `${…}` token in a host must have a name of
+ASCII letters, digits and `.`, `_`, `:`, `%`, `-`, `[`, `]` (`${now.date}`,
+`${now.strftime.%Y}`). A broker list is split on commas, as librdkafka splits it. A URL whose host a caller's config takes from
 records (`https://${parent.host}/…`, a whole `${parent.next_url}`) cannot be
 checked, so it is refused; register the pipeline as a template instead.
 

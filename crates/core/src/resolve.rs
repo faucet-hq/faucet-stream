@@ -480,12 +480,21 @@ pub fn literal_host(host: &str) -> String {
     }
 }
 
-/// Whether `host` (a host as [`url_hosts`] returns it) holds only the
-/// characters a host name or bracketed IPv6 address can (ASCII letters,
-/// digits, `.`, `-`, `_`, `[`, `]`, `:`) and `${…}` tokens whose name holds
-/// only ASCII letters, digits, `.`, `_`, `:`, `%` and `-`. A policy that
-/// compares hosts refuses any other host.
-pub fn is_plain_host(host: &str) -> bool {
+/// Characters a `${…}` token name in a host may hold besides ASCII letters
+/// and digits.
+const HOST_TOKEN_CHARS: &[char] = &['.', '_', ':', '%', '-', '[', ']'];
+
+/// Why a host is not plain ([`is_plain_host`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostProblem {
+    /// A character no host name holds, outside any token.
+    Characters,
+    /// A `${…}` token that is empty, unclosed, or whose name holds other
+    /// characters than [`HOST_TOKEN_CHARS`].
+    TokenName,
+}
+
+fn host_problem(host: &str) -> Option<HostProblem> {
     let plain = |part: &str| {
         part.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '[' | ']' | ':'))
@@ -494,21 +503,28 @@ pub fn is_plain_host(host: &str) -> bool {
         !name.is_empty()
             && name
                 .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '%' | '-'))
+                .all(|c| c.is_ascii_alphanumeric() || HOST_TOKEN_CHARS.contains(&c))
     };
     let mut rest = host;
-    while let Some(start) = rest.find("${") {
-        if !plain(&rest[..start]) {
-            return false;
+    while let Some((before, body)) = rest.split_once("${") {
+        if !plain(before) {
+            return Some(HostProblem::Characters);
         }
-        match rest[start + 2..].find('}') {
-            Some(end) if token(&rest[start + 2..start + 2 + end]) => {
-                rest = &rest[start + 2 + end + 1..];
-            }
-            _ => return false,
+        match body.split_once('}') {
+            Some((name, after)) if token(name) => rest = after,
+            _ => return Some(HostProblem::TokenName),
         }
     }
-    plain(rest)
+    (!plain(rest)).then_some(HostProblem::Characters)
+}
+
+/// Whether `host` (a host as [`url_hosts`] returns it) holds only the
+/// characters a host name or bracketed IPv6 address can (ASCII letters,
+/// digits, `.`, `-`, `_`, `[`, `]`, `:`) and `${…}` tokens whose name holds
+/// only ASCII letters, digits and `.`, `_`, `:`, `%`, `-`, `[`, `]`. A policy
+/// that compares hosts refuses any other host.
+pub fn is_plain_host(host: &str) -> bool {
+    host_problem(host).is_none()
 }
 
 /// IPv6 instance-metadata endpoints outside link-local space (AWS, GCP, OCI).
@@ -2012,20 +2028,34 @@ impl ReferencePolicy {
     fn check_host(&self, subject: &str, host: &str) -> Result<(), Refusal> {
         let refuse = |reason: String| Refusal::new(RefusalKind::Url, subject, reason);
         let compares = self.path_roots.is_some() || self.url_hosts.is_some();
-        if host.contains('\0') || (compares && !is_plain_host(host)) {
-            return Err(refuse(if host.contains("${") {
-                format!(
-                    "host `{}` holds a token whose name is not ASCII letters, digits, `.`, `_`, \
-                     `:`, `%` and `-`, or characters a host name cannot",
+        let problem = if host.contains('\0') {
+            Some(HostProblem::Characters)
+        } else if compares {
+            host_problem(host)
+        } else {
+            None
+        };
+        match problem {
+            Some(HostProblem::TokenName) => {
+                let chars: String = HOST_TOKEN_CHARS
+                    .iter()
+                    .map(|c| format!("`{c}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(refuse(format!(
+                    "host `{}` holds a `${{…}}` token that is empty, unclosed or names more than \
+                     ASCII letters, digits and {chars}",
                     host.escape_debug()
-                )
-            } else {
-                format!(
+                )));
+            }
+            Some(HostProblem::Characters) => {
+                return Err(refuse(format!(
                     "host `{}` holds characters a host name cannot (only ASCII letters, digits, \
                      `.`, `-` and `_`; write an internationalised name in its `xn--` form)",
                     host.escape_debug()
-                )
-            }));
+                )));
+            }
+            None => {}
         }
         if host.contains("${") {
             if self.url_hosts.is_some() {
@@ -2054,7 +2084,15 @@ impl ReferencePolicy {
     /// redirect) and dials as written: read literally ([`literal_host`]),
     /// then judged as a host in a value is.
     pub fn check_host_literal(&self, host: &str) -> Result<(), Refusal> {
-        self.check_host(&host.escape_debug().to_string(), &literal_host(host))
+        let subject = host.escape_debug().to_string();
+        if host.contains("${") {
+            return Err(Refusal::new(
+                RefusalKind::Url,
+                &subject,
+                "a host received at run time is dialled as written; `${` cannot be part of it",
+            ));
+        }
+        self.check_host(&subject, &literal_host(host))
     }
 
     /// Check a URL scheme against the scheme allow-list.
@@ -4355,7 +4393,7 @@ mod tests {
     }
 
     #[test]
-    fn plain_hosts_are_host_names_tokens_or_patterns() {
+    fn plain_hosts_are_host_names_or_tokens() {
         for h in [
             "db.example.com",
             "[fe80::1]",
@@ -4365,6 +4403,7 @@ mod tests {
             "${now.date}.example.com",
             "${now.strftime.%Y}",
             "${partition.key:x}",
+            "${parent.items[0]}",
         ] {
             assert!(is_plain_host(h), "{h}");
         }
@@ -4395,6 +4434,21 @@ mod tests {
         let crash = "mongodb://upppp${\u{497}\u{19D}o\u{199}F}pppppppppp";
         let reason = confined().check_url(crash).unwrap_err().reason;
         assert!(reason.contains("token"), "{reason}");
+        let reason = confined()
+            .check_url("https://b\u{FC}cher.example${now.date}/")
+            .unwrap_err()
+            .reason;
+        assert!(reason.contains("xn--"), "{reason}");
+        let reason = ReferencePolicy::open()
+            .check_host_literal("a\0${x}")
+            .unwrap_err()
+            .reason;
+        assert!(!reason.contains("token"), "{reason}");
+        assert!(
+            ReferencePolicy::open()
+                .check_host_literal("169.254.169.254${x}")
+                .is_err()
+        );
         assert_eq!(
             url_hosts("mongodb://a${%41}b/"),
             vec!["a${%41}b".to_string()]
