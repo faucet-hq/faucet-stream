@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.18.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-cli-v1.18.0...faucet-cli-v1.18.1) - 2026-11-12
+
+### Bug Fixes
+
+- *(release)* Build the macOS arm64 binary on a supported runner, so prebuilt binaries, the Homebrew formula and provenance are published again (1.18.0 shipped to crates.io and the container registry only)
+
 ## [1.18.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-cli-v1.17.0...faucet-cli-v1.18.0) - 2026-11-12
 
 ### Bug Fixes
