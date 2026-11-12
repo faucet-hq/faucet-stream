@@ -150,7 +150,7 @@ unsafe_code = "deny"
 # Internal crates
 faucet-core = { path = "crates/core", version = "1" }
 faucet-auth = { path = "crates/auth", version = "1" }
-faucet-registry = { path = "crates/registry", version = "1.0.1" }
+faucet-registry = { path = "crates/registry", version = "1.0.2" }
 faucet-lineage = { path = "crates/lineage", version = "2" }
 faucet-common-bigquery = { path = "crates/common/bigquery", version = "1" }
 faucet-common-elasticsearch = { path = "crates/common/elasticsearch", version = "1" }

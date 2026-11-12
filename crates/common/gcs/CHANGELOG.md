@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.3.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-common-gcs-v1.3.1...faucet-common-gcs-v1.3.2) - 2026-11-12
+
+### Bug Fixes
+
+- *(serve)* Tighten what caller configs can reach; read connection strings like their clients; bound decoding; russh-sftp 3 ([#1063](https://github.com/faucet-hq/faucet-stream/pull/1063))
+- *(serve)* Fail closed while the run history is unreachable, #1053 review fixes, real license texts ([#1056](https://github.com/faucet-hq/faucet-stream/pull/1056))
+
 ## [1.3.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-common-gcs-v1.3.0...faucet-common-gcs-v1.3.1) - 2026-11-02
 
 ### Bug Fixes
