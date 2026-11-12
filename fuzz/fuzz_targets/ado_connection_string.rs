@@ -1,7 +1,7 @@
 #![no_main]
 
 use faucet_core::ado;
-use faucet_core::resolve::{ReferencePolicy, UrlSyntax, literal_host, url_hosts_as};
+use faucet_core::resolve::{ReferencePolicy, UrlSyntax, is_plain_host, literal_host, url_hosts_as};
 use libfuzzer_sys::fuzz_target;
 
 // The screen and the SQL Server driver must read a connection string alike:
@@ -27,9 +27,8 @@ fuzz_target!(|s: &str| {
         host.is_empty() || hosts.contains(&host),
         "{s:?}: {host} not in {hosts:?}"
     );
-    let odd = !host.contains("${")
-        && !host.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '[' | ']' | ':' | '*')
-        });
-    assert!(!odd || verdict.is_err(), "{s:?}: {host:?} accepted");
+    assert!(
+        is_plain_host(&host) || verdict.is_err(),
+        "{s:?}: {host:?} accepted"
+    );
 });
