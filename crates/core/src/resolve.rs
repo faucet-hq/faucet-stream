@@ -713,7 +713,11 @@ fn sqlite_file(value: &str) -> Location<'_> {
     let database = rest.split('?').next().unwrap_or(rest);
     match percent_decoded(database) {
         // SQLite opens a name starting `file:` as a URI and decodes it again.
-        Some(name) if name.len() >= 5 && name[..5].eq_ignore_ascii_case("file:") => {
+        Some(name)
+            if name
+                .get(..5)
+                .is_some_and(|p| p.eq_ignore_ascii_case("file:")) =>
+        {
             Location::Refused(
                 "a SQLite database name that is itself a `file:` URI cannot be checked",
             )
@@ -4427,6 +4431,22 @@ mod tests {
         ] {
             assert!(!is_plain_host(h), "{h}");
         }
+    }
+
+    #[test]
+    fn sqlite_names_with_multibyte_characters_are_read_without_panicking() {
+        for v in [
+            "sqlite:ab\u{DF7DF}x",
+            "sqlite://ab%F3%9F%9F%9Fx",
+            "sqlite:\u{E9}\u{E9}\u{E9}",
+        ] {
+            assert!(matches!(sqlite_file(v), Location::Local(_)), "{v}");
+        }
+        assert!(
+            confined()
+                .check_url("mongodb://h/?directConnection=true&tlsCAFile=sqlite:ab%F3%9F%9F%9Fx")
+                .is_err()
+        );
     }
 
     #[test]
