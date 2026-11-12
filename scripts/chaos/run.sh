@@ -193,7 +193,7 @@ EOF
     CREATE FUNCTION log_slow() RETURNS trigger LANGUAGE plpgsql AS \$\$
       BEGIN INSERT INTO slow_log VALUES (NEW.id, inet_client_addr(), clock_timestamp()); RETURN NEW; END \$\$;
     CREATE TRIGGER slow_log AFTER INSERT OR UPDATE ON slow_out FOR EACH ROW EXECUTE FUNCTION log_slow()"
-  k create secret generic faucet-creds --from-literal=PGPASSWORD=pw >/dev/null
+  k create secret generic faucet-creds --from-literal=PGPASSWORD=pw --from-literal=CHAOS_PGPASSWORD=pw >/dev/null
 }
 
 psql() { k exec deploy/pg -- psql -U postgres -d "$1" -v ON_ERROR_STOP=1 -tAq -c "$2"; }
@@ -223,6 +223,9 @@ fresh_history_db() {
 }
 
 PG='postgres://postgres:${env:PGPASSWORD}@pg:5432/data'
+# Submitted configs and templates read their own variable: the server marks
+# every variable its --default-config reads as its own, so they can't share it.
+PG_CALLER='postgres://postgres:${env:CHAOS_PGPASSWORD}@pg:5432/data'
 
 pipeline_yaml() { # slow|fast
   local rows=100 table=fast_out sleep=""
@@ -234,13 +237,13 @@ pipeline:
   source:
     type: postgres
     config:
-      connection_url: "${PG}"
+      connection_url: "${PIPELINE_PG:-$PG}"
       query: "SELECT g AS id, md5(g::text) AS v FROM generate_series(1,${rows}) g${sleep}"
       batch_size: 50
   sink:
     type: postgres
     config:
-      connection_url: "${PG}"
+      connection_url: "${PIPELINE_PG:-$PG}"
       table_name: ${table}
       column_mapping: auto_map
       write_mode: upsert
@@ -258,7 +261,7 @@ serve:
   cluster: { enabled: true }
   history: { backend: postgres, existingSecret: faucet-history }
   auth: { mode: token }
-  extraArgs: [--allow-env=PGPASSWORD, "--lease-ttl-secs=${LEASE_TTL}"]
+  extraArgs: [--allow-env=CHAOS_PGPASSWORD, "--lease-ttl-secs=${LEASE_TTL}"]
   podDisruptionBudget: { enabled: true }
   # Soft: a hard spread rule leaves a rolling update's surge pod with no
   # allowed node, and it stays Pending.
@@ -268,26 +271,6 @@ serve:
       whenUnsatisfiable: ScheduleAnyway
       nodeTaintsPolicy: Honor
       labelSelector: { matchLabels: { app.kubernetes.io/component: serve } }
-  triggers:
-    enabled: true
-    content:
-      version: 1
-      triggers:
-        - name: every-minute
-          type: schedule
-          cron: "* * * * *"
-          config:
-            version: 1
-            name: tick
-            pipeline:
-              source:
-                type: postgres
-                config:
-                  connection_url: "${PG}"
-                  query: "SELECT to_char(date_trunc('minute', '\${trigger.tick}'::timestamptz), 'HH24:MI') AS ts, to_char(now(), 'HH24:MI:SS') AS fired"
-              sink:
-                type: postgres
-                config: { connection_url: "${PG}", table_name: tick_log, column_mapping: auto_map }
 EOF
 }
 
@@ -300,7 +283,7 @@ serve:
   history: { backend: sqlite }
   persistence: { enabled: true, size: 1Gi }
   auth: { mode: token }
-  extraArgs: [--allow-env=PGPASSWORD, "--lease-ttl-secs=${LEASE_TTL}"]
+  extraArgs: [--allow-env=CHAOS_PGPASSWORD, "--lease-ttl-secs=${LEASE_TTL}"]
 job: { enabled: true }
 pipelineConfig:
   create: true
@@ -357,7 +340,7 @@ api() { local port="$1" path="$2"; shift 2; curl -s -m 20 "localhost:${port}${pa
 
 submit() { # port slow|fast [idempotency-key]
   local body
-  body="$(pipeline_yaml "$2" | jq -Rs --arg k "${3:-}" '{config: ., config_format: "yaml"} + (if $k == "" then {} else {idempotency_key: $k} end)')"
+  body="$(PIPELINE_PG="$PG_CALLER" pipeline_yaml "$2" | jq -Rs --arg k "${3:-}" '{config: ., config_format: "yaml"} + (if $k == "" then {} else {idempotency_key: $k} end)')"
   api "$1" /v1/runs -X POST -H 'Content-Type: application/json' --data-binary "$body"
 }
 
@@ -451,7 +434,7 @@ s_idempotency() {
   a="$(port_for "$(pods | sed -n 1p)")"; b="$(port_for "$(pods | sed -n 2p)")"; key="chaos-$RANDOM$RANDOM"
   r1="$(submit "$a" fast "$key" | run_id)"; r2="$(submit "$b" fast "$key" | run_id)"
   [ -n "$r1" ] && [ "$r1" = "$r2" ] || fail "different runs: ${r1} ${r2}" || return 1
-  code="$(pipeline_yaml slow | jq -Rs --arg k "$key" '{config: ., config_format: "yaml", idempotency_key: $k}' \
+  code="$(PIPELINE_PG="$PG_CALLER" pipeline_yaml slow | jq -Rs --arg k "$key" '{config: ., config_format: "yaml", idempotency_key: $k}' \
     | curl -s -o /dev/null -w '%{http_code}' -X POST "localhost:${b}/v1/runs" -H "Authorization: Bearer ${TOKEN}" -H 'Content-Type: application/json' --data-binary @-)"
   [ "$code" = 409 ] || fail "reused key with another body: HTTP ${code}" || return 1
   echo "same key on both pods -> one run; different body -> 409"
@@ -459,15 +442,13 @@ s_idempotency() {
 
 s_node_stop() {
   reset_slow
-  local port id owner node t0 st
+  local port id owner node t0 st p nodes
+  # Checked before submitting, so a failure here leaves no run behind.
+  nodes="$(for p in $(pods); do k get pod "$p" -o jsonpath='{.spec.nodeName}'; echo; done | sort -u | grep -c .)"
+  [ "$nodes" -gt 1 ] || fail "every replica is on one node; stopping it leaves no survivor" || return 1
   port="$(any_port)"; id="$(submit "$port" slow | run_id)"
   owner="$(wait_owner "$id")" || return 1
   node="$(k get pod "$owner" -o jsonpath='{.spec.nodeName}')"
-  for p in $(pods); do
-    [ "$p" = "$owner" ] && continue
-    [ "$(k get pod "$p" -o jsonpath='{.spec.nodeName}')" != "$node" ] && break
-    fail "every replica is on ${node}; stopping it leaves no survivor"; return 1
-  done
   sleep 8
   docker stop "$node" >/dev/null; t0=$(date +%s)
   local survivor; survivor="$(pods | grep -v "$owner" | head -1)"; port="$(port_for "$survivor")"
@@ -579,22 +560,60 @@ s_poison() {
   echo "failed as a poison run after $(field "$port" "$id" attempt) reclaims"
 }
 
+# A template that records the tick it ran for, on a schedule every 5 minutes
+# (the shortest a schedule may tick). Counted from here by s_schedule.
+setup_schedule() {
+  local port tpl
+  port="$(any_port)"
+  tpl="$(cat <<EOF
+kind: pipeline
+version: 1
+name: tick
+params:
+  tick: { type: string, required: true }
+pipeline:
+  source:
+    type: postgres
+    config:
+      connection_url: "${PG_CALLER}"
+      query: "SELECT to_char(now(), 'HH24:MI:SS') AS fired"
+  transforms:
+    - type: set
+      config:
+        values: { ts: "\${param.tick}" }
+  sink:
+    type: postgres
+    config: { connection_url: "${PG_CALLER}", table_name: tick_log, column_mapping: auto_map }
+EOF
+)"
+  api "$port" /v1/templates -X POST -H 'Content-Type: application/json' \
+    --data-binary "$(jq -n --arg c "$tpl" '{config: $c}')" | jq -e '.version == 1' >/dev/null || return 1
+  api "$port" /v1/schedules -X POST -H 'Content-Type: application/json' --data-binary \
+    '{"name":"every-five","cron":"*/5 * * * *","template":{"id":"tick","version":"1","params":{"tick":"${schedule.tick}"}}}' \
+    | jq -e '.name == "every-five"' >/dev/null || return 1
+  INSTALLED_AT=$(date +%s)
+  SCHEDULE_READY=1
+}
+
 s_schedule() { # once per tick across every replica, through everything above
   # Each row carries the tick it ran for. A tick may be missing only inside an
   # outage (no replica or no history), where catch-up runs just the latest one.
-  local window minutes expected actual dupes missing excused="false" o
-  window="ts > to_char(date_trunc('minute', to_timestamp(${INSTALLED_AT})), 'HH24:MI') AND ts < to_char(date_trunc('minute', now()), 'HH24:MI')"
-  minutes="generate_series(date_trunc('minute', to_timestamp(${INSTALLED_AT})) + interval '1 minute', date_trunc('minute', now()) - interval '1 minute', interval '1 minute') m"
+  local bin window ticks expected actual dupes missing excused="false" o
+  [ "${SCHEDULE_READY:-0}" = 1 ] || fail "registering the tick template or its schedule failed" || return 1
+  bin="date_bin('5 minutes', %s, TIMESTAMPTZ '2000-01-01')"
+  window="ts::timestamptz > to_timestamp(${INSTALLED_AT}) AND ts::timestamptz < $(printf "$bin" 'now()')"
+  ticks="generate_series($(printf "$bin" "to_timestamp(${INSTALLED_AT})") + interval '5 minutes', $(printf "$bin" 'now()') - interval '5 minutes', interval '5 minutes') m"
   for o in ${OUTAGES[@]+"${OUTAGES[@]}"}; do
-    excused="${excused} OR m BETWEEN to_timestamp(${o% *}) - interval '1 minute' AND to_timestamp(${o#* }) + interval '1 minute'"
+    excused="${excused} OR m BETWEEN to_timestamp(${o% *}) - interval '5 minutes' AND to_timestamp(${o#* }) + interval '5 minutes'"
   done
-  expected="$(sql "SELECT count(*) FROM ${minutes}")"
+  expected="$(sql "SELECT count(*) FROM ${ticks}")"
+  [ "$expected" -gt 0 ] || fail "no 5-minute tick fell inside the run" || return 1
   actual="$(sql "SELECT count(*) FROM tick_log WHERE ${window}")"
   dupes="$(sql "SELECT coalesce(string_agg(ts || ' x' || n, ', '), '') FROM (SELECT ts, count(*) n FROM tick_log WHERE ${window} GROUP BY ts HAVING count(*) > 1) d")"
   [ -z "$dupes" ] || fail "a tick ran more than once: ${dupes}" || return 1
-  missing="$(sql "SELECT coalesce(string_agg(to_char(m, 'HH24:MI'), ', '), '') FROM ${minutes} WHERE to_char(m, 'HH24:MI') NOT IN (SELECT ts FROM tick_log) AND NOT (${excused})")"
+  missing="$(sql "SELECT coalesce(string_agg(to_char(m, 'HH24:MI'), ', '), '') FROM ${ticks} WHERE m NOT IN (SELECT ts::timestamptz FROM tick_log) AND NOT (${excused})")"
   [ -z "$missing" ] || fail "ticks never ran outside an outage: ${missing}" || return 1
-  echo "${actual} scheduled runs over ${expected} minutes across ${REPLICAS} replicas, none twice"
+  echo "${actual} scheduled runs over ${expected} five-minute ticks across ${REPLICAS} replicas, none twice"
 }
 
 s_single_kill() {
@@ -672,6 +691,7 @@ deploy_postgres
 log "installing ${REPLICAS} clustered replicas"
 fresh_history_db
 if install cluster; then
+  wanted schedule && { setup_schedule || log "registering the tick template or its schedule failed"; }
   run_scenario membership s_membership
   run_scenario kill-owner s_kill_owner
   run_scenario cross-cancel s_cross_cancel
