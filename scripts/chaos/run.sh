@@ -443,8 +443,16 @@ s_idempotency() {
 s_node_stop() {
   reset_slow
   local port id owner node t0 st p nodes
-  # Checked before submitting, so a failure here leaves no run behind.
+  # The spread rule is soft, so earlier kills can leave every replica on one
+  # node; move one off it before submitting, so a failure leaves no run behind.
   nodes="$(for p in $(pods); do k get pod "$p" -o jsonpath='{.spec.nodeName}'; echo; done | sort -u | grep -c .)"
+  if [ "$nodes" -le 1 ]; then
+    node="$(k get pod "$(pods | head -1)" -o jsonpath='{.spec.nodeName}')"
+    k cordon "$node" >/dev/null
+    k delete pod "$(pods | head -1)" --wait=false >/dev/null
+    sleep 2; wait_all_ready; k uncordon "$node" >/dev/null
+    nodes="$(for p in $(pods); do k get pod "$p" -o jsonpath='{.spec.nodeName}'; echo; done | sort -u | grep -c .)"
+  fi
   [ "$nodes" -gt 1 ] || fail "every replica is on one node; stopping it leaves no survivor" || return 1
   port="$(any_port)"; id="$(submit "$port" slow | run_id)"
   owner="$(wait_owner "$id")" || return 1
