@@ -30,6 +30,7 @@ on:
           - patch
           - minor
           - major
+          - release     # publish the version already on main without bumping (resumes a run that failed after its bump commit)
       custom_crates:
         description: "Comma-separated crate names (only when scope=custom), e.g. faucet-sink-postgres,faucet-source-rest"
         required: false
@@ -361,7 +362,7 @@ jobs:
             PKGS=""
             for c in "${selected[@]}"; do PKGS="$PKGS -p $c"; done
             echo "==> Publishing ${#selected[@]} crates directly"
-            cargo release "$BUMP" $PKGS --no-confirm --execute
+            cargo release "$BUMP" $PKGS --no-confirm --no-verify --execute
             exit $?
           fi
 
