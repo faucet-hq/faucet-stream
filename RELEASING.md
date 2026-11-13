@@ -46,7 +46,12 @@ classification and the changelog grouping work.
 - **`CARGO_REGISTRY_TOKEN`** — required, for publishing to crates.io.
 - **`RELEASE_PLZ_TOKEN`** (PAT or GitHub App) — recommended, so the release PR
   and its tags trigger downstream CI/builds. GitHub forbids the default
-  `GITHUB_TOKEN` from triggering downstream workflows.
+  `GITHUB_TOKEN` from triggering downstream workflows. Store it as an
+  environment secret in `release` (the publishing jobs, approval required)
+  and in `release-pr` (the release-PR job, limited to `main`, no approval),
+  never as a repository secret, so a workflow on another branch cannot read it.
+- **`SITE_DISPATCH_TOKEN`** — repository secret with `contents: write` on
+  `faucet-hq/faucet-hq.github.io`, for the site rebuild after a release.
 - **`HOMEBREW_TAP_TOKEN`** — PAT with repo scope on the tap repo, for the
   Homebrew publish step (see below). Without it, archives/installer still
   publish; only the tap push fails.

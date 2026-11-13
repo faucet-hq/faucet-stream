@@ -286,7 +286,10 @@ release-plz release    --dry-run     # prints what it would publish, in order
   owned by a member of the `faucet-hq/owners` GitHub team. `change-owners` is
   what lets the release job add the team to new crates.
 - `RELEASE_PLZ_TOKEN` (optional but recommended) — a PAT or GitHub App token
-  with `contents: write` + `pull-requests: write`. Without it the release PR
+  with `contents: write` + `pull-requests: write`, stored as an **environment**
+  secret in both `release` (publishing jobs, approval required) and
+  `release-pr` (the release-PR job; `main` only, no approval), not as a
+  repository secret. Without it the release PR
   is opened by the default `GITHUB_TOKEN`, which by GitHub policy does **not**
   trigger downstream workflow runs — CI won't run on the release PR.
 - `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` (optional) — a read-only Docker Hub
