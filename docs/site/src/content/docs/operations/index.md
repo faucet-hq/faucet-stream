@@ -16,22 +16,22 @@ description: "Deploy faucet, run it on a schedule, keep it healthy and upgrade i
 
 <div class="fs-dlist">
 <a href="/faucet-stream/operations/deploying/"><b>Deploying faucet</b></a>
-<a href="/faucet-stream/cookbook/serve/"><b>Running faucet as a service</b></a>
-<a href="/faucet-stream/cookbook/web-console/"><b>Web console (serve-ui)</b></a>
-<a href="/faucet-stream/cookbook/mcp/"><b>MCP server (agent tools)</b></a>
+<a href="/faucet-stream/cookbook/serve/"><b>Running as a service</b></a>
+<a href="/faucet-stream/cookbook/web-console/"><b>Web console</b></a>
+<a href="/faucet-stream/cookbook/mcp/"><b>MCP server</b></a>
 <a href="/faucet-stream/cookbook/cluster/"><b>Running a cluster</b></a>
 <a href="/faucet-stream/cookbook/scheduling/"><b>Scheduling</b></a>
 <a href="/faucet-stream/cookbook/triggers/"><b>Event-driven triggers</b></a>
 <a href="/faucet-stream/cookbook/schedules/"><b>Schedules</b></a>
-<a href="/faucet-stream/cookbook/orchestration/"><b>Orchestration (Airflow / Dagster + dbt)</b></a>
+<a href="/faucet-stream/cookbook/orchestration/"><b>Orchestration</b></a>
 <a href="/faucet-stream/operations/observability/"><b>Observability</b></a>
 <a href="/faucet-stream/operations/reliability-testing/"><b>Reliability testing</b></a>
-<a href="/faucet-stream/operations/chaos-testing/"><b>Chaos testing faucet serve</b></a>
+<a href="/faucet-stream/operations/chaos-testing/"><b>Chaos testing</b></a>
 <a href="/faucet-stream/operations/tuning/"><b>Performance tuning</b></a>
-<a href="/faucet-stream/cookbook/troubleshooting/"><b>Troubleshooting with faucet doctor</b></a>
+<a href="/faucet-stream/cookbook/troubleshooting/"><b>faucet doctor</b></a>
 <a href="/faucet-stream/operations/troubleshooting/"><b>Troubleshooting & FAQ</b></a>
-<a href="/faucet-stream/operations/pinning/"><b>Pinning the faucet version</b></a>
-<a href="/faucet-stream/operations/upgrading/"><b>Upgrading faucet safely</b></a>
-<a href="/faucet-stream/operations/migrating/"><b>Migrating from Meltano, Singer or Airbyte</b></a>
-<a href="/faucet-stream/operations/backup/"><b>Backing up the server database</b></a>
+<a href="/faucet-stream/operations/pinning/"><b>Pinning the version</b></a>
+<a href="/faucet-stream/operations/upgrading/"><b>Upgrading safely</b></a>
+<a href="/faucet-stream/operations/migrating/"><b>Migrating to faucet</b></a>
+<a href="/faucet-stream/operations/backup/"><b>Backing up the server</b></a>
 </div>

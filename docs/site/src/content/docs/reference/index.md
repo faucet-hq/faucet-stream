@@ -14,15 +14,15 @@ description: "Every connector, command and config field, generated from the code
 
 <div class="fs-dlist">
 <a href="/faucet-stream/reference/connectors/"><b>Connector catalog</b></a>
-<a href="/faucet-stream/reference/conformance/"><b>Connector conformance & tiers</b></a>
-<a href="/faucet-stream/reference/capability-matrix/"><b>Connector capability matrix</b></a>
+<a href="/faucet-stream/reference/conformance/"><b>Conformance & tiers</b></a>
+<a href="/faucet-stream/reference/capability-matrix/"><b>Capability matrix</b></a>
 <a href="/faucet-stream/reference/compatibility/"><b>Feature compatibility</b></a>
 <a href="/faucet-stream/reference/value-fidelity/"><b>Value fidelity</b></a>
 <a href="/faucet-stream/reference/choosing/"><b>Choosing a connector</b></a>
-<a href="/faucet-stream/reference/template-hub-matrix/"><b>Template Hub — source × sink matrix</b></a>
+<a href="/faucet-stream/reference/template-hub-matrix/"><b>Template Hub matrix</b></a>
 <a href="/faucet-stream/reference/cli/"><b>CLI commands</b></a>
 <a href="/faucet-stream/reference/config/"><b>Configuration file format</b></a>
-<a href="/faucet-stream/reference/editor-setup/"><b>Editor setup (autocomplete & validation)</b></a>
-<a href="/faucet-stream/reference/http-api/"><b>HTTP API (faucet serve)</b></a>
+<a href="/faucet-stream/reference/editor-setup/"><b>Editor setup</b></a>
+<a href="/faucet-stream/reference/http-api/"><b>HTTP API</b></a>
 <a href="/faucet-stream/reference/triggers/"><b>Triggers</b></a>
 </div>

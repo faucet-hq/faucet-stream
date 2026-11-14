@@ -2,6 +2,8 @@ import { defineConfig, passthroughImageService } from 'astro/config';
 import starlight from '@astrojs/starlight';
 import starlightSidebarTopics from 'starlight-sidebar-topics';
 import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import rehypeRepoLinks from './plugins/rehype-repo-links.mjs';
 
 const topics = JSON.parse(readFileSync(new URL('./src/topics.json', import.meta.url), 'utf8'));
 const SITE = 'https://faucet-hq.github.io';
@@ -12,6 +14,9 @@ export default defineConfig({
   base: BASE,
   trailingSlash: 'always',
   image: { service: passthroughImageService() },
+  markdown: {
+    rehypePlugins: [[rehypeRepoLinks, { root: fileURLToPath(new URL('../..', import.meta.url)), repo: 'https://github.com/faucet-hq/faucet-stream' }]],
+  },
   integrations: [
     starlight({
       title: 'faucet-stream',
