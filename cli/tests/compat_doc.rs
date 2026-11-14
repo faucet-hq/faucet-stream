@@ -5,7 +5,8 @@
 use std::path::PathBuf;
 
 fn doc_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../docs/site/generated/reference/compatibility.md")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../docs/site/generated/reference/compatibility.md")
 }
 
 #[test]
