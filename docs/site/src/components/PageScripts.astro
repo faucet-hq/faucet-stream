@@ -48,7 +48,7 @@
       contents.forEach((c) => { const on = c.getAttribute('data-mode') === mode; c.classList.toggle('active', on); if (on) active = c; });
       if (user && active && !revealed[mode]) { revealed[mode] = true; onReveal(active); }
       // Starlight's TOC watches headings that were visible when it started; rebuild it for the new mode.
-      if (user) { dispatchEvent(new Event('fs-layout')); dispatchEvent(new Event('resize')); }
+      if (user) dispatchEvent(new Event('resize'));
       try { localStorage.setItem(MODE_KEY, mode); } catch {}
     };
     buttons.forEach((b) => b.addEventListener('click', () => apply(b.dataset.mode!, true)));
@@ -174,45 +174,47 @@
     });
   }
 
-  // The last sections of a page are often too short for their heading to reach the top of the
-  // window, so the TOC can never mark them current. Give the page just enough room below.
-  function tocTailRoom() {
-    const links = [...document.querySelectorAll<HTMLAnchorElement>('starlight-toc nav a[href^="#"]')];
-    const last = links.length > 1 ? document.getElementById(decodeURIComponent(links[links.length - 1].hash.slice(1))) : null;
-    const main = document.querySelector<HTMLElement>('.main-pane');
-    if (!last || !main) return;
-    const apply = () => {
-      main.style.paddingBottom = '';
-      const nav = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--sl-nav-height')) * 16 || 64;
-      const top = last.getBoundingClientRect().top + scrollY;
-      const room = document.documentElement.scrollHeight - top;
-      const need = innerHeight - nav - 32 - room;
-      if (need > 0) main.style.paddingBottom = `${Math.ceil(need)}px`;
+  type Toc = HTMLElement & { current?: HTMLAnchorElement };
+  const tocs = () => [...document.querySelectorAll<Toc>('starlight-toc, mobile-starlight-toc')];
+  const markCurrent = (hash: string) => tocs().forEach((toc) => {
+    const link = [...toc.querySelectorAll<HTMLAnchorElement>('a')].find((l) => l.hash === hash);
+    if (link && toc.current !== link) toc.current = link;
+  });
+
+  // At the very bottom of a page, the last sections are often too short for their heading to reach
+  // Starlight's detection band, so they could never be marked current. Once scrolling settles there
+  // (after Starlight's own update), mark the last section whose heading is on screen.
+  function tocBottom() {
+    if (!tocs().length) return;
+    let timer = 0;
+    const check = () => {
+      if (pinned || scrollY + innerHeight < document.documentElement.scrollHeight - 4) return;
+      const links = [...tocs()[0].querySelectorAll<HTMLAnchorElement>('a[href^="#"]')];
+      const onScreen = links.filter((l) => {
+        const h = document.getElementById(decodeURIComponent(l.hash.slice(1)));
+        return h && h.offsetParent !== null && h.getBoundingClientRect().top < innerHeight - 40;
+      });
+      const last = onScreen[onScreen.length - 1];
+      if (last) markCurrent(last.hash);
     };
-    apply();
-    addEventListener('resize', apply, { passive: true });
-    addEventListener('load', apply, { once: true });
-    addEventListener('fs-layout', apply);
+    addEventListener('scroll', () => { clearTimeout(timer); timer = window.setTimeout(check, 160); }, { passive: true });
   }
 
-  // Clicking a TOC item marks it current once the page has scrolled to its heading; Starlight's own
-  // tracking can miss a heading that lands just above its detection band (short or revealed sections).
+  // Clicking a TOC item keeps that item current while the page scrolls to it: Starlight's tracking
+  // updates late (long smooth scrolls, a revealed Learn mode) and would otherwise mark a neighbour.
+  // The pin ends as soon as the reader scrolls by hand.
+  let pinned = '';
   function tocClickSelects() {
+    const keep = () => { if (pinned) markCurrent(pinned); };
+    tocs().forEach((toc) => new MutationObserver(keep).observe(toc, { subtree: true, attributes: true, attributeFilter: ['aria-current'] }));
     document.addEventListener('click', (e) => {
       const a = (e.target as HTMLElement).closest<HTMLAnchorElement>('starlight-toc a[href^="#"], mobile-starlight-toc a[href^="#"]');
       if (!a) return;
-      const hash = a.hash;
-      setTimeout(() => {
-        const target = document.getElementById(decodeURIComponent(hash.slice(1)));
-        if (!target) return;
-        const top = target.getBoundingClientRect().top;
-        if (top < -4 || top > innerHeight * 0.5) return;
-        document.querySelectorAll<HTMLElement & { current?: HTMLAnchorElement }>('starlight-toc, mobile-starlight-toc').forEach((toc) => {
-          const link = [...toc.querySelectorAll<HTMLAnchorElement>('a')].find((l) => l.hash === hash);
-          if (link) toc.current = link;
-        });
-      }, 700);
+      pinned = a.hash;
+      keep();
     });
+    const unpin = () => { pinned = ''; };
+    ['wheel', 'touchmove', 'keydown'].forEach((t) => addEventListener(t, unpin, { passive: true }));
   }
 
   // Keep the highlighted TOC item in view when the list is longer than the window.
@@ -261,7 +263,7 @@
     buildFlows();
     tables();
     longCode();
-    tocTailRoom();
+    tocBottom();
     tocFollow();
     tocClickSelects();
     catalogFilter();

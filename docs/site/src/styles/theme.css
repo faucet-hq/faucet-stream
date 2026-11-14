@@ -428,3 +428,87 @@ starlight-toc nav ul ul a { font-size: 13px; }
 .sl-markdown-content .fs-notes ul { list-style: none; padding-inline-start: 0 !important; }
 .sl-markdown-content .fs-notes li + li { margin-top: .5rem; }
 .sl-markdown-content .fs-notes :is(strong, b) { color: var(--fs-ink-2); }
+
+/* ---------- alignment pass ---------- */
+/* centred task cards: the title row centres its text and arrow like the icon and description */
+@media (min-width: 50.0625rem) {
+  .fs-card:not(.fs-card-left) > span:last-of-type { display: flex; flex-direction: column; align-items: center; }
+  .fs-card:not(.fs-card-left) .fs-card-title { justify-content: center; }
+}
+.fs-card-left .fs-card-title { justify-content: flex-start; }
+.fs-card-text { display: block; line-height: 1.55; }
+.fs-card-title .fs-i { flex: none; }
+
+/* =====================================================================
+   SPACING SYSTEM — the one source of vertical rhythm in page content.
+   Components carry no outer margins; the flow rules below space every
+   block by what it is and what follows it. Add new components to
+   --blocks lists, never give them their own margin.
+   ===================================================================== */
+:root {
+  --fs-s1: 4px; --fs-s2: 8px; --fs-s3: 12px; --fs-s4: 16px;
+  --fs-s5: 24px; --fs-s6: 32px; --fs-s7: 48px; --fs-s8: 64px;
+}
+
+/* 1 · components: no outer margins of their own (zero specificity, so the flow rules always win) */
+:where(.sl-markdown-content) :where(
+  .fs-lead, .fs-btns, .fs-cards, .fs-links2, .fs-dlist, .fs-flow, .fs-filter, .fs-filter-empty,
+  .fs-table, .fs-notes, .mode-toggle-bar, .expressive-code, .starlight-aside, pre.mermaid,
+  .viz-root, figure, details, blockquote, hr, img, p, ul, ol, dl,
+  h2, h3, h4, h5, h6, .sl-heading-wrapper
+) { margin-block: 0 !important; }
+
+/* 2 · flow containers: every block after another block gets the base gap */
+:is(.sl-markdown-content, .sl-markdown-content .mode-content, .sl-markdown-content details,
+    .sl-markdown-content .fs-notes) > * + * { margin-top: var(--fs-s4) !important; }
+
+/* 3 · components get room on both sides */
+:is(.sl-markdown-content, .sl-markdown-content .mode-content, .sl-markdown-content details) > * + :is(
+  .fs-btns, .fs-cards, .fs-links2, .fs-dlist, .fs-flow, .fs-filter, .fs-filter-empty, .fs-table,
+  .mode-toggle-bar, .expressive-code, .starlight-aside, pre.mermaid, .viz-root, figure, details,
+  blockquote, hr, img, .mode-content
+),
+:is(.sl-markdown-content, .sl-markdown-content .mode-content, .sl-markdown-content details) > :is(
+  .fs-btns, .fs-cards, .fs-links2, .fs-dlist, .fs-flow, .fs-filter, .fs-filter-empty, .fs-table,
+  .mode-toggle-bar, .expressive-code, .starlight-aside, pre.mermaid, .viz-root, figure, details,
+  blockquote, hr, img
+) + * { margin-top: var(--fs-s5) !important; }
+/* a table's footnotes sit close under it; the lead opens the page with more air */
+.sl-markdown-content .fs-table + .fs-notes { margin-top: var(--fs-s3) !important; }
+.sl-markdown-content > .fs-lead + * { margin-top: var(--fs-s6) !important; }
+.sl-markdown-content > .fs-filter + .fs-filter-empty { margin-top: var(--fs-s3) !important; }
+
+/* 4 · headings: a clear seam above, the first block close below */
+:is(.sl-markdown-content, .sl-markdown-content .mode-content) > * + :is(h2, .sl-heading-wrapper.level-h2) { margin-top: var(--fs-s7) !important; }
+:is(.sl-markdown-content, .sl-markdown-content .mode-content) > * + :is(h3, .sl-heading-wrapper.level-h3) { margin-top: var(--fs-s6) !important; }
+:is(.sl-markdown-content, .sl-markdown-content .mode-content) > * + :is(h4, h5, h6, .sl-heading-wrapper.level-h4, .sl-heading-wrapper.level-h5, .sl-heading-wrapper.level-h6) { margin-top: var(--fs-s5) !important; }
+:is(.sl-markdown-content, .sl-markdown-content .mode-content) > :is(h2, h3, h4, h5, h6, .sl-heading-wrapper) + * { margin-top: var(--fs-s3) !important; }
+
+/* 5 · inside blocks: lists, asides, list items */
+.sl-markdown-content li + li { margin-top: var(--fs-s2) !important; }
+.sl-markdown-content li > * + * { margin-top: var(--fs-s2) !important; }
+.sl-markdown-content .starlight-aside__content > * + * { margin-top: var(--fs-s3) !important; }
+.starlight-aside__title { margin-bottom: var(--fs-s2) !important; }
+
+/* 6 · components use gap, never child margins */
+.fs-btns { gap: var(--fs-s3); }
+.fs-cards { gap: var(--fs-s5); }
+.fs-links2 { gap: var(--fs-s1) var(--fs-s7); }
+.fs-filter { gap: var(--fs-s3); }
+.fs-card-ic { margin-bottom: var(--fs-s4); }
+.fs-card-title { margin-bottom: var(--fs-s2); }
+.fs-card-more { margin-top: var(--fs-s3); }
+.fs-dlist b { margin-bottom: var(--fs-s1); }
+@media (max-width: 50rem) { .fs-cards, .fs-cards-3 { gap: 0; } }
+
+/* 7 · page frame: title block, footer, pagination */
+.fs-crumbs { margin-bottom: var(--fs-s4); }
+h1#_top { margin-bottom: var(--fs-s2) !important; }
+footer.sl-flex { gap: var(--fs-s5) !important; margin-top: var(--fs-s8) !important; }
+/* 404 stack: spaced by gap on the same scale */
+.sl-markdown-content .fs-nf { display: flex; flex-direction: column; align-items: center; gap: var(--fs-s3); }
+.sl-markdown-content .fs-nf > .fs-nf-search { margin-block: var(--fs-s3) !important; }
+.sl-markdown-content .fs-nf > .fs-cards { align-self: stretch; }
+/* link grid: grid items, not a list — no list padding or item offsets */
+.sl-markdown-content .fs-links2 { padding-inline-start: 0 !important; list-style: none; }
+.sl-markdown-content .fs-links2 > li { margin: 0 !important; }

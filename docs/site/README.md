@@ -38,3 +38,13 @@ npm run check     # every old mdBook .html URL redirects; every internal link an
 
 - Mermaid loads from the vendored, MIT-licensed `public/assets/mermaid.min.js`, so the `mermaid` npm package and its GPL/EPL `elkjs` dependency stay out.
 - `sharp` (an optional Astro dependency with LGPL libvips binaries) is replaced by the empty stub in `stubs/sharp`. The site uses Astro's passthrough image service, so sharp is never loaded.
+
+## Spacing system
+
+Vertical rhythm in page content comes from one place: the "SPACING SYSTEM" block in `src/styles/theme.css`.
+
+- **Scale:** `--fs-s1`…`--fs-s8` = 4, 8, 12, 16, 24, 32, 48, 64 px. Use these, never ad-hoc values.
+- **Components have no outer margins.** A new block component is added to the component lists in that block; it never sets its own `margin`.
+- **Flow rules:** 16 px between paragraphs and lists; 24 px before and after any component (code, table, aside, cards, buttons, diagram); 48 px above an `h2`, 32 px above an `h3`; 12 px from a heading to its first block; 32 px after the page lead.
+- **Inside components:** spacing is `gap` on the scale, not child margins.
+- **Check:** a spacing audit (every page, 1440 and 390 px) flags any gap under 12 px between neighbouring blocks and any sideways overflow on phones; run it after a layout change.
