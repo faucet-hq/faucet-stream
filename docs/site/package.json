@@ -14,7 +14,10 @@
   "dependencies": {
     "@astrojs/starlight": "0.43.1",
     "astro": "7.4.12",
-    "mermaid": "12.3.0",
+    "sharp": "file:stubs/sharp",
     "starlight-sidebar-topics": "0.9.0"
+  },
+  "overrides": {
+    "sharp": "$sharp"
   }
 }

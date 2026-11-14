@@ -211,6 +211,7 @@ writeFileSync(path.join(gen, 'topics.json'), JSON.stringify(topics, null, 2) + '
 // assets + old-URL redirects
 rmSync(path.join(pub, 'assets'), { recursive: true, force: true });
 cpSync(path.join(book, 'assets'), path.join(pub, 'assets'), { recursive: true });
+cpSync(path.join(repo, 'docs/book/mermaid.min.js'), path.join(pub, 'assets/mermaid.min.js'));
 const redirects = {};
 for (const page of pages) redirects[page.file.replace(/\.md$/, '.html')] = urlOf(slugOf(page.file));
 redirects['print.html'] = urlOf('');

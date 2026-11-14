@@ -51,6 +51,12 @@ class Matches(unittest.TestCase):
         self.assertFalse(vn.scan("scripts/vendor-names.py", "HubSpot"))
         self.assertFalse(vn.scan("some/file.rs", "a generic OAuth1 provider"))
 
+    def test_npm_integrity_hashes_are_allowed_only_in_the_docs_lockfile(self):
+        line = '      "integrity": "sha512-lfab8x0Bj0UO7SNsY8dZSbNIA6ipbkE3X0NG9nqjCu6CfCHZseuDnOSJY7hidKrjpP++i1M2qT+FlAdPKYRilA==",'
+        self.assertFalse(vn.scan("docs/site/package-lock.json", line))
+        self.assertTrue(vn.scan("other/package-lock.json", line))
+        self.assertTrue(vn.scan("docs/site/package-lock.json", '      "name": "hubspot-client",'))
+
     def test_changelogs_are_skipped(self):
         self.assertTrue(vn.SKIPPED_FILES.search("crates/core/CHANGELOG.md"))
         self.assertFalse(vn.SKIPPED_FILES.search("docs/changelog-notes.md"))

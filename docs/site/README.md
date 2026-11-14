@@ -26,3 +26,8 @@ node scripts/check-links.mjs       # every internal link and #anchor resolves
 | `src/styles/theme.css` | The mockup tokens mapped onto Starlight's variables, plus every component style, light and dark. |
 
 Generated folders (`src/content/docs`, `src/generated`, `public`) are git-ignored.
+
+## Dependencies
+
+- Mermaid loads from the repo's vendored, MIT-licensed `docs/book/mermaid.min.js` (copied into `public/assets/` by the converter), so the `mermaid` npm package and its GPL/EPL `elkjs` dependency stay out.
+- `sharp` (an optional Astro dependency with LGPL libvips binaries) is replaced by the empty stub in `stubs/sharp`. The site uses Astro's passthrough image service, so sharp is never loaded.

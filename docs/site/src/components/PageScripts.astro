@@ -57,10 +57,19 @@
     apply(initial, false);
   }
 
-  type Mermaid = typeof import('mermaid').default;
+  type Mermaid = { initialize: (c: object) => void; run: (o: { nodes: HTMLElement[] }) => Promise<void> };
   let mermaidMod: Mermaid | null = null;
+  const loadMermaid = () => new Promise<Mermaid>((resolve, reject) => {
+    const w = window as unknown as { mermaid?: Mermaid };
+    if (w.mermaid) return resolve(w.mermaid);
+    const s = document.createElement('script');
+    s.src = `${import.meta.env.BASE_URL.replace(/\/$/, '')}/assets/mermaid.min.js`;
+    s.onload = () => (w.mermaid ? resolve(w.mermaid) : reject(new Error('mermaid did not load')));
+    s.onerror = () => reject(new Error('mermaid did not load'));
+    document.head.appendChild(s);
+  });
   const isDark = () => document.documentElement.dataset.theme !== 'light';
-  function mermaidTheme(): Parameters<Mermaid['initialize']>[0] {
+  function mermaidTheme(): object {
     const dark = isDark();
     return {
       startOnLoad: false,
@@ -74,7 +83,7 @@
   async function renderMermaid(scope: ParentNode = document) {
     const nodes = [...scope.querySelectorAll<HTMLElement>('pre.mermaid')].filter((n) => n.offsetParent !== null);
     if (!nodes.length) return;
-    if (!mermaidMod) mermaidMod = (await import('mermaid')).default;
+    if (!mermaidMod) { try { mermaidMod = await loadMermaid(); } catch (e) { console.warn(e); return; } }
     mermaidMod.initialize(mermaidTheme());
     nodes.forEach((n) => {
       if (!n.dataset.src) n.dataset.src = n.textContent || '';

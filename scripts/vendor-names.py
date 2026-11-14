@@ -48,6 +48,8 @@ RAW = [
 ALLOWED = [
     ("scripts/vendor-names.py", r".*"),
     ("scripts/test_vendor_names.py", r".*"),
+    # npm integrity hashes are random base64 that can spell a name ("AdP").
+    ("docs/site/package-lock.json", r'^\s*"integrity": "sha\d+-[A-Za-z0-9+/=]+",?$'),
 ]
 
 

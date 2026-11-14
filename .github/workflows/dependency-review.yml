@@ -34,6 +34,11 @@ jobs:
           # brotli-decompressor declares "BSD-3-Clause/MIT", which the review
           # misreads (cargo-deny reads it as allowed); libfuzzer-sys adds NCSA
           # for the bundled libFuzzer and is only in the unpublished fuzz crate.
+          # The npm packages are build-time tools of the docs site (docs/site,
+          # never shipped) under permissive licences outside the Rust list:
+          # tslib is 0BSD; lru-cache, sax and common-ancestor-path are BlueOak-1.0.0.
           allow-dependencies-licenses: >-
-            pkg:cargo/brotli-decompressor, pkg:cargo/libfuzzer-sys
+            pkg:cargo/brotli-decompressor, pkg:cargo/libfuzzer-sys,
+            pkg:npm/tslib, pkg:npm/lru-cache, pkg:npm/sax,
+            pkg:npm/common-ancestor-path
           comment-summary-in-pr: on-failure

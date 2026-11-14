@@ -1,4 +1,4 @@
-import { defineConfig } from 'astro/config';
+import { defineConfig, passthroughImageService } from 'astro/config';
 import starlight from '@astrojs/starlight';
 import starlightSidebarTopics from 'starlight-sidebar-topics';
 import { readFileSync } from 'node:fs';
@@ -11,6 +11,7 @@ export default defineConfig({
   site: SITE,
   base: BASE,
   trailingSlash: 'always',
+  image: { service: passthroughImageService() },
   integrations: [
     starlight({
       title: 'faucet-stream',
