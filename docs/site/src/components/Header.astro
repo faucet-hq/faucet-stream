@@ -1,0 +1,28 @@
+---
+import SiteTitle from 'virtual:starlight/components/SiteTitle';
+import Search from 'virtual:starlight/components/Search';
+import ThemeSelect from 'virtual:starlight/components/ThemeSelect';
+import AskAi from './AskAi.astro';
+import Ic from './Ic.astro';
+
+const topics = Astro.locals.starlightSidebarTopics?.topics ?? [];
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const topicHref = (link: string) => (link.startsWith(base + '/') ? link : base + link);
+---
+
+<div class="fs-header">
+  <div class="fs-title"><SiteTitle /></div>
+  <nav class="fs-topics" aria-label="Topics">
+    {topics.map((t) => (
+      <a href={topicHref(t.link)} class:list={{ on: t.isCurrent }} aria-current={t.isCurrent ? 'page' : undefined}>{t.label}</a>
+    ))}
+  </nav>
+  <div class="fs-right">
+    <div class="fs-search"><Search /></div>
+    <div class="fs-right-desk">
+      <AskAi />
+      <a class="fs-icon-btn" href="https://github.com/faucet-hq/faucet-stream" aria-label="GitHub"><Ic name="github" /></a>
+      <ThemeSelect />
+    </div>
+  </div>
+</div>

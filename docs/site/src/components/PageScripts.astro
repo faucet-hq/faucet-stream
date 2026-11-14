@@ -1,0 +1,155 @@
+<script>
+  function buildFlows() {
+    document.querySelectorAll<HTMLElement>('.fs-flow[data-flow]').forEach((el) => {
+      if (el.dataset.fsFlowDone) return;
+      const nodes = el.dataset.flow!.split('|').map((s) => s.trim()).filter(Boolean);
+      if (!nodes.length) return;
+      el.textContent = '';
+      nodes.forEach((raw, i) => {
+        const [name, sub] = raw.split('::').map((s) => (s || '').trim());
+        const node = document.createElement('div');
+        node.className = 'fs-flow-node';
+        const nm = document.createElement('span');
+        nm.className = 'fs-flow-name';
+        nm.textContent = name;
+        node.appendChild(nm);
+        if (sub) {
+          const s = document.createElement('span');
+          s.className = 'fs-flow-sub';
+          s.textContent = sub;
+          node.appendChild(s);
+        }
+        el.appendChild(node);
+        if (i < nodes.length - 1) {
+          const edge = document.createElement('div');
+          edge.className = 'fs-flow-edge';
+          edge.setAttribute('aria-hidden', 'true');
+          edge.innerHTML = '<i></i><i></i><i></i>';
+          el.appendChild(edge);
+        }
+      });
+      el.setAttribute('role', 'img');
+      el.setAttribute('aria-label', nodes.map((n) => n.split('::')[0].trim()).join(' then '));
+      el.dataset.fsFlowDone = '1';
+    });
+  }
+
+  const MODE_KEY = 'faucet-learn-mode';
+  function learnToggle(onReveal: (c: Element) => void) {
+    const toggle = document.querySelector('[data-mode-toggle]');
+    if (!toggle) return;
+    const buttons = [...toggle.querySelectorAll<HTMLButtonElement>('.mode-switch button')];
+    const contents = [...document.querySelectorAll('.mode-content')];
+    if (!buttons.length || !contents.length) return;
+    const revealed: Record<string, boolean> = {};
+    const apply = (mode: string, user: boolean) => {
+      buttons.forEach((b) => { const on = b.dataset.mode === mode; b.classList.toggle('active', on); b.setAttribute('aria-pressed', String(on)); });
+      let active: Element | undefined;
+      contents.forEach((c) => { const on = c.getAttribute('data-mode') === mode; c.classList.toggle('active', on); if (on) active = c; });
+      if (user && active && !revealed[mode]) { revealed[mode] = true; onReveal(active); }
+      try { localStorage.setItem(MODE_KEY, mode); } catch {}
+    };
+    buttons.forEach((b) => b.addEventListener('click', () => apply(b.dataset.mode!, true)));
+    let saved: string | null = null;
+    try { saved = localStorage.getItem(MODE_KEY); } catch {}
+    const initial = saved === 'architect' ? 'architect' : 'beginner';
+    revealed[initial] = true;
+    apply(initial, false);
+  }
+
+  type Mermaid = typeof import('mermaid').default;
+  let mermaidMod: Mermaid | null = null;
+  const isDark = () => document.documentElement.dataset.theme !== 'light';
+  function mermaidTheme(): Parameters<Mermaid['initialize']>[0] {
+    const dark = isDark();
+    return {
+      startOnLoad: false,
+      theme: 'base',
+      fontFamily: 'Geist, system-ui, sans-serif',
+      themeVariables: dark
+        ? { primaryColor: '#132529', primaryTextColor: '#e7eef1', primaryBorderColor: '#2a6b66', lineColor: '#5eead4', secondaryColor: '#16232b', tertiaryColor: '#121d24', edgeLabelBackground: '#121d24', clusterBkg: '#121d24', clusterBorder: '#1f3a3e', titleColor: '#e7eef1', noteBkgColor: '#261f10', noteTextColor: '#fcd34d', noteBorderColor: '#4a3a17' }
+        : { primaryColor: '#eef6f4', primaryTextColor: '#0f172a', primaryBorderColor: '#9ccfc5', lineColor: '#0f766e', secondaryColor: '#f3f2ed', tertiaryColor: '#ffffff', edgeLabelBackground: '#ffffff', clusterBkg: '#fbfaf7', clusterBorder: '#d9ebe6', titleColor: '#0f172a', noteBkgColor: '#fdf6ea', noteTextColor: '#78350f', noteBorderColor: '#f2dcb4' },
+    };
+  }
+  async function renderMermaid(scope: ParentNode = document) {
+    const nodes = [...scope.querySelectorAll<HTMLElement>('pre.mermaid')].filter((n) => n.offsetParent !== null);
+    if (!nodes.length) return;
+    if (!mermaidMod) mermaidMod = (await import('mermaid')).default;
+    mermaidMod.initialize(mermaidTheme());
+    nodes.forEach((n) => {
+      if (!n.dataset.src) n.dataset.src = n.textContent || '';
+      n.removeAttribute('data-processed');
+      n.textContent = n.dataset.src;
+    });
+    try { await mermaidMod.run({ nodes }); } catch (e) { console.warn('mermaid', e); }
+  }
+
+  function catalogFilter() {
+    const box = document.querySelector<HTMLElement>('[data-fs-catalog]');
+    if (!box) return;
+    const tableAfter = (id: string) => {
+      const h = document.getElementById(id);
+      let el: Element | null = h ? (h.closest('.sl-heading-wrapper') ?? h) : null;
+      const owned: Element[] = el ? [el] : [];
+      while (el && (el = el.nextElementSibling)) { owned.push(el); if (el.tagName === 'TABLE' || el.querySelector('table')) break; }
+      const table = owned.length ? (owned[owned.length - 1].tagName === 'TABLE' ? owned[owned.length - 1] : owned[owned.length - 1].querySelector('table')) : null;
+      return { owned, rows: table ? [...table.querySelectorAll<HTMLTableRowElement>('tbody tr')] : [] };
+    };
+    const kinds = { Sources: tableAfter('sources'), Sinks: tableAfter('sinks') };
+    const total = kinds.Sources.rows.length + kinds.Sinks.rows.length;
+    if (!total) return;
+    box.innerHTML = `<label class="fs-filter-input"><svg class="fs-i" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7.5"/><path d="m20.5 20.5-4.2-4.2"/></svg><input type="search" placeholder="Filter connectors…" aria-label="Filter connectors"></label>
+      <button type="button" class="fs-chip" data-kind="All" aria-pressed="true">All<span class="ct">${total}</span></button>
+      <button type="button" class="fs-chip" data-kind="Sources" aria-pressed="false">Sources<span class="ct">${kinds.Sources.rows.length}</span></button>
+      <button type="button" class="fs-chip" data-kind="Sinks" aria-pressed="false">Sinks<span class="ct">${kinds.Sinks.rows.length}</span></button>
+      <button type="button" class="fs-chip" data-t1 aria-pressed="false">T1 only</button>
+      <p class="fs-filter-count" aria-live="polite"></p>`;
+    const empty = document.createElement('div');
+    empty.className = 'fs-filter-empty fs-hidden not-content';
+    box.after(empty);
+    const input = box.querySelector('input')!;
+    const count = box.querySelector('.fs-filter-count')!;
+    let kind = 'All', t1 = false;
+    const apply = () => {
+      const q = input.value.trim().toLowerCase();
+      let shown = 0;
+      (Object.entries(kinds) as [string, { owned: Element[]; rows: HTMLTableRowElement[] }][]).forEach(([k, part]) => {
+        const kindOn = kind === 'All' || kind === k;
+        let partShown = 0;
+        part.rows.forEach((r) => {
+          const cells = r.cells;
+          const text = ((cells[0]?.textContent ?? '') + ' ' + (cells[2]?.textContent ?? '')).toLowerCase();
+          const ok = kindOn && (!q || text.includes(q)) && (!t1 || (cells[1]?.textContent ?? '').includes('T1'));
+          r.classList.toggle('fs-hidden', !ok);
+          if (ok) partShown++;
+        });
+        part.owned.forEach((el) => el.classList.toggle('fs-hidden', partShown === 0));
+        shown += partShown;
+      });
+      const filtered = q || kind !== 'All' || t1;
+      count.textContent = filtered ? `Showing ${shown} of ${total}${q ? ` matching “${input.value.trim()}”` : ''}` : `${total} connectors`;
+      empty.classList.toggle('fs-hidden', shown > 0);
+      empty.innerHTML = `<b>No connector matches “${input.value.trim().replace(/[<>&]/g, '')}”</b>Try a shorter name, or look for community crates on the Connector Hub.`;
+    };
+    box.querySelectorAll<HTMLButtonElement>('[data-kind]').forEach((b) => b.addEventListener('click', () => {
+      kind = b.dataset.kind!;
+      box.querySelectorAll('[data-kind]').forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      apply();
+    }));
+    const t1b = box.querySelector<HTMLButtonElement>('[data-t1]')!;
+    t1b.addEventListener('click', () => { t1 = !t1; t1b.setAttribute('aria-pressed', String(t1)); apply(); });
+    input.addEventListener('input', apply);
+    apply();
+  }
+
+  function init() {
+    buildFlows();
+    catalogFilter();
+    learnToggle((c) => renderMermaid(c));
+    if (document.querySelector('pre.mermaid')) {
+      renderMermaid();
+      new MutationObserver(() => renderMermaid()).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+    }
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
+</script>

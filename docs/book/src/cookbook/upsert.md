@@ -203,7 +203,7 @@ act on. The destination looks healthy, the run reports success, and stale rows
 accumulate forever.
 
 If your source emits deletions — a CDC stream, or a soft-delete field — use
-[`delete_marker`](#delete-marker) and stop here. **Scoped cleanup** is for the
+[`delete_marker`](#cdc--mirror-with-cdc_unwrap) and stop here. **Scoped cleanup** is for the
 common case where it does not: a REST API with an updated-since filter and no
 tombstones.
 

@@ -1,0 +1,20 @@
+{
+  "name": "faucet-docs-site",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "convert": "node scripts/convert.mjs",
+    "dev": "npm run convert && astro dev",
+    "build": "npm run convert && astro build",
+    "preview": "astro preview"
+  },
+  "engines": {
+    "node": ">=22.12"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "0.43.1",
+    "astro": "7.4.12",
+    "mermaid": "12.3.0",
+    "starlight-sidebar-topics": "0.9.0"
+  }
+}

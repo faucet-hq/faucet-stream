@@ -24,3 +24,15 @@ updates:
       default-days: 7
     commit-message:
       prefix: build
+  # The Starlight docs site's npm dependencies (docs/site, #1073).
+  - package-ecosystem: npm
+    directory: /docs/site
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      docs-site:
+        patterns: ["*"]
+    commit-message:
+      prefix: docs

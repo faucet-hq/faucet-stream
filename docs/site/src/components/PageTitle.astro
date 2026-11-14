@@ -1,0 +1,27 @@
+---
+import Default from '@astrojs/starlight/components/PageTitle.astro';
+
+type Entry = { type: 'link' | 'group'; label: string; isCurrent?: boolean; entries?: Entry[] };
+const route = Astro.locals.starlightRoute;
+const topic = Astro.locals.starlightSidebarTopics?.topics?.find((t) => t.isCurrent);
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const topicHref = (link: string) => (link.startsWith(base + '/') ? link : base + link);
+function trail(entries: Entry[], path: string[] = []): string[] | null {
+  for (const e of entries) {
+    if (e.type === 'link' && e.isCurrent) return path;
+    if (e.type === 'group' && e.entries) { const t = trail(e.entries, [...path, e.label]); if (t) return t; }
+  }
+  return null;
+}
+const groups = (trail(route.sidebar as Entry[]) ?? []).filter((g) => !/^\d+$/.test(g));
+const crumbs = topic && route.id ? [{ label: topic.label, href: topicHref(topic.link) }, ...groups.map((g) => ({ label: g, href: '' }))] : [{ label: 'Docs', href: base + '/' }];
+const isTopicHome = !!topic && topicHref(topic.link).slice(base.length).replace(/^\/|\/$/g, '') === route.id;
+---
+
+<nav class="fs-crumbs" aria-label="Breadcrumbs">
+  {(isTopicHome ? [] : crumbs).map((c) => (
+    <>{c.href ? <a href={c.href}>{c.label}</a> : <span>{c.label}</span>}<span class="fs-sep" aria-hidden="true">/</span></>
+  ))}
+  <span aria-current="page">{route.entry.data.title}</span>
+</nav>
+<Default />

@@ -1,0 +1,19 @@
+---
+import Ic from './Ic.astro';
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+---
+
+<footer class="fs-sfoot">
+  <a class="fs-brand fs-brand-sm" href={base + '/'} aria-label="faucet-stream docs home">
+    <svg viewBox="6 11 112 112" aria-hidden="true"><g fill="none" stroke="var(--fs-mark)" stroke-width="13" stroke-linecap="round" stroke-linejoin="round"><path d="M55 40 V24"/><path d="M43 24 H67"/><path d="M32 40 H78 a15 15 0 0 1 15 15 V66"/></g><g fill="var(--fs-mark)"><circle cx="93" cy="82" r="6"/><circle cx="93" cy="99" r="5" opacity=".7"/><circle cx="93" cy="112" r="4" opacity=".45"/></g></svg>
+    <span class="fs-wm"><b>faucet</b><span>stream</span></span>
+  </a>
+  <span class="fs-sfoot-note">Apache-2.0 · Move data, reliably.</span>
+  <nav aria-label="Elsewhere">
+    <a href="https://github.com/faucet-hq/faucet-stream"><Ic name="github" />GitHub</a>
+    <a href="https://www.linkedin.com/company/faucet-stream"><Ic name="linkedin" />LinkedIn</a>
+    <a href="https://docs.rs/faucet-stream">docs.rs</a>
+    <a href="https://github.com/faucet-hq/template-hub">Template Hub</a>
+    <a href="https://faucet-hq.github.io/connectors">Connector Hub</a>
+  </nav>
+</footer>

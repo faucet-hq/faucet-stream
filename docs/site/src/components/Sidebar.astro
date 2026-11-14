@@ -1,0 +1,18 @@
+---
+import Default from '@astrojs/starlight/components/Sidebar.astro';
+import Ic from './Ic.astro';
+
+const topics = Astro.locals.starlightSidebarTopics?.topics ?? [];
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const topicHref = (link: string) => (link.startsWith(base + '/') ? link : base + link);
+const ICONS: Record<string, string> = { Learn: 'cap', Cookbook: 'book', Reference: 'hash', Operate: 'server', Extend: 'plug', Compare: 'scale' };
+---
+
+{topics.length > 0 && (
+  <nav class="fs-mobile-topics" aria-label="Topics">
+    {topics.map((t) => (
+      <a href={topicHref(t.link)} class:list={{ on: t.isCurrent }} aria-current={t.isCurrent ? 'page' : undefined}><Ic name={ICONS[t.label] ?? 'book'} />{t.label}</a>
+    ))}
+  </nav>
+)}
+<Default><slot /></Default>
