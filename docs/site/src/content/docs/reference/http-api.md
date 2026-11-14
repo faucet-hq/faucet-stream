@@ -187,9 +187,13 @@ someone does.
 | `POST /v1/reload` | — | — | ✓ |
 | *any unclassified `/v1` route* | — | — | ✓ |
 
-¹ Reaching the route; the `approvals:` policy then decides whether the approval counts.
-³ Below an unscoped admin, credential-looking values come back masked.
-² With a registered `template` and its declared param defaults. An inline `config` is loaded on the server, and caller `params` decide what it connects to, so either needs `operator` (`403` for a viewer).
+<div class="fs-notes">
+
+- ¹ Reaching the route; the `approvals:` policy then decides whether the approval counts.
+- ² With a registered `template` and its declared param defaults. An inline `config` is loaded on the server, and caller `params` decide what it connects to, so either needs `operator` (`403` for a viewer).
+- ³ Below an unscoped admin, credential-looking values come back masked.
+
+</div>
 
 Two entries are POSTs a **read** token can reach, because they change nothing:
 

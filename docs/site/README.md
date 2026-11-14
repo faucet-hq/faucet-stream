@@ -53,3 +53,5 @@ Vertical rhythm in page content comes from one place: the "SPACING SYSTEM" block
 
 - **Tables:** each table sits in a scroll box; columns are divided by a rule; only whole short columns stay on one line, everything else wraps inside its own cell (no cell has a max width, so content never spills into the next column). The spacing audit also fails on any cell whose content crosses its edge.
 - **Repo paths:** inline code that names a path existing in this repository (`cli/examples/…`, `docs/spec/…`) is linked to it on GitHub at build time by `plugins/rehype-repo-links.mjs`; `npm run check` fails if such a link points at a missing path.
+- **Containment:** nothing in the text column may cross its edges. Unbreakable words, URLs and paths break as a last resort; inline code over 40 characters wraps everywhere, 21–40 wraps on phones; wrapped code keeps its padding only at its ends. The audit fails on any element (outside scroll boxes) that crosses the column at 1440 or 390 px.
+- **Footnotes** under a table are a `<div class="fs-notes">` list, one note per item, in numeric order (lettered notes after).

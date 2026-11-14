@@ -174,7 +174,9 @@
 
   function longCode() {
     document.querySelectorAll<HTMLElement>('.sl-markdown-content :not(pre) > code').forEach((c) => {
-      if ((c.textContent || '').length > 40) c.classList.add('fs-long');
+      const n = (c.textContent || '').length;
+      if (n > 40) c.classList.add('fs-long');
+      else if (n > 20) c.classList.add('fs-code-mid');
     });
   }
 

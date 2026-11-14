@@ -544,3 +544,16 @@ footer.sl-flex { gap: var(--fs-s5) !important; margin-top: var(--fs-s8) !importa
 .sl-markdown-content a.fs-repo-link { text-decoration: none !important; }
 .sl-markdown-content a.fs-repo-link code { color: var(--fs-accent) !important; background: color-mix(in srgb, var(--fs-accent-fill) 10%, transparent) !important; }
 .sl-markdown-content a.fs-repo-link:hover code { background: color-mix(in srgb, var(--fs-accent-fill) 18%, transparent) !important; text-decoration: underline; text-underline-offset: 3px; }
+
+/* ---------- containment: nothing in the text column crosses its edges ----------
+   An unbreakable word, URL or path may break as a last resort; mid-length inline code wraps on
+   phones; chip padding is small enough that a wrapped fragment stays inside the column. */
+.sl-markdown-content { overflow-wrap: break-word; }
+.sl-markdown-content :is(h1, h2, h3, h4, a) { overflow-wrap: anywhere; }
+.sl-markdown-content :not(pre) > code:not(:where(.not-content *)) { padding-inline: .3em; }
+@media (max-width: 50rem) {
+  .sl-markdown-content :not(pre) > code.fs-code-mid:not(:where(.not-content *)) { white-space: normal; overflow-wrap: anywhere; }
+}
+/* code that may wrap keeps its side padding only at its real start and end, so a fragment ending a
+   line cannot poke past the column */
+.sl-markdown-content :not(pre) > code:is(.fs-long, .fs-code-mid) { box-decoration-break: slice; -webkit-box-decoration-break: slice; }
