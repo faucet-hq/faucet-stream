@@ -97,6 +97,7 @@ pub struct Capabilities {
     native: bool,
     table_routing: bool,
     read_side_effects: bool,
+    consumes_destructively: bool,
     complete_reads: bool,
     declared_columns: bool,
     declared_types: bool,
@@ -152,6 +153,7 @@ impl Capabilities {
             .shardable(source.is_shardable())
             .columnar(columnar)
             .native(!source.native_output_formats().is_empty())
+            .consumes_destructively(source.consumes_destructively())
             .build()
     }
 
@@ -197,6 +199,7 @@ impl Capabilities {
             .reports_lag(inner.reports_lag)
             .table_routing(inner.table_routing)
             .read_side_effects(inner.read_side_effects)
+            .consumes_destructively(inner.consumes_destructively)
             .complete_reads(inner.complete_reads)
             .declared_columns(inner.declared_columns)
             .build()
@@ -334,6 +337,16 @@ impl Capabilities {
         self.read_side_effects
     }
 
+    /// Reading cannot be repeated once the pipeline moves past a page
+    /// (`Source::consumes_destructively`): a queue acks, deletes or settles
+    /// what it read, a receiver answers its senders. Anything that reads
+    /// without durably writing, polls ahead of its sinks, or replaces its
+    /// output on the next run would lose what was read, so it refuses such a
+    /// source.
+    pub fn consumes_destructively(&self) -> bool {
+        self.consumes_destructively
+    }
+
     /// A run can read the whole dataset (`Source::read_completeness`), after
     /// which destination rows it did not write are deleted — so the sink must
     /// support keyed cleanup.
@@ -432,6 +445,7 @@ impl CapabilitiesBuilder {
         native,
         table_routing,
         read_side_effects,
+        consumes_destructively,
         complete_reads,
         declared_columns,
         declared_types,
@@ -662,6 +676,27 @@ mod tests {
         }
     }
 
+    struct Queue;
+    #[async_trait]
+    impl Source for Queue {
+        async fn fetch_with_context(
+            &self,
+            _: &std::collections::HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            Ok(vec![])
+        }
+        fn consumes_destructively(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_source_that_consumes_destructively_declares_it() {
+        assert!(Capabilities::of_source(&Queue).consumes_destructively());
+        assert!(!Capabilities::of_source(&Plain).consumes_destructively());
+        assert!(!Capabilities::of_sink(&Plain).consumes_destructively());
+    }
+
     struct Rich;
     #[async_trait]
     impl Source for Rich {
@@ -773,6 +808,7 @@ mod tests {
             .reports_lag(true)
             .table_routing(true)
             .read_side_effects(true)
+            .consumes_destructively(true)
             .complete_reads(true)
             .declared_columns(true)
             .declared_types(true)
@@ -784,6 +820,7 @@ mod tests {
         let src = Capabilities::decorated_source(&Plain, &inner);
         assert!(src.range_read() && src.range_digest() && src.reports_lag());
         assert!(src.table_routing() && src.read_side_effects() && src.complete_reads());
+        assert!(src.consumes_destructively());
         assert!(src.declared_columns() && !src.declared_types());
         assert!(!src.discover(), "derived from the outer connector");
         let sink = Capabilities::decorated_sink(&Plain, &inner);

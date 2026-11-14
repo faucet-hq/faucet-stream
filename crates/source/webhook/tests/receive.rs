@@ -595,9 +595,7 @@ async fn a_resend_of_a_pending_signed_request_retries_then_is_acknowledged() {
         503,
         "first copy still pending"
     );
-    // Polling again acknowledges the page. Once the first copy has its 200, a
-    // resend is acknowledged without being stored; the cancel then ends the
-    // window with nothing held.
+    // Once committed, a resend is acknowledged without being stored.
     let (rest, resend) = tokio::join!(next_page(&mut pages), async {
         assert_eq!(first.await.unwrap().status(), 200);
         let resend = send().send().await.unwrap().status();

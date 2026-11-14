@@ -27299,7 +27299,7 @@
                       "x-faucet-caller-max": 300
                     },
                     "max_held": {
-                      "description": "`ack: on_commit`: the most requests open at once, waiting for a page or\nin the page being written (default 2000). Above it a POST is refused\nwith `503` + `Retry-After` and not stored, so a slow sink cannot pile\nup open connections. `0` removes the cap.",
+                      "description": "`ack: on_commit`: the most requests open at once, waiting for a page or\nin the page being written (default 2000); a page takes at most half. Above it a POST is refused\nwith `503` + `Retry-After` and not stored, so a slow sink cannot pile\nup open connections. `0` removes the cap.",
                       "type": [
                         "integer",
                         "string"

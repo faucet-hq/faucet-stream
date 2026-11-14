@@ -542,7 +542,10 @@ against (RFC 0013): `write_modes`, `idempotent_writes` (exactly-once watermark),
 `reports_lag`, `table_routing` (names each record's table, so it can drive a
 multi-table `faucet mirror`), `read_side_effects` (reading creates or
 advances a slot, joins a consumer group or opens a listener, so `faucet plan
---live` refuses it) and `complete_reads` (a run can read the whole dataset,
+--live` refuses it), `consumes_destructively` (reading cannot be repeated —
+a queue acks, a webhook answers its senders — so commands that read without
+writing, topology graphs and sinks that replace their output refuse it) and
+`complete_reads` (a run can read the whole dataset,
 after which destination rows it did not write are deleted — the sink must
 support cleanup) for sources, plus `columnar` / `native` for both. The listing
 shows the kind-level view — every capability some config enables; a few depend

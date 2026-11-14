@@ -629,12 +629,26 @@ async fn each_run_takes_its_own_cancel_token() {
     assert!(faucet_core::driver::SourceDriver::set_cancel(
         &driver, token
     ));
-    let first = super::Session::open(&driver, "/webhook").await.unwrap();
-    assert!(first.cancel.is_some());
-    drop(first);
-    let second = super::Session::open(&driver, "/webhook").await.unwrap();
+    let ctx = HashMap::new();
+    // Creating the run's page stream takes the token, before any poll.
+    let stream = driver.held_pages(&ctx);
+    assert!(driver.cancel.lock().unwrap().is_none());
+    drop(stream);
+    let next = super::Session::open(&driver, "/webhook", None)
+        .await
+        .unwrap();
     assert!(
-        second.cancel.is_none(),
+        next.cancel.is_none(),
         "a later run must not inherit the token"
     );
+}
+
+#[test]
+fn a_page_never_takes_more_than_half_of_max_held() {
+    assert_eq!(super::page_cap(1000, 2000), 1000);
+    assert_eq!(super::page_cap(5000, 2000), 1000);
+    assert_eq!(super::page_cap(0, 2000), 1000);
+    assert_eq!(super::page_cap(0, 1), 1);
+    assert_eq!(super::page_cap(0, 0), 0);
+    assert_eq!(super::page_cap(7, 0), 7);
 }

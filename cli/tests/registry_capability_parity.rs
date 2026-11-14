@@ -363,6 +363,7 @@ fn kind_capabilities_cover_every_config() {
             ("native", c.native()),
             ("table_routing", c.table_routing()),
             ("read_side_effects", c.read_side_effects()),
+            ("consumes_destructively", c.consumes_destructively()),
             ("complete_reads", c.complete_reads()),
         ]
     }

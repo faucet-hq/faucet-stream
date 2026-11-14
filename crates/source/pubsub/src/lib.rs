@@ -30,5 +30,12 @@ pub use faucet_common_pubsub::{PubsubConnection, PubsubCredentials};
 
 /// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
 pub const DESCRIPTOR: faucet_core::ConnectorDescriptor =
-    faucet_core::ConnectorDescriptor::new("pubsub", faucet_core::capabilities::plain_source)
+    faucet_core::ConnectorDescriptor::new("pubsub", capabilities)
         .with_host_identity(faucet_common_pubsub::host_identity);
+
+/// Reading acknowledges what was read, so it cannot be read again.
+fn capabilities(_config: &faucet_core::Value) -> faucet_core::Capabilities {
+    faucet_core::Capabilities::builder()
+        .consumes_destructively(true)
+        .build()
+}

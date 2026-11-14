@@ -1133,10 +1133,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             v.validate()
                 .map_err(|e| CliError::Config(format!("verify: {e}")))?;
         }
-        // A source that cannot be read again — a queue that acks, or a webhook
-        // that answers each sender once its event is written — must not write
-        // to a sink that replaces its output on the next run: the next run
-        // would delete what the previous one acknowledged (#1032).
+        // An unrepeatable source must not feed a sink that replaces last run's output.
         if crate::registry::source_kind_consumes_destructively(
             &merged_source.kind,
             &merged_source.config,
@@ -1146,6 +1143,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                 .or_else(|| {
                     crate::registry::sink_replaced_object(&merged_sink.kind, &merged_sink.config)
                 })
+            && !names_each_run(&target)
         {
             let (acked, escape) = if merged_source.kind == "webhook" {
                 (
@@ -1159,7 +1157,8 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                 "row '{row_id}': the `{}` source {acked}, but the `{}` sink replaces `{target}` \
                  on every run, so the next run would delete what the previous one acknowledged. \
                  Make the sink append (`if_exists: append` for `file` and the object stores, \
-                 `append: true` for `jsonl` / `csv`){escape}",
+                 `append: true` for `jsonl` / `csv`), name a new file each run (`${{now.unix}}` \
+                 or `${{now.datetime}}` in the path){escape}",
                 merged_source.kind, merged_sink.kind
             )));
         }
@@ -1901,6 +1900,20 @@ fn varies_per_invocation(path: &str, n: &ExpandedNode) -> bool {
         let rest = &path[i + 2..];
         ids.iter()
             .any(|id| rest.starts_with(&format!("{id}.")) || rest.starts_with(&format!("{id}}}")))
+    })
+}
+
+/// Whether a sink path names a new file on every run: it holds a `${now.*}`
+/// token that changes at least once a second (a date alone repeats).
+fn names_each_run(path: &str) -> bool {
+    path.match_indices("${now.").any(|(i, _)| {
+        let token = &path[i + 6..path[i..].find('}').map_or(path.len(), |e| i + e)];
+        match token.strip_prefix("strftime.") {
+            Some(fmt) => ["%S", "%s", "%T", "%f", "%+", "%X", "%c"]
+                .iter()
+                .any(|spec| fmt.contains(spec)),
+            None => matches!(token, "unix" | "datetime" | "iso"),
+        }
     })
 }
 
@@ -2870,8 +2883,7 @@ mod tests {
             err.contains("`sqs` source acknowledges what it reads") && !err.contains("ack:"),
             "{err}"
         );
-        // An appending sink, the old acknowledgement, or a source that can be
-        // read again is accepted.
+        // Appending sinks, `ack: on_receive` and repeatable sources are accepted.
         let appending = "    type: jsonl\n    config: { path: ./out.jsonl, append: true }\n";
         expand(&cfg(&doc(webhook, appending))).unwrap();
         let file_append = "    type: file\n    config: { path: ./out.jsonl, if_exists: append }\n";
@@ -2889,9 +2901,38 @@ mod tests {
     }
 
     #[test]
+    fn a_path_that_names_a_new_file_each_run_replaces_nothing() {
+        for each_run in [
+            "./events-${now.unix}.jsonl",
+            "./events-${now.datetime}.jsonl",
+            "./events-${now.iso}.jsonl",
+            "./events-${now.strftime.%Y%m%dT%H%M%S}.jsonl",
+        ] {
+            assert!(names_each_run(each_run), "{each_run}");
+        }
+        for repeats in [
+            "./events.jsonl",
+            "./events-${now.date}.jsonl",
+            "./events-${now.strftime.%Y-%m-%d}.jsonl",
+            "./events-${now.hour}.jsonl",
+        ] {
+            assert!(!names_each_run(repeats), "{repeats}");
+        }
+        let doc = |path: &str| {
+            cfg(&format!(
+                "version: 1\npipeline:\n  source:\n    type: webhook\n    config: {{}}\n  sink:\n    type: jsonl\n    config: {{ path: \"{path}\" }}\n"
+            ))
+        };
+        expand(&doc("./events-${now.unix}.jsonl")).unwrap();
+        let err = expand(&doc("./events-${now.date}.jsonl"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("${now.unix}"), "{err}");
+    }
+
+    #[test]
     fn verify_skips_or_refuses_a_source_whose_read_cannot_be_repeated() {
-        // A `verify:` block does not refuse the config: a `faucet mirror`
-        // keeps it for its snapshot phase while its CDC phase cannot verify.
+        // A `verify:` block is kept for `faucet mirror`'s snapshot phase.
         let config = cfg(
             "version: 1\npipeline:\n  source:\n    type: webhook\n    config: {}\n  sink:\n    type: jsonl\n    config: { path: ./out.jsonl, append: true }\nverify:\n  key: [id]\n",
         );

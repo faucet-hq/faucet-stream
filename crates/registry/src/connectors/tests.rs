@@ -20,6 +20,13 @@ use super::*;
 
 use serde_json::json;
 
+#[cfg(all(
+    feature = "source-sqs",
+    feature = "source-pubsub",
+    feature = "source-rabbitmq",
+    feature = "source-nats",
+    feature = "source-kafka"
+))]
 #[test]
 fn queue_sources_consume_destructively_by_kind() {
     let empty = serde_json::json!({});
@@ -34,6 +41,7 @@ fn queue_sources_consume_destructively_by_kind() {
     assert!(!source_kind_consumes_destructively("kafka", &empty));
 }
 
+#[cfg(feature = "source-webhook")]
 #[test]
 fn a_webhook_that_answers_after_commit_consumes_destructively() {
     let empty = serde_json::json!({});

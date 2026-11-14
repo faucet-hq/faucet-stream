@@ -26,5 +26,12 @@ pub use faucet_common_sqs::{SqsCredentials, build_client};
 
 /// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
 pub const DESCRIPTOR: faucet_core::ConnectorDescriptor =
-    faucet_core::ConnectorDescriptor::new("sqs", faucet_core::capabilities::plain_source)
+    faucet_core::ConnectorDescriptor::new("sqs", capabilities)
         .with_host_identity(faucet_common_sqs::host_identity);
+
+/// Reading acknowledges what was read, so it cannot be read again.
+fn capabilities(_config: &faucet_core::Value) -> faucet_core::Capabilities {
+    faucet_core::Capabilities::builder()
+        .consumes_destructively(true)
+        .build()
+}

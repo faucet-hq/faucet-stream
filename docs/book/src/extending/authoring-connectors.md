@@ -497,7 +497,9 @@ fn capabilities(cfg: &Value) -> Capabilities {
   descriptor. Override `capabilities()` for what no method expresses —
   `range_read` / `range_digest` / `reports_lag` / `table_routing` (your
   source implements `record_table`) / `read_side_effects` (reading creates a
-  slot, joins a consumer group or opens a listener) / `complete_reads` (a run
+  slot, joins a consumer group or opens a listener) / `consumes_destructively`
+  (derived from `Source::consumes_destructively`; declare it in the descriptor
+  too, for the config that enables it) / `complete_reads` (a run
   can read the whole dataset and report it through `read_completeness`, after
   which destination rows it did not write are deleted) on a source,
   `scoped_overwrite` / `schema_report` on a sink — starting from

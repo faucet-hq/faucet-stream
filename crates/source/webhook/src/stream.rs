@@ -449,11 +449,7 @@ async fn webhook_handler(
     if inbox.closed {
         return retry_later();
     }
-    // `ack: on_commit` bounds what is open — held, or in the page being
-    // written — rather than the window's total: over `max_held` requests or
-    // `max_buffered_bytes` a POST is asked to retry and the window stays
-    // open. Checked before the count cap, so a refused POST never closes the
-    // window. An empty inbox always takes one POST, however large.
+    // on_commit bounds open requests and bytes; checked first so a refusal never closes the window.
     if state.hold {
         let open = inbox.held.len() + inbox.in_page;
         let over_bytes = state.max_buffered_bytes > 0
@@ -469,10 +465,7 @@ async fn webhook_handler(
     // — is refused with a retryable status rather than a `200` the sender
     // would read as delivered (API-14).
     let decision = decide_payload(inbox.stored, state.max_payloads);
-    // `ack: on_receive`: the window's bytes are bounded and a full window is
-    // emitted. An empty window always takes the payload, as the count cap
-    // does: a body larger than the byte cap (allowed by `max_body_bytes`)
-    // would otherwise be refused in every window and retried forever.
+    // on_receive bounds the window's bytes; an empty window always takes one payload.
     let over_bytes = !state.hold
         && state.max_buffered_bytes > 0
         && inbox.stored > 0
@@ -512,8 +505,7 @@ async fn webhook_handler(
         key,
     });
     state.arrived.notify_one();
-    // Release the lock before waiting: the page stream takes held requests
-    // under it.
+    // The page stream takes held requests under this lock.
     drop(inbox);
     tokio::select! {
         biased;
@@ -557,7 +549,11 @@ struct Session {
 }
 
 impl Session {
-    async fn open(driver: &WebhookDriver, path: &str) -> Result<Self, FaucetError> {
+    async fn open(
+        driver: &WebhookDriver,
+        path: &str,
+        cancel: Option<CancellationToken>,
+    ) -> Result<Self, FaucetError> {
         crate::config::validate_resolved_path(path)?;
         driver.config.check_listener()?;
         let state = driver.new_state(true);
@@ -583,13 +579,6 @@ impl Session {
                 })
                 .into_future(),
         );
-        // Each run hands its own token through `set_cancel`; take it so a
-        // later run of the same source does not inherit a cancelled one.
-        let cancel = driver
-            .cancel
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
         Ok(Self {
             state,
             stop: Some(stop_tx),
@@ -739,6 +728,21 @@ impl Drop for Session {
     }
 }
 
+/// The most requests one page takes: `batch_size` (`0` = no count limit),
+/// and never more than half of `max_held`, so requests keep being accepted
+/// while a page is written.
+fn page_cap(batch_size: usize, max_held: usize) -> usize {
+    if max_held == 0 {
+        return batch_size;
+    }
+    let half = (max_held / 2).max(1);
+    if batch_size == 0 {
+        half
+    } else {
+        batch_size.min(half)
+    }
+}
+
 /// How many held requests to take into the next page, if any: `batch_size`
 /// once that many are held (`0` = no count trigger), everything (up to
 /// `batch_size`) once the oldest has waited `max_hold` or the window has
@@ -769,10 +773,12 @@ impl WebhookDriver {
     /// again; a page's requests are answered `200` at that next poll.
     fn held_pages<'a>(&'a self, context: &'a HashMap<String, Value>) -> PageStream<'a> {
         let max_hold = Duration::from_secs(self.config.max_hold_secs);
-        let batch_size = self.config.batch_size;
+        let batch_size = page_cap(self.config.batch_size, self.config.max_held);
+        // Taken now, so a later run of this source never inherits it.
+        let cancel = self.cancel.lock().unwrap_or_else(|e| e.into_inner()).take();
         Box::pin(faucet_core::async_stream::try_stream! {
             let path = self.resolve_path(context)?;
-            let mut session = Session::open(self, &path).await?;
+            let mut session = Session::open(self, &path, cancel).await?;
             let mut page_acks: Vec<(oneshot::Sender<()>, Option<String>)> = Vec::new();
             let mut page_bytes = 0usize;
             let mut received = 0usize;
@@ -821,8 +827,7 @@ impl WebhookDriver {
             self.config.validate()?;
             return Ok(self.config.path.clone());
         }
-        // Percent-encode each value so a parent value cannot add segments or
-        // route syntax (API-49).
+        // Percent-encoded so a value cannot add segments or route syntax (API-49).
         let encoded: HashMap<String, Value> = context
             .iter()
             .map(|(k, v)| {

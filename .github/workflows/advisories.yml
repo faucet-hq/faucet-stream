@@ -1,8 +1,7 @@
 # Daily RustSec advisory scan (#789 SUPPLY-03). The `Supply chain` CI job gates
 # merges; this catches advisories published between merges and files an issue
 # so someone triages them (fix the dependency, or add a dated `ignore` entry
-# with a reason to deny.toml). The issue names each advisory, and a green scan
-# closes it again (#1064).
+# with a reason to deny.toml); a green scan closes it.
 name: Advisories
 
 on:
@@ -40,14 +39,13 @@ jobs:
           failed=0
           for manifest in Cargo.toml fuzz/Cargo.toml; do
             json="$RUNNER_TEMP/deny-$(dirname "$manifest" | tr / _).json"
-            # The JSON diagnostics go to stderr; print their messages to the log too.
             cargo deny --manifest-path "$manifest" --all-features --format json --log-level warn \
               check advisories 2> "$json"
             status=$?
-            jq -r 'select(.type == "diagnostic") | .fields.message // empty' "$json" || true
+            jq -R -r 'fromjson? | select(.type == "diagnostic") | .fields.message // empty' "$json" || true
             if [ "$status" -ne 0 ]; then
               failed=1
-              found=$(jq -r 'select(.type == "diagnostic" and .fields.severity == "error")
+              found=$(jq -R -r 'fromjson? | select(.type == "diagnostic" and .fields.severity == "error")
                 | if .fields.advisory then
                     "- [\(.fields.advisory.id)](https://rustsec.org/advisories/\(.fields.advisory.id)) in `\(.fields.advisory.package)`: \(.fields.advisory.title)"
                   else

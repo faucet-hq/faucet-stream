@@ -282,11 +282,16 @@ fn refuse_destructive_sources(cfg: &PipelineConfig) -> CliResult<()> {
             continue;
         };
         if crate::registry::source_kind_consumes_destructively(&kind, &config) {
+            let escape = if kind == "webhook" {
+                ", or set `ack: on_receive` on the source"
+            } else {
+                ""
+            };
             return Err(CliError::Config(format!(
-                "topology source node '{id}' (`{kind}`) acknowledges messages as it is read, and \
-                 a graph polls its sources ahead of its sinks, so a failed or cancelled sink \
-                 would lose messages that were already acked; run this source in a linear \
-                 pipeline instead"
+                "topology source node '{id}' (`{kind}`) consumes what it reads (a queue \
+                 acknowledges messages, a webhook answers its senders), and a graph polls its \
+                 sources ahead of its sinks, so a failed or cancelled sink would lose what was \
+                 already acknowledged; run this source in a linear pipeline instead{escape}"
             )));
         }
     }
