@@ -5,8 +5,11 @@
       const nodes = el.dataset.flow!.split('|').map((s) => s.trim()).filter(Boolean);
       if (!nodes.length) return;
       el.textContent = '';
+      // Each step is a node plus the arrow after it, so a wrapped row always starts with a node.
       nodes.forEach((raw, i) => {
         const [name, sub] = raw.split('::').map((s) => (s || '').trim());
+        const step = document.createElement('div');
+        step.className = 'fs-flow-step';
         const node = document.createElement('div');
         node.className = 'fs-flow-node';
         const nm = document.createElement('span');
@@ -19,14 +22,15 @@
           s.textContent = sub;
           node.appendChild(s);
         }
-        el.appendChild(node);
+        step.appendChild(node);
         if (i < nodes.length - 1) {
           const edge = document.createElement('div');
           edge.className = 'fs-flow-edge';
           edge.setAttribute('aria-hidden', 'true');
           edge.innerHTML = '<i></i><i></i><i></i>';
-          el.appendChild(edge);
+          step.appendChild(edge);
         }
+        el.appendChild(step);
       });
       el.setAttribute('role', 'img');
       el.setAttribute('aria-label', nodes.map((n) => n.split('::')[0].trim()).join(' then '));

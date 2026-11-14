@@ -512,3 +512,35 @@ footer.sl-flex { gap: var(--fs-s5) !important; margin-top: var(--fs-s8) !importa
 /* link grid: grid items, not a list — no list padding or item offsets */
 .sl-markdown-content .fs-links2 { padding-inline-start: 0 !important; list-style: none; }
 .sl-markdown-content .fs-links2 > li { margin: 0 !important; }
+
+/* flow diagrams: steps (node + its arrow) wrap as units; arrows have one length; dots are centred
+   with transforms so no spacing rule can move them */
+.sl-markdown-content .fs-flow { display: flex; flex-wrap: wrap; align-items: center; gap: var(--fs-s3) 0; padding: var(--fs-s5); }
+.fs-flow-step { display: flex; align-items: center; }
+.fs-flow-node { align-items: center; text-align: center; padding: var(--fs-s2) var(--fs-s4); }
+.sl-markdown-content .fs-flow-edge { flex: 0 0 44px; width: 44px; height: 2px; margin: 0 var(--fs-s2) !important; }
+.sl-markdown-content .fs-flow-edge i { top: 50%; left: 0; margin: 0 !important; transform: translate(-50%, -50%); }
+@media (max-width: 50rem) {
+  .sl-markdown-content .fs-flow { flex-direction: column; align-items: stretch; gap: 0; padding: var(--fs-s4); }
+  .fs-flow-step { flex-direction: column; align-items: stretch; }
+  .sl-markdown-content .fs-flow-edge { flex: none; width: 2px; height: 28px; margin: var(--fs-s1) auto !important; }
+  .sl-markdown-content .fs-flow-edge i { left: 50%; top: 0; animation-name: fs-flow-down-c; }
+}
+@keyframes fs-flow-down-c { 0% { top: 0; opacity: 0; } 15% { opacity: 1; } 85% { opacity: 1; } 100% { top: 100%; opacity: 0; } }
+/* the Beginner / Architect switch scrolls with the page: sticky, it floated over the text and,
+   like any sticky block, pinned the TOC highlight */
+.sl-markdown-content .mode-toggle-bar { position: static; }
+
+/* ---------- table framework: every cell contains its content ----------
+   Only whole short columns (.fs-short) stay on one line; anything longer wraps inside its cell,
+   cells have no max-width, and columns are divided by a rule. */
+.sl-markdown-content .fs-table table td:first-child:not(.fs-short) { white-space: normal !important; }
+.sl-markdown-content .fs-table table td { max-width: none !important; overflow-wrap: anywhere; }
+.sl-markdown-content .fs-table table td :is(code, a):not(.fs-short code, .fs-short a) { white-space: normal; }
+.sl-markdown-content .fs-table table td code:not(.fs-long) { white-space: nowrap; }
+.sl-markdown-content .fs-table table td code.fs-long { white-space: normal; overflow-wrap: anywhere; }
+.sl-markdown-content .fs-table table :is(th, td) + :is(th, td) { border-inline-start: 1px solid var(--fs-line) !important; }
+/* repo paths linked from inline code */
+.sl-markdown-content a.fs-repo-link { text-decoration: none !important; }
+.sl-markdown-content a.fs-repo-link code { color: var(--fs-accent) !important; background: color-mix(in srgb, var(--fs-accent-fill) 10%, transparent) !important; }
+.sl-markdown-content a.fs-repo-link:hover code { background: color-mix(in srgb, var(--fs-accent-fill) 18%, transparent) !important; text-decoration: underline; text-underline-offset: 3px; }
