@@ -157,13 +157,36 @@ pub async fn verify_node(
     verify_node_guarded(node, spec, inputs, &RunGuards::default()).await
 }
 
-/// [`verify_node`] whose repair runs under `guards` (#871).
+/// Whether a source's read cannot be repeated for a comparison: it consumes
+/// what it reads (a queue, or a webhook that answers senders once their
+/// events are written) or its read has side effects (a CDC slot or capture
+/// position, a consumer group, a listener) (#1032).
+pub fn reads_unrepeatably(kind: &str, config: &Value) -> bool {
+    crate::registry::source_kind_consumes_destructively(kind, config)
+        || crate::registry::source_capabilities(kind, config).read_side_effects()
+}
+
+/// Whether the executor's post-run verify pass skips this row because its
+/// source cannot be read again for a comparison; logs why. A `faucet mirror`
+/// CDC phase, for example, keeps the `verify:` block its snapshot phase uses.
+pub fn post_run_skips(node: &ExpandedNode) -> bool {
+    let skip = reads_unrepeatably(&node.source.kind, &node.source.config);
+    if skip {
+        tracing::warn!(
+            row = %node.id,
+            source = %node.source.kind,
+            "verify: skipping the post-run check: a `{}` source cannot be read again for a \
+             comparison without acknowledging or moving what the pipeline reads",
+            node.source.kind
+        );
+    }
+    skip
+}
+
 /// Refuse to verify against a source whose read cannot be repeated for a
-/// comparison: one that consumes what it reads (a queue, or a webhook that
-/// answers senders once their events are written) or whose read has side
-/// effects (a CDC slot or capture position, a consumer group, a listener).
-/// Verify reads outside the pipeline, so the read would acknowledge or move
-/// the real pipeline's position and compare nothing useful (#1032).
+/// comparison ([`reads_unrepeatably`]). Verify reads outside the pipeline, so
+/// the read would acknowledge or move the real pipeline's position and
+/// compare nothing useful (#1032).
 pub fn refuse_unrepeatable_read(
     row: &str,
     side: &str,
@@ -171,7 +194,7 @@ pub fn refuse_unrepeatable_read(
     config: &Value,
 ) -> CliResult<()> {
     let consumes = crate::registry::source_kind_consumes_destructively(kind, config);
-    if consumes || crate::registry::source_capabilities(kind, config).read_side_effects() {
+    if reads_unrepeatably(kind, config) {
         let why = if consumes {
             "reading it removes or acknowledges what it reads"
         } else {
@@ -186,6 +209,7 @@ pub fn refuse_unrepeatable_read(
     Ok(())
 }
 
+/// [`verify_node`] whose repair runs under `guards` (#871).
 pub async fn verify_node_guarded(
     node: &ExpandedNode,
     spec: &VerifySpec,

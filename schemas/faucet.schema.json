@@ -27243,7 +27243,7 @@
                       "default": 1048576
                     },
                     "max_buffered_bytes": {
-                      "description": "Most request-body bytes held in memory for one window (default:\n256 MiB). Once a POST would cross it the window closes, the payloads\nalready stored are emitted, and that POST and later ones are refused\nwith `503 Service Unavailable` + `Retry-After`. An empty window always\ntakes one POST, however large (`max_body_bytes` bounds it), and closes\nonce it reaches the bound. `0` removes the bound.",
+                      "description": "Most request-body bytes held in memory (default: 256 MiB). With `ack:\non_receive` it bounds one window: once a POST would cross it the window\ncloses, the payloads already stored are emitted, and that POST and\nlater ones are refused with `503 Service Unavailable` + `Retry-After`.\nWith `ack: on_commit` it bounds the bodies held and not yet\nacknowledged: a POST that would cross it is refused with `503` +\n`Retry-After` and the window stays open. An empty inbox always takes\none POST, however large (`max_body_bytes` bounds it). `0` removes the\nbound.",
                       "type": [
                         "integer",
                         "string"
@@ -27283,7 +27283,7 @@
                       ]
                     },
                     "ack": {
-                      "description": "When a sender's POST is answered (default `on_commit`): after the\npipeline has written and flushed its event (`on_commit`), or as soon\nas it is held in memory (`on_receive`, which loses acknowledged events\nif the run fails before the sink commits). With `on_commit`, commands\nthat read without writing (`--dry-run`, `--limit`, `preview`, `plan\n--sample`, `verify`) and topology graphs refuse this source.",
+                      "description": "When a sender's POST is answered (default `on_commit`): after the\npipeline has written and flushed its event (`on_commit`), or as soon\nas it is held in memory (`on_receive`, which loses acknowledged events\nif the run fails before the sink commits). With `on_commit`, commands\nthat read without writing (`--dry-run`, `--limit`, `preview`, `plan\n--live`, `verify`), topology graphs and `write_mode: overwrite` refuse\nthis source.",
                       "$ref": "#/$defs/source_webhook__AckMode",
                       "default": "on_commit"
                     },
@@ -27299,14 +27299,14 @@
                       "x-faucet-caller-max": 300
                     },
                     "max_held": {
-                      "description": "`ack: on_commit`: the most requests held open at once (default 1000).\nAbove it a POST is refused with `503` + `Retry-After` and not stored,\nso a slow sink cannot pile up open connections. `0` removes the cap.",
+                      "description": "`ack: on_commit`: the most requests open at once, waiting for a page or\nin the page being written (default 2000). Above it a POST is refused\nwith `503` + `Retry-After` and not stored, so a slow sink cannot pile\nup open connections. `0` removes the cap.",
                       "type": [
                         "integer",
                         "string"
                       ],
                       "format": "uint",
                       "minimum": 0,
-                      "default": 1000,
+                      "default": 2000,
                       "x-faucet-caller-max": 100000
                     }
                   }

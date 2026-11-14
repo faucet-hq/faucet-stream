@@ -87,7 +87,7 @@ The receive window ends as soon as **any** configured condition is met; the serv
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `max_body_bytes` | int | `1048576` | Max accepted request body size (1 MiB). Larger POSTs are rejected with `413 Payload Too Large` before buffering, so one huge request can't exhaust memory. |
-| `max_buffered_bytes` | int | `268435456` | Most request-body bytes held in memory for one window (256 MiB). A POST that would cross it closes the window — the stored payloads are emitted — and is refused with `503` + `Retry-After`. An empty window always takes one POST, however large (`max_body_bytes` bounds it), and closes once it reaches the bound. `0` removes the bound. In a config submitted to `faucet serve` it may be 1 to 1 GiB (1,073,741,824); `null` and `0` are refused. |
+| `max_buffered_bytes` | int | `268435456` | Most request-body bytes held in memory (256 MiB). With `ack: on_commit` it bounds the bodies held and not yet acknowledged: a POST that would cross it is refused with `503` + `Retry-After` and the window stays open. With `ack: on_receive` it bounds one window: a POST that would cross it closes the window — the stored payloads are emitted — and is refused. An empty inbox always takes one POST, however large (`max_body_bytes` bounds it). `0` removes the bound. In a config submitted to `faucet serve` it may be 1 to 1 GiB (1,073,741,824); `null` and `0` are refused. |
 | `auth_token` | string \| null | `null` | Optional shared secret. When set, requests must carry it in the `Authorization` header (raw value or `Bearer <token>`); others get `401`. Comparison is constant-time. An empty or blank value is refused. Strongly recommended whenever `listen_addr` isn't loopback. |
 | `signature` | object \| null | `null` | HMAC verification of the raw body for senders that sign requests: `header` (signature header), `secret`, `algorithm` (`sha256` default / `sha512`), `encoding` (`hex` default, case-insensitive / `base64`), optional `prefix` (e.g. `sha256=`), optional `timestamp_header` (then the signed content is `<timestamp>.<body>` and a timestamp more than `tolerance_secs` — default 300 — from now is refused, and a request repeating one already stored in the window gets `200` without being stored again; the timestamp must be plain unix seconds, as the content is rebuilt from its integer value). One signature per request in the `<timestamp>.<body>` layout is supported — schemes that sign another layout (`v0:<ts>:<body>`), pack `t=…,v1=…` into one header, send several signatures during key rotation, or use URL-safe / unpadded base64 cannot be verified. Checked in constant time; failures get `401`. |
 
@@ -97,7 +97,7 @@ The receive window ends as soon as **any** configured condition is met; the serv
 |-------|------|---------|-------------|
 | `ack` | `on_commit` \| `on_receive` | `on_commit` | When a sender's `POST` is answered. `on_commit`: after the pipeline has written and flushed its event. `on_receive`: as soon as it is held in memory (the behaviour before #1032), which loses acknowledged events if the run fails before the sink commits them. See [Acknowledgement](#acknowledgement). |
 | `max_hold_secs` | int | `5` | `ack: on_commit`: the longest a held request waits before its page is emitted, 1 to 300. |
-| `max_held` | int | `1000` | `ack: on_commit`: the most requests held open at once. Above it a `POST` is refused with `503` + `Retry-After` and not stored. `0` removes the cap. In a config submitted to `faucet serve` it may be at most 100,000. |
+| `max_held` | int | `2000` | `ack: on_commit`: the most requests open at once, waiting for a page or in the page being written (the default leaves room for one full page being written and the next filling). Above it a `POST` is refused with `503` + `Retry-After` and not stored. `0` removes the cap. In a config submitted to `faucet serve` it may be at most 100,000. |
 
 ### Batching
 
@@ -195,8 +195,8 @@ A webhook sender does not keep its events: once it gets a `2xx`, it considers th
 - **Duplicates are possible:** a page written just before a crash, or a sink write slower than the sender's timeout, leads the sender to retry an event that was already written. Deduplicate on the sender's delivery id with `write_mode: upsert` and a `key`.
 - **`200` means "handled by your pipeline's rules"**, not always "stored": rows dropped by a `filter`, a contract in `warn` mode or a drift `ignore` policy, or sent to the DLQ, are acknowledged once their page is processed.
 - **How long a sender waits:** up to `max_hold_secs` plus the sink's write time, and up to twice the write time when a write is already in progress. Keep that well under your senders' timeout (often 10–30 s). The source logs a warning when a sender waited more than 10 s.
-- **Open connections** are capped by `max_held` (default 1000).
-- **Commands that read without writing refuse this source:** `--dry-run`, `--limit`, `faucet preview`, `faucet plan --live`, `faucet verify`, topology graphs and `write_mode: overwrite`. A sink that replaces its output on every run (`file` with `if_exists: replace`, `jsonl` / `csv` without `append: true`) is refused too, because the next run would delete events already acknowledged.
+- **Open connections and memory** are capped by `max_held` (default 2000 requests, counting the page being written) and `max_buffered_bytes` (bodies not yet acknowledged). Over either, a `POST` gets `503` + `Retry-After` and the window stays open.
+- **Commands that read without writing refuse this source:** `--dry-run`, `--limit`, `faucet preview`, `faucet plan --live`, `faucet verify`, topology graphs and `write_mode: overwrite`; a post-run `verify:` pass skips it with a warning. A sink that replaces its output on every run (`file`, `s3`, `gcs`, `azure-blob` or `sftp` with `if_exists: replace`, `jsonl` / `csv` without `append: true`) is refused too, because the next run would delete events already acknowledged.
 
 **`ack: on_receive`.** The behaviour before #1032: a `POST` is answered `200` as soon as it is held in memory, and the window's events are emitted when it closes. Events acknowledged this way are lost if the run fails before the sink commits them. Use it only when a sender cannot wait for the write.
 
@@ -221,7 +221,7 @@ There is no resume position for a webhook receiver (see [Resume & state](#resume
 | Missing/wrong `auth_token` (when set) | *(not stored)* | `401 Unauthorized` |
 | Missing/invalid `signature` (when set) | *(not stored)* | `401 Unauthorized` |
 | Arriving after `max_payloads` is reached or the window closed | *(not stored)* | `503 Service Unavailable` + `Retry-After: 60` |
-| `ack: on_commit`, more than `max_held` requests already held | *(not stored)* | `503 Service Unavailable` + `Retry-After: 60` |
+| `ack: on_commit`, `max_held` requests or `max_buffered_bytes` already open | *(not stored)* | `503 Service Unavailable` + `Retry-After: 60` |
 | `ack: on_commit`, its page written and flushed | the parsed value | `200 OK`, sent then |
 | `ack: on_commit`, the run fails before its page is written | *(written or not, never acknowledged)* | `503 Service Unavailable` + `Retry-After: 60` |
 | A byte-identical resend of a signed request whose page is still being written | *(not stored again)* | `503 Service Unavailable` + `Retry-After: 60` |

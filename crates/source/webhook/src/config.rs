@@ -13,8 +13,9 @@ pub const DEFAULT_MAX_HOLD_SECS: u64 = 5;
 /// Largest accepted [`WebhookSourceConfig::max_hold_secs`].
 pub const MAX_HOLD_SECS: u64 = 300;
 
-/// Default [`WebhookSourceConfig::max_held`]: 1000 requests.
-pub const DEFAULT_MAX_HELD: usize = 1000;
+/// Default [`WebhookSourceConfig::max_held`]: 2000 requests, room for one
+/// default-sized page being written and the next one filling.
+pub const DEFAULT_MAX_HELD: usize = 2000;
 
 /// When the source answers a sender's POST.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -57,12 +58,15 @@ pub struct WebhookSourceConfig {
     /// POSTs are rejected with `413 Payload Too Large` so a single huge
     /// request can't exhaust memory.
     pub max_body_bytes: usize,
-    /// Most request-body bytes held in memory for one window (default:
-    /// 256 MiB). Once a POST would cross it the window closes, the payloads
-    /// already stored are emitted, and that POST and later ones are refused
-    /// with `503 Service Unavailable` + `Retry-After`. An empty window always
-    /// takes one POST, however large (`max_body_bytes` bounds it), and closes
-    /// once it reaches the bound. `0` removes the bound.
+    /// Most request-body bytes held in memory (default: 256 MiB). With `ack:
+    /// on_receive` it bounds one window: once a POST would cross it the window
+    /// closes, the payloads already stored are emitted, and that POST and
+    /// later ones are refused with `503 Service Unavailable` + `Retry-After`.
+    /// With `ack: on_commit` it bounds the bodies held and not yet
+    /// acknowledged: a POST that would cross it is refused with `503` +
+    /// `Retry-After` and the window stays open. An empty inbox always takes
+    /// one POST, however large (`max_body_bytes` bounds it). `0` removes the
+    /// bound.
     #[schemars(extend("x-faucet-caller-max" = 1_073_741_824))]
     pub max_buffered_bytes: usize,
     /// Optional shared secret. When set, every request must carry it in the
@@ -88,7 +92,8 @@ pub struct WebhookSourceConfig {
     /// as it is held in memory (`on_receive`, which loses acknowledged events
     /// if the run fails before the sink commits). With `on_commit`, commands
     /// that read without writing (`--dry-run`, `--limit`, `preview`, `plan
-    /// --sample`, `verify`) and topology graphs refuse this source.
+    /// --live`, `verify`), topology graphs and `write_mode: overwrite` refuse
+    /// this source.
     pub ack: AckMode,
     /// `ack: on_commit`: the longest a held request waits before its page is
     /// emitted, in seconds (default 5, at most 300). A sender then waits for
@@ -96,9 +101,10 @@ pub struct WebhookSourceConfig {
     /// already in progress, so keep it well under the senders' timeout.
     #[schemars(extend("x-faucet-caller-max" = 300))]
     pub max_hold_secs: u64,
-    /// `ack: on_commit`: the most requests held open at once (default 1000).
-    /// Above it a POST is refused with `503` + `Retry-After` and not stored,
-    /// so a slow sink cannot pile up open connections. `0` removes the cap.
+    /// `ack: on_commit`: the most requests open at once, waiting for a page or
+    /// in the page being written (default 2000). Above it a POST is refused
+    /// with `503` + `Retry-After` and not stored, so a slow sink cannot pile
+    /// up open connections. `0` removes the cap.
     #[schemars(extend("x-faucet-caller-max" = 100_000))]
     pub max_held: usize,
 }

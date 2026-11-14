@@ -163,7 +163,7 @@ fn version_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>
 fn version_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({
         "description": "A version number or a channel name.",
-        "type": ["string", "integer"],
+        "type": ["string", "integer", "null"],
         "minimum": 0
     })
 }
@@ -401,7 +401,7 @@ mod tests {
         for field in ["version", "sink_version", "overlay_version"] {
             assert_eq!(
                 schema["properties"][field]["type"],
-                json!(["string", "integer"]),
+                json!(["string", "integer", "null"]),
                 "{field}"
             );
         }

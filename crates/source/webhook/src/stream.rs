@@ -45,7 +45,12 @@ struct Inbox {
     held: VecDeque<Held>,
     /// Payloads accepted this window (the `max_payloads` count).
     stored: usize,
+    /// Body bytes: accepted this window under `ack: on_receive`; held and not
+    /// yet acknowledged under `ack: on_commit`.
     bytes: usize,
+    /// `ack: on_commit`: requests taken into the page being written, still
+    /// open until that page is acknowledged.
+    in_page: usize,
     closed: bool,
     /// Signatures of stored timestamped requests, so a byte-identical resend
     /// inside the tolerance window is not stored twice.
@@ -56,6 +61,7 @@ struct Inbox {
 /// page holding it is committed.
 struct Held {
     record: Value,
+    bytes: usize,
     tx: oneshot::Sender<()>,
     at: Instant,
     key: Option<String>,
@@ -440,32 +446,46 @@ async fn webhook_handler(
             None => {}
         }
     }
+    if inbox.closed {
+        return retry_later();
+    }
+    // `ack: on_commit` bounds what is open — held, or in the page being
+    // written — rather than the window's total: over `max_held` requests or
+    // `max_buffered_bytes` a POST is asked to retry and the window stays
+    // open. Checked before the count cap, so a refused POST never closes the
+    // window. An empty inbox always takes one POST, however large.
+    if state.hold {
+        let open = inbox.held.len() + inbox.in_page;
+        let over_bytes = state.max_buffered_bytes > 0
+            && open > 0
+            && inbox.bytes.saturating_add(body.len()) > state.max_buffered_bytes;
+        if (state.max_held > 0 && open >= state.max_held) || over_bytes {
+            return retry_later();
+        }
+    }
     // Decide under the lock so the cap is exact: concurrent in-flight POSTs
     // that have already been accepted can't push the count past `max_payloads`.
     // A payload that is not stored — over the cap, or after the window closed
     // — is refused with a retryable status rather than a `200` the sender
     // would read as delivered (API-14).
     let decision = decide_payload(inbox.stored, state.max_payloads);
-    // An empty window always takes the payload, as the count cap does: a body
-    // larger than the byte cap (allowed by `max_body_bytes`) would otherwise
-    // be refused in every window and retried forever.
-    let over_bytes = state.max_buffered_bytes > 0
+    // `ack: on_receive`: the window's bytes are bounded and a full window is
+    // emitted. An empty window always takes the payload, as the count cap
+    // does: a body larger than the byte cap (allowed by `max_body_bytes`)
+    // would otherwise be refused in every window and retried forever.
+    let over_bytes = !state.hold
+        && state.max_buffered_bytes > 0
         && inbox.stored > 0
         && inbox.bytes.saturating_add(body.len()) > state.max_buffered_bytes;
     if decision.done || over_bytes {
         state.done.notify_one();
     }
-    if inbox.closed || !decision.accept || over_bytes {
-        return retry_later();
-    }
-    // Too many requests already held open: refuse without storing, so a slow
-    // sink cannot pile up connections. The window stays open.
-    if state.hold && state.max_held > 0 && inbox.held.len() >= state.max_held {
+    if !decision.accept || over_bytes {
         return retry_later();
     }
     inbox.bytes += body.len();
     inbox.stored += 1;
-    if state.max_buffered_bytes > 0 && inbox.bytes >= state.max_buffered_bytes {
+    if !state.hold && state.max_buffered_bytes > 0 && inbox.bytes >= state.max_buffered_bytes {
         // The window is full: emit it rather than wait for a refused POST.
         state.done.notify_one();
     }
@@ -486,6 +506,7 @@ async fn webhook_handler(
     let (tx, rx) = oneshot::channel();
     inbox.held.push_back(Held {
         record: value,
+        bytes: body.len(),
         tx,
         at: Instant::now(),
         key,
@@ -562,11 +583,13 @@ impl Session {
                 })
                 .into_future(),
         );
+        // Each run hands its own token through `set_cancel`; take it so a
+        // later run of the same source does not inherit a cancelled one.
         let cancel = driver
             .cancel
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone();
+            .take();
         Ok(Self {
             state,
             stop: Some(stop_tx),
@@ -596,6 +619,7 @@ impl Session {
                     batch_size,
                     max_hold,
                 ) {
+                    inbox.in_page += n;
                     return Ok(Some(inbox.held.drain(..n).collect()));
                 }
                 if inbox.closed {
@@ -654,13 +678,15 @@ impl Session {
         }
     }
 
-    /// Answer `200` to every request of a committed page, and remember its
-    /// signed requests as committed.
-    async fn acknowledge(&self, page: Vec<(oneshot::Sender<()>, Option<String>)>) {
+    /// Answer `200` to every request of a committed page, release what it
+    /// held, and remember its signed requests as committed.
+    async fn acknowledge(&self, page: Vec<(oneshot::Sender<()>, Option<String>)>, bytes: usize) {
         if page.is_empty() {
             return;
         }
         let mut inbox = self.state.inbox.lock().await;
+        inbox.in_page = inbox.in_page.saturating_sub(page.len());
+        inbox.bytes = inbox.bytes.saturating_sub(bytes);
         for key in page.iter().filter_map(|(_, k)| k.as_ref()) {
             if let Some(seen) = inbox.seen.get_mut(key) {
                 seen.committed = true;
@@ -748,10 +774,13 @@ impl WebhookDriver {
             let path = self.resolve_path(context)?;
             let mut session = Session::open(self, &path).await?;
             let mut page_acks: Vec<(oneshot::Sender<()>, Option<String>)> = Vec::new();
+            let mut page_bytes = 0usize;
             let mut received = 0usize;
             loop {
                 // Being polled again means the last page was written and flushed.
-                session.acknowledge(std::mem::take(&mut page_acks)).await;
+                session
+                    .acknowledge(std::mem::take(&mut page_acks), std::mem::take(&mut page_bytes))
+                    .await;
                 let Some(batch) = session.next_batch(batch_size, max_hold).await? else {
                     break;
                 };
@@ -759,6 +788,7 @@ impl WebhookDriver {
                 let oldest = batch.first().map(|h| h.at);
                 let mut records = Vec::with_capacity(batch.len());
                 for held in batch {
+                    page_bytes += held.bytes;
                     records.push(held.record);
                     page_acks.push((held.tx, held.key));
                 }
