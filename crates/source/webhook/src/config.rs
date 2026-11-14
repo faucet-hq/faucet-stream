@@ -7,6 +7,32 @@ use serde::{Deserialize, Serialize};
 /// Default [`WebhookSourceConfig::max_buffered_bytes`]: 256 MiB.
 pub const DEFAULT_MAX_BUFFERED_BYTES: usize = 256 * 1024 * 1024;
 
+/// Default [`WebhookSourceConfig::max_hold_secs`]: 5 seconds.
+pub const DEFAULT_MAX_HOLD_SECS: u64 = 5;
+
+/// Largest accepted [`WebhookSourceConfig::max_hold_secs`].
+pub const MAX_HOLD_SECS: u64 = 300;
+
+/// Default [`WebhookSourceConfig::max_held`]: 2000 requests, room for one
+/// default-sized page being written and the next one filling.
+pub const DEFAULT_MAX_HELD: usize = 2000;
+
+/// When the source answers a sender's POST.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AckMode {
+    /// Answer `200` only after the page holding the event has been written
+    /// and flushed by the pipeline; answer `503` + `Retry-After` when the run
+    /// fails first, so the sender retries. Nothing acknowledged is lost; a
+    /// sender may see a duplicate after a crash or a slow commit.
+    #[default]
+    OnCommit,
+    /// Answer `200` as soon as the event is held in memory, and emit the
+    /// window's events when it closes. Events acknowledged this way are lost
+    /// if the run fails before the sink commits them.
+    OnReceive,
+}
+
 /// Configuration for the webhook receiver source.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
@@ -32,12 +58,15 @@ pub struct WebhookSourceConfig {
     /// POSTs are rejected with `413 Payload Too Large` so a single huge
     /// request can't exhaust memory.
     pub max_body_bytes: usize,
-    /// Most request-body bytes held in memory for one window (default:
-    /// 256 MiB). Once a POST would cross it the window closes, the payloads
-    /// already stored are emitted, and that POST and later ones are refused
-    /// with `503 Service Unavailable` + `Retry-After`. An empty window always
-    /// takes one POST, however large (`max_body_bytes` bounds it), and closes
-    /// once it reaches the bound. `0` removes the bound.
+    /// Most request-body bytes held in memory (default: 256 MiB). With `ack:
+    /// on_receive` it bounds one window: once a POST would cross it the window
+    /// closes, the payloads already stored are emitted, and that POST and
+    /// later ones are refused with `503 Service Unavailable` + `Retry-After`.
+    /// With `ack: on_commit` it bounds the bodies held and not yet
+    /// acknowledged: a POST that would cross it is refused with `503` +
+    /// `Retry-After` and the window stays open. An empty inbox always takes
+    /// one POST, however large (`max_body_bytes` bounds it). `0` removes the
+    /// bound.
     #[schemars(extend("x-faucet-caller-max" = 1_073_741_824))]
     pub max_buffered_bytes: usize,
     /// Optional shared secret. When set, every request must carry it in the
@@ -45,16 +74,12 @@ pub struct WebhookSourceConfig {
     /// requests without it are rejected with `401 Unauthorized`. When `None`
     /// (default) the endpoint is unauthenticated.
     pub auth_token: Option<String>,
-    /// Records per emitted [`StreamPage`](faucet_core::StreamPage). The webhook
-    /// source has no native streaming primitive — it accumulates incoming POSTs
-    /// into an in-memory buffer during the receive window, then the default
-    /// [`Source::stream_pages`](faucet_core::Source::stream_pages) impl chunks
-    /// that buffer into pages of this size. Defaults to [`DEFAULT_BATCH_SIZE`].
-    ///
-    /// `batch_size = 0` is the "no batching" sentinel: the entire flush window
-    /// is emitted in a single page. For this source it is functionally
-    /// equivalent to any positive value larger than the received payload count
-    /// — the server-side buffering behaviour does not change.
+    /// Records per emitted [`StreamPage`](faucet_core::StreamPage) (default
+    /// [`DEFAULT_BATCH_SIZE`]). With `ack: on_commit` a page is emitted while
+    /// the window is open, as soon as this many requests are held or the
+    /// oldest has waited `max_hold_secs`; `0` drops the count trigger. With
+    /// `ack: on_receive` the window's events are emitted when it closes, in
+    /// pages of this size; `0` emits them as one page.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
     /// Optional HMAC request-signature verification for senders that sign the
@@ -62,6 +87,26 @@ pub struct WebhookSourceConfig {
     /// requests are rejected with `401`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<WebhookSignature>,
+    /// When a sender's POST is answered (default `on_commit`): after the
+    /// pipeline has written and flushed its event (`on_commit`), or as soon
+    /// as it is held in memory (`on_receive`, which loses acknowledged events
+    /// if the run fails before the sink commits). With `on_commit`, commands
+    /// that read without writing (`--dry-run`, `--limit`, `preview`, `plan
+    /// --live`, `verify`), topology graphs and `write_mode: overwrite` refuse
+    /// this source.
+    pub ack: AckMode,
+    /// `ack: on_commit`: the longest a held request waits before its page is
+    /// emitted, in seconds (default 5, at most 300). A sender then waits for
+    /// up to this plus the sink's write time, twice over when a write is
+    /// already in progress, so keep it well under the senders' timeout.
+    #[schemars(extend("x-faucet-caller-max" = 300))]
+    pub max_hold_secs: u64,
+    /// `ack: on_commit`: the most requests open at once, waiting for a page or
+    /// in the page being written (default 2000). Above it a POST is refused
+    /// with `503` + `Retry-After` and not stored, so a slow sink cannot pile
+    /// up open connections. `0` removes the cap.
+    #[schemars(extend("x-faucet-caller-max" = 100_000))]
+    pub max_held: usize,
 }
 
 /// HMAC signature verification over the raw request body.
@@ -176,6 +221,9 @@ impl Default for WebhookSourceConfig {
             auth_token: None,
             batch_size: DEFAULT_BATCH_SIZE,
             signature: None,
+            ack: AckMode::OnCommit,
+            max_hold_secs: DEFAULT_MAX_HOLD_SECS,
+            max_held: DEFAULT_MAX_HELD,
         }
     }
 }
@@ -247,6 +295,12 @@ impl WebhookSourceConfig {
                     .into(),
             ));
         }
+        if !(1..=MAX_HOLD_SECS).contains(&self.max_hold_secs) {
+            return Err(faucet_core::FaucetError::Config(format!(
+                "webhook source: `max_hold_secs` must be between 1 and {MAX_HOLD_SECS}, got {}",
+                self.max_hold_secs
+            )));
+        }
         Ok(())
     }
 
@@ -295,6 +349,24 @@ impl WebhookSourceConfig {
     /// Require a shared-secret token in the `Authorization` header.
     pub fn auth_token(mut self, token: impl Into<String>) -> Self {
         self.auth_token = Some(token.into());
+        self
+    }
+
+    /// Set when a sender's POST is answered.
+    pub fn ack(mut self, ack: AckMode) -> Self {
+        self.ack = ack;
+        self
+    }
+
+    /// Set the longest a held request waits before its page is emitted.
+    pub fn max_hold_secs(mut self, secs: u64) -> Self {
+        self.max_hold_secs = secs;
+        self
+    }
+
+    /// Set the most requests held open at once (`0` = no cap).
+    pub fn max_held(mut self, max: usize) -> Self {
+        self.max_held = max;
         self
     }
 
@@ -388,6 +460,36 @@ mod tests {
         assert_eq!(config.timeout_secs, 30);
         assert_eq!(config.max_body_bytes, 1024 * 1024);
         assert!(config.auth_token.is_none());
+        assert_eq!(config.ack, AckMode::OnCommit);
+        assert_eq!(config.max_hold_secs, DEFAULT_MAX_HOLD_SECS);
+        assert_eq!(config.max_held, DEFAULT_MAX_HELD);
+    }
+
+    #[test]
+    fn ack_settings_parse_and_max_hold_is_bounded() {
+        let config: WebhookSourceConfig =
+            serde_json::from_str(r#"{"ack": "on_receive", "max_hold_secs": 2, "max_held": 0}"#)
+                .unwrap();
+        assert_eq!(config.ack, AckMode::OnReceive);
+        assert_eq!((config.max_hold_secs, config.max_held), (2, 0));
+        for bad in [0, MAX_HOLD_SECS + 1] {
+            let e = WebhookSourceConfig::new()
+                .max_hold_secs(bad)
+                .validate()
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains("`max_hold_secs` must be between 1 and 300"),
+                "{e}"
+            );
+        }
+        let built = WebhookSourceConfig::new()
+            .ack(AckMode::OnReceive)
+            .max_hold_secs(MAX_HOLD_SECS)
+            .max_held(3);
+        built.validate().unwrap();
+        assert_eq!((built.ack, built.max_held), (AckMode::OnReceive, 3));
+        assert!(serde_json::from_str::<WebhookSourceConfig>(r#"{"ack": "later"}"#).is_err());
     }
 
     #[test]

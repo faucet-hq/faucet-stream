@@ -298,7 +298,7 @@ async fn cancel_transitions_to_cancelled() {
     let dir = tempfile::tempdir().unwrap();
     let output = dir.path().join("out.jsonl");
     let config_yaml = format!(
-        "version: 1\npipeline:\n  source:\n    type: webhook\n    config:\n      listen_addr: \"127.0.0.1:{webhook_port}\"\n      timeout_secs: 3600\n  sink:\n    type: jsonl\n    config:\n      path: \"{output}\"\n",
+        "version: 1\npipeline:\n  source:\n    type: webhook\n    config:\n      listen_addr: \"127.0.0.1:{webhook_port}\"\n      timeout_secs: 3600\n  sink:\n    type: jsonl\n    config:\n      path: \"{output}\"\n      append: true\n",
         webhook_port = webhook_port,
         output = output.display(),
     );
@@ -447,7 +447,7 @@ async fn cancel_of_queued_run_transitions_to_cancelled() {
     let webhook_port = free_port();
     let dir = tempfile::tempdir().unwrap();
     let block_cfg = format!(
-        "version: 1\npipeline:\n  source:\n    type: webhook\n    config:\n      listen_addr: \"127.0.0.1:{webhook_port}\"\n      timeout_secs: 3600\n  sink:\n    type: jsonl\n    config:\n      path: \"{}\"\n",
+        "version: 1\npipeline:\n  source:\n    type: webhook\n    config:\n      listen_addr: \"127.0.0.1:{webhook_port}\"\n      timeout_secs: 3600\n  sink:\n    type: jsonl\n    config:\n      path: \"{}\"\n      append: true\n",
         dir.path().join("a.jsonl").display(),
     );
     let a_id = client

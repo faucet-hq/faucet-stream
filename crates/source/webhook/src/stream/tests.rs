@@ -1,17 +1,104 @@
 fn state(max_payloads: Option<usize>, closed: bool) -> std::sync::Arc<super::AppState> {
+    held_state(max_payloads, closed, false, 0)
+}
+
+fn held_state(
+    max_payloads: Option<usize>,
+    closed: bool,
+    hold: bool,
+    max_held: usize,
+) -> std::sync::Arc<super::AppState> {
     std::sync::Arc::new(super::AppState {
         inbox: tokio::sync::Mutex::new(super::Inbox {
-            records: Vec::new(),
-            bytes: 0,
             closed,
-            seen: HashMap::new(),
+            ..Default::default()
         }),
         max_payloads,
         max_buffered_bytes: 0,
         done: tokio::sync::Notify::new(),
         auth_token: None,
         signature: None,
+        hold,
+        max_held,
+        arrived: tokio::sync::Notify::new(),
+        abort: faucet_core::CancellationToken::new(),
     })
+}
+
+#[test]
+fn take_count_emits_on_count_age_or_close() {
+    use std::time::Duration;
+    let hold = Duration::from_secs(5);
+    let young = Some(Duration::from_secs(1));
+    let old = Some(Duration::from_secs(5));
+    assert_eq!(super::take_count(0, None, true, 10, hold), None);
+    assert_eq!(super::take_count(3, young, false, 10, hold), None);
+    assert_eq!(super::take_count(10, young, false, 10, hold), Some(10));
+    assert_eq!(super::take_count(12, young, false, 10, hold), Some(10));
+    assert_eq!(super::take_count(3, old, false, 10, hold), Some(3));
+    assert_eq!(super::take_count(30, old, false, 10, hold), Some(10));
+    assert_eq!(super::take_count(3, young, true, 10, hold), Some(3));
+    // `batch_size: 0` drops the count trigger and takes everything.
+    assert_eq!(super::take_count(5000, young, false, 0, hold), None);
+    assert_eq!(super::take_count(5000, old, false, 0, hold), Some(5000));
+}
+
+#[tokio::test]
+async fn a_held_request_answers_after_its_page_is_acknowledged() {
+    let s = held_state(None, false, true, 0);
+    let post = tokio::spawn(send_payload(s.clone()));
+    // Wait until the request is held, then answer it as the stream would.
+    let held = loop {
+        if let Some(h) = s.inbox.lock().await.held.pop_front() {
+            break h;
+        }
+        tokio::task::yield_now().await;
+    };
+    assert_eq!(held.record, serde_json::json!({"a": 1}));
+    assert!(!post.is_finished());
+    held.tx.send(()).unwrap();
+    assert_eq!(post.await.unwrap().status(), axum::http::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_dropped_page_or_an_abort_answers_retry_later() {
+    let s = held_state(None, false, true, 0);
+    let post = tokio::spawn(send_payload(s.clone()));
+    let held = loop {
+        if let Some(h) = s.inbox.lock().await.held.pop_front() {
+            break h;
+        }
+        tokio::task::yield_now().await;
+    };
+    drop(held);
+    let resp = post.await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.headers()[axum::http::header::RETRY_AFTER], "60");
+
+    // A request still in the inbox when the stream goes away is answered too.
+    let post = tokio::spawn(send_payload(s.clone()));
+    while s.inbox.lock().await.held.is_empty() {
+        tokio::task::yield_now().await;
+    }
+    s.abort.cancel();
+    assert_eq!(
+        post.await.unwrap().status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+}
+
+#[tokio::test]
+async fn requests_over_max_held_are_refused_and_not_stored() {
+    let s = held_state(None, false, true, 1);
+    let _first = tokio::spawn(send_payload(s.clone()));
+    while s.inbox.lock().await.held.is_empty() {
+        tokio::task::yield_now().await;
+    }
+    let resp = send_payload(s.clone()).await;
+    assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    let inbox = s.inbox.lock().await;
+    assert_eq!((inbox.held.len(), inbox.stored), (1, 1));
+    assert!(!inbox.closed);
 }
 
 async fn send_payload(state: std::sync::Arc<super::AppState>) -> axum::response::Response {
@@ -181,6 +268,10 @@ async fn handler_never_exceeds_cap_under_concurrent_posts() {
         done: Notify::new(),
         auth_token: None,
         signature: None,
+        hold: false,
+        max_held: 0,
+        arrived: Notify::new(),
+        abort: faucet_core::CancellationToken::new(),
     });
 
     let mut handles = Vec::new();
@@ -229,6 +320,10 @@ async fn webhook_collects_payloads() {
         done: Notify::new(),
         auth_token: config.auth_token.clone(),
         signature: None,
+        hold: false,
+        max_held: 0,
+        arrived: Notify::new(),
+        abort: faucet_core::CancellationToken::new(),
     });
 
     let server_state = Arc::clone(&state);
@@ -339,6 +434,10 @@ async fn webhook_handles_non_json_body() {
         done: Notify::new(),
         auth_token: None,
         signature: None,
+        hold: false,
+        max_held: 0,
+        arrived: Notify::new(),
+        abort: faucet_core::CancellationToken::new(),
     });
 
     let server_state = Arc::clone(&state);
@@ -434,4 +533,108 @@ fn signature_config_requires_header_and_secret() {
     s.secret.clear();
     let cfg = WebhookSourceConfig::new().signature(s);
     assert!(cfg.validate().is_err());
+}
+
+async fn held_request(s: &std::sync::Arc<super::AppState>) -> super::Held {
+    loop {
+        if let Some(h) = s.inbox.lock().await.held.pop_front() {
+            return h;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test]
+async fn requests_in_the_page_being_written_count_against_max_held() {
+    let s = held_state(None, false, true, 1);
+    let _first = tokio::spawn(send_payload(s.clone()));
+    // Take it into a page, as `next_batch` does.
+    let page = held_request(&s).await;
+    s.inbox.lock().await.in_page += 1;
+    let resp = send_payload(s.clone()).await;
+    assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    drop(page);
+}
+
+#[tokio::test]
+async fn a_post_refused_by_max_held_does_not_close_the_window() {
+    let s = held_state(Some(2), false, true, 1);
+    let _first = tokio::spawn(send_payload(s.clone()));
+    while s.inbox.lock().await.held.is_empty() {
+        tokio::task::yield_now().await;
+    }
+    // This one would fill `max_payloads`, but it is refused first.
+    let resp = send_payload(s.clone()).await;
+    assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    let closed =
+        tokio::time::timeout(std::time::Duration::from_millis(50), s.done.notified()).await;
+    assert!(closed.is_err(), "the window must stay open");
+    assert_eq!(s.inbox.lock().await.stored, 1);
+}
+
+#[tokio::test]
+async fn on_commit_bounds_unacknowledged_bytes_and_keeps_the_window_open() {
+    let s = std::sync::Arc::new(super::AppState {
+        inbox: tokio::sync::Mutex::new(super::Inbox::default()),
+        max_payloads: None,
+        max_buffered_bytes: 10,
+        done: tokio::sync::Notify::new(),
+        auth_token: None,
+        signature: None,
+        hold: true,
+        max_held: 0,
+        arrived: tokio::sync::Notify::new(),
+        abort: faucet_core::CancellationToken::new(),
+    });
+    let _first = tokio::spawn(send_payload(s.clone()));
+    while s.inbox.lock().await.held.is_empty() {
+        tokio::task::yield_now().await;
+    }
+    // 7 + 7 bytes would cross 10: refused, window still open.
+    let resp = send_payload(s.clone()).await;
+    assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!s.inbox.lock().await.closed);
+    let closed =
+        tokio::time::timeout(std::time::Duration::from_millis(50), s.done.notified()).await;
+    assert!(closed.is_err());
+    // Acknowledging the page releases its bytes, so the next POST fits.
+    let held = held_request(&s).await;
+    let session = super::Session {
+        state: s.clone(),
+        stop: None,
+        server: None,
+        window_end: tokio::time::Instant::now(),
+        cancel: None,
+    };
+    s.inbox.lock().await.in_page += 1;
+    session.acknowledge(vec![(held.tx, None)], held.bytes).await;
+    {
+        let inbox = s.inbox.lock().await;
+        assert_eq!((inbox.bytes, inbox.in_page), (0, 0));
+    }
+    let _next = tokio::spawn(send_payload(s.clone()));
+    let next = held_request(&s).await;
+    assert_eq!(next.bytes, 7);
+    drop(session);
+}
+
+#[tokio::test]
+async fn each_run_takes_its_own_cancel_token() {
+    let driver = super::WebhookDriver {
+        config: crate::config::WebhookSourceConfig::new().listen_addr("127.0.0.1:0"),
+        cancel: std::sync::Mutex::new(None),
+    };
+    let token = faucet_core::CancellationToken::new();
+    token.cancel();
+    assert!(faucet_core::driver::SourceDriver::set_cancel(
+        &driver, token
+    ));
+    let first = super::Session::open(&driver, "/webhook").await.unwrap();
+    assert!(first.cancel.is_some());
+    drop(first);
+    let second = super::Session::open(&driver, "/webhook").await.unwrap();
+    assert!(
+        second.cancel.is_none(),
+        "a later run must not inherit the token"
+    );
 }

@@ -11,6 +11,11 @@ pipeline:
       path: /inbox
       max_payloads: 5000
       timeout_secs: 120
+      # Answer each sender once its event is written (the default); a page is
+      # written at least every 5 s, and at most 2000 requests are held open.
+      ack: on_commit
+      max_hold_secs: 5
+      max_held: 2000
 
   sink:
     type: file

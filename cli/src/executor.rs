@@ -3345,7 +3345,8 @@ async fn run_one_invocation(
                 && !opts.dry_run
                 && opts.limit.is_none()
                 && opts.shard.is_none()
-                && !cancel.is_cancelled() =>
+                && !cancel.is_cancelled()
+                && !crate::verify::post_run_skips(node) =>
         {
             let inputs = crate::verify::VerifyInputs {
                 row: Some(node.id.clone()),

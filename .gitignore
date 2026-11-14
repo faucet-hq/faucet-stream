@@ -53,6 +53,9 @@ docs/superpowers/
 !/scripts/test_failing_tests.py
 !/scripts/coverage_shards.py
 !/scripts/test_coverage_shards.py
+!/scripts/coverage_shard_weights.py
+!/scripts/test_coverage_shard_weights.py
+!/scripts/coverage-shard-weights.json
 !/scripts/docker-hub-mirror.sh
 !/scripts/semver-exclude.py
 !/scripts/test_integration_coverage.py

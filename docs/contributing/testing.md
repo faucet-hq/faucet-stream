@@ -126,7 +126,23 @@ The tests run in eight parallel **`Coverage shard (…)`** jobs: four split the
 workspace's library and connector integration tests by package, three split
 `faucet-cli`'s integration test targets, and one runs every crate's unit tests
 (`scripts/coverage_shards.py` plans the split, so a new crate needs no workflow
-edit). Each shard runs with `--no-fail-fast`, writes its own lcov report even
+edit). The library shards are balanced by each package's measured test time in
+`scripts/coverage-shard-weights.json`; a package missing from it is estimated
+from its number of test targets. When the shards drift apart (one finishing
+well after the others), regenerate the file from recent green `main` runs:
+
+```bash
+python3 scripts/coverage_shard_weights.py --run <run id> --run <run id> --write
+```
+
+The script matches each test binary in the shard logs to its package and
+stops if the workspace has changed since those runs. A stale file only makes
+the shards less even; every package still runs in exactly one shard.
+
+Only `Coverage`, `Test` and `Clippy` save a Rust build cache, on `main`. The
+repository's 10 GB Actions cache cannot hold one per job, and caches saved by
+other jobs used to evict these three. The budget is written above `jobs:` in
+`.github/workflows/ci.yml`. Each shard runs with `--no-fail-fast`, writes its own lcov report even
 when tests fail, and only then fails, so one red run reports every failure: the
 **List every failing test** step and the job summary name each failing test
 with its binary, panic location and the `cargo test` target to rerun

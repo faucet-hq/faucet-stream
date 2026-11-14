@@ -157,6 +157,58 @@ pub async fn verify_node(
     verify_node_guarded(node, spec, inputs, &RunGuards::default()).await
 }
 
+/// Whether a source's read cannot be repeated for a comparison: it consumes
+/// what it reads (a queue, or a webhook that answers senders once their
+/// events are written) or its read has side effects (a CDC slot or capture
+/// position, a consumer group, a listener) (#1032).
+pub fn reads_unrepeatably(kind: &str, config: &Value) -> bool {
+    crate::registry::source_kind_consumes_destructively(kind, config)
+        || crate::registry::source_capabilities(kind, config).read_side_effects()
+}
+
+/// Whether the executor's post-run verify pass skips this row because its
+/// source cannot be read again for a comparison; logs why. A `faucet mirror`
+/// CDC phase, for example, keeps the `verify:` block its snapshot phase uses.
+pub fn post_run_skips(node: &ExpandedNode) -> bool {
+    let skip = reads_unrepeatably(&node.source.kind, &node.source.config);
+    if skip {
+        tracing::warn!(
+            row = %node.id,
+            source = %node.source.kind,
+            "verify: skipping the post-run check: a `{}` source cannot be read again for a \
+             comparison without acknowledging or moving what the pipeline reads",
+            node.source.kind
+        );
+    }
+    skip
+}
+
+/// Refuse to verify against a source whose read cannot be repeated for a
+/// comparison ([`reads_unrepeatably`]). Verify reads outside the pipeline, so
+/// the read would acknowledge or move the real pipeline's position and
+/// compare nothing useful (#1032).
+pub fn refuse_unrepeatable_read(
+    row: &str,
+    side: &str,
+    kind: &str,
+    config: &Value,
+) -> CliResult<()> {
+    let consumes = crate::registry::source_kind_consumes_destructively(kind, config);
+    if reads_unrepeatably(kind, config) {
+        let why = if consumes {
+            "reading it removes or acknowledges what it reads"
+        } else {
+            "reading it has side effects (a replication slot, a consumer group, a listener)"
+        };
+        return Err(CliError::Config(format!(
+            "verify: row '{row}' reads its {side} from a `{kind}` source, and {why}; verify \
+             reads outside the pipeline, so it cannot compare against it. Verify a source that \
+             can be read again, such as the table the stream is copied from"
+        )));
+    }
+    Ok(())
+}
+
 /// [`verify_node`] whose repair runs under `guards` (#871).
 pub async fn verify_node_guarded(
     node: &ExpandedNode,
@@ -170,6 +222,7 @@ pub async fn verify_node_guarded(
             node.id
         )));
     }
+    refuse_unrepeatable_read(&node.id, "source", &node.source.kind, &node.source.config)?;
     let started = std::time::Instant::now();
     let mut source_cfg = node.source.config.clone();
     let mut sink_cfg = node.sink.config.clone();
@@ -219,6 +272,8 @@ pub async fn verify_node_guarded(
             ))
         })?,
     };
+
+    refuse_unrepeatable_read(&node.id, "destination read-back", &dest_kind, &dest_cfg)?;
 
     // Range mode needs one integer key and two range-readable sources. The
     // key's type is only known to the backend: planning the ranges casts its

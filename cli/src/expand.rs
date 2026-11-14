@@ -1133,6 +1133,36 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             v.validate()
                 .map_err(|e| CliError::Config(format!("verify: {e}")))?;
         }
+        // A source that cannot be read again — a queue that acks, or a webhook
+        // that answers each sender once its event is written — must not write
+        // to a sink that replaces its output on the next run: the next run
+        // would delete what the previous one acknowledged (#1032).
+        if crate::registry::source_kind_consumes_destructively(
+            &merged_source.kind,
+            &merged_source.config,
+        ) && let Some(target) =
+            crate::registry::sink_truncating_path(&merged_sink.kind, &merged_sink.config)
+                .map(str::to_owned)
+                .or_else(|| {
+                    crate::registry::sink_replaced_object(&merged_sink.kind, &merged_sink.config)
+                })
+        {
+            let (acked, escape) = if merged_source.kind == "webhook" {
+                (
+                    "answers each sender once its event is written (`ack: on_commit`)",
+                    ", or set `ack: on_receive` on the source",
+                )
+            } else {
+                ("acknowledges what it reads, so it cannot be read again", "")
+            };
+            return Err(CliError::Config(format!(
+                "row '{row_id}': the `{}` source {acked}, but the `{}` sink replaces `{target}` \
+                 on every run, so the next run would delete what the previous one acknowledged. \
+                 Make the sink append (`if_exists: append` for `file` and the object stores, \
+                 `append: true` for `jsonl` / `csv`){escape}",
+                merged_source.kind, merged_sink.kind
+            )));
+        }
 
         // write_mode × sink validation (load-time): reject an unsupported mode
         // for the sink kind, and upsert/delete without a key, before any run.
@@ -1211,8 +1241,14 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                     "row '{}': write_mode: overwrite cannot read from source '{}' — it \
                      acknowledges each page once it is written into the staging copy, and a \
                      failed or cancelled run discards staging, losing those messages for \
-                     good. Use write_mode: append or upsert",
-                    ids[i], merged_source.kind
+                     good. Use write_mode: append or upsert{}",
+                    ids[i],
+                    merged_source.kind,
+                    if merged_source.kind == "webhook" {
+                        ", or set `ack: on_receive` on the source"
+                    } else {
+                        ""
+                    }
                 )));
             }
             if state.is_some()
@@ -2801,6 +2837,92 @@ mod tests {
 
     fn cfg(yaml: &str) -> PipelineConfig {
         parse_with_extension(yaml, "yaml").unwrap()
+    }
+
+    #[test]
+    fn a_source_that_cannot_be_read_again_refuses_a_sink_that_replaces_its_output() {
+        let doc = |source: &str, sink: &str| {
+            format!("version: 1\npipeline:\n  source:\n{source}  sink:\n{sink}")
+        };
+        let webhook = "    type: webhook\n    config: {}\n";
+        let replacing = "    type: jsonl\n    config: { path: ./out.jsonl }\n";
+        let err = expand(&cfg(&doc(webhook, replacing)))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("would delete what the previous one acknowledged"),
+            "{err}"
+        );
+        assert!(
+            err.contains("./out.jsonl") && err.contains("ack: on_receive"),
+            "{err}"
+        );
+        let file = "    type: file\n    config: { path: ./out.jsonl }\n";
+        assert!(expand(&cfg(&doc(webhook, file))).is_err());
+        // A remote object store replacing one fixed object every run.
+        let s3 = "    type: s3\n    config: { bucket: b, prefix: \"\", region: us-east-1, path: events.jsonl }\n";
+        let err = expand(&cfg(&doc(webhook, s3))).unwrap_err().to_string();
+        assert!(err.contains("`s3` sink replaces"), "{err}");
+        // A queue that acks loses the same way; its error has no webhook hint.
+        let sqs = "    type: sqs\n    config: { queue_url: \"https://sqs.us-east-1.amazonaws.com/1/q\" }\n";
+        let err = expand(&cfg(&doc(sqs, replacing))).unwrap_err().to_string();
+        assert!(
+            err.contains("`sqs` source acknowledges what it reads") && !err.contains("ack:"),
+            "{err}"
+        );
+        // An appending sink, the old acknowledgement, or a source that can be
+        // read again is accepted.
+        let appending = "    type: jsonl\n    config: { path: ./out.jsonl, append: true }\n";
+        expand(&cfg(&doc(webhook, appending))).unwrap();
+        let file_append = "    type: file\n    config: { path: ./out.jsonl, if_exists: append }\n";
+        expand(&cfg(&doc(webhook, file_append))).unwrap();
+        expand(&cfg(&doc(
+            "    type: webhook\n    config: { ack: on_receive }\n",
+            replacing,
+        )))
+        .unwrap();
+        expand(&cfg(&doc(
+            "    type: csv\n    config: { path: ./x.csv }\n",
+            replacing,
+        )))
+        .unwrap();
+    }
+
+    #[test]
+    fn verify_skips_or_refuses_a_source_whose_read_cannot_be_repeated() {
+        // A `verify:` block does not refuse the config: a `faucet mirror`
+        // keeps it for its snapshot phase while its CDC phase cannot verify.
+        let config = cfg(
+            "version: 1\npipeline:\n  source:\n    type: webhook\n    config: {}\n  sink:\n    type: jsonl\n    config: { path: ./out.jsonl, append: true }\nverify:\n  key: [id]\n",
+        );
+        let nodes = expand(&config).unwrap();
+        assert!(crate::verify::post_run_skips(&nodes[0]));
+        let readable = cfg(
+            "version: 1\npipeline:\n  source:\n    type: csv\n    config: { path: ./x.csv }\n  sink:\n    type: jsonl\n    config: { path: ./out.jsonl, append: true }\nverify:\n  key: [id]\n",
+        );
+        assert!(!crate::verify::post_run_skips(
+            &expand(&readable).unwrap()[0]
+        ));
+        // `faucet verify` itself refuses.
+        for (kind, config, why) in [
+            ("webhook", serde_json::json!({}), "removes or acknowledges"),
+            (
+                "webhook",
+                serde_json::json!({"ack": "on_receive"}),
+                "has side effects",
+            ),
+            ("postgres-cdc", serde_json::json!({}), "has side effects"),
+        ] {
+            let err = crate::verify::refuse_unrepeatable_read("r", "source", kind, &config)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(why) && err.contains("verify reads outside the pipeline"),
+                "{kind}: {err}"
+            );
+        }
+        crate::verify::refuse_unrepeatable_read("r", "source", "postgres", &serde_json::json!({}))
+            .unwrap();
     }
 
     fn cdc_unwrap(config: serde_json::Value) -> Vec<TransformSpec> {

@@ -1420,14 +1420,17 @@ pub fn sink_destination_patch(kind: &str, cfg: &Value, tag: &str) -> Option<Valu
 }
 
 /// Config-level mirror of `Source::consumes_destructively` for the built-in
-/// queue sources: reading them acks, deletes or settles messages as the
-/// pipeline moves past each page (`sqs`, `pubsub`, `rabbitmq`, and `nats` in
-/// JetStream mode). Lets graph validation refuse them without building a
-/// connector (#789 MSG-14).
+/// sources whose read cannot be repeated once the pipeline moves past a page:
+/// queue sources ack, delete or settle messages (`sqs`, `pubsub`, `rabbitmq`,
+/// and `nats` in JetStream mode), and the `webhook` source with `ack:
+/// on_commit` (its default) answers each sender once its page is written
+/// (#1032). Lets graph validation refuse them without building a connector
+/// (#789 MSG-14).
 pub fn source_kind_consumes_destructively(kind: &str, config: &Value) -> bool {
     match kind {
         "sqs" | "pubsub" | "rabbitmq" => true,
         "nats" => config.get("jetstream_stream").is_some_and(|v| !v.is_null()),
+        "webhook" => config.get("ack").and_then(Value::as_str) != Some("on_receive"),
         _ => false,
     }
 }

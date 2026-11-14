@@ -41,6 +41,10 @@ jobs:
         with:
           toolchain: "1.99.1"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Restore only: the repository cache budget is kept for CI's
+          # required checks (see the note above `jobs:` in ci.yml).
+          save-if: false
       - name: Run the ignored SQL Server CDC suites
         run: >-
           scripts/retry-on-image-pull.sh cargo test -p faucet-source-mssql-cdc --all-features
@@ -84,6 +88,10 @@ jobs:
           dir="$(ls -d /opt/oracle/instantclient_* | sort -V | tail -1)"
           echo "LD_LIBRARY_PATH=$dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Restore only: the repository cache budget is kept for CI's
+          # required checks (see the note above `jobs:` in ci.yml).
+          save-if: false
       - name: Pull Docker Hub images through a mirror
         # Avoids Docker Hub's anonymous pull rate limit on shared runners.
         env:
@@ -133,6 +141,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Restore only: the repository cache budget is kept for CI's
+          # required checks (see the note above `jobs:` in ci.yml).
+          save-if: false
       - name: Seed the secrets
         run: |
           set -euo pipefail
@@ -169,6 +181,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Restore only: the repository cache budget is kept for CI's
+          # required checks (see the note above `jobs:` in ci.yml).
+          save-if: false
       - name: Run the ignored scaffold build tests
         run: cargo test -p faucet-cli --test scaffold_build -- --ignored
 

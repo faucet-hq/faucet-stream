@@ -56,7 +56,7 @@ The full example is
 | `catch_up` | Default `true`: after a gap (no server running, or the server fell behind), run the latest missed tick once. `false` skips missed ticks. Either way missed ticks are counted. |
 | `overlap` | What a tick does while a run from an earlier tick is still going: `skip` it (default), `queue` it until that run ends, or `forbid` (record the tick as failed). |
 | `paused` | Start paused. |
-| `template.id`, `version` | A registered template and a version selector (`stable` by default, resolved at each tick; a number pins it). |
+| `template.id`, `version` | A registered template and a version selector (`stable` by default, resolved at each tick; a number pins it, written as `3` or `"3"` in the file and the API alike). |
 | `template.params` | Param values. `${schedule.tick}`, `${schedule.name}` and `${schedule.fired_at}` are filled in at each tick. |
 | `template.sink`, `sink_version` | The sink template a source template runs with. |
 | `template.overlay`, `overlay_version` | A deployment overlay. |

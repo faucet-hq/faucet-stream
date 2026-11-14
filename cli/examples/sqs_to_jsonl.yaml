@@ -20,3 +20,6 @@ pipeline:
     type: file
     config:
       path: ./out/sqs_events.jsonl
+      # Append: the queue deletes what each run acknowledges, so a run must
+      # not replace the previous run's output.
+      if_exists: append

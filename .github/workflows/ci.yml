@@ -36,6 +36,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Cache budget (#1031). The repository's Actions cache holds 10 GB, and
+  # GitHub evicts the least recently used entries once it is full. Every job
+  # that saves a Rust cache competes for it: when the 145-entry feature
+  # isolation matrix saved too, it filled the 10 GB on every `main` run and
+  # evicted the coverage, test and clippy caches, so the required checks always
+  # compiled cold. Only the slowest required checks save, on `main`:
+  #   - Coverage (one shared entry, saved by the `unit` shard)
+  #   - Test
+  #   - Clippy
+  # Every other job runs with `save-if: false`. Before letting another job
+  # save, check that the total still fits: `gh api
+  # repos/faucet-hq/faucet-stream/actions/caches --jq '.actions_caches[] |
+  # [.key, .size_in_bytes]'` after a `main` run.
   # Detect whether a PR touches anything that can affect the build/tests. When a
   # PR only changes docs / workflows / assets, the heavy (non-required) jobs
   # below skip. Pushes to main always run everything (the `github.event_name`
@@ -242,7 +255,7 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: false # cache budget: see the note above `jobs:`
           workspaces: skills/faucet-connector/examples/${{ matrix.crate }}
       # The crates depend on crates.io `faucet-core = "1"` as a third-party
       # connector would; patch them onto this commit's faucet-core and
@@ -303,7 +316,7 @@ jobs:
           sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: false # cache budget: see the note above `jobs:`
       # Fail on any rustdoc warning (broken intra-doc links, etc.) so the
       # docs.rs render stays clean. The `doc_cfg` feature-badge path itself is
       # nightly-only and exercised by docs.rs, not here.
@@ -477,7 +490,7 @@ jobs:
           toolchain: "1.99.1"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: false # cache budget: see the note above `jobs:`
         if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
       - name: Engine guarantee suites (Category A) + state-format gates (Category G)
         # No Docker, no network: the scripted doubles inject failures at exact
@@ -518,7 +531,7 @@ jobs:
           sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: false # cache budget: see the note above `jobs:`
       - name: Serve-ui + serve-openapi isolation tests
         run: cargo test -p faucet-cli --features serve-ui --test serve_ui --test serve_openapi
 
@@ -555,7 +568,7 @@ jobs:
           sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: false # cache budget: see the note above `jobs:`
       - name: Tests that read docs
         run: >-
           cargo test --no-fail-fast -p faucet-cli --all-features
@@ -823,7 +836,7 @@ jobs:
         run: echo "key=${FEATURES//,/__}" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: false # cache budget: see the note above `jobs:`
           key: ${{ steps.cache-key.outputs.key }}
       - name: Install librdkafka prerequisites (Ubuntu)
         if: runner.os == 'Linux'
@@ -889,7 +902,7 @@ jobs:
         run: echo "key=${FEATURES//,/__}" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: false # cache budget: see the note above `jobs:`
           key: ${{ steps.cache-key.outputs.key }}
       - if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
         run: cargo build -p faucet-cli --no-default-features --features "${{ matrix.features }}"
@@ -949,7 +962,7 @@ jobs:
           echo "C:\\Program Files\\NASM" >> "$GITHUB_PATH"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: false # cache budget: see the note above `jobs:`
       - name: Build the shipped CLI
         run: cargo build -p faucet-cli --features "$SHIPPED_FEATURES"
       - name: Smoke-test the binary
@@ -985,7 +998,7 @@ jobs:
           toolchain: "1.99.1"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: false # cache budget: see the note above `jobs:`
       - name: Install valgrind and gungraun-runner
         run: |
           sudo apt-get update
@@ -1040,7 +1053,7 @@ jobs:
           sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: false # cache budget: see the note above `jobs:`
       - name: Pull Docker Hub images through a mirror
         # Avoids Docker Hub's anonymous pull rate limit on shared runners.
         env:
@@ -1163,7 +1176,7 @@ jobs:
           sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: false # cache budget: see the note above `jobs:`
       # Excluded: faucet-cli / faucet-stream (see
       # scripts/semver-exclude.py for why) plus any crate not yet on crates.io
       # — computed, so a crate is guarded from its first release on without

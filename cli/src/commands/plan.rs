@@ -1045,7 +1045,7 @@ mod tests {
         let cfg_path = dir.path().join("q.yaml");
         std::fs::write(
             &cfg_path,
-            "version: 1\nname: q\npipeline:\n  source:\n    type: sqs\n    config:\n      queue_url: \"http://127.0.0.1:1/000000000000/orders\"\n      region: us-east-1\n      endpoint_url: \"http://127.0.0.1:1\"\n      credentials: { type: access_key, config: { access_key_id: t, secret_access_key: t } }\n      idle_timeout_secs: 1\n  sink: { type: jsonl, config: { path: out.jsonl } }\n",
+            "version: 1\nname: q\npipeline:\n  source:\n    type: sqs\n    config:\n      queue_url: \"http://127.0.0.1:1/000000000000/orders\"\n      region: us-east-1\n      endpoint_url: \"http://127.0.0.1:1\"\n      credentials: { type: access_key, config: { access_key_id: t, secret_access_key: t } }\n      idle_timeout_secs: 1\n  sink: { type: jsonl, config: { path: out.jsonl, append: true } }\n",
         )
         .unwrap();
         let args = PlanArgs {

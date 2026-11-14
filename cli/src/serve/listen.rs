@@ -130,7 +130,7 @@ mod tests {
         let cfg = crate::config::PipelineConfig::from_value(serde_json::json!({
             "version": 1,
             "pipeline": { "source": { "type": "webhook", "config": source },
-                          "sink": { "type": "jsonl", "config": { "path": "o.jsonl" } } }
+                          "sink": { "type": "jsonl", "config": { "path": "o.jsonl", "append": true } } }
         }))
         .unwrap();
         crate::expand::expand(&cfg).unwrap()

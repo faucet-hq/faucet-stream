@@ -144,7 +144,7 @@ mod tests {
     fn webhook(config: Value) -> Value {
         serde_json::json!({ "version": 1, "pipeline": {
             "source": { "type": "webhook", "config": config },
-            "sink": { "type": "jsonl", "config": { "path": "o.jsonl" } } } })
+            "sink": { "type": "jsonl", "config": { "path": "o.jsonl", "append": true } } } })
     }
 
     fn refused(doc: Value, needle: &str) {
@@ -182,7 +182,7 @@ mod tests {
         );
         let topology = serde_json::json!({ "version": 1, "pipeline": {
             "sources": { "hook": { "type": "webhook", "config": {} } },
-            "sinks": { "out": { "type": "jsonl", "config": { "path": "o.jsonl" } } },
+            "sinks": { "out": { "type": "jsonl", "config": { "path": "o.jsonl", "append": true } } },
             "nodes": {
                 "in": { "kind": "source", "ref": "hook", "config": { "batch_size": 0 } },
                 "w": { "kind": "sink", "ref": "out" }
