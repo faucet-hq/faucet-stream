@@ -113,6 +113,16 @@ partition chunk, or several matrix rows on one table — since its source covers
 only part of the destination and every other row's data would count as a
 difference (and `allow_delete` would remove it). `faucet verify` refuses such
 a shared-destination row too.
+
+Verify also refuses a source it cannot read a second time without harm: one
+that consumes what it reads (a queue, or a `webhook` source, which answers
+senders once their events are written) or whose read has side effects (a CDC
+replication slot or capture position, a Kafka consumer group, a listener).
+Verify reads outside the pipeline, so reading such a source would acknowledge
+events or move the real pipeline's position, and it has no stable data set to
+compare. Verify against the table the stream is copied from instead. The
+refusal is raised by `faucet validate` when a `verify:` block applies, and by
+`faucet verify`.
 The command's flags (`--repair`, `--allow-delete`, `--max-differences`)
 override the block for that invocation; without a block, `faucet verify` uses
 the defaults above.

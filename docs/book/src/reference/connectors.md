@@ -52,7 +52,7 @@ Legend: ✓ supported · ✗ not applicable. Tier: T1 = passes the faucet-confor
 | MongoDB | T1 ✅ | `source-mongodb` | ✓ | ✗ | ✗ | ✗ | ✓ | `find()` with filter/projection/sort |
 | MongoDB CDC | T1 ✅ | `source-mongodb-cdc` | ✓ | ✓ | **✓** | ✗ | ✗ | Change Streams, resumeToken bookmarks; `max_staged_records` buffer cap |
 | Redis | T1 ✅ | `source-redis` | ✓ | ✗ | ✗ | ✗ | ✗ | streams, lists, key patterns |
-| Webhook | T2 | `source-webhook` | ✗⁶ | ✗ | ✗ | ✗ | ✗ | temporary HTTP server collecting POSTs |
+| Webhook | T2 | `source-webhook` | ✗⁶ | ✗ | ✗ | ✗ | ✗ | temporary HTTP server collecting POSTs; answers each sender once its event is written (`ack: on_commit`) |
 | WebSocket | T1 ✅ | `source-websocket` | ✓ | ✗ | ✗ | ✗ | ✗ | live push feed; subscribe frames, reconnect, ping keepalive |
 | CSV *(deprecated: use `file`)* | T1 ✅ | `source-csv` | ✓ | ✗ | ✗ | ✓ | ✗ | CSV files as JSON; strict field count by default (`flexible: true` to tolerate ragged rows). For new configs prefer the file source |
 | Local files | T1 ✅ | `source-file` | ✓ | ✓ | ✗ | ✓ | ✓ | [file source](../cookbook/file-formats.md#the-local-file-source): a path, directory, glob or `http(s)://` URL; JSONL / JSON / CSV / Excel / XML / Parquet / Avro / ORC, format + compression resolved per file; incremental by mtime or name; hash-of-path sharding; Avro / ORC / Parquet join the columnar path |
@@ -135,8 +135,9 @@ individual tap — pair it with a keyed/upsert sink for clean, effectively-once
 > are cloud-only and tested against wiremock, which cannot validate real
 > idempotent dedup; the **GCS** source's bounded-memory check needs a real gRPC
 > backend (the emulator is REST-only); the **GCS** sink cannot be durably counted
-> against the emulator; the **webhook** source is buffer-shaped (no bounded-memory
-> page check); and the **Iceberg** sink is append-only with a terminal `flush`
+> against the emulator; the **webhook** source only produces records while
+> senders post to it (no bounded-memory page check; its page flow is tested
+> over real HTTP); and the **Iceberg** sink is append-only with a terminal `flush`
 > that does not fit the effectively-once replay check on iceberg-rust 0.10.0. The
 > **Singer bridge ⚠️** source passes the battery but is additionally **experimental
 > (v0, single-stream)**; the Singer bridge **sink** is experimental too — its
@@ -166,11 +167,13 @@ and the [stream-pages architecture note](https://github.com/faucet-hq/faucet-str
 `xml`, `postgres`, `postgres-cdc`, `mysql`, `mysql-cdc`, `mssql`, `mssql-cdc`, `sqlite`,
 `mongodb`, `mongodb-cdc`, `s3`/`gcs`/`azure-blob` (JSONL & raw-text modes), `parquet`,
 `csv`, `elasticsearch` (scroll), `kafka`, `kinesis`, `spanner`, `websocket`, `redis`,
-and `grpc` (server-streaming mode).
+`grpc` (server-streaming mode), and `webhook` with `ack: on_commit` (its default: pages
+flow while the receive window is open, and each sender is answered once its page is
+written).
 
 **Sources that intentionally keep the buffered default:** `grpc` unary mode (a single
-response — no paging primitive) and `webhook` (buffer-shaped by nature — it collects
-POSTs over a window). S3/GCS/Azure fall back to buffered for the JSON-array format only
+response — no paging primitive) and `webhook` with `ack: on_receive` (it collects
+POSTs over a window and emits them when it closes). S3/GCS/Azure fall back to buffered for the JSON-array format only
 (one array object must be parsed whole).
 
 ## Sinks
