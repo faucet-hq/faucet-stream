@@ -1,7 +1,8 @@
 # Daily RustSec advisory scan (#789 SUPPLY-03). The `Supply chain` CI job gates
 # merges; this catches advisories published between merges and files an issue
 # so someone triages them (fix the dependency, or add a dated `ignore` entry
-# with a reason to deny.toml).
+# with a reason to deny.toml). The issue names each advisory, and a green scan
+# closes it again (#1064).
 name: Advisories
 
 on:
@@ -23,35 +24,73 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.99.1"
+      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
+        with:
+          tool: cargo-deny@0.19.7
       - name: cargo deny check advisories
         id: deny
-        continue-on-error: true
-        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
-        with:
-          command: check advisories
-      - name: cargo deny check advisories (fuzz workspace)
-        id: deny_fuzz
-        continue-on-error: true
-        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
-        with:
-          manifest-path: fuzz/Cargo.toml
-          command: check advisories
+        env:
+          REPORT: ${{ runner.temp }}/advisories.md
+        run: |
+          set -uo pipefail
+          : > "$REPORT"
+          failed=0
+          for manifest in Cargo.toml fuzz/Cargo.toml; do
+            json="$RUNNER_TEMP/deny-$(dirname "$manifest" | tr / _).json"
+            # The JSON diagnostics go to stderr; print their messages to the log too.
+            cargo deny --manifest-path "$manifest" --all-features --format json --log-level warn \
+              check advisories 2> "$json"
+            status=$?
+            jq -r 'select(.type == "diagnostic") | .fields.message // empty' "$json" || true
+            if [ "$status" -ne 0 ]; then
+              failed=1
+              found=$(jq -r 'select(.type == "diagnostic" and .fields.severity == "error")
+                | if .fields.advisory then
+                    "- [\(.fields.advisory.id)](https://rustsec.org/advisories/\(.fields.advisory.id)) in `\(.fields.advisory.package)`: \(.fields.advisory.title)"
+                  else
+                    "- \(.fields.code): \(.fields.message)"
+                  end' "$json" 2>/dev/null | sort -u)
+              if [ -z "$found" ]; then
+                found="- the scan failed without naming an advisory (a tool or network error); see the run log"
+              fi
+              printf '**%s**\n%s\n\n' "$manifest" "$found" >> "$REPORT"
+            fi
+          done
+          echo "failed=$failed" >> "$GITHUB_OUTPUT"
       - name: Open or update the tracking issue
-        if: steps.deny.outcome == 'failure' || steps.deny_fuzz.outcome == 'failure'
+        if: steps.deny.outputs.failed == '1'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REPORT: ${{ runner.temp }}/advisories.md
         run: |
           title="RustSec advisory needs triage"
           body="The daily advisory scan failed: ${RUN_URL}
 
-          Fix the dependency (bump to a fixed release) or add a dated \`ignore\` entry with a reason to \`deny.toml\`."
+          $(cat "$REPORT")
+          Fix the dependency (bump to a fixed release) or add a dated \`ignore\` entry with a reason to \`deny.toml\`. This issue closes itself after the next green scan."
           existing=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --body "$body"
           else
             gh issue create --title "$title" --label bug --label tier-1 --body "$body"
           fi
+      - name: Close the tracking issue after a green scan
+        if: steps.deny.outputs.failed == '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="RustSec advisory needs triage"
+          gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[].number' |
+            while read -r n; do
+              gh issue close "$n" --reason completed --comment "The advisory scan is green again: ${RUN_URL}"
+            done
       - name: Fail when advisories are open
-        if: steps.deny.outcome == 'failure' || steps.deny_fuzz.outcome == 'failure'
+        if: steps.deny.outputs.failed != '0'
         run: exit 1
