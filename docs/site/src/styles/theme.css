@@ -356,3 +356,75 @@ site-search dialog mark { background: color-mix(in srgb, var(--fs-accent-fill) 2
 @media (max-width: 50rem) { .fs-filter-input { min-width: 0; flex-basis: 100%; } }
 .main-pane:has(.fs-nf) :is(.fs-crumbs, h1#_top) { display: none; }
 .sl-markdown-content .fs-nf .fs-nf-search { margin: 26px 0 30px !important; }
+
+/* ---------- readability pass (2026-11-14): calmer prose, tables, TOC ---------- */
+.sl-markdown-content { line-height: 1.75; }
+.sl-markdown-content :is(p, li) { text-wrap: pretty; }
+/* inline code: a quiet tint, no border, never split mid-token */
+.sl-markdown-content :not(pre) > code:not(:where(.not-content *)) {
+  font-size: .875em; padding: .14em .4em; border: 0; border-radius: 5px;
+  background: color-mix(in srgb, var(--fs-ink) 6.5%, transparent); color: var(--fs-ink);
+  white-space: nowrap; box-decoration-break: clone; -webkit-box-decoration-break: clone;
+}
+.sl-markdown-content :not(pre) > code.fs-long:not(:where(.not-content *)) { white-space: normal; overflow-wrap: anywhere; }
+.sl-markdown-content a > code:not(:where(.not-content *)) { color: inherit; }
+/* headings: clear seams between sections */
+.sl-markdown-content h2:not(:where(.not-content *)) { margin-top: 3.25rem; margin-bottom: .25rem; }
+.sl-markdown-content h3:not(:where(.not-content *)) { margin-top: 2.25rem; }
+.sl-markdown-content h4:not(:where(.not-content *)) { margin-top: 1.75rem; }
+.sl-markdown-content :is(h2, h3, h4) code { font-size: .86em; }
+/* lists: room between items, bold leads read as labels */
+.sl-markdown-content :is(ul, ol):not(:where(.not-content *)) { padding-inline-start: 1.35rem; }
+.sl-markdown-content li:not(:where(.not-content *)) + li { margin-top: .55rem; }
+.sl-markdown-content li > :is(ul, ol) { margin-top: .5rem; }
+.sl-markdown-content li::marker { color: var(--fs-faint); }
+/* asides breathe */
+.starlight-aside { padding: 16px 18px; line-height: 1.7; }
+.starlight-aside__content > * + * { margin-top: .6rem !important; }
+/* tables: scroll sideways instead of squashing columns */
+.sl-markdown-content table:not(:where(.not-content *)) { width: max-content; min-width: 100%; line-height: 1.6; }
+.sl-markdown-content table:not(:where(.not-content *)) :is(th, td) { padding: 11px 16px; vertical-align: top; }
+.sl-markdown-content table:not(:where(.not-content *)) td:first-child { white-space: nowrap; color: var(--fs-ink); }
+.sl-markdown-content table:not(:where(.not-content *)) td { max-width: 34rem; }
+.sl-markdown-content table:not(:where(.not-content *)) td :is(code, a) { white-space: nowrap; }
+.sl-markdown-content table:not(:where(.not-content *)) tbody tr:nth-child(even) td { background: color-mix(in srgb, var(--fs-bg-soft) 45%, transparent); }
+/* code blocks keep air around them */
+.sl-markdown-content .expressive-code { margin-block: 1.25rem 1.6rem !important; }
+/* inline-HTML charts (benchmarks) opt out of Starlight's sibling spacing */
+.sl-markdown-content :is(.viz-root, .bar-row, .viz-tile, .viz-group, .viz-legend) * { margin-top: 0 !important; }
+.sl-markdown-content .viz-root { line-height: 1.5; }
+.sl-markdown-content .viz-tile { padding: 16px 18px !important; }
+.sl-markdown-content .bar-row { align-items: center !important; margin: 8px 0 !important; }
+/* "On this page": a long list scrolls; items breathe */
+.right-sidebar { scrollbar-width: thin; }
+starlight-toc nav a { line-height: 1.4; padding-block: 5px !important; }
+starlight-toc nav ul ul a { font-size: 13px; }
+/* the filter scrolls with the page: a sticky box would sit at the top of every
+   viewport and pin the TOC's highlight on "Overview" */
+.fs-filter { position: static; }
+/* PageScripts marks each table's prose column (.fs-prose) and its short columns (.fs-short) */
+.sl-markdown-content table td.fs-prose { white-space: normal; }
+.sl-markdown-content table :is(td, th).fs-short { white-space: nowrap; }
+
+/* tables live in a scroll box (PageScripts wraps them); the table fills it and grows past it only when needed */
+.sl-markdown-content .fs-table { overflow-x: auto; border: 1px solid var(--fs-line); border-radius: 10px; background: var(--fs-bg-raised); margin-block: 1.25rem 1.6rem; }
+.sl-markdown-content .fs-table > table:not(:where(.not-content *)) { display: table; width: 100%; min-width: 100%; max-width: none; border: 0; border-radius: 0; margin: 0; background: none; overflow: visible; }
+.sl-markdown-content table.fs-wide td.fs-mid { width: 9.5rem; min-width: 9.5rem; }
+.sl-markdown-content table.fs-wide td.fs-prose { width: 40rem; min-width: 40rem; }
+.sl-markdown-content table:not(.fs-wide) td.fs-mid { min-width: 7.5rem; }
+/* scroll hint: soft shadows appear at an edge that has more table behind it */
+.sl-markdown-content .fs-table {
+  background:
+    linear-gradient(to right, var(--fs-bg-raised) 30%, transparent) left / 40px 100% no-repeat local,
+    linear-gradient(to left, var(--fs-bg-raised) 30%, transparent) right / 40px 100% no-repeat local,
+    radial-gradient(farthest-side at 0 50%, color-mix(in srgb, var(--fs-ink) 14%, transparent), transparent) left / 12px 100% no-repeat scroll,
+    radial-gradient(farthest-side at 100% 50%, color-mix(in srgb, var(--fs-ink) 14%, transparent), transparent) right / 12px 100% no-repeat scroll,
+    var(--fs-bg-raised);
+}
+.sl-markdown-content .fs-table th { background: color-mix(in srgb, var(--fs-bg-soft) 85%, transparent) !important; }
+@media (max-width: 50rem) { .sl-markdown-content table.fs-wide td.fs-prose { width: 18rem; min-width: 18rem; } }
+/* footnote lists under reference tables */
+.sl-markdown-content .fs-notes { margin-top: .75rem; font-size: 14px; line-height: 1.65; color: var(--fs-muted); }
+.sl-markdown-content .fs-notes ul { list-style: none; padding-inline-start: 0 !important; }
+.sl-markdown-content .fs-notes li + li { margin-top: .5rem; }
+.sl-markdown-content .fs-notes :is(strong, b) { color: var(--fs-ink-2); }

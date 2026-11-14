@@ -79,36 +79,20 @@ connector's config schema and advertised capabilities; that tier shows in
 | Cloud Spanner | T1 ✅ᵉ | `source-spanner` | ✓ | ✓⁸ | ✗ | ✗ | ✓ | streaming SQL (gRPC), incremental `@bookmark` replication in cursor order, stale reads, PK-range sharding |
 | Singer bridge ⚠️ | T2 ⚠️ | `source-singer` | ✓ | ✓⁹ | ✗ | ✗ | ✗ | runs an external Singer tap; NDJSON over stdout, STATE→bookmark. **Tier-2 / experimental** |
 
-¹⁰ **Discover** = enumerates the datasets behind the connection for
-[`faucet discover`](/faucet-stream/cookbook/discover/) (tables / collections / indices /
-prefixes with schemas + row estimates where the catalog provides them).
-ᵒ REST supports discovery with an `odata:` block (via the OData `$metadata`
-(EDMX) catalog — one dataset per entity set) **or** a generic `discovery:`
-recipe (a config-driven list → describe → emit pipeline — one dataset per
-listed object, with a templated source config, typed schema, and optional
-per-object sink `table_id`).
-¹ **Streams** = yields records in bounded-memory batches rather than buffering the
-whole result. ² **Resumable** = persists a bookmark to a [state store](/faucet-stream/cookbook/state/)
-so re-runs continue where they left off (incremental replication / CDC / Kafka
-offsets). ³ **Effectively-once** = the source emits a complete resume position on
-every page and replaying from a bookmark continues the record stream at exactly
-that position (immutable-log sources: CDC WAL/binlog/change streams, Kafka
-partition offsets); required for the atomic-watermark mechanism behind
-`delivery: exactly_once` — see
-[Effectively-once delivery](/faucet-stream/cookbook/state/#effectively-once-delivery).
-⁴ gRPC streams natively in *server-streaming* mode; unary buffers the
-single response. ⁵ S3/GCS stream in JSONL and raw-text modes; JSON-array mode
-buffers one object. ⁶ Webhook is buffer-shaped by nature (it collects POSTs over
-a window). ⁸ The SQL query sources (PostgreSQL, MySQL, MSSQL, Oracle,
-Redshift, ClickHouse, Databricks, Cloud Spanner) are resumable only in
-`replication: incremental` mode (they persist a tracking-column bookmark); in
-`full` mode they are not. In incremental mode they read in cursor order,
-bookmark every page and never skip rows that share a cursor value — see
-[Incremental SQL queries](/faucet-stream/cookbook/state/#incremental-sql-queries).
-⁹ The Singer bridge is resumable via the tap's `STATE` messages, but the
-*granularity* of resume (and whether re-emitted rows overlap) depends on the
-individual tap — pair it with a keyed/upsert sink for clean, effectively-once
-(idempotent at-least-once) behavior.
+<div class="fs-notes">
+
+- ¹⁰ **Discover** = enumerates the datasets behind the connection for [`faucet discover`](/faucet-stream/cookbook/discover/) (tables / collections / indices / prefixes with schemas + row estimates where the catalog provides them).
+- ᵒ REST supports discovery with an `odata:` block (via the OData `$metadata` (EDMX) catalog — one dataset per entity set) **or** a generic `discovery:` recipe (a config-driven list → describe → emit pipeline — one dataset per listed object, with a templated source config, typed schema, and optional per-object sink `table_id`).
+- ¹ **Streams** = yields records in bounded-memory batches rather than buffering the whole result.
+- ² **Resumable** = persists a bookmark to a [state store](/faucet-stream/cookbook/state/) so re-runs continue where they left off (incremental replication / CDC / Kafka offsets).
+- ³ **Effectively-once** = the source emits a complete resume position on every page and replaying from a bookmark continues the record stream at exactly that position (immutable-log sources: CDC WAL/binlog/change streams, Kafka partition offsets); required for the atomic-watermark mechanism behind `delivery: exactly_once` — see [Effectively-once delivery](/faucet-stream/cookbook/state/#effectively-once-delivery).
+- ⁴ gRPC streams natively in *server-streaming* mode; unary buffers the single response.
+- ⁵ S3/GCS stream in JSONL and raw-text modes; JSON-array mode buffers one object.
+- ⁶ Webhook is buffer-shaped by nature (it collects POSTs over a window).
+- ⁸ The SQL query sources (PostgreSQL, MySQL, MSSQL, Oracle, Redshift, ClickHouse, Databricks, Cloud Spanner) are resumable only in `replication: incremental` mode (they persist a tracking-column bookmark); in `full` mode they are not. In incremental mode they read in cursor order, bookmark every page and never skip rows that share a cursor value — see [Incremental SQL queries](/faucet-stream/cookbook/state/#incremental-sql-queries).
+- ⁹ The Singer bridge is resumable via the tap's `STATE` messages, but the *granularity* of resume (and whether re-emitted rows overlap) depends on the individual tap — pair it with a keyed/upsert sink for clean, effectively-once (idempotent at-least-once) behavior.
+
+</div>
 
 :::note[Support tiers]
 (the **Tier** column above). A connector is **Tier-1 ✅**
@@ -301,51 +285,14 @@ config this project treats as a defect.
 | Amazon DynamoDB | T1 ✅ᵉ | `sink-dynamodb` | ✓ | ✗ | **✓** | ✗ | per-row | `BatchWriteItem` (25 items / 16 MiB per request) with unprocessed-item retry, bounded concurrency; `write_mode: upsert\|delete` by the table key; optional `condition_expression` writes (`on_condition_failure`) |
 | Databricks SQL | T1 ✅ᵐ | `sink-databricks` | ✓ | ✗ | **✓** | **✓** | best-effort | Statement Execution API into a Delta table: multi-row `INSERT` / `MERGE`, or staged `COPY INTO` (Unity Catalog volume, or `s3://`/`gs://`/`abfss://` with the `sink-databricks-staging` feature); per-token idempotent page write + commit-token table for effectively-once |
 
-⁶ Parquet and Iceberg both handle compression internally at the Parquet column
-level, so the file-level `compression` feature doesn't apply to either.
-⁷ **Effectively-once** = commits data and a watermark token atomically; required for
-`delivery: exactly_once`. The BigQuery sink does this via a multi-statement
-`MERGE` transaction (distinct from its default bulk-load append path); the
-Kafka sink uses a transactional producer that writes each page's records plus a
-commit-token record into a compacted side-topic in one Kafka transaction; the
-Snowflake sink runs one multi-statement `BEGIN;INSERT;MERGE;COMMIT` request; the
-Redis sink wraps the page plus a `_faucet_commit_token:<scope>` key in one
-`MULTI`/`EXEC`; the Databricks sink makes each page's write idempotent per token
-(`INSERT … REPLACE WHERE _faucet_scope/_faucet_seq`, or a keyed `MERGE`) and then
-advances a `_faucet_commit_token` Delta table, so a replayed page replaces its
-earlier attempt; the MongoDB sink commits the page plus a watermark document in
-one multi-document transaction (replica set required); the Cloud Spanner sink
-buffers the page's mutations plus a `faucet_commit_token` row in one
-read-write transaction; the Oracle sink upserts a `_faucet_commit_token`
-row in the page's transaction. Sinks configured with
-`write_mode: upsert` + `key` also reach effectively-once via keyed dedup, with
-any source. See
-[Effectively-once delivery](/faucet-stream/cookbook/state/#effectively-once-delivery).
-⁹ **Batch atomicity** (#737) = what a failed sink write leaves behind: **atomic**
-(nothing lands), **per-row** (per-row outcomes; a whole-write error means nothing
-from that write landed), or **best-effort** (some rows may already have
-landed). `on_batch_error: dlq_all` is refused on a best-effort sink — replaying
-the DLQ would write the landed rows a second time — unless the sink writes by
-key (`write_mode: upsert|delete`) or the `dlq:` block sets
-`allow_duplicates_on_dlq_all: true`. The conditions in brackets are the sink
-config that makes a write all-or-nothing; see
-[Batch atomicity and `dlq_all`](/faucet-stream/cookbook/dlq/#batch-atomicity-and-dlq_all).
-⁸ **Upsert** = supports `write_mode: upsert` / `delete` (insert-or-update and
-delete by `key`) in addition to plain `append`. The SQL sinks require
-column-mapping mode (`auto_map`, or `auto_columns` for mssql) and a
-UNIQUE/PRIMARY KEY on `key`; the
-schemaless sinks (MongoDB, Elasticsearch) map `key` to a match filter / `_id`;
-DynamoDB requires `key` to name the table's partition (+ sort) key; Databricks
-`MERGE`s on `key`.
-Iceberg upsert is not yet supported (a follow-up, blocked on `iceberg-rust`).
-`write_mode: overwrite` (full-refresh: atomically replace the whole
-destination each run) is additionally supported by **PostgreSQL, SQLite, MySQL,
-MSSQL, Oracle, MongoDB, BigQuery, Databricks, and Elasticsearch** (via an atomic alias
-swap — the configured `index` must be an alias), and by the append-only **local file**,
-**S3**, **GCS**, **Azure Blob** and **SFTP** sinks (files staged under a hidden
-directory or key prefix and moved into place on success) — not Spanner or
-DynamoDB. See
-[Upsert / mirror tables](/faucet-stream/cookbook/upsert/).
+<div class="fs-notes">
+
+- ⁶ Parquet and Iceberg both handle compression internally at the Parquet column level, so the file-level `compression` feature doesn't apply to either.
+- ⁷ **Effectively-once** = commits data and a watermark token atomically; required for `delivery: exactly_once`. The BigQuery sink does this via a multi-statement `MERGE` transaction (distinct from its default bulk-load append path); the Kafka sink uses a transactional producer that writes each page's records plus a commit-token record into a compacted side-topic in one Kafka transaction; the Snowflake sink runs one multi-statement `BEGIN;INSERT;MERGE;COMMIT` request; the Redis sink wraps the page plus a `_faucet_commit_token:<scope>` key in one `MULTI`/`EXEC`; the Databricks sink makes each page's write idempotent per token (`INSERT … REPLACE WHERE _faucet_scope/_faucet_seq`, or a keyed `MERGE`) and then advances a `_faucet_commit_token` Delta table, so a replayed page replaces its earlier attempt; the MongoDB sink commits the page plus a watermark document in one multi-document transaction (replica set required); the Cloud Spanner sink buffers the page's mutations plus a `faucet_commit_token` row in one read-write transaction; the Oracle sink upserts a `_faucet_commit_token` row in the page's transaction. Sinks configured with `write_mode: upsert` + `key` also reach effectively-once via keyed dedup, with any source. See [Effectively-once delivery](/faucet-stream/cookbook/state/#effectively-once-delivery).
+- ⁹ **Batch atomicity** (#737) = what a failed sink write leaves behind: **atomic** (nothing lands), **per-row** (per-row outcomes; a whole-write error means nothing from that write landed), or **best-effort** (some rows may already have landed). `on_batch_error: dlq_all` is refused on a best-effort sink — replaying the DLQ would write the landed rows a second time — unless the sink writes by key (`write_mode: upsert|delete`) or the `dlq:` block sets `allow_duplicates_on_dlq_all: true`. The conditions in brackets are the sink config that makes a write all-or-nothing; see [Batch atomicity and `dlq_all`](/faucet-stream/cookbook/dlq/#batch-atomicity-and-dlq_all).
+- ⁸ **Upsert** = supports `write_mode: upsert` / `delete` (insert-or-update and delete by `key`) in addition to plain `append`. The SQL sinks require column-mapping mode (`auto_map`, or `auto_columns` for mssql) and a UNIQUE/PRIMARY KEY on `key`; the schemaless sinks (MongoDB, Elasticsearch) map `key` to a match filter / `_id`; DynamoDB requires `key` to name the table's partition (+ sort) key; Databricks `MERGE`s on `key`. Iceberg upsert is not yet supported (a follow-up, blocked on `iceberg-rust`). `write_mode: overwrite` (full-refresh: atomically replace the whole destination each run) is additionally supported by **PostgreSQL, SQLite, MySQL, MSSQL, Oracle, MongoDB, BigQuery, Databricks, and Elasticsearch** (via an atomic alias swap — the configured `index` must be an alias), and by the append-only **local file**, **S3**, **GCS**, **Azure Blob** and **SFTP** sinks (files staged under a hidden directory or key prefix and moved into place on success) — not Spanner or DynamoDB. See [Upsert / mirror tables](/faucet-stream/cookbook/upsert/).
+
+</div>
 
 Every sink in this column except **DynamoDB**, **Databricks** and **Oracle** also supports
 **scoped cleanup** (`complete_for.on_missing: delete` on the source), which deletes

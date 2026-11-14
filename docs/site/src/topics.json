@@ -17,7 +17,7 @@
             "slug": "getting-started/installation"
           },
           {
-            "label": "Agent skills (Claude Code, Codex)",
+            "label": "Agent skills",
             "slug": "getting-started/agent-skills"
           },
           {
@@ -25,7 +25,7 @@
             "slug": "getting-started/first-pipeline"
           },
           {
-            "label": "Try it locally (interactive demo)",
+            "label": "Try it locally",
             "slug": "getting-started/try-it-locally"
           },
           {
@@ -38,7 +38,7 @@
         "label": "Understand",
         "items": [
           {
-            "label": "Learn the architecture (interactive)",
+            "label": "Learn the architecture",
             "slug": "getting-started/learn"
           }
         ]
@@ -47,7 +47,7 @@
         "label": "Tutorials",
         "items": [
           {
-            "label": "REST API → BigQuery (incremental)",
+            "label": "REST API → BigQuery",
             "slug": "tutorials/rest-to-bigquery"
           },
           {
@@ -55,11 +55,11 @@
             "slug": "tutorials/postgres-cdc"
           },
           {
-            "label": "Multi-pipeline DAGs with matrix",
+            "label": "Multi-pipeline DAGs",
             "slug": "tutorials/matrix-dag"
           },
           {
-            "label": "Embedding faucet as a Rust library",
+            "label": "Embedding in Rust",
             "slug": "tutorials/library"
           }
         ]
@@ -84,11 +84,11 @@
             "slug": "cookbook/sql-transform"
           },
           {
-            "label": "WASM transform (custom code)",
+            "label": "WASM transform",
             "slug": "cookbook/wasm-transforms"
           },
           {
-            "label": "Topology mode (tee / merge / join)",
+            "label": "Topology (tee / merge / join)",
             "slug": "cookbook/topology"
           }
         ]
@@ -105,7 +105,7 @@
             "slug": "cookbook/auth"
           },
           {
-            "label": "Source discovery (auto-generate configs)",
+            "label": "Source discovery",
             "slug": "cookbook/discover"
           },
           {
@@ -122,7 +122,7 @@
             "slug": "cookbook/state"
           },
           {
-            "label": "Pipeline state & status (faucet state / faucet status)",
+            "label": "State & status",
             "slug": "cookbook/state-and-status"
           },
           {
@@ -130,11 +130,11 @@
             "slug": "cookbook/upsert"
           },
           {
-            "label": "Mirror (snapshot → CDC)",
+            "label": "Mirror: snapshot → CDC",
             "slug": "cookbook/replication"
           },
           {
-            "label": "Backfill (historical replay)",
+            "label": "Backfill",
             "slug": "cookbook/backfill"
           },
           {
@@ -146,15 +146,15 @@
             "slug": "cookbook/dlq"
           },
           {
-            "label": "Content verification (faucet verify)",
+            "label": "Content verification",
             "slug": "cookbook/verify"
           },
           {
-            "label": "Undoing a run (faucet rollback)",
+            "label": "Undoing a run",
             "slug": "cookbook/rollback"
           },
           {
-            "label": "Resilience (retry / circuit breaker / poison-pill)",
+            "label": "Resilience",
             "slug": "cookbook/resilience"
           },
           {
@@ -204,7 +204,7 @@
             "slug": "cookbook/templates"
           },
           {
-            "label": "Template Hub: source × sink templates",
+            "label": "Template Hub templates",
             "slug": "cookbook/template-hub"
           },
           {
@@ -229,19 +229,19 @@
         "label": "Observability & lineage",
         "items": [
           {
-            "label": "SLA monitoring (freshness & volume)",
+            "label": "SLA monitoring",
             "slug": "cookbook/sla"
           },
           {
-            "label": "Column profiling (learned baselines & drift)",
+            "label": "Column profiling",
             "slug": "cookbook/profiling"
           },
           {
-            "label": "Notifications (Slack / PagerDuty / webhook)",
+            "label": "Notifications",
             "slug": "cookbook/notifications"
           },
           {
-            "label": "Lineage (OpenLineage)",
+            "label": "Lineage",
             "slug": "cookbook/lineage"
           },
           {
@@ -265,7 +265,7 @@
             "slug": "cookbook/approvals"
           },
           {
-            "label": "Embedded integrations (multi-tenant)",
+            "label": "Embedded integrations",
             "slug": "cookbook/embedded-integrations"
           }
         ]
@@ -286,11 +286,11 @@
             "slug": "reference/connectors"
           },
           {
-            "label": "Connector conformance & tiers",
+            "label": "Conformance & tiers",
             "slug": "reference/conformance"
           },
           {
-            "label": "Connector capability matrix",
+            "label": "Capability matrix",
             "slug": "reference/capability-matrix"
           },
           {
@@ -306,7 +306,7 @@
             "slug": "reference/choosing"
           },
           {
-            "label": "Template Hub — source × sink matrix",
+            "label": "Template Hub matrix",
             "slug": "reference/template-hub-matrix"
           }
         ]
@@ -323,11 +323,11 @@
             "slug": "reference/config"
           },
           {
-            "label": "Editor setup (autocomplete & validation)",
+            "label": "Editor setup",
             "slug": "reference/editor-setup"
           },
           {
-            "label": "HTTP API (faucet serve)",
+            "label": "HTTP API",
             "slug": "reference/http-api"
           },
           {
@@ -352,15 +352,15 @@
             "slug": "operations/deploying"
           },
           {
-            "label": "Running faucet as a service",
+            "label": "Running as a service",
             "slug": "cookbook/serve"
           },
           {
-            "label": "Web console (serve-ui)",
+            "label": "Web console",
             "slug": "cookbook/web-console"
           },
           {
-            "label": "MCP server (agent tools)",
+            "label": "MCP server",
             "slug": "cookbook/mcp"
           },
           {
@@ -385,7 +385,7 @@
             "slug": "cookbook/schedules"
           },
           {
-            "label": "Orchestration (Airflow / Dagster + dbt)",
+            "label": "Orchestration",
             "slug": "cookbook/orchestration"
           }
         ]
@@ -402,7 +402,7 @@
             "slug": "operations/reliability-testing"
           },
           {
-            "label": "Chaos testing faucet serve",
+            "label": "Chaos testing",
             "slug": "operations/chaos-testing"
           },
           {
@@ -410,7 +410,7 @@
             "slug": "operations/tuning"
           },
           {
-            "label": "Troubleshooting with faucet doctor",
+            "label": "faucet doctor",
             "slug": "cookbook/troubleshooting"
           },
           {
@@ -423,19 +423,19 @@
         "label": "Upgrade & maintain",
         "items": [
           {
-            "label": "Pinning the faucet version",
+            "label": "Pinning the version",
             "slug": "operations/pinning"
           },
           {
-            "label": "Upgrading faucet safely",
+            "label": "Upgrading safely",
             "slug": "operations/upgrading"
           },
           {
-            "label": "Migrating from Meltano, Singer or Airbyte",
+            "label": "Migrating to faucet",
             "slug": "operations/migrating"
           },
           {
-            "label": "Backing up the server database",
+            "label": "Backing up the server",
             "slug": "operations/backup"
           }
         ]
@@ -456,7 +456,7 @@
             "slug": "extending/authoring-connectors"
           },
           {
-            "label": "Connector protocol (FCP v0)",
+            "label": "Connector protocol",
             "slug": "spec/faucet-connector-spec-v0"
           },
           {
@@ -464,7 +464,7 @@
             "slug": "extending/marketplace"
           },
           {
-            "label": "Embedding faucet in another tool",
+            "label": "Embedding faucet",
             "slug": "extending/embedding"
           }
         ]
@@ -481,15 +481,15 @@
         "label": "Comparisons",
         "items": [
           {
-            "label": "How faucet-stream compares",
+            "label": "How faucet compares",
             "slug": "comparison"
           },
           {
-            "label": "Benchmarks (vs Meltano)",
+            "label": "Benchmarks",
             "slug": "comparison/benchmarks"
           },
           {
-            "label": "vs. Meltano (Singer)",
+            "label": "vs. Meltano",
             "slug": "comparison/meltano"
           },
           {
@@ -501,7 +501,7 @@
             "slug": "comparison/singer"
           },
           {
-            "label": "vs. Redpanda Connect (Benthos)",
+            "label": "vs. Redpanda Connect",
             "slug": "comparison/redpanda-connect"
           },
           {

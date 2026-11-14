@@ -47,14 +47,31 @@
       let active: Element | undefined;
       contents.forEach((c) => { const on = c.getAttribute('data-mode') === mode; c.classList.toggle('active', on); if (on) active = c; });
       if (user && active && !revealed[mode]) { revealed[mode] = true; onReveal(active); }
+      // Starlight's TOC watches headings that were visible when it started; rebuild it for the new mode.
+      if (user) { dispatchEvent(new Event('fs-layout')); dispatchEvent(new Event('resize')); }
       try { localStorage.setItem(MODE_KEY, mode); } catch {}
     };
     buttons.forEach((b) => b.addEventListener('click', () => apply(b.dataset.mode!, true)));
+    // A TOC link (or a #hash) pointing into the hidden mode switches to it first, then scrolls there.
+    const reveal = (hash: string) => {
+      const target = hash ? document.getElementById(decodeURIComponent(hash.slice(1))) : null;
+      const section = target?.closest('.mode-content');
+      if (!target || !section || section.classList.contains('active')) return false;
+      apply(section.getAttribute('data-mode')!, true);
+      requestAnimationFrame(() => target.scrollIntoView());
+      return true;
+    };
+    document.addEventListener('click', (e) => {
+      const a = (e.target as HTMLElement).closest<HTMLAnchorElement>('a[href^="#"]');
+      if (a && reveal(a.hash)) { e.preventDefault(); history.pushState(null, '', a.hash); }
+    });
+    addEventListener('hashchange', () => reveal(location.hash));
     let saved: string | null = null;
     try { saved = localStorage.getItem(MODE_KEY); } catch {}
     const initial = saved === 'architect' ? 'architect' : 'beginner';
     revealed[initial] = true;
     apply(initial, false);
+    reveal(location.hash);
   }
 
   type Mermaid = { initialize: (c: object) => void; run: (o: { nodes: HTMLElement[] }) => Promise<void> };
@@ -151,8 +168,102 @@
     apply();
   }
 
+  function longCode() {
+    document.querySelectorAll<HTMLElement>('.sl-markdown-content :not(pre) > code').forEach((c) => {
+      if ((c.textContent || '').length > 40) c.classList.add('fs-long');
+    });
+  }
+
+  // The last sections of a page are often too short for their heading to reach the top of the
+  // window, so the TOC can never mark them current. Give the page just enough room below.
+  function tocTailRoom() {
+    const links = [...document.querySelectorAll<HTMLAnchorElement>('starlight-toc nav a[href^="#"]')];
+    const last = links.length > 1 ? document.getElementById(decodeURIComponent(links[links.length - 1].hash.slice(1))) : null;
+    const main = document.querySelector<HTMLElement>('.main-pane');
+    if (!last || !main) return;
+    const apply = () => {
+      main.style.paddingBottom = '';
+      const nav = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--sl-nav-height')) * 16 || 64;
+      const top = last.getBoundingClientRect().top + scrollY;
+      const room = document.documentElement.scrollHeight - top;
+      const need = innerHeight - nav - 32 - room;
+      if (need > 0) main.style.paddingBottom = `${Math.ceil(need)}px`;
+    };
+    apply();
+    addEventListener('resize', apply, { passive: true });
+    addEventListener('load', apply, { once: true });
+    addEventListener('fs-layout', apply);
+  }
+
+  // Clicking a TOC item marks it current once the page has scrolled to its heading; Starlight's own
+  // tracking can miss a heading that lands just above its detection band (short or revealed sections).
+  function tocClickSelects() {
+    document.addEventListener('click', (e) => {
+      const a = (e.target as HTMLElement).closest<HTMLAnchorElement>('starlight-toc a[href^="#"], mobile-starlight-toc a[href^="#"]');
+      if (!a) return;
+      const hash = a.hash;
+      setTimeout(() => {
+        const target = document.getElementById(decodeURIComponent(hash.slice(1)));
+        if (!target) return;
+        const top = target.getBoundingClientRect().top;
+        if (top < -4 || top > innerHeight * 0.5) return;
+        document.querySelectorAll<HTMLElement & { current?: HTMLAnchorElement }>('starlight-toc, mobile-starlight-toc').forEach((toc) => {
+          const link = [...toc.querySelectorAll<HTMLAnchorElement>('a')].find((l) => l.hash === hash);
+          if (link) toc.current = link;
+        });
+      }, 700);
+    });
+  }
+
+  // Keep the highlighted TOC item in view when the list is longer than the window.
+  function tocFollow() {
+    const pane = document.querySelector<HTMLElement>('.right-sidebar');
+    const toc = document.querySelector('starlight-toc');
+    if (!pane || !toc) return;
+    new MutationObserver(() => {
+      const cur = toc.querySelector<HTMLElement>('a[aria-current="true"]');
+      if (!cur) return;
+      const p = pane.getBoundingClientRect(), c = cur.getBoundingClientRect();
+      if (c.top < p.top + 48 || c.bottom > p.bottom - 24) pane.scrollTo({ top: pane.scrollTop + (c.top - p.top) - p.height / 3, behavior: 'smooth' });
+    }).observe(toc, { subtree: true, attributes: true, attributeFilter: ['aria-current'] });
+  }
+
+  // Size each table by its content: the column with the most text gets a readable width, short
+  // columns never wrap. Avoids squashed tables without guessing which column is the prose.
+  function tables() {
+    document.querySelectorAll<HTMLTableElement>('.sl-markdown-content table').forEach((t) => {
+      const rows = [...t.rows];
+      const cols = Math.max(...rows.map((r) => r.cells.length));
+      const len = (c?: HTMLTableCellElement) => (c?.textContent || '').trim().length;
+      const avg: number[] = [], max: number[] = [];
+      for (let i = 0; i < cols; i++) {
+        const body = rows.slice(1).map((r) => len(r.cells[i]));
+        avg[i] = body.reduce((a, b) => a + b, 0) / Math.max(body.length, 1);
+        max[i] = Math.max(0, ...rows.map((r) => len(r.cells[i])));
+      }
+      const prose = avg.indexOf(Math.max(...avg));
+      if (cols >= 6) t.classList.add('fs-wide');
+      rows.forEach((r) => [...r.cells].forEach((c, i) => {
+        if (i === prose && avg[i] > 45) c.classList.add('fs-prose');
+        else if (max[i] <= 28) c.classList.add('fs-short');
+        else if (c.tagName === 'TD') c.classList.add('fs-mid');
+      }));
+      if (!t.parentElement?.classList.contains('fs-table')) {
+        const box = document.createElement('div');
+        box.className = 'fs-table';
+        t.replaceWith(box);
+        box.appendChild(t);
+      }
+    });
+  }
+
   function init() {
     buildFlows();
+    tables();
+    longCode();
+    tocTailRoom();
+    tocFollow();
+    tocClickSelects();
     catalogFilter();
     learnToggle((c) => renderMermaid(c));
     if (document.querySelector('pre.mermaid')) {
