@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.6.3](https://github.com/faucet-hq/faucet-stream/compare/faucet-conformance-v1.6.2...faucet-conformance-v1.6.3) - 2026-11-14
+
+### Bug Fixes
+
+- *(webhook)* Review follow-ups — declared consumes_destructively capability, per-run paths, page cap ([#1081](https://github.com/faucet-hq/faucet-stream/pull/1081))
+
+### Documentation
+
+- Switch the docs site to Astro Starlight and remove mdBook ([#1080](https://github.com/faucet-hq/faucet-stream/pull/1080))
+
 ## [1.6.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-conformance-v1.6.1...faucet-conformance-v1.6.2) - 2026-11-12
 
 ### Bug Fixes

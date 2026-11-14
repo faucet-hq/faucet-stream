@@ -4663,7 +4663,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-cli"
-version = "1.18.2"
+version = "1.18.3"
 dependencies = [
  "aho-corasick",
  "arrow 58.4.1",
@@ -5291,7 +5291,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-conformance"
-version = "1.6.2"
+version = "1.6.3"
 dependencies = [
  "arrow 58.4.1",
  "async-stream",
@@ -5309,7 +5309,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-core"
-version = "1.17.0"
+version = "1.17.1"
 dependencies = [
  "aes-gcm 0.11.0",
  "apache-avro 0.22.0",
@@ -5487,7 +5487,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-registry"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "faucet-auth",
  "faucet-core",
@@ -6832,7 +6832,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-nats"
-version = "1.2.3"
+version = "1.2.4"
 dependencies = [
  "async-nats",
  "async-stream",
@@ -6971,7 +6971,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-pubsub"
-version = "1.3.2"
+version = "1.3.3"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -6994,7 +6994,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-rabbitmq"
-version = "1.1.3"
+version = "1.1.4"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -7232,7 +7232,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-sqs"
-version = "1.3.2"
+version = "1.3.3"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -7255,7 +7255,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-source-webhook"
-version = "1.4.2"
+version = "1.4.3"
 dependencies = [
  "async-trait",
  "axum",
@@ -7353,7 +7353,7 @@ dependencies = [
 
 [[package]]
 name = "faucet-stream"
-version = "1.11.2"
+version = "1.11.3"
 dependencies = [
  "faucet-auth",
  "faucet-common-azure",

@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.4.3](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-webhook-v1.4.2...faucet-source-webhook-v1.4.3) - 2026-11-14
+
+### Bug Fixes
+
+- *(webhook)* Review follow-ups — declared consumes_destructively capability, per-run paths, page cap ([#1081](https://github.com/faucet-hq/faucet-stream/pull/1081))
+- Webhook answers after commit, numeric schedule versions, self-closing advisory issue, coverage cache budget ([#1074](https://github.com/faucet-hq/faucet-stream/pull/1074))
+
+### Documentation
+
+- Switch the docs site to Astro Starlight and remove mdBook ([#1080](https://github.com/faucet-hq/faucet-stream/pull/1080))
+
 ## [1.4.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-webhook-v1.4.1...faucet-source-webhook-v1.4.2) - 2026-11-12
 
 ### Bug Fixes

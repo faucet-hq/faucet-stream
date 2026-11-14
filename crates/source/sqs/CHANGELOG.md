@@ -7,6 +7,12 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
 
+## [1.3.3](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-sqs-v1.3.2...faucet-source-sqs-v1.3.3) - 2026-11-14
+
+### Bug Fixes
+
+- *(webhook)* Review follow-ups — declared consumes_destructively capability, per-run paths, page cap ([#1081](https://github.com/faucet-hq/faucet-stream/pull/1081))
+
 ## [1.3.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-sqs-v1.3.1...faucet-source-sqs-v1.3.2) - 2026-11-12
 
 ### Bug Fixes
