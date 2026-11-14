@@ -13,7 +13,7 @@ description: "Write your own connector, publish it, or embed the faucet engine i
 
 <div class="fs-dlist">
 <a href="/faucet-stream/extending/authoring-connectors/"><b>Authoring a connector</b></a>
-<a href="/faucet-stream/spec/faucet-connector-spec-v0/"><b>Connector protocol (FCP v0)</b></a>
+<a href="/faucet-stream/spec/faucet-connector-spec-v0/"><b>Connector protocol</b></a>
 <a href="/faucet-stream/extending/marketplace/"><b>Connector marketplace</b></a>
-<a href="/faucet-stream/extending/embedding/"><b>Embedding faucet in another tool</b></a>
+<a href="/faucet-stream/extending/embedding/"><b>Embedding faucet</b></a>
 </div>
