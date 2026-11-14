@@ -26,6 +26,14 @@ pub struct Sample {
 /// not durably write what it reads — the messages would leave the queue for
 /// good (#789 MSG-01).
 pub fn destructive_read_refusal(kind: &str, command: &str) -> String {
+    if kind == "webhook" {
+        return format!(
+            "the `webhook` source answers each sender once its event is written (`ack: \
+             on_commit`), and {command} does not durably write what it reads, so senders would \
+             be told their events were delivered when they were not; set `ack: on_receive` on \
+             the source to read it this way, or run the pipeline for real"
+        );
+    }
     format!(
         "the `{kind}` source removes messages from its queue as it reads them, and {command} \
          does not durably write what it reads, so those messages would be lost; run against a \
@@ -395,6 +403,17 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn the_webhook_refusal_names_the_setting_that_allows_it() {
+        let webhook = destructive_read_refusal("webhook", "--dry-run");
+        assert!(
+            webhook.contains("ack: on_receive") && webhook.contains("--dry-run"),
+            "{webhook}"
+        );
+        let queue = destructive_read_refusal("sqs", "preview");
+        assert!(queue.contains("removes messages from its queue"), "{queue}");
     }
 
     #[tokio::test]

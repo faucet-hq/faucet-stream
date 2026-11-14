@@ -1,17 +1,104 @@
 fn state(max_payloads: Option<usize>, closed: bool) -> std::sync::Arc<super::AppState> {
+    held_state(max_payloads, closed, false, 0)
+}
+
+fn held_state(
+    max_payloads: Option<usize>,
+    closed: bool,
+    hold: bool,
+    max_held: usize,
+) -> std::sync::Arc<super::AppState> {
     std::sync::Arc::new(super::AppState {
         inbox: tokio::sync::Mutex::new(super::Inbox {
-            records: Vec::new(),
-            bytes: 0,
             closed,
-            seen: HashMap::new(),
+            ..Default::default()
         }),
         max_payloads,
         max_buffered_bytes: 0,
         done: tokio::sync::Notify::new(),
         auth_token: None,
         signature: None,
+        hold,
+        max_held,
+        arrived: tokio::sync::Notify::new(),
+        abort: faucet_core::CancellationToken::new(),
     })
+}
+
+#[test]
+fn take_count_emits_on_count_age_or_close() {
+    use std::time::Duration;
+    let hold = Duration::from_secs(5);
+    let young = Some(Duration::from_secs(1));
+    let old = Some(Duration::from_secs(5));
+    assert_eq!(super::take_count(0, None, true, 10, hold), None);
+    assert_eq!(super::take_count(3, young, false, 10, hold), None);
+    assert_eq!(super::take_count(10, young, false, 10, hold), Some(10));
+    assert_eq!(super::take_count(12, young, false, 10, hold), Some(10));
+    assert_eq!(super::take_count(3, old, false, 10, hold), Some(3));
+    assert_eq!(super::take_count(30, old, false, 10, hold), Some(10));
+    assert_eq!(super::take_count(3, young, true, 10, hold), Some(3));
+    // `batch_size: 0` drops the count trigger and takes everything.
+    assert_eq!(super::take_count(5000, young, false, 0, hold), None);
+    assert_eq!(super::take_count(5000, old, false, 0, hold), Some(5000));
+}
+
+#[tokio::test]
+async fn a_held_request_answers_after_its_page_is_acknowledged() {
+    let s = held_state(None, false, true, 0);
+    let post = tokio::spawn(send_payload(s.clone()));
+    // Wait until the request is held, then answer it as the stream would.
+    let held = loop {
+        if let Some(h) = s.inbox.lock().await.held.pop_front() {
+            break h;
+        }
+        tokio::task::yield_now().await;
+    };
+    assert_eq!(held.record, serde_json::json!({"a": 1}));
+    assert!(!post.is_finished());
+    held.tx.send(()).unwrap();
+    assert_eq!(post.await.unwrap().status(), axum::http::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_dropped_page_or_an_abort_answers_retry_later() {
+    let s = held_state(None, false, true, 0);
+    let post = tokio::spawn(send_payload(s.clone()));
+    let held = loop {
+        if let Some(h) = s.inbox.lock().await.held.pop_front() {
+            break h;
+        }
+        tokio::task::yield_now().await;
+    };
+    drop(held);
+    let resp = post.await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.headers()[axum::http::header::RETRY_AFTER], "60");
+
+    // A request still in the inbox when the stream goes away is answered too.
+    let post = tokio::spawn(send_payload(s.clone()));
+    while s.inbox.lock().await.held.is_empty() {
+        tokio::task::yield_now().await;
+    }
+    s.abort.cancel();
+    assert_eq!(
+        post.await.unwrap().status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+}
+
+#[tokio::test]
+async fn requests_over_max_held_are_refused_and_not_stored() {
+    let s = held_state(None, false, true, 1);
+    let _first = tokio::spawn(send_payload(s.clone()));
+    while s.inbox.lock().await.held.is_empty() {
+        tokio::task::yield_now().await;
+    }
+    let resp = send_payload(s.clone()).await;
+    assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    let inbox = s.inbox.lock().await;
+    assert_eq!((inbox.held.len(), inbox.stored), (1, 1));
+    assert!(!inbox.closed);
 }
 
 async fn send_payload(state: std::sync::Arc<super::AppState>) -> axum::response::Response {
@@ -181,6 +268,10 @@ async fn handler_never_exceeds_cap_under_concurrent_posts() {
         done: Notify::new(),
         auth_token: None,
         signature: None,
+        hold: false,
+        max_held: 0,
+        arrived: Notify::new(),
+        abort: faucet_core::CancellationToken::new(),
     });
 
     let mut handles = Vec::new();
@@ -229,6 +320,10 @@ async fn webhook_collects_payloads() {
         done: Notify::new(),
         auth_token: config.auth_token.clone(),
         signature: None,
+        hold: false,
+        max_held: 0,
+        arrived: Notify::new(),
+        abort: faucet_core::CancellationToken::new(),
     });
 
     let server_state = Arc::clone(&state);
@@ -339,6 +434,10 @@ async fn webhook_handles_non_json_body() {
         done: Notify::new(),
         auth_token: None,
         signature: None,
+        hold: false,
+        max_held: 0,
+        arrived: Notify::new(),
+        abort: faucet_core::CancellationToken::new(),
     });
 
     let server_state = Arc::clone(&state);

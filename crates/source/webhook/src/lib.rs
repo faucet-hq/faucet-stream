@@ -10,7 +10,9 @@ pub mod stream;
 
 pub use faucet_core::{FaucetError, Source};
 
-pub use config::{SignatureAlgorithm, SignatureEncoding, WebhookSignature, WebhookSourceConfig};
+pub use config::{
+    AckMode, SignatureAlgorithm, SignatureEncoding, WebhookSignature, WebhookSourceConfig,
+};
 pub use stream::WebhookSource;
 
 /// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.

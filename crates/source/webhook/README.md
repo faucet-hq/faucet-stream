@@ -7,11 +7,12 @@
 
 A **webhook receiver** source that starts a temporary HTTP server, collects incoming `POST` payloads as JSON records, and then hands them to the pipeline. Part of the [faucet-stream](https://github.com/faucet-hq/faucet-stream) ecosystem.
 
-Reach for it to capture push-style events — GitHub/GitLab hooks, payment events, SaaS callbacks, IoT pushes — without standing up a separate ingestion service. The server is short-lived: it runs for a bounded receive window (a timeout and/or a payload cap), drains everything it collected, and shuts down. Built on [`axum`](https://crates.io/crates/axum) + [`tokio`](https://crates.io/crates/tokio), with a constant-time shared-secret check and a hard request-body cap so a single huge POST can't exhaust memory.
+Reach for it to capture push-style events — GitHub/GitLab hooks, payment events, SaaS callbacks, IoT pushes — without standing up a separate ingestion service. The server is short-lived: it runs for a bounded receive window (a timeout and/or a payload cap) and shuts down. By default it answers a sender's `POST` only after the pipeline has written its event, so a failed run never loses an event it acknowledged (see [Acknowledgement](#acknowledgement)). Built on [`axum`](https://crates.io/crates/axum) + [`tokio`](https://crates.io/crates/tokio), with a constant-time shared-secret check and a hard request-body cap so a single huge POST can't exhaust memory.
 
 ## Feature highlights
 
 - **Zero-infrastructure receiver** — one `axum` route, bound on demand; no broker or queue to operate.
+- **Acknowledged means written** — with `ack: on_commit` (the default) a sender gets `200` only once its event's page has been written and flushed; if the run fails first it gets `503` + `Retry-After` and retries.
 - **Bounded receive window** — terminates on `timeout_secs`, on `max_payloads`, or both (whichever comes first), so a run always completes.
 - **Lenient body parsing** — JSON bodies become native JSON values; non-JSON-but-UTF-8 bodies become JSON strings; non-UTF-8 bodies are rejected with `400`.
 - **Request-size guard** — `max_body_bytes` (default 1 MiB) rejects oversized POSTs with `413` before buffering them.
@@ -90,11 +91,19 @@ The receive window ends as soon as **any** configured condition is met; the serv
 | `auth_token` | string \| null | `null` | Optional shared secret. When set, requests must carry it in the `Authorization` header (raw value or `Bearer <token>`); others get `401`. Comparison is constant-time. An empty or blank value is refused. Strongly recommended whenever `listen_addr` isn't loopback. |
 | `signature` | object \| null | `null` | HMAC verification of the raw body for senders that sign requests: `header` (signature header), `secret`, `algorithm` (`sha256` default / `sha512`), `encoding` (`hex` default, case-insensitive / `base64`), optional `prefix` (e.g. `sha256=`), optional `timestamp_header` (then the signed content is `<timestamp>.<body>` and a timestamp more than `tolerance_secs` — default 300 — from now is refused, and a request repeating one already stored in the window gets `200` without being stored again; the timestamp must be plain unix seconds, as the content is rebuilt from its integer value). One signature per request in the `<timestamp>.<body>` layout is supported — schemes that sign another layout (`v0:<ts>:<body>`), pack `t=…,v1=…` into one header, send several signatures during key rotation, or use URL-safe / unpadded base64 cannot be verified. Checked in constant time; failures get `401`. |
 
+### Acknowledgement
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `ack` | `on_commit` \| `on_receive` | `on_commit` | When a sender's `POST` is answered. `on_commit`: after the pipeline has written and flushed its event. `on_receive`: as soon as it is held in memory (the behaviour before #1032), which loses acknowledged events if the run fails before the sink commits them. See [Acknowledgement](#acknowledgement). |
+| `max_hold_secs` | int | `5` | `ack: on_commit`: the longest a held request waits before its page is emitted, 1 to 300. |
+| `max_held` | int | `1000` | `ack: on_commit`: the most requests held open at once. Above it a `POST` is refused with `503` + `Retry-After` and not stored. `0` removes the cap. In a config submitted to `faucet serve` it may be at most 100,000. |
+
 ### Batching
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `batch_size` | int | `1000` | Records per emitted `StreamPage` when chunking the collected buffer downstream. `0` is the "no batching" sentinel — emit the whole flush window in one page. See [Streaming & batching](#streaming--batching). Validated against `MAX_BATCH_SIZE` (1,000,000) at load time. |
+| `batch_size` | int | `1000` | Records per emitted `StreamPage`. With `ack: on_commit` a page is emitted while the window is open, once this many requests are held (or the oldest has waited `max_hold_secs`); `0` drops the count trigger. With `ack: on_receive` the window's events are emitted when it closes, in pages of this size; `0` emits them as one page. Validated against `MAX_BATCH_SIZE` (1,000,000) at load time. |
 
 ## Authentication
 
@@ -175,15 +184,31 @@ pipeline:
       path: ./telemetry.parquet
 ```
 
+## Acknowledgement
+
+A webhook sender does not keep its events: once it gets a `2xx`, it considers the event delivered. So the source answers only when that is true.
+
+**`ack: on_commit` (default).** Each accepted `POST` is held open. While the window is open the source emits a page as soon as `batch_size` requests are held or the oldest has waited `max_hold_secs`. Every page carries a bookmark (`{"received": n}`), so the pipeline writes the page, runs its quality / contract / DLQ passes, flushes the sink and saves state before it asks for the next page. When it asks, the source answers that page's requests `200`.
+
+- **The run fails** (a sink error, a budget, a crash): every held request is answered `503` + `Retry-After: 60`, or its connection drops. The sender retries; nothing it was told was delivered is lost.
+- **The run is cancelled** (`faucet serve` cancel, timeout, shutdown): the window closes, what is held is emitted and written, and those senders get `200`.
+- **Duplicates are possible:** a page written just before a crash, or a sink write slower than the sender's timeout, leads the sender to retry an event that was already written. Deduplicate on the sender's delivery id with `write_mode: upsert` and a `key`.
+- **`200` means "handled by your pipeline's rules"**, not always "stored": rows dropped by a `filter`, a contract in `warn` mode or a drift `ignore` policy, or sent to the DLQ, are acknowledged once their page is processed.
+- **How long a sender waits:** up to `max_hold_secs` plus the sink's write time, and up to twice the write time when a write is already in progress. Keep that well under your senders' timeout (often 10–30 s). The source logs a warning when a sender waited more than 10 s.
+- **Open connections** are capped by `max_held` (default 1000).
+- **Commands that read without writing refuse this source:** `--dry-run`, `--limit`, `faucet preview`, `faucet plan --live`, `faucet verify`, topology graphs and `write_mode: overwrite`. A sink that replaces its output on every run (`file` with `if_exists: replace`, `jsonl` / `csv` without `append: true`) is refused too, because the next run would delete events already acknowledged.
+
+**`ack: on_receive`.** The behaviour before #1032: a `POST` is answered `200` as soon as it is held in memory, and the window's events are emitted when it closes. Events acknowledged this way are lost if the run fails before the sink commits them. Use it only when a sender cannot wait for the write.
+
+The buffered library calls (`WebhookSource::fetch_all`, `Source::fetch_with_context`) cannot know when their caller writes what they return, so they always answer on receipt.
+
 ## Streaming & batching
 
-The webhook source is **buffer-shaped**: it has no native streaming primitive, so it keeps the default chunk-the-buffer `Source::stream_pages` implementation. During the receive window the `axum` handler accumulates every accepted POST into an in-process `Vec`; once the window closes (timeout or `max_payloads`), the default trait impl chunks that buffer into pages of `batch_size` records.
+- With `ack: on_commit` pages flow while the window is open: one page per `batch_size` held requests, or what is held once the oldest has waited `max_hold_secs`. `batch_size = 0` emits only on `max_hold_secs` and when the window closes.
+- With `ack: on_receive` the window's events are emitted when it closes, `batch_size` per page (`0` = one page), with no bookmark.
+- Memory at receive time is bounded by `max_buffered_bytes` (256 MiB by default) per window; `timeout_secs` and `max_payloads` cap how much is collected.
 
-- `batch_size` shapes only the **downstream** page size handed to the sink — it does not change server-side buffering, which always pushes into the in-memory `Vec` until the receive window ends.
-- `batch_size = 0` emits the entire flush window in one page. For this source it is functionally equivalent to any positive value larger than the received payload count.
-- Memory at **receive** time is bounded by `max_buffered_bytes` (256 MiB by default); `timeout_secs` and `max_payloads` cap how much is collected, not `batch_size`.
-
-Every page carries `bookmark: None` — there is no incremental-replication or resume mode for a webhook receiver (see [Resume & state](#resume--state)).
+There is no resume position for a webhook receiver (see [Resume & state](#resume--state)); the `{"received": n}` bookmark on an `on_commit` page only makes the pipeline flush before the next page, and is never read back.
 
 ## Payload handling
 
@@ -196,12 +221,16 @@ Every page carries `bookmark: None` — there is no incremental-replication or r
 | Missing/wrong `auth_token` (when set) | *(not stored)* | `401 Unauthorized` |
 | Missing/invalid `signature` (when set) | *(not stored)* | `401 Unauthorized` |
 | Arriving after `max_payloads` is reached or the window closed | *(not stored)* | `503 Service Unavailable` + `Retry-After: 60` |
+| `ack: on_commit`, more than `max_held` requests already held | *(not stored)* | `503 Service Unavailable` + `Retry-After: 60` |
+| `ack: on_commit`, its page written and flushed | the parsed value | `200 OK`, sent then |
+| `ack: on_commit`, the run fails before its page is written | *(written or not, never acknowledged)* | `503 Service Unavailable` + `Retry-After: 60` |
+| A byte-identical resend of a signed request whose page is still being written | *(not stored again)* | `503 Service Unavailable` + `Retry-After: 60` |
 
 Only `POST` is routed; other methods on the path return `405 Method Not Allowed` from `axum`.
 
 ## Resume & state
 
-**Not supported.** A webhook receiver has no replayable position to bookmark — events are pushed to it, not pulled from an offset — so the source does not override `state_key()` / `apply_start_bookmark()` and emits `bookmark: None`. For at-most-once delivery to the sink within a single run, rely on `max_payloads` + `timeout_secs` to bound the window. If you need durable, replayable ingestion, push the events into a broker (e.g. Kafka or Redis Streams) and consume from there with a resumable source.
+**Not supported.** A webhook receiver has no replayable position to bookmark — events are pushed to it, not pulled from an offset — so a stored bookmark is never applied. With `ack: on_commit` the sender holds each event until it is written, which is what makes a failed run safe; if you need replayable ingestion beyond that, push the events into a broker (e.g. Kafka or Redis Streams) and consume from there with a resumable source.
 
 ## Config loading
 
@@ -292,7 +321,10 @@ println!("Processed {} webhook events", result.records_written);
 
 ## How it works
 
-`fetch_with_context` (and the convenience `fetch_all`) build a single-route `axum::Router` with a `DefaultBodyLimit` set to `max_body_bytes`, bind a `tokio::net::TcpListener` to `listen_addr`, and then `tokio::select!` three futures: the running server, a `timeout_secs` sleep, and a `Notify` that fires when `max_payloads` is reached. Whichever resolves first ends the window; the collected `Vec` is cloned out and returned.
+The source builds a single-route `axum::Router` with a `DefaultBodyLimit` set to `max_body_bytes` and binds a `tokio::net::TcpListener` to `listen_addr`. The window ends on the first of: `timeout_secs`, `max_payloads` / `max_buffered_bytes` reached, or (with `ack: on_commit`) the run's cancel.
+
+- **`ack: on_commit`** — the handler stores the request with a one-shot channel and, after releasing the inbox lock, waits on that channel or a run-wide abort token. The page stream takes held requests into pages and answers a page's channels when it is polled again. When the stream ends or is dropped, a guard cancels the abort token (every request still waiting gets `503`), stops the server, and aborts it after a 10 s grace.
+- **`ack: on_receive` and the buffered calls** — the handler pushes the payload into the window's buffer and answers at once; the buffer is returned when the window closes.
 
 - **Exact cap under concurrency** — each accepted POST decides under the shared records lock whether there's room and whether the cap is now satisfied, so concurrently in-flight requests can never push the buffer past `max_payloads` (surplus is dropped while still notifying `done`).
 - **Constant-time auth** — the shared-secret check uses `subtle::ConstantTimeEq` with a non-short-circuiting compare across both the raw and `Bearer` forms, so neither which form matched nor where the first differing byte is can be inferred from response timing.
@@ -333,13 +365,14 @@ The crate exports `DESCRIPTOR` (RFC 0013). It declares no optional source capabi
 ## How it is built
 
 The source runs on the family-neutral source driver (RFC 0014):
-`WebhookDriver` implements `faucet_core::driver::SourceDriver` — `fetch`
-serves the endpoint until the window closes and returns what arrived, `read`
-pages that by `batch_size` (`faucet_core::driver::pages_of`), and `check`
-probes the listen address without starting the receive loop — and
-`WebhookSource` wraps it in a `DriverSource`. Reads have side effects (a
-sender is answered), which the driver adds to the derived capabilities. The
-public type and config are unchanged.
+`WebhookDriver` implements `faucet_core::driver::SourceDriver`:
+
+- `read` streams held pages under `ack: on_commit`, or serves until the window closes and pages what arrived by `batch_size` under `ack: on_receive`.
+- `fetch` is the buffered read (answers on receipt).
+- `consumes_destructively` is `true` and `set_cancel` takes the run's cancel (the source drains) under `ack: on_commit`.
+- `check` probes the listen address without starting the receive loop.
+
+`WebhookSource` wraps it in a `DriverSource`. Reads have side effects (a sender is answered), which the driver adds to the derived capabilities.
 
 ## License
 

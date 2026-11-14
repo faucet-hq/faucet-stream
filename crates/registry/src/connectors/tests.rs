@@ -35,6 +35,20 @@ fn queue_sources_consume_destructively_by_kind() {
 }
 
 #[test]
+fn a_webhook_that_answers_after_commit_consumes_destructively() {
+    let empty = serde_json::json!({});
+    assert!(source_kind_consumes_destructively("webhook", &empty));
+    assert!(source_kind_consumes_destructively(
+        "webhook",
+        &serde_json::json!({"ack": "on_commit"})
+    ));
+    assert!(!source_kind_consumes_destructively(
+        "webhook",
+        &serde_json::json!({"ack": "on_receive"})
+    ));
+}
+
+#[test]
 fn bookmark_schema_and_migration_per_source_kind() {
     assert_eq!(source_state_schema("csv"), 0);
     assert_eq!(

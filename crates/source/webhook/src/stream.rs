@@ -1,15 +1,18 @@
 //! Webhook source stream executor.
 
-use crate::config::{SignatureAlgorithm, SignatureEncoding, WebhookSignature, WebhookSourceConfig};
+use crate::config::{
+    AckMode, SignatureAlgorithm, SignatureEncoding, WebhookSignature, WebhookSourceConfig,
+};
 use async_trait::async_trait;
 use axum::{Router, extract::State, http::StatusCode, routing::post};
 use faucet_core::driver::{DriverSource, PageStream, SourceDriver};
-use faucet_core::{CallSlot, FaucetError};
+use faucet_core::{CallSlot, CancellationToken, FaucetError, StreamPage};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, oneshot};
 
 /// Shared state for the webhook HTTP handler.
 struct AppState {
@@ -20,28 +23,64 @@ struct AppState {
     /// Optional shared secret required in the `Authorization` header.
     auth_token: Option<String>,
     signature: Option<WebhookSignature>,
+    /// `ack: on_commit`: hold each request until its page is committed.
+    hold: bool,
+    /// Most requests held at once (`0` = no cap).
+    max_held: usize,
+    /// Wakes the page stream when a request is held.
+    arrived: Notify,
+    /// Cancelled when the page stream ends or is dropped, so every request
+    /// still held is answered `503` instead of waiting for its client to time
+    /// out (connection tasks outlive the stream).
+    abort: CancellationToken,
 }
 
 /// Stored payloads plus the closed flag, under one lock so a payload is either
 /// stored before the window closes or refused with a retryable status.
 #[derive(Default)]
 struct Inbox {
+    /// `ack: on_receive`: payloads stored this window.
     records: Vec<Value>,
+    /// `ack: on_commit`: requests held until their page commits.
+    held: VecDeque<Held>,
+    /// Payloads accepted this window (the `max_payloads` count).
+    stored: usize,
     bytes: usize,
     closed: bool,
-    /// Signatures of stored timestamped requests, by their signed timestamp,
-    /// so a repeat inside the tolerance window is not stored twice.
-    seen: HashMap<String, u64>,
+    /// Signatures of stored timestamped requests, so a byte-identical resend
+    /// inside the tolerance window is not stored twice.
+    seen: HashMap<String, Seen>,
+}
+
+/// A held request: its record, and the channel its `200` is sent on once the
+/// page holding it is committed.
+struct Held {
+    record: Value,
+    tx: oneshot::Sender<()>,
+    at: Instant,
+    key: Option<String>,
+}
+
+/// A signed request already stored: its signed timestamp, and whether its
+/// page has been committed yet.
+#[derive(Debug, Clone, Copy)]
+struct Seen {
+    ts: u64,
+    committed: bool,
 }
 
 /// How long a refused sender is told to wait before retrying.
 const RETRY_AFTER_SECS: &str = "60";
 
 /// How long in-flight requests get to finish once the window closes.
-const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
+/// A page whose oldest request waited longer than this logs a warning: many
+/// senders give up after 10–30 s and retry.
+const SLOW_ACK: Duration = Duration::from_secs(10);
 
 impl WebhookDriver {
-    fn new_state(&self) -> Arc<AppState> {
+    fn new_state(&self, hold: bool) -> Arc<AppState> {
         Arc::new(AppState {
             inbox: Mutex::new(Inbox::default()),
             max_payloads: self.config.max_payloads,
@@ -49,6 +88,10 @@ impl WebhookDriver {
             done: Notify::new(),
             auth_token: self.config.auth_token.clone(),
             signature: self.config.signature.clone(),
+            hold,
+            max_held: self.config.max_held,
+            arrived: Notify::new(),
+            abort: CancellationToken::new(),
         })
     }
 
@@ -73,17 +116,27 @@ pub struct WebhookSource {
 /// The connector's I/O primitives (RFC 0014).
 pub(crate) struct WebhookDriver {
     config: WebhookSourceConfig,
+    /// The run's cancellation token (`ack: on_commit` drains on cancel).
+    cancel: std::sync::Mutex<Option<CancellationToken>>,
 }
 
 impl WebhookSource {
     /// Create a new webhook source from the given configuration.
     pub fn new(config: WebhookSourceConfig) -> Self {
         Self {
-            inner: DriverSource::new(WebhookDriver { config }),
+            inner: DriverSource::new(WebhookDriver {
+                config,
+                cancel: std::sync::Mutex::new(None),
+            }),
         }
     }
 
     /// Start the webhook server, collect payloads, and return them.
+    ///
+    /// This is a buffered read: it cannot know when the caller has written
+    /// what it returns, so it answers each POST when it is received, whatever
+    /// `ack` says. A pipeline reads through the page stream instead, which
+    /// honours `ack: on_commit`.
     pub async fn fetch_all(&self) -> Result<Vec<Value>, FaucetError> {
         self.inner.driver().fetch_all().await
     }
@@ -106,7 +159,7 @@ impl WebhookDriver {
     async fn receive(&self, path: &str) -> Result<Vec<Value>, FaucetError> {
         crate::config::validate_resolved_path(path)?;
         self.config.check_listener()?;
-        let state = self.new_state();
+        let state = self.new_state(false);
         let app = self.build_router(path, Arc::clone(&state));
 
         let listener = tokio::net::TcpListener::bind(&self.config.listen_addr)
@@ -377,61 +430,427 @@ async fn webhook_handler(
 
     let mut inbox = state.inbox.lock().await;
     if let Some((key, _, cutoff)) = &replay_key {
-        inbox.seen.retain(|_, ts| *ts >= *cutoff);
-        if inbox.seen.contains_key(key) {
+        // A key whose page is still being written stays until it commits.
+        inbox.seen.retain(|_, s| s.ts >= *cutoff || !s.committed);
+        match inbox.seen.get(key) {
             // The same signed request was already stored: acknowledge it again.
-            return StatusCode::OK.into_response();
+            Some(s) if s.committed => return StatusCode::OK.into_response(),
+            // Its first copy is still being written: ask the sender to retry.
+            Some(_) => return retry_later(),
+            None => {}
         }
     }
     // Decide under the lock so the cap is exact: concurrent in-flight POSTs
-    // that have already been accepted can't push the Vec past `max_payloads`.
+    // that have already been accepted can't push the count past `max_payloads`.
     // A payload that is not stored — over the cap, or after the window closed
     // — is refused with a retryable status rather than a `200` the sender
     // would read as delivered (API-14).
-    let decision = decide_payload(inbox.records.len(), state.max_payloads);
-    // An empty inbox always takes the payload, as the count cap does: a body
+    let decision = decide_payload(inbox.stored, state.max_payloads);
+    // An empty window always takes the payload, as the count cap does: a body
     // larger than the byte cap (allowed by `max_body_bytes`) would otherwise
     // be refused in every window and retried forever.
     let over_bytes = state.max_buffered_bytes > 0
-        && !inbox.records.is_empty()
+        && inbox.stored > 0
         && inbox.bytes.saturating_add(body.len()) > state.max_buffered_bytes;
     if decision.done || over_bytes {
         state.done.notify_one();
     }
     if inbox.closed || !decision.accept || over_bytes {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [(axum::http::header::RETRY_AFTER, RETRY_AFTER_SECS)],
-        )
-            .into_response();
+        return retry_later();
+    }
+    // Too many requests already held open: refuse without storing, so a slow
+    // sink cannot pile up connections. The window stays open.
+    if state.hold && state.max_held > 0 && inbox.held.len() >= state.max_held {
+        return retry_later();
     }
     inbox.bytes += body.len();
-    inbox.records.push(value);
+    inbox.stored += 1;
     if state.max_buffered_bytes > 0 && inbox.bytes >= state.max_buffered_bytes {
         // The window is full: emit it rather than wait for a refused POST.
         state.done.notify_one();
     }
-    if let Some((key, ts, _)) = replay_key {
-        inbox.seen.insert(key, ts);
+    let key = replay_key.map(|(key, ts, _)| {
+        inbox.seen.insert(
+            key.clone(),
+            Seen {
+                ts,
+                committed: !state.hold,
+            },
+        );
+        key
+    });
+    if !state.hold {
+        inbox.records.push(value);
+        return StatusCode::OK.into_response();
     }
-    StatusCode::OK.into_response()
+    let (tx, rx) = oneshot::channel();
+    inbox.held.push_back(Held {
+        record: value,
+        tx,
+        at: Instant::now(),
+        key,
+    });
+    state.arrived.notify_one();
+    // Release the lock before waiting: the page stream takes held requests
+    // under it.
+    drop(inbox);
+    tokio::select! {
+        biased;
+        acked = rx => match acked {
+            Ok(()) => StatusCode::OK.into_response(),
+            // The page was dropped unwritten (the run failed or was cancelled).
+            Err(_) => retry_later(),
+        },
+        () = state.abort.cancelled() => retry_later(),
+    }
+}
+
+/// `503 Service Unavailable` + `Retry-After`: the sender should try again.
+fn retry_later() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(axum::http::header::RETRY_AFTER, RETRY_AFTER_SECS)],
+    )
+        .into_response()
+}
+
+/// What woke the page stream while the window was open.
+enum Wake {
+    /// A request arrived, or the oldest held one reached `max_hold_secs`.
+    Look,
+    /// The window closed for this reason.
+    Close(&'static str),
+    /// The server task ended on its own.
+    Server(Result<std::io::Result<()>, tokio::task::JoinError>),
+}
+
+/// One `ack: on_commit` receive window: the listener, and the guard that
+/// answers every request still held with `503` however the stream ends.
+struct Session {
+    state: Arc<AppState>,
+    stop: Option<oneshot::Sender<()>>,
+    server: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+    window_end: tokio::time::Instant,
+    cancel: Option<CancellationToken>,
+}
+
+impl Session {
+    async fn open(driver: &WebhookDriver, path: &str) -> Result<Self, FaucetError> {
+        crate::config::validate_resolved_path(path)?;
+        driver.config.check_listener()?;
+        let state = driver.new_state(true);
+        let app = driver.build_router(path, Arc::clone(&state));
+        let listener = tokio::net::TcpListener::bind(&driver.config.listen_addr)
+            .await
+            .map_err(|e| {
+                FaucetError::Config(format!(
+                    "failed to bind to {}: {e}",
+                    driver.config.listen_addr
+                ))
+            })?;
+        tracing::info!(
+            addr = %driver.config.listen_addr,
+            path = %path,
+            "webhook server listening; each POST is answered once its page is written"
+        );
+        let (stop_tx, stop_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = stop_rx.await;
+                })
+                .into_future(),
+        );
+        let cancel = driver
+            .cancel
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        Ok(Self {
+            state,
+            stop: Some(stop_tx),
+            server: Some(server),
+            window_end: tokio::time::Instant::now()
+                + Duration::from_secs(driver.config.timeout_secs),
+            cancel,
+        })
+    }
+
+    /// The next page's held requests: `batch_size` of them (`0` = no count
+    /// trigger), or what is held once the oldest has waited `max_hold`, or
+    /// what is left once the window has closed. `None` when the window is
+    /// closed and nothing is held.
+    async fn next_batch(
+        &mut self,
+        batch_size: usize,
+        max_hold: Duration,
+    ) -> Result<Option<Vec<Held>>, FaucetError> {
+        loop {
+            let deadline = {
+                let mut inbox = self.state.inbox.lock().await;
+                if let Some(n) = take_count(
+                    inbox.held.len(),
+                    inbox.held.front().map(|h| h.at.elapsed()),
+                    inbox.closed,
+                    batch_size,
+                    max_hold,
+                ) {
+                    return Ok(Some(inbox.held.drain(..n).collect()));
+                }
+                if inbox.closed {
+                    return Ok(None);
+                }
+                inbox
+                    .held
+                    .front()
+                    .map(|h| tokio::time::Instant::from_std(h.at + max_hold))
+            };
+            let wake = {
+                let server = self.server.as_mut();
+                let cancel = self.cancel.clone();
+                #[allow(clippy::disallowed_methods)] // the collection window, not a backend wait
+                let aged = async {
+                    match deadline {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                };
+                #[allow(clippy::disallowed_methods)] // the collection window, not a backend wait
+                let window = tokio::time::sleep_until(self.window_end);
+                tokio::select! {
+                    () = self.state.arrived.notified() => Wake::Look,
+                    () = aged => Wake::Look,
+                    () = window => Wake::Close("webhook timeout reached"),
+                    () = self.state.done.notified() => Wake::Close("max payloads reached"),
+                    () = async {
+                        match &cancel {
+                            Some(token) => token.cancelled().await,
+                            None => std::future::pending().await,
+                        }
+                    } => Wake::Close("run cancelled; emitting what is held"),
+                    result = async {
+                        match server {
+                            Some(handle) => handle.await,
+                            None => std::future::pending().await,
+                        }
+                    } => Wake::Server(result),
+                }
+            };
+            match wake {
+                Wake::Look => {}
+                Wake::Close(why) => {
+                    tracing::info!("{why}");
+                    self.state.inbox.lock().await.closed = true;
+                }
+                Wake::Server(result) => {
+                    self.server = None;
+                    server_result(result)?;
+                    return Err(FaucetError::Source(
+                        "webhook server stopped before the receive window closed".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Answer `200` to every request of a committed page, and remember its
+    /// signed requests as committed.
+    async fn acknowledge(&self, page: Vec<(oneshot::Sender<()>, Option<String>)>) {
+        if page.is_empty() {
+            return;
+        }
+        let mut inbox = self.state.inbox.lock().await;
+        for key in page.iter().filter_map(|(_, k)| k.as_ref()) {
+            if let Some(seen) = inbox.seen.get_mut(key) {
+                seen.committed = true;
+            }
+        }
+        drop(inbox);
+        for (tx, _) in page {
+            // The client may have gone; its record is still written.
+            let _ = tx.send(());
+        }
+    }
+
+    /// Every held request is answered: stop the server and let in-flight
+    /// requests finish within the grace period.
+    async fn finish(&mut self) -> Result<(), FaucetError> {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(mut server) = self.server.take() {
+            match tokio::time::timeout(SHUTDOWN_GRACE, &mut server).await {
+                Ok(result) => server_result(result)?,
+                Err(_) => server.abort(),
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.state.abort.cancel();
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(mut server) = self.server.take() {
+            match tokio::runtime::Handle::try_current() {
+                Ok(rt) => {
+                    rt.spawn(async move {
+                        if tokio::time::timeout(SHUTDOWN_GRACE, &mut server)
+                            .await
+                            .is_err()
+                        {
+                            server.abort();
+                        }
+                    });
+                }
+                Err(_) => server.abort(),
+            }
+        }
+    }
+}
+
+/// How many held requests to take into the next page, if any: `batch_size`
+/// once that many are held (`0` = no count trigger), everything (up to
+/// `batch_size`) once the oldest has waited `max_hold` or the window has
+/// closed.
+fn take_count(
+    held: usize,
+    oldest_waited: Option<Duration>,
+    closed: bool,
+    batch_size: usize,
+    max_hold: Duration,
+) -> Option<usize> {
+    if held == 0 {
+        return None;
+    }
+    let cap = if batch_size == 0 {
+        held
+    } else {
+        batch_size.min(held)
+    };
+    let full = batch_size > 0 && held >= batch_size;
+    let aged = oldest_waited.is_some_and(|w| w >= max_hold);
+    (full || aged || closed).then_some(cap)
+}
+
+impl WebhookDriver {
+    /// `ack: on_commit`: serve while the window is open and emit each page
+    /// with a bookmark, so the pipeline writes and flushes it before polling
+    /// again; a page's requests are answered `200` at that next poll.
+    fn held_pages<'a>(&'a self, context: &'a HashMap<String, Value>) -> PageStream<'a> {
+        let max_hold = Duration::from_secs(self.config.max_hold_secs);
+        let batch_size = self.config.batch_size;
+        Box::pin(faucet_core::async_stream::try_stream! {
+            let path = self.resolve_path(context)?;
+            let mut session = Session::open(self, &path).await?;
+            let mut page_acks: Vec<(oneshot::Sender<()>, Option<String>)> = Vec::new();
+            let mut received = 0usize;
+            loop {
+                // Being polled again means the last page was written and flushed.
+                session.acknowledge(std::mem::take(&mut page_acks)).await;
+                let Some(batch) = session.next_batch(batch_size, max_hold).await? else {
+                    break;
+                };
+                received += batch.len();
+                let oldest = batch.first().map(|h| h.at);
+                let mut records = Vec::with_capacity(batch.len());
+                for held in batch {
+                    records.push(held.record);
+                    page_acks.push((held.tx, held.key));
+                }
+                tracing::debug!(records = records.len(), received, "webhook page emitted");
+                yield StreamPage {
+                    records,
+                    bookmark: Some(serde_json::json!({ "received": received })),
+                };
+                if let Some(at) = oldest
+                    && at.elapsed() > SLOW_ACK
+                {
+                    tracing::warn!(
+                        waited_secs = at.elapsed().as_secs(),
+                        "webhook: a sender waited over {}s for its event to be written; \
+                         lower `max_hold_secs` or speed up the sink, or senders may time out \
+                         and retry",
+                        SLOW_ACK.as_secs()
+                    );
+                }
+            }
+            session.finish().await?;
+            tracing::info!(records = received, "webhook receive window complete");
+        })
+    }
+
+    /// The endpoint path for this read: the configured one, or (with a
+    /// parent context) the template filled with percent-encoded values.
+    fn resolve_path(&self, context: &HashMap<String, Value>) -> Result<String, FaucetError> {
+        if context.is_empty() {
+            self.config.validate()?;
+            return Ok(self.config.path.clone());
+        }
+        // Percent-encode each value so a parent value cannot add segments or
+        // route syntax (API-49).
+        let encoded: HashMap<String, Value> = context
+            .iter()
+            .map(|(k, v)| {
+                let raw = match v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                (
+                    k.clone(),
+                    Value::String(faucet_core::encode_url_component(&raw)),
+                )
+            })
+            .collect();
+        self.config.validate_settings()?;
+        Ok(faucet_core::util::substitute_context(
+            &self.config.path,
+            &encoded,
+        ))
+    }
 }
 
 #[async_trait]
 impl SourceDriver for WebhookDriver {
-    /// Serve until the collection window closes, then emit what arrived:
-    /// one page per `batch_size` records.
+    /// `ack: on_commit` streams pages while the window is open and answers
+    /// each request after its page commits; `ack: on_receive` serves until
+    /// the window closes and then emits what arrived, `batch_size` per page.
     fn read<'a>(
         &'a self,
         _calls: &'a CallSlot,
         context: &'a HashMap<String, Value>,
-        batch_size: usize,
+        _batch_size: usize,
     ) -> PageStream<'a> {
+        if self.config.ack == AckMode::OnCommit {
+            return self.held_pages(context);
+        }
         Box::pin(faucet_core::async_stream::try_stream! {
-            for page in faucet_core::driver::pages_of(self.fetch_with_context(context).await?, None, batch_size) {
+            let records = self.fetch_with_context(context).await?;
+            for page in faucet_core::driver::pages_of(records, None, self.config.batch_size) {
                 yield page;
             }
         })
+    }
+
+    /// With `ack: on_commit` a read answers senders as the pipeline writes
+    /// their events, so reading without writing would acknowledge events
+    /// nobody stored.
+    fn consumes_destructively(&self) -> bool {
+        self.config.ack == AckMode::OnCommit
+    }
+
+    /// With `ack: on_commit`, a cancel closes the window and the source emits
+    /// what it holds, so it is written and answered rather than refused.
+    fn set_cancel(&self, cancel: CancellationToken) -> bool {
+        if self.config.ack != AckMode::OnCommit {
+            return false;
+        }
+        *self.cancel.lock().unwrap_or_else(|e| e.into_inner()) = Some(cancel);
+        true
     }
 
     async fn fetch(
@@ -500,28 +919,8 @@ impl WebhookDriver {
         &self,
         context: &std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<Vec<Value>, FaucetError> {
-        if context.is_empty() {
-            return self.fetch_all().await;
-        }
-
-        // Substitute context into the webhook path, percent-encoding each
-        // value so a parent value cannot add segments or route syntax (API-49).
-        let encoded: std::collections::HashMap<String, Value> = context
-            .iter()
-            .map(|(k, v)| {
-                let raw = match v {
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                (
-                    k.clone(),
-                    Value::String(faucet_core::encode_url_component(&raw)),
-                )
-            })
-            .collect();
-        self.config.validate_settings()?;
-        let resolved_path = faucet_core::util::substitute_context(&self.config.path, &encoded);
-        self.receive(&resolved_path).await
+        let path = self.resolve_path(context)?;
+        self.receive(&path).await
     }
 }
 

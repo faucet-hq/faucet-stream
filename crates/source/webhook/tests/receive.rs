@@ -3,7 +3,7 @@
 #![allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 
 use faucet_core::Source;
-use faucet_source_webhook::{WebhookSource, WebhookSourceConfig};
+use faucet_source_webhook::{AckMode, WebhookSource, WebhookSourceConfig};
 use hmac::{Mac, digest::KeyInit};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -378,13 +378,15 @@ async fn partial_segment_placeholders_resolve_and_unfilled_ones_fail() {
     assert_eq!(run.await.unwrap().unwrap().len(), 1);
 }
 
-/// RFC 0014: the pipeline's page stream serves what the window collected,
-/// `batch_size` records per page, with no bookmark.
+/// RFC 0014: with `ack: on_receive` the page stream serves what the window
+/// collected, `batch_size` records per page, with no bookmark.
 #[tokio::test]
 async fn the_page_stream_chunks_the_collected_payloads() {
     let addr = free_addr();
     let cfg = WebhookSourceConfig::new()
         .listen_addr(addr.clone())
+        .ack(AckMode::OnReceive)
+        .with_batch_size(2)
         .max_payloads(3)
         .timeout_secs(10);
     let source = WebhookSource::new(cfg);
@@ -407,4 +409,201 @@ async fn the_page_stream_chunks_the_collected_payloads() {
     }
     let pages = run.await.unwrap().unwrap();
     assert_eq!(pages, vec![(2, None), (1, None)]);
+}
+
+/// Poll the next page of a source's stream.
+async fn next_page(
+    stream: &mut faucet_core::driver::PageStream<'_>,
+) -> Option<Result<faucet_core::StreamPage, faucet_core::FaucetError>> {
+    std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await
+}
+
+fn on_commit(addr: &str) -> WebhookSourceConfig {
+    WebhookSourceConfig::new()
+        .listen_addr(addr.to_string())
+        .timeout_secs(30)
+        .max_hold_secs(1)
+}
+
+/// #1032: with `ack: on_commit` a POST is answered only when the pipeline
+/// polls again after its page, and every page carries a bookmark so the
+/// pipeline flushes before polling.
+#[tokio::test]
+async fn a_post_is_answered_only_after_its_page_is_written() {
+    let addr = free_addr();
+    let source = WebhookSource::new(on_commit(&addr).with_batch_size(2).max_payloads(3));
+    let ctx = HashMap::new();
+    let mut pages = source.stream_pages(&ctx, 1000);
+    let url = format!("http://{addr}/webhook");
+    let client = reqwest::Client::new();
+    let posts: Vec<_> = (0..2)
+        .map(|i| {
+            let (client, url) = (client.clone(), url.clone());
+            tokio::spawn(async move {
+                post_until_up(&client, &url, || client.post(&url).json(&json!({"id": i}))).await
+            })
+        })
+        .collect();
+    let first = next_page(&mut pages).await.unwrap().unwrap();
+    assert_eq!(first.records.len(), 2, "batch_size triggers the page");
+    assert_eq!(first.bookmark, Some(json!({"received": 2})));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        posts.iter().all(|p| !p.is_finished()),
+        "held until the page commits"
+    );
+
+    let third = {
+        let (client, url) = (client.clone(), url.clone());
+        tokio::spawn(async move { client.post(&url).json(&json!({"id": 2})).send().await })
+    };
+    // Polling again acknowledges the first page.
+    let second = next_page(&mut pages).await.unwrap().unwrap();
+    for p in posts {
+        assert_eq!(p.await.unwrap().status(), 200);
+    }
+    assert_eq!(second.records, vec![json!({"id": 2})]);
+    assert_eq!(second.bookmark, Some(json!({"received": 3})));
+    assert!(
+        next_page(&mut pages).await.is_none(),
+        "max_payloads closed the window"
+    );
+    assert_eq!(third.await.unwrap().unwrap().status(), 200);
+}
+
+/// #1032: when the run fails (the stream is dropped) every held request is
+/// answered `503` + `Retry-After`, including one never taken into a page.
+#[tokio::test]
+async fn a_failed_run_answers_held_requests_retry_later() {
+    let addr = free_addr();
+    let source = WebhookSource::new(on_commit(&addr).with_batch_size(1));
+    let url = format!("http://{addr}/webhook");
+    let client = reqwest::Client::new();
+    let ctx = HashMap::new();
+    let mut pages = source.stream_pages(&ctx, 1000);
+    let in_page = {
+        let (client, url) = (client.clone(), url.clone());
+        tokio::spawn(async move {
+            post_until_up(&client, &url, || client.post(&url).json(&json!({"n": 1}))).await
+        })
+    };
+    let page = next_page(&mut pages).await.unwrap().unwrap();
+    assert_eq!(page.records, vec![json!({"n": 1})]);
+    let waiting = {
+        let (client, url) = (client.clone(), url.clone());
+        tokio::spawn(async move { client.post(&url).json(&json!({"n": 2})).send().await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(pages);
+    for resp in [in_page.await.unwrap(), waiting.await.unwrap().unwrap()] {
+        assert_eq!(resp.status(), 503);
+        assert_eq!(resp.headers()["retry-after"], "60");
+    }
+}
+
+/// #1032: `max_hold_secs` emits a partial page, and a cancel closes the
+/// window, emits what is held and ends the stream once it is acknowledged.
+#[tokio::test]
+async fn max_hold_emits_a_partial_page_and_cancel_drains() {
+    let addr = free_addr();
+    let source = WebhookSource::new(on_commit(&addr));
+    let cancel = faucet_core::CancellationToken::new();
+    assert!(
+        source.set_cancel(cancel.clone()),
+        "on_commit drains on cancel"
+    );
+    assert!(source.consumes_destructively());
+    let url = format!("http://{addr}/webhook");
+    let client = reqwest::Client::new();
+    let ctx = HashMap::new();
+    let mut pages = source.stream_pages(&ctx, 1000);
+    let post = {
+        let (client, url) = (client.clone(), url.clone());
+        tokio::spawn(async move {
+            post_until_up(&client, &url, || client.post(&url).json(&json!({"n": 1}))).await
+        })
+    };
+    let started = std::time::Instant::now();
+    let page = next_page(&mut pages).await.unwrap().unwrap();
+    assert_eq!(page.records.len(), 1);
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "emitted by max_hold_secs"
+    );
+    let late = {
+        let (client, url) = (client.clone(), url.clone());
+        tokio::spawn(async move { client.post(&url).json(&json!({"n": 2})).send().await })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    cancel.cancel();
+    let drained = next_page(&mut pages).await.unwrap().unwrap();
+    assert_eq!(drained.records, vec![json!({"n": 2})]);
+    assert_eq!(post.await.unwrap().status(), 200);
+    assert!(next_page(&mut pages).await.is_none());
+    assert_eq!(late.await.unwrap().unwrap().status(), 200);
+
+    let receive = WebhookSource::new(on_commit(&addr).ack(AckMode::OnReceive));
+    assert!(!receive.set_cancel(faucet_core::CancellationToken::new()));
+    assert!(!receive.consumes_destructively());
+}
+
+/// #1032: a byte-identical resend of a signed request whose page is still
+/// being written is asked to retry; once committed it is acknowledged without
+/// being stored again.
+#[tokio::test]
+async fn a_resend_of_a_pending_signed_request_retries_then_is_acknowledged() {
+    let addr = free_addr();
+    let cfg = on_commit(&addr).with_batch_size(1).signature(
+        serde_json::from_value(json!({
+            "header": "X-Signature",
+            "secret": "s3cret",
+            "timestamp_header": "X-Timestamp"
+        }))
+        .unwrap(),
+    );
+    let source = WebhookSource::new(cfg);
+    let url = format!("http://{addr}/webhook");
+    let client = reqwest::Client::new();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let body = r#"{"id":7}"#;
+    let signature = sign("s3cret", format!("{now}.{body}").as_bytes());
+    let send = {
+        let (client, url) = (client.clone(), url.clone());
+        move || {
+            client
+                .post(&url)
+                .header("X-Timestamp", now.to_string())
+                .header("X-Signature", signature.clone())
+                .body(body)
+        }
+    };
+    let cancel = faucet_core::CancellationToken::new();
+    assert!(source.set_cancel(cancel.clone()));
+    let ctx = HashMap::new();
+    let mut pages = source.stream_pages(&ctx, 1000);
+    let first = {
+        let (client, url, send) = (client.clone(), url.clone(), send.clone());
+        tokio::spawn(async move { post_until_up(&client, &url, send).await })
+    };
+    let page = next_page(&mut pages).await.unwrap().unwrap();
+    assert_eq!(page.records, vec![json!({"id": 7})]);
+    assert_eq!(
+        send().send().await.unwrap().status(),
+        503,
+        "first copy still pending"
+    );
+    // Polling again acknowledges the page. Once the first copy has its 200, a
+    // resend is acknowledged without being stored; the cancel then ends the
+    // window with nothing held.
+    let (rest, resend) = tokio::join!(next_page(&mut pages), async {
+        assert_eq!(first.await.unwrap().status(), 200);
+        let resend = send().send().await.unwrap().status();
+        cancel.cancel();
+        resend
+    });
+    assert_eq!(resend, 200, "a committed resend is acknowledged");
+    assert!(rest.is_none(), "the resend was not stored");
 }

@@ -27262,7 +27262,7 @@
                       "default": null
                     },
                     "batch_size": {
-                      "description": "Records per emitted [`StreamPage`](faucet_core::StreamPage). The webhook\nsource has no native streaming primitive — it accumulates incoming POSTs\ninto an in-memory buffer during the receive window, then the default\n[`Source::stream_pages`](faucet_core::Source::stream_pages) impl chunks\nthat buffer into pages of this size. Defaults to [`DEFAULT_BATCH_SIZE`].\n\n`batch_size = 0` is the \"no batching\" sentinel: the entire flush window\nis emitted in a single page. For this source it is functionally\nequivalent to any positive value larger than the received payload count\n— the server-side buffering behaviour does not change.",
+                      "description": "Records per emitted [`StreamPage`](faucet_core::StreamPage) (default\n[`DEFAULT_BATCH_SIZE`]). With `ack: on_commit` a page is emitted while\nthe window is open, as soon as this many requests are held or the\noldest has waited `max_hold_secs`; `0` drops the count trigger. With\n`ack: on_receive` the window's events are emitted when it closes, in\npages of this size; `0` emits them as one page.",
                       "type": [
                         "integer",
                         "string"
@@ -27281,6 +27281,33 @@
                           "type": "null"
                         }
                       ]
+                    },
+                    "ack": {
+                      "description": "When a sender's POST is answered (default `on_commit`): after the\npipeline has written and flushed its event (`on_commit`), or as soon\nas it is held in memory (`on_receive`, which loses acknowledged events\nif the run fails before the sink commits). With `on_commit`, commands\nthat read without writing (`--dry-run`, `--limit`, `preview`, `plan\n--sample`, `verify`) and topology graphs refuse this source.",
+                      "$ref": "#/$defs/source_webhook__AckMode",
+                      "default": "on_commit"
+                    },
+                    "max_hold_secs": {
+                      "description": "`ack: on_commit`: the longest a held request waits before its page is\nemitted, in seconds (default 5, at most 300). A sender then waits for\nup to this plus the sink's write time, twice over when a write is\nalready in progress, so keep it well under the senders' timeout.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 5,
+                      "x-faucet-caller-max": 300
+                    },
+                    "max_held": {
+                      "description": "`ack: on_commit`: the most requests held open at once (default 1000).\nAbove it a POST is refused with `503` + `Retry-After` and not stored,\nso a slow sink cannot pile up open connections. `0` removes the cap.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint",
+                      "minimum": 0,
+                      "default": 1000,
+                      "x-faucet-caller-max": 100000
                     }
                   }
                 },
@@ -37827,6 +37854,21 @@
               }
             }
           }
+        }
+      ]
+    },
+    "source_webhook__AckMode": {
+      "description": "When the source answers a sender's POST.",
+      "oneOf": [
+        {
+          "description": "Answer `200` only after the page holding the event has been written\nand flushed by the pipeline; answer `503` + `Retry-After` when the run\nfails first, so the sender retries. Nothing acknowledged is lost; a\nsender may see a duplicate after a crash or a slow commit.",
+          "type": "string",
+          "const": "on_commit"
+        },
+        {
+          "description": "Answer `200` as soon as the event is held in memory, and emit the\nwindow's events when it closes. Events acknowledged this way are lost\nif the run fails before the sink commits them.",
+          "type": "string",
+          "const": "on_receive"
         }
       ]
     }

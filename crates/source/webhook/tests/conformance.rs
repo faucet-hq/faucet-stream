@@ -4,14 +4,13 @@
 //!          (pure, offline — always runs).
 //!
 //! Check 2 (bounded memory) is intentionally NOT run here: the webhook source
-//! is buffer-shaped — it runs a temporary HTTP server that accumulates incoming
-//! POSTs into an in-memory buffer during the receive window and then uses the
-//! DEFAULT `Source::stream_pages` chunking impl (it does not override it). That
-//! default chunking's bounded-memory behaviour is covered by faucet-core's own
-//! tests, and driving the receiver end-to-end would require a concurrent HTTP
-//! client racing the server's bind/receive window on a fixed port — not cleanly
-//! or reliably expressible through the `assert_bounded_memory` harness (which
-//! owns the `stream_pages` drive). Check 1 (config schema) applies here.
+//! only produces records while HTTP senders post to it, and with `ack:
+//! on_commit` each sender waits until the page holding its event is
+//! acknowledged, so driving it needs a concurrent client racing the server's
+//! bind on a fixed port — not expressible through the `assert_bounded_memory`
+//! harness, which owns the `stream_pages` drive. Memory per window is bounded
+//! by `max_buffered_bytes` / `max_held`, and the page flow is covered by
+//! `tests/receive.rs`. Check 1 (config schema) applies here.
 //!
 //! Check 6 (errors, not panics) is expressible cleanly: the webhook source
 //! binds a `TcpListener` to `listen_addr` at read time, so an unbindable
