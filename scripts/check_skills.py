@@ -4,7 +4,7 @@
 Always (no binary needed):
   - every skill has a SKILL.md with `name` = its directory, a description
     starting "Use when", and the shared version step;
-  - relative links resolve; docs-site links name a page under docs/book/src/;
+  - relative links resolve; docs-site links name a page under docs/site/;
     repository links and `cli/examples/...` paths name files that exist;
   - no skill pins a faucet release in prose (facts come from the binary);
   - every fenced `yaml` block is a complete faucet document (`version:` or
@@ -37,7 +37,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SKILLS = ROOT / "skills"
-DOCS_SRC = ROOT / "docs" / "book" / "src"
+DOCS_SRC = ROOT / "docs" / "site" / "src" / "content" / "docs"
+DOCS_GENERATED = ROOT / "docs" / "site" / "generated"
 DOCS_URL = "https://faucet-hq.github.io/faucet-stream/"
 REPO_URL = re.compile(r"https://github\.com/faucet-hq/faucet-stream/(?:blob|tree)/[^/\s)]+/([^\s)#`>]+)")
 EXAMPLE_PATH = re.compile(r"(?<![\w/.-])(cli/examples/[\w./-]+\.(?:yaml|yml|json))")
@@ -132,13 +133,20 @@ def command_lines(body):
 
 
 def docs_page(url):
-    """The docs/book/src file a docs-site URL names, or None for the site root."""
+    """The docs/site source file a docs-site URL names, or None for the site root.
+
+    Pages live at `<slug>/`; the old mdBook form `<slug>.html` redirects there."""
     path = url[len(DOCS_URL) :].split("#", 1)[0]
     if not path or path == "index.html":
         return None
-    if not path.endswith(".html"):
+    if path.endswith(".html"):
+        slug = path[: -len(".html")]
+    elif path.endswith("/"):
+        slug = path[:-1]
+    else:
         return DOCS_SRC / "__not_a_page__" / path
-    return DOCS_SRC / (path[: -len(".html")] + ".md")
+    candidates = [DOCS_SRC / f"{slug}.md", DOCS_SRC / slug / "index.md", DOCS_GENERATED / f"{slug}.md", ROOT / "docs" / f"{slug}.md"]
+    return next((c for c in candidates if c.exists()), candidates[0])
 
 
 def link_errors(doc, text):
@@ -147,7 +155,7 @@ def link_errors(doc, text):
         if target.startswith(DOCS_URL):
             page = docs_page(target)
             if page is not None and not page.exists():
-                errors.append(f"docs link {target} names no page under docs/book/src/")
+                errors.append(f"docs link {target} names no page under docs/site/")
             continue
         if re.match(r"^[a-z]+:", target) or target.startswith("#"):
             continue

@@ -60,7 +60,7 @@ the engine calls two collaborators, which neither a pure unit test nor a
 per-connector test can observe. Those suites drive the real `Pipeline::run`
 against doubles that fail at one named boundary and assert on the recorded event
 sequence. They are Docker-free, run in seconds, and are a **required** CI check.
-See [Reliability testing](../book/src/operations/reliability-testing.md) for the
+See [Reliability testing](../site/src/content/docs/operations/reliability-testing.md) for the
 tier map and how to add a guarantee.
 
 ## Starting a test container
@@ -252,7 +252,7 @@ python3 scripts/integration-coverage.py --lcov integration.lcov --unit-lcov unit
 
 ## Related
 
-- [Reliability testing](../book/src/operations/reliability-testing.md)
+- [Reliability testing](../site/src/content/docs/operations/reliability-testing.md)
 - [Testing standards](../standards/testing.md)
 - [Debugging](./debugging.md)
 - [Common mistakes](./common-mistakes.md)

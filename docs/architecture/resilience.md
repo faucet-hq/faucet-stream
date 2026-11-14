@@ -108,4 +108,4 @@ flowchart TD
 - [Retries](./retries.md) · [Recovery](./recovery.md) · [Pipeline engine](./pipeline.md)
 - [Observability](./observability.md) (the `faucet_resilience_*` metrics)
 - [ADR 0007 — Retries](../adr/0007-retries.md)
-- User guide: [Resilience cookbook](../book/src/cookbook/resilience.md)
+- User guide: [Resilience cookbook](../site/src/content/docs/cookbook/resilience.md)

@@ -110,7 +110,7 @@ DB→DB move, **~80×** as the CSV→JSONL upper bound — never the ~80× alone
   welcome," not an ad.
 - **r/dataengineering** — lead with the DE pain: no platform to operate, version-controlled
   YAML pipelines, runs on cron/CI, CDC + incremental + DLQ built in. Be honest about
-  connector-count vs. incumbents (link the [comparison pages](https://faucet-hq.github.io/faucet-stream/comparison/index.html)).
+  connector-count vs. incumbents (link the [comparison pages](https://faucet-hq.github.io/faucet-stream/comparison/)).
 
 ## Metrics view (know which channels convert)
 

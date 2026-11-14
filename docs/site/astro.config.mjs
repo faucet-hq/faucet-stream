@@ -3,7 +3,7 @@ import starlight from '@astrojs/starlight';
 import starlightSidebarTopics from 'starlight-sidebar-topics';
 import { readFileSync } from 'node:fs';
 
-const topics = JSON.parse(readFileSync(new URL('./src/generated/topics.json', import.meta.url), 'utf8'));
+const topics = JSON.parse(readFileSync(new URL('./src/topics.json', import.meta.url), 'utf8'));
 const SITE = 'https://faucet-hq.github.io';
 const BASE = '/faucet-stream';
 
@@ -19,7 +19,7 @@ export default defineConfig({
       logo: { src: './src/assets/logo-mark.svg', alt: 'faucet-stream' },
       favicon: '/assets/favicon.svg',
       social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/faucet-hq/faucet-stream' }],
-      editLink: { baseUrl: 'https://github.com/faucet-hq/faucet-stream/edit/main/docs/book/src/' },
+      editLink: { baseUrl: 'https://github.com/faucet-hq/faucet-stream/edit/main/docs/site/' },
       lastUpdated: true,
       customCss: ['./src/styles/fonts.css', './src/styles/theme.css'],
       tableOfContents: { minHeadingLevel: 2, maxHeadingLevel: 3 },

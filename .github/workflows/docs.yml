@@ -1,98 +1,62 @@
 name: Docs site
 
-# Builds the mdBook in docs/book. On pull requests it only verifies the book
-# builds; on push to main it also deploys to GitHub Pages.
+# Builds the Astro Starlight docs site in docs/site. On pull requests it only
+# verifies the build, the old-URL redirects and every internal link; on push to
+# main it also deploys to GitHub Pages.
 #
 # NOTE: deployment requires Pages to be enabled for the repo with the source set
 # to "GitHub Actions" (Settings → Pages → Build and deployment → GitHub Actions).
 
 on:
-  # Manual trigger so the site can be re-deployed on demand — e.g. when a docs
-  # change lands via a PR that did NOT touch docs/book/** (the path filter below
-  # only fires the deploy on docs/book changes, so a teal-theme rebuild can be
-  # forced from the Actions tab without a dummy commit).
+  # Manual trigger so the site can be re-deployed on demand without a docs change.
   workflow_dispatch:
   push:
     branches: [main]
     paths:
-      - "docs/book/**"
-      - "scripts/inject-page-meta.py"
+      - "docs/site/**"
       - ".github/workflows/docs.yml"
   pull_request:
     branches: [main]
     paths:
-      - "docs/book/**"
-      - "scripts/inject-page-meta.py"
+      - "docs/site/**"
       - ".github/workflows/docs.yml"
 
 permissions:
   contents: read
 
 concurrency:
-  group: docs-pages
+  group: docs-pages-${{ github.ref }}
   cancel-in-progress: false
-
-env:
-  MDBOOK_VERSION: "0.5.3"
-  MDBOOK_MERMAID_VERSION: "0.17.0"
-  # SHA-256 of each pinned x86_64-unknown-linux-gnu archive; update with the version.
-  MDBOOK_SHA256: "e2fd508a4fac06cbaa9f88b97d27bdc3b55a08946304ca845879fe26a3699e11"
-  MDBOOK_MERMAID_SHA256: "8aced70d781830fb0e81988f081c4abdd49e056a001ae2f1e4d484e1f6385c57"
 
 jobs:
   build:
-    name: Build book
+    name: Build docs site
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: docs/site
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install mdBook
-        run: |
-          mkdir -p "$HOME/.local/bin"
-          url="https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
-          curl -fsSL -o "$RUNNER_TEMP/mdbook.tar.gz" "$url"
-          echo "${MDBOOK_SHA256}  $RUNNER_TEMP/mdbook.tar.gz" | sha256sum -c -
-          tar -xzf "$RUNNER_TEMP/mdbook.tar.gz" -C "$HOME/.local/bin"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-      - name: Install mdbook-mermaid
-        run: |
-          url="https://github.com/badboy/mdbook-mermaid/releases/download/v${MDBOOK_MERMAID_VERSION}/mdbook-mermaid-v${MDBOOK_MERMAID_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
-          curl -fsSL -o "$RUNNER_TEMP/mdbook-mermaid.tar.gz" "$url"
-          echo "${MDBOOK_MERMAID_SHA256}  $RUNNER_TEMP/mdbook-mermaid.tar.gz" | sha256sum -c -
-          tar -xzf "$RUNNER_TEMP/mdbook-mermaid.tar.gz" -C "$HOME/.local/bin"
+          # Full history: each page's "Last updated" date comes from git.
+          fetch-depth: 0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: docs/site/.node-version
+          cache: npm
+          cache-dependency-path: docs/site/package-lock.json
+      - name: Install
+        run: npm ci --no-audit --no-fund
       - name: Build
-        run: mdbook build docs/book
-      - name: Inject per-page SEO metadata
-        # mdBook's head.hbs is site-wide; rewrite per-page description + Open
-        # Graph / Twitter title & description from each page's <h1>/first <p>.
-        run: python3 scripts/inject-page-meta.py docs/book/book
-      - name: Generate sitemap.xml
-        # mdBook has no native sitemap (rust-lang/mdBook#1491); generate one from
-        # the built HTML so search engines can crawl every page. Uses the full
-        # Pages origin (site-url in book.toml is only a path prefix).
-        env:
-          BASE_URL: "https://faucet-hq.github.io/faucet-stream"
-        run: |
-          cd docs/book/book
-          {
-            echo '<?xml version="1.0" encoding="UTF-8"?>'
-            echo '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
-            find . -type f -name '*.html' ! -name '404.html' ! -name 'print.html' \
-              | sed 's|^\./||' \
-              | LC_ALL=C sort \
-              | while IFS= read -r f; do
-                  loc="${f%index.html}"
-                  echo "  <url><loc>${BASE_URL}/${loc}</loc></url>"
-                done
-            echo '</urlset>'
-          } > sitemap.xml
-          echo "Wrote $(grep -c '<url>' sitemap.xml) URLs to sitemap.xml"
+        run: npm run build
+      - name: Check old URLs, internal links and anchors
+        run: npm run check
       # Inlined actions/upload-pages-artifact: it calls actions/upload-artifact by tag, which the repository's SHA-pinning rule refuses.
       - name: Archive Pages artifact
         if: github.ref == 'refs/heads/main'
         run: |
-          tar --dereference --hard-dereference --directory docs/book/book \
+          tar --dereference --hard-dereference --directory dist \
             -cvf "$RUNNER_TEMP/artifact.tar" --exclude=.git --exclude=.github .
       - name: Upload Pages artifact
         if: github.ref == 'refs/heads/main'

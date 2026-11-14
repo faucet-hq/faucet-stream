@@ -286,7 +286,7 @@ def main():
         print(
             "\nCall the named assertion from the crate's tests/conformance.rs, or list it in "
             f"{EXEMPT} with the reason it cannot run in CI. The table is "
-            "faucet_conformance::required (docs/book/src/reference/conformance.md)."
+            "faucet_conformance::required (docs/site/src/content/docs/reference/conformance.md)."
         )
         return 1
     print("conformance coverage: every declared capability has its conformance test")

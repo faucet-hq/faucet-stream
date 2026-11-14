@@ -529,7 +529,7 @@ The `Sink` hooks the drivers replace are deprecated since 1.14.0
 `overwrite_staging_exists`, `write_batch_idempotent`,
 `write_batch_idempotent_reported`, `last_committed_token`, `cleanup_scope`);
 they keep working until 2.0 (#888). See
-[Authoring connectors](https://faucet-hq.github.io/faucet-stream/extending/authoring-connectors.html#start-from-a-family-driver).
+[Authoring connectors](https://faucet-hq.github.io/faucet-stream/extending/authoring-connectors/#start-from-a-family-driver).
 
 ## Row accounting
 
@@ -566,7 +566,7 @@ assert_eq!(v["id"], serde_json::json!("18446744073709551616"));
 
 `Pipeline::run` counts the non-finite values a run's source wrote as `null`
 (`RowAccountsSnapshot::non_finite`, `faucet_fidelity_non_finite_total`). See
-the [value fidelity reference](https://faucet-hq.github.io/faucet-stream/reference/value-fidelity.html).
+the [value fidelity reference](https://faucet-hq.github.io/faucet-stream/reference/value-fidelity/).
 
 ## Declared column types
 
@@ -583,7 +583,7 @@ reshapes it for any stage but a filter). A creating sink keeps it in a
 `plan_keyed_columns_declared` / `plan_table_declared`, which set
 `PlannedColumn::declared`; its `complete_run` creates the empty typed table when
 nothing was written and the declaration is complete. See
-`docs/book/src/reference/value-fidelity.md#declared-column-types`.
+`docs/site/src/content/docs/reference/value-fidelity.md#declared-column-types`.
 
 ## Effectively-once delivery
 
@@ -925,11 +925,11 @@ Defaults: `transform-flatten`, `transform-rename-keys`, `transform-keys-case`.
 
 ## See also
 
-- **Concepts & library guide:** <https://faucet-hq.github.io/faucet-stream/getting-started/concepts.html> · <https://faucet-hq.github.io/faucet-stream/tutorials/library.html>
-- **Transforms cookbook:** <https://faucet-hq.github.io/faucet-stream/cookbook/transforms.html>
-- **State & effectively-once:** <https://faucet-hq.github.io/faucet-stream/cookbook/state.html>
-- **Upsert / write modes:** <https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html>
-- **Quality checks & DLQ:** <https://faucet-hq.github.io/faucet-stream/reference/config.html>
+- **Concepts & library guide:** <https://faucet-hq.github.io/faucet-stream/getting-started/concepts/> · <https://faucet-hq.github.io/faucet-stream/tutorials/library/>
+- **Transforms cookbook:** <https://faucet-hq.github.io/faucet-stream/cookbook/transforms/>
+- **State & effectively-once:** <https://faucet-hq.github.io/faucet-stream/cookbook/state/>
+- **Upsert / write modes:** <https://faucet-hq.github.io/faucet-stream/cookbook/upsert/>
+- **Quality checks & DLQ:** <https://faucet-hq.github.io/faucet-stream/reference/config/>
 - **Related crates:** [`faucet-auth`](https://crates.io/crates/faucet-auth) (shared auth providers) · [`faucet-state-redis`](https://crates.io/crates/faucet-state-redis) / [`faucet-state-postgres`](https://crates.io/crates/faucet-state-postgres) (state backends) · [`faucet-stream`](https://crates.io/crates/faucet-stream) (umbrella) · [`faucet-cli`](https://crates.io/crates/faucet-cli) (the `faucet` binary)
 
 ## License

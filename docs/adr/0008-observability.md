@@ -69,4 +69,4 @@ strings) are **span attributes only, never metric labels**.
 
 - [Observability](../architecture/observability.md) · [resilience](../architecture/resilience.md)
 - [Standards: logging & metrics](../standards/logging.md) · [Design invariants (I11)](../architecture/invariants.md)
-- User guide: [Observability](../book/src/operations/observability.md)
+- User guide: [Observability](../site/src/content/docs/operations/observability.md)

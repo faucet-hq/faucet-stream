@@ -45,4 +45,4 @@ Connectors do **not** write their own metrics code. The pipeline-internal decora
 - [Observability architecture](../architecture/observability.md)
 - [ADR 0008 — Observability](../adr/0008-observability.md)
 - [Error Handling Standard](./error-handling.md)
-- [Operations: Observability](../../docs/book/src/operations/observability.md)
+- [Operations: Observability](../../docs/site/src/content/docs/operations/observability.md)

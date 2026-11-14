@@ -132,4 +132,4 @@ retried — retrying it would only waste time and delay the real failure.
 - [Resilience](./resilience.md) · [Recovery](./recovery.md) · [Pipeline engine](./pipeline.md)
 - [Design invariants](./invariants.md)
 - [ADR 0007 — Retries](../adr/0007-retries.md)
-- User guide: [Resilience cookbook](../book/src/cookbook/resilience.md)
+- User guide: [Resilience cookbook](../site/src/content/docs/cookbook/resilience.md)

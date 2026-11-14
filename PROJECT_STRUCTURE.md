@@ -51,7 +51,7 @@ deploy/                       — container + Kubernetes assets
   otel/                       — log-shipping recipes (Alloy → Loki, OTel Collector → S3/GCS/Azure)
 supply-chain/                 — cargo-vet audits, imports and exemptions (checked by `cargo vet --locked` in CI)
 scripts/                      — helper and CI-check scripts (try-local.sh, build-image.sh, chaos/run.sh, …)
-docs/book/                    — mdBook documentation site (source under docs/book/src)
+docs/site/                    — Astro Starlight documentation site (pages under docs/site/src/content/docs, generated reference pages under docs/site/generated)
 rfcs/                         — design RFCs
 .github/workflows/            — ci.yml, release-plz.yml, docs.yml, docker-images.yml, chaos.yml, codeql.yml, scorecard.yml, …
 .github/codeql/               — codeql-config.yml (CodeQL scan scope: test code excluded)

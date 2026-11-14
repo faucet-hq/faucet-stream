@@ -55,7 +55,7 @@ config written for a newer faucet can fail or be misread on an older one.
    If the checksum or the attestation does not verify, stop and tell the user.
 6. With no pin at all, install the latest release the same way (the archive
    and its `.sha256` from `releases/latest/download/`) and pin it as described in
-   [Pinning the faucet version](https://faucet-hq.github.io/faucet-stream/operations/pinning.html).
+   [Pinning the faucet version](https://faucet-hq.github.io/faucet-stream/operations/pinning/).
 
 Every version-specific fact (which connectors and blocks exist, config keys,
 types, defaults, commands and flags) comes from that binary: `faucet list`,
@@ -69,7 +69,7 @@ binary predates it, so leave it out.
 
 `faucet verify` compares source and destination **by content**, keyed, and
 names every key that differs
-([Content verification](https://faucet-hq.github.io/faucet-stream/cookbook/verify.html)).
+([Content verification](https://faucet-hq.github.io/faucet-stream/cookbook/verify/)).
 It needs a key (the sink's upsert key, or one set in a `verify:` block) and a
 way to read the destination back.
 
@@ -87,7 +87,7 @@ faucet verify pipeline.yaml --row orders --max-differences 50
    opt-in. Read the flags from `faucet verify --help`.
 4. To check every run, add a `verify:` block (`faucet schema verify`), or the
    cheaper count check (the `reconcile:` block in `faucet schema config`,
-   [`reconcile:`](https://faucet-hq.github.io/faucet-stream/reference/config.html#reconcile)).
+   [`reconcile:`](https://faucet-hq.github.io/faucet-stream/reference/config/#reconcile)).
    A worked example is `cli/examples/sqlite_mirror_verify_rollback.yaml`.
 
 Use the manual comparison below when `faucet verify` cannot run: a keyless
@@ -139,16 +139,16 @@ Read the destination's column types and compare them with the source's.
   nothing, a transform or mask rewrote the column, or the table already
   existed), they land as text holding the exact rendering. Both are by
   design: see
-  [Declared column types](https://faucet-hq.github.io/faucet-stream/reference/value-fidelity.html#declared-column-types)
-  and [canonical renderings](https://faucet-hq.github.io/faucet-stream/reference/value-fidelity.html#canonical-renderings).
+  [Declared column types](https://faucet-hq.github.io/faucet-stream/reference/value-fidelity/#declared-column-types)
+  and [canonical renderings](https://faucet-hq.github.io/faucet-stream/reference/value-fidelity/#canonical-renderings).
 - Report such a column as a **known mapping**, with the rendering it holds,
   not as data loss. It is data loss only when the values themselves differ
   (Step 3 on the cast column).
 - An existing table is never retyped; changing it is a schema-drift decision
-  ([Schema drift](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift.html)).
+  ([Schema drift](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift/)).
 - Non-finite floats arrive as null and are counted; a null-count difference
   on a float column may be that
-  ([Non-finite values](https://faucet-hq.github.io/faucet-stream/reference/value-fidelity.html#non-finite-values)).
+  ([Non-finite values](https://faucet-hq.github.io/faucet-stream/reference/value-fidelity/#non-finite-values)).
 
 ## Step 5: report
 

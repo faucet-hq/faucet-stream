@@ -52,7 +52,7 @@ config written for a newer faucet can fail or be misread on an older one.
    If the checksum or the attestation does not verify, stop and tell the user.
 6. With no pin at all, install the latest release the same way (the archive
    and its `.sha256` from `releases/latest/download/`) and pin it as described in
-   [Pinning the faucet version](https://faucet-hq.github.io/faucet-stream/operations/pinning.html).
+   [Pinning the faucet version](https://faucet-hq.github.io/faucet-stream/operations/pinning/).
 
 Every version-specific fact (which connectors and blocks exist, config keys,
 types, defaults, commands and flags) comes from that binary: `faucet list`,
@@ -77,7 +77,7 @@ binary predates it, so leave it out.
 3. Find the side that dominates. For a long-running `faucet schedule` or
    `faucet serve`, compare the source page time with the sink write and
    flush time in the metrics
-   ([Finding the problem from metrics](https://faucet-hq.github.io/faucet-stream/operations/observability.html#finding-the-problem-from-metrics));
+   ([Finding the problem from metrics](https://faucet-hq.github.io/faucet-stream/operations/observability/#finding-the-problem-from-metrics));
    for a one-shot run, compare the page and write timings in the debug-level
    logs of a short run, or run the source into a throwaway local file sink
    and see whether it alone takes the time.
@@ -91,17 +91,17 @@ Do not change anything until you know the bottleneck side.
 Read every setting's name, default and range from the binary:
 `faucet schema source <kind>`, `faucet schema sink <kind>`,
 `faucet schema execution`, `faucet run --help`. What each kind of knob does
-is in [Throughput tuning](https://faucet-hq.github.io/faucet-stream/cookbook/tuning.html)
-and [Performance tuning](https://faucet-hq.github.io/faucet-stream/operations/tuning.html).
+is in [Throughput tuning](https://faucet-hq.github.io/faucet-stream/cookbook/tuning/)
+and [Performance tuning](https://faucet-hq.github.io/faucet-stream/operations/tuning/).
 In rough order of payoff:
 
 | Bottleneck | Try |
 |---|---|
-| Either side, many small round trips | The source page size and the sink batch size; or let faucet size sink batches ([Adaptive batching](https://faucet-hq.github.io/faucet-stream/cookbook/adaptive-batching.html)) |
+| Either side, many small round trips | The source page size and the sink batch size; or let faucet size sink batches ([Adaptive batching](https://faucet-hq.github.io/faucet-stream/cookbook/adaptive-batching/)) |
 | Sink writes | The sink's bulk or staged load path if it has one, its connection pool or concurrency, then destination-side settings (indexes, logging) |
-| Source reads, one large table | Shard the table across workers ([Mode B](https://faucet-hq.github.io/faucet-stream/cookbook/cluster.html#distributing-one-big-source-across-workers-mode-b)); `cli/examples/postgres_to_postgres_sharded.yaml` |
+| Source reads, one large table | Shard the table across workers ([Mode B](https://faucet-hq.github.io/faucet-stream/cookbook/cluster/#distributing-one-big-source-across-workers-mode-b)); `cli/examples/postgres_to_postgres_sharded.yaml` |
 | Many independent tables | More matrix rows in parallel (the `execution` block) |
-| Write mode | Upsert costs a keyed merge per page; overwrite stages and swaps; append is cheapest. Change it only when the data's semantics allow ([Upsert](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html)) |
+| Write mode | Upsert costs a keyed merge per page; overwrite stages and swaps; append is cheapest. Change it only when the data's semantics allow ([Upsert](https://faucet-hq.github.io/faucet-stream/cookbook/upsert/)) |
 
 After each change, rerun the baseline (Step 1) and keep the change only if it
 helps. Also check memory: a larger batch holds more rows at once.
@@ -130,4 +130,4 @@ Faster must not break the systems at either end:
 4. Size a window from the median, plus margin for the slowest table.
 
 The engine's own benchmark harness and its method are described under
-[Measure, don't guess](https://faucet-hq.github.io/faucet-stream/cookbook/tuning.html#measure-dont-guess).
+[Measure, don't guess](https://faucet-hq.github.io/faucet-stream/cookbook/tuning/#measure-dont-guess).

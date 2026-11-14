@@ -433,8 +433,8 @@ It is pulled in by:
 
 ## See also
 
-- [Authentication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/auth.html) — the full `{ type, config }` vs `{ ref }` model, per-connector auth methods, and the shared `auth:` catalog.
-- [Secrets cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/secrets.html) — feeding `${secret:…}` / `${vault:…}` references into provider configs.
+- [Authentication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/auth/) — the full `{ type, config }` vs `{ ref }` model, per-connector auth methods, and the shared `auth:` catalog.
+- [Secrets cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/secrets/) — feeding `${secret:…}` / `${vault:…}` references into provider configs.
 - [`faucet-core`](https://crates.io/crates/faucet-core) — defines the [`AuthProvider`](https://docs.rs/faucet-core/latest/faucet_core/trait.AuthProvider.html) trait, [`Credential`](https://docs.rs/faucet-core/latest/faucet_core/enum.Credential.html) enum, and `SharedAuthProvider` / `AuthSpec` types this crate implements against.
 
 ## License

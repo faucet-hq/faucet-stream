@@ -39,9 +39,9 @@ brew install faucet-hq/faucet-stream/faucet-cli
 ```
 
 [Guide](https://faucet-hq.github.io/faucet-stream/) ·
-[Your first pipeline](https://faucet-hq.github.io/faucet-stream/getting-started/first-pipeline.html) ·
-[Connectors](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) ·
-[Config reference](https://faucet-hq.github.io/faucet-stream/reference/config.html) ·
+[Your first pipeline](https://faucet-hq.github.io/faucet-stream/getting-started/first-pipeline/) ·
+[Connectors](https://faucet-hq.github.io/faucet-stream/reference/connectors/) ·
+[Config reference](https://faucet-hq.github.io/faucet-stream/reference/config/) ·
 [Benchmarks](BENCHMARKS.md) ·
 [API docs](https://docs.rs/faucet-stream)
 
@@ -212,9 +212,9 @@ The [`cli/examples/`](cli/examples) directory has runnable configs for common
 source-to-sink pairs and for each governance feature on its own.
 
 **No infrastructure handy?** `./scripts/try-local.sh` builds a light binary, runs a governed
-demo pipeline on generated data and opens the [web console](https://faucet-hq.github.io/faucet-stream/cookbook/web-console.html),
+demo pipeline on generated data and opens the [web console](https://faucet-hq.github.io/faucet-stream/cookbook/web-console/),
 where you can browse runs, datasets and lineage. It needs no Docker and no cloud account
-([details](https://faucet-hq.github.io/faucet-stream/getting-started/try-it-locally.html)).
+([details](https://faucet-hq.github.io/faucet-stream/getting-started/try-it-locally/)).
 
 ## The data path
 
@@ -239,45 +239,45 @@ block in the pipeline file and applies to every connector.
 
 | Guardrail | What it does | Guide |
 |---|---|---|
-| **PII masking** | Redact, hash, tokenize or partially mask fields, matched by name, pattern or value detector (emails, cards, …). Runs first, so raw PII never reaches a sink, the DLQ or a lineage event. | [masking](https://faucet-hq.github.io/faucet-stream/cookbook/masking.html) |
-| **Data-quality checks** | 13 per-record and per-batch assertions: not-null, regex, ranges, sets, uniqueness, row counts, JSON Schema. Each can quarantine, abort or warn. | [quality](https://faucet-hq.github.io/faucet-stream/cookbook/quality.html) |
-| **Data contracts** | A versioned, owned promise about output shape: types, nullability, enums, patterns and bounds, enforced per page. Export it as JSON Schema with `faucet contract`. | [contracts](https://faucet-hq.github.io/faucet-stream/cookbook/contracts.html) |
-| **Data-flow policies** | Classify columns and declare which sinks each label may reach, for example "PII only to EU sinks" or "salaries only hashed". `validate`, `plan` and `doctor` report violations, and `run` refuses them. | [policies](https://faucet-hq.github.io/faucet-stream/cookbook/policies.html) |
-| **Schema drift** | Detects added, removed and retyped columns per page, and then evolves the destination, quarantines or fails, according to the policy you set. | [schema drift](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift.html) |
-| **Column profiling** | Learns per-column profiles (null rate, type mix, distinct counts, distributions) and reports statistically significant drift, with no thresholds to write. | [profiling](https://faucet-hq.github.io/faucet-stream/cookbook/profiling.html) |
-| **SLA monitoring** | Declared freshness and volume floors, plus anomaly detection against learned baselines. | [SLA](https://faucet-hq.github.io/faucet-stream/cookbook/sla.html) |
-| **Lineage and catalog** | OpenLineage events with schema and column-level lineage, sent over HTTP, file or Kafka, and a catalog of every dataset faucet has written. | [lineage](https://faucet-hq.github.io/faucet-stream/cookbook/lineage.html) · [catalog](https://faucet-hq.github.io/faucet-stream/cookbook/catalog.html) |
-| **Change impact analysis** | With a `catalog:` block, as in the example above, `faucet plan --impact` walks the lineage graph and shows which datasets, contracts, owners and consumers a dropped or retyped column breaks, before the change ships. | [impact](https://faucet-hq.github.io/faucet-stream/cookbook/impact.html) |
-| **Plan, approve, run** | Runs and template changes can require approval from named approvers. faucet re-plans before it executes, and every step is audited. | [approvals](https://faucet-hq.github.io/faucet-stream/cookbook/approvals.html) |
-| **Cost and budgets** | Meters rows, bytes, round trips and connector cost signals per run, and enforces hard ceilings with a `budget:` block. | [usage](https://faucet-hq.github.io/faucet-stream/cookbook/usage.html) |
-| **Verify and roll back** | Compares source and destination content with targeted repair, and undoes a bad load with `faucet rollback <run-id>`. | [verify](https://faucet-hq.github.io/faucet-stream/cookbook/verify.html) · [rollback](https://faucet-hq.github.io/faucet-stream/cookbook/rollback.html) |
-| **Secrets** | `${vault:…}`, `${aws-sm:…}`, `${gcp-sm:…}` and `${azure-kv:…}` are resolved at load time and redacted from logs. | [secrets](https://faucet-hq.github.io/faucet-stream/cookbook/secrets.html) |
+| **PII masking** | Redact, hash, tokenize or partially mask fields, matched by name, pattern or value detector (emails, cards, …). Runs first, so raw PII never reaches a sink, the DLQ or a lineage event. | [masking](https://faucet-hq.github.io/faucet-stream/cookbook/masking/) |
+| **Data-quality checks** | 13 per-record and per-batch assertions: not-null, regex, ranges, sets, uniqueness, row counts, JSON Schema. Each can quarantine, abort or warn. | [quality](https://faucet-hq.github.io/faucet-stream/cookbook/quality/) |
+| **Data contracts** | A versioned, owned promise about output shape: types, nullability, enums, patterns and bounds, enforced per page. Export it as JSON Schema with `faucet contract`. | [contracts](https://faucet-hq.github.io/faucet-stream/cookbook/contracts/) |
+| **Data-flow policies** | Classify columns and declare which sinks each label may reach, for example "PII only to EU sinks" or "salaries only hashed". `validate`, `plan` and `doctor` report violations, and `run` refuses them. | [policies](https://faucet-hq.github.io/faucet-stream/cookbook/policies/) |
+| **Schema drift** | Detects added, removed and retyped columns per page, and then evolves the destination, quarantines or fails, according to the policy you set. | [schema drift](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift/) |
+| **Column profiling** | Learns per-column profiles (null rate, type mix, distinct counts, distributions) and reports statistically significant drift, with no thresholds to write. | [profiling](https://faucet-hq.github.io/faucet-stream/cookbook/profiling/) |
+| **SLA monitoring** | Declared freshness and volume floors, plus anomaly detection against learned baselines. | [SLA](https://faucet-hq.github.io/faucet-stream/cookbook/sla/) |
+| **Lineage and catalog** | OpenLineage events with schema and column-level lineage, sent over HTTP, file or Kafka, and a catalog of every dataset faucet has written. | [lineage](https://faucet-hq.github.io/faucet-stream/cookbook/lineage/) · [catalog](https://faucet-hq.github.io/faucet-stream/cookbook/catalog/) |
+| **Change impact analysis** | With a `catalog:` block, as in the example above, `faucet plan --impact` walks the lineage graph and shows which datasets, contracts, owners and consumers a dropped or retyped column breaks, before the change ships. | [impact](https://faucet-hq.github.io/faucet-stream/cookbook/impact/) |
+| **Plan, approve, run** | Runs and template changes can require approval from named approvers. faucet re-plans before it executes, and every step is audited. | [approvals](https://faucet-hq.github.io/faucet-stream/cookbook/approvals/) |
+| **Cost and budgets** | Meters rows, bytes, round trips and connector cost signals per run, and enforces hard ceilings with a `budget:` block. | [usage](https://faucet-hq.github.io/faucet-stream/cookbook/usage/) |
+| **Verify and roll back** | Compares source and destination content with targeted repair, and undoes a bad load with `faucet rollback <run-id>`. | [verify](https://faucet-hq.github.io/faucet-stream/cookbook/verify/) · [rollback](https://faucet-hq.github.io/faucet-stream/cookbook/rollback/) |
+| **Secrets** | `${vault:…}`, `${aws-sm:…}`, `${gcp-sm:…}` and `${azure-kv:…}` are resolved at load time and redacted from logs. | [secrets](https://faucet-hq.github.io/faucet-stream/cookbook/secrets/) |
 
 ## Transform in flight
 
-- **Record transforms**: `flatten`, `select`, `drop`, `rename_keys`, `keys_case`, `cast`, `set`, `coalesce`, `split`, `join`, `json_parse`, `redact`, `hash`, `cdc_unwrap`, and more ([transforms](https://faucet-hq.github.io/faucet-stream/cookbook/transforms.html)).
-- **SQL on each page** with embedded DuckDB, for aggregations, filters and joins against lookup tables ([SQL transform](https://faucet-hq.github.io/faucet-stream/cookbook/sql-transform.html)).
-- **Custom code** in any language that compiles to WebAssembly, sandboxed and run per record ([WASM transforms](https://faucet-hq.github.io/faucet-stream/cookbook/wasm-transforms.html)).
+- **Record transforms**: `flatten`, `select`, `drop`, `rename_keys`, `keys_case`, `cast`, `set`, `coalesce`, `split`, `join`, `json_parse`, `redact`, `hash`, `cdc_unwrap`, and more ([transforms](https://faucet-hq.github.io/faucet-stream/cookbook/transforms/)).
+- **SQL on each page** with embedded DuckDB, for aggregations, filters and joins against lookup tables ([SQL transform](https://faucet-hq.github.io/faucet-stream/cookbook/sql-transform/)).
+- **Custom code** in any language that compiles to WebAssembly, sandboxed and run per record ([WASM transforms](https://faucet-hq.github.io/faucet-stream/cookbook/wasm-transforms/)).
 
 faucet transforms data while it moves. Modelling data that has already landed in the
 warehouse is dbt's job, and the two work well together
-([orchestration recipe](https://faucet-hq.github.io/faucet-stream/cookbook/orchestration.html)).
+([orchestration recipe](https://faucet-hq.github.io/faucet-stream/cookbook/orchestration/)).
 
 ## Reliability you don't have to build
 
 | Guarantee | How it works |
 |---|---|
 | **Bounded memory** | Sources stream page by page and sinks write each page as it arrives, so memory stays at one batch whatever the volume. |
-| **Incremental and resumable** | Bookmarks are saved only after the page is durably written, to a file, Redis or Postgres. A crash replays at most the last page. State is versioned: after an upgrade, faucet migrates an older bookmark or refuses one it can't read, instead of silently re-syncing or skipping ([state](https://faucet-hq.github.io/faucet-stream/cookbook/state.html)). |
+| **Incremental and resumable** | Bookmarks are saved only after the page is durably written, to a file, Redis or Postgres. A crash replays at most the last page. State is versioned: after an upgrade, faucet migrates an older bookmark or refuses one it can't read, instead of silently re-syncing or skipping ([state](https://faucet-hq.github.io/faucet-stream/cookbook/state/)). |
 | **Effectively-once** | On supported sinks, a per-page commit token is written atomically with the data, so a resumed run writes no duplicates. This is idempotent at-least-once, not distributed-consensus exactly-once. |
-| **Upsert and delete** | `write_mode: upsert \| delete` with a key and a delete marker ([upsert](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html)). |
-| **Failure handling** | Retries with backoff and `Retry-After`, a circuit breaker, and a dead-letter queue you can inspect and replay. Each sink declares whether a failed batch is all-or-nothing, and `on_batch_error: dlq_all` is refused on sinks where a failed write may have partly landed, so replaying the DLQ can't duplicate rows ([resilience](https://faucet-hq.github.io/faucet-stream/cookbook/resilience.html) · [DLQ](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html)). |
-| **Change data capture** | Row-level CDC from PostgreSQL, MySQL, SQL Server, MongoDB, Oracle (LogMiner) and DynamoDB Streams. `faucet mirror` runs a snapshot and hands it off to CDC without gaps, for one table or a whole table set ([replication](https://faucet-hq.github.io/faucet-stream/cookbook/replication.html)). |
-| **Status and state** | `faucet status` shows each pipeline on one screen: last success or failure, where the next run resumes, how far a CDC or streaming source is behind, the DLQ backlog, and SLA and profiling verdicts. Exit codes 0 / 1 / 2 make it a cron or Nagios check. `faucet state show / set / reset / export / import` moves, resets, backs up or migrates a bookmark safely, including between file, Redis and Postgres stores ([state and status](https://faucet-hq.github.io/faucet-stream/cookbook/state-and-status.html)). |
-| **Backfills** | Resumable, windowed historical replays with `faucet backfill` ([backfill](https://faucet-hq.github.io/faucet-stream/cookbook/backfill.html)). |
-| **Observability** | Prometheus metrics and `tracing` / OTLP spans for every source, sink, transform and state operation, including source lag (`faucet_source_lag_seconds`, `_bytes`, `_events`) and API throttling (`faucet_source_throttled_total`, `faucet_source_throttle_wait_seconds`) ([observability](https://faucet-hq.github.io/faucet-stream/operations/observability.html)). |
-| **Alerts** | Slack, PagerDuty or signed webhooks on run failures, SLA breaches, DLQ thresholds, open circuit breakers and column drift, with deduplication ([notifications](https://faucet-hq.github.io/faucet-stream/cookbook/notifications.html)). |
-| **Testing** | `faucet test` runs fixture-based tests of a pipeline's transforms and checks offline, and `validate --no-secrets` checks configs in CI without credentials ([testing](https://faucet-hq.github.io/faucet-stream/cookbook/testing.html)). |
+| **Upsert and delete** | `write_mode: upsert \| delete` with a key and a delete marker ([upsert](https://faucet-hq.github.io/faucet-stream/cookbook/upsert/)). |
+| **Failure handling** | Retries with backoff and `Retry-After`, a circuit breaker, and a dead-letter queue you can inspect and replay. Each sink declares whether a failed batch is all-or-nothing, and `on_batch_error: dlq_all` is refused on sinks where a failed write may have partly landed, so replaying the DLQ can't duplicate rows ([resilience](https://faucet-hq.github.io/faucet-stream/cookbook/resilience/) · [DLQ](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/)). |
+| **Change data capture** | Row-level CDC from PostgreSQL, MySQL, SQL Server, MongoDB, Oracle (LogMiner) and DynamoDB Streams. `faucet mirror` runs a snapshot and hands it off to CDC without gaps, for one table or a whole table set ([replication](https://faucet-hq.github.io/faucet-stream/cookbook/replication/)). |
+| **Status and state** | `faucet status` shows each pipeline on one screen: last success or failure, where the next run resumes, how far a CDC or streaming source is behind, the DLQ backlog, and SLA and profiling verdicts. Exit codes 0 / 1 / 2 make it a cron or Nagios check. `faucet state show / set / reset / export / import` moves, resets, backs up or migrates a bookmark safely, including between file, Redis and Postgres stores ([state and status](https://faucet-hq.github.io/faucet-stream/cookbook/state-and-status/)). |
+| **Backfills** | Resumable, windowed historical replays with `faucet backfill` ([backfill](https://faucet-hq.github.io/faucet-stream/cookbook/backfill/)). |
+| **Observability** | Prometheus metrics and `tracing` / OTLP spans for every source, sink, transform and state operation, including source lag (`faucet_source_lag_seconds`, `_bytes`, `_events`) and API throttling (`faucet_source_throttled_total`, `faucet_source_throttle_wait_seconds`) ([observability](https://faucet-hq.github.io/faucet-stream/operations/observability/)). |
+| **Alerts** | Slack, PagerDuty or signed webhooks on run failures, SLA breaches, DLQ thresholds, open circuit breakers and column drift, with deduplication ([notifications](https://faucet-hq.github.io/faucet-stream/cookbook/notifications/)). |
+| **Testing** | `faucet test` runs fixture-based tests of a pipeline's transforms and checks offline, and `validate --no-secrets` checks configs in CI without credentials ([testing](https://faucet-hq.github.io/faucet-stream/cookbook/testing/)). |
 
 ## Connectors
 
@@ -295,10 +295,10 @@ connector depends only on `faucet-core`, so any source works with any sink.
 | **Search** | Elasticsearch | Elasticsearch |
 | **Bridges** | Singer taps (experimental) | Singer targets (experimental), stdout |
 
-- **Capabilities per connector** (streaming, resumable state, write modes, delivery guarantee, auth) are in the [connector matrix](https://faucet-hq.github.io/faucet-stream/reference/connectors.html). For help choosing between overlapping connectors, see [choosing a connector](https://faucet-hq.github.io/faucet-stream/reference/choosing.html).
-- **File formats**: the file and object-store connectors read and write JSONL, JSON, CSV, Excel, XML, Parquet and Avro, and read ORC, chosen per file by extension or set explicitly ([file formats](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats.html)).
-- **Tier 1** connectors pass the [conformance battery](https://faucet-hq.github.io/faucet-stream/reference/conformance.html) in CI against a real backend or an official emulator.
-- **SaaS sources** (CRM, payments, ticketing, advertising and analytics APIs) are maintained as declarative templates on the REST and GraphQL engines, not as separate crates. Browse the [Template Hub](https://faucet-hq.github.io/hub) and run one with `faucet run --source <owner>/<system> --sink faucet-hq/bigquery` ([guide](https://faucet-hq.github.io/faucet-stream/cookbook/template-hub.html)).
+- **Capabilities per connector** (streaming, resumable state, write modes, delivery guarantee, auth) are in the [connector matrix](https://faucet-hq.github.io/faucet-stream/reference/connectors/). For help choosing between overlapping connectors, see [choosing a connector](https://faucet-hq.github.io/faucet-stream/reference/choosing/).
+- **File formats**: the file and object-store connectors read and write JSONL, JSON, CSV, Excel, XML, Parquet and Avro, and read ORC, chosen per file by extension or set explicitly ([file formats](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats/)).
+- **Tier 1** connectors pass the [conformance battery](https://faucet-hq.github.io/faucet-stream/reference/conformance/) in CI against a real backend or an official emulator.
+- **SaaS sources** (CRM, payments, ticketing, advertising and analytics APIs) are maintained as declarative templates on the REST and GraphQL engines, not as separate crates. Browse the [Template Hub](https://faucet-hq.github.io/hub) and run one with `faucet run --source <owner>/<system> --sink faucet-hq/bigquery` ([guide](https://faucet-hq.github.io/faucet-stream/cookbook/template-hub/)).
 
 ## Performance
 
@@ -324,15 +324,15 @@ faucet schedule pipeline.yaml   # built-in cron: DST-correct, overlap policies, 
 faucet serve                    # HTTP control plane with a web console
 ```
 
-- **`faucet run`** runs once and exits, which suits cron, CI and orchestrators like Airflow or Dagster ([orchestration](https://faucet-hq.github.io/faucet-stream/cookbook/orchestration.html)).
-- **`faucet schedule`** is a built-in cron runtime ([scheduling](https://faucet-hq.github.io/faucet-stream/cookbook/scheduling.html)).
+- **`faucet run`** runs once and exits, which suits cron, CI and orchestrators like Airflow or Dagster ([orchestration](https://faucet-hq.github.io/faucet-stream/cookbook/orchestration/)).
+- **`faucet schedule`** is a built-in cron runtime ([scheduling](https://faucet-hq.github.io/faucet-stream/cookbook/scheduling/)).
 - **`faucet serve`** is a long-running control plane. It covers:
-  - a REST API for submitting, polling and cancelling runs ([serve](https://faucet-hq.github.io/faucet-stream/cookbook/serve.html) · [HTTP API](https://faucet-hq.github.io/faucet-stream/reference/http-api.html))
-  - event triggers on object arrival, webhooks and queue depth ([triggers](https://faucet-hq.github.io/faucet-stream/reference/triggers.html))
-  - clustered execution ([cluster](https://faucet-hq.github.io/faucet-stream/cookbook/cluster.html))
-  - an MCP server for agents ([MCP](https://faucet-hq.github.io/faucet-stream/cookbook/mcp.html))
-  - multi-tenant embedding with per-tenant credentials, hosted OAuth and isolated state ([embedded integrations](https://faucet-hq.github.io/faucet-stream/cookbook/embedded-integrations.html))
-- **Deployment**: a [Helm chart](deploy/helm/faucet-stream) and container images are provided ([deploying](https://faucet-hq.github.io/faucet-stream/operations/deploying.html)).
+  - a REST API for submitting, polling and cancelling runs ([serve](https://faucet-hq.github.io/faucet-stream/cookbook/serve/) · [HTTP API](https://faucet-hq.github.io/faucet-stream/reference/http-api/))
+  - event triggers on object arrival, webhooks and queue depth ([triggers](https://faucet-hq.github.io/faucet-stream/reference/triggers/))
+  - clustered execution ([cluster](https://faucet-hq.github.io/faucet-stream/cookbook/cluster/))
+  - an MCP server for agents ([MCP](https://faucet-hq.github.io/faucet-stream/cookbook/mcp/))
+  - multi-tenant embedding with per-tenant credentials, hosted OAuth and isolated state ([embedded integrations](https://faucet-hq.github.io/faucet-stream/cookbook/embedded-integrations/))
+- **Deployment**: a [Helm chart](deploy/helm/faucet-stream) and container images are provided ([deploying](https://faucet-hq.github.io/faucet-stream/operations/deploying/)).
 
 ## Embed it in Rust
 
@@ -361,7 +361,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 - **Compile in only what you use.** Every connector is a Cargo feature, for example `--features source-postgres,sink-bigquery`.
-- **Write your own connector.** Depend on `faucet-core`, implement `Source` or `Sink`, and publish it as `faucet-source-*` / `faucet-sink-*`. The [library tutorial](https://faucet-hq.github.io/faucet-stream/tutorials/library.html) and the [connector spec](docs/spec/faucet-connector-spec-v0.md) cover the contract, and `faucet-conformance` tests it.
+- **Write your own connector.** Depend on `faucet-core`, implement `Source` or `Sink`, and publish it as `faucet-source-*` / `faucet-sink-*`. The [library tutorial](https://faucet-hq.github.io/faucet-stream/tutorials/library/) and the [connector spec](docs/spec/faucet-connector-spec-v0.md) cover the contract, and `faucet-conformance` tests it.
 
 ## When not to use faucet
 
@@ -371,9 +371,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - **You need a never-ending, record-at-a-time stream processor.** Use Redpanda Connect or Vector. faucet runs pipelines as discrete, resumable runs.
 
 For detailed comparisons that are honest about where each tool wins, see
-[vs. Meltano](https://faucet-hq.github.io/faucet-stream/comparison/meltano.html),
-[vs. Airbyte](https://faucet-hq.github.io/faucet-stream/comparison/airbyte.html) and
-[vs. Singer](https://faucet-hq.github.io/faucet-stream/comparison/singer.html).
+[vs. Meltano](https://faucet-hq.github.io/faucet-stream/comparison/meltano/),
+[vs. Airbyte](https://faucet-hq.github.io/faucet-stream/comparison/airbyte/) and
+[vs. Singer](https://faucet-hq.github.io/faucet-stream/comparison/singer/).
 
 ## Install
 
@@ -387,12 +387,12 @@ cargo add faucet-registry --features source-postgres,sink-jsonl # connectors by 
 
 Prebuilt archives with SHA-256 checksums are on the
 [releases page](https://github.com/faucet-hq/faucet-stream/releases). The minimum supported
-Rust version is 1.99. See the [installation guide](https://faucet-hq.github.io/faucet-stream/getting-started/installation.html)
+Rust version is 1.99. See the [installation guide](https://faucet-hq.github.io/faucet-stream/getting-started/installation/)
 for container images and slim builds. Prebuilt binaries cover macOS and Linux.
 
 Pin the version a project uses in its `mise.toml` (`faucet init` writes it) and
 declare the oldest faucet a config needs with `requires_faucet`; see
-[pinning](https://faucet-hq.github.io/faucet-stream/operations/pinning.html).
+[pinning](https://faucet-hq.github.io/faucet-stream/operations/pinning/).
 
 **Agent skills.** Teach Claude Code, Codex or any Agent Skills reader to write,
 debug and deploy faucet pipelines with the skills that ship with each release:
@@ -402,7 +402,7 @@ debug and deploy faucet pipelines with the skills that ship with each release:
 /plugin install faucet@faucet
 ```
 
-Codex and other agents: [agent skills](https://faucet-hq.github.io/faucet-stream/getting-started/agent-skills.html).
+Codex and other agents: [agent skills](https://faucet-hq.github.io/faucet-stream/getting-started/agent-skills/).
 
 ## Star history
 

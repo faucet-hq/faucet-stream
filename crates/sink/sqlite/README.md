@@ -269,7 +269,7 @@ pipeline:
 delivery: exactly_once
 ```
 
-See the [Effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state.html#effectively-once-delivery) for full rationale and the supported source/sink set.
+See the [Effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state/#effectively-once-delivery) for full rationale and the supported source/sink set.
 
 ## Schema evolution
 
@@ -281,11 +281,11 @@ Under `on_drift: evolve`, `SqliteSink::evolve_schema()` is **add-column only**, 
 - **Type widenings are a no-op** — under SQLite's dynamic typing a column already accepts a value of any type, so there is nothing to alter (logged once at `debug`).
 - **Nullability relaxations are a no-op** — SQLite cannot drop a `NOT NULL` constraint in place (it would require a full table rebuild, out of scope here); the column is left as-is (logged once at `debug`).
 
-Incompatible changes (narrowing / type swaps) are never auto-applied — they are routed by `on_incompatible` (`fail` or `quarantine`). See the [schema-drift cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift.html).
+Incompatible changes (narrowing / type swaps) are never auto-applied — they are routed by `on_incompatible` (`fail` or `quarantine`). See the [schema-drift cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift/).
 
 ## Dead-letter queue
 
-The sink reports per-row outcomes via `write_batch_partial`, so when a `dlq:` block is configured, rows that fail (e.g. a missing/null key column in upsert/delete mode) are wrapped in a DLQ envelope and routed to the configured DLQ sink while the rest of the batch still commits. Without a DLQ, a failing row fails the whole batch. See the [DLQ cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html).
+The sink reports per-row outcomes via `write_batch_partial`, so when a `dlq:` block is configured, rows that fail (e.g. a missing/null key column in upsert/delete mode) are wrapped in a DLQ envelope and routed to the configured DLQ sink while the rest of the batch still commits. Without a DLQ, a failing row fails the whole batch. See the [DLQ cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/).
 
 ## How it is built
 
@@ -410,10 +410,10 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 
 ## See also
 
-- [Choosing a connector](https://faucet-hq.github.io/faucet-stream/reference/choosing.html)
-- [Connector capability matrix](https://faucet-hq.github.io/faucet-stream/reference/connectors.html)
-- [Upsert cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html)
-- [State & effectively-once cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state.html)
+- [Choosing a connector](https://faucet-hq.github.io/faucet-stream/reference/choosing/)
+- [Connector capability matrix](https://faucet-hq.github.io/faucet-stream/reference/connectors/)
+- [Upsert cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert/)
+- [State & effectively-once cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state/)
 - [`faucet-source-sqlite`](https://crates.io/crates/faucet-source-sqlite) — the matching SQLite query source.
 - [`faucet-sink-postgres`](https://crates.io/crates/faucet-sink-postgres) / [`faucet-sink-mysql`](https://crates.io/crates/faucet-sink-mysql) — server-database sinks with the same write-mode surface.
 
@@ -432,7 +432,7 @@ fails fast with the same error every table sink raises, naming both ways out.
 
 ## Declared column types
 
-When the run's source declares its column types (a SQL query source, #955 — see [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types)), a table this sink creates types each declared column from the declaration instead of from the first page: SQLite keeps decimals, dates and timestamps as text, so only the integer, real and boolean affinities come from the declaration (a column that is all `null` on the first page still gets its declared affinity). A declared column whose first-page values do not fit its type keeps the inferred type; an existing table is never retyped. With a complete declaration a run that writes nothing creates the empty, typed table.
+When the run's source declares its column types (a SQL query source, #955 — see [Declared column types](../../../docs/site/src/content/docs/reference/value-fidelity.md#declared-column-types)), a table this sink creates types each declared column from the declaration instead of from the first page: SQLite keeps decimals, dates and timestamps as text, so only the integer, real and boolean affinities come from the declaration (a column that is all `null` on the first page still gets its declared affinity). A declared column whose first-page values do not fit its type keeps the inferred type; an existing table is never retyped. With a complete declaration a run that writes nothing creates the empty, typed table.
 
 ## Batch atomicity
 
@@ -440,7 +440,7 @@ What a failed write leaves behind (#737): **atomic** with `batch_size: 0` or `wr
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See
-[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/#batch-atomicity-and-dlq_all).
 
 ## Capabilities
 
@@ -500,7 +500,7 @@ have stored them in (the text, the number it spells, `1` / `0` for `true` /
 `false`), so keys in an untyped or `BOOLEAN` column are found too. Sink hooks: `supports_rollback`, `rollback_run`, `forget_run`,
 `rewind_commit_token`, `readback_source` (the `sqlite` source config
 `faucet verify` reads the destination back with). See the [rollback
-cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/rollback.html).
+cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/rollback/).
 
 Before-images are exact: REAL values are journaled with 17 significant digits
 and BLOBs as hex, and the restore reads them back from the journal in SQL, so

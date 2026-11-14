@@ -125,7 +125,7 @@ half-open connection fails the request instead of hanging the run.
 
 ## Declared column types
 
-When the run's source declares its column types (a SQL query source, #955 — see [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types)), a table this sink creates types each declared column from the declaration instead of from the first page: `Nullable(Int64)`, `Nullable(Float64)`, `Nullable(Bool)`, `Nullable(Decimal(p, s))` (`Decimal(76, 38)` without precision), `Nullable(Date32)`, `Nullable(DateTime64(6, 'UTC'))` / `Nullable(DateTime64(6))`, `Nullable(UUID)`. A declared column whose first-page values do not fit its type keeps the inferred type; an existing table is never retyped. With a complete declaration a run that writes nothing creates the empty, typed table.
+When the run's source declares its column types (a SQL query source, #955 — see [Declared column types](../../../docs/site/src/content/docs/reference/value-fidelity.md#declared-column-types)), a table this sink creates types each declared column from the declaration instead of from the first page: `Nullable(Int64)`, `Nullable(Float64)`, `Nullable(Bool)`, `Nullable(Decimal(p, s))` (`Decimal(76, 38)` without precision), `Nullable(Date32)`, `Nullable(DateTime64(6, 'UTC'))` / `Nullable(DateTime64(6))`, `Nullable(UUID)`. A declared column whose first-page values do not fit its type keeps the inferred type; an existing table is never retyped. With a complete declaration a run that writes nothing creates the empty, typed table.
 
 ## Commit accumulation (`commit_rows` / `commit_bytes`)
 
@@ -161,7 +161,7 @@ What a failed write leaves behind (#737): **atomic** with `batch_size: 0` or a `
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See
-[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/#batch-atomicity-and-dlq_all).
 
 ## Capabilities
 

@@ -29,7 +29,7 @@ and every crate is `1.0.0`+. Maturity varies **by connector**, and we make that
 explicit: **Tier-1 / conformant** connectors pass the
 [`faucet-conformance`](../../crates/conformance) battery in CI; **Tier-2**
 connectors have their own integration tests but aren't conformance-certified yet
-(see the [connector matrix](https://faucet-hq.github.io/faucet-stream/reference/connectors.html)).
+(see the [connector matrix](https://faucet-hq.github.io/faucet-stream/reference/connectors/)).
 Pick the tier that matches your risk tolerance, pin versions, and — please —
 [reproduce the benchmark](../../BENCHMARKS.md) on your hardware before relying on
 the numbers.
@@ -49,12 +49,12 @@ the numbers.
 It is **not** distributed-consensus exactly-once — there is no cross-system
 two-phase commit or consensus protocol. `faucet validate` prints which mechanism
 each pipeline row actually gets. Full detail:
-[delivery guarantees](https://faucet-hq.github.io/faucet-stream/cookbook/state.html).
+[delivery guarantees](https://faucet-hq.github.io/faucet-stream/cookbook/state/).
 
 ## Can I write my own connector?
 
 Yes — that's the point of the marketplace design. `faucet-core` is the only
 required dependency. Read the [FCP spec](../spec/faucet-connector-spec-v0.md) and
-the [authoring guide](https://faucet-hq.github.io/faucet-stream/extending/authoring-connectors.html),
+the [authoring guide](https://faucet-hq.github.io/faucet-stream/extending/authoring-connectors/),
 scaffold with `faucet new connector`, and add a `tests/conformance.rs` to reach
 Tier-1. There's an "add a connector" issue template to claim one.

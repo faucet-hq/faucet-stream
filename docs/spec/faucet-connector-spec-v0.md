@@ -12,7 +12,7 @@ capabilities honestly.
 > reusable [`faucet-conformance`](https://github.com/faucet-hq/faucet-stream/tree/main/crates/conformance)
 > battery. A connector is **Tier-1 / conformant** exactly when it invokes and
 > passes that battery in CI — there is no separate certification. See
-> [Authoring a connector](https://faucet-hq.github.io/faucet-stream/extending/authoring-connectors.html).
+> [Authoring a connector](https://faucet-hq.github.io/faucet-stream/extending/authoring-connectors/).
 
 ---
 

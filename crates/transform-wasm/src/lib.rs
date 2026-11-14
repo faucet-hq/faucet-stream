@@ -37,7 +37,7 @@
 //! Optional exports: `free(ptr: i32, len: i32)` (host calls it after copying
 //! output out), `error_ptr() -> i32` / `error_len() -> i32` (error message).
 //!
-//! See the crate README and the `docs/book` cookbook page for full details and
+//! See the crate README and the docs-site cookbook page for full details and
 //! reference modules.
 
 mod abi;

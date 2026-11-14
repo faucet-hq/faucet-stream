@@ -72,7 +72,7 @@ complementary to dbt — it owns Extract + Load (raw lossless rows into Postgres
 dbt owns Transform (typed, tested staging models), and because faucet is a single
 binary the orchestrator just shells out to `faucet run`. See
 [`orchestration/README.md`](orchestration/README.md) and the
-[Orchestration cookbook page](../docs/book/src/cookbook/orchestration.md).
+[Orchestration cookbook page](../docs/site/src/content/docs/cookbook/orchestration.md).
 
 ## Dashboards & alerts
 

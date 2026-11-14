@@ -463,7 +463,7 @@ export async function renderDatasets(host, params) {
     if (listErr) return catalogUnavailable(listErr) ? empty("The catalogue is not available", CATALOG_MISSING, { icon: "db" }) : "";
     if (!all) return html`<span class="skel t"></span><span class="skel w60"></span>${skelCards(3)}`;
     if (!all.length) {
-      return empty("Nothing catalogued yet", "A dataset appears here after the first successful run that reads or writes it. Every run records its source, destination, schema and row counts.", { icon: "db", btns: html`${btn("Submit a run", { kind: "primary", icon: "submit", href: href.submit(), perm: "config_submit" })}${btn("How the catalogue works", { href: "https://faucet-hq.github.io/faucet-stream/cookbook/catalog.html" })}` });
+      return empty("Nothing catalogued yet", "A dataset appears here after the first successful run that reads or writes it. Every run records its source, destination, schema and row counts.", { icon: "db", btns: html`${btn("Submit a run", { kind: "primary", icon: "submit", href: href.submit(), perm: "config_submit" })}${btn("How the catalogue works", { href: "https://faucet-hq.github.io/faucet-stream/cookbook/catalog/" })}` });
     }
     const by = (k) => all.filter((x) => freshness(x).key === k);
     const stale = by("stale").sort((a, b) => ageMs(b.last_success) - ageMs(a.last_success));

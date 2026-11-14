@@ -30,7 +30,7 @@ fn hub_dir() -> PathBuf {
     repo_root().join("hub")
 }
 
-const MATRIX_PAGE: &str = "docs/book/src/reference/template-hub-matrix.md";
+const MATRIX_PAGE: &str = "docs/site/generated/reference/template-hub-matrix.md";
 const INDEX_JSON: &str = "hub/index.json";
 
 fn catalog() -> Catalog {

@@ -316,4 +316,4 @@ The Snowflake source has no equivalent (its REST API is jsonv2-only).
 The source reports its backend round trips (`query`, `poll`, `job`) and the
 `bytes_processed` cost signal (`totalBytesProcessed` of each query job) to
 faucet's usage meter, priced with `usage.pricing.warehouse.bigquery_per_tib_scanned`;
-see the [usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage.html).
+see the [usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage/).

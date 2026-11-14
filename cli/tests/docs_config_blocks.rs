@@ -1,6 +1,6 @@
 //! Every complete config in the docs site validates (#821).
 //!
-//! A fenced ```yaml block under `docs/book/src/` whose document has top-level
+//! A fenced ```yaml block under `docs/site/src/content/docs/` whose document has top-level
 //! `version:` and `pipeline:` keys is a config a reader will copy. It goes
 //! through the same path as `faucet validate --no-secrets`: required params
 //! bind to placeholders, secret-manager directives are tolerated, and
@@ -156,14 +156,15 @@ async fn validate(path: &Path) -> Result<(), String> {
 
 #[tokio::test]
 async fn every_complete_config_in_the_docs_validates() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/book/src");
-    if !root.is_dir() {
-        return;
-    }
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .canonicalize()
+        .unwrap();
+    let root = repo.join("docs/site/src/content/docs");
+    assert!(root.is_dir(), "docs pages not found at {}", root.display());
     // Docs paths (a wasm module, a reference CSV) are relative to the repo root,
     // where a reader runs them. Run from a scratch directory that links those
     // trees, so the generated block files stay out of the checkout.
-    let repo = root.join("../../..").canonicalize().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     for tree in ["cli", "examples"] {
         std::os::unix::fs::symlink(repo.join(tree), tmp.path().join(tree)).unwrap();

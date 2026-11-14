@@ -356,7 +356,7 @@ This crate has no optional features of its own. Enable it in the CLI / umbrella 
 
 ## See also
 
-- [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) · [Choosing a connector](https://faucet-hq.github.io/faucet-stream/reference/choosing.html)
+- [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors/) · [Choosing a connector](https://faucet-hq.github.io/faucet-stream/reference/choosing/)
 - Related crates: [faucet-source-websocket](https://crates.io/crates/faucet-source-websocket) · [faucet-source-kafka](https://crates.io/crates/faucet-source-kafka) · [faucet-sink-http](https://crates.io/crates/faucet-sink-http)
 
 ## Capabilities

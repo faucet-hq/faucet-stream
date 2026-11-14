@@ -1,0 +1,823 @@
+---
+title: "Template Hub: source × sink templates"
+description: "A pipeline config bundles two very different kinds of knowledge: how to read a system — auth, pagination, incremental cursors, which endpoints become which tables, how records…"
+---
+
+A pipeline config bundles two very different kinds of knowledge: **how to
+read a system** — auth, pagination, incremental cursors, which endpoints
+become which tables, how records are shaped — and **where to put the
+result**. The first is hard-won and reusable; the second is a handful of
+credentials. Bundling them means an `erp-to-bigquery` template is useless
+to a Snowflake or Postgres user.
+
+The Template Hub splits them:
+
+- a **`source-template`** owns the source side: one connector, its shared
+  `transforms`, and a list of **streams** (tables), each declaring the write
+  semantics it needs;
+- a **`sink-template`** owns the destination: one connector and how a stream
+  is addressed (`per_stream`).
+
+Any source × any sink composes into an ordinary pipeline at run time:
+
+```bash
+faucet run --source acme/billing --sink faucet-hq/bigquery \
+  --param api_token --param bq_project=my-project --param bq_sa_key   # secrets from $API_TOKEN / $BQ_SA_KEY
+
+faucet run --source acme/billing --sink faucet-hq/jsonl     # the same source, validated locally first
+faucet run --source acme/billing --sink faucet-hq/postgres  # real upsert/overwrite semantics
+```
+
+The engine repository ships the **layout and tooling** under
+[`hub/`](https://github.com/faucet-hq/faucet-stream/tree/main/hub): sink templates
+for BigQuery, PostgreSQL, SQLite, and JSON Lines, plus two example source
+templates (`example-csv` runs offline; `example-rest-api` is a skeleton to copy).
+Real source templates live in the **public hub**,
+[faucet-hq/template-hub](https://github.com/faucet-hq/template-hub) — the
+default `--hub`, browsable at [faucet-hq.github.io/hub](https://faucet-hq.github.io/hub) —
+so the engine repo does not become a vendor directory. The generated
+[source × sink matrix](/faucet-stream/reference/template-hub-matrix/) renders whatever
+catalog the docs are built from, with a copy-paste command per pairing.
+
+## A source template
+
+```yaml
+kind: source-template
+name: billing
+owner: acme                      # hub id acme/billing: the composed pipeline's `name:`
+description: Acme Billing — invoices, payments, and customers
+tags: [finance, billing]
+params:
+  client_id:     { type: string, required: true, secret: true }
+  client_secret: { type: string, required: true, secret: true }
+source:                          # the connector every stream shares
+  type: rest
+  config:
+    base_url: https://api.acme-billing.example/v1
+    auth: { type: oauth2, config: { token_url: …, client_id: "${param.client_id}", client_secret: "${param.client_secret}", scopes: […] } }
+    records_path: $.data[*]
+    pagination: { type: NextLinkInBody, next_link_path: $.page.next }
+transforms:                      # shaping that travels with the source — runs before EVERY sink
+  - { type: keys_case, config: { mode: snake } }
+streams:
+  - name: bills                  # → matrix row id, state-key suffix, and the destination table
+    source: { config: { path: /bills } }          # merged onto source.config
+    transforms: [{ type: json_encode, config: { fields: [line_items, vendor] } }]
+    primary_keys: [id]
+    write: [overwrite, upsert]   # preference order
+  - name: transactions
+    source: { config: { path: /transactions, replication_method: { type: Incremental, … } } }
+    primary_keys: [id]
+    write: [upsert, append]
+```
+
+| Field | Purpose |
+|---|---|
+| `name` | Short name (`^[a-z0-9][a-z0-9_-]*$`, equal to the file stem). With `owner`, the hub id is `owner/name`; the composed pipeline's `name:` is `{id}.{sink id}` — so per-stream state keys are `{id}.{sink id}::{stream}` and each pairing keeps its own bookmarks (a deployment overlay's `state_scope: source` shares them across sinks). |
+| `owner` | Publisher namespace — the GitHub user or org login the file lives under (`source-templates/<owner>/`). `faucet-hq` for the hub's official templates. |
+| `params`, `auth` | Same grammar as a pipeline's `params:` / `auth:` blocks. Merged with the sink template's at compose time; a name declared by both with different specs is an error. |
+| `source` | The connector every stream reads through. Shared transforms go in the top-level `transforms`, not here. |
+| `sources` | Additional named connectors for streams that read a second endpoint family (a reports API beside the entity API). A stream picks one with `source.ref`. |
+| `transforms` | The pipeline layer — runs before any sink, so every destination receives the same record shape (`keys_case`, `json_encode` for nested fields, `cast`, …). |
+| `contract` | Optional data contract, passed through as `pipeline.contract`. |
+| `streams[]` | One table each: `name`, `source.config` override, per-stream `transforms` (the matrix-row layer), `primary_keys`, `write`, and optionally `parent` / `parent_key` (per-record fan-out), `depends_on` (streams this one starts after — completion order only; a run request can add more, #960), `inherit_transforms: false`, and `for_each` / `as` / `name_case` ([one row per list item](#repeating-a-stream-over-a-list-param-for_each)). |
+
+`write` is a single mode or an **ordered preference list**: `overwrite` for a
+full refresh, `upsert` (needs `primary_keys`, which become the sink's `key`),
+`append`, `delete`. Default `append`.
+
+Writing one well comes down to a few choices:
+
+| The stream is… | `write` |
+|---|---|
+| a full refresh of a dimension or list, re-read every run | `[overwrite, upsert]` |
+| an incremental feed of mutable records | `[upsert, append]` |
+| an immutable event log | `append` |
+
+Order matters: `[overwrite, upsert]` gets an atomic replace on a warehouse and
+still composes with a sink that cannot overwrite. `primary_keys` name columns as
+they look **after** the template's transforms, while an incremental stream's
+`replication_key` is read from the raw API record
+([Nested replication keys](/faucet-stream/cookbook/state/#nested-replication-keys)) — when
+`keys_case` renames `updatedAt` to `updated_at`, the key is `updatedAt`. A wrong
+key only warns and the bookmark never advances, so run twice with
+a state store and check that the second run asks for newer records. Make every
+host a param that defaults to the public URL (`api_base_url`), so a test or a
+recorded replay can point it at a local server and a self-hosted variant needs
+no fork; every credential is a `secret: true` param with no default. Shaping
+that every destination needs (`keys_case`, `json_encode` for nested objects)
+goes in the top-level `transforms`.
+
+### Repeating a stream over a list param (`for_each`)
+
+A stream can repeat once per item of a `type: list` param, so one run copies
+a set of tables the caller picks when it triggers the run — every table of a
+connection, say — each as its own row, with its own row id, state key and
+destination:
+
+```yaml
+kind: source-template
+name: pg-tables
+params:
+  pg_url:    { type: string, required: true, secret: true }
+  pg_schema: { type: string, default: public }
+  tables:                          # ["orders", "customers"]
+    type: list
+    required: true
+    items: { type: string }
+    max_items: 500
+  shards: { type: list, required: true, items: { type: int } }   # [1, 2, 3]
+  objects:                         # [{schema: sales, table: Orders}]
+    type: list
+    required: true
+    items:
+      type: object
+      properties:
+        schema: { type: string, required: true }
+        table:  { type: string, required: true }
+source:
+  type: postgres
+  config: { connection_url: "${param.pg_url}" }
+streams:
+  - for_each: ${param.tables}
+    as: t                          # a scalar item is ${t}
+    name: "${param.pg_schema}_${t}"
+    source: { config: { query: 'SELECT * FROM "${param.pg_schema}"."${t}"' } }
+    write: overwrite
+  - for_each: ${param.shards}
+    as: n
+    name: "events_shard_${n}"
+    source: { config: { query: "SELECT * FROM events WHERE shard_id = ${n}" } }
+  - for_each: ${param.objects}
+    as: o                          # an object item's fields are ${o.field}
+    name: "${o.schema}_${o.table}"
+    name_case: snake               # Sales_Orders → sales_orders
+    source: { config: { query: 'SELECT * FROM "${o.schema}"."${o.table}"' } }
+```
+
+Each item becomes one stream before the template composes: `${<as>}` (a
+scalar item) or `${<as>.<field>}` (an object item) is rendered in the stream's
+`name`, `source.config`, `transforms`, `primary_keys` and `write`; a name may
+also use scalar `${param.*}` values. With a sink whose `per_stream` is
+`table_id: "${stream}"` each item lands in its own table
+(`public_orders`, `public_customers`), and its bookmarks live under
+`{id}.{sink id}::{rendered name}` — stable for as long as the item is.
+Dropping an item from the list leaves its state alone; it is not deleted.
+The rows run through the matrix executor like any others, up to the run's
+`execution.max_concurrent`, and one failing row never hides the others:
+`GET /v1/runs/{id}` reports every row's `status` (`succeeded` / `failed` /
+`skipped`) and `error`.
+
+The rules, all checked before anything starts (an HTTP trigger answers `422`):
+
+| Rule | Refused with |
+|---|---|
+| `for_each` is exactly `${param.NAME}` of a declared `type: list` param — never upstream data or `${env:}` | the stream named |
+| `as` is a lower-case identifier that shadows no namespace (`param`, `stream`, `env`, …) | the stream named |
+| every item matches `items:` — its type, its `values:` set, an object's `required` fields (and no other field) | the item's index: `param 'tables[2]': expected an integer, got "abc"` |
+| the list holds `min_items` (default **1** — an empty list is refused rather than run with no rows; set `min_items: 0` to allow it) to `max_items` items | the count |
+| each rendered name matches `^[a-z0-9][a-z0-9_]*$` (≤ 64 chars), after `name_case: snake` when set | the item and the name it rendered |
+| rendered names are unique across the template, static streams included (`1` and `"1"` coerce to the same `int`) | both items |
+| two items do not render the same destination ([below](#a-sink-template)) | the stream |
+| a list of lists, a `parent:` on a repeated stream, or a child of one | at registration |
+| a `secret` item (or field, or param) in a `name` — row names show in run records and logs | at registration |
+
+An item spliced into a longer string is held to exactly the rules a
+`${param.*}` is: in SQL text a text item must sit inside quotes
+(`"${t}"`, `'${t}'`) and may not carry a quote, backtick, `;`, backslash or
+control character; in a URL it may not add a query, fragment or `..`
+segment; it can never form a `${…}` directive with the text around it. An
+`int` / `float` item may stand unquoted (`WHERE shard_id = ${n}`) because it
+is type-checked; a string item in a value position must be quoted. A closed
+`values:` set on the items (or a field) lifts the text rules. `int` items
+render as their exact digits (`9007199254740993` stays exact), `float` items
+through faucet's exact-decimal rendering, `bool` as `true` / `false`.
+
+The list is supplied like any param: a JSON array over HTTP
+(`"tables": ["orders", "customers"]`), `--param tables='["orders","customers"]'`
+on the CLI, or comma-separated text for a list of strings
+(`--param tables=orders,customers`). A `secret: true` list (or a `secret`
+field of an object item) is masked as `***` in run records and responses
+and refused where a run body is persisted, like a scalar secret param.
+`faucet template rows <id> --param tables=…` / `faucet hub rows` (and
+`GET /v1/templates/{id}/rows?params={"tables":[…]}`) list the rows a trigger
+with those items would run, and `--select public_orders` selects by rendered
+name. Without the param a listing shows two placeholder items. `faucet hub
+compose` needs every list param passed, so the composed config it prints
+holds real rows.
+
+## Importing a template from an OpenAPI description
+
+When an API publishes an OpenAPI 3.x or Swagger 2.0 document, start from it
+instead of a blank file:
+
+```bash
+faucet hub import openapi https://api.example.com/openapi.json --owner acme --out .
+faucet hub import openapi ./openapi.yaml --owner acme --include '/v1/*' --dry-run
+```
+
+The importer writes `source-templates/<owner>/<name>.yaml` and a draft suite at
+`tests/<owner>/<name>/suite.yaml` under `--out` (a hub root). It is
+deterministic: the same spec gives the same bytes, so a re-import diffs cleanly
+against the published version, and it refuses to overwrite a changed file
+unless `--force` (it prints the diff either way). Every connector field comes
+from the REST source's own config types, and the result is read back through
+the parser `faucet validate` and `faucet hub lint` use before anything is
+written.
+
+| In the spec | In the template |
+|---|---|
+| `servers[]` (Swagger: `schemes` + `host` + `basePath`) | an `api_root` param defaulting to the chosen server (`--server` picks an index or URL); `base_url: ${param.api_root}`. No absolute server → `api_root` is required |
+| `components.securitySchemes` (Swagger: `securityDefinitions`) | `auth:` — HTTP bearer → `bearer`, HTTP basic → `basic`, `apiKey` in a header or query → `api_key` / `api_key_query`, OAuth2 client credentials → `oauth2`. Each credential is a `secret: true` param with no default. The scheme most operations use becomes the shared auth |
+| each `GET` operation that returns an array, directly or under an envelope property (`data`, `items`, `results`, …) | one stream, with `records_path` |
+| a path parameter (`/customers/{customer_id}/orders`) that resolves to another list | a child stream with `parent:` and a `${parent.field}` path token |
+| `cursor` / `starting_after` / `page_token` + a next-cursor field, `page` / `per_page`, `offset` / `limit`, a `Link` response header, a next-page URL in the body | `pagination:` `Cursor`, `PageNumber`, `Offset`, `LinkHeader`, `NextLinkInBody` |
+| `x-primary-key`, an `id` property, or one required key-like property | `primary_keys` |
+| an `updated_since`-style filter parameter + a timestamp property | an incremental stream (`replication_key` + `replication_bind`), `write: [upsert, append]` |
+| no incremental filter | `write: [overwrite, upsert]` |
+| an event or log list (`/events`, `/logs`, `/audit_logs`, …) | `write: append` |
+| response schemas | a per-stream `schema` hint; nested object and array fields are encoded by one shared `json_encode` transform |
+| a documented `429`, `Retry-After` or `x-ratelimit-*` header | `retry_on_response` rules (the reset header's wait is read when its unit is documented) |
+| response `example` / `examples` | behavioural cases in the draft suite: the example records in, the transformed records out |
+
+When the spec does not settle a choice — two candidate cursor parameters, no
+detectable key, a reset header without a unit, a page-size parameter with nothing
+that advances pages, a `count` field that may be the page size rather than the
+total — the field is left unset and the choice is listed as an open **decision**
+in the report. Where the importer does pick (the first of several servers, a
+conventional wrapper among several arrays, `{customer_id}` taken to be the
+parent's `id`, the alphabetically first of equally used auth schemes), the pick
+is listed as a decision too (stderr, or `--format
+json` for the report and both files as one document). Nothing is guessed, so a
+missing key fails `faucet hub check` for keyed write modes instead of shipping a
+wrong one. Auth schemes and spec features the REST source cannot express
+(OAuth2 flows that need a browser, cookie API keys, mutual TLS) are reported as
+**unsupported**, and operations that are not lists (single-object lookups,
+reports) are listed as **skipped**. A spec with more than 200 `GET` operations
+needs `--include`.
+
+`$ref`s are followed within the document and into relative files inside the
+spec's own location: the same scheme, host and port for a URL, the spec's
+directory (symlinks resolved) for a file. An absolute or network-path
+reference, one that leaves that location, or one with a backslash or
+surrounding whitespace is refused unless `--allow-remote-refs`; a remote
+document is never allowed to reference a local file. `$ref`s inside literal
+data (`example`, `default`, `enum`, `x-*` extensions, an Example Object's
+`value`) are not followed. Each document is read with a 32 MiB limit, local
+ones only when they are regular files.
+
+Spec text is untrusted: a path, server URL, parameter or field name, token URL
+or API-key name containing `${` would become an interpolation directive in the
+template, so it is refused (reported as unsupported, the item left out), and
+descriptions and example records containing it are dropped.
+
+Then finish it like any other template: resolve the decisions from the API
+reference or a live response, lint, check against two sinks, run the suite:
+
+```bash
+faucet hub lint --hub .
+faucet hub check --hub . --source acme/example-store --sink faucet-hq/sqlite
+faucet template test tests/acme/example-store/suite.yaml
+```
+
+The agent skill's [from-API-docs workflow](https://github.com/faucet-hq/faucet-stream/blob/main/skills/faucet-templates/references/from-api-docs.md)
+covers APIs without a machine-readable description, and a worked example (spec,
+generated template and suite) lives under
+[`skills/faucet-templates/examples/`](https://github.com/faucet-hq/faucet-stream/tree/main/skills/faucet-templates/examples).
+
+## A sink template
+
+```yaml
+kind: sink-template
+name: bigquery
+description: Google BigQuery — one table per stream
+params:
+  bq_project: { type: string, required: true }
+  bq_dataset: { type: string, default: raw }
+  bq_sa_key:  { type: string, required: true, secret: true }
+sink:
+  type: bigquery
+  config:
+    project_id: "${param.bq_project}"
+    dataset_id: "${param.bq_dataset}"
+    auth: { type: service_account_key, config: { json: "${param.bq_sa_key}" } }
+per_stream:
+  table_id: "${stream}"          # rendered once per stream
+```
+
+`per_stream` is the addressing rule: every key is copied into the sink config
+of each stream's row with `${stream}` (the stream name) and `${source}` (the
+source template's name) substituted — `table_id: "${stream}"` for a
+warehouse, `path: "${param.out_dir}/${source}/${stream}.jsonl"` for files.
+`write_mode` and `key` are **never** written in a sink template: the composer
+injects them per stream.
+
+A destination can come from a param instead (`table_id: "${param.table}"`),
+for a caller that triggers one run per table of a one-stream source
+template. Whether two streams would land in the same place is decided when
+the pair composes, on the **rendered** values: a pairing where two streams
+(or two items of a [`for_each`](#repeating-a-stream-over-a-list-param-for_each)
+stream) render the same `per_stream` block is refused —
+`sink-template 'X': per_stream renders the same destination for streams a and
+b — use ${stream} (or a per-stream param) so they don't collide` — and
+`faucet hub check` / `faucet hub matrix` report it as incompatible. So
+`table_id: "${param.table}"` composes with a one-stream source and is refused
+with a multi-stream one.
+
+### Satisfying a mode by construction
+
+A sink that replaces its output on every run *is* doing a full refresh, even
+when its connector only knows `append`. The `file` sink overwrites natively, so
+the hub's `jsonl` template needs nothing extra; a template over an append-only
+connector that truncates (a [plugin](/faucet-stream/tutorials/library/) sink, say) can
+declare the substitution:
+
+```yaml
+sink:
+  type: acme-files               # a plugin sink that rewrites its file each run
+  config: {}
+per_stream:
+  path: "${param.out_dir}/${source}/${stream}.jsonl"
+write_mode_aliases:
+  overwrite: append              # a stream that wants overwrite runs as append here
+```
+
+The composer records the substitution (`overwrite→append` in `faucet hub
+check`) and validates it against the connector registry: the target mode must
+be one the connector supports, an alias for a natively supported mode is
+refused as redundant, and `overwrite: append` is the only alias: keyed modes
+(`upsert`, `delete`) can neither be aliased — only a sink that dedups by key can
+honour them — nor be an alias's target (`overwrite: delete` would delete
+exactly the rows each run fetched), and no mode may stand in for `overwrite`. `overwrite: append` is refused
+for a built-in sink that, as configured, keeps what earlier runs wrote (an
+appending file, a queue, an object store with unique names, a warehouse): every
+overwrite stream would re-append the whole table on each run. A plugin sink is
+taken at its template's word.
+
+### Child streams and truncating sinks
+
+A child stream (`parent:`) runs once **per parent record** into the same
+destination. On a sink that replaces its output on every invocation — a
+`file` sink in `if_exists: replace` (its default) writing one fixed path — every
+parent's invocation would wipe the previous one's
+rows, leaving only the last parent's. So the composer refuses:
+
+- a child stream on a truncating sink, whatever mode it asks for; and
+- a child stream's `overwrite` satisfied through an alias (`overwrite: append`)
+  on any sink.
+
+A **native** overwrite (postgres, sqlite, mysql, mssql, mongodb, bigquery) is
+allowed: the executor stages it once for all of a row's invocations and swaps
+once. When a child stream lists several modes, a refused one falls through to
+the next (`write: [overwrite, upsert]` → `upsert`); if none remains the pairing
+fails with the stream named:
+
+```text
+child stream 'bill_lines' (parent: bills) cannot satisfy overwrite via append on sink 'acme-files':
+each parent invocation would replace the output, keeping only the last parent's rows
+```
+
+`faucet validate` / `run` apply the same rule to hand-written configs and to
+deployment overlays: a `parent:` or `fan_out:` row whose truncating file sink
+writes one fixed path (no `${parent.*}`-style token; `${now.*}` does not count)
+is refused. Set `if_exists: append`, or put a per-parent token in the path.
+
+## Composition and the compatibility matrix
+
+`faucet run --source X --sink Y` (and `faucet validate --source X --sink Y`,
+`faucet hub compose`) build an ordinary config document (shape only — the
+`<…>` parts stand for what each template contributes):
+
+<!-- faucet:no-validate -->
+```yaml
+version: 1
+name: acme/billing                           # the source's hub id
+params: { …merged… }
+pipeline:
+  sources: { default: <source-template.source> }
+  sinks:   { default: <sink-template.sink> }
+  transforms: <source-template.transforms>
+matrix:
+  - id: bills
+    source: { ref: default, config: { path: /bills } }
+    sink:   { ref: default, config: { table_id: bills, write_mode: overwrite } }
+    transforms: [{ type: json_encode, … }]
+  - id: transactions
+    source: { ref: default, config: { path: /transactions, … } }
+    sink:   { ref: default, config: { table_id: transactions, write_mode: upsert, key: [id] } }
+```
+
+For each stream the composer walks its `write` list and picks the **first
+mode the sink supports** — natively (from the connector registry's write-mode
+capabilities) or through an alias. A stream with no viable mode fails the
+pairing with a per-stream message naming both sides:
+
+```
+source-template 'acme/billing' cannot compose with sink-template 'plain' — 2 stream(s) have no viable write mode:
+  - bills: needs overwrite|upsert; sink 'jsonl' supports only append
+  - transactions: needs upsert|append; …
+```
+
+Everything after composition is the existing run path — params binding,
+secret resolution, `expand` (with its write-mode × sink gate), the executor —
+so a composed pipeline inherits every guarantee a hand-written one has.
+
+`faucet hub matrix` renders the whole catalog: `--format table` for the
+terminal, `markdown` for the docs page, `json` for `hub/index.json`.
+
+## Deployment overlays
+
+A composed run still needs the blocks that belong to **neither** template: a
+state store for incremental bookmarks, a DLQ, notifications, an SLA. A source
+template is published for everyone, so it cannot name *your* state store; a
+sink template describes a destination, not an operations policy. Those blocks
+live in a third document, a `kind: deployment` overlay, applied last:
+
+```yaml
+# ops/prod.yaml
+kind: deployment
+name: prod
+description: Production state, DLQ and paging for composed runs
+params:
+  state_dsn: { type: string, required: true, secret: true }
+state: { type: postgres, config: { connection_url: "${param.state_dsn}" } }
+dlq:   { sink: { type: file, config: { path: /var/faucet/dlq/${now.date}.jsonl } } }
+notify:
+  - { name: oncall, on: [run_failure, sla_breach], channel: { type: pagerduty, config: { routing_key: "${env:PD_KEY}" } } }
+sla: { max_staleness_secs: 86400 }
+streams:
+  invoices: { sla: { min_rows_per_run: 1 } }   # per-stream override
+  scratch:  { dlq: null }                       # no DLQ for this one
+```
+
+```bash
+faucet run      --source acme/billing --sink faucet-hq/bigquery --overlay ops/prod.yaml --param state_dsn=…
+faucet validate --source acme/billing --sink faucet-hq/bigquery --overlay ops/prod.yaml
+```
+
+An overlay may set only operational blocks — `state`, `dlq`,
+`notifications` (alias `notify`), `sla`, `profiling`, `policy`, `resilience`, `execution`,
+`delivery`, `schedule` — and per-stream `sla` / `dlq` / `delivery` under
+`streams:`. Anything that would change which connectors run or what the streams
+produce (`pipeline`, `matrix`, `source`, `sink`, `transforms`) is refused with a
+message saying so, so the shape of a run is always fixed by its two templates.
+`state` and `dlq` land under `pipeline.`, the rest at the top level, and an
+overlay's value replaces whatever the composition carried. Its `params:` merge
+with the templates' (a name declared on both sides must be declared
+identically). The run keeps the pairing's `name` (`{source}.{sink}`), so its
+state keys are the same with or without an overlay. A new destination starts
+from an empty bookmark; to have a sink swap resume where the previous sink
+stopped, set `state_scope: source` on the overlay — the run is then named after
+the source alone, so never run two pairings of it at once. A `streams.<name>`
+entry must name a stream of the source template; on a run that selects only
+some streams (a row selection, or the streams a sink can run), entries for the
+streams left out are skipped.
+
+`faucet validate` and `faucet hub check --overlay` print what the overlay set
+(`pipeline.state, notifications, matrix.invoices.sla`, …). Two warnings are
+worth knowing:
+
+- a source with **incremental** streams composed with **no** `state:` re-reads
+  everything each run, and the plan says so, naming the overlay as the fix;
+- an overlay whose state store is `memory` loses those bookmarks when the
+  process exits.
+
+An overlay passed as `--overlay` is a file, or an id under `<hub>/deployments/`.
+In the [template registry](/faucet-stream/cookbook/templates/) it is a registered template like any
+other (`faucet template register ops/prod.yaml`), picked per trigger:
+`faucet template run acme/billing --sink bigquery --overlay prod`, HTTP
+`{"sink": "bigquery", "overlay": "prod"}` (or an inline mapping), MCP
+`run_template {overlay}`, a suite's `overlay:`, or the console's **deployment**
+selector. `faucet hub lint` checks an overlay for literal credentials — a
+password in a connection URL included — since the values it holds are usually
+secrets.
+
+## Commands
+
+```bash
+faucet hub list      [--hub DIR] [--json]
+faucet hub check     --source X --sink Y [--overlay O] [--json]  # per-stream write modes + typed config validation; exit≠0 if incompatible or invalid
+faucet hub compose   --source X --sink Y [--overlay O] [--out FILE|--json]
+faucet hub matrix    [--format table|markdown|json] [--out FILE]
+faucet hub lint      [--hub DIR] [FILE…]                   # publishability lint + typed config validation
+faucet hub import    openapi <URL|PATH> --owner O [--out DIR] [--include GLOB] [--dry-run] [--format json]  # draft source template + suite
+faucet run           --source X --sink Y [--overlay O] [--param k=v] …  # compose + run
+faucet validate      --source X --sink Y [--overlay O] [--show-composed]  # compose + validate offline
+faucet schema source-template | sink-template | deployment | test-suite | template-tests
+```
+
+`hub check` and `hub lint` also run every template's **test bundle** (its
+`tests:` block, see [Test bundles](/faucet-stream/cookbook/templates/#template-tests-and-labels)):
+check runs the source's and the sink's, lint runs every source, sink and
+deployment in the catalog (or the files named). A failing case is a finding and
+fails the command. A bundle's companions (`tests.sink`, `tests.source`,
+`tests.overlay`) resolve in the same hub, and `requires_suites` resolves against
+the hub's `test-suites/` directory (`<hub>/test-suites/[<owner>/]<name>.yaml`, one
+release per file). A hub's CI should run `faucet hub lint` so a template whose
+tests fail never merges; a server mirroring the hub with `--templates-sync` runs
+each new version's bundle as it registers it and records the result, so a
+`launch: true` sidecar launches only what passed when the server requires tests.
+
+`--source` / `--sink` take a **path** or a **hub id**, resolved as
+`<hub>/source-templates/<id>.yaml` and `<hub>/sink-templates/<id>.yaml`. The
+hub is `--hub`, else `$FAUCET_HUB`, else `./hub` when that directory exists,
+else the **public hub** (next section).
+
+## The public hub
+
+The shared catalog lives at
+[github.com/faucet-hq/template-hub](https://github.com/faucet-hq/template-hub)
+and is browsable at [faucet-hq.github.io/hub](https://faucet-hq.github.io/hub).
+It is the default hub, so with no `./hub` checkout and no `--hub`:
+
+```bash
+faucet hub list                                   # fetches github:faucet-hq/template-hub (cached)
+faucet run --source acme/billing --sink faucet-hq/bigquery --param api_token="$T" …
+```
+
+A remote hub is any GitHub repository laid out like `hub/`:
+`--hub github:owner/repo[@ref][/path]` or a `https://github.com/…[/tree/ref/path]`
+URL. The CLI resolves the ref to a commit with one API request, downloads the
+catalog into `~/.cache/faucet/hub/<repo>/<ref>/<commit>/` the first time
+(`%LOCALAPPDATA%\faucet\hub\` on Windows; `FAUCET_HUB_CACHE` or
+`XDG_CACHE_HOME` override the location), and reuses the snapshot until the ref moves. The
+snapshot includes the catalog's `index.json`, so an unpinned template resolves
+to its launched (`stable`) version — not whatever body was merged last — and
+`@N` / `@stable` / `@newest` pins work against a remote hub. When the ref moves,
+the snapshot it replaced is kept until the next move, so a run that started a
+moment earlier keeps reading it. Offline, the last snapshot is used
+with a warning (`FAUCET_HUB_OFFLINE=1` skips the network altogether); it never
+falls back to an empty catalog. `GITHUB_TOKEN` (or `FAUCET_GITHUB_TOKEN`) is
+sent when set — needed for a private catalog, and it lifts the anonymous API
+rate limit.
+
+### The official starter set
+
+The `faucet-hq` namespace carries a set of maintained SaaS source templates
+(CRM, payments, ticketing, e-commerce, advertising and analytics APIs). Each
+has a README beside it (scopes, run times, changelog), a `faucet template test`
+suite and recorded API fixtures, and composes with all four official sinks
+(`bigquery`, `postgres`, `sqlite`, `jsonl`). The catalog itself lists them:
+browse the [Template Hub](https://faucet-hq.github.io/hub), or run
+`faucet hub list` / `faucet hub matrix` against the default hub.
+
+Incremental streams keep their bookmark in the pipeline's `state:` store —
+supply one with a [deployment overlay](#deployment-overlays), or they re-read
+everything each run. Rolling-window streams re-read a fixed trailing window
+every run and upsert on date + dimensions, because the upstream keeps
+revising recent days.
+
+```bash
+faucet hub check --source faucet-hq/<system> --sink faucet-hq/postgres
+faucet run --source faucet-hq/<system> --sink faucet-hq/sqlite \
+  --param client_id=… --param client_secret="$SECRET" \
+  --param refresh_token="$REFRESH"
+```
+
+### A private source with the public sinks
+
+Keep internal source templates in your own repository and still use the
+maintained sink templates, without copying them:
+
+```bash
+faucet run --source acme/erp --source-hub github:acme/private-hub \
+           --sink faucet-hq/postgres --param …
+# The sink resolves in the default public hub; only the source is private.
+```
+
+Each side takes its own hub (`--source-hub`, `--sink-hub`, `--overlay-hub`), or
+repeat `--hub` to search several hubs in order: a bare id resolves in the first
+hub that has it, and an id found nowhere names every hub searched. One locator
+can also name its hub inline, `github:acme/private-hub:acme/erp`. When the
+two repositories belong to different owners, give each its own token with
+`FAUCET_GITHUB_TOKEN_<OWNER>` (for `acme-corp/…`, `FAUCET_GITHUB_TOKEN_ACME_CORP`);
+it takes precedence over the global token for that owner's repositories.
+`faucet hub compose` writes a header recording where each side came from:
+
+```yaml
+# source: acme/erp from github:acme/private-hub@main
+# sink: faucet-hq/postgres from github:faucet-hq/template-hub@main
+```
+
+### Namespaces: `owner/name`
+
+A hundred teams will want their own ERP template, so a template's hub id
+is **`owner/name`** — the owner being the publisher's GitHub user or org login
+— and the catalog is laid out to match: `source-templates/acme/erp.yaml`
+carries `owner: acme` and is addressed as `acme/erp`. The hub's own,
+maintained templates are simply the **`faucet-hq`** namespace
+(`source-templates/faucet-hq/…`, `owner: faucet-hq`) — owned by the faucet-hq
+org exactly like any other namespace, and marked **official**. A bare name is
+shorthand for it: `--source erp` means `faucet-hq/erp`; when there is
+none, the CLI lists the community variants instead of guessing.
+
+A community template — any owner other than `faucet-hq`, any file outside the
+catalog's `faucet-hq/` directory, and any template at all from a hub other
+than the `faucet-hq/template-hub` repository at its default branch (a pinned
+`@<ref>` or `/<path>` is not reviewed), whatever its `owner:` says — may not
+read the machine it runs on: one that uses `${env:…}`, `${file:…}` or a secret-manager
+directive is refused, since it could send a credential to a URL it chooses.
+So is one that reads the other template of the pairing (`${sources.…}`,
+`${sinks.…}`, `${vars.…}`) or names a connector that runs a program (`singer`).
+Hand it credentials through its declared params (`--param`, `--param-env`),
+or review it and pass `--trust <owner>` (or `--trust <owner/name>`). The owner
+`--trust` matches is the namespace directory the file sits in
+(`source-templates/<owner>/`), not the file's own `owner:` field.
+
+The full id names the composed pipeline, so state keys are
+`acme/erp.faucet-hq/bigquery::invoices` and two publishers' templates never collide in a
+shared state store or registry (`/` is a legal state-key character; the file
+store encodes it). In `per_stream` addressing `${source}` stays the short
+name — a table cannot contain `/` — and `${owner}` is available for paths
+(`"${param.out_dir}/${owner}/${source}/${stream}.jsonl"`).
+
+Ownership is enforced by the catalog's CI: the first pull request into a
+namespace adds `<owner>/OWNERS` with the author's numeric GitHub id, and every
+later change must come from a listed id — `faucet-hq/` included, whose
+OWNERS lists the hub's maintainers. Nothing lives at the top level.
+
+### Versions: v1, v2, v3 and `stable`
+
+Every merged change to a template's meaning is its next numeric version —
+computed from git history by the catalog, never written by the author.
+A sidecar beside the template decides what is **stable**: `launch: false`
+publishes a version as a preview without moving `stable`; `stable: 3` pins
+it. The catalog records all of this in its `index.json`, and the CLI honours
+it:
+
+```bash
+faucet run --source acme/erp --sink faucet-hq/bigquery …          # stable (the default)
+faucet run --source acme/erp@newest --sink faucet-hq/bigquery …   # the tip
+faucet run --source acme/erp@3 --sink faucet-hq/bigquery …        # pinned — always the same body
+```
+
+A version whose body is not the snapshot's is fetched from the catalog at that
+commit and cached, so a pinned run composes the same document every time. A
+local directory hub has no history: selectors are an error there.
+
+#### Retiring a version
+
+A version cannot be edited: `@3` must always mean the same bytes, or a pinned
+pipeline changes under its owner. There are three supported moves instead:
+
+- **Fix forward.** Commit the fix; it becomes the next version.
+- **Roll back.** Re-commit an older body. It becomes a new version with the old
+  content, and the sidecar points `stable` at it.
+- **Retire.** Deprecate the bad version in the sidecar, with a reason that
+  names the replacement:
+
+```yaml
+# source-templates/acme/erp.faucet.yaml
+stable: 4
+deprecated:
+  2: "drops the invoices stream; use v3+"
+  1: "superseded"
+```
+
+A deprecated version stays resolvable, so nothing already pinned to it breaks.
+It is dropped from everything that *chooses* a version for you:
+
+- `@newest` resolves to the highest version that is **not** deprecated.
+- An explicit pin still runs, and prints
+  `warning: acme/erp v2 is deprecated: drops the invoices stream; use v3+ — stable is v4`.
+- The hub website hides deprecated versions behind **Show deprecated versions**.
+- A server mirroring the hub never registers a body the catalog marks deprecated.
+
+The catalog's CI refuses a sidecar that deprecates the `stable` version, or a
+version that does not exist, so the default selector always lands on a live
+version. Un-deprecating is deleting the entry.
+
+### Choosing between variants: stars and trust
+
+When several namespaces publish a template for the same system, the catalog
+records facts that help you choose, in `index.json` under each entry's `trust`:
+
+| Signal | What it is |
+|---|---|
+| `stars` | upvotes (↑) on the template's discussion in the catalog (**Discussions → Templates**). GitHub keeps one upvote per account; emoji reactions are not counted. |
+| `updated` / `stable_since` | when the newest version landed, and when the stable one did |
+| `open_issues` | open catalog issues labelled `template:<id>` |
+| `compatible_sinks` | how many sink templates the source composes with in full |
+| `publisher` | how many templates the namespace publishes, and its GitHub account age |
+
+Stars measure popularity, not correctness, so they are one signal among
+these. They are never used to pick a template for you. The CLI shows the
+signals and orders by them:
+
+```bash
+faucet hub list --sort stars       # most starred first; ★ and last-updated columns
+faucet hub list --sort updated     # most recently changed first
+faucet run --source erp --sink faucet-hq/bigquery
+# error: no hub template 'erp' at the top level or under faucet-hq/, but 2 published one:
+#   octo/erp (★ 37 · updated 2026-09-12), acme/erp (★ 9 · updated 2026-09-22)
+#   — pick one with `--source <owner>/erp`
+```
+
+Variants are ranked official first, then by stars, then by recency. The
+[hub page](https://faucet-hq.github.io/hub) shows the same signals on every
+card and sorts by them. To star a template, upvote (↑) its discussion; to report a
+problem, open an issue with its `template:<id>` label.
+
+### Mirror the hub into your server
+
+`faucet serve` pulls the catalog into its template registry with a sync file
+([hosting templates](/faucet-stream/cookbook/templates/#hosting-templates-in-a-repo-or-bucket-sync)),
+so the console's Templates view lists every hub template with a kind pill, a
+source template's page offers every registered sink in its trigger form, and
+the **Compatibility** grid (`GET /v1/templates/matrix`) shows which pairings
+work:
+
+```yaml
+# cli/examples/templates/hub-sync.yaml
+version: 1
+origins:
+  - name: hub
+    source:
+      type: github
+      config: { repo: faucet-hq/template-hub, paths: [source-templates, sink-templates] }
+    launch: always
+    interval_secs: 3600
+```
+
+```bash
+faucet serve --history sqlite:./faucet.db --templates-sync cli/examples/templates/hub-sync.yaml
+```
+
+`paths` reads both catalog directories as one origin. A hub's source and sink
+names share the registry's id namespace, so a stem may appear in only one of
+them.
+
+The pull reads the catalog's `index.json` too. When a template's newest body is
+a version the publisher deprecated, the sync skips it (the report names the
+reason) instead of registering a retired version. Catalog sidecar keys
+(`stable`, `deprecated`) are accepted by the sync; they describe catalog
+versions, which the registry numbers separately.
+
+### Publish a template
+
+Registering a template in the public hub is a pull request to the catalog
+repository — the lint is the review bar, and CI composes every pairing. The
+website's **Publish** button opens a pre-filled new-file form; or copy the
+closest existing file and follow
+[CONTRIBUTING](https://github.com/faucet-hq/template-hub/blob/main/CONTRIBUTING.md).
+Your own organisation's templates can live in a private repository with the
+same layout: point `--hub github:org/catalog` (with `GITHUB_TOKEN`) or a sync
+origin at it.
+
+## Registering hub templates
+
+The [template registry](/faucet-stream/cookbook/templates/) stores source and sink templates as
+first-class kinds — there is no need to compose first. Register each file
+(its id is its hub id: `acme/billing`, `faucet-hq/bigquery`), then run any pairing by id; the server composes at
+trigger time, so a new sink template is immediately usable with every
+registered source template:
+
+```bash
+faucet template register hub/source-templates/acme/billing.yaml --launch
+faucet template register hub/sink-templates/faucet-hq/bigquery.yaml --launch
+faucet template register hub/sink-templates/faucet-hq/postgres.yaml --launch
+faucet template list --kind source-template
+faucet template run acme/billing --sink faucet-hq/bigquery --param api_token="$T" --param bq_project=p --param bq_sa_key="$K"
+faucet template run acme/billing --sink faucet-hq/postgres --param api_token="$T" --param pg_url="$PG"
+```
+
+Over HTTP the trigger is `POST /v1/templates/acme%2Fbilling/runs` with
+`{"sink": "faucet-hq/bigquery", "params": {…}}`; the console's template page offers the
+registered sink templates in a dropdown. Registration runs the same
+publishability lint as `faucet hub lint`, so a literal credential never lands in
+a shared registry. A sync origin ([hosting templates](/faucet-stream/cookbook/templates/#hosting-templates-in-a-repo-or-bucket-sync))
+may hold hub templates too — a repository laid out like `hub/` syncs straight
+into the registry.
+
+A composed config is also just a config: `faucet hub compose … --out f.yaml` to
+inspect it, hand-edit it, or commit it as a complete `kind: pipeline` template.
+
+## Publishing rules
+
+`faucet hub lint` enforces what a public template must satisfy, and the
+repository's catalog test runs it plus a full composition of every pairing:
+
+- credentials are `${param.NAME}` (`secret: true`) or `${env:…}` /
+  `${secret:…}` — never a literal value; a param whose name looks like a
+  credential must be marked `secret`, and a secret param has no default. The
+  check covers every block of the template (named `sources:`, per-stream
+  overrides, headers), any key spelling (`api_token`, `apiToken`,
+  `X-Api-Key`, `Authorization`), numbers as well as strings, a value written
+  as `Bearer …` / `Basic …` / `Token …`, and a password embedded in a URL
+  (`postgres://user:pw@host`);
+- no private infrastructure or placeholder text (`.internal`, managed-DB
+  hostnames, `REPLACE_ME`);
+- a `description`; `name` equal to the file stem; unique stream names; every
+  `${param.*}` reference declared;
+- the configs it produces pass the typed validation `faucet validate` runs:
+  a source template is composed with a probe sink, a sink template with a probe
+  source, every placeholder-bound connector config is deserialized into its
+  typed struct and every transform chain compiled. A failure names the param
+  responsible when one is — e.g. a `type: int` param used as a whole
+  `query_params` value, which the REST source requires to be a string. A
+  connector this binary was built without is skipped. `faucet hub check` runs
+  the same validation on the composed pairing and names both template files.
+
+See also: [Parameters & pipeline templates](/faucet-stream/cookbook/templates/) (the registry a
+composed pipeline can be registered into), [Write modes / upsert](/faucet-stream/cookbook/upsert/),
+[Transforms](/faucet-stream/cookbook/transforms/).

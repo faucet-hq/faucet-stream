@@ -81,7 +81,7 @@ faucet run pipeline.yaml
 | `create_table` | bool | `true` | Create the target table (and its dataset) if it does not exist — or **re-create it if it exists without a schema** (e.g. one made by a bare `bq mk`) — inferring the schema from the first written page. A first-ever sync cannot assume the table exists. Set to `false` to require the table to pre-exist with a schema and fail fast otherwise (e.g. the schema is managed externally and a missing table signals a typo). |
 | `location` | string | *(unset)* | Dataset location (region or multi-region, e.g. `US`, `EU`, `us-central1`) used only when `create_table` has to create the dataset. Unset uses the BigQuery job's default location; ignored once the dataset exists. |
 
-When `create_table` is on and the table is missing (or exists without a schema), the schema is inferred from the first page: JSON scalars map to `INT64` / `FLOAT64` / `BOOL` / `STRING`, and nested objects/arrays to `JSON`. When the sink's `schema` is set (e.g. by a discovered OData entity), a `string` field with `format: date-time` / `date` / `decimal` becomes a `TIMESTAMP` / `DATE` / `BIGNUMERIC` column. A schemaless table is replaced (`CREATE OR REPLACE`); a table that already has a schema is used as-is and never dropped — the table is re-checked right before the DDL, so one a concurrent writer created (and is streaming into) meanwhile is used, not replaced. For `write_mode: overwrite`, the target and its staging clone are created on the first page (before the atomic swap); for `append`/`upsert`/`delete` the table is created before the first write. When the run's source declares its column types (a SQL query source — see [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types)), a declared column takes its type instead of the inferred one: a decimal becomes `NUMERIC` (at most 29 integer and 9 fractional digits) or `BIGNUMERIC` (wider, or no precision), a date `DATE`, a timestamp with a zone `TIMESTAMP` and one without `DATETIME`, a time `TIME`, a UUID `STRING`, binary `BYTES`, JSON `JSON`; a declared column whose first-page values do not fit the type keeps the inferred type, and an explicit `schema` still wins. The same types go into the load schema of an overwrite that creates the table. An empty source with no declaration produces no schema, so nothing is created — the run is a clean no-op; with a complete declaration the empty, typed table is created. An empty source against an **existing** table under `write_mode: overwrite` empties it on every path: the staged path swaps in the empty staging table, the direct media-load path runs `TRUNCATE TABLE` at the terminal flush. If later pages introduce new columns, pair with a [`schema:` drift policy](../../../docs/book/src/cookbook/schema-drift.md) set to `evolve`.
+When `create_table` is on and the table is missing (or exists without a schema), the schema is inferred from the first page: JSON scalars map to `INT64` / `FLOAT64` / `BOOL` / `STRING`, and nested objects/arrays to `JSON`. When the sink's `schema` is set (e.g. by a discovered OData entity), a `string` field with `format: date-time` / `date` / `decimal` becomes a `TIMESTAMP` / `DATE` / `BIGNUMERIC` column. A schemaless table is replaced (`CREATE OR REPLACE`); a table that already has a schema is used as-is and never dropped — the table is re-checked right before the DDL, so one a concurrent writer created (and is streaming into) meanwhile is used, not replaced. For `write_mode: overwrite`, the target and its staging clone are created on the first page (before the atomic swap); for `append`/`upsert`/`delete` the table is created before the first write. When the run's source declares its column types (a SQL query source — see [Declared column types](../../../docs/site/src/content/docs/reference/value-fidelity.md#declared-column-types)), a declared column takes its type instead of the inferred one: a decimal becomes `NUMERIC` (at most 29 integer and 9 fractional digits) or `BIGNUMERIC` (wider, or no precision), a date `DATE`, a timestamp with a zone `TIMESTAMP` and one without `DATETIME`, a time `TIME`, a UUID `STRING`, binary `BYTES`, JSON `JSON`; a declared column whose first-page values do not fit the type keeps the inferred type, and an explicit `schema` still wins. The same types go into the load schema of an overwrite that creates the table. An empty source with no declaration produces no schema, so nothing is created — the run is a clean no-op; with a complete declaration the empty, typed table is created. An empty source against an **existing** table under `write_mode: overwrite` empties it on every path: the staged path swaps in the empty staging table, the direct media-load path runs `TRUNCATE TABLE` at the terminal flush. If later pages introduce new columns, pair with a [`schema:` drift policy](../../../docs/site/src/content/docs/cookbook/schema-drift.md) set to `evolve`.
 
 ### Reliability & batching
 
@@ -296,7 +296,7 @@ pipeline:
 delivery: exactly_once
 ```
 
-See the [Effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state.html#effectively-once-delivery) for full rationale and the supported source/sink set.
+See the [Effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state/#effectively-once-delivery) for full rationale and the supported source/sink set.
 
 ## Schema evolution
 
@@ -308,7 +308,7 @@ Under `on_drift: evolve`, `BigQuerySink::evolve_schema()` applies `ALTER TABLE` 
 - **Lossless widenings** (e.g. integer → number) → `ALTER COLUMN <col> SET DATA TYPE <type>` — gated on `allow_type_widening`. An `INT64` column that starts receiving fractions becomes `BIGNUMERIC`, which holds every `INT64` and the fraction exactly (`FLOAT64` would round stored values above 2^53).
 - **Nullability relaxations** → `ALTER COLUMN <col> DROP NOT NULL`.
 
-The cached schema is invalidated afterwards so the next page (and the next effectively-once / upsert page) reads the evolved table. Incompatible changes (narrowing / type swaps) are never auto-applied — they are routed by `on_incompatible` (`fail` or `quarantine`). See the [schema-drift cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift.html).
+The cached schema is invalidated afterwards so the next page (and the next effectively-once / upsert page) reads the evolved table. Incompatible changes (narrowing / type swaps) are never auto-applied — they are routed by `on_incompatible` (`fail` or `quarantine`). See the [schema-drift cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift/).
 
 ## Dead-letter queue
 
@@ -436,9 +436,9 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 
 ## See also
 
-- [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) — capability matrix.
-- [Effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state.html#effectively-once-delivery).
-- [Upsert / write-modes cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html).
+- [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors/) — capability matrix.
+- [Effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state/#effectively-once-delivery).
+- [Upsert / write-modes cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert/).
 - [`faucet-source-bigquery`](https://crates.io/crates/faucet-source-bigquery) — the matching BigQuery query source.
 - [`faucet-common-bigquery`](https://crates.io/crates/faucet-common-bigquery) — shared `BigQueryCredentials` + client builder.
 
@@ -448,7 +448,7 @@ What a failed write leaves behind (#737): **per-row** with `batch_size: 0` (one 
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See
-[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/#batch-atomicity-and-dlq_all).
 
 ## Capabilities
 
@@ -606,7 +606,7 @@ load job) and three cost signals to faucet's usage meter: `bytes_streamed`
 bytes of each load job) and `bytes_billed` (`totalBytesBilled` of each query
 job). `faucet run`, `faucet usage` and `GET /v1/usage` price them with the
 `usage.pricing.warehouse.bigquery_*` rates; see the
-[usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage.html).
+[usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage/).
 
 Load jobs are free; streaming inserts are billed. A source that bookmarks every
 page (CDC, Kafka, Kinesis) makes the first flush commit the run's load job, and

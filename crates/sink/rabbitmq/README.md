@@ -94,7 +94,7 @@ What a failed write leaves behind (#737): **best-effort** — publishes and conf
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See
-[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/#batch-atomicity-and-dlq_all).
 
 ## Capabilities
 

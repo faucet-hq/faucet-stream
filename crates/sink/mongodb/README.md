@@ -205,11 +205,11 @@ pipeline:
 delivery: exactly_once
 ```
 
-`delivery: exactly_once` and `write_mode: upsert` compose — the planned upserts/deletes and the watermark upsert commit in the same transaction, as in the example above. See the [effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state.html#effectively-once-delivery).
+`delivery: exactly_once` and `write_mode: upsert` compose — the planned upserts/deletes and the watermark upsert commit in the same transaction, as in the example above. See the [effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state/#effectively-once-delivery).
 
 ## Dead-letter queue
 
-The sink overrides `write_batch_partial`, so a `dlq:` block in the pipeline config catches per-row failures (missing/null-key rows in `upsert` / `delete` mode) and routes them to the dead-letter sink while the rest of the page commits. Without a DLQ, a row-level failure aborts the batch. See the [DLQ cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html).
+The sink overrides `write_batch_partial`, so a `dlq:` block in the pipeline config catches per-row failures (missing/null-key rows in `upsert` / `delete` mode) and routes them to the dead-letter sink while the rest of the page commits. Without a DLQ, a row-level failure aborts the batch. See the [DLQ cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/).
 
 ## Connection URIs in `faucet serve`
 
@@ -224,7 +224,7 @@ own cloud or Kubernetes identity) is refused. Unless the server lists hosts
 with `--allow-url-host` (and always for a tenant), the URI must keep the driver
 on the server it names: add `directConnection=true`, or `loadBalanced=true`
 behind a load balancer. Templates and the triggers file are not limited. See
-the [HTTP API reference](https://faucet-hq.github.io/faucet-stream/reference/http-api.html).
+the [HTTP API reference](https://faucet-hq.github.io/faucet-stream/reference/http-api/).
 
 ## Config loading & schema
 
@@ -334,9 +334,9 @@ This crate has no optional features of its own; enable it in the CLI / umbrella 
 
 ## See also
 
-- [Sinks reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) — capability matrix across all connectors.
-- [Write modes / upsert cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html) — the shared upsert layer.
-- [Dead-letter queue cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html) — routing failed rows.
+- [Sinks reference](https://faucet-hq.github.io/faucet-stream/reference/connectors/) — capability matrix across all connectors.
+- [Write modes / upsert cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert/) — the shared upsert layer.
+- [Dead-letter queue cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/) — routing failed rows.
 - [`faucet-source-mongodb`](https://crates.io/crates/faucet-source-mongodb) — the MongoDB source (`find()` with filter / projection / sort).
 - [`faucet-source-mongodb-cdc`](https://crates.io/crates/faucet-source-mongodb-cdc) — MongoDB Change Streams CDC source; the natural upstream for an upsert mirror.
 
@@ -346,7 +346,7 @@ What a failed write leaves behind (#737): **per-row** for `append` / `overwrite`
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See
-[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/#batch-atomicity-and-dlq_all).
 
 ## Capabilities
 

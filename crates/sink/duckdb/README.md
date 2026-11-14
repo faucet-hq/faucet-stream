@@ -86,7 +86,7 @@ would otherwise drop the offset. Offset-less strings are stored as given.
 
 ## Declared column types
 
-When the run's source declares its column types (a SQL query source, #955 — see [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types)), a table this sink creates types each declared column from the declaration instead of from the first page: `BIGINT`, `DOUBLE`, `BOOLEAN`, `DECIMAL(p,s)` (up to 38 digits; wider or unbounded stays `TEXT`), `DATE`, `TIME`, `TIMESTAMPTZ` / `TIMESTAMP`, `UUID` — in `auto_map` mode. A declared column whose first-page values do not fit its type keeps the inferred type; an existing table is never retyped. With a complete declaration a run that writes nothing creates the empty, typed table.
+When the run's source declares its column types (a SQL query source, #955 — see [Declared column types](../../../docs/site/src/content/docs/reference/value-fidelity.md#declared-column-types)), a table this sink creates types each declared column from the declaration instead of from the first page: `BIGINT`, `DOUBLE`, `BOOLEAN`, `DECIMAL(p,s)` (up to 38 digits; wider or unbounded stays `TEXT`), `DATE`, `TIME`, `TIMESTAMPTZ` / `TIMESTAMP`, `UUID` — in `auto_map` mode. A declared column whose first-page values do not fit its type keeps the inferred type; an existing table is never retyped. With a complete declaration a run that writes nothing creates the empty, typed table.
 
 ## Batch atomicity
 
@@ -94,7 +94,7 @@ What a failed write leaves behind (#737): **atomic** — every chunk of a batch 
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See
-[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/#batch-atomicity-and-dlq_all).
 
 ## Capabilities
 
@@ -126,4 +126,4 @@ public type and config are unchanged.
 ## Value fidelity
 
 A non-integer JSON number is bound as its shortest decimal text, which DuckDB
-casts exactly into a `DECIMAL` or `DOUBLE` column. See [value fidelity](https://faucet-hq.github.io/faucet-stream/reference/value-fidelity.html).
+casts exactly into a `DECIMAL` or `DOUBLE` column. See [value fidelity](https://faucet-hq.github.io/faucet-stream/reference/value-fidelity/).

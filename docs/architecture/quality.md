@@ -97,4 +97,4 @@ partial progress.
 
 - [Schema handling](./schema.md) · [Contracts](./contracts.md) · [Pipeline](./pipeline.md)
 - [Design invariants](./invariants.md) · [ADR 0009 — Schema validation](../adr/0009-schema-validation.md)
-- User guide: [../book/src/cookbook/quality.md](../book/src/cookbook/quality.md)
+- User guide: [../site/src/content/docs/cookbook/quality.md](../site/src/content/docs/cookbook/quality.md)

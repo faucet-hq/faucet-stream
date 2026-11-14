@@ -1,6 +1,6 @@
 # Reference WASM transform modules
 
-These are runnable reference modules for the faucet-stream [`wasm` transform](../../docs/book/src/cookbook/wasm-transforms.md).
+These are runnable reference modules for the faucet-stream [`wasm` transform](../../docs/site/src/content/docs/cookbook/wasm-transforms.md).
 Each implements the same v1 ABI in a different source language and does the same
 thing: uppercase a top-level `name` field and stamp `wasm_processed: true`.
 
@@ -36,7 +36,7 @@ The host writes the record as UTF-8 JSON into memory returned by your exported
 (message via the optional `error_ptr()`/`error_len()` exports), and anything
 else points at the output UTF-8 JSON. Export `memory`, and optionally
 `free(ptr, len)` so the host can reclaim buffers. Full details:
-[cookbook](../../docs/book/src/cookbook/wasm-transforms.md).
+[cookbook](../../docs/site/src/content/docs/cookbook/wasm-transforms.md).
 
 ## Try it
 

@@ -11,6 +11,6 @@ source:
     collection: orders
 ```
 
-The block above is this connector's entry in a pipeline config; it runs from a custom `faucet` binary that registers the crate (see [Authoring a connector](https://faucet-hq.github.io/faucet-stream/extending/authoring-connectors.html)).
+The block above is this connector's entry in a pipeline config; it runs from a custom `faucet` binary that registers the crate (see [Authoring a connector](https://faucet-hq.github.io/faucet-stream/extending/authoring-connectors/)).
 
 `cargo test` runs the unit tests and the `faucet-conformance` battery against a `wiremock` backend.

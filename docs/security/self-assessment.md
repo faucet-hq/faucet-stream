@@ -14,7 +14,7 @@ architecture and hardening checklist) and the disclosure policy in
 | **Security provider** | No. faucet-stream moves data; it is not a security tool, but it holds credentials and handles sensitive records, so its security features are part of its core. |
 | **Languages** | Rust (engine, connectors, CLI, server); JavaScript, HTML and CSS (the embedded web console) |
 | **Software bill of materials** | Each `faucet-cli` release attaches a CycloneDX SBOM (`faucet-cli.cdx.json`); prebuilt binaries embed their dependency list (`cargo-auditable`); every container image ships an SBOM attestation; `Cargo.lock` pins the full dependency tree. |
-| **Security links** | [`SECURITY.md`](../../SECURITY.md) · [security model](../architecture/security.md) · [reference policy](../book/src/reference/http-api.md#reference-policy) · [secrets](../book/src/cookbook/secrets.md) · [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/faucet-hq/faucet-stream) |
+| **Security links** | [`SECURITY.md`](../../SECURITY.md) · [security model](../architecture/security.md) · [reference policy](../site/src/content/docs/reference/http-api.md#reference-policy) · [secrets](../site/src/content/docs/cookbook/secrets.md) · [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/faucet-hq/faucet-stream) |
 
 ## Overview
 

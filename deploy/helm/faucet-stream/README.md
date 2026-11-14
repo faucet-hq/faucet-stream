@@ -370,7 +370,7 @@ volume an `extraInitContainers` fetcher fills.
 `scripts/chaos/run.sh` installs this chart on a throwaway kind cluster, clustered
 and single-pod, and kills pods and nodes, cuts off the history database, rolls
 upgrades and floods it with runs, then reports what held. See
-[chaos testing](https://faucet-hq.github.io/faucet-stream/operations/chaos-testing.html).
+[chaos testing](https://faucet-hq.github.io/faucet-stream/operations/chaos-testing/).
 
 ### Render-time checks
 

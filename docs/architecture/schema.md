@@ -105,4 +105,4 @@ The order — **masking → quality → contract → drift** — is enforced in
 - [Quality](./quality.md) · [Contracts](./contracts.md) · [Masking](./masking.md)
 - [Pipeline](./pipeline.md) · [Design invariants](./invariants.md)
 - [ADR 0009 — Schema validation](../adr/0009-schema-validation.md)
-- User guide: [../book/src/cookbook/schema-drift.md](../book/src/cookbook/schema-drift.md)
+- User guide: [../site/src/content/docs/cookbook/schema-drift.md](../site/src/content/docs/cookbook/schema-drift.md)

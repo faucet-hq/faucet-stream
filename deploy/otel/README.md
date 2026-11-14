@@ -3,7 +3,7 @@
 Recipes for the receiving end of faucet's log shipping (#806). faucet buffers
 every run-log line locally first and ships it to an OTLP collector, advancing a
 per-run watermark only when the collector acknowledges the batch — see
-[Shipping logs](../../docs/book/src/operations/observability.md#shipping-logs).
+[Shipping logs](../../docs/site/src/content/docs/operations/observability.md#shipping-logs).
 
 | File | What it is |
 |---|---|

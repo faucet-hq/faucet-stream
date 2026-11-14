@@ -168,4 +168,4 @@ Everything above follows semver. The hidden `internal` module holds helpers the
 `faucet_cli::registry` and `faucet_cli::auth_catalog` as re-exports of this
 crate.
 
-See also [Embedding faucet in another tool](https://faucet-hq.github.io/faucet-stream/extending/embedding.html).
+See also [Embedding faucet in another tool](https://faucet-hq.github.io/faucet-stream/extending/embedding/).

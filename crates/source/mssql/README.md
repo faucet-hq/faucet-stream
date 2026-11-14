@@ -333,9 +333,9 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 
 ## See also
 
-- [SQL Server connector docs](https://faucet-hq.github.io/faucet-stream/reference/connectors.html)
-- [State & incremental replication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state.html)
-- [Configuration grammar reference](https://faucet-hq.github.io/faucet-stream/reference/config.html)
+- [SQL Server connector docs](https://faucet-hq.github.io/faucet-stream/reference/connectors/)
+- [State & incremental replication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state/)
+- [Configuration grammar reference](https://faucet-hq.github.io/faucet-stream/reference/config/)
 - [`faucet-common-mssql`](https://crates.io/crates/faucet-common-mssql) — shared connection/TLS/pool types.
 - [`faucet-sink-mssql`](https://crates.io/crates/faucet-sink-mssql) — the matching SQL Server sink.
 
@@ -343,7 +343,7 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 
 Key ranges are re-planned every run, so `shard:` cannot be combined with incremental replication (`faucet validate` refuses it when a `state:` block is set): a range could move to a shard whose cursor is already past a late row.
 
-Under [`faucet serve --cluster`](https://faucet-hq.github.io/faucet-stream/cookbook/cluster.html),
+Under [`faucet serve --cluster`](https://faucet-hq.github.io/faucet-stream/cookbook/cluster/),
 a top-level `shard: { count: N }` block splits this source into contiguous
 primary-key ranges that different cluster workers process concurrently. Opt in
 by naming an integer-typed key column:
@@ -391,4 +391,4 @@ Licensed under either of [Apache License, Version 2.0](https://www.apache.org/li
 
 ## Declared column types
 
-The source declares the query's columns and their types (`Source::declared_columns`, #955) from the describe its read makes, so a sink that creates its table types it from the source rather than from the first page's JSON values. See [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types).
+The source declares the query's columns and their types (`Source::declared_columns`, #955) from the describe its read makes, so a sink that creates its table types it from the source rather than from the first page's JSON values. See [Declared column types](../../../docs/site/src/content/docs/reference/value-fidelity.md#declared-column-types).

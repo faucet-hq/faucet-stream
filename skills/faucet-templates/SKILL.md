@@ -28,9 +28,9 @@ sink supports. A third document, a `kind: deployment` overlay, adds the
 operational blocks (state, DLQ, alerts) that belong to neither template.
 
 How composition, overlays, namespaces, versions and trust signals work:
-[Template Hub](https://faucet-hq.github.io/faucet-stream/cookbook/template-hub.html).
+[Template Hub](https://faucet-hq.github.io/faucet-stream/cookbook/template-hub/).
 Params, the template registry and suites:
-[Parameters & pipeline templates](https://faucet-hq.github.io/faucet-stream/cookbook/templates.html).
+[Parameters & pipeline templates](https://faucet-hq.github.io/faucet-stream/cookbook/templates/).
 
 `faucet hub ...` works on template files in a catalog. `faucet template ...` is
 a different tool: the registry that `faucet serve` triggers by id. Publishing
@@ -71,7 +71,7 @@ config written for a newer faucet can fail or be misread on an older one.
    If the checksum or the attestation does not verify, stop and tell the user.
 6. With no pin at all, install the latest release the same way (the archive
    and its `.sha256` from `releases/latest/download/`) and pin it as described in
-   [Pinning the faucet version](https://faucet-hq.github.io/faucet-stream/operations/pinning.html).
+   [Pinning the faucet version](https://faucet-hq.github.io/faucet-stream/operations/pinning/).
 
 Every version-specific fact (which connectors and blocks exist, config keys,
 types, defaults, commands and flags) comes from that binary: `faucet list`,
@@ -108,7 +108,7 @@ the container image (Step 0).
    ```
    When several namespaces publish the same system, prefer the official
    `faucet-hq/` one, then compare the trust signals `faucet hub list` shows
-   ([Choosing between variants](https://faucet-hq.github.io/faucet-stream/cookbook/template-hub.html#choosing-between-variants-stars-and-trust)).
+   ([Choosing between variants](https://faucet-hq.github.io/faucet-stream/cookbook/template-hub/#choosing-between-variants-stars-and-trust)).
    Stars measure popularity, not correctness. Read the README the catalog keeps
    beside the template (required scopes, run times, changelog) before picking
    credentials.
@@ -125,7 +125,7 @@ the container image (Step 0).
 3. **Add operations with an overlay.** Incremental streams need a durable state
    store or they re-read everything every run (`faucet validate` warns). Write
    a `kind: deployment` file (`faucet schema deployment` lists what it may set;
-   [Deployment overlays](https://faucet-hq.github.io/faucet-stream/cookbook/template-hub.html#deployment-overlays)
+   [Deployment overlays](https://faucet-hq.github.io/faucet-stream/cookbook/template-hub/#deployment-overlays)
    shows one) and pass it with `--overlay`. Keep the state DSN a `secret: true`
    param.
 
@@ -170,12 +170,12 @@ ordinary config from then on.
    faucet schema source graphql
    ```
    The patterns for each piece are documented once:
-   [Authentication](https://faucet-hq.github.io/faucet-stream/cookbook/auth.html)
+   [Authentication](https://faucet-hq.github.io/faucet-stream/cookbook/auth/)
    (inline auth, or a shared `auth:` catalog entry referenced with `auth: { ref }`),
-   [Pagination styles](https://faucet-hq.github.io/faucet-stream/cookbook/pagination.html),
-   [Incremental replication & state](https://faucet-hq.github.io/faucet-stream/cookbook/state.html)
+   [Pagination styles](https://faucet-hq.github.io/faucet-stream/cookbook/pagination/),
+   [Incremental replication & state](https://faucet-hq.github.io/faucet-stream/cookbook/state/)
    (replication keys, request-side bookmark binds, GraphQL variables),
-   [Resilience](https://faucet-hq.github.io/faucet-stream/cookbook/resilience.html)
+   [Resilience](https://faucet-hq.github.io/faucet-stream/cookbook/resilience/)
    (throttling signalled in a response), and the REST source's
    [README](https://github.com/faucet-hq/faucet-stream/blob/main/crates/source/rest/README.md)
    (date-window slicing, async jobs, discovery).
@@ -184,12 +184,12 @@ ordinary config from then on.
    `source.config` override (usually the endpoint path), `primary_keys` and a
    `write` preference list. How to choose them, and the raw-versus-transformed
    key naming trap:
-   [A source template](https://faucet-hq.github.io/faucet-stream/cookbook/template-hub.html#a-source-template).
+   [A source template](https://faucet-hq.github.io/faucet-stream/cookbook/template-hub/#a-source-template).
    Shaping every sink needs goes in the top-level `transforms`. When the
    caller picks the tables at trigger time, declare one stream with
    `for_each:` over a `type: list` param instead of one per table, and list
    the rows it expands to with `faucet hub rows --param …`:
-   [Repeating a stream over a list param](https://faucet-hq.github.io/faucet-stream/cookbook/template-hub.html#repeating-a-stream-over-a-list-param-for_each).
+   [Repeating a stream over a list param](https://faucet-hq.github.io/faucet-stream/cookbook/template-hub/#repeating-a-stream-over-a-list-param-for_each).
 
 4. **Make every host and every secret a param.** The API root is a param that
    defaults to the public URL (tests and replays point it at a local server).
@@ -243,7 +243,7 @@ write modes each supports), then read `faucet schema sink-template` and
 `faucet schema sink <type>`. Prefix params (`pg_`, `bq_`) so they cannot
 collide with a source's. Address each stream through `per_stream` (its
 substitution tokens are on the
-[Template Hub](https://faucet-hq.github.io/faucet-stream/cookbook/template-hub.html#a-sink-template)
+[Template Hub](https://faucet-hq.github.io/faucet-stream/cookbook/template-hub/#a-sink-template)
 page). Declare a `write_mode_aliases` entry only when the destination satisfies
 a mode by construction, and read that page's rules on aliases and child streams
 first. A destination may come from a param, but `hub check` refuses any
@@ -260,11 +260,11 @@ faucet hub matrix --hub .
 
 1. **Suite.** Write `tests/<owner>/<name>/suite.yaml` (shape:
    `faucet schema template-test`; walkthrough:
-   [Testing the parameter space](https://faucet-hq.github.io/faucet-stream/cookbook/templates.html#testing-the-parameter-space);
+   [Testing the parameter space](https://faucet-hq.github.io/faucet-stream/cookbook/templates/#testing-the-parameter-space);
    example: [examples/tests/](examples/tests/acme/example-api/suite.yaml)). A
    suite for a source template names a sink. (A `tests:` bundle of a new
    source + sink pair names each other: register both, then launch both —
-   [Bootstrapping a new source + sink pair](https://faucet-hq.github.io/faucet-stream/cookbook/templates.html#bootstrapping-a-new-source--sink-pair).)
+   [Bootstrapping a new source + sink pair](https://faucet-hq.github.io/faucet-stream/cookbook/templates/#bootstrapping-a-new-source--sink-pair).)
    Turn on the `auto` cases so every
    required param, every closed value set and the all-defaults combination is
    covered, add explicit cases for the params that matter, and add
@@ -296,7 +296,7 @@ The catalog's
 [CONTRIBUTING](https://github.com/faucet-hq/template-hub/blob/main/CONTRIBUTING.md)
 is the source of truth for the PR flow; the versioning model (computed
 versions, `stable`, previews, deprecation) is on the
-[Template Hub](https://faucet-hq.github.io/faucet-stream/cookbook/template-hub.html#the-public-hub)
+[Template Hub](https://faucet-hq.github.io/faucet-stream/cookbook/template-hub/#the-public-hub)
 page.
 
 1. Fork faucet-hq/template-hub and touch only your namespace: the template,
@@ -318,7 +318,7 @@ reason naming the replacement.
 
 For a private catalog, lay a repository out the same way and point consumers
 at it with `--hub` / `--source-hub` and a GitHub token
-([A private source with the public sinks](https://faucet-hq.github.io/faucet-stream/cookbook/template-hub.html#a-private-source-with-the-public-sinks)).
+([A private source with the public sinks](https://faucet-hq.github.io/faucet-stream/cookbook/template-hub/#a-private-source-with-the-public-sinks)).
 
 ## Hard rules
 

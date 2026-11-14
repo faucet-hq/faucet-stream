@@ -138,7 +138,7 @@ limitation. Where a risk already has a mitigation planned, the relevant
 
 ## Contributor experience
 
-- **Strong onboarding surface:** `CONTRIBUTING.md`, the mdBook, `faucet init` /
+- **Strong onboarding surface:** `CONTRIBUTING.md`, the docs site, `faucet init` /
   `doctor` / `test`, and now this architecture documentation.
 - **Sharp edges:** the size of `pipeline.rs`, the feature-declaration rule (a
   crate must declare every dep-feature it uses or feature-isolation CI fails), and
@@ -156,7 +156,7 @@ limitation. Where a risk already has a mitigation planned, the relevant
 
 ## Documentation
 
-- **User-facing docs are strong** (the mdBook covers connectors, cookbook,
+- **User-facing docs are strong** (the docs site covers connectors, cookbook,
   reference, operations). The historical gap — now being closed — was
   *internal/architectural* documentation explaining *why*. This review and its
   sibling ADRs/standards are that closure.

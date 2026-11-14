@@ -262,9 +262,9 @@ If you are **building your own connector**, depend only on `faucet-core` — it 
 
 ## See also
 
-- [Getting started](https://faucet-hq.github.io/faucet-stream/getting-started/concepts.html) and the [library tutorial](https://faucet-hq.github.io/faucet-stream/tutorials/library.html)
-- [Connector reference & capability matrix](https://faucet-hq.github.io/faucet-stream/reference/connectors.html)
-- [Choosing connectors](https://faucet-hq.github.io/faucet-stream/reference/choosing.html)
+- [Getting started](https://faucet-hq.github.io/faucet-stream/getting-started/concepts/) and the [library tutorial](https://faucet-hq.github.io/faucet-stream/tutorials/library/)
+- [Connector reference & capability matrix](https://faucet-hq.github.io/faucet-stream/reference/connectors/)
+- [Choosing connectors](https://faucet-hq.github.io/faucet-stream/reference/choosing/)
 - [`faucet-core`](https://crates.io/crates/faucet-core) — the traits + pipeline engine (the only dependency connector authors need)
 - [`faucet-cli`](https://crates.io/crates/faucet-cli) — drive these connectors from YAML/JSON with no Rust code
 

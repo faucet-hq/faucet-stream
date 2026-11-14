@@ -114,8 +114,10 @@ docs/superpowers/
 doc/
 libtest_compile.rlib
 
-# mdBook rendered output (docs site source lives in docs/book/src)
-docs/book/book/
+# Docs site build output (sources live in docs/site/src/content/docs)
+docs/site/dist/
+docs/site/.astro/
+docs/site/node_modules/
 
 # Coverage instrumentation artifacts (cargo-llvm-cov)
 *.profraw

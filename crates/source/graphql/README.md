@@ -448,7 +448,7 @@ To share one token across many sources, build a provider and inject it with `Gra
 
 1. `new()` builds the `reqwest::Client` **once** and reuses it for every request.
 2. Each request merges static `variables`, the current cursor (into `cursor_variable`), the page-size value (into `page_size_variable`, unless `batch_size = 0`), and any parent-record context values into the GraphQL variables map.
-3. The POST is retried up to 3 times with exponential backoff + jitter (500 ms base) on retriable HTTP failures. When driven by the CLI, a pipeline-level [`resilience:`](https://faucet-hq.github.io/faucet-stream/cookbook/resilience.html) block replaces these built-in retry defaults with one shared policy — GraphQL honors the policy's `max_attempts`, `base`, `max`, `jitter`, and `retry_on` in full.
+3. The POST is retried up to 3 times with exponential backoff + jitter (500 ms base) on retriable HTTP failures. When driven by the CLI, a pipeline-level [`resilience:`](https://faucet-hq.github.io/faucet-stream/cookbook/resilience/) block replaces these built-in retry defaults with one shared policy — GraphQL honors the policy's `max_attempts`, `base`, `max`, `jitter`, and `retry_on` in full.
 4. `records_path` extracts the record array via JSONPath; the page is yielded immediately.
 5. **Cursor** pagination advances by reading `hasNextPage` / `endCursor` (a numeric cursor is used as text), stopping on a false flag or `max_pages`. While `hasNextPage` is `true`, a missing, non-scalar, repeated or cycling cursor **fails** the run rather than ending it green with pages unread; when `hasNextPage` cannot be read, an absent cursor stops and a repeated one is treated as a loop. **Offset** pagination advances an integer offset variable by the records each page returned, stopping on a fully empty page, an identical repeated page, a short page (only with `stop_when_short: true`), or `max_pages`.
 
@@ -475,9 +475,9 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 
 ## See also
 
-- [Pagination guide](https://faucet-hq.github.io/faucet-stream/cookbook/pagination.html) — cursor pagination across connectors.
-- [Authentication guide](https://faucet-hq.github.io/faucet-stream/cookbook/auth.html) — inline auth and the shared `auth:` catalog.
-- [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) — capability matrix.
+- [Pagination guide](https://faucet-hq.github.io/faucet-stream/cookbook/pagination/) — cursor pagination across connectors.
+- [Authentication guide](https://faucet-hq.github.io/faucet-stream/cookbook/auth/) — inline auth and the shared `auth:` catalog.
+- [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors/) — capability matrix.
 - [`faucet-source-rest`](https://crates.io/crates/faucet-source-rest) — the REST sibling source with broader pagination styles.
 - [`faucet-auth`](https://crates.io/crates/faucet-auth) — shared OAuth2 / token-endpoint providers.
 

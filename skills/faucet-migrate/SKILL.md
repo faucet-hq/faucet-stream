@@ -22,7 +22,7 @@ Meltano, Singer or Airbyte. Writing each faucet config follows the
 `faucet-pipelines` skill; operating and debugging them follows `faucet-debug`;
 hub templates follow `faucet-templates`. What the old tools' files mean, and
 how faucet treats bookmarks during a migration, is on
-[Migrating from Meltano, Singer or Airbyte](https://faucet-hq.github.io/faucet-stream/operations/migrating.html).
+[Migrating from Meltano, Singer or Airbyte](https://faucet-hq.github.io/faucet-stream/operations/migrating/).
 
 ## Step 0: use the project's faucet version
 
@@ -58,7 +58,7 @@ config written for a newer faucet can fail or be misread on an older one.
    If the checksum or the attestation does not verify, stop and tell the user.
 6. With no pin at all, install the latest release the same way (the archive
    and its `.sha256` from `releases/latest/download/`) and pin it as described in
-   [Pinning the faucet version](https://faucet-hq.github.io/faucet-stream/operations/pinning.html).
+   [Pinning the faucet version](https://faucet-hq.github.io/faucet-stream/operations/pinning/).
 
 Every version-specific fact (which connectors and blocks exist, config keys,
 types, defaults, commands and flags) comes from that binary: `faucet list`,

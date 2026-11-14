@@ -181,7 +181,7 @@ This crate has no optional features of its own. Enable it in the CLI or the `fau
 
 ## See also
 
-- [State & resume cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state.html) — bookmarks, resume semantics, and choosing a backend.
+- [State & resume cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state/) — bookmarks, resume semantics, and choosing a backend.
 - [`faucet-core`](https://crates.io/crates/faucet-core) — the `StateStore` trait this crate implements, plus the built-in `memory` and `file` backends.
 - [`faucet-state-postgres`](https://crates.io/crates/faucet-state-postgres) — the PostgreSQL-backed sibling backend.
 - [faucet-stream on GitHub](https://github.com/faucet-hq/faucet-stream) — the full ecosystem.

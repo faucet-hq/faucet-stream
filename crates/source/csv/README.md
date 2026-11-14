@@ -288,7 +288,7 @@ The connector itself is enabled in the CLI/umbrella via the `source-csv` feature
 
 ## See also
 
-- [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) · [Compression cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/compression.html) · [Transforms cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/transforms.html)
+- [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors/) · [Compression cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/compression/) · [Transforms cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/transforms/)
 - Related crates: [faucet-sink-csv](https://crates.io/crates/faucet-sink-csv) · [faucet-source-parquet](https://crates.io/crates/faucet-source-parquet) · [faucet-source-s3](https://crates.io/crates/faucet-source-s3)
 
 ## License

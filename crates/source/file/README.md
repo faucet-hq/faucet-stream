@@ -148,7 +148,7 @@ When Arrow data becomes JSON rows (a row-path sink, or a transform or
 governance pass), decimals arrive as exact strings (`"12.50"`) so no digits are
 lost, non-finite floats as a `null` counted in the run summary (`non_finite`), binary columns as
 base64, and timestamps at their unit's precision (the canonical renderings of
-[value fidelity](https://faucet-hq.github.io/faucet-stream/reference/value-fidelity.html)).
+[value fidelity](https://faucet-hq.github.io/faucet-stream/reference/value-fidelity/)).
 
 ## Incremental mode
 

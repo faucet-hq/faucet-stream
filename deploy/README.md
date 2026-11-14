@@ -78,7 +78,7 @@ The chart mounts its PVC there by default (`serve.persistence.enabled: true`,
 Postgres: `serve.history.backend: postgres` with the DSN in a Secret.
 `--history memory` (`serve.history.backend: memory`) keeps nothing across a
 restart. Back the file up with SQLite's online backup — see
-[Backing up the server database](../docs/book/src/operations/backup.md). Every `faucet serve` feature (triggers, template sync, policy,
+[Backing up the server database](../docs/site/src/content/docs/operations/backup.md). Every `faucet serve` feature (triggers, template sync, policy,
 tenants and hosted OAuth connect, OTLP export, approvals, MCP) has its own
 values block; [`examples/everything.yaml`](./helm/faucet-stream/examples/everything.yaml)
 turns them all on.

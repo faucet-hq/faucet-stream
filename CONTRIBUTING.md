@@ -85,7 +85,7 @@ faucet-stream connectors follow a fixed shape. To add `faucet-source-foo` /
 5. **Wire it up** — add the feature to the umbrella crate, the CLI registry, and
    the `feature-check` matrix in `.github/workflows/ci.yml`.
 6. **Docs** — a crate `README.md`, an entry in the root README + the docs-site
-   [connector catalog](./docs/book/src/reference/connectors.md), and a runnable
+   [connector catalog](./docs/site/src/content/docs/reference/connectors.md), and a runnable
    example under `cli/examples/`.
 
 To reach **Tier-1 / conformant**, ship a `tests/conformance.rs` that invokes the
@@ -93,7 +93,7 @@ reusable `faucet-conformance` battery against the real connector (valid config
 schema, bounded-memory streaming, honest capabilities) and passes it in CI —
 that battery is the single source of truth for the tier. Where a connector
 legitimately can't satisfy a check, assert the honest branch instead. See the
-docs-site [authoring guide](./docs/book/src/extending/authoring-connectors.md)
+docs-site [authoring guide](./docs/site/src/content/docs/extending/authoring-connectors.md)
 for a worked example and the
 [Faucet Connector Protocol (FCP v0)](./docs/spec/faucet-connector-spec-v0.md)
 for the full contract.

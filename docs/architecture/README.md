@@ -19,7 +19,7 @@ This directory is the **internal engineering reference** for faucet-stream. It
 explains the *why* behind the system: the invariants that protect data, the
 trade-offs that shaped each subsystem, and the failure modes each was designed to
 survive. It is deliberately distinct from the **user-facing documentation** under
-[`../book/`](../book/src/introduction.md) (how to *use* the tool) — where a
+[`../site/`](../site/src/content/docs/index.md) (how to *use* the tool) — where a
 how-to already exists there, these pages link to it rather than repeat it.
 
 If you are about to touch `crates/core`, add a connector, or change delivery
@@ -34,7 +34,7 @@ semantics, start here.
 | Contributor guides | [`../contributing/`](../contributing/architecture.md) | New contributors | *How do I add/change things safely?* |
 | Standards | [`../standards/`](../standards/api-design.md) | Everyone | *What are the repo-wide conventions?* |
 | RFCs | [`../../rfcs/`](../../rfcs/README.md) | Proposers | *What might change, and how?* |
-| User docs (mdBook) | [`../book/`](../book/src/introduction.md) | Operators | *How do I run a pipeline?* |
+| User docs (docs site) | [`../site/`](../site/src/content/docs/index.md) | Operators | *How do I run a pipeline?* |
 
 ## Reading order
 

@@ -240,7 +240,7 @@ pipeline:
 delivery: exactly_once
 ```
 
-See the [effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state.html#effectively-once-delivery).
+See the [effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state/#effectively-once-delivery).
 
 ## Config loading & schema
 
@@ -337,9 +337,9 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 
 - [Snowflake source](https://crates.io/crates/faucet-source-snowflake) — query Snowflake via the same SQL REST API.
 - [faucet-common-snowflake](https://crates.io/crates/faucet-common-snowflake) — the shared `SnowflakeAuth` enum and auth helpers.
-- [Sinks reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) — capability matrix across all connectors.
-- [Authentication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/auth.html) — the shared `auth:` provider catalog.
-- [Secrets cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/secrets.html) — injecting the PEM / token from a secrets manager.
+- [Sinks reference](https://faucet-hq.github.io/faucet-stream/reference/connectors/) — capability matrix across all connectors.
+- [Authentication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/auth/) — the shared `auth:` provider catalog.
+- [Secrets cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/secrets/) — injecting the PEM / token from a secrets manager.
 
 
 ## Auto-create (`create_table`)
@@ -358,7 +358,7 @@ before any row of that page is buffered.
 
 ## Declared column types
 
-When the run's source declares its column types (a SQL query source, #955 — see [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types)), a table this sink creates types each declared column from the declaration instead of from the first page: `NUMBER(38,0)`, `FLOAT`, `BOOLEAN`, `NUMBER(p,s)` (up to 38 digits), `DATE`, `TIME(9)`, `TIMESTAMP_TZ(9)` / `TIMESTAMP_NTZ(9)`; the `::string` projection is coerced into them on insert, and binary and JSON stay `STRING`. A declared column whose first-page values do not fit its type keeps the inferred type; an existing table is never retyped. With a complete declaration a run that writes nothing creates the empty, typed table.
+When the run's source declares its column types (a SQL query source, #955 — see [Declared column types](../../../docs/site/src/content/docs/reference/value-fidelity.md#declared-column-types)), a table this sink creates types each declared column from the declaration instead of from the first page: `NUMBER(38,0)`, `FLOAT`, `BOOLEAN`, `NUMBER(p,s)` (up to 38 digits), `DATE`, `TIME(9)`, `TIMESTAMP_TZ(9)` / `TIMESTAMP_NTZ(9)`; the `::string` projection is coerced into them on insert, and binary and JSON stay `STRING`. A declared column whose first-page values do not fit its type keeps the inferred type; an existing table is never retyped. With a complete declaration a run that writes nothing creates the empty, typed table.
 
 ## Commit accumulation (`commit_rows` / `commit_bytes`)
 
@@ -395,7 +395,7 @@ What a failed write leaves behind (#737): **atomic** with `batch_size: 0`, other
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See
-[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/#batch-atomicity-and-dlq_all).
 
 ## Capabilities
 

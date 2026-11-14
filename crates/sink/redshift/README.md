@@ -129,7 +129,7 @@ field (drop or rename it with a transform).
 
 ## Declared column types
 
-When the run's source declares its column types (a SQL query source, #955 — see [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types)), a table this sink creates types each declared column from the declaration instead of from the first page: `BIGINT`, `DOUBLE PRECISION`, `BOOLEAN`, `DECIMAL(p,s)` (up to 38 digits; wider or unbounded stays `VARCHAR`), `DATE`, `TIME`, `TIMESTAMPTZ` / `TIMESTAMP`. A declared column whose first-page values do not fit its type keeps the inferred type; an existing table is never retyped. With a complete declaration a run that writes nothing creates the empty, typed table. Row-by-row `INSERT`s bind each decimal, date, time, timestamp and `UUID` value as text cast to its column's type (`$n::date`), so these typed columns — created here or already present — accept the source's string renderings.
+When the run's source declares its column types (a SQL query source, #955 — see [Declared column types](../../../docs/site/src/content/docs/reference/value-fidelity.md#declared-column-types)), a table this sink creates types each declared column from the declaration instead of from the first page: `BIGINT`, `DOUBLE PRECISION`, `BOOLEAN`, `DECIMAL(p,s)` (up to 38 digits; wider or unbounded stays `VARCHAR`), `DATE`, `TIME`, `TIMESTAMPTZ` / `TIMESTAMP`. A declared column whose first-page values do not fit its type keeps the inferred type; an existing table is never retyped. With a complete declaration a run that writes nothing creates the empty, typed table. Row-by-row `INSERT`s bind each decimal, date, time, timestamp and `UUID` value as text cast to its column's type (`$n::date`), so these typed columns — created here or already present — accept the source's string renderings.
 
 ## Commit accumulation (`commit_rows` / `commit_bytes`)
 
@@ -169,7 +169,7 @@ What a failed write leaves behind (#737): **atomic** for `write_strategy: copy` 
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See
-[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/#batch-atomicity-and-dlq_all).
 
 ## Capabilities
 
@@ -196,7 +196,7 @@ A column with an exact-decimal type (`NUMERIC(p,s)` / `DECIMAL`) is bound as
 text cast to that type (`$n::numeric(38,9)`), so an exact decimal string from a
 source (`"12345678901234567890.123456789"`) and a non-integer JSON number both
 land with every digit — the server parses them, never a double. See
-[value fidelity](https://faucet-hq.github.io/faucet-stream/reference/value-fidelity.html).
+[value fidelity](https://faucet-hq.github.io/faucet-stream/reference/value-fidelity/).
 
 ## Caller configs under `faucet serve`
 

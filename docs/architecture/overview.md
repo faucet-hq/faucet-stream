@@ -125,4 +125,4 @@ Arrow, are in [ADR 0004](../adr/0004-json-record-model.md) and
 - [Connector SDK](./connector-sdk.md) · [Extensibility](./extensibility.md)
 - [Design invariants](./invariants.md)
 - [ADR 0004 — JSON record model](../adr/0004-json-record-model.md) · [ADR 0010 — Pipeline runtime](../adr/0010-pipeline-runtime.md)
-- User guide: [Core concepts](../book/src/getting-started/concepts.md)
+- User guide: [Core concepts](../site/src/content/docs/getting-started/concepts.md)

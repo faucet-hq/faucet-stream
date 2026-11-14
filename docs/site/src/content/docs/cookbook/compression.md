@@ -1,0 +1,65 @@
+---
+title: "Compression"
+description: "The file-shaped connectors can read and write gzip / zstd transparently. Enable the compression feature, then set a compression: field on the connector."
+---
+
+The file-shaped connectors can read and write gzip / zstd transparently. Enable
+the `compression` feature, then set a `compression:` field on the connector.
+
+## Enable the feature
+
+```bash
+# CLI
+cargo install faucet-cli --features compression
+
+# Library (umbrella) — activates compression on whichever file connectors you've enabled
+faucet-stream = { version = "1.0", features = ["sink-file", "source-file", "compression"] }
+```
+
+The `compression` aggregate feature forwards to whichever of the supported
+connectors you've already opted into; it doesn't pull in connectors by itself.
+`full` includes compression.
+
+## Connectors that support it
+
+`source-file` and `sink-file` (always — no feature needed), `source-s3`,
+`source-gcs`, `source-azure-blob`, `sink-s3`, `sink-gcs`, `sink-azure-blob`,
+`sink-sftp`, and the deprecated `source-csv`, `sink-jsonl` and `sink-csv`.
+
+Compression is independent of [file format](/faucet-stream/cookbook/file-formats/): pick the format,
+pick the codec.
+
+## Config
+
+```yaml
+sink:
+  type: file
+  config:
+    path: ./out/records.jsonl.gz
+    compression: auto      # none | gzip | zstd | auto (default)
+```
+
+- `auto` chooses from the filename suffix: `.gz` → gzip, `.zst` → zstd, anything
+  else → none.
+- Explicit `gzip` / `zstd` / `none` override the suffix.
+
+Auto-detection runs per file at I/O time, so one matrix run can read a mix of
+`.jsonl`, `.jsonl.gz`, and `.jsonl.zst` objects.
+
+## Notes
+
+- File sinks finalize the encoder on `flush()`; later writes reopen in append
+  mode, producing a multi-member compressed file that gzip/zstd decoders read
+  back transparently.
+- S3 and GCS sinks do **not** set a `Content-Encoding` header — consumers must
+  decompress explicitly.
+- Parquet, Kafka, HTTP, stdout, and the database sinks are intentionally out of
+  scope: Parquet has internal columnar compression and the others have native
+  protocol-level options.
+
+## See also
+
+- [Throughput tuning](/faucet-stream/cookbook/tuning/) — compression trades CPU for I/O; tune it
+  alongside batch sizes.
+- [Connector capability matrix](/faucet-stream/reference/capability-matrix/) — which
+  connectors expose the `compression` field.

@@ -343,9 +343,9 @@ This is a write-only file sink: it does **not** support effectively-once deliver
 
 ## See also
 
-- [Compression cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/compression.html) — codecs, auto-detection, and the `Content-Encoding` note.
-- [Connector reference & capability matrix](https://faucet-hq.github.io/faucet-stream/reference/connectors.html)
-- [CLI & config-file reference](https://faucet-hq.github.io/faucet-stream/reference/cli.html)
+- [Compression cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/compression/) — codecs, auto-detection, and the `Content-Encoding` note.
+- [Connector reference & capability matrix](https://faucet-hq.github.io/faucet-stream/reference/connectors/)
+- [CLI & config-file reference](https://faucet-hq.github.io/faucet-stream/reference/cli/)
 - [`faucet-source-s3`](https://crates.io/crates/faucet-source-s3) — read JSONL / JSON-array / raw-text objects back out of S3.
 - [`faucet-sink-gcs`](https://crates.io/crates/faucet-sink-gcs) — the equivalent sink for Google Cloud Storage.
 - [`faucet-sink-parquet`](https://crates.io/crates/faucet-sink-parquet) — columnar output to local or S3 with internal compression.
@@ -414,7 +414,7 @@ records are buffered and encoded together at the rollover — bounded by the sam
 same thing whatever the format. Columns are the union of every record's keys in
 the group, so a record that gains a field mid-page widens the file rather than
 losing it. See the
-[file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats.html).
+[file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats/).
 
 ## Avro (#719)
 
@@ -492,7 +492,7 @@ a page is encoded locally and published only at `flush` — otherwise
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See
-[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/#batch-atomicity-and-dlq_all).
 
 ## Timeouts, cancellation and retries
 
@@ -528,7 +528,7 @@ Every request is reported to faucet's usage meter as a sink round trip, by op:
 | `head` | `HeadObject` (existence checks, and the size probe before a promote) | read |
 | `delete` | `DeleteObject` | free (S3 does not bill deletes) |
 
-See the [usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage.html).
+See the [usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage/).
 
 ## Server-side copies and retries (#783)
 
@@ -540,7 +540,7 @@ aborted on any failure.
 
 A request that fails with HTTP 429 or a 5xx (`SlowDown`,
 `ServiceUnavailable`, …) is reported as a typed `HttpStatus` error, so a
-pipeline [`resilience:`](https://faucet-hq.github.io/faucet-stream/cookbook/resilience.html)
+pipeline [`resilience:`](https://faucet-hq.github.io/faucet-stream/cookbook/resilience/)
 policy retries it; any other failure is a plain sink error.
 
 ## Capabilities

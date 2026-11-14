@@ -299,7 +299,7 @@ A **permanent** slot keeps pinning WAL even when no consumer is connected — an
 
 This source implements `capture_resume_position()`: it ensures the slot exists, reads the slot's position (`confirmed_flush_lsn`, else `restart_lsn`, else the server's current WAL LSN for a slot that reports none yet) as a resume bookmark, and consumes no changes. The `faucet replicate` command uses it to anchor the CDC stream at-or-before a bulk snapshot of the table, so the combined snapshot + CDC result is a gap-free, duplicate-free mirror when paired with a `write_mode: upsert` sink.
 
-Capture uses the permanent slot (`slot_type: temporary` is refused at config load), so WAL is retained across the snapshot. See the [replication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/replication.html) for the full handoff model.
+Capture uses the permanent slot (`slot_type: temporary` is refused at config load), so WAL is retained across the snapshot. See the [replication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/replication/) for the full handoff model.
 
 ## Crash-safe WAL feedback (durability)
 
@@ -373,7 +373,7 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 
 ## See also
 
-- [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) · [Replication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/replication.html) · [State & resume cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state.html) · [Upsert cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html)
+- [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors/) · [Replication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/replication/) · [State & resume cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state/) · [Upsert cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert/)
 - [faucet-source-postgres](https://crates.io/crates/faucet-source-postgres) (query-mode snapshots, not CDC) · [faucet-state-postgres](https://crates.io/crates/faucet-state-postgres) (pair as a `StateStore`) · `cli/examples/postgres_cdc_to_jsonl.yaml`
 
 ## Source lag

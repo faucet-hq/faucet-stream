@@ -283,7 +283,7 @@ own cloud or Kubernetes identity) is refused. Unless the server lists hosts
 with `--allow-url-host` (and always for a tenant), the URI must keep the driver
 on the server it names: add `directConnection=true`, or `loadBalanced=true`
 behind a load balancer. Templates and the triggers file are not limited. See
-the [HTTP API reference](https://faucet-hq.github.io/faucet-stream/reference/http-api.html).
+the [HTTP API reference](https://faucet-hq.github.io/faucet-stream/reference/http-api/).
 
 ## Streaming & batching
 
@@ -345,13 +345,13 @@ pipeline:
       connection_url: postgres://user:pass@localhost/warehouse
 ```
 
-> **Note:** a mirror built with the `cdc_unwrap` transform + `write_mode: upsert` needs an `after` image on every update, so set `full_document: update_lookup` (or `required` on a collection with `changeStreamPreAndPostImages` enabled). `faucet validate` refuses the pairing with the default `full_document: off`, and `cdc_unwrap` fails the run on an update it cannot turn into a row rather than dropping it. `update_lookup` re-reads the document at lookup time, not change time (see [Caveats](#caveats)). See the [upsert cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html).
+> **Note:** a mirror built with the `cdc_unwrap` transform + `write_mode: upsert` needs an `after` image on every update, so set `full_document: update_lookup` (or `required` on a collection with `changeStreamPreAndPostImages` enabled). `faucet validate` refuses the pairing with the default `full_document: off`, and `cdc_unwrap` fails the run on an update it cannot turn into a row rather than dropping it. `update_lookup` re-reads the document at lookup time, not change time (see [Caveats](#caveats)). See the [upsert cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert/).
 
 ## Snapshot → CDC handoff
 
 This source implements `capture_resume_position()`, which opens a change stream against the configured scope and reads its `postBatchResumeToken` (present after the first server round-trip even with no events) as a resume bookmark — **without consuming any changes**. The `faucet replicate` command uses it to anchor the change stream at-or-before a bulk snapshot of the collection, so the combined snapshot + CDC result is a gap-free, duplicate-free mirror when paired with a `write_mode: upsert` sink.
 
-There is no replication slot to pin — the **oplog window** is the retention risk. Keep it comfortably larger than the expected snapshot duration, or the captured token may roll off the oplog before CDC starts and the stream will error. See the [replication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/replication.html) for the full handoff model.
+There is no replication slot to pin — the **oplog window** is the retention risk. Keep it comfortably larger than the expected snapshot duration, or the captured token may roll off the oplog before CDC starts and the stream will error. See the [replication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/replication/) for the full handoff model.
 
 ## `invalidate` events
 
@@ -446,10 +446,10 @@ This crate has no optional features of its own. From the umbrella / CLI it is ga
 
 ## See also
 
-- [State & resumability cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state.html) — bookmarks, durable state stores, effectively-once.
-- [Replication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/replication.html) — the snapshot → CDC handoff with `faucet replicate`.
-- [Upsert cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html) — `cdc_unwrap` + `write_mode: upsert` for a true CDC mirror.
-- [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) — the full capability matrix.
+- [State & resumability cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state/) — bookmarks, durable state stores, effectively-once.
+- [Replication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/replication/) — the snapshot → CDC handoff with `faucet replicate`.
+- [Upsert cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert/) — `cdc_unwrap` + `write_mode: upsert` for a true CDC mirror.
+- [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors/) — the full capability matrix.
 - [`faucet-source-mongodb`](https://crates.io/crates/faucet-source-mongodb) — query-mode MongoDB source (`find()` snapshots).
 - [`faucet-state-redis`](https://crates.io/crates/faucet-state-redis) / [`faucet-state-postgres`](https://crates.io/crates/faucet-state-postgres) — durable `StateStore` backends for resumeToken bookmarks.
 - [`faucet-source-postgres-cdc`](https://crates.io/crates/faucet-source-postgres-cdc) / [`faucet-source-mysql-cdc`](https://crates.io/crates/faucet-source-mysql-cdc) — CDC sources for other databases.
@@ -469,7 +469,7 @@ with `invalidate` always written. Schema 0 (releases before versioned state)
 omitted the flag when `false`; such a bookmark is migrated on the next run
 (`MongoCdcSource::migrate_state`, pure) or ahead of it with
 `faucet migrate --state`. A bookmark at a newer schema is refused rather than
-misread. See [Upgrading faucet safely](https://faucet-hq.github.io/faucet-stream/operations/upgrading.html).
+misread. See [Upgrading faucet safely](https://faucet-hq.github.io/faucet-stream/operations/upgrading/).
 
 ## Capabilities
 

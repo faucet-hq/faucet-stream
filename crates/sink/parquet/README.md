@@ -365,7 +365,7 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 
 ## See also
 
-- [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) · [faucet-source-parquet](https://crates.io/crates/faucet-source-parquet) · [faucet-sink-s3](https://crates.io/crates/faucet-sink-s3)
+- [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors/) · [faucet-source-parquet](https://crates.io/crates/faucet-source-parquet) · [faucet-sink-s3](https://crates.io/crates/faucet-sink-s3)
 
 ## Batch atomicity
 
@@ -373,7 +373,7 @@ What a failed write leaves behind (#737): **best-effort** — rows stream into a
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See
-[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/#batch-atomicity-and-dlq_all).
 
 ## How it is built
 

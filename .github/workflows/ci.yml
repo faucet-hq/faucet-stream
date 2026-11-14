@@ -89,12 +89,13 @@ jobs:
             deploy:
               - 'deploy/helm/**'
             # Docs that Rust tests read (generated reference pages, the OpenAPI
-            # spec, YAML blocks in the book). They are excluded from `code`, so a
-            # docs-only PR edit to them runs the `doc-sync` job below instead of
-            # the full suite.
+            # spec, YAML blocks in the docs pages). They are excluded from `code`,
+            # so a docs-only PR edit to them runs the `doc-sync` job below instead
+            # of the full suite.
             docsync:
               - 'docs/openapi.yaml'
-              - 'docs/book/src/**'
+              - 'docs/site/src/content/docs/**'
+              - 'docs/site/generated/**'
       # The release-plz "chore: release" PR is auto-updated on every push to main
       # (version + changelog bumps), which would otherwise re-run the full CI on
       # it after every normal merge. Force `code=false` for that PR so all heavy

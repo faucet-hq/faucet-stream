@@ -129,7 +129,7 @@ connector's `tls` / transport option as something to configure, not to inherit.
   records in an envelope. If masking is **not** configured, those envelopes
   contain the original (possibly sensitive) data. Treat the DLQ location with the
   same sensitivity as the source data, and apply masking if the source carries
-  PII. See [`../book/src/cookbook/dlq.md`](../book/src/cookbook/dlq.md).
+  PII. See [`../site/src/content/docs/cookbook/dlq.md`](../site/src/content/docs/cookbook/dlq.md).
 - **State at rest.** Bookmarks are usually non-sensitive (offsets, timestamps,
   max-column values) but can contain primary-key values. `FileStateStore`
   supports optional at-rest encryption (`crates/core/src/encryption.rs`); the
@@ -209,7 +209,7 @@ connector's `tls` / transport option as something to configure, not to inherit.
   check, this is a limit of what the server can see.
   Operator-written configs
   (templates, the triggers file, `--default-config`) are not checked. See
-  [Reference policy](../book/src/reference/http-api.md#reference-policy).
+  [Reference policy](../site/src/content/docs/reference/http-api.md#reference-policy).
 - **Run errors are redacted before they are persisted**, so the history
   database never holds a resolved secret or a URL password from a failure
   message.
@@ -275,4 +275,4 @@ the faucet process.
 - [Standards: logging & redaction](../standards/logging.md) · [Standards: error handling](../standards/error-handling.md)
 - [Glossary](../glossary.md)
 - Disclosure policy: [`SECURITY.md`](../../SECURITY.md)
-- User guide: [Secrets-manager interpolation](../book/src/cookbook/secrets.md) · [Dead-letter queues](../book/src/cookbook/dlq.md)
+- User guide: [Secrets-manager interpolation](../site/src/content/docs/cookbook/secrets.md) · [Dead-letter queues](../site/src/content/docs/cookbook/dlq.md)

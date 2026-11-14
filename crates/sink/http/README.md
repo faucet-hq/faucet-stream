@@ -192,7 +192,7 @@ Recommended `batch_size` for array-accepting endpoints: match the destination's 
 
 ## Dead-letter queue
 
-The sink overrides `write_batch_partial` so a configured [DLQ](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html) gets accurate per-row outcomes:
+The sink overrides `write_batch_partial` so a configured [DLQ](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/) gets accurate per-row outcomes:
 
 - **`Individual` mode** — every record is an independent POST, so each success/failure is attributable. The sink attempts **all** records (failures don't short-circuit siblings) and returns one outcome per record; only the genuinely-failed rows are dead-lettered. This avoids duplicating already-delivered rows against a non-idempotent endpoint under `on_batch_error: dlq_all`.
 - **`Array` mode** — a single array POST cannot attribute a failure to specific rows, so it stays all-or-nothing: the whole array surfaces as an error and the DLQ `on_batch_error` policy decides whether to abort or dead-letter the batch.
@@ -270,9 +270,9 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 
 ## See also
 
-- [Sinks reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) — capability matrix across all connectors.
-- [Authentication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/auth.html) — shared `auth:` providers and the `{ type, config }` shape.
-- [Dead-letter queue cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html) — `on_batch_error` policies and per-row dead-lettering.
+- [Sinks reference](https://faucet-hq.github.io/faucet-stream/reference/connectors/) — capability matrix across all connectors.
+- [Authentication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/auth/) — shared `auth:` providers and the `{ type, config }` shape.
+- [Dead-letter queue cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/) — `on_batch_error` policies and per-row dead-lettering.
 - [`faucet-source-webhook`](https://crates.io/crates/faucet-source-webhook) — the natural upstream for HTTP fan-out pipelines.
 - [`faucet-source-rest`](https://crates.io/crates/faucet-source-rest) — pull from a REST API and forward it over HTTP.
 
@@ -282,7 +282,7 @@ What a failed write leaves behind (#737): **per-row** — per-request outcomes; 
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See
-[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/#batch-atomicity-and-dlq_all).
 
 ## Capabilities
 

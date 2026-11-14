@@ -179,7 +179,7 @@ record_ancestors: { event_id: id, event_created: created }
 | `tolerated_http_errors` | array<int> | `[]` | HTTP status codes treated as an empty page **on the first request only**. Mid-pagination, a tolerated status surfaces as an error instead of silently ending the stream (otherwise a transient failure on page _N_ would drop every later page as a "successful" run). Only safe for genuinely-empty resources. |
 | `retry_on_response` | array of matchers | `[]` | Treat a non-2xx response as **throttling** and retry it with backoff — for APIs that signal a rate limit with a 4xx other than 429 plus a code in the body. Each matcher has `status` (list; empty = any non-2xx), `body_path` (JSONPath into the JSON error body) + `values` (numbers and strings compare by text), optional `header` (must be present; compared with `values` when there is no `body_path`), optional `match_success: true` (also match a 2xx, e.g. `x-ratelimit-remaining: 0`; requires `body_path` or `header`), optional `backoff_from` (read the wait from the response: `{type: header, config: {name, unit}}`, `{type: header_json, config: {name, path, unit}}`, `{type: body, config: {path, unit}}` or `{type: cost_bucket, config: {requested, available, restore_rate}}`; `unit` is `seconds`, `ms`, `minutes`, `epoch_s`, `epoch_ms` or `rfc3339`, an absolute instant measured from the response's `Date` header), optional `backoff_secs` (fixed wait), and optional `max_wait_secs` (default 3600; a longer wait — from `backoff_from`, `backoff_secs` or `Retry-After` — fails the run instead of parking it). The wait is `backoff_from`, else `backoff_secs`, else `Retry-After`, else the exponential `retry_backoff`. A match is counted as a rate-limit response (`faucet_source_throttled_total`, `faucet_source_retries_total{class="rate_limited"}`, `faucet_source_throttle_wait_seconds`), is checked before `tolerated_http_errors`, and applies to data pages, `async_job` requests (success-matching only on submit/poll, not streamed results) and discovery requests. After `max_retries` consecutive matches on one request the original error (status + body) is surfaced — each request (page, partition, key range, job call) has its own count, so concurrent requests never share a budget; a 2xx that still matches fails rather than being read as data. A non-JSON body never matches. |
 
-**Throttling is metered (#734):** every `429` counts in `faucet_source_throttled_total`, the time actually slept on it (not the header's value — a cancelled sleep records the partial wait) in `faucet_source_throttle_wait_seconds`, and every retry by class in `faucet_source_retries_total{class}`. The totals land on the run's usage record, so `faucet run` / `faucet usage` print `throttled 312× · waited 41 min`, and a run that spent more than 10 % of its time rate-limited logs a warning. See [source-side throttling](https://faucet-hq.github.io/faucet-stream/cookbook/resilience.html#source-side-throttling).
+**Throttling is metered (#734):** every `429` counts in `faucet_source_throttled_total`, the time actually slept on it (not the header's value — a cancelled sleep records the partial wait) in `faucet_source_throttle_wait_seconds`, and every retry by class in `faucet_source_retries_total{class}`. The totals land on the run's usage record, so `faucet run` / `faucet usage` print `throttled 312× · waited 41 min`, and a run that spent more than 10 % of its time rate-limited logs a warning. See [source-side throttling](https://faucet-hq.github.io/faucet-stream/cookbook/resilience/#source-side-throttling).
 
 A **`204 No Content`** response — or any `2xx` with an empty/whitespace-only body — is treated as an empty page ("no data"), not a parse error. A non-empty body that isn't valid JSON still fails loudly with `FaucetError::Json`.
 
@@ -212,7 +212,7 @@ source:
 
 #### Unified `resilience:` policy
 
-When driven by the CLI, a pipeline-level [`resilience:`](https://faucet-hq.github.io/faucet-stream/cookbook/resilience.html) block can inject one shared retry policy into this source. **Legacy fields win when set explicitly:** if you set `max_retries` or `retry_backoff` to anything other than their defaults (`3` / `1`), the per-connector value is used and the injected policy is ignored for that field — an explicit setting is never silently overridden. Otherwise the injected policy applies.
+When driven by the CLI, a pipeline-level [`resilience:`](https://faucet-hq.github.io/faucet-stream/cookbook/resilience/) block can inject one shared retry policy into this source. **Legacy fields win when set explicitly:** if you set `max_retries` or `retry_backoff` to anything other than their defaults (`3` / `1`), the per-connector value is used and the injected policy is ignored for that field — an explicit setting is never silently overridden. Otherwise the injected policy applies.
 
 Because the REST source keeps its own `429`/`Retry-After`-aware retry runner, it honors **only** the injected policy's `max_attempts` (→ `max_retries`) and `base` (→ `retry_backoff`). The policy's `retry_on`, `max` (per-sleep cap), and `jitter` fields are **inert on REST** — they are honored on the `xml`/`graphql` sources and on every sink-side write.
 
@@ -730,7 +730,7 @@ instead. `only: [stream, …]` emits a subset of the routes on purpose.
 
 **One job, several sinks.** An API that runs one bulk job per account at a
 time means each stream must not submit its own job. Run the source once in
-[topology mode](../../docs/book/src/cookbook/topology.md) and fan it out with
+[topology mode](../../docs/site/src/content/docs/cookbook/topology.md) and fan it out with
 a `tee` and one `filter` per stream (`path: _stream, op: eq, value: orders`),
 dropping `_stream` before each sink — see the cookbook's "Fan one bulk job out
 to several sinks" section.
@@ -1120,11 +1120,11 @@ Attach transforms by wrapping the source with [`faucet_core::TransformingSource`
 
 ## See also
 
-- [Connector catalog & capability matrix](https://faucet-hq.github.io/faucet-stream/reference/connectors.html)
-- [Authentication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/auth.html)
-- [Pagination cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/pagination.html)
-- [Resumable state & bookmarks](https://faucet-hq.github.io/faucet-stream/cookbook/state.html)
-- [Config-file grammar](https://faucet-hq.github.io/faucet-stream/reference/config.html)
+- [Connector catalog & capability matrix](https://faucet-hq.github.io/faucet-stream/reference/connectors/)
+- [Authentication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/auth/)
+- [Pagination cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/pagination/)
+- [Resumable state & bookmarks](https://faucet-hq.github.io/faucet-stream/cookbook/state/)
+- [Config-file grammar](https://faucet-hq.github.io/faucet-stream/reference/config/)
 - Related crates: [`faucet-source-graphql`](https://crates.io/crates/faucet-source-graphql), [`faucet-source-xml`](https://crates.io/crates/faucet-source-xml), [`faucet-sink-http`](https://crates.io/crates/faucet-sink-http), [`faucet-auth`](https://crates.io/crates/faucet-auth).
 
 ## Capabilities

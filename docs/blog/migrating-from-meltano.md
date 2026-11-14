@@ -5,7 +5,7 @@ Meltano who want a single fast binary instead of a Python plugin runtime — wit
 an honest note on when you shouldn't switch.*
 
 > Grounded in [`cli/examples/rest_to_postgres.yaml`](https://github.com/faucet-hq/faucet-stream/blob/main/cli/examples/rest_to_postgres.yaml).
-> Reflects both tools as of 2026-07. See the [full comparison](https://faucet-hq.github.io/faucet-stream/comparison/meltano.html)
+> Reflects both tools as of 2026-07. See the [full comparison](https://faucet-hq.github.io/faucet-stream/comparison/meltano/)
 > and [our benchmarks](https://github.com/faucet-hq/faucet-stream/blob/main/BENCHMARKS.md).
 
 ## Should you migrate?
@@ -33,7 +33,7 @@ gotcha below — so "no native connector" isn't necessarily a dealbreaker.)
   external tooling.
 
 If you're doing EL→dbt today, note faucet doesn't replace dbt either — see the
-[orchestration recipe](https://faucet-hq.github.io/faucet-stream/cookbook/orchestration.html)
+[orchestration recipe](https://faucet-hq.github.io/faucet-stream/cookbook/orchestration/)
 (faucet for EL, dbt for T, Airflow/Dagster to schedule).
 
 ## The mental model maps cleanly
@@ -132,7 +132,7 @@ This is a real, runnable config —
 ## Migration steps
 
 1. **Inventory your taps and targets.** For each, check the
-   [connector catalog](https://faucet-hq.github.io/faucet-stream/reference/connectors.html).
+   [connector catalog](https://faucet-hq.github.io/faucet-stream/reference/connectors/).
    Native SaaS taps usually map onto faucet's generic
    `rest` / `graphql` source pointed at the same API. Databases, warehouses,
    files, and streaming systems map to dedicated connectors.
@@ -149,26 +149,26 @@ This is a real, runnable config —
 6. **Run it, and diff row counts** against your Meltano output for the same
    window.
 7. **Adopt the governance you were bolting on** — replace mapper-based redaction
-   with native [masking](https://faucet-hq.github.io/faucet-stream/cookbook/masking.html),
-   dbt data tests at the edge with in-path [quality checks](https://faucet-hq.github.io/faucet-stream/cookbook/quality.html)
-   and [contracts](https://faucet-hq.github.io/faucet-stream/cookbook/contracts.html).
+   with native [masking](https://faucet-hq.github.io/faucet-stream/cookbook/masking/),
+   dbt data tests at the edge with in-path [quality checks](https://faucet-hq.github.io/faucet-stream/cookbook/quality/)
+   and [contracts](https://faucet-hq.github.io/faucet-stream/cookbook/contracts/).
 
 ## Gotchas
 
 - **No tap for your source?** If it's a REST or GraphQL API, the generic source
   usually covers it with `pagination` + `auth` config — you're configuring, not
   writing a plugin. If it's a truly bespoke SaaS with only a Singer tap, the
-  experimental [`singer` source](https://faucet-hq.github.io/faucet-stream/reference/connectors.html)
+  experimental [`singer` source](https://faucet-hq.github.io/faucet-stream/reference/connectors/)
   runs that tap unchanged under faucet — a zero-rewrite stepping stone (it's v0
   and single-stream, and reintroduces the tap's Python process) while you wait
   for, or file, a native connector request.
 - **Mappers → transforms.** Simple renames/casts/drops map to built-in
-  [record transforms](https://faucet-hq.github.io/faucet-stream/cookbook/transforms.html);
+  [record transforms](https://faucet-hq.github.io/faucet-stream/cookbook/transforms/);
   anything SQL-shaped maps to the embedded-DuckDB
-  [`sql` transform](https://faucet-hq.github.io/faucet-stream/cookbook/sql-transform.html).
+  [`sql` transform](https://faucet-hq.github.io/faucet-stream/cookbook/sql-transform/).
 - **Orchestration.** If you drove Meltano from Airflow, keep Airflow — just swap
   the `meltano run` call for `faucet run`. See the
-  [orchestration recipe](https://faucet-hq.github.io/faucet-stream/cookbook/orchestration.html).
+  [orchestration recipe](https://faucet-hq.github.io/faucet-stream/cookbook/orchestration/).
 
 ## Try it in 60 seconds
 

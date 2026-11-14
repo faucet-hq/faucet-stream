@@ -227,7 +227,7 @@ pipeline:
 - Upserts and deletes within a page are applied inside **one transaction** — they commit atomically or not at all.
 - The `delete_marker` field is stripped from upsert records before writing.
 
-Pair `write_mode: upsert` with the [`cdc_unwrap`](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html) transform to mirror a CDC source into MySQL. See the [upsert cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html).
+Pair `write_mode: upsert` with the [`cdc_unwrap`](https://faucet-hq.github.io/faucet-stream/cookbook/upsert/) transform to mirror a CDC source into MySQL. See the [upsert cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert/).
 
 ## Scoped cleanup
 
@@ -286,7 +286,7 @@ pipeline:
 delivery: exactly_once
 ```
 
-See the [effectively-once cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state.html#effectively-once-delivery) for the full rationale and the supported source/sink set.
+See the [effectively-once cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state/#effectively-once-delivery) for the full rationale and the supported source/sink set.
 
 ## Schema evolution
 
@@ -298,7 +298,7 @@ Under `on_drift: evolve`, `MysqlSink::evolve_schema()` applies additive DDL:
 - **Lossless widenings** (e.g. integer → number) → `MODIFY COLUMN` — gated on `allow_type_widening`; re-running the same `MODIFY` is a no-op. An integer column that starts receiving fractions becomes `DECIMAL(65,30)` (exact — `DOUBLE` would round every stored value above 2^53), and the statement re-emits the rest of the definition — `NOT NULL`, default, `ON UPDATE`, comment — so it survives. An `AUTO_INCREMENT` column cannot become `DECIMAL`; widening one fails with a schema-drift error.
 - **Nullability relaxations** → `MODIFY COLUMN` re-emits the column's exact definition from `INFORMATION_SCHEMA.COLUMNS` — `COLUMN_TYPE` (so `DECIMAL(12,2)` stays `DECIMAL(12,2)`), character set and collation, default (an expression default stays an expression; MySQL 5.7's unmarked `CURRENT_TIMESTAMP`, MariaDB's already-quoted defaults and `BIT` literals such as `b'0'` are kept as they are), `AUTO_INCREMENT`, `ON UPDATE` and comment — with `NOT NULL` replaced by `NULL`. A generated column is left as it is.
 
-Incompatible changes (narrowing / type swaps) are never auto-applied — they are routed by `on_incompatible` (`fail` or `quarantine`). See the [schema-drift cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift.html).
+Incompatible changes (narrowing / type swaps) are never auto-applied — they are routed by `on_incompatible` (`fail` or `quarantine`). See the [schema-drift cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift/).
 
 ## Dead-letter queue
 
@@ -407,9 +407,9 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 
 ## See also
 
-- [Sinks reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) — capability matrix.
-- [Upsert cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html) — write modes & `cdc_unwrap`.
-- [State & effectively-once cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state.html) — resumable and effectively-once runs.
+- [Sinks reference](https://faucet-hq.github.io/faucet-stream/reference/connectors/) — capability matrix.
+- [Upsert cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert/) — write modes & `cdc_unwrap`.
+- [State & effectively-once cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state/) — resumable and effectively-once runs.
 - [`faucet-source-mysql`](https://crates.io/crates/faucet-source-mysql) · [`faucet-source-mysql-cdc`](https://crates.io/crates/faucet-source-mysql-cdc) — the MySQL query and CDC sources.
 
 
@@ -427,7 +427,7 @@ fails fast with the same error every table sink raises, naming both ways out.
 
 ## Declared column types
 
-When the run's source declares its column types (a SQL query source, #955 — see [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types)), a table this sink creates types each declared column from the declaration instead of from the first page: `BIGINT`, `DOUBLE`, `TINYINT(1)`, `DECIMAL(p,s)` (`DECIMAL(65,30)` without precision), `DATE`, `TIME(6)`, `DATETIME(6)`, `CHAR(36)` for a UUID, `LONGBLOB`, `JSON`. A declared column whose first-page values do not fit the column created keeps the inferred type — a decimal with more than 30 fractional or 35 integer digits for `DECIMAL(65,30)`, a time with more than microseconds; an existing table is never retyped. With a complete declaration a run that writes nothing creates the empty, typed table (under `write_mode: overwrite`, the empty staging table the commit publishes).
+When the run's source declares its column types (a SQL query source, #955 — see [Declared column types](../../../docs/site/src/content/docs/reference/value-fidelity.md#declared-column-types)), a table this sink creates types each declared column from the declaration instead of from the first page: `BIGINT`, `DOUBLE`, `TINYINT(1)`, `DECIMAL(p,s)` (`DECIMAL(65,30)` without precision), `DATE`, `TIME(6)`, `DATETIME(6)`, `CHAR(36)` for a UUID, `LONGBLOB`, `JSON`. A declared column whose first-page values do not fit the column created keeps the inferred type — a decimal with more than 30 fractional or 35 integer digits for `DECIMAL(65,30)`, a time with more than microseconds; an existing table is never retyped. With a complete declaration a run that writes nothing creates the empty, typed table (under `write_mode: overwrite`, the empty staging table the commit publishes).
 
 ### Zoned timestamps
 
@@ -439,7 +439,7 @@ What a failed write leaves behind (#737): **atomic** for `write_mode: upsert|del
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See
-[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/#batch-atomicity-and-dlq_all).
 
 ## Capabilities
 
@@ -532,7 +532,7 @@ changed the same keys — and rewinds the row's bookmark and exactly-once
 watermark. Sink hooks: `supports_rollback`, `rollback_run`, `forget_run`,
 `rewind_commit_token`, `readback_source` (the `mysql` source config
 `faucet verify` reads the destination back with). See the [rollback
-cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/rollback.html).
+cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/rollback/).
 
 The journal table is created on its own connection before the write
 transaction begins (MySQL commits an open transaction on any `CREATE TABLE`),
@@ -547,4 +547,4 @@ in place rather than renaming.
 A non-integer JSON number is bound as its shortest decimal text (`0.1`), which
 MySQL parses exactly into a `DECIMAL` (or a `DOUBLE`); a bound double would be
 converted from binary. Exact decimals from a source arrive as strings and are
-bound as text. See [value fidelity](https://faucet-hq.github.io/faucet-stream/reference/value-fidelity.html).
+bound as text. See [value fidelity](https://faucet-hq.github.io/faucet-stream/reference/value-fidelity/).

@@ -57,7 +57,7 @@ config written for a newer faucet can fail or be misread on an older one.
    If the checksum or the attestation does not verify, stop and tell the user.
 6. With no pin at all, install the latest release the same way (the archive
    and its `.sha256` from `releases/latest/download/`) and pin it as described in
-   [Pinning the faucet version](https://faucet-hq.github.io/faucet-stream/operations/pinning.html).
+   [Pinning the faucet version](https://faucet-hq.github.io/faucet-stream/operations/pinning/).
 
 Every version-specific fact (which connectors and blocks exist, config keys,
 types, defaults, commands and flags) comes from that binary: `faucet list`,
@@ -82,16 +82,16 @@ Never write a client from memory or from this skill.
    on `main` is the newest). A CI test keeps it in step with the router, so
    every path, request field, response field and status code is there.
 3. Read the prose for each endpoint you use in the
-   [HTTP API reference](https://faucet-hq.github.io/faucet-stream/reference/http-api.html),
+   [HTTP API reference](https://faucet-hq.github.io/faucet-stream/reference/http-api/),
    and the security model in
-   [Running faucet as a service](https://faucet-hq.github.io/faucet-stream/cookbook/serve.html).
+   [Running faucet as a service](https://faucet-hq.github.io/faucet-stream/cookbook/serve/).
 4. Generate the client from the OpenAPI document where your language allows,
    so a field rename fails at build time rather than in production.
 
 ## Step 2: pick the token the caller needs
 
 The server has roles, and each route needs a permission
-([role × route matrix](https://faucet-hq.github.io/faucet-stream/reference/http-api.html#role--route-matrix)).
+([role × route matrix](https://faucet-hq.github.io/faucet-stream/reference/http-api/#role--route-matrix)).
 
 1. List the endpoints the caller uses, and look each one up in the matrix.
 2. Give the caller the **least** role that covers them. A service that only
@@ -107,7 +107,7 @@ The server has roles, and each route needs a permission
 ## Step 3: register and launch templates (release pipeline)
 
 Templates are registered once and triggered many times
-([Registering a template](https://faucet-hq.github.io/faucet-stream/cookbook/templates.html#registering-a-template)).
+([Registering a template](https://faucet-hq.github.io/faucet-stream/cookbook/templates/#registering-a-template)).
 
 1. Before registering, run the template's tests locally with
    `faucet template test <file>` and `faucet hub check` (the
@@ -119,12 +119,12 @@ Templates are registered once and triggered many times
    with. For a brand-new pair, register both and then launch both: a
    companion with no launched version is tested at its newest, and
    registering the second half re-tests the first
-   ([Bootstrapping a new source + sink pair](https://faucet-hq.github.io/faucet-stream/cookbook/templates.html#bootstrapping-a-new-source--sink-pair)).
+   ([Bootstrapping a new source + sink pair](https://faucet-hq.github.io/faucet-stream/cookbook/templates/#bootstrapping-a-new-source--sink-pair)).
 4. When a source and a sink template change together, register first the half
    the other's tests depend on, then the other, then re-run the first half's
    tests (`POST /v1/templates/{id}/versions/{version}/test`) before launching.
 5. Launch moves only onto a passing version
-   ([Labels need passing tests](https://faucet-hq.github.io/faucet-stream/cookbook/templates.html#labels-need-passing-tests)).
+   ([Labels need passing tests](https://faucet-hq.github.io/faucet-stream/cookbook/templates/#labels-need-passing-tests)).
    A refusal is a `422` whose details list the failing cases: fix the
    template, do not look for an override.
 6. **Roll out the template before the caller.** A trigger with a param the
@@ -135,7 +135,7 @@ Templates are registered once and triggered many times
 ## Step 4: trigger runs
 
 Trigger a template by `POST /v1/templates/{id}/runs`, or submit a whole config
-by `POST /v1/runs` ([Triggering over HTTP](https://faucet-hq.github.io/faucet-stream/cookbook/templates.html#triggering-over-http)).
+by `POST /v1/runs` ([Triggering over HTTP](https://faucet-hq.github.io/faucet-stream/cookbook/templates/#triggering-over-http)).
 Read the exact request fields from the OpenAPI document. For every trigger:
 
 1. **Validate first.** Before triggering the first run of a batch, check every
@@ -146,12 +146,12 @@ Read the exact request fields from the OpenAPI document. For every trigger:
    plus attempt-independent unit id), never a random value, so a retried
    request replays the original run instead of starting a second one. A reused
    key with a different request is a `409`
-   ([Idempotency](https://faucet-hq.github.io/faucet-stream/cookbook/serve.html#idempotency)).
+   ([Idempotency](https://faucet-hq.github.io/faucet-stream/cookbook/serve/#idempotency)).
 3. **Labels.** Put the caller's own ids (tenant, job, unit) in the run's
    labels: they are how you find the run later, and they are stored on the
    run record.
 4. **Pool.** On a cluster with
-   [execution pools](https://faucet-hq.github.io/faucet-stream/cookbook/cluster.html#execution-pools),
+   [execution pools](https://faucet-hq.github.io/faucet-stream/cookbook/cluster/#execution-pools),
    name the pool when the run must execute on particular replicas (a private
    network, an allowlisted egress IP). A pool no live member serves is
    refused, so treat that `422` as a deployment problem, not a retry.
@@ -165,22 +165,22 @@ Read the exact request fields from the OpenAPI document. For every trigger:
 2. Map the server's statuses (listed in the OpenAPI document) to the caller's
    own states once, in one function.
 3. Read each invocation's own status, error and row accounting
-   ([`GET /v1/runs/{id}`](https://faucet-hq.github.io/faucet-stream/reference/http-api.html#get-v1runsid--runrecord)):
+   ([`GET /v1/runs/{id}`](https://faucet-hq.github.io/faucet-stream/reference/http-api/#get-v1runsid--runrecord)):
    one failed stream does not hide the others, so report per stream.
 4. To find runs again (a lost run id, a dashboard, a reconciliation job),
    list them with `GET /v1/runs?label=key:value`, repeated to AND several
    labels
-   ([`GET /v1/runs`](https://faucet-hq.github.io/faucet-stream/reference/http-api.html#get-v1runs)).
+   ([`GET /v1/runs`](https://faucet-hq.github.io/faucet-stream/reference/http-api/#get-v1runs)).
    An unknown query parameter is a `400`, so a typo cannot silently match
    every run.
 5. Prefer a completion callback over tight polling when the caller can
    receive one
-   ([Completion callbacks](https://faucet-hq.github.io/faucet-stream/reference/http-api.html#completion-callbacks)).
+   ([Completion callbacks](https://faucet-hq.github.io/faucet-stream/reference/http-api/#completion-callbacks)).
 
 ## Step 6: decode an error
 
 Every error has the same envelope
-([Error envelope](https://faucet-hq.github.io/faucet-stream/reference/http-api.html#error-envelope)).
+([Error envelope](https://faucet-hq.github.io/faucet-stream/reference/http-api/#error-envelope)).
 Read `error.code`, `error.message` and `error.details`; the message names the
 cause. Decide by status:
 

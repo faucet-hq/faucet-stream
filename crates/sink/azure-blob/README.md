@@ -123,7 +123,7 @@ records are buffered and encoded together at the rollover — bounded by the sam
 same thing whatever the format. Columns are the union of every record's keys in
 the group, so a record that gains a field mid-page widens the file rather than
 losing it. See the
-[file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats.html).
+[file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats/).
 
 ## Avro (#719)
 
@@ -204,7 +204,7 @@ a page is encoded locally and published only at `flush` — otherwise
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See
-[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/#batch-atomicity-and-dlq_all).
 
 ## Retries
 
@@ -227,7 +227,7 @@ Every request is reported to faucet's usage meter as a sink round trip, by op:
 | `get` | each blob read back | read |
 | `delete` | each blob delete | free |
 
-See the [usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage.html).
+See the [usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage/).
 
 ## Lineage dataset URI
 

@@ -440,8 +440,8 @@ cargo add faucet-stream --features full
 
 ## See also
 
-- [SQL transform cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/transforms.html) — the transforms model and worked examples.
-- [Transforms reference](https://faucet-hq.github.io/faucet-stream/reference/config.html) — the full `transforms:` grammar and layering rules.
+- [SQL transform cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/transforms/) — the transforms model and worked examples.
+- [Transforms reference](https://faucet-hq.github.io/faucet-stream/reference/config/) — the full `transforms:` grammar and layering rules.
 - [`faucet-core`](https://crates.io/crates/faucet-core) — the `TransformStage` / `TransformingSource` types this transform plugs into.
 - [`faucet-stream`](https://crates.io/crates/faucet-stream) — the umbrella crate that exposes the `transform-sql` feature.
 - [DuckDB SQL documentation](https://duckdb.org/docs/sql/introduction) — the dialect available inside the `query`.

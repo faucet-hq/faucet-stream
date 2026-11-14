@@ -91,4 +91,4 @@ Every query runs through the pipeline's `CallContext` (#880): the run's deadline
 
 ## Declared column types
 
-The source declares the query's columns and their types (`Source::declared_columns`, #955) from the describe its read makes, so a sink that creates its table types it from the source rather than from the first page's JSON values. See [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types).
+The source declares the query's columns and their types (`Source::declared_columns`, #955) from the describe its read makes, so a sink that creates its table types it from the source rather than from the first page's JSON values. See [Declared column types](../../../docs/site/src/content/docs/reference/value-fidelity.md#declared-column-types).

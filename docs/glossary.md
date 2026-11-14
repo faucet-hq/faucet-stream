@@ -70,7 +70,7 @@ sink under failure: [at-least-once](#at-least-once) (default) or
 to write (or were quarantined by quality/contract/drift), wrapped in a
 fixed-shape envelope. Note the envelope holds the *raw* failed record — see the
 [security model](./architecture/security.md). See
-[`../book/src/cookbook/dlq.md`](./book/src/cookbook/dlq.md).
+[`../site/src/content/docs/cookbook/dlq.md`](./site/src/content/docs/cookbook/dlq.md).
 
 **Effectively-once** — the guarantee `delivery: exactly_once` actually provides:
 each record's *effect* on the sink is applied once, via one of two mechanisms —
@@ -139,7 +139,7 @@ that persists [bookmarks](#bookmark). Built-in `memory` and `file` in core;
 **Transform** — a record-shaping stage (`flatten`, `select`, `cast`, `sql`,
 `cdc_unwrap`, …) applied per page between source and sink. Layered
 pipeline/source/row and resolved additively. See
-[`../book/src/cookbook/transforms.md`](./book/src/cookbook/transforms.md).
+[`../site/src/content/docs/cookbook/transforms.md`](./site/src/content/docs/cookbook/transforms.md).
 
 **Write mode** — how a [sink](#sink) applies records: `append` (default),
 `upsert`, or `delete` (`faucet_core::write_mode`). Upsert/delete require a `key`

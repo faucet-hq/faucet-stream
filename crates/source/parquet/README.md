@@ -199,11 +199,11 @@ No optional features of its own; enable it in the CLI/umbrella via the `source-p
 
 ## See also
 
-- [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) · [faucet-sink-parquet](https://crates.io/crates/faucet-sink-parquet) · [faucet-source-s3](https://crates.io/crates/faucet-source-s3)
+- [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors/) · [faucet-sink-parquet](https://crates.io/crates/faucet-sink-parquet) · [faucet-source-s3](https://crates.io/crates/faucet-source-s3)
 
 ## Sharded execution (cluster Mode B)
 
-Under [`faucet serve --cluster`](https://faucet-hq.github.io/faucet-stream/cookbook/cluster.html),
+Under [`faucet serve --cluster`](https://faucet-hq.github.io/faucet-stream/cookbook/cluster/),
 a top-level `shard: { count: N }` block splits this source across cluster
 workers **automatically — no connector config needed**. Each worker reads the
 files whose path hashes to its shard index (stable FNV-1a modulo `count`),

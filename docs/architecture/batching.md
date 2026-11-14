@@ -112,4 +112,4 @@ handed.
 - [Stream pages](./stream-pages.md) · [Pipeline](./pipeline.md) · [Performance](./performance.md)
 - [State management](./state-management.md) · [Design invariants](./invariants.md)
 - [ADR 0001 — Stream pages](../adr/0001-stream-pages.md)
-- User guide: [../book/src/cookbook/adaptive-batching.md](../book/src/cookbook/adaptive-batching.md)
+- User guide: [../site/src/content/docs/cookbook/adaptive-batching.md](../site/src/content/docs/cookbook/adaptive-batching.md)

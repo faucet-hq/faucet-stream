@@ -156,7 +156,7 @@
   "sinks": [
     {
       "description": "Google BigQuery — one table per stream, atomic overwrite or keyed MERGE upsert",
-      "docs": "https://faucet-hq.github.io/faucet-stream/reference/connectors.html",
+      "docs": "https://faucet-hq.github.io/faucet-stream/reference/connectors/",
       "file": "sink-templates/faucet-hq/bigquery.yaml",
       "has_tests": false,
       "id": "faucet-hq/bigquery",
