@@ -3609,7 +3609,7 @@ mod tests {
         let mut rec = RunRecord::queued("r".into(), None, BTreeMap::new(), None, Utc::now());
         rec.status = RunStatus::Running;
         rec.config_body = Some(format!(
-            "version: 1\npipeline:\n  source: {{ type: webhook, config: {{ listen_addr: \"127.0.0.1:0\", timeout_secs: 60 }} }}\n  sink: {{ type: jsonl, config: {{ path: \"{}\" }} }}\n",
+            "version: 1\npipeline:\n  source: {{ type: webhook, config: {{ listen_addr: \"127.0.0.1:0\", timeout_secs: 60 }} }}\n  sink: {{ type: jsonl, config: {{ path: \"{}\", append: true }} }}\n",
             dir.path().join("out.jsonl").display()
         ));
         state.history().upsert(&rec).await.unwrap();
@@ -3642,7 +3642,7 @@ mod tests {
         let state = crate::serve::test_support::test_state();
         let req: SubmitRequest = serde_json::from_value(serde_json::json!({
             "config": format!(
-                "version: 1\npipeline:\n  source: {{ type: webhook, config: {{ listen_addr: \"127.0.0.1:{}\", timeout_secs: 60 }} }}\n  sink: {{ type: jsonl, config: {{ path: \"{}\" }} }}\n",
+                "version: 1\npipeline:\n  source: {{ type: webhook, config: {{ listen_addr: \"127.0.0.1:{}\", timeout_secs: 60 }} }}\n  sink: {{ type: jsonl, config: {{ path: \"{}\", append: true }} }}\n",
                 caller_listen_port(),
                 dir.path().join("out.jsonl").display()
             ),
@@ -4674,7 +4674,7 @@ mod tests {
             format!(
                 "version: 1\npipeline:\n  \
                  source: {{ type: webhook, config: {{ listen_addr: \"127.0.0.1:0\", timeout_secs: 60 }} }}\n  \
-                 sink: {{ type: jsonl, config: {{ path: \"{}\" }} }}\n",
+                 sink: {{ type: jsonl, config: {{ path: \"{}\", append: true }} }}\n",
                 dir.join("out.jsonl").display()
             )
         }

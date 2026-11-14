@@ -153,7 +153,7 @@ async fn a_read_only_failover_admits_nothing_and_the_finished_run_lands_after() 
     drop(hook);
     let body = |name: &str| {
         serde_json::json!({ "name": name, "config": format!(
-            "version: 1\nname: {name}\npipeline:\n  source: {{ type: webhook, config: {{ listen_addr: \"{hook_addr}\", path: /in, timeout_secs: 3 }} }}\n  sink: {{ type: jsonl, config: {{ path: {} }} }}\n",
+            "version: 1\nname: {name}\npipeline:\n  source: {{ type: webhook, config: {{ listen_addr: \"{hook_addr}\", path: /in, timeout_secs: 3 }} }}\n  sink: {{ type: jsonl, config: {{ path: {}, append: true }} }}\n",
             dir.path().join(format!("{name}.jsonl")).display()
         )})
     };

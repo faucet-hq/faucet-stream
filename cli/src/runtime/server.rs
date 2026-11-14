@@ -2284,7 +2284,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "config": serde_json::json!({
                 "version": 1,
                 "pipeline": { "source": source,
-                              "sink": { "type": "jsonl", "config": { "path": out } } }
+                              "sink": { "type": "jsonl", "config": { "path": out, "append": true } } }
             }).to_string(), "config_format": "json" }))
             .unwrap()
         };
@@ -2381,7 +2381,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "config": serde_json::json!({
                 "version": 1,
                 "pipeline": { "source": source,
-                              "sink": { "type": "jsonl", "config": { "path": out } } }
+                              "sink": { "type": "jsonl", "config": { "path": out, "append": true } } }
             }).to_string(), "config_format": "json" }))
             .unwrap()
         };
