@@ -57,7 +57,7 @@ ARG CARGO_PROFILE="release"
 ARG FEATURES=""
 
 ########################  builder  ########################
-FROM rust:1.99.1-bookworm@sha256:e9da6f6c3ed5095fd5d33bf7cdf309830a178a8147888f1b2f76d5769bd9306c AS builder
+FROM rust:1.99.1-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c AS builder
 
 ARG SOURCES
 ARG SINKS
