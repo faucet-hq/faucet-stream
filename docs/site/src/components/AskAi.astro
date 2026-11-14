@@ -1,0 +1,79 @@
+---
+import Ic from './Ic.astro';
+
+const PROVIDERS = [
+  { id: 'claude', label: 'Claude', url: 'https://claude.ai/new', param: 'q', color: '#c96442' },
+  { id: 'chatgpt', label: 'ChatGPT', url: 'https://chatgpt.com/', param: 'q', color: '#10a37f' },
+  { id: 'perplexity', label: 'Perplexity', url: 'https://www.perplexity.ai/search', param: 'q', color: '#1f6f78' },
+  { id: 'grok', label: 'Grok', url: 'https://grok.com/', param: 'q', color: '#111827' },
+  { id: 'gemini', label: 'Gemini', url: 'https://gemini.google.com/app', param: '', color: '#3b6fe0' },
+];
+const { id } = Astro.locals.starlightRoute;
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const mdUrl = `${base}/${id ? id : 'index'}.md`;
+interface Props { variant?: 'header' | 'mobile' }
+const { variant = 'header' } = Astro.props;
+---
+
+<fs-ask-ai class:list={['fs-pop-anchor', `fs-ask-${variant}`]} data-md={mdUrl}>
+  <button type="button" class="fs-icon-btn fs-ask-btn" aria-haspopup="menu" aria-expanded="false">
+    <Ic name="sparkles" /><span class="fs-lbl">Ask AI</span><Ic name="down" class="fs-chev" />
+  </button>
+  <div class="fs-pop fs-ask-pop" role="menu" hidden>
+    <div class="fs-pop-h">Ask about this page</div>
+    <p class="fs-pop-note">Opens a chat that already links this page and llms.txt.</p>
+    {PROVIDERS.map((p) => (
+      <a class="fs-pop-item" role="menuitem" target="_blank" rel="noopener" data-url={p.url} data-param={p.param} href={p.url}>
+        <span class="fs-prov" style={`background:${p.color}`}>{p.label[0]}</span><span>Open in {p.label}</span><Ic name="ext" class="fs-ext" />
+      </a>
+    ))}
+    <div class="fs-pop-sep"></div>
+    <button type="button" class="fs-pop-item fs-copy-md" role="menuitem"><Ic name="mdcopy" /><span><span class="fs-copy-label">Copy page as Markdown</span><span class="fs-sub">Paste it into any AI tool</span></span></button>
+    <a class="fs-pop-item" role="menuitem" target="_blank" rel="noopener" href="https://faucet-hq.github.io/llms.txt"><Ic name="file" /><span>Open llms.txt</span><Ic name="ext" class="fs-ext" /></a>
+  </div>
+</fs-ask-ai>
+
+<script>
+  class FsAskAi extends HTMLElement {
+    connectedCallback() {
+      const btn = this.querySelector('.fs-ask-btn') as HTMLButtonElement;
+      const pop = this.querySelector('.fs-ask-pop') as HTMLElement;
+      const close = () => { pop.hidden = true; btn.setAttribute('aria-expanded', 'false'); btn.classList.remove('open'); };
+      const prompt = () => {
+        const page = location.href.split('#')[0];
+        return `I'm reading the faucet-stream docs page ${page} (title: "${document.title}"). Please read that page (and the site guide at https://faucet-hq.github.io/llms.txt) and help me with: `;
+      };
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const open = pop.hidden;
+        document.dispatchEvent(new CustomEvent('fs-close-pops'));
+        pop.hidden = !open; btn.setAttribute('aria-expanded', String(open)); btn.classList.toggle('open', open);
+        if (open) {
+          pop.querySelectorAll<HTMLAnchorElement>('a[data-url]').forEach((a) => {
+            const u = new URL(a.dataset.url!);
+            if (a.dataset.param) u.searchParams.set(a.dataset.param, prompt());
+            a.href = u.toString();
+          });
+        }
+      });
+      const copy = this.querySelector('.fs-copy-md') as HTMLButtonElement;
+      const label = copy.querySelector('.fs-copy-label') as HTMLElement;
+      copy.addEventListener('click', async () => {
+        try {
+          const res = await fetch(this.dataset.md!);
+          if (!res.ok) throw new Error(String(res.status));
+          await navigator.clipboard.writeText(await res.text());
+          label.textContent = 'Copied';
+        } catch {
+          label.textContent = 'Could not copy this page';
+        }
+        setTimeout(() => { label.textContent = 'Copy page as Markdown'; }, 2000);
+      });
+      pop.addEventListener('click', (e) => { if ((e.target as HTMLElement).closest('a')) close(); });
+      document.addEventListener('click', (e) => { if (!this.contains(e.target as Node)) close(); });
+      document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !pop.hidden) { close(); btn.focus(); } });
+      document.addEventListener('fs-close-pops', close);
+    }
+  }
+  if (!customElements.get('fs-ask-ai')) customElements.define('fs-ask-ai', FsAskAi);
+</script>

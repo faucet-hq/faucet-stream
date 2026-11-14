@@ -1,0 +1,51 @@
+---
+import Ic from './Ic.astro';
+---
+
+<fs-theme-select class="fs-pop-anchor">
+  <button type="button" class="fs-icon-btn fs-theme-btn" aria-haspopup="menu" aria-expanded="false" aria-label="Theme">
+    <span class="fs-ti fs-ti-light"><Ic name="sun" /></span>
+    <span class="fs-ti fs-ti-dark"><Ic name="moon" /></span>
+    <span class="fs-ti fs-ti-auto"><Ic name="monitor" /></span>
+    <span class="fs-theme-label">Theme</span>
+  </button>
+  <div class="fs-pop fs-theme-pop" role="menu" hidden>
+    <button type="button" role="menuitemradio" data-theme-value="auto" class="fs-pop-item"><Ic name="monitor" /><span>Auto</span><Ic name="check" class="fs-tick" /></button>
+    <button type="button" role="menuitemradio" data-theme-value="light" class="fs-pop-item"><Ic name="sun" /><span>Light</span><Ic name="check" class="fs-tick" /></button>
+    <button type="button" role="menuitemradio" data-theme-value="dark" class="fs-pop-item"><Ic name="moon" /><span>Dark</span><Ic name="check" class="fs-tick" /></button>
+  </div>
+</fs-theme-select>
+
+<script>
+  type Theme = 'auto' | 'dark' | 'light';
+  const KEY = 'starlight-theme';
+  const parse = (t: unknown): Theme => (t === 'dark' || t === 'light' ? t : 'auto');
+  const load = (): Theme => { try { return parse(localStorage.getItem(KEY)); } catch { return 'auto'; } };
+  const system = () => (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+  function apply(choice: Theme) {
+    document.documentElement.dataset.theme = choice === 'auto' ? system() : choice;
+    document.documentElement.dataset.themeChoice = choice;
+    try { localStorage.setItem(KEY, choice === 'auto' ? '' : choice); } catch {}
+    document.querySelectorAll('[data-theme-value]').forEach((b) => b.setAttribute('aria-checked', String(b.getAttribute('data-theme-value') === choice)));
+  }
+  class FsThemeSelect extends HTMLElement {
+    connectedCallback() {
+      const btn = this.querySelector('button.fs-theme-btn') as HTMLButtonElement;
+      const pop = this.querySelector('.fs-theme-pop') as HTMLElement;
+      const close = () => { pop.hidden = true; btn.setAttribute('aria-expanded', 'false'); btn.classList.remove('open'); };
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const open = pop.hidden;
+        document.dispatchEvent(new CustomEvent('fs-close-pops'));
+        pop.hidden = !open; btn.setAttribute('aria-expanded', String(open)); btn.classList.toggle('open', open);
+      });
+      pop.querySelectorAll<HTMLButtonElement>('[data-theme-value]').forEach((b) => b.addEventListener('click', () => { apply(parse(b.dataset.themeValue)); close(); btn.focus(); }));
+      document.addEventListener('click', (e) => { if (!this.contains(e.target as Node)) close(); });
+      document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !pop.hidden) { close(); btn.focus(); } });
+      document.addEventListener('fs-close-pops', close);
+      apply(load());
+    }
+  }
+  if (!customElements.get('fs-theme-select')) customElements.define('fs-theme-select', FsThemeSelect);
+  matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => { if (load() === 'auto') apply('auto'); });
+</script>

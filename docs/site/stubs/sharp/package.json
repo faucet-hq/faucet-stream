@@ -1,0 +1,8 @@
+{
+  "name": "sharp",
+  "version": "0.0.0-faucet-stub",
+  "private": true,
+  "license": "MIT",
+  "description": "Empty stand-in: the docs site uses Astro's passthrough image service, so sharp (and its LGPL libvips binaries) is never loaded.",
+  "main": "index.js"
+}
