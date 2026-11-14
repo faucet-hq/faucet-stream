@@ -81,8 +81,8 @@ ready-made **Grafana dashboards** and **Prometheus alert rules** (under
 [`observability/`](../../observability)) so the EL half of this pipeline is
 observable out of the box — run outcomes, throughput, bookmark staleness,
 retries, and DLQ traffic. See the
-[Dashboards & alerts cookbook](../../docs/book/src/cookbook/dashboards.md) and
-the [Orchestration cookbook page](../../docs/book/src/cookbook/orchestration.md)
+[Dashboards & alerts cookbook](../../docs/site/src/content/docs/cookbook/dashboards.md) and
+the [Orchestration cookbook page](../../docs/site/src/content/docs/cookbook/orchestration.md)
 for the full walkthrough. Bring up the pre-provisioned stack with:
 
 ```bash

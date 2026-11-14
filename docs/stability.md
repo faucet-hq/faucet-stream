@@ -146,6 +146,6 @@ break is worth investigating as a CI-coverage gap, not just a fix.
 - [Standards: API design](./standards/api-design.md)
 - [Architectural roadmap](./roadmap.md)
 - [Connector protocol (FCP v0)](./spec/faucet-connector-spec-v0.md)
-- [Connector conformance & tiers](./book/src/reference/conformance.md) — the
+- [Connector conformance & tiers](./site/src/content/docs/reference/conformance.md) — the
   per-connector maturity tier (`Stable` / `Experimental` / `Beta` / `Draft`)
   from `faucet conformance`, complementing the crate-level policy above.

@@ -303,5 +303,5 @@ Can resolve during implementation:
 ## Related
 
 - [RFC process](./README.md)
-- [Parameters & pipeline templates](../docs/book/src/cookbook/templates.md)
+- [Parameters & pipeline templates](../docs/site/src/content/docs/cookbook/templates.md)
 - [Documentation hub](../docs/README.md)

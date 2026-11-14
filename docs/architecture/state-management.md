@@ -122,4 +122,4 @@ store against the sink's committed watermark. See [recovery](./recovery.md).
 - [Recovery](./recovery.md) · [Pipeline engine](./pipeline.md) · [Stream pages](./stream-pages.md)
 - [Design invariants](./invariants.md) · [Standards: state](../standards/state.md)
 - [ADR 0006 — State management](../adr/0006-state-management.md) · [ADR 0002 — Checkpoint ordering](../adr/0002-checkpoint-ordering.md)
-- User guide: [Incremental replication & state](../book/src/cookbook/state.md)
+- User guide: [Incremental replication & state](../site/src/content/docs/cookbook/state.md)

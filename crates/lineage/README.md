@@ -341,8 +341,8 @@ In the CLI these surface as the `lineage` (HTTP + file) and `lineage-kafka` (add
 
 ## See also
 
-- [Lineage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/lineage.html) — end-to-end walkthrough.
-- [Config reference](https://faucet-hq.github.io/faucet-stream/reference/config.html) — the full `lineage:` grammar.
+- [Lineage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/lineage/) — end-to-end walkthrough.
+- [Config reference](https://faucet-hq.github.io/faucet-stream/reference/config/) — the full `lineage:` grammar.
 - [OpenLineage](https://openlineage.io/) · [Marquez](https://marquezproject.ai/) — the spec and a reference backend.
 
 ## License

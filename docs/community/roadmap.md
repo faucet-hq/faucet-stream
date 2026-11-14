@@ -15,7 +15,7 @@ machine in Rust — usable **two ways from one codebase**:
 
 The number-one design goal for every connector is throughput and reliability
 (see [BENCHMARKS.md](../../BENCHMARKS.md) and the
-[delivery-guarantee docs](https://faucet-hq.github.io/faucet-stream/cookbook/state.html)).
+[delivery-guarantee docs](https://faucet-hq.github.io/faucet-stream/cookbook/state/)).
 
 ## How we grow — conformance-tiered, not connector-count-racing
 

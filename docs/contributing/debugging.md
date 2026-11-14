@@ -74,4 +74,4 @@ password in it. Debug against non-production credentials.
 - [Recovery & resume](../architecture/recovery.md)
 - [Testing](./testing.md)
 - [Common mistakes](./common-mistakes.md)
-- [Troubleshooting cookbook](../book/src/cookbook/troubleshooting.md)
+- [Troubleshooting cookbook](../site/src/content/docs/cookbook/troubleshooting.md)

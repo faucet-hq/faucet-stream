@@ -112,7 +112,7 @@ triggers:
     type: object_arrival
     store: { type: s3, bucket: landing, prefix: partner/ }
     template: { id: acme/billing-api }`, { box: false }) })}
-      ${card({ title: "Then", body: code("faucet serve --triggers triggers.yaml", { box: false, lang: "text" }), note: html`Read the <a class="lnk" href="https://faucet-hq.github.io/faucet-stream/reference/triggers.html" target="_blank" rel="noopener">triggers reference</a> for object arrival and queue depth.` })}`;
+      ${card({ title: "Then", body: code("faucet serve --triggers triggers.yaml", { box: false, lang: "text" }), note: html`Read the <a class="lnk" href="https://faucet-hq.github.io/faucet-stream/reference/triggers/" target="_blank" rel="noopener">triggers reference</a> for object arrival and queue depth.` })}`;
   }
 
   function detailHtml() {

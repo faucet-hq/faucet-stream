@@ -291,9 +291,9 @@ This crate has no optional features of its own. Enable it in the CLI / umbrella 
 
 ## See also
 
-- [Connector reference & capability matrix](https://faucet-hq.github.io/faucet-stream/reference/connectors.html)
-- [CLI & config-file grammar](https://faucet-hq.github.io/faucet-stream/reference/cli.html)
-- [State & resume cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state.html)
+- [Connector reference & capability matrix](https://faucet-hq.github.io/faucet-stream/reference/connectors/)
+- [CLI & config-file grammar](https://faucet-hq.github.io/faucet-stream/reference/cli/)
+- [State & resume cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state/)
 - [`faucet-sink-sqlite`](https://crates.io/crates/faucet-sink-sqlite) — the matching SQLite sink
 - [`faucet-source-postgres`](https://crates.io/crates/faucet-source-postgres) · [`faucet-source-mysql`](https://crates.io/crates/faucet-source-mysql) — server-based SQL sources
 
@@ -301,7 +301,7 @@ This crate has no optional features of its own. Enable it in the CLI / umbrella 
 
 Key ranges are re-planned every run, so `shard:` cannot be combined with incremental replication (`faucet validate` refuses it when a `state:` block is set): a range could move to a shard whose cursor is already past a late row.
 
-Under [`faucet serve --cluster`](https://faucet-hq.github.io/faucet-stream/cookbook/cluster.html),
+Under [`faucet serve --cluster`](https://faucet-hq.github.io/faucet-stream/cookbook/cluster/),
 a top-level `shard: { count: N }` block splits this source into contiguous
 primary-key ranges that different cluster workers process concurrently. Opt in
 by naming an integer-typed key column:

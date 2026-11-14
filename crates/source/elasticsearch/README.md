@@ -359,9 +359,9 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 
 ## See also
 
-- [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) — the full capability matrix.
-- [Authentication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/auth.html) — inline vs shared providers.
-- [Configuration grammar](https://faucet-hq.github.io/faucet-stream/reference/config.html) — the YAML/JSON config shape.
+- [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors/) — the full capability matrix.
+- [Authentication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/auth/) — inline vs shared providers.
+- [Configuration grammar](https://faucet-hq.github.io/faucet-stream/reference/config/) — the YAML/JSON config shape.
 - [`faucet-sink-elasticsearch`](https://crates.io/crates/faucet-sink-elasticsearch) — the matching bulk-index sink.
 - [`faucet-common-elasticsearch`](https://crates.io/crates/faucet-common-elasticsearch) — the shared `ElasticsearchAuth` enum.
 

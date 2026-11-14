@@ -123,7 +123,7 @@ is upsert-capable, you get idempotency a different way: write with
 `write_mode: upsert` keyed on the primary key. A replayed row overwrites itself
 instead of duplicating. That's a weaker guarantee (it needs a stable key and
 last-write-wins semantics) but it covers non-log sources into any of the eight
-upsert-capable sinks. See the [upsert cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html).
+upsert-capable sinks. See the [upsert cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert/).
 
 ## Try it
 

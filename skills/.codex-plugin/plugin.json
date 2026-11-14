@@ -6,7 +6,7 @@
     "name": "faucet-hq",
     "url": "https://faucet-hq.github.io"
   },
-  "homepage": "https://faucet-hq.github.io/faucet-stream/getting-started/agent-skills.html",
+  "homepage": "https://faucet-hq.github.io/faucet-stream/getting-started/agent-skills/",
   "repository": "https://github.com/faucet-hq/faucet-stream",
   "license": "MIT OR Apache-2.0",
   "keywords": [

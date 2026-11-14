@@ -56,7 +56,7 @@ config written for a newer faucet can fail or be misread on an older one.
    If the checksum or the attestation does not verify, stop and tell the user.
 6. With no pin at all, install the latest release the same way (the archive
    and its `.sha256` from `releases/latest/download/`) and pin it as described in
-   [Pinning the faucet version](https://faucet-hq.github.io/faucet-stream/operations/pinning.html).
+   [Pinning the faucet version](https://faucet-hq.github.io/faucet-stream/operations/pinning/).
 
 Every version-specific fact (which connectors and blocks exist, config keys,
 types, defaults, commands and flags) comes from that binary: `faucet list`,
@@ -88,7 +88,7 @@ binary predates it, so leave it out.
 5. **Know the bookmark rule.** The bookmark is saved only after the sink
    confirms the page, so a crash never loses data; it can replay the page in
    flight, which at-least-once delivery may write twice
-   ([how bookmarks advance](https://faucet-hq.github.io/faucet-stream/cookbook/state.html#how-bookmarks-advance)).
+   ([how bookmarks advance](https://faucet-hq.github.io/faucet-stream/cookbook/state/#how-bookmarks-advance)).
 6. **Never edit state files, keys or tables by hand.** Use `faucet state`; it
    respects run leases and exactly-once watermarks.
 
@@ -99,17 +99,17 @@ how to read it:
 
 | Question | Command | Docs |
 |---|---|---|
-| Which row is unhealthy, when did it last succeed, where will it resume? | `faucet status pipeline.yaml` (add `--probe` to ask the sink and source now) | [Pipeline state and status](https://faucet-hq.github.io/faucet-stream/cookbook/state-and-status.html) |
-| Can every connector and the state store be reached? | `faucet doctor pipeline.yaml` (`--offline` for static lints only) | [Troubleshooting with `faucet doctor`](https://faucet-hq.github.io/faucet-stream/cookbook/troubleshooting.html) |
-| What does the config actually do? | `faucet explain pipeline.yaml`, `faucet validate pipeline.yaml --show-composed` | [CLI reference](https://faucet-hq.github.io/faucet-stream/reference/cli.html) |
-| What would a run produce, without writing? | `faucet plan pipeline.yaml --live` | [CLI reference](https://faucet-hq.github.io/faucet-stream/reference/cli.html) |
-| What failed, and what kind of failure? | `faucet run pipeline.yaml --output json` (per-row `status` and `error`), `--log-format json` logs (`kind` field) | [Error kinds](https://faucet-hq.github.io/faucet-stream/operations/troubleshooting.html#error-kinds), [run --output](https://faucet-hq.github.io/faucet-stream/reference/cli.html#run---output) |
-| Why did rows land in the DLQ? | `faucet dlq inspect ./dlq/` | [Dead-letter queues](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html) |
-| What is stored for a row? | `faucet state show pipeline.yaml` | [State: show, move, reset](https://faucet-hq.github.io/faucet-stream/cookbook/state-and-status.html#state-show-move-reset) |
-| Which keys differ between source and destination? | `faucet verify pipeline.yaml` | [Content verification](https://faucet-hq.github.io/faucet-stream/cookbook/verify.html) |
-| Which runs can be undone? | `faucet rollback pipeline.yaml --list` | [Undoing a run](https://faucet-hq.github.io/faucet-stream/cookbook/rollback.html) |
-| Did the shape of the data drift? | `faucet profiling show pipeline.yaml` | [Column profiling](https://faucet-hq.github.io/faucet-stream/cookbook/profiling.html) |
-| Which row is slow, throttled, behind or losing rows? | Prometheus `/metrics` | [Finding the problem from metrics](https://faucet-hq.github.io/faucet-stream/operations/observability.html#finding-the-problem-from-metrics) |
+| Which row is unhealthy, when did it last succeed, where will it resume? | `faucet status pipeline.yaml` (add `--probe` to ask the sink and source now) | [Pipeline state and status](https://faucet-hq.github.io/faucet-stream/cookbook/state-and-status/) |
+| Can every connector and the state store be reached? | `faucet doctor pipeline.yaml` (`--offline` for static lints only) | [Troubleshooting with `faucet doctor`](https://faucet-hq.github.io/faucet-stream/cookbook/troubleshooting/) |
+| What does the config actually do? | `faucet explain pipeline.yaml`, `faucet validate pipeline.yaml --show-composed` | [CLI reference](https://faucet-hq.github.io/faucet-stream/reference/cli/) |
+| What would a run produce, without writing? | `faucet plan pipeline.yaml --live` | [CLI reference](https://faucet-hq.github.io/faucet-stream/reference/cli/) |
+| What failed, and what kind of failure? | `faucet run pipeline.yaml --output json` (per-row `status` and `error`), `--log-format json` logs (`kind` field) | [Error kinds](https://faucet-hq.github.io/faucet-stream/operations/troubleshooting/#error-kinds), [run --output](https://faucet-hq.github.io/faucet-stream/reference/cli/#run---output) |
+| Why did rows land in the DLQ? | `faucet dlq inspect ./dlq/` | [Dead-letter queues](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/) |
+| What is stored for a row? | `faucet state show pipeline.yaml` | [State: show, move, reset](https://faucet-hq.github.io/faucet-stream/cookbook/state-and-status/#state-show-move-reset) |
+| Which keys differ between source and destination? | `faucet verify pipeline.yaml` | [Content verification](https://faucet-hq.github.io/faucet-stream/cookbook/verify/) |
+| Which runs can be undone? | `faucet rollback pipeline.yaml --list` | [Undoing a run](https://faucet-hq.github.io/faucet-stream/cookbook/rollback/) |
+| Did the shape of the data drift? | `faucet profiling show pipeline.yaml` | [Column profiling](https://faucet-hq.github.io/faucet-stream/cookbook/profiling/) |
+| Which row is slow, throttled, behind or losing rows? | Prometheus `/metrics` | [Finding the problem from metrics](https://faucet-hq.github.io/faucet-stream/operations/observability/#finding-the-problem-from-metrics) |
 
 Exit codes are part of what these commands report (`faucet status` and
 `faucet doctor` exit codes are usable as checks on their own); see the
@@ -129,7 +129,7 @@ faucet run pipeline.yaml --select orders --log-level debug --output json
 
 Find the failed row's `last error:` line in `status` and its `error` in the
 JSON summary. The error kind names the next step; look it up in the
-[error kinds](https://faucet-hq.github.io/faucet-stream/operations/troubleshooting.html#error-kinds)
+[error kinds](https://faucet-hq.github.io/faucet-stream/operations/troubleshooting/#error-kinds)
 table, then follow the matching recipe below. Configuration errors come from
 `faucet validate pipeline.yaml`; a connector the binary lacks shows up as an
 unknown type (check `faucet list`).
@@ -193,7 +193,7 @@ different DNS, routes and egress IP. Use generic tools there: `dig` or
    subnet, the NAT gateway's IP on a private one. Pin runs that need an
    allowlisted IP or a private network to the replicas that have it (the
    `faucet-deploy` skill, and
-   [execution pools](https://faucet-hq.github.io/faucet-stream/cookbook/cluster.html#execution-pools)
+   [execution pools](https://faucet-hq.github.io/faucet-stream/cookbook/cluster/#execution-pools)
    on a cluster).
 
 Then confirm with `faucet doctor pipeline.yaml`, run from that same worker.
@@ -206,10 +206,10 @@ faucet run pipeline.yaml --output json
 
 Find the slowest row by its duration, then compare its source page time with
 its sink write and flush time in the metrics
-([finding the problem from metrics](https://faucet-hq.github.io/faucet-stream/operations/observability.html#finding-the-problem-from-metrics)):
+([finding the problem from metrics](https://faucet-hq.github.io/faucet-stream/operations/observability/#finding-the-problem-from-metrics)):
 whichever dominates is the bottleneck. Rule out rate-limit waits first (next
 recipe). The knobs are batch size, connector concurrency and how many matrix
-rows run in parallel ([Throughput tuning](https://faucet-hq.github.io/faucet-stream/cookbook/tuning.html));
+rows run in parallel ([Throughput tuning](https://faucet-hq.github.io/faucet-stream/cookbook/tuning/));
 read the exact key names from `faucet schema source <kind>`,
 `faucet schema sink <kind>` and `faucet run --help`. The measure-and-change
 loop for a healthy but slow pipeline is the `faucet-tune` skill.
@@ -220,7 +220,7 @@ Look for the run-end warning that the source spent a share of the run waiting
 on rate limits, and for the throttling metrics by row. Fixes: lower
 concurrency, stagger schedules so rows do not share a quota window, or teach
 the source the API's reset signal
-([source-side throttling](https://faucet-hq.github.io/faucet-stream/cookbook/resilience.html#source-side-throttling)).
+([source-side throttling](https://faucet-hq.github.io/faucet-stream/cookbook/resilience/#source-side-throttling)).
 A rate-limit failure means retries ran out; allow more only if the quota
 really resets.
 
@@ -236,7 +236,7 @@ value is stale. Lag that grows while every run succeeds means the pipeline
 drains slower than the source produces: run more often, or speed up the sink
 (slow-run recipe). On a Postgres CDC source, lag growing while nothing runs
 means the replication slot is holding WAL: run the pipeline or drop the slot.
-See [Source lag](https://faucet-hq.github.io/faucet-stream/cookbook/sla.html#source-lag).
+See [Source lag](https://faucet-hq.github.io/faucet-stream/cookbook/sla/#source-lag).
 
 ### Rows in the DLQ
 
@@ -246,7 +246,7 @@ faucet dlq inspect ./dlq/ --limit 10
 ```
 
 Read the breakdown by reason and error kind: it says which stage rejected the
-rows ([the envelope](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#the-envelope)).
+rows ([the envelope](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/#the-envelope)).
 Fix that cause (data, transform, contract, destination schema) first. Then:
 
 ```bash
@@ -270,7 +270,7 @@ faucet verify pipeline.yaml
 delivery the page in flight at a crash may be written twice; that is expected.
 A DLQ replay into an append-only sink can also duplicate. To make the
 destination immune, use a keyed upsert write mode or effectively-once delivery
-([effectively-once delivery](https://faucet-hq.github.io/faucet-stream/cookbook/state.html#effectively-once-delivery)).
+([effectively-once delivery](https://faucet-hq.github.io/faucet-stream/cookbook/state/#effectively-once-delivery)).
 `verify` lists each duplicated key; it does not dedupe an append table for you.
 
 ### Missing rows
@@ -287,7 +287,7 @@ Check, in order: rows sitting in the DLQ; a bookmark that moved past the data
 arriving without their replication key (misspelled or nested key); and a
 transform filter dropping rows (transform records out below records in). The
 metrics for the last two are in
-[finding the problem from metrics](https://faucet-hq.github.io/faucet-stream/operations/observability.html#finding-the-problem-from-metrics).
+[finding the problem from metrics](https://faucet-hq.github.io/faucet-stream/operations/observability/#finding-the-problem-from-metrics).
 `verify` lists the keys missing in the destination, and `verify --repair`
 re-syncs them.
 
@@ -304,7 +304,7 @@ If a few keys differ, use `faucet verify pipeline.yaml --repair`. If a whole
 run was bad (a wrong parameter, a bad upstream extract), roll it back, newest
 run first, after fixing the cause so the next run does not reload the same bad
 data. Rollback has prerequisites (a `rollback:` block, durable state, a
-capable sink): see [Undoing a run](https://faucet-hq.github.io/faucet-stream/cookbook/rollback.html).
+capable sink): see [Undoing a run](https://faucet-hq.github.io/faucet-stream/cookbook/rollback/).
 A blocked rollback means later runs changed the same keys; read the
 `--dry-run` output before reaching for `--force`.
 
@@ -314,7 +314,7 @@ A schema-drift error means the page's shape diverged from the destination
 under a `fail` policy. Confirm the new shape with
 `faucet plan pipeline.yaml --live`, then change the destination or the
 `schema:` policy (`faucet schema config` documents the block;
-[Schema drift](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift.html)).
+[Schema drift](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift/)).
 Do not reset state for drift: the bookmark is fine.
 
 ### Profile drift or SLA violation
@@ -324,8 +324,8 @@ drift findings per row. A profile-drift failure marks a run whose data was
 already written: if the data is wrong, follow the wrong-values recipe; if the
 change is legitimate, re-baseline with `faucet profiling reset`. A volume or
 row-count violation after a bookmark move usually means the bookmark moved
-too far. See [SLA monitoring](https://faucet-hq.github.io/faucet-stream/cookbook/sla.html)
-and [Column profiling](https://faucet-hq.github.io/faucet-stream/cookbook/profiling.html).
+too far. See [SLA monitoring](https://faucet-hq.github.io/faucet-stream/cookbook/sla/)
+and [Column profiling](https://faucet-hq.github.io/faucet-stream/cookbook/profiling/).
 
 ### State unreadable after an upgrade
 
@@ -339,7 +339,7 @@ faucet migrate --state pipeline.yaml
 Read the `state format` per row. An `incompatible` row was written by a newer
 faucet or by a different source: run the release that wrote it, or restore an
 export taken before the upgrade. Reset the row only after deciding where it
-should resume. See [Upgrading faucet safely](https://faucet-hq.github.io/faucet-stream/operations/upgrading.html).
+should resume. See [Upgrading faucet safely](https://faucet-hq.github.io/faucet-stream/operations/upgrading/).
 
 ### Scheduled run skipped
 
@@ -348,7 +348,7 @@ schedule's overlap policy. Compare the last run's duration with the cron
 period in the scheduler metrics. Fix: a faster run, a wider period, or a
 different overlap policy (`faucet schema schedule` lists them). An open
 circuit breaker also delays the next tick. See
-[Overlap policy](https://faucet-hq.github.io/faucet-stream/cookbook/scheduling.html#overlap-policy).
+[Overlap policy](https://faucet-hq.github.io/faucet-stream/cookbook/scheduling/#overlap-policy).
 
 ### A bookmark needs moving or resetting
 
@@ -365,4 +365,4 @@ a shape. Moving a bookmark backwards re-reads data (an append sink gets
 duplicates); moving it forwards skips data for good; a reset means a full
 re-sync. Both commands refuse while a run holds the row; use `--force` only
 when that run is known to be gone. Exactly-once rows have extra rules:
-[Exactly-once rows](https://faucet-hq.github.io/faucet-stream/cookbook/state-and-status.html#exactly-once-rows).
+[Exactly-once rows](https://faucet-hq.github.io/faucet-stream/cookbook/state-and-status/#exactly-once-rows).

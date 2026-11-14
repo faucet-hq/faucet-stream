@@ -331,14 +331,14 @@ and composable: **`flatten`** (nested JSON → flat columns), **`select` / `drop
 **`cast`** (change a field's type, with a policy for bad values), and
 **`redact` / `value_case` / `set`**. Transforms layer at three levels —
 pipeline-wide, per-source, and per-row — and compose in that order.
-→ [Record transforms](../book/src/cookbook/transforms.md)
+→ [Record transforms](../site/src/content/docs/cookbook/transforms.md)
 
 ### SQL transform
 
 When simple field-shaping isn't enough, the **SQL transform** runs an embedded
 DuckDB query over each page — `SELECT … FROM batch` — so you can filter, join, or
 aggregate with plain SQL and hand the result straight to the sink.
-→ [SQL transform](../book/src/cookbook/sql-transform.md)
+→ [SQL transform](../site/src/content/docs/cookbook/sql-transform.md)
 
 ### Quality checks
 
@@ -374,7 +374,7 @@ unknown fields, quarantine, or fail — instead of silently corrupting the targe
 A single bad row shouldn't kill a whole run. A **dead-letter queue (DLQ)** catches
 the rows that fail to write (or that a check quarantines), wraps them in an
 envelope, and sends them aside so the rest of the page still lands.
-→ [Dead-letter queue](../book/src/cookbook/dlq.md)
+→ [Dead-letter queue](../site/src/content/docs/cookbook/dlq.md)
 
 ### Retries and resilience
 
@@ -398,65 +398,65 @@ To keep a destination table *mirrored* rather than append-only, set
 **`cdc_unwrap`** — which turns a raw CDC envelope into a clean row plus a
 delete/upsert marker — a database change-feed becomes a live mirror of the source
 table.
-→ [Upsert / mirror tables](../book/src/cookbook/upsert.md)
+→ [Upsert / mirror tables](../site/src/content/docs/cookbook/upsert.md)
 
 ### Sharding
 
 When one source is too big for a single worker, **sharding** splits it — by
 primary-key range, by hash, or by Kafka partition — so several workers pull
 disjoint slices in parallel.
-→ [Sharding & cluster](../book/src/cookbook/cluster.md)
+→ [Sharding & cluster](../site/src/content/docs/cookbook/cluster.md)
 
 ### Replication
 
 **Replication** does the snapshot-then-follow dance for you: it bookmarks the
 change-feed position, bulk-copies the table, then streams changes from that exact
 point — no gap, no duplicates, a true mirror.
-→ [Replication](../book/src/cookbook/replication.md)
+→ [Replication](../site/src/content/docs/cookbook/replication.md)
 
 ### Backfill
 
 Need to (re)load a slice of history? **Backfill** replays a bounded `--from/--to`
 window in chunks, using its own state so it never disturbs your live bookmark.
-→ [Backfill](../book/src/cookbook/backfill.md)
+→ [Backfill](../site/src/content/docs/cookbook/backfill.md)
 
 ### Discovery
 
 Pointing faucet at a new database or bucket? **`faucet discover`** introspects the
 live catalog and writes you a ready-to-edit config with one pipeline per
 table / collection / prefix it finds.
-→ [Discovery](../book/src/cookbook/discover.md)
+→ [Discovery](../site/src/content/docs/cookbook/discover.md)
 
 ### Compression
 
 File sources and sinks read and write **gzip / zstd** transparently — usually just
 from the filename (`.jsonl.gz`) — so you move compressed data without extra code.
-→ [Compression](../book/src/cookbook/compression.md)
+→ [Compression](../site/src/content/docs/cookbook/compression.md)
 
 ### Scheduling
 
 **`faucet schedule`** runs a pipeline on a cron schedule in a long-lived process,
 with timezone/DST-correct ticks, an overlap policy, and per-run timeouts.
-→ [Scheduling](../book/src/cookbook/scheduling.md)
+→ [Scheduling](../site/src/content/docs/cookbook/scheduling.md)
 
 ### Serve
 
 **`faucet serve`** turns faucet into an HTTP control plane: submit pipelines over a
 REST API, track runs, stream logs, and optionally drive it from a built-in web
 console.
-→ [Serve](../book/src/cookbook/serve.md)
+→ [Serve](../site/src/content/docs/cookbook/serve.md)
 
 ### Cluster
 
 For scale or resilience, **cluster mode** spreads runs — and shards of one run —
 across several `serve` instances that coordinate through a shared database.
-→ [Cluster](../book/src/cookbook/cluster.md)
+→ [Cluster](../site/src/content/docs/cookbook/cluster.md)
 
 ### Triggers
 
 Instead of polling, **triggers** start a run on an event — an object landing in
 S3/GCS, an incoming webhook, or a queue crossing a depth threshold.
-→ [Triggers](../book/src/cookbook/triggers.md)
+→ [Triggers](../site/src/content/docs/cookbook/triggers.md)
 
 ### Matrix and composition
 
@@ -470,35 +470,35 @@ child / dependency edges), and **composition** (`extends` / `!include` /
 Never hard-code credentials. **Secret interpolation** pulls them at load time from
 Vault, AWS/GCP Secret Manager, or Azure Key Vault via `${vault:…}`-style
 references, and redacts them from faucet's own logs.
-→ [Secrets](../book/src/cookbook/secrets.md)
+→ [Secrets](../site/src/content/docs/cookbook/secrets.md)
 
 ### Observability and lineage
 
 Every run emits **metrics and traces automatically** (Prometheus, plus OTLP if you
 want it) with no per-connector code, and can emit **OpenLineage** events so you see
 exactly which datasets a run read and wrote.
-→ [Observability](./observability.md) · [Lineage](../book/src/cookbook/lineage.md)
+→ [Observability](./observability.md) · [Lineage](../site/src/content/docs/cookbook/lineage.md)
 
 ### SLA monitoring
 
 **SLA monitoring** watches data *freshness* and *volume* — it can alert when a
 pipeline hasn't succeeded recently, or when a run's row count looks anomalous
 against its own history.
-→ [SLA monitoring](../book/src/cookbook/sla.md)
+→ [SLA monitoring](../site/src/content/docs/cookbook/sla.md)
 
 ### Data Movement Catalog
 
 The **catalog** is a persistent record of every dataset your pipelines touch — its
 schema over time, per-run volume and freshness, and the source→sink lineage edges
 — browsable via the API or the web console.
-→ [Data Movement Catalog](../book/src/cookbook/catalog.md)
+→ [Data Movement Catalog](../site/src/content/docs/cookbook/catalog.md)
 
 ### Notifications
 
 **Notifications** route run outcomes and incidents to Slack, PagerDuty, or a
 webhook, so a failure or an SLA breach pages the right people instead of sitting
 in a log.
-→ [Notifications](../book/src/cookbook/notifications.md)
+→ [Notifications](../site/src/content/docs/cookbook/notifications.md)
 
 ---
 
@@ -528,11 +528,11 @@ You've built the whole mental model. From here:
   state → recovery).
 - **Build your own connector** → [Authoring a connector](../contributing/connector-authoring.md).
 - **Actually run a pipeline** → the user guide's
-  [first pipeline tutorial](../book/src/getting-started/first-pipeline.md).
+  [first pipeline tutorial](../site/src/content/docs/getting-started/first-pipeline.md).
 - **Look up a term** → the [Glossary](../glossary.md).
 
 ## Related
 
 - [Architect reference (home)](./README.md) · [Overview](./overview.md) · [Design invariants](./invariants.md)
 - [Glossary](../glossary.md)
-- User guide: [Core concepts](../book/src/getting-started/concepts.md) · [Your first pipeline](../book/src/getting-started/first-pipeline.md)
+- User guide: [Core concepts](../site/src/content/docs/getting-started/concepts.md) · [Your first pipeline](../site/src/content/docs/getting-started/first-pipeline.md)

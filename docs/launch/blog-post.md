@@ -51,7 +51,7 @@ pipeline from Rust with typed `Source`/`Sink` traits.
   [`BENCHMARKS.md`](https://github.com/faucet-hq/faucet-stream/blob/main/BENCHMARKS.md)
   for the methodology and the caveats.
 - **A connector marketplace you can trust.** Every connector is graded against the
-  [Faucet Connector Protocol](https://faucet-hq.github.io/faucet-stream/spec/faucet-connector-spec-v0.html)
+  [Faucet Connector Protocol](https://faucet-hq.github.io/faucet-stream/spec/faucet-connector-spec-v0/)
   by a conformance battery — valid config schema, bounded-memory streaming,
   bookmark round-trip, idempotent replay, truthful capabilities, errors-not-panics
   — that runs in CI and sets each connector's maturity tier.

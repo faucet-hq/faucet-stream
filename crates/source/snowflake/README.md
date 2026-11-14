@@ -294,9 +294,9 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 
 ## See also
 
-- [Connector reference & capability matrix](https://faucet-hq.github.io/faucet-stream/reference/connectors.html)
-- [Authentication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/auth.html) — shared `auth:` catalog and the `{ type, config }` shape
-- [Secrets interpolation](https://faucet-hq.github.io/faucet-stream/cookbook/secrets.html) — `${env:…}` / `${file:…}` / `${secret:…}`
+- [Connector reference & capability matrix](https://faucet-hq.github.io/faucet-stream/reference/connectors/)
+- [Authentication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/auth/) — shared `auth:` catalog and the `{ type, config }` shape
+- [Secrets interpolation](https://faucet-hq.github.io/faucet-stream/cookbook/secrets/) — `${env:…}` / `${file:…}` / `${secret:…}`
 - [`faucet-common-snowflake`](https://crates.io/crates/faucet-common-snowflake) — the shared `SnowflakeAuth` enum and header helpers
 - [`faucet-sink-snowflake`](https://crates.io/crates/faucet-sink-snowflake) — write rows back to Snowflake
 

@@ -6,7 +6,7 @@ name: bigquery
 owner: faucet-hq
 description: Google BigQuery — one table per stream, atomic overwrite or keyed MERGE upsert
 tags: [warehouse, gcp]
-docs: https://faucet-hq.github.io/faucet-stream/reference/connectors.html
+docs: https://faucet-hq.github.io/faucet-stream/reference/connectors/
 params:
   bq_project: { type: string, required: true, description: "GCP project id that owns the dataset" }
   bq_dataset: { type: string, default: raw, description: "Dataset every stream's table lands in" }

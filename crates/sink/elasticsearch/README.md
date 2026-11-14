@@ -297,7 +297,7 @@ Under `on_drift: evolve`, `ElasticsearchSink::evolve_schema()` is **add-fields o
 - **New fields** → `PUT /<index>/_mapping` adding the field mappings. An array column maps to its item type (not `object`), and strings map to `keyword` with `ignore_above: 8191`, so an over-long value is stored but not indexed instead of rejecting its document.
 - **Type widenings and nullability relaxations are no-ops** — Elasticsearch cannot change an existing field's mapping type or nullability in place (a one-shot `debug` log notes this).
 
-Because ES cannot retype an existing field, any change to an existing field's type is classified as **incompatible** and routed by `on_incompatible` (`fail` or `quarantine`) rather than applied. See the [schema-drift cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift.html).
+Because ES cannot retype an existing field, any change to an existing field's type is classified as **incompatible** and routed by `on_incompatible` (`fail` or `quarantine`) rather than applied. See the [schema-drift cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift/).
 
 ## Scoped cleanup
 
@@ -405,10 +405,10 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 
 ## See also
 
-- [Sinks reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) — capability matrix.
-- [Upsert & write modes cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html).
-- [Dead-letter queue cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html).
-- [Authentication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/auth.html).
+- [Sinks reference](https://faucet-hq.github.io/faucet-stream/reference/connectors/) — capability matrix.
+- [Upsert & write modes cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert/).
+- [Dead-letter queue cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/).
+- [Authentication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/auth/).
 - [`faucet-source-elasticsearch`](https://crates.io/crates/faucet-source-elasticsearch) — the Elasticsearch source (search/scroll API).
 
 ## Batch atomicity
@@ -417,7 +417,7 @@ What a failed write leaves behind (#737): **per-row** with `batch_size: 0` (one 
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See
-[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/#batch-atomicity-and-dlq_all).
 
 ## Capabilities
 

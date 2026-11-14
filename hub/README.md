@@ -38,7 +38,7 @@ resume from each other's position; a deployment overlay with
 
 The matrix with a copy-paste command for every compatible pairing is generated
 into the docs site:
-[Template Hub — source × sink matrix](../docs/book/src/reference/template-hub-matrix.md)
+[Template Hub — source × sink matrix](../docs/site/generated/reference/template-hub-matrix.md)
 (and `index.json` here, for machines).
 
 ## Contributing a template
@@ -69,4 +69,4 @@ cargo test -p faucet-cli --test hub_catalog
 ```
 
 Schemas: `faucet schema source-template`, `faucet schema sink-template`.
-Docs: [Template Hub cookbook](../docs/book/src/cookbook/template-hub.md).
+Docs: [Template Hub cookbook](../docs/site/src/content/docs/cookbook/template-hub.md).

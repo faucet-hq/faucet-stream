@@ -5,7 +5,7 @@ reads the [Agent Skills](https://agentskills.io/) format) to work with faucet.
 They ship with the engine: each faucet release carries the skills that match
 it, and the plugin version equals the `faucet-cli` version.
 
-Install: see [Agent skills](https://faucet-hq.github.io/faucet-stream/getting-started/agent-skills.html).
+Install: see [Agent skills](https://faucet-hq.github.io/faucet-stream/getting-started/agent-skills/).
 
 | Skill | Use it to |
 |---|---|
@@ -36,7 +36,7 @@ releases comes from the binary the project uses, at run time:
 
 A skill must not list config keys, defaults, connector names or flags as
 prose. Engine behaviour (how the DLQ, state or delivery guarantees work) lives
-in the docs site under `docs/book/src/`; a skill links to the published page
+in the docs site under `docs/site/src/content/docs/`; a skill links to the published page
 (`https://faucet-hq.github.io/faucet-stream/<path>.html`). Example configs
 live in `cli/examples/` (validated by CI); a skill names them by path rather
 than copying them. A fenced `yaml` block in a skill must be a complete faucet

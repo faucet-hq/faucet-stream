@@ -120,7 +120,7 @@ fn the_feature_walk_reports_what_a_hand_picked_set_misses() {
 
 #[test]
 fn installation_page_names_every_shipped_feature() {
-    let page = repo_file("docs/book/src/getting-started/installation.md");
+    let page = repo_file("docs/site/src/content/docs/getting-started/installation.md");
     let start = page
         .find("The prebuilt binary includes")
         .expect("prebuilt feature paragraph");

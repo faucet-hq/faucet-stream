@@ -282,9 +282,9 @@ This sink does **not** support effectively-once delivery or upsert/delete write 
 
 ## See also
 
-- [Sinks reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) — the full connector capability matrix.
-- [Compression cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/compression.html) — gzip/zstd across file sinks.
-- [CLI reference](https://faucet-hq.github.io/faucet-stream/reference/cli.html) — `faucet run`, `faucet validate`, `faucet schema`, `faucet doctor`.
+- [Sinks reference](https://faucet-hq.github.io/faucet-stream/reference/connectors/) — the full connector capability matrix.
+- [Compression cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/compression/) — gzip/zstd across file sinks.
+- [CLI reference](https://faucet-hq.github.io/faucet-stream/reference/cli/) — `faucet run`, `faucet validate`, `faucet schema`, `faucet doctor`.
 - [`faucet-sink-stdout`](https://crates.io/crates/faucet-sink-stdout) — the same JSON Lines to a standard stream instead of a file.
 - [`faucet-sink-csv`](https://crates.io/crates/faucet-sink-csv) — CSV/TSV file output with full quoting.
 - [`faucet-sink-s3`](https://crates.io/crates/faucet-sink-s3) / [`faucet-sink-gcs`](https://crates.io/crates/faucet-sink-gcs) — the same JSONL records to object storage.
@@ -325,7 +325,7 @@ What a failed write leaves behind (#737): **best-effort** — records are writte
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See
-[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/#batch-atomicity-and-dlq_all).
 
 ## How it is built
 

@@ -58,7 +58,7 @@ Oracle stores `''` as `NULL`; an empty string is written as `NULL`.
 
 ## Declared column types
 
-When the run's source declares its column types (a SQL query source, #955 — see [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types)), a table this sink creates types each declared column from the declaration instead of from the first page: `NUMBER(19)`, `BINARY_DOUBLE`, `NUMBER(1)`, `NUMBER(p,s)` (`NUMBER` without precision), `DATE`, `TIMESTAMP(9) WITH TIME ZONE` / `TIMESTAMP(9)`, `VARCHAR2(36 CHAR)` for a UUID, `BLOB` — in `auto_columns` mode. A declared column whose first-page values do not fit its type keeps the inferred type; an existing table is never retyped. With a complete declaration a run that writes nothing creates the empty, typed table.
+When the run's source declares its column types (a SQL query source, #955 — see [Declared column types](../../../docs/site/src/content/docs/reference/value-fidelity.md#declared-column-types)), a table this sink creates types each declared column from the declaration instead of from the first page: `NUMBER(19)`, `BINARY_DOUBLE`, `NUMBER(1)`, `NUMBER(p,s)` (`NUMBER` without precision), `DATE`, `TIMESTAMP(9) WITH TIME ZONE` / `TIMESTAMP(9)`, `VARCHAR2(36 CHAR)` for a UUID, `BLOB` — in `auto_columns` mode. A declared column whose first-page values do not fit its type keeps the inferred type; an existing table is never retyped. With a complete declaration a run that writes nothing creates the empty, typed table.
 
 ## Write modes (upsert / delete)
 

@@ -68,7 +68,7 @@ Schedule Tue–Thu; prep the hunter, gallery images, and a strong first comment 
   transform). Each doubles as SEO and proof of depth.
 - **Migration guides** (highest-intent) — Singer/Meltano → faucet-stream, Airbyte →
   faucet-stream, "replacing a pile of Python cron scripts." The docs-site
-  [comparison pages](https://faucet-hq.github.io/faucet-stream/comparison/index.html) are
+  [comparison pages](https://faucet-hq.github.io/faucet-stream/comparison/) are
   the on-site anchor for these.
 - **"Build X in 10 minutes" tutorials** — REST → BigQuery, Postgres CDC → Kafka, S3 →
   Parquet. Cross-post to dev.to / Hashnode / Medium / lobste.rs.

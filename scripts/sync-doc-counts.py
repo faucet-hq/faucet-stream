@@ -7,7 +7,7 @@ Every doc that states a count wraps it in a sentinel span:
 
     <!--COUNT:sources-->37<!--/COUNT-->
 
-The HTML comments are invisible in rendered Markdown (GitHub, docs.rs, mdBook),
+The HTML comments are invisible in rendered Markdown (GitHub, docs.rs, the docs site),
 so the visible text is just "37". This script re-renders the value inside every
 span from the live crate count.
 
@@ -30,9 +30,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SENTINEL = re.compile(r"(<!--COUNT:(?P<key>[a-z]+)-->)(?P<val>.*?)(<!--/COUNT-->)", re.DOTALL)
 # Pruned by directory name anywhere in the tree.
 SKIP_DIRS = {".git", "target", "node_modules"}
-# Pruned by exact repo-relative path (the mdBook *rendered output* — its `src/`
-# sibling holds the sources we DO want to process).
-SKIP_PATHS = {os.path.join("docs", "book", "book")}
+# Pruned by exact repo-relative path: the docs site's build output, whose
+# Markdown copies are written from the sources in docs/site/src/content/docs.
+SKIP_PATHS = {os.path.join("docs", "site", "dist"), os.path.join("docs", "site", ".astro")}
 
 
 def counts() -> dict[str, int]:

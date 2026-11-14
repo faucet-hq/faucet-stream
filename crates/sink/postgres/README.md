@@ -261,7 +261,7 @@ flips them silently:
   index maintenance frequently dominates bulk-insert cost; one bulk rebuild
   is much cheaper than a million incremental updates.
 
-See the [throughput tuning guide](https://faucet-hq.github.io/faucet-stream/cookbook/tuning.html)
+See the [throughput tuning guide](https://faucet-hq.github.io/faucet-stream/cookbook/tuning/)
 for the full decision table.
 
 ## Write modes (upsert / delete)
@@ -279,7 +279,7 @@ Semantics:
 - **`write_mode: delete`** routes every record to a delete by key.
 - A record missing a key column (or with a `null` key value) fails with a typed `Sink` error. When a `dlq:` block is configured the good rows are still written (upserts + deletes applied) and only the missing/null-key rows are routed to the DLQ per-row; without a DLQ the whole batch fails.
 
-The `cdc_unwrap` transform pairs naturally with upsert — it normalizes a CDC envelope into a flat row plus a `__op` marker (`"u"`/`"d"`) that the `delete_marker` matches. See the [upsert cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html).
+The `cdc_unwrap` transform pairs naturally with upsert — it normalizes a CDC envelope into a flat row plus a `__op` marker (`"u"`/`"d"`) that the `delete_marker` matches. See the [upsert cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert/).
 
 ## Effectively-once delivery
 
@@ -312,7 +312,7 @@ pipeline:
 delivery: exactly_once
 ```
 
-`delivery: exactly_once` and `write_mode: upsert` compose — the upsert and the commit-token UPSERT commit in the same transaction. See the [effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state.html#effectively-once-delivery).
+`delivery: exactly_once` and `write_mode: upsert` compose — the upsert and the commit-token UPSERT commit in the same transaction. See the [effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state/#effectively-once-delivery).
 
 ## Schema evolution
 
@@ -324,11 +324,11 @@ Under `on_drift: evolve`, `PostgresSink::evolve_schema()` applies additive DDL i
 - **Lossless widenings** (e.g. integer → number) → `ALTER COLUMN … TYPE` — gated on `allow_type_widening`. An integer column that starts receiving fractions becomes exact `numeric`, never `double precision`, so stored values above 2^53 keep every digit.
 - **Nullability relaxations** (a previously `NOT NULL` column absent from the page) → `ALTER COLUMN … DROP NOT NULL`.
 
-Incompatible changes (narrowing / type swaps) are never auto-applied — they are routed by `on_incompatible` (`fail` or `quarantine`). See the [schema-drift cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift.html).
+Incompatible changes (narrowing / type swaps) are never auto-applied — they are routed by `on_incompatible` (`fail` or `quarantine`). See the [schema-drift cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift/).
 
 ## Dead-letter queue
 
-The sink overrides `Sink::write_batch_partial`, so when a `dlq:` block is configured the router gets per-row outcomes: good rows commit and only the failing rows (e.g. missing/null key columns under `write_mode: upsert`/`delete`) are wrapped in a DLQ envelope and routed to the DLQ sink — the batch is not aborted. Without a DLQ, a row failure fails the whole batch. See the [DLQ cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html).
+The sink overrides `Sink::write_batch_partial`, so when a `dlq:` block is configured the router gets per-row outcomes: good rows commit and only the failing rows (e.g. missing/null key columns under `write_mode: upsert`/`delete`) are wrapped in a DLQ envelope and routed to the DLQ sink — the batch is not aborted. Without a DLQ, a row failure fails the whole batch. See the [DLQ cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/).
 
 ## Config loading & schema introspection
 
@@ -436,10 +436,10 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 
 ## See also
 
-- [Sinks reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) — capability matrix across all connectors.
-- [Upsert cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html) — write modes and CDC mirroring.
-- [Effectively-once delivery](https://faucet-hq.github.io/faucet-stream/cookbook/state.html#effectively-once-delivery) — state, watermarks, supported source/sink set.
-- [Dead-letter queue cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html) — routing bad rows.
+- [Sinks reference](https://faucet-hq.github.io/faucet-stream/reference/connectors/) — capability matrix across all connectors.
+- [Upsert cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert/) — write modes and CDC mirroring.
+- [Effectively-once delivery](https://faucet-hq.github.io/faucet-stream/cookbook/state/#effectively-once-delivery) — state, watermarks, supported source/sink set.
+- [Dead-letter queue cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/) — routing bad rows.
 - [`faucet-source-postgres`](https://crates.io/crates/faucet-source-postgres) — the matching query source.
 - [`faucet-source-postgres-cdc`](https://crates.io/crates/faucet-source-postgres-cdc) — the CDC source that pairs with upsert/effectively-once.
 
@@ -464,7 +464,7 @@ catalog. A race lost to a creator outside faucet is retried.
 
 ## Declared column types
 
-When the run's source declares its column types (a SQL query source, #955 — see [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types)), a table this sink creates types each declared column from the declaration instead of from the first page: `bigint`, `double precision`, `boolean`, `text`, `numeric(p,s)` (`numeric` without precision), `date`, `time`, `timestamptz` / `timestamp`, `uuid`, `bytea`, `jsonb`. A declared column whose first-page values do not fit its type keeps the inferred type; an existing table is never retyped. With a complete declaration a run that writes nothing creates the empty, typed table.
+When the run's source declares its column types (a SQL query source, #955 — see [Declared column types](../../../docs/site/src/content/docs/reference/value-fidelity.md#declared-column-types)), a table this sink creates types each declared column from the declaration instead of from the first page: `bigint`, `double precision`, `boolean`, `text`, `numeric(p,s)` (`numeric` without precision), `date`, `time`, `timestamptz` / `timestamp`, `uuid`, `bytea`, `jsonb`. A declared column whose first-page values do not fit its type keeps the inferred type; an existing table is never retyped. With a complete declaration a run that writes nothing creates the empty, typed table.
 
 ## Batch atomicity
 
@@ -472,7 +472,7 @@ What a failed write leaves behind (#737): **atomic** for a JSONB-column append w
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See
-[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/#batch-atomicity-and-dlq_all).
 
 ## Capabilities
 
@@ -532,7 +532,7 @@ staged into a `LIKE … INCLUDING DEFAULTS INCLUDING GENERATED` clone
 needed; a missing target is created by the first run
 (staged from the first page, then renamed into place at commit — a failed first
 run leaves no table) when `create_table: true`. See the
-[Overwrite cookbook](../../../docs/book/src/cookbook/upsert.md).
+[Overwrite cookbook](../../../docs/site/src/content/docs/cookbook/upsert.md).
 
 **Scoped / windowed overwrite (#518):** add a `scope: { window: { column, from, to } }`
 to replace only the rows in a half-open `[from, to)` window — the swap becomes
@@ -578,7 +578,7 @@ restored: rows outside it keep their earlier run ids without blocking the
 rollback, and stay as they are. Sink hooks: `supports_rollback`, `rollback_run`, `forget_run`,
 `rewind_commit_token`, `readback_source` (the `postgres` source config
 `faucet verify` reads the destination back with). See the [rollback
-cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/rollback.html).
+cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/rollback/).
 
 Restores are exact: each journaled image is expanded server-side with
 `jsonb_populate_record` into the table's row type, so NUMERIC, timestamps and

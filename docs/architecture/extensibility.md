@@ -45,7 +45,7 @@ through "does this keep the barrier to a third-party connector low?"
   faucet builds any connector from `type:` + JSON config without the CLI. It
   uses configs as given (no reference resolution) and refuses connectors that
   run programs unless the caller passes `BuildPolicy::allow_subprocess`. See
-  `docs/book/src/extending/embedding.md`.
+  `docs/site/src/content/docs/extending/embedding.md`.
 - **Declared capabilities** (`crates/core/src/capabilities.rs`, RFC 0013) — a
   connector declares what it can do as a `Capabilities` value: through
   `Source::capabilities` / `Sink::capabilities` on a built connector (defaulted,
@@ -100,7 +100,7 @@ that keeps the trait small while the runtime grows.
   alone, so the CLI's expand-time gates (`registry::source_capabilities` /
   `sink_capabilities`) validate capability requirements before a run — for
   built-ins and plugins alike. Which features compose with which write path is
-  one table, `faucet_core::compat` ([Feature compatibility](../book/src/reference/compatibility.md)).
+  one table, `faucet_core::compat` ([Feature compatibility](../site/generated/reference/compatibility.md)).
 - **`serde_json::Value` record model** keeps authoring trivial at an allocation
   cost — see [performance](./performance.md) and
   [ADR 0004](../adr/0004-json-record-model.md).

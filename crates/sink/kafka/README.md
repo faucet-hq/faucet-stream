@@ -384,7 +384,7 @@ pipeline:
       path: ./.faucet-state/pg_cdc_to_kafka_eo
 ```
 
-The `exactly_once:` block (`transactional_id_prefix`, `commit_token_topic`, `commit_token_topic_partitions`, `commit_token_topic_replication`) tunes the transactional id namespace and the side-topic. See the [effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state.html#effectively-once-delivery) for the cross-connector picture, and the runnable [`cli/examples/postgres_cdc_to_kafka_exactly_once.yaml`](https://github.com/faucet-hq/faucet-stream/blob/main/cli/examples/postgres_cdc_to_kafka_exactly_once.yaml).
+The `exactly_once:` block (`transactional_id_prefix`, `commit_token_topic`, `commit_token_topic_partitions`, `commit_token_topic_replication`) tunes the transactional id namespace and the side-topic. See the [effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state/#effectively-once-delivery) for the cross-connector picture, and the runnable [`cli/examples/postgres_cdc_to_kafka_exactly_once.yaml`](https://github.com/faucet-hq/faucet-stream/blob/main/cli/examples/postgres_cdc_to_kafka_exactly_once.yaml).
 
 ## Config loading & schema
 
@@ -481,8 +481,8 @@ whole page and aborts its transaction — none of which the per-message
 
 - [`faucet-source-kafka`](https://crates.io/crates/faucet-source-kafka) — consume records from Kafka topics.
 - [`faucet-common-kafka`](https://crates.io/crates/faucet-common-kafka) — shared auth modes, value formats, schema-registry client, and policy enums.
-- [Connectors reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) — capability matrix.
-- [Configuration reference](https://faucet-hq.github.io/faucet-stream/reference/config.html) — the full pipeline-config grammar.
+- [Connectors reference](https://faucet-hq.github.io/faucet-stream/reference/connectors/) — capability matrix.
+- [Configuration reference](https://faucet-hq.github.io/faucet-stream/reference/config/) — the full pipeline-config grammar.
 - A complete working example: [`cli/examples/rest_to_kafka.yaml`](https://github.com/faucet-hq/faucet-stream/blob/main/cli/examples/rest_to_kafka.yaml).
 
 ## Batch atomicity
@@ -491,7 +491,7 @@ What a failed write leaves behind (#737): **best-effort** — each record is its
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See
-[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/#batch-atomicity-and-dlq_all).
 
 ## Capabilities
 

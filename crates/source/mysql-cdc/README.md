@@ -373,13 +373,13 @@ pipeline:
       connection_url: postgres://app:app@localhost:5432/mirror
 ```
 
-To build a true table mirror (rather than an append-only change log), pair the `cdc_unwrap` transform with a `write_mode: upsert` sink — see the [upsert cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html).
+To build a true table mirror (rather than an append-only change log), pair the `cdc_unwrap` transform with a `write_mode: upsert` sink — see the [upsert cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert/).
 
 ## Snapshot → CDC handoff
 
 This source implements `capture_resume_position()`, which reads the server's **current binlog coordinates** (`{ file, pos }`) as a resume bookmark — without consuming any changes. The `faucet replicate` command uses it to anchor the binlog stream at-or-before a bulk snapshot of the table, so the combined snapshot + CDC result is a gap-free, duplicate-free mirror when paired with a `write_mode: upsert` sink. The capture refuses while an XA transaction is prepared (listed by `XA RECOVER`): the snapshot cannot see its rows and the stream would start after them. Commit or roll it back and retry. Without the `XA_RECOVER_ADMIN` privilege the check cannot run and the capture only warns.
 
-There is no slot to pin; binlog retention is **time-based**, so keep your binlog retention window comfortably larger than the expected snapshot duration. If the captured position is purged before CDC starts, the stream errors that its start position is unavailable. See the [replication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/replication.html) for the full handoff model.
+There is no slot to pin; binlog retention is **time-based**, so keep your binlog retention window comfortably larger than the expected snapshot duration. If the captured position is purged before CDC starts, the stream errors that its start position is unavailable. See the [replication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/replication/) for the full handoff model.
 
 ## Config loading & schema
 
@@ -451,7 +451,7 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 
 ## See also
 
-- [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) · [CDC / state cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state.html) · [Upsert cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html) · [Replication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/replication.html)
+- [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors/) · [CDC / state cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state/) · [Upsert cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert/) · [Replication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/replication/)
 - [faucet-source-mysql](https://crates.io/crates/faucet-source-mysql) — query-mode MySQL source (snapshots via SQL)
 - [faucet-source-postgres-cdc](https://crates.io/crates/faucet-source-postgres-cdc) · [faucet-source-mongodb-cdc](https://crates.io/crates/faucet-source-mongodb-cdc) — sibling CDC sources
 - [faucet-state-redis](https://crates.io/crates/faucet-state-redis) · [faucet-state-postgres](https://crates.io/crates/faucet-state-postgres) — durable bookmark stores

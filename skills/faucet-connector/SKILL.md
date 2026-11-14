@@ -24,11 +24,11 @@ fast.
 The engine contract a connector must honour (streaming and bookmarks, the
 write → flush → checkpoint order, effectively-once, retries, error typing,
 performance, config rules, versioning) is on
-[Authoring a connector](https://faucet-hq.github.io/faucet-stream/extending/authoring-connectors.html);
+[Authoring a connector](https://faucet-hq.github.io/faucet-stream/extending/authoring-connectors/);
 the conformance battery and tiers on
-[Connector conformance](https://faucet-hq.github.io/faucet-stream/reference/conformance.html);
+[Connector conformance](https://faucet-hq.github.io/faucet-stream/reference/conformance/);
 publishing and discovery on
-[Connector marketplace](https://faucet-hq.github.io/faucet-stream/extending/marketplace.html).
+[Connector marketplace](https://faucet-hq.github.io/faucet-stream/extending/marketplace/).
 Read the authoring page before writing code.
 
 Working, tested examples to copy: [examples/faucet-source-acme/](examples/faucet-source-acme/src/stream.rs)
@@ -71,7 +71,7 @@ config written for a newer faucet can fail or be misread on an older one.
    If the checksum or the attestation does not verify, stop and tell the user.
 6. With no pin at all, install the latest release the same way (the archive
    and its `.sha256` from `releases/latest/download/`) and pin it as described in
-   [Pinning the faucet version](https://faucet-hq.github.io/faucet-stream/operations/pinning.html).
+   [Pinning the faucet version](https://faucet-hq.github.io/faucet-stream/operations/pinning/).
 
 Every version-specific fact (which connectors and blocks exist, config keys,
 types, defaults, commands and flags) comes from that binary: `faucet list`,
@@ -123,7 +123,7 @@ the compiler and the tests, not this skill.
 2. **Config.** Fill `src/config.rs`: every field documented (the doc comments
    become the schema `faucet schema` and editors show), safe bounded defaults,
    validation in the constructor returning a config error. Rules:
-   [Config and schema](https://faucet-hq.github.io/faucet-stream/extending/authoring-connectors.html#config-and-schema).
+   [Config and schema](https://faucet-hq.github.io/faucet-stream/extending/authoring-connectors/#config-and-schema).
    Keep all I/O out of `config.rs`.
 
 3. **Implement the trait** in `src/stream.rs` or `src/sink.rs`, the only
@@ -133,16 +133,16 @@ the compiler and the tests, not this skill.
    `CallSlot` built in the constructor (its own timeout and retry policy) and
    forward `set_call_context` / `set_roundtrip_recorder` to it, so the run's
    deadline, cancel token and round-trip metering reach each call
-   ([Backend calls](https://faucet-hq.github.io/faucet-stream/extending/authoring-connectors.html#backend-calls-callcontext-httpclient-batching)).
+   ([Backend calls](https://faucet-hq.github.io/faucet-stream/extending/authoring-connectors/#backend-calls-callcontext-httpclient-batching)).
    Export a `DESCRIPTOR` that answers the connector's capabilities from config
    alone
-   ([Declaring capabilities](https://faucet-hq.github.io/faucet-stream/extending/authoring-connectors.html#declaring-capabilities)).
+   ([Declaring capabilities](https://faucet-hq.github.io/faucet-stream/extending/authoring-connectors/#declaring-capabilities)).
    Then, in order of importance:
    - **Source:** override `stream_pages` to read page by page from the
      backend's paging primitive (the default buffers everything), and make the
      whole-result method drain that stream. For incremental sync, add the state
      key, start-bookmark and per-page bookmark pieces
-     ([Streaming pages and bookmarks](https://faucet-hq.github.io/faucet-stream/extending/authoring-connectors.html#streaming-pages-and-bookmarks)).
+     ([Streaming pages and bookmarks](https://faucet-hq.github.io/faucet-stream/extending/authoring-connectors/#streaming-pages-and-bookmarks)).
      Stop paging on an empty page or an explicit end marker, never on a short
      page (backends clamp the page size), and fail when the next cursor does
      not advance.
@@ -153,7 +153,7 @@ the compiler and the tests, not this skill.
      backend reports them; keyed upsert/delete through the shared write spec
      and planner; an atomic watermark only when rows and token commit in one
      transaction
-     ([Write, flush, checkpoint](https://faucet-hq.github.io/faucet-stream/extending/authoring-connectors.html#write-flush-checkpoint)).
+     ([Write, flush, checkpoint](https://faucet-hq.github.io/faucet-stream/extending/authoring-connectors/#write-flush-checkpoint)).
      When a page goes out in several requests, report the rows of requests
      that succeeded as written so a dead-letter replay does not append them
      twice;
@@ -162,11 +162,11 @@ the compiler and the tests, not this skill.
 4. **Unit and integration tests.** Unit tests at the bottom of each file,
    integration tests in `tests/` against `wiremock` or `testcontainers`,
    asserting exact records, bookmarks and error variants
-   ([Tests](https://faucet-hq.github.io/faucet-stream/extending/authoring-connectors.html#tests)).
+   ([Tests](https://faucet-hq.github.io/faucet-stream/extending/authoring-connectors/#tests)).
 
 5. **Conformance.** Grow `tests/conformance.rs` with every check that applies
    to what the connector does, and assert the honest branch for what it does
-   not ([which checks apply](https://faucet-hq.github.io/faucet-stream/extending/authoring-connectors.html#self-certify-with-the-conformance-battery)).
+   not ([which checks apply](https://faucet-hq.github.io/faucet-stream/extending/authoring-connectors/#self-certify-with-the-conformance-battery)).
    Give each sink check its own fresh destination.
 
 6. **Gate.** All must pass before publishing:
@@ -187,7 +187,7 @@ the compiler and the tests, not this skill.
    source or an append-only sink, so `write_mode: upsert` is refused)
    ([Custom binaries with third-party connectors](https://github.com/faucet-hq/faucet-stream/blob/main/cli/README.md#custom-binaries-with-third-party-connectors)),
    and a PR to the registry index makes `faucet search` find it
-   ([Connector marketplace](https://faucet-hq.github.io/faucet-stream/extending/marketplace.html#publishing-your-connector)).
+   ([Connector marketplace](https://faucet-hq.github.io/faucet-stream/extending/marketplace/#publishing-your-connector)).
    Check the entry with a local copy of the index:
    ```bash
    faucet search acme --index ./registry.json

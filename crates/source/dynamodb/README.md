@@ -132,7 +132,7 @@ TTL expirations arrive as `op: "d"` with `user_identity.principal_id =
   rows of items deleted during the gap). Up to `resnapshot_max_keys`
   (default 1,000,000) distinct keys are tracked; a re-read that writes more
   fails once with nothing deleted and saves its position, so the next run
-  resumes streaming — see [complete reads](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html#complete-reads-dynamodb-on_gap-resnapshot).
+  resumes streaming — see [complete reads](https://faucet-hq.github.io/faucet-stream/cookbook/upsert/#complete-reads-dynamodb-on_gap-resnapshot).
 - **`faucet mirror`** — `capture_resume_position` returns every current shard at
   its trim horizon, so a CDC run after the snapshot replays the retained window
   and converges.

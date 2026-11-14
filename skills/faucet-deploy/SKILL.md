@@ -57,7 +57,7 @@ config written for a newer faucet can fail or be misread on an older one.
    If the checksum or the attestation does not verify, stop and tell the user.
 6. With no pin at all, install the latest release the same way (the archive
    and its `.sha256` from `releases/latest/download/`) and pin it as described in
-   [Pinning the faucet version](https://faucet-hq.github.io/faucet-stream/operations/pinning.html).
+   [Pinning the faucet version](https://faucet-hq.github.io/faucet-stream/operations/pinning/).
 
 Every version-specific fact (which connectors and blocks exist, config keys,
 types, defaults, commands and flags) comes from that binary: `faucet list`,
@@ -70,7 +70,7 @@ binary predates it, so leave it out.
 ## Step 1: pick the runtime
 
 Use the runtime table in
-[Deploying faucet](https://faucet-hq.github.io/faucet-stream/operations/deploying.html):
+[Deploying faucet](https://faucet-hq.github.io/faucet-stream/operations/deploying/):
 `faucet run` when something else owns the timer (cron, systemd, an
 orchestrator, a Kubernetes CronJob), `faucet schedule` for one pipeline on a
 timer with no orchestrator, `faucet serve` for many pipelines, API callers,
@@ -79,7 +79,7 @@ an object landing or a queue filling.
 
 Whatever you pick, **one row must never run twice at the same time**. Make the
 scheduler enforce it as well as the run lease
-([one run per row at a time](https://faucet-hq.github.io/faucet-stream/operations/deploying.html#one-run-per-row-at-a-time)).
+([one run per row at a time](https://faucet-hq.github.io/faucet-stream/operations/deploying/#one-run-per-row-at-a-time)).
 
 ## Step 2: confirm the build has what the deployment needs
 
@@ -107,7 +107,7 @@ faucet serve --help
 
 For an image, run the same commands through it
 (`docker run --rm <image> list`). If something is missing, pick another image
-profile or build one: [installation](https://faucet-hq.github.io/faucet-stream/getting-started/installation.html)
+profile or build one: [installation](https://faucet-hq.github.io/faucet-stream/getting-started/installation/)
 and [`deploy/README.md`](https://github.com/faucet-hq/faucet-stream/blob/main/deploy/README.md).
 
 ## Step 3: validate the config for unattended use
@@ -124,9 +124,9 @@ structure without credentials. A secrets-manager reference passes
 `faucet doctor` at deploy time: it probes every connector and the state store.
 
 Choose a durable state backend for where the process runs
-([choosing a state backend](https://faucet-hq.github.io/faucet-stream/operations/deploying.html#choosing-a-state-backend));
+([choosing a state backend](https://faucet-hq.github.io/faucet-stream/operations/deploying/#choosing-a-state-backend));
 read its keys from `faucet schema config` and the state section of
-[State stores](https://faucet-hq.github.io/faucet-stream/cookbook/state.html#state-stores).
+[State stores](https://faucet-hq.github.io/faucet-stream/cookbook/state/#state-stores).
 Never `memory` in production.
 
 ## Checklist: `faucet run` from an orchestrator, cron or CronJob
@@ -134,7 +134,7 @@ Never `memory` in production.
 1. Durable state, shared by every process that runs the pipeline.
 2. Invoke with `--no-env-file --log-format json --output json`; read the exit
    code and the stdout summary
-   ([calling `faucet run` from an orchestrator](https://faucet-hq.github.io/faucet-stream/operations/deploying.html#calling-faucet-run-from-an-orchestrator)).
+   ([calling `faucet run` from an orchestrator](https://faucet-hq.github.io/faucet-stream/operations/deploying/#calling-faucet-run-from-an-orchestrator)).
 3. Serialize runs of one config in the scheduler; keep a timeout below the
    period (a Job deadline, or a run budget: `faucet run --help`).
 4. Credentials from platform secrets as env vars or mounted files.
@@ -156,7 +156,7 @@ read it at the tag `faucet-cli-v<version>` matching your binary).
 1. A `schedule:` block. Read its keys with `faucet schema schedule`; decide the
    overlap policy, a failure limit that exits non-zero so the supervisor
    notices, a run timeout under the period, and a shutdown grace longer than
-   the slowest flush ([Scheduling pipelines](https://faucet-hq.github.io/faucet-stream/cookbook/scheduling.html)).
+   the slowest flush ([Scheduling pipelines](https://faucet-hq.github.io/faucet-stream/cookbook/scheduling/)).
    Examples: `cli/examples/scheduled_production.yaml`,
    `cli/examples/scheduled_nightly.yaml`.
 2. A supervisor that restarts on a non-zero exit (systemd `Restart=on-failure`,
@@ -178,7 +178,7 @@ faucet schedule /etc/faucet/orders.yaml --no-env-file --log-format json
 
 ## Checklist: `faucet serve`
 
-Read [Running faucet as a service](https://faucet-hq.github.io/faucet-stream/cookbook/serve.html)
+Read [Running faucet as a service](https://faucet-hq.github.io/faucet-stream/cookbook/serve/)
 first: a submitted config runs with the server's identity, so serve is code
 execution on that host. Every flag below is in `faucet serve --help`.
 
@@ -186,8 +186,8 @@ execution on that host. Every flag below is in `faucet serve --help`.
    file of named principals, or the per-role tokens) over one admin token;
    give `viewer` by default and `operator` only to orchestrators. Pass tokens
    through env vars or Secret-mounted files, never as command-line values. The
-   file format and roles: [RBAC & audit log](https://faucet-hq.github.io/faucet-stream/cookbook/serve.html#rbac--audit-log);
-   an approvals policy: [Approvals](https://faucet-hq.github.io/faucet-stream/cookbook/approvals.html).
+   file format and roles: [RBAC & audit log](https://faucet-hq.github.io/faucet-stream/cookbook/serve/#rbac--audit-log);
+   an approvals policy: [Approvals](https://faucet-hq.github.io/faucet-stream/cookbook/approvals/).
 2. A persistent run history (`--history` with a database URL) so runs, audit
    and templates survive a restart; confirm the build accepts it (Step 2).
 3. `--cluster` on a shared Postgres history when more than one replica runs.
@@ -205,8 +205,8 @@ execution on that host. Every flag below is in `faucet serve --help`.
 faucet serve --listen 0.0.0.0:8080 --auth-config /etc/faucet-auth/auth.yaml --history "$FAUCET_HISTORY_URL" --cluster --log-format json
 ```
 
-Event triggers: [Event-driven triggers](https://faucet-hq.github.io/faucet-stream/cookbook/triggers.html),
-the [triggers reference](https://faucet-hq.github.io/faucet-stream/reference/triggers.html)
+Event triggers: [Event-driven triggers](https://faucet-hq.github.io/faucet-stream/cookbook/triggers/),
+the [triggers reference](https://faucet-hq.github.io/faucet-stream/reference/triggers/)
 (`faucet schema triggers` prints the file schema) and
 `cli/examples/triggers/triggers.yaml`. Treat trigger bodies and headers as
 untrusted input.
@@ -214,7 +214,7 @@ untrusted input.
 ## Kubernetes and Helm
 
 - Shapes per runtime (CronJob, Job, Deployment) and their must-haves:
-  [Kubernetes](https://faucet-hq.github.io/faucet-stream/operations/deploying.html#kubernetes).
+  [Kubernetes](https://faucet-hq.github.io/faucet-stream/operations/deploying/#kubernetes).
 - The Helm chart is
   [`deploy/helm/faucet-stream`](https://github.com/faucet-hq/faucet-stream/tree/main/deploy/helm/faucet-stream)
   in the repository at the tag matching your version; read its `README.md`
@@ -234,10 +234,10 @@ Render the chart and read the manifests before installing.
 ## Observability
 
 - Prometheus endpoint, structured logs, OTLP export and log shipping:
-  [Observability](https://faucet-hq.github.io/faucet-stream/operations/observability.html).
+  [Observability](https://faucet-hq.github.io/faucet-stream/operations/observability/).
   The config keys come from `faucet schema config`.
 - Grafana dashboards and Prometheus alert rules ship in the repository under
-  `observability/` ([Dashboards & alerts](https://faucet-hq.github.io/faucet-stream/cookbook/dashboards.html)).
+  `observability/` ([Dashboards & alerts](https://faucet-hq.github.io/faucet-stream/cookbook/dashboards/)).
   Load those instead of writing alerts by hand.
 - Alert at least on: failed runs, scheduler heartbeat age and consecutive
   failures, bookmark staleness or source lag, rows going to the DLQ, and a
@@ -259,7 +259,7 @@ Render the chart and read the manifests before installing.
 - [ ] Secrets only through `${env:…}` / `${file:…}` or a secrets manager;
       `--no-env-file` set
 - [ ] JSON logs at `info` or quieter; never debug with resolved secrets
-- [ ] The [hardening list](https://faucet-hq.github.io/faucet-stream/operations/deploying.html#hardening) reviewed
+- [ ] The [hardening list](https://faucet-hq.github.io/faucet-stream/operations/deploying/#hardening) reviewed
 
 ```bash
 faucet doctor /etc/faucet/orders.yaml

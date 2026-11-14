@@ -146,7 +146,7 @@ to pin the engine's guarantees — bookmark ordering, exactly-once, lifecycle,
 cleanup safety, the DLQ boundary, panic isolation, state migration and
 (`reliability_governance`) the governed DLQ, row accounting and per-row policy
 quarantine on every write path (RFC 0013). See the
-[reliability testing guide](../../docs/book/src/operations/reliability-testing.md).
+[reliability testing guide](../../docs/site/src/content/docs/operations/reliability-testing.md).
 
 ### What the durability helpers count
 

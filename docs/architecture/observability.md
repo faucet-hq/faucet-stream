@@ -137,4 +137,4 @@ truth; this page explains the model, not the exhaustive list.
 - [State management](./state-management.md) · [Design invariants](./invariants.md)
 - [ADR 0008 — Observability](../adr/0008-observability.md)
 - [Logging standard](../standards/logging.md)
-- User guide: [../book/src/operations/observability.md](../book/src/operations/observability.md)
+- User guide: [../site/src/content/docs/operations/observability.md](../site/src/content/docs/operations/observability.md)

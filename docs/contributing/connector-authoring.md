@@ -3,7 +3,7 @@
 *How to build a source or sink that is fast, resumable, and ships cleanly — and every place you must wire it in.*
 
 This is the contributor-facing companion to the user-facing
-[authoring guide](../book/src/extending/authoring-connectors.md) and the
+[authoring guide](../site/src/content/docs/extending/authoring-connectors.md) and the
 [connector protocol spec](../spec/faucet-connector-spec-v0.md). Read those for
 the external contract; read this for the *internal* conventions and the wiring
 checklist that CI enforces.
@@ -84,7 +84,7 @@ pub path: String,
 ```
 
 `faucet serve` reads it from the schema and checks the value against the
-operator's [reference policy](../book/src/reference/http-api.md#reference-policy)
+operator's [reference policy](../site/src/content/docs/reference/http-api.md#reference-policy)
 before running a config a caller sent, so your connector is confined with no
 serve code. A field that only looks like a resource (an object key inside a
 configured bucket, a URL path appended to a checked `base_url`) goes in
@@ -181,7 +181,7 @@ durably wrote and flushed the page. You never call `StateStore::put` yourself.
 |---|---|---|
 | Exactly-once (source) | `supports_exactly_once`, `replay_guarantee`, `capture_resume_position` | Only for deterministic-replay sources (CDC, Kafka). See [idempotency](../architecture/recovery.md). |
 | Exactly-once (sink) | `supports_idempotent_writes`, `write_batch_idempotent`, `last_committed_token` | Commit records + the commit token **atomically**. |
-| Upsert / delete | `supported_write_modes`, and use `faucet_core::write_mode::plan_writes` | See the [write-mode](../book/src/cookbook/upsert.md) cookbook. |
+| Upsert / delete | `supported_write_modes`, and use `faucet_core::write_mode::plan_writes` | See the [write-mode](../site/src/content/docs/cookbook/upsert.md) cookbook. |
 | Discovery | `supports_discover`, `discover` | Read-only, cheap catalog introspection only. |
 | Sharding | `is_shardable`, `enumerate_shards`, `apply_shard` | PK-range or hash-of-key. |
 | Schema evolution (sink) | `current_schema`, `supports_schema_evolution`, `evolve_schema` | Additive/widening DDL. |
@@ -196,7 +196,7 @@ Route every backend call through a `faucet_core::io::CallSlot` /
 `CallContext::call` and build HTTP clients with `faucet_core::http::Client`;
 the workspace `clippy.toml` refuses `reqwest::Client::new` / `builder` and
 `tokio::time::sleep` outside sanctioned sites. See
-[Backend calls](../book/src/extending/authoring-connectors.md#backend-calls-callcontext-httpclient-batching).
+[Backend calls](../site/src/content/docs/extending/authoring-connectors.md#backend-calls-callcontext-httpclient-batching).
 Call `faucet_core::ensure_crypto_provider()` before any TLS connect that does
 not go through `faucet_core::http::Client` (#971).
 
@@ -226,7 +226,7 @@ wired into every surface. Miss one and a CI job — or a downstream user — bre
       locally but the isolation matrix catches it (see [common-mistakes](./common-mistakes.md)).
 - [ ] **README** — crate `README.md` with config fields, auth, defaults.
 - [ ] **Docs site** — the capability matrix in
-      `docs/book/src/reference/connectors.md`, plus a `cli/examples/*.yaml`.
+      `docs/site/src/content/docs/reference/connectors.md`, plus a `cli/examples/*.yaml`.
 - [ ] **Shipped example validates** — the example must pass the
       `cli_end_to_end` validate test (use literal hosts, not `${env:VAR}`
       unless the var is in the allowlist).

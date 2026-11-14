@@ -421,6 +421,6 @@ the driver boundary) and a generated connector skeleton become small.
 ## Related
 
 - [RFC 0013 — Structural core guarantees](./0013-structural-core-guarantees.md)
-- [Authoring connectors](../docs/book/src/extending/authoring-connectors.md)
-- [Conformance reference](../docs/book/src/reference/conformance.md)
+- [Authoring connectors](../docs/site/src/content/docs/extending/authoring-connectors.md)
+- [Conformance reference](../docs/site/src/content/docs/reference/conformance.md)
 - [RFC process](./README.md)

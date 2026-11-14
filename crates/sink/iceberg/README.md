@@ -282,13 +282,13 @@ pipeline:
 delivery: exactly_once
 ```
 
-See the [Effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state.html#effectively-once-delivery) for the full rationale and supported source/sink set.
+See the [Effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state/#effectively-once-delivery) for the full rationale and supported source/sink set.
 
 ## Schema drift
 
 `IcebergSink` reports its live table schema via `current_schema()` (the table's current Iceberg schema converted through Arrow to the `infer_schema` JSON shape; a missing table → `None`), so the pipeline-level `schema:` policy can **detect** drift between an incoming page's top-level shape and the real table. The `warn` / `ignore` / `quarantine` / `fail` modes all work against this sink.
 
-**`on_drift: evolve` supports additive columns** ([#255](https://github.com/faucet-hq/faucet-stream/issues/255)). `supports_schema_evolution()` returns `true`: on drift, each **new** column is added as an optional field via `iceberg-rust` 0.10.0's `Transaction::update_schema` action, in a single schema-update commit. The sink's open writer is closed (its files are committed on the next flush) and every later page is written against the evolved schema, so the new column's values land. Only additions are applied — iceberg-rust 0.10.0's `update_schema` exposes `add_column` (+ `delete_column`) but **no** in-place type promotion or nullability relaxation, so a `widenings` / `relax_nullability` evolution is rejected with a typed error rather than silently ignored. Row-level overwrite/upsert remain separately blocked upstream (#179 / #225). See the [schema-drift cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift.html).
+**`on_drift: evolve` supports additive columns** ([#255](https://github.com/faucet-hq/faucet-stream/issues/255)). `supports_schema_evolution()` returns `true`: on drift, each **new** column is added as an optional field via `iceberg-rust` 0.10.0's `Transaction::update_schema` action, in a single schema-update commit. The sink's open writer is closed (its files are committed on the next flush) and every later page is written against the evolved schema, so the new column's values land. Only additions are applied — iceberg-rust 0.10.0's `update_schema` exposes `add_column` (+ `delete_column`) but **no** in-place type promotion or nullability relaxation, so a `widenings` / `relax_nullability` evolution is rejected with a typed error rather than silently ignored. Row-level overwrite/upsert remain separately blocked upstream (#179 / #225). See the [schema-drift cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift/).
 
 ## Schema inference
 
@@ -384,9 +384,9 @@ In the CLI/umbrella, the corresponding feature is `sink-iceberg` (REST), with `s
 
 ## See also
 
-- [Connector reference & capability matrix](https://faucet-hq.github.io/faucet-stream/reference/connectors.html)
-- [Effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state.html#effectively-once-delivery)
-- [Configuration grammar](https://faucet-hq.github.io/faucet-stream/reference/config.html)
+- [Connector reference & capability matrix](https://faucet-hq.github.io/faucet-stream/reference/connectors/)
+- [Effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state/#effectively-once-delivery)
+- [Configuration grammar](https://faucet-hq.github.io/faucet-stream/reference/config/)
 - Read Iceberg tables back with [`faucet-source-iceberg`](https://crates.io/crates/faucet-source-iceberg) (same `catalog` block).
 - Related crates: [`faucet-sink-parquet`](https://crates.io/crates/faucet-sink-parquet), [`faucet-sink-s3`](https://crates.io/crates/faucet-sink-s3), [`faucet-sink-bigquery`](https://crates.io/crates/faucet-sink-bigquery), [`faucet-source-postgres-cdc`](https://crates.io/crates/faucet-source-postgres-cdc)
 
@@ -396,7 +396,7 @@ What a failed write leaves behind (#737): **per-row** — rows are staged and co
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See
-[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/#batch-atomicity-and-dlq_all).
 
 ## Capabilities
 

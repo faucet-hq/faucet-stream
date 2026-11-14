@@ -57,7 +57,7 @@ The module must export:
 
 Optional: `free(ptr: i32, len: i32)`, `error_ptr() -> i32`, `error_len() -> i32`.
 
-See the [WASM transform cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/wasm-transforms.html)
+See the [WASM transform cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/wasm-transforms/)
 for the full ABI, host imports, reference modules, and metrics.
 
 ## Library usage

@@ -3,9 +3,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "convert": "node scripts/convert.mjs",
-    "dev": "npm run convert && astro dev",
-    "build": "npm run convert && astro build",
+    "prebuild": "node scripts/prebuild.mjs",
+    "dev": "node scripts/prebuild.mjs && astro dev",
+    "build": "astro build && node scripts/postbuild.mjs",
+    "check": "node scripts/check-redirects.mjs && node scripts/check-links.mjs",
     "preview": "astro preview"
   },
   "engines": {

@@ -7,7 +7,7 @@
 use faucet_cli::registry;
 use faucet_cli::registry_index::RegistryIndex;
 
-const COMMITTED: &str = include_str!("../../docs/book/src/reference/capability-matrix.md");
+const COMMITTED: &str = include_str!("../../docs/site/generated/reference/capability-matrix.md");
 
 fn every_builtin_compiled() -> bool {
     RegistryIndex::embedded()
@@ -27,9 +27,9 @@ fn every_builtin_compiled() -> bool {
 #[test]
 fn committed_matrix_matches_generated() {
     let generated = faucet_cli::conformance::capability_matrix_markdown();
-    let hint = "docs/book/src/reference/capability-matrix.md is stale — regenerate it:\n  \
+    let hint = "docs/site/generated/reference/capability-matrix.md is stale — regenerate it:\n  \
          cargo run -p faucet-cli --all-features -- conformance --matrix > \
-         docs/book/src/reference/capability-matrix.md";
+         docs/site/generated/reference/capability-matrix.md";
     if every_builtin_compiled() {
         assert_eq!(COMMITTED, generated, "{hint}");
         return;

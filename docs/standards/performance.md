@@ -41,4 +41,4 @@ Apply these when adding or modifying any connector. Each is a MUST unless the co
 - [Performance architecture](../architecture/performance.md)
 - [Batching](../architecture/batching.md) · [Stream Pages](../architecture/stream-pages.md)
 - [State & Durability Standard](./state.md)
-- [Book: throughput tuning](../../docs/book/src/cookbook/tuning.md)
+- [Book: throughput tuning](../../docs/site/src/content/docs/cookbook/tuning.md)

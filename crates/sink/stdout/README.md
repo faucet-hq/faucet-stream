@@ -218,8 +218,8 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 
 ## See also
 
-- [Sinks reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) — the full connector capability matrix.
-- [CLI reference](https://faucet-hq.github.io/faucet-stream/reference/cli.html) — `faucet run`, `faucet preview`, `faucet schema`.
+- [Sinks reference](https://faucet-hq.github.io/faucet-stream/reference/connectors/) — the full connector capability matrix.
+- [CLI reference](https://faucet-hq.github.io/faucet-stream/reference/cli/) — `faucet run`, `faucet preview`, `faucet schema`.
 - [`faucet-sink-jsonl`](https://crates.io/crates/faucet-sink-jsonl) — write the same JSON Lines to a file instead of a stream.
 - [`faucet-sink-csv`](https://crates.io/crates/faucet-sink-csv) — TSV/CSV to a file with full quoting.
 - [`faucet-core`](https://crates.io/crates/faucet-core) — the `Sink` trait this connector implements.
@@ -230,7 +230,7 @@ What a failed write leaves behind (#737): **best-effort** — records are writte
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See
-[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/#batch-atomicity-and-dlq_all).
 
 ## Capabilities
 

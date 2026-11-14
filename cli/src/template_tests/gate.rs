@@ -19,7 +19,7 @@ use crate::error::CliError;
 
 /// Where the rules for template tests and labels are explained.
 pub const TESTS_DOC: &str =
-    "https://faucet-hq.github.io/faucet-stream/cookbook/templates.html#template-tests-and-labels";
+    "https://faucet-hq.github.io/faucet-stream/cookbook/templates/#template-tests-and-labels";
 
 /// A version's test status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

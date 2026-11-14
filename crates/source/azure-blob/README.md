@@ -111,7 +111,7 @@ link an Excel reader. Format composes with `compression`.
 chunked into pages — a workbook is a zip container whose directory sits at the
 end, and an XML document is a tree. `csv` and `xml` are text formats: every
 value comes back a string. See the
-[file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats.html).
+[file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats/).
 
 ## Avro and ORC (#719)
 
@@ -140,7 +140,7 @@ Both decode straight to Arrow, so with the `arrow` feature they take the
 columnar path (`avro → parquet` never builds JSON rows). Enable with
 `file-format-avro` / `file-format-orc` (ORC turns on `arrow`), or with
 `file-formats`. Details: the
-[file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats.html#avro).
+[file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats/#avro).
 
 ## Parquet (#777)
 

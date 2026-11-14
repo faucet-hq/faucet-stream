@@ -333,7 +333,7 @@ This crate has no optional features of its own. Enable it in the CLI / umbrella 
 
 ## See also
 
-- [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) · [faucet-sink-redis](https://crates.io/crates/faucet-sink-redis) · [faucet-source-kafka](https://crates.io/crates/faucet-source-kafka)
+- [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors/) · [faucet-sink-redis](https://crates.io/crates/faucet-sink-redis) · [faucet-source-kafka](https://crates.io/crates/faucet-source-kafka)
 
 ## Capabilities
 

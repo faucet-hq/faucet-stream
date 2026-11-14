@@ -322,9 +322,9 @@ This crate has no optional features of its own; enable it in the CLI / umbrella 
 
 ## See also
 
-- [Connectors reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) — capability matrix.
-- [Authentication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/auth.html) — inline auth and shared `auth:` providers.
-- [Configuration reference](https://faucet-hq.github.io/faucet-stream/reference/config.html) — the full config-file grammar.
+- [Connectors reference](https://faucet-hq.github.io/faucet-stream/reference/connectors/) — capability matrix.
+- [Authentication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/auth/) — inline auth and shared `auth:` providers.
+- [Configuration reference](https://faucet-hq.github.io/faucet-stream/reference/config/) — the full config-file grammar.
 - [`faucet-source-webhook`](https://crates.io/crates/faucet-source-webhook) — the inbound (server) counterpart for push delivery over HTTP.
 - [`faucet-source-kafka`](https://crates.io/crates/faucet-source-kafka) — durable, resumable streaming for a different transport.
 

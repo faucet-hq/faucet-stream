@@ -326,9 +326,9 @@ Enable the connector itself in the CLI / umbrella via the `sink-csv` feature.
 
 ## See also
 
-- [Connectors reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) — the full connector capability matrix.
-- [Compression cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/compression.html) — gzip / zstd across file sinks.
-- [CLI reference](https://faucet-hq.github.io/faucet-stream/reference/cli.html) — `faucet run`, `faucet schema`, `faucet doctor`.
+- [Connectors reference](https://faucet-hq.github.io/faucet-stream/reference/connectors/) — the full connector capability matrix.
+- [Compression cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/compression/) — gzip / zstd across file sinks.
+- [CLI reference](https://faucet-hq.github.io/faucet-stream/reference/cli/) — `faucet run`, `faucet schema`, `faucet doctor`.
 - [`faucet-sink-jsonl`](https://crates.io/crates/faucet-sink-jsonl) — write JSON Lines to a file instead of delimited text.
 - [`faucet-sink-stdout`](https://crates.io/crates/faucet-sink-stdout) — TSV/JSON to a standard stream for debugging and piping.
 - [`faucet-source-csv`](https://crates.io/crates/faucet-source-csv) — read CSV files as a pipeline source.
@@ -340,7 +340,7 @@ What a failed write leaves behind (#737): **best-effort** — records are writte
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See
-[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/#batch-atomicity-and-dlq_all).
 
 ## How it is built
 

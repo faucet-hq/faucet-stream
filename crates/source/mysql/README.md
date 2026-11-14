@@ -190,7 +190,7 @@ With `replication: { type: full }` (the default) every page carries `bookmark: N
 
 ## Incremental replication
 
-`replication: { type: incremental }` reads only the rows that changed since the last run. The bookmark lives in the pipeline's [state store](https://faucet-hq.github.io/faucet-stream/cookbook/state.html), so pair it with a durable `state:` block (`file`, `redis` or `postgres`).
+`replication: { type: incremental }` reads only the rows that changed since the last run. The bookmark lives in the pipeline's [state store](https://faucet-hq.github.io/faucet-stream/cookbook/state/), so pair it with a durable `state:` block (`file`, `redis` or `postgres`).
 
 ```yaml
 pipeline:
@@ -401,14 +401,14 @@ This crate has no optional Cargo features of its own. Enable it in the CLI / umb
 
 ## See also
 
-- [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) · [Config grammar](https://faucet-hq.github.io/faucet-stream/reference/config.html) · [CLI reference](https://faucet-hq.github.io/faucet-stream/reference/cli.html)
+- [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors/) · [Config grammar](https://faucet-hq.github.io/faucet-stream/reference/config/) · [CLI reference](https://faucet-hq.github.io/faucet-stream/reference/cli/)
 - Related crates: [faucet-source-mysql-cdc](https://crates.io/crates/faucet-source-mysql-cdc) · [faucet-sink-mysql](https://crates.io/crates/faucet-sink-mysql) · [faucet-source-postgres](https://crates.io/crates/faucet-source-postgres)
 
 ## Sharded execution (cluster Mode B)
 
 Key ranges are re-planned every run, so `shard:` cannot be combined with incremental replication (`faucet validate` refuses it when a `state:` block is set): a range could move to a shard whose cursor is already past a late row.
 
-Under [`faucet serve --cluster`](https://faucet-hq.github.io/faucet-stream/cookbook/cluster.html),
+Under [`faucet serve --cluster`](https://faucet-hq.github.io/faucet-stream/cookbook/cluster/),
 a top-level `shard: { count: N }` block splits this source into contiguous
 primary-key ranges that different cluster workers process concurrently. Opt in
 by naming an integer-typed key column:
@@ -469,8 +469,8 @@ computed by one aggregate query over the range-wrapped `query`. Algorithm id
 `mysql:md5-60-sum:v1`; two digests compare only when both sides report the same id, so a
 pair of these sources verifies without shipping any rows for the ranges that
 match (other pairings stream and hash client-side). See the [verification
-cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/verify.html).
+cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/verify/).
 
 ## Declared column types
 
-The source declares the query's columns and their types (`Source::declared_columns`, #955) from the describe its read makes, so a sink that creates its table types it from the source rather than from the first page's JSON values. `DATETIME` is declared as a timestamp with a zone, because this source reads it as a UTC instant (`…+00:00`), the same as `TIMESTAMP`; `DECIMAL` is declared without precision (the describe does not report it). See [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types).
+The source declares the query's columns and their types (`Source::declared_columns`, #955) from the describe its read makes, so a sink that creates its table types it from the source rather than from the first page's JSON values. `DATETIME` is declared as a timestamp with a zone, because this source reads it as a UTC instant (`…+00:00`), the same as `TIMESTAMP`; `DECIMAL` is declared without precision (the describe does not report it). See [Declared column types](../../../docs/site/src/content/docs/reference/value-fidelity.md#declared-column-types).

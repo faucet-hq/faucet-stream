@@ -266,7 +266,7 @@ pipeline:
 delivery: exactly_once
 ```
 
-Note the usual Redis caveat: `List` and `Stream` modes append, so a page that was *fully* committed is never re-applied — but downstream consumers should still treat entry IDs as the identity of a stream record. See the [effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state.html#effectively-once-delivery).
+Note the usual Redis caveat: `List` and `Stream` modes append, so a page that was *fully* committed is never re-applied — but downstream consumers should still treat entry IDs as the identity of a stream record. See the [effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state/#effectively-once-delivery).
 
 ## Config loading & schema
 
@@ -394,9 +394,9 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 
 ## See also
 
-- [Sinks reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) — capability matrix across all connectors.
-- [Configuration grammar](https://faucet-hq.github.io/faucet-stream/reference/config.html) — the full pipeline config shape.
-- [State & resumability cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state.html).
+- [Sinks reference](https://faucet-hq.github.io/faucet-stream/reference/connectors/) — capability matrix across all connectors.
+- [Configuration grammar](https://faucet-hq.github.io/faucet-stream/reference/config/) — the full pipeline config shape.
+- [State & resumability cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state/).
 - [`faucet-source-redis`](https://crates.io/crates/faucet-source-redis) — the Redis **source** (streams, lists, key patterns).
 - [`faucet-core`](https://crates.io/crates/faucet-core) — traits, pipeline, and error types.
 
@@ -406,7 +406,7 @@ What a failed write leaves behind (#737): **best-effort** — pipelines are not 
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See
-[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/#batch-atomicity-and-dlq_all).
 
 ## Capabilities
 

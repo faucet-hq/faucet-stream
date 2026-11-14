@@ -280,6 +280,6 @@ Can resolve during implementation:
 ## Related
 
 - [RFC process](./README.md)
-- [Data Movement Catalog](../docs/book/src/cookbook/catalog.md)
-- [PII masking](../docs/book/src/cookbook/masking.md)
+- [Data Movement Catalog](../docs/site/src/content/docs/cookbook/catalog.md)
+- [PII masking](../docs/site/src/content/docs/cookbook/masking.md)
 - [Documentation hub](../docs/README.md)

@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Want to build it yourself? See the [authoring guide](https://faucet-hq.github.io/faucet-stream/extending/authoring-connectors.html) — third-party `faucet-source-*` / `faucet-sink-*` crates are welcome.
+        Want to build it yourself? See the [authoring guide](https://faucet-hq.github.io/faucet-stream/extending/authoring-connectors/) — third-party `faucet-source-*` / `faucet-sink-*` crates are welcome.
   - type: input
     id: system
     attributes:

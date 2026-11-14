@@ -116,4 +116,4 @@ evolves independently.
 - [Overview](./overview.md) · [Pipeline engine](./pipeline.md)
 - [State management](./state-management.md) · [Recovery](./recovery.md)
 - [ADR 0010 — Pipeline runtime](../adr/0010-pipeline-runtime.md)
-- User guide: [matrix DAGs](../book/src/tutorials/matrix-dag.md) · [serve](../book/src/cookbook/serve.md)
+- User guide: [matrix DAGs](../site/src/content/docs/tutorials/matrix-dag.md) · [serve](../site/src/content/docs/cookbook/serve.md)

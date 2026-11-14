@@ -383,9 +383,9 @@ This crate has no optional features of its own. Enable it in the CLI/umbrella vi
 
 ## See also
 
-- [Choosing a connector](https://faucet-hq.github.io/faucet-stream/reference/choosing.html)
-- [Connector capability matrix](https://faucet-hq.github.io/faucet-stream/reference/connectors.html)
-- [Authentication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/auth.html)
+- [Choosing a connector](https://faucet-hq.github.io/faucet-stream/reference/choosing/)
+- [Connector capability matrix](https://faucet-hq.github.io/faucet-stream/reference/connectors/)
+- [Authentication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/auth/)
 - [`faucet-sink-http`](https://crates.io/crates/faucet-sink-http) · [`faucet-source-rest`](https://crates.io/crates/faucet-source-rest) · [`faucet-source-graphql`](https://crates.io/crates/faucet-source-graphql)
 
 ## Capabilities

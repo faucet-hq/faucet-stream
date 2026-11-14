@@ -102,4 +102,4 @@ only masked values.
 
 - [Schema handling](./schema.md) · [Quality](./quality.md) · [Contracts](./contracts.md)
 - [Pipeline](./pipeline.md) · [Design invariants](./invariants.md)
-- User guide: [../book/src/cookbook/masking.md](../book/src/cookbook/masking.md)
+- User guide: [../site/src/content/docs/cookbook/masking.md](../site/src/content/docs/cookbook/masking.md)

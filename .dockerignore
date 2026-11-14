@@ -3,7 +3,8 @@
 /target
 **/target
 /doc
-/docs/book/book
+/docs/site/node_modules
+/docs/site/dist
 faucet-demo
 benchmarks/**/target
 

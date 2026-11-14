@@ -55,7 +55,7 @@ config written for a newer faucet can fail or be misread on an older one.
    If the checksum or the attestation does not verify, stop and tell the user.
 6. With no pin at all, install the latest release the same way (the archive
    and its `.sha256` from `releases/latest/download/`) and pin it as described in
-   [Pinning the faucet version](https://faucet-hq.github.io/faucet-stream/operations/pinning.html).
+   [Pinning the faucet version](https://faucet-hq.github.io/faucet-stream/operations/pinning/).
 
 Every version-specific fact (which connectors and blocks exist, config keys,
 types, defaults, commands and flags) comes from that binary: `faucet list`,
@@ -171,9 +171,9 @@ with the run clock (`${now.*}` tokens) and pair it with a keyed write mode, so
 skipped run leaves a gap until backfilled. When deletes or every change
 matter, use the source system's CDC connector, and `faucet mirror` (read
 `faucet schema mirror`) when existing rows need a snapshot first.
-See [Incremental replication & state](https://faucet-hq.github.io/faucet-stream/cookbook/state.html),
-[Mirror](https://faucet-hq.github.io/faucet-stream/cookbook/replication.html),
-[Backfill](https://faucet-hq.github.io/faucet-stream/cookbook/backfill.html).
+See [Incremental replication & state](https://faucet-hq.github.io/faucet-stream/cookbook/state/),
+[Mirror](https://faucet-hq.github.io/faucet-stream/cookbook/replication/),
+[Backfill](https://faucet-hq.github.io/faucet-stream/cookbook/backfill/).
 
 **Write mode.** Read the modes the sink's schema lists.
 - Events or logs that never change: append.
@@ -186,34 +186,34 @@ See [Incremental replication & state](https://faucet-hq.github.io/faucet-stream/
 - A small table re-read in full: overwrite (swapped in only after success).
 - Rows deleted at the source that no feed reports: scoped cleanup on a
   complete fetch.
-See [Upsert / mirror tables](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html).
+See [Upsert / mirror tables](https://faucet-hq.github.io/faucet-stream/cookbook/upsert/).
 
 **Delivery guarantee.** Leave the default unless the user needs
 effectively-once; then require it in the config and let validate say whether
 the source, sink, state and DLQ combination qualifies. A keyed upsert sink
 qualifies with any source; the alternative (atomic watermark) has stricter
 requirements, listed on
-[Effectively-once delivery](https://faucet-hq.github.io/faucet-stream/cookbook/state.html#effectively-once-delivery).
+[Effectively-once delivery](https://faucet-hq.github.io/faucet-stream/cookbook/state/#effectively-once-delivery).
 
 **Shaping and governance.** Transforms run in the order listed: unwrap and
 reshape first, rename next, trim and filter, fix values, stamp constants last.
 Masking, quality, contract and drift run after the whole chain, so write their
 rules against final field names. Use
-[masking](https://faucet-hq.github.io/faucet-stream/cookbook/masking.html) for
-PII, [quality checks](https://faucet-hq.github.io/faucet-stream/cookbook/quality.html)
-for bad rows, a [contract](https://faucet-hq.github.io/faucet-stream/cookbook/contracts.html)
+[masking](https://faucet-hq.github.io/faucet-stream/cookbook/masking/) for
+PII, [quality checks](https://faucet-hq.github.io/faucet-stream/cookbook/quality/)
+for bad rows, a [contract](https://faucet-hq.github.io/faucet-stream/cookbook/contracts/)
 for the promised output shape,
-[schema drift](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift.html)
+[schema drift](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift/)
 for destination changes, and a
-[policy](https://faucet-hq.github.io/faucet-stream/cookbook/policies.html) for
+[policy](https://faucet-hq.github.io/faucet-stream/cookbook/policies/) for
 which labelled columns may reach which sinks.
 
 **Many datasets.** Declare each connection once as a named template and add a
 matrix row per dataset, each with its own destination; use `depends_on` for
 ordering and parent rows for per-record fan-out. Run a subset with the
 selection flags in `faucet run --help`.
-See [Multi-pipeline DAGs](https://faucet-hq.github.io/faucet-stream/tutorials/matrix-dag.html)
-and [Source discovery](https://faucet-hq.github.io/faucet-stream/cookbook/discover.html).
+See [Multi-pipeline DAGs](https://faucet-hq.github.io/faucet-stream/tutorials/matrix-dag/)
+and [Source discovery](https://faucet-hq.github.io/faucet-stream/cookbook/discover/).
 
 ## When validate fails
 
@@ -232,20 +232,20 @@ and [Source discovery](https://faucet-hq.github.io/faucet-stream/cookbook/discov
 
 | Task | Page |
 |---|---|
-| Top-level grammar, interpolation, `params` | [Configuration file format](https://faucet-hq.github.io/faucet-stream/reference/config.html) |
-| `extends`, `profiles`, `!include` | [Config composition](https://faucet-hq.github.io/faucet-stream/cookbook/composition.html) |
-| Choosing a connector, capabilities | [Choosing a connector](https://faucet-hq.github.io/faucet-stream/reference/choosing.html), [Connector catalog](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) |
-| Auth blocks, shared `auth:` providers | [Authentication](https://faucet-hq.github.io/faucet-stream/cookbook/auth.html) |
-| REST pagination | [Pagination styles](https://faucet-hq.github.io/faucet-stream/cookbook/pagination.html) |
-| Transforms and their order | [Record transforms](https://faucet-hq.github.io/faucet-stream/cookbook/transforms.html) |
-| State stores, `faucet state` / `faucet status` | [Pipeline state & status](https://faucet-hq.github.io/faucet-stream/cookbook/state-and-status.html) |
-| Dead-letter queues | [Dead-letter queues](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html) |
-| Retries, circuit breaker | [Resilience](https://faucet-hq.github.io/faucet-stream/cookbook/resilience.html) |
-| Secret references | [Secrets-manager interpolation](https://faucet-hq.github.io/faucet-stream/cookbook/secrets.html) |
-| Cron | [Scheduling](https://faucet-hq.github.io/faucet-stream/cookbook/scheduling.html) |
-| Freshness and volume checks | [SLA monitoring](https://faucet-hq.github.io/faucet-stream/cookbook/sla.html) |
-| Offline tests | [Testing pipelines](https://faucet-hq.github.io/faucet-stream/cookbook/testing.html) |
-| Every command and flag | [CLI commands](https://faucet-hq.github.io/faucet-stream/reference/cli.html) |
+| Top-level grammar, interpolation, `params` | [Configuration file format](https://faucet-hq.github.io/faucet-stream/reference/config/) |
+| `extends`, `profiles`, `!include` | [Config composition](https://faucet-hq.github.io/faucet-stream/cookbook/composition/) |
+| Choosing a connector, capabilities | [Choosing a connector](https://faucet-hq.github.io/faucet-stream/reference/choosing/), [Connector catalog](https://faucet-hq.github.io/faucet-stream/reference/connectors/) |
+| Auth blocks, shared `auth:` providers | [Authentication](https://faucet-hq.github.io/faucet-stream/cookbook/auth/) |
+| REST pagination | [Pagination styles](https://faucet-hq.github.io/faucet-stream/cookbook/pagination/) |
+| Transforms and their order | [Record transforms](https://faucet-hq.github.io/faucet-stream/cookbook/transforms/) |
+| State stores, `faucet state` / `faucet status` | [Pipeline state & status](https://faucet-hq.github.io/faucet-stream/cookbook/state-and-status/) |
+| Dead-letter queues | [Dead-letter queues](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/) |
+| Retries, circuit breaker | [Resilience](https://faucet-hq.github.io/faucet-stream/cookbook/resilience/) |
+| Secret references | [Secrets-manager interpolation](https://faucet-hq.github.io/faucet-stream/cookbook/secrets/) |
+| Cron | [Scheduling](https://faucet-hq.github.io/faucet-stream/cookbook/scheduling/) |
+| Freshness and volume checks | [SLA monitoring](https://faucet-hq.github.io/faucet-stream/cookbook/sla/) |
+| Offline tests | [Testing pipelines](https://faucet-hq.github.io/faucet-stream/cookbook/testing/) |
+| Every command and flag | [CLI commands](https://faucet-hq.github.io/faucet-stream/reference/cli/) |
 
 ## Examples
 

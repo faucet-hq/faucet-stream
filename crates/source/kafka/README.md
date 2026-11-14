@@ -330,7 +330,7 @@ embeds the page's offsets bookmark; on resume the pipeline recovers that exact
 position from the sink's watermark and re-anchors the consumer there — nothing
 is re-written, nothing is skipped.
 
-In a [topology](https://faucet-hq.github.io/faucet-stream/cookbook/topology.html#exactly-once-delivery)
+In a [topology](https://faucet-hq.github.io/faucet-stream/cookbook/topology/#exactly-once-delivery)
 with several sinks, the source orders its bookmarks per partition (a bookmark
 is at or before another when every partition's offset is), so sinks that
 committed different positions resume by position: the source restarts from the
@@ -377,7 +377,7 @@ pipeline:
 
 In plain (non-member) mode the source never commits consumer-group offsets, so
 the broker's group position can never run ahead of the durable bookmark. See
-the [state cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state.html#effectively-once-delivery)
+the [state cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state/#effectively-once-delivery)
 for the full mechanism.
 
 ## Clustered consumption (Mode B, native consumer groups)
@@ -390,7 +390,7 @@ In member mode (i.e. only when a cluster coordinator applies a shard — a plain
 - **commits offsets to the consumer group at durable page boundaries** — after the pipeline has written a page to the sink and persisted its bookmark, plus a synchronous commit at stream end — so a partition that migrates to another member resumes from the last durable position instead of `auto_offset_reset`;
 - **defers bookmark seeks to the group's committed offsets** whenever those are ahead (another member may have durably advanced a partition past this member's bookmark); a bookmark *ahead* of the committed offset — the durable-write→commit crash window — still wins.
 
-The boundary on membership change is **at-least-once**: a crash between a durable page and its commit makes the partition's next owner re-read that page. Pair with an upsert-mode or otherwise idempotent sink. Note `max_messages` applies per member (N members consume up to N × `max_messages` total); `idle_timeout` is the natural terminator for shared consumption. See the [cluster cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/cluster.html) for the full Mode B walkthrough.
+The boundary on membership change is **at-least-once**: a crash between a durable page and its commit makes the partition's next owner re-read that page. Pair with an upsert-mode or otherwise idempotent sink. Note `max_messages` applies per member (N members consume up to N × `max_messages` total); `idle_timeout` is the natural terminator for shared consumption. See the [cluster cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/cluster/) for the full Mode B walkthrough.
 
 ## Config loading & schema introspection
 
@@ -476,8 +476,8 @@ In the CLI / umbrella, enable the connector with `source-kafka`, and the registr
 
 ## See also
 
-- [Kafka source reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) — capability matrix.
-- [State & resume cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state.html) — bookmarks and delivery semantics.
+- [Kafka source reference](https://faucet-hq.github.io/faucet-stream/reference/connectors/) — capability matrix.
+- [State & resume cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state/) — bookmarks and delivery semantics.
 - [`faucet-sink-kafka`](https://crates.io/crates/faucet-sink-kafka) — produce records to Kafka topics.
 - [`faucet-common-kafka`](https://crates.io/crates/faucet-common-kafka) — shared auth modes, value formats, Schema Registry client, and policy enums.
 

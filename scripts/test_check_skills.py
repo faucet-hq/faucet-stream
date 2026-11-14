@@ -39,7 +39,10 @@ class Links(unittest.TestCase):
     def test_docs_page_mapping(self):
         self.assertEqual(cs.docs_page(cs.DOCS_URL + "cookbook/dlq.html#replay"), cs.DOCS_SRC / "cookbook/dlq.md")
         self.assertIsNone(cs.docs_page(cs.DOCS_URL))
-        self.assertFalse(cs.docs_page(cs.DOCS_URL + "cookbook/").exists())
+        self.assertEqual(cs.docs_page(cs.DOCS_URL + "cookbook/dlq/#replay"), cs.DOCS_SRC / "cookbook/dlq.md")
+        self.assertEqual(cs.docs_page(cs.DOCS_URL + "cookbook/"), cs.DOCS_SRC / "cookbook/index.md")
+        self.assertTrue(cs.docs_page(cs.DOCS_URL + "reference/capability-matrix/").exists())
+        self.assertFalse(cs.docs_page(cs.DOCS_URL + "cookbook").exists())
 
     def test_link_errors(self):
         d = Path(tempfile.mkdtemp())

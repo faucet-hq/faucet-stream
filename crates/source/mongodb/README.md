@@ -270,7 +270,7 @@ own cloud or Kubernetes identity) is refused. Unless the server lists hosts
 with `--allow-url-host` (and always for a tenant), the URI must keep the driver
 on the server it names: add `directConnection=true`, or `loadBalanced=true`
 behind a load balancer. Templates and the triggers file are not limited. See
-the [HTTP API reference](https://faucet-hq.github.io/faucet-stream/reference/http-api.html).
+the [HTTP API reference](https://faucet-hq.github.io/faucet-stream/reference/http-api/).
 
 ## Config loading & schema
 
@@ -382,7 +382,7 @@ This crate has no optional features of its own. Enable it in the CLI / umbrella 
 
 ## See also
 
-- [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) · [Choosing a connector](https://faucet-hq.github.io/faucet-stream/reference/choosing.html)
+- [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors/) · [Choosing a connector](https://faucet-hq.github.io/faucet-stream/reference/choosing/)
 - [faucet-source-mongodb-cdc](https://crates.io/crates/faucet-source-mongodb-cdc) — resumable, effectively-once change capture from MongoDB.
 - [faucet-sink-mongodb](https://crates.io/crates/faucet-sink-mongodb) — write into MongoDB (with upsert/delete write modes).
 

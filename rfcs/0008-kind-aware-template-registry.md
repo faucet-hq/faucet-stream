@@ -246,5 +246,5 @@ run time.
 ## Related
 
 - RFC 0006 — Template hosting and sync
-- `docs/book/src/cookbook/template-hub.md`, `docs/book/src/cookbook/templates.md`
+- `docs/site/src/content/docs/cookbook/template-hub.md`, `docs/site/src/content/docs/cookbook/templates.md`
 - `cli/src/templates/store.rs` (`register`, `materialize_for_run`, `materialize_pair`)

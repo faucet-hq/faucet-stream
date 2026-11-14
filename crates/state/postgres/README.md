@@ -207,8 +207,8 @@ This crate has **no optional features of its own**. Enable the backend in the CL
 
 ## See also
 
-- [State & resumability cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state.html) — how bookmarks, resume, and effectively-once work end to end.
-- [Configuration reference](https://faucet-hq.github.io/faucet-stream/reference/config.html) — the full `state:` block grammar.
+- [State & resumability cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state/) — how bookmarks, resume, and effectively-once work end to end.
+- [Configuration reference](https://faucet-hq.github.io/faucet-stream/reference/config/) — the full `state:` block grammar.
 - [`faucet-core`](https://crates.io/crates/faucet-core) — the `StateStore` trait, `Pipeline`, and the built-in `MemoryStateStore` / `FileStateStore`.
 - [`faucet-state-redis`](https://crates.io/crates/faucet-state-redis) — the Redis-backed alternative for the same role.
 

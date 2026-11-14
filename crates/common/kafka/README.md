@@ -188,8 +188,8 @@ a config before it is built.
 
 - [faucet-source-kafka](https://crates.io/crates/faucet-source-kafka) — Kafka consumer source
 - [faucet-sink-kafka](https://crates.io/crates/faucet-sink-kafka) — Kafka producer sink
-- [Connectors reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html)
-- [Authentication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/auth.html)
+- [Connectors reference](https://faucet-hq.github.io/faucet-stream/reference/connectors/)
+- [Authentication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/auth/)
 
 ---
 

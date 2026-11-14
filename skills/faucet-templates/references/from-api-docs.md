@@ -56,7 +56,7 @@ syncing, `--name` when the spec's title does not make a good template name,
 and `--server` when the spec lists several servers. The output is the template
 at `source-templates/<owner>/<name>.yaml` and a draft suite at
 `tests/<owner>/<name>/suite.yaml`. What the importer maps is documented on the
-[Template Hub](https://faucet-hq.github.io/faucet-stream/cookbook/template-hub.html#importing-a-template-from-an-openapi-description)
+[Template Hub](https://faucet-hq.github.io/faucet-stream/cookbook/template-hub/#importing-a-template-from-an-openapi-description)
 page; a worked example (spec, template, suite) is under
 [examples/](../examples/openapi/example-store.yaml).
 
@@ -91,10 +91,10 @@ From the reference, collect per endpoint: the path, the records' location in
 the body, the pagination signal (a cursor field, page numbers, offsets, a
 `Link` header, a next-page URL), the unique key, an "updated since" filter and
 the matching timestamp field. The patterns for each are on the
-[Pagination](https://faucet-hq.github.io/faucet-stream/cookbook/pagination.html),
-[Authentication](https://faucet-hq.github.io/faucet-stream/cookbook/auth.html),
-[Incremental replication](https://faucet-hq.github.io/faucet-stream/cookbook/state.html)
-and [Resilience](https://faucet-hq.github.io/faucet-stream/cookbook/resilience.html)
+[Pagination](https://faucet-hq.github.io/faucet-stream/cookbook/pagination/),
+[Authentication](https://faucet-hq.github.io/faucet-stream/cookbook/auth/),
+[Incremental replication](https://faucet-hq.github.io/faucet-stream/cookbook/state/)
+and [Resilience](https://faucet-hq.github.io/faucet-stream/cookbook/resilience/)
 pages.
 
 ### 3b. GraphQL, WebSocket, XML or gRPC APIs

@@ -53,7 +53,7 @@ config written for a newer faucet can fail or be misread on an older one.
    If the checksum or the attestation does not verify, stop and tell the user.
 6. With no pin at all, install the latest release the same way (the archive
    and its `.sha256` from `releases/latest/download/`) and pin it as described in
-   [Pinning the faucet version](https://faucet-hq.github.io/faucet-stream/operations/pinning.html).
+   [Pinning the faucet version](https://faucet-hq.github.io/faucet-stream/operations/pinning/).
 
 Every version-specific fact (which connectors and blocks exist, config keys,
 types, defaults, commands and flags) comes from that binary: `faucet list`,
@@ -73,18 +73,18 @@ release.
    `/metrics` and the logs change nothing. Read them first.
 2. **Cancel, never kill.** A cancel stops at a page boundary and flushes the
    sink; killing a process mid-write can lose buffered output
-   ([Cancellation](https://faucet-hq.github.io/faucet-stream/cookbook/serve.html#cancellation)).
+   ([Cancellation](https://faucet-hq.github.io/faucet-stream/cookbook/serve/#cancellation)).
 3. **A rerun can duplicate on append sinks.** Failover, reclaim and shutdown
    hand-back are at-least-once; recommend upsert or overwrite for pipelines on
    a cluster
-   ([Delivery guarantees](https://faucet-hq.github.io/faucet-stream/cookbook/cluster.html#delivery-guarantees-and-double-run-boundary)).
+   ([Delivery guarantees](https://faucet-hq.github.io/faucet-stream/cookbook/cluster/#delivery-guarantees-and-double-run-boundary)).
 4. **Never edit the history database by hand.** Use the API.
 
 ## Health: `/healthz` vs `/readyz`
 
 `/healthz` says the process serves; `/readyz` says it should get traffic.
 Read the `/readyz` JSON body
-([`/readyz` body](https://faucet-hq.github.io/faucet-stream/cookbook/cluster.html#readyz-body)):
+([`/readyz` body](https://faucet-hq.github.io/faucet-stream/cookbook/cluster/#readyz-body)):
 history, queue, draining, and on a cluster every live member with its pools
 and load.
 
@@ -98,7 +98,7 @@ and load.
 ### When the history backend is degraded (single node)
 
 What still works and what does not is in
-[Run history & persistence](https://faucet-hq.github.io/faucet-stream/cookbook/serve.html#run-history--persistence):
+[Run history & persistence](https://faucet-hq.github.io/faucet-stream/cookbook/serve/#run-history--persistence):
 runs keep going with records in memory, while template, tenant, connection
 and change-request calls, and idempotency-keyed submissions, fail with `503`.
 
@@ -119,7 +119,7 @@ and change-request calls, and idempotency-keyed submissions, fail with `503`.
    in-flight counts, and the owner's logs carry the run id.
 2. **Pending for long:** on a cluster, check that some live member serves
    the run's pool
-   ([Execution pools](https://faucet-hq.github.io/faucet-stream/cookbook/cluster.html#execution-pools));
+   ([Execution pools](https://faucet-hq.github.io/faucet-stream/cookbook/cluster/#execution-pools));
    a pool with no member never runs. Start a member of that pool, or cancel.
 3. **Running, owner alive:** it is working or blocked. Read its logs
    (`GET /v1/runs/{id}/logs`) and use `faucet-debug`; a row held by another
@@ -127,12 +127,12 @@ and change-request calls, and idempotency-keyed submissions, fail with `503`.
 4. **Running, owner gone:** its lease expires and a survivor reclaims it
    (requeued up to the attempt cap, then failed), or on a single node the
    restarted server marks it failed
-   ([Run lifecycle](https://faucet-hq.github.io/faucet-stream/cookbook/cluster.html#run-lifecycle-in-cluster-mode),
-   [orphan recovery](https://faucet-hq.github.io/faucet-stream/cookbook/serve.html#multi-instance-orphan-recovery-run-ownership-leases)).
+   ([Run lifecycle](https://faucet-hq.github.io/faucet-stream/cookbook/cluster/#run-lifecycle-in-cluster-mode),
+   [orphan recovery](https://faucet-hq.github.io/faucet-stream/cookbook/serve/#multi-instance-orphan-recovery-run-ownership-leases)).
    Wait one lease period before acting.
 5. **To stop it:** `POST /v1/runs/{id}/cancel` to any member; it reaches the
    owner within one poll interval
-   ([Cross-instance cancel](https://faucet-hq.github.io/faucet-stream/cookbook/cluster.html#cross-instance-cancel)).
+   ([Cross-instance cancel](https://faucet-hq.github.io/faucet-stream/cookbook/cluster/#cross-instance-cancel)).
 6. **To retry:** re-submit with a new idempotency key (or the same key after
    deleting the failed run), since there is no cross-process resume; the
    pipeline resumes from its bookmark.
@@ -140,23 +140,23 @@ and change-request calls, and idempotency-keyed submissions, fail with `503`.
 ## Losing, adding or draining a member
 
 - Losing one: survivors reclaim its runs once leases expire. Watch the
-  reclaim metrics ([Prometheus metrics](https://faucet-hq.github.io/faucet-stream/cookbook/cluster.html#prometheus-metrics)).
+  reclaim metrics ([Prometheus metrics](https://faucet-hq.github.io/faucet-stream/cookbook/cluster/#prometheus-metrics)).
   Frequent reclaims of live members mean the lease is shorter than real
   stalls; raise it (`faucet serve --help`).
 - Adding one: same image, env, secrets, vault key and default config as the
-  rest ([Homogeneous deployment](https://faucet-hq.github.io/faucet-stream/cookbook/cluster.html#2-homogeneous-deployment-shared-env--secrets)).
+  rest ([Homogeneous deployment](https://faucet-hq.github.io/faucet-stream/cookbook/cluster/#2-homogeneous-deployment-shared-env--secrets)).
   A member missing a credential fails the runs it claims.
 - Draining one: send it a stop signal and let its grace period run; it
   refuses new work and hands unfinished runs back
-  ([Graceful shutdown](https://faucet-hq.github.io/faucet-stream/cookbook/serve.html#graceful-shutdown)).
+  ([Graceful shutdown](https://faucet-hq.github.io/faucet-stream/cookbook/serve/#graceful-shutdown)).
 
 ## Rolling upgrades
 
 1. Read the release notes and
-   [Upgrading faucet safely](https://faucet-hq.github.io/faucet-stream/operations/upgrading.html),
+   [Upgrading faucet safely](https://faucet-hq.github.io/faucet-stream/operations/upgrading/),
    including its
-   [cluster section](https://faucet-hq.github.io/faucet-stream/operations/upgrading.html#clusters-faucet-serve---cluster)
-   and [rolling upgrades and stored state](https://faucet-hq.github.io/faucet-stream/cookbook/cluster.html#rolling-upgrades-and-stored-state).
+   [cluster section](https://faucet-hq.github.io/faucet-stream/operations/upgrading/#clusters-faucet-serve---cluster)
+   and [rolling upgrades and stored state](https://faucet-hq.github.io/faucet-stream/cookbook/cluster/#rolling-upgrades-and-stored-state).
 2. Back up the history database and export state for critical pipelines.
 3. Replace one member at a time: drain, upgrade, wait for `/readyz`, then
    the next. Mixed versions are expected meanwhile; features gated on every
@@ -165,13 +165,13 @@ and change-request calls, and idempotency-keyed submissions, fail with `503`.
 4. Expect replays of handed-back runs (golden rule 3).
 5. After the last member: run `faucet template revalidate` (or let the server
    do it on start) and check that label-holding templates still pass
-   ([Faucet upgrades and revalidation](https://faucet-hq.github.io/faucet-stream/cookbook/templates.html#faucet-upgrades-and-revalidation)).
+   ([Faucet upgrades and revalidation](https://faucet-hq.github.io/faucet-stream/cookbook/templates/#faucet-upgrades-and-revalidation)).
 
 ## Run history
 
 - Query it with `GET /v1/runs`: filter by status, name, time and labels
   (`?label=key:value`), page with the cursor
-  ([`GET /v1/runs`](https://faucet-hq.github.io/faucet-stream/reference/http-api.html#get-v1runs)).
+  ([`GET /v1/runs`](https://faucet-hq.github.io/faucet-stream/reference/http-api/#get-v1runs)).
 - Who did what: `GET /v1/audit` (admin).
 - Retention of terminal runs and logs is set by server flags
   (`faucet serve --help`); templates, catalog and usage are never purged by

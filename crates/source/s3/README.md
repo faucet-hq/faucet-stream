@@ -433,12 +433,12 @@ Enable the connector itself in the CLI/umbrella via the `source-s3` feature.
 
 ## See also
 
-- [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) · [Compression cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/compression.html)
+- [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors/) · [Compression cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/compression/)
 - Related crates: [faucet-sink-s3](https://crates.io/crates/faucet-sink-s3) · [faucet-source-gcs](https://crates.io/crates/faucet-source-gcs) · [faucet-source-parquet](https://crates.io/crates/faucet-source-parquet)
 
 ## Sharded execution (cluster Mode B)
 
-Under [`faucet serve --cluster`](https://faucet-hq.github.io/faucet-stream/cookbook/cluster.html),
+Under [`faucet serve --cluster`](https://faucet-hq.github.io/faucet-stream/cookbook/cluster/),
 a top-level `shard: { count: N }` block splits this source across cluster
 workers **automatically — no connector config needed**. Each worker reads the
 objects whose key hashes to its shard index (stable FNV-1a modulo `count`),
@@ -477,7 +477,7 @@ link an Excel reader. Format composes with `compression`.
 chunked into pages — a workbook is a zip container whose directory sits at the
 end, and an XML document is a tree. `csv` and `xml` are text formats: every
 value comes back a string. See the
-[file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats.html).
+[file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats/).
 
 ## Avro and ORC (#719)
 
@@ -506,7 +506,7 @@ Both decode straight to Arrow, so with the `arrow` feature they take the
 columnar path (`avro → parquet` never builds JSON rows). Enable with
 `file-format-avro` / `file-format-orc` (ORC turns on `arrow`), or with
 `file-formats`. Details: the
-[file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats.html#avro).
+[file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats/#avro).
 
 ## Timeouts, cancellation and retries
 
@@ -543,7 +543,7 @@ per ranged read) and `HeadObject` (`head`) is reported to faucet's usage meter
 as a source round trip. Reads and heads are priced as S3 read requests
 (`usage.pricing.object_storage.read_per_1k_requests`), a listing page like a
 PUT (`write_per_1k_requests`); see the
-[usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage.html).
+[usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage/).
 
 ## Capabilities
 

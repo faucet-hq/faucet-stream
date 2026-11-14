@@ -260,7 +260,7 @@ println!("uploaded {written} records");
 # }
 ```
 
-Most users drive the sink through a `Pipeline` rather than calling `write_batch` directly — see the [library tutorial](https://faucet-hq.github.io/faucet-stream/tutorials/library.html).
+Most users drive the sink through a `Pipeline` rather than calling `write_batch` directly — see the [library tutorial](https://faucet-hq.github.io/faucet-stream/tutorials/library/).
 
 ## How it works
 
@@ -301,8 +301,8 @@ Enable the connector itself in the CLI/umbrella via the `sink-gcs` feature.
 
 ## See also
 
-- [Connector reference & capability matrix](https://faucet-hq.github.io/faucet-stream/reference/connectors.html)
-- [Compression cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/compression.html)
+- [Connector reference & capability matrix](https://faucet-hq.github.io/faucet-stream/reference/connectors/)
+- [Compression cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/compression/)
 - [`faucet-source-gcs`](https://crates.io/crates/faucet-source-gcs) — the matching GCS source.
 - [`faucet-common-gcs`](https://crates.io/crates/faucet-common-gcs) — shared `GcsCredentials` enum and client builders.
 - [`faucet-sink-s3`](https://crates.io/crates/faucet-sink-s3) — the structurally equivalent AWS S3 sink.
@@ -362,7 +362,7 @@ records are buffered and encoded together at the rollover — bounded by the sam
 same thing whatever the format. Columns are the union of every record's keys in
 the group, so a record that gains a field mid-page widens the file rather than
 losing it. See the
-[file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats.html).
+[file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats/).
 
 ## Avro (#719)
 
@@ -441,7 +441,7 @@ a page is encoded locally and published only at `flush` — otherwise
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See
-[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/#batch-atomicity-and-dlq_all).
 
 ## Timeouts, cancellation and retries
 
@@ -470,7 +470,7 @@ Every request is reported to faucet's usage meter as a sink round trip, by op:
 | `head` | each metadata read (existence checks) | read |
 | `delete` | each object delete | free (GCS does not bill deletes) |
 
-See the [usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage.html).
+See the [usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage/).
 
 ## Server-side copies and retries (#783)
 
@@ -483,7 +483,7 @@ than looping.
 A request that fails with HTTP 429 or a 5xx — or the gRPC
 `RESOURCE_EXHAUSTED` / `UNAVAILABLE` / `INTERNAL` codes — is reported as a
 typed `HttpStatus` error, so a pipeline
-[`resilience:`](https://faucet-hq.github.io/faucet-stream/cookbook/resilience.html)
+[`resilience:`](https://faucet-hq.github.io/faucet-stream/cookbook/resilience/)
 policy retries it; any other failure is a plain sink error.
 
 ## Capabilities

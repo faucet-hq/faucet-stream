@@ -96,8 +96,8 @@ let resp = client
 ## See also
 
 - [Snowflake source crate](https://crates.io/crates/faucet-source-snowflake) · [Snowflake sink crate](https://crates.io/crates/faucet-sink-snowflake)
-- [Authentication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/auth.html)
-- [Configuration reference](https://faucet-hq.github.io/faucet-stream/reference/config.html)
+- [Authentication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/auth/)
+- [Configuration reference](https://faucet-hq.github.io/faucet-stream/reference/config/)
 
 ## License
 

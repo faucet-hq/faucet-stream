@@ -55,7 +55,7 @@ release as `<asset>.sigstore.json`), are built with `cargo-auditable` so
 (`faucet-cli.cdx.json`) and SLSA level 3 provenance for all its assets
 (`faucet-cli.intoto.jsonl`). Container images are keyless-signed with SLSA
 provenance and an SBOM. Commands:
-[installation guide](https://faucet-hq.github.io/faucet-stream/getting-started/installation.html).
+[installation guide](https://faucet-hq.github.io/faucet-stream/getting-started/installation/).
 
 ## What counts as a vulnerability
 

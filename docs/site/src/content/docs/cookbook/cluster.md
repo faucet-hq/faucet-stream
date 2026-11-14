@@ -1,0 +1,610 @@
+---
+title: "Running a cluster"
+description: "faucet serve --cluster turns a fleet of identical faucet serve processes into a pull-balanced, self-healing cluster. Each instance monitors a shared SQL history database for…"
+---
+
+`faucet serve --cluster` turns a fleet of identical `faucet serve` processes
+into a **pull-balanced, self-healing cluster**. Each instance monitors a shared
+SQL history database for `pending` runs, claims them exclusively, and executes
+them locally. When a node crashes, a survivor reclaims its runs and re-executes
+them up to a configurable attempt cap.
+
+This is **Mode A** — a simple, coordinator-free design where any node can run
+any submitted pipeline. Mode B (source-shard rebalancing, dedicated coordinator)
+is a future follow-up ([#197](https://github.com/faucet-hq/faucet-stream/issues/197)).
+
+:::note[Use clustered serve when]
+you have more concurrent pipeline runs than one
+node can handle, or when you need resilience against single-node failure.
+Single-node deployments do **not** need `--cluster` — the default `faucet serve`
+already handles orphan recovery on restart via the existing lease mechanism.
+:::
+
+## Requirements
+
+### 1. Shared persistent SQL history backend
+
+All cluster instances must point `--history` at the **same** database:
+
+```bash
+faucet serve --cluster --history 'postgres://user:pw@db/faucet' \
+             --listen 0.0.0.0:8080
+
+# Second instance (same DB, different port / host)
+faucet serve --cluster --history 'postgres://user:pw@db/faucet' \
+             --listen 0.0.0.0:8081
+```
+
+Cluster mode is rejected if `--history` is omitted (in-memory store) or
+not a persistent SQL URL:
+
+```
+--cluster requires a persistent --history backend (postgres://… or sqlite:…); the in-memory store is single-process
+```
+
+Requires the matching SQL history feature:
+```bash
+cargo install faucet-cli --features "serve,serve-history-postgres"
+# or
+cargo install faucet-cli --features "serve,serve-history-sqlite"
+```
+
+### 2. Homogeneous deployment (shared env + secrets)
+
+When a run is submitted, the config is stored **verbatim** (with `${env:…}`,
+`${secret:…}`, `${vault:…}` directives unresolved) in the shared DB. The
+instance that **claims** the run re-resolves those directives with its own
+environment and credential chain at execution time.
+
+**This means every cluster instance must have the same env vars, secrets-manager
+access, and `--default-config` workspace defaults** — the same container image,
+the same `.env` file, the same IAM role, etc. An instance that cannot resolve a
+directive will fail the run with a config error rather than silently producing
+wrong results.
+
+### 3. Per-run secret template params need a vault key
+
+A template trigger can supply `secret: true` params — a per-tenant database
+password, a service-account key passed per run. The materialized config is
+persisted for the claiming member, so a clustered server seals those values:
+
+- every occurrence of a supplied secret value in the stored config is replaced
+  by a `${sealed:N}` token, so the run record, `GET /v1/runs/{id}`, logs and
+  audit never carry it;
+- the values are encrypted with AES-256-GCM under the vault key
+  (`--vault-key` / `FAUCET_VAULT_KEY`), bound to the run id, and stored apart
+  from the run record;
+- the member that claims the run opens them in memory, registers them for log
+  redaction and restores the config just before loading it;
+- they are deleted once the run is terminal (completed, failed or cancelled),
+  so retries and re-claims after a failover still find them, and a finished
+  run's stored config holds tokens only. Rolling back such a run therefore
+  needs `config` in the request.
+
+**Every member needs the same vault key.** A member without one (or with a
+different one) fails a claimed run with a `422`-class error naming the key; it
+never runs the tokens. To rotate, start every member with the new
+`--vault-key` and the old one as `--vault-previous-key` (or
+`FAUCET_VAULT_PREVIOUS_KEYS`) until every run sealed under the old key has
+finished. Without a vault key such triggers are refused with a `422` naming
+`--vault-key`. A trigger with `env` overrides, and one that needs an approved
+change request (`--require-approval run`), stay refused: the change request
+stores the config for its reviewers.
+
+An idempotent replay (same `idempotency_key`) answers with the original run
+and does not re-seal; the fingerprint is taken over the tokenized config, so
+the secret values themselves are not part of it.
+
+**With a vault key, the whole stored config is sealed too.** A pending run's
+config, whatever its origin (a submitted body with inline credentials, a
+template's materialized body), is written to the shared history encrypted
+under the vault key and bound to the run id; the member that claims it, a
+shard worker, `GET /v1/runs/{id}/config` and a rollback open it in memory.
+What stays in clear text in the run record: its name, labels, tenant, pool,
+selection, timestamps and error text (redacted where it is created). Without
+a vault key the stored config is kept as submitted, so keep credentials in
+`${env:}` / `${file:}` / secret-manager references, which stay references in
+the stored body and resolve on the member that runs it. A member of an older
+release cannot read a sealed config and fails the run: upgrade every member
+before setting a vault key on a running cluster.
+
+## Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--cluster` | (disabled) | Enable cluster mode. Requires a persistent `--history` backend. |
+| `--cluster-poll-secs` | `2` | How often (seconds) each instance polls for pending runs and propagates cross-instance cancels. Also the maximum cancel-propagation lag between instances. |
+| `--cluster-max-attempts` | `3` | Maximum number of times a run will be attempted across all instances. After `max-attempts` failures (including crash-failovers) the run is marked `failed` (poisoned). |
+| `--pool <name>` | `default` | An [execution pool](#execution-pools) this replica serves. Repeatable or comma-separated; also `FAUCET_SERVE_POOLS`. Without it the replica serves only `default`. |
+| `--pool-wait-timeout-secs` | (unset) | Fail a pending run whose pool no live member has served for this long (error `pool_unavailable`). Unset: such runs wait. Needs `--cluster`. |
+| `--lease-ttl-secs` | `30` | Run-ownership lease TTL. An instance heartbeats its own in-flight runs at ~⅓ of this interval. A run whose owner's lease expires is eligible for reclaim. Tune this above your worst-case GC/IO stall — a longer TTL is safer but increases the time before a dead node's runs are requeued. |
+
+## Run lifecycle in cluster mode
+
+Cluster mode adds one state before execution: **`pending`**. A run lives in
+`pending` in the shared DB until an instance claims it.
+
+```
+submit → pending → [claim] → running → completed
+                           ↘ failed
+                           ↘ cancelled
+```
+
+Step by step:
+
+1. **Submit** (`POST /v1/runs`) — any instance validates and interpolates the
+   config synchronously, writes the run as `pending` (raw config stored), and
+   kicks the local claim loop. Returns immediately with `status: pending`.
+2. **Claim** — the claim loop on each instance polls every `--cluster-poll-secs`
+   seconds. It atomically claims up to `available_capacity` pending runs
+   (Pending → Running, exclusive). Only one instance can claim a given run.
+3. **Execute** — the claiming instance re-resolves `${env:…}` / `${secret:…}`
+   directives with its own credentials, then runs the pipeline via the same
+   executor as `faucet run`. The run record is heartbeated (lease renewed) while
+   in flight.
+4. **Complete / fail** — the run is marked `completed` or `failed`. The attempt
+   count is incremented.
+5. **Failover** — if the owner's lease expires (the instance crashed or stopped
+   heartbeating), a survivor's next lease tick calls `reclaim_orphans`:
+   - If `attempt_count < --cluster-max-attempts` → requeued back to `pending`.
+   - If `attempt_count >= --cluster-max-attempts` → marked `failed` (poisoned).
+
+## Cross-instance cancel
+
+`POST /v1/runs/{id}/cancel` works correctly regardless of which instance receives
+the request:
+
+- **Pending run** (not yet claimed): the run is cancelled directly in the DB —
+  no coordination needed.
+- **Running on the same instance**: the local cancel token fires immediately;
+  flush-completing cancel behaviour (page boundary + sink flush) applies as
+  normal.
+- **Running on a peer instance**: the cancel flag is written to the DB. The
+  peer's claim loop picks it up on its next `pending_cancellations` poll (latency
+  ≈ `--cluster-poll-secs`, default 2 s) and fires the local cancel token.
+
+## Health check and metrics
+
+### `/readyz` body
+
+In cluster mode, `/readyz` returns a JSON body with the cluster section
+populated:
+
+```json
+{
+  "status": "ready",
+  "history_ok": true,
+  "queue_ok": true,
+  "draining": false,
+  "cluster": {
+    "enabled": true,
+    "instances": 3,
+    "pools": ["default"],
+    "members": [
+      { "instance_id": "8c1…", "listen": "10.0.1.4:8080", "pools": ["default"], "in_flight": 1, "max_concurrent": 4 },
+      { "instance_id": "f02…", "listen": "10.0.2.7:8080", "pools": ["private"], "in_flight": 0, "max_concurrent": 4 }
+    ]
+  }
+}
+```
+
+`pools` is what this replica serves; `members` lists every live member with
+its pools (`null` for a member running a release without execution pools).
+
+A member that received `SIGTERM` reports `"draining": true` (and `503`),
+refuses new submissions, and hands any run still unfinished at the end of its
+grace window back as `pending` for another member — a rolling deploy does not
+turn long runs into failures.
+
+`instances` is the count of live cluster members (those whose membership
+heartbeat has not yet expired). A single-instance deployment returns `1`;
+a node that loses its DB connection may report stale counts.
+
+### Prometheus metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `faucet_serve_cluster_enabled` | gauge | `1` if this instance started with `--cluster`, `0` otherwise. |
+| `faucet_serve_cluster_instances` | gauge | Count of live cluster members (from last membership heartbeat). Alert on `faucet_serve_cluster_instances < expected_count`. |
+| `faucet_serve_runs_claimed_total` | counter | Total runs claimed (transitioned from `pending` to `running`) by this instance. |
+| `faucet_serve_runs_reclaimed_total{outcome="requeued"}` | counter | Orphaned runs requeued by this instance after a peer's lease expired. |
+| `faucet_serve_runs_reclaimed_total{outcome="failed"}` | counter | Orphaned runs poisoned after reaching `--cluster-max-attempts`. |
+| `faucet_serve_runs_pending{pool}` | gauge | Unclaimed cluster runs per execution pool, from the shared history (every member reports the same value). |
+| `faucet_serve_runs_total{status="failed",reason="pool_unavailable"}` | counter | Runs failed by `--pool-wait-timeout-secs`. |
+
+Useful alert expressions:
+
+- `faucet_serve_cluster_instances < N` — fewer nodes alive than expected.
+- `increase(faucet_serve_runs_reclaimed_total{outcome="failed"}[5m]) > 0` — a
+  run was poisoned; investigate the per-run error.
+- `faucet_serve_history_unreachable == 1` — the history database did not
+  answer the last lease heartbeat; `/readyz` returns `503` until it does.
+  A clustered instance never falls back to memory, so submissions fail.
+  An instance that cannot renew its run and shard leases for two heartbeats
+  (two thirds of `--lease-ttl-secs`) cancels every run and shard it is
+  executing, before the leases expire, so a peer that reclaims them never runs
+  them at the same time. Those runs and shards are not cancelled for good: once
+  the database answers again, the instance hands each one back as `pending`
+  (unless a peer has already reclaimed it), and the cluster resumes it from its
+  bookmark, as after a clustered shutdown.
+
+## Delivery guarantees and double-run boundary
+
+### What is guaranteed
+
+- **Claim exclusivity:** at most one instance ever *starts* executing a given
+  `pending` run. The atomic SQL claim (`UPDATE … WHERE status = 'pending' LIMIT
+  N … RETURNING`) ensures two instances never both transition the same run to
+  `running`.
+- **Crash-failover is clean:** if an instance crashes after claiming a run but
+  before writing output, a survivor re-queues the run and a fresh instance
+  executes it from scratch. No partial results from the crashed run pollute the
+  destination (assuming the pipeline had not yet flushed a page to the sink).
+
+### What is NOT guaranteed without effectively-once delivery
+
+An instance that was **paused** (e.g. a long GC pause, network partition, heavy
+I/O stall) longer than `--lease-ttl-secs` may have its run stolen by a survivor
+while the original instance is still alive. The original instance is
+**owner-fenced** — it cannot update the run *record* after its lease expires —
+but any sink *writes* already issued before the fencing cannot be recalled.
+
+The survivor then re-runs the pipeline from the last persisted bookmark, which
+may overlap with writes the paused instance already made. This means a run can
+be **executed twice** (partial overlap) if the original instance was paused-not-crashed.
+
+**To fully close this window,** pair the pipeline with
+[effectively-once delivery](/faucet-stream/cookbook/state/#effectively-once-delivery): a CDC source
+(`postgres-cdc`, `mysql-cdc`, `mongodb-cdc`) plus an idempotent SQL or Iceberg
+sink. The sink's atomic commit token deduplicates replayed pages regardless of
+how many instances attempted them.
+
+:::note[Clustered runs are at-least-once]
+Both `--cluster` failover and Mode B
+shard reclaim can re-execute work, so an **append**-mode sink can end up with
+duplicate rows. When a run is submitted to a clustered or sharded server,
+faucet logs a warning recommending [`write_mode: upsert`](/faucet-stream/cookbook/upsert/) with a
+`key` so any replay is idempotent. The run still proceeds — the warning is a
+reminder, not a gate.
+:::
+
+**Practical sizing advice:** set `--lease-ttl-secs` comfortably above your
+worst-case GC/IO stall. A 30-second default is appropriate for most JVM-free
+workloads; bump to 60–120 s if you observe false-reclaim events in the metrics.
+
+## Two-instance example
+
+Terminal 1 (node A):
+
+```bash
+export FAUCET_SERVE_AUTH_TOKEN=s3cret
+faucet serve \
+  --cluster \
+  --history 'postgres://faucet:pw@db:5432/faucet' \
+  --listen 0.0.0.0:8080 \
+  --max-concurrent-runs 8
+```
+
+Terminal 2 (node B — same DB, different port/host):
+
+```bash
+export FAUCET_SERVE_AUTH_TOKEN=s3cret
+faucet serve \
+  --cluster \
+  --history 'postgres://faucet:pw@db:5432/faucet' \
+  --listen 0.0.0.0:8081 \
+  --max-concurrent-runs 8
+```
+
+Both instances now compete to claim submitted runs. Submit a run to either
+endpoint — whichever instance has capacity first will pick it up:
+
+```bash
+curl -XPOST http://node-a:8080/v1/runs \
+  -H "Authorization: Bearer s3cret" \
+  -H 'content-type: application/json' \
+  -d '{"config":"version: 1\npipeline:\n  source: {type: file, config: { path: in.csv }}\n  sink: {type: file, config: { path: out.jsonl }}\n","name":"my-pipeline"}'
+```
+
+Check cluster membership via `/readyz`:
+
+```bash
+curl http://node-a:8080/readyz | jq .cluster
+# { "enabled": true, "instances": 2 }
+```
+
+## Execution pools
+
+Some runs must execute on a particular placement: a source inside a private
+network needs replicas on private-subnet nodes, while public endpoints are
+cheaper to reach from public-subnet nodes (no NAT-gateway egress). Other
+placements work the same way: GPU or high-memory nodes, a data-residency
+region, a dedicated egress IP on an allowlist. **Execution pools** route each
+run to the replicas that can serve it, inside one cluster — one history
+database, one template registry, one catalog.
+
+- **A replica** serves the pools it is started with:
+  `faucet serve --cluster --pool private` (repeatable, or
+  `FAUCET_SERVE_POOLS=private,gpu`). Without `--pool` it serves `default`.
+- **A run** carries one pool, from the first of:
+  1. `pool` on the request — `POST /v1/runs`, `POST /v1/templates/{id}/runs`
+     (and tenant template runs and fan-out), `POST /v1/backfill`, a trigger's
+     `run.pool` (schedule triggers included), the MCP `run_pipeline` /
+     `run_template` / `propose_run` tools; a change request keeps the pool it
+     was proposed with;
+  2. `pool:` in the pipeline config, or in the source template a composed run
+     comes from;
+  3. `default`.
+- **Templates choose whether a run may change it.** A run of a registered
+  template that a caller or a tenant starts (`POST /v1/templates/{id}/runs`,
+  tenant template runs, MCP `run_template`) may ask for a pool other than the
+  template's own `pool:` only when the template sets `pool_override`: `true`
+  (any pool) or a list of pools. Without it (or with `false`, the default) the
+  request is a `422` naming `pool_override`. The server operator's own
+  triggers, schedules and fan-outs choose the pool freely, and a raw config a
+  caller submits names its own.
+
+  ```yaml
+  pool: private
+  pool_override: [private, gpu]
+  ```
+- **Claiming** — a replica claims only pending runs, and shards of sharded
+  runs, in its pools. Shards inherit their run's pool; a run re-queued after
+  its owner's lease expired, or released at shutdown, keeps its pool; an
+  idempotent replay returns the original run.
+- **Admission** — a submission to a pool that no live member serves is
+  refused with `422` naming the pool, so nothing queues forever. A
+  non-clustered server serves only its own pools and refuses any other with
+  `422`.
+
+```yaml
+version: 1
+name: invoices_from_private_db
+pool: private
+pipeline:
+  source:
+    type: postgres
+    config:
+      connection_url: postgres://faucet@10.20.0.5:5432/app
+      query: SELECT id, account_id, amount, updated_at FROM invoices
+  sink:
+    type: file
+    config:
+      path: ./out/invoices.jsonl
+```
+
+```bash
+curl -X POST localhost:8080/v1/runs -H 'content-type: application/json' \
+  -d '{"config": "…", "pool": "gpu"}'
+# {"error": {"message": "no live cluster member serves pool `gpu` (live members serve: default, private); start a replica with `--pool gpu`"}}
+```
+
+**When a pool's last replica goes away** its pending runs stay pending — they
+are never claimed by another pool. `faucet_serve_runs_pending{pool}` keeps
+rising and the shipped `FaucetServePoolStarved` alert fires after 15 minutes.
+Start a replica of the pool and the runs are claimed; or set
+`--pool-wait-timeout-secs` so any member fails them (error
+`pool_unavailable: …`, metric reason `pool_unavailable`, completion callback
+fired) once no live member has served the pool for that long.
+
+**Rolling upgrades** — a member running a release without execution pools
+claims any pending run, whatever its pool. Every member advertises its pools
+in the `faucet_serve_instance_caps` row it heartbeats; while a member that
+advertises none is live, a submission to a pool other than `default` is
+refused with `422` naming that member, and runs in `default` behave as
+before. Finish upgrading every replica, then use pools. Runs recorded before
+the upgrade belong to `default`. Do not roll a replica back below the
+execution-pools release while runs in other pools are pending.
+
+## Kubernetes / Helm deployment
+
+Deploy N replicas behind a Service; all replicas share the same `--history`
+connection string and the same environment (ConfigMap + Secret). The Service
+load-balances submissions across replicas; each replica independently claims
+from the shared DB.
+
+With the Helm chart, `serve.cluster.pools` renders a `--pool` per entry and
+`serve.cluster.poolWaitTimeoutSecs` the timeout. To put pools on different
+node groups, install one release per group, each with its own
+`serve.nodeSelector` / `tolerations` and `serve.cluster.pools`, all pointing at
+the same postgres history Secret and auth Secret:
+
+```bash
+helm install faucet-private deploy/helm/faucet-stream -f deploy/helm/faucet-stream/examples/pools-private.yaml
+helm install faucet-public  deploy/helm/faucet-stream -f deploy/helm/faucet-stream/examples/pools-public.yaml
+```
+
+The two releases form one cluster: submit to either Service.
+
+## Distributing one big source across workers (Mode B)
+
+Everything above is **Mode A**: whole *runs* pull-balance across instances, but a
+single large source still runs entirely on one worker. **Mode B** splits *one
+source* into shards that different workers process concurrently, so a single
+logical pipeline over a huge table or object prefix scales horizontally.
+
+### Enabling it
+
+Add a top-level `shard:` block to the submitted config and run the cluster as
+usual (Mode B requires `--cluster` + a SQL history backend — it builds on the
+same lease/claim machinery):
+
+```yaml
+version: 1
+name: big-table-mirror
+shard:
+  count: 8            # split the source into ~8 shards
+pipeline:
+  source:
+    type: postgres
+    config:
+      connection_url: ${env:PG_URL}
+      query: "SELECT * FROM events"
+      shard: { key: id }   # integer column to range-partition on
+  sink:
+    type: postgres
+    config:
+      connection_url: ${env:WAREHOUSE_URL}
+      table_name: events
+      column_mapping: auto_map
+      write_mode: upsert
+      key: [id]
+  state: { type: postgres, config: { connection_url: ${env:PG_URL} } }
+```
+
+`shard.count` is at most 4096; a larger value is refused when the config is
+loaded (`faucet validate` reports it too), and every planner caps its shard
+list there.
+
+When a sharded run is submitted, the instance that claims it acts as an
+(ephemeral) **coordinator**: it enumerates the shards and inserts them into the
+shared `faucet_serve_shards` table (idempotently — no leader election). Every
+instance's claim loop then pulls shard rows up to its free capacity, narrows its
+source to that shard, and runs it. The parent run is marked `sharded` and is
+finalized to `completed`/`failed` once every shard is terminal.
+
+### Shardable sources
+
+| Source | Strategy | How to enable |
+|--------|----------|---------------|
+| `postgres` | primary-key range (`WHERE key >= lo AND key < hi`) | `source.config.shard: { key: <int column> }` |
+| `mysql` | primary-key range | `source.config.shard: { key: <int column> }` |
+| `mssql` | primary-key range | `source.config.shard: { key: <int column> }` |
+| `sqlite` | primary-key range | `source.config.shard: { key: <int column> }` |
+| `s3` | hash-of-object-key modulo N | automatic (no config) |
+| `gcs` | hash-of-object-key modulo N | automatic (no config) |
+| `parquet` | hash-of-file-path modulo N | automatic (no config) |
+| `file` | hash-of-file-path modulo N (local paths; a single `http(s)://` file is one shard) | automatic (no config) |
+| `kafka` | native consumer-group membership | automatic (no config) |
+
+:::caution[NULL shard keys are not dropped]
+Rows whose `shard` key column is `NULL`
+fall outside every range predicate, so the SQL sharders assign them to
+exactly one shard (alongside its range) — they are mirrored once, never
+silently lost.
+:::
+
+PK-range notes: the shard `key` must be an integer-typed column present in the
+query's output. On `mssql`, a sharded query must not end in a top-level
+`ORDER BY` (T-SQL forbids it inside the derived table the shard predicate
+wraps — and ordering across concurrent shards is meaningless anyway). Sharding
+a `sqlite` source across workers requires every worker to reach the same
+database file (e.g. a shared volume). On `mssql` with incremental replication,
+shard bounds are computed over the not-yet-synced slice (the `@bookmark`
+binding is honoured during enumeration).
+
+A non-shardable source (or a matrix pipeline) ignores `shard:` and runs whole — Mode B is fully backward compatible.
+
+### Kafka: native consumer-group sharding
+
+Kafka already solves work distribution inside the broker, so the `kafka`
+source does not enumerate data slices like the sharders above
+([#261](https://github.com/faucet-hq/faucet-stream/issues/261)). Each shard
+is a **membership slot**: `shard.count: N` makes N workers each run one more
+consumer with the pipeline's `group_id`, and Kafka's consumer-group protocol
+assigns the topic's partitions across them — killing a worker triggers a
+broker-side rebalance onto the survivors immediately (well before the shard
+lease even expires), and the reclaimed membership slot simply rejoins the
+group on another worker.
+
+```yaml
+version: 1
+name: orders-fanin
+shard:
+  count: 4            # four cooperating members of the consumer group
+pipeline:
+  source:
+    type: kafka
+    config:
+      brokers: broker-1:9092,broker-2:9092
+      topics: [orders]
+      group_id: faucet-orders     # ALL members share this group
+      idle_timeout: 60
+  sink:
+    type: postgres
+    config:
+      connection_url: ${env:WAREHOUSE_URL}
+      table_name: orders
+      column_mapping: auto_map
+      write_mode: upsert
+      key: [id]
+  state: { type: postgres, config: { connection_url: ${env:STATE_URL} } }
+```
+
+How it differs from the other sharders:
+
+- **The broker decides the split.** Which member consumes which partition is
+  Kafka's choice, not faucet's; the member count is capped at the
+  subscription's total partition count (an extra member would sit idle).
+- **Offset continuity is Kafka-managed.** In member mode each consumer
+  *commits offsets to the group* at durable page boundaries (after the sink
+  confirmed the page and its bookmark persisted; plus a synchronous commit at
+  stream end). A partition that migrates to another member — rebalance,
+  worker death, shard reclaim — resumes from the last committed (= durable)
+  position instead of `auto.offset.reset`. The per-shard state-store bookmark
+  remains the safety net for the tiny durable-write→commit crash window: a
+  member seeks to its bookmark only when it is *ahead* of the committed
+  offset, never behind.
+- **The boundary is at-least-once on membership change.** A crash between a
+  durable page and its commit makes the partition's next owner re-read that
+  page. Pair with `write_mode: upsert` or an idempotent destination, as with
+  every clustered run.
+- **Termination:** each member stops on its own `idle_timeout` /
+  `max_messages` (`max_messages` is per member — N members consume up to N ×
+  `max_messages` in total). `idle_timeout` is the natural terminator for
+  shared consumption; a non-cluster Kafka run is completely unchanged.
+
+### Per-shard resume and rebalancing
+
+- **Per-shard bookmarks:** each shard has its own state key (`{run}::{shard}`),
+  so a reassigned shard resumes where its dead owner left off, independent of its
+  siblings.
+- **No incremental replication on key-range shards:** the ranges of a
+  `postgres` / `mysql` / `mssql` / `sqlite` source are re-planned from the
+  current `MIN`/`MAX` every run, so a key range can move to a shard whose cursor
+  bookmark is already past a late row. `faucet serve --cluster` refuses a
+  `shard: { count: 2+ }` run with `replication: { type: incremental }` on those
+  sources while a `state:` block is set (`422`).
+- **No shared file destination:** every shard of a row runs at once with the
+  same sink config, so a file or object sink would have several writers
+  clobbering each other's files; such a sharded run is refused too. Write to a
+  database or keyed sink instead.
+- **No watermark exactly-once:** each shard keeps its own commit watermark,
+  and which records a shard reads can change between runs (the broker assigns
+  a Kafka slot its partitions; key ranges are re-planned), so a shard can
+  re-read records another shard already committed. A sharded
+  `delivery: exactly_once` run is refused unless its sink writes by key
+  (`write_mode: upsert` / `delete` with a `key`), where a re-written record
+  converges.
+- `faucet run`, `validate` and `schedule` ignore `shard:` (the config runs as
+  one unsharded invocation), so there these cases only log a warning.
+- **Rebalancing:** a shard whose owning instance's lease expires is reclaimed by
+  the lease loop — requeued to another worker, or poisoned (failed) past
+  `--cluster-max-attempts`. New members pick up unassigned/reclaimed shards on
+  their next claim tick.
+- **Correctness boundary:** the same paused-not-crashed double-processing window
+  as Mode A applies per shard. Pair with `write_mode: upsert` so a reassigned
+  shard's overlap is idempotent — as in the example above.
+
+Mode B metrics: `faucet_serve_shards_claimed_total`,
+`faucet_serve_shards_reclaimed_total{outcome}`.
+
+## Rolling upgrades and stored state
+
+Members share one state store, so during a rolling upgrade an old and a new
+member can resume the same pipeline. Every member advertises the newest state
+format it reads (the `faucet_serve_instance_caps` table, written with each
+heartbeat); while a live member predates versioned state (#736), the others
+write bookmarks bare so it can still read them, and refuse to run a pipeline
+whose source bookmark shape is past schema 0. When the last old member stops
+heartbeating, the versioned envelope is written again — nothing to configure.
+See [Upgrading faucet safely](/faucet-stream/operations/upgrading/).
+
+## Related pages
+
+- [Running faucet as a service](/faucet-stream/cookbook/serve/) — `faucet serve` fundamentals,
+  security model, idempotency, concurrency, and the orphan-recovery lease
+  mechanism that cluster mode extends.
+- [Incremental replication and effectively-once delivery](/faucet-stream/cookbook/state/) — use a CDC
+  source + idempotent sink to close the double-run window.
+- [Observability](/faucet-stream/operations/observability/) — all `faucet_serve_*` metrics.

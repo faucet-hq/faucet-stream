@@ -56,7 +56,7 @@ config written for a newer faucet can fail or be misread on an older one.
    If the checksum or the attestation does not verify, stop and tell the user.
 6. With no pin at all, install the latest release the same way (the archive
    and its `.sha256` from `releases/latest/download/`) and pin it as described in
-   [Pinning the faucet version](https://faucet-hq.github.io/faucet-stream/operations/pinning.html).
+   [Pinning the faucet version](https://faucet-hq.github.io/faucet-stream/operations/pinning/).
 
 Every version-specific fact (which connectors and blocks exist, config keys,
 types, defaults, commands and flags) comes from that binary: `faucet list`,
@@ -85,18 +85,18 @@ binary predates it, so leave it out.
 
 Read these pages for the current behaviour; do not rely on memory:
 
-- [What is and isn't stored](https://faucet-hq.github.io/faucet-stream/cookbook/templates.html#what-is-and-isnt-stored):
+- [What is and isn't stored](https://faucet-hq.github.io/faucet-stream/cookbook/templates/#what-is-and-isnt-stored):
   a registered body is stored verbatim, references stay unresolved, a
   non-secret param value is stored with the run and echoed in the trigger
   response, a `secret: true` value is redacted and never persisted on a
   single node.
-- [Per-run secret template params need a vault key](https://faucet-hq.github.io/faucet-stream/cookbook/cluster.html#3-per-run-secret-template-params-need-a-vault-key):
+- [Per-run secret template params need a vault key](https://faucet-hq.github.io/faucet-stream/cookbook/cluster/#3-per-run-secret-template-params-need-a-vault-key):
   how a clustered server seals `secret: true` values, and what it refuses.
-- [Secrets managers](https://faucet-hq.github.io/faucet-stream/cookbook/secrets.html)
+- [Secrets managers](https://faucet-hq.github.io/faucet-stream/cookbook/secrets/)
   and its
-  [redaction boundary](https://faucet-hq.github.io/faucet-stream/cookbook/secrets.html#redaction-guarantee-and-its-boundary):
+  [redaction boundary](https://faucet-hq.github.io/faucet-stream/cookbook/secrets/#redaction-guarantee-and-its-boundary):
   which output faucet scrubs and which it cannot.
-- [Server credentials](https://faucet-hq.github.io/faucet-stream/reference/http-api.html#server-credentials):
+- [Server credentials](https://faucet-hq.github.io/faucet-stream/reference/http-api/#server-credentials):
   a submitted config may not read the server's own secrets.
 
 The rule of thumb: only a **non-secret param** value ends up in plain text in
@@ -111,7 +111,7 @@ run time or a redacted value.
 | A credential per run or per customer, single-node server | A `secret: true` template param |
 | A credential per run or per customer, clustered server | A `secret: true` template param, with the same `--vault-key` on every member; see the cluster page above for sealing and key rotation |
 | The same, clustered, no vault key | Refused with a `422` naming the key. Configure the key, or reference the credential from the body, or use a non-clustered server |
-| A customer's long-lived connection (OAuth refresh token, database login) on a multi-tenant server | A sealed tenant connection, referenced by the run's `auth: { ref }` ([Connections](https://faucet-hq.github.io/faucet-stream/cookbook/embedded-integrations.html#connections)) |
+| A customer's long-lived connection (OAuth refresh token, database login) on a multi-tenant server | A sealed tenant connection, referenced by the run's `auth: { ref }` ([Connections](https://faucet-hq.github.io/faucet-stream/cookbook/embedded-integrations/#connections)) |
 
 Confirm the flags and param fields on the binary: `faucet serve --help`,
 `faucet schema params`. Never work around a refusal by renaming a secret

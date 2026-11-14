@@ -175,7 +175,7 @@ link an Excel reader. Format composes with `compression`.
 chunked into pages — a workbook is a zip container whose directory sits at the
 end, and an XML document is a tree. `csv` and `xml` are text formats: every
 value comes back a string. See the
-[file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats.html).
+[file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats/).
 
 ## Avro and ORC (#719)
 
@@ -204,7 +204,7 @@ Both decode straight to Arrow, so with the `arrow` feature they take the
 columnar path (`avro → parquet` never builds JSON rows). Enable with
 `file-format-avro` / `file-format-orc` (ORC turns on `arrow`), or with
 `file-formats`. Details: the
-[file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats.html#avro).
+[file-formats cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/file-formats/#avro).
 
 ## Examples
 
@@ -452,16 +452,16 @@ Enable the connector itself in the CLI/umbrella via the `source-gcs` feature.
 
 ## See also
 
-- [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) — the full source/sink capability matrix.
-- [Authentication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/auth.html) — shared auth providers and the `{type, config}` shape.
-- [Compression cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/compression.html) — gzip/zstd across file connectors.
+- [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors/) — the full source/sink capability matrix.
+- [Authentication cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/auth/) — shared auth providers and the `{type, config}` shape.
+- [Compression cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/compression/) — gzip/zstd across file connectors.
 - [`faucet-sink-gcs`](https://crates.io/crates/faucet-sink-gcs) — the matching GCS sink.
 - [`faucet-source-s3`](https://crates.io/crates/faucet-source-s3) — the AWS S3 equivalent with the same format semantics.
 - [`faucet-common-gcs`](https://crates.io/crates/faucet-common-gcs) — the shared credentials enum and client builders.
 
 ## Sharded execution (cluster Mode B)
 
-Under [`faucet serve --cluster`](https://faucet-hq.github.io/faucet-stream/cookbook/cluster.html),
+Under [`faucet serve --cluster`](https://faucet-hq.github.io/faucet-stream/cookbook/cluster/),
 a top-level `shard: { count: N }` block splits this source across cluster
 workers **automatically — no connector config needed**. Each worker reads the
 objects whose key hashes to its shard index (stable FNV-1a modulo `count`),
@@ -498,7 +498,7 @@ per ranged read) and metadata read (`head`) is reported to faucet's usage
 meter as a source round trip. Reads and metadata reads are priced as GCS
 class-B requests (`usage.pricing.object_storage.read_per_1k_requests`), a
 listing as class A (`write_per_1k_requests`); see the
-[usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage.html).
+[usage cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/usage/).
 
 ## Capabilities
 

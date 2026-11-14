@@ -256,7 +256,7 @@ In addition to the default append, the sink can **upsert** (insert-or-update by 
 
 A row missing or null in a key column fails with a clear `mssql upsert: …` error. With a `dlq:` block configured, the good rows still apply (upserts + deletes) and only the missing/null-key rows are routed to the DLQ per-row; without a DLQ the whole batch fails. Upserts and deletes for a batch always run inside a single `BEGIN TRAN` / `COMMIT TRAN`, applied in page order (a run of upserts, then the following run of deletes, and so on), so a delete followed by an upsert of a key equal under the column collation (`'Bob'` / `'bob'` with a `_CI_` collation) leaves the row in place. Two upserts (or deletes) whose keys are equal only under such a collation go to separate `MERGE`s in page order, so one `MERGE` never matches a row twice (error 8672) and the later record wins.
 
-See the [upsert cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html) for the full write-mode model.
+See the [upsert cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert/) for the full write-mode model.
 
 ## Dead-letter queue (partial failures)
 
@@ -295,7 +295,7 @@ pipeline:
 delivery: exactly_once
 ```
 
-See the [effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state.html#effectively-once-delivery) for the full rationale and supported source/sink set.
+See the [effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state/#effectively-once-delivery) for the full rationale and supported source/sink set.
 
 ## Schema evolution
 
@@ -307,7 +307,7 @@ Under `on_drift: evolve`, `MssqlSink::evolve_schema()` applies additive DDL:
 - **Lossless widenings** (e.g. integer → number) → `ALTER COLUMN` to the wider type — gated on `allow_type_widening`. An integer column that starts receiving fractions becomes `DECIMAL(38,10)` (exact for every `BIGINT` and for values up to 28 integer and 10 fractional digits — precision is capped at 38, so the server rounds a later value with more fractional digits; declare the column with the scale the data needs to keep more; `FLOAT` would round stored values above 2^53), and the statement re-states the column's current `NULL` / `NOT NULL` so the session's `ANSI_NULL_DFLT` setting cannot flip it.
 - **Nullability relaxations** → `ALTER COLUMN … NULL`. MSSQL's `ALTER COLUMN` requires the full type spec, so the column's exact declared type is re-stated from `sys.columns` — length, precision, scale and collation (`DECIMAL(38,10)`, `DATETIME2(3)`, `VARCHAR(20) COLLATE …`) — and only its nullability changes. A column whose type cannot be re-stated (CLR types) fails the evolution instead of being rewritten.
 
-After an evolution the cached AutoColumns set is dropped so the next write re-discovers any newly-added column. Incompatible changes (narrowing / type swaps) are never auto-applied — they are routed by `on_incompatible` (`fail` or `quarantine`). See the [schema-drift cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift.html).
+After an evolution the cached AutoColumns set is dropped so the next write re-discovers any newly-added column. Incompatible changes (narrowing / type swaps) are never auto-applied — they are routed by `on_incompatible` (`fail` or `quarantine`). See the [schema-drift cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/schema-drift/).
 
 ## Config loading & schema
 
@@ -385,10 +385,10 @@ This crate has no optional Cargo features of its own; enable it in the CLI / umb
 
 ## See also
 
-- [Sinks reference & capability matrix](https://faucet-hq.github.io/faucet-stream/reference/connectors.html)
-- [Upsert / write modes cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert.html)
-- [State & effectively-once cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state.html)
-- [Dead-letter queue cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html)
+- [Sinks reference & capability matrix](https://faucet-hq.github.io/faucet-stream/reference/connectors/)
+- [Upsert / write modes cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/upsert/)
+- [State & effectively-once cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/state/)
+- [Dead-letter queue cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/)
 - [`faucet-common-mssql`](https://crates.io/crates/faucet-common-mssql) — shared connection/TLS config
 - [`faucet-source-mssql`](https://crates.io/crates/faucet-source-mssql) — the matching SQL Server source
 - [`faucet-sink-postgres`](https://crates.io/crates/faucet-sink-postgres) · [`faucet-sink-mysql`](https://crates.io/crates/faucet-sink-mysql) · [`faucet-sink-sqlite`](https://crates.io/crates/faucet-sink-sqlite) — sibling SQL sinks
@@ -412,7 +412,7 @@ Concurrent first writes are safe (#828): when two writers create the same table
 
 ## Declared column types
 
-When the run's source declares its column types (a SQL query source, #955 — see [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types)), a table this sink creates types each declared column from the declaration instead of from the first page: `BIGINT`, `FLOAT`, `BIT`, `DECIMAL(p,s)` (up to 38 digits; wider or unbounded stays `NVARCHAR(MAX)`), `DATE`, `TIME(7)`, `DATETIMEOFFSET(7)` / `DATETIME2(7)`, `UNIQUEIDENTIFIER` — in `auto_columns` mode. A declared column whose first-page values do not fit its type keeps the inferred type; an existing table is never retyped. With a complete declaration a run that writes nothing creates the empty, typed table.
+When the run's source declares its column types (a SQL query source, #955 — see [Declared column types](../../../docs/site/src/content/docs/reference/value-fidelity.md#declared-column-types)), a table this sink creates types each declared column from the declaration instead of from the first page: `BIGINT`, `FLOAT`, `BIT`, `DECIMAL(p,s)` (up to 38 digits; wider or unbounded stays `NVARCHAR(MAX)`), `DATE`, `TIME(7)`, `DATETIMEOFFSET(7)` / `DATETIME2(7)`, `UNIQUEIDENTIFIER` — in `auto_columns` mode. A declared column whose first-page values do not fit its type keeps the inferred type; an existing table is never retyped. With a complete declaration a run that writes nothing creates the empty, typed table.
 
 ## Batch atomicity
 
@@ -420,7 +420,7 @@ What a failed write leaves behind (#737): **atomic** for `write_mode: upsert|del
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See
-[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq.html#batch-atomicity-and-dlq_all).
+[batch atomicity](https://faucet-hq.github.io/faucet-stream/cookbook/dlq/#batch-atomicity-and-dlq_all).
 
 ## Capabilities
 
@@ -495,4 +495,4 @@ A non-integer JSON number is bound as its shortest decimal text (`0.1`), which
 SQL Server parses exactly into a `DECIMAL` / `NUMERIC` / `MONEY` (or a float
 column); a bound `float` would be converted from binary and land as
 `0.10000000000000001`. Exact decimals from a source arrive as strings and are
-bound as text. See [value fidelity](https://faucet-hq.github.io/faucet-stream/reference/value-fidelity.html).
+bound as text. See [value fidelity](https://faucet-hq.github.io/faucet-stream/reference/value-fidelity/).

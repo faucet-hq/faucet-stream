@@ -15,7 +15,7 @@ Built on [`sqlx`](https://crates.io/crates/sqlx) with a reusable connection pool
 - **Connection pooling** — a `PgPoolOptions` pool sized by `max_connections` is built once in `new()` and reused for every fetch.
 - **Type-aware row decoding** — integers, floats, booleans, `text`, `json`/`jsonb`, `timestamp(tz)`, `date`/`time`, `uuid`, `numeric`/`decimal`, and `bytea` are each converted to the right JSON shape (full numeric precision preserved as strings; binary base64-encoded); every other type arrives as its text output, never as a silent `null`.
 - **Positional bind parameters** — `params` from config are bound as native scalar types (`$1`, `$2`, …), so a numeric or boolean bind compares correctly against a typed column instead of being coerced to `jsonb`.
-- **Matrix-context binding** — `${parent.path}` tokens in the query are rewritten to additional positional bind markers and filled per parent record, so the same query template runs once per row produced by a parent in a [matrix](https://faucet-hq.github.io/faucet-stream/reference/config.html) pipeline.
+- **Matrix-context binding** — `${parent.path}` tokens in the query are rewritten to additional positional bind markers and filled per parent record, so the same query template runs once per row produced by a parent in a [matrix](https://faucet-hq.github.io/faucet-stream/reference/config/) pipeline.
 - **Incremental replication** — `replication: { type: incremental, column, initial_value }` reads only rows changed since the stored bookmark, in cursor order, without skipping rows that share a cursor value; a crash replays at most one page (see [Incremental replication](#incremental-replication)).
 - **Credential redaction** — the connection URL is masked in `Debug` output and stripped from the emitted lineage dataset URI.
 
@@ -172,7 +172,7 @@ With `replication: { type: full }` (the default) every page carries `bookmark: N
 
 ## Incremental replication
 
-`replication: { type: incremental }` reads only the rows that changed since the last run. The bookmark lives in the pipeline's [state store](https://faucet-hq.github.io/faucet-stream/cookbook/state.html), so pair it with a durable `state:` block (`file`, `redis` or `postgres`).
+`replication: { type: incremental }` reads only the rows that changed since the last run. The bookmark lives in the pipeline's [state store](https://faucet-hq.github.io/faucet-stream/cookbook/state/), so pair it with a durable `state:` block (`file`, `redis` or `postgres`).
 
 ```yaml
 pipeline:
@@ -252,7 +252,7 @@ so one column would be lost. Alias them (`o.id AS order_id, c.id AS customer_id`
 
 ## Matrix-context binding
 
-In a parent/child [matrix](https://faucet-hq.github.io/faucet-stream/reference/config.html) pipeline, the query may reference fields from each parent record with `${parent_id.dotted.path}` tokens. At runtime these are rewritten to additional positional bind markers (appended after the static `params`) and filled per parent record, so a single query template fans out into one parameterized execution per parent row — never string-interpolated, so it is SQL-injection safe. A token may also be a whole quoted literal (`'${parent.name}'` binds the same way); a token embedded in a longer literal (`'x-${parent.id}'`), inside a quoted identifier or inside a comment cannot be bound and is refused when the config loads.
+In a parent/child [matrix](https://faucet-hq.github.io/faucet-stream/reference/config/) pipeline, the query may reference fields from each parent record with `${parent_id.dotted.path}` tokens. At runtime these are rewritten to additional positional bind markers (appended after the static `params`) and filled per parent record, so a single query template fans out into one parameterized execution per parent row — never string-interpolated, so it is SQL-injection safe. A token may also be a whole quoted literal (`'${parent.name}'` binds the same way); a token embedded in a longer literal (`'x-${parent.id}'`), inside a quoted identifier or inside a comment cannot be bound and is refused when the config loads.
 
 ```yaml
 matrix:
@@ -365,7 +365,7 @@ This crate has no optional features of its own. Enable it in the CLI or umbrella
 
 ## See also
 
-- [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors.html) · [Choosing a connector](https://faucet-hq.github.io/faucet-stream/reference/choosing.html)
+- [Connector reference](https://faucet-hq.github.io/faucet-stream/reference/connectors/) · [Choosing a connector](https://faucet-hq.github.io/faucet-stream/reference/choosing/)
 - [`faucet-source-postgres-cdc`](https://crates.io/crates/faucet-source-postgres-cdc) — resumable change data capture via logical replication
 - [`faucet-sink-postgres`](https://crates.io/crates/faucet-sink-postgres) — the PostgreSQL sink (insert / upsert / delete)
 - [`faucet-source-mysql`](https://crates.io/crates/faucet-source-mysql) · [`faucet-source-sqlite`](https://crates.io/crates/faucet-source-sqlite) · [`faucet-source-mssql`](https://crates.io/crates/faucet-source-mssql)
@@ -374,7 +374,7 @@ This crate has no optional features of its own. Enable it in the CLI or umbrella
 
 Key ranges are re-planned every run, so `shard:` cannot be combined with incremental replication (`faucet validate` refuses it when a `state:` block is set): a range could move to a shard whose cursor is already past a late row.
 
-Under [`faucet serve --cluster`](https://faucet-hq.github.io/faucet-stream/cookbook/cluster.html),
+Under [`faucet serve --cluster`](https://faucet-hq.github.io/faucet-stream/cookbook/cluster/),
 a top-level `shard: { count: N }` block splits this source into contiguous
 primary-key ranges that different cluster workers process concurrently. Opt in
 by naming an integer-typed key column:
@@ -439,8 +439,8 @@ computed by one aggregate query over the range-wrapped `query`. Algorithm id
 `postgres:md5-60-sum:v1`; two digests compare only when both sides report the same id, so a
 pair of these sources verifies without shipping any rows for the ranges that
 match (other pairings stream and hash client-side). See the [verification
-cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/verify.html).
+cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/verify/).
 
 ## Declared column types
 
-The source declares the query's columns and their types (`Source::declared_columns`, #955) from the describe its read makes, so a sink that creates its table types it from the source rather than from the first page's JSON values. See [Declared column types](../../../docs/book/src/reference/value-fidelity.md#declared-column-types).
+The source declares the query's columns and their types (`Source::declared_columns`, #955) from the describe its read makes, so a sink that creates its table types it from the source rather than from the first page's JSON values. See [Declared column types](../../../docs/site/src/content/docs/reference/value-fidelity.md#declared-column-types).

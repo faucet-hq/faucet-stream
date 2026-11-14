@@ -227,7 +227,7 @@ def main():
             "\nRun faucet_conformance::fidelity's corpus for the connector (a pair in "
             "crates/interop-tests/tests/, a one-sided test in the crate's tests/, or its "
             f"converter in a #[cfg(test)] module), or list the reason it cannot in {EXEMPT}. "
-            "See docs/book/src/reference/value-fidelity.md."
+            "See docs/site/src/content/docs/reference/value-fidelity.md."
         )
         return 1
     print("fidelity coverage: every connector runs the value-fidelity corpus")

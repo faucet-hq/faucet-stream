@@ -39,7 +39,7 @@ release archives:
 
 `faucet init` writes both. Container deployments pin the image tag
 (`ghcr.io/faucet-hq/faucet-stream:<version>`). See
-[Pinning the faucet version](https://faucet-hq.github.io/faucet-stream/operations/pinning.html).
+[Pinning the faucet version](https://faucet-hq.github.io/faucet-stream/operations/pinning/).
 
 ### Agent skills
 
@@ -47,7 +47,7 @@ The faucet agent skills (pipelines, debug, deploy, migrate, templates,
 connector) ship in this repository and are versioned with this crate. In
 Claude Code: `/plugin marketplace add faucet-hq/faucet-stream`, then
 `/plugin install faucet@faucet`; other agents:
-[Agent skills](https://faucet-hq.github.io/faucet-stream/getting-started/agent-skills.html).
+[Agent skills](https://faucet-hq.github.io/faucet-stream/getting-started/agent-skills/).
 
 ## Commands
 
@@ -166,7 +166,7 @@ tests:
       # match: subset                             # expected records name only the fields they assert
 ```
 
-Failures print a structured path diff (`records[0].amount: expected 9.5, got 3.0`); the **exit code** is the failed-case count clamped to 255. The `schema:` (drift) block is inert offline; referenced configs load without contacting secrets managers (pass `--resolve-secrets` to opt in). A runnable example lives in [`examples/tests/`](examples/tests/); the [testing cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/testing.html) has the full walkthrough and CI recipe.
+Failures print a structured path diff (`records[0].amount: expected 9.5, got 3.0`); the **exit code** is the failed-case count clamped to 255. The `schema:` (drift) block is inert offline; referenced configs load without contacting secrets managers (pass `--resolve-secrets` to opt in). A runnable example lives in [`examples/tests/`](examples/tests/); the [testing cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/testing/) has the full walkthrough and CI recipe.
 
 Flags:
 
@@ -341,7 +341,7 @@ Auth is mandatory: without `--auth-token`/`FAUCET_SERVE_AUTH_TOKEN` **and** with
 | `--allowed-host <host>` | A host name clients reach the server by (repeatable or comma-separated; `*` for any; env `FAUCET_SERVE_ALLOWED_HOSTS`). Set, any other `Host` gets `403`. Unset, only a `--no-auth` server on loopback checks `Host` (allowing `localhost`, `127.0.0.1`, `[::1]` and its listen address). Health and metrics probes are exempt. |
 | `--allowed-origin <origin>` | A browser origin (`https://app.example`) that may send `POST`/`PUT`/`PATCH`/`DELETE` besides the server's own and the `--cors-origin` list (repeatable; env `FAUCET_SERVE_ALLOWED_ORIGINS`). A state-changing request with any other `Origin` gets `403`. |
 | `--lease-ttl-secs <n>` | Run-ownership lease TTL (default `30`). Set above your worst-case GC/IO stall to avoid false-reclaim of paused instances. |
-| `--cluster` | Enable clustered execution: all instances sharing the same `--history` DB pull-balance `pending` runs and provide crash-failover. Requires a persistent `--history` backend. See the [cluster cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/cluster.html). |
+| `--cluster` | Enable clustered execution: all instances sharing the same `--history` DB pull-balance `pending` runs and provide crash-failover. Requires a persistent `--history` backend. See the [cluster cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/cluster/). |
 | `--cluster-poll-secs <n>` | Claim-loop poll interval in seconds (default `2`). Also the maximum cross-instance cancel propagation lag. |
 | `--cluster-max-attempts <n>` | Maximum attempts per run (including crash-failovers) before it is poisoned as `failed` (default `3`). |
 | `--pool <name>` | Execution pool this replica serves (repeatable, comma-separated, or `FAUCET_SERVE_POOLS`; default `default`). A run's pool is its request's `pool`, else its config's `pool:`, else `default`; only replicas serving it claim it, and a pool nobody serves is a `422`. |
@@ -374,7 +374,7 @@ idempotency key, so replicas start one run per tick. Tenants can own schedules
 within `max_schedules` and `--tenant-schedule-min-interval-secs`;
 `--require-approval schedule` gates changes. `faucet schema schedules` prints
 the file schema. See the
-[schedules cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/schedules.html)
+[schedules cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/schedules/)
 and `cli/examples/schedules/schedules.yaml`.
 
 #### Event-driven triggers (`--triggers`)
@@ -437,8 +437,8 @@ Each trigger emits `faucet_serve_triggers_fired_total{trigger,type}`,
 `faucet_serve_trigger_healthy{trigger,type}`, and related Prometheus metrics.
 `GET /readyz` includes a `triggers` array showing per-watcher health.
 
-See the [triggers cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/triggers.html)
-for detailed walkthroughs and the [triggers reference](https://faucet-hq.github.io/faucet-stream/reference/triggers.html)
+See the [triggers cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/triggers/)
+for detailed walkthroughs and the [triggers reference](https://faucet-hq.github.io/faucet-stream/reference/triggers/)
 for the full field reference.
 
 Requires the `triggers` feature family (included in `full`):
@@ -483,7 +483,7 @@ start each replica with `--pool <name>` and put `pool: <name>` in the config —
 or `"pool"` in the request. A replica claims only the runs, and shards, in its
 pools; a pool no live member serves is refused with `422`.
 
-See the [cluster cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/cluster.html)
+See the [cluster cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/cluster/)
 for the full lifecycle, execution pools, delivery guarantees, and Kubernetes deployment notes.
 
 Submit a run:
@@ -494,7 +494,7 @@ curl -XPOST localhost:8080/v1/runs -H "Authorization: Bearer s3cret" \
   -d '{"config":"version: 1\npipeline:\n  source: {type: file, config: { path: in.csv }}\n  sink: {type: file, config: { path: out.jsonl }}\n","name":"adhoc","idempotency_key":"k1"}'
 ```
 
-> ⚠️ **Security:** `serve` executes arbitrary client-supplied configs with the server's identity — secrets, files, and network egress (SSRF). Run single-tenant, authenticated, behind egress controls; terminate TLS at a proxy. See the [serve cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/serve.html) and [HTTP API reference](https://faucet-hq.github.io/faucet-stream/reference/http-api.html).
+> ⚠️ **Security:** `serve` executes arbitrary client-supplied configs with the server's identity — secrets, files, and network egress (SSRF). Run single-tenant, authenticated, behind egress controls; terminate TLS at a proxy. See the [serve cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/serve/) and [HTTP API reference](https://faucet-hq.github.io/faucet-stream/reference/http-api/).
 
 Requires the `serve` Cargo feature (included in `full`):
 
@@ -535,7 +535,7 @@ stops at the bound rather than truncating afterwards), there is no paging
 accepts a path from the request — only the id of an output the server already
 tracks — and it is off by default because it returns file contents over HTTP.
 
-See the [web console guide](https://faucet-hq.github.io/faucet-stream/cookbook/web-console.html)
+See the [web console guide](https://faucet-hq.github.io/faucet-stream/cookbook/web-console/)
 for the full walkthrough.
 
 #### Change approvals (`--require-approval`)
@@ -550,7 +550,7 @@ approver (`invalidated`). `faucet serve --require-approval run` turns every
 `--require-approval template_register,template_launch` makes the template
 lifecycle routes and MCP tools answer `409` (and cannot be combined with
 `--templates-sync`). See the
-[approvals cookbook](../docs/book/src/cookbook/approvals.md).
+[approvals cookbook](../docs/site/src/content/docs/cookbook/approvals.md).
 
 #### Tenants (`--vault-key`, `--connect-providers`)
 
@@ -572,7 +572,7 @@ marks the connection `needs_reauth`, notifies the tenant and pauses its runs.
 A principal with `tenant:` in `--auth-config` is confined to one tenant and
 runs registered templates only (a config of its own is a `403`).
 `DELETE /v1/tenants/{t}` removes everything faucet holds for it. See the
-[embedded integrations cookbook](../docs/book/src/cookbook/embedded-integrations.md).
+[embedded integrations cookbook](../docs/site/src/content/docs/cookbook/embedded-integrations.md).
 
 ### `faucet mcp` / `faucet serve --mcp`
 
@@ -597,7 +597,7 @@ Tools: `list_connectors`, `get_connector_schema`, `scaffold_config`,
 `validate_config`, `preview` (read-only, ≤100 rows), and the gated
 `run_pipeline` (`dry_run: true` validates + previews only). Secret material is
 redacted from all tool output. See the
-[MCP guide](https://faucet-hq.github.io/faucet-stream/cookbook/mcp.html).
+[MCP guide](https://faucet-hq.github.io/faucet-stream/cookbook/mcp/).
 
 ### `faucet completions`
 
@@ -763,7 +763,7 @@ configs read from disk (`run`/`validate`/`preview`/`doctor`/`schedule`), **not**
 to configs submitted to `faucet serve` over HTTP (a submitted body is a single
 self-contained document with no filesystem access). See
 [`examples/compose/`](examples/compose/) for an end-to-end example, and the
-[docs-site composition cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/composition.html)
+[docs-site composition cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/composition/)
 for the full walkthrough.
 
 ## Config shape
@@ -863,7 +863,7 @@ tuple of the **cartesian product** of those dimensions, with `${<dim>.<alias>}`
 substituted into its config — "sync this report once per `{subsidiary} ×
 {custom-field}`". The discovery source is a `{ ref }` to a `pipeline.sources`
 template or a standalone `{ type, config }`; the product is bounded by
-`MAX_MATRIX_PRODUCT` (10 000). See `docs/book/src/reference/config.md` and
+`MAX_MATRIX_PRODUCT` (10 000). See `docs/site/src/content/docs/reference/config.md` and
 `cli/examples/discovery_matrix.yaml`.
 
 #### `depends_on:` — completion ordering between rows
@@ -1071,7 +1071,7 @@ execution:
   controller reslices pages it already received — it cannot buffer across pages.
   Raise the source `batch_size` to allow bigger write batches.
 
-See the [Adaptive batching cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/adaptive-batching.html)
+See the [Adaptive batching cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/adaptive-batching/)
 for the full field reference, AIMD trajectory example, and the four Prometheus
 metrics (`faucet_pipeline_adaptive_batch_*`).
 
@@ -1256,7 +1256,7 @@ pipeline:
 Inspect or publish it with `faucet contract <config> [--export
 contract|json-schema|openlineage]`; `faucet schema contract` prints the
 block's JSON Schema. Full model:
-[Data contracts](https://faucet-hq.github.io/faucet-stream/cookbook/contracts.html).
+[Data contracts](https://faucet-hq.github.io/faucet-stream/cookbook/contracts/).
 
 ### `sla:` (optional)
 
@@ -1281,7 +1281,7 @@ sla:
 reported lag (Postgres slot, MySQL binlog, SQL Server LSN, MongoDB change
 stream, Kafka consumer lag, Kinesis `MillisBehindLatest`) at the end of each
 run, and in `faucet status` / `faucet doctor`. `faucet schema sla` prints the block's JSON Schema. Full model:
-[SLA monitoring](https://faucet-hq.github.io/faucet-stream/cookbook/sla.html).
+[SLA monitoring](https://faucet-hq.github.io/faucet-stream/cookbook/sla/).
 
 ### `profiling:` (optional)
 
@@ -1305,7 +1305,7 @@ profiling:
 
 `faucet profiling show|reset` inspects / re-baselines; `faucet doctor` reports
 the baseline depth; `faucet schema profiling` prints the JSON Schema. Full
-model: [column profiling](https://faucet-hq.github.io/faucet-stream/cookbook/profiling.html).
+model: [column profiling](https://faucet-hq.github.io/faucet-stream/cookbook/profiling/).
 
 ### `policy:` (optional)
 
@@ -1334,7 +1334,7 @@ pipeline:
 ```
 
 `faucet schema policy` prints the JSON Schema. Full model:
-[data-flow policies](https://faucet-hq.github.io/faucet-stream/cookbook/policies.html).
+[data-flow policies](https://faucet-hq.github.io/faucet-stream/cookbook/policies/).
 
 ### `catalog:` (optional)
 
@@ -1357,7 +1357,7 @@ catalog:
 Browse with `faucet catalog datasets|show|lineage`, `GET /v1/catalog/*` on
 `faucet serve`, or the web console's Datasets / Lineage views.
 `faucet schema catalog` prints the block's JSON Schema. Full model:
-[Data Movement Catalog](https://faucet-hq.github.io/faucet-stream/cookbook/catalog.html).
+[Data Movement Catalog](https://faucet-hq.github.io/faucet-stream/cookbook/catalog/).
 
 ### `usage:` / `budget:` (optional)
 
@@ -1373,7 +1373,7 @@ across runs. A `budget:` block sets hard ceilings on one invocation
 page that would cross a ceiling is refused whole and the run fails with
 `budget_exceeded`; `faucet run --max-records/--max-bytes/--max-duration-secs/
 --allowed-sink` merge with it (stricter wins). See the
-[usage cookbook](../docs/book/src/cookbook/usage.md).
+[usage cookbook](../docs/site/src/content/docs/cookbook/usage.md).
 
 ```yaml
 usage:
@@ -1430,7 +1430,7 @@ also makes the axis enumerable, which is what `faucet template test`'s
 available (no build feature); `faucet schema params` prints one entry's JSON
 Schema. To register a parameterized config once and trigger it by id, see
 `faucet template` and
-[Parameters & pipeline templates](https://faucet-hq.github.io/faucet-stream/cookbook/templates.html).
+[Parameters & pipeline templates](https://faucet-hq.github.io/faucet-stream/cookbook/templates/).
 
 `faucet template test <suite>` sweeps a template's whole parameter space
 offline — each case materializes the template as a real trigger would, then
@@ -1464,7 +1464,7 @@ recording results only. **Breaking change:** `--require-template-tests`,
 `--require-tests` and `--skip-tests-reason` are gone; a template launched before
 this release without tests keeps its labels but cannot register a new version or
 roll back until a version with a `tests:` block is registered — see
-[Template tests and labels](https://faucet-hq.github.io/faucet-stream/cookbook/templates.html#template-tests-and-labels). `faucet hub check` / `lint` run hub templates' bundles. Example:
+[Template tests and labels](https://faucet-hq.github.io/faucet-stream/cookbook/templates/#template-tests-and-labels). `faucet hub check` / `lint` run hub templates' bundles. Example:
 [`examples/csv_to_jsonl_with_tests.yaml`](examples/csv_to_jsonl_with_tests.yaml);
 `faucet schema template-tests` / `faucet schema test-suite` print the schemas.
 
@@ -1474,7 +1474,7 @@ Eleven built-in transforms are exposed as `type:` values: `flatten`,
 `rename_keys`, `keys_case`, `spell_symbols`, `select`, `drop`, `set`,
 `rename_field`, `cast`, `redact`, `value_case`. They run in declared
 order. The
-[record transforms cookbook page](../docs/book/src/cookbook/transforms.md)
+[record transforms cookbook page](../docs/site/src/content/docs/cookbook/transforms.md)
 has the full reference.
 
 ```yaml
@@ -1578,7 +1578,7 @@ top-level `auth:` catalog and `vars:` block, `pipeline.masking` (the hash key),
 `lineage`, `notifications`, `catalog` and `observability`. A secret directive
 left anywhere else fails the load instead of being sent as a literal.
 
-See the [docs-site secrets cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/secrets.html)
+See the [docs-site secrets cookbook](https://faucet-hq.github.io/faucet-stream/cookbook/secrets/)
 for full examples and details.
 
 ## Running from environment variables (`--from-env`)
@@ -1778,7 +1778,7 @@ binary — build any connector from its `type:` name and a JSON config — depen
 on [`faucet-registry`](https://crates.io/crates/faucet-registry) instead of `faucet-cli`:
 it is the same registry (`faucet_cli::registry` and `faucet_cli::auth_catalog`
 re-export it), without the CLI's dependencies, and it follows semver. See
-[Embedding faucet in another tool](https://faucet-hq.github.io/faucet-stream/extending/embedding.html).
+[Embedding faucet in another tool](https://faucet-hq.github.io/faucet-stream/extending/embedding/).
 
 [`PluginRegistry`]: https://docs.rs/faucet-registry/latest/faucet_registry/struct.PluginRegistry.html
 

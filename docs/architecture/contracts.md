@@ -96,4 +96,4 @@ Runs after the quality pass and before the schema-drift pass (see
 - [Quality](./quality.md) · [Schema handling](./schema.md) · [Masking](./masking.md)
 - [Pipeline](./pipeline.md) · [Design invariants](./invariants.md)
 - [ADR 0009 — Schema validation](../adr/0009-schema-validation.md)
-- User guide: [../book/src/cookbook/contracts.md](../book/src/cookbook/contracts.md)
+- User guide: [../site/src/content/docs/cookbook/contracts.md](../site/src/content/docs/cookbook/contracts.md)

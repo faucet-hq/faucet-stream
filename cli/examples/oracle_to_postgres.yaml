@@ -1,7 +1,7 @@
 # Incrementally copy an Oracle table into PostgreSQL.
 # Requires a binary built with `--features source-oracle,sink-postgres` and
 # Oracle Instant Client on the library path (LD_LIBRARY_PATH on Linux) —
-# see docs/book/src/getting-started/installation.md#oracle-instant-client.
+# see docs/site/src/content/docs/getting-started/installation.md#oracle-instant-client.
 #
 # Run with:  faucet run cli/examples/oracle_to_postgres.yaml
 version: 1
