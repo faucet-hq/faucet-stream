@@ -1,6 +1,6 @@
 # faucet design mockups
 
-Static design mockups for faucet's user interfaces, kept on this `designs` branch so every mockup lives in one place. They use sample data only and are not product code: the shipped console is `cli/src/serve/ui/` on `main`, built to match the approved screens here.
+Static design mockups for faucet's user interfaces, kept on this `designs` branch so every mockup lives in one place. Each interface has its own top-level folder: `console-redesign/` for the web console and `docs/` for the docs site (a `website/` folder will hold marketing-site mockups when that work starts). They use sample data only and are not product code: the shipped console is `cli/src/serve/ui/` on `main`, built to match the approved screens here.
 
 UI work follows "mockups first, then build": every page and every state after a click is drawn here in both themes, the owner approves it, and only then is the console code written.
 
@@ -9,7 +9,7 @@ UI work follows "mockups first, then build": every page and every state after a 
 | Path | What it is |
 |---|---|
 | `console-redesign/gallery.html` | Every view and state, in both themes. Start here. |
-| `docs-redesign/gallery.html` | The docs site on Astro Starlight (#1073): every page and state, both themes, three widths. See `docs-redesign/README.md`. |
+| `docs/gallery.html` | The docs site on Astro Starlight (#1073): every page and state, both themes, three widths. See `docs/README.md`. |
 | `console-redesign/viewer.html` | One screen at a time, chosen in the URL. |
 | `console-redesign/index.html` | The console shell the views render into. |
 | `console-redesign/views/` | One file per page (`runs.js`, `schedules.js`, `policy.js`, …) with its states. |

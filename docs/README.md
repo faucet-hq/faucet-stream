@@ -17,10 +17,11 @@ Static mockups for moving the docs site from mdBook to **Astro Starlight**, in t
 
 All pages use plain scripts, so they open straight from disk: open `gallery.html`. To serve them instead:
 
+From the root of the `designs` branch:
+
 ```bash
-cd docs-redesign
 python3 -m http.server 8766 --bind 127.0.0.1
-# http://127.0.0.1:8766/gallery.html
+# http://127.0.0.1:8766/docs/gallery.html
 ```
 
 ## What is drawn
