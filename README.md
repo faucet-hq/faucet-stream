@@ -9,6 +9,7 @@ UI work follows "mockups first, then build": every page and every state after a 
 | Path | What it is |
 |---|---|
 | `console-redesign/gallery.html` | Every view and state, in both themes. Start here. |
+| `docs-redesign/gallery.html` | The docs site on Astro Starlight (#1073): every page and state, both themes, three widths. See `docs-redesign/README.md`. |
 | `console-redesign/viewer.html` | One screen at a time, chosen in the URL. |
 | `console-redesign/index.html` | The console shell the views render into. |
 | `console-redesign/views/` | One file per page (`runs.js`, `schedules.js`, `policy.js`, …) with its states. |

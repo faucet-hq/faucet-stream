@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docs redesign gallery</title>
+<link rel="stylesheet" href="docs.css">
+<script src="shots/manifest.js"></script>
+<style>
+  .g-wrap { max-width: 1440px; margin: 0 auto; padding: 32px; }
+  .g-top { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; margin-bottom: 8px; }
+  .g-top h1 { margin: 0; font-size: 30px; color: var(--ink); letter-spacing: -0.02em; font-weight: 600; }
+  .g-top .seg { margin: 0 0 0 auto; }
+  .g-sub { color: var(--muted); margin: 0 0 28px; max-width: 760px; }
+  .g-group { margin: 40px 0 8px; font-size: 12px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+  .g-view { border-top: 1px solid var(--line); padding: 22px 0; }
+  .g-view h2 { margin: 0 0 14px; font-size: 19px; color: var(--ink); font-weight: 600; }
+  .g-states { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 18px; }
+  .g-st { border: 1px solid var(--line); border-radius: 12px; background: var(--bg-raised); padding: 12px; }
+  .g-st b { display: block; color: var(--ink); font-weight: 550; font-size: 14px; margin-bottom: 10px; }
+  .g-shots { display: flex; gap: 8px; align-items: flex-start; }
+  .g-shots a { display: block; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--bg-soft); position: relative; }
+  .g-shots a.w1440 { flex: 4; } .g-shots a.w1000 { flex: 3; } .g-shots a.w390 { flex: 1.2; }
+  .g-shots img { display: block; width: 100%; height: 190px; object-fit: cover; object-position: top; }
+  .g-shots span { position: absolute; left: 6px; bottom: 6px; font: 500 11px var(--mono); background: var(--bg-raised); color: var(--muted); border: 1px solid var(--line); border-radius: 5px; padding: 1px 5px; }
+  .g-live { display: inline-block; margin-top: 8px; font-size: 13px; }
+  @media (max-width: 700px) { .g-wrap { padding: 16px; } .g-top .seg { margin-left: 0; } }
+</style>
+</head>
+<body>
+<div class="g-wrap">
+  <div class="g-top">
+    <h1>Docs redesign</h1>
+    <div class="seg" id="theme"><button data-v="light" class="on">Light</button><button data-v="dark">Dark</button></div>
+  </div>
+  <p class="g-sub">Every page and state of the faucet-stream docs site on Astro Starlight, in both themes, at desktop (1440), tablet (1000) and phone (390) widths. Click a screenshot to open it full size, or “Open live” for the HTML. Sample data only. What the current site can do is listed in <a href="spec/functionality-inventory.md">spec/functionality-inventory.md</a>.</p>
+  <div id="list"></div>
+</div>
+<script>
+  const ORDER = ['Pages', 'Reference', 'Overlays', 'System'];
+  let theme = 'light';
+  try { theme = localStorage.getItem('docs-gallery-theme') || 'light'; } catch (e) {}
+  function render() {
+    document.documentElement.dataset.theme = theme;
+    document.querySelectorAll('#theme button').forEach((b) => b.classList.toggle('on', b.dataset.v === theme));
+    const shots = (window.SHOTS || []).filter((s) => s.theme === theme);
+    if (!shots.length) { document.getElementById('list').innerHTML = '<div class="empty"><b>No screenshots yet</b>Run <code>node render.mjs</code> in this folder.</div>'; return; }
+    const views = {};
+    shots.forEach((s) => { (views[s.view] ||= { title: s.title, group: s.group, states: {} }); (views[s.view].states[s.state] ||= { label: s.label, shots: [] }).shots.push(s); });
+    let html = '';
+    ORDER.forEach((g) => {
+      const vs = Object.entries(views).filter(([, v]) => v.group === g);
+      if (!vs.length) return;
+      html += `<div class="g-group">${g}</div>`;
+      vs.forEach(([name, v]) => {
+        html += `<section class="g-view" id="${name}"><h2>${v.title}</h2><div class="g-states">`;
+        Object.entries(v.states).forEach(([key, st]) => {
+          html += `<div class="g-st"><b>${st.label}</b><div class="g-shots">${st.shots.map((s) => `<a class="w${s.width}" href="${s.file}" target="_blank"><img loading="lazy" src="${s.file}" alt="${v.title}, ${st.label}, ${s.width}px"><span>${s.width}</span></a>`).join('')}</div><a class="g-live" href="index.html?view=${name}&state=${key}&theme=${theme}" target="_blank">Open live →</a></div>`;
+        });
+        html += '</div></section>';
+      });
+    });
+    document.getElementById('list').innerHTML = html;
+  }
+  document.getElementById('theme').addEventListener('click', (e) => {
+    const b = e.target.closest('button'); if (!b) return;
+    theme = b.dataset.v;
+    try { localStorage.setItem('docs-gallery-theme', theme); } catch (err) {}
+    render();
+  });
+  render();
+</script>
+</body>
+</html>
