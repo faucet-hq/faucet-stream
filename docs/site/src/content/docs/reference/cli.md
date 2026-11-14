@@ -523,7 +523,7 @@ faucet install my-connector --index ./my-registry.json
 - a **built-in** already compiled in → "already available";
 - a **built-in** not compiled in → `cargo install faucet-cli --features <kind>-<name>`;
 - a **community** connector → a copy-pasteable custom-binary snippet (see
-  [Custom binaries](https://github.com/faucet-hq/faucet-stream/blob/main/docs/book/cli/README.md#custom-binaries-with-third-party-connectors)).
+  [Custom binaries](https://github.com/faucet-hq/faucet-stream/blob/main/cli/README.md#custom-binaries-with-third-party-connectors)).
 
 `--index <path>` points any of these at a custom/mirror index instead of the
 built-in one. Ambiguous names (a connector that is both a source and a sink,

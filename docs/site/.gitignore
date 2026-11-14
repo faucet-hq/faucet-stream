@@ -1,7 +1,8 @@
 node_modules/
 dist/
 .astro/
-# Written by scripts/prebuild.mjs from generated/ (the generators' exact output).
+# Written by scripts/prebuild.mjs from generated/ (the generators' exact output) and docs/spec/.
 src/content/docs/reference/capability-matrix.md
 src/content/docs/reference/compatibility.md
 src/content/docs/reference/template-hub-matrix.md
+src/content/docs/spec/faucet-connector-spec-v0.md

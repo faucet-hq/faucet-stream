@@ -145,7 +145,7 @@ def docs_page(url):
         slug = path[:-1]
     else:
         return DOCS_SRC / "__not_a_page__" / path
-    candidates = [DOCS_SRC / f"{slug}.md", DOCS_SRC / slug / "index.md", DOCS_GENERATED / f"{slug}.md"]
+    candidates = [DOCS_SRC / f"{slug}.md", DOCS_SRC / slug / "index.md", DOCS_GENERATED / f"{slug}.md", ROOT / "docs" / f"{slug}.md"]
     return next((c for c in candidates if c.exists()), candidates[0])
 
 
