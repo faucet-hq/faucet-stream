@@ -17,6 +17,10 @@ independently).
 
 - Switch the docs site to Astro Starlight and remove mdBook ([#1080](https://github.com/faucet-hq/faucet-stream/pull/1080))
 
+### Dependencies
+
+- Bumped with: faucet-core 1.17.0 → 1.17.1, faucet-registry 1.0.2 → 1.0.3, faucet-source-nats 1.2.3 → 1.2.4, faucet-source-pubsub 1.3.2 → 1.3.3, faucet-source-rabbitmq 1.1.3 → 1.1.4, faucet-source-sqs 1.3.2 → 1.3.3, faucet-source-webhook 1.4.2 → 1.4.3
+
 ## [1.18.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-cli-v1.18.0...faucet-cli-v1.18.2) - 2026-11-13
 
 ### Bug Fixes
