@@ -3471,12 +3471,12 @@ components:
           additionalProperties: false
           properties:
             id: { type: string }
-            version: { type: string, description: "A channel (`stable`, `newest`, …) or a version number; default `stable`." }
+            version: { oneOf: [{ type: string }, { type: integer, minimum: 0 }], description: "A channel (`stable`, `newest`, …) or a version number, written as a number or a string and stored as a string; default `stable`." }
             params: { type: object, additionalProperties: true, description: "Secret params are stored sealed and shown as `{\"$sealed\": true}`; send that marker back to keep a stored value." }
             sink: { type: string }
-            sink_version: { type: string }
+            sink_version: { oneOf: [{ type: string }, { type: integer, minimum: 0 }], description: "A channel or a version number." }
             overlay: { type: string }
-            overlay_version: { type: string }
+            overlay_version: { oneOf: [{ type: string }, { type: integer, minimum: 0 }], description: "A channel or a version number." }
         tenants:
           description: Operators only. `all` or a list of tenant ids; one run per tenant each tick.
           oneOf:

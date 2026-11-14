@@ -91,7 +91,12 @@ pub struct ScheduleTemplate {
     /// Template id.
     pub id: String,
     /// Version: a number or a channel. Default `stable`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "version_text"
+    )]
+    #[schemars(schema_with = "version_schema")]
     pub version: Option<String>,
     /// Values for the template's `params:`. A string value may use
     /// `${schedule.tick}` (the scheduled instant, RFC 3339 UTC),
@@ -101,13 +106,66 @@ pub struct ScheduleTemplate {
     /// For a source template: the sink template to compose in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sink: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The sink template's version: a number or a channel.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "version_text"
+    )]
+    #[schemars(schema_with = "version_schema")]
     pub sink_version: Option<String>,
     /// A registered deployment overlay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The overlay's version: a number or a channel.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "version_text"
+    )]
+    #[schemars(schema_with = "version_schema")]
     pub overlay_version: Option<String>,
+}
+
+/// A template version as text: a channel name or numeric string as given, or a
+/// non-negative integer rendered in decimal, so a body or file may write
+/// `version: 3` or `version: "3"` and both store `"3"`.
+fn version_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    struct V;
+    impl serde::de::Visitor<'_> for V {
+        type Value = Option<String>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a version number or a channel name")
+        }
+        fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Self::Value, E> {
+            Ok(Some(s.to_owned()))
+        }
+        fn visit_u64<E: serde::de::Error>(self, n: u64) -> Result<Self::Value, E> {
+            Ok(Some(n.to_string()))
+        }
+        fn visit_i64<E: serde::de::Error>(self, n: i64) -> Result<Self::Value, E> {
+            u64::try_from(n).map(|n| Some(n.to_string())).map_err(|_| {
+                E::custom(format!(
+                    "version {n} is negative; expected a version number or a channel name"
+                ))
+            })
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+    }
+    d.deserialize_any(V)
+}
+
+fn version_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "description": "A version number or a channel name.",
+        "type": ["string", "integer"],
+        "minimum": 0
+    })
 }
 
 /// Run-shaping for the runs a tick starts.
@@ -305,6 +363,48 @@ mod tests {
         assert_eq!(OverlapMode::Queue.as_str(), "queue");
         assert_eq!(OverlapMode::Forbid.as_str(), "forbid");
         assert_eq!(OverlapMode::Skip.as_str(), "skip");
+    }
+
+    #[test]
+    fn template_versions_take_a_number_or_text_and_store_text() {
+        let t: ScheduleTemplate = serde_json::from_value(json!({
+            "id": "t", "version": 3, "sink": "s", "sink_version": "7",
+            "overlay": "o", "overlay_version": "stable"
+        }))
+        .unwrap();
+        assert_eq!(t.version.as_deref(), Some("3"));
+        assert_eq!(t.sink_version.as_deref(), Some("7"));
+        assert_eq!(t.overlay_version.as_deref(), Some("stable"));
+        assert_eq!(serde_json::to_value(&t).unwrap()["version"], json!("3"));
+        let y: ScheduleTemplate =
+            crate::yaml::from_str("id: t\nversion: 4\nsink_version: 0\n").unwrap();
+        assert_eq!(
+            (y.version.as_deref(), y.sink_version.as_deref()),
+            (Some("4"), Some("0"))
+        );
+        let none: ScheduleTemplate =
+            serde_json::from_value(json!({"id": "t", "version": null})).unwrap();
+        assert_eq!(none.version, None);
+        for bad in [json!(-1), json!(1.5), json!(true), json!(["1"])] {
+            let err = serde_json::from_value::<ScheduleTemplate>(
+                json!({"id": "t", "overlay_version": bad}),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("a version number or a channel name"), "{err}");
+        }
+    }
+
+    #[test]
+    fn the_version_schema_allows_a_number() {
+        let schema = serde_json::to_value(schemars::schema_for!(ScheduleTemplate)).unwrap();
+        for field in ["version", "sink_version", "overlay_version"] {
+            assert_eq!(
+                schema["properties"][field]["type"],
+                json!(["string", "integer"]),
+                "{field}"
+            );
+        }
     }
 
     #[test]

@@ -1598,6 +1598,18 @@ async fn schedules_are_managed_over_http() {
         )
         .await;
     assert!(code == 404 || code == 422, "{code} {unknown}");
+    // A numeric version is accepted like the file and trigger APIs (#1068).
+    let (code, numbered) = api
+        .post(
+            "op-tok",
+            "/v1/schedules",
+            json!({"name": "pinned", "cron": "0 4 * * *", "template": {"id": "plain-sync", "version": 1}}),
+        )
+        .await;
+    assert_eq!(code, 201, "{numbered}");
+    assert_eq!(numbered["template"]["version"], "1", "{numbered}");
+    let (code, gone) = api.delete("op-tok", "/v1/schedules/pinned").await;
+    assert!(code == 200 || code == 204, "{code} {gone}");
 
     let (code, list) = api.get("view-tok", "/v1/schedules").await;
     assert_eq!(code, 200, "{list}");
