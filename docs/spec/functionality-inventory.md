@@ -13,7 +13,7 @@ What the current mdBook docs site (`docs/book/`, published at faucet-hq.github.i
 | S5 | "Ask AI" about the current page | Header menu: opens the page in Claude, ChatGPT, Perplexity, Grok or Gemini with a prompt that names the page URL and `llms.txt` | ✅ Same menu and providers, plus "Copy page as Markdown" 🆕 |
 | S6 | Link to the GitHub repo | Header icon | ✅ Header icon |
 | S7 | Link to LinkedIn | Header icon | ⚠️ Moves to the site footer |
-| S8 | Print the page | Header print icon (mdBook print-all page) | ❌ The browser's own print stays, with print styles. The single "print the whole book" page is dropped; nobody prints 97 pages, and `llms-full.txt` covers "the whole docs in one file" |
+| S8 | Print the page | Header print icon (mdBook print-all page) | ❌ The browser's own print stays, with print styles. The single "print the whole book" page is dropped; nobody prints 97 pages, and every page can be copied as Markdown from the Ask AI menu |
 | S9 | Edit this page on GitHub | Header pencil icon (`edit-url-template`) | ⚠️ "Edit this page" link in the page footer |
 | S10 | Sidebar with every page | Numbered tree (1. … 15.6.), groups collapsible (`fold.level = 1`), sidebar resizable and hideable | ⚠️ Pages split into header topics (Learn · Cookbook · Reference · Operate · Extend · Compare); the sidebar shows one topic's groups, with no numbers. Groups collapse. The sidebar can no longer be resized or hidden on desktop |
 | S11 | Current page highlighted in the sidebar | Yes | ✅ |
@@ -23,7 +23,7 @@ What the current mdBook docs site (`docs/book/`, published at faucet-hq.github.i
 | S15 | 404 page | mdBook's default 404 | ⚠️ Branded 404 with search and links to the main topics |
 | S16 | Favicon | `favicon.svg` / `.png` | ✅ |
 | S17 | Sitemap and stable base URL | `site-url = /faucet-stream/`, sitemap written in `docs.yml` | ✅ Same base path; Astro sitemap integration |
-| S18 | `llms.txt` / `llms-full.txt` for AI tools | Generated in `docs.yml` | ✅ Kept (Ask AI prompt still names it) |
+| S18 | `llms.txt` for AI tools | Served from the marketing site root (faucet-hq.github.io/llms.txt); the docs only link to it | ✅ Kept: Ask AI names it and links to it |
 | S19 | Old deep links keep working | n/a (current URLs) | 🆕 Redirects from every mdBook `.html` path |
 
 ## Page content
