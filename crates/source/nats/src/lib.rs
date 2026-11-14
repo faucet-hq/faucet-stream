@@ -34,4 +34,14 @@ pub use faucet_core::{FaucetError, Source};
 
 /// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
 pub const DESCRIPTOR: faucet_core::ConnectorDescriptor =
-    faucet_core::ConnectorDescriptor::new("nats", faucet_core::capabilities::plain_source);
+    faucet_core::ConnectorDescriptor::new("nats", capabilities);
+
+/// A JetStream consumer acknowledges what it read (the kind-level view, a
+/// `Null` config, reports what some config enables).
+fn capabilities(config: &faucet_core::Value) -> faucet_core::Capabilities {
+    let jetstream =
+        config.is_null() || config.get("jetstream_stream").is_some_and(|v| !v.is_null());
+    faucet_core::Capabilities::builder()
+        .consumes_destructively(jetstream)
+        .build()
+}

@@ -97,13 +97,13 @@ The receive window ends as soon as **any** configured condition is met; the serv
 |-------|------|---------|-------------|
 | `ack` | `on_commit` \| `on_receive` | `on_commit` | When a sender's `POST` is answered. `on_commit`: after the pipeline has written and flushed its event. `on_receive`: as soon as it is held in memory (the behaviour before #1032), which loses acknowledged events if the run fails before the sink commits them. See [Acknowledgement](#acknowledgement). |
 | `max_hold_secs` | int | `5` | `ack: on_commit`: the longest a held request waits before its page is emitted, 1 to 300. |
-| `max_held` | int | `2000` | `ack: on_commit`: the most requests open at once, waiting for a page or in the page being written (the default leaves room for one full page being written and the next filling). Above it a `POST` is refused with `503` + `Retry-After` and not stored. `0` removes the cap. In a config submitted to `faucet serve` it may be at most 100,000. |
+| `max_held` | int | `2000` | `ack: on_commit`: the most requests open at once, waiting for a page or in the page being written. A page takes at most half of it, so new requests keep being accepted while a page is written. Above it a `POST` is refused with `503` + `Retry-After` and not stored. `0` removes the cap. In a config submitted to `faucet serve` it may be at most 100,000. |
 
 ### Batching
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `batch_size` | int | `1000` | Records per emitted `StreamPage`. With `ack: on_commit` a page is emitted while the window is open, once this many requests are held (or the oldest has waited `max_hold_secs`); `0` drops the count trigger. With `ack: on_receive` the window's events are emitted when it closes, in pages of this size; `0` emits them as one page. Validated against `MAX_BATCH_SIZE` (1,000,000) at load time. |
+| `batch_size` | int | `1000` | Records per emitted `StreamPage`. With `ack: on_commit` a page is emitted while the window is open, once this many requests are held (or the oldest has waited `max_hold_secs`), and never holds more than half of `max_held`; `0` drops the count trigger. With `ack: on_receive` the window's events are emitted when it closes, in pages of this size; `0` emits them as one page. Validated against `MAX_BATCH_SIZE` (1,000,000) at load time. |
 
 ## Authentication
 
@@ -196,7 +196,8 @@ A webhook sender does not keep its events: once it gets a `2xx`, it considers th
 - **`200` means "handled by your pipeline's rules"**, not always "stored": rows dropped by a `filter`, a contract in `warn` mode or a drift `ignore` policy, or sent to the DLQ, are acknowledged once their page is processed.
 - **How long a sender waits:** up to `max_hold_secs` plus the sink's write time, and up to twice the write time when a write is already in progress. Keep that well under your senders' timeout (often 10–30 s). The source logs a warning when a sender waited more than 10 s.
 - **Open connections and memory** are capped by `max_held` (default 2000 requests, counting the page being written) and `max_buffered_bytes` (bodies not yet acknowledged). Over either, a `POST` gets `503` + `Retry-After` and the window stays open.
-- **Commands that read without writing refuse this source:** `--dry-run`, `--limit`, `faucet preview`, `faucet plan --live`, `faucet verify`, topology graphs and `write_mode: overwrite`; a post-run `verify:` pass skips it with a warning. A sink that replaces its output on every run (`file`, `s3`, `gcs`, `azure-blob` or `sftp` with `if_exists: replace`, `jsonl` / `csv` without `append: true`) is refused too, because the next run would delete events already acknowledged.
+- **Commands that read without writing refuse this source:** `--dry-run`, `--limit`, `faucet preview`, `faucet plan --live`, `faucet verify`, topology graphs and `write_mode: overwrite`; a post-run `verify:` pass skips it with a warning. A sink that replaces its output on every run (`file`, `s3`, `gcs`, `azure-blob` or `sftp` with `if_exists: replace`, `jsonl` / `csv` without `append: true`) is refused too, because the next run would delete events already acknowledged — unless its path names a new file each run (`${now.unix}`, `${now.datetime}`; a date alone repeats within a day).
+- **Every page is a sink commit.** The pipeline flushes the sink after each page, so a busy webhook writes a page at least every `max_hold_secs`. For a table format or file sink (`iceberg`, `delta`, `parquet`, `file`) that is one snapshot, commit or file per page, which adds up (about 17,000 a day at the 5 s default). Raise `max_hold_secs` (up to 300) and `batch_size` to make fewer, larger commits, as long as senders' timeouts allow; or land events in a queue first and read it with a batching source.
 
 **`ack: on_receive`.** The behaviour before #1032: a `POST` is answered `200` as soon as it is held in memory, and the window's events are emitted when it closes. Events acknowledged this way are lost if the run fails before the sink commits them. Use it only when a sender cannot wait for the write.
 

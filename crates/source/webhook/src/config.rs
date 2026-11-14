@@ -102,7 +102,7 @@ pub struct WebhookSourceConfig {
     #[schemars(extend("x-faucet-caller-max" = 300))]
     pub max_hold_secs: u64,
     /// `ack: on_commit`: the most requests open at once, waiting for a page or
-    /// in the page being written (default 2000). Above it a POST is refused
+    /// in the page being written (default 2000); a page takes at most half. Above it a POST is refused
     /// with `503` + `Retry-After` and not stored, so a slow sink cannot pile
     /// up open connections. `0` removes the cap.
     #[schemars(extend("x-faucet-caller-max" = 100_000))]

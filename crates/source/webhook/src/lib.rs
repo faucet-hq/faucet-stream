@@ -19,9 +19,13 @@ pub use stream::WebhookSource;
 pub const DESCRIPTOR: faucet_core::ConnectorDescriptor =
     faucet_core::ConnectorDescriptor::new("webhook", capabilities);
 
-/// Reading opens a listener: a side effect a read-only preview must not cause.
-fn capabilities(_config: &faucet_core::Value) -> faucet_core::Capabilities {
+/// Reading opens a listener; with `ack: on_commit` (the default) it also
+/// answers senders as their events are written, so it cannot be read again.
+fn capabilities(config: &faucet_core::Value) -> faucet_core::Capabilities {
+    let on_commit = config.is_null()
+        || config.get("ack").and_then(faucet_core::Value::as_str) != Some("on_receive");
     faucet_core::Capabilities::builder()
         .read_side_effects(true)
+        .consumes_destructively(on_commit)
         .build()
 }

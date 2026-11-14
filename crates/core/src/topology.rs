@@ -540,10 +540,11 @@ impl Topology {
                     arity(&n.id, "source", i == 0, o == 1, "0 in, exactly 1 out")?;
                     if source.consumes_destructively() {
                         return Err(cfg(format!(
-                            "source '{}' ({}) acknowledges messages as it is read past each \
-                             page, and a graph polls its sources ahead of its sinks, so a \
-                             failed or cancelled sink would lose messages that were already \
-                             acked; run this source in a linear pipeline instead",
+                            "source '{}' ({}) consumes what it reads as it moves past each page \
+                             (a queue acknowledges messages, a webhook answers its senders), and \
+                             a graph polls its sources ahead of its sinks, so a failed or \
+                             cancelled sink would lose what was already acknowledged; run this \
+                             source in a linear pipeline instead",
                             n.id,
                             source.connector_name()
                         )));

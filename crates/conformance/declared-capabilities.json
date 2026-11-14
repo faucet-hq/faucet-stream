@@ -336,6 +336,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -362,6 +363,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -388,6 +390,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -414,6 +417,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -440,6 +444,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -466,6 +471,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -492,6 +498,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": true,
       "declared_types": false
@@ -518,6 +525,7 @@
       "native": false,
       "table_routing": true,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": true,
       "declared_columns": false,
       "declared_types": false
@@ -544,6 +552,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -570,6 +579,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -596,6 +606,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -622,6 +633,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -648,6 +660,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -674,6 +687,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -700,6 +714,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": true,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -726,6 +741,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -752,6 +768,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -778,6 +795,7 @@
       "native": false,
       "table_routing": true,
       "read_side_effects": true,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -804,6 +822,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": true,
       "declared_types": false
@@ -830,6 +849,7 @@
       "native": false,
       "table_routing": true,
       "read_side_effects": true,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -856,6 +876,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": true,
       "declared_types": false
@@ -882,6 +903,7 @@
       "native": false,
       "table_routing": true,
       "read_side_effects": true,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -908,6 +930,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": true,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -934,6 +957,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -960,6 +984,7 @@
       "native": false,
       "table_routing": true,
       "read_side_effects": true,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -986,6 +1011,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -1012,6 +1038,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": true,
       "declared_types": false
@@ -1038,6 +1065,7 @@
       "native": false,
       "table_routing": true,
       "read_side_effects": true,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -1064,6 +1092,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": true,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -1090,6 +1119,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": true,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -1116,6 +1146,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -1142,6 +1173,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": true,
       "declared_types": false
@@ -1168,6 +1200,7 @@
       "native": true,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -1194,6 +1227,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -1220,6 +1254,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -1246,6 +1281,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -1272,6 +1308,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -1298,6 +1335,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -1324,6 +1362,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -1350,6 +1389,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": true,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -1376,6 +1416,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": true,
+      "consumes_destructively": true,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -1402,6 +1443,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": true,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -1428,6 +1470,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -1459,6 +1502,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -1490,6 +1534,7 @@
       "native": true,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": true
@@ -1518,6 +1563,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": true
@@ -1546,6 +1592,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -1577,6 +1624,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": true
@@ -1605,6 +1653,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -1633,6 +1682,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": true
@@ -1663,6 +1713,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -1694,6 +1745,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -1723,6 +1775,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -1752,6 +1805,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -1780,6 +1834,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -1808,6 +1863,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -1836,6 +1892,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -1864,6 +1921,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -1892,6 +1950,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -1923,6 +1982,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -1954,6 +2014,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": true
@@ -1985,6 +2046,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": true
@@ -2013,6 +2075,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -2044,6 +2107,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": true
@@ -2072,6 +2136,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -2103,6 +2168,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": true
@@ -2131,6 +2197,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -2159,6 +2226,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -2187,6 +2255,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -2215,6 +2284,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": true
@@ -2244,6 +2314,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -2273,6 +2344,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -2303,6 +2375,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -2331,6 +2404,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": true
@@ -2361,6 +2435,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": true
@@ -2392,6 +2467,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": true
@@ -2420,6 +2496,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false
@@ -2448,6 +2525,7 @@
       "native": false,
       "table_routing": false,
       "read_side_effects": false,
+      "consumes_destructively": false,
       "complete_reads": false,
       "declared_columns": false,
       "declared_types": false

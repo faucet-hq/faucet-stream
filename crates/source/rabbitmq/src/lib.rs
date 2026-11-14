@@ -35,4 +35,11 @@ pub use faucet_core::{FaucetError, Source};
 
 /// The connector's static descriptor (RFC 0013): its capabilities, answered from config alone.
 pub const DESCRIPTOR: faucet_core::ConnectorDescriptor =
-    faucet_core::ConnectorDescriptor::new("rabbitmq", faucet_core::capabilities::plain_source);
+    faucet_core::ConnectorDescriptor::new("rabbitmq", capabilities);
+
+/// Reading acknowledges what was read, so it cannot be read again.
+fn capabilities(_config: &faucet_core::Value) -> faucet_core::Capabilities {
+    faucet_core::Capabilities::builder()
+        .consumes_destructively(true)
+        .build()
+}
