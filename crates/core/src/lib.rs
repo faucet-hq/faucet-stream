@@ -88,6 +88,8 @@ pub mod retry;
 pub mod rollback;
 pub mod schema;
 pub mod shard;
+#[cfg(feature = "signature")]
+pub mod signature;
 pub mod stage;
 pub mod staging;
 pub mod state;
