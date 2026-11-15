@@ -52,6 +52,9 @@ audit-as-crates-io = false
 [policy.faucet-common-elasticsearch]
 audit-as-crates-io = false
 
+[policy.faucet-common-feed]
+audit-as-crates-io = false
+
 [policy.faucet-common-file]
 audit-as-crates-io = false
 
@@ -251,6 +254,9 @@ audit-as-crates-io = false
 audit-as-crates-io = false
 
 [policy.faucet-source-elasticsearch]
+audit-as-crates-io = false
+
+[policy.faucet-source-feed]
 audit-as-crates-io = false
 
 [policy.faucet-source-file]

@@ -103,6 +103,7 @@ source = [
     "source-websocket",
     "source-csv",
     "source-file",
+    "source-feed",
     "source-elasticsearch",
     "source-kafka",
     "source-kinesis",
@@ -187,6 +188,7 @@ source-webhook = ["dep:faucet-source-webhook", "faucet-registry/source-webhook"]
 source-websocket = ["dep:faucet-source-websocket", "faucet-registry/source-websocket"]
 source-csv = ["dep:faucet-source-csv", "faucet-registry/source-csv"]
 source-file = ["dep:faucet-source-file", "faucet-registry/source-file"]
+source-feed = ["dep:faucet-source-feed", "faucet-registry/source-feed"]
 source-elasticsearch = ["dep:faucet-source-elasticsearch", "faucet-registry/source-elasticsearch"]
 source-kafka = ["dep:faucet-source-kafka", "faucet-registry/source-kafka"]
 source-kinesis = ["dep:faucet-source-kinesis", "faucet-registry/source-kinesis"]
@@ -600,6 +602,7 @@ faucet-source-webhook = { workspace = true, optional = true }
 faucet-source-websocket = { workspace = true, optional = true }
 faucet-source-csv = { workspace = true, optional = true }
 faucet-source-file = { workspace = true, optional = true }
+faucet-source-feed = { workspace = true, optional = true }
 faucet-source-elasticsearch = { workspace = true, optional = true }
 faucet-source-kafka = { workspace = true, optional = true }
 faucet-source-kinesis = { workspace = true, optional = true }
@@ -779,6 +782,8 @@ opentelemetry-proto = { workspace = true, features = ["metrics"] }
 prost-otlp = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
+# `faucet run` over the `feed` source: seeds a real SQLite feed store.
+faucet-common-feed = { workspace = true, features = ["sqlite"] }
 
 [package.metadata.docs.rs]
 # Every feature but bundled DuckDB, librdkafka and Oracle (docs.rs OOM, #794); see scripts/full-feature-coverage.py.
@@ -796,7 +801,7 @@ features = [
     "sink-sftp", "sink-singer", "sink-snowflake", "sink-spanner", "sink-sqlite", "sink-sqs",
     "sink-stdout", "source-azure-blob", "source-bigquery", "source-clickhouse", "source-csv",
     "source-databricks", "source-delta", "source-dynamodb", "source-elasticsearch",
-    "source-file", "source-gcs", "source-graphql", "source-grpc", "source-iceberg",
+    "source-feed", "source-file", "source-gcs", "source-graphql", "source-grpc", "source-iceberg",
     "source-iceberg-glue", "source-iceberg-hms", "source-iceberg-sql", "source-kinesis",
     "source-mongodb", "source-mongodb-cdc", "source-mssql", "source-mssql-cdc", "source-mysql",
     "source-mysql-cdc", "source-nats", "source-parquet", "source-postgres",

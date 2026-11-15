@@ -6,7 +6,7 @@ tableOfContents:
   maxHeadingLevel: 2
 ---
 
-<p class="fs-lead">faucet-stream is a data-movement platform. One <code>faucet</code> binary moves data between <b><!--COUNT:sources-->43<!--/COUNT--> sources</b> and <b><!--COUNT:sinks-->35<!--/COUNT--> sinks</b> from a YAML file, with incremental state, CDC and exactly-once delivery built in.</p>
+<p class="fs-lead">faucet-stream is a data-movement platform. One <code>faucet</code> binary moves data between <b><!--COUNT:sources-->44<!--/COUNT--> sources</b> and <b><!--COUNT:sinks-->35<!--/COUNT--> sinks</b> from a YAML file, with incremental state, CDC and exactly-once delivery built in.</p>
 
 <div class="fs-btns not-content"><a class="fs-btn fs-btn-primary" href="/faucet-stream/getting-started/installation/">Get started<svg class="fs-i" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg></a><a class="fs-btn fs-btn-ghost" href="/faucet-stream/getting-started/learn/"><svg class="fs-i" viewBox="0 0 24 24" aria-hidden="true"><path d="M22 10 12 5 2 10l10 5 10-5Z"/><path d="M6 12v5c3 3 9 3 12 0v-5"/></svg>Learn the architecture</a></div>
 

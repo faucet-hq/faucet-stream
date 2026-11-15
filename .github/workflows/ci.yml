@@ -655,6 +655,7 @@ jobs:
           - source-websocket
           - source-csv
           - source-file
+          - source-feed
           - "source-file,file-formats"
           - source-elasticsearch
           - source-kafka

@@ -281,7 +281,7 @@ warehouse is dbt's job, and the two work well together
 
 ## Connectors
 
-<!--COUNT:sources-->43<!--/COUNT--> sources and <!--COUNT:sinks-->35<!--/COUNT--> sinks. Every
+<!--COUNT:sources-->44<!--/COUNT--> sources and <!--COUNT:sinks-->35<!--/COUNT--> sinks. Every
 connector depends only on `faucet-core`, so any source works with any sink.
 
 | Category | Sources | Sinks |
@@ -290,7 +290,7 @@ connector depends only on `faucet-core`, so any source works with any sink.
 | **CDC** | PostgreSQL, MySQL, SQL Server, MongoDB, Oracle, DynamoDB Streams | Applied through `write_mode: upsert` / `delete` on keyed sinks |
 | **Warehouses and lakehouses** | BigQuery, Snowflake, Redshift, ClickHouse, Databricks, Delta, Iceberg | BigQuery, Snowflake, Redshift, ClickHouse, Databricks, Delta, Iceberg |
 | **Object stores and files** | S3, GCS, Azure Blob, SFTP, local files (path, glob or URL); CSV and Parquet *(deprecated: use local files)* | S3, GCS, Azure Blob, SFTP, local files; CSV, Parquet and JSONL *(deprecated: use local files)* |
-| **Streams and queues** | Kafka, Kinesis, Pub/Sub, NATS, RabbitMQ, SQS | Kafka, Kinesis, Pub/Sub, NATS, RabbitMQ, SQS |
+| **Streams and queues** | Kafka, Kinesis, Pub/Sub, NATS, RabbitMQ, SQS, feed (a durable event feed store) | Kafka, Kinesis, Pub/Sub, NATS, RabbitMQ, SQS |
 | **APIs** | REST, GraphQL, gRPC, XML, Webhook, WebSocket | HTTP |
 | **Search** | Elasticsearch | Elasticsearch |
 | **Bridges** | Singer taps (experimental) | Singer targets (experimental), stdout |

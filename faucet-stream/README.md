@@ -58,6 +58,7 @@ cargo add faucet-stream --features full
 | `source-mongodb-cdc` | no | MongoDB CDC — Change Streams, resumable via resumeToken |
 | `source-redis` | no | Redis — streams, lists, or key patterns |
 | `source-webhook` | no | Webhook — temporary HTTP server collecting POSTs |
+| `source-feed` | no | Feed — delivers the events a durable feed store holds for one delivery, in order |
 | `source-websocket` | no | WebSocket — live streaming, subscription frames, reconnect |
 | `source-csv` | no | Deprecated (use `source-file`): the old `faucet-source-csv` crate, unchanged until the next major release |
 | `source-elasticsearch` | no | Elasticsearch — search / scroll API |

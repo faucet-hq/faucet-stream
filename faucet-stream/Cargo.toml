@@ -46,6 +46,7 @@ source = [
     "source-websocket",
     "source-csv",
     "source-file",
+    "source-feed",
     "source-elasticsearch",
     "source-parquet",
     "source-delta",
@@ -313,6 +314,7 @@ source-webhook = ["dep:faucet-source-webhook", "faucet-registry?/source-webhook"
 source-websocket = ["dep:faucet-source-websocket", "faucet-registry?/source-websocket"]
 source-csv = ["dep:faucet-source-csv", "faucet-registry?/source-csv"]
 source-file = ["dep:faucet-source-file", "faucet-registry?/source-file"]
+source-feed = ["dep:faucet-source-feed", "faucet-registry?/source-feed"]
 source-elasticsearch = ["dep:faucet-source-elasticsearch", "faucet-registry?/source-elasticsearch"]
 source-kafka = ["dep:faucet-source-kafka", "dep:faucet-common-kafka", "faucet-registry?/source-kafka"]
 source-kinesis = ["dep:faucet-source-kinesis", "dep:faucet-common-kinesis", "faucet-registry?/source-kinesis"]
@@ -473,6 +475,7 @@ faucet-source-webhook = { workspace = true, optional = true }
 faucet-source-websocket = { workspace = true, optional = true }
 faucet-source-csv = { workspace = true, optional = true }
 faucet-source-file = { workspace = true, optional = true }
+faucet-source-feed = { workspace = true, optional = true }
 faucet-source-elasticsearch = { workspace = true, optional = true }
 faucet-source-parquet = { workspace = true, optional = true }
 faucet-source-delta = { workspace = true, optional = true }
@@ -698,7 +701,7 @@ features = [
     "sink-redshift", "sink-s3", "sink-sftp", "sink-singer", "sink-snowflake", "sink-spanner",
     "sink-sqlite", "sink-sqs", "sink-stdout", "source-azure-blob", "source-bigquery",
     "source-clickhouse", "source-csv", "source-databricks", "source-delta", "source-dynamodb",
-    "source-elasticsearch", "source-file", "source-gcs", "source-graphql", "source-grpc",
+    "source-elasticsearch", "source-feed", "source-file", "source-gcs", "source-graphql", "source-grpc",
     "source-iceberg", "source-iceberg-glue", "source-iceberg-hms", "source-iceberg-sql",
     "source-kinesis", "source-mongodb", "source-mongodb-cdc", "source-mssql",
     "source-mssql-cdc", "source-mysql", "source-mysql-cdc", "source-nats", "source-parquet",

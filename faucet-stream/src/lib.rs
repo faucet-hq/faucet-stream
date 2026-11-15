@@ -26,6 +26,7 @@
 //! | `source-rabbitmq` | RabbitMQ (AMQP 0.9.1) queue source |
 //! | `source-sftp` | SFTP source |
 //! | `source-file` | Local file source (path, directory, glob or URL; every file format) |
+//! | `source-feed` | Feed source (delivers a durable feed store's events, in order) |
 //! | `source-s3` | AWS S3 file source |
 //! | `source-mongodb` | MongoDB query source |
 //! | `source-mongodb-cdc` | MongoDB CDC source (Change Streams) |
@@ -214,6 +215,11 @@ pub mod source {
     #[cfg(feature = "source-file")]
     pub mod file {
         pub use faucet_source_file::*;
+    }
+
+    #[cfg(feature = "source-feed")]
+    pub mod feed {
+        pub use faucet_source_feed::*;
     }
 
     #[cfg(feature = "source-s3")]
@@ -428,6 +434,11 @@ pub mod source {
     #[cfg(feature = "source-file")]
     pub mod file {
         pub use faucet_source_file::*;
+    }
+
+    #[cfg(feature = "source-feed")]
+    pub mod feed {
+        pub use faucet_source_feed::*;
     }
 
     #[cfg(feature = "source-s3")]

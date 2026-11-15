@@ -11991,6 +11991,61 @@
         }
       ]
     },
+    "source_feed__FeedStoreSpec": {
+      "description": "The store a `faucet run` drain opens.",
+      "oneOf": [
+        {
+          "description": "A SQLite feed store file.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "sqlite"
+            },
+            "config": {
+              "$ref": "#/$defs/source_feed__SqliteStoreConfig"
+            }
+          }
+        },
+        {
+          "description": "A PostgreSQL feed store.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "postgres"
+            },
+            "config": {
+              "$ref": "#/$defs/source_feed__PostgresStoreConfig"
+            }
+          }
+        }
+      ]
+    },
+    "source_feed__SqliteStoreConfig": {
+      "description": "A SQLite feed store.",
+      "type": "object",
+      "properties": {
+        "path": {
+          "description": "Path of the store's database file. It must exist.",
+          "type": "string",
+          "x-faucet-resource": "path"
+        }
+      },
+      "additionalProperties": true
+    },
+    "source_feed__PostgresStoreConfig": {
+      "description": "A PostgreSQL feed store.",
+      "type": "object",
+      "properties": {
+        "url": {
+          "description": "Connection URL of the database that holds the store.",
+          "type": "string",
+          "x-faucet-resource": "url"
+        }
+      },
+      "additionalProperties": true
+    },
     "source_websocket__AuthSpec": {
       "description": "A connector's `auth:` field: **either** an inline auth definition `A`\n(the `{ type, config }` shape), **or** a `{ ref: <name> }` reference to a\nshared provider defined in the top-level `auth:` catalog.\n\n`ref` is mutually exclusive with inline fields — supplying both is a\ndeserialization error.",
       "anyOf": [
@@ -27308,6 +27363,157 @@
                       "minimum": 0,
                       "default": 2000,
                       "x-faucet-caller-max": 100000
+                    }
+                  }
+                },
+                true
+              ]
+            },
+            "attributes": {
+              "description": "Destination attributes a data-flow policy (#702) reasons about —\n`residency: eu`, `environment: prod`, `region: eu-west-1`, … Free-form\nstring pairs; a policy rule's `require` / `when.sink` names them.\nMeaningful on sinks (a sink template carries them for every row that\nresolves to it; a matrix row's `sink.attributes` adds or overrides).",
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "complete_for": {
+              "description": "**Completeness claim** for scoped cleanup (#478). Meaningful only on\nsource templates; rejected at expand time on sinks — only a source knows\nwhether a fetch returned every record for a scope.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/CompletenessClaim"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "transforms": {
+              "description": "Transforms bound to this source template. Applied after `T_pipeline`\nand before `T_row` for every matrix row that resolves to this template.\nRejected at expand time when this `ConnectorSpec` is used as a sink.",
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "$ref": "#/$defs/TransformSpec"
+              },
+              "default": null
+            },
+            "inherit_transforms": {
+              "description": "When `false`, drops upstream `T_pipeline` transforms for every matrix\nrow that resolves to this source template. Default `true`. Rejected\nat expand time on sinks.",
+              "type": "boolean",
+              "default": true
+            },
+            "status": {
+              "description": "Readiness ladder for the *source* side of a row (#371). Governs whether\na row runs by default. Deep-merges from template → row `source` override\nlike any scalar. `None` resolves to the built-in default (`active`).\nMeaningful only on source templates; ignored on sinks.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SourceStatus"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "tags": {
+              "description": "Free-form classification tags for the *source* template (#376).\nUnion-merged (not replaced) with a matrix row's own `tags:` to form the\nrow's effective tag set. Meaningful only on source templates; ignored on\nsinks. Validated at expand time (charset `^[a-z0-9][a-z0-9_-]*$`).",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "title": "feed",
+          "properties": {
+            "type": {
+              "const": "feed"
+            },
+            "config": {
+              "anyOf": [
+                {
+                  "additionalProperties": true,
+                  "title": "FeedSourceConfig",
+                  "description": "Configuration of the `feed` source.\n\nEvery field is optional. Under `faucet serve` the feed, the delivery and\nthe store come from the delivery run itself, and setting any of `feed`,\n`delivery` or `store` is refused. Under `faucet run` all three are\nrequired.",
+                  "type": "object",
+                  "properties": {
+                    "feed": {
+                      "description": "The feed's uid in the store (`faucet run` only).",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "delivery": {
+                      "description": "The delivery's id within the feed (`faucet run` only).",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "store": {
+                      "description": "The store that holds the feed (`faucet run` only).",
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/source_feed__FeedStoreSpec"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "page_events": {
+                      "description": "Split a run's events into pages of this many. Each page is written and\ncommitted on its own. Unset: one page per run.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0
+                    },
+                    "include_metadata": {
+                      "description": "Add `_feed: {seq, id, received_at, headers}` to every record.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ],
+                      "default": true
+                    },
+                    "claim_ttl_secs": {
+                      "description": "How long the range claim lasts without a renewal, in seconds. The\nsource renews it every tenth of this while it runs.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0
+                    },
+                    "max_events": {
+                      "description": "Most events one `faucet run` drain reads.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0
+                    },
+                    "max_bytes": {
+                      "description": "Most payload bytes one `faucet run` drain reads; a single larger event\nis still read.",
+                      "type": [
+                        "integer",
+                        "null",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0
                     }
                   }
                 },

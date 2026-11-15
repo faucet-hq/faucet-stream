@@ -48,6 +48,7 @@ source = [
     "source-websocket",
     "source-csv",
     "source-file",
+    "source-feed",
     "source-elasticsearch",
     "source-kafka",
     "source-kinesis",
@@ -168,6 +169,7 @@ source-webhook = ["dep:faucet-source-webhook"]
 source-websocket = ["dep:faucet-source-websocket"]
 source-csv = ["dep:faucet-source-csv"]
 source-file = ["dep:faucet-source-file"]
+source-feed = ["dep:faucet-source-feed"]
 source-elasticsearch = ["dep:faucet-source-elasticsearch"]
 source-kafka = ["dep:faucet-source-kafka"]
 source-kinesis = ["dep:faucet-source-kinesis"]
@@ -395,6 +397,7 @@ faucet-source-redis = { workspace = true, optional = true }
 faucet-source-webhook = { workspace = true, optional = true }
 faucet-source-websocket = { workspace = true, optional = true }
 faucet-source-csv = { workspace = true, optional = true }
+faucet-source-feed = { workspace = true, optional = true }
 faucet-source-file = { workspace = true, optional = true }
 faucet-source-elasticsearch = { workspace = true, optional = true }
 faucet-source-kafka = { workspace = true, optional = true }
@@ -517,6 +520,7 @@ features = [
     "source-delta",
     "source-dynamodb",
     "source-elasticsearch",
+    "source-feed",
     "source-file",
     "source-gcs",
     "source-graphql",

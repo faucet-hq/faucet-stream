@@ -115,6 +115,7 @@ The service column lists what each example touches; all are provided by
 | `s3_to_postgres.yaml`, `s3_to_mongodb.yaml` | minio (S3), target |
 | `mongodb_to_redis.yaml`, `xml_to_mongodb.yaml`, `mongodb_to_parquet.yaml` | mongodb (single-node replica set; query mode connects to the primary); `mongodb_to_parquet` writes local Parquet files (no cloud infra) |
 | `webhook_to_csv.yaml`, `webhook_to_http.yaml`, `grpc_to_http.yaml` | none external beyond the source/HTTP target |
+| `feed_to_jsonl.yaml` | none: reads a local SQLite feed store (`./feeds.db`) that already holds the feed and its delivery |
 | `dag_users_posts.yaml`, `rest_users_posts_dag.yaml`, `rest_to_bigquery_matrix.yaml`, `templates_*.yaml` | demonstrate matrix / DAG / template syntax (REST source) |
 | `matrix_depends_on.yaml` | demonstrates `depends_on` completion ordering between matrix rows (local CSV/JSONL, no infra) |
 
