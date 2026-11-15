@@ -256,14 +256,14 @@ mod tests {
                 other = 1
             );
             let _i = inner.enter();
-            tracing::warn!(nnn = 31337, "hello-capture");
+            tracing::warn!(nnn = 31337, "zqx-capture-msg");
         });
         let e = got.lock().unwrap().pop().unwrap();
         // Other tests register secrets process-wide; compare against the
         // redacted form so a short registered value cannot flake this.
         let r = |v: &str| crate::secrets::registry::redact(v).into_owned();
         assert_eq!(e.level, "WARN");
-        assert_eq!(e.body, r("hello-capture nnn=31337"));
+        assert_eq!(e.body, r("zqx-capture-msg nnn=31337"));
         assert_eq!(e.attr("pipeline"), Some(r("pipe-capture-a").as_str()));
         assert_eq!(e.attr("row"), Some(r("row-capture-2").as_str()));
         assert_eq!(e.attr("connector"), Some(r("conn-capture").as_str()));
@@ -271,7 +271,7 @@ mod tests {
         assert!(e.attr("other").is_none());
         assert_eq!(e.attr("target"), Some(e.target.as_str()));
         assert!(e.rendered().contains(" WARN "));
-        assert!(e.rendered().ends_with(&r("hello-capture nnn=31337")));
+        assert!(e.rendered().ends_with(&r("zqx-capture-msg nnn=31337")));
     }
 
     #[cfg(feature = "otel")]
