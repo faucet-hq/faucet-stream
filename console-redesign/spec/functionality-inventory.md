@@ -7,7 +7,7 @@ Legend once the build lands: ✅ kept (where) · ⚠️ changed (how) · ❌ dro
 ## Shell (index.html, shell.js, app.js, access.js, tenant.js, tz.js)
 - Grouped sidebar Operate / Data / Build / Govern / Admin, groups collapsible (localStorage `faucet.nav.collapsed`) → client
 - Nav badges: running runs, pending changes (warn), tenants → `GET /v1/runs?status=running&limit=100`, `GET /v1/changes?status=pending&limit=100`, `GET /v1/tenants`
-- Disabled "soon" entries for pages without an API (Feeds; Schedules and Policy until #1044 / #1043) → client
+- Disabled "soon" entries for pages without an API (Feeds until #1034; Schedules and Policy until #1044 / #1043) → client
 - Breadcrumb group / page / item; item replaced by the view's own title (`setCrumbTitle`) → client
 - Context chip (short run id on a run page) → client
 - Tenant switcher (hidden without tenants API; pinned for a tenant-scoped principal) → `GET /v1/tenants`, `GET /v1/whoami`
@@ -25,6 +25,7 @@ Legend once the build lands: ✅ kept (where) · ⚠️ changed (how) · ❌ dro
 - 🆕 Keyboard: j/k move in any list, Enter opens, Esc back to the list / closes menus, `/` focuses the list search → client
 - 🆕 Every id/URI/config with a copy button; relative times with the absolute time on hover; every name links to its page → client
 - 🆕 Audit log, Triggers and Settings become real pages (APIs exist); Feeds stays "soon" with a designed placeholder
+- 🆕 Feeds (#1034) becomes a real page: see `views/feeds.js` and api-proposals #13. Per feed: the ingest URL and how senders sign in; events received / delivered / pending / refused; storage against the retention limits; its deliveries (template, flush policy, position, lag, runs with their event ranges); newest events (payload for admins, never for a sealed feed); refusals by reason; tokens (made, shown once, revoked) and the signature check; change history. Actions: create / edit / delete a feed, add / pause / resume / deliver now / replay a delivery, send a test event, recover a held feed. States: stalled delivery, feed full (refusing), feed held after a store restore, store unreachable, from the feeds file (read-only), under approval, tenant-scoped with quotas
 - 🆕 Schedules (#1044) and Policy (#1043) become real pages: see `views/schedules.js` and `views/policy.js` and api-proposals #9 / #10
 - 🆕 The top tenant switcher also scopes Schedules (own + shared schedules that include the tenant, runs filtered to it) and Policy (server policy + that tenant's add-only rules and their history) → api-proposals #11 / #12
 - 🆕 Tenant principals: Schedules shows their own schedules (editable within `max_schedules` and the minimum interval) and the operator's shared ones read-only; Policy shows the server rules that apply to them (names + requirements, read-only) and their tenant's rules (editable by tenant admins through approval) → api-proposals #11 / #12

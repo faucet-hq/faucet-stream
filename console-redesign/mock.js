@@ -136,7 +136,7 @@
 
   // ---- shell ----
   const NAV = [
-    ['Operate', [['home', 'Overview', 'overview'], ['runs', 'Runs', 'runs', '3'], ['changes', 'Changes', 'changes', '2', true], ['trig', 'Triggers', 'triggers'], ['sched', 'Schedules', 'schedules', '8'], ['feed', 'Feeds', 'feeds', null, false, true]]],
+    ['Operate', [['home', 'Overview', 'overview'], ['runs', 'Runs', 'runs', '3'], ['changes', 'Changes', 'changes', '2', true], ['trig', 'Triggers', 'triggers'], ['sched', 'Schedules', 'schedules', '8'], ['feed', 'Feeds', 'feeds', '7']]],
     ['Data', [['db', 'Datasets', 'datasets', '48'], ['lineage', 'Lineage', 'lineage']]],
     ['Build', [['tpl', 'Templates', 'templates', '17'], ['schema', 'Schemas', 'schemas'], ['submit', 'Submit', 'submit']]],
     ['Govern', [['policy', 'Policy', 'policy'], ['usage', 'Usage', 'usage'], ['tenants', 'Tenants', 'tenants', '6']]],

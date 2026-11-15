@@ -12,5 +12,6 @@ tenants
 audit
 triggers
 schedules
+feeds
 policy
 settings
