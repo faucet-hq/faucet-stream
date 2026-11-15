@@ -4686,6 +4686,7 @@ dependencies = [
  "dotenvy",
  "faucet-auth",
  "faucet-common-azure",
+ "faucet-common-feed",
  "faucet-common-file",
  "faucet-common-nats",
  "faucet-common-rabbitmq",
@@ -4739,6 +4740,7 @@ dependencies = [
  "faucet-source-duckdb",
  "faucet-source-dynamodb",
  "faucet-source-elasticsearch",
+ "faucet-source-feed",
  "faucet-source-file",
  "faucet-source-gcs",
  "faucet-source-graphql",
@@ -5404,6 +5406,7 @@ dependencies = [
  "bytes",
  "chrono",
  "faucet-common-azure",
+ "faucet-common-feed",
  "faucet-common-file",
  "faucet-common-iceberg",
  "faucet-common-oracle",
@@ -5439,6 +5442,7 @@ dependencies = [
  "faucet-source-delta",
  "faucet-source-duckdb",
  "faucet-source-elasticsearch",
+ "faucet-source-feed",
  "faucet-source-file",
  "faucet-source-gcs",
  "faucet-source-graphql",
@@ -5555,6 +5559,7 @@ dependencies = [
  "faucet-source-duckdb",
  "faucet-source-dynamodb",
  "faucet-source-elasticsearch",
+ "faucet-source-feed",
  "faucet-source-file",
  "faucet-source-gcs",
  "faucet-source-graphql",
@@ -6543,6 +6548,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "faucet-source-feed"
+version = "1.0.0"
+dependencies = [
+ "async-trait",
+ "faucet-common-feed",
+ "faucet-conformance",
+ "faucet-core",
+ "futures",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "testcontainers",
+ "testcontainers-modules",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "faucet-source-file"
 version = "1.2.1"
 dependencies = [
@@ -7439,6 +7465,7 @@ dependencies = [
  "faucet-source-duckdb",
  "faucet-source-dynamodb",
  "faucet-source-elasticsearch",
+ "faucet-source-feed",
  "faucet-source-file",
  "faucet-source-gcs",
  "faucet-source-graphql",
