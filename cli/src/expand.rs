@@ -775,6 +775,16 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
                     attributes: Default::default(),
                 }
             };
+            // A discovery read has no sink, so nothing it reads is written.
+            if crate::registry::source_kind_consumes_destructively(&src.kind, &src.config) {
+                return Err(CliError::Config(format!(
+                    "matrix row '{row_id}': a `fan_out:` row only reads its source to list values \
+                     and writes nothing, but the `{}` source removes or acknowledges what it \
+                     reads, so those records would be lost. List the values from a source that \
+                     can be read again",
+                    src.kind
+                )));
+            }
             crate::sql_bind::check_source_query(
                 &src.kind,
                 &src.config,
@@ -3800,6 +3810,33 @@ matrix:
         }
         // The dim is folded into depends_on so readiness/skip/cycle reuse it.
         assert_eq!(report.depends_on, vec!["subs".to_string()]);
+    }
+
+    #[test]
+    fn a_source_that_consumes_what_it_reads_cannot_be_a_fan_out_row() {
+        let empty = serde_json::json!({});
+        let kinds: Vec<&str> = crate::registry::source_kinds()
+            .into_iter()
+            .filter(|k| crate::registry::source_kind_consumes_destructively(k, &empty))
+            .collect();
+        #[cfg(feature = "source-feed")]
+        assert!(kinds.contains(&"feed"), "{kinds:?}");
+        for kind in kinds {
+            let c = cfg(&disc_cfg(&format!(
+                r#"  - id: subs
+    discover:
+      source: {{ type: {kind}, config: {{}} }}
+      select: "$.id"
+      as: subsidiary_id
+  - id: report
+    for_each: [subs]"#
+            )));
+            let err = expand(&c).unwrap_err().to_string();
+            assert!(err.contains("matrix row 'subs'"), "{err}");
+            assert!(err.contains("`fan_out:` row"), "{err}");
+            assert!(err.contains(&format!("`{kind}` source")), "{err}");
+            assert!(err.contains("would be lost"), "{err}");
+        }
     }
 
     #[test]
