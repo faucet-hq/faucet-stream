@@ -23,6 +23,7 @@ file-format-xml = []
 
 [dev-dependencies]
 faucet-common-file = { workspace = true, features = ["encryption"] }
+faucet-common-feed = { workspace = true, features = ["sqlite"] }
 faucet-core = { workspace = true, features = ["arrow", "compression", "encryption", "file-formats"] }
 faucet-conformance = { workspace = true, features = ["containers"] }
 faucet-common-oracle.workspace = true
@@ -37,6 +38,7 @@ faucet-source-delta = { workspace = true, features = ["arrow"] }
 faucet-source-duckdb.workspace = true
 faucet-source-graphql.workspace = true
 faucet-source-elasticsearch.workspace = true
+faucet-source-feed.workspace = true
 faucet-source-file = { workspace = true, features = ["arrow", "encryption", "file-formats"] }
 faucet-source-gcs = { workspace = true, features = ["arrow", "compression", "file-formats"] }
 faucet-source-iceberg = { workspace = true, features = ["arrow", "catalog-sql"] }
