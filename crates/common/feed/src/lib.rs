@@ -15,12 +15,16 @@
 //!   holder token, retention and the maintenance claim.
 //! - [`SqliteFeedStore`] (feature `sqlite`) — one server per database file.
 //! - [`PostgresFeedStore`] (feature `postgres`) — safe for several servers.
-//! - [`conformance`] (feature `conformance`) — the suite every backend passes.
+//! - [`conformance`] (feature `conformance`) — the suite every backend passes,
+//!   and `StalledStore`, a store that never answers.
+//! - [`FeedExecution`] — the handle a host scopes over a delivery run
+//!   ([`scope`]) and the `feed` source reads through ([`current`]).
 //!
 //! A delivery's cursor is the **next** sequence number to read. Claim expiry,
 //! dedupe expiry and retention age follow the store's clock.
 
 mod error;
+mod execution;
 mod store;
 mod types;
 
@@ -34,14 +38,22 @@ mod sqlite;
 
 #[cfg(feature = "conformance")]
 pub mod conformance;
+#[cfg(any(test, feature = "conformance"))]
+mod stalled;
 
 pub use error::{FeedError, Result};
+pub use execution::{
+    FeedBinding, FeedExecution, OpenError, PayloadOpener, current, inherit, scope, sealing_context,
+};
 pub use store::FeedStore;
 pub use types::{
     AppendAck, Appended, Batch, BatchLimits, Claim, ClaimId, ClaimInfo, ClaimOwner, DeliveryHead,
     DeliveryState, DeliveryUid, Epoch, FeedUid, FullLimit, Gap, Head, Holder, Move, NewEvent,
     PurgeStats, Seq, Start, StoreCaps, StoreLimits, StoredEvent, TenantId, Timestamp, TrimStats,
 };
+
+#[cfg(feature = "conformance")]
+pub use stalled::StalledStore;
 
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub use sql::SCHEMA_VERSION;

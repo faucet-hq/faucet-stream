@@ -18,7 +18,7 @@ sqlite = ["dep:sqlx", "sqlx/sqlite"]
 postgres = ["dep:sqlx", "sqlx/postgres", "faucet-core/libpq-sqlx"]
 # The store conformance suite (`faucet_common_feed::conformance`), for the
 # tests of this crate and of any other `FeedStore` backend.
-conformance = ["tokio/rt"]
+conformance = []
 
 [dependencies]
 faucet-core.workspace = true
@@ -29,7 +29,7 @@ uuid.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sqlx = { workspace = true, optional = true }
-tokio = { workspace = true, features = ["sync", "time"] }
+tokio = { workspace = true, features = ["sync", "time", "rt"] }
 
 [dev-dependencies]
 faucet-conformance = { workspace = true, features = ["containers"] }

@@ -10,7 +10,8 @@ suite every backend passes. It has no HTTP surface and no connector in it.
 | `FeedStore` | The contract: append, read, claim, commit, retention. Object-safe; every method takes a `&CallContext`. |
 | `SqliteFeedStore` (feature `sqlite`) | One SQLite file (WAL, `synchronous = FULL`). One server per file. |
 | `PostgresFeedStore` (feature `postgres`) | PostgreSQL. Safe for several servers; always its own connection pool. |
-| `conformance` (feature `conformance`) | The suite: implement `Backend` for a store and run `CHECKS`. |
+| `conformance` (feature `conformance`) | The suite: implement `Backend` for a store and run `CHECKS`. Also `StalledStore`, a store that never answers. |
+| `FeedExecution`, `scope`, `current`, `inherit` | The handle a host scopes over a delivery run's task and the `feed` source reads through. |
 
 ## Install
 
@@ -108,6 +109,33 @@ version (`SCHEMA_VERSION`); a store written by a newer release is refused with
 The tables are frozen per format version in `tests/fixtures/<backend>-store-v1.json`;
 a test fails when they change, so a new shape means a new version, a migration
 and a new fixture.
+
+## The run-scoped handle
+
+A host that runs a delivery gives the `feed` source its store, its claim and
+its sealed-payload opener through a `FeedExecution` scoped over the run's
+task. Nothing of it is in the run's config and nothing is process-global, so
+several hosts in one process do not cross.
+
+```rust,ignore
+use faucet_common_feed::{FeedBinding, FeedExecution, scope};
+
+let binding = FeedBinding::new(delivery, epoch, claim.id, claim.from, claim.to, "default");
+let execution = FeedExecution::new(binding, store)   // Arc<dyn FeedStore>
+    .opener(opener)                                  // optional: opens sealed payloads
+    .dataset("acme/orders");                         // optional: the name lineage reports
+let result = scope(execution, pipeline.run()).await;
+```
+
+- `current()` returns the handle inside the scope, `None` outside it.
+- A task spawned from inside the scope sees it only when its future is
+  wrapped with `inherit(..)`.
+- `FeedBinding` holds names and ids only (feed, delivery, epoch, claim, range,
+  store name) and is `Serialize` / `Deserialize`, so it can be stored on a run
+  record.
+- A `PayloadOpener` is `Fn(&[u8], &str) -> Result<Vec<u8>, OpenError>`; the
+  second argument is `sealing_context(feed, tenant)`, i.e.
+  `feed:{uid}:tenant:{tenant|-}:event`.
 
 ## Errors
 
