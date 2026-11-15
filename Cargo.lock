@@ -4948,6 +4948,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "faucet-common-feed"
+version = "1.0.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "faucet-conformance",
+ "faucet-core",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "testcontainers",
+ "testcontainers-modules",
+ "thiserror 2.0.21",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "faucet-common-file"
 version = "1.1.4"
 dependencies = [

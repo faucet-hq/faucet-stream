@@ -1,0 +1,67 @@
+[package]
+name = "faucet-common-feed"
+version = "1.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Durable event feed store (types, the FeedStore contract, SQLite and PostgreSQL backends) for the faucet-stream ecosystem"
+readme = "README.md"
+keywords = ["feed", "events", "queue", "etl", "pipeline"]
+categories.workspace = true
+
+[features]
+default = []
+# SQLite backend (`SqliteFeedStore`): one server per database file.
+sqlite = ["dep:sqlx", "sqlx/sqlite"]
+# PostgreSQL backend (`PostgresFeedStore`): safe for several servers.
+postgres = ["dep:sqlx", "sqlx/postgres", "faucet-core/libpq-sqlx"]
+# The store conformance suite (`faucet_common_feed::conformance`), for the
+# tests of this crate and of any other `FeedStore` backend.
+conformance = ["tokio/rt"]
+
+[dependencies]
+faucet-core.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sqlx = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["sync", "time"] }
+
+[dev-dependencies]
+faucet-conformance = { workspace = true, features = ["containers"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile.workspace = true
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
+
+[[test]]
+name = "sqlite"
+required-features = ["sqlite", "conformance"]
+
+[[test]]
+name = "postgres"
+required-features = ["postgres", "conformance"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+# API-stability (cargo-semver-checks) lint overrides.
+#
+# Additive evolution is a MINOR bump by declared contract (CLAUDE.md
+# "API-Evolution & Versioning Policy"): struct-literal construction and
+# exhaustive matching of config/data types are NOT part of this crate's
+# stability surface — construct via `new()`/`Default` or builders, and match
+# with a `_` arm. Every other API-stability lint stays at its default (deny)
+# level, so genuine removals and signature changes still fail the gate.
+[package.metadata.cargo-semver-checks.lints]
+constructible_struct_adds_field = "allow"
+constructible_struct_adds_private_field = "allow"
+enum_struct_variant_field_added = "allow"
+
+[lints]
+workspace = true
