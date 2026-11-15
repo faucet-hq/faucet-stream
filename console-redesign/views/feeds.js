@@ -81,7 +81,7 @@
     ${head('to-warehouse', [stalled ? pill('Stalled', 'bad', 'alert') : paused ? pill('Paused', '', 'pause') : pill('Delivering', 'ok', 'check'), `<span>runs ${lnk('acme/tickets-to-lake')} <span class="mono">pin v4</span></span>`, '<span>exactly once</span>'])}
     <div class="two"><div class="stack">
       ${card({ icon: 'feed', title: 'Position', body: grid(4, [kv('Delivered to', '<span class="mono">#1,204,881</span>', 'the cursor'), kv('Newest event', '<span class="mono">#1,205,193</span>'), kv('Behind', '312 events', '38s · 1.1 MiB'), kv('Replay from', '<span class="mono">#1,163,400</span>', '7 days ago')]) })}
-      ${card({ icon: 'tpl', title: 'What it runs', right: lnk('open template'), body: `${grid(2, [kv('Template', lnk('acme/tickets-to-lake'), 'pipeline'), kv('Version', '<span class="mono">pin v4</span>', 'never moves'), kv('Pool', 'default'), kv('After 5 failed runs', 'stall and alert')])}
+      ${card({ icon: 'tpl', title: 'What it runs', right: lnk('open template'), body: `${grid(2, [kv('Template', lnk('acme/tickets-to-lake'), 'pipeline'), kv('Version', '<span class="mono">pin v4</span>', 'never moves'), kv('Pool', 'default'), kv('If an event keeps failing', 'stall and alert')])}
         <div class="pad" style="padding-top:0">${tbl(['Param', 'Value'], [['<span class="mono">table</span>', 'support.tickets'], ['<span class="mono">warehouse_token</span>', '<span class="faint">sealed · secret param</span>']])}</div>` })}
     </div><div class="stack">
       ${card({ icon: 'clock', title: 'When it flushes', body: grid(2, [kv('Events', '5,000', 'or'), kv('Size', '64 MiB', 'or'), kv('Oldest waiting', '60s', 'whichever comes first'), kv('At most every', '10s')]), note: 'One run per flush, never one per event. A backlog is delivered in runs of up to 50,000 events.' })}
@@ -91,7 +91,7 @@
         [lnk('to-warehouse · 8f20'), '<span class="mono">#1,199,570–1,204,569</span>', '<span class="ok">● completed</span>', '5,000', '1m ago'],
         [lnk('to-warehouse · 8f1f'), '<span class="mono">#1,199,102–1,199,569</span>', '<span class="ok">● completed</span>', '468', '2m ago'],
         [lnk('to-warehouse · 8f1e'), '<span class="mono">#1,199,102–1,199,569</span>', '<span class="bad">● failed</span>', '—', '3m ago']]),
-        note: 'A run that fails is tried again over the same events. Runs carry the labels <code>feed=support-tickets</code> and <code>feed_delivery=to-warehouse</code>.' })}`;
+        note: 'A run that fails is tried again with half as many events, until it gets through or one event is left. Runs carry the labels <code>feed=support-tickets</code> and <code>feed_delivery=to-warehouse</code>.' })}`;
 
   const events = ({ open = false, sealed = false } = {}) => {
     const payload = sealed
@@ -203,8 +203,9 @@
       'deliver-now': { label: 'Deliver now dialog', covers: ['POST …/deliveries/{d}/flush'] },
       pause: { label: 'Pause delivery dialog', covers: ['POST …/deliveries/{d}/pause'] },
       paused: { label: 'Paused delivery', covers: ['events keep arriving', 'who paused and why', 'resume'] },
-      stalled: { label: 'Delivery stalled after failed runs', covers: ['failing event range', 'retry', 'never skipped silently'] },
-      skip: { label: 'Skip events dialog · admins', covers: ['POST …/deliveries/{d}/skip', 'gap recorded, reason required'] },
+      failing: { label: 'Delivery failing · batches shrinking', covers: ['failed runs with their event ranges', 'next run halved', 'still trying'] },
+      stalled: { label: 'Delivery stalled on one event', covers: ['the single failing event', 'retry or skip', 'never skipped silently'] },
+      skip: { label: 'Skip event dialog · admins', covers: ['POST …/deliveries/{d}/skip', 'gap recorded, reason required'] },
       full: { label: 'Feed full · refusing new events', covers: ['undelivered limit reached', '503 to senders, nothing dropped'] },
       held: { label: 'Feed held after a store restore', covers: ['POST /v1/feeds/{name}/recover'] },
       replay: { label: 'Replay dialog', covers: ['POST …/deliveries/{d}/replay', 'event count before confirming'] },
@@ -285,16 +286,16 @@ feeds:
         return;
       }
 
-      const sel = { stalled: 'partner', skip: 'partner', full: 'pings', held: 'billing', file: 'audit', paused: 'legacy', create: '', invalid: '', approval: '', requested: '', created: 'tickets' }[state];
+      const sel = { stalled: 'partner', skip: 'partner', failing: 'partner', full: 'pings', held: 'billing', file: 'audit', paused: 'legacy', create: '', invalid: '', approval: '', requested: '', created: 'tickets' }[state];
       const selected = sel === undefined ? 'tickets' : sel;
       const title = { partner: 'partner-callbacks', pings: 'device-pings', billing: 'billing-events', audit: 'audit-trail', legacy: 'legacy-import', tickets: 'support-tickets', '': 'New feed' }[selected];
-      const sub = { delivery: 'to-warehouse', 'deliver-now': 'to-warehouse', pause: 'to-warehouse', replay: 'to-warehouse', 'delivery-new': 'New delivery', paused: 'to-lake', stalled: 'to-warehouse', skip: 'to-warehouse' }[state];
+      const sub = { delivery: 'to-warehouse', 'deliver-now': 'to-warehouse', pause: 'to-warehouse', replay: 'to-warehouse', 'delivery-new': 'New delivery', paused: 'to-lake', stalled: 'to-warehouse', skip: 'to-warehouse', failing: 'to-warehouse' }[state];
       M.top(crumbs(state === 'list' ? '' : title, sub));
       M.list(listPane(state === 'list' ? '' : selected));
 
       if (state === 'list') {
         M.detail(`${head('7 feeds', ['<span>212,430 events today</span>', '<span class="warn">26,866 pending</span>', '<span>1.2% refused</span>'])}
-          ${alert('partner-callbacks has not delivered for 3 hours.', 'Its delivery to-warehouse stalled after 5 failed runs. Events are still being stored.', 'bad', btn('Open', { icon: 'right' }))}
+          ${alert('partner-callbacks has not delivered for 3 hours.', 'Its delivery to-warehouse is stalled on one event it cannot deliver. Events are still being stored.', 'bad', btn('Open', { icon: 'right' }))}
           ${alert('device-pings is refusing new events.', 'It holds 50 GiB of events that are not delivered yet, which is its limit.', 'bad', btn('Open', { icon: 'right' }))}
           ${card({ title: 'Deliveries', right: 'most behind first', body: tbl(['Feed', 'Delivery', 'Behind', 'Last run'], [
             [lnk('partner-callbacks'), lnk('to-warehouse'), '<span class="bad">18,204 · 3h 12m</span>', '<span class="bad">● failed</span> 2m ago'],
@@ -344,20 +345,27 @@ feeds:
       flush: { max_events: 1000, max_age: 5m }`, { box: false }) })}</div></div>`);
         return;
       }
-      if (state === 'stalled' || state === 'skip') {
+      if (state === 'stalled' || state === 'skip' || state === 'failing') {
+        const failing = state === 'failing';
+        const why = failing ? 'sink: connection refused (warehouse.internal:5439)' : 'sink: value too long for column note (4,096)';
         M.detail(`${dhead(dtab('Deliveries', { deliveries: 1, refused: 12 }), `${btn('Try again now', { icon: 'refresh', kind: 'primary', act: true })}${btn('Pause', { icon: 'pause', act: true })}${ibtn('more', { act: true })}`, 'partner-callbacks')}
-          ${head('to-warehouse', [pill('Stalled', 'bad', 'alert'), `<span>runs ${lnk('partners/callbacks-to-warehouse')} <span class="mono">stable</span></span>`, '<span>at least once</span>'])}
-          ${alert('Stopped after 5 failed runs. No events were skipped.', 'Every run failed on the same events with <code>sink: connection refused (warehouse.internal:5439)</code>. New events are still stored, and delivery continues from the same place once a run succeeds.', 'bad', btn('Open the last run', { icon: 'right' }) + btn('Skip events…', { icon: 'right', act: true }))}
-          <div class="two"><div class="stack">${card({ icon: 'feed', title: 'Position', body: grid(4, [kv('Delivered to', '<span class="mono">#402,117</span>', '3h 12m ago'), kv('Newest event', '<span class="mono">#420,321</span>'), kv('Behind', '<span class="bad">18,204 events</span>', '71 MiB'), kv('Feed limit', '0.1% used', 'of 50 GiB')]) })}</div>
-          <div class="stack">${storeCard({ und: '71 MiB of 50 GiB', oldest: '3 hours', kept: '310 MiB' })}</div></div>
-${card({ icon: 'runs', title: 'Failed runs', body: tbl(['Run', 'Events', 'Status', 'Why'], [
-              [lnk('to-warehouse · 2c91'), '<span class="mono">#402,118–407,117</span>', '<span class="bad">● failed</span>', 'sink: connection refused'],
-              [lnk('to-warehouse · 2c90'), '<span class="mono">#402,118–407,117</span>', '<span class="bad">● failed</span>', 'sink: connection refused'],
-              [lnk('to-warehouse · 2c8f'), '<span class="mono">#402,118–407,117</span>', '<span class="bad">● failed</span>', 'sink: connection refused']]) })}`);
-        if (state === 'skip') M.overlay(dialog('Skip events for to-warehouse?', `<span>Moves this delivery past events it cannot deliver. The skipped events stay stored until they age out, and the gap is recorded on the feed for good.</span>
-          ${field('Skip up to and including', input('#407,117', { mono: true }), { help: 'The range every failed run stopped on: #402,118–407,117 · 5,000 events' })}
-          ${field('Reason', '<div class="area sans">Malformed batch from the partner, re-sent by them as #418,002 onward</div>', { req: true, help: 'Shown on the feed and in the audit log' })}
-          ${alert('5,000 events will never reach this delivery’s destination.', 'Other deliveries of this feed are not affected.', 'warn')}`, `${btn('Cancel')}${btn('Skip 5,000 events', { kind: 'danger', icon: 'right' })}`, 'alert'));
+          ${head('to-warehouse', [failing ? pill('Failing', 'warn', 'alert') : pill('Stalled', 'bad', 'alert'), `<span>runs ${lnk('partners/callbacks-to-warehouse')} <span class="mono">stable</span></span>`, '<span>at least once</span>'])}
+          ${failing
+            ? alert('The last 3 runs failed. Still trying, with smaller batches.', `Each run failed with <code>${why}</code>. The next run takes 1,250 events and starts in 40 seconds. Nothing is skipped, and new events are still stored.`, 'warn', btn('Open the last run', { icon: 'right' }))
+            : alert('One event cannot be delivered. Nothing was skipped.', `Runs were cut down to a single event, and <span class="mono">#402,118</span> still fails with <code>${why}</code>. New events are still stored. Fix the template or the destination and try again, or skip this event.`, 'bad', btn('Open the last run', { icon: 'right' }) + btn('Open the event', { icon: 'code' }) + btn('Skip this event…', { icon: 'right', act: true }))}
+          <div class="two"><div class="stack">${card({ icon: 'feed', title: 'Position', body: grid(4, [kv('Delivered to', '<span class="mono">#402,117</span>', failing ? '6m ago' : '3h 12m ago'), kv('Newest event', failing ? '<span class="mono">#403,041</span>' : '<span class="mono">#420,321</span>'), kv('Behind', failing ? '<span class="warn">924 events</span>' : '<span class="bad">18,204 events</span>', failing ? '3.6 MiB' : '71 MiB'), kv('Next run takes', failing ? '1,250 events' : '1 event', failing ? 'halved after each failure' : 'cannot go smaller')]) })}</div>
+          <div class="stack">${storeCard(failing ? { und: '3.6 MiB of 50 GiB', oldest: '6 minutes', kept: '310 MiB' } : { und: '71 MiB of 50 GiB', oldest: '3 hours', kept: '310 MiB' })}</div></div>
+          ${card({ icon: 'runs', title: 'Failed runs', body: tbl(['Run', 'Events', 'Status', 'Why'], failing ? [
+              [lnk('to-warehouse · 2c91'), '<span class="mono">#402,118–404,617</span> · 2,500', '<span class="bad">● failed</span>', why],
+              [lnk('to-warehouse · 2c90'), '<span class="mono">#402,118–407,117</span> · 5,000', '<span class="bad">● failed</span>', why],
+              [lnk('to-warehouse · 2c8f'), '<span class="mono">#402,118–412,117</span> · 10,000', '<span class="bad">● failed</span>', why]] : [
+              [lnk('to-warehouse · 2ca4'), '<span class="mono">#402,118</span> · 1', '<span class="bad">● failed</span>', why],
+              [lnk('to-warehouse · 2ca3'), '<span class="mono">#402,118</span> · 1', '<span class="bad">● failed</span>', why],
+              [lnk('to-warehouse · 2ca2'), '<span class="mono">#402,118–402,119</span> · 2', '<span class="bad">● failed</span>', why]]) })}`);
+        if (state === 'skip') M.overlay(dialog('Skip event #402,118 for to-warehouse?', `<span>Moves this delivery past an event it cannot deliver. The event stays stored until it ages out, and the gap is recorded on the feed for good.</span>
+          ${field('Skip up to and including', input('#402,118', { mono: true }), { help: 'The one event every run fails on' })}
+          ${field('Reason', '<div class="area sans">Note field longer than the warehouse column; partner re-sent it trimmed as #418,002</div>', { req: true, help: 'Shown on the feed and in the audit log' })}
+          ${alert('1 event will never reach this delivery’s destination.', 'Other deliveries of this feed are not affected.', 'warn')}`, `${btn('Cancel')}${btn('Skip 1 event', { kind: 'danger', icon: 'right' })}`, 'alert'));
         return;
       }
       if (state === 'full') {
