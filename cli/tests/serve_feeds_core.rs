@@ -2777,7 +2777,7 @@ async fn the_feed_verbs_manage_feeds_straight_in_their_stores() {
     feed(&[&push[..], &["--json"]].concat()).await.unwrap();
     std::fs::write(&events, "{").unwrap();
     assert!(
-        feed(&["send", "orders", &events_arg])
+        feed(&["push", "orders", &events_arg])
             .await
             .unwrap_err()
             .contains("not JSON")
